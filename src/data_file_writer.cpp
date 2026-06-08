@@ -4,6 +4,8 @@
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/schema_mapper.hpp"
 
+#include <zstd.h>
+
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -262,6 +264,53 @@ std::vector<std::uint8_t> page_layout_bytes(const LanceField& field, std::uint64
     return page_layout_bytes(flat_bits_per_value_token(field), rows, false);
 }
 
+// Variable-width structural payload whose value_compression is wrapped in General(ZSTD), so the
+// chunk's value buffer is interpreted as [u64 LE uncompressed size][zstd frame]. Byte layout mirrors
+// what lance 7.0 emits for a zstd variable-width column (see memory: lance-zstd-variable-encoding).
+std::vector<std::uint8_t> variable_width_structural_payload_zstd(std::uint8_t bits_token, std::uint64_t rows) {
+    // Uncompressed variable CompressiveEncoding body: f2 Variable{ f1 offsets = Flat{ f1 bits } }.
+    const std::vector<std::uint8_t> inner_ce{0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, bits_token};
+    // General{ f1 BufferCompression{ f1 scheme = ZSTD(2) }, f3 values = inner_ce }.
+    std::vector<std::uint8_t> general{0x0a, 0x02, 0x08, 0x02, 0x1a, static_cast<std::uint8_t>(inner_ce.size())};
+    general.insert(general.end(), inner_ce.begin(), inner_ce.end());
+    // value_compression CompressiveEncoding{ f10 General }.
+    std::vector<std::uint8_t> value_comp{0x52, static_cast<std::uint8_t>(general.size())};
+    value_comp.insert(value_comp.end(), general.begin(), general.end());
+    // MiniBlockLayout f3 = value_compression, followed by the unchanged f6/f7/f9/f10 tail.
+    std::vector<std::uint8_t> out{0x1a, static_cast<std::uint8_t>(value_comp.size())};
+    out.insert(out.end(), value_comp.begin(), value_comp.end());
+    const auto mini = build_mini_block_layout(bits_token, rows);
+    out.insert(out.end(), mini.begin() + 6, mini.end());
+    return out;
+}
+
+std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_token, std::uint64_t rows) {
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, 1, variable_width_structural_payload_zstd(bits_token, rows));
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
+// Frame a raw buffer as Lance's general-compression payload: [u64 LE uncompressed size][zstd frame].
+bool zstd_frame_buffer(const std::vector<std::uint8_t>& raw, int level, std::vector<std::uint8_t>& out,
+                       std::string& error) {
+    const auto bound = ZSTD_compressBound(raw.size());
+    out.assign(8U + bound, 0U);
+    const std::uint64_t uncompressed = raw.size();
+    for (int i = 0; i < 8; ++i) {
+        out[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((uncompressed >> (8 * i)) & 0xFFU);
+    }
+    const auto csize = ZSTD_compress(out.data() + 8U, bound, raw.data(), raw.size(), level);
+    if (ZSTD_isError(csize) != 0U) {
+        error = std::string("zstd compress failed: ") + ZSTD_getErrorName(csize);
+        return false;
+    }
+    out.resize(8U + csize);
+    return true;
+}
+
 std::size_t padded_size(std::size_t size, std::size_t alignment) {
     return (size + alignment - 1U) & ~(alignment - 1U);
 }
@@ -357,6 +406,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                            const std::vector<ColumnValues>& column_values,
                            std::uint64_t rows,
                            int compression_level,
+                           bool compress_variable,
                            DataFileResult& result,
                            std::string& error) {
     error.clear();
@@ -452,10 +502,19 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             }
         }
 
+        const bool zstd_variable = is_variable && compress_variable;
         pb::ColumnMetadata column;
         column.encoding = column_encoding_bytes();
         for (const auto& chunk : chunks) {
-            const std::vector<MiniblockChunk> single_chunk{chunk};
+            MiniblockChunk stored_chunk = chunk;
+            if (zstd_variable) {
+                std::vector<std::uint8_t> framed;
+                if (!zstd_frame_buffer(chunk.bytes, compression_level, framed, error)) {
+                    return false;
+                }
+                stored_chunk.bytes = std::move(framed);  // value_count unchanged; bytes are now [u64][zstd]
+            }
+            const std::vector<MiniblockChunk> single_chunk{stored_chunk};
             const auto control = control_buffer_for(single_chunk);
             const auto payload = miniblock_payload(single_chunk);
 
@@ -477,7 +536,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             if (is_variable) {
                 const auto bits_token =
                     values.variable.large ? static_cast<std::uint8_t>(0x40U) : static_cast<std::uint8_t>(0x20U);
-                page.encoding = page_layout_bytes(bits_token, chunk.value_count, true);
+                page.encoding = zstd_variable ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count)
+                                              : page_layout_bytes(bits_token, chunk.value_count, true);
             } else {
                 page.encoding = page_layout_bytes(field, chunk.value_count);
             }

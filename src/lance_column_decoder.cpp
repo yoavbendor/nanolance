@@ -4,6 +4,8 @@
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/schema_mapper.hpp"
 
+#include <zstd.h>
+
 #include <cstring>
 #include <limits>
 
@@ -17,6 +19,34 @@ bool field_metadata_is_true(const pb::Field& field, const char* key) {
     }
     static const std::vector<std::uint8_t> kTrue{'t', 'r', 'u', 'e'};
     return it->second == kTrue;
+}
+
+bool field_metadata_equals(const pb::Field& field, const char* key, const char* value) {
+    const auto it = field.metadata.find(key);
+    if (it == field.metadata.end()) {
+        return false;
+    }
+    const std::string v(it->second.begin(), it->second.end());
+    return v == value;
+}
+
+// Inverse of zstd_frame_buffer: [u64 LE uncompressed size][zstd frame] -> raw bytes.
+bool zstd_unframe_buffer(const std::vector<std::uint8_t>& framed, std::vector<std::uint8_t>& out, std::string& error) {
+    if (framed.size() < 8U) {
+        error = "zstd frame shorter than size header";
+        return false;
+    }
+    std::uint64_t uncompressed = 0;
+    for (int i = 0; i < 8; ++i) {
+        uncompressed |= static_cast<std::uint64_t>(framed[static_cast<std::size_t>(i)]) << (8 * i);
+    }
+    out.assign(uncompressed, 0U);
+    const auto got = ZSTD_decompress(out.data(), uncompressed, framed.data() + 8U, framed.size() - 8U);
+    if (ZSTD_isError(got) != 0U || got != uncompressed) {
+        error = "zstd decompress failed for variable-width column";
+        return false;
+    }
+    return true;
 }
 
 bool read_le16(const std::uint8_t* p, std::uint16_t& v) {
@@ -109,8 +139,16 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
         for (std::uint64_t i = 0; i <= num_values; ++i) {
             append_list_offset(out_offsets, read_list_offset(chunk_bytes, i, large) - data_base_in_chunk, large);
         }
-        out_data.insert(out_data.end(),
-                        chunk_bytes.begin() + static_cast<std::ptrdiff_t>(data_base_in_chunk), chunk_bytes.end());
+        // Append only the value bytes [data_base, terminal_offset); the chunk is padded to 8 bytes at
+        // the end, and including that padding would misalign every subsequent page's data.
+        const auto data_end_in_chunk = read_list_offset(chunk_bytes, num_values, large);
+        if (data_end_in_chunk < data_base_in_chunk ||
+            static_cast<std::size_t>(data_end_in_chunk) > chunk_bytes.size()) {
+            error = "variable-width chunk terminal offset out of range";
+            return false;
+        }
+        out_data.insert(out_data.end(), chunk_bytes.begin() + static_cast<std::ptrdiff_t>(data_base_in_chunk),
+                        chunk_bytes.begin() + static_cast<std::ptrdiff_t>(data_end_in_chunk));
         return true;
     }
 
@@ -190,6 +228,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     if (variable) {
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
+        const bool zstd = field_metadata_equals(on_disk_field, "lance-encoding:compression", "zstd");
         for (const auto& page : column_metadata.pages) {
             std::vector<std::uint8_t> control;
             std::vector<std::uint8_t> payload;
@@ -199,6 +238,14 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             std::vector<std::uint8_t> chunk_bytes;
             if (!parse_miniblock_payload_chunks(payload, chunk_bytes, error)) {
                 return false;
+            }
+            if (zstd) {
+                // One chunk per page in nanolance's writer, so the payload holds one [u64][zstd] frame.
+                std::vector<std::uint8_t> raw;
+                if (!zstd_unframe_buffer(chunk_bytes, raw, error)) {
+                    return false;
+                }
+                chunk_bytes = std::move(raw);
             }
             if (!decode_variable_width_page(chunk_bytes, page.length, out.variable.large, out.variable.offsets,
                                           out.variable.data, error)) {

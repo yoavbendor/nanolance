@@ -226,6 +226,10 @@ add_executable(nano_lance_blob_v2_uri_dictionary_test tests/test_blob_v2_uri_dic
 target_compile_features(nano_lance_blob_v2_uri_dictionary_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_blob_v2_uri_dictionary_test PRIVATE nanolance)
 
+add_executable(nano_lance_compression_roundtrip_test tests/test_compression_roundtrip.cpp)
+target_compile_features(nano_lance_compression_roundtrip_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_compression_roundtrip_test PRIVATE nanolance)
+
 add_executable(nano_lance_array_accessor_test tests/test_array_accessor.cpp)
 target_compile_features(nano_lance_array_accessor_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_array_accessor_test PRIVATE nanolance)
@@ -281,6 +285,9 @@ set_tests_properties(nano_lance_blob_v2_external_preprocess PROPERTIES LABELS "s
 
 add_test(NAME nano_lance_blob_v2_uri_dictionary COMMAND $<TARGET_FILE:nano_lance_blob_v2_uri_dictionary_test>)
 set_tests_properties(nano_lance_blob_v2_uri_dictionary PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_compression_roundtrip COMMAND $<TARGET_FILE:nano_lance_compression_roundtrip_test>)
+set_tests_properties(nano_lance_compression_roundtrip PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_array_accessor COMMAND $<TARGET_FILE:nano_lance_array_accessor_test>)
 set_tests_properties(nano_lance_array_accessor PROPERTIES LABELS "smoke")

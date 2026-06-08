@@ -33,6 +33,11 @@ int nano_lance_writer_set_ignore_nullability(NanoLanceWriter* writer, bool ignor
 /// result is a nanolance-only layout (stock Lance/lance-c cannot read those blob columns). Must be
 /// set before any batch is written, and is only supported for create-mode datasets (not append).
 int nano_lance_writer_set_blob_uri_dictionary(NanoLanceWriter* writer, bool enable);
+/// Opt in to Lance-compatible zstd compression of variable-width (string/binary) columns. Each
+/// chunk's value bytes are stored as [uint64 LE uncompressed size][zstd frame] and the column's
+/// PageLayout advertises General(ZSTD) so stock Lance can still read it. Off by default; must be set
+/// before any batch is written. The zstd level is the writer's compression_level (0 = zstd default).
+int nano_lance_writer_set_compression(NanoLanceWriter* writer, bool enable);
 int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, struct ArrowSchema* schema);
 int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append);
 int nano_lance_writer_close(NanoLanceWriter* writer);

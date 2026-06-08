@@ -74,6 +74,16 @@ This is a **nanolance-only** layout — stock Lance/lance-c cannot read those bl
 off by default and create-mode only (not append). nanolance's own reader resolves the URIs
 transparently, so the data you read back is identical either way.
 
+## Compressing string/binary columns (Lance-compatible)
+
+`nano_lance_writer_set_compression(&writer, true)` (CLI: `--compress`) zstd-compresses variable-width
+(string/binary) columns. Each chunk's value buffer is stored as `[uint64 LE uncompressed size][zstd
+frame]` and the column's `PageLayout` advertises `General(ZSTD)`, exactly as the Lance reference
+writer does — so the output is **still readable by stock `lance`** (verified against `lance` 7.0.0;
+a 5000-row repetitive string column read back identically, ~2.7× smaller on disk). The zstd level is
+the writer's `compression_level`. Off by default. (Fixed-width columns are written uncompressed;
+Lance compresses those via bitpacking, which nanolance does not implement.)
+
 ## Embedded in streamingtestapps
 
 The parent project sets `NANOLANCE_SOURCE_DIR` and calls `add_subdirectory` with `NANOLANCE_ENABLE_S3`, `NANOLANCE_S3_TARGET`, and `NANOLANCE_BUILD_TESTS` so it reuses nanoarrow, zstd, and `stream_helper_s3` from the main tree.

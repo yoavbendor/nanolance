@@ -21,6 +21,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                            const std::vector<ColumnValues>& column_values,
                            std::uint64_t rows,
                            int compression_level,
+                           bool compress_variable,
                            DataFileResult& result,
                            std::string& error);
 

@@ -30,6 +30,7 @@ struct WriterState {
     const nano_lance::LanceField* blob_field = nullptr;
     bool ignore_nullability = false;
     bool blob_uri_dictionary = false;
+    bool compression = false;
     bool has_schema = false;
     /// After the first successful manifest write, further commits must pass `is_append=true`.
     bool append_only_commits = false;
@@ -217,6 +218,19 @@ int nano_lance_writer_set_blob_uri_dictionary(NanoLanceWriter* writer, bool enab
     return NANO_LANCE_OK;
 }
 
+int nano_lance_writer_set_compression(NanoLanceWriter* writer, bool enable) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (state->pending_batches != 0 || state->pending_rows != 0) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "compression must be set before writing batches");
+    }
+    state->compression = enable;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
 int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, struct ArrowSchema* schema) {
     auto* state = state_from(writer);
     if (state == nullptr) {
@@ -344,6 +358,18 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
         }
     }
 
+    // When compressing, tag each variable-width physical field so the reader knows to zstd-decompress.
+    // (Stock Lance reads the encoding from the data-file PageLayout; this metadata is nanolance's own
+    // read-side signal and is an inert write hint to Lance.)
+    if (state->compression) {
+        for (auto& field : disk_schema.fields) {
+            if (nano_lance::lance_field_is_physical(field) &&
+                nano_lance::lance_field_is_variable_width(field.logical_type) && field.extension_name.empty()) {
+                field.metadata["lance-encoding:compression"] = "zstd";
+            }
+        }
+    }
+
     std::vector<nano_lance::ColumnValues> commit_columns;
     if (state->blob_field != nullptr) {
         const auto physical = nano_lance::lance_physical_fields(disk_schema);
@@ -375,6 +401,7 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
                                            commit_columns,
                                            state->pending_rows,
                                            state->compression_level,
+                                           state->compression,
                                            data_file,
                                            writer_error)) {
         return set_error(writer, NANO_LANCE_IO_ERROR, writer_error);
