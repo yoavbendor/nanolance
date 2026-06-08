@@ -14,6 +14,8 @@ Requires CMake 3.22+, C++20, network for first-time FetchContent (nanoarrow, zst
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+# Full smoke needs Python with pyarrow for several arrowipc2lance scripts; otherwise use a venv:
+#   cmake -S . -B build -DNANO_LANCE_WRITER_PYTHON=/path/to/venv/bin/python
 ctest --test-dir build -L smoke --output-on-failure
 ```
 
@@ -31,4 +33,6 @@ The parent project sets `NANOLANCE_SOURCE_DIR` and calls `add_subdirectory` with
 
 ## Version
 
-Version macros are generated into `build/include/nanolance/version.h`. Runtime string: `nanolance::library_version()` in `include/nanolance/version.hpp`.
+Version **0.2.0** — macros are generated into `build/include/nanolance/version.h`. Runtime string: `nanolance::library_version()` (declared in `include/nanolance/version.hpp`). `arrowipc2lance --version` includes this string.
+
+Standalone FetchContent pins **nanoarrow** to commit `ffe61d3cd2d02da9e60cfc405cd6c50c512f64b9` for reproducibility (align with a known-good streamingtestapps fetch).
