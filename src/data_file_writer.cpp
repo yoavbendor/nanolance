@@ -77,6 +77,10 @@ std::size_t value_width_bytes(const LanceField& field) {
 
 constexpr std::uint32_t kMaxEightByteWordsPerMetadata = 4095U;
 constexpr std::uint32_t kMaxUncompressedMiniblockBytes = 800U;
+// Variable-width chunks may be much larger: one chunk = one page here, so a small cap means thousands
+// of tiny pages (huge per-page overhead). The miniblock control word is 12-bit (4095 eight-byte
+// words), so a single chunk can hold up to 4095*8 = 32760 bytes.
+constexpr std::uint32_t kMaxVariableMiniblockBytes = kMaxEightByteWordsPerMetadata * 8U;
 
 struct MiniblockChunk {
     std::vector<std::uint8_t> bytes;
@@ -440,7 +444,7 @@ bool build_variable_chunks(const VariableWidthColumnValues& column,
             if (!build_variable_chunk_bytes(offsets, column.data, first_value, last_value + 1U, probe)) {
                 break;
             }
-            if (probe.size() > kMaxUncompressedMiniblockBytes) {
+            if (probe.size() > kMaxVariableMiniblockBytes) {
                 break;
             }
             last_value++;
