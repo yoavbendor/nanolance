@@ -41,6 +41,13 @@ inline bool lance_field_is_variable_width(const std::string& logical_type) {
            logical_type == "binary" || logical_type == "large_binary";
 }
 
+/// Integer logical types (8/16/32/64-bit) eligible for Lance InlineBitpacking. Excludes bool/float.
+inline bool lance_logical_type_is_bitpackable_integer(const std::string& logical_type) {
+    return logical_type == "int8" || logical_type == "uint8" || logical_type == "int16" ||
+           logical_type == "uint16" || logical_type == "int32" || logical_type == "uint32" ||
+           logical_type == "int64" || logical_type == "uint64";
+}
+
 /// Lance `file.Field.encoding`: 1 = fixed-width, 2 = variable-width.
 inline std::int32_t lance_on_disk_field_encoding(const std::string& logical_type) {
     return lance_field_is_variable_width(logical_type) ? 2 : 1;

@@ -74,15 +74,23 @@ This is a **nanolance-only** layout — stock Lance/lance-c cannot read those bl
 off by default and create-mode only (not append). nanolance's own reader resolves the URIs
 transparently, so the data you read back is identical either way.
 
-## Compressing string/binary columns (Lance-compatible)
+## Compression (Lance-compatible)
 
-`nano_lance_writer_set_compression(&writer, true)` (CLI: `--compress`) zstd-compresses variable-width
-(string/binary) columns. Each chunk's value buffer is stored as `[uint64 LE uncompressed size][zstd
-frame]` and the column's `PageLayout` advertises `General(ZSTD)`, exactly as the Lance reference
-writer does — so the output is **still readable by stock `lance`** (verified against `lance` 7.0.0;
-a 5000-row repetitive string column read back identically, ~2.7× smaller on disk). The zstd level is
-the writer's `compression_level`. Off by default. (Fixed-width columns are written uncompressed;
-Lance compresses those via bitpacking, which nanolance does not implement.)
+`nano_lance_writer_set_compression(&writer, true)` (CLI: `--compress`) turns on Lance-compatible
+compression, off by default. The output stays readable by stock `lance` (verified against `lance`
+7.0.0); nanolance's own reader decodes it transparently.
+
+- **String / binary columns → zstd.** Each chunk's value buffer is stored as `[uint64 LE
+  uncompressed size][zstd frame]` and the `PageLayout` advertises `General(ZSTD)`, exactly as the
+  Lance reference writer does. A 5000-row repetitive string column round-trips identically and is
+  ~2.7× smaller. The zstd level is the writer's `compression_level`.
+- **Integer columns (8/16/32/64-bit) → FastLanes bitpacking.** Values are packed in 1024-element
+  blocks at the minimum bit width, emitting `InlineBitpacking` (a faithful port of Lance's vendored
+  `spiraldb/fastlanes` kernel). A 5000-row int64 column with ~10-bit values is ~6.4× smaller and
+  reads back identically under stock `lance`.
+
+Float/bool fixed-width columns are written uncompressed (Lance uses byte-stream-split / other
+schemes there, not yet implemented).
 
 ## Embedded in streamingtestapps
 

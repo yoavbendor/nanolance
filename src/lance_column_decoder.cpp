@@ -2,6 +2,7 @@
 
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/fastlanes_bitpack.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <zstd.h>
@@ -167,6 +168,54 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
     return true;
 }
 
+// Decode one bitpacked page chunk ([bit_width word][FastLanes packed 1024]) into `num_values`
+// little-endian fixed-width values appended to out_fixed.
+template <class T>
+bool unpack_bitpacked_page(const std::vector<std::uint8_t>& chunk, std::uint64_t num_values,
+                           std::vector<std::uint8_t>& out_fixed, std::string& error) {
+    if (chunk.size() < sizeof(T)) {
+        error = "bitpacked chunk shorter than width header";
+        return false;
+    }
+    T width_word = 0;
+    std::memcpy(&width_word, chunk.data(), sizeof(T));
+    const unsigned width = static_cast<unsigned>(width_word);
+    if (width > sizeof(T) * 8U) {
+        error = "bitpacked chunk has invalid bit width";
+        return false;
+    }
+    const auto packed_words = nano_lance::fastlanes::packed_words_1024<T>(width);
+    if (chunk.size() != sizeof(T) * (1U + packed_words)) {
+        error = "bitpacked chunk size does not match bit width";
+        return false;
+    }
+    std::vector<T> packed(packed_words, 0);
+    if (packed_words != 0U) {
+        std::memcpy(packed.data(), chunk.data() + sizeof(T), packed_words * sizeof(T));
+    }
+    T values[1024];
+    nano_lance::fastlanes::unpack_1024<T>(width, packed.data(), values);
+    const auto bytes = static_cast<std::size_t>(num_values) * sizeof(T);
+    const auto* p = reinterpret_cast<const std::uint8_t*>(values);
+    out_fixed.insert(out_fixed.end(), p, p + bytes);
+    return true;
+}
+
+bool unpack_bitpacked_page_dispatch(const std::vector<std::uint8_t>& chunk, std::uint64_t num_values,
+                                    std::size_t bytes_per_value, std::vector<std::uint8_t>& out_fixed,
+                                    std::string& error) {
+    switch (bytes_per_value) {
+        case 1U:
+            return unpack_bitpacked_page<std::uint8_t>(chunk, num_values, out_fixed, error);
+        case 2U:
+            return unpack_bitpacked_page<std::uint16_t>(chunk, num_values, out_fixed, error);
+        case 4U:
+            return unpack_bitpacked_page<std::uint32_t>(chunk, num_values, out_fixed, error);
+        default:
+            return unpack_bitpacked_page<std::uint64_t>(chunk, num_values, out_fixed, error);
+    }
+}
+
 bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& page, bool blob_layout,
                        std::vector<std::uint8_t>& first, std::vector<std::uint8_t>& second, std::string& error) {
     if (page.buffer_offsets.size() < 2U || page.buffer_sizes.size() < 2U) {
@@ -261,6 +310,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         internal_type = "utf8";
     }
     const auto bytes_per_value = lance_logical_type_value_bytes(internal_type);
+    const bool bitpacked = field_metadata_equals(on_disk_field, "nanolance:packing", "bitpack");
     for (const auto& page : column_metadata.pages) {
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
@@ -270,6 +320,12 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         std::vector<std::uint8_t> chunk_bytes;
         if (!parse_miniblock_payload_chunks(payload, chunk_bytes, error)) {
             return false;
+        }
+        if (bitpacked) {
+            if (!unpack_bitpacked_page_dispatch(chunk_bytes, page.length, bytes_per_value, out.fixed, error)) {
+                return false;
+            }
+            continue;
         }
         if (chunk_bytes.size() != page.length * bytes_per_value) {
             error = "fixed-width page byte count mismatch";

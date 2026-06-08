@@ -2,6 +2,7 @@
 
 #include "lance_minimal.pb.hpp"
 #include "nanolance/blob_v2_external.hpp"
+#include "nanolance/fastlanes_bitpack.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <zstd.h>
@@ -293,6 +294,73 @@ std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_toke
     return encoding;
 }
 
+// MiniBlockLayout PageLayout advertising InlineBitpacking{uncompressed_bits_per_value}. Matches lance
+// output (CompressiveEncoding f5 = inline_bitpacking). See memory: lance-inline-bitpacking-format.
+std::vector<std::uint8_t> page_layout_bytes_inline_bitpacking(std::uint8_t uncompressed_bits, std::uint64_t rows) {
+    // value_compression CompressiveEncoding{ f5 InlineBitpacking{ f1 uncompressed_bits_per_value } }.
+    const std::vector<std::uint8_t> ce{0x2a, 0x02, 0x08, uncompressed_bits};
+    std::vector<std::uint8_t> structural{0x1a, static_cast<std::uint8_t>(ce.size())};  // MiniBlockLayout f3
+    structural.insert(structural.end(), ce.begin(), ce.end());
+    const auto mini = build_mini_block_layout(0x40U, rows);  // token irrelevant; reuse the f6/f7/f9/f10 tail
+    structural.insert(structural.end(), mini.begin() + 6, mini.end());
+
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, 1, structural);
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
+// Bit width (0..bits) needed to represent the largest of `count` little-endian values of `width_bytes`.
+unsigned chunk_bit_width(const std::uint8_t* src, std::size_t count, std::size_t width_bytes) {
+    std::uint64_t max_value = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, src + i * width_bytes, width_bytes);
+        max_value |= v;
+    }
+    unsigned bits = 0;
+    while (max_value != 0U) {
+        ++bits;
+        max_value >>= 1U;
+    }
+    return bits;
+}
+
+// Build one bitpacked chunk buffer: [bit_width as one width_bytes word][FastLanes packed 1024 values].
+// `count` (<=1024) values are read from `src`; the rest of the 1024-block is zero-padded.
+template <class T>
+std::vector<std::uint8_t> build_bitpacked_chunk_typed(const std::uint8_t* src, std::size_t count) {
+    T in[1024] = {};
+    for (std::size_t i = 0; i < count; ++i) {
+        std::memcpy(&in[i], src + i * sizeof(T), sizeof(T));
+    }
+    unsigned width = chunk_bit_width(src, count, sizeof(T));
+    std::vector<T> packed(nano_lance::fastlanes::packed_words_1024<T>(width), T(0));
+    nano_lance::fastlanes::pack_1024<T>(width, in, packed.data());
+    std::vector<std::uint8_t> out(sizeof(T) * (1U + packed.size()));
+    const T width_word = static_cast<T>(width);
+    std::memcpy(out.data(), &width_word, sizeof(T));
+    if (!packed.empty()) {
+        std::memcpy(out.data() + sizeof(T), packed.data(), packed.size() * sizeof(T));
+    }
+    return out;
+}
+
+std::vector<std::uint8_t> build_bitpacked_chunk(const std::uint8_t* src, std::size_t count, std::size_t width_bytes) {
+    switch (width_bytes) {
+        case 1U:
+            return build_bitpacked_chunk_typed<std::uint8_t>(src, count);
+        case 2U:
+            return build_bitpacked_chunk_typed<std::uint16_t>(src, count);
+        case 4U:
+            return build_bitpacked_chunk_typed<std::uint32_t>(src, count);
+        default:
+            return build_bitpacked_chunk_typed<std::uint64_t>(src, count);
+    }
+}
+
 // Frame a raw buffer as Lance's general-compression payload: [u64 LE uncompressed size][zstd frame].
 bool zstd_frame_buffer(const std::vector<std::uint8_t>& raw, int level, std::vector<std::uint8_t>& out,
                        std::string& error) {
@@ -406,7 +474,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                            const std::vector<ColumnValues>& column_values,
                            std::uint64_t rows,
                            int compression_level,
-                           bool compress_variable,
+                           bool compress,
                            DataFileResult& result,
                            std::string& error) {
     error.clear();
@@ -481,28 +549,40 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
 
         std::vector<MiniblockChunk> chunks;
         const bool is_variable = values.kind == ColumnValues::Kind::VariableWidth;
+        const bool bitpack = !is_variable && compress && lance_logical_type_is_bitpackable_integer(field.logical_type);
+        const auto fixed_bytes_per_value = value_width_bytes(field);
         if (is_variable) {
             if (!build_variable_chunks_for_column(values.variable, chunks, error)) {
                 return false;
             }
         } else {
-            const auto bytes_per_value = value_width_bytes(field);
-            if (values.fixed.size() % bytes_per_value != 0U) {
+            if (values.fixed.size() % fixed_bytes_per_value != 0U) {
                 error = "column value buffer size is not aligned to field width for ";
                 error += field.name;
                 return false;
             }
-            if (values.fixed.size() / bytes_per_value != static_cast<std::size_t>(rows)) {
+            if (values.fixed.size() / fixed_bytes_per_value != static_cast<std::size_t>(rows)) {
                 error = "column value count does not match row count for ";
                 error += field.name;
                 return false;
             }
-            if (!build_miniblock_chunks(values.fixed, bytes_per_value, compression_level, chunks, error)) {
+            if (bitpack) {
+                // One FastLanes 1024-value chunk per page; each chunk buffer = [bit_width][packed].
+                const auto total = values.fixed.size() / fixed_bytes_per_value;
+                for (std::size_t off = 0; off < total; off += 1024U) {
+                    const auto count = std::min<std::size_t>(1024U, total - off);
+                    MiniblockChunk chunk;
+                    chunk.value_count = count;
+                    chunk.bytes = build_bitpacked_chunk(values.fixed.data() + off * fixed_bytes_per_value, count,
+                                                        fixed_bytes_per_value);
+                    chunks.push_back(std::move(chunk));
+                }
+            } else if (!build_miniblock_chunks(values.fixed, fixed_bytes_per_value, compression_level, chunks, error)) {
                 return false;
             }
         }
 
-        const bool zstd_variable = is_variable && compress_variable;
+        const bool zstd_variable = is_variable && compress;
         pb::ColumnMetadata column;
         column.encoding = column_encoding_bytes();
         for (const auto& chunk : chunks) {
@@ -538,6 +618,9 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                     values.variable.large ? static_cast<std::uint8_t>(0x40U) : static_cast<std::uint8_t>(0x20U);
                 page.encoding = zstd_variable ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count)
                                               : page_layout_bytes(bits_token, chunk.value_count, true);
+            } else if (bitpack) {
+                page.encoding = page_layout_bytes_inline_bitpacking(
+                    static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), chunk.value_count);
             } else {
                 page.encoding = page_layout_bytes(field, chunk.value_count);
             }

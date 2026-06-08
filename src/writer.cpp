@@ -363,9 +363,13 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
     // read-side signal and is an inert write hint to Lance.)
     if (state->compression) {
         for (auto& field : disk_schema.fields) {
-            if (nano_lance::lance_field_is_physical(field) &&
-                nano_lance::lance_field_is_variable_width(field.logical_type) && field.extension_name.empty()) {
+            if (!nano_lance::lance_field_is_physical(field) || !field.extension_name.empty()) {
+                continue;
+            }
+            if (nano_lance::lance_field_is_variable_width(field.logical_type)) {
                 field.metadata["lance-encoding:compression"] = "zstd";
+            } else if (nano_lance::lance_logical_type_is_bitpackable_integer(field.logical_type)) {
+                field.metadata["nanolance:packing"] = "bitpack";
             }
         }
     }
