@@ -1,5 +1,5 @@
-#include "nano_lance_writer/nano_lance_reader.h"
-#include "nano_lance_writer/nano_lance_writer.h"
+#include "nanolance/nano_lance_reader.h"
+#include "nanolance/nano_lance_writer.h"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -49,14 +49,14 @@ void write_one_batch(NanoLanceWriter& writer) {
 int main() {
     const auto ds = temp_dataset();
     NanoLanceWriter writer{};
-    require(nano_lance_writer_init(&writer, ds.c_str(), 3) == NANO_LANCE_OK, "init");
+    require(nano_lance_writer_init(&writer, ds.string().c_str(), 3) == NANO_LANCE_OK, "init");
     write_one_batch(writer);
     require(nano_lance_writer_commit(&writer, false) == NANO_LANCE_OK, "commit");
     require(nano_lance_writer_close(&writer) == NANO_LANCE_OK, "close");
 
     NanoLanceDatasetMetadata meta{};
     char err[512]{};
-    require(nano_lance_dataset_read_latest(ds.c_str(), &meta, err, sizeof err) == NANO_LANCE_READER_OK, err);
+    require(nano_lance_dataset_read_latest(ds.string().c_str(), &meta, err, sizeof err) == NANO_LANCE_READER_OK, err);
     require(meta.manifest_version == 1, "manifest version");
     require(meta.fragments_len == 1, "fragment count");
     require(meta.total_physical_rows == 4, "total rows");

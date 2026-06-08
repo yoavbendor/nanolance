@@ -1,4 +1,4 @@
-#include "nano_lance_writer/nano_lance_reader.h"
+#include "nanolance/nano_lance_reader.h"
 
 #include <algorithm>
 #include <cstdint>

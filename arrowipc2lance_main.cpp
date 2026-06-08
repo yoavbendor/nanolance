@@ -1,5 +1,5 @@
-#include "nano_lance_writer/nano_lance_reader.h"
-#include "nano_lance_writer/nano_lance_writer.h"
+#include "nanolance/nano_lance_reader.h"
+#include "nanolance/nano_lance_writer.h"
 #include "nanolance/version.hpp"
 
 #include <CLI/CLI.hpp>
@@ -12,6 +12,11 @@
 #include <iostream>
 #include <string>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
 namespace {
 
 volatile std::sig_atomic_t g_stop_requested = 0;
@@ -20,12 +25,22 @@ void signal_handler(int /*signal*/) {
     g_stop_requested = 1;
 }
 
+// Portable handler install. SIGINT exists on every platform; SIGPIPE is POSIX-only
+// (on Windows a broken pipe surfaces as a write error, which the IPC loop already handles).
 bool install_signal_handlers() {
-    struct sigaction action {};
-    action.sa_handler = signal_handler;
-    sigemptyset(&action.sa_mask);
-    action.sa_flags = 0;
-    return sigaction(SIGINT, &action, nullptr) == 0 && sigaction(SIGPIPE, &action, nullptr) == 0;
+    bool ok = std::signal(SIGINT, signal_handler) != SIG_ERR;
+#ifdef SIGPIPE
+    ok = ok && std::signal(SIGPIPE, signal_handler) != SIG_ERR;
+#endif
+    return ok;
+}
+
+// stdin defaults to text mode on Windows, which mangles binary Arrow IPC bytes
+// (CRLF translation, Ctrl-Z as EOF). No-op elsewhere.
+void set_stdin_binary() {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
 }
 
 }  // namespace
@@ -127,6 +142,7 @@ int main(int argc, char** argv) {
         std::cerr << "failed to install signal handlers\n";
         return 1;
     }
+    set_stdin_binary();
 
     NanoLanceWriter writer{};
     const int init_status = nano_lance_writer_init(&writer, output_path.c_str(), compression_level);

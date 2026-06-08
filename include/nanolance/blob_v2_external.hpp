@@ -1,7 +1,7 @@
 #pragma once
 
-#include "nano_lance_writer/column_values.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/column_values.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <cstdint>
 #include <string>
@@ -42,10 +42,23 @@ bool blob_v2_unpack_descriptor_row(const std::vector<std::uint8_t>& row_bytes,
 /// the last `append_batch_column_values` (e.g. at commit); Arrow ingest layout is no longer read.
 bool finalize_blob_v2_schema_for_write(LanceSchemaMapping& mapping, std::string& error);
 
+/// Manifest/field metadata key holding the newline-joined URI dictionary (nanolance extension).
+/// Presence of this key marks a blob column as dictionary-encoded; readers resolve each row's
+/// `uri` from `dictionary[blob_id]` instead of the (empty) inline URI. NOT readable by stock Lance.
+constexpr const char* kBlobV2UriDictMetadataKey = "nanolance:blob_uri_dict";
+
+/// Serialize / parse the URI dictionary for storage in field metadata (newline-joined).
+std::string blob_v2_serialize_uri_dictionary(const std::vector<std::string>& dictionary);
+std::vector<std::string> blob_v2_parse_uri_dictionary(const std::string& serialized);
+
 /// Append packed external-only blob rows from the Arrow struct column for `blob_field`.
+/// When `dictionary_mode` is true, distinct URIs are deduplicated into `out.blob_v2.uri_dictionary`
+/// and each packed row stores `blob_id` = dictionary index with an empty inline URI (smaller, but
+/// produces a nanolance-only layout). When false, URIs are stored inline per row (Lance-compatible).
 bool append_blob_v2_batch_column_values(const ArrowArray& batch,
                                          const LanceSchemaMapping& mapping,
                                          const LanceField& blob_field,
+                                         bool dictionary_mode,
                                          ColumnValues& out,
                                          std::string& error);
 

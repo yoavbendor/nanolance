@@ -1,7 +1,7 @@
 #pragma once
 
-#include "nano_lance_writer/column_values.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/column_values.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <cstdint>
 #include <filesystem>

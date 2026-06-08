@@ -1,10 +1,10 @@
-#include "nano_lance_writer/lance_table_reader.hpp"
+#include "nanolance/lance_table_reader.hpp"
 
-#include "nano_lance_writer/blob_v2_external.hpp"
-#include "nano_lance_writer/data_file_reader.hpp"
-#include "nano_lance_writer/lance_column_decoder.hpp"
-#include "nano_lance_writer/manifest_reader.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/blob_v2_external.hpp"
+#include "nanolance/data_file_reader.hpp"
+#include "nanolance/lance_column_decoder.hpp"
+#include "nanolance/manifest_reader.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -289,10 +289,19 @@ bool append_uint64_value(ArrowArray& array, const std::uint64_t value, std::stri
     return true;
 }
 
-bool append_blob_v2_row(ArrowArray& struct_array, const std::vector<std::uint8_t>& row_bytes, std::string& error) {
+bool append_blob_v2_row(ArrowArray& struct_array, const std::vector<std::uint8_t>& row_bytes,
+                        const std::vector<std::string>* uri_dictionary, std::string& error) {
     BlobV2ExternalDescriptor descriptor{};
     if (!blob_v2_unpack_descriptor_row(row_bytes, descriptor, error)) {
         return false;
+    }
+    // Dictionary-encoded rows carry an empty inline URI and a blob_id index into the dictionary.
+    if (uri_dictionary != nullptr && !uri_dictionary->empty() && descriptor.blob_uri.empty()) {
+        if (descriptor.blob_id >= uri_dictionary->size()) {
+            error = "blob_id out of range for URI dictionary";
+            return false;
+        }
+        descriptor.blob_uri = (*uri_dictionary)[descriptor.blob_id];
     }
     auto* data = struct_array.children[0];
     auto* uri = struct_array.children[1];
@@ -382,7 +391,7 @@ bool build_array_from_field(const LanceField& field, const LanceSchemaMapping& m
                             static_cast<std::ptrdiff_t>(blob_payload_offset),
                         blob_packed->blob_v2.packed_payload.begin() +
                             static_cast<std::ptrdiff_t>(blob_payload_offset + row_size));
-                    if (!append_blob_v2_row(*child_array, row_bytes, error)) {
+                    if (!append_blob_v2_row(*child_array, row_bytes, nullptr, error)) {
                         ArrowArrayRelease(&array);
                         return false;
                     }
@@ -457,7 +466,8 @@ bool build_array_from_field(const LanceField& field, const LanceSchemaMapping& m
 }
 
 bool append_column_value_at_row(const LanceField& field, const ColumnValues& values, const std::int64_t row,
-                                ArrowArray& array, std::string& error) {
+                                const std::vector<std::string>* uri_dictionary, ArrowArray& array,
+                                std::string& error) {
     if (field.extension_name == "lance.blob.v2") {
         if (values.kind != ColumnValues::Kind::BlobV2External) {
             error = "expected blob v2 packed values for " + field.name;
@@ -483,7 +493,7 @@ bool append_column_value_at_row(const LanceField& field, const ColumnValues& val
         const std::vector<std::uint8_t> row_bytes(
             values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(offset),
             values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(offset + row_size));
-        return append_blob_v2_row(array, row_bytes, error);
+        return append_blob_v2_row(array, row_bytes, uri_dictionary, error);
     }
     if (lance_field_is_variable_width(field.logical_type)) {
         return append_string_at_row(array, values.variable, static_cast<std::size_t>(row), error);
@@ -514,6 +524,22 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         ArrowArrayRelease(&batch);
         return false;
     }
+
+    // Precompute URI dictionaries for any dictionary-encoded blob columns (nanolance extension).
+    std::unordered_map<std::int32_t, std::vector<std::string>> blob_uri_dicts;
+    for (const auto& f : mapping.fields) {
+        if (f.extension_name == "lance.blob.v2") {
+            const auto it = f.metadata.find(kBlobV2UriDictMetadataKey);
+            if (it != f.metadata.end()) {
+                blob_uri_dicts.emplace(f.id, blob_v2_parse_uri_dictionary(it->second));
+            }
+        }
+    }
+    auto dict_for = [&](std::int32_t id) -> const std::vector<std::string>* {
+        const auto it = blob_uri_dicts.find(id);
+        return it == blob_uri_dicts.end() ? nullptr : &it->second;
+    };
+
     for (std::int64_t row = 0; row < length; ++row) {
         for (int64_t c = 0; c < batch_schema.n_children; ++c) {
             const auto* child_schema = batch_schema.children[c];
@@ -538,7 +564,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                     ArrowArrayRelease(&batch);
                     return false;
                 }
-                if (!append_column_value_at_row(*field, col_it->second, row, *child_array, error)) {
+                if (!append_column_value_at_row(*field, col_it->second, row, dict_for(field->id), *child_array,
+                                                error)) {
                     ArrowArrayRelease(&batch);
                     return false;
                 }
@@ -559,7 +586,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                 ArrowArrayRelease(&batch);
                 return false;
             }
-            if (!append_column_value_at_row(*field, col_it->second, row, *child_array, error)) {
+            if (!append_column_value_at_row(*field, col_it->second, row, dict_for(field->id), *child_array, error)) {
                 error += " (column ";
                 error += field->name;
                 error += ")";

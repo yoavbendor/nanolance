@@ -135,9 +135,9 @@ flowchart TB
 
 ## Estimated touch files
 
-- `apps/nano_lance_writer/src/data_file_reader.{hpp,cpp}`
-- `apps/nano_lance_writer/src/lance_column_decoder.{hpp,cpp}` (new)
-- `apps/nano_lance_writer/src/lance_table_reader.{hpp,cpp}` (new)
-- `apps/nano_lance_writer/src/nano_lance_reader.cpp`
-- `apps/nano_lance_writer/include/nano_lance_writer/nano_lance_reader.h`
+- `apps/nanolance/src/data_file_reader.{hpp,cpp}`
+- `apps/nanolance/src/lance_column_decoder.{hpp,cpp}` (new)
+- `apps/nanolance/src/lance_table_reader.{hpp,cpp}` (new)
+- `apps/nanolance/src/nano_lance_reader.cpp`
+- `apps/nanolance/include/nanolance/nano_lance_reader.h`
 - `apps/mdf2lance/mdf2lance_main.cpp`

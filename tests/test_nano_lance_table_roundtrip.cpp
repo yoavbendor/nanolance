@@ -1,5 +1,5 @@
-#include "nano_lance_writer/lance_table_reader.hpp"
-#include "nano_lance_writer/nano_lance_writer.h"
+#include "nanolance/lance_table_reader.hpp"
+#include "nanolance/nano_lance_writer.h"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -68,7 +68,7 @@ void test_int64_roundtrip() {
 
     {
         NanoLanceWriter writer{};
-        require(nano_lance_writer_init(&writer, ds.c_str(), 0) == NANO_LANCE_OK, "init");
+        require(nano_lance_writer_init(&writer, ds.string().c_str(), 0) == NANO_LANCE_OK, "init");
         require(nano_lance_write_batch(&writer, &source, &field) == NANO_LANCE_OK, "write");
         require(nano_lance_writer_commit(&writer, false) == NANO_LANCE_OK, "commit");
         require(nano_lance_writer_close(&writer) == NANO_LANCE_OK, "close");
@@ -107,7 +107,7 @@ void test_utf8_roundtrip() {
 
     {
         NanoLanceWriter writer{};
-        require(nano_lance_writer_init(&writer, ds.c_str(), 0) == NANO_LANCE_OK, "init");
+        require(nano_lance_writer_init(&writer, ds.string().c_str(), 0) == NANO_LANCE_OK, "init");
         require(nano_lance_writer_set_ignore_nullability(&writer, true) == NANO_LANCE_OK, "ignore nullability");
         require(nano_lance_write_batch(&writer, &source, &schema) == NANO_LANCE_OK, "write");
         require(nano_lance_writer_commit(&writer, false) == NANO_LANCE_OK, "commit");

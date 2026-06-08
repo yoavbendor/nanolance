@@ -1,4 +1,4 @@
-#include "nano_lance_writer/blob_builder.hpp"
+#include "nanolance/blob_builder.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 

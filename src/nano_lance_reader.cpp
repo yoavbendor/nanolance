@@ -1,7 +1,7 @@
-#include "nano_lance_writer/nano_lance_reader.h"
+#include "nanolance/nano_lance_reader.h"
 
 #include "lance_minimal.pb.hpp"
-#include "nano_lance_writer/manifest_reader.hpp"
+#include "nanolance/manifest_reader.hpp"
 
 #include <algorithm>
 #include <cstdlib>

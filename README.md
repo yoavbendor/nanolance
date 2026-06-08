@@ -1,10 +1,10 @@
 # nanolance
 
-Standalone C++ library for writing **Lance v2.2** datasets (minimal protobuf scaffold, no Rust `lance` core). Public headers remain under `include/nano_lance_writer/` for compatibility.
+Standalone C++ library for writing **Lance v2.2** datasets (minimal protobuf scaffold, no Rust `lance` core). Public headers live under `include/nanolance/`.
 
 ## Layout
 
-- **Libraries (CMake targets):** `nanolance_proto`, `nanolance_reader`, `nanolance` (aliases: `nano_lance_proto_minimal`, `nano_lance_reader`, `nano_lance_writer`)
+- **Libraries (CMake targets):** `nanolance_proto`, `nanolance_reader`, `nanolance` (namespaced alias `nanolance::nanolance`)
 - **Tool:** `arrowipc2lance` — Arrow IPC stream → Lance dataset (`--version` prints nanolance version)
 
 ## Standalone build
@@ -27,9 +27,79 @@ cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON \
   -DNANOLANCE_S3_INCLUDE_DIR=/path/to/headers
 ```
 
+## Writing external references (C++)
+
+nanolance is write-centric and its headline feature is pointing rows at raw bytes that live
+elsewhere (a local file, or an object in S3) instead of copying them into the dataset. A row's
+`payload_ref` carries a `uri` + `position` + `size`; the bytes are never read at write time.
+
+```cpp
+#include "nanolance/blob_builder.hpp"   // build_epb_table_{schema,array}, BlobV2Row
+#include "nanolance/nano_lance_writer.h" // C writer API
+#include <nanoarrow/nanoarrow.h>
+
+// Two packets whose payloads live in one S3 object at different offsets — no bytes copied.
+std::vector<std::uint64_t> packet_ids = {0, 1};
+std::vector<nano_lance::BlobV2Row> refs = {
+    {/*inline_data=*/std::nullopt, /*uri=*/"s3://bucket/capture.pcapng", /*position=*/2048, /*size=*/1500},
+    {/*inline_data=*/std::nullopt, /*uri=*/"s3://bucket/capture.pcapng", /*position=*/3548, /*size=*/512},
+};
+
+ArrowSchema schema{};
+ArrowArray batch{};
+std::string err;
+nano_lance::build_epb_table_schema(schema, err);
+nano_lance::build_epb_table_array(packet_ids, refs, batch, err);
+
+NanoLanceWriter writer{};
+nano_lance_writer_init(&writer, "capture.lance", /*compression_level=*/3);
+nano_lance_write_batch(&writer, &batch, &schema);
+nano_lance_writer_commit(&writer, /*is_append=*/false);
+nano_lance_writer_close(&writer);
+// Read the referenced bytes back later with nano_lance_fetch_external_blob(uri, position, size, ...).
+```
+
+Link `nanolance` (writer) for the build; `nanolance_reader` is enough if you only fetch blobs.
+
+### Shrinking many refs to one object (URI dictionary, opt-in)
+
+By default each row stores its URI inline, matching Lance's on-disk blob-v2 layout (verified against
+`lance` 7.0.0: it stores the external URI per row and only generally compresses it — it does **not**
+dictionary-dedup). When many rows point at the *same* object (e.g. millions of packets in one
+`.pcapng`), call `nano_lance_writer_set_blob_uri_dictionary(&writer, true)` before writing. Each
+distinct URI is then stored once and referenced per row by index, so a reference costs a handful of
+bytes instead of the full URI.
+
+This is a **nanolance-only** layout — stock Lance/lance-c cannot read those blob columns — so it is
+off by default and create-mode only (not append). nanolance's own reader resolves the URIs
+transparently, so the data you read back is identical either way.
+
 ## Embedded in streamingtestapps
 
 The parent project sets `NANOLANCE_SOURCE_DIR` and calls `add_subdirectory` with `NANOLANCE_ENABLE_S3`, `NANOLANCE_S3_TARGET`, and `NANOLANCE_BUILD_TESTS` so it reuses nanoarrow, zstd, and `stream_helper_s3` from the main tree.
+
+## Repo size (why a zip looked huge)
+
+**The library sources are small** (on the order of 1–2 MB without `build/`). What explodes disk usage is the **CMake `build/` directory** after a standalone configure:
+
+- FetchContent checkouts live under `build/_deps/` (nanoarrow, zstd, CLI11).
+- CMake clones those repos with **`.git` object packs`** (often tens of MB each) unless shallow clones are used.
+- Object files and static libs add more under `build/`.
+
+**Nothing in `build/` is part of the “library” you distribute** — delete it before making a zip, or never add it to the archive:
+
+```bash
+rm -rf build
+du -sh .   # expect ~1–3MB for sources + .git + small fixtures
+```
+
+**Prefer a clean export** (no build, no deps):
+
+```bash
+git archive --format=zip -o nanolance-src.zip HEAD
+```
+
+Standalone configures use **`GIT_SHALLOW TRUE`** on FetchContent to keep *future* `build/_deps` smaller; an existing `build/` from before that change should still be removed or reconfigured from scratch to drop old full clones.
 
 ## Version
 

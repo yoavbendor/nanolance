@@ -1,5 +1,5 @@
-#include "nano_lance_writer/array_accessor.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/array_accessor.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 

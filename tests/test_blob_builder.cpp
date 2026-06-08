@@ -1,5 +1,5 @@
-#include "nano_lance_writer/blob_builder.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/blob_builder.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 

@@ -28,6 +28,11 @@ int nano_lance_writer_init(NanoLanceWriter* writer, const char* path, int compre
 /// Open an existing dataset for more fragments (reloads schema from latest manifest; commits must use `is_append=true`).
 int nano_lance_writer_init_append(NanoLanceWriter* writer, const char* path, int compression_level);
 int nano_lance_writer_set_ignore_nullability(NanoLanceWriter* writer, bool ignore_nullability);
+/// Opt in to URI-dictionary encoding for `lance.blob.v2` external columns: store each distinct URI
+/// once and reference it per row by index. Much smaller when many rows point at one object, but the
+/// result is a nanolance-only layout (stock Lance/lance-c cannot read those blob columns). Must be
+/// set before any batch is written, and is only supported for create-mode datasets (not append).
+int nano_lance_writer_set_blob_uri_dictionary(NanoLanceWriter* writer, bool enable);
 int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, struct ArrowSchema* schema);
 int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append);
 int nano_lance_writer_close(NanoLanceWriter* writer);

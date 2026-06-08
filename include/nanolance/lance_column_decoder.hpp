@@ -1,7 +1,7 @@
 #pragma once
 
 #include "lance_minimal.pb.hpp"
-#include "nano_lance_writer/column_values.hpp"
+#include "nanolance/column_values.hpp"
 
 #include <cstdint>
 #include <filesystem>

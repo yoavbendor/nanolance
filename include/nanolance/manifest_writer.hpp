@@ -1,7 +1,7 @@
 #pragma once
 
-#include "nano_lance_writer/data_file_writer.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/data_file_writer.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <cstdint>
 #include <filesystem>

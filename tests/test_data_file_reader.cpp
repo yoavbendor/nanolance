@@ -1,5 +1,5 @@
-#include "nano_lance_writer/data_file_reader.hpp"
-#include "nano_lance_writer/nano_lance_writer.h"
+#include "nanolance/data_file_reader.hpp"
+#include "nanolance/nano_lance_writer.h"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -31,7 +31,7 @@ int main() {
 
     {
         NanoLanceWriter writer{};
-        require(nano_lance_writer_init(&writer, ds.c_str(), 0) == NANO_LANCE_OK, "init");
+        require(nano_lance_writer_init(&writer, ds.string().c_str(), 0) == NANO_LANCE_OK, "init");
         ArrowArray batch{};
         batch.length = 7;
         ArrowSchema field{};

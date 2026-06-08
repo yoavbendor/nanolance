@@ -1,4 +1,4 @@
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow_ipc.h>

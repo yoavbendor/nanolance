@@ -56,6 +56,7 @@ if(NOT TARGET nanoarrow_static OR NOT DEFINED nanoarrow_SOURCE_DIR)
     FetchContent_Declare(nanoarrow
         GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow.git
         GIT_TAG ffe61d3cd2d02da9e60cfc405cd6c50c512f64b9
+        GIT_SHALLOW TRUE
     )
     FetchContent_Populate(nanoarrow)
     add_subdirectory(${nanoarrow_SOURCE_DIR} ${nanoarrow_BINARY_DIR} EXCLUDE_FROM_ALL)
@@ -85,6 +86,7 @@ if(NOT NANOLANCE_ZSTD_TARGET AND NANOLANCE_STANDALONE)
     FetchContent_Declare(_nanolance_zstd
         GIT_REPOSITORY https://github.com/facebook/zstd.git
         GIT_TAG v1.5.6
+        GIT_SHALLOW TRUE
     )
     FetchContent_GetProperties(_nanolance_zstd)
     if(NOT _nanolance_zstd_POPULATED)
@@ -114,6 +116,7 @@ if(NANOLANCE_BUILD_TOOLS)
         FetchContent_Declare(_nanolance_cli11
             GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
             GIT_TAG v2.4.2
+            GIT_SHALLOW TRUE
         )
         FetchContent_MakeAvailable(_nanolance_cli11)
     endif()
@@ -191,9 +194,6 @@ target_link_libraries(nanolance PUBLIC
     "${NANOLANCE_ZSTD_TARGET}"
 )
 
-add_library(nano_lance_proto_minimal ALIAS nanolance_proto)
-add_library(nano_lance_reader ALIAS nanolance_reader)
-add_library(nano_lance_writer ALIAS nanolance)
 add_library(nanolance::nanolance ALIAS nanolance)
 
 if(NANOLANCE_BUILD_TOOLS)
@@ -221,6 +221,10 @@ target_link_libraries(nano_lance_blob_builder_test PRIVATE nanolance)
 add_executable(nano_lance_blob_v2_external_test tests/test_blob_v2_external_preprocess.cpp)
 target_compile_features(nano_lance_blob_v2_external_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_blob_v2_external_test PRIVATE nanolance)
+
+add_executable(nano_lance_blob_v2_uri_dictionary_test tests/test_blob_v2_uri_dictionary.cpp)
+target_compile_features(nano_lance_blob_v2_uri_dictionary_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_blob_v2_uri_dictionary_test PRIVATE nanolance)
 
 add_executable(nano_lance_array_accessor_test tests/test_array_accessor.cpp)
 target_compile_features(nano_lance_array_accessor_test PRIVATE cxx_std_20)
@@ -274,6 +278,9 @@ set_tests_properties(nano_lance_blob_builder PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_blob_v2_external_preprocess COMMAND $<TARGET_FILE:nano_lance_blob_v2_external_test>)
 set_tests_properties(nano_lance_blob_v2_external_preprocess PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_blob_v2_uri_dictionary COMMAND $<TARGET_FILE:nano_lance_blob_v2_uri_dictionary_test>)
+set_tests_properties(nano_lance_blob_v2_uri_dictionary PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_array_accessor COMMAND $<TARGET_FILE:nano_lance_array_accessor_test>)
 set_tests_properties(nano_lance_array_accessor PROPERTIES LABELS "smoke")

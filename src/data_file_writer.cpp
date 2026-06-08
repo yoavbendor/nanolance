@@ -1,8 +1,8 @@
-#include "nano_lance_writer/data_file_writer.hpp"
+#include "nanolance/data_file_writer.hpp"
 
 #include "lance_minimal.pb.hpp"
-#include "nano_lance_writer/blob_v2_external.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/blob_v2_external.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <array>
 #include <cstring>

@@ -1,7 +1,7 @@
-#include "nano_lance_writer/array_accessor.hpp"
-#include "nano_lance_writer/blob_builder.hpp"
-#include "nano_lance_writer/blob_v2_external.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/array_accessor.hpp"
+#include "nanolance/blob_builder.hpp"
+#include "nanolance/blob_v2_external.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -124,7 +124,8 @@ int main() {
 
     {
         nano_lance::ColumnValues column_values;
-        require(nano_lance::append_blob_v2_batch_column_values(batch, mapping, *payload, column_values, error),
+        require(nano_lance::append_blob_v2_batch_column_values(batch, mapping, *payload, /*dictionary_mode=*/false,
+                                                               column_values, error),
                 error.c_str());
         require(column_values.kind == nano_lance::ColumnValues::Kind::BlobV2External, "column kind mismatch");
         require(column_values.blob_v2.row_packed_sizes.size() == 2U, "packed row count mismatch");

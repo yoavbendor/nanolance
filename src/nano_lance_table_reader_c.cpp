@@ -1,5 +1,5 @@
-#include "nano_lance_writer/lance_table_reader.hpp"
-#include "nano_lance_writer/nano_lance_reader.h"
+#include "nanolance/lance_table_reader.hpp"
+#include "nanolance/nano_lance_reader.h"
 
 #include <cstring>
 #include <filesystem>

@@ -1,8 +1,8 @@
-#include "nano_lance_writer/lance_column_decoder.hpp"
+#include "nanolance/lance_column_decoder.hpp"
 
-#include "nano_lance_writer/blob_v2_external.hpp"
-#include "nano_lance_writer/data_file_reader.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/blob_v2_external.hpp"
+#include "nanolance/data_file_reader.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <cstring>
 #include <limits>

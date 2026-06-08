@@ -1,4 +1,4 @@
-#include "nano_lance_writer/array_accessor.hpp"
+#include "nanolance/array_accessor.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 

@@ -1,4 +1,4 @@
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include "lance_minimal.pb.hpp"
 

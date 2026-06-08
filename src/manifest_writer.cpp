@@ -1,8 +1,8 @@
-#include "nano_lance_writer/manifest_writer.hpp"
+#include "nanolance/manifest_writer.hpp"
 
 #include "lance_minimal.pb.hpp"
-#include "nano_lance_writer/manifest_reader.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/manifest_reader.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <array>
 #include <algorithm>

@@ -1,5 +1,5 @@
-#include "nano_lance_writer/nano_lance_reader.h"
-#include "nano_lance_writer/nano_lance_writer.h"
+#include "nanolance/nano_lance_reader.h"
+#include "nanolance/nano_lance_writer.h"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -45,7 +45,7 @@ int main() {
 
     {
         NanoLanceWriter writer{};
-        require(nano_lance_writer_init(&writer, ds.c_str(), 3) == NANO_LANCE_OK, "init");
+        require(nano_lance_writer_init(&writer, ds.string().c_str(), 3) == NANO_LANCE_OK, "init");
         write_batch(writer, 42);
         require(nano_lance_writer_commit(&writer, false) == NANO_LANCE_OK, "create commit");
         write_batch(writer, 77);
@@ -55,14 +55,14 @@ int main() {
 
     {
         NanoLanceWriter writer{};
-        require(nano_lance_writer_init_append(&writer, ds.c_str(), 3) == NANO_LANCE_OK, "init_append");
+        require(nano_lance_writer_init_append(&writer, ds.string().c_str(), 3) == NANO_LANCE_OK, "init_append");
         write_batch(writer, 100);
         require(nano_lance_writer_commit(&writer, true) == NANO_LANCE_OK, "append after init_append");
         require(nano_lance_writer_close(&writer) == NANO_LANCE_OK, "close");
     }
 
     NanoLanceDatasetMetadata meta{};
-    require(nano_lance_dataset_read_latest(ds.c_str(), &meta, err, sizeof err) == NANO_LANCE_READER_OK, err);
+    require(nano_lance_dataset_read_latest(ds.string().c_str(), &meta, err, sizeof err) == NANO_LANCE_READER_OK, err);
     require(meta.manifest_version == 3, "expected manifest v3 after three commits");
     require(meta.fragments_len == 3, "expected three fragments");
     require(meta.total_physical_rows == 3, "sum of physical rows");

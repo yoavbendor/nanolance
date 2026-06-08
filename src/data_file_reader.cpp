@@ -1,4 +1,4 @@
-#include "nano_lance_writer/data_file_reader.hpp"
+#include "nanolance/data_file_reader.hpp"
 
 #include <array>
 #include <cstring>

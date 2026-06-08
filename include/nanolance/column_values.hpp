@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace nano_lance {
@@ -17,6 +19,12 @@ struct BlobV2ExternalColumnValues {
     std::vector<std::uint8_t> packed_payload;
     /// Byte length of each row's packed record (for Lance control buffer).
     std::vector<std::uint32_t> row_packed_sizes;
+    /// Opt-in URI dictionary (nanolance extension): distinct external URIs stored once.
+    /// When non-empty, packed rows carry `blob_id` = index here and an empty inline `uri`.
+    /// Empty means Lance-compatible per-row inline URIs.
+    std::vector<std::string> uri_dictionary;
+    /// Dedup lookup used only while building `uri_dictionary` on the write side.
+    std::unordered_map<std::string, std::uint32_t> uri_to_id;
 };
 
 struct ColumnValues {

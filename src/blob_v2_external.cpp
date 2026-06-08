@@ -1,7 +1,7 @@
-#include "nano_lance_writer/blob_v2_external.hpp"
+#include "nanolance/blob_v2_external.hpp"
 
-#include "nano_lance_writer/array_accessor.hpp"
-#include "nano_lance_writer/blob_builder.hpp"
+#include "nanolance/array_accessor.hpp"
+#include "nanolance/blob_builder.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -10,6 +10,24 @@
 #include <limits>
 
 namespace nano_lance {
+
+// On-disk packed layout of one external (kind=3) blob v2 descriptor row. All integers little-endian.
+//
+//   offset  size  field
+//   ------  ----  -----------------------------------------------------------
+//      0      4   prefix      = kBlobV2FixedDescriptorBytes + uri_len (record length minus this u32)
+//      4      1   kind        = 3 (external reference)
+//      5      8   position    byte offset of the blob inside the external object
+//     13      8   size        blob length in bytes
+//     21      4   blob_id     reserved; currently always 0
+//     25      4   uri_len     length of the uri bytes that follow
+//     29  uri_len uri         external object URI (e.g. "s3://bucket/key", "file:///path")
+//
+// Total record bytes = kBlobV2RecordHeaderBytes + uri_len.
+// `prefix` deliberately excludes its own 4 bytes so it equals everything Lance counts as the record body.
+constexpr std::uint32_t kBlobV2FixedDescriptorBytes = 25U;             // kind..uri_len, excludes leading prefix u32
+constexpr std::size_t kBlobV2RecordHeaderBytes = 4U + kBlobV2FixedDescriptorBytes;  // prefix u32 + fixed fields = 29
+
 namespace {
 
 void append_le16(std::vector<std::uint8_t>& out, std::uint16_t value) {
@@ -392,7 +410,7 @@ bool preprocess_blob_v2_external_row(const ArrowArray& data,
 
 std::vector<std::uint8_t> blob_v2_pack_descriptor_row(const BlobV2ExternalDescriptor& descriptor) {
     const auto uri_bytes = static_cast<std::uint32_t>(descriptor.blob_uri.size());
-    const std::uint32_t prefix = 25U + uri_bytes;
+    const std::uint32_t prefix = kBlobV2FixedDescriptorBytes + uri_bytes;
 
     std::vector<std::uint8_t> row_bytes;
     row_bytes.reserve(4U + 1U + 8U + 8U + 4U + 4U + descriptor.blob_uri.size());
@@ -424,7 +442,7 @@ bool blob_v2_unpack_descriptor_row(const std::vector<std::uint8_t>& row_bytes,
                                      std::string& error) {
     error.clear();
     out = BlobV2ExternalDescriptor{};
-    if (row_bytes.size() < 29U) {
+    if (row_bytes.size() < kBlobV2RecordHeaderBytes) {
         error = "packed blob v2 row is too short";
         return false;
     }
@@ -437,21 +455,51 @@ bool blob_v2_unpack_descriptor_row(const std::vector<std::uint8_t>& row_bytes,
     std::memcpy(&out.blob_id, row_bytes.data() + 21U, sizeof(std::uint32_t));
     std::uint32_t uri_len = 0;
     std::memcpy(&uri_len, row_bytes.data() + 25U, sizeof(std::uint32_t));
-    if (prefix != 25U + uri_len) {
+    if (prefix != kBlobV2FixedDescriptorBytes + uri_len) {
         error = "packed blob v2 row prefix does not match uri length";
         return false;
     }
-    if (row_bytes.size() != 29U + uri_len) {
+    if (row_bytes.size() != kBlobV2RecordHeaderBytes + uri_len) {
         error = "packed blob v2 row size does not match uri payload";
         return false;
     }
-    out.blob_uri.assign(reinterpret_cast<const char*>(row_bytes.data() + 29U), uri_len);
+    out.blob_uri.assign(reinterpret_cast<const char*>(row_bytes.data() + kBlobV2RecordHeaderBytes), uri_len);
     return true;
+}
+
+std::string blob_v2_serialize_uri_dictionary(const std::vector<std::string>& dictionary) {
+    std::string out;
+    for (std::size_t i = 0; i < dictionary.size(); ++i) {
+        if (i != 0U) {
+            out.push_back('\n');
+        }
+        out += dictionary[i];
+    }
+    return out;
+}
+
+std::vector<std::string> blob_v2_parse_uri_dictionary(const std::string& serialized) {
+    std::vector<std::string> out;
+    if (serialized.empty()) {
+        return out;
+    }
+    std::size_t start = 0;
+    while (true) {
+        const auto nl = serialized.find('\n', start);
+        if (nl == std::string::npos) {
+            out.push_back(serialized.substr(start));
+            break;
+        }
+        out.push_back(serialized.substr(start, nl - start));
+        start = nl + 1U;
+    }
+    return out;
 }
 
 bool append_blob_v2_batch_column_values(const ArrowArray& batch,
                                         const LanceSchemaMapping& mapping,
                                         const LanceField& blob_field,
+                                        bool dictionary_mode,
                                         ColumnValues& out,
                                         std::string& error) {
     error.clear();
@@ -496,6 +544,21 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
         BlobV2ExternalDescriptor descriptor;
         if (!preprocess_blob_v2_external_row(*data_a, *uri_a, *pos_a, *size_a, row, descriptor, error)) {
             return false;
+        }
+        if (dictionary_mode) {
+            // Deduplicate the URI: assign a stable dictionary index and store it once.
+            // The packed row then carries blob_id = index and an empty inline URI.
+            auto it = out.blob_v2.uri_to_id.find(descriptor.blob_uri);
+            std::uint32_t id = 0;
+            if (it == out.blob_v2.uri_to_id.end()) {
+                id = static_cast<std::uint32_t>(out.blob_v2.uri_dictionary.size());
+                out.blob_v2.uri_dictionary.push_back(descriptor.blob_uri);
+                out.blob_v2.uri_to_id.emplace(descriptor.blob_uri, id);
+            } else {
+                id = it->second;
+            }
+            descriptor.blob_id = id;
+            descriptor.blob_uri.clear();
         }
         const auto row_bytes = blob_v2_pack_descriptor_row(descriptor);
         out.blob_v2.row_packed_sizes.push_back(static_cast<std::uint32_t>(row_bytes.size()));

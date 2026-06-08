@@ -1,4 +1,4 @@
-#include "nano_lance_writer/manifest_reader.hpp"
+#include "nanolance/manifest_reader.hpp"
 
 #include <algorithm>
 #include <cstring>

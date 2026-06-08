@@ -1,12 +1,12 @@
-#include "nano_lance_writer/nano_lance_writer.h"
+#include "nanolance/nano_lance_writer.h"
 
-#include "nano_lance_writer/array_accessor.hpp"
-#include "nano_lance_writer/blob_builder.hpp"
-#include "nano_lance_writer/blob_v2_external.hpp"
-#include "nano_lance_writer/data_file_writer.hpp"
-#include "nano_lance_writer/manifest_reader.hpp"
-#include "nano_lance_writer/manifest_writer.hpp"
-#include "nano_lance_writer/schema_mapper.hpp"
+#include "nanolance/array_accessor.hpp"
+#include "nanolance/blob_builder.hpp"
+#include "nanolance/blob_v2_external.hpp"
+#include "nanolance/data_file_writer.hpp"
+#include "nanolance/manifest_reader.hpp"
+#include "nanolance/manifest_writer.hpp"
+#include "nanolance/schema_mapper.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -29,6 +29,7 @@ struct WriterState {
     nano_lance::ColumnValues blob_column_values;
     const nano_lance::LanceField* blob_field = nullptr;
     bool ignore_nullability = false;
+    bool blob_uri_dictionary = false;
     bool has_schema = false;
     /// After the first successful manifest write, further commits must pass `is_append=true`.
     bool append_only_commits = false;
@@ -200,6 +201,22 @@ int nano_lance_writer_set_ignore_nullability(NanoLanceWriter* writer, bool ignor
     return NANO_LANCE_OK;
 }
 
+int nano_lance_writer_set_blob_uri_dictionary(NanoLanceWriter* writer, bool enable) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (state->pending_batches != 0 || state->pending_rows != 0) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "blob URI dictionary must be set before writing batches");
+    }
+    if (enable && state->append_only_commits) {
+        return set_error(writer, NANO_LANCE_UNSUPPORTED, "blob URI dictionary mode is not supported for append datasets");
+    }
+    state->blob_uri_dictionary = enable;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
 int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, struct ArrowSchema* schema) {
     auto* state = state_from(writer);
     if (state == nullptr) {
@@ -252,6 +269,7 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
         if (!nano_lance::append_blob_v2_batch_column_values(*batch,
                                                             state->schema_mapping,
                                                             *state->blob_field,
+                                                            state->blob_uri_dictionary,
                                                             state->blob_column_values,
                                                             error)) {
             return set_error(writer, NANO_LANCE_UNSUPPORTED, error);
@@ -281,6 +299,10 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
         return set_error(writer, NANO_LANCE_INVALID_STATE,
                          "commit requires is_append=true after the first manifest was written");
     }
+    if (state->blob_uri_dictionary && is_append) {
+        return set_error(writer, NANO_LANCE_UNSUPPORTED,
+                         "blob URI dictionary mode does not support append commits");
+    }
 
     std::error_code error;
     if (is_append && !std::filesystem::exists(state->dataset_path, error)) {
@@ -306,6 +328,19 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
     if (state->blob_field != nullptr) {
         if (!nano_lance::finalize_blob_v2_schema_for_write(disk_schema, writer_error)) {
             return set_error(writer, NANO_LANCE_UNSUPPORTED, writer_error);
+        }
+        // Persist the URI dictionary on the blob parent field so the reader can resolve each row's
+        // URI by index. Stored in manifest/field metadata; only present in dictionary mode.
+        if (state->blob_uri_dictionary && !state->blob_column_values.blob_v2.uri_dictionary.empty()) {
+            const auto serialized =
+                nano_lance::blob_v2_serialize_uri_dictionary(state->blob_column_values.blob_v2.uri_dictionary);
+            for (auto& field : disk_schema.fields) {
+                if (field.extension_name == nano_lance::kBlobV2ExtensionName && field.logical_type == "struct" &&
+                    field.parent_id == -1) {
+                    field.metadata[nano_lance::kBlobV2UriDictMetadataKey] = serialized;
+                    break;
+                }
+            }
         }
     }
 

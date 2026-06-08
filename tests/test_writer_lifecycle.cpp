@@ -1,4 +1,4 @@
-#include "nano_lance_writer/nano_lance_writer.h"
+#include "nanolance/nano_lance_writer.h"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -37,7 +37,7 @@ int main() {
             "invalid compression level should fail");
 
     const auto dataset_path = temp_dataset_path();
-    require(nano_lance_writer_init(&writer, dataset_path.c_str(), 3) == NANO_LANCE_OK, "valid init should pass");
+    require(nano_lance_writer_init(&writer, dataset_path.string().c_str(), 3) == NANO_LANCE_OK, "valid init should pass");
     require(nano_lance_writer_pending_batches(&writer) == 0, "new writer should have no pending batches");
 
     ArrowArray batch{};
