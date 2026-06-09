@@ -10,6 +10,7 @@ on:
       - 'include/**'
       - 'tools/**'
       - 'tests/**'
+      - 'examples/**'
       - 'generated/**'
       - 'CMakeLists.txt'
       - '.github/workflows/linux-bench.yml'
@@ -43,6 +44,10 @@ jobs:
           ctest --test-dir build -L smoke \
             -E "golden|blob_v2_smoke|nonnull|ignore_nullability|inspect|append_smoke|version|help" \
             --output-on-failure | tee /tmp/ctest.txt
+
+      - name: Interop tests (stock lance reads our files)
+        run: |
+          ctest --test-dir build -L interop --output-on-failure
 
       - name: Benchmark (size + write/read time)
         env:
