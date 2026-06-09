@@ -57,7 +57,8 @@ All of these stay readable by stock `lance`; nanolance's own reader decodes them
 |---|---|---|
 | Integer 8/16/32/64-bit | FastLanes **InlineBitpacking** (1024-value blocks) | int64 ~10-bit values: 84 → 3.4 B/row |
 | Constant column (all rows equal), fixed **or** string/binary | **ConstantLayout** (value stored once; ~0 data bytes) | constant int → 0.007, constant URI string → 0.009 B/row |
-| String / binary (non-constant) | **zstd** (`General(ZSTD)`, `[u64 len][zstd]` per chunk) | repetitive string: 7.6 → ~3 B/row |
+| Low-cardinality run-length column, fixed **or** string | **RLE** (ints) / **Dictionary+RLE** (strings) | run-length URI: 2.90 → 0.033 B/row (87×); run-length int: → 0.027 B/row |
+| String / binary (non-constant, high-cardinality) | **zstd** (`General(ZSTD)`, `[u64 len][zstd]` per chunk) | repetitive string: 7.6 → ~3 B/row |
 | float / bool fixed-width | left uncompressed (Lance uses other schemes) | — |
 
 `compression_level` is the zstd level (also used as a hint; 0 = zstd default). Bitpacking/constant

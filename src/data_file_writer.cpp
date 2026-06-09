@@ -10,6 +10,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -342,6 +343,48 @@ std::vector<std::uint8_t> page_layout_bytes_rle(std::uint8_t value_bits, std::ui
                                          0x08, value_bits, 0x12, 0x04, 0x0a, 0x02, 0x08, length_bits};
     const auto tail = miniblock_tail(num_items, 2U);
     structural.insert(structural.end(), tail.begin(), tail.end());
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, 1, structural);
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
+// Build the dictionary's inner Variable block (Lance VariableEncoder block format):
+// [u32 bits_per_offset=32][u32 bytes_start_offset][u32 offsets (N+1, relative to data, start 0)][data].
+std::vector<std::uint8_t> build_dict_variable_block(const std::vector<std::string>& distinct) {
+    const std::size_t n = distinct.size();
+    const auto bytes_start_offset = static_cast<std::uint32_t>(8U + (n + 1U) * 4U);
+    std::vector<std::uint8_t> out;
+    append_le32(out, 32U);                 // bits_per_offset
+    append_le32(out, bytes_start_offset);  // where the data bytes start
+    std::uint32_t cum = 0;
+    append_le32(out, 0U);  // offset[0]
+    for (const auto& s : distinct) {
+        cum += static_cast<std::uint32_t>(s.size());
+        append_le32(out, cum);
+    }
+    for (const auto& s : distinct) {
+        out.insert(out.end(), s.begin(), s.end());
+    }
+    return out;
+}
+
+// PageLayout for a dictionary-encoded low-cardinality column: value_compression = Rle over u32
+// indices, dictionary = General(ZSTD)+Variable, num_dictionary_items, num_buffers=2.
+std::vector<std::uint8_t> page_layout_bytes_dict_rle(std::uint32_t num_distinct, std::uint64_t num_items) {
+    static const std::uint8_t kF3Rle[] = {0x1a, 0x0e, 0x42, 0x0c, 0x0a, 0x04, 0x0a, 0x02,
+                                          0x08, 0x20, 0x12, 0x04, 0x0a, 0x02, 0x08, 0x08};
+    static const std::uint8_t kF4Dict[] = {0x22, 0x10, 0x52, 0x0e, 0x0a, 0x02, 0x08, 0x02, 0x1a,
+                                           0x08, 0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20};
+    std::vector<std::uint8_t> structural(kF3Rle, kF3Rle + sizeof(kF3Rle));
+    structural.insert(structural.end(), kF4Dict, kF4Dict + sizeof(kF4Dict));
+    structural.push_back(0x28);  // f5 num_dictionary_items
+    append_varint(structural, num_distinct);
+    const auto tail = miniblock_tail(num_items, 2U);
+    structural.insert(structural.end(), tail.begin(), tail.end());
+
     std::vector<std::uint8_t> page_layout;
     write_length_delimited(page_layout, 1, structural);
     std::vector<std::uint8_t> encoding;
@@ -737,6 +780,96 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.priority = 0;
             page.encoding = page_layout_bytes_rle(static_cast<std::uint8_t>(bpv * 8U),
                                                   static_cast<std::uint8_t>(length_bytes * 8U), rows);
+            column.pages.push_back(std::move(page));
+            columns.push_back(std::move(column));
+            continue;
+        }
+
+        // Dictionary + RLE for a low-cardinality variable-width column: distinct values in buffer[2],
+        // per-row u32 indices RLE'd in buffer[1].
+        if (packing_it != field.metadata.end() && packing_it->second == "dict-rle" &&
+            values.kind == ColumnValues::Kind::VariableWidth) {
+            const bool large =
+                field.logical_type == "large_utf8" || field.logical_type == "large_binary";
+            const std::size_t ow = large ? 8U : 4U;
+            const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
+            auto read_offset = [&](std::size_t idx) -> std::int64_t {
+                const auto* p = values.variable.offsets.data() + idx * ow;
+                if (large) {
+                    std::int64_t v = 0;
+                    std::memcpy(&v, p, 8);
+                    return v;
+                }
+                std::int32_t v = 0;
+                std::memcpy(&v, p, 4);
+                return v;
+            };
+            std::map<std::string, std::uint32_t> dict;
+            std::vector<std::string> distinct;
+            std::vector<std::uint32_t> indices;
+            indices.reserve(num_rows);
+            for (std::size_t r = 0; r < num_rows; ++r) {
+                const auto s = read_offset(r);
+                const auto e = read_offset(r + 1);
+                std::string val(reinterpret_cast<const char*>(values.variable.data.data() + s),
+                                static_cast<std::size_t>(e - s));
+                auto it = dict.find(val);
+                if (it == dict.end()) {
+                    const auto id = static_cast<std::uint32_t>(distinct.size());
+                    dict.emplace(val, id);
+                    distinct.push_back(std::move(val));
+                    indices.push_back(id);
+                } else {
+                    indices.push_back(it->second);
+                }
+            }
+            // RLE the u32 indices (8-bit sub-runs).
+            std::vector<std::uint8_t> run_values;
+            std::vector<std::uint8_t> run_lengths;
+            for (std::size_t r = 0; r < indices.size();) {
+                std::size_t run = 1;
+                while (r + run < indices.size() && indices[r + run] == indices[r]) {
+                    ++run;
+                }
+                for (std::size_t remaining = run; remaining > 0;) {
+                    const std::size_t take = std::min<std::size_t>(255U, remaining);
+                    append_le32(run_values, indices[r]);
+                    run_lengths.push_back(static_cast<std::uint8_t>(take));
+                    remaining -= take;
+                }
+                r += run;
+            }
+            const auto chunk_bytes = build_multibuffer_chunk({run_values, run_lengths});
+            MiniblockChunk chunk;
+            chunk.bytes = chunk_bytes;
+            const auto control = control_buffer_for({chunk});
+            std::vector<std::uint8_t> dict_frame;
+            if (!zstd_frame_buffer(build_dict_variable_block(distinct), compression_level, dict_frame, error)) {
+                return false;
+            }
+
+            align64(out);
+            const auto control_offset = pos(out);
+            out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
+            align64(out);
+            const auto data_offset = pos(out);
+            out.write(reinterpret_cast<const char*>(chunk_bytes.data()), static_cast<std::streamsize>(chunk_bytes.size()));
+            align64(out);
+            const auto dict_offset = pos(out);
+            out.write(reinterpret_cast<const char*>(dict_frame.data()), static_cast<std::streamsize>(dict_frame.size()));
+
+            pb::ColumnMetadata column;
+            column.encoding = column_encoding_bytes();
+            pb::ColumnPage page;
+            page.buffer_offsets.push_back(control_offset);
+            page.buffer_offsets.push_back(data_offset);
+            page.buffer_offsets.push_back(dict_offset);
+            page.buffer_sizes.push_back(control.size());
+            page.buffer_sizes.push_back(chunk_bytes.size());
+            page.buffer_sizes.push_back(dict_frame.size());
+            page.length = rows;
+            page.priority = 0;
+            page.encoding = page_layout_bytes_dict_rle(static_cast<std::uint32_t>(distinct.size()), rows);
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
             continue;

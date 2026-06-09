@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -120,6 +121,80 @@ bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vec
     }
     value_out.assign(cv.variable.data.begin() + start0, cv.variable.data.begin() + end0);
     return true;
+}
+
+// Reconstruct each row's bytes from a variable-width column into `rows_out`.
+bool variable_column_rows(const nano_lance::ColumnValues& cv, std::vector<std::string>& rows_out) {
+    const std::size_t ow = cv.variable.large ? 8U : 4U;
+    if (cv.variable.offsets.size() < ow) {
+        return false;
+    }
+    auto read_offset = [&](std::size_t index) -> std::int64_t {
+        const auto* p = cv.variable.offsets.data() + index * ow;
+        if (cv.variable.large) {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, 8);
+            return v;
+        }
+        std::int32_t v = 0;
+        std::memcpy(&v, p, 4);
+        return v;
+    };
+    const std::size_t rows = cv.variable.offsets.size() / ow - 1U;
+    rows_out.clear();
+    rows_out.reserve(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        const auto s = read_offset(i);
+        const auto e = read_offset(i + 1);
+        if (s < 0 || e < s || static_cast<std::size_t>(e) > cv.variable.data.size()) {
+            return false;
+        }
+        rows_out.emplace_back(reinterpret_cast<const char*>(cv.variable.data.data() + s),
+                              static_cast<std::size_t>(e - s));
+    }
+    return true;
+}
+
+// Decide whether dictionary + RLE wins for a low-cardinality, run-length variable-width column:
+// few distinct values AND the per-row index array is run-length friendly (the per-minute URI case).
+bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
+    std::vector<std::string> rows;
+    if (!variable_column_rows(cv, rows) || rows.empty()) {
+        return false;
+    }
+    std::map<std::string, std::uint32_t> dict;
+    std::vector<std::uint32_t> indices;
+    indices.reserve(rows.size());
+    for (const auto& r : rows) {
+        auto it = dict.find(r);
+        if (it == dict.end()) {
+            const auto id = static_cast<std::uint32_t>(dict.size());
+            dict.emplace(r, id);
+            indices.push_back(id);
+        } else {
+            indices.push_back(it->second);
+        }
+    }
+    // Require real low cardinality (dictionary must be small relative to the data).
+    if (dict.size() * 2U >= rows.size()) {
+        return false;
+    }
+    // The index array must be run-length friendly (split runs of <=255).
+    std::size_t split_runs = 0;
+    std::size_t i = 0;
+    while (i < indices.size()) {
+        std::size_t run = 1;
+        while (i + run < indices.size() && indices[i + run] == indices[i]) {
+            ++run;
+        }
+        split_runs += (run + 254U) / 255U;
+        i += run;
+    }
+    if (split_runs * 2U >= indices.size()) {
+        return false;
+    }
+    const std::size_t values_size = split_runs * 4U;  // u32 indices
+    return (values_size + split_runs + 32U) <= 32760U;
 }
 
 WriterState* state_from(NanoLanceWriter* writer) {
@@ -517,6 +592,15 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
                             field.metadata["nanolance:packing"] = "rle";
                             break;
                         }
+                    }
+                }
+            } else if (cv.kind == nano_lance::ColumnValues::Kind::VariableWidth &&
+                       variable_column_dict_rle_beneficial(cv)) {
+                // Low-cardinality run-length string column -> dictionary + RLE'd indices.
+                for (auto& field : disk_schema.fields) {
+                    if (field.id == pf->id) {
+                        field.metadata["nanolance:packing"] = "dict-rle";
+                        break;
                     }
                 }
             }

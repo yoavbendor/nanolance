@@ -377,6 +377,106 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         return true;
     }
 
+    // Dictionary + RLE variable-width column: buffer[1] = RLE'd u32 indices, buffer[2] = dictionary.
+    if (field_metadata_equals(on_disk_field, "nanolance:packing", "dict-rle")) {
+        out.kind = ColumnValues::Kind::VariableWidth;
+        out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
+        const auto ow = out.variable.large ? 8U : 4U;
+        for (const auto& page : column_metadata.pages) {
+            if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
+                error = "dict-rle page missing buffers";
+                return false;
+            }
+            std::vector<std::uint8_t> data;       // buffer[1]: RLE chunk of indices
+            std::vector<std::uint8_t> dict_frame;  // buffer[2]: dictionary
+            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[1], page.buffer_sizes[1], data, error) ||
+                !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_frame,
+                                            error)) {
+                return false;
+            }
+            // Decode the dictionary: un-zstd -> [u32 32][u32 bytes_start][u32 offsets][data].
+            std::vector<std::uint8_t> dict_block;
+            if (!zstd_unframe_buffer(dict_frame, dict_block, error)) {
+                return false;
+            }
+            if (dict_block.size() < 8U) {
+                error = "dict block too short";
+                return false;
+            }
+            std::uint32_t bytes_start = 0;
+            std::memcpy(&bytes_start, dict_block.data() + 4U, 4U);
+            if (bytes_start < 12U || bytes_start > dict_block.size() || (bytes_start - 8U) % 4U != 0U) {
+                error = "dict block header invalid";
+                return false;
+            }
+            const std::size_t num_dict = (bytes_start - 8U) / 4U - 1U;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> dict_ranges(num_dict);
+            for (std::size_t d = 0; d < num_dict; ++d) {
+                std::uint32_t a = 0;
+                std::uint32_t b = 0;
+                std::memcpy(&a, dict_block.data() + 8U + d * 4U, 4U);
+                std::memcpy(&b, dict_block.data() + 8U + (d + 1U) * 4U, 4U);
+                if (bytes_start + b > dict_block.size() || b < a) {
+                    error = "dict offsets out of range";
+                    return false;
+                }
+                dict_ranges[d] = {bytes_start + a, b - a};
+            }
+            // Decode the RLE chunk of u32 indices (same framing as the fixed-width RLE path).
+            if (data.size() < 10U) {
+                error = "dict-rle data chunk too short";
+                return false;
+            }
+            std::uint32_t size0 = 0;
+            std::uint32_t size1 = 0;
+            std::memcpy(&size0, data.data() + 2U, 4U);
+            std::memcpy(&size1, data.data() + 6U, 4U);
+            std::size_t voff = 10U;
+            voff += (8U - (voff % 8U)) % 8U;
+            std::size_t loff = voff + size0;
+            loff += (8U - (loff % 8U)) % 8U;
+            if (loff + size1 > data.size() || size0 % 4U != 0U || size0 / 4U != size1) {
+                error = "dict-rle chunk sizes invalid";
+                return false;
+            }
+            const std::size_t num_runs = size1;
+            std::uint64_t cumulative = 0;
+            auto push_offset = [&](std::uint64_t v) {
+                if (out.variable.large) {
+                    out.variable.offsets.insert(out.variable.offsets.end(),
+                                                reinterpret_cast<const std::uint8_t*>(&v),
+                                                reinterpret_cast<const std::uint8_t*>(&v) + 8);
+                } else {
+                    const auto v32 = static_cast<std::uint32_t>(v);
+                    out.variable.offsets.insert(out.variable.offsets.end(),
+                                                reinterpret_cast<const std::uint8_t*>(&v32),
+                                                reinterpret_cast<const std::uint8_t*>(&v32) + 4);
+                }
+            };
+            if (out.variable.offsets.empty()) {
+                push_offset(0);
+            }
+            for (std::size_t r = 0; r < num_runs; ++r) {
+                std::uint32_t index = 0;
+                std::memcpy(&index, data.data() + voff + r * 4U, 4U);
+                const std::uint8_t run = data[loff + r];
+                if (index >= num_dict) {
+                    error = "dict-rle index out of range";
+                    return false;
+                }
+                const auto [start, len] = dict_ranges[index];
+                for (std::uint8_t c = 0; c < run; ++c) {
+                    out.variable.data.insert(out.variable.data.end(), dict_block.begin() + start,
+                                             dict_block.begin() + start + len);
+                    cumulative += len;
+                    push_offset(cumulative);
+                }
+            }
+            (void)ow;
+        }
+        return true;
+    }
+
     const bool variable = on_disk_field.encoding == 2;
     if (variable) {
         out.kind = ColumnValues::Kind::VariableWidth;
