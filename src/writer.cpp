@@ -52,6 +52,37 @@ int set_error(NanoLanceWriter* writer, int code, const std::string& message) {
     return code;
 }
 
+// Decide whether RLE beats bitpacking for a fixed-width column. Lance requires 8-bit run lengths, so
+// runs longer than 255 are split into <=255 sub-runs; we count those split runs.
+bool fixed_column_rle_plan(const nano_lance::ColumnValues& cv, std::size_t bpv) {
+    if (bpv == 0U || cv.fixed.empty() || cv.fixed.size() % bpv != 0U) {
+        return false;
+    }
+    const std::size_t n = cv.fixed.size() / bpv;
+    std::size_t split_runs = 0;
+    std::size_t i = 0;
+    while (i < n) {
+        std::size_t run = 1;
+        while (i + run < n &&
+               std::memcmp(cv.fixed.data() + (i + run) * bpv, cv.fixed.data() + i * bpv, bpv) == 0) {
+            ++run;
+        }
+        split_runs += (run + 254U) / 255U;  // each sub-run holds at most 255
+        i += run;
+    }
+    // RLE pays off only with substantial repetition (Lance uses runs < 50% of values).
+    if (split_runs * 2U >= n) {
+        return false;
+    }
+    // One chunk for the whole column: run buffers must fit the miniblock (12-bit word => 32760 bytes).
+    const std::size_t values_size = split_runs * bpv;
+    const std::size_t lengths_size = split_runs;  // 1 byte each
+    if ((values_size + lengths_size + 32U) > 32760U) {
+        return false;
+    }
+    return true;
+}
+
 // True if every row of a variable-width column is identical; returns that value in `value_out`.
 bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vector<std::uint8_t>& value_out) {
     const std::size_t ow = cv.variable.large ? 8U : 4U;
@@ -465,14 +496,28 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
             } else if (cv.kind == nano_lance::ColumnValues::Kind::VariableWidth) {
                 constant = variable_column_constant_value(cv, value);
             }
-            if (!constant) {
+            if (constant) {
+                for (auto& field : disk_schema.fields) {
+                    if (field.id == pf->id) {
+                        field.metadata["nanolance:packing"] = "constant";
+                        field.metadata["nanolance:const-value"] = std::string(value.begin(), value.end());
+                        break;
+                    }
+                }
                 continue;
             }
-            for (auto& field : disk_schema.fields) {
-                if (field.id == pf->id) {
-                    field.metadata["nanolance:packing"] = "constant";
-                    field.metadata["nanolance:const-value"] = std::string(value.begin(), value.end());
-                    break;
+            // Run-length encoding for repetitive fixed-width integer columns (beats bitpacking when
+            // there are long runs, e.g. dictionary indices later).
+            if (cv.kind == nano_lance::ColumnValues::Kind::FixedWidth &&
+                nano_lance::lance_logical_type_is_bitpackable_integer(pf->logical_type)) {
+                const auto bpv = nano_lance::lance_logical_type_value_bytes(pf->logical_type);
+                if (fixed_column_rle_plan(cv, bpv)) {
+                    for (auto& field : disk_schema.fields) {
+                        if (field.id == pf->id) {
+                            field.metadata["nanolance:packing"] = "rle";
+                            break;
+                        }
+                    }
                 }
             }
         }

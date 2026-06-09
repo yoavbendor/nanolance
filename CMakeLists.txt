@@ -238,6 +238,10 @@ add_executable(nano_lance_constant_roundtrip_test tests/test_constant_roundtrip.
 target_compile_features(nano_lance_constant_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_constant_roundtrip_test PRIVATE nanolance)
 
+add_executable(nano_lance_rle_roundtrip_test tests/test_rle_roundtrip.cpp)
+target_compile_features(nano_lance_rle_roundtrip_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_rle_roundtrip_test PRIVATE nanolance)
+
 add_executable(nano_lance_array_accessor_test tests/test_array_accessor.cpp)
 target_compile_features(nano_lance_array_accessor_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_array_accessor_test PRIVATE nanolance)
@@ -302,6 +306,9 @@ set_tests_properties(nano_lance_bitpacking_roundtrip PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_constant_roundtrip COMMAND $<TARGET_FILE:nano_lance_constant_roundtrip_test>)
 set_tests_properties(nano_lance_constant_roundtrip PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_rle_roundtrip COMMAND $<TARGET_FILE:nano_lance_rle_roundtrip_test>)
+set_tests_properties(nano_lance_rle_roundtrip PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_array_accessor COMMAND $<TARGET_FILE:nano_lance_array_accessor_test>)
 set_tests_properties(nano_lance_array_accessor PROPERTIES LABELS "smoke")

@@ -325,6 +325,58 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         return true;
     }
 
+    // Run-length encoded fixed-width column: one chunk with two buffers (run values + run lengths).
+    if (field_metadata_equals(on_disk_field, "nanolance:packing", "rle")) {
+        out.kind = ColumnValues::Kind::FixedWidth;
+        std::string internal = on_disk_field.logical_type;
+        if (internal == "string") {
+            internal = "utf8";
+        }
+        const auto bpv = lance_logical_type_value_bytes(internal);
+        const std::size_t length_bytes = 1U;  // Lance RLE uses 8-bit run lengths
+        for (const auto& page : column_metadata.pages) {
+            std::vector<std::uint8_t> control;
+            std::vector<std::uint8_t> data;
+            if (!read_page_buffers(data_file_path, page, false, control, data, error)) {
+                return false;
+            }
+            if (data.size() < 10U) {
+                error = "rle chunk too short";
+                return false;
+            }
+            std::uint32_t size0 = 0;
+            std::uint32_t size1 = 0;
+            std::memcpy(&size0, data.data() + 2U, 4U);
+            std::memcpy(&size1, data.data() + 6U, 4U);
+            std::size_t off = 10U;
+            off += (8U - (off % 8U)) % 8U;  // pad to 8 after the [num_levels][size0][size1] header
+            const std::size_t values_off = off;
+            std::size_t lengths_off = values_off + size0;
+            lengths_off += (8U - (lengths_off % 8U)) % 8U;
+            if (lengths_off + size1 > data.size() || size0 % bpv != 0U || length_bytes == 0U ||
+                size1 % length_bytes != 0U) {
+                error = "rle chunk buffer sizes invalid";
+                return false;
+            }
+            const std::size_t num_runs = size0 / bpv;
+            if (num_runs != size1 / length_bytes) {
+                error = "rle run count mismatch between values and lengths";
+                return false;
+            }
+            for (std::size_t r = 0; r < num_runs; ++r) {
+                std::uint64_t run = 0;
+                for (std::size_t k = 0; k < length_bytes; ++k) {
+                    run |= static_cast<std::uint64_t>(data[lengths_off + r * length_bytes + k]) << (8U * k);
+                }
+                const auto* vptr = data.data() + values_off + r * bpv;
+                for (std::uint64_t c = 0; c < run; ++c) {
+                    out.fixed.insert(out.fixed.end(), vptr, vptr + bpv);
+                }
+            }
+        }
+        return true;
+    }
+
     const bool variable = on_disk_field.encoding == 2;
     if (variable) {
         out.kind = ColumnValues::Kind::VariableWidth;

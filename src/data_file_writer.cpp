@@ -298,6 +298,58 @@ std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_toke
     return encoding;
 }
 
+void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value) {
+    out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
+}
+
+// Assemble one miniblock chunk holding multiple buffers (has_large_chunk => u32 sizes), matching
+// Lance's decode_miniblock_chunk: [u16 num_levels=0][u32 size_i...][pad8]([buf_i][pad8])*.
+std::vector<std::uint8_t> build_multibuffer_chunk(const std::vector<std::vector<std::uint8_t>>& buffers) {
+    std::vector<std::uint8_t> out;
+    append_le16(out, 0U);  // num_levels (no rep/def)
+    for (const auto& b : buffers) {
+        append_le32(out, static_cast<std::uint32_t>(b.size()));
+    }
+    while (out.size() % 8U != 0U) {
+        out.push_back(0U);
+    }
+    for (const auto& b : buffers) {
+        out.insert(out.end(), b.begin(), b.end());
+        while (out.size() % 8U != 0U) {
+            out.push_back(0U);
+        }
+    }
+    return out;
+}
+
+// MiniBlockLayout tail (f6 layers, f7 num_buffers, f9 num_items, f10 has_large_chunk=1).
+std::vector<std::uint8_t> miniblock_tail(std::uint64_t num_items, std::uint8_t num_buffers) {
+    std::vector<std::uint8_t> t{0x32, 0x01, 0x01, 0x38, num_buffers, 0x48};
+    append_varint(t, num_items);
+    t.push_back(0x50);
+    t.push_back(0x01);
+    return t;
+}
+
+// PageLayout for a run-length-encoded fixed-width column: value_compression =
+// Rle{ values=Flat(value_bits), run_lengths=Flat(length_bits) }, num_buffers=2.
+std::vector<std::uint8_t> page_layout_bytes_rle(std::uint8_t value_bits, std::uint8_t length_bits,
+                                                std::uint64_t num_items) {
+    std::vector<std::uint8_t> structural{0x1a, 0x0e, 0x42, 0x0c, 0x0a, 0x04, 0x0a, 0x02,
+                                         0x08, value_bits, 0x12, 0x04, 0x0a, 0x02, 0x08, length_bits};
+    const auto tail = miniblock_tail(num_items, 2U);
+    structural.insert(structural.end(), tail.begin(), tail.end());
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, 1, structural);
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
 // Lance scalar value buffer for a length-1 string/binary array: [u32 num_buffers][u32 buf_len...]
 // [buffers]. A utf8/binary value is 2 buffers (offsets [0,len] + data). See lance-arrow scalar.rs.
 std::vector<std::uint8_t> encode_scalar_variable_value(const std::vector<std::uint8_t>& value, bool large) {
@@ -630,6 +682,61 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             } else {
                 page.encoding = constant_layout_message(&value);  // inline, no data buffers
             }
+            column.pages.push_back(std::move(page));
+            columns.push_back(std::move(column));
+            continue;
+        }
+
+        // Run-length encoded fixed-width column (tagged by the writer): one chunk with two buffers
+        // (run values + run lengths) -> Rle PageLayout.
+        if (packing_it != field.metadata.end() && packing_it->second == "rle" &&
+            values.kind == ColumnValues::Kind::FixedWidth) {
+            const auto bpv = value_width_bytes(field);
+            const std::size_t n = values.fixed.size() / bpv;
+            std::vector<std::uint8_t> run_values;
+            std::vector<std::uint8_t> run_lengths;  // Lance requires 8-bit run lengths
+            std::size_t i = 0;
+            while (i < n) {
+                std::size_t run = 1;
+                while (i + run < n &&
+                       std::memcmp(values.fixed.data() + (i + run) * bpv, values.fixed.data() + i * bpv, bpv) == 0) {
+                    ++run;
+                }
+                // Emit the run in sub-runs of at most 255 (8-bit run length).
+                for (std::size_t remaining = run; remaining > 0;) {
+                    const std::size_t take = std::min<std::size_t>(255U, remaining);
+                    run_values.insert(run_values.end(), values.fixed.begin() + static_cast<std::ptrdiff_t>(i * bpv),
+                                      values.fixed.begin() + static_cast<std::ptrdiff_t>((i + 1) * bpv));
+                    run_lengths.push_back(static_cast<std::uint8_t>(take));
+                    remaining -= take;
+                }
+                i += run;
+            }
+            const std::size_t length_bytes = 1U;
+            const auto chunk_bytes = build_multibuffer_chunk({run_values, run_lengths});
+            MiniblockChunk chunk;
+            chunk.bytes = chunk_bytes;
+            chunk.value_count = n;
+            const auto control = control_buffer_for({chunk});
+
+            align64(out);
+            const auto control_offset = pos(out);
+            out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
+            align64(out);
+            const auto data_offset = pos(out);
+            out.write(reinterpret_cast<const char*>(chunk_bytes.data()), static_cast<std::streamsize>(chunk_bytes.size()));
+
+            pb::ColumnMetadata column;
+            column.encoding = column_encoding_bytes();
+            pb::ColumnPage page;
+            page.buffer_offsets.push_back(control_offset);
+            page.buffer_offsets.push_back(data_offset);
+            page.buffer_sizes.push_back(control.size());
+            page.buffer_sizes.push_back(chunk_bytes.size());
+            page.length = rows;
+            page.priority = 0;
+            page.encoding = page_layout_bytes_rle(static_cast<std::uint8_t>(bpv * 8U),
+                                                  static_cast<std::uint8_t>(length_bytes * 8U), rows);
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
             continue;
