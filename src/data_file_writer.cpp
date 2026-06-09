@@ -877,7 +877,9 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
 
         std::vector<MiniblockChunk> chunks;
         const bool is_variable = values.kind == ColumnValues::Kind::VariableWidth;
-        const bool bitpack = !is_variable && compress && lance_logical_type_is_bitpackable_integer(field.logical_type);
+        // Bitpack only when the writer tagged it (it drops the tag for full-width/incompressible
+        // integer columns so they store flat instead of paying a no-benefit transpose).
+        const bool bitpack = !is_variable && packing_it != field.metadata.end() && packing_it->second == "bitpack";
         const auto fixed_bytes_per_value = value_width_bytes(field);
         if (is_variable) {
             if (!build_variable_chunks_for_column(values.variable, chunks, error)) {
