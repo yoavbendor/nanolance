@@ -96,6 +96,33 @@ Tips that help the encoders:
   choice) makes the delta column constant/low-range → near-0 (the un-delta is your application's job;
   Lance has no transparent delta encoding).
 
+## 4a. Measured performance vs Parquet and Rust Lance
+
+200k rows, Ubuntu CI, clang Release, best-of-5 writes / best-of-7 reads. Reproduce with
+`tools/bench.py`; the live numbers are committed to `bench/linux-results.md` by the GitHub Actions
+workflow on every push.
+
+**pcap-style columns** (run-length URI + monotonic `position` + constant `size`):
+
+| metric | nanolance | rust lance | parquet (zstd) |
+|---|---|---|---|
+| size (B/row) | **3.64** | 3.47 | 4.19 |
+| write core (ms) | ~26 | ~11 | ~23 |
+| read native (ms) | ~12 | ~6 | ~6 |
+
+- **Size:** at Lance parity, **beats Parquet** — the design goal.
+- **Write:** ~Parquet-parity for the core encode, ~2.4× Lance. `write(core)` excludes subprocess
+  startup + Arrow-IPC parse (3–9 ms of the CLI's wall clock); `write(proc)` in the bench includes them.
+- **Read:** nanolance's own reader is ~2× Lance after optimization (was ~5×); nanolance files read
+  *by* Rust Lance are fast (~8.5 ms). The native reader is a simple writer-parity decoder — read
+  throughput is the known remaining gap (memory-bandwidth bound on column materialization).
+
+Where Parquet wins: high-cardinality strings and monotonic **high-range** integers (Parquet
+delta-encodes; Lance and nanolance bitpack absolute values). Store such columns as app-level deltas to
+recover the win. Known TODO: the **flat** fixed-width path still caps chunks at 800 bytes, so a large
+incompressible integer column becomes many tiny pages — widen it to the 32 KB miniblock max (as the
+variable-width path already is) before trying to store such columns flat instead of bitpacked.
+
 ## 5. Verifying Lance interop (do this after changes)
 
 ```bash
