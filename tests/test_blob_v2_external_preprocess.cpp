@@ -156,6 +156,20 @@ int main() {
         for (std::size_t i = 0; i < roundtrip_sizes.size(); ++i) {
             require(roundtrip_sizes[i] == column_values.blob_v2.row_packed_sizes[i], "control parse row size mismatch");
         }
+
+        {
+            const std::vector<std::uint32_t> large_row_sizes{40000U, 30000U, 42U};
+            const auto large_control = nano_lance::blob_v2_build_control_buffer(large_row_sizes);
+            std::vector<std::uint32_t> large_roundtrip;
+            require(nano_lance::blob_v2_control_buffer_to_row_sizes(large_control, large_row_sizes.size(),
+                                                                    large_roundtrip, error),
+                    error.c_str());
+            require(large_roundtrip.size() == large_row_sizes.size(), "large control parse row count mismatch");
+            for (std::size_t i = 0; i < large_roundtrip.size(); ++i) {
+                require(large_roundtrip[i] == large_row_sizes[i], "large control parse row size mismatch");
+            }
+        }
+
         require(!nano_lance::blob_v2_page_layout_encoding().empty(), "page layout encoding must not be empty");
         require(nano_lance::blob_v2_column_page_encoding().size() >= 100U,
                 "blob column page encoding should match Lance reference size");
