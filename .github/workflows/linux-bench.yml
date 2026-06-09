@@ -1,0 +1,98 @@
+name: linux-bench
+
+# Builds + tests + benchmarks + profiles nanolance on an Ubuntu/clang runner, then commits the
+# results to bench/linux-results.md so they can be pulled back. Path filter excludes bench/ so the
+# results commit (also tagged [skip ci]) does not retrigger.
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tools/**'
+      - 'tests/**'
+      - 'generated/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/linux-bench.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build valgrind cmake
+          python3 -m pip install --quiet --break-system-packages pyarrow pylance || python3 -m pip install --quiet pyarrow pylance
+
+      - name: Configure + build (clang, Release)
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+
+      - name: C++ smoke tests
+        run: |
+          ctest --test-dir build -L smoke \
+            -E "golden|blob_v2_smoke|nonnull|ignore_nullability|inspect|append_smoke|version|help" \
+            --output-on-failure | tee /tmp/ctest.txt
+
+      - name: Benchmark (size + write/read time)
+        env:
+          BENCH_TMP: /tmp/nlb
+        run: |
+          python3 tools/bench.py | tee /tmp/bench.txt
+
+      - name: Profile native read (callgrind on pcap_ref)
+        run: |
+          DS=/tmp/nlb/pcap_ref_nl.lance
+          valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+            build/nlbench "$DS" 1 || true
+          callgrind_annotate --threshold=98 /tmp/cg.out 2>/dev/null \
+            | sed -n '1,60p' > /tmp/callgrind.txt || echo "callgrind_annotate unavailable" > /tmp/callgrind.txt
+
+      - name: Assemble results
+        run: |
+          mkdir -p bench
+          {
+            echo "# Linux CI results"
+            echo
+            echo "_$(date -u '+%Y-%m-%d %H:%M:%S UTC') · commit \`$(git rev-parse --short HEAD)\`_"
+            echo
+            echo '## Environment'
+            echo '```'
+            uname -a
+            (clang --version | head -1)
+            (cmake --version | head -1)
+            echo '```'
+            echo
+            echo '## Tests'
+            echo '```'
+            tail -n 3 /tmp/ctest.txt
+            echo '```'
+            echo
+            echo '## Benchmark (parquet vs rust lance vs nanolance)'
+            echo '```'
+            cat /tmp/bench.txt
+            echo '```'
+            echo
+            echo '## Native-read profile (callgrind, nlbench on pcap_ref)'
+            echo '```'
+            cat /tmp/callgrind.txt
+            echo '```'
+          } > bench/linux-results.md
+
+      - name: Commit results back
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bench/linux-results.md
+          git commit -m "ci: linux benchmark + profile results [skip ci]" || { echo "no changes"; exit 0; }
+          git push

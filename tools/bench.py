@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Three-way benchmark: nanolance vs Rust Lance vs Parquet (file size + write/read time)."""
-import os, glob, json, shutil, subprocess, time, statistics
+import os, glob, json, shutil, subprocess, tempfile, time, statistics
 import pyarrow as pa, pyarrow.ipc as ipc, pyarrow.parquet as pq
 import lance
 
-EXE = "C:/Users/yoavbd/Downloads/nanolance_2/nanolance/build/arrowipc2lance.exe"
-NLBENCH = "C:/Users/yoavbd/Downloads/nanolance_2/nanolance/build/nlbench.exe"
-TMP = "C:/tmp/bench"
+# Cross-platform paths: build dir relative to repo root (override with NL_BUILD), scratch in BENCH_TMP.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_BUILD = os.environ.get("NL_BUILD", os.path.join(_ROOT, "build"))
+_EXT = ".exe" if os.name == "nt" else ""
+EXE = os.path.join(_BUILD, "arrowipc2lance" + _EXT)
+NLBENCH = os.path.join(_BUILD, "nlbench" + _EXT)
+TMP = os.environ.get("BENCH_TMP", os.path.join(tempfile.gettempdir(), "nlbench"))
 READ_ITERS = 7
 os.makedirs(TMP, exist_ok=True)
 
