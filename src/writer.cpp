@@ -16,8 +16,6 @@
 #include <memory>
 #include <map>
 #include <string>
-#include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -125,11 +123,10 @@ bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vec
     return true;
 }
 
-// Decide whether dictionary + RLE wins for a low-cardinality, run-length variable-width column:
-// few distinct values AND the per-row index array is run-length friendly (the per-minute URI case).
-// Uses string_view (zero allocation) + an unordered_map and bails the moment the distinct count can
-// no longer be "low cardinality" — so a high-cardinality column is rejected cheaply, not after
-// building a full dictionary of every value.
+// Decide whether dictionary + RLE wins for a variable-width column. dict-RLE only helps when the
+// per-row values form long runs (the per-minute URI case); since distinct values <= number of runs,
+// "run-friendly" already implies "low cardinality", so this needs NO dictionary build — just a cheap
+// consecutive-value run scan that bails the moment it stops being run-friendly. Zero allocation.
 bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
     const std::size_t ow = cv.variable.large ? 8U : 4U;
     if (cv.variable.offsets.size() < 2U * ow) {
@@ -150,46 +147,36 @@ bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
     if (rows == 0U) {
         return false;
     }
-    const std::size_t max_dict = rows / 2U;  // beyond this it is not "low cardinality"
     const char* base = reinterpret_cast<const char*>(cv.variable.data.data());
-    std::unordered_map<std::string_view, std::uint32_t> dict;
-    dict.reserve(std::min<std::size_t>(max_dict + 1U, 8192U));
-    std::vector<std::uint32_t> indices;
-    indices.reserve(rows);
-    for (std::size_t i = 0; i < rows; ++i) {
-        const auto s = read_offset(i);
-        const auto e = read_offset(i + 1);
-        if (s < 0 || e < s || static_cast<std::size_t>(e) > cv.variable.data.size()) {
-            return false;
-        }
-        const std::string_view sv(base + s, static_cast<std::size_t>(e - s));
-        const auto it = dict.find(sv);
-        if (it == dict.end()) {
-            if (dict.size() >= max_dict) {
-                return false;  // early bail: too many distinct values for dictionary encoding
-            }
-            const auto id = static_cast<std::uint32_t>(dict.size());
-            dict.emplace(sv, id);
-            indices.push_back(id);
-        } else {
-            indices.push_back(it->second);
-        }
-    }
-    // The index array must be run-length friendly (split runs of <=255).
+    const std::size_t data_size = cv.variable.data.size();
     std::size_t split_runs = 0;
     std::size_t i = 0;
-    while (i < indices.size()) {
+    while (i < rows) {
+        const auto s0 = read_offset(i);
+        const auto e0 = read_offset(i + 1);
+        if (s0 < 0 || e0 < s0 || static_cast<std::size_t>(e0) > data_size) {
+            return false;
+        }
+        const std::size_t len0 = static_cast<std::size_t>(e0 - s0);
         std::size_t run = 1;
-        while (i + run < indices.size() && indices[i + run] == indices[i]) {
+        while (i + run < rows) {
+            const auto sk = read_offset(i + run);
+            const auto ek = read_offset(i + run + 1);
+            if (sk < 0 || ek < sk || static_cast<std::size_t>(ek) > data_size) {
+                return false;
+            }
+            if (static_cast<std::size_t>(ek - sk) != len0 || std::memcmp(base + sk, base + s0, len0) != 0) {
+                break;
+            }
             ++run;
         }
-        split_runs += (run + 254U) / 255U;
+        split_runs += (run + 254U) / 255U;  // Lance caps run length at 255
+        if (split_runs * 2U >= rows) {
+            return false;  // not run-friendly (and therefore not low-cardinality)
+        }
         i += run;
     }
-    if (split_runs * 2U >= indices.size()) {
-        return false;
-    }
-    const std::size_t values_size = split_runs * 4U;  // u32 indices
+    const std::size_t values_size = split_runs * 4U;  // u32 dictionary indices, one per split run
     return (values_size + split_runs + 32U) <= 32760U;
 }
 
