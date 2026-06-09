@@ -1,0 +1,126 @@
+# nanolance — integration guide for AI agents
+
+This file tells an automated agent how to integrate with nanolance **as it is now**, after a round of
+interface changes and compression work. If you previously knew this library, re-read §1 — the include
+path and CMake targets changed.
+
+nanolance is the "nanoarrow of Lance": a small C++ library that **writes Lance v2.2 datasets** (and
+reads back what it wrote) with no Rust `lance` core. Its headline feature is pointing rows at raw
+bytes that live elsewhere (local file or S3) instead of copying them in. Everything it writes is
+readable by stock `lance` (verified against `lance` 7.0.0), unless a feature is explicitly marked
+"nanolance-only" below.
+
+## 1. What changed (breaking)
+
+- **Public headers moved to `include/nanolance/`** (was `include/nano_lance_writer/`). Update every
+  include: `#include "nanolance/nano_lance_writer.h"`, `#include "nanolance/nano_lance_reader.h"`, etc.
+- **CMake targets are `nanolance`, `nanolance_reader`, `nanolance_proto`** plus the alias
+  `nanolance::nanolance`. The old `nano_lance_writer` / `nano_lance_reader` / `nano_lance_proto_minimal`
+  target aliases were removed. Link `nanolance` for writing; `nanolance_reader` alone if you only fetch
+  external blobs.
+- The C ABI symbol names are unchanged (`nano_lance_writer_*`, `nano_lance_*`). Only the header path
+  and CMake target names changed.
+
+## 2. Minimal write flow (C API)
+
+```c
+#include "nanolance/nano_lance_writer.h"
+#include <nanoarrow/nanoarrow.h>
+
+NanoLanceWriter w = {0};
+nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
+nano_lance_writer_set_ignore_nullability(&w, true);  // if your Arrow fields are nullable
+nano_lance_writer_set_compression(&w, true);         // enable Lance-compatible compression (see §3)
+nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // call repeatedly; schema is fixed after #1
+nano_lance_writer_commit(&w, /*is_append=*/false);
+nano_lance_writer_close(&w);
+// On any non-zero return, read nano_lance_writer_last_error(&w).
+```
+
+Lifecycle rules:
+- Schema is locked after the first batch; all batches in a writer session share it.
+- All `set_*` options must be called **before the first `write_batch`**.
+- `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
+  adds a fragment to an existing dataset.
+
+Read back with `nano_lance::lance_table_read_dataset(path, schema, batches, error)` (C++,
+`nanolance/lance_table_reader.hpp`) or fetch external bytes with
+`nano_lance_fetch_external_blob(uri, position, size, ...)`.
+
+## 3. Enabling the compression that was measured
+
+There is **one switch**: `nano_lance_writer_set_compression(&w, true)` (CLI: `arrowipc2lance
+--compress`). It is **off by default** and picks the right Lance-compatible encoding per column type.
+All of these stay readable by stock `lance`; nanolance's own reader decodes them transparently.
+
+| Column type | Encoding applied | Measured (50k pcap-like rows) |
+|---|---|---|
+| Integer 8/16/32/64-bit | FastLanes **InlineBitpacking** (1024-value blocks) | int64 ~10-bit values: 84 → 3.4 B/row |
+| Constant fixed-width (all values equal) | **ConstantLayout** (value inline in descriptor, 0 data bytes) | constant int: → 0.01 B/row |
+| String / binary | **zstd** (`General(ZSTD)`, `[u64 len][zstd]` per chunk) | repetitive string: 7.6 → ~3 B/row |
+| float / bool fixed-width | left uncompressed (Lance uses other schemes) | — |
+
+`compression_level` is the zstd level (also used as a hint; 0 = zstd default). Bitpacking/constant
+ignore it.
+
+### nanolance-only option: external-URI dictionary
+
+`nano_lance_writer_set_blob_uri_dictionary(&w, true)` deduplicates identical external URIs in a
+`lance.blob.v2` column (stores each URI once, references by index). It is **not Lance-readable** for
+that column and is create-mode only. Use it only if you stick with the packed blob-v2 descriptor and
+do not need third-party Lance tools to read those blob columns.
+
+## 4. Data model: how to actually get small files (important)
+
+To compete with Parquet, **model external references as ordinary typed columns**, not the packed
+`lance.blob.v2` descriptor:
+
+- Good: three columns `uri` (string), `position` (uint64), `size` (uint64). You fetch payloads
+  yourself with `nano_lance_fetch_external_blob(uri, position, size, ...)`.
+- Avoid for size: the blob-v2 FullZip packed descriptor. Measured at ~41 B/row because it row-zips
+  raw `position`/`size`/`uri` per row with no per-column dictionary/RLE/bitpacking.
+
+Measured, same 50k rows, `--compress`, columns model: ~6.5 B/row today and dropping as more per-column
+encodings land (RLE / string-dictionary are in progress). The blob-v2 descriptor was 41 B/row. Prefer
+the columns model unless you specifically need Lance's native blob-fetch semantics.
+
+Tips that help the encoders:
+- Constant fields (snaplen, a fixed capture size, a per-file URI as a separate constant column) →
+  ConstantLayout → ~0.
+- Monotonic offsets: bitpacking handles them; storing first-offset + deltas as the column (your
+  choice) makes the delta column constant/low-range → near-0 (the un-delta is your application's job;
+  Lance has no transparent delta encoding).
+
+## 5. Verifying Lance interop (do this after changes)
+
+```bash
+# build (see §6), then:
+python - <<'PY'
+import lance
+ds = lance.dataset("out.lance"); t = ds.to_table()
+print(t.num_rows, t.schema)   # values must match what you wrote
+PY
+```
+The repo's C++ smoke tests cover writer→reader round-trips without Python. Run:
+`ctest --test-dir build -L smoke`. Keep new encodings behind a round-trip test that also checks the
+on-disk size shrank.
+
+## 6. Build notes
+
+- Standalone: `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build -j`.
+  First configure uses FetchContent for nanoarrow (pinned), zstd, CLI11 (needs network).
+- **zstd under MinGW/Windows:** if a system MSVC `zstd_static` is on the prefix path, linking fails
+  with undefined `__security_cookie`. Force the source build:
+  `-DCMAKE_DISABLE_FIND_PACKAGE_zstd=ON`.
+- Tools (`arrowipc2lance`) need CLI11; turn off with `-DNANOLANCE_BUILD_TOOLS=OFF` if unavailable.
+
+## 7. When adding a new Lance encoding (how this codebase does it)
+
+1. Find the authoritative format in the Lance Rust source (`protos/encodings_v2_1.proto` for the
+   `PageLayout` / `CompressiveEncoding` field numbers; `rust/lance-encoding/src/encodings/...` for the
+   byte layout). Don't guess from prose docs — verify against real `lance` output bytes.
+2. Writer: build the exact `PageLayout` protobuf + data buffer in `src/data_file_writer.cpp`.
+3. Reader: invert it in `src/lance_column_decoder.cpp`. The decoder dispatches on the on-disk field's
+   `encoding` and `nanolance:*` metadata tags set by the writer (Lance ignores those tags and reads the
+   real `PageLayout`).
+4. Validate both directions: nanolance write → nanolance read, **and** nanolance write → `lance` read.

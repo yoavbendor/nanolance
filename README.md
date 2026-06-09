@@ -2,6 +2,9 @@
 
 Standalone C++ library for writing **Lance v2.2** datasets (minimal protobuf scaffold, no Rust `lance` core). Public headers live under `include/nanolance/`.
 
+> Integrating programmatically (or via an AI agent)? See [AGENTS.md](AGENTS.md) for the current
+> include path / CMake targets, the write API, and how to enable each compression measure.
+
 ## Layout
 
 - **Libraries (CMake targets):** `nanolance_proto`, `nanolance_reader`, `nanolance` (namespaced alias `nanolance::nanolance`)
