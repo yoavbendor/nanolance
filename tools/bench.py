@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Three-way benchmark: nanolance vs Rust Lance vs Parquet (file size + write/read time)."""
+import os, glob, json, shutil, subprocess, time, statistics
+import pyarrow as pa, pyarrow.ipc as ipc, pyarrow.parquet as pq
+import lance
+
+EXE = "C:/Users/yoavbd/Downloads/nanolance_2/nanolance/build/arrowipc2lance.exe"
+NLBENCH = "C:/Users/yoavbd/Downloads/nanolance_2/nanolance/build/nlbench.exe"
+TMP = "C:/tmp/bench"
+READ_ITERS = 7
+os.makedirs(TMP, exist_ok=True)
+
+def dsize(path_glob):
+    return sum(os.path.getsize(f) for f in glob.glob(path_glob))
+
+def best_read(fn, iters=READ_ITERS):
+    ts = []
+    for _ in range(iters):
+        t0 = time.perf_counter(); fn(); ts.append((time.perf_counter()-t0)*1000)
+    return min(ts)
+
+def make_datasets():
+    N = 200_000
+    ds = {}
+    # D1: pcap reference (columns model) — run-length URI, monotonic position, constant size
+    MIN = N // 5000  # ~40 distinct, runs of 5000
+    ds["pcap_ref"] = pa.table({
+        "uri": pa.array([f"s3://my-bucket/captures/2026-06-09T12_{(i*MIN//N):02d}_00.pcapng" for i in range(N)], pa.string()),
+        "position": pa.array([i*1500 for i in range(N)], pa.uint64()),
+        "size": pa.array([1500]*N, pa.uint64()),
+    })
+    # D2: wide integer EPB-like — bitpack/RLE friendly
+    import random; random.seed(1)
+    ds["wide_int"] = pa.table({
+        "ts": pa.array([1_700_000_000_000_000 + i*1500 + random.randint(0,200) for i in range(N)], pa.uint64()),
+        "caplen": pa.array([random.randint(60, 1514) for _ in range(N)], pa.uint32()),
+        "iface": pa.array([ (i//10000) % 4 for i in range(N)], pa.uint8()),   # low-card runs
+        "ipproto": pa.array([random.choice([6,17,6,6,1]) for _ in range(N)], pa.uint8()),  # low-card scattered
+    })
+    # D3: high-cardinality — random unique-ish strings + random ints (where zstd-only lags)
+    ds["high_card"] = pa.table({
+        "id": pa.array([random.getrandbits(64) for _ in range(N)], pa.uint64()),
+        "label": pa.array([f"obj-{random.getrandbits(40):010x}" for _ in range(N)], pa.string()),
+    })
+    return ds, N
+
+def run_one(name, tbl, N):
+    print(f"\n========== {name}  ({N} rows, {tbl.num_columns} cols) ==========")
+    arrow_path = f"{TMP}/{name}.arrow"
+    with ipc.new_stream(arrow_path, tbl.schema) as w:
+        w.write_table(tbl)
+
+    rows = []
+
+    # ---- Parquet (zstd) ----
+    pqf = f"{TMP}/{name}.parquet"
+    if os.path.exists(pqf): os.remove(pqf)
+    t0=time.perf_counter(); pq.write_table(tbl, pqf, compression="zstd"); wp=(time.perf_counter()-t0)*1000
+    szp = os.path.getsize(pqf)
+    rp = best_read(lambda: pq.read_table(pqf))
+    assert pq.read_table(pqf).num_rows == N
+    rows.append(("parquet (zstd)", wp, szp, rp, None))
+
+    # ---- Rust Lance (2.2) ----
+    lf = f"{TMP}/{name}_lance.lance"; shutil.rmtree(lf, ignore_errors=True)
+    t0=time.perf_counter(); lance.write_dataset(tbl, lf, mode="create", data_storage_version="2.2"); wl=(time.perf_counter()-t0)*1000
+    szl = dsize(lf+"/data/*.lance")
+    rl = best_read(lambda: lance.dataset(lf).to_table())
+    assert lance.dataset(lf).to_table().num_rows == N
+    rows.append(("rust lance", wl, szl, rl, None))
+
+    # ---- nanolance (--compress) ----
+    nf = f"{TMP}/{name}_nl.lance"; shutil.rmtree(nf, ignore_errors=True)
+    with open(arrow_path, "rb") as fin:
+        t0=time.perf_counter()
+        subprocess.run([EXE, "-c", "--ignore-nullability", "--compress", "-o", nf],
+                       stdin=fin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        wn=(time.perf_counter()-t0)*1000
+    szn = dsize(nf+"/data/*.lance")
+    # native read (nlbench)
+    out = subprocess.run([NLBENCH, nf, str(READ_ITERS)], capture_output=True, text=True, check=True)
+    rn_native = json.loads(out.stdout)["best_ms"]
+    # interop read: rust lance reads nanolance file
+    rn_lance = best_read(lambda: lance.dataset(nf).to_table())
+    assert lance.dataset(nf).to_table().num_rows == N, "lance row count on nanolance file"
+    rows.append(("nanolance", wn, szn, rn_native, rn_lance))
+
+    # ---- report ----
+    print(f"{'engine':16} {'write ms':>9} {'file bytes':>12} {'B/row':>8} {'read ms':>9} {'read(lance)':>12}")
+    base = next(r[2] for r in rows if r[0]=='parquet (zstd)')
+    for eng, wms, sz, rms, rms2 in rows:
+        ratio = f"{sz/base:.2f}x" if sz else ""
+        print(f"{eng:16} {wms:9.1f} {sz:12,} {sz/N:8.3f} {rms:9.2f} {('' if rms2 is None else f'{rms2:9.2f}'):>12}   ({ratio} vs pq)")
+    return rows
+
+def main():
+    ds, N = make_datasets()
+    for name, tbl in ds.items():
+        run_one(name, tbl, N)
+    print("\nnote: nanolance write ms includes process startup; read ms 'read ms' col is each engine's "
+          "native reader, 'read(lance)' is rust-lance reading the nanolance file (interop). best of "
+          f"{READ_ITERS}.")
+
+if __name__ == "__main__":
+    main()

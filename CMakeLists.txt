@@ -200,6 +200,10 @@ if(NANOLANCE_BUILD_TOOLS)
     add_executable(arrowipc2lance arrowipc2lance_main.cpp)
     target_compile_features(arrowipc2lance PRIVATE cxx_std_20)
     target_link_libraries(arrowipc2lance PRIVATE CLI11::CLI11 nanolance)
+
+    add_executable(nlbench tools/nlbench.cpp)
+    target_compile_features(nlbench PRIVATE cxx_std_20)
+    target_link_libraries(nlbench PRIVATE nanolance)
 endif()
 
 if(NOT NANOLANCE_BUILD_TESTS)
