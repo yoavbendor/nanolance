@@ -36,6 +36,22 @@ const std::vector<std::uint8_t>* field_metadata_bytes(const pb::Field& field, co
     return it == field.metadata.end() ? nullptr : &it->second;
 }
 
+// Append `count` copies of an vlen-byte value via one resize + tight memcpy loop. Much leaner than
+// count separate std::vector::insert calls (whose per-call machinery dominated the read profile).
+void append_repeated_value(std::vector<std::uint8_t>& out, const std::uint8_t* val, std::size_t vlen,
+                           std::size_t count) {
+    if (count == 0U || vlen == 0U) {
+        return;
+    }
+    const std::size_t base = out.size();
+    out.resize(base + vlen * count);
+    std::uint8_t* dst = out.data() + base;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::memcpy(dst, val, vlen);
+        dst += vlen;
+    }
+}
+
 // Inverse of zstd_frame_buffer: [u64 LE uncompressed size][zstd frame] -> raw bytes.
 bool zstd_unframe_buffer(const std::vector<std::uint8_t>& framed, std::vector<std::uint8_t>& out, std::string& error) {
     if (framed.size() < 8U) {
@@ -293,35 +309,25 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             out.kind = ColumnValues::Kind::VariableWidth;
             out.variable.large = on_disk_field.logical_type == "large_utf8" ||
                                  on_disk_field.logical_type == "large_binary";
-            const auto ow = out.variable.large ? 8U : 4U;
-            out.variable.data.reserve(static_cast<std::size_t>(total_rows) * value->size());
-            out.variable.offsets.reserve((static_cast<std::size_t>(total_rows) + 1U) * ow);
-            std::uint64_t cumulative = 0;
-            auto push_offset = [&](std::uint64_t v) {
-                if (out.variable.large) {
-                    out.variable.offsets.insert(out.variable.offsets.end(),
-                                                reinterpret_cast<const std::uint8_t*>(&v),
-                                                reinterpret_cast<const std::uint8_t*>(&v) + 8);
-                } else {
-                    const auto v32 = static_cast<std::uint32_t>(v);
-                    out.variable.offsets.insert(out.variable.offsets.end(),
-                                                reinterpret_cast<const std::uint8_t*>(&v32),
-                                                reinterpret_cast<const std::uint8_t*>(&v32) + 4);
-                }
-            };
-            push_offset(0);
-            for (std::uint64_t i = 0; i < total_rows; ++i) {
-                out.variable.data.insert(out.variable.data.end(), value->begin(), value->end());
-                cumulative += value->size();
-                push_offset(cumulative);
+            const std::size_t len = value->size();
+            const auto rows = static_cast<std::size_t>(total_rows);
+            append_repeated_value(out.variable.data, value->data(), len, rows);  // every row = value
+            // offsets are arithmetic (0, len, 2*len, ...); build typed then one bulk copy.
+            if (out.variable.large) {
+                std::vector<std::uint64_t> offs(rows + 1U);
+                for (std::size_t i = 0; i <= rows; ++i) offs[i] = static_cast<std::uint64_t>(i) * len;
+                out.variable.offsets.resize(offs.size() * 8U);
+                std::memcpy(out.variable.offsets.data(), offs.data(), offs.size() * 8U);
+            } else {
+                std::vector<std::uint32_t> offs(rows + 1U);
+                for (std::size_t i = 0; i <= rows; ++i) offs[i] = static_cast<std::uint32_t>(i * len);
+                out.variable.offsets.resize(offs.size() * 4U);
+                std::memcpy(out.variable.offsets.data(), offs.data(), offs.size() * 4U);
             }
             return true;
         }
         out.kind = ColumnValues::Kind::FixedWidth;
-        out.fixed.reserve(static_cast<std::size_t>(total_rows) * value->size());
-        for (std::uint64_t i = 0; i < total_rows; ++i) {
-            out.fixed.insert(out.fixed.end(), value->begin(), value->end());
-        }
+        append_repeated_value(out.fixed, value->data(), value->size(), static_cast<std::size_t>(total_rows));
         return true;
     }
 
@@ -370,17 +376,10 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 }
                 return run;
             };
-            std::size_t total_vals = 0;
-            for (std::size_t r = 0; r < num_runs; ++r) {
-                total_vals += run_length_at(r);
-            }
-            out.fixed.reserve(out.fixed.size() + total_vals * bpv);  // avoid per-row reallocation
             for (std::size_t r = 0; r < num_runs; ++r) {
                 const std::uint64_t run = run_length_at(r);
                 const auto* vptr = data.data() + values_off + r * bpv;
-                for (std::uint64_t c = 0; c < run; ++c) {
-                    out.fixed.insert(out.fixed.end(), vptr, vptr + bpv);
-                }
+                append_repeated_value(out.fixed, vptr, bpv, static_cast<std::size_t>(run));  // one fill per run
             }
         }
         return true;
@@ -390,7 +389,6 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     if (field_metadata_equals(on_disk_field, "nanolance:packing", "dict-rle")) {
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
-        const auto ow = out.variable.large ? 8U : 4U;
         for (const auto& page : column_metadata.pages) {
             if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
                 error = "dict-rle page missing buffers";
@@ -449,20 +447,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 return false;
             }
             const std::size_t num_runs = size1;
-            std::uint64_t cumulative = 0;
-            auto push_offset = [&](std::uint64_t v) {
-                if (out.variable.large) {
-                    out.variable.offsets.insert(out.variable.offsets.end(),
-                                                reinterpret_cast<const std::uint8_t*>(&v),
-                                                reinterpret_cast<const std::uint8_t*>(&v) + 8);
-                } else {
-                    const auto v32 = static_cast<std::uint32_t>(v);
-                    out.variable.offsets.insert(out.variable.offsets.end(),
-                                                reinterpret_cast<const std::uint8_t*>(&v32),
-                                                reinterpret_cast<const std::uint8_t*>(&v32) + 4);
-                }
-            };
-            // Pre-pass: reserve data + offsets to final size so the expansion never reallocates.
+            // Pre-pass: validate indices and size the output.
             std::size_t total_rows = 0;
             std::size_t total_data = 0;
             for (std::size_t r = 0; r < num_runs; ++r) {
@@ -472,29 +457,42 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                     error = "dict-rle index out of range";
                     return false;
                 }
-                const std::uint8_t run = data[loff + r];
-                total_rows += run;
-                total_data += static_cast<std::size_t>(run) * dict_ranges[index].second;
+                total_rows += data[loff + r];
+                total_data += static_cast<std::size_t>(data[loff + r]) * dict_ranges[index].second;
             }
             out.variable.data.reserve(out.variable.data.size() + total_data);
-            out.variable.offsets.reserve(out.variable.offsets.size() + (total_rows + 1U) * ow);
+            const bool first_page = out.variable.offsets.empty();
+            std::uint64_t cumulative = out.variable.data.size();  // byte offset (continues across pages)
 
-            if (out.variable.offsets.empty()) {
-                push_offset(0);
-            }
-            for (std::size_t r = 0; r < num_runs; ++r) {
-                std::uint32_t index = 0;
-                std::memcpy(&index, data.data() + voff + r * 4U, 4U);
-                const std::uint8_t run = data[loff + r];
-                const auto [start, len] = dict_ranges[index];
-                for (std::uint8_t c = 0; c < run; ++c) {
-                    out.variable.data.insert(out.variable.data.end(), dict_block.begin() + start,
-                                             dict_block.begin() + start + len);
-                    cumulative += len;
-                    push_offset(cumulative);
+            // Expand: bulk-fill data once per run; collect offsets in a typed temp, then one bulk copy.
+            auto expand = [&](auto& offs) {
+                offs.reserve(total_rows + (first_page ? 1U : 0U));
+                using OT = typename std::decay_t<decltype(offs)>::value_type;
+                if (first_page) {
+                    offs.push_back(static_cast<OT>(cumulative));
                 }
+                for (std::size_t r = 0; r < num_runs; ++r) {
+                    std::uint32_t index = 0;
+                    std::memcpy(&index, data.data() + voff + r * 4U, 4U);
+                    const std::uint8_t run = data[loff + r];
+                    const auto [start, len] = dict_ranges[index];
+                    append_repeated_value(out.variable.data, dict_block.data() + start, len, run);
+                    for (std::uint8_t c = 0; c < run; ++c) {
+                        cumulative += len;
+                        offs.push_back(static_cast<OT>(cumulative));
+                    }
+                }
+                const std::size_t base = out.variable.offsets.size();
+                out.variable.offsets.resize(base + offs.size() * sizeof(OT));
+                std::memcpy(out.variable.offsets.data() + base, offs.data(), offs.size() * sizeof(OT));
+            };
+            if (out.variable.large) {
+                std::vector<std::uint64_t> offs;
+                expand(offs);
+            } else {
+                std::vector<std::uint32_t> offs;
+                expand(offs);
             }
-            (void)ow;
         }
         return true;
     }
