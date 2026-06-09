@@ -363,11 +363,20 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 error = "rle run count mismatch between values and lengths";
                 return false;
             }
-            for (std::size_t r = 0; r < num_runs; ++r) {
+            auto run_length_at = [&](std::size_t r) -> std::uint64_t {
                 std::uint64_t run = 0;
                 for (std::size_t k = 0; k < length_bytes; ++k) {
                     run |= static_cast<std::uint64_t>(data[lengths_off + r * length_bytes + k]) << (8U * k);
                 }
+                return run;
+            };
+            std::size_t total_vals = 0;
+            for (std::size_t r = 0; r < num_runs; ++r) {
+                total_vals += run_length_at(r);
+            }
+            out.fixed.reserve(out.fixed.size() + total_vals * bpv);  // avoid per-row reallocation
+            for (std::size_t r = 0; r < num_runs; ++r) {
+                const std::uint64_t run = run_length_at(r);
                 const auto* vptr = data.data() + values_off + r * bpv;
                 for (std::uint64_t c = 0; c < run; ++c) {
                     out.fixed.insert(out.fixed.end(), vptr, vptr + bpv);
@@ -453,6 +462,23 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                                                 reinterpret_cast<const std::uint8_t*>(&v32) + 4);
                 }
             };
+            // Pre-pass: reserve data + offsets to final size so the expansion never reallocates.
+            std::size_t total_rows = 0;
+            std::size_t total_data = 0;
+            for (std::size_t r = 0; r < num_runs; ++r) {
+                std::uint32_t index = 0;
+                std::memcpy(&index, data.data() + voff + r * 4U, 4U);
+                if (index >= num_dict) {
+                    error = "dict-rle index out of range";
+                    return false;
+                }
+                const std::uint8_t run = data[loff + r];
+                total_rows += run;
+                total_data += static_cast<std::size_t>(run) * dict_ranges[index].second;
+            }
+            out.variable.data.reserve(out.variable.data.size() + total_data);
+            out.variable.offsets.reserve(out.variable.offsets.size() + (total_rows + 1U) * ow);
+
             if (out.variable.offsets.empty()) {
                 push_offset(0);
             }
@@ -460,10 +486,6 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 std::uint32_t index = 0;
                 std::memcpy(&index, data.data() + voff + r * 4U, 4U);
                 const std::uint8_t run = data[loff + r];
-                if (index >= num_dict) {
-                    error = "dict-rle index out of range";
-                    return false;
-                }
                 const auto [start, len] = dict_ranges[index];
                 for (std::uint8_t c = 0; c < run; ++c) {
                     out.variable.data.insert(out.variable.data.end(), dict_block.begin() + start,
