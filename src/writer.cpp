@@ -123,28 +123,6 @@ bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vec
     return true;
 }
 
-// Bitpacking only helps if some bits are always zero across the column. If any value uses the type's
-// top bit, the max bit width is the full type width and bitpacking would just transpose the data for
-// zero size benefit — store flat instead. Early-exits as soon as a full-width value appears (so random
-// data is rejected in a few values). Returns true iff bitpacking compresses by at least one bit.
-bool fixed_column_bitpack_beneficial(const nano_lance::ColumnValues& cv, std::size_t bpv) {
-    if (bpv == 0U || bpv > 8U || cv.fixed.empty() || cv.fixed.size() % bpv != 0U) {
-        return false;
-    }
-    const std::size_t n = cv.fixed.size() / bpv;
-    const unsigned top_bit = static_cast<unsigned>(bpv * 8U - 1U);
-    std::uint64_t acc = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        std::uint64_t v = 0;
-        std::memcpy(&v, cv.fixed.data() + i * bpv, bpv);
-        acc |= v;
-        if (((acc >> top_bit) & 1ULL) != 0ULL) {
-            return false;  // a value needs the full type width -> bitpacking saves nothing
-        }
-    }
-    return true;
-}
-
 // Decide whether dictionary + RLE wins for a variable-width column. dict-RLE only helps when the
 // per-row values form long runs (the per-minute URI case); since distinct values <= number of runs,
 // "run-friendly" already implies "low cardinality", so this needs NO dictionary build — just a cheap
@@ -595,15 +573,6 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
                     for (auto& field : disk_schema.fields) {
                         if (field.id == pf->id) {
                             field.metadata["nanolance:packing"] = "rle";
-                            break;
-                        }
-                    }
-                } else if (!fixed_column_bitpack_beneficial(cv, bpv)) {
-                    // Incompressible (full-width) integer column: drop the bitpack tag -> store flat,
-                    // avoiding a transpose that yields no size benefit.
-                    for (auto& field : disk_schema.fields) {
-                        if (field.id == pf->id) {
-                            field.metadata.erase("nanolance:packing");
                             break;
                         }
                     }
