@@ -94,7 +94,7 @@ every encoder we built.
 | `ts_raw` | uint64 | bitpack | raw `(ts_high<<32)|ts_low`; interpret with `ts_resol` |
 | `caplen` | uint32 | bitpack | |
 | `origlen` | uint32 | bitpack | |
-| `payload_uri` | string | **ConstantLayout** (1 file) / **dict-RLE** (per-minute files) | the per-minute-batch case we optimized |
+| `payload_uri` | string | **ConstantLayout** (one input file) / **dict-RLE** (many files in one dataset) | per-input-file URI (decision 3): a single-file run yields one constant URI; batching N input files into one dataset yields the run-length URI case we optimized |
 | `payload_off` | uint64 | bitpack (monotonic) | byte offset of packet data in the source file |
 | `payload_size` | uint32 | bitpack / RLE | == caplen (or constant snaplen) |
 | `link_type` | uint16 | **ConstantLayout** | denormalized from IDB (constant per single-interface file) |
@@ -130,7 +130,7 @@ BlockRef)`, which is what makes it a valid device lambda.
 // === Proposed; NOT yet implemented. Lives in examples/pcapng2lance/include/pcap_blocks.hpp ===
 namespace pcapblocks {
 
-struct ByteSpan { const std::uint8_t* data; std::size_t size; };   // → std::span in impl
+using Bytes = std::span<const std::uint8_t>;   // decision 5: std::span (POD, usable in CUDA device code)
 enum class Kind : std::uint8_t { Shb, Idb, Epb, PcapRecord, SimplePacket, Other };
 
 // Phase-A output: a flat, trivially-copyable boundary record (GPU-transferable).
@@ -155,12 +155,12 @@ struct EpbView { std::uint32_t interface_id; std::uint64_t ts_raw; std::uint32_t
 
 // ---- Phase A: sequential boundary scan (cheap; the only inherently serial part) ----
 // Detects pcap vs pcapng from the leading magic, sets endianness, walks the length chain.
-bool scan_blocks(ByteSpan file, std::vector<BlockRef>& out, std::string& error);
+bool scan_blocks(Bytes file, std::vector<BlockRef>& out, std::string& error);
 
 // ---- Phase B: pure per-block parse (parallelizable) ----
-bool parse_shb(ByteSpan file, const BlockRef&, ShbView&) noexcept;
-bool parse_idb(ByteSpan file, const BlockRef&, IdbView&) noexcept;
-bool parse_epb(ByteSpan file, const BlockRef&, EpbView&) noexcept;  // also handles PcapRecord
+bool parse_shb(Bytes file, const BlockRef&, ShbView&) noexcept;
+bool parse_idb(Bytes file, const BlockRef&, IdbView&) noexcept;
+bool parse_epb(Bytes file, const BlockRef&, EpbView&) noexcept;  // also handles PcapRecord
 
 // ---- Phase B (bulk / CUDA form) — the primary path the example uses ----
 // SoA output buffers, pre-sized to the EPB/record count. The CPU reference impl loops calling
@@ -173,7 +173,7 @@ struct EpbColumns {
     std::uint32_t* epb_flags;     /* comment handled via a separate offsets+data builder */
     std::size_t    count;
 };
-bool parse_epbs_bulk(ByteSpan file, const BlockRef* epbs, std::size_t n, EpbColumns& out,
+bool parse_epbs_bulk(Bytes file, const BlockRef* epbs, std::size_t n, EpbColumns& out,
                      std::string& error);
 
 }  // namespace pcapblocks
@@ -244,15 +244,19 @@ The example links `nanolance` (writer). It uses **no** Lance Rust core.
 
 ---
 
-## 8. Decisions to confirm before coding step 1
-1. **Section/interface metadata sink:** dataset-level key-value metadata (recommended, simplest) vs a
-   separate normalized `interfaces` Lance table. *Recommendation: KV metadata for step 1.*
-2. **Timestamp:** store raw `ts_raw` + denormalized `ts_resol` (recommended; defers/normalizes
-   interpretation, keeps it bitpackable) vs convert to a fixed unit (e.g., ns `uint64`) at write time.
-3. **`payload_uri` policy:** one URI for the whole input file (→ ConstantLayout) vs per-input-file
-   when batching many files in one dataset (→ the dict-RLE run-length case). *Recommendation: support
-   both; a single conversion run writes one constant URI, batch runs produce run-length URIs.*
-4. **Multiple interfaces / linktypes:** denormalize `link_type`/`ts_resol` per row (recommended;
-   ConstantLayout makes it free for the common single-interface file) vs require a join.
-5. **`std::span` vs the `ByteSpan` shim:** use `std::span<const std::uint8_t>` directly (C++20, already
-   our standard) unless the future CUDA path needs the POD shim. *Recommendation: `std::span` now.*
+## 8. Decisions (confirmed)
+1. **Section/interface metadata sink:** dataset-level **key-value metadata** (SHB/IDB options not
+   needed per-packet live here; no separate `interfaces` table in step 1).
+2. **Timestamp:** store raw **`ts_raw`** (`(ts_high<<32)|ts_low`) + **denormalized `ts_resol`** per
+   row; no unit conversion at write time (keeps `ts_raw` bitpackable, `ts_resol` ConstantLayout).
+3. **`payload_uri` policy:** **per-input-file** — the URI identifies the source capture file. One
+   input file → a single constant URI (ConstantLayout); many input files batched into one dataset →
+   run-length URIs (dict-RLE). The converter sets it from the input path/URI it is given.
+4. **Multiple interfaces / linktypes:** **denormalize `link_type` and `ts_resol` onto every packet
+   row** (ConstantLayout makes this ~free for the common single-interface capture; small for a few).
+   No join needed to interpret a row.
+5. **Span type:** use **`std::span<const std::uint8_t>`** (aliased `Bytes`) throughout the seam — POD
+   (pointer+size), valid in CUDA device code, matches our C++20 baseline. No custom shim.
+
+These are locked for step 1. Next action when moving plan → build: implement `pcap_blocks.hpp` + the
+CPU reference impl `pcap_blocks_ref.cpp` + golden/interop tests (seam first), then the driver.
