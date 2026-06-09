@@ -41,6 +41,26 @@ build/examples/pcapng2lance/pcapng2lance capture.pcapng out.lance
 Usage: `pcapng2lance [--no-compress] [--decode-l2l3] <input.pcap|pcapng> <output.lance> [payload_uri]`.
 With `--decode-l2l3` it also emits `<stem>_<pdu>.lance` tables (Ethernet captures only; non-Ethernet
 link types pass through as payload-only).
+
+### Staged / incremental parsing (`--stage`)
+
+Decode one layer at a time, enriching the same data folder across separate runs — demonstrating that
+parsing work can be done in parts and added to the dataset later, with the still-unparsed bytes kept as
+a blob.v2 external reference into the *original* capture (never copied):
+
+```
+pcapng2lance --stage l1 capture.pcapng data/   # packets.lance + payload_ref (whole payload)
+pcapng2lance --stage l2 data/                  # ethernet/vlan tables + remainder_after_l2
+pcapng2lance --stage l3 data/                  # ipv4/ipv6 tables    + remainder_after_l3
+pcapng2lance --stage l4 data/                  # tcp/udp tables      + remainder_after_l4 (= app payload)
+```
+
+Each enrich stage reads the previous stage's table, `nano_lance_fetch_external_blob`s each packet's
+current remainder, decodes exactly one more layer, writes that layer's PDU tables, and writes the
+advanced remainder (`packet_id` + next-layer discriminator + blob.v2 ref with `offset += header_len`).
+Everything is joined by `packet_id`; the original capture must remain present. The final
+`remainder_after_l4.lance` holds the application payloads as external references (packets fully consumed
+by L4 have no remainder row).
 The `payload_uri` defaults to a `file://` URI of the input; pass an explicit one (e.g. `s3://…`) when
 the Lance dataset will be read elsewhere.
 
@@ -66,6 +86,7 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
 | `pcapng2lance_realfile_multisection` | interop | same, on `tests/test_framed.pcapng` — 12 concatenated SHB sections (per-section interface reset) |
 | `pcapng2lance_protocols` | smoke | L2/L3 wire structs overlay real bytes; bitfields + `columns_of` expansion |
 | `pcapng2lance_l2l3` | interop | `--decode-l2l3` on a crafted Ethernet capture; per-PDU tables verified via stock lance |
+| `pcapng2lance_staged` | interop | `--stage l1→l2→l3→l4` incremental enrichment; per-stage tables + final external remainder verified |
 
 ## Notes / known limitations
 

@@ -111,5 +111,11 @@ if(NANOLANCE_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_l2l3.py"
                     $<TARGET_FILE:pcapng2lance>)
         set_tests_properties(pcapng2lance_l2l3 PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
+        # Staged / incremental: l1 -> l2 -> l3 -> l4 enriching one data folder, layer by layer.
+        add_test(NAME pcapng2lance_staged
+            COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_staged.py"
+                    $<TARGET_FILE:pcapng2lance>)
+        set_tests_properties(pcapng2lance_staged PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
     endif()
 endif()

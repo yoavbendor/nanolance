@@ -7,8 +7,10 @@
 #include "pcap_blocks.hpp"
 #include "pdu_table_writer.hpp"
 #include "protocol_decode.hpp"
+#include "staged_pipeline.hpp"
 
 #include "nanolance/blob_builder.hpp"
+#include "nanolance/nano_lance_reader.h"
 #include "nanolance/nano_lance_writer.h"
 
 #include <boost/describe.hpp>
@@ -27,6 +29,7 @@ namespace {
 // The all-scalar packet row that flows through the nanotins reflection core. payload_uri/off/size are
 // NOT here — they ride in the lance.blob.v2 `payload_ref` struct appended alongside.
 struct PacketRow {
+    std::uint64_t packet_id;  // stable row id; join key for the per-PDU / staged tables
     std::uint32_t interface_id;
     std::uint64_t ts_raw;
     std::uint32_t caplen;
@@ -35,7 +38,8 @@ struct PacketRow {
     std::uint8_t ts_resol;    // denormalized; lets a row self-describe its time unit
     std::uint32_t epb_flags;
 };
-BOOST_DESCRIBE_STRUCT(PacketRow, (), (interface_id, ts_raw, caplen, origlen, link_type, ts_resol, epb_flags))
+BOOST_DESCRIBE_STRUCT(PacketRow, (),
+                      (packet_id, interface_id, ts_raw, caplen, origlen, link_type, ts_resol, epb_flags))
 
 bool read_file(const std::filesystem::path& path, std::vector<std::uint8_t>& out, std::string& error) {
     std::ifstream in(path, std::ios::binary | std::ios::ate);
@@ -74,12 +78,106 @@ int fail(const std::string& msg) {
     return 1;
 }
 
+// One enrichment stage (l2/l3/l4): read the previous stage's payload table, fetch each packet's
+// still-unparsed bytes via its external reference, decode exactly one more layer, write that layer's
+// PDU tables, and write the advanced remainder for the next stage. Nothing is recomputed; the data
+// folder simply gains tables. Payload bytes are never copied (the remainder points back into the
+// original capture).
+int run_enrich_stage(const std::filesystem::path& datadir, const std::string& stage, bool compress) {
+    std::filesystem::path input;
+    if (stage == "l2") {
+        input = datadir / "packets.lance";  // discriminator column = link_type
+    } else if (stage == "l3") {
+        input = datadir / "remainder_after_l2.lance";  // discriminator = next_protocol (ethertype)
+    } else if (stage == "l4") {
+        input = datadir / "remainder_after_l3.lance";  // discriminator = next_protocol (ip_proto)
+    } else {
+        return fail("unknown --stage '" + stage + "' (expected l1/l2/l3/l4)");
+    }
+    const char* disc_col = (stage == "l2") ? "link_type" : "next_protocol";
+
+    std::vector<staged::PayloadRow> in_rows;
+    std::string error;
+    if (!staged::read_payload_table(input, disc_col, in_rows, error)) {
+        return fail("read " + input.string() + ": " + error);
+    }
+
+    protocols::DecodedPdus pdus;
+    std::vector<staged::PayloadRow> remainder;
+    std::vector<std::uint8_t> buf;
+    char ferr[512]{};
+    for (const auto& r : in_rows) {
+        buf.resize(r.size);
+        std::size_t got = 0;
+        if (r.size > 0 && nano_lance_fetch_external_blob(r.uri.c_str(), r.off, r.size, buf.data(), buf.size(),
+                                                         &got, ferr, sizeof ferr) != NANO_LANCE_READER_OK) {
+            return fail(std::string("fetch_external_blob: ") + ferr);
+        }
+        protocols::Bytes bytes(buf.data(), got);
+        std::size_t consumed = 0;
+        std::uint64_t next_disc = 0;
+        bool ok = false;
+        if (stage == "l2") {
+            std::uint16_t et = 0;
+            ok = protocols::decode_l2(r.packet_id, static_cast<std::uint32_t>(r.discriminator), bytes, pdus,
+                                      consumed, et);
+            next_disc = et;
+        } else if (stage == "l3") {
+            std::uint8_t proto = 0;
+            ok = protocols::decode_l3(r.packet_id, static_cast<std::uint16_t>(r.discriminator), bytes, pdus,
+                                      consumed, proto);
+            next_disc = proto;
+        } else {
+            ok = protocols::decode_l4(r.packet_id, static_cast<std::uint8_t>(r.discriminator), bytes, pdus,
+                                      consumed);
+        }
+        // Only carry forward packets that still have unparsed bytes; a fully-consumed packet has no
+        // external remainder (blob.v2 references must be non-empty).
+        if (ok && consumed < r.size) {
+            remainder.push_back(staged::PayloadRow{r.packet_id, next_disc, r.uri, r.off + consumed,
+                                                   r.size - consumed});
+        }
+    }
+
+    std::string perr;
+    const auto write_one = [&](const char* name, auto& column) -> bool {
+        if (!pdu_io::write_pdu_table(datadir / name, column, compress, perr)) {
+            std::fprintf(stderr, "pcapng2lance: failed to write %s: %s\n", name, perr.c_str());
+            return false;
+        }
+        return true;
+    };
+    bool ok = true;
+    const char* remainder_name = nullptr;
+    if (stage == "l2") {
+        ok = write_one("ethernet.lance", pdus.ethernet) & write_one("vlan.lance", pdus.vlan);
+        remainder_name = "remainder_after_l2.lance";
+    } else if (stage == "l3") {
+        ok = write_one("ipv4.lance", pdus.ipv4) & write_one("ipv6.lance", pdus.ipv6);
+        remainder_name = "remainder_after_l3.lance";
+    } else {
+        ok = write_one("tcp.lance", pdus.tcp) & write_one("udp.lance", pdus.udp);
+        remainder_name = "remainder_after_l4.lance";
+    }
+    if (!ok) {
+        return 1;
+    }
+    if (!staged::write_remainder_table(datadir / remainder_name, remainder, "next_protocol", compress, error)) {
+        return fail("write remainder: " + error);
+    }
+
+    std::fprintf(stderr, "pcapng2lance: stage %s -> %zu input rows, %zu decoded forward\n", stage.c_str(),
+                 in_rows.size(), remainder.size());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     // Positional: <input> <output> [payload_uri]. Flags: --no-compress, --decode-l2l3.
     bool compress = true;
     bool decode_l2l3 = false;
+    std::string stage;  // empty = one-shot; l1 writes <datadir>/packets.lance; l2/l3/l4 enrich <datadir>
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -87,18 +185,40 @@ int main(int argc, char** argv) {
             compress = false;
         } else if (a == "--decode-l2l3") {
             decode_l2l3 = true;
+        } else if (a == "--stage") {
+            if (i + 1 >= argc) {
+                return fail("--stage requires a value (l1/l2/l3/l4)");
+            }
+            stage = argv[++i];
         } else {
             pos.push_back(a);
         }
     }
+
+    // Enrichment stages take just <datadir> and run entirely off the previously-written tables.
+    if (stage == "l2" || stage == "l3" || stage == "l4") {
+        if (pos.empty()) {
+            std::fprintf(stderr, "usage: %s --stage l2|l3|l4 <datadir>\n", argv[0]);
+            return 2;
+        }
+        return run_enrich_stage(pos[0], stage, compress);
+    }
+
     if (pos.size() < 2) {
         std::fprintf(stderr,
-                     "usage: %s [--no-compress] [--decode-l2l3] <input.pcap|pcapng> <output.lance> [payload_uri]\n",
-                     argv[0]);
+                     "usage: %s [--no-compress] [--decode-l2l3] <input.pcap|pcapng> <output.lance> [payload_uri]\n"
+                     "       %s --stage l1 <input.pcap|pcapng> <datadir>   (then --stage l2|l3|l4 <datadir>)\n",
+                     argv[0], argv[0]);
         return 2;
     }
     const std::filesystem::path input = pos[0];
-    const std::filesystem::path output = pos[1];
+    std::filesystem::path output = pos[1];
+    if (stage == "l1") {
+        std::error_code ec;
+        std::filesystem::create_directories(output, ec);  // <datadir>
+        output = output / "packets.lance";
+        decode_l2l3 = false;  // in staged mode each layer is its own run
+    }
     const std::string payload_uri = (pos.size() >= 3) ? pos[2] : to_file_uri(input);
 
     std::string error;
@@ -195,7 +315,7 @@ int main(int argc, char** argv) {
             id < table.size() ? table[id].link_type : static_cast<std::uint16_t>(0);
         const std::uint8_t ts_resol = id < table.size() ? table[id].ts_resol : static_cast<std::uint8_t>(6);
         pkt_link_type[i] = link_type;
-        rows.store(i, PacketRow{iface[i], ts[i], caplen[i], origlen[i], link_type, ts_resol, flags[i]});
+        rows.store(i, PacketRow{i, iface[i], ts[i], caplen[i], origlen[i], link_type, ts_resol, flags[i]});
     }
 
     // Build the combined record-batch schema: scalar columns + lance.blob.v2 payload_ref.
