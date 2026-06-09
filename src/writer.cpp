@@ -52,6 +52,45 @@ int set_error(NanoLanceWriter* writer, int code, const std::string& message) {
     return code;
 }
 
+// True if every row of a variable-width column is identical; returns that value in `value_out`.
+bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vector<std::uint8_t>& value_out) {
+    const std::size_t ow = cv.variable.large ? 8U : 4U;
+    if (cv.variable.offsets.size() < 2U * ow) {
+        return false;
+    }
+    auto read_offset = [&](std::size_t index) -> std::int64_t {
+        const auto* p = cv.variable.offsets.data() + index * ow;
+        if (cv.variable.large) {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, 8);
+            return v;
+        }
+        std::int32_t v = 0;
+        std::memcpy(&v, p, 4);
+        return v;
+    };
+    const std::size_t rows = cv.variable.offsets.size() / ow - 1U;
+    if (rows == 0U) {
+        return false;
+    }
+    const auto start0 = read_offset(0);
+    const auto end0 = read_offset(1);
+    if (start0 < 0 || end0 < start0 || static_cast<std::size_t>(end0) > cv.variable.data.size()) {
+        return false;
+    }
+    const auto len = static_cast<std::size_t>(end0 - start0);
+    for (std::size_t i = 1; i < rows; ++i) {
+        const auto s = read_offset(i);
+        const auto e = read_offset(i + 1);
+        if (e - s != static_cast<std::int64_t>(len) ||
+            std::memcmp(cv.variable.data.data() + s, cv.variable.data.data() + start0, len) != 0) {
+            return false;
+        }
+    }
+    value_out.assign(cv.variable.data.begin() + start0, cv.variable.data.begin() + end0);
+    return true;
+}
+
 WriterState* state_from(NanoLanceWriter* writer) {
     if (writer == nullptr) {
         return nullptr;
@@ -403,23 +442,28 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
         const auto physical = nano_lance::lance_physical_fields(disk_schema);
         for (std::size_t i = 0; i < physical.size() && i < commit_columns.size(); ++i) {
             const auto* pf = physical[i];
-            if (!pf->extension_name.empty() || nano_lance::lance_field_is_variable_width(pf->logical_type)) {
+            if (!pf->extension_name.empty()) {
                 continue;
             }
             const auto& cv = commit_columns[i];
-            if (cv.kind != nano_lance::ColumnValues::Kind::FixedWidth) {
-                continue;
-            }
-            const auto bpv = nano_lance::lance_logical_type_value_bytes(pf->logical_type);
-            if (bpv == 0U || cv.fixed.size() < bpv || cv.fixed.size() % bpv != 0U) {
-                continue;
-            }
-            bool constant = true;
-            for (std::size_t off = bpv; off + bpv <= cv.fixed.size(); off += bpv) {
-                if (std::memcmp(cv.fixed.data(), cv.fixed.data() + off, bpv) != 0) {
-                    constant = false;
-                    break;
+            std::vector<std::uint8_t> value;
+            bool constant = false;
+            if (cv.kind == nano_lance::ColumnValues::Kind::FixedWidth) {
+                const auto bpv = nano_lance::lance_logical_type_value_bytes(pf->logical_type);
+                if (bpv != 0U && cv.fixed.size() >= bpv && cv.fixed.size() % bpv == 0U) {
+                    constant = true;
+                    for (std::size_t off = bpv; off + bpv <= cv.fixed.size(); off += bpv) {
+                        if (std::memcmp(cv.fixed.data(), cv.fixed.data() + off, bpv) != 0) {
+                            constant = false;
+                            break;
+                        }
+                    }
+                    if (constant) {
+                        value.assign(cv.fixed.begin(), cv.fixed.begin() + static_cast<std::ptrdiff_t>(bpv));
+                    }
                 }
+            } else if (cv.kind == nano_lance::ColumnValues::Kind::VariableWidth) {
+                constant = variable_column_constant_value(cv, value);
             }
             if (!constant) {
                 continue;
@@ -427,8 +471,7 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
             for (auto& field : disk_schema.fields) {
                 if (field.id == pf->id) {
                     field.metadata["nanolance:packing"] = "constant";
-                    field.metadata["nanolance:const-value"] =
-                        std::string(cv.fixed.begin(), cv.fixed.begin() + static_cast<std::ptrdiff_t>(bpv));
+                    field.metadata["nanolance:const-value"] = std::string(value.begin(), value.end());
                     break;
                 }
             }

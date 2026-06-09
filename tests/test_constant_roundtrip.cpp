@@ -73,6 +73,47 @@ std::vector<std::int64_t> read_int64(const std::filesystem::path& ds) {
 
 }  // namespace
 
+void write_string_const(const std::filesystem::path& ds, const std::string& value, int rows) {
+    ArrowSchema schema{};
+    ArrowSchemaInit(&schema);
+    require(ArrowSchemaSetFormat(&schema, "u") == NANOARROW_OK, "format");
+    require(ArrowSchemaSetName(&schema, "u") == NANOARROW_OK, "name");
+    ArrowArray source{};
+    require(ArrowArrayInitFromSchema(&source, &schema, nullptr) == NANOARROW_OK, "array init");
+    require(ArrowArrayStartAppending(&source) == NANOARROW_OK, "append start");
+    for (int i = 0; i < rows; ++i) {
+        require(ArrowArrayAppendString(&source, {value.data(), static_cast<int64_t>(value.size())}) == NANOARROW_OK,
+                "append");
+    }
+    require(ArrowArrayFinishBuildingDefault(&source, nullptr) == NANOARROW_OK, "finish");
+    NanoLanceWriter writer{};
+    require(nano_lance_writer_init(&writer, ds.string().c_str(), 3) == NANO_LANCE_OK, "init");
+    require(nano_lance_writer_set_ignore_nullability(&writer, true) == NANO_LANCE_OK, "ignore null");
+    require(nano_lance_writer_set_compression(&writer, true) == NANO_LANCE_OK, "compress");
+    require(nano_lance_write_batch(&writer, &source, &schema) == NANO_LANCE_OK, "write");
+    require(nano_lance_writer_commit(&writer, false) == NANO_LANCE_OK, "commit");
+    require(nano_lance_writer_close(&writer) == NANO_LANCE_OK, "close");
+    ArrowArrayRelease(&source);
+    ArrowSchemaRelease(&schema);
+}
+
+std::vector<std::string> read_string(const std::filesystem::path& ds) {
+    ArrowSchema schema{};
+    std::vector<ArrowArray> batches;
+    std::string error;
+    require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error.c_str());
+    const ArrowArray* col = (batches[0].n_children > 0) ? batches[0].children[0] : &batches[0];
+    const auto* off = static_cast<const std::int32_t*>(col->buffers[1]);
+    const auto* data = static_cast<const char*>(col->buffers[2]);
+    std::vector<std::string> out;
+    for (std::int64_t i = 0; i < col->length; ++i) {
+        out.emplace_back(data + off[i], static_cast<std::size_t>(off[i + 1] - off[i]));
+    }
+    ArrowSchemaRelease(&schema);
+    ArrowArrayRelease(&batches[0]);
+    return out;
+}
+
 int main() {
     const std::vector<std::int64_t> vals(20000, 1500);  // all identical -> ConstantLayout
 
@@ -86,12 +127,22 @@ int main() {
 
     const auto plain_bytes = data_dir_bytes(ds_plain);
     const auto const_bytes = data_dir_bytes(ds_const);
-    std::cerr << "constant: plain=" << plain_bytes << "B constant=" << const_bytes << "B\n";
+    std::cerr << "constant int: plain=" << plain_bytes << "B constant=" << const_bytes << "B\n";
     // A constant column should be tiny regardless of row count (value stored once in the descriptor).
     require(const_bytes < 2048U, "ConstantLayout column must be near-zero on disk");
+
+    // Constant string column -> ConstantLayout with a single-value scalar buffer.
+    const auto ds_str = temp_dataset("str");
+    const std::string uri = "s3://my-multimodal-bucket/captures/run_001.pcapng";
+    write_string_const(ds_str, uri, 20000);
+    const auto got = read_string(ds_str);
+    require(got.size() == 20000U, "constant string row count");
+    require(got.front() == uri && got.back() == uri, "constant string must round-trip");
+    require(data_dir_bytes(ds_str) < 2048U, "constant string column must be near-zero on disk");
 
     std::error_code ec;
     std::filesystem::remove_all(ds_plain, ec);
     std::filesystem::remove_all(ds_const, ec);
+    std::filesystem::remove_all(ds_str, ec);
     return 0;
 }

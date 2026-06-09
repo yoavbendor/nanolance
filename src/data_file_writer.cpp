@@ -298,14 +298,46 @@ std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_toke
     return encoding;
 }
 
-// PageLayout = ConstantLayout{ layers, inline_value }. A constant column stores its single value in
-// the page descriptor and writes zero data buffers. Bytes match lance output (see dump in chat).
-std::vector<std::uint8_t> page_layout_bytes_constant(const std::vector<std::uint8_t>& value_bytes) {
-    std::vector<std::uint8_t> constant_layout{0x2a, 0x01, 0x01};  // f5 layers = single non-null layer
-    constant_layout.push_back(0x32);                              // f6 inline_value
-    constant_layout.push_back(static_cast<std::uint8_t>(value_bytes.size()));
-    constant_layout.insert(constant_layout.end(), value_bytes.begin(), value_bytes.end());
+// Lance scalar value buffer for a length-1 string/binary array: [u32 num_buffers][u32 buf_len...]
+// [buffers]. A utf8/binary value is 2 buffers (offsets [0,len] + data). See lance-arrow scalar.rs.
+std::vector<std::uint8_t> encode_scalar_variable_value(const std::vector<std::uint8_t>& value, bool large) {
+    std::vector<std::uint8_t> out;
+    auto write_u32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            out.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFU));
+        }
+    };
+    const std::uint32_t offsets_len = large ? 16U : 8U;
+    write_u32(2U);                                          // num_buffers (offsets + data)
+    write_u32(offsets_len);                                // buffer 0: offsets
+    write_u32(static_cast<std::uint32_t>(value.size()));   // buffer 1: data
+    if (large) {
+        const std::uint64_t start = 0;
+        const std::uint64_t end = value.size();
+        for (int i = 0; i < 8; ++i) {
+            out.push_back(static_cast<std::uint8_t>((start >> (8 * i)) & 0xFFU));
+        }
+        for (int i = 0; i < 8; ++i) {
+            out.push_back(static_cast<std::uint8_t>((end >> (8 * i)) & 0xFFU));
+        }
+    } else {
+        write_u32(0U);
+        write_u32(static_cast<std::uint32_t>(value.size()));
+    }
+    out.insert(out.end(), value.begin(), value.end());
+    return out;
+}
 
+// PageLayout = ConstantLayout. Fixed-width constants store the value inline in the descriptor (zero
+// data buffers); variable-width (string/binary) constants omit inline_value and store the single
+// value in one data buffer instead. Bytes match lance output.
+std::vector<std::uint8_t> constant_layout_message(const std::vector<std::uint8_t>* inline_value) {
+    std::vector<std::uint8_t> constant_layout{0x2a, 0x01, 0x01};  // f5 layers = single non-null layer
+    if (inline_value != nullptr) {
+        constant_layout.push_back(0x32);  // f6 inline_value
+        constant_layout.push_back(static_cast<std::uint8_t>(inline_value->size()));
+        constant_layout.insert(constant_layout.end(), inline_value->begin(), inline_value->end());
+    }
     std::vector<std::uint8_t> page_layout;
     write_length_delimited(page_layout, 2, constant_layout);  // PageLayout f2 = constant_layout
     std::vector<std::uint8_t> encoding;
@@ -567,19 +599,37 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             continue;
         }
 
-        // Constant fixed-width column (tagged by the writer): one zero-data ConstantLayout page.
+        // Constant column (tagged by the writer): ConstantLayout. The single value comes from the
+        // field metadata. Fixed-width stores it inline (zero data buffers); variable-width stores it
+        // in one data buffer.
         const auto packing_it = field.metadata.find("nanolance:packing");
-        if (packing_it != field.metadata.end() && packing_it->second == "constant" &&
-            values.kind == ColumnValues::Kind::FixedWidth) {
-            const auto bpv = value_width_bytes(field);
-            std::vector<std::uint8_t> value(values.fixed.begin(),
-                                            values.fixed.begin() + static_cast<std::ptrdiff_t>(bpv));
+        if (packing_it != field.metadata.end() && packing_it->second == "constant") {
+            const auto value_it = field.metadata.find("nanolance:const-value");
+            if (value_it == field.metadata.end()) {
+                error = "constant column missing nanolance:const-value for ";
+                error += field.name;
+                return false;
+            }
+            const std::vector<std::uint8_t> value(value_it->second.begin(), value_it->second.end());
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
             pb::ColumnPage page;
             page.length = rows;
             page.priority = 0;
-            page.encoding = page_layout_bytes_constant(value);  // no data buffers
+            if (lance_field_is_variable_width(field.logical_type)) {
+                const bool large =
+                    field.logical_type == "large_utf8" || field.logical_type == "large_binary";
+                const auto scalar_buffer = encode_scalar_variable_value(value, large);
+                align64(out);
+                const auto value_offset = pos(out);
+                out.write(reinterpret_cast<const char*>(scalar_buffer.data()),
+                          static_cast<std::streamsize>(scalar_buffer.size()));
+                page.buffer_offsets.push_back(value_offset);
+                page.buffer_sizes.push_back(scalar_buffer.size());
+                page.encoding = constant_layout_message(nullptr);  // value is in the data buffer
+            } else {
+                page.encoding = constant_layout_message(&value);  // inline, no data buffers
+            }
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
             continue;

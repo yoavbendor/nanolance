@@ -278,11 +278,10 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         return true;
     }
 
-    // Constant fixed-width column: value stored once in field metadata; expand to one value per row.
+    // Constant column: the single value is stored once in field metadata; expand to one value per row.
     if (field_metadata_equals(on_disk_field, "nanolance:packing", "constant")) {
-        out.kind = ColumnValues::Kind::FixedWidth;
         const auto* value = field_metadata_bytes(on_disk_field, "nanolance:const-value");
-        if (value == nullptr || value->empty()) {
+        if (value == nullptr) {
             error = "constant column missing nanolance:const-value";
             return false;
         }
@@ -290,6 +289,35 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         for (const auto& page : column_metadata.pages) {
             total_rows += page.length;
         }
+        if (on_disk_field.encoding == 2) {  // variable-width
+            out.kind = ColumnValues::Kind::VariableWidth;
+            out.variable.large = on_disk_field.logical_type == "large_utf8" ||
+                                 on_disk_field.logical_type == "large_binary";
+            const auto ow = out.variable.large ? 8U : 4U;
+            out.variable.data.reserve(static_cast<std::size_t>(total_rows) * value->size());
+            out.variable.offsets.reserve((static_cast<std::size_t>(total_rows) + 1U) * ow);
+            std::uint64_t cumulative = 0;
+            auto push_offset = [&](std::uint64_t v) {
+                if (out.variable.large) {
+                    out.variable.offsets.insert(out.variable.offsets.end(),
+                                                reinterpret_cast<const std::uint8_t*>(&v),
+                                                reinterpret_cast<const std::uint8_t*>(&v) + 8);
+                } else {
+                    const auto v32 = static_cast<std::uint32_t>(v);
+                    out.variable.offsets.insert(out.variable.offsets.end(),
+                                                reinterpret_cast<const std::uint8_t*>(&v32),
+                                                reinterpret_cast<const std::uint8_t*>(&v32) + 4);
+                }
+            };
+            push_offset(0);
+            for (std::uint64_t i = 0; i < total_rows; ++i) {
+                out.variable.data.insert(out.variable.data.end(), value->begin(), value->end());
+                cumulative += value->size();
+                push_offset(cumulative);
+            }
+            return true;
+        }
+        out.kind = ColumnValues::Kind::FixedWidth;
         out.fixed.reserve(static_cast<std::size_t>(total_rows) * value->size());
         for (std::uint64_t i = 0; i < total_rows; ++i) {
             out.fixed.insert(out.fixed.end(), value->begin(), value->end());
