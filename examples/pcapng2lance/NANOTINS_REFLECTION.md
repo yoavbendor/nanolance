@@ -133,6 +133,52 @@ The SoA column for field `K` is `std::vector<column_traits<Field_K>::elem>`; its
 
 ---
 
+## 3a. Bitfields packed into a (big-endian) word — `bits<Word, field<…>…>`
+
+Native C++ bitfields can't overlay wire data (bit order, unit allocation, and endianness interaction
+are all implementation-defined), and pulling bits straight out of raw big-endian bytes is the
+error-prone "BE bitfield hell." The robust recipe: **byteswap the whole containing word first (the
+`be<>` already does this), then shift+mask on the host value** — bit positions then match the RFC's
+MSB-first numbering and are byte-order-independent. So **endianness belongs to the word, not the
+sub-field**: tag the word `be<>`, and declare each sub-field's *width* (not a per-field "_BE" flag).
+
+Attach the bit layout to a field type that nests `be<>` and lists sub-fields MSB-first:
+
+```cpp
+struct VlanTag {
+    be<std::uint16_t> tpid;                                          // 0x8100
+    bits<be<std::uint16_t>, field<"pcp",3>, field<"dei",1>, field<"vid",12>> tci;
+};
+BOOST_DESCRIBE_STRUCT(VlanTag, (), (tpid, tci))
+
+struct Ipv4 {
+    bits<std::uint8_t,      field<"version",4>, field<"ihl",4>>      v_ihl;       // 1 byte → no swap
+    /* … */
+    bits<be<std::uint16_t>, field<"flags",3>,  field<"frag_off",13>> flags_frag;  // straddles 2 BE bytes
+    /* … */
+};
+```
+
+`field<"name", W>` uses a C++20 fixed-string NTTP for the column name. From the width pack nanotins
+deduces, at compile time, MSB-first:
+
+```
+shift_j = word_bits − (w0 + … + wj)     mask_j = (1u << w_j) − 1
+value_j = (word.host() >> shift_j) & mask_j
+static_assert( Σ w == word_bits );      // catches the #1 manual bug: a miscounted bit width
+```
+
+Each sub-field's column element type is the smallest unsigned int that holds `W` bits (`pcp`→u8,
+`vid`→u16). `column_traits<bits<…>>` is a **multi-column** trait: one `bits<>` member expands to one
+Lance column per sub-field, each with its own Arrow type and name; the `store` extractor for sub-field
+*j* is exactly the shift+mask above on the word's host value. The parser stays a plain overlay
+(`bits<be<uint16>>` is layout-identical to the two wire bytes — no hand-written shifting anywhere).
+Keeping the raw word as an extra column is opt-in via a tag; default is sub-fields only (queryable,
+compact, bitpack-friendly).
+
+This *is* your `fld:11` idea — with the correction that the layout (and the swap) is declared on the
+word, so a field that straddles bytes (IPv4 `frag_off`, TCP flags) is handled correctly and portably.
+
 ## 4. SoA: owning host type + POD device view
 
 ```cpp
@@ -159,6 +205,13 @@ template<class T> struct soa_view {           // POD: tuple<elem*...> — trivia
 `store` is the whole story: an unrolled fold that, per field, reads through its type (so `be<U>`
 swaps) and writes the host value into column `K` at row `i`. On GPU, adjacent threads write
 `col<K>[i]` and `col<K>[i+1]` → **coalesced per column**. No allocation, no boost, `__device__`-clean.
+
+Generalization for multi-column field types: members are first flattened to a compile-time
+`columns_of<T>` list, where each entry is `{name, elem, arrow, extractor(const T&)→elem}`. A plain
+`be<U>`/`U` member contributes one entry; a `bits<…>` member contributes one per sub-field (§3a); a
+byte array contributes one fixed-size-binary entry. `store`, `to_arrow`, and `arrow_schema` all
+iterate `columns_of<T>` (not the raw member list), so the fold above is really *per column* — which is
+what makes bitfields, endianness, and plain fields one uniform mechanism.
 
 ---
 
