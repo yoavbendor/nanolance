@@ -507,6 +507,53 @@ bool append_column_value_at_row(const LanceField& field, const ColumnValues& val
                             field.arrow_format, error);
 }
 
+// Fixed-width arrow format codes, resolved once per column to avoid per-row string comparisons.
+enum class FixedFmt { kU8, kI64, kU64, kU32, kUnsupported };
+
+FixedFmt fixed_fmt_code(const std::string& arrow_format) {
+    if (arrow_format == "C" || arrow_format == "c") return FixedFmt::kU8;
+    if (arrow_format == "l") return FixedFmt::kI64;
+    if (arrow_format == "L") return FixedFmt::kU64;
+    if (arrow_format == "I") return FixedFmt::kU32;
+    return FixedFmt::kUnsupported;
+}
+
+bool append_fixed_fast(ArrowArray& array, const std::uint8_t* data, FixedFmt fmt, std::string& error) {
+    switch (fmt) {
+        case FixedFmt::kU8:
+            return ArrowArrayAppendUInt(&array, data[0]) == NANOARROW_OK;
+        case FixedFmt::kI64: {
+            std::int64_t v = 0;
+            std::memcpy(&v, data, 8);
+            return ArrowArrayAppendInt(&array, v) == NANOARROW_OK;
+        }
+        case FixedFmt::kU64: {
+            std::uint64_t v = 0;
+            std::memcpy(&v, data, 8);
+            return ArrowArrayAppendUInt(&array, static_cast<std::int64_t>(v)) == NANOARROW_OK;
+        }
+        case FixedFmt::kU32: {
+            std::uint32_t v = 0;
+            std::memcpy(&v, data, 4);
+            return ArrowArrayAppendUInt(&array, v) == NANOARROW_OK;
+        }
+        default:
+            error = "unsupported fixed arrow format in fast path";
+            return false;
+    }
+}
+
+// One column's decode plan, resolved once before the row loop (no per-row metadata/string work).
+struct ColumnPlan {
+    enum class Kind { Skip, Blob, Variable, Fixed } kind = Kind::Skip;
+    ArrowArray* array = nullptr;
+    const LanceField* field = nullptr;      // Blob path needs the full field
+    const ColumnValues* values = nullptr;
+    const std::vector<std::string>* dict = nullptr;
+    std::size_t width = 0;                   // Fixed
+    FixedFmt fmt = FixedFmt::kUnsupported;   // Fixed
+};
+
 bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaMapping& mapping,
                              const std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id,
                              const std::int64_t length, ArrowArray& batch, std::string& error) {
@@ -540,58 +587,85 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         return it == blob_uri_dicts.end() ? nullptr : &it->second;
     };
 
+    // Resolve every column's decode plan ONCE (field lookup, kind, width, format, dict) so the row
+    // loop does zero per-row metadata/string work — this was ~27% of read instructions (callgrind).
+    std::vector<ColumnPlan> plans(static_cast<std::size_t>(batch_schema.n_children));
+    for (int64_t c = 0; c < batch_schema.n_children; ++c) {
+        const auto* child_schema = batch_schema.children[c];
+        auto* child_array = batch.children[c];
+        if (child_schema == nullptr || child_schema->name == nullptr || child_array == nullptr) {
+            error = "batch schema child is missing";
+            ArrowArrayRelease(&batch);
+            return false;
+        }
+        const auto* field = find_mapping_field_by_name(mapping, child_schema->name);
+        if (field == nullptr) {
+            error = "mapping field not found for schema child ";
+            error += child_schema->name;
+            ArrowArrayRelease(&batch);
+            return false;
+        }
+        auto& plan = plans[static_cast<std::size_t>(c)];
+        plan.array = child_array;
+        plan.field = field;
+        const bool is_blob = field->extension_name == "lance.blob.v2";
+        if (!is_blob && child_schema->format != nullptr && child_schema->format[0] == '+') {
+            error = "nested struct children are not supported in this reader build";
+            ArrowArrayRelease(&batch);
+            return false;
+        }
+        if (!is_blob && field->column_index < 0) {
+            plan.kind = ColumnPlan::Kind::Skip;
+            continue;
+        }
+        const auto col_it = decoded_by_field_id.find(field->id);
+        if (col_it == decoded_by_field_id.end()) {
+            error = "missing decoded column for ";
+            error += field->name;
+            ArrowArrayRelease(&batch);
+            return false;
+        }
+        plan.values = &col_it->second;
+        if (is_blob) {
+            plan.kind = ColumnPlan::Kind::Blob;
+            plan.dict = dict_for(field->id);
+        } else if (lance_field_is_variable_width(field->logical_type)) {
+            plan.kind = ColumnPlan::Kind::Variable;
+        } else {
+            plan.kind = ColumnPlan::Kind::Fixed;
+            plan.width = lance_logical_type_value_bytes(field->logical_type);
+            plan.fmt = fixed_fmt_code(field->arrow_format);
+        }
+    }
+
     for (std::int64_t row = 0; row < length; ++row) {
-        for (int64_t c = 0; c < batch_schema.n_children; ++c) {
-            const auto* child_schema = batch_schema.children[c];
-            auto* child_array = batch.children[c];
-            if (child_schema == nullptr || child_schema->name == nullptr || child_array == nullptr) {
-                error = "batch schema child is missing";
-                ArrowArrayRelease(&batch);
-                return false;
-            }
-            const auto* field = find_mapping_field_by_name(mapping, child_schema->name);
-            if (field == nullptr) {
-                error = "mapping field not found for schema child ";
-                error += child_schema->name;
-                ArrowArrayRelease(&batch);
-                return false;
-            }
-            if (field->extension_name == "lance.blob.v2") {
-                const auto col_it = decoded_by_field_id.find(field->id);
-                if (col_it == decoded_by_field_id.end()) {
-                    error = "missing decoded blob column for ";
-                    error += field->name;
-                    ArrowArrayRelease(&batch);
-                    return false;
-                }
-                if (!append_column_value_at_row(*field, col_it->second, row, dict_for(field->id), *child_array,
-                                                error)) {
-                    ArrowArrayRelease(&batch);
-                    return false;
-                }
-                continue;
-            }
-            if (child_schema->format != nullptr && child_schema->format[0] == '+') {
-                error = "nested struct children are not supported in this reader build";
-                ArrowArrayRelease(&batch);
-                return false;
-            }
-            if (field->column_index < 0) {
-                continue;
-            }
-            const auto col_it = decoded_by_field_id.find(field->id);
-            if (col_it == decoded_by_field_id.end()) {
-                error = "missing decoded column for ";
-                error += field->name;
-                ArrowArrayRelease(&batch);
-                return false;
-            }
-            if (!append_column_value_at_row(*field, col_it->second, row, dict_for(field->id), *child_array, error)) {
-                error += " (column ";
-                error += field->name;
-                error += ")";
-                ArrowArrayRelease(&batch);
-                return false;
+        for (auto& plan : plans) {
+            switch (plan.kind) {
+                case ColumnPlan::Kind::Skip:
+                    break;
+                case ColumnPlan::Kind::Variable:
+                    if (!append_string_at_row(*plan.array, plan.values->variable, static_cast<std::size_t>(row),
+                                              error)) {
+                        ArrowArrayRelease(&batch);
+                        return false;
+                    }
+                    break;
+                case ColumnPlan::Kind::Fixed:
+                    if (plan.values->fixed.size() < (static_cast<std::size_t>(row) + 1U) * plan.width ||
+                        !append_fixed_fast(*plan.array,
+                                           plan.values->fixed.data() + static_cast<std::size_t>(row) * plan.width,
+                                           plan.fmt, error)) {
+                        error += " (fixed column decode)";
+                        ArrowArrayRelease(&batch);
+                        return false;
+                    }
+                    break;
+                case ColumnPlan::Kind::Blob:
+                    if (!append_column_value_at_row(*plan.field, *plan.values, row, plan.dict, *plan.array, error)) {
+                        ArrowArrayRelease(&batch);
+                        return false;
+                    }
+                    break;
             }
         }
         if (ArrowArrayFinishElement(&batch) != NANOARROW_OK) {
