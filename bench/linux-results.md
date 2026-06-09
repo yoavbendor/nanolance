@@ -1,6 +1,6 @@
 # Linux CI results
 
-_2026-06-09 09:52:39 UTC · commit `d320805`_
+_2026-06-09 10:04:40 UTC · commit `4500b5c`_
 
 ## Environment
 ```
@@ -11,33 +11,33 @@ cmake version 3.31.6
 
 ## Tests
 ```
-smoke    =   0.09 sec*proc (17 tests)
+smoke    =   0.12 sec*proc (17 tests)
 
-Total Test time (real) =   0.23 sec
+Total Test time (real) =   0.17 sec
 ```
 
 ## Benchmark (parquet vs rust lance vs nanolance)
 ```
 
 ========== pcap_ref  (200000 rows, 3 cols) ==========
-engine            write ms   file bytes    B/row   read ms  read(lance)
-parquet (zstd)        31.7      837,834    4.189      7.68                (1.00x vs pq)
-rust lance            13.8      694,409    3.472      5.90                (0.83x vs pq)
-nanolance             56.0      728,616    3.643     10.98         9.61   (0.87x vs pq)
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         22.75       22.75    4.189      6.68                (1.00x vs pq)
+rust lance              9.90        9.90    3.472      5.78                (0.83x vs pq)
+nanolance              48.89       57.73    3.643     11.22         9.32   (0.87x vs pq)
 
 ========== wide_int  (200000 rows, 4 cols) ==========
-engine            write ms   file bytes    B/row   read ms  read(lance)
-parquet (zstd)        29.8    1,042,350    5.212      3.99                (1.00x vs pq)
-rust lance             5.0    1,696,945    8.485      3.68                (1.63x vs pq)
-nanolance             12.9    1,802,616    9.013      7.79        12.48   (1.73x vs pq)
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         25.01       25.01    5.212      3.68                (1.00x vs pq)
+rust lance              2.62        2.62    8.485      3.68                (1.63x vs pq)
+nanolance              10.39       13.64    9.013     12.45        11.95   (1.73x vs pq)
 
 ========== high_card  (200000 rows, 2 cols) ==========
-engine            write ms   file bytes    B/row   read ms  read(lance)
-parquet (zstd)        42.9    3,102,688   15.513      8.98                (1.00x vs pq)
-rust lance            19.8    3,775,338   18.877      5.90                (1.22x vs pq)
-nanolance            306.4    3,641,112   18.206     11.80        12.03   (1.17x vs pq)
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         30.62       30.62   15.513      8.09                (1.00x vs pq)
+rust lance             17.26       17.26   18.910      5.86                (1.22x vs pq)
+nanolance             301.12      307.57   18.206     14.62        11.71   (1.17x vs pq)
 
-note: nanolance write ms includes process startup; read ms 'read ms' col is each engine's native reader, 'read(lance)' is rust-lance reading the nanolance file (interop). best of 7.
+note: best of 5 writes / 7 reads. write(core)=in-process encode work (parquet/lance: the write call; nanolance: ingest+encode+commit, EXCLUDING process startup + Arrow-IPC parse). write(proc)=full wall clock (nanolance includes subprocess startup + IPC parse). read ms=native reader; read(lance)=rust-lance reading the nanolance file.
 ```
 
 ## Native-read profile (callgrind, nlbench on pcap_ref)
@@ -48,9 +48,9 @@ Profile data file '/tmp/cg.out' (creator: callgrind-3.22.0)
 I1 cache: 
 D1 cache: 
 LL cache: 
-Timerange: Basic block 0 - 20188693
+Timerange: Basic block 0 - 20188711
 Trigger: Program termination
-Profiled target:  build/nlbench /tmp/nlb/pcap_ref_nl.lance 1 (PID 3387, part 1)
+Profiled target:  build/nlbench /tmp/nlb/pcap_ref_nl.lance 1 (PID 3463, part 1)
 Events recorded:  Ir
 Events shown:     Ir
 Event sort order: Ir
@@ -62,7 +62,7 @@ Auto-annotation:  on
 --------------------------------------------------------------------------------
 Ir                  
 --------------------------------------------------------------------------------
-39,422,948 (100.0%)  PROGRAM TOTALS
+39,423,028 (100.0%)  PROGRAM TOTALS
 
 --------------------------------------------------------------------------------
 Ir                   file:function
