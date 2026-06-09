@@ -56,8 +56,8 @@ All of these stay readable by stock `lance`; nanolance's own reader decodes them
 | Column type | Encoding applied | Measured (50k pcap-like rows) |
 |---|---|---|
 | Integer 8/16/32/64-bit | FastLanes **InlineBitpacking** (1024-value blocks) | int64 ~10-bit values: 84 → 3.4 B/row |
-| Constant fixed-width (all values equal) | **ConstantLayout** (value inline in descriptor, 0 data bytes) | constant int: → 0.01 B/row |
-| String / binary | **zstd** (`General(ZSTD)`, `[u64 len][zstd]` per chunk) | repetitive string: 7.6 → ~3 B/row |
+| Constant column (all rows equal), fixed **or** string/binary | **ConstantLayout** (value stored once; ~0 data bytes) | constant int → 0.007, constant URI string → 0.009 B/row |
+| String / binary (non-constant) | **zstd** (`General(ZSTD)`, `[u64 len][zstd]` per chunk) | repetitive string: 7.6 → ~3 B/row |
 | float / bool fixed-width | left uncompressed (Lance uses other schemes) | — |
 
 `compression_level` is the zstd level (also used as a hint; 0 = zstd default). Bitpacking/constant
@@ -80,9 +80,13 @@ To compete with Parquet, **model external references as ordinary typed columns**
 - Avoid for size: the blob-v2 FullZip packed descriptor. Measured at ~41 B/row because it row-zips
   raw `position`/`size`/`uri` per row with no per-column dictionary/RLE/bitpacking.
 
-Measured, same 50k rows, `--compress`, columns model: ~6.5 B/row today and dropping as more per-column
-encodings land (RLE / string-dictionary are in progress). The blob-v2 descriptor was 41 B/row. Prefer
-the columns model unless you specifically need Lance's native blob-fetch semantics.
+Measured, same 50k rows, `--compress`, columns model: **3.39 B/row** (constant URI 0.009 + constant
+size 0.007 + bitpacked monotonic position 3.38), at parity with the Lance reference writer (3.21) and
+now dominated only by the `position` column. The blob-v2 packed descriptor for the same data was
+41 B/row. Prefer the columns model unless you specifically need Lance's native blob-fetch semantics.
+To push `position` lower, store it as first-offset + deltas at the application level (the delta column
+becomes constant/low-range → ~0); Lance has no transparent delta encoding. True low-cardinality
+(non-constant) string columns still fall back to zstd until RLE/dictionary land.
 
 Tips that help the encoders:
 - Constant fields (snaplen, a fixed capture size, a per-file URI as a separate constant column) →
