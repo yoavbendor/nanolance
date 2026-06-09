@@ -35,6 +35,13 @@ void append_le16(std::vector<std::uint8_t>& out, std::uint16_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
 }
 
+void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value) {
+    out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
+}
+
 void append_varint(std::vector<std::uint8_t>& out, std::uint64_t value) {
     while (value >= 0x80U) {
         out.push_back(static_cast<std::uint8_t>((value & 0x7FU) | 0x80U));
@@ -194,6 +201,12 @@ std::vector<std::uint8_t> blob_v2_build_control_buffer(const std::vector<std::ui
         total += static_cast<std::uint64_t>(sz);
         prefixes.push_back(total);
     }
+    // Blob control buffer encodings (cumulative row-end offsets):
+    //   narrow: [0][u8  cumulative offsets ...]            total < 256
+    //   wide16: [0][0][u16 cumulative offsets ...]         total <= 65535
+    //   wide32: [0][1][u32 cumulative offsets ...]         otherwise
+    // The wide forms carry a width discriminator in byte[1] (the reader already keyed off it). Writing
+    // a too-narrow width above wrapped the cumulative offsets and made them non-monotonic.
     const bool narrow = total < 256U;
     if (narrow) {
         out.push_back(0U);
@@ -202,10 +215,15 @@ std::vector<std::uint8_t> blob_v2_build_control_buffer(const std::vector<std::ui
         }
         return out;
     }
+    const bool wide16 = total <= static_cast<std::uint64_t>(std::numeric_limits<std::uint16_t>::max());
     out.push_back(0U);
-    out.push_back(0U);
+    out.push_back(wide16 ? 0U : 1U);
     for (const auto p : prefixes) {
-        append_le16(out, static_cast<std::uint16_t>(p));
+        if (wide16) {
+            append_le16(out, static_cast<std::uint16_t>(p));
+        } else {
+            append_le32(out, static_cast<std::uint32_t>(p));
+        }
     }
     return out;
 }
@@ -235,7 +253,8 @@ bool blob_v2_control_buffer_to_row_sizes(const std::vector<std::uint8_t>& contro
         return true;
     }
     const auto expect_narrow = static_cast<std::size_t>(1U) + static_cast<std::size_t>(n);
-    const auto expect_wide = static_cast<std::size_t>(2U) + 2U * static_cast<std::size_t>(n);
+    const auto expect_wide16 = static_cast<std::size_t>(2U) + 2U * static_cast<std::size_t>(n);
+    const auto expect_wide32 = static_cast<std::size_t>(2U) + 4U * static_cast<std::size_t>(n);
     if (control.size() == expect_narrow) {
         std::uint8_t prev = 0;
         for (std::uint32_t i = 0; i < n; ++i) {
@@ -249,11 +268,9 @@ bool blob_v2_control_buffer_to_row_sizes(const std::vector<std::uint8_t>& contro
         }
         return true;
     }
-    if (control.size() == expect_wide) {
-        if (control[1] != 0U) {
-            error = "invalid wide blob control buffer header";
-            return false;
-        }
+    // Wide control buffers carry a width discriminator in byte[1]: 0 = u16 offsets, 1 = u32 offsets.
+    // expect_wide16 and expect_wide32 only collide when n == 0, which is handled above.
+    if (control.size() == expect_wide16 && control[1] == 0U) {
         std::uint16_t prev = 0;
         for (std::uint32_t i = 0; i < n; ++i) {
             const auto base = static_cast<std::size_t>(2U + 2U * i);
@@ -268,7 +285,22 @@ bool blob_v2_control_buffer_to_row_sizes(const std::vector<std::uint8_t>& contro
         }
         return true;
     }
-    error = "blob control buffer size does not match row count (narrow/wide)";
+    if (control.size() == expect_wide32 && control[1] == 1U) {
+        std::uint32_t prev = 0;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const auto base = static_cast<std::size_t>(2U + 4U * i);
+            std::uint32_t cum = 0;
+            std::memcpy(&cum, control.data() + base, sizeof(cum));
+            if (cum < prev) {
+                error = "invalid wide cumulative offsets in blob control buffer";
+                return false;
+            }
+            row_packed_sizes.push_back(cum - prev);
+            prev = cum;
+        }
+        return true;
+    }
+    error = "blob control buffer size does not match row count (narrow/wide16/wide32)";
     return false;
 }
 

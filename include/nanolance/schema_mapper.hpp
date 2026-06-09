@@ -67,6 +67,9 @@ inline std::size_t lance_logical_type_value_bytes(const std::string& logical_typ
     if (logical_type == "int32" || logical_type == "uint32" || logical_type == "float") {
         return 4U;
     }
+    if (logical_type.rfind("fixed_size_binary:", 0) == 0) {
+        return static_cast<std::size_t>(std::stoul(logical_type.substr(18)));  // strlen("fixed_size_binary:")
+    }
     return 8U;
 }
 

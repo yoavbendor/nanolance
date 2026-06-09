@@ -34,7 +34,13 @@ int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t 
     *bytes_read = 0U;
     const std::string suri(uri);
     if (suri.rfind("file://", 0) == 0) {
-        const std::string path = suri.substr(7);
+        std::string path = suri.substr(7);
+        // Standard Windows file URIs are "file:///C:/..."; after stripping "file://" a stray leading
+        // slash precedes the drive letter ("/C:/..."), which the OS can't open. Drop it.
+        if (path.size() >= 3 && path[0] == '/' &&
+            ((path[1] >= 'A' && path[1] <= 'Z') || (path[1] >= 'a' && path[1] <= 'z')) && path[2] == ':') {
+            path.erase(0, 1);
+        }
         std::ifstream in(path, std::ios::binary);
         if (!in) {
             set_error(error_message, error_message_capacity, "failed to open file:// path");

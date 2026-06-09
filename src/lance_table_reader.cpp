@@ -139,46 +139,63 @@ bool build_schema_from_mapping(const LanceSchemaMapping& mapping, ArrowSchema& s
 
 bool append_fixed_raw(ArrowArray& array, const std::uint8_t* data, const std::size_t bytes_per_value,
                       const std::string& arrow_format, std::string& error) {
-    if (arrow_format == "C" || arrow_format == "c") {
-        std::uint8_t value = 0;
-        if (bytes_per_value >= 1U) {
-            value = data[0];
-        }
-        if (ArrowArrayAppendUInt(&array, value) != NANOARROW_OK) {
-            error = "failed to append uint8";
-            return false;
-        }
-        return true;
+    const auto append_int = [&](std::int64_t v) { return ArrowArrayAppendInt(&array, v) == NANOARROW_OK; };
+    const auto append_uint = [&](std::uint64_t v) {
+        return ArrowArrayAppendUInt(&array, static_cast<std::int64_t>(v)) == NANOARROW_OK;
+    };
+    bool ok = false;
+    if (arrow_format == "c") {
+        ok = append_int(static_cast<std::int8_t>(data[0]));
+    } else if (arrow_format == "C") {
+        ok = append_uint(data[0]);
+    } else if (arrow_format == "b") {
+        ok = append_int(data[0] != 0 ? 1 : 0);
+    } else if (arrow_format == "s") {
+        std::int16_t v = 0;
+        std::memcpy(&v, data, 2);
+        ok = append_int(v);
+    } else if (arrow_format == "S") {
+        std::uint16_t v = 0;
+        std::memcpy(&v, data, 2);
+        ok = append_uint(v);
+    } else if (arrow_format == "i") {
+        std::int32_t v = 0;
+        std::memcpy(&v, data, 4);
+        ok = append_int(v);
+    } else if (arrow_format == "I") {
+        std::uint32_t v = 0;
+        std::memcpy(&v, data, 4);
+        ok = append_uint(v);
+    } else if (arrow_format == "l") {
+        std::int64_t v = 0;
+        std::memcpy(&v, data, 8);
+        ok = append_int(v);
+    } else if (arrow_format == "L") {
+        std::uint64_t v = 0;
+        std::memcpy(&v, data, 8);
+        ok = append_uint(v);
+    } else if (arrow_format == "f") {
+        float v = 0;
+        std::memcpy(&v, data, 4);
+        ok = ArrowArrayAppendDouble(&array, static_cast<double>(v)) == NANOARROW_OK;
+    } else if (arrow_format == "g") {
+        double v = 0;
+        std::memcpy(&v, data, 8);
+        ok = ArrowArrayAppendDouble(&array, v) == NANOARROW_OK;
+    } else if (arrow_format.rfind("w:", 0) == 0) {
+        ArrowBufferView view{};
+        view.data.data = data;
+        view.size_bytes = static_cast<int64_t>(bytes_per_value);
+        ok = ArrowArrayAppendBytes(&array, view) == NANOARROW_OK;
+    } else {
+        error = "unsupported fixed arrow format: " + arrow_format;
+        return false;
     }
-    if (arrow_format == "l") {
-        std::int64_t value = 0;
-        std::memcpy(&value, data, sizeof(value));
-        if (ArrowArrayAppendInt(&array, value) != NANOARROW_OK) {
-            error = "failed to append int64";
-            return false;
-        }
-        return true;
+    if (!ok) {
+        error = "failed to append value of arrow format " + arrow_format;
+        return false;
     }
-    if (arrow_format == "L") {
-        std::uint64_t value = 0;
-        std::memcpy(&value, data, sizeof(value));
-        if (ArrowArrayAppendUInt(&array, value) != NANOARROW_OK) {
-            error = "failed to append uint64";
-            return false;
-        }
-        return true;
-    }
-    if (arrow_format == "I") {
-        std::uint32_t value = 0;
-        std::memcpy(&value, data, sizeof(value));
-        if (ArrowArrayAppendUInt(&array, value) != NANOARROW_OK) {
-            error = "failed to append uint32";
-            return false;
-        }
-        return true;
-    }
-    error = "unsupported fixed arrow format: " + arrow_format;
-    return false;
+    return true;
 }
 
 bool append_fixed_values(ArrowArray& array, const std::vector<std::uint8_t>& bytes, const std::size_t bytes_per_value,
@@ -508,20 +525,55 @@ bool append_column_value_at_row(const LanceField& field, const ColumnValues& val
 }
 
 // Fixed-width arrow format codes, resolved once per column to avoid per-row string comparisons.
-enum class FixedFmt { kU8, kI64, kU64, kU32, kUnsupported };
+// Covers every fixed-width type the writer can emit (the write/read parity principle): signed/unsigned
+// ints 8..64, float/double, bool, and fixed-size-binary (width carried in ColumnPlan::width).
+enum class FixedFmt { kI8, kU8, kI16, kU16, kI32, kU32, kI64, kU64, kF32, kF64, kBool, kFixedBinary, kUnsupported };
 
 FixedFmt fixed_fmt_code(const std::string& arrow_format) {
-    if (arrow_format == "C" || arrow_format == "c") return FixedFmt::kU8;
+    if (arrow_format == "c") return FixedFmt::kI8;
+    if (arrow_format == "C") return FixedFmt::kU8;
+    if (arrow_format == "s") return FixedFmt::kI16;
+    if (arrow_format == "S") return FixedFmt::kU16;
+    if (arrow_format == "i") return FixedFmt::kI32;
+    if (arrow_format == "I") return FixedFmt::kU32;
     if (arrow_format == "l") return FixedFmt::kI64;
     if (arrow_format == "L") return FixedFmt::kU64;
-    if (arrow_format == "I") return FixedFmt::kU32;
+    if (arrow_format == "f") return FixedFmt::kF32;
+    if (arrow_format == "g") return FixedFmt::kF64;
+    if (arrow_format == "b") return FixedFmt::kBool;
+    if (arrow_format.rfind("w:", 0) == 0) return FixedFmt::kFixedBinary;
     return FixedFmt::kUnsupported;
 }
 
-bool append_fixed_fast(ArrowArray& array, const std::uint8_t* data, FixedFmt fmt, std::string& error) {
+bool append_fixed_fast(ArrowArray& array, const std::uint8_t* data, FixedFmt fmt, std::size_t width,
+                       std::string& error) {
     switch (fmt) {
+        case FixedFmt::kI8:
+            return ArrowArrayAppendInt(&array, static_cast<std::int8_t>(data[0])) == NANOARROW_OK;
         case FixedFmt::kU8:
             return ArrowArrayAppendUInt(&array, data[0]) == NANOARROW_OK;
+        case FixedFmt::kBool:
+            return ArrowArrayAppendInt(&array, data[0] != 0 ? 1 : 0) == NANOARROW_OK;
+        case FixedFmt::kI16: {
+            std::int16_t v = 0;
+            std::memcpy(&v, data, 2);
+            return ArrowArrayAppendInt(&array, v) == NANOARROW_OK;
+        }
+        case FixedFmt::kU16: {
+            std::uint16_t v = 0;
+            std::memcpy(&v, data, 2);
+            return ArrowArrayAppendUInt(&array, v) == NANOARROW_OK;
+        }
+        case FixedFmt::kI32: {
+            std::int32_t v = 0;
+            std::memcpy(&v, data, 4);
+            return ArrowArrayAppendInt(&array, v) == NANOARROW_OK;
+        }
+        case FixedFmt::kU32: {
+            std::uint32_t v = 0;
+            std::memcpy(&v, data, 4);
+            return ArrowArrayAppendUInt(&array, v) == NANOARROW_OK;
+        }
         case FixedFmt::kI64: {
             std::int64_t v = 0;
             std::memcpy(&v, data, 8);
@@ -532,10 +584,21 @@ bool append_fixed_fast(ArrowArray& array, const std::uint8_t* data, FixedFmt fmt
             std::memcpy(&v, data, 8);
             return ArrowArrayAppendUInt(&array, static_cast<std::int64_t>(v)) == NANOARROW_OK;
         }
-        case FixedFmt::kU32: {
-            std::uint32_t v = 0;
+        case FixedFmt::kF32: {
+            float v = 0;
             std::memcpy(&v, data, 4);
-            return ArrowArrayAppendUInt(&array, v) == NANOARROW_OK;
+            return ArrowArrayAppendDouble(&array, static_cast<double>(v)) == NANOARROW_OK;
+        }
+        case FixedFmt::kF64: {
+            double v = 0;
+            std::memcpy(&v, data, 8);
+            return ArrowArrayAppendDouble(&array, v) == NANOARROW_OK;
+        }
+        case FixedFmt::kFixedBinary: {
+            ArrowBufferView view{};
+            view.data.data = data;
+            view.size_bytes = static_cast<int64_t>(width);
+            return ArrowArrayAppendBytes(&array, view) == NANOARROW_OK;
         }
         default:
             error = "unsupported fixed arrow format in fast path";
@@ -720,7 +783,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                     if (plan.values->fixed.size() < (static_cast<std::size_t>(row) + 1U) * plan.width ||
                         !append_fixed_fast(*plan.array,
                                            plan.values->fixed.data() + static_cast<std::size_t>(row) * plan.width,
-                                           plan.fmt, error)) {
+                                           plan.fmt, plan.width, error)) {
                         error += " (fixed column decode)";
                         ArrowArrayRelease(&batch);
                         return false;

@@ -164,6 +164,24 @@ int main() {
                 "column page encoding must strip outer PageLayout wrapper");
     }
 
+    // Regression: control-buffer offset width must scale with the cumulative total. Previously wide
+    // mode always wrote 16-bit cumulative offsets, so a total above 65535 wrapped and became
+    // non-monotonic ("invalid wide cumulative offsets"). narrow(<256) / wide16(<=65535) / wide32 must
+    // all round-trip exactly.
+    {
+        const auto check_roundtrip = [&](const std::vector<std::uint32_t>& sizes, const char* what) {
+            const auto control = nano_lance::blob_v2_build_control_buffer(sizes);
+            std::vector<std::uint32_t> back;
+            std::string err;
+            require(nano_lance::blob_v2_control_buffer_to_row_sizes(control, sizes.size(), back, err), err.c_str());
+            require(back == sizes, what);
+        };
+        check_roundtrip({10, 200, 40}, "narrow control round-trip");          // total 250 (< 256)
+        check_roundtrip({50000, 10000, 5000}, "wide16 control round-trip");   // total 65000 (<= 65535)
+        check_roundtrip({60000, 60000, 60000}, "wide32 control round-trip");  // total 180000 (> 65535)
+        check_roundtrip({4000000000U, 200000000U}, "wide32 large control round-trip");  // ~4.2e9 cumulative
+    }
+
     {
         nano_lance::LanceSchemaMapping write_mapping = mapping;
         require(nano_lance::finalize_blob_v2_schema_for_write(write_mapping, error), error.c_str());

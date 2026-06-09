@@ -114,7 +114,9 @@ ParsedFormat parse_format(const char* format) {
         return out;
     }
     if (starts_with(format, "w:")) {
-        out.logical_type = "fixed_size_binary";
+        // Carry the byte width through (Lance's own logical type is "fixed_size_binary:<N>"), so it can
+        // be recovered from the manifest on read.
+        out.logical_type = std::string("fixed_size_binary:") + (format + 2);
         out.supported = true;
         return out;
     }
@@ -398,8 +400,12 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
         arrow_format = "+s";
         return true;
     }
+    if (logical_type.rfind("fixed_size_binary:", 0) == 0) {
+        arrow_format = "w:" + logical_type.substr(std::strlen("fixed_size_binary:"));
+        return true;
+    }
     if (logical_type == "fixed_size_binary") {
-        error = "fixed_size_binary recovery from manifest is not supported in this build";
+        error = "fixed_size_binary on-disk logical type is missing its width (expected fixed_size_binary:N)";
         return false;
     }
     error = "unsupported on-disk logical type for manifest recovery: " + logical_type;

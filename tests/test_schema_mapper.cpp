@@ -107,7 +107,9 @@ void test_fixed_size_binary() {
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
     require(nano_lance::map_arrow_schema(mac, mapping, error), error.c_str());
-    require(mapping.fields[0].logical_type == "fixed_size_binary", "fixed size binary logical type mismatch");
+    // The width is carried in the logical type (Lance's own form is "fixed_size_binary:<N>") so it can
+    // be recovered from the manifest on read.
+    require(mapping.fields[0].logical_type == "fixed_size_binary:6", "fixed size binary logical type mismatch");
     require(mapping.fields[0].arrow_format == "w:6", "fixed size binary format mismatch");
 }
 

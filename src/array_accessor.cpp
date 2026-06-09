@@ -90,14 +90,10 @@ bool append_fixed_width(const ArrowArray& array,
         error += field.name;
         return false;
     }
-    std::size_t width = 8;
-    if (field.logical_type == "int8" || field.logical_type == "uint8") {
-        width = 1;
-    } else if (field.logical_type == "int16" || field.logical_type == "uint16") {
-        width = 2;
-    } else if (field.logical_type == "int32" || field.logical_type == "uint32" || field.logical_type == "float") {
-        width = 4;
-    }
+    // Use the shared width table so every fixed-width logical type (incl. fixed_size_binary:N) agrees
+    // with the decoder; a local table here previously defaulted to 8 and over-read narrow/byte-array
+    // columns.
+    const std::size_t width = lance_logical_type_value_bytes(field.logical_type);
     const auto byte_count = static_cast<std::size_t>(array.length) * width;
     const auto* first = static_cast<const std::uint8_t*>(array.buffers[1]);
     out.kind = ColumnValues::Kind::FixedWidth;

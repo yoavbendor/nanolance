@@ -65,6 +65,9 @@ std::uint32_t bits_per_value(const LanceField& field) {
     if (field.logical_type == "int32" || field.logical_type == "uint32" || field.logical_type == "float") {
         return 32;
     }
+    if (field.logical_type.rfind("fixed_size_binary:", 0) == 0) {
+        return static_cast<std::uint32_t>(lance_logical_type_value_bytes(field.logical_type) * 8U);
+    }
     return 64;
 }
 
