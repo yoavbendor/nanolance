@@ -6,6 +6,7 @@
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow_ipc.h>
 
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -197,6 +198,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Accumulate ONLY the core write work (ingest + encode + commit), excluding IPC parse and process
+    // startup, so it can be compared apples-to-apples with an in-process writer like lance.write_dataset.
+    double core_write_ms = 0.0;
+    using clock = std::chrono::steady_clock;
+
     std::uint64_t batches = 0;
     while (g_stop_requested == 0) {
         ArrowArray batch{};
@@ -213,7 +219,9 @@ int main(int argc, char** argv) {
         if (batch.release == nullptr) {
             break;
         }
+        const auto write_t0 = clock::now();
         const int write_status = nano_lance_write_batch(&writer, &batch, &schema);
+        core_write_ms += std::chrono::duration<double, std::milli>(clock::now() - write_t0).count();
         batch.release(&batch);
         if (write_status != NANO_LANCE_OK) {
             std::cerr << nano_lance_writer_last_error(&writer) << '\n';
@@ -233,7 +241,9 @@ int main(int argc, char** argv) {
     }
 
     if (batches > 0) {
+        const auto commit_t0 = clock::now();
         const int commit_status = nano_lance_writer_commit(&writer, append);
+        core_write_ms += std::chrono::duration<double, std::milli>(clock::now() - commit_t0).count();
         if (commit_status != NANO_LANCE_OK) {
             std::cerr << nano_lance_writer_last_error(&writer) << '\n';
             nano_lance_writer_close(&writer);
@@ -247,5 +257,6 @@ int main(int argc, char** argv) {
         return close_status;
     }
     std::cerr << "arrowipc2lance: committed " << batches << " complete IPC batches to " << output_path << '\n';
+    std::cerr << "nl_write_ms=" << core_write_ms << '\n';  // core ingest+encode+commit only (machine-readable)
     return 0;
 }

@@ -48,6 +48,11 @@ def make_datasets():
     })
     return ds, N
 
+WRITE_ITERS = 5
+
+def best_of(fn, iters):
+    return min(fn() for _ in range(iters))
+
 def run_one(name, tbl, N):
     print(f"\n========== {name}  ({N} rows, {tbl.num_columns} cols) ==========")
     arrow_path = f"{TMP}/{name}.arrow"
@@ -56,54 +61,66 @@ def run_one(name, tbl, N):
 
     rows = []
 
-    # ---- Parquet (zstd) ----
+    # ---- Parquet (zstd) ----  write is in-process, so core==proc
     pqf = f"{TMP}/{name}.parquet"
-    if os.path.exists(pqf): os.remove(pqf)
-    t0=time.perf_counter(); pq.write_table(tbl, pqf, compression="zstd"); wp=(time.perf_counter()-t0)*1000
+    def w_pq():
+        if os.path.exists(pqf): os.remove(pqf)
+        t0=time.perf_counter(); pq.write_table(tbl, pqf, compression="zstd"); return (time.perf_counter()-t0)*1000
+    wp = best_of(w_pq, WRITE_ITERS)
     szp = os.path.getsize(pqf)
     rp = best_read(lambda: pq.read_table(pqf))
     assert pq.read_table(pqf).num_rows == N
-    rows.append(("parquet (zstd)", wp, szp, rp, None))
+    rows.append(("parquet (zstd)", wp, wp, szp, rp, None))
 
-    # ---- Rust Lance (2.2) ----
-    lf = f"{TMP}/{name}_lance.lance"; shutil.rmtree(lf, ignore_errors=True)
-    t0=time.perf_counter(); lance.write_dataset(tbl, lf, mode="create", data_storage_version="2.2"); wl=(time.perf_counter()-t0)*1000
+    # ---- Rust Lance (2.2) ----  in-process, core==proc
+    lf = f"{TMP}/{name}_lance.lance"
+    def w_lance():
+        shutil.rmtree(lf, ignore_errors=True)
+        t0=time.perf_counter(); lance.write_dataset(tbl, lf, mode="create", data_storage_version="2.2"); return (time.perf_counter()-t0)*1000
+    wl = best_of(w_lance, WRITE_ITERS)
     szl = dsize(lf+"/data/*.lance")
     rl = best_read(lambda: lance.dataset(lf).to_table())
     assert lance.dataset(lf).to_table().num_rows == N
-    rows.append(("rust lance", wl, szl, rl, None))
+    rows.append(("rust lance", wl, wl, szl, rl, None))
 
-    # ---- nanolance (--compress) ----
-    nf = f"{TMP}/{name}_nl.lance"; shutil.rmtree(nf, ignore_errors=True)
-    with open(arrow_path, "rb") as fin:
-        t0=time.perf_counter()
-        subprocess.run([EXE, "-c", "--ignore-nullability", "--compress", "-o", nf],
-                       stdin=fin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        wn=(time.perf_counter()-t0)*1000
+    # ---- nanolance (--compress) ----  separate subprocess-total (proc) from core ingest+encode+commit
+    nf = f"{TMP}/{name}_nl.lance"
+    def w_nl():
+        shutil.rmtree(nf, ignore_errors=True)
+        with open(arrow_path, "rb") as fin:
+            t0=time.perf_counter()
+            r = subprocess.run([EXE, "-c", "--ignore-nullability", "--compress", "-o", nf],
+                               stdin=fin, capture_output=True, text=True, check=True)
+            proc = (time.perf_counter()-t0)*1000
+        core = next((float(l.split("=")[1]) for l in r.stderr.splitlines() if l.startswith("nl_write_ms=")), float("nan"))
+        return (proc, core)
+    nl_runs = [w_nl() for _ in range(WRITE_ITERS)]
+    wn_proc = min(p for p, _ in nl_runs)
+    wn_core = min(c for _, c in nl_runs)
     szn = dsize(nf+"/data/*.lance")
-    # native read (nlbench)
     out = subprocess.run([NLBENCH, nf, str(READ_ITERS)], capture_output=True, text=True, check=True)
     rn_native = json.loads(out.stdout)["best_ms"]
-    # interop read: rust lance reads nanolance file
     rn_lance = best_read(lambda: lance.dataset(nf).to_table())
     assert lance.dataset(nf).to_table().num_rows == N, "lance row count on nanolance file"
-    rows.append(("nanolance", wn, szn, rn_native, rn_lance))
+    rows.append(("nanolance", wn_core, wn_proc, szn, rn_native, rn_lance))
 
     # ---- report ----
-    print(f"{'engine':16} {'write ms':>9} {'file bytes':>12} {'B/row':>8} {'read ms':>9} {'read(lance)':>12}")
-    base = next(r[2] for r in rows if r[0]=='parquet (zstd)')
-    for eng, wms, sz, rms, rms2 in rows:
+    print(f"{'engine':16} {'write(core)':>11} {'write(proc)':>11} {'B/row':>8} {'read ms':>9} {'read(lance)':>12}")
+    base = next(r[3] for r in rows if r[0]=='parquet (zstd)')
+    for eng, wcore, wproc, sz, rms, rms2 in rows:
         ratio = f"{sz/base:.2f}x" if sz else ""
-        print(f"{eng:16} {wms:9.1f} {sz:12,} {sz/N:8.3f} {rms:9.2f} {('' if rms2 is None else f'{rms2:9.2f}'):>12}   ({ratio} vs pq)")
+        print(f"{eng:16} {wcore:11.2f} {wproc:11.2f} {sz/N:8.3f} {rms:9.2f} "
+              f"{('' if rms2 is None else f'{rms2:9.2f}'):>12}   ({ratio} vs pq)")
     return rows
 
 def main():
     ds, N = make_datasets()
     for name, tbl in ds.items():
         run_one(name, tbl, N)
-    print("\nnote: nanolance write ms includes process startup; read ms 'read ms' col is each engine's "
-          "native reader, 'read(lance)' is rust-lance reading the nanolance file (interop). best of "
-          f"{READ_ITERS}.")
+    print(f"\nnote: best of {WRITE_ITERS} writes / {READ_ITERS} reads. write(core)=in-process encode work "
+          "(parquet/lance: the write call; nanolance: ingest+encode+commit, EXCLUDING process startup + "
+          "Arrow-IPC parse). write(proc)=full wall clock (nanolance includes subprocess startup + IPC parse). "
+          "read ms=native reader; read(lance)=rust-lance reading the nanolance file.")
 
 if __name__ == "__main__":
     main()
