@@ -298,6 +298,22 @@ std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_toke
     return encoding;
 }
 
+// PageLayout = ConstantLayout{ layers, inline_value }. A constant column stores its single value in
+// the page descriptor and writes zero data buffers. Bytes match lance output (see dump in chat).
+std::vector<std::uint8_t> page_layout_bytes_constant(const std::vector<std::uint8_t>& value_bytes) {
+    std::vector<std::uint8_t> constant_layout{0x2a, 0x01, 0x01};  // f5 layers = single non-null layer
+    constant_layout.push_back(0x32);                              // f6 inline_value
+    constant_layout.push_back(static_cast<std::uint8_t>(value_bytes.size()));
+    constant_layout.insert(constant_layout.end(), value_bytes.begin(), value_bytes.end());
+
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, 2, constant_layout);  // PageLayout f2 = constant_layout
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
 // MiniBlockLayout PageLayout advertising InlineBitpacking{uncompressed_bits_per_value}. Matches lance
 // output (CompressiveEncoding f5 = inline_bitpacking). See memory: lance-inline-bitpacking-format.
 std::vector<std::uint8_t> page_layout_bytes_inline_bitpacking(std::uint8_t uncompressed_bits, std::uint64_t rows) {
@@ -546,6 +562,24 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.length = rows;
             page.priority = 0;
             page.encoding = blob_v2_column_page_encoding();
+            column.pages.push_back(std::move(page));
+            columns.push_back(std::move(column));
+            continue;
+        }
+
+        // Constant fixed-width column (tagged by the writer): one zero-data ConstantLayout page.
+        const auto packing_it = field.metadata.find("nanolance:packing");
+        if (packing_it != field.metadata.end() && packing_it->second == "constant" &&
+            values.kind == ColumnValues::Kind::FixedWidth) {
+            const auto bpv = value_width_bytes(field);
+            std::vector<std::uint8_t> value(values.fixed.begin(),
+                                            values.fixed.begin() + static_cast<std::ptrdiff_t>(bpv));
+            pb::ColumnMetadata column;
+            column.encoding = column_encoding_bytes();
+            pb::ColumnPage page;
+            page.length = rows;
+            page.priority = 0;
+            page.encoding = page_layout_bytes_constant(value);  // no data buffers
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
             continue;

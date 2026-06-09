@@ -396,6 +396,45 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
         commit_columns = std::move(state->column_values);
     }
 
+    // Constant fixed-width columns -> ConstantLayout (value inline in the page descriptor, zero data
+    // bytes). Overrides the bitpack tag for those columns. Tags disk_schema so both the manifest and
+    // the data-file descriptor carry packing=constant + the raw value bytes for the reader.
+    if (state->compression) {
+        const auto physical = nano_lance::lance_physical_fields(disk_schema);
+        for (std::size_t i = 0; i < physical.size() && i < commit_columns.size(); ++i) {
+            const auto* pf = physical[i];
+            if (!pf->extension_name.empty() || nano_lance::lance_field_is_variable_width(pf->logical_type)) {
+                continue;
+            }
+            const auto& cv = commit_columns[i];
+            if (cv.kind != nano_lance::ColumnValues::Kind::FixedWidth) {
+                continue;
+            }
+            const auto bpv = nano_lance::lance_logical_type_value_bytes(pf->logical_type);
+            if (bpv == 0U || cv.fixed.size() < bpv || cv.fixed.size() % bpv != 0U) {
+                continue;
+            }
+            bool constant = true;
+            for (std::size_t off = bpv; off + bpv <= cv.fixed.size(); off += bpv) {
+                if (std::memcmp(cv.fixed.data(), cv.fixed.data() + off, bpv) != 0) {
+                    constant = false;
+                    break;
+                }
+            }
+            if (!constant) {
+                continue;
+            }
+            for (auto& field : disk_schema.fields) {
+                if (field.id == pf->id) {
+                    field.metadata["nanolance:packing"] = "constant";
+                    field.metadata["nanolance:const-value"] =
+                        std::string(cv.fixed.begin(), cv.fixed.begin() + static_cast<std::ptrdiff_t>(bpv));
+                    break;
+                }
+            }
+        }
+    }
+
     nano_lance::DataFileResult data_file;
     const auto data_file_name =
         "fragment-" + std::to_string(next_fragment_numeric_suffix(state->dataset_path)) + ".lance";

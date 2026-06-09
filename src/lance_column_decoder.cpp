@@ -31,6 +31,11 @@ bool field_metadata_equals(const pb::Field& field, const char* key, const char* 
     return v == value;
 }
 
+const std::vector<std::uint8_t>* field_metadata_bytes(const pb::Field& field, const char* key) {
+    const auto it = field.metadata.find(key);
+    return it == field.metadata.end() ? nullptr : &it->second;
+}
+
 // Inverse of zstd_frame_buffer: [u64 LE uncompressed size][zstd frame] -> raw bytes.
 bool zstd_unframe_buffer(const std::vector<std::uint8_t>& framed, std::vector<std::uint8_t>& out, std::string& error) {
     if (framed.size() < 8U) {
@@ -269,6 +274,25 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 error = "blob values buffer has trailing bytes";
                 return false;
             }
+        }
+        return true;
+    }
+
+    // Constant fixed-width column: value stored once in field metadata; expand to one value per row.
+    if (field_metadata_equals(on_disk_field, "nanolance:packing", "constant")) {
+        out.kind = ColumnValues::Kind::FixedWidth;
+        const auto* value = field_metadata_bytes(on_disk_field, "nanolance:const-value");
+        if (value == nullptr || value->empty()) {
+            error = "constant column missing nanolance:const-value";
+            return false;
+        }
+        std::uint64_t total_rows = 0;
+        for (const auto& page : column_metadata.pages) {
+            total_rows += page.length;
+        }
+        out.fixed.reserve(static_cast<std::size_t>(total_rows) * value->size());
+        for (std::uint64_t i = 0; i < total_rows; ++i) {
+            out.fixed.insert(out.fixed.end(), value->begin(), value->end());
         }
         return true;
     }
