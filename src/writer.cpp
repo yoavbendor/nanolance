@@ -16,6 +16,8 @@
 #include <memory>
 #include <map>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -123,10 +125,14 @@ bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vec
     return true;
 }
 
-// Reconstruct each row's bytes from a variable-width column into `rows_out`.
-bool variable_column_rows(const nano_lance::ColumnValues& cv, std::vector<std::string>& rows_out) {
+// Decide whether dictionary + RLE wins for a low-cardinality, run-length variable-width column:
+// few distinct values AND the per-row index array is run-length friendly (the per-minute URI case).
+// Uses string_view (zero allocation) + an unordered_map and bails the moment the distinct count can
+// no longer be "low cardinality" — so a high-cardinality column is rejected cheaply, not after
+// building a full dictionary of every value.
+bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
     const std::size_t ow = cv.variable.large ? 8U : 4U;
-    if (cv.variable.offsets.size() < ow) {
+    if (cv.variable.offsets.size() < 2U * ow) {
         return false;
     }
     auto read_offset = [&](std::size_t index) -> std::int64_t {
@@ -141,43 +147,33 @@ bool variable_column_rows(const nano_lance::ColumnValues& cv, std::vector<std::s
         return v;
     };
     const std::size_t rows = cv.variable.offsets.size() / ow - 1U;
-    rows_out.clear();
-    rows_out.reserve(rows);
+    if (rows == 0U) {
+        return false;
+    }
+    const std::size_t max_dict = rows / 2U;  // beyond this it is not "low cardinality"
+    const char* base = reinterpret_cast<const char*>(cv.variable.data.data());
+    std::unordered_map<std::string_view, std::uint32_t> dict;
+    dict.reserve(std::min<std::size_t>(max_dict + 1U, 8192U));
+    std::vector<std::uint32_t> indices;
+    indices.reserve(rows);
     for (std::size_t i = 0; i < rows; ++i) {
         const auto s = read_offset(i);
         const auto e = read_offset(i + 1);
         if (s < 0 || e < s || static_cast<std::size_t>(e) > cv.variable.data.size()) {
             return false;
         }
-        rows_out.emplace_back(reinterpret_cast<const char*>(cv.variable.data.data() + s),
-                              static_cast<std::size_t>(e - s));
-    }
-    return true;
-}
-
-// Decide whether dictionary + RLE wins for a low-cardinality, run-length variable-width column:
-// few distinct values AND the per-row index array is run-length friendly (the per-minute URI case).
-bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
-    std::vector<std::string> rows;
-    if (!variable_column_rows(cv, rows) || rows.empty()) {
-        return false;
-    }
-    std::map<std::string, std::uint32_t> dict;
-    std::vector<std::uint32_t> indices;
-    indices.reserve(rows.size());
-    for (const auto& r : rows) {
-        auto it = dict.find(r);
+        const std::string_view sv(base + s, static_cast<std::size_t>(e - s));
+        const auto it = dict.find(sv);
         if (it == dict.end()) {
+            if (dict.size() >= max_dict) {
+                return false;  // early bail: too many distinct values for dictionary encoding
+            }
             const auto id = static_cast<std::uint32_t>(dict.size());
-            dict.emplace(r, id);
+            dict.emplace(sv, id);
             indices.push_back(id);
         } else {
             indices.push_back(it->second);
         }
-    }
-    // Require real low cardinality (dictionary must be small relative to the data).
-    if (dict.size() * 2U >= rows.size()) {
-        return false;
     }
     // The index array must be run-length friendly (split runs of <=255).
     std::size_t split_runs = 0;
