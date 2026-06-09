@@ -554,6 +554,37 @@ struct ColumnPlan {
     FixedFmt fmt = FixedFmt::kUnsupported;   // Fixed
 };
 
+// Bulk-fill a fixed-width child array's data buffer from the already-decoded column bytes.
+bool fill_fixed_child(ArrowArray* child, const std::vector<std::uint8_t>& bytes, std::int64_t rows,
+                      std::string& error) {
+    ArrowBuffer* data = ArrowArrayBuffer(child, 1);
+    if (ArrowBufferReserve(data, static_cast<std::int64_t>(bytes.size())) != NANOARROW_OK) {
+        error = "failed to reserve fixed data buffer";
+        return false;
+    }
+    ArrowBufferAppendUnsafe(data, bytes.data(), static_cast<std::int64_t>(bytes.size()));
+    child->length = rows;
+    child->null_count = 0;
+    return true;
+}
+
+// Bulk-fill a variable-width child array's offsets+data buffers from the decoded column.
+bool fill_variable_child(ArrowArray* child, const VariableWidthColumnValues& v, std::int64_t rows,
+                         std::string& error) {
+    ArrowBuffer* offsets = ArrowArrayBuffer(child, 1);
+    ArrowBuffer* data = ArrowArrayBuffer(child, 2);
+    if (ArrowBufferReserve(offsets, static_cast<std::int64_t>(v.offsets.size())) != NANOARROW_OK ||
+        ArrowBufferReserve(data, static_cast<std::int64_t>(v.data.size())) != NANOARROW_OK) {
+        error = "failed to reserve variable buffers";
+        return false;
+    }
+    ArrowBufferAppendUnsafe(offsets, v.offsets.data(), static_cast<std::int64_t>(v.offsets.size()));
+    ArrowBufferAppendUnsafe(data, v.data.data(), static_cast<std::int64_t>(v.data.size()));
+    child->length = rows;
+    child->null_count = 0;
+    return true;
+}
+
 bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaMapping& mapping,
                              const std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id,
                              const std::int64_t length, ArrowArray& batch, std::string& error) {
@@ -561,11 +592,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         error = "failed to init batch array from schema";
         return false;
     }
-    if (ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
-        error = "failed to start batch append";
-        ArrowArrayRelease(&batch);
-        return false;
-    }
+    // NB: ArrowArrayStartAppending is only for the per-row fallback below; the bulk path fills buffers
+    // directly and must NOT call it (StartAppending pre-seeds the leading 0 offset on variable arrays).
     if (batch_schema.n_children <= 0) {
         error = "batch schema has no children";
         ArrowArrayRelease(&batch);
@@ -638,6 +666,44 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         }
     }
 
+    // Fast path: when every column is a plain fixed/variable leaf (no blob struct, no skipped logical
+    // field), build each child's Arrow buffers in one bulk copy from the decoded column and skip the
+    // per-row append/FinishElement entirely.
+    bool bulk_ok = true;
+    for (const auto& plan : plans) {
+        if (plan.kind != ColumnPlan::Kind::Fixed && plan.kind != ColumnPlan::Kind::Variable) {
+            bulk_ok = false;
+            break;
+        }
+    }
+    if (bulk_ok) {
+        for (auto& plan : plans) {
+            const bool ok = plan.kind == ColumnPlan::Kind::Fixed
+                                ? fill_fixed_child(plan.array, plan.values->fixed, length, error)
+                                : fill_variable_child(plan.array, plan.values->variable, length, error);
+            if (!ok) {
+                ArrowArrayRelease(&batch);
+                return false;
+            }
+        }
+        batch.length = length;
+        batch.null_count = 0;
+        ArrowError arrow_error;
+        if (ArrowArrayFinishBuildingDefault(&batch, &arrow_error) != NANOARROW_OK) {
+            error = "failed to finish bulk-built batch: ";
+            error += arrow_error.message;
+            ArrowArrayRelease(&batch);
+            return false;
+        }
+        return true;
+    }
+
+    // Per-row fallback (blob struct columns or skipped logical fields): needs the append machinery.
+    if (ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
+        error = "failed to start batch append";
+        ArrowArrayRelease(&batch);
+        return false;
+    }
     for (std::int64_t row = 0; row < length; ++row) {
         for (auto& plan : plans) {
             switch (plan.kind) {
