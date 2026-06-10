@@ -158,5 +158,20 @@ if(NANOLANCE_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_enrich_chunking.py"
                     $<TARGET_FILE:pcapng2lance>)
         set_tests_properties(pcapng2lance_enrich_chunking PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
+        # nlance2table (top-level tool) dumps the PDU tables to CSV/NDJSON; registered only when that
+        # tool is built (NANOLANCE_BUILD_TOOLS). Smoke = text-shape self-check; tshark = field alignment
+        # vs Wireshark on the same pcapng (skips 77 if tshark is absent).
+        if(TARGET nlance2table)
+            add_test(NAME nlance2table_smoke
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nlance2table.py"
+                        $<TARGET_FILE:nlance2table> $<TARGET_FILE:pcapng2lance>)
+            set_tests_properties(nlance2table_smoke PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
+            add_test(NAME nlance2table_tshark
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nlance2table_tshark.py"
+                        $<TARGET_FILE:nlance2table> $<TARGET_FILE:pcapng2lance>)
+            set_tests_properties(nlance2table_tshark PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+        endif()
     endif()
 endif()

@@ -122,6 +122,8 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
 | `pcapng2lance_staged` | interop | `--stage l1→l2→l3→l4` incremental enrichment; per-stage tables + final external remainder verified |
 | `pcapng2lance_streaming` / `_multisection` | interop | tiny `--window-bytes` (refill/straddle/grow/multi-fragment) gives byte-identical output to the whole-file path |
 | `pcapng2lance_enrich_chunking` | interop | tiny `--mem-bytes`/`--read-tile-bytes` (many chunks/fragments) enrich == single-chunk enrich for every PDU + remainder table |
+| `nlance2table_smoke` | interop | `nlance2table` (top-level tool) dumps PDU + L1 tables to CSV/NDJSON: header, row counts, `--limit`, `fixed_size_binary` hex, nested-struct flatten |
+| `nlance2table_tshark` | interop | per-PDU tables dumped via `nlance2table` match **tshark**'s dissection of the same pcapng field-for-field (eth/vlan/ipv4/ipv6/tcp/udp); skips if `tshark` absent |
 
 ## Notes / known limitations
 

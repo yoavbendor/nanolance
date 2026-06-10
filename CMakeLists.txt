@@ -204,6 +204,10 @@ if(NANOLANCE_BUILD_TOOLS)
     add_executable(nlbench tools/nlbench.cpp)
     target_compile_features(nlbench PRIVATE cxx_std_20)
     target_link_libraries(nlbench PRIVATE nanolance)
+
+    add_executable(nlance2table tools/nlance2table.cpp)
+    target_compile_features(nlance2table PRIVATE cxx_std_20)
+    target_link_libraries(nlance2table PRIVATE CLI11::CLI11 nanolance)
 endif()
 
 if(NANOLANCE_STANDALONE)
