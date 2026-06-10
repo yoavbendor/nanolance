@@ -40,6 +40,14 @@ See [`DESIGN.md`](DESIGN.md) (step-1 architecture + the parsing seam), [`NANOTIN
   parse already runs through it: a device-safe kernel (POD captures, no alloc) calls the pure
   `parse_epb` per `BlockRef` and scatters into the SoA columns. stdexec builds and runs on this MinGW
   host (verified), so the CPU bulk is real stdexec, not a stand-in.
+  The **L2/L3/L4 decode** (`--decode-l2l3`) also runs through `bulk_for_each` now
+  (`include/protocol_decode_bulk.hpp`), as the canonical GPU pattern for a *variable-outputs-per-input*
+  problem: two device-safe bulk passes bracket a prefix-sum — pass 1 `count_packet` per packet → exclusive
+  scan per PDU type → size each output column exactly → pass 2 `scatter_packet` writes each PDU to its own
+  prefix-summed slot (disjoint writes, no `push_back`). Both passes walk the one shared `walk_packet`
+  traversal (so count == scatter by construction), and row order is packet order → byte-identical tables
+  to the serial path (`pcapng2lance_l2l3` verifies). On a CUDA host the scan becomes a
+  `thrust::exclusive_scan` and the two kernels run on the GPU unchanged.
 
 ## Build & run
 
