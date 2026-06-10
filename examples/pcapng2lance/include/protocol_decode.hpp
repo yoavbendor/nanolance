@@ -80,7 +80,10 @@ inline bool decode_l3(std::uint64_t packet_id, std::uint16_t ethertype, Bytes by
         out.ipv4.add(packet_id, ip);
         const std::size_t hdr = static_cast<std::size_t>(ip.ver_ihl.word_host() & 0x0FU) * 4U;
         consumed = hdr >= sizeof(Ipv4) ? hdr : sizeof(Ipv4);  // skip IPv4 options
-        next_ip_proto = ip.protocol;
+        // A non-zero fragment offset means the remainder is fragment data, not an L4 header — report no
+        // next layer (discriminator 0) so the L4 stage decodes nothing (matches walk_packet's L4 gate).
+        const bool first_fragment = (ip.flags_frag.word_host() & 0x1FFFU) == 0;
+        next_ip_proto = first_fragment ? ip.protocol : static_cast<std::uint8_t>(0);
         return true;
     }
     if (ethertype == kEtherTypeIpv6) {
