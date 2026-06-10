@@ -61,68 +61,6 @@ Kind classify_block_type(std::uint32_t type) noexcept {
     }
 }
 
-bool scan_pcap(Bytes file, std::vector<BlockRef>& out, std::string& error) {
-    if (file.size() < 24) {
-        error = "pcap file shorter than global header";
-        return false;
-    }
-    const std::uint32_t magic = rd32(file.data(), /*le=*/true);
-    const bool le = is_pcap_magic_le(magic);
-    const std::uint32_t link_type = rd32(file.data() + 20, le);
-
-    // Synthetic IDB at the global header so the driver builds its interface table uniformly.
-    out.push_back(BlockRef{/*file_offset=*/0,
-                           /*length=*/24,
-                           /*type_or_link=*/link_type,
-                           Kind::Idb,
-                           le});
-
-    std::uint64_t pos = 24;
-    while (pos + 16 <= file.size()) {
-        const std::uint8_t* rec = file.data() + pos;
-        const std::uint32_t incl_len = rd32(rec + 8, le);
-        const std::uint64_t total = std::uint64_t{16} + incl_len;
-        if (pos + total > file.size()) {
-            error = "pcap record truncated";
-            return false;
-        }
-        out.push_back(BlockRef{pos, static_cast<std::uint32_t>(total), link_type, Kind::PcapRecord, le});
-        pos += total;
-    }
-    return true;
-}
-
-bool scan_pcapng(Bytes file, std::vector<BlockRef>& out, std::string& error) {
-    bool le = true;  // resolved from the first SHB's byte-order magic
-    std::uint64_t pos = 0;
-    bool seen_shb = false;
-    while (pos + 12 <= file.size()) {
-        const std::uint8_t* blk = file.data() + pos;
-        const std::uint32_t type = rd32(blk, le);  // type is endianness-independent for SHB
-        if (type == kPcapngShbType) {
-            // (Re)resolve endianness from this section header's byte-order magic.
-            if (pos + 12 > file.size()) {
-                error = "pcapng SHB truncated";
-                return false;
-            }
-            const std::uint32_t bom_le = rd32(blk + 8, true);
-            le = (bom_le == kPcapngByteOrderMagic);
-            seen_shb = true;
-        } else if (!seen_shb) {
-            error = "pcapng does not start with a section header block";
-            return false;
-        }
-        const std::uint32_t total = rd32(blk + 4, le);
-        if (total < 12 || pos + total > file.size()) {
-            error = "pcapng block length invalid or truncated";
-            return false;
-        }
-        out.push_back(BlockRef{pos, total, type, classify_block_type(type), le});
-        pos += total;  // total length is already a multiple of 4
-    }
-    return true;
-}
-
 }  // namespace
 
 bool next_option(Options& cursor, Option& out) noexcept {
@@ -146,22 +84,95 @@ bool next_option(Options& cursor, Option& out) noexcept {
     return true;
 }
 
-bool scan_blocks(Bytes file, std::vector<BlockRef>& out, std::string& error) {
-    out.clear();
+bool scan_window(ScanState& st, Bytes file, std::vector<BlockRef>& out, std::size_t& consumed, bool at_eof,
+                 std::string& error) {
+    consumed = 0;
     error.clear();
-    if (file.size() < 4) {
-        error = "file too short";
+    std::size_t pos = 0;
+
+    // First call: detect format + endianness from the leading magic. The pcap global header (24 B) is
+    // consumed here and surfaced as a synthetic IDB so the driver builds its interface table uniformly.
+    if (!st.started) {
+        if (file.size() < 4) {
+            if (at_eof) {
+                error = "file too short";
+                return false;
+            }
+            return true;  // need more bytes
+        }
+        const std::uint32_t lead = rd32(file.data(), /*le=*/true);
+        if (lead == kPcapngShbType) {
+            st.is_pcapng = true;
+            st.started = true;  // endianness resolved at the first SHB in the walk below
+        } else if (is_pcap_magic(lead)) {
+            if (file.size() < 24) {
+                if (at_eof) {
+                    error = "pcap file shorter than global header";
+                    return false;
+                }
+                return true;  // need more bytes for the global header
+            }
+            st.is_pcapng = false;
+            st.little_endian = is_pcap_magic_le(lead);
+            st.pcap_link_type = rd32(file.data() + 20, st.little_endian);
+            st.started = true;
+            out.push_back(BlockRef{0, 24, st.pcap_link_type, Kind::Idb, st.little_endian});
+            pos = 24;
+        } else {
+            error = "unrecognized file magic (not pcap or pcapng)";
+            return false;
+        }
+    }
+
+    if (!st.is_pcapng) {
+        while (pos + 16 <= file.size()) {
+            const std::uint8_t* rec = file.data() + pos;
+            const std::uint32_t incl_len = rd32(rec + 8, st.little_endian);
+            const std::uint64_t total = std::uint64_t{16} + incl_len;
+            if (pos + total > file.size()) {
+                break;  // record not fully buffered yet
+            }
+            out.push_back(BlockRef{pos, static_cast<std::uint32_t>(total), st.pcap_link_type, Kind::PcapRecord,
+                                   st.little_endian});
+            pos += total;
+        }
+    } else {
+        while (pos + 12 <= file.size()) {
+            const std::uint8_t* blk = file.data() + pos;
+            // The SHB type is endianness-independent (palindrome bytes); every other block type must be
+            // read in the section's byte order. An SHB also (re)sets that byte order from its BOM.
+            const bool is_shb = (rd32(blk, /*le=*/true) == kPcapngShbType);
+            const bool le = is_shb ? (rd32(blk + 8, true) == kPcapngByteOrderMagic) : st.little_endian;
+            const std::uint32_t type = is_shb ? kPcapngShbType : rd32(blk, le);
+            const std::uint32_t total = rd32(blk + 4, le);
+            if (total < 12) {
+                error = "pcapng block length invalid";
+                return false;
+            }
+            if (pos + total > file.size()) {
+                break;  // block not fully buffered yet
+            }
+            if (is_shb) {
+                st.little_endian = le;  // commit per-section endianness only once the block fully fits
+            }
+            out.push_back(BlockRef{pos, total, type, classify_block_type(type), le});
+            pos += total;
+        }
+    }
+
+    consumed = pos;
+    if (at_eof && pos < file.size()) {
+        error = "trailing truncated block at end of capture";
         return false;
     }
-    const std::uint32_t lead = rd32(file.data(), /*le=*/true);
-    if (lead == kPcapngShbType) {
-        return scan_pcapng(file, out, error);
-    }
-    if (is_pcap_magic(lead)) {
-        return scan_pcap(file, out, error);
-    }
-    error = "unrecognized file magic (not pcap or pcapng)";
-    return false;
+    return true;
+}
+
+bool scan_blocks(Bytes file, std::vector<BlockRef>& out, std::string& error) {
+    out.clear();
+    ScanState st;
+    std::size_t consumed = 0;
+    return scan_window(st, file, out, consumed, /*at_eof=*/true, error);
 }
 
 bool parse_shb(Bytes file, const BlockRef& ref, ShbView& out) noexcept {

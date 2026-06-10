@@ -8,6 +8,7 @@
 #include "pdu_table_writer.hpp"
 #include "protocol_decode.hpp"
 #include "staged_pipeline.hpp"
+#include "streaming_reader.hpp"
 
 #include "nanolance/blob_builder.hpp"
 #include "nanolance/nano_lance_reader.h"
@@ -40,26 +41,6 @@ struct PacketRow {
 };
 BOOST_DESCRIBE_STRUCT(PacketRow, (),
                       (packet_id, interface_id, ts_raw, caplen, origlen, link_type, ts_resol, epb_flags))
-
-bool read_file(const std::filesystem::path& path, std::vector<std::uint8_t>& out, std::string& error) {
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in) {
-        error = "cannot open input file: " + path.string();
-        return false;
-    }
-    const auto size = in.tellg();
-    if (size < 0) {
-        error = "cannot size input file";
-        return false;
-    }
-    out.resize(static_cast<std::size_t>(size));
-    in.seekg(0);
-    if (size > 0 && !in.read(reinterpret_cast<char*>(out.data()), size)) {
-        error = "failed to read input file";
-        return false;
-    }
-    return true;
-}
 
 std::string to_file_uri(const std::filesystem::path& path) {
     const auto abs = std::filesystem::absolute(path).generic_string();  // forward slashes
@@ -178,6 +159,7 @@ int main(int argc, char** argv) {
     bool compress = true;
     bool decode_l2l3 = false;
     std::string stage;  // empty = one-shot; l1 writes <datadir>/packets.lance; l2/l3/l4 enrich <datadir>
+    std::size_t window_bytes = std::size_t{512} * 1024 * 1024;  // RAM/VRAM budget per chunk; small files = 1 chunk
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -190,6 +172,14 @@ int main(int argc, char** argv) {
                 return fail("--stage requires a value (l1/l2/l3/l4)");
             }
             stage = argv[++i];
+        } else if (a == "--window-bytes") {
+            if (i + 1 >= argc) {
+                return fail("--window-bytes requires a value");
+            }
+            window_bytes = static_cast<std::size_t>(std::stoull(argv[++i]));
+            if (window_bytes == 0) {
+                return fail("--window-bytes must be > 0");
+            }
         } else {
             pos.push_back(a);
         }
@@ -222,103 +212,19 @@ int main(int argc, char** argv) {
     const std::string payload_uri = (pos.size() >= 3) ? pos[2] : to_file_uri(input);
 
     std::string error;
-    std::vector<std::uint8_t> file_bytes;
-    if (!read_file(input, file_bytes, error)) {
-        return fail(error);
+
+    // Stream the capture in bounded windows: scan complete blocks in the window, bulk-parse them from
+    // the SAME resident bytes (no re-read), write a Lance batch, commit it as a fragment, slide. The only
+    // viable shape for endless / S3-backed captures, and exactly the per-window batch a CUDA ex::bulk path
+    // will run. `--window-bytes` is the RAM/VRAM budget; a small file is simply one window/fragment.
+    streaming::FileSource source(input);
+    if (!source.ok()) {
+        return fail("cannot open input file: " + input.string());
     }
-    pcapblocks::Bytes file(file_bytes.data(), file_bytes.size());
+    streaming::Window<streaming::FileSource> win(source, window_bytes);
 
-    // Phase A: scan.
-    std::vector<pcapblocks::BlockRef> refs;
-    if (!pcapblocks::scan_blocks(file, refs, error)) {
-        return fail("scan: " + error);
-    }
-
-    // Walk blocks in order. A pcapng file may concatenate several sections (one SHB each); the
-    // interface table RESETS per SHB and `interface_id` is section-relative (DESIGN section 6). So we
-    // keep a per-section interface table and remember which section each packet belongs to, rather than
-    // accumulating IDBs globally.
-    std::vector<std::vector<pcapblocks::IdbView>> sections;  // one interface table per section
-    std::vector<pcapblocks::BlockRef> packets;
-    std::vector<std::size_t> packet_section;  // section index for each packet
-    std::size_t shb_count = 0, other_count = 0, total_idb = 0;
-    std::ptrdiff_t cur_section = -1;
-    ArrowBuffer meta;
-    ArrowMetadataBuilderInit(&meta, nullptr);
-
-    const auto ensure_section = [&]() {
-        if (cur_section < 0) {
-            sections.emplace_back();
-            cur_section = 0;
-        }
-    };
-
-    for (const auto& r : refs) {
-        if (r.kind == pcapblocks::Kind::Shb) {
-            ++shb_count;
-            sections.emplace_back();  // reset interface table for the new section
-            cur_section = static_cast<std::ptrdiff_t>(sections.size()) - 1;
-            pcapblocks::ShbView shb{};
-            if (pcapblocks::parse_shb(file, r, shb)) {
-                pcapblocks::Options opts = shb.options;
-                pcapblocks::Option opt{};
-                const std::string prefix = "pcapng:shb" + std::to_string(shb_count - 1) + ":";
-                while (pcapblocks::next_option(opts, opt)) {
-                    if (opt.code == 2) add_string_option(meta, prefix + "hardware", opt);
-                    else if (opt.code == 3) add_string_option(meta, prefix + "os", opt);
-                    else if (opt.code == 4) add_string_option(meta, prefix + "userappl", opt);
-                }
-            }
-        } else if (r.kind == pcapblocks::Kind::Idb) {
-            ensure_section();
-            pcapblocks::IdbView idb{};
-            if (!pcapblocks::parse_idb(file, r, idb)) {
-                return fail("failed to parse interface description block");
-            }
-            pcapblocks::Options opts = idb.options;
-            pcapblocks::Option opt{};
-            const std::string prefix = "pcapng:if" + std::to_string(total_idb) + ":";
-            while (pcapblocks::next_option(opts, opt)) {
-                if (opt.code == 2) add_string_option(meta, prefix + "name", opt);
-                else if (opt.code == 3) add_string_option(meta, prefix + "description", opt);
-                else if (opt.code == 12) add_string_option(meta, prefix + "os", opt);
-            }
-            sections[static_cast<std::size_t>(cur_section)].push_back(idb);
-            ++total_idb;
-        } else if (r.kind == pcapblocks::Kind::Epb || r.kind == pcapblocks::Kind::PcapRecord) {
-            ensure_section();
-            packets.push_back(r);
-            packet_section.push_back(static_cast<std::size_t>(cur_section));
-        } else {
-            ++other_count;
-        }
-    }
-    const std::size_t n = packets.size();
-
-    // Phase B (bulk): parse packet blocks into raw column arrays.
-    std::vector<std::uint32_t> iface(n), caplen(n), origlen(n), psize(n), flags(n);
-    std::vector<std::uint64_t> ts(n), poff(n);
-    pcapblocks::EpbColumns cols{iface.data(), ts.data(),   caplen.data(), origlen.data(),
-                                poff.data(),  psize.data(), flags.data(),  n};
-    if (n > 0 && !pcapblocks::parse_epbs_bulk(file, packets.data(), n, cols, error)) {
-        return fail("bulk parse: " + error);
-    }
-
-    // Fill the nanotins SoA (scalar columns, with link_type/ts_resol denormalized per row).
-    nanotins::soa<PacketRow> rows;
-    rows.resize(n);
-    std::vector<std::uint16_t> pkt_link_type(n);  // kept for the optional L2/L3 decode pass
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto& table = sections[packet_section[i]];  // this packet's section interface table
-        const std::uint32_t id = iface[i];
-        const std::uint16_t link_type =
-            id < table.size() ? table[id].link_type : static_cast<std::uint16_t>(0);
-        const std::uint8_t ts_resol = id < table.size() ? table[id].ts_resol : static_cast<std::uint8_t>(6);
-        pkt_link_type[i] = link_type;
-        rows.store(i, PacketRow{i, iface[i], ts[i], caplen[i], origlen[i], link_type, ts_resol, flags[i]});
-    }
-
-    // Build the combined record-batch schema: scalar columns + lance.blob.v2 payload_ref.
+    // Combined record-batch schema (scalar columns + lance.blob.v2 payload_ref), built once and reused
+    // for every chunk's write_batch (the writer requires an identical schema each time).
     constexpr std::size_t kScalarCols = nanotins::column_count<PacketRow>;
     ArrowSchema schema{};
     ArrowSchemaInit(&schema);
@@ -333,81 +239,203 @@ int main(int argc, char** argv) {
         if (!nano_lance::build_blob_v2_payload_schema(blob, error)) {
             return fail("blob schema: " + error);
         }
-        ArrowSchemaRelease(schema.children[kScalarCols]);  // free placeholder
+        ArrowSchemaRelease(schema.children[kScalarCols]);
         std::memcpy(schema.children[kScalarCols], &blob, sizeof(ArrowSchema));
-        blob.release = nullptr;  // ownership transferred into the struct's child slot
+        blob.release = nullptr;
     }
-    // Dataset KV metadata (SHB/IDB options) ride as field metadata on the first scalar column.
-    // (Root-level metadata can't be used: the mapper treats any root metadata as an extension marker,
-    // breaking record-batch detection.) Field metadata round-trips to the manifest and the reader.
-    if (ArrowSchemaSetMetadata(schema.children[0], reinterpret_cast<const char*>(meta.data)) != NANOARROW_OK) {
-        return fail("set field metadata");
-    }
-    ArrowBufferReset(&meta);
     schema.flags = 0;
 
-    // Build the combined array and fill it row by row.
-    ArrowArray batch{};
-    if (ArrowArrayInitFromSchema(&batch, &schema, nullptr) != NANOARROW_OK) {
-        return fail("alloc combined array");
-    }
-    if (ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
-        return fail("start appending");
-    }
-    ArrowArray* payload = batch.children[kScalarCols];
-    ArrowArray* p_data = payload->children[0];
-    ArrowArray* p_uri = payload->children[1];
-    ArrowArray* p_pos = payload->children[2];
-    ArrowArray* p_size = payload->children[3];
-    for (std::size_t i = 0; i < n; ++i) {
-        if (!nanotins::nt_append_scalar_row<PacketRow>(&batch, 0, rows, i)) {
-            return fail("append scalar columns");
-        }
-        ArrowStringView uri_view{payload_uri.data(), static_cast<int64_t>(payload_uri.size())};
-        if (ArrowArrayAppendNull(p_data, 1) != NANOARROW_OK ||
-            ArrowArrayAppendString(p_uri, uri_view) != NANOARROW_OK ||
-            ArrowArrayAppendUInt(p_pos, poff[i]) != NANOARROW_OK ||
-            ArrowArrayAppendUInt(p_size, psize[i]) != NANOARROW_OK) {
-            return fail("append payload_ref");
-        }
-        if (ArrowArrayFinishElement(payload) != NANOARROW_OK || ArrowArrayFinishElement(&batch) != NANOARROW_OK) {
-            return fail("finish element");
-        }
-    }
-    if (ArrowArrayFinishBuildingDefault(&batch, nullptr) != NANOARROW_OK) {
-        return fail("finalize array");
-    }
-
-    // Write the Lance dataset (compression on: lights up bitpacking / RLE / ConstantLayout).
     NanoLanceWriter writer{};
     if (nano_lance_writer_init(&writer, output.string().c_str(), 3) != NANO_LANCE_OK) {
         return fail(std::string("writer init: ") + nano_lance_writer_last_error(&writer));
     }
-    // The blob.v2 payload_ref's `data` child is null for external rows (uri-only), so nullability must
-    // be ignored — the same mode every other lance.blob.v2 writer path uses.
-    nano_lance_writer_set_ignore_nullability(&writer, true);
+    nano_lance_writer_set_ignore_nullability(&writer, true);  // blob.v2 data child is null for external rows
     nano_lance_writer_set_compression(&writer, compress);
-    if (n > 0 && nano_lance_write_batch(&writer, &batch, &schema) != NANO_LANCE_OK) {
-        return fail(std::string("write_batch: ") + nano_lance_writer_last_error(&writer));
-    }
-    if (n > 0 && nano_lance_writer_commit(&writer, false) != NANO_LANCE_OK) {
-        return fail(std::string("commit: ") + nano_lance_writer_last_error(&writer));
-    }
-    nano_lance_writer_close(&writer);
 
-    batch.release(&batch);
-    schema.release(&schema);
+    // State carried across windows: per-section interface tables (a pcapng may concatenate sections, each
+    // resetting the table; interface_id is section-relative), the current section, a global monotonic
+    // packet id, and the SHB/IDB option metadata frozen onto the schema before the first commit.
+    pcapblocks::ScanState st;
+    std::vector<std::vector<pcapblocks::IdbView>> sections;
+    std::ptrdiff_t cur_section = -1;
+    std::uint64_t global_pid = 0;
+    std::size_t shb_count = 0, total_idb = 0, other_count = 0;
+    ArrowBuffer meta;
+    ArrowMetadataBuilderInit(&meta, nullptr);
+    bool schema_meta_set = false;
+    bool first_commit = true;
+    protocols::DecodedPdus pdus;  // accumulated only when --decode-l2l3
 
-    // Optional L2/L3 decode: walk each packet's bytes and write one Lance table per PDU type, keyed by
-    // packet row id. Tables land next to the packets dataset: <stem>_<pdu>.lance.
-    if (decode_l2l3 && n > 0) {
-        protocols::DecodedPdus pdus;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (poff[i] + psize[i] <= file_bytes.size()) {
-                protocols::Bytes pkt(file_bytes.data() + poff[i], psize[i]);
-                protocols::decode_packet(i, pkt_link_type[i], pkt, pdus);
+    const auto ensure_section = [&]() {
+        if (cur_section < 0) {
+            sections.emplace_back();
+            cur_section = 0;
+        }
+    };
+
+    win.fill();
+    while (win.size() > 0) {
+        std::vector<pcapblocks::BlockRef> refs;
+        std::size_t consumed = 0;
+        if (!pcapblocks::scan_window(st, win.bytes(), refs, consumed, win.eof(), error)) {
+            return fail("scan: " + error);
+        }
+        if (consumed == 0) {
+            if (win.eof()) {
+                break;  // no complete block remains
+            }
+            if (win.full()) {
+                win.grow();  // a single block larger than the window
+            }
+            win.fill();
+            continue;
+        }
+        const pcapblocks::Bytes wbytes = win.bytes();
+        const std::uint64_t wbase = win.base();
+
+        std::vector<pcapblocks::BlockRef> packets;
+        std::vector<std::size_t> packet_section;
+        for (const auto& r : refs) {
+            if (r.kind == pcapblocks::Kind::Shb) {
+                ++shb_count;
+                sections.emplace_back();
+                cur_section = static_cast<std::ptrdiff_t>(sections.size()) - 1;
+                pcapblocks::ShbView shb{};
+                if (!schema_meta_set && pcapblocks::parse_shb(wbytes, r, shb)) {
+                    pcapblocks::Options opts = shb.options;
+                    pcapblocks::Option opt{};
+                    const std::string prefix = "pcapng:shb" + std::to_string(shb_count - 1) + ":";
+                    while (pcapblocks::next_option(opts, opt)) {
+                        if (opt.code == 2) add_string_option(meta, prefix + "hardware", opt);
+                        else if (opt.code == 3) add_string_option(meta, prefix + "os", opt);
+                        else if (opt.code == 4) add_string_option(meta, prefix + "userappl", opt);
+                    }
+                }
+            } else if (r.kind == pcapblocks::Kind::Idb) {
+                ensure_section();
+                pcapblocks::IdbView idb{};
+                if (!pcapblocks::parse_idb(wbytes, r, idb)) {
+                    return fail("failed to parse interface description block");
+                }
+                if (!schema_meta_set) {
+                    pcapblocks::Options opts = idb.options;
+                    pcapblocks::Option opt{};
+                    const std::string prefix = "pcapng:if" + std::to_string(total_idb) + ":";
+                    while (pcapblocks::next_option(opts, opt)) {
+                        if (opt.code == 2) add_string_option(meta, prefix + "name", opt);
+                        else if (opt.code == 3) add_string_option(meta, prefix + "description", opt);
+                        else if (opt.code == 12) add_string_option(meta, prefix + "os", opt);
+                    }
+                }
+                sections[static_cast<std::size_t>(cur_section)].push_back(idb);
+                ++total_idb;
+            } else if (r.kind == pcapblocks::Kind::Epb || r.kind == pcapblocks::Kind::PcapRecord) {
+                ensure_section();
+                packets.push_back(r);
+                packet_section.push_back(static_cast<std::size_t>(cur_section));
+            } else {
+                ++other_count;
             }
         }
+
+        const std::size_t n = packets.size();
+        if (n == 0) {
+            win.consume(consumed);
+            win.fill();
+            continue;  // window held only SHB/IDB/other; no packet batch to write
+        }
+
+        // Phase B (bulk) over the resident window — window-relative offsets.
+        std::vector<std::uint32_t> iface(n), caplen(n), origlen(n), psize(n), flags(n);
+        std::vector<std::uint64_t> ts(n), poff(n);
+        pcapblocks::EpbColumns cols{iface.data(), ts.data(),   caplen.data(), origlen.data(),
+                                    poff.data(),  psize.data(), flags.data(),  n};
+        if (!pcapblocks::parse_epbs_bulk(wbytes, packets.data(), n, cols, error)) {
+            return fail("bulk parse: " + error);
+        }
+
+        nanotins::soa<PacketRow> rows;
+        rows.resize(n);
+        std::vector<std::uint16_t> pkt_link_type(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& table = sections[packet_section[i]];
+            const std::uint32_t id = iface[i];
+            const std::uint16_t link_type =
+                id < table.size() ? table[id].link_type : static_cast<std::uint16_t>(0);
+            const std::uint8_t ts_resol =
+                id < table.size() ? table[id].ts_resol : static_cast<std::uint8_t>(6);
+            pkt_link_type[i] = link_type;
+            rows.store(i, PacketRow{global_pid + i, iface[i], ts[i], caplen[i], origlen[i], link_type, ts_resol,
+                                    flags[i]});
+        }
+
+        // Freeze the SHB/IDB KV metadata onto the schema before the first commit (it can't change once
+        // the writer has mapped the schema). Captures every option seen before the first packet.
+        if (!schema_meta_set) {
+            if (ArrowSchemaSetMetadata(schema.children[0], reinterpret_cast<const char*>(meta.data)) !=
+                NANOARROW_OK) {
+                return fail("set field metadata");
+            }
+            schema_meta_set = true;
+        }
+
+        ArrowArray batch{};
+        if (ArrowArrayInitFromSchema(&batch, &schema, nullptr) != NANOARROW_OK ||
+            ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
+            return fail("alloc combined array");
+        }
+        ArrowArray* payload = batch.children[kScalarCols];
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!nanotins::nt_append_scalar_row<PacketRow>(&batch, 0, rows, i)) {
+                return fail("append scalar columns");
+            }
+            ArrowStringView uri_view{payload_uri.data(), static_cast<int64_t>(payload_uri.size())};
+            if (ArrowArrayAppendNull(payload->children[0], 1) != NANOARROW_OK ||
+                ArrowArrayAppendString(payload->children[1], uri_view) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(payload->children[2], wbase + poff[i]) != NANOARROW_OK ||  // absolute offset
+                ArrowArrayAppendUInt(payload->children[3], psize[i]) != NANOARROW_OK) {
+                return fail("append payload_ref");
+            }
+            if (ArrowArrayFinishElement(payload) != NANOARROW_OK ||
+                ArrowArrayFinishElement(&batch) != NANOARROW_OK) {
+                return fail("finish element");
+            }
+        }
+        if (ArrowArrayFinishBuildingDefault(&batch, nullptr) != NANOARROW_OK) {
+            return fail("finalize array");
+        }
+        if (nano_lance_write_batch(&writer, &batch, &schema) != NANO_LANCE_OK) {
+            batch.release(&batch);
+            return fail(std::string("write_batch: ") + nano_lance_writer_last_error(&writer));
+        }
+        batch.release(&batch);
+        // Commit this chunk as its own fragment (first = create, rest = append) so writer memory stays
+        // bounded by one window.
+        if (nano_lance_writer_commit(&writer, /*is_append=*/!first_commit) != NANO_LANCE_OK) {
+            return fail(std::string("commit: ") + nano_lance_writer_last_error(&writer));
+        }
+        first_commit = false;
+
+        if (decode_l2l3) {
+            for (std::size_t i = 0; i < n; ++i) {
+                if (poff[i] + psize[i] <= wbytes.size()) {
+                    protocols::decode_packet(global_pid + i, pkt_link_type[i], wbytes.subspan(poff[i], psize[i]),
+                                             pdus);
+                }
+            }
+        }
+
+        global_pid += n;
+        win.consume(consumed);
+        win.fill();
+    }
+    ArrowBufferReset(&meta);
+    nano_lance_writer_close(&writer);
+    schema.release(&schema);
+
+    // Optional one-shot L2/L3 decode -> one Lance table per PDU type (accumulated across windows; for
+    // truly endless captures use the staged --stage path, which is itself bounded).
+    if (decode_l2l3 && global_pid > 0) {
         const auto stem = (output.parent_path() / output.stem()).string();
         std::string perr;
         const auto write_one = [&](const char* suffix, auto& column) -> bool {
@@ -431,7 +459,8 @@ int main(int argc, char** argv) {
     }
 
     std::fprintf(stderr,
-                 "pcapng2lance: %zu packets, %zu interface(s) across %zu section(s), %zu skipped block(s) -> %s\n",
-                 n, total_idb, shb_count, other_count, output.string().c_str());
+                 "pcapng2lance: %llu packets, %zu interface(s) across %zu section(s), %zu skipped block(s) -> %s\n",
+                 static_cast<unsigned long long>(global_pid), total_idb, shb_count, other_count,
+                 output.string().c_str());
     return 0;
 }

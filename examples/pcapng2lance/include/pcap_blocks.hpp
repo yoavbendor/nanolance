@@ -68,7 +68,22 @@ struct EpbView {
 
 // ---- Phase A: sequential boundary scan (the only inherently serial part). ----
 // Detects pcap vs pcapng from the leading magic, sets endianness, walks the length chain.
+// `BlockRef.file_offset` is relative to the start of `file` (so parse_* can index `file` directly).
 bool scan_blocks(Bytes file, std::vector<BlockRef>& out, std::string& error);
+
+// Streaming scan: walk complete blocks in one window of an endless capture without buffering the whole
+// file. `st` carries format/endianness across windows (detected on the first call from the leading
+// magic; per-section endianness updated at each SHB). Emits BlockRefs with WINDOW-relative file_offset;
+// `consumed` is set to the bytes covered by complete blocks (slide the window by it). A trailing partial
+// block means "need more bytes" unless `at_eof`, where it is a truncation error. `out` is appended to.
+struct ScanState {
+    bool started = false;
+    bool is_pcapng = false;
+    bool little_endian = true;
+    std::uint32_t pcap_link_type = 0;  // carried so PcapRecord refs report the link type
+};
+bool scan_window(ScanState& st, Bytes window, std::vector<BlockRef>& out, std::size_t& consumed, bool at_eof,
+                 std::string& error);
 
 // ---- Phase B: pure per-block parse (parallelizable). ----
 bool parse_shb(Bytes file, const BlockRef& ref, ShbView& out) noexcept;

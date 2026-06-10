@@ -17,6 +17,13 @@ See [`DESIGN.md`](DESIGN.md) (step-1 architecture + the parsing seam), [`NANOTIN
   `src/pcap_blocks_ref.cpp` (Phase A scan → `BlockRef[]`, Phase B pure per-block parse → SoA), and the
   driver `src/pcapng2lance_main.cpp`. The seam is the contract a future `nanotins` (CPU + CUDA) drops
   into unchanged.
+- **Windowed streaming** (for endless / S3-backed captures): the driver never reads the whole file. It
+  pulls bounded windows (`include/streaming_reader.hpp`), the seam's stateful `scan_window` walks the
+  complete blocks in each window, and the bulk parse runs over those *resident* bytes (no re-read) →
+  one Lance fragment per window, committed and freed before the next. Section/interface state and a
+  global `packet_id` carry across windows; stored payload offsets are absolute (fetchable from S3
+  regardless of windowing). `--window-bytes` is the RAM/VRAM budget (default 512 MiB; a small file is
+  one window). This is exactly the per-window batch a CUDA `ex::bulk` path will run.
 - **M3 — L2/L3 decode** (`--decode-l2l3`): `include/protocols.hpp` defines Ethernet / 802.1Q VLAN /
   IPv4 / IPv6 / TCP / UDP as `be<>`/`bits<>` packed structs (one `BOOST_DESCRIBE_STRUCT` each);
   `include/protocol_decode.hpp` walks each packet (Ethernet → VLAN* → IPv4/IPv6 → TCP/UDP, honoring
@@ -38,7 +45,9 @@ cmake --build build --target pcapng2lance
 build/examples/pcapng2lance/pcapng2lance capture.pcapng out.lance
 ```
 
-Usage: `pcapng2lance [--no-compress] [--decode-l2l3] <input.pcap|pcapng> <output.lance> [payload_uri]`.
+Usage: `pcapng2lance [--no-compress] [--decode-l2l3] [--window-bytes N] <input.pcap|pcapng> <output.lance> [payload_uri]`.
+`--window-bytes` bounds the per-chunk RAM/VRAM (default 512 MiB); the capture is streamed in windows and
+written as one fragment per window, so memory stays bounded regardless of capture size.
 With `--decode-l2l3` it also emits `<stem>_<pdu>.lance` tables (Ethernet captures only; non-Ethernet
 link types pass through as payload-only).
 
@@ -87,6 +96,7 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
 | `pcapng2lance_protocols` | smoke | L2/L3 wire structs overlay real bytes; bitfields + `columns_of` expansion |
 | `pcapng2lance_l2l3` | interop | `--decode-l2l3` on a crafted Ethernet capture; per-PDU tables verified via stock lance |
 | `pcapng2lance_staged` | interop | `--stage l1→l2→l3→l4` incremental enrichment; per-stage tables + final external remainder verified |
+| `pcapng2lance_streaming` / `_multisection` | interop | tiny `--window-bytes` (refill/straddle/grow/multi-fragment) gives byte-identical output to the whole-file path |
 
 ## Notes / known limitations
 
