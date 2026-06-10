@@ -157,6 +157,9 @@ inline void walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, FVlan o
     Bytes after_l2 = pkt.subspan(off);
     std::uint8_t ip_proto = 0;
     std::size_t l3 = 0;
+    bool has_l4 = true;  // a non-zero IPv4 fragment offset means this packet carries fragment data, not an
+                         // L4 header — decoding L4 there would overlay garbage (matches tshark, which shows
+                         // udp/tcp only on the first fragment). IPv6 frag ext-headers are out of scope here.
     if (ethertype == kEtherTypeIpv4) {
         Ipv4 ip{};
         if (!overlay(after_l2, 0, ip)) {
@@ -166,6 +169,7 @@ inline void walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, FVlan o
         const std::size_t hdr = static_cast<std::size_t>(ip.ver_ihl.word_host() & 0x0FU) * 4U;
         l3 = hdr >= sizeof(Ipv4) ? hdr : sizeof(Ipv4);  // skip IPv4 options
         ip_proto = ip.protocol;
+        has_l4 = (ip.flags_frag.word_host() & 0x1FFFU) == 0;  // frag_offset == 0 (first/only fragment)
     } else if (ethertype == kEtherTypeIpv6) {
         Ipv6 ip{};
         if (!overlay(after_l2, 0, ip)) {
@@ -177,7 +181,7 @@ inline void walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, FVlan o
     } else {
         return;
     }
-    if (l3 > after_l2.size()) {
+    if (l3 > after_l2.size() || !has_l4) {
         return;
     }
     Bytes after_l3 = after_l2.subspan(l3);

@@ -172,6 +172,14 @@ if(NANOLANCE_BUILD_TESTS)
                 COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nlance2table_tshark.py"
                         $<TARGET_FILE:nlance2table> $<TARGET_FILE:pcapng2lance>)
             set_tests_properties(nlance2table_tshark PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
+            # Real fragmented capture: regression guard for the IPv4-fragmentation L4 gate (udp only on the
+            # first fragment) + L2/L3 field alignment vs tshark on real-world traffic.
+            add_test(NAME nlance2table_tshark_realfile
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nlance2table_tshark_realfile.py"
+                        $<TARGET_FILE:nlance2table> $<TARGET_FILE:pcapng2lance>
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/SRL_front_left_51_short.pcapng")
+            set_tests_properties(nlance2table_tshark_realfile PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
         endif()
     endif()
 endif()

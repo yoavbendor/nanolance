@@ -124,6 +124,7 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
 | `pcapng2lance_enrich_chunking` | interop | tiny `--mem-bytes`/`--read-tile-bytes` (many chunks/fragments) enrich == single-chunk enrich for every PDU + remainder table |
 | `nlance2table_smoke` | interop | `nlance2table` (top-level tool) dumps PDU + L1 tables to CSV/NDJSON: header, row counts, `--limit`, `fixed_size_binary` hex, nested-struct flatten |
 | `nlance2table_tshark` | interop | per-PDU tables dumped via `nlance2table` match **tshark**'s dissection of the same pcapng field-for-field (eth/vlan/ipv4/ipv6/tcp/udp); skips if `tshark` absent |
+| `nlance2table_tshark_realfile` | interop | real fragmented capture (`tests/SRL_front_left_51_short.pcapng`, 224 frames): L4 gated to first fragments (udp on 7 only) + eth/vlan/ipv4 fields match `tshark` (reassembly off); skips if `tshark` absent |
 
 ## Notes / known limitations
 
@@ -137,3 +138,10 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
   now, and stock-Lance interop of `fixed_size_binary` is unverified (nanolance round-trips it).
 - Dataset KV metadata is attached to a scalar **field**, not the root struct (the schema mapper treats
   any root metadata as an extension marker, which breaks record-batch flattening).
+- **IPv4 fragmentation**: the L4 (TCP/UDP) header lives only in the first fragment, so the decode emits a
+  TCP/UDP row **only when `frag_offset == 0`** (verified against `tshark` with reassembly off on a real
+  fragmented capture). Continuation fragments still appear in the `ipv4` table (every fragment carries
+  `protocol`), so "how many packets belong to a UDP datagram" is the `ipv4.protocol==17` count, while the
+  `udp` table holds the real headers only. Payload **reassembly** across fragments is not done. The staged
+  `--stage l4` enrich path does not yet apply this gate (it decodes L4 per remainder row); only the
+  one-shot `--decode-l2l3` path is fragmentation-aware today.
