@@ -3,6 +3,7 @@
 //   SoA scalar columns + a lance.blob.v2 payload_ref (external uri+off+size) -> nano_lance write.
 // Packet payloads are never copied: each row stores where its bytes live in the source file.
 
+#include "mem_budget.hpp"
 #include "nanotins/arrow_glue.hpp"
 #include "pcap_blocks.hpp"
 #include "pdu_table_writer.hpp"
@@ -17,11 +18,13 @@
 #include <boost/describe.hpp>
 #include <nanoarrow/nanoarrow.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -64,7 +67,8 @@ int fail(const std::string& msg) {
 // PDU tables, and write the advanced remainder for the next stage. Nothing is recomputed; the data
 // folder simply gains tables. Payload bytes are never copied (the remainder points back into the
 // original capture).
-int run_enrich_stage(const std::filesystem::path& datadir, const std::string& stage, bool compress) {
+int run_enrich_stage(const std::filesystem::path& datadir, const std::string& stage, bool compress,
+                     std::uint64_t mem_bytes, std::size_t read_tile_bytes, std::size_t prefix_cap) {
     std::filesystem::path input;
     if (stage == "l2") {
         input = datadir / "packets.lance";  // discriminator column = link_type
@@ -83,72 +87,122 @@ int run_enrich_stage(const std::filesystem::path& datadir, const std::string& st
         return fail("read " + input.string() + ": " + error);
     }
 
-    protocols::DecodedPdus pdus;
-    std::vector<staged::PayloadRow> remainder;
-    std::vector<std::uint8_t> buf;
+    // Size the per-chunk bulk from THIS host's memory budget (the enrich host may differ from the L1
+    // chunker). Per-row working set ~ carved header + decoded structs + a remainder row.
+    const std::size_t per_row_cost = prefix_cap + sizeof(protocols::Ipv6) + sizeof(staged::PayloadRow) + 64;
+    const std::uint64_t budget = membudget::resolve_budget(mem_bytes);
+    const std::size_t chunk_rows = membudget::rows_per_chunk(budget, per_row_cost);
+
+    const char* remainder_name = (stage == "l2") ? "remainder_after_l2.lance"
+                                 : (stage == "l3") ? "remainder_after_l3.lance"
+                                                   : "remainder_after_l4.lance";
+    std::size_t total_forward = 0;
+    std::vector<std::uint8_t> tile;  // resident big-read buffer, carved per row
     char ferr[512]{};
-    for (const auto& r : in_rows) {
-        buf.resize(r.size);
-        std::size_t got = 0;
-        if (r.size > 0 && nano_lance_fetch_external_blob(r.uri.c_str(), r.off, r.size, buf.data(), buf.size(),
-                                                         &got, ferr, sizeof ferr) != NANO_LANCE_READER_OK) {
-            return fail(std::string("fetch_external_blob: ") + ferr);
-        }
-        protocols::Bytes bytes(buf.data(), got);
-        std::size_t consumed = 0;
-        std::uint64_t next_disc = 0;
-        bool ok = false;
-        if (stage == "l2") {
-            std::uint16_t et = 0;
-            ok = protocols::decode_l2(r.packet_id, static_cast<std::uint32_t>(r.discriminator), bytes, pdus,
-                                      consumed, et);
-            next_disc = et;
-        } else if (stage == "l3") {
-            std::uint8_t proto = 0;
-            ok = protocols::decode_l3(r.packet_id, static_cast<std::uint16_t>(r.discriminator), bytes, pdus,
-                                      consumed, proto);
-            next_disc = proto;
-        } else {
-            ok = protocols::decode_l4(r.packet_id, static_cast<std::uint8_t>(r.discriminator), bytes, pdus,
-                                      consumed);
-        }
-        // Only carry forward packets that still have unparsed bytes; a fully-consumed packet has no
-        // external remainder (blob.v2 references must be non-empty).
-        if (ok && consumed < r.size) {
-            remainder.push_back(staged::PayloadRow{r.packet_id, next_disc, r.uri, r.off + consumed,
-                                                   r.size - consumed});
-        }
-    }
 
-    std::string perr;
-    const auto write_one = [&](const char* name, auto& column) -> bool {
-        if (!pdu_io::write_pdu_table(datadir / name, column, compress, perr)) {
-            std::fprintf(stderr, "pcapng2lance: failed to write %s: %s\n", name, perr.c_str());
-            return false;
-        }
-        return true;
+    // One open writer per output table; each appends a fragment per chunk (lazily created on first rows).
+    // All six are declared; the ones the current stage never fills simply never open.
+    pdu_io::PduAppender<protocols::Ethernet> eth_app(datadir / "ethernet.lance", compress);
+    pdu_io::PduAppender<protocols::VlanTag> vlan_app(datadir / "vlan.lance", compress);
+    pdu_io::PduAppender<protocols::Ipv4> ipv4_app(datadir / "ipv4.lance", compress);
+    pdu_io::PduAppender<protocols::Ipv6> ipv6_app(datadir / "ipv6.lance", compress);
+    pdu_io::PduAppender<protocols::Tcp> tcp_app(datadir / "tcp.lance", compress);
+    pdu_io::PduAppender<protocols::Udp> udp_app(datadir / "udp.lance", compress);
+    staged::RemainderAppender rem_app(datadir / remainder_name, "next_protocol", compress);
+    const auto close_all = [&]() {
+        eth_app.close();
+        vlan_app.close();
+        ipv4_app.close();
+        ipv6_app.close();
+        tcp_app.close();
+        udp_app.close();
+        rem_app.close();
     };
-    bool ok = true;
-    const char* remainder_name = nullptr;
-    if (stage == "l2") {
-        ok = write_one("ethernet.lance", pdus.ethernet) & write_one("vlan.lance", pdus.vlan);
-        remainder_name = "remainder_after_l2.lance";
-    } else if (stage == "l3") {
-        ok = write_one("ipv4.lance", pdus.ipv4) & write_one("ipv6.lance", pdus.ipv6);
-        remainder_name = "remainder_after_l3.lance";
-    } else {
-        ok = write_one("tcp.lance", pdus.tcp) & write_one("udp.lance", pdus.udp);
-        remainder_name = "remainder_after_l4.lance";
-    }
-    if (!ok) {
-        return 1;
-    }
-    if (!staged::write_remainder_table(datadir / remainder_name, remainder, "next_protocol", compress, error)) {
-        return fail("write remainder: " + error);
-    }
 
-    std::fprintf(stderr, "pcapng2lance: stage %s -> %zu input rows, %zu decoded forward\n", stage.c_str(),
-                 in_rows.size(), remainder.size());
+    // Process the input rows in N-row chunks (N from the budget). Each chunk appends its own fragment(s)
+    // to the per-PDU + remainder tables, so writer memory stays bounded by one chunk.
+    for (std::size_t start = 0; start < in_rows.size(); start += chunk_rows) {
+        const std::size_t end = std::min(start + chunk_rows, in_rows.size());
+        protocols::DecodedPdus pdus;
+        std::vector<staged::PayloadRow> remainder;
+
+        // Within the chunk, fetch in big contiguous tiles (S3-throughput friendly) and carve each row's
+        // header prefix out of the resident tile.
+        std::size_t i = start;
+        while (i < end) {
+            // Grow a fetch group of consecutive rows whose byte span stays within read_tile_bytes (and
+            // that share the same uri — distinct input files would live at distinct objects).
+            const std::uint64_t group_base = in_rows[i].off;
+            const std::string& group_uri = in_rows[i].uri;
+            std::size_t j = i;
+            std::uint64_t span_end = group_base;
+            while (j < end && in_rows[j].uri == group_uri) {
+                const std::uint64_t need = in_rows[j].off + std::min<std::uint64_t>(in_rows[j].size, prefix_cap);
+                if (j > i && need - group_base > read_tile_bytes) {
+                    break;
+                }
+                span_end = std::max(span_end, need);
+                ++j;
+            }
+            const std::size_t span_len = static_cast<std::size_t>(span_end - group_base);
+            tile.resize(span_len);
+            std::size_t got = 0;
+            if (span_len > 0 &&
+                nano_lance_fetch_external_blob(group_uri.c_str(), group_base, span_len, tile.data(), tile.size(),
+                                               &got, ferr, sizeof ferr) != NANO_LANCE_READER_OK) {
+                return fail(std::string("fetch_external_blob: ") + ferr);
+            }
+            for (std::size_t k = i; k < j; ++k) {
+                const staged::PayloadRow& r = in_rows[k];
+                const std::size_t local = static_cast<std::size_t>(r.off - group_base);
+                const std::size_t hdr = static_cast<std::size_t>(std::min<std::uint64_t>(r.size, prefix_cap));
+                if (local + hdr > got) {
+                    continue;  // header prefix not available (truncated fetch) -> skip this row's layer
+                }
+                protocols::Bytes bytes(tile.data() + local, hdr);
+                std::size_t consumed = 0;
+                std::uint64_t next_disc = 0;
+                bool ok = false;
+                if (stage == "l2") {
+                    std::uint16_t et = 0;
+                    ok = protocols::decode_l2(r.packet_id, static_cast<std::uint32_t>(r.discriminator), bytes,
+                                              pdus, consumed, et);
+                    next_disc = et;
+                } else if (stage == "l3") {
+                    std::uint8_t proto = 0;
+                    ok = protocols::decode_l3(r.packet_id, static_cast<std::uint16_t>(r.discriminator), bytes,
+                                              pdus, consumed, proto);
+                    next_disc = proto;
+                } else {
+                    ok = protocols::decode_l4(r.packet_id, static_cast<std::uint8_t>(r.discriminator), bytes,
+                                              pdus, consumed);
+                }
+                // Carry forward only packets with bytes left; remainder size is arithmetic (no re-read).
+                if (ok && consumed < r.size) {
+                    remainder.push_back(staged::PayloadRow{r.packet_id, next_disc, r.uri, r.off + consumed,
+                                                           r.size - consumed});
+                }
+            }
+            i = j;
+        }
+
+        // Append this chunk's fragment to each output table (empty columns are no-ops).
+        std::string perr;
+        const bool ok = eth_app.append(pdus.ethernet, perr) && vlan_app.append(pdus.vlan, perr) &&
+                        ipv4_app.append(pdus.ipv4, perr) && ipv6_app.append(pdus.ipv6, perr) &&
+                        tcp_app.append(pdus.tcp, perr) && udp_app.append(pdus.udp, perr) &&
+                        rem_app.append(remainder, perr);
+        if (!ok) {
+            close_all();
+            return fail("enrich write: " + perr);
+        }
+        total_forward += remainder.size();
+    }
+    close_all();
+
+    std::fprintf(stderr,
+                 "pcapng2lance: stage %s -> %zu input rows, %zu decoded forward (chunk=%zu rows, tile=%zu B)\n",
+                 stage.c_str(), in_rows.size(), total_forward, chunk_rows, read_tile_bytes);
     return 0;
 }
 
@@ -159,7 +213,10 @@ int main(int argc, char** argv) {
     bool compress = true;
     bool decode_l2l3 = false;
     std::string stage;  // empty = one-shot; l1 writes <datadir>/packets.lance; l2/l3/l4 enrich <datadir>
-    std::size_t window_bytes = std::size_t{512} * 1024 * 1024;  // RAM/VRAM budget per chunk; small files = 1 chunk
+    std::size_t window_bytes = std::size_t{512} * 1024 * 1024;  // L1 RAM budget per chunk; small files = 1 chunk
+    std::uint64_t mem_bytes = 0;                                // enrich budget; 0 = auto-detect free RAM
+    std::size_t read_tile_bytes = std::size_t{32} * 1024 * 1024;  // enrich big-read tile (S3 throughput)
+    std::size_t prefix_cap = 256;                              // header bytes carved per row for the bulk
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -180,6 +237,19 @@ int main(int argc, char** argv) {
             if (window_bytes == 0) {
                 return fail("--window-bytes must be > 0");
             }
+        } else if (a == "--mem-bytes") {
+            if (i + 1 >= argc) {
+                return fail("--mem-bytes requires a value");
+            }
+            mem_bytes = std::stoull(argv[++i]);
+        } else if (a == "--read-tile-bytes") {
+            if (i + 1 >= argc) {
+                return fail("--read-tile-bytes requires a value");
+            }
+            read_tile_bytes = static_cast<std::size_t>(std::stoull(argv[++i]));
+            if (read_tile_bytes == 0) {
+                return fail("--read-tile-bytes must be > 0");
+            }
         } else {
             pos.push_back(a);
         }
@@ -188,10 +258,11 @@ int main(int argc, char** argv) {
     // Enrichment stages take just <datadir> and run entirely off the previously-written tables.
     if (stage == "l2" || stage == "l3" || stage == "l4") {
         if (pos.empty()) {
-            std::fprintf(stderr, "usage: %s --stage l2|l3|l4 <datadir>\n", argv[0]);
+            std::fprintf(stderr,
+                         "usage: %s --stage l2|l3|l4 [--mem-bytes N] [--read-tile-bytes N] <datadir>\n", argv[0]);
             return 2;
         }
-        return run_enrich_stage(pos[0], stage, compress);
+        return run_enrich_stage(pos[0], stage, compress, mem_bytes, read_tile_bytes, prefix_cap);
     }
 
     if (pos.size() < 2) {

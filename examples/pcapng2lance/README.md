@@ -70,6 +70,15 @@ advanced remainder (`packet_id` + next-layer discriminator + blob.v2 ref with `o
 Everything is joined by `packet_id`; the original capture must remain present. The final
 `remainder_after_l4.lance` holds the application payloads as external references (packets fully consumed
 by L4 have no remainder row).
+
+The enrich stages are **memory-bounded and chunked, sized to the host they run on** (which may differ
+from the L1 chunker — so the original capture's `uri` must be reachable, e.g. `s3://`). No forward scan
+is needed: the table already gives each row's `(uri, off, size)`, so enrich is a pure random-access
+bulk. Per chunk it (1) sizes `N = mem_budget / per_row_cost` from `--mem-bytes` (default: detected free
+RAM × a fraction), (2) fetches the chunk's bytes in large contiguous tiles (`--read-tile-bytes`, default
+32 MiB — far faster on S3 than many tiny ranged GETs) and **carves** each row's header prefix (256 B)
+out of the resident tile, (3) bulk-decodes one layer, (4) appends a fragment to each table. Memory is
+bounded by `read-tile + N × small`, independent of total rows and payload sizes.
 The `payload_uri` defaults to a `file://` URI of the input; pass an explicit one (e.g. `s3://…`) when
 the Lance dataset will be read elsewhere.
 
@@ -97,6 +106,7 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
 | `pcapng2lance_l2l3` | interop | `--decode-l2l3` on a crafted Ethernet capture; per-PDU tables verified via stock lance |
 | `pcapng2lance_staged` | interop | `--stage l1→l2→l3→l4` incremental enrichment; per-stage tables + final external remainder verified |
 | `pcapng2lance_streaming` / `_multisection` | interop | tiny `--window-bytes` (refill/straddle/grow/multi-fragment) gives byte-identical output to the whole-file path |
+| `pcapng2lance_enrich_chunking` | interop | tiny `--mem-bytes`/`--read-tile-bytes` (many chunks/fragments) enrich == single-chunk enrich for every PDU + remainder table |
 
 ## Notes / known limitations
 

@@ -115,14 +115,8 @@ inline bool nt_set_scalar_child(ArrowSchema* child, ArrowType type, const char* 
     return true;
 }
 
-// Write a remainder table: struct[ packet_id u64, <disc_col> u64, payload_ref blob.v2 external ]. The
-// blob ref points at the bytes the next stage will parse (already advanced past this stage's header).
-inline bool write_remainder_table(const std::filesystem::path& path, const std::vector<PayloadRow>& rows,
-                                  const char* disc_col, bool compress, std::string& error) {
-    if (rows.empty()) {
-        return true;
-    }
-    ArrowSchema schema{};
+// Schema for a remainder table: struct[ packet_id u64, <disc_col> u64, payload_ref blob.v2 external ].
+inline bool build_remainder_schema(ArrowSchema& schema, const char* disc_col, std::string& error) {
     ArrowSchemaInit(&schema);
     if (ArrowSchemaSetTypeStruct(&schema, 3) != NANOARROW_OK) {
         error = "remainder schema alloc failed";
@@ -133,27 +127,26 @@ inline bool write_remainder_table(const std::filesystem::path& path, const std::
         ArrowSchemaRelease(&schema);
         return false;
     }
-    {
-        ArrowSchema blob{};
-        if (!nano_lance::build_blob_v2_payload_schema(blob, error)) {
-            ArrowSchemaRelease(&schema);
-            return false;
-        }
-        ArrowSchemaRelease(schema.children[2]);
-        std::memcpy(schema.children[2], &blob, sizeof(ArrowSchema));
-        blob.release = nullptr;
-    }
-    schema.flags = 0;
-
-    ArrowArray batch{};
-    if (ArrowArrayInitFromSchema(&batch, &schema, nullptr) != NANOARROW_OK ||
-        ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
-        error = "remainder array init failed";
+    ArrowSchema blob{};
+    if (!nano_lance::build_blob_v2_payload_schema(blob, error)) {
         ArrowSchemaRelease(&schema);
         return false;
     }
+    ArrowSchemaRelease(schema.children[2]);
+    std::memcpy(schema.children[2], &blob, sizeof(ArrowSchema));
+    blob.release = nullptr;
+    schema.flags = 0;
+    return true;
+}
+
+inline bool build_remainder_batch(const ArrowSchema& schema, const std::vector<PayloadRow>& rows,
+                                  ArrowArray& batch, std::string& error) {
+    if (ArrowArrayInitFromSchema(&batch, const_cast<ArrowSchema*>(&schema), nullptr) != NANOARROW_OK ||
+        ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
+        error = "remainder array init failed";
+        return false;
+    }
     ArrowArray* payload = batch.children[2];
-    bool ok = true;
     for (const auto& r : rows) {
         ArrowStringView uri_view{r.uri.data(), static_cast<int64_t>(r.uri.size())};
         if (ArrowArrayAppendUInt(batch.children[0], r.packet_id) != NANOARROW_OK ||
@@ -164,33 +157,90 @@ inline bool write_remainder_table(const std::filesystem::path& path, const std::
             ArrowArrayAppendUInt(payload->children[3], r.size) != NANOARROW_OK ||
             ArrowArrayFinishElement(payload) != NANOARROW_OK || ArrowArrayFinishElement(&batch) != NANOARROW_OK) {
             error = "remainder row append failed";
-            ok = false;
-            break;
+            batch.release(&batch);
+            return false;
         }
     }
-    if (ok && ArrowArrayFinishBuildingDefault(&batch, nullptr) != NANOARROW_OK) {
+    if (ArrowArrayFinishBuildingDefault(&batch, nullptr) != NANOARROW_OK) {
         error = "remainder array finalize failed";
-        ok = false;
+        batch.release(&batch);
+        return false;
     }
-    if (ok) {
-        std::error_code ec;
-        std::filesystem::remove_all(path, ec);
-        NanoLanceWriter writer{};
-        ok = nano_lance_writer_init(&writer, path.string().c_str(), 3) == NANO_LANCE_OK;
-        if (ok) {
-            nano_lance_writer_set_ignore_nullability(&writer, true);
-            nano_lance_writer_set_compression(&writer, compress);
-            ok = nano_lance_write_batch(&writer, &batch, &schema) == NANO_LANCE_OK &&
-                 nano_lance_writer_commit(&writer, false) == NANO_LANCE_OK;
+    return true;
+}
+
+// One writer session for a remainder table; append a fragment per chunk (lazily created on first rows).
+class RemainderAppender {
+public:
+    RemainderAppender(std::filesystem::path path, const char* disc_col, bool compress)
+        : path_(std::move(path)), disc_col_(disc_col), compress_(compress) {}
+
+    bool append(const std::vector<PayloadRow>& rows, std::string& error) {
+        if (rows.empty()) {
+            return true;
         }
+        if (!opened_ && !open(error)) {
+            return false;
+        }
+        ArrowArray batch{};
+        if (!build_remainder_batch(schema_, rows, batch, error)) {
+            return false;
+        }
+        bool ok = nano_lance_write_batch(&writer_, &batch, &schema_) == NANO_LANCE_OK &&
+                  nano_lance_writer_commit(&writer_, /*is_append=*/committed_) == NANO_LANCE_OK;
         if (!ok) {
-            error = nano_lance_writer_last_error(&writer);
+            error = nano_lance_writer_last_error(&writer_);
         }
-        nano_lance_writer_close(&writer);
+        batch.release(&batch);
+        committed_ = committed_ || ok;
+        return ok;
     }
-    batch.release(&batch);
-    schema.release(&schema);
-    return ok;
+
+    void close() {
+        if (opened_) {
+            nano_lance_writer_close(&writer_);
+            schema_.release(&schema_);
+            opened_ = false;
+        }
+    }
+
+private:
+    bool open(std::string& error) {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+        if (!build_remainder_schema(schema_, disc_col_, error)) {
+            return false;
+        }
+        if (nano_lance_writer_init(&writer_, path_.string().c_str(), 3) != NANO_LANCE_OK) {
+            error = nano_lance_writer_last_error(&writer_);
+            schema_.release(&schema_);
+            return false;
+        }
+        nano_lance_writer_set_ignore_nullability(&writer_, true);
+        nano_lance_writer_set_compression(&writer_, compress_);
+        opened_ = true;
+        return true;
+    }
+
+    std::filesystem::path path_;
+    const char* disc_col_;
+    bool compress_;
+    NanoLanceWriter writer_{};
+    ArrowSchema schema_{};
+    bool opened_ = false;
+    bool committed_ = false;
+};
+
+// One-shot: write a single-fragment remainder table.
+inline bool write_remainder_table(const std::filesystem::path& path, const std::vector<PayloadRow>& rows,
+                                  const char* disc_col, bool compress, std::string& error) {
+    RemainderAppender appender(path, disc_col, compress);
+    if (!appender.append(rows, error)) {
+        appender.close();
+        return false;
+    }
+    appender.close();
+    return true;
 }
 
 }  // namespace staged
