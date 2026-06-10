@@ -387,16 +387,11 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
         const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
         state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
         state->has_schema = true;
-    } else {
-        nano_lance::LanceSchemaMapping candidate = batch_mapping;
-        if (nano_lance::find_blob_v2_parent(candidate) != nullptr) {
-            if (!nano_lance::finalize_blob_v2_schema_for_write(candidate, error)) {
-                return set_error(writer, NANO_LANCE_UNSUPPORTED, error);
-            }
-        }
-        if (!nano_lance::schema_mappings_equal(state->schema_mapping, candidate)) {
-            return set_error(writer, NANO_LANCE_UNSUPPORTED, "schema changes are not supported in this phase");
-        }
+    } else if (!nano_lance::schema_mappings_equal(state->schema_mapping, batch_mapping)) {
+        // `state->schema_mapping` is the ingest-shape mapping captured on the first batch; compare the
+        // new batch's ingest mapping directly. (Finalization to the packed blob layout happens at commit,
+        // not here — finalizing only the candidate made every 2nd+ blob batch look like a schema change.)
+        return set_error(writer, NANO_LANCE_UNSUPPORTED, "schema changes are not supported in this phase");
     }
 
     const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
