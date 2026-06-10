@@ -246,6 +246,7 @@ bool parse_epb(Bytes file, const BlockRef& ref, EpbView& out) noexcept {
         out.caplen = rd32(base + 8, ref.little_endian);
         out.origlen = rd32(base + 12, ref.little_endian);
         out.payload_file_offset = ref.file_offset + 16;
+        out.epb_flags = 0;  // legacy pcap records have no options
         out.options = Options{nullptr, 0, ref.little_endian};
         return true;
     }
@@ -271,6 +272,15 @@ bool parse_epb(Bytes file, const BlockRef& ref, EpbView& out) noexcept {
     } else {
         out.options = Options{nullptr, 0, ref.little_endian};
     }
+
+    out.epb_flags = 0;
+    Options cursor = out.options;
+    Option opt{};
+    while (next_option(cursor, opt)) {
+        if (opt.code == 2 /*epb_flags*/ && opt.length >= 4) {
+            out.epb_flags = rd32(opt.value, ref.little_endian);
+        }
+    }
     return true;
 }
 
@@ -291,16 +301,7 @@ bool parse_epbs_bulk(Bytes file, const BlockRef* epbs, std::size_t n, EpbColumns
         out.origlen[i] = v.origlen;
         out.payload_off[i] = v.payload_file_offset;
         out.payload_size[i] = v.caplen;
-
-        std::uint32_t flags = 0;
-        Options cursor = v.options;
-        Option opt{};
-        while (next_option(cursor, opt)) {
-            if (opt.code == 2 /*epb_flags*/ && opt.length >= 4) {
-                flags = rd32(opt.value, cursor.little_endian);
-            }
-        }
-        out.epb_flags[i] = flags;
+        out.epb_flags[i] = v.epb_flags;
     }
     return true;
 }

@@ -33,6 +33,13 @@ See [`DESIGN.md`](DESIGN.md) (step-1 architecture + the parsing seam), [`NANOTIN
   branch in the walk; a UDP-internal-PDU registry hook (dispatch on `dst_port`) is the next extension
   point. (M2 — extracting the core into the standalone `nanotins` lib + a CUDA `ex::bulk` path — is the
   remaining milestone; the seam and reflection core are already shaped for it.)
+- **Scheduler-agnostic bulk** (`include/nanotins/bulk.hpp`, M2 start): `bulk_for_each(sched, num_tasks,
+  n, kernel)` is a partitioned stdexec `ex::schedule | ex::bulk` — the CPU path passes an
+  `exec::static_thread_pool` scheduler; a CUDA build later passes `nvexec::stream_context` and the SAME
+  call runs on the GPU (the only difference, exactly as in `stdexec_gpu_experiment`). The L1 Phase-B
+  parse already runs through it: a device-safe kernel (POD captures, no alloc) calls the pure
+  `parse_epb` per `BlockRef` and scatters into the SoA columns. stdexec builds and runs on this MinGW
+  host (verified), so the CPU bulk is real stdexec, not a stand-in.
 
 ## Build & run
 

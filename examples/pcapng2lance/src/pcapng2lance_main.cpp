@@ -5,6 +5,7 @@
 
 #include "mem_budget.hpp"
 #include "nanotins/arrow_glue.hpp"
+#include "nanotins/bulk.hpp"
 #include "pcap_blocks.hpp"
 #include "pdu_table_writer.hpp"
 #include "protocol_decode.hpp"
@@ -16,6 +17,7 @@
 #include "nanolance/nano_lance_writer.h"
 
 #include <boost/describe.hpp>
+#include <exec/static_thread_pool.hpp>
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
@@ -26,6 +28,7 @@
 #include <fstream>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -344,6 +347,12 @@ int main(int argc, char** argv) {
         }
     };
 
+    // Phase-B runs as a scheduler-agnostic ex::bulk over each window's BlockRefs. On this host the
+    // scheduler is a CPU thread pool; a CUDA build swaps it for nvexec and the kernel is unchanged.
+    const unsigned hc = std::thread::hardware_concurrency();
+    exec::static_thread_pool bulk_pool(hc == 0 ? 4 : hc);
+    auto bulk_sched = bulk_pool.get_scheduler();
+
     win.fill();
     while (win.size() > 0) {
         std::vector<pcapblocks::BlockRef> refs;
@@ -416,13 +425,35 @@ int main(int argc, char** argv) {
             continue;  // window held only SHB/IDB/other; no packet batch to write
         }
 
-        // Phase B (bulk) over the resident window — window-relative offsets.
+        // Phase B as a scheduler-agnostic ex::bulk over the window's BlockRefs: one task range per
+        // partition, each calling the pure per-block parse_epb and scattering into the SoA columns. The
+        // kernel captures only POD pointers + the (ptr+size) window span — the device-safe shape a CUDA
+        // scheduler runs unchanged.
         std::vector<std::uint32_t> iface(n), caplen(n), origlen(n), psize(n), flags(n);
         std::vector<std::uint64_t> ts(n), poff(n);
-        pcapblocks::EpbColumns cols{iface.data(), ts.data(),   caplen.data(), origlen.data(),
-                                    poff.data(),  psize.data(), flags.data(),  n};
-        if (!pcapblocks::parse_epbs_bulk(wbytes, packets.data(), n, cols, error)) {
-            return fail("bulk parse: " + error);
+        {
+            const pcapblocks::Bytes wb = wbytes;
+            const pcapblocks::BlockRef* pk = packets.data();
+            std::uint32_t* p_iface = iface.data();
+            std::uint32_t* p_caplen = caplen.data();
+            std::uint32_t* p_origlen = origlen.data();
+            std::uint32_t* p_psize = psize.data();
+            std::uint32_t* p_flags = flags.data();
+            std::uint64_t* p_ts = ts.data();
+            std::uint64_t* p_poff = poff.data();
+            const std::size_t num_tasks = std::min<std::size_t>(n, 64);
+            nanotins::bulk_for_each(bulk_sched, num_tasks, n, [=](std::size_t i) {
+                pcapblocks::EpbView v{};
+                if (pcapblocks::parse_epb(wb, pk[i], v)) {
+                    p_iface[i] = v.interface_id;
+                    p_ts[i] = v.ts_raw;
+                    p_caplen[i] = v.caplen;
+                    p_origlen[i] = v.origlen;
+                    p_poff[i] = v.payload_file_offset;
+                    p_psize[i] = v.caplen;
+                    p_flags[i] = v.epb_flags;
+                }
+            });
         }
 
         nanotins::soa<PacketRow> rows;

@@ -62,7 +62,9 @@ struct EpbView {
     std::uint32_t interface_id;
     std::uint64_t ts_raw;  // (ts_high << 32) | ts_low
     std::uint32_t caplen, origlen;
-    std::uint64_t payload_file_offset;  // absolute offset of packet bytes in the file
+    std::uint64_t payload_file_offset;  // offset of packet bytes (relative to the parsed buffer)
+    std::uint32_t epb_flags;            // epb_flags option (0 when absent) — parsed in, so the view is
+                                        // self-contained and the bulk kernel needs no option walk
     Options options;
 };
 

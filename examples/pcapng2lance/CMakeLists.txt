@@ -38,11 +38,29 @@ target_include_directories(nanotins_boost INTERFACE
     "${_nt_inc_mp11}"
     "${_nt_inc_describe}")
 
+# stdexec (header-only) for the scheduler-agnostic ex::bulk path. On a CUDA host the same call swaps to
+# nvexec::stream_context. Populate-only (its CMake pulls extra deps we don't need).
+FetchContent_Declare(stdexec
+    GIT_REPOSITORY https://github.com/NVIDIA/stdexec.git
+    GIT_TAG main
+    GIT_SHALLOW TRUE)
+FetchContent_GetProperties(stdexec)
+if(NOT stdexec_POPULATED)
+    FetchContent_Populate(stdexec)
+endif()
+add_library(nanotins_stdexec INTERFACE)
+target_include_directories(nanotins_stdexec INTERFACE "${stdexec_SOURCE_DIR}/include")
+target_compile_features(nanotins_stdexec INTERFACE cxx_std_20)
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(nanotins_stdexec INTERFACE Threads::Threads)
+endif()
+
 # The nanotins reflection core (header-only) — the part destined to become its own library.
 add_library(nanotins INTERFACE)
 target_include_directories(nanotins INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(nanotins INTERFACE cxx_std_20)
-target_link_libraries(nanotins INTERFACE nanotins_boost)
+target_link_libraries(nanotins INTERFACE nanotins_boost nanotins_stdexec)
 
 # The pcapng -> Lance converter: driver + in-tree CPU reference implementation of the seam.
 add_executable(pcapng2lance
@@ -67,6 +85,11 @@ if(NANOLANCE_BUILD_TESTS)
     target_link_libraries(pcapng2lance_seam_test PRIVATE nanotins nanolance)
     add_test(NAME pcapng2lance_seam COMMAND $<TARGET_FILE:pcapng2lance_seam_test>)
     set_tests_properties(pcapng2lance_seam PROPERTIES LABELS "smoke")
+
+    add_executable(nanotins_bulk_smoke tests/test_bulk_smoke.cpp)
+    target_link_libraries(nanotins_bulk_smoke PRIVATE nanotins)
+    add_test(NAME nanotins_bulk_smoke COMMAND $<TARGET_FILE:nanotins_bulk_smoke>)
+    set_tests_properties(nanotins_bulk_smoke PROPERTIES LABELS "smoke")
 
     add_executable(pcapng2lance_protocols_test tests/test_protocols.cpp)
     target_include_directories(pcapng2lance_protocols_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
