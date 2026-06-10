@@ -2,7 +2,7 @@
 // nanotins implementation). Hand-built pcap + pcapng fixtures, incl. a byte-swapped pcapng for
 // endianness, plus external-offset verification (payload bytes must live at payload_off..+size).
 
-#include "pcap_blocks.hpp"
+#include "nanotins/pcap_blocks.hpp"
 
 #include <cstdint>
 #include <cstdio>

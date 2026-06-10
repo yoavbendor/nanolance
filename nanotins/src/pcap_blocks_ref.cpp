@@ -2,7 +2,7 @@
 // SHB/IDB/EPB (+ options), with endianness honored per section. This is the *oracle*: nanotins will
 // later provide a drop-in (CPU + CUDA) implementation of the same header. Keep Phase-B pure.
 
-#include "pcap_blocks.hpp"
+#include "nanotins/pcap_blocks.hpp"
 
 #include <cstring>
 

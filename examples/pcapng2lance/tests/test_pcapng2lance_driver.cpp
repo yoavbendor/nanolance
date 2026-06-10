@@ -7,7 +7,7 @@
 // argv[1] = path to the pcapng2lance executable (passed by CTest).
 
 #include "pcap_fixtures.hpp"
-#include "pcap_blocks.hpp"
+#include "nanotins/pcap_blocks.hpp"
 
 #include "nanolance/nano_lance_reader.h"
 

@@ -5,7 +5,7 @@
 // decoded header into a per-PDU-type list keyed by the owning packet's row id. Each list becomes its own
 // Lance table (one row per PDU instance). Adding a protocol = a struct in protocols.hpp + a branch here.
 
-#include "protocols.hpp"
+#include "nanotins/protocols.hpp"
 
 #include <cstdint>
 #include <vector>

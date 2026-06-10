@@ -3,7 +3,7 @@
 // core expands each struct into the expected flat column list.
 
 #include "nanotins/reflect.hpp"
-#include "protocols.hpp"
+#include "nanotins/protocols.hpp"
 
 #include <cstdint>
 #include <cstdio>

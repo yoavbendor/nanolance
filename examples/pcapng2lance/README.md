@@ -9,7 +9,8 @@ See [`DESIGN.md`](DESIGN.md) (step-1 architecture + the parsing seam), [`NANOTIN
 
 ## What's built (M0 + M1 + M3)
 
-- **M0 — `nanotins` reflection core** (`include/nanotins/`, header-only): `be<>`/`le<>` wire scalars,
+- **M0 — `nanotins` reflection core** (now the standalone top-level [`nanotins/`](../../nanotins) library —
+  see its [guide](../../nanotins/docs/nanotins.html); header-only core): `be<>`/`le<>` wire scalars,
   `bits<Word, field<…>…>` bitfields, `column_traits`, `columns_of<T>` (flattened column list),
   `soa<T>`/`store`, `arrow_schema<T>()` + `to_arrow()`. One `BOOST_DESCRIBE_STRUCT` line per row type
   drives SoA storage, an Arrow schema, and a Lance table. Proven bit-exact by `nanotins_roundtrip`.

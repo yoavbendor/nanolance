@@ -215,6 +215,13 @@ if(NANOLANCE_STANDALONE)
 else()
     option(NANOLANCE_BUILD_EXAMPLES "Build examples (pcapng2lance + nanotins)" OFF)
 endif()
+# nanotins: the standalone pcap/pcapng + L2/L3/L4 parsing & reflection library (nanoarrow + boost only).
+# Built whenever the examples that consume it are, or tests are on. Its unit tests follow NANOLANCE_BUILD_TESTS.
+if(NANOLANCE_BUILD_EXAMPLES OR NANOLANCE_BUILD_TESTS)
+    set(NANOTINS_BUILD_TESTS ${NANOLANCE_BUILD_TESTS} CACHE BOOL "" FORCE)
+    add_subdirectory(nanotins)
+endif()
+
 if(NANOLANCE_BUILD_EXAMPLES)
     add_subdirectory(examples/pcapng2lance)
 endif()

@@ -8,7 +8,7 @@
 // path); `write_pdu_table` is the one-shot convenience (one fragment) used by --decode-l2l3.
 
 #include "nanotins/arrow_glue.hpp"
-#include "protocol_decode.hpp"
+#include "nanotins/protocol_decode.hpp"
 
 #include "nanolance/nano_lance_writer.h"
 

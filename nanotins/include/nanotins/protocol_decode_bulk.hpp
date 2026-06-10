@@ -15,7 +15,7 @@
 // the scan at each column's current size.
 
 #include "nanotins/bulk.hpp"
-#include "protocol_decode.hpp"
+#include "nanotins/protocol_decode.hpp"
 
 #include <algorithm>
 #include <cstddef>

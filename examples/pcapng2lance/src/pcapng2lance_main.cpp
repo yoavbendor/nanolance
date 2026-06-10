@@ -6,10 +6,10 @@
 #include "mem_budget.hpp"
 #include "nanotins/arrow_glue.hpp"
 #include "nanotins/bulk.hpp"
-#include "pcap_blocks.hpp"
+#include "nanotins/pcap_blocks.hpp"
 #include "pdu_table_writer.hpp"
-#include "protocol_decode.hpp"
-#include "protocol_decode_bulk.hpp"
+#include "nanotins/protocol_decode.hpp"
+#include "nanotins/protocol_decode_bulk.hpp"
 #include "staged_pipeline.hpp"
 #include "streaming_reader.hpp"
 
