@@ -208,6 +208,15 @@ if(NANOLANCE_BUILD_TOOLS)
     add_executable(nlance2table tools/nlance2table.cpp)
     target_compile_features(nlance2table PRIVATE cxx_std_20)
     target_link_libraries(nlance2table PRIVATE CLI11::CLI11 nanolance)
+
+    # Blob-fetch benchmark tooling: generate a tiled external-blob dataset, and fetch via nanolance.
+    add_executable(nlance_blobgen tools/nlance_blobgen.cpp)
+    target_compile_features(nlance_blobgen PRIVATE cxx_std_20)
+    target_link_libraries(nlance_blobgen PRIVATE CLI11::CLI11 nanolance)
+
+    add_executable(nlance_blobfetch tools/nlance_blobfetch.cpp)
+    target_compile_features(nlance_blobfetch PRIVATE cxx_std_20)
+    target_link_libraries(nlance_blobfetch PRIVATE CLI11::CLI11 nanolance)
 endif()
 
 if(NANOLANCE_STANDALONE)
