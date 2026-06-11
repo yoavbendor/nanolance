@@ -276,14 +276,14 @@ int run_enrich_stage(const fs::path& datadir, const Args& a) {
 
 // ---- L1 windowed conversion ----------------------------------------------------------------------
 
-// SoA column buffers for one window's packets (filled by the bulk parse, then by row building).
-struct PacketColumns {
-    std::vector<std::uint32_t> iface, caplen, origlen, psize, flags;
-    std::vector<std::uint64_t> ts, poff;
-    std::vector<std::uint16_t> link_type;  // resolved per packet from its section's interface table
-    explicit PacketColumns(std::size_t n)
-        : iface(n), caplen(n), origlen(n), psize(n), flags(n), ts(n), poff(n), link_type(n) {}
-    std::size_t size() const { return iface.size(); }
+// Assembled output for one window's packets: the L1 scalar columns (auto-built by soa<PacketRow> — no
+// hand-rolled columns) plus the few per-packet arrays the writer + L2/L3 decoder consume as raw pointers.
+struct PacketBatch {
+    nanotins::soa<PacketRow> rows;          // scalar columns, columnarized from PacketRow by reflection
+    std::vector<std::uint16_t> link_type;   // per packet, for L2/L3 decode dispatch
+    std::vector<std::uint64_t> poff;        // payload file offset, for the blob ref + the decode span
+    std::vector<std::uint32_t> psize;       // payload size (== caplen), likewise
+    std::size_t size() const { return link_type.size(); }
 };
 
 unsigned pool_threads(unsigned override_count) {
@@ -450,51 +450,49 @@ private:
         }
     }
 
-    // Phase B: parse each EPB BlockRef into the SoA columns via the chosen policy (the device-safe shape a
-    // CUDA scheduler runs unchanged — POD captures + the window span only).
-    void parse_packets(pcapblocks::Bytes wbytes, const std::vector<pcapblocks::BlockRef>& packets,
-                       PacketColumns& cols) {
+    // Phase B: parse each EPB BlockRef into a whole EpbView, scattered into an AoS vector (the same
+    // device-safe shape — POD captures + the window span — a CUDA scheduler runs unchanged). One struct
+    // assignment per packet; soa<PacketRow> does the columnar fan-out later (see assemble).
+    std::vector<pcapblocks::EpbView> parse_packets(pcapblocks::Bytes wbytes,
+                                                   const std::vector<pcapblocks::BlockRef>& packets) {
         const std::size_t n = packets.size();
+        std::vector<pcapblocks::EpbView> parsed(n);
         const pcapblocks::Bytes wb = wbytes;
         const pcapblocks::BlockRef* pk = packets.data();
-        std::uint32_t* iface = cols.iface.data();
-        std::uint32_t* caplen = cols.caplen.data();
-        std::uint32_t* origlen = cols.origlen.data();
-        std::uint32_t* psize = cols.psize.data();
-        std::uint32_t* flags = cols.flags.data();
-        std::uint64_t* ts = cols.ts.data();
-        std::uint64_t* poff = cols.poff.data();
-        const std::size_t num_tasks = std::min<std::size_t>(n, 64);
+        pcapblocks::EpbView* out = parsed.data();
         auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
-        run(num_tasks, n, [=](std::size_t i) {
+        run(std::min<std::size_t>(n, 64), n, [=](std::size_t i) {
             pcapblocks::EpbView v{};
-            if (pcapblocks::parse_epb(wb, pk[i], v)) {
-                iface[i] = v.interface_id;
-                ts[i] = v.ts_raw;
-                caplen[i] = v.caplen;
-                origlen[i] = v.origlen;
-                poff[i] = v.payload_file_offset;
-                psize[i] = v.caplen;
-                flags[i] = v.epb_flags;
-            }
+            if (pcapblocks::parse_epb(wb, pk[i], v)) out[i] = v;  // whole-struct scatter, like the PDU path
         });
+        return parsed;
     }
 
-    // Build the PacketRow SoA, denormalizing link_type/ts_resol from each packet's section interface table.
-    nanotins::soa<PacketRow> build_rows(const std::vector<std::size_t>& packet_section, PacketColumns& cols) {
-        const std::size_t n = cols.size();
-        nanotins::soa<PacketRow> rows;
-        rows.resize(n);
+    // Assemble the columnar batch from the parsed EpbViews: soa<PacketRow>::store fans each row out into
+    // columns by reflection (no hand-written columns), denormalizing link_type/ts_resol from the section's
+    // interface table; the writer/decoder arrays (link_type/poff/psize) come along in the same pass.
+    PacketBatch assemble(const std::vector<pcapblocks::EpbView>& parsed,
+                         const std::vector<std::size_t>& packet_section) {
+        const std::size_t n = parsed.size();
+        PacketBatch b;
+        b.rows.resize(n);
+        b.link_type.resize(n);
+        b.poff.resize(n);
+        b.psize.resize(n);
         for (std::size_t i = 0; i < n; ++i) {
+            const pcapblocks::EpbView& e = parsed[i];
             const auto& table = sections_[packet_section[i]];
-            const std::uint32_t id = cols.iface[i];
-            const std::uint16_t link = id < table.size() ? table[id].link_type : std::uint16_t{0};
-            const std::uint8_t res = id < table.size() ? table[id].ts_resol : std::uint8_t{6};
-            cols.link_type[i] = link;
-            rows.store(i, PacketRow{global_pid_ + i, cols.iface[i], cols.ts[i], cols.caplen[i], cols.origlen[i],
-                                    link, res, cols.flags[i]});
+            const std::uint16_t link = e.interface_id < table.size() ? table[e.interface_id].link_type
+                                                                     : std::uint16_t{0};
+            const std::uint8_t res = e.interface_id < table.size() ? table[e.interface_id].ts_resol
+                                                                   : std::uint8_t{6};
+            b.rows.store(i, PacketRow{global_pid_ + i, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
+                                      e.epb_flags});
+            b.link_type[i] = link;
+            b.poff[i] = e.payload_file_offset;
+            b.psize[i] = e.caplen;
         }
-        return rows;
+        return b;
     }
 
     // Freeze the accumulated SHB/IDB KV metadata onto the schema (once, before the first commit).
@@ -509,8 +507,8 @@ private:
     }
 
     // Build the combined Arrow batch (scalars + external payload_ref) and commit it as its own fragment.
-    int write_batch(const nanotins::soa<PacketRow>& rows, const PacketColumns& cols, std::uint64_t wbase) {
-        const std::size_t n = cols.size();
+    int write_batch(const PacketBatch& b, std::uint64_t wbase) {
+        const std::size_t n = b.size();
         ArrowArray batch{};
         if (ArrowArrayInitFromSchema(&batch, &schema_, nullptr) != NANOARROW_OK ||
             ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
@@ -518,14 +516,14 @@ private:
         }
         ArrowArray* payload = batch.children[kScalarCols];
         for (std::size_t i = 0; i < n; ++i) {
-            if (!nanotins::nt_append_scalar_row<PacketRow>(&batch, 0, rows, i)) {
+            if (!nanotins::nt_append_scalar_row<PacketRow>(&batch, 0, b.rows, i)) {
                 return fail("append scalar columns");
             }
             ArrowStringView uri{payload_uri_.data(), static_cast<int64_t>(payload_uri_.size())};
             if (ArrowArrayAppendNull(payload->children[0], 1) != NANOARROW_OK ||
                 ArrowArrayAppendString(payload->children[1], uri) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(payload->children[2], wbase + cols.poff[i]) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(payload->children[3], cols.psize[i]) != NANOARROW_OK) {
+                ArrowArrayAppendUInt(payload->children[2], wbase + b.poff[i]) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(payload->children[3], b.psize[i]) != NANOARROW_OK) {
                 return fail("append payload_ref");
             }
             if (ArrowArrayFinishElement(payload) != NANOARROW_OK ||
@@ -557,19 +555,18 @@ private:
         const std::size_t n = packets.size();
         if (n == 0) return 0;  // window held only SHB/IDB/other; nothing to write
 
-        PacketColumns cols(n);
-        parse_packets(wbytes, packets, cols);
-        const nanotins::soa<PacketRow> rows = build_rows(packet_section, cols);
+        const std::vector<pcapblocks::EpbView> parsed = parse_packets(wbytes, packets);
+        const PacketBatch batch = assemble(parsed, packet_section);
         if (!args_.no_write) {  // --no-write isolates Phase B (scan+parse+decode) from the Lance I/O
             if (const int rc = freeze_metadata()) return rc;
-            if (const int rc = write_batch(rows, cols, wbase)) return rc;
+            if (const int rc = write_batch(batch, wbase)) return rc;
         }
         if (args_.decode_l2l3) {
             auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
             std::vector<protocols::WalkResult> trailers(n);
-            protocols::decode_window(run, global_pid_, cols.link_type.data(), cols.poff.data(),
-                                     cols.psize.data(), wbytes, n, pdus_, trailers.data());
-            collect_remainder(trailers, cols, wbase);
+            protocols::decode_window(run, global_pid_, batch.link_type.data(), batch.poff.data(),
+                                     batch.psize.data(), wbytes, n, pdus_, trailers.data());
+            collect_remainder(trailers, batch, wbase);
         }
         global_pid_ += n;
         return 0;
@@ -578,15 +575,14 @@ private:
     // Build remainder_after_l4 rows from this window's L4 boundaries: the application payload (after L4)
     // as an external blob.v2 ref into the original capture. Only packets that reached L4 and still have
     // bytes left contribute — byte-identical to what the staged --stage l4 path emits.
-    void collect_remainder(const std::vector<protocols::WalkResult>& trailers, const PacketColumns& cols,
+    void collect_remainder(const std::vector<protocols::WalkResult>& trailers, const PacketBatch& b,
                            std::uint64_t wbase) {
-        const std::size_t n = cols.size();
+        const std::size_t n = b.size();
         for (std::size_t i = 0; i < n; ++i) {
             const protocols::WalkResult& w = trailers[i];
-            if (w.reached_l4 && w.l4_payload_offset < cols.psize[i]) {
+            if (w.reached_l4 && w.l4_payload_offset < b.psize[i]) {
                 remainder_.push_back({global_pid_ + i, /*next_protocol=*/w.l4_ports, payload_uri_,
-                                      wbase + cols.poff[i] + w.l4_payload_offset,
-                                      cols.psize[i] - w.l4_payload_offset});
+                                      wbase + b.poff[i] + w.l4_payload_offset, b.psize[i] - w.l4_payload_offset});
             }
         }
     }
