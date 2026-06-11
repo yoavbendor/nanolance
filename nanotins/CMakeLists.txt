@@ -123,6 +123,11 @@ if(NANOTINS_BUILD_TESTS)
     add_test(NAME nanotins_bulk_smoke COMMAND $<TARGET_FILE:nanotins_bulk_smoke>)
     set_tests_properties(nanotins_bulk_smoke PROPERTIES LABELS "smoke")
 
+    add_executable(nanotins_soa_scatter tests/test_soa_scatter.cpp)
+    target_link_libraries(nanotins_soa_scatter PRIVATE nanotins_core)
+    add_test(NAME nanotins_soa_scatter COMMAND $<TARGET_FILE:nanotins_soa_scatter>)
+    set_tests_properties(nanotins_soa_scatter PROPERTIES LABELS "smoke")
+
     add_executable(nanotins_gptp_test tests/test_gptp.cpp)
     target_link_libraries(nanotins_gptp_test PRIVATE nanotins_core nanotins_protocols)
     add_test(NAME nanotins_gptp COMMAND $<TARGET_FILE:nanotins_gptp_test>)

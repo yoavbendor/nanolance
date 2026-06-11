@@ -111,6 +111,17 @@ struct soa_storage<std::tuple<C...>> {
     using type = std::tuple<std::vector<typename C::elem>...>;
 };
 
+// A pack of raw per-column pointers (one elem* per flattened column) — the device-capturable view of a
+// SoA. std::tuple of pointers is trivially copyable, so it is safe to capture into a bulk/device lambda.
+template <class Cols>
+struct soa_ptrs_h;
+template <class... C>
+struct soa_ptrs_h<std::tuple<C...>> {
+    using type = std::tuple<typename C::elem*...>;
+};
+template <class T>
+using soa_ptrs = typename soa_ptrs_h<columns_of<T>>::type;
+
 template <class T>
 class soa {
 public:
@@ -138,9 +149,30 @@ public:
         return std::get<I>(columns_);
     }
 
+    // A POD pack of raw per-column pointers into this SoA's buffers — trivially copyable, so a bulk kernel
+    // (CPU or CUDA device) can capture it and scatter rows in parallel via `scatter()` below, without any
+    // hand-written column list. (The GPU path builds the same pack from device allocations instead.)
+    soa_ptrs<T> raw() {
+        soa_ptrs<T> p;
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            ((std::get<I>(p) = std::get<I>(columns_).data()), ...);
+        }(std::make_index_sequence<ncols>{});
+        return p;
+    }
+
 private:
     typename soa_storage<cols>::type columns_;
     std::size_t size_ = 0;
 };
+
+// Scatter one row into a soa_ptrs pack at index i — the device-safe twin of soa<T>::store, reading raw
+// pointers instead of the owning soa. The be<>/le<>/bits<> conversions happen in each Col::get, so any
+// described struct's SoA is fillable by a bulk kernel with zero per-field boilerplate.
+template <class T>
+NANOTINS_HD void scatter(const soa_ptrs<T>& p, std::size_t i, const T& row) {
+    [&]<std::size_t... I>(std::index_sequence<I...>) {
+        ((std::get<I>(p)[i] = col_at<T, I>::get(row)), ...);
+    }(std::make_index_sequence<column_count<T>>{});
+}
 
 }  // namespace nanotins
