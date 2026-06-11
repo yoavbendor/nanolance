@@ -55,6 +55,7 @@ struct Args {
     bool compress = true;
     bool decode_l2l3 = false;
     bool sequential = false;     // run Phase B in-thread (reference/debug) instead of the ex::bulk pool
+    bool no_write = false;       // scan+parse+decode only, skip all Lance writes (isolates Phase B for bench)
     unsigned threads = 0;        // ex::bulk pool size; 0 = hardware_concurrency
     std::string stage;           // "" = one-shot; l1 writes packets.lance; l2/l3/l4 enrich a data dir
     std::size_t window_bytes = std::size_t{512} * 1024 * 1024;    // L1 RAM/VRAM budget per window
@@ -80,6 +81,8 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             a.decode_l2l3 = true;
         } else if (s == "--sequential") {
             a.sequential = true;
+        } else if (s == "--no-write") {
+            a.no_write = true;
         } else if (s == "--threads") {
             const char* v = value(i);
             if (!v) return false;
@@ -303,14 +306,15 @@ public:
         streaming::Window<streaming::FileSource> win(source, args_.window_bytes);
 
         std::string err;
-        if (!build_schema(err)) return fail(err);
-        if (const int rc = open_writer()) return rc;
-        ArrowMetadataBuilderInit(&meta_, nullptr);
-        if (args_.sequential) {
-            std::fprintf(stderr, "pcapng2lance: Phase B = sequential (1 thread)\n");
-        } else {
-            std::fprintf(stderr, "pcapng2lance: Phase B = bulk (%u threads)\n", pool_threads(args_.threads));
+        if (!args_.no_write) {
+            if (!build_schema(err)) return fail(err);
+            if (const int rc = open_writer()) return rc;
         }
+        ArrowMetadataBuilderInit(&meta_, nullptr);
+        std::fprintf(stderr, "pcapng2lance: Phase B = %s%s\n",
+                     args_.sequential ? "sequential (1 thread)" : "bulk",
+                     args_.sequential ? "" : (" (" + std::to_string(pool_threads(args_.threads)) + " threads)").c_str());
+        if (args_.no_write) std::fprintf(stderr, "pcapng2lance: --no-write (scan+parse+decode only, no Lance output)\n");
 
         win.fill();
         while (win.size() > 0) {
@@ -331,9 +335,11 @@ public:
         }
 
         ArrowBufferReset(&meta_);
-        nano_lance_writer_close(&writer_);
-        ArrowSchemaRelease(&schema_);
-        if (args_.decode_l2l3 && global_pid_ > 0) {
+        if (!args_.no_write) {
+            nano_lance_writer_close(&writer_);
+            ArrowSchemaRelease(&schema_);
+        }
+        if (!args_.no_write && args_.decode_l2l3 && global_pid_ > 0) {
             if (const int rc = write_pdu_tables()) return rc;
         }
         print_summary();
@@ -554,8 +560,10 @@ private:
         PacketColumns cols(n);
         parse_packets(wbytes, packets, cols);
         const nanotins::soa<PacketRow> rows = build_rows(packet_section, cols);
-        if (const int rc = freeze_metadata()) return rc;
-        if (const int rc = write_batch(rows, cols, wbase)) return rc;
+        if (!args_.no_write) {  // --no-write isolates Phase B (scan+parse+decode) from the Lance I/O
+            if (const int rc = freeze_metadata()) return rc;
+            if (const int rc = write_batch(rows, cols, wbase)) return rc;
+        }
         if (args_.decode_l2l3) {
             auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
             std::vector<protocols::WalkResult> trailers(n);
@@ -661,7 +669,7 @@ int main(int argc, char** argv) {
     if (args.pos.size() < 2) {
         std::fprintf(
             stderr,
-            "usage: %s [--no-compress] [--decode-l2l3] [--sequential] [--threads N] <input.pcap|pcapng> <output.lance> [payload_uri]\n"
+            "usage: %s [--no-compress] [--decode-l2l3] [--sequential] [--threads N] [--no-write] <input.pcap|pcapng> <output.lance> [payload_uri]\n"
             "       %s --stage l1 <input.pcap|pcapng> <datadir>   (then --stage l2|l3|l4 <datadir>)\n",
             argv[0], argv[0]);
         return 2;

@@ -51,8 +51,11 @@ See [`DESIGN.md`](DESIGN.md) (step-1 architecture + the parsing seam), [`NANOTIN
   sequential are within noise (L1 ~0.8 s both; L1+L2/L3/L4 ~0.71 vs 0.73 s), plateauing by ~2–8 threads —
   the kernels are light and the pipeline is memory-bandwidth-bound, so CPU thread-parallelism barely
   helps. Sweep it yourself with [`bench/decode_bench.sh`](../../bench/decode_bench.sh)
-  (`--threads 4,8,16,32,64,128,164`). The bulk path's real payoff is the **GPU** (swap the scheduler to
-  `nvexec`; many threads hide memory latency), not multicore CPU.
+  (`--threads 4,8,16,32,64,128,164`); pass `--no-write` (a driver flag that runs scan+parse+decode but
+  skips the Lance output) to isolate Phase B from the I/O+write cost. Confirmed even with `--no-write`,
+  Phase B is flat across thread counts — one thread already saturates memory-read bandwidth, so more
+  threads only contend for it. The bulk path's real payoff is the **GPU** (swap the scheduler to `nvexec`;
+  far higher memory bandwidth + latency hiding), not multicore CPU.
   The **L2/L3/L4 decode** (`--decode-l2l3`) also runs through `bulk_for_each` now
   (`include/protocol_decode_bulk.hpp`), as the canonical GPU pattern for a *variable-outputs-per-input*
   problem: two device-safe bulk passes bracket a prefix-sum — pass 1 `count_packet` per packet → exclusive
