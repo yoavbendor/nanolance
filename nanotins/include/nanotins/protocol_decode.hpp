@@ -7,7 +7,9 @@
 
 #include "nanotins/protocols.hpp"
 
+#include <array>
 #include <cstdint>
+#include <tuple>
 #include <vector>
 
 namespace protocols {
@@ -31,7 +33,15 @@ struct DecodedPdus {
     PduColumn<Ipv6> ipv6;
     PduColumn<Tcp> tcp;
     PduColumn<Udp> udp;
+
+    // The six columns as a tuple of references, in table order — so consumers (writers, appenders) can
+    // fold over them instead of naming each. Pairs 1:1 with kPduTableNames below.
+    auto columns() { return std::tie(ethernet, vlan, ipv4, ipv6, tcp, udp); }
 };
+
+// Lance table base-names for the six PDU columns, in the same order as DecodedPdus::columns().
+inline constexpr std::array<const char*, 6> kPduTableNames = {"ethernet", "vlan", "ipv4", "ipv6", "tcp",
+                                                              "udp"};
 
 // Per-layer decode steps. Each consumes a span that STARTS at the layer's first byte (so they compose
 // for staged parsing where the previous stage advanced past its header), appends the decoded header(s)

@@ -32,6 +32,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -183,33 +184,33 @@ bool decode_layer(const std::string& stage, const staged::PayloadRow& r, protoco
                                 next_disc);  // next_disc = packed src+dst ports (L5 dispatch key)
 }
 
-// The six per-PDU appenders + the remainder appender, opened once; each appends a fragment per chunk.
+// The six per-PDU appenders (held as a tuple so append/close fold over them, paired 1:1 with
+// DecodedPdus::columns()) + the remainder appender. Opened once; each appends a fragment per chunk.
 struct EnrichTables {
-    pdu_io::PduAppender<protocols::Ethernet> eth;
-    pdu_io::PduAppender<protocols::VlanTag> vlan;
-    pdu_io::PduAppender<protocols::Ipv4> ipv4;
-    pdu_io::PduAppender<protocols::Ipv6> ipv6;
-    pdu_io::PduAppender<protocols::Tcp> tcp;
-    pdu_io::PduAppender<protocols::Udp> udp;
+    std::tuple<pdu_io::PduAppender<protocols::Ethernet>, pdu_io::PduAppender<protocols::VlanTag>,
+               pdu_io::PduAppender<protocols::Ipv4>, pdu_io::PduAppender<protocols::Ipv6>,
+               pdu_io::PduAppender<protocols::Tcp>, pdu_io::PduAppender<protocols::Udp>>
+        apps;
     staged::RemainderAppender remainder;
 
     EnrichTables(const fs::path& d, const char* rem, bool compress)
-        : eth(d / "ethernet.lance", compress), vlan(d / "vlan.lance", compress),
-          ipv4(d / "ipv4.lance", compress), ipv6(d / "ipv6.lance", compress), tcp(d / "tcp.lance", compress),
-          udp(d / "udp.lance", compress), remainder(d / rem, "next_protocol", compress) {}
+        : apps(pdu_io::PduAppender<protocols::Ethernet>(d / "ethernet.lance", compress),
+               pdu_io::PduAppender<protocols::VlanTag>(d / "vlan.lance", compress),
+               pdu_io::PduAppender<protocols::Ipv4>(d / "ipv4.lance", compress),
+               pdu_io::PduAppender<protocols::Ipv6>(d / "ipv6.lance", compress),
+               pdu_io::PduAppender<protocols::Tcp>(d / "tcp.lance", compress),
+               pdu_io::PduAppender<protocols::Udp>(d / "udp.lance", compress)),
+          remainder(d / rem, "next_protocol", compress) {}
 
     bool append(protocols::DecodedPdus& p, std::vector<staged::PayloadRow>& rem, std::string& err) {
-        return eth.append(p.ethernet, err) && vlan.append(p.vlan, err) && ipv4.append(p.ipv4, err) &&
-               ipv6.append(p.ipv6, err) && tcp.append(p.tcp, err) && udp.append(p.udp, err) &&
-               remainder.append(rem, err);
+        auto cols = p.columns();  // tuple of the six PduColumn refs, in the same order as `apps`
+        const bool ok = [&]<std::size_t... I>(std::index_sequence<I...>) {
+            return (std::get<I>(apps).append(std::get<I>(cols), err) && ...);  // short-circuits on failure
+        }(std::make_index_sequence<6>{});
+        return ok && remainder.append(rem, err);
     }
     void close() {
-        eth.close();
-        vlan.close();
-        ipv4.close();
-        ipv6.close();
-        tcp.close();
-        udp.close();
+        std::apply([](auto&... a) { (a.close(), ...); }, apps);
         remainder.close();
     }
 };
