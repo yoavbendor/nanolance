@@ -3,7 +3,7 @@
 // Hand-built pcap / pcapng fixtures shared by the seam test and the driver test. Pure byte assembly
 // (endianness-parametric) so the tests need no scapy/tshark and stay deterministic.
 
-#include "pcap_blocks.hpp"
+#include "nanotins/pcap_blocks.hpp"
 
 #include <cstdint>
 #include <vector>

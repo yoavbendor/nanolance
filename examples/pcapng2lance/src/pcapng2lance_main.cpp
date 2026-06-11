@@ -6,9 +6,10 @@
 #include "mem_budget.hpp"
 #include "nanotins/arrow_glue.hpp"
 #include "nanotins/bulk.hpp"
-#include "pcap_blocks.hpp"
+#include "nanotins/pcap_blocks.hpp"
 #include "pdu_table_writer.hpp"
-#include "protocol_decode.hpp"
+#include "nanotins/protocol_decode.hpp"
+#include "nanotins/protocol_decode_bulk.hpp"
 #include "staged_pipeline.hpp"
 #include "streaming_reader.hpp"
 
@@ -519,12 +520,10 @@ int main(int argc, char** argv) {
         first_commit = false;
 
         if (decode_l2l3) {
-            for (std::size_t i = 0; i < n; ++i) {
-                if (poff[i] + psize[i] <= wbytes.size()) {
-                    protocols::decode_packet(global_pid + i, pkt_link_type[i], wbytes.subspan(poff[i], psize[i]),
-                                             pdus);
-                }
-            }
+            // Scheduler-agnostic bulk L2/L3/L4 decode over this window (count -> prefix-sum -> scatter),
+            // same bulk_for_each + scheduler as the L1 parse. Byte-identical to the serial decode_packet.
+            protocols::decode_window_bulk(bulk_sched, global_pid, pkt_link_type.data(), poff.data(),
+                                          psize.data(), wbytes, n, pdus);
         }
 
         global_pid += n;

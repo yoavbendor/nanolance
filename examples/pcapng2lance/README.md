@@ -9,7 +9,8 @@ See [`DESIGN.md`](DESIGN.md) (step-1 architecture + the parsing seam), [`NANOTIN
 
 ## What's built (M0 + M1 + M3)
 
-- **M0 — `nanotins` reflection core** (`include/nanotins/`, header-only): `be<>`/`le<>` wire scalars,
+- **M0 — `nanotins` reflection core** (now the standalone top-level [`nanotins/`](../../nanotins) library —
+  see its [guide](../../nanotins/docs/nanotins.html); header-only core): `be<>`/`le<>` wire scalars,
   `bits<Word, field<…>…>` bitfields, `column_traits`, `columns_of<T>` (flattened column list),
   `soa<T>`/`store`, `arrow_schema<T>()` + `to_arrow()`. One `BOOST_DESCRIBE_STRUCT` line per row type
   drives SoA storage, an Arrow schema, and a Lance table. Proven bit-exact by `nanotins_roundtrip`.
@@ -40,6 +41,14 @@ See [`DESIGN.md`](DESIGN.md) (step-1 architecture + the parsing seam), [`NANOTIN
   parse already runs through it: a device-safe kernel (POD captures, no alloc) calls the pure
   `parse_epb` per `BlockRef` and scatters into the SoA columns. stdexec builds and runs on this MinGW
   host (verified), so the CPU bulk is real stdexec, not a stand-in.
+  The **L2/L3/L4 decode** (`--decode-l2l3`) also runs through `bulk_for_each` now
+  (`include/protocol_decode_bulk.hpp`), as the canonical GPU pattern for a *variable-outputs-per-input*
+  problem: two device-safe bulk passes bracket a prefix-sum — pass 1 `count_packet` per packet → exclusive
+  scan per PDU type → size each output column exactly → pass 2 `scatter_packet` writes each PDU to its own
+  prefix-summed slot (disjoint writes, no `push_back`). Both passes walk the one shared `walk_packet`
+  traversal (so count == scatter by construction), and row order is packet order → byte-identical tables
+  to the serial path (`pcapng2lance_l2l3` verifies). On a CUDA host the scan becomes a
+  `thrust::exclusive_scan` and the two kernels run on the GPU unchanged.
 
 ## Build & run
 
@@ -114,6 +123,9 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
 | `pcapng2lance_staged` | interop | `--stage l1→l2→l3→l4` incremental enrichment; per-stage tables + final external remainder verified |
 | `pcapng2lance_streaming` / `_multisection` | interop | tiny `--window-bytes` (refill/straddle/grow/multi-fragment) gives byte-identical output to the whole-file path |
 | `pcapng2lance_enrich_chunking` | interop | tiny `--mem-bytes`/`--read-tile-bytes` (many chunks/fragments) enrich == single-chunk enrich for every PDU + remainder table |
+| `nlance2table_smoke` | interop | `nlance2table` (top-level tool) dumps PDU + L1 tables to CSV/NDJSON: header, row counts, `--limit`, `fixed_size_binary` hex, nested-struct flatten |
+| `nlance2table_tshark` | interop | per-PDU tables dumped via `nlance2table` match **tshark**'s dissection of the same pcapng field-for-field (eth/vlan/ipv4/ipv6/tcp/udp); skips if `tshark` absent |
+| `nlance2table_tshark_realfile` | interop | real fragmented capture (`tests/SRL_front_left_51_short.pcapng`, 224 frames): L4 gated to first fragments (udp on 7 only) + eth/vlan/ipv4 fields match `tshark` (reassembly off); skips if `tshark` absent |
 
 ## Notes / known limitations
 
@@ -127,3 +139,10 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
   now, and stock-Lance interop of `fixed_size_binary` is unverified (nanolance round-trips it).
 - Dataset KV metadata is attached to a scalar **field**, not the root struct (the schema mapper treats
   any root metadata as an extension marker, which breaks record-batch flattening).
+- **IPv4 fragmentation**: the L4 (TCP/UDP) header lives only in the first fragment, so the decode emits a
+  TCP/UDP row **only when `frag_offset == 0`** (verified against `tshark` with reassembly off on a real
+  fragmented capture). Continuation fragments still appear in the `ipv4` table (every fragment carries
+  `protocol`), so "how many packets belong to a UDP datagram" is the `ipv4.protocol==17` count, while the
+  `udp` table holds the real headers only. Payload **reassembly** across fragments is not done. The staged
+  `--stage l4` enrich path does not yet apply this gate (it decodes L4 per remainder row); only the
+  one-shot `--decode-l2l3` path is fragmentation-aware today.

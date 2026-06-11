@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanotins — describe a wire struct once, get everything</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#161922; --ink:#e6e9ef; --muted:#9aa3b2; --line:#262b38;
+    --accent:#6cb6ff; --accent2:#7ee787; --warn:#ffd479; --code:#0b0d13; --pill:#1f2430;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{display:grid;grid-template-columns:240px minmax(0,1fr);gap:0;max-width:1180px;margin:0 auto}
+  nav{position:sticky;top:0;align-self:start;height:100vh;overflow:auto;padding:28px 18px;
+      border-right:1px solid var(--line)}
+  nav h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:18px 0 8px}
+  nav a{display:block;color:var(--ink);text-decoration:none;padding:4px 8px;border-radius:7px;font-size:14px}
+  nav a:hover{background:var(--pill);color:var(--accent)}
+  main{padding:40px 44px 120px;min-width:0}
+  h1{font-size:34px;margin:.1em 0 .1em;letter-spacing:-.01em}
+  h2{font-size:25px;margin:2.2em 0 .5em;padding-top:.3em;border-top:1px solid var(--line)}
+  h3{font-size:18px;margin:1.6em 0 .4em;color:var(--accent)}
+  p,li{color:#d7dbe4}
+  .lede{font-size:19px;color:var(--muted);max-width:62ch}
+  code{font-family:"SF Mono",ui-monospace,"Cascadia Code",Consolas,monospace;font-size:.92em;
+       background:var(--pill);padding:1px 6px;border-radius:5px;color:#cfe3ff}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:11px;padding:16px 18px;overflow:auto;
+      font-family:"SF Mono",ui-monospace,"Cascadia Code",Consolas,monospace;font-size:13.5px;line-height:1.55}
+  pre code{background:none;padding:0;color:#d7dbe4}
+  .k{color:#ff7b72}.t{color:#7ee787}.s{color:#a5d6ff}.c{color:#7d8694;font-style:italic}.n{color:#ffd479}
+  .pill{display:inline-block;background:var(--pill);border:1px solid var(--line);border-radius:999px;
+        padding:2px 11px;font-size:12.5px;color:var(--muted);margin:0 4px 4px 0}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:14px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card h4{margin:.1em 0 .3em;color:var(--accent2);font-size:15px}
+  .card p{margin:.2em 0 0;font-size:14px;color:var(--muted)}
+  .note{border-left:3px solid var(--accent);background:#10151f;border-radius:0 10px 10px 0;padding:12px 16px;margin:16px 0}
+  .note.warn{border-color:var(--warn);background:#1a160d}
+  .note.good{border-color:var(--accent2);background:#0e1612}
+  a.link{color:var(--accent)}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left}
+  th{background:var(--panel);color:var(--accent)}
+  .small{font-size:13px;color:var(--muted)}
+  svg{max-width:100%;height:auto}
+  footer{color:var(--muted);font-size:13px;border-top:1px solid var(--line);padding-top:18px;margin-top:40px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <strong style="font-size:18px">nano<span style="color:var(--accent2)">tins</span></strong>
+  <div class="small" style="margin:2px 0 10px">describe once · parse anywhere</div>
+  <h2>Ideas</h2>
+  <a href="#why">Why nanotins</a>
+  <a href="#describe">Describe a struct once</a>
+  <a href="#endian">Endianness: be/le</a>
+  <a href="#bits">Bitfields: bits/field</a>
+  <a href="#overlay">Zero-copy overlay</a>
+  <a href="#arrow">SoA → nanoarrow table</a>
+  <h2>Parsing</h2>
+  <a href="#pipeline">The two-phase pipeline</a>
+  <a href="#walk">The L2/L3/L4 walk</a>
+  <a href="#bulk">Bulk &amp; GPU-ready</a>
+  <h2>Extend it</h2>
+  <a href="#gptp">Worked example: gPTP</a>
+  <a href="#validate">Validate vs tshark</a>
+  <h2>Use it</h2>
+  <a href="#layout">Library layout &amp; CMake</a>
+</nav>
+<main>
+
+<h1>nanotins</h1>
+<p class="lede">A small C++20 library for parsing <strong>pcap/pcapng</strong> and <strong>L2/L3/L4</strong>
+packets — sequentially or in data-parallel bulk — whose one killer idea is the
+<em>overlay-able, self-describing wire struct</em>. You describe a packet header <strong>once</strong>;
+nanotins hands you a zero-copy overlay, a flattened column list, an SoA store, and a
+<a class="link" href="https://github.com/apache/arrow-nanoarrow">nanoarrow</a> table — so any backend
+(Lance, Parquet, Arrow IPC) can persist it.</p>
+
+<p>
+  <span class="pill">C++20</span><span class="pill">header-mostly</span>
+  <span class="pill">deps: nanoarrow + boost::describe</span><span class="pill">no Lance dependency</span>
+  <span class="pill">CPU bulk today, GPU-ready</span>
+</p>
+
+<h2 id="why">Why nanotins</h2>
+<p>Packet parsing usually means hand-written byte offsets, manual byte-swaps, and a second, totally
+separate body of code to get the parsed fields into a columnar table. nanotins collapses both into a
+single declaration. Write the struct that matches the wire; the same declaration drives parsing
+<em>and</em> the table schema. Add a protocol = add a struct + one branch. There is no schema to keep in
+sync, because the struct <em>is</em> the schema.</p>
+
+<div class="grid">
+  <div class="card"><h4>Overlay</h4><p>Cast raw bytes to a typed view with no copy and no allocation — valid in a CUDA kernel.</p></div>
+  <div class="card"><h4>Self-describing</h4><p>One <code>BOOST_DESCRIBE_STRUCT</code> line exposes the fields to compile-time reflection.</p></div>
+  <div class="card"><h4>Columnar for free</h4><p>That reflection becomes an Arrow schema + an SoA store + a nanoarrow array.</p></div>
+  <div class="card"><h4>Bulk &amp; portable</h4><p>The parse runs through a scheduler-agnostic <code>bulk_for_each</code>: CPU pool now, GPU later.</p></div>
+</div>
+
+<h2 id="describe">Describe a struct once</h2>
+<p>A wire struct is a normal C++ <code>struct</code> of nanotins field types, packed (1-aligned, no
+padding), with a single description line. Here is Ethernet II:</p>
+<pre><code><span class="k">struct</span> <span class="t">Ethernet</span> {
+    std::array&lt;std::uint8_t, <span class="n">6</span>&gt; dst;     <span class="c">// 6-byte MAC -&gt; fixed_size_binary(6)</span>
+    std::array&lt;std::uint8_t, <span class="n">6</span>&gt; src;
+    be&lt;std::uint16_t&gt; ethertype;             <span class="c">// big-endian on the wire</span>
+};
+<span class="k">BOOST_DESCRIBE_STRUCT</span>(Ethernet, (), (dst, src, ethertype))
+<span class="k">static_assert</span>(std::is_standard_layout_v&lt;Ethernet&gt; &amp;&amp; <span class="k">sizeof</span>(Ethernet) == <span class="n">14</span> &amp;&amp; <span class="k">alignof</span>(Ethernet) == <span class="n">1</span>);</code></pre>
+<p>The <code>static_assert</code> is the contract that makes <a href="#overlay">overlay</a> safe: the struct
+is exactly the wire layout. The <code>BOOST_DESCRIBE_STRUCT</code> line is what lets nanotins enumerate
+<code>(dst, src, ethertype)</code> at compile time — the basis of everything columnar below.</p>
+
+<h2 id="endian">Endianness, declared on the type: <code>be&lt;T&gt;</code> / <code>le&lt;T&gt;</code></h2>
+<p>Wire integers carry their byte order in the <em>type</em>, not in scattered swap calls. <code>be&lt;u16&gt;</code>
+stores raw big-endian bytes; reading <code>.host()</code> swaps to host order on demand. <code>le&lt;T&gt;</code>
+is the little-endian counterpart. A plain <code>std::uint32_t</code> means host order (already-native fields).</p>
+<pre><code>be&lt;std::uint16_t&gt; ethertype;     <span class="c">// 0x0800 stored as bytes 08 00</span>
+ethertype.host();                <span class="c">// -&gt; 0x0800 as a host uint16_t</span></code></pre>
+<div class="note">Because the swap lives in the field type, a struct can mix byte orders (pcapng is
+little-endian framing around big-endian network headers) and every column still reads correctly.</div>
+
+<h2 id="bits">Bitfields that straddle bytes: <code>bits&lt;Word, field…&gt;</code></h2>
+<p>Sub-byte and byte-straddling fields are declared as a <code>bits&lt;&gt;</code> over a backing word, listing
+each <code>field&lt;"name", width&gt;</code> MSB-first. nanotins byteswaps the whole word first (if it is a
+<code>be&lt;&gt;</code>), then shifts and masks — so IPv4 flags/fragment-offset over a big-endian 16-bit word
+Just Work, and each named sub-field becomes its own column.</p>
+<pre><code><span class="c">// IPv4 byte 0: version(4) | ihl(4) — one host byte, no swap</span>
+bits&lt;std::uint8_t, field&lt;<span class="s">"version"</span>, <span class="n">4</span>&gt;, field&lt;<span class="s">"ihl"</span>, <span class="n">4</span>&gt;&gt; ver_ihl;
+
+<span class="c">// flags(3) | frag_offset(13) straddling a big-endian 16-bit word</span>
+bits&lt;be&lt;std::uint16_t&gt;, field&lt;<span class="s">"flags"</span>, <span class="n">3</span>&gt;, field&lt;<span class="s">"frag_offset"</span>, <span class="n">13</span>&gt;&gt; flags_frag;</code></pre>
+<p>Read the raw backing word with <code>.word_host()</code>; in a table, <code>version</code>, <code>ihl</code>,
+<code>flags</code> and <code>frag_offset</code> appear as four separate integer columns.</p>
+
+<h2 id="overlay">Zero-copy overlay</h2>
+<p><code>overlay(bytes, offset, out)</code> bounds-checks and <code>memcpy</code>s <code>sizeof(T)</code> bytes
+into a typed struct. No heap, no STL in the hot path, <code>noexcept</code> — the same call is valid as a
+<code>__host__ __device__</code> kernel body. The byte order and bit layout are decoded lazily when you read
+a field.</p>
+<pre><code><span class="t">Ethernet</span> eth{};
+<span class="k">if</span> (overlay(packet, <span class="n">0</span>, eth)) {
+    std::uint16_t et = eth.ethertype.host();   <span class="c">// decode on read</span>
+}</code></pre>
+
+<h2 id="arrow">From struct to a nanoarrow table</h2>
+<p>The same description drives the columnar side. <code>soa&lt;T&gt;</code> is a struct-of-arrays store;
+<code>arrow_schema&lt;T&gt;()</code> emits the matching <code>ArrowSchema</code> (bitfields expanded to named
+columns, <code>be/le</code> as their host type, byte arrays as <code>fixed_size_binary</code>); and
+<code>to_arrow&lt;T&gt;()</code> fills an <code>ArrowArray</code>. That array is plain nanoarrow — hand it to any
+writer.</p>
+<pre><code>nanotins::soa&lt;<span class="t">Ethernet</span>&gt; rows;
+rows.resize(n);
+<span class="k">for</span> (std::size_t i = <span class="n">0</span>; i &lt; n; ++i) rows.store(i, decoded[i]);
+
+ArrowSchema schema{}; ArrowArray batch{}; std::string err;
+nanotins::arrow_schema&lt;<span class="t">Ethernet</span>&gt;(schema, err);   <span class="c">// dst, src, ethertype columns</span>
+nanotins::to_arrow&lt;<span class="t">Ethernet</span>&gt;(rows, batch, err);   <span class="c">// the data</span>
+<span class="c">// `batch` + `schema` are now a normal nanoarrow record batch.</span></code></pre>
+
+<div style="margin:22px 0">
+<svg viewBox="0 0 720 230" role="img" aria-label="One struct description fans out to overlay, columns, SoA, and an Arrow table">
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 Z" fill="#6cb6ff"/></marker></defs>
+  <rect x="20" y="92" width="200" height="46" rx="9" fill="#161922" stroke="#7ee787"/>
+  <text x="120" y="112" fill="#e6e9ef" font-size="13" text-anchor="middle" font-family="monospace">struct + DESCRIBE</text>
+  <text x="120" y="128" fill="#9aa3b2" font-size="11" text-anchor="middle">the single source of truth</text>
+  <g font-family="monospace" font-size="12.5" text-anchor="middle">
+    <rect x="430" y="14" width="270" height="40" rx="9" fill="#10151f" stroke="#262b38"/>
+    <text x="565" y="38" fill="#cfe3ff">overlay(bytes) → typed view</text>
+    <rect x="430" y="66" width="270" height="40" rx="9" fill="#10151f" stroke="#262b38"/>
+    <text x="565" y="90" fill="#cfe3ff">columns_of&lt;T&gt; → named columns</text>
+    <rect x="430" y="118" width="270" height="40" rx="9" fill="#10151f" stroke="#262b38"/>
+    <text x="565" y="142" fill="#cfe3ff">soa&lt;T&gt; → struct-of-arrays</text>
+    <rect x="430" y="170" width="270" height="40" rx="9" fill="#10151f" stroke="#262b38"/>
+    <text x="565" y="194" fill="#cfe3ff">to_arrow&lt;T&gt; → nanoarrow table</text>
+  </g>
+  <g stroke="#6cb6ff" fill="none" marker-end="url(#a)">
+    <path d="M220,108 C320,80 340,34 428,34"/>
+    <path d="M220,112 C320,100 350,86 428,86"/>
+    <path d="M220,120 C320,128 350,138 428,138"/>
+    <path d="M220,126 C320,150 340,190 428,190"/>
+  </g>
+</svg>
+</div>
+
+<h2 id="pipeline">The two-phase pipeline (pcap/pcapng)</h2>
+<p>Capture files are parsed in two phases — the split is what makes the heavy part parallel.</p>
+<table>
+  <tr><th>Phase</th><th>Function</th><th>Shape</th></tr>
+  <tr><td><strong>A — scan</strong></td><td><code>scan_blocks()</code> / <code>scan_window()</code></td>
+      <td>Inherently sequential boundary walk. Detects pcap vs pcapng + endianness, follows the length
+          chain, emits a flat <code>BlockRef[]</code> (offset, length, kind). <code>scan_window</code> does it
+          over a bounded window of an endless/S3 capture, carrying section state across windows.</td></tr>
+  <tr><td><strong>B — parse</strong></td><td><code>parse_epb()</code> / <code>parse_epbs_bulk()</code></td>
+      <td>Pure, per-block, order-independent. Each <code>BlockRef</code> is parsed into columns with no
+          shared state — a <code>for</code> loop today, a GPU kernel tomorrow (one thread per block).</td></tr>
+</table>
+<pre><code>std::vector&lt;<span class="t">BlockRef</span>&gt; refs; std::string err;
+scan_blocks(file_bytes, refs, err);          <span class="c">// Phase A: serial boundary walk</span>
+<span class="c">// Phase B: each ref parses independently into SoA columns (see Bulk below).</span></code></pre>
+
+<h2 id="walk">The L2/L3/L4 walk</h2>
+<p>Above the capture layer, <code>walk_packet()</code> is the one traversal that decodes a frame:
+Ethernet → VLAN* → IPv4/IPv6 → TCP/UDP. It is visited by callbacks, so the <em>same</em> walk powers the
+serial path, the bulk <em>count</em> pass, and the bulk <em>scatter</em> pass — they can never disagree.</p>
+<pre><code>walk_packet(link_type, pkt,
+    [&](<span class="k">const</span> <span class="t">Ethernet</span>&amp; e){ ... },   [&](<span class="k">const</span> <span class="t">VlanTag</span>&amp; v){ ... },
+    [&](<span class="k">const</span> <span class="t">Ipv4</span>&amp; ip){ ... },     [&](<span class="k">const</span> <span class="t">Ipv6</span>&amp; ip){ ... },
+    [&](<span class="k">const</span> <span class="t">Tcp</span>&amp; t){ ... },        [&](<span class="k">const</span> <span class="t">Udp</span>&amp; u){ ... });</code></pre>
+<div class="note warn"><strong>Fragmentation:</strong> the L4 header exists only in the first IPv4 fragment,
+so <code>walk_packet</code> emits TCP/UDP only when <code>frag_offset == 0</code>. Continuation fragments
+still produce an <code>ipv4</code> row (every fragment carries <code>protocol</code>); they just have no L4
+row. This matches Wireshark with reassembly off — see <a href="#validate">Validate vs tshark</a>.</div>
+
+<h2 id="bulk">Bulk &amp; GPU-ready</h2>
+<p>The parallel parse is a scheduler-agnostic <code>bulk_for_each(sched, num_tasks, n, kernel)</code> — a
+partitioned <code>stdexec</code> <code>ex::bulk</code>. Today the scheduler is an
+<code>exec::static_thread_pool</code>; on a CUDA host it becomes an <code>nvexec::stream_context</code> and
+the <em>same</em> kernel runs on the GPU. The kernel must be device-safe: POD captures, no allocation — which
+nanotins' overlay/store already are.</p>
+<p>Decoding a frame emits a <em>variable</em> number of PDUs (0..N VLAN tags, maybe one IPv4, maybe one
+UDP), so the bulk path uses the canonical GPU pattern for variable output — <strong>count → prefix-sum →
+scatter</strong>:</p>
+<pre><code><span class="c">// pass 1 (bulk): how many of each PDU does each packet emit?</span>
+bulk_for_each(sched, tasks, n, [=](std::size_t i){ counts[i] = count_packet(link[i], pkt(i)); });
+<span class="c">// scan: exclusive prefix-sum per PDU type -&gt; exact per-packet write offsets + totals</span>
+<span class="c">// resize each output column to its total (no over-allocation, no push_back)</span>
+<span class="c">// pass 2 (bulk): write each PDU to its own prefix-summed slot (disjoint, device-safe)</span>
+bulk_for_each(sched, tasks, n, [=](std::size_t i){ scatter_packet(pid(i), link[i], pkt(i), base[i], sink); });</code></pre>
+<div class="note good">Because the scatter writes are disjoint and ordered by packet index, the output
+tables are <strong>byte-identical</strong> to the serial decode — the bulk path is verified against the
+serial one on every test capture. On a GPU the scan becomes a <code>thrust::exclusive_scan</code>; the two
+kernels are unchanged.</div>
+
+<h2 id="gptp">Worked example: adding gPTP</h2>
+<p>Here is the entire recipe for teaching nanotins a new protocol — generalized Precision Time Protocol
+(IEEE&nbsp;802.1AS / PTPv2), which rides directly on Ethernet (EtherType <code>0x88F7</code>, no IP layer).
+The full module is <code>nanotins/include/nanotins/gptp.hpp</code> with a test in
+<code>nanotins/tests/test_gptp.cpp</code>.</p>
+
+<h3>Step 1 — describe the wire header</h3>
+<p>One packed struct of <code>be&lt;&gt;</code>/<code>bits&lt;&gt;</code>/array fields. <code>reserved*</code> members
+keep the byte layout exact but are left out of the description, so they never become columns —
+<em>describe the fields you want, no more.</em></p>
+<pre><code><span class="k">struct</span> <span class="t">Gptp</span> {                                              <span class="c">// 34-byte common header</span>
+    bits&lt;std::uint8_t, field&lt;<span class="s">"transport_specific"</span>,<span class="n">4</span>&gt;, field&lt;<span class="s">"message_type"</span>,<span class="n">4</span>&gt;&gt; ts_msgtype;
+    bits&lt;std::uint8_t, field&lt;<span class="s">"reserved0"</span>,<span class="n">4</span>&gt;, field&lt;<span class="s">"version_ptp"</span>,<span class="n">4</span>&gt;&gt; rsv_version;
+    be&lt;std::uint16_t&gt; message_length;
+    std::uint8_t domain_number, reserved1;
+    be&lt;std::uint16_t&gt; flags;
+    be&lt;std::uint64_t&gt; correction_field;
+    be&lt;std::uint32_t&gt; reserved2;
+    std::array&lt;std::uint8_t,<span class="n">8</span>&gt; clock_identity;
+    be&lt;std::uint16_t&gt; source_port_number, sequence_id;
+    std::uint8_t control_field; std::int8_t log_message_interval;
+};
+<span class="k">BOOST_DESCRIBE_STRUCT</span>(Gptp, (), (ts_msgtype, rsv_version, message_length, domain_number,
+                            flags, correction_field, clock_identity, source_port_number,
+                            sequence_id, control_field, log_message_interval))
+<span class="k">static_assert</span>(<span class="k">sizeof</span>(Gptp) == <span class="n">34</span> &amp;&amp; <span class="k">alignof</span>(Gptp) == <span class="n">1</span>);</code></pre>
+
+<h3>Step 2 — one decode branch</h3>
+<p>gPTP's discriminator is the (post-VLAN) EtherType, so its branch is a one-liner you drop into a walk
+right where the IPv4/IPv6 branches live:</p>
+<pre><code><span class="k">inline bool</span> <span class="t">decode_gptp</span>(std::uint16_t ethertype, Bytes bytes, <span class="t">Gptp</span>&amp; out) <span class="k">noexcept</span> {
+    <span class="k">if</span> (ethertype != kEtherTypePtp) <span class="k">return false</span>;   <span class="c">// 0x88F7</span>
+    <span class="k">return</span> overlay(bytes, <span class="n">0</span>, out);
+}</code></pre>
+
+<h3>Step 3 — you already have a table</h3>
+<p>No extra work. The struct flows through the exact same machinery as the built-in protocols, so an
+SoA + nanoarrow schema come for free — bitfields expand to <code>message_type</code>, <code>version_ptp</code>,
+… columns; <code>clock_identity</code> is <code>fixed_size_binary(8)</code>:</p>
+<pre><code>nanotins::soa&lt;<span class="t">Gptp</span>&gt; rows;  rows.resize(n);  <span class="c">/* store decoded ... */</span>
+ArrowSchema schema{}; ArrowArray batch{}; std::string err;
+nanotins::arrow_schema&lt;<span class="t">Gptp</span>&gt;(schema, err);
+nanotins::to_arrow&lt;<span class="t">Gptp</span>&gt;(rows, batch, err);     <span class="c">// → a gPTP table, ready for any writer</span></code></pre>
+<div class="note good">That is the whole extension: <strong>one struct, one branch, zero schema code.</strong>
+The test overlays a real Sync message, checks every field, then asserts the generated Arrow columns —
+proving the killer feature end-to-end for a protocol the core never knew about.</div>
+
+<h2 id="validate">Validate against tshark</h2>
+<p>nanotins is paired with a dumper (<code>nlance2table</code>) that prints any table as CSV/NDJSON keyed by
+<code>packet_id</code>. That makes it trivial to diff a decoded table, field-for-field, against an
+authoritative dissector:</p>
+<pre><code>pcapng2lance --decode-l2l3 capture.pcapng out.lance
+nlance2table -f ndjson out_ipv4.lance        <span class="c"># our rows, hex src/dst</span>
+tshark -r capture.pcapng -o ip.defragment:FALSE \
+       -T fields -e frame.number -e ip.src -e ip.dst -e udp.dstport</code></pre>
+<div class="note">Use <code>-o ip.defragment:FALSE</code> so tshark dissects the L4 header on the
+<em>first</em> fragment (where its bytes physically are) — matching nanotins' fragmentation gate. With
+reassembly on, tshark attributes UDP to the <em>last</em> fragment and the rows won't line up. The repo's
+<code>nlance2table_tshark*</code> tests automate exactly this comparison.</div>
+
+<h2 id="layout">Library layout &amp; CMake</h2>
+<p>nanotins depends only on nanoarrow + header-only boost (and stdexec for the bulk path). It knows nothing
+about Lance — it produces nanoarrow tables and stops there.</p>
+<table>
+  <tr><th>Target</th><th>Kind</th><th>What</th></tr>
+  <tr><td><code>nanotins::core</code></td><td>INTERFACE</td>
+      <td>Reflection/overlay/SoA/arrow + <code>be/le</code>, <code>bits</code>, <code>bulk_for_each</code>. The reusable nucleus.</td></tr>
+  <tr><td><code>nanotins::pcap</code></td><td>STATIC</td>
+      <td>The pcap/pcapng block scanner (<code>scan_blocks</code>/<code>scan_window</code>) + per-block parse.</td></tr>
+  <tr><td><code>nanotins::protocols</code></td><td>INTERFACE</td>
+      <td>L2/L3/L4 wire structs + the serial/bulk decode walk + the gPTP example.</td></tr>
+  <tr><td><code>nanotins</code></td><td>INTERFACE</td>
+      <td>Umbrella — link this for the whole stack (core + pcap + protocols).</td></tr>
+</table>
+<pre><code><span class="c"># In-tree:</span>
+add_subdirectory(nanotins)
+target_link_libraries(my_app PRIVATE nanotins)        <span class="c"># whole stack</span>
+target_link_libraries(my_tool PRIVATE nanotins::core) <span class="c"># just the reflection core</span></code></pre>
+
+<footer>
+  nanotins — part of the nanolance project. Sources: <code>nanotins/include/nanotins/</code>.
+  The pcapng→Lance converter in <code>examples/pcapng2lance/</code> is the reference consumer; its test
+  suite (incl. the tshark cross-checks) is the library's golden.
+</footer>
+
+</main>
+</div>
+</body>
+</html>
