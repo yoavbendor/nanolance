@@ -14,8 +14,8 @@
 // gPTP rides directly on L2 (Ethernet, optionally VLAN-tagged) — there is no IP/UDP layer — so the
 // discriminator is the (post-VLAN) EtherType, not an ip_proto. See docs/nanotins.html for the narrative.
 
-#include "nanotins/bits.hpp"
-#include "nanotins/endian.hpp"
+#include "soatins/bits.hpp"
+#include "soatins/endian.hpp"
 #include "nanotins/protocols.hpp"
 
 #include <boost/describe.hpp>

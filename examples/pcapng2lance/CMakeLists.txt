@@ -1,14 +1,15 @@
-# pcapng -> Lance example: a thin consumer of the standalone `nanotins` library (top-level ../../nanotins,
-# added by the root CMakeLists before this dir). All pcap/pcapng + L2/L3/L4 parsing and the
-# be<>/bits<>/SoA/arrow reflection live in nanotins; this directory owns only the Lance-writing glue —
-# the CLI driver, streaming windows, the per-PDU Lance table writer, and the staged enrich pipeline.
+# pcapng -> Lance example: a thin consumer of the standalone parsing stack (top-level ../../soatins,
+# ../../nanotins, ../../gputins, added by the root CMakeLists before this dir). The be<>/bits<>/SoA/arrow
+# reflection lives in soatins; pcap/pcapng + L2/L3/L4 parsing in nanotins; the CUDA executors in gputins.
+# This directory owns only the Lance-writing glue — the CLI driver, streaming windows, the per-PDU Lance
+# table writer, the staged enrich pipeline, and the (optional) CUDA build wiring for the GPU bridge TU.
 
 # The pcapng -> Lance converter.
 add_executable(pcapng2lance src/pcapng2lance_main.cpp)
 target_sources(pcapng2lance PRIVATE src/phase_b_runner.cpp)
 target_sources(pcapng2lance PRIVATE src/pcapng2lance_gpu_bridge.cpp)
 target_include_directories(pcapng2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(pcapng2lance PRIVATE nanotins nanolance)
+target_link_libraries(pcapng2lance PRIVATE nanotins gputins nanolance)
 
 # --- optional GPU (nvexec) bulk path -------------------------------------------------------------
 # OFF by default; the CPU build needs none of this (all GPU code is behind #ifdef NANOTINS_ENABLE_CUDA).

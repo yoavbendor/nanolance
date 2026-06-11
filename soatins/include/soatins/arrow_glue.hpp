@@ -4,7 +4,7 @@
 // (a Lance record batch). Maps the backend-neutral `arrow_kind` to nanoarrow types and appends each
 // SoA column. The reflection core headers stay nanoarrow-free; only this glue pulls it in.
 
-#include "nanotins/reflect.hpp"
+#include "soatins/reflect.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -13,7 +13,7 @@
 #include <string>
 #include <type_traits>
 
-namespace nanotins {
+namespace soatins {
 
 inline ArrowType map_arrow_type(arrow_kind k) {
     switch (k) {
@@ -162,4 +162,4 @@ bool to_arrow(const soa<T>& s, ArrowArray& out, std::string& error) {
     return true;
 }
 
-}  // namespace nanotins
+}  // namespace soatins

@@ -12,7 +12,7 @@
 // any toolchain-specific syntax, and VERIFY the output is byte-identical to decode_window (CPU).
 
 #include "nanotins/bulk.hpp"
-#include "nanotins/gpu.hpp"
+#include "gputins/gpu.hpp"
 #include "nanotins/protocol_decode.hpp"
 
 #ifdef NANOTINS_ENABLE_CUDA

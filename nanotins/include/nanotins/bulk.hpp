@@ -8,7 +8,7 @@
 // already are. Mirrors stdexec_gpu_experiment's run_bulk_cpu/run_bulk_gpu, where the scheduler is the
 // only difference.
 
-#include "nanotins/portability.hpp"
+#include "soatins/portability.hpp"
 
 #include <cstddef>
 

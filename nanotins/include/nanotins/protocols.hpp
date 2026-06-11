@@ -8,9 +8,9 @@
 // Bitfields straddling bytes (IPv4 flags/frag over a BE u16, IPv6 version/tc/flow over a BE u32) are
 // handled by byteswapping the whole word first, then shift+mask — see nanotins/bits.hpp.
 
-#include "nanotins/bits.hpp"
-#include "nanotins/endian.hpp"
-#include "nanotins/fixed_string.hpp"
+#include "soatins/bits.hpp"
+#include "soatins/endian.hpp"
+#include "soatins/fixed_string.hpp"
 
 #include <boost/describe.hpp>
 
@@ -23,9 +23,9 @@
 
 namespace protocols {
 
-using nanotins::be;
-using nanotins::bits;
-using nanotins::field;
+using soatins::be;
+using soatins::bits;
+using soatins::field;
 // POD byte span (ptr + size) that stays device-safe under clang-cuda/libstdc++ (std::span in this toolchain
 // pulls host-only assertion hooks in device code paths).
 struct Bytes {

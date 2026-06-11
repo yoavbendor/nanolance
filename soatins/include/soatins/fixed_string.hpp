@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 
-namespace nanotins {
+namespace soatins {
 
 // C++20 class-type NTTP carrying a compile-time field name (the `field<"vid", 12>` parameter).
 // `N` includes the trailing NUL of the source literal; `size()` is the visible length.
@@ -20,4 +20,4 @@ struct fixed_string {
 template <std::size_t N>
 fixed_string(const char (&)[N]) -> fixed_string<N>;
 
-}  // namespace nanotins
+}  // namespace soatins

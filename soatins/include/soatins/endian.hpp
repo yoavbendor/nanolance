@@ -5,13 +5,13 @@
 // overlay directly on packet memory. `host()` assembles a host-order value (the only place a swap
 // happens). Rolled by hand (not boost::endian) so the conversion is `__host__ __device__`.
 
-#include "nanotins/portability.hpp"
+#include "soatins/portability.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
-namespace nanotins {
+namespace soatins {
 
 template <class T>
 struct be {
@@ -73,4 +73,4 @@ NANOTINS_HD constexpr auto host_value(const F& f) {
     }
 }
 
-}  // namespace nanotins
+}  // namespace soatins

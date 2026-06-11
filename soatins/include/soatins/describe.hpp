@@ -12,7 +12,7 @@
 #include <boost/mp11/algorithm.hpp>
 #include <boost/mp11/list.hpp>
 
-namespace nanotins {
+namespace soatins {
 
 // describe_members yields boost::describe::detail::list<...>, so match any L<D...> rather than
 // hardcoding mp_list.
@@ -45,4 +45,4 @@ M nt_pointee(M C::*);
 template <auto MP>
 using nt_pointee_t = decltype(nt_pointee(MP));
 
-}  // namespace nanotins
+}  // namespace soatins

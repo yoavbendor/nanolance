@@ -93,7 +93,7 @@ is real but per-field and implicit** — it happens inside `store` when each fie
 type. No cast site, and mixed structs (ints + addresses) are handled correctly.
 
 > Optional struct-level alternative (your "cast before store" mental model): a describe-driven
-> `nanotins::to_host(r)` that blanket-byteswaps every multi-byte *arithmetic* member (byte arrays are
+> `soatins::to_host(r)` that blanket-byteswaps every multi-byte *arithmetic* member (byte arrays are
 > skipped because they aren't arithmetic), enabled by a `wire_be` tag on the struct so `store` can
 > auto-apply. It's less code per struct but **blanket** — it can't tell a counter from an address that
 > happens to be a `uint32_t`. Prefer per-field `be<T>`; offer `to_host` only for all-scalar-BE structs.
@@ -124,7 +124,7 @@ template<class U> struct column_traits<le<U>> { /* like be<U> but le::host() */ 
 template<std::size_t N> struct column_traits<std::array<std::uint8_t,N>> { // MAC/IPv6/etc.
     static constexpr const char* arrow = fixed_size_binary_format_v<N>;   // Arrow w:N
     static constexpr bool variable = false; /* store = memcpy N bytes, no swap */ };
-template<> struct column_traits<nanotins::bytes> {                        // variable payload/string
+template<> struct column_traits<soatins::bytes> {                        // variable payload/string
     static constexpr const char* arrow = "z"; static constexpr bool variable = true; };
 ```
 
@@ -256,7 +256,7 @@ correct for Arrow. Wire byte-order is fully consumed at parse/store time and nev
   all scalar *because the payload is stored external* (`payload_uri`/`off`/`size`), so the GPU hot
   path needs no variable-width handling. The external-reference design and the GPU design reinforce
   each other.
-- **Variable-width fields** (a string `comment`, or extracted PDU bytes via `nanotins::bytes`) need
+- **Variable-width fields** (a string `comment`, or extracted PDU bytes via `soatins::bytes`) need
   offsets = prefix-sum of per-row lengths → a two-phase bulk (lengths → scan → write at `offset[i]`).
   Keep these off the all-scalar fast path; route them through the length→scan→write path when needed.
 
@@ -270,7 +270,7 @@ entry:
 ```cpp
 struct UdpHdr { be<std::uint16_t> src, dst, len, csum; };
 BOOST_DESCRIBE_STRUCT(UdpHdr, (), (src, dst, len, csum))
-register_parser(/*ip_proto*/17, [](nanotins::bytes p, UdpHdr& o){ o = overlay<UdpHdr>(p); return true; });
+register_parser(/*ip_proto*/17, [](soatins::bytes p, UdpHdr& o){ o = overlay<UdpHdr>(p); return true; });
 ```
 
 From that you automatically get a `soa<UdpHdr>`, an Arrow schema, and a Lance table — endianness

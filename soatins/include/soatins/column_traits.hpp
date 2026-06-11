@@ -4,15 +4,15 @@
 // element type, a backend-neutral `arrow_kind` tag, and a host-order extractor. Kept free of
 // nanoarrow so the reflection core stays device-usable; the host glue maps `arrow_kind` -> nanoarrow.
 
-#include "nanotins/bits.hpp"
-#include "nanotins/endian.hpp"
-#include "nanotins/portability.hpp"
+#include "soatins/bits.hpp"
+#include "soatins/endian.hpp"
+#include "soatins/portability.hpp"
 
 #include <array>
 #include <cstdint>
 #include <type_traits>
 
-namespace nanotins {
+namespace soatins {
 
 enum class arrow_kind {
     i8, u8, i16, u16, i32, u32, i64, u64, f32, f64, boolean, string, large_binary, fixed_binary
@@ -88,4 +88,4 @@ struct is_bits<bits<Word, Fields...>> : std::true_type {};
 template <class F>
 inline constexpr bool is_bits_v = is_bits<F>::value;
 
-}  // namespace nanotins
+}  // namespace soatins

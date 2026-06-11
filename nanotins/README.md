@@ -9,10 +9,20 @@ line) and get, for free:
 - a flattened **column list** (`columns_of<T>`, bitfields expanded to named columns),
 - an **SoA** store (`soa<T>`) + a **nanoarrow** schema/array (`arrow_schema<T>()` / `to_arrow<T>()`).
 
-It depends only on **nanoarrow + header-only boost** (plus **stdexec** for the scheduler-agnostic bulk
-path), and is itself **header-only** — the Phase-B parsers are device-callable (`NANOTINS_HD`), so they
-live inline in the headers where device code can see them. It knows nothing about Lance — it produces
-nanoarrow tables that any backend (Lance, Parquet, Arrow IPC) can persist.
+That describe→SoA→Arrow nucleus is its own library now — **[`soatins`](../soatins)** (namespace `soatins`,
+include prefix `soatins/`) — so the reflection trick can be vendored on its own (it depends only on
+**nanoarrow + header-only boost**, and knows nothing about packets). `nanotins` builds on it, adding the
+pcap/pcapng scanner, the L2/L3/L4 wire structs + layered decode, the gPTP extension, and the
+scheduler-agnostic `bulk_for_each` (over **stdexec**). The CUDA (nvexec) executors are split off again into
+**[`gputins`](../gputins)** so the GPU dependency is isolated. All three are **header-only** — the Phase-B
+parsers are device-callable (`NANOTINS_HD`), so they live inline in the headers where device code can see
+them. None of them know anything about Lance — they produce nanoarrow tables that any backend (Lance,
+Parquet, Arrow IPC) can persist.
+
+```
+soatins  →  nanotins  →  gputins        (each depends only on the one to its left)
+reflect     pcap + protocols + bulk      CUDA/nvexec executors (inert without NANOTINS_ENABLE_CUDA)
+```
 
 ## Read this first
 
@@ -23,26 +33,30 @@ new protocol (gPTP / IEEE 802.1AS)**. Open it in a browser.
 ## Layout
 
 ```
-include/nanotins/   core: reflect, bits, endian, fixed_string, column_traits, arrow_glue, bulk
-                    pcap: pcap_blocks.hpp (scan_blocks / scan_window / parse_epb — header-only)
-                    protocols: protocols.hpp, protocol_decode{,_bulk}.hpp, gptp.hpp (the extension example)
-tests/              reflect / protocols / pcap_blocks / bulk / gptp unit tests
-docs/nanotins.html  the guide
+../soatins/include/soatins/  reflect, bits, endian, fixed_string, column_traits, describe, arrow_glue
+include/nanotins/            bulk: bulk.hpp (scheduler-agnostic bulk_for_each / serial_for_each)
+                             pcap: pcap_blocks.hpp (scan_blocks / scan_window / parse_epb — header-only)
+                             protocols: protocols.hpp, protocol_decode{,_bulk}.hpp, gptp.hpp (extension)
+../gputins/include/gputins/  gpu.hpp, protocol_decode_gpu.hpp (CUDA/nvexec, behind NANOTINS_ENABLE_CUDA)
+tests/                       protocols / pcap_blocks / bulk / gptp  (reflect / soa_scatter live in soatins)
+docs/nanotins.html           the guide
 ```
 
 ## CMake targets
 
 | Target | Kind | What |
 |---|---|---|
-| `nanotins::core` | INTERFACE | reflection / overlay / SoA / arrow + endian / bits / bulk |
+| `soatins::core` | INTERFACE | reflection / overlay / SoA / arrow + endian / bits (the reusable nucleus) |
 | `nanotins::pcap` | INTERFACE | pcap/pcapng block scanner + per-block parse (header-only) |
-| `nanotins::protocols` | INTERFACE | L2/L3/L4 wire structs + serial/bulk decode + gPTP |
-| `nanotins` | INTERFACE | umbrella (core + pcap + protocols) |
+| `nanotins::protocols` | INTERFACE | L2/L3/L4 wire structs + serial/bulk decode + gPTP + bulk_for_each |
+| `nanotins` | INTERFACE | umbrella (pcap + protocols, pulls soatins) |
+| `gputins` | INTERFACE | CUDA (nvexec) executors; pulls nanotins; inert without NANOTINS_ENABLE_CUDA |
 
 ```cmake
-add_subdirectory(nanotins)
-target_link_libraries(my_app  PRIVATE nanotins)        # whole stack
-target_link_libraries(my_tool PRIVATE nanotins::core)  # just the reflection core
+add_subdirectory(soatins)                              # the reflection nucleus, on its own…
+target_link_libraries(my_tool PRIVATE soatins::core)   #   …for any describe→SoA→Arrow use
+add_subdirectory(nanotins)                             # …or the whole packet stack
+target_link_libraries(my_app  PRIVATE nanotins)
 ```
 
 Consumed in-tree by [`examples/pcapng2lance`](../examples/pcapng2lance) (the reference pcapng→Lance

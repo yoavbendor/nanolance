@@ -7,7 +7,7 @@
 #include "mem_budget.hpp"
 #include "packet_row.hpp"
 #include "phase_b_runner.hpp"
-#include "nanotins/arrow_glue.hpp"
+#include "soatins/arrow_glue.hpp"
 #include "nanotins/pcap_blocks.hpp"
 #include "pdu_table_writer.hpp"
 #include "nanotins/protocol_decode.hpp"
@@ -300,7 +300,7 @@ int run_enrich_stage(const fs::path& datadir, const Args& a) {
 // Assembled output for one window's packets: the L1 scalar columns (auto-built by soa<PacketRow> — no
 // hand-rolled columns) plus the few per-packet arrays the writer + L2/L3 decoder consume as raw pointers.
 struct PacketBatch {
-    nanotins::soa<PacketRow> rows;          // scalar columns, columnarized from PacketRow by reflection
+    soatins::soa<PacketRow> rows;          // scalar columns, columnarized from PacketRow by reflection
     std::vector<std::uint16_t> link_type;   // per packet, for L2/L3 decode dispatch
     std::vector<std::uint64_t> poff;        // payload file offset, for the blob ref + the decode span
     std::vector<std::uint32_t> psize;       // payload size (== caplen), likewise
@@ -384,7 +384,7 @@ public:
     }
 
 private:
-    static constexpr std::size_t kScalarCols = nanotins::column_count<PacketRow>;
+    static constexpr std::size_t kScalarCols = soatins::column_count<PacketRow>;
 
     // Phase-B execution policy: parallel ex::bulk, or an in-thread loop under --sequential.
     void phase_b(std::size_t num_tasks, std::size_t n, const std::function<void(std::size_t)>& k) {
@@ -396,7 +396,7 @@ private:
         if (ArrowSchemaSetTypeStruct(&schema_, static_cast<int64_t>(kScalarCols + 1)) != NANOARROW_OK) {
             return (err = "alloc combined schema", false);
         }
-        if (!nanotins::nt_fill_struct_schema<PacketRow>(&schema_, 0, err)) {
+        if (!soatins::nt_fill_struct_schema<PacketRow>(&schema_, 0, err)) {
             return (err = "scalar schema: " + err, false);
         }
         ArrowSchema blob{};
@@ -556,7 +556,7 @@ private:
         }
         ArrowArray* payload = batch.children[kScalarCols];
         for (std::size_t i = 0; i < n; ++i) {
-            if (!nanotins::nt_append_scalar_row<PacketRow>(&batch, 0, b.rows, i)) {
+            if (!soatins::nt_append_scalar_row<PacketRow>(&batch, 0, b.rows, i)) {
                 return fail("append scalar columns");
             }
             ArrowStringView uri{payload_uri_.data(), static_cast<int64_t>(payload_uri_.size())};

@@ -13,7 +13,7 @@
 // The scheduler-agnostic `bulk_for_each` runs `parse_epb` per `BlockRef`; on a CUDA host the same call
 // runs on the GPU. Keep Phase B pure.
 
-#include "nanotins/portability.hpp"
+#include "soatins/portability.hpp"
 
 #include <cstddef>
 #include <cstdint>

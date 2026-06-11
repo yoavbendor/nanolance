@@ -6,8 +6,8 @@
 #ifdef NANOTINS_ENABLE_CUDA
 
 #include "nanotins/bulk.hpp"
-#include "nanotins/gpu.hpp"
-#include "nanotins/protocol_decode_gpu.hpp"
+#include "gputins/gpu.hpp"
+#include "gputins/protocol_decode_gpu.hpp"
 
 namespace pcapng2lance::gpu_bridge {
 

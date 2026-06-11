@@ -3,7 +3,7 @@
 // previously only handled u8/u32/u64/i64). Covers signed/unsigned ints 8..64, float, double, bool, and
 // fixed-size-binary. The blob column is what makes this exercise the previously-broken path.
 
-#include "nanotins/arrow_glue.hpp"
+#include "soatins/arrow_glue.hpp"
 
 #include "nanolance/blob_builder.hpp"
 #include "nanolance/lance_table_reader.hpp"
@@ -67,19 +67,19 @@ int main() {
                  2.5, {1, 2, 3, 4, 5, 6}},
         AllTypes{7, 8, 9, 10, 11, 12, 13, 14, -3.25f, 9.75, {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}}};
 
-    nanotins::soa<AllTypes> s;
+    soatins::soa<AllTypes> s;
     s.resize(rows.size());
     for (std::size_t i = 0; i < rows.size(); ++i) {
         s.store(i, rows[i]);
     }
 
     // Combined batch: AllTypes scalar columns + a lance.blob.v2 payload_ref (forces per-row decode).
-    constexpr std::size_t kScalarCols = nanotins::column_count<AllTypes>;
+    constexpr std::size_t kScalarCols = soatins::column_count<AllTypes>;
     std::string err;
     ArrowSchema schema{};
     ArrowSchemaInit(&schema);
     require(ArrowSchemaSetTypeStruct(&schema, static_cast<int64_t>(kScalarCols + 1)) == NANOARROW_OK, "alloc schema");
-    require(nanotins::nt_fill_struct_schema<AllTypes>(&schema, 0, err), err.c_str());
+    require(soatins::nt_fill_struct_schema<AllTypes>(&schema, 0, err), err.c_str());
     {
         ArrowSchema blob{};
         require(nano_lance::build_blob_v2_payload_schema(blob, err), err.c_str());
@@ -94,7 +94,7 @@ int main() {
     require(ArrowArrayStartAppending(&batch) == NANOARROW_OK, "start appending");
     ArrowArray* payload = batch.children[kScalarCols];
     for (std::size_t i = 0; i < rows.size(); ++i) {
-        require(nanotins::nt_append_scalar_row<AllTypes>(&batch, 0, s, i), "append scalars");
+        require(soatins::nt_append_scalar_row<AllTypes>(&batch, 0, s, i), "append scalars");
         const std::string uri = "file:///dev/null";
         ArrowStringView uri_view{uri.data(), static_cast<int64_t>(uri.size())};
         require(ArrowArrayAppendNull(payload->children[0], 1) == NANOARROW_OK, "blob data");

@@ -153,13 +153,13 @@ a field.</p>
 columns, <code>be/le</code> as their host type, byte arrays as <code>fixed_size_binary</code>); and
 <code>to_arrow&lt;T&gt;()</code> fills an <code>ArrowArray</code>. That array is plain nanoarrow — hand it to any
 writer.</p>
-<pre><code>nanotins::soa&lt;<span class="t">Ethernet</span>&gt; rows;
+<pre><code>soatins::soa&lt;<span class="t">Ethernet</span>&gt; rows;
 rows.resize(n);
 <span class="k">for</span> (std::size_t i = <span class="n">0</span>; i &lt; n; ++i) rows.store(i, decoded[i]);
 
 ArrowSchema schema{}; ArrowArray batch{}; std::string err;
-nanotins::arrow_schema&lt;<span class="t">Ethernet</span>&gt;(schema, err);   <span class="c">// dst, src, ethertype columns</span>
-nanotins::to_arrow&lt;<span class="t">Ethernet</span>&gt;(rows, batch, err);   <span class="c">// the data</span>
+soatins::arrow_schema&lt;<span class="t">Ethernet</span>&gt;(schema, err);   <span class="c">// dst, src, ethertype columns</span>
+soatins::to_arrow&lt;<span class="t">Ethernet</span>&gt;(rows, batch, err);   <span class="c">// the data</span>
 <span class="c">// `batch` + `schema` are now a normal nanoarrow record batch.</span></code></pre>
 
 <div style="margin:22px 0">
@@ -276,10 +276,10 @@ right where the IPv4/IPv6 branches live:</p>
 <p>No extra work. The struct flows through the exact same machinery as the built-in protocols, so an
 SoA + nanoarrow schema come for free — bitfields expand to <code>message_type</code>, <code>version_ptp</code>,
 … columns; <code>clock_identity</code> is <code>fixed_size_binary(8)</code>:</p>
-<pre><code>nanotins::soa&lt;<span class="t">Gptp</span>&gt; rows;  rows.resize(n);  <span class="c">/* store decoded ... */</span>
+<pre><code>soatins::soa&lt;<span class="t">Gptp</span>&gt; rows;  rows.resize(n);  <span class="c">/* store decoded ... */</span>
 ArrowSchema schema{}; ArrowArray batch{}; std::string err;
-nanotins::arrow_schema&lt;<span class="t">Gptp</span>&gt;(schema, err);
-nanotins::to_arrow&lt;<span class="t">Gptp</span>&gt;(rows, batch, err);     <span class="c">// → a gPTP table, ready for any writer</span></code></pre>
+soatins::arrow_schema&lt;<span class="t">Gptp</span>&gt;(schema, err);
+soatins::to_arrow&lt;<span class="t">Gptp</span>&gt;(rows, batch, err);     <span class="c">// → a gPTP table, ready for any writer</span></code></pre>
 <div class="note good">That is the whole extension: <strong>one struct, one branch, zero schema code.</strong>
 The test overlays a real Sync message, checks every field, then asserts the generated Arrow columns —
 proving the killer feature end-to-end for a protocol the core never knew about.</div>
@@ -302,12 +302,12 @@ reassembly on, tshark attributes UDP to the <em>last</em> fragment and the rows 
 about Lance — it produces nanoarrow tables and stops there.</p>
 <table>
   <tr><th>Target</th><th>Kind</th><th>What</th></tr>
-  <tr><td><code>nanotins::core</code></td><td>INTERFACE</td>
+  <tr><td><code>soatins::core</code></td><td>INTERFACE</td>
       <td>Reflection/overlay/SoA/arrow + <code>be/le</code>, <code>bits</code>, <code>bulk_for_each</code>. The reusable nucleus.</td></tr>
-  <tr><td><code>nanotins::pcap</code></td><td>INTERFACE</td>
+  <tr><td><code>soatins::pcap</code></td><td>INTERFACE</td>
       <td>The pcap/pcapng block scanner (<code>scan_blocks</code>/<code>scan_window</code>) + per-block parse —
           header-only; the Phase-B parsers are device-callable, so they are inline in the header.</td></tr>
-  <tr><td><code>nanotins::protocols</code></td><td>INTERFACE</td>
+  <tr><td><code>soatins::protocols</code></td><td>INTERFACE</td>
       <td>L2/L3/L4 wire structs + the serial/bulk decode walk + the gPTP example.</td></tr>
   <tr><td><code>nanotins</code></td><td>INTERFACE</td>
       <td>Umbrella — link this for the whole stack (core + pcap + protocols).</td></tr>
@@ -315,7 +315,7 @@ about Lance — it produces nanoarrow tables and stops there.</p>
 <pre><code><span class="c"># In-tree:</span>
 add_subdirectory(nanotins)
 target_link_libraries(my_app PRIVATE nanotins)        <span class="c"># whole stack</span>
-target_link_libraries(my_tool PRIVATE nanotins::core) <span class="c"># just the reflection core</span></code></pre>
+target_link_libraries(my_tool PRIVATE soatins::core) <span class="c"># just the reflection core</span></code></pre>
 
 <footer>
   nanotins — part of the nanolance project. Sources: <code>nanotins/include/nanotins/</code>.
