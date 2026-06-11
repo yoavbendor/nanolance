@@ -304,8 +304,9 @@ about Lance — it produces nanoarrow tables and stops there.</p>
   <tr><th>Target</th><th>Kind</th><th>What</th></tr>
   <tr><td><code>nanotins::core</code></td><td>INTERFACE</td>
       <td>Reflection/overlay/SoA/arrow + <code>be/le</code>, <code>bits</code>, <code>bulk_for_each</code>. The reusable nucleus.</td></tr>
-  <tr><td><code>nanotins::pcap</code></td><td>STATIC</td>
-      <td>The pcap/pcapng block scanner (<code>scan_blocks</code>/<code>scan_window</code>) + per-block parse.</td></tr>
+  <tr><td><code>nanotins::pcap</code></td><td>INTERFACE</td>
+      <td>The pcap/pcapng block scanner (<code>scan_blocks</code>/<code>scan_window</code>) + per-block parse —
+          header-only; the Phase-B parsers are device-callable, so they are inline in the header.</td></tr>
   <tr><td><code>nanotins::protocols</code></td><td>INTERFACE</td>
       <td>L2/L3/L4 wire structs + the serial/bulk decode walk + the gPTP example.</td></tr>
   <tr><td><code>nanotins</code></td><td>INTERFACE</td>

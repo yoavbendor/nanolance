@@ -10,8 +10,9 @@ line) and get, for free:
 - an **SoA** store (`soa<T>`) + a **nanoarrow** schema/array (`arrow_schema<T>()` / `to_arrow<T>()`).
 
 It depends only on **nanoarrow + header-only boost** (plus **stdexec** for the scheduler-agnostic bulk
-path). It knows nothing about Lance — it produces nanoarrow tables that any backend (Lance, Parquet, Arrow
-IPC) can persist.
+path), and is itself **header-only** — the Phase-B parsers are device-callable (`NANOTINS_HD`), so they
+live inline in the headers where device code can see them. It knows nothing about Lance — it produces
+nanoarrow tables that any backend (Lance, Parquet, Arrow IPC) can persist.
 
 ## Read this first
 
@@ -23,9 +24,8 @@ new protocol (gPTP / IEEE 802.1AS)**. Open it in a browser.
 
 ```
 include/nanotins/   core: reflect, bits, endian, fixed_string, column_traits, arrow_glue, bulk
-                    pcap: pcap_blocks.hpp (scan_blocks / scan_window / parse_epb)
+                    pcap: pcap_blocks.hpp (scan_blocks / scan_window / parse_epb — header-only)
                     protocols: protocols.hpp, protocol_decode{,_bulk}.hpp, gptp.hpp (the extension example)
-src/                pcap_blocks_ref.cpp (the compiled scanner/parser)
 tests/              reflect / protocols / pcap_blocks / bulk / gptp unit tests
 docs/nanotins.html  the guide
 ```
@@ -35,7 +35,7 @@ docs/nanotins.html  the guide
 | Target | Kind | What |
 |---|---|---|
 | `nanotins::core` | INTERFACE | reflection / overlay / SoA / arrow + endian / bits / bulk |
-| `nanotins::pcap` | STATIC | pcap/pcapng block scanner + per-block parse |
+| `nanotins::pcap` | INTERFACE | pcap/pcapng block scanner + per-block parse (header-only) |
 | `nanotins::protocols` | INTERFACE | L2/L3/L4 wire structs + serial/bulk decode + gPTP |
 | `nanotins` | INTERFACE | umbrella (core + pcap + protocols) |
 

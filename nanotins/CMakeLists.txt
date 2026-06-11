@@ -84,10 +84,11 @@ target_compile_features(nanotins_core INTERFACE cxx_std_20)
 target_link_libraries(nanotins_core INTERFACE nanotins_boost nanotins_stdexec nanoarrow_static)
 
 # nanotins_pcap: the pcap/pcapng block scanner (sequential boundary walk + streaming scan_window) and the
-# pure per-block parse. One compiled TU (the reference impl); the seam header is in nanotins_core's include.
-add_library(nanotins_pcap STATIC src/pcap_blocks_ref.cpp)
+# pure per-block parse. Header-only: the Phase-B parsers are device-callable (NANOTINS_HD), so they must be
+# visible to device code — hence inline in the header, no compiled TU. INTERFACE = just the headers.
+add_library(nanotins_pcap INTERFACE)
 add_library(nanotins::pcap ALIAS nanotins_pcap)
-target_link_libraries(nanotins_pcap PUBLIC nanotins_core)
+target_link_libraries(nanotins_pcap INTERFACE nanotins_core)
 
 # nanotins_protocols: L2/L3/L4 wire structs + the layered decode (serial + scheduler-agnostic bulk) and
 # the gPTP extension. Header-only (overlay+store kernels), so an INTERFACE target.
