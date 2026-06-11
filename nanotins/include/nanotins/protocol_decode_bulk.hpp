@@ -27,10 +27,12 @@ namespace protocols {
 // `run` is the execution policy: a callable `run(num_tasks, n, kernel)` that runs kernel(i) for i in
 // [0,n). Pass a bulk runner (nanotins::bulk_for_each bound to a scheduler) for the parallel path, or
 // nanotins::serial_for_each for the sequential reference/debug path — the output is identical either way.
+// `trailers` (optional, pre-sized to n) receives each packet's WalkResult — the L4-payload boundary —
+// from the scatter pass, so the caller can build the remainder_after_l4 rows from the same traversal.
 template <class Runner>
 void decode_window(Runner run_each, std::uint64_t pid_base, const std::uint16_t* link_type,
                    const std::uint64_t* poff, const std::uint32_t* psize, Bytes window, std::size_t n,
-                   DecodedPdus& out) {
+                   DecodedPdus& out, WalkResult* trailers = nullptr) {
     if (n == 0) {
         return;
     }
@@ -93,12 +95,16 @@ void decode_window(Runner run_each, std::uint64_t pid_base, const std::uint16_t*
         const std::uint64_t* off = poff;
         const std::uint32_t* sz = psize;
         const std::uint16_t* lt = link_type;
+        WalkResult* tr = trailers;
         run_each(num_tasks, n, [=](std::size_t i) {
             Bytes pkt{};
             if (off[i] + sz[i] <= wsize) {
                 pkt = Bytes(wbase + off[i], sz[i]);
             }
-            scatter_packet(pid_base + i, lt[i], pkt, b[i], sink);
+            const WalkResult w = scatter_packet(pid_base + i, lt[i], pkt, b[i], sink);
+            if (tr != nullptr) {
+                tr[i] = w;
+            }
         });
     }
 }

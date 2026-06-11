@@ -15,7 +15,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-PDUS = ["ethernet", "vlan", "ipv4", "ipv6", "tcp", "udp"]
+# The six PDU tables plus the L4 remainder (the application payload, as external refs) — both decode
+# paths must emit all of them identically.
+PDUS = ["ethernet", "vlan", "ipv4", "ipv6", "tcp", "udp", "remainder_after_l4"]
 
 
 def dump_rows(n2t: str, table: Path) -> list:

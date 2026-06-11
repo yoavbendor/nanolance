@@ -547,11 +547,29 @@ private:
         if (const int rc = write_batch(rows, cols, wbase)) return rc;
         if (args_.decode_l2l3) {
             auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
+            std::vector<protocols::WalkResult> trailers(n);
             protocols::decode_window(run, global_pid_, cols.link_type.data(), cols.poff.data(),
-                                     cols.psize.data(), wbytes, n, pdus_);
+                                     cols.psize.data(), wbytes, n, pdus_, trailers.data());
+            collect_remainder(trailers, cols, wbase);
         }
         global_pid_ += n;
         return 0;
+    }
+
+    // Build remainder_after_l4 rows from this window's L4 boundaries: the application payload (after L4)
+    // as an external blob.v2 ref into the original capture. Only packets that reached L4 and still have
+    // bytes left contribute — byte-identical to what the staged --stage l4 path emits.
+    void collect_remainder(const std::vector<protocols::WalkResult>& trailers, const PacketColumns& cols,
+                           std::uint64_t wbase) {
+        const std::size_t n = cols.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            const protocols::WalkResult& w = trailers[i];
+            if (w.reached_l4 && w.l4_payload_offset < cols.psize[i]) {
+                remainder_.push_back({global_pid_ + i, /*next_protocol=*/0, payload_uri_,
+                                      wbase + cols.poff[i] + w.l4_payload_offset,
+                                      cols.psize[i] - w.l4_payload_offset});
+            }
+        }
     }
 
     // Final one-shot L2/L3 output: one Lance table per PDU type (accumulated across windows).
@@ -570,10 +588,18 @@ private:
                         write_one("_ipv4.lance", pdus_.ipv4) & write_one("_ipv6.lance", pdus_.ipv6) &
                         write_one("_tcp.lance", pdus_.tcp) & write_one("_udp.lance", pdus_.udp);
         if (!ok) return 1;
-        std::fprintf(stderr,
-                     "pcapng2lance: decoded L2/L3 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, udp %zu\n",
-                     pdus_.ethernet.size(), pdus_.vlan.size(), pdus_.ipv4.size(), pdus_.ipv6.size(),
-                     pdus_.tcp.size(), pdus_.udp.size());
+        // The application payload after L4 (for later UDP-internal PDU parsing), as external refs — the
+        // same remainder_after_l4 table the staged --stage l4 path emits.
+        const fs::path rpath = stem + "_remainder_after_l4.lance";
+        if (!staged::write_remainder_table(rpath, remainder_, "next_protocol", args_.compress, err)) {
+            std::fprintf(stderr, "pcapng2lance: failed to write %s: %s\n", rpath.string().c_str(), err.c_str());
+            return 1;
+        }
+        std::fprintf(
+            stderr,
+            "pcapng2lance: decoded L2/L3 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, udp %zu, remainder %zu\n",
+            pdus_.ethernet.size(), pdus_.vlan.size(), pdus_.ipv4.size(), pdus_.ipv6.size(), pdus_.tcp.size(),
+            pdus_.udp.size(), remainder_.size());
         return 0;
     }
 
@@ -600,7 +626,8 @@ private:
     std::size_t shb_count_ = 0, total_idb_ = 0, other_count_ = 0;
     bool schema_meta_set_ = false;
     bool first_commit_ = true;
-    protocols::DecodedPdus pdus_;  // accumulated only when --decode-l2l3
+    protocols::DecodedPdus pdus_;                  // accumulated only when --decode-l2l3
+    std::vector<staged::PayloadRow> remainder_;    // app payload after L4 (remainder_after_l4), likewise
 };
 
 }  // namespace

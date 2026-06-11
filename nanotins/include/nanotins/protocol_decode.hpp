@@ -126,21 +126,31 @@ inline bool decode_l4(std::uint64_t packet_id, std::uint8_t ip_proto, Bytes byte
     return false;
 }
 
+// Result of one walk: where the application payload begins (bytes consumed by L2+L3+L4) and whether an L4
+// header was actually decoded. `reached_l4` distinguishes "no L4 here" (non-IP, fragment, truncated) from
+// a real TCP/UDP header, so the one-shot path can emit the same remainder_after_l4 the staged path does.
+struct WalkResult {
+    std::size_t l4_payload_offset = 0;  // == total L2+L3+L4 header length (valid only when reached_l4)
+    bool reached_l4 = false;
+};
+
 // ---- The shared walk: one Ethernet -> VLAN* -> IPv4/IPv6 -> TCP/UDP traversal, visited by callbacks. ----
 // Replays the exact same sequence as the serial decode_l2/l3/l4 chain, invoking on_<pdu>(view) for each
 // emitted header in order. It is device-safe (noexcept, no allocation, no STL/globals in the body, only
 // overlay() reads) and is the SINGLE source of truth for both the serial path (decode_packet) and the
 // bulk count/scatter passes — so the count pass and the scatter pass can never disagree (the count is
-// exactly the number of on_* calls, which is exactly the number of rows scattered).
+// exactly the number of on_* calls, which is exactly the number of rows scattered). Returns a WalkResult
+// so callers that need the L4-payload boundary (the remainder) get it from the same traversal.
 template <class FEth, class FVlan, class FIpv4, class FIpv6, class FTcp, class FUdp>
-inline void walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, FVlan on_vlan, FIpv4 on_ipv4,
-                        FIpv6 on_ipv6, FTcp on_tcp, FUdp on_udp) noexcept {
+inline WalkResult walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, FVlan on_vlan, FIpv4 on_ipv4,
+                              FIpv6 on_ipv6, FTcp on_tcp, FUdp on_udp) noexcept {
+    WalkResult res;
     if (link_type != kLinkTypeEthernet) {
-        return;  // non-Ethernet link types decode to nothing in step 1
+        return res;  // non-Ethernet link types decode to nothing in step 1
     }
     Ethernet eth{};
     if (!overlay(pkt, 0, eth)) {
-        return;
+        return res;
     }
     on_eth(eth);
     std::uint16_t ethertype = eth.ethertype.host();
@@ -148,14 +158,14 @@ inline void walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, FVlan o
     while (ethertype == kEtherTypeVlan || ethertype == kEtherTypeQinQ) {
         VlanTag tag{};
         if (!overlay(pkt, off, tag)) {
-            return;
+            return res;
         }
         on_vlan(tag);
         ethertype = tag.inner_ethertype.host();
         off += sizeof(VlanTag);
     }
     if (off > pkt.size()) {
-        return;
+        return res;
     }
     Bytes after_l2 = pkt.subspan(off);
     std::uint8_t ip_proto = 0;
@@ -166,7 +176,7 @@ inline void walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, FVlan o
     if (ethertype == kEtherTypeIpv4) {
         Ipv4 ip{};
         if (!overlay(after_l2, 0, ip)) {
-            return;
+            return res;
         }
         on_ipv4(ip);
         const std::size_t hdr = static_cast<std::size_t>(ip.ver_ihl.word_host() & 0x0FU) * 4U;
@@ -176,31 +186,37 @@ inline void walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, FVlan o
     } else if (ethertype == kEtherTypeIpv6) {
         Ipv6 ip{};
         if (!overlay(after_l2, 0, ip)) {
-            return;
+            return res;
         }
         on_ipv6(ip);
         l3 = sizeof(Ipv6);  // step 1 ignores IPv6 extension headers
         ip_proto = ip.next_header;
     } else {
-        return;
+        return res;
     }
     if (l3 > after_l2.size() || !has_l4) {
-        return;
+        return res;
     }
     Bytes after_l3 = after_l2.subspan(l3);
     if (ip_proto == kIpProtoTcp) {
         Tcp tcp{};
         if (!overlay(after_l3, 0, tcp)) {
-            return;
+            return res;
         }
         on_tcp(tcp);
+        const std::size_t hdr = static_cast<std::size_t>((tcp.off_flags.word_host() >> 12) & 0x0FU) * 4U;
+        res.l4_payload_offset = off + l3 + (hdr >= sizeof(Tcp) ? hdr : sizeof(Tcp));
+        res.reached_l4 = true;
     } else if (ip_proto == kIpProtoUdp) {
         Udp udp{};
         if (!overlay(after_l3, 0, udp)) {
-            return;
+            return res;
         }
         on_udp(udp);
+        res.l4_payload_offset = off + l3 + sizeof(Udp);
+        res.reached_l4 = true;
     }
+    return res;
 }
 
 // One-shot decode of all layers from a packet's first byte (the --decode-l2l3 path). Stops at the first
@@ -255,10 +271,11 @@ struct PduSink {
 // column where this packet's first PDU of that type goes (from the exclusive scan). Device-safe: every
 // write index is derived solely from this packet's `base` + its own emit order, so no two packets touch
 // the same slot — exactly the data-parallel write pattern a GPU thread runs.
-inline void scatter_packet(std::uint64_t packet_id, std::uint32_t link_type, Bytes pkt, const PduCounts& base,
-                           const PduSink& sink) noexcept {
+// Returns the WalkResult (the L4-payload boundary) so the caller can also build the remainder row.
+inline WalkResult scatter_packet(std::uint64_t packet_id, std::uint32_t link_type, Bytes pkt,
+                                 const PduCounts& base, const PduSink& sink) noexcept {
     std::uint32_t e = base.eth, v = base.vlan, i4 = base.ipv4, i6 = base.ipv6, t = base.tcp, u = base.udp;
-    walk_packet(
+    return walk_packet(
         link_type, pkt,
         [&](const Ethernet& x) {
             sink.eth_pid[e] = packet_id;

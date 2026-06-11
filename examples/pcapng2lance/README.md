@@ -30,9 +30,11 @@ See [`DESIGN.md`](DESIGN.md) (step-1 architecture + the parsing seam), [`NANOTIN
   `include/protocol_decode.hpp` walks each packet (Ethernet → VLAN* → IPv4/IPv6 → TCP/UDP, honoring
   `ihl`/`data_offset`); `include/pdu_table_writer.hpp` writes **one Lance table per PDU type**
   (`<stem>_ethernet.lance`, `_vlan`, `_ipv4`, `_ipv6`, `_tcp`, `_udp`), each row = `packet_id` + the
-  reflected header fields (MAC/IP addresses as fixed-size-binary). Adding a protocol = a struct + a
-  branch in the walk; a UDP-internal-PDU registry hook (dispatch on `dst_port`) is the next extension
-  point. (M2 — extracting the core into the standalone `nanotins` lib + a CUDA `ex::bulk` path — is the
+  reflected header fields (MAC/IP addresses as fixed-size-binary). It also writes
+  `<stem>_remainder_after_l4.lance` — the application payload after L4 as external blob.v2 refs, the
+  hook for later UDP-internal PDU parsing (SOME/IP, etc.) — **byte-identical to the staged `--stage l4`
+  remainder** (guarded by `pcapng2lance_frag_harmony`). Adding a protocol = a struct + a branch in the
+  walk; a UDP-internal-PDU registry (dispatch on `dst_port`) is the next extension point. (M2 — extracting the core into the standalone `nanotins` lib + a CUDA `ex::bulk` path — is the
   remaining milestone; the seam and reflection core are already shaped for it.)
 - **Scheduler-agnostic bulk** (`include/nanotins/bulk.hpp`, M2 start): `bulk_for_each(sched, num_tasks,
   n, kernel)` is a partitioned stdexec `ex::schedule | ex::bulk` — the CPU path passes an
@@ -133,7 +135,7 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
 | `nlance2table_smoke` | interop | `nlance2table` (top-level tool) dumps PDU + L1 tables to CSV/NDJSON: header, row counts, `--limit`, `fixed_size_binary` hex, nested-struct flatten |
 | `nlance2table_tshark` | interop | per-PDU tables dumped via `nlance2table` match **tshark**'s dissection of the same pcapng field-for-field (eth/vlan/ipv4/ipv6/tcp/udp); skips if `tshark` absent |
 | `nlance2table_tshark_realfile` | interop | real fragmented capture (`tests/SRL_front_left_51_short.pcapng`, 224 frames): L4 gated to first fragments (udp on 7 only) + eth/vlan/ipv4 fields match `tshark` (reassembly off); skips if `tshark` absent |
-| `pcapng2lance_frag_harmony` | interop | one-shot (`--decode-l2l3`) and staged (`--stage l1→l4`) emit **identical** PDU tables on the fragmented capture — the IPv4-fragmentation L4 gate behaves the same in both decode paths |
+| `pcapng2lance_frag_harmony` | interop | one-shot (`--decode-l2l3`) and staged (`--stage l1→l4`) emit **identical** PDU tables **and `remainder_after_l4`** on the fragmented capture — the IPv4-fragmentation L4 gate + the L4 remainder match in both decode paths |
 
 ## Notes / known limitations
 
