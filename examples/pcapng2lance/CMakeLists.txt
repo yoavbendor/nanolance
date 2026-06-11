@@ -8,6 +8,29 @@ add_executable(pcapng2lance src/pcapng2lance_main.cpp)
 target_include_directories(pcapng2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(pcapng2lance PRIVATE nanotins nanolance)
 
+# --- optional GPU (nvexec) bulk path -------------------------------------------------------------
+# OFF by default; the CPU build needs none of this (all GPU code is behind #ifdef NANOTINS_ENABLE_CUDA).
+# When ON, the driver TU must be compiled as CUDA so the nvexec device scheduler + device lambdas work.
+# The exact toolchain wiring (clang -x cuda vs nvcc, the nvexec target name, the CUDA arch) is host
+# specific — see nanotins/docs/GPU_BULK_INTEGRATION.md. This block is the documented starting point.
+option(NANOTINS_ENABLE_CUDA "Build pcapng2lance with the GPU (nvexec) bulk path" OFF)
+if(NANOTINS_ENABLE_CUDA)
+    target_compile_definitions(pcapng2lance PRIVATE NANOTINS_ENABLE_CUDA=1)
+    # Compile the driver TU as CUDA. With the LLVM/clang-cuda toolchain the experiment used, this is
+    # `clang++ -x cuda --cuda-gpu-arch=sm_XX`; with NVIDIA's toolchain it is nvcc. Pick ONE:
+    #   (clang-cuda) set via CMAKE_CXX_COMPILER=clang++ + the flags below, OR
+    #   (nvcc)       enable_language(CUDA) and set_source_files_properties(... LANGUAGE CUDA).
+    # nvexec headers live under the stdexec include dir (already on nanotins_core); link cudart.
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        target_link_libraries(pcapng2lance PRIVATE CUDA::cudart)
+    endif()
+    # set(_NT_GPU_ARCH sm_80 CACHE STRING "CUDA arch for the weaker model's GPU")
+    # target_compile_options(pcapng2lance PRIVATE -x cuda --cuda-gpu-arch=${_NT_GPU_ARCH}
+    #                        --expt-relaxed-constexpr)
+    message(STATUS "pcapng2lance: NANOTINS_ENABLE_CUDA=ON — see nanotins/docs/GPU_BULK_INTEGRATION.md to finish toolchain wiring")
+endif()
+
 if(NANOLANCE_BUILD_TESTS)
     # struct -> soa -> arrow -> Lance -> read-back (exercises nanotins reflection through the nanolance
     # writer/reader; stays here because it depends on nanolance, not just nanotins).
