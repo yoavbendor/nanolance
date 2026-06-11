@@ -99,10 +99,19 @@ inline bool decode_l3(std::uint64_t packet_id, std::uint16_t ethertype, Bytes by
     return false;
 }
 
-// L4 (TCP / UDP). `consumed` = transport-header length; the rest is the application payload.
+// L5 dispatch key for the L4 remainder: the L4 src+dst ports packed into one value, so a later
+// UDP-internal stage (SOME/IP, etc.) can dispatch on either, and either is recoverable
+// (dst = key & 0xFFFF, src = (key >> 16) & 0xFFFF). 0 when there is no L4.
+inline constexpr std::uint64_t pack_ports(std::uint16_t src_port, std::uint16_t dst_port) noexcept {
+    return (static_cast<std::uint64_t>(src_port) << 16) | dst_port;
+}
+
+// L4 (TCP / UDP). `consumed` = transport-header length; the rest is the application payload. `next_disc`
+// receives the packed src+dst ports (the L5 dispatch key), or 0 when no L4 header is present.
 inline bool decode_l4(std::uint64_t packet_id, std::uint8_t ip_proto, Bytes bytes, DecodedPdus& out,
-                      std::size_t& consumed) {
+                      std::size_t& consumed, std::uint64_t& next_disc) {
     consumed = 0;
+    next_disc = 0;
     if (ip_proto == kIpProtoTcp) {
         Tcp tcp{};
         if (!overlay(bytes, 0, tcp)) {
@@ -111,6 +120,7 @@ inline bool decode_l4(std::uint64_t packet_id, std::uint8_t ip_proto, Bytes byte
         out.tcp.add(packet_id, tcp);
         const std::size_t hdr = static_cast<std::size_t>((tcp.off_flags.word_host() >> 12) & 0x0FU) * 4U;
         consumed = hdr >= sizeof(Tcp) ? hdr : sizeof(Tcp);
+        next_disc = pack_ports(tcp.src_port.host(), tcp.dst_port.host());
         return true;
     }
     if (ip_proto == kIpProtoUdp) {
@@ -120,7 +130,7 @@ inline bool decode_l4(std::uint64_t packet_id, std::uint8_t ip_proto, Bytes byte
         }
         out.udp.add(packet_id, udp);
         consumed = sizeof(Udp);
-        // Hook for UDP-internal PDUs: dispatch on udp.dst_port.host() to a registry of inner parsers.
+        next_disc = pack_ports(udp.src_port.host(), udp.dst_port.host());
         return true;
     }
     return false;
@@ -131,6 +141,7 @@ inline bool decode_l4(std::uint64_t packet_id, std::uint8_t ip_proto, Bytes byte
 // a real TCP/UDP header, so the one-shot path can emit the same remainder_after_l4 the staged path does.
 struct WalkResult {
     std::size_t l4_payload_offset = 0;  // == total L2+L3+L4 header length (valid only when reached_l4)
+    std::uint64_t l4_ports = 0;         // packed src+dst ports (pack_ports), the L5 dispatch key; 0 if none
     bool reached_l4 = false;
 };
 
@@ -206,6 +217,7 @@ inline WalkResult walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, F
         on_tcp(tcp);
         const std::size_t hdr = static_cast<std::size_t>((tcp.off_flags.word_host() >> 12) & 0x0FU) * 4U;
         res.l4_payload_offset = off + l3 + (hdr >= sizeof(Tcp) ? hdr : sizeof(Tcp));
+        res.l4_ports = pack_ports(tcp.src_port.host(), tcp.dst_port.host());
         res.reached_l4 = true;
     } else if (ip_proto == kIpProtoUdp) {
         Udp udp{};
@@ -214,6 +226,7 @@ inline WalkResult walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, F
         }
         on_udp(udp);
         res.l4_payload_offset = off + l3 + sizeof(Udp);
+        res.l4_ports = pack_ports(udp.src_port.host(), udp.dst_port.host());
         res.reached_l4 = true;
     }
     return res;

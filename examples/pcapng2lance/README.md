@@ -46,10 +46,13 @@ See [`DESIGN.md`](DESIGN.md) (step-1 architecture + the parsing seam), [`NANOTIN
   **Sequential reference path** (`--sequential`): both the L1 parse and the L2/L3/L4 decode run through one
   policy seam (`nanotins::bulk_for_each` vs `nanotins::serial_for_each`), so `--sequential` swaps the whole
   Phase B to a plain in-thread loop — the readable/debuggable baseline and a byte-identical correctness
-  oracle for the bulk path. Measured on this 8-core host (1.9 GB capture, single window): bulk and
-  sequential are within noise (L1 ~0.8 s both; L1+L2/L3/L4 ~0.71 vs 0.73 s) — the kernels are light and the
-  pipeline is memory-bandwidth-bound, so CPU thread-parallelism barely helps. The bulk path's real payoff
-  is the **GPU** (swap the scheduler to `nvexec`; many threads hide memory latency), not multicore CPU.
+  oracle for the bulk path. `--threads N` sets the ex::bulk pool size (default = `hardware_concurrency`),
+  for tuning on many-core hosts. Measured on this 8-core host (1.9 GB capture, single window): bulk and
+  sequential are within noise (L1 ~0.8 s both; L1+L2/L3/L4 ~0.71 vs 0.73 s), plateauing by ~2–8 threads —
+  the kernels are light and the pipeline is memory-bandwidth-bound, so CPU thread-parallelism barely
+  helps. Sweep it yourself with [`bench/decode_bench.sh`](../../bench/decode_bench.sh)
+  (`--threads 4,8,16,32,64,128,164`). The bulk path's real payoff is the **GPU** (swap the scheduler to
+  `nvexec`; many threads hide memory latency), not multicore CPU.
   The **L2/L3/L4 decode** (`--decode-l2l3`) also runs through `bulk_for_each` now
   (`include/protocol_decode_bulk.hpp`), as the canonical GPU pattern for a *variable-outputs-per-input*
   problem: two device-safe bulk passes bracket a prefix-sum — pass 1 `count_packet` per packet → exclusive

@@ -55,6 +55,7 @@ struct Args {
     bool compress = true;
     bool decode_l2l3 = false;
     bool sequential = false;     // run Phase B in-thread (reference/debug) instead of the ex::bulk pool
+    unsigned threads = 0;        // ex::bulk pool size; 0 = hardware_concurrency
     std::string stage;           // "" = one-shot; l1 writes packets.lance; l2/l3/l4 enrich a data dir
     std::size_t window_bytes = std::size_t{512} * 1024 * 1024;    // L1 RAM/VRAM budget per window
     std::uint64_t mem_bytes = 0;                                  // enrich budget; 0 = auto-detect free RAM
@@ -79,6 +80,10 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             a.decode_l2l3 = true;
         } else if (s == "--sequential") {
             a.sequential = true;
+        } else if (s == "--threads") {
+            const char* v = value(i);
+            if (!v) return false;
+            a.threads = static_cast<unsigned>(std::stoul(v));
         } else if (s == "--stage") {
             const char* v = value(i);
             if (!v) return false;
@@ -151,8 +156,8 @@ bool decode_layer(const std::string& stage, const staged::PayloadRow& r, protoco
         next_disc = proto;
         return ok;
     }
-    next_disc = 0;
-    return protocols::decode_l4(r.packet_id, static_cast<std::uint8_t>(r.discriminator), bytes, pdus, consumed);
+    return protocols::decode_l4(r.packet_id, static_cast<std::uint8_t>(r.discriminator), bytes, pdus, consumed,
+                                next_disc);  // next_disc = packed src+dst ports (L5 dispatch key)
 }
 
 // The six per-PDU appenders + the remainder appender, opened once; each appends a fragment per chunk.
@@ -278,7 +283,8 @@ struct PacketColumns {
     std::size_t size() const { return iface.size(); }
 };
 
-unsigned pool_threads() {
+unsigned pool_threads(unsigned override_count) {
+    if (override_count > 0) return override_count;  // --threads N
     const unsigned hc = std::thread::hardware_concurrency();
     return hc == 0 ? 4U : hc;
 }
@@ -289,7 +295,7 @@ class L1Converter {
 public:
     L1Converter(Args args, fs::path output, std::string payload_uri)
         : args_(std::move(args)), output_(std::move(output)), payload_uri_(std::move(payload_uri)),
-          pool_(pool_threads()) {}
+          pool_(pool_threads(args_.threads)) {}
 
     int run(const fs::path& input) {
         streaming::FileSource source(input);
@@ -300,6 +306,11 @@ public:
         if (!build_schema(err)) return fail(err);
         if (const int rc = open_writer()) return rc;
         ArrowMetadataBuilderInit(&meta_, nullptr);
+        if (args_.sequential) {
+            std::fprintf(stderr, "pcapng2lance: Phase B = sequential (1 thread)\n");
+        } else {
+            std::fprintf(stderr, "pcapng2lance: Phase B = bulk (%u threads)\n", pool_threads(args_.threads));
+        }
 
         win.fill();
         while (win.size() > 0) {
@@ -565,7 +576,7 @@ private:
         for (std::size_t i = 0; i < n; ++i) {
             const protocols::WalkResult& w = trailers[i];
             if (w.reached_l4 && w.l4_payload_offset < cols.psize[i]) {
-                remainder_.push_back({global_pid_ + i, /*next_protocol=*/0, payload_uri_,
+                remainder_.push_back({global_pid_ + i, /*next_protocol=*/w.l4_ports, payload_uri_,
                                       wbase + cols.poff[i] + w.l4_payload_offset,
                                       cols.psize[i] - w.l4_payload_offset});
             }
@@ -650,7 +661,7 @@ int main(int argc, char** argv) {
     if (args.pos.size() < 2) {
         std::fprintf(
             stderr,
-            "usage: %s [--no-compress] [--decode-l2l3] [--sequential] <input.pcap|pcapng> <output.lance> [payload_uri]\n"
+            "usage: %s [--no-compress] [--decode-l2l3] [--sequential] [--threads N] <input.pcap|pcapng> <output.lance> [payload_uri]\n"
             "       %s --stage l1 <input.pcap|pcapng> <datadir>   (then --stage l2|l3|l4 <datadir>)\n",
             argv[0], argv[0]);
         return 2;
