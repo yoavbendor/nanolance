@@ -41,6 +41,48 @@ inline int nt_child_index(const ArrowSchema& s, const char* name) {
 
 // Read `packet_id` + a discriminator scalar column + the `payload_ref` blob (uri/position/size) from a
 // committed Lance dataset (the packets table, or a previous remainder table).
+// Resolved column indices for a payload table: packet_id + discriminator at top level, and
+// position/size/uri inside the payload_ref struct (lance_table_read_dataset rebuilds the blob column in
+// INGEST shape: children data/uri/position/size).
+struct PayloadCols {
+    int pid, disc, blob, pos, size, uri;
+};
+
+inline bool resolve_payload_cols(const ArrowSchema& schema, const char* disc_col, PayloadCols& c,
+                                 std::string& error) {
+    c.pid = nt_child_index(schema, "packet_id");
+    c.disc = nt_child_index(schema, disc_col);
+    c.blob = nt_child_index(schema, "payload_ref");
+    if (c.pid < 0 || c.disc < 0 || c.blob < 0) {
+        error = std::string("table missing packet_id / ") + disc_col + " / payload_ref";
+        return false;
+    }
+    const ArrowSchema& blob = *schema.children[c.blob];
+    c.pos = nt_child_index(blob, "position");
+    c.size = nt_child_index(blob, "size");
+    c.uri = nt_child_index(blob, "uri");
+    if (c.pos < 0 || c.size < 0 || c.uri < 0) {
+        error = "payload_ref struct missing position/size/uri";
+        return false;
+    }
+    return true;
+}
+
+inline void append_payload_rows(const ArrowArrayView& view, const PayloadCols& c,
+                                std::vector<PayloadRow>& out) {
+    const ArrowArrayView* blob = view.children[c.blob];
+    for (std::int64_t i = 0; i < view.length; ++i) {
+        PayloadRow r;
+        r.packet_id = ArrowArrayViewGetUIntUnsafe(view.children[c.pid], i);
+        r.discriminator = ArrowArrayViewGetUIntUnsafe(view.children[c.disc], i);
+        r.off = ArrowArrayViewGetUIntUnsafe(blob->children[c.pos], i);
+        r.size = ArrowArrayViewGetUIntUnsafe(blob->children[c.size], i);
+        const ArrowStringView sv = ArrowArrayViewGetStringUnsafe(blob->children[c.uri], i);
+        r.uri.assign(sv.data, static_cast<std::size_t>(sv.size_bytes));
+        out.push_back(std::move(r));
+    }
+}
+
 inline bool read_payload_table(const std::filesystem::path& dir, const char* disc_col,
                                std::vector<PayloadRow>& out, std::string& error) {
     ArrowSchema schema{};
@@ -50,30 +92,13 @@ inline bool read_payload_table(const std::filesystem::path& dir, const char* dis
     }
     const auto release_all = [&]() {
         for (auto& b : batches) {
-            if (b.release) {
-                b.release(&b);
-            }
+            if (b.release) b.release(&b);
         }
-        if (schema.release) {
-            schema.release(&schema);
-        }
+        if (schema.release) schema.release(&schema);
     };
 
-    const int pid_idx = nt_child_index(schema, "packet_id");
-    const int disc_idx = nt_child_index(schema, disc_col);
-    const int blob_idx = nt_child_index(schema, "payload_ref");
-    if (pid_idx < 0 || disc_idx < 0 || blob_idx < 0) {
-        error = std::string("table missing packet_id / ") + disc_col + " / payload_ref";
-        release_all();
-        return false;
-    }
-    // lance_table_read_dataset rebuilds the blob column in INGEST shape: children data/uri/position/size.
-    const ArrowSchema& blob_schema = *schema.children[blob_idx];
-    const int pos_g = nt_child_index(blob_schema, "position");
-    const int size_g = nt_child_index(blob_schema, "size");
-    const int uri_g = nt_child_index(blob_schema, "uri");
-    if (pos_g < 0 || size_g < 0 || uri_g < 0) {
-        error = "payload_ref struct missing position/size/uri";
+    PayloadCols cols{};
+    if (!resolve_payload_cols(schema, disc_col, cols, error)) {
         release_all();
         return false;
     }
@@ -89,17 +114,7 @@ inline bool read_payload_table(const std::filesystem::path& dir, const char* dis
             ok = false;
             break;
         }
-        const ArrowArrayView* blob = view.children[blob_idx];
-        for (std::int64_t i = 0; i < view.length; ++i) {
-            PayloadRow r;
-            r.packet_id = ArrowArrayViewGetUIntUnsafe(view.children[pid_idx], i);
-            r.discriminator = ArrowArrayViewGetUIntUnsafe(view.children[disc_idx], i);
-            r.off = ArrowArrayViewGetUIntUnsafe(blob->children[pos_g], i);
-            r.size = ArrowArrayViewGetUIntUnsafe(blob->children[size_g], i);
-            const ArrowStringView sv = ArrowArrayViewGetStringUnsafe(blob->children[uri_g], i);
-            r.uri.assign(sv.data, static_cast<std::size_t>(sv.size_bytes));
-            out.push_back(std::move(r));
-        }
+        append_payload_rows(view, cols, out);
         ArrowArrayViewReset(&view);
     }
     release_all();
