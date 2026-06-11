@@ -32,4 +32,15 @@ void bulk_for_each(Scheduler sch, std::size_t num_tasks, std::size_t n, Kernel k
     ex::sync_wait(std::move(pipeline));
 }
 
+// Sequential reference executor: same (num_tasks, n, kernel) contract as bulk_for_each, but runs the
+// kernel in-thread with no scheduler. It is the readable/debuggable baseline and the correctness oracle
+// for the bulk path — select it (e.g. behind a --sequential flag) to get identical output from a plain
+// loop you can step through. `num_tasks` is ignored (one task).
+template <class Kernel>
+void serial_for_each(std::size_t /*num_tasks*/, std::size_t n, Kernel k) {
+    for (std::size_t i = 0; i < n; ++i) {
+        k(i);
+    }
+}
+
 }  // namespace nanotins

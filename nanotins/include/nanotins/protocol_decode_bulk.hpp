@@ -24,10 +24,13 @@
 
 namespace protocols {
 
-template <class Scheduler>
-void decode_window_bulk(Scheduler sched, std::uint64_t pid_base, const std::uint16_t* link_type,
-                        const std::uint64_t* poff, const std::uint32_t* psize, Bytes window, std::size_t n,
-                        DecodedPdus& out) {
+// `run` is the execution policy: a callable `run(num_tasks, n, kernel)` that runs kernel(i) for i in
+// [0,n). Pass a bulk runner (nanotins::bulk_for_each bound to a scheduler) for the parallel path, or
+// nanotins::serial_for_each for the sequential reference/debug path — the output is identical either way.
+template <class Runner>
+void decode_window(Runner run_each, std::uint64_t pid_base, const std::uint16_t* link_type,
+                   const std::uint64_t* poff, const std::uint32_t* psize, Bytes window, std::size_t n,
+                   DecodedPdus& out) {
     if (n == 0) {
         return;
     }
@@ -42,7 +45,7 @@ void decode_window_bulk(Scheduler sched, std::uint64_t pid_base, const std::uint
         const std::uint64_t* off = poff;
         const std::uint32_t* sz = psize;
         const std::uint16_t* lt = link_type;
-        nanotins::bulk_for_each(sched, num_tasks, n, [=](std::size_t i) {
+        run_each(num_tasks, n, [=](std::size_t i) {
             Bytes pkt{};
             if (off[i] + sz[i] <= wsize) {
                 pkt = Bytes(wbase + off[i], sz[i]);
@@ -90,7 +93,7 @@ void decode_window_bulk(Scheduler sched, std::uint64_t pid_base, const std::uint
         const std::uint64_t* off = poff;
         const std::uint32_t* sz = psize;
         const std::uint16_t* lt = link_type;
-        nanotins::bulk_for_each(sched, num_tasks, n, [=](std::size_t i) {
+        run_each(num_tasks, n, [=](std::size_t i) {
             Bytes pkt{};
             if (off[i] + sz[i] <= wsize) {
                 pkt = Bytes(wbase + off[i], sz[i]);

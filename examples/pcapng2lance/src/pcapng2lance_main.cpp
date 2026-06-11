@@ -4,6 +4,7 @@
 // Packet payloads are never copied: each row stores where its bytes live in the source file.
 
 #include "mem_budget.hpp"
+#include "packet_row.hpp"
 #include "nanotins/arrow_glue.hpp"
 #include "nanotins/bulk.hpp"
 #include "nanotins/pcap_blocks.hpp"
@@ -34,20 +35,7 @@
 
 namespace {
 
-// The all-scalar packet row that flows through the nanotins reflection core. payload_uri/off/size are
-// NOT here — they ride in the lance.blob.v2 `payload_ref` struct appended alongside.
-struct PacketRow {
-    std::uint64_t packet_id;  // stable row id; join key for the per-PDU / staged tables
-    std::uint32_t interface_id;
-    std::uint64_t ts_raw;
-    std::uint32_t caplen;
-    std::uint32_t origlen;
-    std::uint16_t link_type;  // denormalized from the interface (ConstantLayout when single-iface)
-    std::uint8_t ts_resol;    // denormalized; lets a row self-describe its time unit
-    std::uint32_t epb_flags;
-};
-BOOST_DESCRIBE_STRUCT(PacketRow, (),
-                      (packet_id, interface_id, ts_raw, caplen, origlen, link_type, ts_resol, epb_flags))
+using pcapng2lance::PacketRow;  // the L1 row schema now lives in packet_row.hpp (shared, reusable)
 
 std::string to_file_uri(const std::filesystem::path& path) {
     const auto abs = std::filesystem::absolute(path).generic_string();  // forward slashes
@@ -216,6 +204,7 @@ int main(int argc, char** argv) {
     // Positional: <input> <output> [payload_uri]. Flags: --no-compress, --decode-l2l3.
     bool compress = true;
     bool decode_l2l3 = false;
+    bool sequential = false;  // run Phase-B in-thread (reference/debug) instead of the ex::bulk thread pool
     std::string stage;  // empty = one-shot; l1 writes <datadir>/packets.lance; l2/l3/l4 enrich <datadir>
     std::size_t window_bytes = std::size_t{512} * 1024 * 1024;  // L1 RAM budget per chunk; small files = 1 chunk
     std::uint64_t mem_bytes = 0;                                // enrich budget; 0 = auto-detect free RAM
@@ -228,6 +217,8 @@ int main(int argc, char** argv) {
             compress = false;
         } else if (a == "--decode-l2l3") {
             decode_l2l3 = true;
+        } else if (a == "--sequential") {
+            sequential = true;
         } else if (a == "--stage") {
             if (i + 1 >= argc) {
                 return fail("--stage requires a value (l1/l2/l3/l4)");
@@ -271,7 +262,7 @@ int main(int argc, char** argv) {
 
     if (pos.size() < 2) {
         std::fprintf(stderr,
-                     "usage: %s [--no-compress] [--decode-l2l3] <input.pcap|pcapng> <output.lance> [payload_uri]\n"
+                     "usage: %s [--no-compress] [--decode-l2l3] [--sequential] <input.pcap|pcapng> <output.lance> [payload_uri]\n"
                      "       %s --stage l1 <input.pcap|pcapng> <datadir>   (then --stage l2|l3|l4 <datadir>)\n",
                      argv[0], argv[0]);
         return 2;
@@ -353,6 +344,17 @@ int main(int argc, char** argv) {
     const unsigned hc = std::thread::hardware_concurrency();
     exec::static_thread_pool bulk_pool(hc == 0 ? 4 : hc);
     auto bulk_sched = bulk_pool.get_scheduler();
+
+    // The Phase-B execution policy, chosen once and used for both the L1 parse and the L2/L3/L4 decode:
+    // the parallel ex::bulk by default, or a plain in-thread loop under --sequential (the readable
+    // reference path and correctness oracle — identical output, easy to step through).
+    auto run_bulk = [&](std::size_t nt, std::size_t n, const auto& kernel) {
+        if (sequential) {
+            nanotins::serial_for_each(nt, n, kernel);
+        } else {
+            nanotins::bulk_for_each(bulk_sched, nt, n, kernel);
+        }
+    };
 
     win.fill();
     while (win.size() > 0) {
@@ -443,7 +445,7 @@ int main(int argc, char** argv) {
             std::uint64_t* p_ts = ts.data();
             std::uint64_t* p_poff = poff.data();
             const std::size_t num_tasks = std::min<std::size_t>(n, 64);
-            nanotins::bulk_for_each(bulk_sched, num_tasks, n, [=](std::size_t i) {
+            run_bulk(num_tasks, n, [=](std::size_t i) {
                 pcapblocks::EpbView v{};
                 if (pcapblocks::parse_epb(wb, pk[i], v)) {
                     p_iface[i] = v.interface_id;
@@ -520,10 +522,10 @@ int main(int argc, char** argv) {
         first_commit = false;
 
         if (decode_l2l3) {
-            // Scheduler-agnostic bulk L2/L3/L4 decode over this window (count -> prefix-sum -> scatter),
-            // same bulk_for_each + scheduler as the L1 parse. Byte-identical to the serial decode_packet.
-            protocols::decode_window_bulk(bulk_sched, global_pid, pkt_link_type.data(), poff.data(),
-                                          psize.data(), wbytes, n, pdus);
+            // L2/L3/L4 decode over this window (count -> prefix-sum -> scatter), through the same Phase-B
+            // policy as the L1 parse (bulk or --sequential). Byte-identical to the serial decode_packet.
+            protocols::decode_window(run_bulk, global_pid, pkt_link_type.data(), poff.data(),
+                                     psize.data(), wbytes, n, pdus);
         }
 
         global_pid += n;
