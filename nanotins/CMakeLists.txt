@@ -17,6 +17,7 @@ if(POLICY CMP0169)
 endif()
 
 option(NANOTINS_BUILD_TESTS "Build nanotins unit tests" ${PROJECT_IS_TOP_LEVEL})
+option(NANOTINS_ENABLE_CUDA "Build nanotins/stdexec using CUDA-capable settings" OFF)
 
 # --- header-only boost (only what boost::describe needs) -------------------------------------------
 set(_NT_BOOST_TAG boost-1.86.0)
@@ -44,9 +45,19 @@ target_include_directories(nanotins_boost INTERFACE
 
 # --- stdexec (header-only) for the scheduler-agnostic ex::bulk path --------------------------------
 # CPU today via exec::static_thread_pool; on a CUDA host the same bulk_for_each takes nvexec::stream_context.
+set(_NT_STDEXEC_TAG_DEFAULT main)
+if(NANOTINS_ENABLE_CUDA)
+    set(_NT_STDEXEC_TAG_DEFAULT nvhpc-24.09)
+endif()
+set(NANOTINS_STDEXEC_TAG "${_NT_STDEXEC_TAG_DEFAULT}" CACHE STRING
+    "stdexec git tag/branch for nanotins (use nvhpc-24.09 with clang-cuda + nvexec)")
+if(NANOTINS_ENABLE_CUDA AND NANOTINS_STDEXEC_TAG STREQUAL "main")
+    set(NANOTINS_STDEXEC_TAG nvhpc-24.09 CACHE STRING
+        "stdexec git tag/branch for nanotins (use nvhpc-24.09 with clang-cuda + nvexec)" FORCE)
+endif()
 FetchContent_Declare(stdexec
     GIT_REPOSITORY https://github.com/NVIDIA/stdexec.git
-    GIT_TAG main
+    GIT_TAG ${NANOTINS_STDEXEC_TAG}
     GIT_SHALLOW TRUE)
 FetchContent_GetProperties(stdexec)
 if(NOT stdexec_POPULATED)

@@ -5,6 +5,8 @@
 
 # The pcapng -> Lance converter.
 add_executable(pcapng2lance src/pcapng2lance_main.cpp)
+target_sources(pcapng2lance PRIVATE src/phase_b_runner.cpp)
+target_sources(pcapng2lance PRIVATE src/pcapng2lance_gpu_bridge.cpp)
 target_include_directories(pcapng2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(pcapng2lance PRIVATE nanotins nanolance)
 
@@ -15,20 +17,38 @@ target_link_libraries(pcapng2lance PRIVATE nanotins nanolance)
 # specific — see nanotins/docs/GPU_BULK_INTEGRATION.md. This block is the documented starting point.
 option(NANOTINS_ENABLE_CUDA "Build pcapng2lance with the GPU (nvexec) bulk path" OFF)
 if(NANOTINS_ENABLE_CUDA)
-    target_compile_definitions(pcapng2lance PRIVATE NANOTINS_ENABLE_CUDA=1)
-    # Compile the driver TU as CUDA. With the LLVM/clang-cuda toolchain the experiment used, this is
-    # `clang++ -x cuda --cuda-gpu-arch=sm_XX`; with NVIDIA's toolchain it is nvcc. Pick ONE:
-    #   (clang-cuda) set via CMAKE_CXX_COMPILER=clang++ + the flags below, OR
-    #   (nvcc)       enable_language(CUDA) and set_source_files_properties(... LANGUAGE CUDA).
-    # nvexec headers live under the stdexec include dir (already on nanotins_core); link cudart.
-    find_package(CUDAToolkit QUIET)
-    if(CUDAToolkit_FOUND)
-        target_link_libraries(pcapng2lance PRIVATE CUDA::cudart)
+    find_package(CUDAToolkit REQUIRED)
+
+    set(_NT_GPU_ARCH sm_89 CACHE STRING "CUDA arch for pcapng2lance (L40S = sm_89)")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        set(_NT_CUDA_OPTS -x cuda --cuda-gpu-arch=${_NT_GPU_ARCH} -Wno-unknown-cuda-version
+                          -U_GLIBCXX_ASSERTIONS -D__STDC_HOSTED__=1)
+        if(DEFINED CUDAToolkit_ROOT)
+            list(APPEND _NT_CUDA_OPTS --cuda-path=${CUDAToolkit_ROOT})
+        elseif(DEFINED CUDAToolkit_LIBRARY_DIR)
+            get_filename_component(_NT_CUDA_ROOT "${CUDAToolkit_LIBRARY_DIR}" DIRECTORY)
+            list(APPEND _NT_CUDA_OPTS --cuda-path=${_NT_CUDA_ROOT})
+        endif()
+        # clang 20 + stdexec/nvexec currently crashes on this very large TU under -O2 in our CUDA build.
+        set_source_files_properties(src/pcapng2lance_main.cpp PROPERTIES COMPILE_OPTIONS "-O0;-g0")
+        set_source_files_properties(src/pcapng2lance_gpu_bridge.cpp PROPERTIES
+            COMPILE_DEFINITIONS "NANOTINS_ENABLE_CUDA=1"
+            COMPILE_OPTIONS "${_NT_CUDA_OPTS}")
+    else()
+        enable_language(CUDA)
+        set_property(SOURCE src/pcapng2lance_gpu_bridge.cpp PROPERTY LANGUAGE CUDA)
+        set_target_properties(pcapng2lance PROPERTIES CUDA_ARCHITECTURES 89)
+        target_compile_definitions(pcapng2lance PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:NANOTINS_ENABLE_CUDA=1>)
+        target_compile_options(pcapng2lance PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-std=c++20 --expt-relaxed-constexpr --extended-lambda>)
     endif()
-    # set(_NT_GPU_ARCH sm_80 CACHE STRING "CUDA arch for the weaker model's GPU")
-    # target_compile_options(pcapng2lance PRIVATE -x cuda --cuda-gpu-arch=${_NT_GPU_ARCH}
-    #                        --expt-relaxed-constexpr)
-    message(STATUS "pcapng2lance: NANOTINS_ENABLE_CUDA=ON — see nanotins/docs/GPU_BULK_INTEGRATION.md to finish toolchain wiring")
+
+    target_include_directories(pcapng2lance PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    if(DEFINED CUDAToolkit_LIBRARY_DIR)
+        target_link_directories(pcapng2lance PRIVATE ${CUDAToolkit_LIBRARY_DIR})
+    endif()
+    target_link_libraries(pcapng2lance PRIVATE CUDA::cudart)
+    message(STATUS "pcapng2lance: NANOTINS_ENABLE_CUDA=ON with clang-cuda (${_NT_GPU_ARCH})")
 endif()
 
 if(NANOLANCE_BUILD_TESTS)
