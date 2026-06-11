@@ -13,6 +13,7 @@
 #include "pdu_table_writer.hpp"
 #include "nanotins/protocol_decode.hpp"
 #include "nanotins/protocol_decode_bulk.hpp"
+#include "nanotins/protocol_decode_gpu.hpp"  // GPU L2/L3/L4 decode; inert unless NANOTINS_ENABLE_CUDA
 #include "staged_pipeline.hpp"
 #include "streaming_reader.hpp"
 
@@ -634,10 +635,20 @@ private:
             if (const int rc = write_batch(batch, wbase)) return rc;
         }
         if (args_.decode_l2l3) {
-            auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
             std::vector<protocols::WalkResult> trailers(n);
-            protocols::decode_window(run, global_pid_, batch.link_type.data(), batch.poff.data(),
-                                     batch.psize.data(), wbytes, n, pdus_, trailers.data());
+#ifdef NANOTINS_ENABLE_CUDA
+            if (args_.gpu) {
+                const std::size_t tasks = args_.threads ? static_cast<std::size_t>(args_.threads) : 256;
+                protocols::gpu::decode_window_gpu(gpu_ctx_->scheduler(), tasks, global_pid_,
+                                                  batch.link_type.data(), batch.poff.data(),
+                                                  batch.psize.data(), wbytes, n, pdus_, trailers.data());
+            } else
+#endif
+            {
+                auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
+                protocols::decode_window(run, global_pid_, batch.link_type.data(), batch.poff.data(),
+                                         batch.psize.data(), wbytes, n, pdus_, trailers.data());
+            }
             collect_remainder(trailers, batch, wbase);
         }
         global_pid_ += n;

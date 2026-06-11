@@ -163,8 +163,8 @@ struct WalkResult {
 // exactly the number of on_* calls, which is exactly the number of rows scattered). Returns a WalkResult
 // so callers that need the L4-payload boundary (the remainder) get it from the same traversal.
 template <class FEth, class FVlan, class FIpv4, class FIpv6, class FTcp, class FUdp>
-inline WalkResult walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, FVlan on_vlan, FIpv4 on_ipv4,
-                              FIpv6 on_ipv6, FTcp on_tcp, FUdp on_udp) noexcept {
+inline NANOTINS_HD WalkResult walk_packet(std::uint32_t link_type, Bytes pkt, FEth on_eth, FVlan on_vlan,
+                                          FIpv4 on_ipv4, FIpv6 on_ipv6, FTcp on_tcp, FUdp on_udp) noexcept {
     WalkResult res;
     if (link_type != kLinkTypeEthernet) {
         return res;  // non-Ethernet link types decode to nothing in step 1
@@ -262,10 +262,16 @@ struct PduCounts {
     std::uint32_t ipv6 = 0;
     std::uint32_t tcp = 0;
     std::uint32_t udp = 0;
+
+    // Component-wise add — lets a single thrust::exclusive_scan / reduce with thrust::plus<PduCounts> do
+    // the per-type prefix-sum for all six PDU types at once on the GPU (see protocol_decode_gpu.hpp).
+    NANOTINS_HD PduCounts operator+(const PduCounts& o) const {
+        return {eth + o.eth, vlan + o.vlan, ipv4 + o.ipv4, ipv6 + o.ipv6, tcp + o.tcp, udp + o.udp};
+    }
 };
 
 // Count how many PDUs of each type a packet emits — no output writes, no allocation (device-safe).
-inline PduCounts count_packet(std::uint32_t link_type, Bytes pkt) noexcept {
+inline NANOTINS_HD PduCounts count_packet(std::uint32_t link_type, Bytes pkt) noexcept {
     PduCounts c{};
     walk_packet(
         link_type, pkt, [&](const Ethernet&) { ++c.eth; }, [&](const VlanTag&) { ++c.vlan; },
@@ -295,8 +301,8 @@ struct PduSink {
 // write index is derived solely from this packet's `base` + its own emit order, so no two packets touch
 // the same slot — exactly the data-parallel write pattern a GPU thread runs.
 // Returns the WalkResult (the L4-payload boundary) so the caller can also build the remainder row.
-inline WalkResult scatter_packet(std::uint64_t packet_id, std::uint32_t link_type, Bytes pkt,
-                                 const PduCounts& base, const PduSink& sink) noexcept {
+inline NANOTINS_HD WalkResult scatter_packet(std::uint64_t packet_id, std::uint32_t link_type, Bytes pkt,
+                                             const PduCounts& base, const PduSink& sink) noexcept {
     std::uint32_t e = base.eth, v = base.vlan, i4 = base.ipv4, i6 = base.ipv6, t = base.tcp, u = base.udp;
     return walk_packet(
         link_type, pkt,

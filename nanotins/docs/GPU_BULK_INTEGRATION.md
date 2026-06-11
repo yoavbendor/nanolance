@@ -26,13 +26,15 @@ The per-element functions it calls (`parse_epb`, `overlay`, `pack_ports`, …) a
 |---|---|
 | `nanotins/include/nanotins/gpu.hpp` | `gpu::context` (owns `nvexec::stream_context`), `gpu::device_buffer<T>` (RAII cudaMalloc/Free + H2D/D2H), `gpu::free_vram_bytes()`, `gpu::vram_budget(bytes,pct)`. All behind `NANOTINS_ENABLE_CUDA`. |
 | `nanotins/include/nanotins/bulk.hpp` | `bulk_for_each` (used as-is with the GPU scheduler) + `serial_for_each`. |
-| `examples/pcapng2lance/src/pcapng2lance_main.cpp` | `L1Converter::parse_packets_gpu()` — the **GPU L1 parse**: H2D(window+BlockRefs) → `bulk_for_each(gpu_ctx_->scheduler(), …, parse_epb kernel)` → D2H(EpbView). Selected by `--gpu`; the window is capped to the VRAM budget. CPU path is unchanged. |
+| `examples/pcapng2lance/src/pcapng2lance_main.cpp` | `L1Converter::parse_packets_gpu()` — the **GPU L1 parse**: H2D(window+BlockRefs) → `bulk_for_each(gpu_ctx_->scheduler(), …, parse_epb kernel)` → D2H(EpbView). Under `--decode-l2l3` it also calls `decode_window_gpu`. Selected by `--gpu`; window capped to the VRAM budget. CPU path unchanged. |
+| `nanotins/include/nanotins/protocol_decode_gpu.hpp` | **GPU L2/L3/L4 decode** `decode_window_gpu` — the on-device count → `thrust::exclusive_scan` → scatter (the variable-output pattern). Same `count_packet`/`scatter_packet`/`walk_packet` kernels as CPU (now `NANOTINS_HD`); only the scan (thrust) + device buffers + D2H append differ. |
 | `examples/pcapng2lance/CMakeLists.txt` | `option(NANOTINS_ENABLE_CUDA …)` + the documented build hook. |
 | CLI | `--gpu`, `--cuda-device D`, `--vram-pct P`, `--vram-bytes B`. Without a CUDA build, `--gpu` exits with a clear error. |
 
-The first GPU kernel is the **L1 `parse_epb` scatter** (one `EpbView` per packet). This matches the
-reference, which also ran only the simple kernel on GPU and kept the heavy work on a CPU pool. The L2/L3/L4
-decode still runs on the CPU pool even under `--gpu` (see "Next steps").
+Both Phase-B halves are now scaffolded on GPU: the **L1 `parse_epb` scatter** (one `EpbView` per packet,
+AoS) and the **L2/L3/L4 decode** (`decode_window_gpu`, count→scan→scatter). The decode is where the GPU
+actually pays off (heavier per-packet work). All of it is written-not-compiled — your job is to compile,
+fix any toolchain syntax, and **verify byte-identical to CPU**.
 
 ## Step 1 — build with CUDA
 
@@ -118,22 +120,42 @@ runs on-device too (Next steps) or the window is large and the kernel heavier.
    scheduler (nvexec compiles it for device); we do the same. Do **not** hand-annotate the `bulk_for_each`
    kernel `__device__` — let nvexec handle it. (The functions it *calls* are `NANOTINS_HD`.)
 
-## Next steps (after the L1 MVP works)
+## Compiling the decode (`decode_window_gpu`)
 
-1. **Decode on GPU.** `protocols::decode_window` is the canonical variable-output GPU pattern
-   (count → exclusive-scan → scatter). To run it on device: H2D the window + the `(link_type, poff,
-   psize)` arrays; run pass-1 `count_packet` and pass-2 `scatter_packet` via `bulk_for_each(gpu_sched,…)`;
-   replace the host serial prefix-sum with `thrust::exclusive_scan` (or cub) on the count arrays; size the
-   device output columns to the scanned totals; D2H the PDU rows. The kernels (`count_packet`,
-   `scatter_packet`, the shared `walk_packet`) are already `NANOTINS_HD`. This is where the GPU actually
-   wins (heavier per-packet work, more parallelism).
-2. **Coalesced SoA output.** Instead of the AoS `std::vector<EpbView>` + a host `assemble`, fill the final
+It needs **thrust** (ships with the CUDA toolkit, header-only): the includes are already in
+`protocol_decode_gpu.hpp`. The single `thrust::exclusive_scan` / `thrust::reduce` with
+`thrust::plus<PduCounts>{}` does the per-type prefix-sum for **all six PDU types at once** —
+`PduCounts::operator+` (component-wise) makes that work.
+
+Extra flags likely needed (on top of the L1 ones): **`--extended-lambda`** (nvcc) or the clang-cuda
+equivalent — because `count_packet`/`scatter_packet` create lambdas *inside* `NANOTINS_HD` functions, and
+those must be device-callable. If the device compile complains about the in-function lambdas, that flag is
+the fix.
+
+Verify the decode the same way as L1, but diff the **PDU tables**:
+```bash
+$EXE --decode-l2l3       capture.pcapng /tmp/cpu.lance
+$EXE --decode-l2l3 --gpu capture.pcapng /tmp/gpu.lance
+for t in ethernet vlan ipv4 ipv6 tcp udp remainder_after_l4; do
+  diff <(nlance2table -f ndjson /tmp/cpu_$t.lance | sort) \
+       <(nlance2table -f ndjson /tmp/gpu_$t.lance | sort) && echo "$t OK"
+done
+```
+Row **order** within a table is by packet index (the scan sums in index order), so the tables must come out
+identical to CPU — `pcapng2lance_frag_harmony` already encodes that contract for the CPU paths.
+
+## Next steps (after GPU matches CPU)
+
+1. **Coalesced SoA output.** Instead of the AoS `std::vector<EpbView>` + a host `assemble`, fill the final
    columns directly on device using the **soa device-view**: allocate one `device_buffer` per column,
    build a `soa_ptrs<EpbRow>`-shaped pack of device pointers, and `nanotins::scatter(pack, i, row)` in the
    kernel (coalesced per-column writes). See `nanotins::soa<T>::raw()` / `nanotins::scatter` and
    `test_soa_scatter.cpp`. (Watch gotcha #2.)
-3. **Overlap copies with compute** (CUDA streams / pinned host memory) so H2D of window N+1 overlaps the
+2. **Overlap copies with compute** (CUDA streams / pinned host memory) so H2D of window N+1 overlaps the
    kernel of window N — the streaming loop already produces one window at a time.
+3. **Keep PDUs on-device across windows** (skip the per-window D2H) and only copy back at the end, if VRAM
+   for the accumulated tables allows; otherwise the per-window D2H append (current `append_column`) is the
+   bounded-memory choice.
 
 ## Acceptance
 
