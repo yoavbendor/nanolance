@@ -270,7 +270,11 @@ bool blob_v2_control_buffer_to_row_sizes(const std::vector<std::uint8_t>& contro
     }
     // Wide control buffers carry a width discriminator in byte[1]: 0 = u16 offsets, 1 = u32 offsets.
     // expect_wide16 and expect_wide32 only collide when n == 0, which is handled above.
-    if (control.size() == expect_wide16 && control[1] == 0U) {
+    if (control.size() == expect_wide16) {
+        if (control[1] != 0U) {
+            error = "invalid wide blob control buffer header";
+            return false;
+        }
         std::uint16_t prev = 0;
         for (std::uint32_t i = 0; i < n; ++i) {
             const auto base = static_cast<std::size_t>(2U + 2U * i);
@@ -285,7 +289,11 @@ bool blob_v2_control_buffer_to_row_sizes(const std::vector<std::uint8_t>& contro
         }
         return true;
     }
-    if (control.size() == expect_wide32 && control[1] == 1U) {
+    if (control.size() == expect_wide32) {
+        if (control[1] != 1U) {
+            error = "invalid wide blob control buffer header";
+            return false;
+        }
         std::uint32_t prev = 0;
         for (std::uint32_t i = 0; i < n; ++i) {
             const auto base = static_cast<std::size_t>(2U + 4U * i);

@@ -6,28 +6,27 @@
 
 #include "mem_budget.hpp"
 #include "packet_row.hpp"
+#include "phase_b_runner.hpp"
 #include "nanotins/arrow_glue.hpp"
-#include "nanotins/bulk.hpp"
-#include "nanotins/gpu.hpp"  // GPU device infra; inert unless built with -DNANOTINS_ENABLE_CUDA
 #include "nanotins/pcap_blocks.hpp"
 #include "pdu_table_writer.hpp"
 #include "nanotins/protocol_decode.hpp"
 #include "nanotins/protocol_decode_bulk.hpp"
-#include "nanotins/protocol_decode_gpu.hpp"  // GPU L2/L3/L4 decode; inert unless NANOTINS_ENABLE_CUDA
 #include "staged_pipeline.hpp"
 #include "streaming_reader.hpp"
+#include "pcapng2lance_gpu_bridge.hpp"
 
 #include "nanolance/blob_builder.hpp"
 #include "nanolance/nano_lance_reader.h"
 #include "nanolance/nano_lance_writer.h"
 
-#include <exec/static_thread_pool.hpp>
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <filesystem>
 #include <initializer_list>
 #include <memory>
@@ -320,7 +319,7 @@ class L1Converter {
 public:
     L1Converter(Args args, fs::path output, std::string payload_uri)
         : args_(std::move(args)), output_(std::move(output)), payload_uri_(std::move(payload_uri)),
-          pool_(pool_threads(args_.threads)) {}
+          phase_b_runner_(pool_threads(args_.threads)) {}
 
     int run(const fs::path& input) {
         streaming::FileSource source(input);
@@ -329,15 +328,13 @@ public:
         // GPU: create the device context and cap the per-window size to the VRAM budget so each window's
         // (bytes + refs + EpbView output) device allocation fits. ~70% headroom for refs+output+overhead.
         std::size_t window_bytes = args_.window_bytes;
-#ifdef NANOTINS_ENABLE_CUDA
         if (args_.gpu) {
-            gpu_ctx_ = std::make_unique<nanotins::gpu::context>(args_.cuda_device);
-            const std::uint64_t budget = nanotins::gpu::vram_budget(args_.vram_bytes, args_.vram_pct);
+            gpu_ctx_ = pcapng2lance::gpu_bridge::create_context(args_.cuda_device);
+            const std::uint64_t budget = pcapng2lance::gpu_bridge::vram_budget(args_.vram_bytes, args_.vram_pct);
             window_bytes = std::min<std::uint64_t>(window_bytes, budget * 7 / 10);
             std::fprintf(stderr, "pcapng2lance: GPU device %d, VRAM budget %llu B -> window %zu B\n",
                          args_.cuda_device, static_cast<unsigned long long>(budget), window_bytes);
         }
-#endif
         streaming::Window<streaming::FileSource> win(source, window_bytes);
 
         std::string err;
@@ -390,13 +387,8 @@ private:
     static constexpr std::size_t kScalarCols = nanotins::column_count<PacketRow>;
 
     // Phase-B execution policy: parallel ex::bulk, or an in-thread loop under --sequential.
-    template <class Kernel>
-    void phase_b(std::size_t num_tasks, std::size_t n, const Kernel& k) {
-        if (args_.sequential) {
-            nanotins::serial_for_each(num_tasks, n, k);
-        } else {
-            nanotins::bulk_for_each(pool_.get_scheduler(), num_tasks, n, k);
-        }
+    void phase_b(std::size_t num_tasks, std::size_t n, const std::function<void(std::size_t)>& k) {
+        phase_b_runner_.run(args_.sequential, num_tasks, n, k);
     }
 
     bool build_schema(std::string& err) {
@@ -496,9 +488,7 @@ private:
     // identical kernel runs on the GPU over device pointers (see parse_packets_gpu).
     std::vector<pcapblocks::EpbView> parse_packets(pcapblocks::Bytes wbytes,
                                                    const std::vector<pcapblocks::BlockRef>& packets) {
-#ifdef NANOTINS_ENABLE_CUDA
         if (args_.gpu) return parse_packets_gpu(wbytes, packets);
-#endif
         const std::size_t n = packets.size();
         std::vector<pcapblocks::EpbView> parsed(n);
         const pcapblocks::Bytes wb = wbytes;
@@ -512,34 +502,11 @@ private:
         return parsed;
     }
 
-#ifdef NANOTINS_ENABLE_CUDA
-    // The SAME L1 parse on the GPU: copy the window bytes + BlockRefs to device, run the identical
-    // bulk_for_each kernel on the nvexec scheduler (parse_epb is NANOTINS_HD), copy the EpbViews back.
-    // Mirrors stdexec_gpu_experiment's run_bulk_gpu — only the scheduler + device pointers differ.
     std::vector<pcapblocks::EpbView> parse_packets_gpu(pcapblocks::Bytes wbytes,
                                                        const std::vector<pcapblocks::BlockRef>& packets) {
-        const std::size_t n = packets.size();
-        nanotins::gpu::device_buffer<std::uint8_t> d_win(wbytes.size());
-        d_win.to_device(wbytes.data(), wbytes.size());
-        nanotins::gpu::device_buffer<pcapblocks::BlockRef> d_refs(n);
-        d_refs.to_device(packets.data(), n);
-        nanotins::gpu::device_buffer<pcapblocks::EpbView> d_out(n);
-        d_out.zero();
-        const std::uint8_t* win = d_win.get();
-        const std::size_t wsize = wbytes.size();
-        const pcapblocks::BlockRef* pk = d_refs.get();
-        pcapblocks::EpbView* out = d_out.get();
-        const std::size_t num_tasks = std::min<std::size_t>(n, args_.threads ? args_.threads : 256);
-        nanotins::bulk_for_each(gpu_ctx_->scheduler(), num_tasks, n, [=](std::size_t i) {
-            pcapblocks::Bytes wb(win, wsize);  // span over DEVICE memory
-            pcapblocks::EpbView v{};
-            if (pcapblocks::parse_epb(wb, pk[i], v)) out[i] = v;
-        });
-        std::vector<pcapblocks::EpbView> parsed(n);
-        d_out.to_host(parsed.data(), n);
-        return parsed;
+        const std::size_t tasks = args_.threads ? static_cast<std::size_t>(args_.threads) : 256;
+        return pcapng2lance::gpu_bridge::parse_packets(*gpu_ctx_, wbytes, packets, tasks);
     }
-#endif
 
     // Assemble the columnar batch from the parsed EpbViews: soa<PacketRow>::store fans each row out into
     // columns by reflection (no hand-written columns), denormalizing link_type/ts_resol from the section's
@@ -636,18 +603,17 @@ private:
         }
         if (args_.decode_l2l3) {
             std::vector<protocols::WalkResult> trailers(n);
-#ifdef NANOTINS_ENABLE_CUDA
             if (args_.gpu) {
                 const std::size_t tasks = args_.threads ? static_cast<std::size_t>(args_.threads) : 256;
-                protocols::gpu::decode_window_gpu(gpu_ctx_->scheduler(), tasks, global_pid_,
-                                                  batch.link_type.data(), batch.poff.data(),
-                                                  batch.psize.data(), wbytes, n, pdus_, trailers.data());
+                pcapng2lance::gpu_bridge::decode_window(*gpu_ctx_, tasks, global_pid_,
+                                                        batch.link_type.data(), batch.poff.data(),
+                                                        batch.psize.data(), wbytes, n, pdus_, trailers.data());
             } else
-#endif
             {
                 auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
+                const protocols::Bytes pwin(wbytes.data(), wbytes.size());
                 protocols::decode_window(run, global_pid_, batch.link_type.data(), batch.poff.data(),
-                                         batch.psize.data(), wbytes, n, pdus_, trailers.data());
+                                         batch.psize.data(), pwin, n, pdus_, trailers.data());
             }
             collect_remainder(trailers, batch, wbase);
         }
@@ -711,10 +677,8 @@ private:
     Args args_;
     fs::path output_;
     std::string payload_uri_;
-    exec::static_thread_pool pool_;
-#ifdef NANOTINS_ENABLE_CUDA
-    std::unique_ptr<nanotins::gpu::context> gpu_ctx_;  // created in run() when --gpu
-#endif
+    pcapng2lance::PhaseBRunner phase_b_runner_;
+    pcapng2lance::gpu_bridge::context_ptr gpu_ctx_{nullptr, &pcapng2lance::gpu_bridge::destroy_context};
 
     ArrowSchema schema_{};
     NanoLanceWriter writer_{};
@@ -738,12 +702,7 @@ int main(int argc, char** argv) {
     std::string err;
     if (!parse_args(argc, argv, args, err)) return fail(err);
 
-#ifndef NANOTINS_ENABLE_CUDA
-    if (args.gpu) {
-        return fail("--gpu requires a CUDA build (configure with -DNANOTINS_ENABLE_CUDA=ON); "
-                    "see nanotins/docs/GPU_BULK_INTEGRATION.md");
-    }
-#endif
+
 
     // Enrichment stages run entirely off the previously-written tables in <datadir>.
     if (args.stage == "l2" || args.stage == "l3" || args.stage == "l4") {

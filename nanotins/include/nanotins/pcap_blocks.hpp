@@ -23,7 +23,30 @@
 
 namespace pcapblocks {
 
-using Bytes = std::span<const std::uint8_t>;  // POD (ptr+size), usable in CUDA device code
+// POD byte span (ptr + size) that stays device-safe under clang-cuda/libstdc++ (std::span in this toolchain
+// pulls host-only assertion hooks in device code paths).
+struct Bytes {
+    const std::uint8_t* ptr = nullptr;
+    std::size_t len = 0;
+
+    constexpr Bytes() = default;
+    constexpr Bytes(const std::uint8_t* data, std::size_t size) : ptr(data), len(size) {}
+    constexpr Bytes(std::span<const std::uint8_t> s) : ptr(s.data()), len(s.size()) {}
+
+    constexpr const std::uint8_t* data() const { return ptr; }
+    constexpr std::size_t size() const { return len; }
+    constexpr bool empty() const { return len == 0; }
+    constexpr const std::uint8_t& operator[](std::size_t i) const { return ptr[i]; }
+
+    constexpr Bytes subspan(std::size_t off) const {
+        return off <= len ? Bytes(ptr + off, len - off) : Bytes{};
+    }
+    constexpr Bytes subspan(std::size_t off, std::size_t count) const {
+        if (off > len) return {};
+        const std::size_t n = count > (len - off) ? (len - off) : count;
+        return Bytes(ptr + off, n);
+    }
+};
 
 enum class Kind : std::uint8_t { Shb, Idb, Epb, PcapRecord, SimplePacket, Other };
 
