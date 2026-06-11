@@ -102,6 +102,14 @@ if(NANOLANCE_BUILD_TESTS)
                         $<TARGET_FILE:nlance2table> $<TARGET_FILE:pcapng2lance>
                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/SRL_front_left_51_short.pcapng")
             set_tests_properties(nlance2table_tshark_realfile PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
+            # Harmonization: one-shot (--decode-l2l3) and staged (--stage l1->l4) must emit identical PDU
+            # tables on a fragmented capture (same IPv4-fragmentation L4 gate in both decode paths).
+            add_test(NAME pcapng2lance_frag_harmony
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_frag_harmony.py"
+                        $<TARGET_FILE:pcapng2lance> $<TARGET_FILE:nlance2table>
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/SRL_front_left_51_short.pcapng")
+            set_tests_properties(pcapng2lance_frag_harmony PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
         endif()
     endif()
 endif()

@@ -126,6 +126,7 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
 | `nlance2table_smoke` | interop | `nlance2table` (top-level tool) dumps PDU + L1 tables to CSV/NDJSON: header, row counts, `--limit`, `fixed_size_binary` hex, nested-struct flatten |
 | `nlance2table_tshark` | interop | per-PDU tables dumped via `nlance2table` match **tshark**'s dissection of the same pcapng field-for-field (eth/vlan/ipv4/ipv6/tcp/udp); skips if `tshark` absent |
 | `nlance2table_tshark_realfile` | interop | real fragmented capture (`tests/SRL_front_left_51_short.pcapng`, 224 frames): L4 gated to first fragments (udp on 7 only) + eth/vlan/ipv4 fields match `tshark` (reassembly off); skips if `tshark` absent |
+| `pcapng2lance_frag_harmony` | interop | one-shot (`--decode-l2l3`) and staged (`--stage l1→l4`) emit **identical** PDU tables on the fragmented capture — the IPv4-fragmentation L4 gate behaves the same in both decode paths |
 
 ## Notes / known limitations
 
@@ -143,6 +144,7 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
   TCP/UDP row **only when `frag_offset == 0`** (verified against `tshark` with reassembly off on a real
   fragmented capture). Continuation fragments still appear in the `ipv4` table (every fragment carries
   `protocol`), so "how many packets belong to a UDP datagram" is the `ipv4.protocol==17` count, while the
-  `udp` table holds the real headers only. Payload **reassembly** across fragments is not done. The staged
-  `--stage l4` enrich path does not yet apply this gate (it decodes L4 per remainder row); only the
-  one-shot `--decode-l2l3` path is fragmentation-aware today.
+  `udp` table holds the real headers only. Payload **reassembly** across fragments is not done. **Both
+  decode paths apply this gate identically** — the one-shot `--decode-l2l3` walk and the staged
+  `--stage l4` enrich produce byte-identical PDU tables on a fragmented capture (guarded by
+  `pcapng2lance_frag_harmony`).
