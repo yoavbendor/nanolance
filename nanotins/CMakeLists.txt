@@ -115,4 +115,10 @@ if(NANOTINS_BUILD_TESTS)
     target_link_libraries(nanotins_protocol_specs PRIVATE nanotins_protocols)
     add_test(NAME nanotins_protocol_specs COMMAND $<TARGET_FILE:nanotins_protocol_specs>)
     set_tests_properties(nanotins_protocol_specs PROPERTIES LABELS "smoke")
+
+    # M4b: PTPv2 via embed<> spec composition (header parity vs Gptp; embed offsets + name prefixes).
+    add_executable(nanotins_struct_spec_ptp tests/test_struct_spec_ptp.cpp)
+    target_link_libraries(nanotins_struct_spec_ptp PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_struct_spec_ptp COMMAND $<TARGET_FILE:nanotins_struct_spec_ptp>)
+    set_tests_properties(nanotins_struct_spec_ptp PROPERTIES LABELS "smoke")
 endif()

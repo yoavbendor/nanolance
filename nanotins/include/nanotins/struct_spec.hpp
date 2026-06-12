@@ -104,10 +104,84 @@ struct named_bytes_field {
     static constexpr std::size_t end_offset() { return Offset + N; }
 };
 
-template <class... Fields>
+// ---- spec composition: embed<Prefix, Offset, SubSpec> splices a sub-spec's fields ---------------------
+// Each sub-field is shifted by Offset and its tag prefixed with Prefix (use decltype(""_fld) for none).
+// Purely compile-time: it flattens to the same leaf field list, so the readers / SoA / device path are
+// unchanged. Lets a header (e.g. the PTP common header) be defined once and reused across message types.
+namespace detail_spec {
+
+template <class A, class B>
+struct cat_tag;
+template <char... A, char... B>
+struct cat_tag<name_tag<A...>, name_tag<B...>> {
+    using type = name_tag<A..., B...>;
+};
+template <class A, class B>
+using cat_tag_t = typename cat_tag<A, B>::type;
+
+template <class Prefix, std::size_t Base, class F>
+struct shift_field;
+template <class Prefix, std::size_t Base, class Tag, std::size_t Off, class T, wire_endian E>
+struct shift_field<Prefix, Base, named_field<Tag, Off, T, E>> {
+    using type = named_field<cat_tag_t<Prefix, Tag>, Base + Off, T, E>;
+};
+template <class Prefix, std::size_t Base, class Tag, std::size_t Off, class S, std::size_t BO, std::size_t W,
+          wire_endian E>
+struct shift_field<Prefix, Base, named_bit_field<Tag, Off, S, BO, W, E>> {
+    using type = named_bit_field<cat_tag_t<Prefix, Tag>, Base + Off, S, BO, W, E>;
+};
+template <class Prefix, std::size_t Base, class Tag, std::size_t Off, std::size_t N>
+struct shift_field<Prefix, Base, named_bytes_field<Tag, Off, N>> {
+    using type = named_bytes_field<cat_tag_t<Prefix, Tag>, Base + Off, N>;
+};
+
+template <class Prefix, std::size_t Base, class Tuple>
+struct shift_all;
+template <class Prefix, std::size_t Base, class... F>
+struct shift_all<Prefix, Base, std::tuple<F...>> {
+    using type = std::tuple<typename shift_field<Prefix, Base, F>::type...>;
+};
+
+template <class A, class B>
+struct cat2;
+template <class... A, class... B>
+struct cat2<std::tuple<A...>, std::tuple<B...>> {
+    using type = std::tuple<A..., B...>;
+};
+template <class... Ts>
+struct concat {
+    using type = std::tuple<>;
+};
+template <class T>
+struct concat<T> {
+    using type = T;
+};
+template <class A, class B, class... R>
+struct concat<A, B, R...> {
+    using type = typename concat<typename cat2<A, B>::type, R...>::type;
+};
+
+}  // namespace detail_spec
+
+template <class Prefix, std::size_t Offset, class SubSpec>
+struct embed {};
+
+namespace detail_spec {
+template <class E>
+struct expand_one {
+    using type = std::tuple<E>;
+};
+template <class Prefix, std::size_t Offset, class SubSpec>
+struct expand_one<embed<Prefix, Offset, SubSpec>> {
+    using type = typename shift_all<Prefix, Offset, typename SubSpec::fields>::type;
+};
+}  // namespace detail_spec
+
+// A StructSpec is a list of leaf fields and/or embed<> groups; it flattens to one leaf field tuple.
+template <class... Elems>
 struct StructSpec {
-    static constexpr std::size_t field_count = sizeof...(Fields);
-    using fields = std::tuple<Fields...>;
+    using fields = typename detail_spec::concat<typename detail_spec::expand_one<Elems>::type...>::type;
+    static constexpr std::size_t field_count = std::tuple_size_v<fields>;
 };
 
 template <class Spec>
