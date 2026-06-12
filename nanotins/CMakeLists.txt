@@ -91,4 +91,10 @@ if(NANOTINS_BUILD_TESTS)
     target_link_libraries(nanotins_gptp_test PRIVATE nanotins_protocols)
     add_test(NAME nanotins_gptp COMMAND $<TARGET_FILE:nanotins_gptp_test>)
     set_tests_properties(nanotins_gptp PROPERTIES LABELS "smoke")
+
+    # struct_spec M1: the UDP header (4x u16) wire spec -> contiguous/device read -> bulk SoA -> Arrow.
+    add_executable(nanotins_struct_spec_udp tests/test_struct_spec_udp.cpp)
+    target_link_libraries(nanotins_struct_spec_udp PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_struct_spec_udp COMMAND $<TARGET_FILE:nanotins_struct_spec_udp>)
+    set_tests_properties(nanotins_struct_spec_udp PROPERTIES LABELS "smoke")
 endif()
