@@ -1,6 +1,6 @@
 # Linux CI results
 
-_2026-06-12 11:44:45 UTC · commit `b78ea55`_
+_2026-06-12 05:24:52 UTC · commit `4b31932`_
 
 ## Environment
 ```
@@ -13,7 +13,7 @@ cmake version 3.31.6
 ```
 smoke    =   0.20 sec*proc (29 tests)
 
-Total Test time (real) =   0.27 sec
+Total Test time (real) =   0.41 sec
 ```
 
 ## Benchmark (parquet vs rust lance vs nanolance)
@@ -21,21 +21,28 @@ Total Test time (real) =   0.27 sec
 
 ========== pcap_ref  (200000 rows, 3 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
-parquet (zstd)         28.34       28.34    4.189      7.88                (1.00x vs pq)
-rust lance             10.56       10.56    3.472      6.30                (0.83x vs pq)
-nanolance              23.67       34.13    3.643     11.17         9.62   (0.87x vs pq)
-
-========== wide_int  (200000 rows, 4 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
 parquet (zstd)         29.12       29.12    5.212      3.85                (1.00x vs pq)
 rust lance              3.11        3.11    8.485      3.34                (1.63x vs pq)
 nanolance               8.39       11.29    9.013      7.48        12.21   (1.73x vs pq)
 
-========== high_card  (200000 rows, 2 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
 parquet (zstd)         32.23       32.23   15.513      8.62                (1.00x vs pq)
 rust lance             17.69       17.69   18.909      5.86                (1.22x vs pq)
 nanolance              98.15      103.94   18.206     13.16        12.20   (1.17x vs pq)
+parquet (zstd)         22.88       22.88    4.189      6.06                (1.00x vs pq)
+rust lance             10.00       10.00    3.472      5.40                (0.83x vs pq)
+nanolance              23.95       31.27    3.643     11.13         9.22   (0.87x vs pq)
+
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         24.36       24.36    5.212      3.51                (1.00x vs pq)
+rust lance              2.63        2.63    8.485      3.69                (1.63x vs pq)
+nanolance              10.45       13.60    9.013     12.24        11.77   (1.73x vs pq)
+
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         30.06       30.06   15.513      8.10                (1.00x vs pq)
+rust lance             16.80       16.80   18.971      5.52                (1.22x vs pq)
+nanolance             151.09      156.36   18.206     15.23        12.05   (1.17x vs pq)
 
 note: best of 5 writes / 7 reads. write(core)=in-process encode work (parquet/lance: the write call; nanolance: ingest+encode+commit, EXCLUDING process startup + Arrow-IPC parse). write(proc)=full wall clock (nanolance includes subprocess startup + IPC parse). read ms=native reader; read(lance)=rust-lance reading the nanolance file.
 ```
@@ -48,9 +55,9 @@ Profile data file '/tmp/cg.out' (creator: callgrind-3.22.0)
 I1 cache: 
 D1 cache: 
 LL cache: 
-Timerange: Basic block 0 - 20189215
+Timerange: Basic block 0 - 20189217
 Trigger: Program termination
-Profiled target:  build/nlbench /tmp/nlb/pcap_ref_nl.lance 1 (PID 4349, part 1)
+Profiled target:  build/nlbench /tmp/nlb/pcap_ref_nl.lance 1 (PID 4368, part 1)
 Events recorded:  Ir
 Events shown:     Ir
 Event sort order: Ir
