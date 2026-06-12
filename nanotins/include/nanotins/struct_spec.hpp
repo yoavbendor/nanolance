@@ -17,6 +17,7 @@
 
 #include "soatins/portability.hpp"  // NANOTINS_HD
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <tuple>
@@ -77,6 +78,18 @@ struct named_bit_field {
     static constexpr std::size_t end_offset() { return Offset + sizeof(StorageT); }
 };
 
+// A fixed-size byte-array field (IPv6/MAC address, a raw blob): N raw bytes at Offset, no endian swap.
+// Its column is a fixed-size-binary, std::array<uint8_t, N> (soatins maps that to Arrow FIXED_SIZE_BINARY).
+template <class Tag, std::size_t Offset, std::size_t N>
+struct named_bytes_field {
+    using tag = Tag;
+    using value_type = std::array<std::uint8_t, N>;
+    static constexpr std::size_t offset = Offset;
+    static constexpr std::size_t byte_count = N;
+    static constexpr const char* name() { return Tag::value; }
+    static constexpr std::size_t end_offset() { return Offset + N; }
+};
+
 template <class... Fields>
 struct StructSpec {
     static constexpr std::size_t field_count = sizeof...(Fields);
@@ -110,7 +123,13 @@ NANOTINS_HD inline T read_scalar_at(const std::uint8_t* p, std::size_t off) {
 // (shift = storage_bits - width - bit_offset), LSB-first for little. Device-safe either way.
 template <class F>
 NANOTINS_HD inline typename F::value_type read_field(const std::uint8_t* p) {
-    if constexpr (requires { F::bit_offset; F::width; F::storage_bits; }) {
+    if constexpr (requires { F::byte_count; }) {
+        typename F::value_type a{};
+        for (std::size_t i = 0; i < F::byte_count; ++i) {
+            a[i] = static_cast<std::uint8_t>(p[F::offset + i]);
+        }
+        return a;
+    } else if constexpr (requires { F::bit_offset; F::width; F::storage_bits; }) {
         using SU = uint_for_width<F::storage_bits>;
         const std::uint64_t unit = static_cast<std::uint64_t>(read_scalar_at<SU, F::order>(p, F::offset));
         const std::uint64_t mask = (std::uint64_t{1} << F::width) - 1;

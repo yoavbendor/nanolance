@@ -29,8 +29,8 @@ namespace nanotins {
 template <class F>
 struct spec_col {
     using elem = typename F::value_type;
-    static constexpr soatins::arrow_kind kind = soatins::kind_for_scalar<elem>();
-    static constexpr int fixed_width = 0;
+    static constexpr soatins::arrow_kind kind = soatins::column_traits<elem>::kind;
+    static constexpr int fixed_width = soatins::column_traits<elem>::fixed_width;
     static const char* name() { return F::name(); }
 };
 

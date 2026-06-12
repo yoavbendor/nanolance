@@ -103,4 +103,10 @@ if(NANOTINS_BUILD_TESTS)
     target_link_libraries(nanotins_struct_spec_ipv4 PRIVATE nanotins_protocols)
     add_test(NAME nanotins_struct_spec_ipv4 COMMAND $<TARGET_FILE:nanotins_struct_spec_ipv4>)
     set_tests_properties(nanotins_struct_spec_ipv4 PROPERTIES LABELS "smoke")
+
+    # struct_spec M3: IPv6 (byte-crossing bit-field + fixed-size-binary addresses + next_header chaining).
+    add_executable(nanotins_struct_spec_ipv6 tests/test_struct_spec_ipv6.cpp)
+    target_link_libraries(nanotins_struct_spec_ipv6 PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_struct_spec_ipv6 COMMAND $<TARGET_FILE:nanotins_struct_spec_ipv6>)
+    set_tests_properties(nanotins_struct_spec_ipv6 PROPERTIES LABELS "smoke")
 endif()
