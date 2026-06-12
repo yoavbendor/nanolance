@@ -127,4 +127,10 @@ if(NANOTINS_BUILD_TESTS)
     target_link_libraries(nanotins_spec_dag PRIVATE nanotins_protocols)
     add_test(NAME nanotins_spec_dag COMMAND $<TARGET_FILE:nanotins_spec_dag>)
     set_tests_properties(nanotins_spec_dag PROPERTIES LABELS "smoke")
+
+    # M5b: DAG-driven columnar decode (per-node SoA + packet_id) == struct_view; counts == walk_packet.
+    add_executable(nanotins_dag_decode tests/test_dag_decode.cpp)
+    target_link_libraries(nanotins_dag_decode PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_dag_decode COMMAND $<TARGET_FILE:nanotins_dag_decode>)
+    set_tests_properties(nanotins_dag_decode PROPERTIES LABELS "smoke")
 endif()
