@@ -37,10 +37,24 @@ template <char... Cs>
 constexpr char name_tag<Cs...>::value[sizeof...(Cs) + 1];
 
 namespace literals {
+// The string-literal operator template (`"foo"_fld`) is a well-supported GNU/Clang extension; silence the
+// pedantic warning rather than lose the ergonomic named-field syntax.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-string-literal-operator-template"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
 template <class CharT, CharT... Cs>
 consteval name_tag<Cs...> operator""_fld() {
     return {};
 }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 }  // namespace literals
 
 // ---- a named wire field: name tag, byte offset, value type, endianness -------------------------------

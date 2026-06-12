@@ -84,9 +84,11 @@ if(NANOLANCE_BUILD_TESTS)
     add_test(NAME struct_spec_gpu_smoke COMMAND $<TARGET_FILE:struct_spec_gpu_smoke>)
     set_tests_properties(struct_spec_gpu_smoke PROPERTIES LABELS "smoke")
     if(NANOTINS_ENABLE_CUDA AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        # Compile the smoke TU as CUDA (clang-cuda), mirroring the gpu bridge. _NT_CUDA_OPTS is set above.
-        set_source_files_properties(tests/test_struct_spec_gpu.cpp PROPERTIES
-            COMPILE_DEFINITIONS "NANOTINS_ENABLE_CUDA=1" COMPILE_OPTIONS "${_NT_CUDA_OPTS}")
+        # struct_spec_gpu_smoke is a single-source target, so compile it as CUDA via TARGET-level options
+        # (reliable — source-level COMPILE_OPTIONS via set_source_files_properties did not propagate to the
+        # build rule here). _NT_CUDA_OPTS (-x cuda, --cuda-gpu-arch, ...) is set in the GPU block above.
+        target_compile_definitions(struct_spec_gpu_smoke PRIVATE NANOTINS_ENABLE_CUDA=1)
+        target_compile_options(struct_spec_gpu_smoke PRIVATE ${_NT_CUDA_OPTS})
         target_include_directories(struct_spec_gpu_smoke PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
         if(DEFINED CUDAToolkit_LIBRARY_DIR)
             target_link_directories(struct_spec_gpu_smoke PRIVATE ${CUDAToolkit_LIBRARY_DIR})
