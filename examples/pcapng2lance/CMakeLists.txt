@@ -74,6 +74,17 @@ if(NANOLANCE_BUILD_TESTS)
     add_test(NAME pdu_table_interop COMMAND $<TARGET_FILE:pdu_table_interop_test>)
     set_tests_properties(pdu_table_interop PROPERTIES LABELS "smoke")
 
+    # M6 (full pipeline, no Python): write both PDU-table paths to real Lance, dump via nlance2table, diff
+    # the CSV. Proves the spec/DAG tables == protocols:: tables through Lance write/read, not just in-memory.
+    if(TARGET nlance2table)
+        add_executable(pdu_table_lance_interop_test tests/test_pdu_table_lance_interop.cpp)
+        target_include_directories(pdu_table_lance_interop_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(pdu_table_lance_interop_test PRIVATE nanotins nanolance)
+        add_test(NAME pdu_table_lance_interop
+                 COMMAND $<TARGET_FILE:pdu_table_lance_interop_test> $<TARGET_FILE:nlance2table>)
+        set_tests_properties(pdu_table_lance_interop PROPERTIES LABELS "smoke")
+    endif()
+
     # End-to-end driver self-check (manifest + KV metadata + external-blob premise). Uses the nanotins
     # pcap scanner (linked via the umbrella target) and the shared pcap_fixtures.hpp from nanotins/tests.
     add_executable(pcapng2lance_driver_test tests/test_pcapng2lance_driver.cpp)

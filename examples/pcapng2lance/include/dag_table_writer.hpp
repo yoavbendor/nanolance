@@ -159,4 +159,17 @@ private:
     bool committed_ = false;
 };
 
+// One-shot: write a single-fragment DAG PDU table (the spec sibling of write_pdu_table).
+template <class Spec>
+bool write_dag_pdu_table(const std::filesystem::path& path, const nanotins::dag_pdu_table<Spec>& table,
+                         bool compress, std::string& error) {
+    DagPduAppender<Spec> appender(path, compress);
+    if (!appender.append(table, error)) {
+        appender.close();
+        return false;
+    }
+    appender.close();
+    return true;
+}
+
 }  // namespace pdu_io
