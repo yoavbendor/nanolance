@@ -11,8 +11,11 @@
 #include "soatins/sink.hpp"
 #include "nanotins/pcap_blocks.hpp"
 #include "pdu_table_writer.hpp"
+#include "dag_decode_window.hpp"
+#include "dag_table_writer.hpp"
 #include "nanotins/protocol_decode.hpp"
 #include "nanotins/protocol_decode_bulk.hpp"
+#include "nanotins/spec_dag.hpp"
 #include "staged_pipeline.hpp"
 #include "streaming_reader.hpp"
 #include "pcapng2lance_gpu_bridge.hpp"
@@ -658,13 +661,12 @@ private:
                 const std::size_t tasks = args_.threads ? static_cast<std::size_t>(args_.threads) : 256;
                 pcapng2lance::gpu_bridge::decode_window(*gpu_ctx_, tasks, global_pid_,
                                                         batch.link_type.data(), batch.poff.data(),
-                                                        batch.psize.data(), wbytes, n, pdus_, trailers.data());
+                                                        batch.psize.data(), wbytes, n, dag_pdus_, trailers.data());
             } else
             {
                 auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
-                const protocols::Bytes pwin(wbytes.data(), wbytes.size());
-                protocols::decode_window(run, global_pid_, batch.link_type.data(), batch.poff.data(),
-                                         batch.psize.data(), pwin, n, pdus_, trailers.data());
+                pcapng2lance::dag_decode_window(run, global_pid_, batch.link_type.data(), batch.poff.data(),
+                                                batch.psize.data(), wbytes, n, dag_pdus_, trailers.data());
             }
             collect_remainder(trailers, batch, wbase);
         }
@@ -708,17 +710,24 @@ private:
     int write_pdu_tables() {
         const auto stem = (output_.parent_path() / output_.stem()).string();
         std::string err;
-        const auto write_one = [&](const char* suffix, auto& column) -> bool {
+        // Each DAG node's table writes to its own Lance table (spec deduced from the table type). The output
+        // is byte-identical to the old protocols:: tables (see test_pdu_table_interop / _lance_interop).
+        const auto write_one = [&](const char* suffix, const auto& table) -> bool {
             const fs::path p = stem + suffix;
-            if (!pdu_io::write_pdu_table(p, column, args_.compress, err)) {
+            if (!pdu_io::write_dag_pdu_table(p, table, args_.compress, err)) {
                 std::fprintf(stderr, "pcapng2lance: failed to write %s: %s\n", p.string().c_str(), err.c_str());
                 return false;
             }
             return true;
         };
-        const bool ok = write_one("_ethernet.lance", pdus_.ethernet) & write_one("_vlan.lance", pdus_.vlan) &
-                        write_one("_ipv4.lance", pdus_.ipv4) & write_one("_ipv6.lance", pdus_.ipv6) &
-                        write_one("_tcp.lance", pdus_.tcp) & write_one("_udp.lance", pdus_.udp);
+        using G = nanotins::L2L3Graph;
+        const bool ok =
+            write_one("_ethernet.lance", std::get<nanotins::node_id_v<nanotins::EthNode, G>>(dag_pdus_)) &
+            write_one("_vlan.lance", std::get<nanotins::node_id_v<nanotins::VlanNode, G>>(dag_pdus_)) &
+            write_one("_ipv4.lance", std::get<nanotins::node_id_v<nanotins::Ipv4Node, G>>(dag_pdus_)) &
+            write_one("_ipv6.lance", std::get<nanotins::node_id_v<nanotins::Ipv6Node, G>>(dag_pdus_)) &
+            write_one("_tcp.lance", std::get<nanotins::node_id_v<nanotins::TcpNode, G>>(dag_pdus_)) &
+            write_one("_udp.lance", std::get<nanotins::node_id_v<nanotins::UdpNode, G>>(dag_pdus_));
         if (!ok) return 1;
         // The application payload after L4 (for later UDP-internal PDU parsing), as external refs — the
         // same remainder_after_l4 table the staged --stage l4 path emits. Written incrementally through the
@@ -734,8 +743,12 @@ private:
         std::fprintf(
             stderr,
             "pcapng2lance: decoded L2/L3 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, udp %zu, remainder %zu\n",
-            pdus_.ethernet.size(), pdus_.vlan.size(), pdus_.ipv4.size(), pdus_.ipv6.size(), pdus_.tcp.size(),
-            pdus_.udp.size(), rem_count_);
+            std::get<nanotins::node_id_v<nanotins::EthNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::VlanNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::Ipv4Node, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::Ipv6Node, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::TcpNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::UdpNode, nanotins::L2L3Graph>>(dag_pdus_).size(), rem_count_);
         return 0;
     }
 
@@ -763,7 +776,7 @@ private:
     std::size_t shb_count_ = 0, total_idb_ = 0, other_count_ = 0;
     bool schema_meta_set_ = false;
     bool first_commit_ = true;
-    protocols::DecodedPdus pdus_;                  // accumulated only when --decode-l2l3
+    nanotins::dag_tables<nanotins::L2L3Graph> dag_pdus_;  // accumulated only when --decode-l2l3 (spec/DAG)
 
     // remainder_after_l4: filled into a fixed-N SoA and flushed in chunks through the shared-URI writer
     // (no per-row uri string, bounded memory). The sink's flush is bound to rem_appender_->append_chunk.

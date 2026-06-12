@@ -171,7 +171,8 @@ void dag_decode_bulk(const std::vector<dag_packet>& pkts, dag_tables<Graph>& tab
     const dag_sink<Graph> sink = detail_dag::bind_sink<Graph>(tabs);
     const dag_packet* pp = pkts.data();
     const node_counts<NN>* bp = base.data();
-    executor(/*num_tasks*/ 0, np, [=](std::size_t k) {
+    const std::size_t num_tasks = std::min<std::size_t>(np, 64);  // match decode_window's partitioning
+    executor(num_tasks, np, [=](std::size_t k) {
         scatter_packet_dag<Graph>(pp[k].packet_id, root, pp[k].data, pp[k].size, bp[k], sink);
     });
 }
