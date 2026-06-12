@@ -56,34 +56,16 @@ void decode_window(Runner run_each, std::uint64_t pid_base, const std::uint16_t*
         });
     }
 
-    // Exclusive prefix-sum per PDU type, seeded at the columns' current sizes (append across windows).
-    PduCounts run{static_cast<std::uint32_t>(out.ethernet.size()), static_cast<std::uint32_t>(out.vlan.size()),
-                  static_cast<std::uint32_t>(out.ipv4.size()),     static_cast<std::uint32_t>(out.ipv6.size()),
-                  static_cast<std::uint32_t>(out.tcp.size()),      static_cast<std::uint32_t>(out.udp.size())};
+    // Exclusive prefix-sum per PDU type, seeded at the columns' current sizes (append across windows). The
+    // per-type running sum is one `run = run + per[i]` (PduCounts::operator+ is component-wise); seeding
+    // and the final resize fold over the columns (seed_counts / resize_columns) — no hand-unrolled types.
+    PduCounts run = seed_counts(out);
     std::vector<PduCounts> base(n);
     for (std::size_t i = 0; i < n; ++i) {
         base[i] = run;
-        run.eth += per[i].eth;
-        run.vlan += per[i].vlan;
-        run.ipv4 += per[i].ipv4;
-        run.ipv6 += per[i].ipv6;
-        run.tcp += per[i].tcp;
-        run.udp += per[i].udp;
+        run = run + per[i];
     }
-
-    // Size each output column exactly to its new total (the running sums after the scan).
-    out.ethernet.packet_id.resize(run.eth);
-    out.ethernet.rows.resize(run.eth);
-    out.vlan.packet_id.resize(run.vlan);
-    out.vlan.rows.resize(run.vlan);
-    out.ipv4.packet_id.resize(run.ipv4);
-    out.ipv4.rows.resize(run.ipv4);
-    out.ipv6.packet_id.resize(run.ipv6);
-    out.ipv6.rows.resize(run.ipv6);
-    out.tcp.packet_id.resize(run.tcp);
-    out.tcp.rows.resize(run.tcp);
-    out.udp.packet_id.resize(run.udp);
-    out.udp.rows.resize(run.udp);
+    resize_columns(out, run);  // size each output column exactly to its new total
 
     // Pass 2: re-walk and scatter each PDU into its prefix-summed slot (device-safe; disjoint writes).
     {
