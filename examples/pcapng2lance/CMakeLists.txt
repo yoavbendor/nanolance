@@ -66,6 +66,14 @@ if(NANOLANCE_BUILD_TESTS)
     add_test(NAME nanotins_reader_parity COMMAND $<TARGET_FILE:nanotins_reader_parity_test>)
     set_tests_properties(nanotins_reader_parity PROPERTIES LABELS "smoke")
 
+    # M6: the DAG-driven PDU tables are byte-identical (schema + Arrow buffers) to the protocols:: tables,
+    # so the driver's decode path can move to the spec/DAG without changing the Lance output.
+    add_executable(pdu_table_interop_test tests/test_pdu_table_interop.cpp)
+    target_include_directories(pdu_table_interop_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(pdu_table_interop_test PRIVATE nanotins nanolance)
+    add_test(NAME pdu_table_interop COMMAND $<TARGET_FILE:pdu_table_interop_test>)
+    set_tests_properties(pdu_table_interop PROPERTIES LABELS "smoke")
+
     # End-to-end driver self-check (manifest + KV metadata + external-blob premise). Uses the nanotins
     # pcap scanner (linked via the umbrella target) and the shared pcap_fixtures.hpp from nanotins/tests.
     add_executable(pcapng2lance_driver_test tests/test_pcapng2lance_driver.cpp)
