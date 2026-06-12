@@ -109,4 +109,10 @@ if(NANOTINS_BUILD_TESTS)
     target_link_libraries(nanotins_struct_spec_ipv6 PRIVATE nanotins_protocols)
     add_test(NAME nanotins_struct_spec_ipv6 COMMAND $<TARGET_FILE:nanotins_struct_spec_ipv6>)
     set_tests_properties(nanotins_struct_spec_ipv6 PROPERTIES LABELS "smoke")
+
+    # M4a: the backbone protocol_specs (eth/vlan/ipv4/ipv6/tcp/udp) read identically to protocols:: structs.
+    add_executable(nanotins_protocol_specs tests/test_protocol_specs.cpp)
+    target_link_libraries(nanotins_protocol_specs PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_protocol_specs COMMAND $<TARGET_FILE:nanotins_protocol_specs>)
+    set_tests_properties(nanotins_protocol_specs PROPERTIES LABELS "smoke")
 endif()
