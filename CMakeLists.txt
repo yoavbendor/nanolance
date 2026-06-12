@@ -224,11 +224,17 @@ if(NANOLANCE_STANDALONE)
 else()
     option(NANOLANCE_BUILD_EXAMPLES "Build examples (pcapng2lance + nanotins)" OFF)
 endif()
-# nanotins: the standalone pcap/pcapng + L2/L3/L4 parsing & reflection library (nanoarrow + boost only).
-# Built whenever the examples that consume it are, or tests are on. Its unit tests follow NANOLANCE_BUILD_TESTS.
+# The reflection/parsing stack, layered so each piece can be vendored on its own:
+#   soatins  — the reusable "describe a struct -> SoA + Arrow" nucleus (nanoarrow + boost only).
+#   nanotins — pcap/pcapng + L2/L3/L4 parsing + bulk_for_each (depends on soatins + stdexec).
+#   gputins  — the CUDA (nvexec) executors, header-only + guarded (depends on nanotins; inert without CUDA).
+# Built whenever the examples that consume them are, or tests are on. Unit tests follow NANOLANCE_BUILD_TESTS.
 if(NANOLANCE_BUILD_EXAMPLES OR NANOLANCE_BUILD_TESTS)
+    set(SOATINS_BUILD_TESTS ${NANOLANCE_BUILD_TESTS} CACHE BOOL "" FORCE)
     set(NANOTINS_BUILD_TESTS ${NANOLANCE_BUILD_TESTS} CACHE BOOL "" FORCE)
+    add_subdirectory(soatins)
     add_subdirectory(nanotins)
+    add_subdirectory(gputins)
 endif()
 
 if(NANOLANCE_BUILD_EXAMPLES)

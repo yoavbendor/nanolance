@@ -8,15 +8,15 @@
 // `bits<Word, field<"a",3>, field<"b",13>>` overlays exactly `sizeof(Word)` wire bytes and expands to
 // one Lance column per sub-field (see column_traits / columns_of).
 
-#include "nanotins/endian.hpp"
-#include "nanotins/fixed_string.hpp"
-#include "nanotins/portability.hpp"
+#include "soatins/endian.hpp"
+#include "soatins/fixed_string.hpp"
+#include "soatins/portability.hpp"
 
 #include <cstdint>
 #include <tuple>
 #include <type_traits>
 
-namespace nanotins {
+namespace soatins {
 
 template <fixed_string Name, unsigned W>
 struct field {
@@ -63,4 +63,4 @@ struct bits {
 template <class Bits, unsigned J>
 using bits_subfield_elem = uint_for_bits<std::tuple_element_t<J, typename Bits::fields_tuple>::width>;
 
-}  // namespace nanotins
+}  // namespace soatins

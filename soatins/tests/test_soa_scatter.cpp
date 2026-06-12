@@ -2,9 +2,9 @@
 // columns to soa<T>::store() (the serial path), including be<>/bits<> conversions. This is the primitive
 // that lets a bulk kernel fill any described struct's SoA with no hand-written column list.
 
-#include "nanotins/bits.hpp"
-#include "nanotins/endian.hpp"
-#include "nanotins/reflect.hpp"
+#include "soatins/bits.hpp"
+#include "soatins/endian.hpp"
+#include "soatins/reflect.hpp"
 
 #include <boost/describe.hpp>
 
@@ -23,8 +23,8 @@ void require(bool ok, const char* msg) {
 
 struct Row {
     std::uint32_t a;
-    nanotins::be<std::uint16_t> b;  // big-endian on the wire
-    nanotins::bits<std::uint8_t, nanotins::field<"hi", 4>, nanotins::field<"lo", 4>> nib;
+    soatins::be<std::uint16_t> b;  // big-endian on the wire
+    soatins::bits<std::uint8_t, soatins::field<"hi", 4>, soatins::field<"lo", 4>> nib;
     std::int64_t c;
 };
 BOOST_DESCRIBE_STRUCT(Row, (), (a, b, nib, c))
@@ -44,22 +44,22 @@ int main() {
     };
 
     // Reference: fill via store().
-    nanotins::soa<Row> ref;
+    soatins::soa<Row> ref;
     ref.resize(n);
     for (std::size_t i = 0; i < n; ++i) {
         ref.store(i, mk(i));
     }
 
     // Under test: fill via raw()+scatter() (what a bulk kernel does).
-    nanotins::soa<Row> got;
+    soatins::soa<Row> got;
     got.resize(n);
-    const nanotins::soa_ptrs<Row> p = got.raw();
+    const soatins::soa_ptrs<Row> p = got.raw();
     for (std::size_t i = 0; i < n; ++i) {
-        nanotins::scatter<Row>(p, i, mk(i));
+        soatins::scatter<Row>(p, i, mk(i));
     }
 
     // Compare every flattened column (a, b, hi, lo, c) element-by-element.
-    nanotins::for_each_column<Row>([&]<std::size_t I, class Col>() {
+    soatins::for_each_column<Row>([&]<std::size_t I, class Col>() {
         for (std::size_t i = 0; i < n; ++i) {
             require(ref.column<I>()[i] == got.column<I>()[i], Col::name());
         }

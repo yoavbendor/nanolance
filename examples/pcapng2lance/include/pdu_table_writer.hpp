@@ -7,7 +7,7 @@
 // `PduAppender<T>` keeps one writer session open and commits a fragment per chunk (the chunked-enrich
 // path); `write_pdu_table` is the one-shot convenience (one fragment) used by --decode-l2l3.
 
-#include "nanotins/arrow_glue.hpp"
+#include "soatins/arrow_glue.hpp"
 #include "nanotins/protocol_decode.hpp"
 
 #include "nanolance/nano_lance_writer.h"
@@ -23,14 +23,14 @@ namespace pdu_io {
 // Schema for a PDU table: struct[ packet_id u64, <reflected header columns...> ].
 template <class T>
 bool build_pdu_schema(ArrowSchema& schema, std::string& error) {
-    constexpr std::size_t kCols = nanotins::column_count<T>;
+    constexpr std::size_t kCols = soatins::column_count<T>;
     ArrowSchemaInit(&schema);
     if (ArrowSchemaSetTypeStruct(&schema, static_cast<int64_t>(kCols + 1)) != NANOARROW_OK) {
         error = "pdu schema alloc failed";
         return false;
     }
-    if (!nanotins::nt_set_column_schema(schema.children[0], nanotins::arrow_kind::u64, 0, "packet_id", error) ||
-        !nanotins::nt_fill_struct_schema<T>(&schema, 1, error)) {
+    if (!soatins::nt_set_column_schema(schema.children[0], soatins::arrow_kind::u64, 0, "packet_id", error) ||
+        !soatins::nt_fill_struct_schema<T>(&schema, 1, error)) {
         ArrowSchemaRelease(&schema);
         return false;
     }
@@ -42,7 +42,7 @@ bool build_pdu_schema(ArrowSchema& schema, std::string& error) {
 template <class T>
 bool build_pdu_batch(const ArrowSchema& schema, const protocols::PduColumn<T>& col, ArrowArray& batch,
                      std::string& error) {
-    nanotins::soa<T> soa;
+    soatins::soa<T> soa;
     soa.resize(col.size());
     for (std::size_t i = 0; i < col.size(); ++i) {
         soa.store(i, col.rows[i]);
@@ -54,7 +54,7 @@ bool build_pdu_batch(const ArrowSchema& schema, const protocols::PduColumn<T>& c
     }
     for (std::size_t i = 0; i < col.size(); ++i) {
         if (ArrowArrayAppendUInt(batch.children[0], col.packet_id[i]) != NANOARROW_OK ||
-            !nanotins::nt_append_scalar_row<T>(&batch, 1, soa, i) ||
+            !soatins::nt_append_scalar_row<T>(&batch, 1, soa, i) ||
             ArrowArrayFinishElement(&batch) != NANOARROW_OK) {
             error = "pdu row append failed";
             batch.release(&batch);

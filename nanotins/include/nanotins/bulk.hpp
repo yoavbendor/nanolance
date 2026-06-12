@@ -8,7 +8,7 @@
 // already are. Mirrors stdexec_gpu_experiment's run_bulk_cpu/run_bulk_gpu, where the scheduler is the
 // only difference.
 
-#include "nanotins/portability.hpp"
+#include "soatins/portability.hpp"
 
 #include <cstddef>
 
@@ -22,7 +22,7 @@ void bulk_for_each(Scheduler sch, std::size_t num_tasks, std::size_t n, Kernel k
         num_tasks = 1;
     }
     namespace ex = stdexec;
-    auto pipeline = ex::schedule(sch) | ex::bulk(stdexec::par, num_tasks, [=](std::size_t task) {
+    auto pipeline = ex::schedule(sch) | ex::bulk(num_tasks, [=](std::size_t task) {
         const std::size_t start = (task * n) / num_tasks;
         const std::size_t end = ((task + 1) * n) / num_tasks;
         for (std::size_t i = start; i < end; ++i) {

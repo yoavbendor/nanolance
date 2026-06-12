@@ -24,10 +24,10 @@ The per-element functions it calls (`parse_epb`, `overlay`, `pack_ports`, …) a
 
 | File | What |
 |---|---|
-| `nanotins/include/nanotins/gpu.hpp` | `gpu::context` (owns `nvexec::stream_context`), `gpu::device_buffer<T>` (RAII cudaMalloc/Free + H2D/D2H), `gpu::free_vram_bytes()`, `gpu::vram_budget(bytes,pct)`. All behind `NANOTINS_ENABLE_CUDA`. |
-| `nanotins/include/nanotins/bulk.hpp` | `bulk_for_each` (used as-is with the GPU scheduler) + `serial_for_each`. |
+| `gputins/include/gputins/gpu.hpp` | `gpu::context` (owns `nvexec::stream_context`), `gpu::device_buffer<T>` (RAII cudaMalloc/Free + H2D/D2H), `gpu::free_vram_bytes()`, `gpu::vram_budget(bytes,pct)`. All behind `NANOTINS_ENABLE_CUDA`. (All CUDA/nvexec code lives in the `gputins` library — a sibling of `nanotins`/`soatins` — so the CUDA dependency is isolated.) |
+| `nanotins/include/nanotins/bulk.hpp` | `bulk_for_each` (used as-is with the GPU scheduler) + `serial_for_each`. (Stays in `nanotins`; reused by both CPU and GPU.) |
 | `examples/pcapng2lance/src/pcapng2lance_main.cpp` | `L1Converter::parse_packets_gpu()` — the **GPU L1 parse**: H2D(window+BlockRefs) → `bulk_for_each(gpu_ctx_->scheduler(), …, parse_epb kernel)` → D2H(EpbView). Under `--decode-l2l3` it also calls `decode_window_gpu`. Selected by `--gpu`; window capped to the VRAM budget. CPU path unchanged. |
-| `nanotins/include/nanotins/protocol_decode_gpu.hpp` | **GPU L2/L3/L4 decode** `decode_window_gpu` — the on-device count → `thrust::exclusive_scan` → scatter (the variable-output pattern). Same `count_packet`/`scatter_packet`/`walk_packet` kernels as CPU (now `NANOTINS_HD`); only the scan (thrust) + device buffers + D2H append differ. |
+| `gputins/include/gputins/protocol_decode_gpu.hpp` | **GPU L2/L3/L4 decode** `decode_window_gpu` — the on-device count → `thrust::exclusive_scan` → scatter (the variable-output pattern). Same `count_packet`/`scatter_packet`/`walk_packet` kernels as CPU (now `NANOTINS_HD`); only the scan (thrust) + device buffers + D2H append differ. |
 | `examples/pcapng2lance/CMakeLists.txt` | `option(NANOTINS_ENABLE_CUDA …)` + the documented build hook. |
 | CLI | `--gpu`, `--cuda-device D`, `--vram-pct P`, `--vram-bytes B`. Without a CUDA build, `--gpu` exits with a clear error. |
 
@@ -57,7 +57,7 @@ cmake --build build-gpu --target pcapng2lance
 `CMAKE_CUDA_ARCHITECTURES`, and add `--expt-relaxed-constexpr --extended-lambda`.
 
 Either way: `nvexec` headers are already on the include path (they ship inside the stdexec repo that
-`nanotins_core` pulls — `#include <nvexec/stream_context.cuh>`), and `CUDA::cudart` is linked by the block
+`nanotins_stdexec` pulls — `#include <nvexec/stream_context.cuh>`), and `CUDA::cudart` is linked by the block
 when `find_package(CUDAToolkit)` succeeds.
 
 Sanity smoke (mirrors the experiment's `--smoke`): a one-line GPU schedule. If you want it, add a

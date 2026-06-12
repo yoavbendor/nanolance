@@ -8,9 +8,9 @@
 // Bitfields straddling bytes (IPv4 flags/frag over a BE u16, IPv6 version/tc/flow over a BE u32) are
 // handled by byteswapping the whole word first, then shift+mask — see nanotins/bits.hpp.
 
-#include "nanotins/bits.hpp"
-#include "nanotins/endian.hpp"
-#include "nanotins/fixed_string.hpp"
+#include "soatins/bits.hpp"
+#include "soatins/endian.hpp"
+#include "soatins/fixed_string.hpp"
 
 #include <boost/describe.hpp>
 
@@ -23,10 +23,33 @@
 
 namespace protocols {
 
-using nanotins::be;
-using nanotins::bits;
-using nanotins::field;
-using Bytes = std::span<const std::uint8_t>;
+using soatins::be;
+using soatins::bits;
+using soatins::field;
+// POD byte span (ptr + size) that stays device-safe under clang-cuda/libstdc++ (std::span in this toolchain
+// pulls host-only assertion hooks in device code paths).
+struct Bytes {
+    const std::uint8_t* ptr = nullptr;
+    std::size_t len = 0;
+
+    constexpr Bytes() = default;
+    constexpr Bytes(const std::uint8_t* data, std::size_t size) : ptr(data), len(size) {}
+    constexpr Bytes(std::span<const std::uint8_t> s) : ptr(s.data()), len(s.size()) {}
+
+    constexpr const std::uint8_t* data() const { return ptr; }
+    constexpr std::size_t size() const { return len; }
+    constexpr bool empty() const { return len == 0; }
+    constexpr const std::uint8_t& operator[](std::size_t i) const { return ptr[i]; }
+
+    constexpr Bytes subspan(std::size_t off) const {
+        return off <= len ? Bytes(ptr + off, len - off) : Bytes{};
+    }
+    constexpr Bytes subspan(std::size_t off, std::size_t count) const {
+        if (off > len) return {};
+        const std::size_t n = count > (len - off) ? (len - off) : count;
+        return Bytes(ptr + off, n);
+    }
+};
 
 // ---- Ethernet II (14 bytes) ----
 struct Ethernet {
@@ -112,7 +135,7 @@ inline constexpr std::uint32_t kLinkTypeEthernet = 1;
 // Copy a wire header out of the buffer at `off`. Bounds-checked; the structs are 1-aligned and packed
 // so a byte-wise copy reconstructs the header exactly (be<>/bits<> convert to host on read).
 template <class T>
-bool overlay(Bytes bytes, std::size_t off, T& out) {
+NANOTINS_HD bool overlay(Bytes bytes, std::size_t off, T& out) {
     if (off + sizeof(T) > bytes.size()) {
         return false;
     }

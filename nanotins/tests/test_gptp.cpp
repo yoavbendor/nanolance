@@ -3,7 +3,7 @@
 // built-in protocols use to produce a nanoarrow table. Proves a user can add a protocol with one struct
 // and get overlay + schema + SoA for free. No Lance here: we read the in-memory Arrow array back directly.
 
-#include "nanotins/arrow_glue.hpp"
+#include "soatins/arrow_glue.hpp"
 #include "nanotins/gptp.hpp"
 
 #include <nanoarrow/nanoarrow.h>
@@ -80,7 +80,7 @@ int main() {
     require(std::memcmp(g.clock_identity.data(), raw.data() + 20, 8) == 0, "clockIdentity");
 
     // --- 2. the killer feature: the SAME struct drives an SoA + a nanoarrow schema/array ---
-    nanotins::soa<protocols::Gptp> s;
+    soatins::soa<protocols::Gptp> s;
     s.resize(2);
     s.store(0, g);
     s.store(1, g);
@@ -88,8 +88,8 @@ int main() {
     ArrowSchema schema{};
     ArrowArray batch{};
     std::string err;
-    require(nanotins::arrow_schema<protocols::Gptp>(schema, err), ("arrow_schema: " + err).c_str());
-    require(nanotins::to_arrow<protocols::Gptp>(s, batch, err), ("to_arrow: " + err).c_str());
+    require(soatins::arrow_schema<protocols::Gptp>(schema, err), ("arrow_schema: " + err).c_str());
+    require(soatins::to_arrow<protocols::Gptp>(s, batch, err), ("to_arrow: " + err).c_str());
 
     // bits<> sub-fields expand to named columns; reserved* members are absent (not described).
     require(child_by_name(schema, "message_type") >= 0, "column message_type present");

@@ -2,7 +2,7 @@
 // bitfields (IPv4 flags/frag, IPv6 version/tc/flow, TCP data_offset/flags), and that the reflection
 // core expands each struct into the expected flat column list.
 
-#include "nanotins/reflect.hpp"
+#include "soatins/reflect.hpp"
 #include "nanotins/protocols.hpp"
 
 #include <cstdint>
@@ -25,7 +25,7 @@ void require(bool ok, const char* msg) {
 template <class T>
 std::vector<std::string> column_names() {
     std::vector<std::string> names;
-    nanotins::for_each_column<T>([&]<std::size_t I, class Col>() { names.emplace_back(Col::name()); });
+    soatins::for_each_column<T>([&]<std::size_t I, class Col>() { names.emplace_back(Col::name()); });
     return names;
 }
 
@@ -68,7 +68,7 @@ int main() {
                                                  "checksum", "src", "dst"};
         require(cols == expect, "ipv4 column expansion");
     }
-    using nanotins::col_at;
+    using soatins::col_at;
     require(col_at<Ipv4, 0>::get(ip) == 4, "ipv4 version extract");      // version
     require(col_at<Ipv4, 1>::get(ip) == 5, "ipv4 ihl extract");         // ihl
     require(col_at<Ipv4, 2>::get(ip) == 46, "ipv4 dscp extract");       // dscp (EF)

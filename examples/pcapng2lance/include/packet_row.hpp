@@ -4,7 +4,7 @@
 // payload_uri/off/size are NOT here — they ride in the lance.blob.v2 `payload_ref` struct appended
 // alongside. Kept in its own header so the driver, tests, and tools share one definition of the schema.
 
-#include "nanotins/describe.hpp"
+#include "soatins/describe.hpp"
 
 #include <boost/describe.hpp>
 

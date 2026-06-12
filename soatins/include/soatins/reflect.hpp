@@ -5,16 +5,16 @@
 // store(), arrow_schema(), and to_arrow() all iterate this column list, so endianness, bitfields, and
 // plain fields are handled by one uniform mechanism.
 
-#include "nanotins/column_traits.hpp"
-#include "nanotins/describe.hpp"
-#include "nanotins/portability.hpp"
+#include "soatins/column_traits.hpp"
+#include "soatins/describe.hpp"
+#include "soatins/portability.hpp"
 
 #include <cstddef>
 #include <tuple>
 #include <utility>
 #include <vector>
 
-namespace nanotins {
+namespace soatins {
 
 // ---- One column descriptor: a stateless type with elem / arrow info / name() / get(const T&). ----
 
@@ -175,4 +175,4 @@ NANOTINS_HD void scatter(const soa_ptrs<T>& p, std::size_t i, const T& row) {
     }(std::make_index_sequence<column_count<T>>{});
 }
 
-}  // namespace nanotins
+}  // namespace soatins
