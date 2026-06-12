@@ -8,6 +8,7 @@
 #include "packet_row.hpp"
 #include "phase_b_runner.hpp"
 #include "soatins/arrow_glue.hpp"
+#include "soatins/sink.hpp"
 #include "nanotins/pcap_blocks.hpp"
 #include "pdu_table_writer.hpp"
 #include "nanotins/protocol_decode.hpp"
@@ -627,11 +628,27 @@ private:
     void collect_remainder(const std::vector<protocols::WalkResult>& trailers, const PacketBatch& b,
                            std::uint64_t wbase) {
         const std::size_t n = b.size();
+        if (!rem_sink_) {  // lazily open the chunked remainder writer on the first contributing window
+            const auto stem = (output_.parent_path() / output_.stem()).string();
+            rem_appender_ = std::make_unique<staged::RemainderAppender>(stem + "_remainder_after_l4.lance",
+                                                                        "next_protocol", args_.compress);
+            rem_sink_ = std::make_unique<RemSink>(
+                [this](soatins::soa<staged::RemainderRow, kRemainderChunk>& chunk, std::string& e) {
+                    return rem_appender_->append_chunk(chunk, payload_uri_, e);
+                });
+        }
         for (std::size_t i = 0; i < n; ++i) {
             const protocols::WalkResult& w = trailers[i];
             if (w.reached_l4 && w.l4_payload_offset < b.psize[i]) {
-                remainder_.push_back({global_pid_ + i, /*next_protocol=*/w.l4_ports, payload_uri_,
-                                      wbase + b.poff[i] + w.l4_payload_offset, b.psize[i] - w.l4_payload_offset});
+                std::string e;
+                if (!rem_sink_->push(staged::RemainderRow{global_pid_ + i, /*next_protocol=*/w.l4_ports,
+                                                          wbase + b.poff[i] + w.l4_payload_offset,
+                                                          b.psize[i] - w.l4_payload_offset},
+                                     e)) {
+                    std::fprintf(stderr, "pcapng2lance: remainder flush failed: %s\n", e.c_str());
+                    rem_ok_ = false;
+                }
+                ++rem_count_;
             }
         }
     }
@@ -653,17 +670,21 @@ private:
                         write_one("_tcp.lance", pdus_.tcp) & write_one("_udp.lance", pdus_.udp);
         if (!ok) return 1;
         // The application payload after L4 (for later UDP-internal PDU parsing), as external refs — the
-        // same remainder_after_l4 table the staged --stage l4 path emits.
-        const fs::path rpath = stem + "_remainder_after_l4.lance";
-        if (!staged::write_remainder_table(rpath, remainder_, "next_protocol", args_.compress, err)) {
-            std::fprintf(stderr, "pcapng2lance: failed to write %s: %s\n", rpath.string().c_str(), err.c_str());
+        // same remainder_after_l4 table the staged --stage l4 path emits. Written incrementally through the
+        // SoA sink (one shared URI, chunked flush); drain the partial tail and close here.
+        if (!rem_ok_) return 1;
+        if (rem_sink_ && !rem_sink_->finish(err)) {
+            std::fprintf(stderr, "pcapng2lance: failed to flush remainder_after_l4: %s\n", err.c_str());
             return 1;
+        }
+        if (rem_appender_) {
+            rem_appender_->close();
         }
         std::fprintf(
             stderr,
             "pcapng2lance: decoded L2/L3 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, udp %zu, remainder %zu\n",
             pdus_.ethernet.size(), pdus_.vlan.size(), pdus_.ipv4.size(), pdus_.ipv6.size(), pdus_.tcp.size(),
-            pdus_.udp.size(), remainder_.size());
+            pdus_.udp.size(), rem_count_);
         return 0;
     }
 
@@ -692,7 +713,17 @@ private:
     bool schema_meta_set_ = false;
     bool first_commit_ = true;
     protocols::DecodedPdus pdus_;                  // accumulated only when --decode-l2l3
-    std::vector<staged::PayloadRow> remainder_;    // app payload after L4 (remainder_after_l4), likewise
+
+    // remainder_after_l4: filled into a fixed-N SoA and flushed in chunks through the shared-URI writer
+    // (no per-row uri string, bounded memory). The sink's flush is bound to rem_appender_->append_chunk.
+    static constexpr std::size_t kRemainderChunk = 16384;
+    using RemSink = soatins::column_sink<
+        staged::RemainderRow, kRemainderChunk,
+        std::function<bool(soatins::soa<staged::RemainderRow, kRemainderChunk>&, std::string&)>>;
+    std::unique_ptr<staged::RemainderAppender> rem_appender_;
+    std::unique_ptr<RemSink> rem_sink_;
+    std::size_t rem_count_ = 0;
+    bool rem_ok_ = true;
 };
 
 }  // namespace

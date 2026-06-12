@@ -10,7 +10,11 @@
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/nano_lance_writer.h"
 
+#include "soatins/reflect.hpp"
+
 #include <nanoarrow/nanoarrow.h>
+
+#include <boost/describe.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -29,6 +33,18 @@ struct PayloadRow {
     std::uint64_t off = 0;
     std::uint64_t size = 0;
 };
+
+// The same row as pure fixed-width columns for a real SoA: the per-row `uri` of PayloadRow is dropped —
+// every remainder row in a table shares one external-file URI (carried out-of-band, once), so storing it
+// per row was pure duplication (and millions of std::string copies). Filled into a soatins soa<,N> and
+// flushed in chunks; the writer pairs it with the shared URI to rebuild the lance.blob.v2 payload_ref.
+struct RemainderRow {
+    std::uint64_t packet_id = 0;
+    std::uint64_t discriminator = 0;
+    std::uint64_t position = 0;  // byte offset of the unparsed payload in the external capture
+    std::uint64_t size = 0;
+};
+BOOST_DESCRIBE_STRUCT(RemainderRow, (), (packet_id, discriminator, position, size))
 
 inline int nt_child_index(const ArrowSchema& s, const char* name) {
     for (std::int64_t i = 0; i < s.n_children; ++i) {
@@ -203,6 +219,58 @@ public:
         }
         bool ok = nano_lance_write_batch(&writer_, &batch, &schema_) == NANO_LANCE_OK &&
                   nano_lance_writer_commit(&writer_, /*is_append=*/committed_) == NANO_LANCE_OK;
+        if (!ok) {
+            error = nano_lance_writer_last_error(&writer_);
+        }
+        batch.release(&batch);
+        committed_ = committed_ || ok;
+        return ok;
+    }
+
+    // Append one chunk of a soatins soa<RemainderRow, N> (the SoA path): the per-row uri is replaced by
+    // the single `uri` shared by every row in the table (one ArrowStringView, no per-row std::string). The
+    // batch shape is identical to build_remainder_batch, so the on-disk table is byte-for-byte the same.
+    template <std::size_t N>
+    bool append_chunk(soatins::soa<RemainderRow, N>& chunk, const std::string& uri, std::string& error) {
+        if (chunk.size() == 0) {
+            return true;
+        }
+        if (!opened_ && !open(error)) {
+            return false;
+        }
+        ArrowArray batch{};
+        if (ArrowArrayInitFromSchema(&batch, &schema_, nullptr) != NANOARROW_OK ||
+            ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
+            error = "remainder chunk array init failed";
+            return false;
+        }
+        ArrowArray* payload = batch.children[2];
+        const ArrowStringView uri_view{uri.data(), static_cast<std::int64_t>(uri.size())};
+        const auto& pid = chunk.template column<0>();
+        const auto& disc = chunk.template column<1>();
+        const auto& pos = chunk.template column<2>();
+        const auto& sz = chunk.template column<3>();
+        for (std::size_t i = 0; i < chunk.size(); ++i) {
+            if (ArrowArrayAppendUInt(batch.children[0], pid[i]) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(batch.children[1], disc[i]) != NANOARROW_OK ||
+                ArrowArrayAppendNull(payload->children[0], 1) != NANOARROW_OK ||
+                ArrowArrayAppendString(payload->children[1], uri_view) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(payload->children[2], pos[i]) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(payload->children[3], sz[i]) != NANOARROW_OK ||
+                ArrowArrayFinishElement(payload) != NANOARROW_OK ||
+                ArrowArrayFinishElement(&batch) != NANOARROW_OK) {
+                error = "remainder chunk row append failed";
+                batch.release(&batch);
+                return false;
+            }
+        }
+        if (ArrowArrayFinishBuildingDefault(&batch, nullptr) != NANOARROW_OK) {
+            error = "remainder chunk array finalize failed";
+            batch.release(&batch);
+            return false;
+        }
+        const bool ok = nano_lance_write_batch(&writer_, &batch, &schema_) == NANO_LANCE_OK &&
+                        nano_lance_writer_commit(&writer_, /*is_append=*/committed_) == NANO_LANCE_OK;
         if (!ok) {
             error = nano_lance_writer_last_error(&writer_);
         }
