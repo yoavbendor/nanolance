@@ -7,6 +7,7 @@
 // payload bytes (they stay external in the original capture).
 
 #include "nanolance/blob_builder.hpp"
+#include "nanolance/blob_v2_external.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/nano_lance_writer.h"
 
@@ -60,8 +61,10 @@ inline int nt_child_index(const ArrowSchema& s, const char* name) {
 // Resolved column indices for a payload table: packet_id + discriminator at top level, and
 // position/size/uri inside the payload_ref struct (lance_table_read_dataset rebuilds the blob column in
 // INGEST shape: children data/uri/position/size).
+// Only the top-level columns are this table's concern; the payload_ref struct's internals
+// (position/size/uri, child order, the lance.blob.v2 conventions) are owned by nano_lance::BlobV2ColumnView.
 struct PayloadCols {
-    int pid, disc, blob, pos, size, uri;
+    int pid, disc, blob;
 };
 
 inline bool resolve_payload_cols(const ArrowSchema& schema, const char* disc_col, PayloadCols& c,
@@ -73,30 +76,30 @@ inline bool resolve_payload_cols(const ArrowSchema& schema, const char* disc_col
         error = std::string("table missing packet_id / ") + disc_col + " / payload_ref";
         return false;
     }
-    const ArrowSchema& blob = *schema.children[c.blob];
-    c.pos = nt_child_index(blob, "position");
-    c.size = nt_child_index(blob, "size");
-    c.uri = nt_child_index(blob, "uri");
-    if (c.pos < 0 || c.size < 0 || c.uri < 0) {
-        error = "payload_ref struct missing position/size/uri";
-        return false;
-    }
     return true;
 }
 
-inline void append_payload_rows(const ArrowArrayView& view, const PayloadCols& c,
-                                std::vector<PayloadRow>& out) {
-    const ArrowArrayView* blob = view.children[c.blob];
+inline bool append_payload_rows(const ArrowSchema& schema, const ArrowArrayView& view, const PayloadCols& c,
+                                std::vector<PayloadRow>& out, std::string& error) {
+    // The blob.v2 internals come from nanolance; this code never names position/size/uri or indexes the
+    // struct's children.
+    nano_lance::BlobV2ColumnView blob;
+    if (!blob.init(*schema.children[c.blob], *view.children[c.blob], error)) {
+        return false;
+    }
     for (std::int64_t i = 0; i < view.length; ++i) {
         PayloadRow r;
         r.packet_id = ArrowArrayViewGetUIntUnsafe(view.children[c.pid], i);
         r.discriminator = ArrowArrayViewGetUIntUnsafe(view.children[c.disc], i);
-        r.off = ArrowArrayViewGetUIntUnsafe(blob->children[c.pos], i);
-        r.size = ArrowArrayViewGetUIntUnsafe(blob->children[c.size], i);
-        const ArrowStringView sv = ArrowArrayViewGetStringUnsafe(blob->children[c.uri], i);
-        r.uri.assign(sv.data, static_cast<std::size_t>(sv.size_bytes));
+        r.off = blob.position(i);
+        r.size = blob.byte_size(i);
+        const char* udata = nullptr;
+        std::int64_t usize = 0;
+        blob.uri(i, &udata, &usize);
+        r.uri.assign(udata, static_cast<std::size_t>(usize));
         out.push_back(std::move(r));
     }
+    return true;
 }
 
 inline bool read_payload_table(const std::filesystem::path& dir, const char* disc_col,
@@ -130,7 +133,11 @@ inline bool read_payload_table(const std::filesystem::path& dir, const char* dis
             ok = false;
             break;
         }
-        append_payload_rows(view, cols, out);
+        if (!append_payload_rows(schema, view, cols, out, error)) {
+            ArrowArrayViewReset(&view);
+            ok = false;
+            break;
+        }
         ArrowArrayViewReset(&view);
     }
     release_all();
