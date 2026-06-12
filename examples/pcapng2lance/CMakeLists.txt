@@ -75,6 +75,25 @@ if(NANOLANCE_BUILD_TESTS)
     add_test(NAME pcapng2lance_driver COMMAND $<TARGET_FILE:pcapng2lance_driver_test> $<TARGET_FILE:pcapng2lance>)
     set_tests_properties(pcapng2lance_driver PROPERTIES LABELS "smoke")
 
+    # struct_spec GPU smoke (T5): GPU scatter_spec == CPU spec_soa, byte-identical. Inert on a CPU build
+    # (the gputins header compiles to nothing without NANOTINS_ENABLE_CUDA), so it passes trivially here;
+    # the CUDA host compiles this TU as CUDA (the same -x cuda step as the gpu bridge) and runs the real
+    # GPU==CPU check. See nanotins/docs/GPU_BULK_INTEGRATION.md.
+    add_executable(struct_spec_gpu_smoke tests/test_struct_spec_gpu.cpp)
+    target_link_libraries(struct_spec_gpu_smoke PRIVATE nanotins gputins)
+    add_test(NAME struct_spec_gpu_smoke COMMAND $<TARGET_FILE:struct_spec_gpu_smoke>)
+    set_tests_properties(struct_spec_gpu_smoke PROPERTIES LABELS "smoke")
+    if(NANOTINS_ENABLE_CUDA AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # Compile the smoke TU as CUDA (clang-cuda), mirroring the gpu bridge. _NT_CUDA_OPTS is set above.
+        set_source_files_properties(tests/test_struct_spec_gpu.cpp PROPERTIES
+            COMPILE_DEFINITIONS "NANOTINS_ENABLE_CUDA=1" COMPILE_OPTIONS "${_NT_CUDA_OPTS}")
+        target_include_directories(struct_spec_gpu_smoke PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        if(DEFINED CUDAToolkit_LIBRARY_DIR)
+            target_link_directories(struct_spec_gpu_smoke PRIVATE ${CUDAToolkit_LIBRARY_DIR})
+        endif()
+        target_link_libraries(struct_spec_gpu_smoke PRIVATE CUDA::cudart)
+    endif()
+
     # Stock-Lance (pylance) interop + on-disk offset verification. Skips (CTest 77) if pylance absent.
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)

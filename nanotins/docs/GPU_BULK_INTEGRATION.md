@@ -157,9 +157,30 @@ identical to CPU — `pcapng2lance_frag_harmony` already encodes that contract f
    for the accumulated tables allows; otherwise the per-window D2H append (current `append_column`) is the
    bounded-memory choice.
 
+## struct_spec GPU smoke (T5) — do this FIRST, it is the smallest device check
+
+Before the full pipeline, validate the new `struct_spec` device path on a 4×u16 UDP header. This is the
+cheapest way to learn whether the `struct_spec` `NANOTINS_HD` primitives compile under clang-cuda/nvcc and
+match the CPU — in particular whether `scatter_spec` capturing a `std::tuple` of device pointers
+(`soatins::soa_ptrs`) into the nvexec bulk lambda survives the device compile (gotcha #2). If it chokes
+here, the fix is a generated struct-of-named-pointers, and you found it on a UDP header instead of a sensor.
+
+- Files: `gputins/include/gputins/struct_spec_gpu.hpp` (`nanotins::gpu::parse_spec_gpu<Spec,N>` — H2D,
+  device columns, `bulk_for_each(ctx.scheduler(), …, scatter_spec)`, D2H) and the test
+  `examples/pcapng2lance/tests/test_struct_spec_gpu.cpp`.
+- The test target `struct_spec_gpu_smoke` is wired in `examples/pcapng2lance/CMakeLists.txt`: with
+  `-DNANOTINS_ENABLE_CUDA=ON` under **clang-cuda** it is already compiled as CUDA (`-x cuda`, the same
+  `_NT_CUDA_OPTS` as the bridge). For **nvcc**, set the source LANGUAGE to CUDA the same way you do the
+  bridge (`set_source_files_properties(tests/test_struct_spec_gpu.cpp PROPERTIES LANGUAGE CUDA)` +
+  `--extended-lambda`).
+- Run: `ctest -R struct_spec_gpu_smoke` — it prints `GPU == CPU over 1024 UDP headers (4 cols)` on success
+  (without CUDA it prints `skipped`). That is the T5 gate; once green, the IPv4/IPv6 specs (bit-fields,
+  fixed-size-binary) use the identical path.
+
 ## Acceptance
 
 - `cmake … -DNANOTINS_ENABLE_CUDA=ON` builds `pcapng2lance` clean.
+- **`struct_spec_gpu_smoke` prints `GPU == CPU`** (the smallest device gate; do this first).
 - `--gpu` runs and prints the GPU Phase-B line.
 - **GPU `packets.lance` diffs identical to CPU** (Step 3). That is the bar; timing is secondary until the
   decode runs on-device.
