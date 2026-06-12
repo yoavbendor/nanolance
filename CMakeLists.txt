@@ -261,6 +261,11 @@ add_executable(nano_lance_blob_v2_external_test tests/test_blob_v2_external_prep
 target_compile_features(nano_lance_blob_v2_external_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_blob_v2_external_test PRIVATE nanolance)
 
+# Columnar blob.v2 encapsulation: producer fills a soatins soa<BlobRef,N>, nanolance owns the envelope.
+add_executable(nano_lance_blob_v2_columnar_test tests/test_blob_v2_columnar.cpp)
+target_compile_features(nano_lance_blob_v2_columnar_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_blob_v2_columnar_test PRIVATE nanolance soatins_core)
+
 add_executable(nano_lance_blob_v2_uri_dictionary_test tests/test_blob_v2_uri_dictionary.cpp)
 target_compile_features(nano_lance_blob_v2_uri_dictionary_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_blob_v2_uri_dictionary_test PRIVATE nanolance)
@@ -336,6 +341,7 @@ add_test(NAME nano_lance_blob_builder COMMAND $<TARGET_FILE:nano_lance_blob_buil
 set_tests_properties(nano_lance_blob_builder PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_blob_v2_external_preprocess COMMAND $<TARGET_FILE:nano_lance_blob_v2_external_test>)
+add_test(NAME nano_lance_blob_v2_columnar COMMAND $<TARGET_FILE:nano_lance_blob_v2_columnar_test>)
 set_tests_properties(nano_lance_blob_v2_external_preprocess PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_blob_v2_uri_dictionary COMMAND $<TARGET_FILE:nano_lance_blob_v2_uri_dictionary_test>)

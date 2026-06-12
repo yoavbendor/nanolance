@@ -8,8 +8,41 @@
 #include <vector>
 
 struct ArrowArray;
+struct ArrowSchema;
+struct ArrowArrayView;
 
 namespace nano_lance {
+
+// ---- Columnar encapsulation of the lance.blob.v2 external reference column ----------------------------
+// A blob.v2 reference is, semantically, just (position, size, uri). Its Arrow *representation* — a struct
+// with children data/uri/position/size, `data` nulled for external rows, the lance.blob.v2 extension tag,
+// the child order — is a Lance implementation detail and belongs here, not in the producer. The producer
+// fills (position, size) as a soatins `soa<{position,size}, N>` and hands the two columns + the shared URI
+// to the builder; nanolance owns the rest. The view is the read-side twin: it resolves the children once
+// so callers never index `children[k]` or look up "position"/"size"/"uri" by name.
+
+/// Build the external-only `payload_ref` blob.v2 struct array from parallel position/size columns sharing
+/// one URI (the per-window external-file case). `n` rows; `shared_uri` is repeated to every row.
+bool build_blob_v2_external_array(const std::uint64_t* positions, const std::uint64_t* sizes, std::size_t n,
+                                  const char* shared_uri, ArrowArray& out_array, std::string& error);
+
+/// Non-owning read view over a read-back `payload_ref` blob.v2 struct (the struct's schema + array view).
+/// Resolves position/size/uri by name on init(); accessors then read row values with no per-call lookup.
+class BlobV2ColumnView {
+public:
+    bool init(const ArrowSchema& payload_ref_schema, const ArrowArrayView& payload_ref_view,
+              std::string& error);
+    std::int64_t size() const { return len_; }
+    std::uint64_t position(std::int64_t row) const;
+    std::uint64_t byte_size(std::int64_t row) const;
+    void uri(std::int64_t row, const char** data, std::int64_t* size) const;
+
+private:
+    const ArrowArrayView* pos_ = nullptr;
+    const ArrowArrayView* size_ = nullptr;
+    const ArrowArrayView* uri_ = nullptr;
+    std::int64_t len_ = 0;
+};
 
 /// Materialized external blob v2 descriptor (`kind = 3`) before Lance packed encoding.
 struct BlobV2ExternalDescriptor {
