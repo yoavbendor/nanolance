@@ -121,4 +121,10 @@ if(NANOTINS_BUILD_TESTS)
     target_link_libraries(nanotins_struct_spec_ptp PRIVATE nanotins_protocols)
     add_test(NAME nanotins_struct_spec_ptp COMMAND $<TARGET_FILE:nanotins_struct_spec_ptp>)
     set_tests_properties(nanotins_struct_spec_ptp PROPERTIES LABELS "smoke")
+
+    # M5a: the spec-driven DAG/FSM reproduces walk_packet's L2/L3/L4 traversal (determinism/parity oracle).
+    add_executable(nanotins_spec_dag tests/test_spec_dag.cpp)
+    target_link_libraries(nanotins_spec_dag PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_spec_dag COMMAND $<TARGET_FILE:nanotins_spec_dag>)
+    set_tests_properties(nanotins_spec_dag PROPERTIES LABELS "smoke")
 endif()
