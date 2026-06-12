@@ -97,4 +97,10 @@ if(NANOTINS_BUILD_TESTS)
     target_link_libraries(nanotins_struct_spec_udp PRIVATE nanotins_protocols)
     add_test(NAME nanotins_struct_spec_udp COMMAND $<TARGET_FILE:nanotins_struct_spec_udp>)
     set_tests_properties(nanotins_struct_spec_udp PROPERTIES LABELS "smoke")
+
+    # struct_spec M2: the IPv4 header (named_bit_field + IHL-driven extent), cross-checked vs soatins bits<>.
+    add_executable(nanotins_struct_spec_ipv4 tests/test_struct_spec_ipv4.cpp)
+    target_link_libraries(nanotins_struct_spec_ipv4 PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_struct_spec_ipv4 COMMAND $<TARGET_FILE:nanotins_struct_spec_ipv4>)
+    set_tests_properties(nanotins_struct_spec_ipv4 PROPERTIES LABELS "smoke")
 endif()

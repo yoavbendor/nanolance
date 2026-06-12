@@ -53,6 +53,30 @@ struct named_field {
     static constexpr std::size_t end_offset() { return Offset + sizeof(T); }
 };
 
+// Smallest unsigned type that holds a Width-bit value (the column element type of a bit-field).
+template <std::size_t Width>
+using uint_for_width =
+    std::conditional_t<(Width <= 8), std::uint8_t,
+                       std::conditional_t<(Width <= 16), std::uint16_t,
+                                          std::conditional_t<(Width <= 32), std::uint32_t, std::uint64_t>>>;
+
+// A bit-field: Width bits at BitOffset inside a StorageT-wide unit at byte Offset, in the unit's endian.
+// BitOffset is MSB-first (BitOffset 0 = the high bit) — network wire order, matching soatins bits<>: a
+// 0x45 byte with version<0,4>/ihl<4,4> yields version=4, ihl=5.
+template <class Tag, std::size_t Offset, class StorageT, std::size_t BitOffset, std::size_t Width,
+          wire_endian E>
+struct named_bit_field {
+    using tag = Tag;
+    using value_type = uint_for_width<Width>;
+    static constexpr std::size_t offset = Offset;
+    static constexpr std::size_t bit_offset = BitOffset;
+    static constexpr std::size_t width = Width;
+    static constexpr wire_endian order = E;
+    static constexpr std::size_t storage_bits = sizeof(StorageT) * 8;
+    static constexpr const char* name() { return Tag::value; }
+    static constexpr std::size_t end_offset() { return Offset + sizeof(StorageT); }
+};
+
 template <class... Fields>
 struct StructSpec {
     static constexpr std::size_t field_count = sizeof...(Fields);
@@ -81,9 +105,23 @@ NANOTINS_HD inline T read_scalar_at(const std::uint8_t* p, std::size_t off) {
     return static_cast<T>(v);
 }
 
+// Read one field — scalar or bit-field — dispatched on whether F carries bit_offset/width. A bit-field
+// reads its StorageT-wide unit (endian-aware), then shifts+masks: MSB-first for big-endian units
+// (shift = storage_bits - width - bit_offset), LSB-first for little. Device-safe either way.
 template <class F>
 NANOTINS_HD inline typename F::value_type read_field(const std::uint8_t* p) {
-    return read_scalar_at<typename F::value_type, F::order>(p, F::offset);
+    if constexpr (requires { F::bit_offset; F::width; F::storage_bits; }) {
+        using SU = uint_for_width<F::storage_bits>;
+        const std::uint64_t unit = static_cast<std::uint64_t>(read_scalar_at<SU, F::order>(p, F::offset));
+        const std::uint64_t mask = (std::uint64_t{1} << F::width) - 1;
+        std::size_t shift = F::bit_offset;
+        if constexpr (F::order == wire_endian::big) {
+            shift = F::storage_bits - F::width - F::bit_offset;
+        }
+        return static_cast<typename F::value_type>((unit >> shift) & mask);
+    } else {
+        return read_scalar_at<typename F::value_type, F::order>(p, F::offset);
+    }
 }
 
 // Fixed extent of the spec (max field end) — buffer sizing now; the basis for length-driven fields later.
