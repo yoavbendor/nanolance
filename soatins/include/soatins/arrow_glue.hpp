@@ -162,4 +162,62 @@ bool to_arrow(const soa<T>& s, ArrowArray& out, std::string& error) {
     return true;
 }
 
+// Record batch for a FIXED soa<T,N>: fill each column's data buffer in ONE bulk append instead of the
+// dynamic path's per-row Append* calls. A fixed column is `std::array<elem, N>` — already the exact,
+// contiguous Arrow data-buffer layout for a fixed-width type — so one ArrowBufferAppend of size_*sizeof
+// per column reproduces byte-for-byte what the row-append would build, at O(ncols) copies instead of
+// O(size_*ncols). (Bool would be bit-packed in Arrow and is excluded from soatins' fixed columns; all
+// fixed-width int/float/fixed_binary elems map straight through.) `requires N != soa_dynamic` keeps this
+// disjoint from the dynamic to_arrow above.
+//
+// This is "minimal-copy": one memcpy per column into nanoarrow's owned buffer. True buffer-borrow (zero
+// copy) pairs with the synchronous column_sink flush, where the soa provably outlives the consumed array.
+template <class T, std::size_t N>
+    requires(N != soa_dynamic)
+bool to_arrow(const soa<T, N>& s, ArrowArray& out, std::string& error) {
+    ArrowSchema schema;
+    if (!arrow_schema<T>(schema, error)) {
+        return false;
+    }
+    if (ArrowArrayInitFromSchema(&out, &schema, nullptr) != NANOARROW_OK) {
+        error = "failed to init struct array";
+        ArrowSchemaRelease(&schema);
+        return false;
+    }
+    ArrowSchemaRelease(&schema);
+
+    const std::int64_t n = static_cast<std::int64_t>(s.size());
+    bool ok = true;
+    std::string err;
+    for_each_column<T>([&]<std::size_t I, class Col>() {
+        if (!ok) {
+            return;
+        }
+        ArrowArray* child = out.children[I];
+        ArrowBuffer* data = ArrowArrayBuffer(child, 1);  // buffer 0 = validity (none), 1 = data
+        const auto& col = s.template column<I>();         // std::array<elem, N>, contiguous
+        const std::int64_t bytes = n * static_cast<std::int64_t>(sizeof(typename Col::elem));
+        if (ArrowBufferAppend(data, col.data(), bytes) != NANOARROW_OK) {
+            ok = false;
+            err = std::string("failed to bulk-fill column ") + Col::name();
+            return;
+        }
+        child->length = n;
+        child->null_count = 0;
+    });
+    if (!ok) {
+        error = err;
+        ArrowArrayRelease(&out);
+        return false;
+    }
+    out.length = n;
+    out.null_count = 0;
+    if (ArrowArrayFinishBuildingDefault(&out, nullptr) != NANOARROW_OK) {
+        error = "failed to finalize fixed struct array";
+        ArrowArrayRelease(&out);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace soatins
