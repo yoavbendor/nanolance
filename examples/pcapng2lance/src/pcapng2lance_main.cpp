@@ -684,6 +684,7 @@ private:
                                                                         "next_protocol", args_.compress);
             rem_sink_ = std::make_unique<RemSink>(
                 [this](soatins::soa<staged::RemainderRow, kRemainderChunk>& chunk, std::string& e) {
+                    if (args_.no_write) return true;  // --no-write isolates Phase B from all Lance I/O
                     return rem_appender_->append_chunk(chunk, payload_uri_, e);
                 });
         }
