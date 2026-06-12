@@ -133,4 +133,10 @@ if(NANOTINS_BUILD_TESTS)
     target_link_libraries(nanotins_dag_decode PRIVATE nanotins_protocols)
     add_test(NAME nanotins_dag_decode COMMAND $<TARGET_FILE:nanotins_dag_decode>)
     set_tests_properties(nanotins_dag_decode PROPERTIES LABELS "smoke")
+
+    # M5c: DAG bulk (count->prefix-sum->scatter) == sequential, serial == thread pool (GPU determinism prereq).
+    add_executable(nanotins_dag_bulk tests/test_dag_bulk.cpp)
+    target_link_libraries(nanotins_dag_bulk PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_dag_bulk COMMAND $<TARGET_FILE:nanotins_dag_bulk>)
+    set_tests_properties(nanotins_dag_bulk PROPERTIES LABELS "smoke")
 endif()
