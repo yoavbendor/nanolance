@@ -536,6 +536,50 @@ private:
         return b;
     }
 
+    // CPU fast path: parse each EPB and scatter its PacketRow straight into the columns in ONE pass — no
+    // intermediate std::vector<EpbView>, no second materialization. soa<PacketRow>::raw() hands the column
+    // pointers to soatins::scatter (the same device-view fill the bulk/GPU kernels use); each task writes
+    // disjoint slots, so it parallelizes exactly like parse_packets did. The interface-table
+    // denormalization (link_type/ts_resol) is a host lookup, which is why this is the CPU path; the GPU
+    // path keeps parse_packets_gpu -> assemble (device parse, then the host join). Byte-identical output.
+    PacketBatch parse_and_assemble(pcapblocks::Bytes wbytes, const std::vector<pcapblocks::BlockRef>& packets,
+                                   const std::vector<std::size_t>& packet_section) {
+        const std::size_t n = packets.size();
+        PacketBatch b;
+        b.rows.resize(n);
+        b.link_type.resize(n);
+        b.poff.resize(n);
+        b.psize.resize(n);
+        const pcapblocks::Bytes wb = wbytes;
+        const pcapblocks::BlockRef* pk = packets.data();
+        const std::size_t* sect = packet_section.data();
+        const soatins::soa_ptrs<PacketRow> cols = b.rows.raw();
+        std::uint16_t* lt = b.link_type.data();
+        std::uint64_t* po = b.poff.data();
+        std::uint32_t* ps = b.psize.data();
+        const std::uint64_t pid0 = global_pid_;
+        auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
+        run(std::min<std::size_t>(n, 64), n, [=](std::size_t i) {
+            pcapblocks::EpbView e{};
+            pcapblocks::EpbView parsed{};
+            if (pcapblocks::parse_epb(wb, pk[i], parsed)) {
+                e = parsed;  // keep e default on parse failure (matches parse_packets' out[i] semantics)
+            }
+            const auto& table = sections_[sect[i]];
+            const std::uint16_t link =
+                e.interface_id < table.size() ? table[e.interface_id].link_type : std::uint16_t{0};
+            const std::uint8_t res =
+                e.interface_id < table.size() ? table[e.interface_id].ts_resol : std::uint8_t{6};
+            soatins::scatter(cols, i,
+                             PacketRow{pid0 + i, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
+                                       e.epb_flags});
+            lt[i] = link;
+            po[i] = e.payload_file_offset;
+            ps[i] = e.caplen;
+        });
+        return b;
+    }
+
     // Freeze the accumulated SHB/IDB KV metadata onto the schema (once, before the first commit).
     int freeze_metadata() {
         if (schema_meta_set_) return 0;
@@ -596,8 +640,14 @@ private:
         const std::size_t n = packets.size();
         if (n == 0) return 0;  // window held only SHB/IDB/other; nothing to write
 
-        const std::vector<pcapblocks::EpbView> parsed = parse_packets(wbytes, packets);
-        const PacketBatch batch = assemble(parsed, packet_section);
+        // GPU: device parse -> EpbView D2H -> host join. CPU: one fused parse+scatter pass (no EpbView).
+        PacketBatch batch;
+        if (args_.gpu) {
+            const std::vector<pcapblocks::EpbView> parsed = parse_packets(wbytes, packets);
+            batch = assemble(parsed, packet_section);
+        } else {
+            batch = parse_and_assemble(wbytes, packets, packet_section);
+        }
         if (!args_.no_write) {  // --no-write isolates Phase B (scan+parse+decode) from the Lance I/O
             if (const int rc = freeze_metadata()) return rc;
             if (const int rc = write_batch(batch, wbase)) return rc;
