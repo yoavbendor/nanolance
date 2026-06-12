@@ -47,17 +47,18 @@ void parse_spec_gpu(context& ctx, std::size_t num_tasks, const std::uint8_t* hos
             device_buffer<typename std::tuple_element_t<I, cols>::elem>(n)...};
     }(std::make_index_sequence<ncols>{});
 
-    // A pointer pack over the DEVICE columns — the same soa_ptrs shape scatter_spec writes through.
-    typename soatins::soa_ptrs_h<cols>::type dptrs;
+    // A TRIVIALLY-COPYABLE pack of the DEVICE column pointers. nvexec memcpys the kernel to the device, so
+    // the captured pack must be trivially copyable — std::tuple (soa_ptrs) is not, a void*[N] POD is.
+    nanotins::dev_ptr_pack<ncols> dptrs;
     [&]<std::size_t... I>(std::index_sequence<I...>) {
-        ((std::get<I>(dptrs) = std::get<I>(dev_cols).get()), ...);
+        ((dptrs.p[I] = static_cast<void*>(std::get<I>(dev_cols).get())), ...);
     }(std::make_index_sequence<ncols>{});
 
     // The kernel: read every field from the device header and scatter into the device columns. dptrs (a
-    // std::tuple of device pointers) is captured by value into the nvexec bulk lambda.
+    // POD void*[ncols]) is captured by value — the lambda is now trivially copyable for the GPU bulk.
     const std::uint8_t* dh = d_hdr.get();
     nanotins::bulk_for_each(ctx.scheduler(), num_tasks, n, [=](std::size_t i) {
-        nanotins::scatter_spec<Spec>(dptrs, i, dh + i * stride);
+        nanotins::scatter_spec_pod<Spec>(dptrs, i, dh + i * stride);
     });
 
     // D2H each column into the caller's host buffers.

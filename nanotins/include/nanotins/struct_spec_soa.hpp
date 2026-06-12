@@ -53,6 +53,27 @@ NANOTINS_HD inline void scatter_spec(const Ptrs& p, std::size_t i, const std::ui
     }(std::make_index_sequence<Spec::field_count>{});
 }
 
+// A TRIVIALLY-COPYABLE device pointer pack: one void* per column. std::tuple (soa_ptrs) is not trivially
+// copyable under libstdc++, so a kernel lambda capturing it fails nvexec's GPU bulk requirement
+// (trivially_copyable<Fun>) — it must memcpy the kernel to the device. A POD void*[N] satisfies it; the
+// per-column element type is recovered at compile time from the Spec. (Same reason decode_window_gpu uses
+// a POD PduSink rather than a tuple.) Used by the GPU path; the CPU path keeps the tuple pack above.
+template <std::size_t N>
+struct dev_ptr_pack {
+    void* p[N];
+};
+
+template <class Spec, std::size_t N>
+NANOTINS_HD inline void scatter_spec_pod(const dev_ptr_pack<N>& pack, std::size_t i,
+                                         const std::uint8_t* pdu) {
+    using fields = spec_fields_t<Spec>;
+    [&]<std::size_t... I>(std::index_sequence<I...>) {
+        ((static_cast<typename std::tuple_element_t<I, fields>::value_type*>(pack.p[I])[i] =
+              read_field<std::tuple_element_t<I, fields>>(pdu)),
+         ...);
+    }(std::make_index_sequence<Spec::field_count>{});
+}
+
 // Fixed-capacity SoA over a wire spec. append()/scatter() read one PDU's fields into row i; raw() hands
 // the column pointers to scatter_spec for the bulk/GPU path.
 template <class Spec, std::size_t N>
