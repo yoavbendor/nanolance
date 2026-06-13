@@ -116,25 +116,33 @@ void dag_decode_window_gpu(Scheduler sch, std::size_t num_tasks, std::uint64_t p
     // Pushed in a fixed order (node 0 pid, node 0 cols..., node 1 pid, ...) so the sink fold below reads
     // them back by the same running index.
     std::vector<device_buffer<std::uint8_t>> bufs;
+    auto alloc_node_buffers = [&]<std::size_t I>() {
+        using NodeI = std::tuple_element_t<I, typename Graph::nodes>;
+        using SpecI = typename NodeI::spec;
+        const std::size_t cnt = static_cast<std::size_t>(total.n[I]);
+        // node I: pid (cnt*8 bytes) then each column (cnt*sizeof(elem) bytes)
+        bufs.emplace_back(cnt * sizeof(std::uint64_t));
+        [&]<std::size_t... C>(std::index_sequence<C...>) {
+            (bufs.emplace_back(cnt * spec_col_bytes<SpecI, C>()), ...);
+        }(std::make_index_sequence<SpecI::field_count>{});
+    };
     [&]<std::size_t... I>(std::index_sequence<I...>) {
-        ((  // node I: pid (total.n[I]*8 bytes) then each column (total.n[I]*sizeof(elem) bytes)
-            bufs.emplace_back(static_cast<std::size_t>(total.n[I]) * sizeof(std::uint64_t)),
-            [&]<std::size_t... C>(std::index_sequence<C...>) {
-                using SpecI = typename std::tuple_element_t<I, typename Graph::nodes>::spec;
-                ((bufs.emplace_back(static_cast<std::size_t>(total.n[I]) * spec_col_bytes<SpecI, C>())), ...);
-            }(std::make_index_sequence<std::tuple_element_t<I, typename Graph::nodes>::spec::field_count>{})),
-         ...);
+        (alloc_node_buffers.template operator()<I>(), ...);
     }(std::make_index_sequence<NN>{});
 
     // --- Build the POD device sink from the byte buffers (same push order, running index) ---
     dag_sink<Graph> sink{};
     std::size_t bi = 0;
+    auto bind_node_sink = [&]<std::size_t I>() {
+        using NodeI = std::tuple_element_t<I, typename Graph::nodes>;
+        using SpecI = typename NodeI::spec;
+        sink.pid[I] = reinterpret_cast<std::uint64_t*>(bufs[bi++].get());
+        [&]<std::size_t... C>(std::index_sequence<C...>) {
+            ((sink.col[I][C] = static_cast<void*>(bufs[bi++].get())), ...);
+        }(std::make_index_sequence<SpecI::field_count>{});
+    };
     [&]<std::size_t... I>(std::index_sequence<I...>) {
-        ((sink.pid[I] = reinterpret_cast<std::uint64_t*>(bufs[bi++].get()),
-          [&]<std::size_t... C>(std::index_sequence<C...>) {
-              ((sink.col[I][C] = static_cast<void*>(bufs[bi++].get())), ...);
-          }(std::make_index_sequence<std::tuple_element_t<I, typename Graph::nodes>::spec::field_count>{})),
-         ...);
+        (bind_node_sink.template operator()<I>(), ...);
     }(std::make_index_sequence<NN>{});
 
     // --- Pass 2: scatter each PDU into its prefix-summed slot (device) ---
@@ -150,29 +158,33 @@ void dag_decode_window_gpu(Scheduler sch, std::size_t num_tasks, std::uint64_t p
 
     // --- D2H: append each node's columns to the host tables at their current size (cross-window accum) ---
     bi = 0;
-    [&]<std::size_t... I>(std::index_sequence<I...>) {
-        ((  // node I
+    auto copy_node_to_host = [&]<std::size_t I>() {
+        using NodeI = std::tuple_element_t<I, typename Graph::nodes>;
+        using SpecI = typename NodeI::spec;
+        auto& table = std::get<I>(out);
+        const std::size_t cnt = static_cast<std::size_t>(total.n[I]);
+        const std::size_t base = table.packet_id.size();
+        table.packet_id.resize(base + cnt);
+        [&]<std::size_t... C>(std::index_sequence<C...>) {
+            ((std::get<C>(table.columns).resize(base + cnt)), ...);
+        }(std::make_index_sequence<SpecI::field_count>{});
+
+        if (cnt > 0) {
+            bufs[bi].to_host(reinterpret_cast<std::uint8_t*>(table.packet_id.data() + base),
+                             cnt * sizeof(std::uint64_t));
+            ++bi;
             [&]<std::size_t... C>(std::index_sequence<C...>) {
-                auto& table = std::get<I>(out);
-                const std::size_t cnt = static_cast<std::size_t>(total.n[I]);
-                const std::size_t base = table.packet_id.size();
-                table.packet_id.resize(base + cnt);
-                ((std::get<C>(table.columns).resize(base + cnt)), ...);
-                if (cnt > 0) {
-                    bufs[bi].to_host(reinterpret_cast<std::uint8_t*>(table.packet_id.data() + base),
-                                     cnt * sizeof(std::uint64_t));
-                    ++bi;
-                    ((bufs[bi++].to_host(reinterpret_cast<std::uint8_t*>(std::get<C>(table.columns).data() + base),
-                                         cnt * sizeof(typename std::tuple_element_t<
-                                                      C, columns_of_spec<typename std::tuple_element_t<
-                                                             I, typename Graph::nodes>::spec>>::elem))),
-                     ...);
-                } else {
-                    // skip this node's buffers (pid + ncols) in the running index
-                    bi += 1 + sizeof...(C);
-                }
-            }(std::make_index_sequence<std::tuple_element_t<I, typename Graph::nodes>::spec::field_count>{})),
-         ...);
+                ((bufs[bi++].to_host(reinterpret_cast<std::uint8_t*>(std::get<C>(table.columns).data() + base),
+                                     cnt * sizeof(typename std::tuple_element_t<C, columns_of_spec<SpecI>>::elem))),
+                 ...);
+            }(std::make_index_sequence<SpecI::field_count>{});
+        } else {
+            // skip this node's buffers (pid + ncols) in the running index
+            bi += 1 + SpecI::field_count;
+        }
+    };
+    [&]<std::size_t... I>(std::index_sequence<I...>) {
+        (copy_node_to_host.template operator()<I>(), ...);
     }(std::make_index_sequence<NN>{});
 }
 
