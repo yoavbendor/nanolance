@@ -177,6 +177,7 @@ add_library(nanolance STATIC
     src/lance_table_reader.cpp
     src/nano_lance_table_reader_c.cpp
     src/manifest_writer.cpp
+    src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp
 )
@@ -208,6 +209,12 @@ if(NANOLANCE_BUILD_TOOLS)
     add_executable(nlance2table tools/nlance2table.cpp)
     target_compile_features(nlance2table PRIVATE cxx_std_20)
     target_link_libraries(nlance2table PRIVATE CLI11::CLI11 nanolance)
+
+    # nlance-stitch: gather/merge many free-standing worker .lance folders into one self-contained dataset
+    # (Option A: relocate fragments into one data/ + write one master manifest; no column data re-encode).
+    add_executable(nlance_stitch tools/nlance_stitch.cpp)
+    target_compile_features(nlance_stitch PRIVATE cxx_std_20)
+    target_link_libraries(nlance_stitch PRIVATE CLI11::CLI11 nanolance)
 
     # Blob-fetch benchmark tooling: generate a tiled external-blob dataset, and fetch via nanolance.
     add_executable(nlance_blobgen tools/nlance_blobgen.cpp)
@@ -312,6 +319,10 @@ add_executable(nano_lance_writer_append_test tests/test_nano_lance_writer_append
 target_compile_features(nano_lance_writer_append_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_writer_append_test PRIVATE nanolance)
 
+add_executable(nano_lance_stitch_test tests/test_dataset_stitch.cpp)
+target_compile_features(nano_lance_stitch_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_stitch_test PRIVATE nanolance)
+
 add_executable(nano_lance_data_file_reader_test tests/test_data_file_reader.cpp)
 target_compile_features(nano_lance_data_file_reader_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_data_file_reader_test PRIVATE nanolance)
@@ -373,6 +384,14 @@ set_tests_properties(nano_lance_manifest_reader PROPERTIES LABELS "smoke" DEPEND
 
 add_test(NAME nano_lance_writer_append COMMAND $<TARGET_FILE:nano_lance_writer_append_test>)
 set_tests_properties(nano_lance_writer_append PROPERTIES LABELS "smoke")
+
+# Gather/stitch: merge N free-standing datasets into one master == an in-order single dataset, validated
+# through the full Lance read path via nlance2table (no Python). Needs the nlance2table tool.
+if(TARGET nlance2table)
+    add_test(NAME nano_lance_stitch
+             COMMAND $<TARGET_FILE:nano_lance_stitch_test> $<TARGET_FILE:nlance2table>)
+    set_tests_properties(nano_lance_stitch PROPERTIES LABELS "smoke")
+endif()
 
 add_test(NAME nano_lance_data_file_reader COMMAND $<TARGET_FILE:nano_lance_data_file_reader_test>)
 set_tests_properties(nano_lance_data_file_reader PROPERTIES LABELS "smoke")
