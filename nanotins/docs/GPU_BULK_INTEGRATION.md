@@ -27,13 +27,13 @@ The per-element functions it calls (`parse_epb`, `overlay`, `pack_ports`, …) a
 | `gputins/include/gputins/gpu.hpp` | `gpu::context` (owns `nvexec::stream_context`), `gpu::device_buffer<T>` (RAII cudaMalloc/Free + H2D/D2H), `gpu::free_vram_bytes()`, `gpu::vram_budget(bytes,pct)`. All behind `NANOTINS_ENABLE_CUDA`. (All CUDA/nvexec code lives in the `gputins` library — a sibling of `nanotins`/`soatins` — so the CUDA dependency is isolated.) |
 | `nanotins/include/nanotins/bulk.hpp` | `bulk_for_each` (used as-is with the GPU scheduler) + `serial_for_each`. (Stays in `nanotins`; reused by both CPU and GPU.) |
 | `examples/pcapng2lance/src/pcapng2lance_main.cpp` | `L1Converter::parse_packets_gpu()` — the **GPU L1 parse**: H2D(window+BlockRefs) → `bulk_for_each(gpu_ctx_->scheduler(), …, parse_epb kernel)` → D2H(EpbView). Under `--decode-l2l3` it also calls `decode_window_gpu`. Selected by `--gpu`; window capped to the VRAM budget. CPU path unchanged. |
-| `gputins/include/gputins/protocol_decode_gpu.hpp` | **GPU L2/L3/L4 decode** `decode_window_gpu` — the on-device count → `thrust::exclusive_scan` → scatter (the variable-output pattern). Same `count_packet`/`scatter_packet`/`walk_packet` kernels as CPU (now `NANOTINS_HD`); only the scan (thrust) + device buffers + D2H append differ. |
+| `gputins/include/gputins/dag_decode_gpu.hpp` | **GPU L2/L3/L4 decode via spec_dag** — on-device count → `thrust::exclusive_scan` → scatter (the variable-output pattern), driven by the **spec_dag** DAG/FSM. Same `count_packet`/`scatter_packet` DAG-walk kernels as CPU (now `NANOTINS_HD`); only the scan (thrust) + device buffers + D2H append differ. Produces byte-identical output to the CPU DAG path. |
 | `examples/pcapng2lance/CMakeLists.txt` | `option(NANOTINS_ENABLE_CUDA …)` + the documented build hook. |
 | CLI | `--gpu`, `--cuda-device D`, `--vram-pct P`, `--vram-bytes B`. Without a CUDA build, `--gpu` exits with a clear error. |
 
 Both Phase-B halves are now scaffolded on GPU: the **L1 `parse_epb` scatter** (one `EpbView` per packet,
-AoS) and the **L2/L3/L4 decode** (`decode_window_gpu`, count→scan→scatter). The decode is where the GPU
-actually pays off (heavier per-packet work). All of it is written-not-compiled — your job is to compile,
+AoS) and the **L2/L3/L4 spec_dag decode** (`dag_decode_gpu`, count→scan→scatter). The decode is where the GPU
+actually pays off (heavier per-packet work). All of it is **written-not-compiled** — your job is to compile,
 fix any toolchain syntax, and **verify byte-identical to CPU**.
 
 ## Step 1 — build with CUDA
@@ -120,17 +120,17 @@ runs on-device too (Next steps) or the window is large and the kernel heavier.
    scheduler (nvexec compiles it for device); we do the same. Do **not** hand-annotate the `bulk_for_each`
    kernel `__device__` — let nvexec handle it. (The functions it *calls* are `NANOTINS_HD`.)
 
-## Compiling the decode (`decode_window_gpu`)
+## Compiling the DAG decode (`dag_decode_gpu`)
 
-It needs **thrust** (ships with the CUDA toolkit, header-only): the includes are already in
-`protocol_decode_gpu.hpp`. The single `thrust::exclusive_scan` / `thrust::reduce` with
-`thrust::plus<PduCounts>{}` does the per-type prefix-sum for **all six PDU types at once** —
-`PduCounts::operator+` (component-wise) makes that work.
+It lives in `gputins/include/gputins/dag_decode_gpu.hpp` and needs **thrust** (ships with the CUDA
+toolkit, header-only): the includes are already there. The single `thrust::exclusive_scan` / `thrust::reduce`
+with `thrust::plus<node_counts<NN>>{}` does the per-node prefix-sum for **all DAG nodes at once** —
+the `node_counts` struct's component-wise `operator+` makes that work.
 
 Extra flags likely needed (on top of the L1 ones): **`--extended-lambda`** (nvcc) or the clang-cuda
-equivalent — because `count_packet`/`scatter_packet` create lambdas *inside* `NANOTINS_HD` functions, and
-those must be device-callable. If the device compile complains about the in-function lambdas, that flag is
-the fix.
+equivalent — because the DAG walkers (`count_packet`/`scatter_packet`) create lambdas *inside*
+`NANOTINS_HD` functions, and those must be device-callable. If the device compile complains about the
+in-function lambdas, that flag is the fix.
 
 Verify the decode the same way as L1, but diff the **PDU tables**:
 ```bash
@@ -142,7 +142,8 @@ for t in ethernet vlan ipv4 ipv6 tcp udp remainder_after_l4; do
 done
 ```
 Row **order** within a table is by packet index (the scan sums in index order), so the tables must come out
-identical to CPU — `pcapng2lance_frag_harmony` already encodes that contract for the CPU paths.
+identical to CPU — the `test_pdu_table_interop` unit test and `pcapng2lance_frag_harmony` integration test
+already encode this contract for the CPU paths (and the GPU scaffold inherits the same structure).
 
 ## Next steps (after GPU matches CPU)
 

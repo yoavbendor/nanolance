@@ -1,23 +1,31 @@
 # nanotins
 
 A small, reusable **C++20** library for parsing **pcap/pcapng** and **L2/L3/L4** packets — sequentially or
-in data-parallel bulk — built around one idea: the **overlay-able, self-describing wire struct**. You
-describe a packet header *once* (a packed `be<>`/`le<>`/`bits<>` struct + one `BOOST_DESCRIBE_STRUCT`
-line) and get, for free:
+in data-parallel bulk — built around one core idea: the **declarative wire-parsing struct spec**. Describe a
+protocol header once with explicit byte offsets (`StructSpec<named_field<>, named_bytes_field<>, …>`)
+and get, for free:
 
-- a zero-copy **`overlay()`** on raw bytes (endianness & bit layout handled by the field types),
-- a flattened **column list** (`columns_of<T>`, bitfields expanded to named columns),
+- a zero-copy **host read** overlay on raw bytes (endianness & bit layout handled by the field types),
+- an equivalent **GPU device read** (device-callable, produces the same columns),
+- a flattened **column list** (bitfields expanded to named scalar columns),
 - an **SoA** store (`soa<T>`) + a **nanoarrow** schema/array (`arrow_schema<T>()` / `to_arrow<T>()`).
 
-That describe→SoA→Arrow nucleus is its own library now — **[`soatins`](../soatins)** (namespace `soatins`,
-include prefix `soatins/`) — so the reflection trick can be vendored on its own (it depends only on
-**nanoarrow + header-only boost**, and knows nothing about packets). `nanotins` builds on it, adding the
-pcap/pcapng scanner, the L2/L3/L4 wire structs + layered decode, the gPTP extension, and the
-scheduler-agnostic `bulk_for_each` (over **stdexec**). The CUDA (nvexec) executors are split off again into
-**[`gputins`](../gputins)** so the GPU dependency is isolated. All three are **header-only** — the Phase-B
-parsers are device-callable (`NANOTINS_HD`), so they live inline in the headers where device code can see
-them. None of them know anything about Lance — they produce nanoarrow tables that any backend (Lance,
-Parquet, Arrow IPC) can persist.
+The **struct_spec** subsystem (files: `struct_spec.hpp`, `struct_spec_soa.hpp`) replaces hand-written
+protocol overlays and gives the **spec_dag** (`spec_dag.hpp`, `dag_decode.hpp`) — a declarative DAG/FSM
+dispatcher — a single source of truth. One walk of the DAG decodes on both host (CPU bulk path via
+`dag_decode_bulk`) and device (GPU via `dag_decode_gpu`). The L2/L3 protocol specs live in
+`protocol_specs.hpp`; PTPv2/gPTP extension specs in `protocol_specs_ptp.hpp`. All DAG-emitted PDU tables are
+byte-identical to the older hand-written `walk_packet` decoder (verified by the
+`test_pdu_table_interop`/`test_pdu_table_lance_interop` suite).
+
+The soatins nucleus (describe→SoA→Arrow) is its own library — **[`soatins`](../soatins)** (namespace `soatins`,
+include prefix `soatins/`) — vendorable on its own (depends only on **nanoarrow + header-only boost**,
+knows nothing about packets). `nanotins` builds on it, adding pcap/pcapng scanning, the struct_spec + spec_dag
+wire-parsing core, the gPTP extension, and scheduler-agnostic `bulk_for_each` (over **stdexec**). The CUDA
+(nvexec) executors are split off again into **[`gputins`](../gputins)** so the GPU dependency is isolated.
+All three are **header-only** — the Phase-B parsers are device-callable (`NANOTINS_HD`), so they live inline
+in the headers where device code can see them. None of them know anything about Lance — they produce nanoarrow
+tables that any backend (Lance, Parquet, Arrow IPC) can persist.
 
 ```
 soatins  →  nanotins  →  gputins        (each depends only on the one to its left)
@@ -34,11 +42,16 @@ new protocol (gPTP / IEEE 802.1AS)**. Open it in a browser.
 
 ```
 ../soatins/include/soatins/  reflect, bits, endian, fixed_string, column_traits, describe, arrow_glue
-include/nanotins/            bulk: bulk.hpp (scheduler-agnostic bulk_for_each / serial_for_each)
+include/nanotins/            struct_spec: struct_spec.hpp, struct_spec_soa.hpp (declarative wire specs)
+                             spec_dag: spec_dag.hpp, dag_decode.hpp, dag_bulk.hpp (DAG dispatcher + bulk)
+                             protocols: protocol_specs.hpp, protocol_specs_ptp.hpp (L2/L3/L4 specs)
+                             protocol_decode.hpp, protocol_decode_bulk.hpp (walk_packet legacy path)
+                             bulk: bulk.hpp (scheduler-agnostic bulk_for_each / serial_for_each)
                              pcap: pcap_blocks.hpp (scan_blocks / scan_window / parse_epb — header-only)
-                             protocols: protocols.hpp, protocol_decode{,_bulk}.hpp, gptp.hpp (extension)
-../gputins/include/gputins/  gpu.hpp, protocol_decode_gpu.hpp (CUDA/nvexec, behind NANOTINS_ENABLE_CUDA)
-tests/                       protocols / pcap_blocks / bulk / gptp  (reflect / soa_scatter live in soatins)
+                             gptp.hpp (PTPv2 extension, legacy overlay)
+../gputins/include/gputins/  gpu.hpp, struct_spec_gpu.hpp, dag_decode_gpu.hpp (CUDA/nvexec, behind NANOTINS_ENABLE_CUDA)
+tests/                       spec_dag / dag_decode / dag_bulk / struct_spec / protocol_specs
+                             protocols / pcap_blocks / bulk / gptp  (reflect / soa_scatter live in soatins)
 docs/nanotins.html           the guide
 ```
 
@@ -48,7 +61,7 @@ docs/nanotins.html           the guide
 |---|---|---|
 | `soatins::core` | INTERFACE | reflection / overlay / SoA / arrow + endian / bits (the reusable nucleus) |
 | `nanotins::pcap` | INTERFACE | pcap/pcapng block scanner + per-block parse (header-only) |
-| `nanotins::protocols` | INTERFACE | L2/L3/L4 wire structs + serial/bulk decode + gPTP + bulk_for_each |
+| `nanotins::protocols` | INTERFACE | struct_spec + spec_dag core + L2/L3/L4 protocol specs + serial/bulk decode + gPTP + bulk_for_each |
 | `nanotins` | INTERFACE | umbrella (pcap + protocols, pulls soatins) |
 | `gputins` | INTERFACE | CUDA (nvexec) executors; pulls nanotins; inert without NANOTINS_ENABLE_CUDA |
 

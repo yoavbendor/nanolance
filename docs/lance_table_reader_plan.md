@@ -1,4 +1,7 @@
-# Plan: native Lance table reader (`nano_lance_reader` + nanoarrow)
+# Lance table reader — implementation & roadmap
+
+**Status:** The core reader (Phases 1–3 below) is **implemented** and shipped. The `nano_lance_reader.h` C API
+and reader parity tests are in place. Phases 4+ (multiple fragments, S3, column projection) are future work.
 
 Goal: read `header.lance` / `entries.lance` (and sidecars) **without Python `lance`**, so tools like **Mdf2Lance** use only `--lance-dir`.
 
