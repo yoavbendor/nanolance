@@ -91,4 +91,52 @@ if(NANOTINS_BUILD_TESTS)
     target_link_libraries(nanotins_gptp_test PRIVATE nanotins_protocols)
     add_test(NAME nanotins_gptp COMMAND $<TARGET_FILE:nanotins_gptp_test>)
     set_tests_properties(nanotins_gptp PROPERTIES LABELS "smoke")
+
+    # struct_spec M1: the UDP header (4x u16) wire spec -> contiguous/device read -> bulk SoA -> Arrow.
+    add_executable(nanotins_struct_spec_udp tests/test_struct_spec_udp.cpp)
+    target_link_libraries(nanotins_struct_spec_udp PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_struct_spec_udp COMMAND $<TARGET_FILE:nanotins_struct_spec_udp>)
+    set_tests_properties(nanotins_struct_spec_udp PROPERTIES LABELS "smoke")
+
+    # struct_spec M2: the IPv4 header (named_bit_field + IHL-driven extent), cross-checked vs soatins bits<>.
+    add_executable(nanotins_struct_spec_ipv4 tests/test_struct_spec_ipv4.cpp)
+    target_link_libraries(nanotins_struct_spec_ipv4 PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_struct_spec_ipv4 COMMAND $<TARGET_FILE:nanotins_struct_spec_ipv4>)
+    set_tests_properties(nanotins_struct_spec_ipv4 PROPERTIES LABELS "smoke")
+
+    # struct_spec M3: IPv6 (byte-crossing bit-field + fixed-size-binary addresses + next_header chaining).
+    add_executable(nanotins_struct_spec_ipv6 tests/test_struct_spec_ipv6.cpp)
+    target_link_libraries(nanotins_struct_spec_ipv6 PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_struct_spec_ipv6 COMMAND $<TARGET_FILE:nanotins_struct_spec_ipv6>)
+    set_tests_properties(nanotins_struct_spec_ipv6 PROPERTIES LABELS "smoke")
+
+    # M4a: the backbone protocol_specs (eth/vlan/ipv4/ipv6/tcp/udp) read identically to protocols:: structs.
+    add_executable(nanotins_protocol_specs tests/test_protocol_specs.cpp)
+    target_link_libraries(nanotins_protocol_specs PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_protocol_specs COMMAND $<TARGET_FILE:nanotins_protocol_specs>)
+    set_tests_properties(nanotins_protocol_specs PROPERTIES LABELS "smoke")
+
+    # M4b: PTPv2 via embed<> spec composition (header parity vs Gptp; embed offsets + name prefixes).
+    add_executable(nanotins_struct_spec_ptp tests/test_struct_spec_ptp.cpp)
+    target_link_libraries(nanotins_struct_spec_ptp PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_struct_spec_ptp COMMAND $<TARGET_FILE:nanotins_struct_spec_ptp>)
+    set_tests_properties(nanotins_struct_spec_ptp PROPERTIES LABELS "smoke")
+
+    # M5a: the spec-driven DAG/FSM reproduces walk_packet's L2/L3/L4 traversal (determinism/parity oracle).
+    add_executable(nanotins_spec_dag tests/test_spec_dag.cpp)
+    target_link_libraries(nanotins_spec_dag PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_spec_dag COMMAND $<TARGET_FILE:nanotins_spec_dag>)
+    set_tests_properties(nanotins_spec_dag PROPERTIES LABELS "smoke")
+
+    # M5b: DAG-driven columnar decode (per-node SoA + packet_id) == struct_view; counts == walk_packet.
+    add_executable(nanotins_dag_decode tests/test_dag_decode.cpp)
+    target_link_libraries(nanotins_dag_decode PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_dag_decode COMMAND $<TARGET_FILE:nanotins_dag_decode>)
+    set_tests_properties(nanotins_dag_decode PROPERTIES LABELS "smoke")
+
+    # M5c: DAG bulk (count->prefix-sum->scatter) == sequential, serial == thread pool (GPU determinism prereq).
+    add_executable(nanotins_dag_bulk tests/test_dag_bulk.cpp)
+    target_link_libraries(nanotins_dag_bulk PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_dag_bulk COMMAND $<TARGET_FILE:nanotins_dag_bulk>)
+    set_tests_properties(nanotins_dag_bulk PROPERTIES LABELS "smoke")
 endif()

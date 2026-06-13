@@ -1,14 +1,19 @@
 # nanolance
 
-Standalone C++ library for writing **Lance v2.2** datasets (minimal protobuf scaffold, no Rust `lance` core). Public headers live under `include/nanolance/`.
+Standalone C++ Arrow ↔ Lance writer and reader — write **Lance v2.2** datasets with minimal protobuf overhead (no Rust `lance` core), and read back what you wrote. Its headline feature: rows keep large payloads external (referenced by `uri` + offset + size, never copied) — so a Lance table of pcap packets stays single-digit bytes per row of references *regardless of packet size*, while the payload bytes live once in the source capture and are fetched on demand (numbers in [bench/linux-results.md](bench/linux-results.md)).
+
+Built on three layered, reusable libraries: **[soatins](soatins/)** (reflection: describe a struct once → SoA + Arrow), **[nanotins](nanotins/)** (pcap/pcapng + L2/L3/L4 protocol decode + the new struct_spec declarative wire-parsing core + the spec_dag DAG/FSM dispatcher), and **[gputins](gputins/)** (CUDA/nvexec GPU bulk decode, behind `NANOTINS_ENABLE_CUDA`). The `[examples/pcapng2lance](examples/pcapng2lance/)` worked example glues them together into a streaming capture → Lance converter.
 
 > Integrating programmatically (or via an AI agent)? See [AGENTS.md](AGENTS.md) for the current
 > include path / CMake targets, the write API, and how to enable each compression measure.
 
 ## Layout
 
-- **Libraries (CMake targets):** `nanolance_proto`, `nanolance_reader`, `nanolance` (namespaced alias `nanolance::nanolance`)
-- **Tool:** `arrowipc2lance` — Arrow IPC stream → Lance dataset (`--version` prints nanolance version)
+- **soatins** (namespace `soatins`, include prefix `soatins/`): reflection nucleus — `be<>`/`le<>` endian-aware fields, bitfield `bits<>`, `soa<T>` columnar store, Arrow `arrow_schema<T>()` / `to_arrow()`. Header-only, depends only on nanoarrow + boost. CMake target: `soatins::core`.
+- **nanotins** (namespace `nanotins`, include prefix `nanotins/`): pcap/pcapng scanner + L2/L3/L4 wire structs and decode, now built on the **struct_spec** declarative spec system (one explicit-offset spec → host read + device read + SoA + Arrow; see `protocol_specs.hpp`) + **spec_dag** DAG/FSM dispatcher (one walk does host AND GPU decode). Also has scheduler-agnostic `bulk_for_each` (over stdexec). Header-only, depends on soatins + header-only stdexec. CMake targets: `nanotins::pcap`, `nanotins::protocols`, `nanotins` (umbrella).
+- **gputins** (namespace `nanotins::gpu`, include prefix `gputins/`): CUDA (nvexec) executors and GPU protocol decode, all behind `NANOTINS_ENABLE_CUDA`. Inert on CPU builds. CMake target: `gputins`.
+- **nanolance** (namespace `nano_lance`, include prefix `nanolance/`): the Lance writer/reader. CMake targets: `nanolance_proto`, `nanolance_reader`, `nanolance` (writing); link `nanolance_reader` alone if you only fetch external blobs.
+- **Tool:** `arrowipc2lance` — Arrow IPC stream → Lance dataset (`--version` prints nanolance version); `nlance2table` — Lance dataset → CSV/NDJSON text (for validation).
 
 ## Standalone build
 
@@ -121,6 +126,10 @@ git archive --format=zip -o nanolance-src.zip HEAD
 ```
 
 Standalone configures use **`GIT_SHALLOW TRUE`** on FetchContent to keep *future* `build/_deps` smaller; an existing `build/` from before that change should still be removed or reconfigured from scratch to drop old full clones.
+
+## Benchmarking
+
+Performance benchmarks (pcap-style columns: run-length URI + monotonic position + constant size) and native-reader profiles are in [bench/linux-results.md](bench/linux-results.md). External blob fetching (nanolance vs. Rust Lance) is in [bench/README_blob_fetch.md](bench/README_blob_fetch.md). The per-column compression ratios and method selection are documented in [AGENTS.md](AGENTS.md#3-enabling-the-compression-that-was-measured).
 
 ## Version
 

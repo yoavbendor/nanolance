@@ -11,7 +11,7 @@ cmake version 3.31.6
 
 ## Tests
 ```
-smoke    =   0.19 sec*proc (26 tests)
+smoke    =   0.20 sec*proc (29 tests)
 
 Total Test time (real) =   0.41 sec
 ```
@@ -21,17 +21,24 @@ Total Test time (real) =   0.41 sec
 
 ========== pcap_ref  (200000 rows, 3 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         29.12       29.12    5.212      3.85                (1.00x vs pq)
+rust lance              3.11        3.11    8.485      3.34                (1.63x vs pq)
+nanolance               8.39       11.29    9.013      7.48        12.21   (1.73x vs pq)
+
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         32.23       32.23   15.513      8.62                (1.00x vs pq)
+rust lance             17.69       17.69   18.909      5.86                (1.22x vs pq)
+nanolance              98.15      103.94   18.206     13.16        12.20   (1.17x vs pq)
 parquet (zstd)         22.88       22.88    4.189      6.06                (1.00x vs pq)
 rust lance             10.00       10.00    3.472      5.40                (0.83x vs pq)
 nanolance              23.95       31.27    3.643     11.13         9.22   (0.87x vs pq)
 
-========== wide_int  (200000 rows, 4 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
 parquet (zstd)         24.36       24.36    5.212      3.51                (1.00x vs pq)
 rust lance              2.63        2.63    8.485      3.69                (1.63x vs pq)
 nanolance              10.45       13.60    9.013     12.24        11.77   (1.73x vs pq)
 
-========== high_card  (200000 rows, 2 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
 parquet (zstd)         30.06       30.06   15.513      8.10                (1.00x vs pq)
 rust lance             16.80       16.80   18.971      5.52                (1.22x vs pq)
@@ -62,7 +69,7 @@ Auto-annotation:  on
 --------------------------------------------------------------------------------
 Ir                  
 --------------------------------------------------------------------------------
-39,425,807 (100.0%)  PROGRAM TOTALS
+39,425,767 (100.0%)  PROGRAM TOTALS
 
 --------------------------------------------------------------------------------
 Ir                   file:function

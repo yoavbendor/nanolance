@@ -66,6 +66,25 @@ if(NANOLANCE_BUILD_TESTS)
     add_test(NAME nanotins_reader_parity COMMAND $<TARGET_FILE:nanotins_reader_parity_test>)
     set_tests_properties(nanotins_reader_parity PROPERTIES LABELS "smoke")
 
+    # M6: the DAG-driven PDU tables are byte-identical (schema + Arrow buffers) to the protocols:: tables,
+    # so the driver's decode path can move to the spec/DAG without changing the Lance output.
+    add_executable(pdu_table_interop_test tests/test_pdu_table_interop.cpp)
+    target_include_directories(pdu_table_interop_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(pdu_table_interop_test PRIVATE nanotins nanolance)
+    add_test(NAME pdu_table_interop COMMAND $<TARGET_FILE:pdu_table_interop_test>)
+    set_tests_properties(pdu_table_interop PROPERTIES LABELS "smoke")
+
+    # M6 (full pipeline, no Python): write both PDU-table paths to real Lance, dump via nlance2table, diff
+    # the CSV. Proves the spec/DAG tables == protocols:: tables through Lance write/read, not just in-memory.
+    if(TARGET nlance2table)
+        add_executable(pdu_table_lance_interop_test tests/test_pdu_table_lance_interop.cpp)
+        target_include_directories(pdu_table_lance_interop_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(pdu_table_lance_interop_test PRIVATE nanotins nanolance)
+        add_test(NAME pdu_table_lance_interop
+                 COMMAND $<TARGET_FILE:pdu_table_lance_interop_test> $<TARGET_FILE:nlance2table>)
+        set_tests_properties(pdu_table_lance_interop PROPERTIES LABELS "smoke")
+    endif()
+
     # End-to-end driver self-check (manifest + KV metadata + external-blob premise). Uses the nanotins
     # pcap scanner (linked via the umbrella target) and the shared pcap_fixtures.hpp from nanotins/tests.
     add_executable(pcapng2lance_driver_test tests/test_pcapng2lance_driver.cpp)
@@ -74,6 +93,27 @@ if(NANOLANCE_BUILD_TESTS)
     target_link_libraries(pcapng2lance_driver_test PRIVATE nanotins nanolance)
     add_test(NAME pcapng2lance_driver COMMAND $<TARGET_FILE:pcapng2lance_driver_test> $<TARGET_FILE:pcapng2lance>)
     set_tests_properties(pcapng2lance_driver PROPERTIES LABELS "smoke")
+
+    # struct_spec GPU smoke (T5): GPU scatter_spec == CPU spec_soa, byte-identical. Inert on a CPU build
+    # (the gputins header compiles to nothing without NANOTINS_ENABLE_CUDA), so it passes trivially here;
+    # the CUDA host compiles this TU as CUDA (the same -x cuda step as the gpu bridge) and runs the real
+    # GPU==CPU check. See nanotins/docs/GPU_BULK_INTEGRATION.md.
+    add_executable(struct_spec_gpu_smoke tests/test_struct_spec_gpu.cpp)
+    target_link_libraries(struct_spec_gpu_smoke PRIVATE nanotins gputins)
+    add_test(NAME struct_spec_gpu_smoke COMMAND $<TARGET_FILE:struct_spec_gpu_smoke>)
+    set_tests_properties(struct_spec_gpu_smoke PROPERTIES LABELS "smoke")
+    if(NANOTINS_ENABLE_CUDA AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # struct_spec_gpu_smoke is a single-source target, so compile it as CUDA via TARGET-level options
+        # (reliable — source-level COMPILE_OPTIONS via set_source_files_properties did not propagate to the
+        # build rule here). _NT_CUDA_OPTS (-x cuda, --cuda-gpu-arch, ...) is set in the GPU block above.
+        target_compile_definitions(struct_spec_gpu_smoke PRIVATE NANOTINS_ENABLE_CUDA=1)
+        target_compile_options(struct_spec_gpu_smoke PRIVATE ${_NT_CUDA_OPTS})
+        target_include_directories(struct_spec_gpu_smoke PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        if(DEFINED CUDAToolkit_LIBRARY_DIR)
+            target_link_directories(struct_spec_gpu_smoke PRIVATE ${CUDAToolkit_LIBRARY_DIR})
+        endif()
+        target_link_libraries(struct_spec_gpu_smoke PRIVATE CUDA::cudart)
+    endif()
 
     # Stock-Lance (pylance) interop + on-disk offset verification. Skips (CTest 77) if pylance absent.
     find_package(Python3 COMPONENTS Interpreter)

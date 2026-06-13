@@ -117,12 +117,16 @@ void decode_window_gpu(Scheduler gpu_sch, std::size_t num_tasks, std::uint64_t p
     }
 
     // --- D2H: append each column to the host DecodedPdus, and the trailers ---
-    append_column(out.ethernet, eth_pid, eth_rows, total.eth);
-    append_column(out.vlan, vlan_pid, vlan_rows, total.vlan);
-    append_column(out.ipv4, ipv4_pid, ipv4_rows, total.ipv4);
-    append_column(out.ipv6, ipv6_pid, ipv6_rows, total.ipv6);
-    append_column(out.tcp, tcp_pid, tcp_rows, total.tcp);
-    append_column(out.udp, udp_pid, udp_rows, total.udp);
+    // Fold the per-type D2H append over the columns (host code) instead of naming each — the same
+    // for_each_column / PduCounts::at plumbing the CPU decode_window uses. The device buffers are tied into
+    // index-matched tuples so column I pulls its own (pid, rows) pair; types line up by construction
+    // (out.columns()[I] is PduColumn<T>, *_rows[I] is device_buffer<T>).
+    auto d_pids = std::tie(eth_pid, vlan_pid, ipv4_pid, ipv6_pid, tcp_pid, udp_pid);
+    auto d_rows = std::tie(eth_rows, vlan_rows, ipv4_rows, ipv6_rows, tcp_rows, udp_rows);
+    for_each_column(out.columns(), [&](auto Ic, auto& col) {
+        constexpr std::size_t i = Ic;
+        append_column(col, std::get<i>(d_pids), std::get<i>(d_rows), total.at(i));
+    });
     if (trailers != nullptr) d_tr.to_host(trailers, n);
 }
 

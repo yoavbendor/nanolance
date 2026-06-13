@@ -8,10 +8,14 @@
 #include "packet_row.hpp"
 #include "phase_b_runner.hpp"
 #include "soatins/arrow_glue.hpp"
+#include "soatins/sink.hpp"
 #include "nanotins/pcap_blocks.hpp"
 #include "pdu_table_writer.hpp"
+#include "dag_decode_window.hpp"
+#include "dag_table_writer.hpp"
 #include "nanotins/protocol_decode.hpp"
 #include "nanotins/protocol_decode_bulk.hpp"
+#include "nanotins/spec_dag.hpp"
 #include "staged_pipeline.hpp"
 #include "streaming_reader.hpp"
 #include "pcapng2lance_gpu_bridge.hpp"
@@ -535,6 +539,50 @@ private:
         return b;
     }
 
+    // CPU fast path: parse each EPB and scatter its PacketRow straight into the columns in ONE pass — no
+    // intermediate std::vector<EpbView>, no second materialization. soa<PacketRow>::raw() hands the column
+    // pointers to soatins::scatter (the same device-view fill the bulk/GPU kernels use); each task writes
+    // disjoint slots, so it parallelizes exactly like parse_packets did. The interface-table
+    // denormalization (link_type/ts_resol) is a host lookup, which is why this is the CPU path; the GPU
+    // path keeps parse_packets_gpu -> assemble (device parse, then the host join). Byte-identical output.
+    PacketBatch parse_and_assemble(pcapblocks::Bytes wbytes, const std::vector<pcapblocks::BlockRef>& packets,
+                                   const std::vector<std::size_t>& packet_section) {
+        const std::size_t n = packets.size();
+        PacketBatch b;
+        b.rows.resize(n);
+        b.link_type.resize(n);
+        b.poff.resize(n);
+        b.psize.resize(n);
+        const pcapblocks::Bytes wb = wbytes;
+        const pcapblocks::BlockRef* pk = packets.data();
+        const std::size_t* sect = packet_section.data();
+        const soatins::soa_ptrs<PacketRow> cols = b.rows.raw();
+        std::uint16_t* lt = b.link_type.data();
+        std::uint64_t* po = b.poff.data();
+        std::uint32_t* ps = b.psize.data();
+        const std::uint64_t pid0 = global_pid_;
+        auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
+        run(std::min<std::size_t>(n, 64), n, [=](std::size_t i) {
+            pcapblocks::EpbView e{};
+            pcapblocks::EpbView parsed{};
+            if (pcapblocks::parse_epb(wb, pk[i], parsed)) {
+                e = parsed;  // keep e default on parse failure (matches parse_packets' out[i] semantics)
+            }
+            const auto& table = sections_[sect[i]];
+            const std::uint16_t link =
+                e.interface_id < table.size() ? table[e.interface_id].link_type : std::uint16_t{0};
+            const std::uint8_t res =
+                e.interface_id < table.size() ? table[e.interface_id].ts_resol : std::uint8_t{6};
+            soatins::scatter(cols, i,
+                             PacketRow{pid0 + i, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
+                                       e.epb_flags});
+            lt[i] = link;
+            po[i] = e.payload_file_offset;
+            ps[i] = e.caplen;
+        });
+        return b;
+    }
+
     // Freeze the accumulated SHB/IDB KV metadata onto the schema (once, before the first commit).
     int freeze_metadata() {
         if (schema_meta_set_) return 0;
@@ -595,8 +643,14 @@ private:
         const std::size_t n = packets.size();
         if (n == 0) return 0;  // window held only SHB/IDB/other; nothing to write
 
-        const std::vector<pcapblocks::EpbView> parsed = parse_packets(wbytes, packets);
-        const PacketBatch batch = assemble(parsed, packet_section);
+        // GPU: device parse -> EpbView D2H -> host join. CPU: one fused parse+scatter pass (no EpbView).
+        PacketBatch batch;
+        if (args_.gpu) {
+            const std::vector<pcapblocks::EpbView> parsed = parse_packets(wbytes, packets);
+            batch = assemble(parsed, packet_section);
+        } else {
+            batch = parse_and_assemble(wbytes, packets, packet_section);
+        }
         if (!args_.no_write) {  // --no-write isolates Phase B (scan+parse+decode) from the Lance I/O
             if (const int rc = freeze_metadata()) return rc;
             if (const int rc = write_batch(batch, wbase)) return rc;
@@ -607,13 +661,12 @@ private:
                 const std::size_t tasks = args_.threads ? static_cast<std::size_t>(args_.threads) : 256;
                 pcapng2lance::gpu_bridge::decode_window(*gpu_ctx_, tasks, global_pid_,
                                                         batch.link_type.data(), batch.poff.data(),
-                                                        batch.psize.data(), wbytes, n, pdus_, trailers.data());
+                                                        batch.psize.data(), wbytes, n, dag_pdus_, trailers.data());
             } else
             {
                 auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
-                const protocols::Bytes pwin(wbytes.data(), wbytes.size());
-                protocols::decode_window(run, global_pid_, batch.link_type.data(), batch.poff.data(),
-                                         batch.psize.data(), pwin, n, pdus_, trailers.data());
+                pcapng2lance::dag_decode_window(run, global_pid_, batch.link_type.data(), batch.poff.data(),
+                                                batch.psize.data(), wbytes, n, dag_pdus_, trailers.data());
             }
             collect_remainder(trailers, batch, wbase);
         }
@@ -627,11 +680,28 @@ private:
     void collect_remainder(const std::vector<protocols::WalkResult>& trailers, const PacketBatch& b,
                            std::uint64_t wbase) {
         const std::size_t n = b.size();
+        if (!rem_sink_) {  // lazily open the chunked remainder writer on the first contributing window
+            const auto stem = (output_.parent_path() / output_.stem()).string();
+            rem_appender_ = std::make_unique<staged::RemainderAppender>(stem + "_remainder_after_l4.lance",
+                                                                        "next_protocol", args_.compress);
+            rem_sink_ = std::make_unique<RemSink>(
+                [this](soatins::soa<staged::RemainderRow, kRemainderChunk>& chunk, std::string& e) {
+                    if (args_.no_write) return true;  // --no-write isolates Phase B from all Lance I/O
+                    return rem_appender_->append_chunk(chunk, payload_uri_, e);
+                });
+        }
         for (std::size_t i = 0; i < n; ++i) {
             const protocols::WalkResult& w = trailers[i];
             if (w.reached_l4 && w.l4_payload_offset < b.psize[i]) {
-                remainder_.push_back({global_pid_ + i, /*next_protocol=*/w.l4_ports, payload_uri_,
-                                      wbase + b.poff[i] + w.l4_payload_offset, b.psize[i] - w.l4_payload_offset});
+                std::string e;
+                if (!rem_sink_->push(staged::RemainderRow{global_pid_ + i, /*next_protocol=*/w.l4_ports,
+                                                          wbase + b.poff[i] + w.l4_payload_offset,
+                                                          b.psize[i] - w.l4_payload_offset},
+                                     e)) {
+                    std::fprintf(stderr, "pcapng2lance: remainder flush failed: %s\n", e.c_str());
+                    rem_ok_ = false;
+                }
+                ++rem_count_;
             }
         }
     }
@@ -640,30 +710,45 @@ private:
     int write_pdu_tables() {
         const auto stem = (output_.parent_path() / output_.stem()).string();
         std::string err;
-        const auto write_one = [&](const char* suffix, auto& column) -> bool {
+        // Each DAG node's table writes to its own Lance table (spec deduced from the table type). The output
+        // is byte-identical to the old protocols:: tables (see test_pdu_table_interop / _lance_interop).
+        const auto write_one = [&](const char* suffix, const auto& table) -> bool {
             const fs::path p = stem + suffix;
-            if (!pdu_io::write_pdu_table(p, column, args_.compress, err)) {
+            if (!pdu_io::write_dag_pdu_table(p, table, args_.compress, err)) {
                 std::fprintf(stderr, "pcapng2lance: failed to write %s: %s\n", p.string().c_str(), err.c_str());
                 return false;
             }
             return true;
         };
-        const bool ok = write_one("_ethernet.lance", pdus_.ethernet) & write_one("_vlan.lance", pdus_.vlan) &
-                        write_one("_ipv4.lance", pdus_.ipv4) & write_one("_ipv6.lance", pdus_.ipv6) &
-                        write_one("_tcp.lance", pdus_.tcp) & write_one("_udp.lance", pdus_.udp);
+        using G = nanotins::L2L3Graph;
+        const bool ok =
+            write_one("_ethernet.lance", std::get<nanotins::node_id_v<nanotins::EthNode, G>>(dag_pdus_)) &
+            write_one("_vlan.lance", std::get<nanotins::node_id_v<nanotins::VlanNode, G>>(dag_pdus_)) &
+            write_one("_ipv4.lance", std::get<nanotins::node_id_v<nanotins::Ipv4Node, G>>(dag_pdus_)) &
+            write_one("_ipv6.lance", std::get<nanotins::node_id_v<nanotins::Ipv6Node, G>>(dag_pdus_)) &
+            write_one("_tcp.lance", std::get<nanotins::node_id_v<nanotins::TcpNode, G>>(dag_pdus_)) &
+            write_one("_udp.lance", std::get<nanotins::node_id_v<nanotins::UdpNode, G>>(dag_pdus_));
         if (!ok) return 1;
         // The application payload after L4 (for later UDP-internal PDU parsing), as external refs — the
-        // same remainder_after_l4 table the staged --stage l4 path emits.
-        const fs::path rpath = stem + "_remainder_after_l4.lance";
-        if (!staged::write_remainder_table(rpath, remainder_, "next_protocol", args_.compress, err)) {
-            std::fprintf(stderr, "pcapng2lance: failed to write %s: %s\n", rpath.string().c_str(), err.c_str());
+        // same remainder_after_l4 table the staged --stage l4 path emits. Written incrementally through the
+        // SoA sink (one shared URI, chunked flush); drain the partial tail and close here.
+        if (!rem_ok_) return 1;
+        if (rem_sink_ && !rem_sink_->finish(err)) {
+            std::fprintf(stderr, "pcapng2lance: failed to flush remainder_after_l4: %s\n", err.c_str());
             return 1;
+        }
+        if (rem_appender_) {
+            rem_appender_->close();
         }
         std::fprintf(
             stderr,
             "pcapng2lance: decoded L2/L3 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, udp %zu, remainder %zu\n",
-            pdus_.ethernet.size(), pdus_.vlan.size(), pdus_.ipv4.size(), pdus_.ipv6.size(), pdus_.tcp.size(),
-            pdus_.udp.size(), remainder_.size());
+            std::get<nanotins::node_id_v<nanotins::EthNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::VlanNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::Ipv4Node, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::Ipv6Node, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::TcpNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::UdpNode, nanotins::L2L3Graph>>(dag_pdus_).size(), rem_count_);
         return 0;
     }
 
@@ -691,8 +776,18 @@ private:
     std::size_t shb_count_ = 0, total_idb_ = 0, other_count_ = 0;
     bool schema_meta_set_ = false;
     bool first_commit_ = true;
-    protocols::DecodedPdus pdus_;                  // accumulated only when --decode-l2l3
-    std::vector<staged::PayloadRow> remainder_;    // app payload after L4 (remainder_after_l4), likewise
+    nanotins::dag_tables<nanotins::L2L3Graph> dag_pdus_;  // accumulated only when --decode-l2l3 (spec/DAG)
+
+    // remainder_after_l4: filled into a fixed-N SoA and flushed in chunks through the shared-URI writer
+    // (no per-row uri string, bounded memory). The sink's flush is bound to rem_appender_->append_chunk.
+    static constexpr std::size_t kRemainderChunk = 16384;
+    using RemSink = soatins::column_sink<
+        staged::RemainderRow, kRemainderChunk,
+        std::function<bool(soatins::soa<staged::RemainderRow, kRemainderChunk>&, std::string&)>>;
+    std::unique_ptr<staged::RemainderAppender> rem_appender_;
+    std::unique_ptr<RemSink> rem_sink_;
+    std::size_t rem_count_ = 0;
+    bool rem_ok_ = true;
 };
 
 }  // namespace

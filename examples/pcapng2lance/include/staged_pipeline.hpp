@@ -7,10 +7,15 @@
 // payload bytes (they stay external in the original capture).
 
 #include "nanolance/blob_builder.hpp"
+#include "nanolance/blob_v2_external.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/nano_lance_writer.h"
 
+#include "soatins/reflect.hpp"
+
 #include <nanoarrow/nanoarrow.h>
+
+#include <boost/describe.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -30,6 +35,18 @@ struct PayloadRow {
     std::uint64_t size = 0;
 };
 
+// The same row as pure fixed-width columns for a real SoA: the per-row `uri` of PayloadRow is dropped —
+// every remainder row in a table shares one external-file URI (carried out-of-band, once), so storing it
+// per row was pure duplication (and millions of std::string copies). Filled into a soatins soa<,N> and
+// flushed in chunks; the writer pairs it with the shared URI to rebuild the lance.blob.v2 payload_ref.
+struct RemainderRow {
+    std::uint64_t packet_id = 0;
+    std::uint64_t discriminator = 0;
+    std::uint64_t position = 0;  // byte offset of the unparsed payload in the external capture
+    std::uint64_t size = 0;
+};
+BOOST_DESCRIBE_STRUCT(RemainderRow, (), (packet_id, discriminator, position, size))
+
 inline int nt_child_index(const ArrowSchema& s, const char* name) {
     for (std::int64_t i = 0; i < s.n_children; ++i) {
         if (s.children[i]->name != nullptr && std::strcmp(s.children[i]->name, name) == 0) {
@@ -44,8 +61,10 @@ inline int nt_child_index(const ArrowSchema& s, const char* name) {
 // Resolved column indices for a payload table: packet_id + discriminator at top level, and
 // position/size/uri inside the payload_ref struct (lance_table_read_dataset rebuilds the blob column in
 // INGEST shape: children data/uri/position/size).
+// Only the top-level columns are this table's concern; the payload_ref struct's internals
+// (position/size/uri, child order, the lance.blob.v2 conventions) are owned by nano_lance::BlobV2ColumnView.
 struct PayloadCols {
-    int pid, disc, blob, pos, size, uri;
+    int pid, disc, blob;
 };
 
 inline bool resolve_payload_cols(const ArrowSchema& schema, const char* disc_col, PayloadCols& c,
@@ -57,30 +76,30 @@ inline bool resolve_payload_cols(const ArrowSchema& schema, const char* disc_col
         error = std::string("table missing packet_id / ") + disc_col + " / payload_ref";
         return false;
     }
-    const ArrowSchema& blob = *schema.children[c.blob];
-    c.pos = nt_child_index(blob, "position");
-    c.size = nt_child_index(blob, "size");
-    c.uri = nt_child_index(blob, "uri");
-    if (c.pos < 0 || c.size < 0 || c.uri < 0) {
-        error = "payload_ref struct missing position/size/uri";
-        return false;
-    }
     return true;
 }
 
-inline void append_payload_rows(const ArrowArrayView& view, const PayloadCols& c,
-                                std::vector<PayloadRow>& out) {
-    const ArrowArrayView* blob = view.children[c.blob];
+inline bool append_payload_rows(const ArrowSchema& schema, const ArrowArrayView& view, const PayloadCols& c,
+                                std::vector<PayloadRow>& out, std::string& error) {
+    // The blob.v2 internals come from nanolance; this code never names position/size/uri or indexes the
+    // struct's children.
+    nano_lance::BlobV2ColumnView blob;
+    if (!blob.init(*schema.children[c.blob], *view.children[c.blob], error)) {
+        return false;
+    }
     for (std::int64_t i = 0; i < view.length; ++i) {
         PayloadRow r;
         r.packet_id = ArrowArrayViewGetUIntUnsafe(view.children[c.pid], i);
         r.discriminator = ArrowArrayViewGetUIntUnsafe(view.children[c.disc], i);
-        r.off = ArrowArrayViewGetUIntUnsafe(blob->children[c.pos], i);
-        r.size = ArrowArrayViewGetUIntUnsafe(blob->children[c.size], i);
-        const ArrowStringView sv = ArrowArrayViewGetStringUnsafe(blob->children[c.uri], i);
-        r.uri.assign(sv.data, static_cast<std::size_t>(sv.size_bytes));
+        r.off = blob.position(i);
+        r.size = blob.byte_size(i);
+        const char* udata = nullptr;
+        std::int64_t usize = 0;
+        blob.uri(i, &udata, &usize);
+        r.uri.assign(udata, static_cast<std::size_t>(usize));
         out.push_back(std::move(r));
     }
+    return true;
 }
 
 inline bool read_payload_table(const std::filesystem::path& dir, const char* disc_col,
@@ -114,7 +133,11 @@ inline bool read_payload_table(const std::filesystem::path& dir, const char* dis
             ok = false;
             break;
         }
-        append_payload_rows(view, cols, out);
+        if (!append_payload_rows(schema, view, cols, out, error)) {
+            ArrowArrayViewReset(&view);
+            ok = false;
+            break;
+        }
         ArrowArrayViewReset(&view);
     }
     release_all();
@@ -203,6 +226,58 @@ public:
         }
         bool ok = nano_lance_write_batch(&writer_, &batch, &schema_) == NANO_LANCE_OK &&
                   nano_lance_writer_commit(&writer_, /*is_append=*/committed_) == NANO_LANCE_OK;
+        if (!ok) {
+            error = nano_lance_writer_last_error(&writer_);
+        }
+        batch.release(&batch);
+        committed_ = committed_ || ok;
+        return ok;
+    }
+
+    // Append one chunk of a soatins soa<RemainderRow, N> (the SoA path): the per-row uri is replaced by
+    // the single `uri` shared by every row in the table (one ArrowStringView, no per-row std::string). The
+    // batch shape is identical to build_remainder_batch, so the on-disk table is byte-for-byte the same.
+    template <std::size_t N>
+    bool append_chunk(soatins::soa<RemainderRow, N>& chunk, const std::string& uri, std::string& error) {
+        if (chunk.size() == 0) {
+            return true;
+        }
+        if (!opened_ && !open(error)) {
+            return false;
+        }
+        ArrowArray batch{};
+        if (ArrowArrayInitFromSchema(&batch, &schema_, nullptr) != NANOARROW_OK ||
+            ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
+            error = "remainder chunk array init failed";
+            return false;
+        }
+        ArrowArray* payload = batch.children[2];
+        const ArrowStringView uri_view{uri.data(), static_cast<std::int64_t>(uri.size())};
+        const auto& pid = chunk.template column<0>();
+        const auto& disc = chunk.template column<1>();
+        const auto& pos = chunk.template column<2>();
+        const auto& sz = chunk.template column<3>();
+        for (std::size_t i = 0; i < chunk.size(); ++i) {
+            if (ArrowArrayAppendUInt(batch.children[0], pid[i]) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(batch.children[1], disc[i]) != NANOARROW_OK ||
+                ArrowArrayAppendNull(payload->children[0], 1) != NANOARROW_OK ||
+                ArrowArrayAppendString(payload->children[1], uri_view) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(payload->children[2], pos[i]) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(payload->children[3], sz[i]) != NANOARROW_OK ||
+                ArrowArrayFinishElement(payload) != NANOARROW_OK ||
+                ArrowArrayFinishElement(&batch) != NANOARROW_OK) {
+                error = "remainder chunk row append failed";
+                batch.release(&batch);
+                return false;
+            }
+        }
+        if (ArrowArrayFinishBuildingDefault(&batch, nullptr) != NANOARROW_OK) {
+            error = "remainder chunk array finalize failed";
+            batch.release(&batch);
+            return false;
+        }
+        const bool ok = nano_lance_write_batch(&writer_, &batch, &schema_) == NANO_LANCE_OK &&
+                        nano_lance_writer_commit(&writer_, /*is_append=*/committed_) == NANO_LANCE_OK;
         if (!ok) {
             error = nano_lance_writer_last_error(&writer_);
         }

@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace protocols {
@@ -42,6 +43,23 @@ struct DecodedPdus {
 // Lance table base-names for the six PDU columns, in the same order as DecodedPdus::columns().
 inline constexpr std::array<const char*, 6> kPduTableNames = {"ethernet", "vlan", "ipv4", "ipv6", "tcp",
                                                               "udp"};
+
+// Compile-time fold over a tuple of column references (e.g. DecodedPdus::columns()): invokes
+// f(std::integral_constant<size_t,I>{}, column_I) for each column in order. This is the ONE tool the host
+// orchestration (seed / scan / resize / D2H-append, in both the CPU and GPU bulk paths) uses to plumb the
+// PDU set without hand-writing the same loop body per type — so adding a PDU column doesn't ripple into
+// every block below. Host-only (never called from a NANOTINS_HD kernel; the kernels stay explicit).
+namespace detail {
+template <class Tuple, class F, std::size_t... Is>
+inline void for_each_column_impl(Tuple&& t, F&& f, std::index_sequence<Is...>) {
+    (f(std::integral_constant<std::size_t, Is>{}, std::get<Is>(t)), ...);
+}
+}  // namespace detail
+template <class Tuple, class F>
+inline void for_each_column(Tuple&& t, F&& f) {
+    detail::for_each_column_impl(std::forward<Tuple>(t), std::forward<F>(f),
+                                 std::make_index_sequence<std::tuple_size_v<std::remove_reference_t<Tuple>>>{});
+}
 
 // Per-layer decode steps. Each consumes a span that STARTS at the layer's first byte (so they compose
 // for staged parsing where the previous stage advanced past its header), appends the decoded header(s)
@@ -263,12 +281,47 @@ struct PduCounts {
     std::uint32_t tcp = 0;
     std::uint32_t udp = 0;
 
+    static constexpr std::size_t kCount = 6;  // pairs 1:1 with DecodedPdus::columns() / kPduTableNames
+
+    // Index a count by column position [0, kCount) — so host orchestration can fold (seed/scan/resize/
+    // append over for_each_column) instead of naming each type. Order matches columns()/kPduTableNames.
+    // (The device kernels below still use the named fields directly; this is only for host plumbing.)
+    NANOTINS_HD std::uint32_t& at(std::size_t i) {
+        std::uint32_t* p[] = {&eth, &vlan, &ipv4, &ipv6, &tcp, &udp};
+        return *p[i];
+    }
+    NANOTINS_HD std::uint32_t at(std::size_t i) const {
+        const std::uint32_t* p[] = {&eth, &vlan, &ipv4, &ipv6, &tcp, &udp};
+        return *p[i];
+    }
+
     // Component-wise add — lets a single thrust::exclusive_scan / reduce with thrust::plus<PduCounts> do
-    // the per-type prefix-sum for all six PDU types at once on the GPU (see protocol_decode_gpu.hpp).
+    // the per-type prefix-sum for all six PDU types at once on the GPU (see protocol_decode_gpu.hpp), and
+    // collapses the host scan to `run = run + per[i]`.
     NANOTINS_HD PduCounts operator+(const PduCounts& o) const {
         return {eth + o.eth, vlan + o.vlan, ipv4 + o.ipv4, ipv6 + o.ipv6, tcp + o.tcp, udp + o.udp};
     }
 };
+
+// Host helpers that fold over DecodedPdus::columns() paired with PduCounts::at(), so the bulk paths
+// (CPU decode_window and GPU decode_window_gpu) never hand-unroll the six columns.
+
+// Seed per-type running totals from each column's CURRENT size, so a bulk decode appends across windows
+// (the scan starts where the previous window left off).
+inline PduCounts seed_counts(DecodedPdus& out) {
+    PduCounts c{};
+    for_each_column(out.columns(),
+                    [&](auto Ic, auto& col) { c.at(Ic) = static_cast<std::uint32_t>(col.size()); });
+    return c;
+}
+
+// Size every output column to its post-scan total (no over-allocation, no push_back).
+inline void resize_columns(DecodedPdus& out, const PduCounts& totals) {
+    for_each_column(out.columns(), [&](auto Ic, auto& col) {
+        col.packet_id.resize(totals.at(Ic));
+        col.rows.resize(totals.at(Ic));
+    });
+}
 
 // Count how many PDUs of each type a packet emits — no output writes, no allocation (device-safe).
 inline NANOTINS_HD PduCounts count_packet(std::uint32_t link_type, Bytes pkt) noexcept {

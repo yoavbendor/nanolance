@@ -9,6 +9,7 @@
 #include "soatins/describe.hpp"
 #include "soatins/portability.hpp"
 
+#include <array>
 #include <cstddef>
 #include <tuple>
 #include <utility>
@@ -122,8 +123,76 @@ struct soa_ptrs_h<std::tuple<C...>> {
 template <class T>
 using soa_ptrs = typename soa_ptrs_h<columns_of<T>>::type;
 
-template <class T>
+// Sentinel capacity selecting the runtime-extent (vector-backed) SoA. soa<T> == soa<T, soa_dynamic>.
+inline constexpr std::size_t soa_dynamic = static_cast<std::size_t>(-1);
+
+// Fixed-capacity storage (the *real* SoA): one std::array<elem, N> per flattened column. POD when the
+// elems are POD (be<>/le<>/fixed_string/arithmetic all are), so the whole block is trivially copyable —
+// contiguous per-column buffers you can reference, H2D as a unit, or borrow into Arrow zero-copy.
+template <class Cols, std::size_t N>
+struct soa_array_storage;
+template <class... C, std::size_t N>
+struct soa_array_storage<std::tuple<C...>, N> {
+    using type = std::tuple<std::array<typename C::elem, N>...>;
+};
+
+// soa<T, N>: fixed-capacity SoA (default) OR soa<T> == soa<T, soa_dynamic>: runtime-extent (vector).
+// Both share the reflection (columns_of / col_at) and the same store()/raw() fold — only the backing
+// container differs. The fixed form carries an *occupied-rows counter* (size_); append() fills the next
+// slot and reports when full, so a sink can flush-and-reset (see column_sink). The unfilled tail
+// [size_, N) is never read. NOTE: default-construct a fixed soa (soa<T,N> s;) so the trivial column
+// arrays stay UNINITIALIZED (zero-copy, zero-init); do NOT value-init (soa<T,N> s{};) or make_unique it,
+// which would zero N*stride bytes for nothing.
+template <class T, std::size_t N = soa_dynamic>
 class soa {
+public:
+    using cols = columns_of<T>;
+    static constexpr std::size_t ncols = column_count<T>;
+    static constexpr std::size_t capacity = N;
+
+    std::size_t size() const { return size_; }
+    bool full() const { return size_ >= N; }
+    std::size_t space() const { return N - size_; }
+    void clear() { size_ = 0; }
+
+    // Scatter one row into slot i (the be<>/bits<> conversions happen in each Col::get).
+    NANOTINS_HD void store(std::size_t i, const T& row) {
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            ((std::get<I>(columns_)[i] = col_at<T, I>::get(row)), ...);
+        }(std::make_index_sequence<ncols>{});
+    }
+
+    // Append at the occupied counter; returns true once the SoA is full (i.e. it is now flush time).
+    bool append(const T& row) {
+        store(size_, row);
+        ++size_;
+        return size_ >= N;
+    }
+
+    template <std::size_t I>
+    const auto& column() const {
+        return std::get<I>(columns_);
+    }
+
+    // A POD pack of raw per-column pointers into this SoA's buffers — trivially copyable, so a bulk kernel
+    // can capture it and scatter rows in parallel via `scatter()`, and a soa_view can borrow it zero-copy.
+    soa_ptrs<T> raw() {
+        soa_ptrs<T> p;
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            ((std::get<I>(p) = std::get<I>(columns_).data()), ...);
+        }(std::make_index_sequence<ncols>{});
+        return p;
+    }
+
+private:
+    typename soa_array_storage<cols, N>::type columns_;  // uninitialized for trivial elems (no zero-init)
+    std::size_t size_ = 0;
+};
+
+// Runtime-extent specialization: the original vector-backed SoA. Kept for the one site that sizes to an
+// exact runtime total after a count pass (the bulk prefix-sum scatter); fixed soa<T,N> is the default.
+template <class T>
+class soa<T, soa_dynamic> {
 public:
     using cols = columns_of<T>;
     static constexpr std::size_t ncols = column_count<T>;
@@ -137,7 +206,6 @@ public:
 
     std::size_t size() const { return size_; }
 
-    // Scatter one row into the columns (the be<>/bits<> conversions happen in each Col::get).
     NANOTINS_HD void store(std::size_t i, const T& row) {
         [&]<std::size_t... I>(std::index_sequence<I...>) {
             ((std::get<I>(columns_)[i] = col_at<T, I>::get(row)), ...);
@@ -149,9 +217,6 @@ public:
         return std::get<I>(columns_);
     }
 
-    // A POD pack of raw per-column pointers into this SoA's buffers — trivially copyable, so a bulk kernel
-    // (CPU or CUDA device) can capture it and scatter rows in parallel via `scatter()` below, without any
-    // hand-written column list. (The GPU path builds the same pack from device allocations instead.)
     soa_ptrs<T> raw() {
         soa_ptrs<T> p;
         [&]<std::size_t... I>(std::index_sequence<I...>) {
@@ -162,6 +227,32 @@ public:
 
 private:
     typename soa_storage<cols>::type columns_;
+    std::size_t size_ = 0;
+};
+
+// A non-owning columnar view: a soa_ptrs<T> pack (one elem* per flattened column) + a row count. The
+// zero-copy READ primitive — over a fixed soa<T,N>'s buffers (soa.raw(), soa.size()), over borrowed Lance
+// page buffers, or as the device-side view a kernel scatters into. Owns nothing; the buffers must outlive
+// it. column<I>() yields the I-th column's elem* (read [0, size())).
+template <class T>
+class soa_view {
+public:
+    using cols = columns_of<T>;
+    static constexpr std::size_t ncols = column_count<T>;
+
+    soa_view() = default;
+    soa_view(soa_ptrs<T> ptrs, std::size_t n) : ptrs_(ptrs), size_(n) {}
+
+    std::size_t size() const { return size_; }
+    const soa_ptrs<T>& raw() const { return ptrs_; }
+
+    template <std::size_t I>
+    auto column() const {
+        return std::get<I>(ptrs_);  // elem* into the borrowed buffer
+    }
+
+private:
+    soa_ptrs<T> ptrs_{};
     std::size_t size_ = 0;
 };
 

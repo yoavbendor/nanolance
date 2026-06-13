@@ -7,7 +7,8 @@
 
 #include "nanotins/bulk.hpp"
 #include "gputins/gpu.hpp"
-#include "gputins/protocol_decode_gpu.hpp"
+#include "gputins/dag_decode_gpu.hpp"
+#include "dag_decode_window.hpp"  // pcapng2lance::dag_l4_trailer (host trailer pass)
 
 namespace pcapng2lance::gpu_bridge {
 
@@ -57,11 +58,24 @@ std::vector<pcapblocks::EpbView> parse_packets(context& gpu_ctx, pcapblocks::Byt
 
 void decode_window(context& gpu_ctx, std::size_t num_tasks, std::uint64_t pid_base,
                    const std::uint16_t* link_type, const std::uint64_t* poff, const std::uint32_t* psize,
-                   pcapblocks::Bytes window, std::size_t n, protocols::DecodedPdus& out,
-                   protocols::WalkResult* trailers) {
-    const protocols::Bytes win(window.data(), window.size());
-    protocols::gpu::decode_window_gpu(gpu_ctx.gpu.scheduler(), num_tasks, pid_base, link_type, poff, psize,
-                                      win, n, out, trailers);
+                   pcapblocks::Bytes window, std::size_t n,
+                   nanotins::dag_tables<nanotins::L2L3Graph>& out, protocols::WalkResult* trailers) {
+    // Rows: the spec/DAG count -> scan -> scatter on the device (see gputins/dag_decode_gpu.hpp).
+    nanotins::gpu::dag_decode_window_gpu<nanotins::L2L3Graph>(gpu_ctx.gpu.scheduler(), num_tasks, pid_base,
+                                                             link_type, poff, psize, window, n, out);
+    // Trailers: the L4 boundary per packet, computed on the host (a cheap read-only re-walk over the host
+    // window bytes) — identical to the CPU path's trailer pass, so no device trailer plumbing is needed.
+    if (trailers != nullptr) {
+        const std::uint8_t* wb = window.data();
+        const std::size_t ws = window.size();
+        const int root = nanotins::kEthRoot;
+        for (std::size_t i = 0; i < n; ++i) {
+            const bool ok = link_type[i] == protocols::kLinkTypeEthernet &&
+                            static_cast<std::size_t>(poff[i]) + psize[i] <= ws;
+            trailers[i] = pcapng2lance::dag_l4_trailer(root, ok ? wb + poff[i] : nullptr,
+                                                       ok ? static_cast<std::size_t>(psize[i]) : std::size_t{0});
+        }
+    }
 }
 
 }  // namespace pcapng2lance::gpu_bridge
@@ -96,7 +110,7 @@ std::vector<pcapblocks::EpbView> parse_packets(context& /*gpu_ctx*/, pcapblocks:
 void decode_window(context& /*gpu_ctx*/, std::size_t /*num_tasks*/, std::uint64_t /*pid_base*/,
                    const std::uint16_t* /*link_type*/, const std::uint64_t* /*poff*/,
                    const std::uint32_t* /*psize*/, pcapblocks::Bytes /*window*/, std::size_t /*n*/,
-                   protocols::DecodedPdus& /*out*/, protocols::WalkResult* /*trailers*/) {
+                   nanotins::dag_tables<nanotins::L2L3Graph>& /*out*/, protocols::WalkResult* /*trailers*/) {
     throw std::runtime_error(
         "pcapng2lance: --gpu requires a CUDA build (configure with -DNANOTINS_ENABLE_CUDA=ON)");
 }

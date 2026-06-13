@@ -608,4 +608,87 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
     return true;
 }
 
+// ---- Columnar build / view for the lance.blob.v2 external reference column ----------------------------
+
+bool build_blob_v2_external_array(const std::uint64_t* positions, const std::uint64_t* sizes, std::size_t n,
+                                  const char* shared_uri, ArrowArray& out_array, std::string& error) {
+    error.clear();
+    ArrowSchema schema;
+    if (!build_blob_v2_payload_schema(schema, error)) {
+        return false;
+    }
+    if (ArrowArrayInitFromSchema(&out_array, &schema, nullptr) != NANOARROW_OK) {
+        error = "failed to init blob v2 external array";
+        ArrowSchemaRelease(&schema);
+        return false;
+    }
+    ArrowSchemaRelease(&schema);
+    if (ArrowArrayStartAppending(&out_array) != NANOARROW_OK) {
+        error = "failed to start appending blob v2 external array";
+        ArrowArrayRelease(&out_array);
+        return false;
+    }
+    const ArrowStringView uri_view{shared_uri,
+                                   static_cast<std::int64_t>(shared_uri ? std::strlen(shared_uri) : 0)};
+    for (std::size_t i = 0; i < n; ++i) {
+        // Canonical child order data(0)/uri(1)/position(2)/size(3); external rows null the inline `data`.
+        if (ArrowArrayAppendNull(out_array.children[0], 1) != NANOARROW_OK ||
+            ArrowArrayAppendString(out_array.children[1], uri_view) != NANOARROW_OK ||
+            ArrowArrayAppendUInt(out_array.children[2], positions[i]) != NANOARROW_OK ||
+            ArrowArrayAppendUInt(out_array.children[3], sizes[i]) != NANOARROW_OK ||
+            ArrowArrayFinishElement(&out_array) != NANOARROW_OK) {
+            error = "failed to append blob v2 external row";
+            ArrowArrayRelease(&out_array);
+            return false;
+        }
+    }
+    if (ArrowArrayFinishBuildingDefault(&out_array, nullptr) != NANOARROW_OK) {
+        error = "failed to finalize blob v2 external array";
+        ArrowArrayRelease(&out_array);
+        return false;
+    }
+    return true;
+}
+
+bool BlobV2ColumnView::init(const ArrowSchema& payload_ref_schema, const ArrowArrayView& payload_ref_view,
+                            std::string& error) {
+    int pos = -1, sz = -1, uri = -1;
+    for (std::int64_t i = 0; i < payload_ref_schema.n_children; ++i) {
+        const char* nm = payload_ref_schema.children[i]->name;
+        if (nm == nullptr) {
+            continue;
+        }
+        if (std::strcmp(nm, "position") == 0) {
+            pos = static_cast<int>(i);
+        } else if (std::strcmp(nm, "size") == 0) {
+            sz = static_cast<int>(i);
+        } else if (std::strcmp(nm, "uri") == 0) {
+            uri = static_cast<int>(i);
+        }
+    }
+    if (pos < 0 || sz < 0 || uri < 0) {
+        error = "payload_ref struct missing position/size/uri";
+        return false;
+    }
+    pos_ = payload_ref_view.children[pos];
+    size_ = payload_ref_view.children[sz];
+    uri_ = payload_ref_view.children[uri];
+    len_ = payload_ref_view.length;
+    return true;
+}
+
+std::uint64_t BlobV2ColumnView::position(std::int64_t row) const {
+    return ArrowArrayViewGetUIntUnsafe(pos_, row);
+}
+
+std::uint64_t BlobV2ColumnView::byte_size(std::int64_t row) const {
+    return ArrowArrayViewGetUIntUnsafe(size_, row);
+}
+
+void BlobV2ColumnView::uri(std::int64_t row, const char** data, std::int64_t* size) const {
+    const ArrowStringView sv = ArrowArrayViewGetStringUnsafe(uri_, row);
+    *data = sv.data;
+    *size = sv.size_bytes;
+}
+
 }  // namespace nano_lance
