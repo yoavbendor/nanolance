@@ -727,7 +727,8 @@ private:
             write_one("_ipv4.lance", std::get<nanotins::node_id_v<nanotins::Ipv4Node, G>>(dag_pdus_)) &
             write_one("_ipv6.lance", std::get<nanotins::node_id_v<nanotins::Ipv6Node, G>>(dag_pdus_)) &
             write_one("_tcp.lance", std::get<nanotins::node_id_v<nanotins::TcpNode, G>>(dag_pdus_)) &
-            write_one("_udp.lance", std::get<nanotins::node_id_v<nanotins::UdpNode, G>>(dag_pdus_));
+            write_one("_udp.lance", std::get<nanotins::node_id_v<nanotins::UdpNode, G>>(dag_pdus_)) &
+            write_one("_gptp.lance", std::get<nanotins::node_id_v<nanotins::GptpNode, G>>(dag_pdus_));
         if (!ok) return 1;
         // The application payload after L4 (for later UDP-internal PDU parsing), as external refs — the
         // same remainder_after_l4 table the staged --stage l4 path emits. Written incrementally through the
@@ -742,13 +743,14 @@ private:
         }
         std::fprintf(
             stderr,
-            "pcapng2lance: decoded L2/L3 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, udp %zu, remainder %zu\n",
+            "pcapng2lance: decoded L2/L3 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, udp %zu, gptp %zu, remainder %zu\n",
             std::get<nanotins::node_id_v<nanotins::EthNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
             std::get<nanotins::node_id_v<nanotins::VlanNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
             std::get<nanotins::node_id_v<nanotins::Ipv4Node, nanotins::L2L3Graph>>(dag_pdus_).size(),
             std::get<nanotins::node_id_v<nanotins::Ipv6Node, nanotins::L2L3Graph>>(dag_pdus_).size(),
             std::get<nanotins::node_id_v<nanotins::TcpNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
-            std::get<nanotins::node_id_v<nanotins::UdpNode, nanotins::L2L3Graph>>(dag_pdus_).size(), rem_count_);
+            std::get<nanotins::node_id_v<nanotins::UdpNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
+            std::get<nanotins::node_id_v<nanotins::GptpNode, nanotins::L2L3Graph>>(dag_pdus_).size(), rem_count_);
         return 0;
     }
 
