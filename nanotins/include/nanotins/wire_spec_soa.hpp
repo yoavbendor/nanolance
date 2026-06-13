@@ -1,7 +1,7 @@
 #pragma once
 
-// The SoA derivative of a StructSpec: a fixed-capacity, columnar store filled directly from raw PDU
-// bytes. The same spec that drives the wire read (struct_spec.hpp) drives the columns here, so one
+// The SoA derivative of a WireSpec: a fixed-capacity, columnar store filled directly from raw PDU
+// bytes. The same spec that drives the wire read (wire_spec.hpp) drives the columns here, so one
 // declaration gives you both the overlay and the Lance-ready table.
 //
 // Reuse over duplication: the column STORAGE (soatins::soa_array_storage) and the column->Arrow mapping
@@ -9,7 +9,7 @@
 // spec-specific piece is the SCATTER — described structs read a member, a spec reads bytes at an offset.
 // scatter()/scatter_spec() are NANOTINS_HD, so the identical fill runs on a CPU pool or a GPU kernel.
 
-#include "nanotins/struct_spec.hpp"
+#include "nanotins/wire_spec.hpp"
 
 #include "soatins/arrow_glue.hpp"      // nt_set_column_schema, map_arrow_type
 #include "soatins/column_traits.hpp"   // kind_for_scalar

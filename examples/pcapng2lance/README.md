@@ -2,7 +2,7 @@
 
 A worked example that converts legacy **pcap** and **pcapng** captures into a Lance dataset — one row
 per packet, with packet **payloads kept external** (referenced by `uri` + offset + size, never
-copied). It demonstrates the full nanotins stack: the pcapng block scanner, the struct_spec declarative
+copied). It demonstrates the full nanotins stack: the pcapng block scanner, the wire_spec declarative
 wire-parsing core + spec_dag DAG dispatcher, windowed streaming, staged enrichment (L1 → L2 → L3 → L4),
 and both CPU bulk (stdexec) and GPU paths.
 
@@ -28,7 +28,7 @@ and [`KICKOFF.md`](docs/KICKOFF.md) (build order + traps).
   windowing). `--window-bytes` is the RAM/VRAM budget (default 512 MiB; a small file is one window).
   `--sequential` or `--threads N` selects the CPU path; `--gpu` (requires CUDA build) selects the GPU path.
   
-- **M3/M6 — L2/L3/L4 decode via struct_spec + spec_dag** (`--decode-l2l3`): The **struct_spec** declarative
+- **M3/M6 — L2/L3/L4 decode via wire_spec + spec_dag** (`--decode-l2l3`): The **wire_spec** declarative
   core (nanotins `protocol_specs.hpp`) defines Ethernet / 802.1Q VLAN / IPv4 / IPv6 / TCP / UDP with explicit
   byte offsets; the **spec_dag** DAG/FSM (`spec_dag.hpp`) chains them together (Ethernet → VLAN* → IPv4/IPv6
   → TCP/UDP, honoring `ihl`/`data_offset`). One walk of the DAG (via `dag_decode.hpp`/`dag_bulk.hpp`) decodes
@@ -85,7 +85,7 @@ build/examples/pcapng2lance/pcapng2lance capture.pcapng out.lance
 Usage: `pcapng2lance [--no-compress] [--decode-l2l3] [--sequential|--threads N|--gpu] [--window-bytes N] <input.pcap|pcapng> <output.lance> [payload_uri]`.
 
 - `--no-compress` — write uncompressed columns (default: compressed).
-- `--decode-l2l3` — also decode L2/L3/L4 via the struct_spec + spec_dag core; emits `<stem>_<pdu>.lance` tables (Ethernet captures only; non-Ethernet link types pass through as payload-only).
+- `--decode-l2l3` — also decode L2/L3/L4 via the wire_spec + spec_dag core; emits `<stem>_<pdu>.lance` tables (Ethernet captures only; non-Ethernet link types pass through as payload-only).
 - `--sequential` — run Phase B in-thread (reference/debug path); `--threads N` (default: hardware concurrency) or `--gpu` (requires CUDA build) select parallelism.
 - `--window-bytes N` (default 512 MiB) — bounds the per-window RAM/VRAM budget; the capture is streamed in windows and written as one fragment per window, so memory stays bounded regardless of capture size.
 - `--gpu` — run Phase B on the GPU (nvexec); also requires `--cuda-device D` (optional, default 0) and either `--vram-bytes B` or `--vram-pct P` (default 80% of free VRAM) to size the per-window VRAM budget.
@@ -157,7 +157,7 @@ reference is a real `lance.blob.v2` external `payload_ref` struct (`data`=null, 
 
 - The L1 packet row is **all-scalar** (payload external), so it needs no variable-width SoA or prefix-sum
   — the simplest GPU-friendly path. Variable-width fields (comments, extracted PDU byte slices, protocol
-  payloads) remain future work. L2/L3/L4 protocol decoding is now built (via struct_spec + spec_dag),
+  payloads) remain future work. L2/L3/L4 protocol decoding is now built (via wire_spec + spec_dag),
   but advanced features like inline comments or UDP-internal-PDU registries are still planned.
 - Write/read parity: nanolance now reads back every fixed-width type it writes — including narrow ints
   and `fixed_size_binary` — even with a blob column present (`nanotins_reader_parity`). The per-column

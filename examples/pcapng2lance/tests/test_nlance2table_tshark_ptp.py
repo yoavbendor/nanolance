@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PTP/gPTP alignment harness: our --decode-l2l3 PTP tables (the spec_dag GptpNode common header +
 the per-message-type body nodes, dumped via nlance2table) must agree field-for-field with Wireshark's
-`tshark` PTPv2 dissection of the SAME capture. Proves the struct_spec/DAG PTP parser — including the
+`tshark` PTPv2 dissection of the SAME capture. Proves the wire_spec/DAG PTP parser — including the
 GptpNode message_type sub-dispatch into the body specs — matches an independent dissector on real gPTP.
 
 Validates:

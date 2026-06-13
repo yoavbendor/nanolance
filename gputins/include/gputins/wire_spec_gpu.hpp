@@ -1,10 +1,10 @@
 #pragma once
 
-// GPU parse of a struct_spec into its SoA columns — the device twin of the CPU spec_soa fill. Same spec,
+// GPU parse of a wire_spec into its SoA columns — the device twin of the CPU spec_soa fill. Same spec,
 // same NANOTINS_HD read_field/scatter_spec; only the scheduler (nvexec), the pointers (device), and the
 // H2D/D2H bracketing differ. Everything is behind NANOTINS_ENABLE_CUDA so the CPU build is untouched.
 //
-// This exists to VALIDATE, early and on the simplest protocols, that the struct_spec device primitives
+// This exists to VALIDATE, early and on the simplest protocols, that the wire_spec device primitives
 // actually compile under clang-cuda/nvcc and produce GPU==CPU results. The key risk it exercises:
 // scatter_spec captures a std::tuple of device pointers (soatins::soa_ptrs) BY VALUE into the nvexec bulk
 // lambda and does std::get<I> inside the kernel — exactly the case GPU_BULK_INTEGRATION.md gotcha #2 warns
@@ -12,8 +12,8 @@
 // spec_soa; if it chokes, the fix is a generated struct-of-named-pointers (and we learn it on a UDP header
 // rather than a sensor).
 
-#include "nanotins/struct_spec.hpp"
-#include "nanotins/struct_spec_soa.hpp"
+#include "nanotins/wire_spec.hpp"
+#include "nanotins/wire_spec_soa.hpp"
 
 #ifdef NANOTINS_ENABLE_CUDA
 

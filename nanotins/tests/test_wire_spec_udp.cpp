@@ -1,4 +1,4 @@
-// struct_spec Milestone 1 — the UDP header (4x uint16, big-endian), the simplest possible wire PDU.
+// wire_spec Milestone 1 — the UDP header (4x uint16, big-endian), the simplest possible wire PDU.
 // Validates the promise chain end to end, all on CPU (the "device" reader runs here too and must match):
 //   T1 one spec, two faces : struct_view == read_field (device-style) == be<> overlay == hand-decoded
 //   T2 deterministic bulk   : sequential scatter == bulk_for_each(pool) scatter, columns byte-identical
@@ -6,8 +6,8 @@
 //   T4 no firehose regress  : time the spec read vs a be<> packed-overlay read (informational)
 
 #include "nanotins/bulk.hpp"
-#include "nanotins/struct_spec.hpp"
-#include "nanotins/struct_spec_soa.hpp"
+#include "nanotins/wire_spec.hpp"
+#include "nanotins/wire_spec_soa.hpp"
 
 #include "soatins/endian.hpp"
 
@@ -36,7 +36,7 @@ namespace {
     } while (0)
 
 // The UDP header as a wire spec: 4x uint16, big-endian, at byte offsets 0/2/4/6.
-using UdpHdrSpec = nanotins::StructSpec<
+using UdpHdrSpec = nanotins::WireSpec<
     nanotins::named_field<decltype("src_port"_fld), 0, std::uint16_t, nanotins::wire_endian::big>,
     nanotins::named_field<decltype("dst_port"_fld), 2, std::uint16_t, nanotins::wire_endian::big>,
     nanotins::named_field<decltype("length"_fld), 4, std::uint16_t, nanotins::wire_endian::big>,
@@ -163,6 +163,6 @@ int main() {
                      ov_ns, static_cast<unsigned long long>(sink));
     }
 
-    std::printf("struct_spec_udp: ok (T1 oracle, T2 bulk==sequential over %zu hdrs, T3 arrow)\n", N);
+    std::printf("wire_spec_udp: ok (T1 oracle, T2 bulk==sequential over %zu hdrs, T3 arrow)\n", N);
     return 0;
 }

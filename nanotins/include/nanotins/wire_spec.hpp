@@ -2,17 +2,17 @@
 
 // Explicit-offset wire spec + a contiguous, device-safe reader.
 //
-// A StructSpec is a compile-time list of named_field<tag, offset, type, endian> — the single source of
+// A WireSpec is a compile-time list of named_field<tag, offset, type, endian> — the single source of
 // truth for a wire PDU. Unlike a packed C struct, offsets are explicit (so unaligned multi-byte fields,
 // e.g. a uint64 at byte 49, are first-class), and the same spec drives both the HOST contiguous read and
 // the GPU firehose: read_field<F>(ptr) is byte-indexed off a raw pointer (no std::ranges, alignment-safe,
 // device-safe via NANOTINS_HD), so the compiler coalesces aligned cases while odd offsets stay correct.
 //
-// This is the wire-IN side. The columnar OUT side (SoA -> Arrow -> Lance) is struct_spec_soa.hpp, which
+// This is the wire-IN side. The columnar OUT side (SoA -> Arrow -> Lance) is wire_spec_soa.hpp, which
 // derives a fixed-N SoA + scatter from the same spec. A host-only SPARSE reader (over fragmented /
 // segmented backings) is a separate, later addition; M1 needs only the contiguous reader.
 //
-// Vocabulary adapted from the udp_ranges StructSpec/named_field/_fld idea; the reader is reimplemented
+// Vocabulary adapted from the udp_ranges WireSpec/named_field/_fld idea; the reader is reimplemented
 // pointer-based for device-safety + no iterator overhead.
 
 #include "soatins/portability.hpp"  // NANOTINS_HD
@@ -177,9 +177,9 @@ struct expand_one<embed<Prefix, Offset, SubSpec>> {
 };
 }  // namespace detail_spec
 
-// A StructSpec is a list of leaf fields and/or embed<> groups; it flattens to one leaf field tuple.
+// A WireSpec is a list of leaf fields and/or embed<> groups; it flattens to one leaf field tuple.
 template <class... Elems>
-struct StructSpec {
+struct WireSpec {
     using fields = typename detail_spec::concat<typename detail_spec::expand_one<Elems>::type...>::type;
     static constexpr std::size_t field_count = std::tuple_size_v<fields>;
 };

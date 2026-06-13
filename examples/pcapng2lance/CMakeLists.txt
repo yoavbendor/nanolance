@@ -94,25 +94,25 @@ if(NANOLANCE_BUILD_TESTS)
     add_test(NAME pcapng2lance_driver COMMAND $<TARGET_FILE:pcapng2lance_driver_test> $<TARGET_FILE:pcapng2lance>)
     set_tests_properties(pcapng2lance_driver PROPERTIES LABELS "smoke")
 
-    # struct_spec GPU smoke (T5): GPU scatter_spec == CPU spec_soa, byte-identical. Inert on a CPU build
+    # wire_spec GPU smoke (T5): GPU scatter_spec == CPU spec_soa, byte-identical. Inert on a CPU build
     # (the gputins header compiles to nothing without NANOTINS_ENABLE_CUDA), so it passes trivially here;
     # the CUDA host compiles this TU as CUDA (the same -x cuda step as the gpu bridge) and runs the real
     # GPU==CPU check. See nanotins/docs/GPU_BULK_INTEGRATION.md.
-    add_executable(struct_spec_gpu_smoke tests/test_struct_spec_gpu.cpp)
-    target_link_libraries(struct_spec_gpu_smoke PRIVATE nanotins gputins)
-    add_test(NAME struct_spec_gpu_smoke COMMAND $<TARGET_FILE:struct_spec_gpu_smoke>)
-    set_tests_properties(struct_spec_gpu_smoke PROPERTIES LABELS "smoke")
+    add_executable(wire_spec_gpu_smoke tests/test_wire_spec_gpu.cpp)
+    target_link_libraries(wire_spec_gpu_smoke PRIVATE nanotins gputins)
+    add_test(NAME wire_spec_gpu_smoke COMMAND $<TARGET_FILE:wire_spec_gpu_smoke>)
+    set_tests_properties(wire_spec_gpu_smoke PROPERTIES LABELS "smoke")
     if(NANOTINS_ENABLE_CUDA AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        # struct_spec_gpu_smoke is a single-source target, so compile it as CUDA via TARGET-level options
+        # wire_spec_gpu_smoke is a single-source target, so compile it as CUDA via TARGET-level options
         # (reliable — source-level COMPILE_OPTIONS via set_source_files_properties did not propagate to the
         # build rule here). _NT_CUDA_OPTS (-x cuda, --cuda-gpu-arch, ...) is set in the GPU block above.
-        target_compile_definitions(struct_spec_gpu_smoke PRIVATE NANOTINS_ENABLE_CUDA=1)
-        target_compile_options(struct_spec_gpu_smoke PRIVATE ${_NT_CUDA_OPTS})
-        target_include_directories(struct_spec_gpu_smoke PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        target_compile_definitions(wire_spec_gpu_smoke PRIVATE NANOTINS_ENABLE_CUDA=1)
+        target_compile_options(wire_spec_gpu_smoke PRIVATE ${_NT_CUDA_OPTS})
+        target_include_directories(wire_spec_gpu_smoke PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
         if(DEFINED CUDAToolkit_LIBRARY_DIR)
-            target_link_directories(struct_spec_gpu_smoke PRIVATE ${CUDAToolkit_LIBRARY_DIR})
+            target_link_directories(wire_spec_gpu_smoke PRIVATE ${CUDAToolkit_LIBRARY_DIR})
         endif()
-        target_link_libraries(struct_spec_gpu_smoke PRIVATE CUDA::cudart)
+        target_link_libraries(wire_spec_gpu_smoke PRIVATE CUDA::cudart)
     endif()
 
     # DAG decode equivalence + benchmark: serial == bulk == gpu, bit-exact, with per-mode timing. The CTest
@@ -123,7 +123,7 @@ if(NANOLANCE_BUILD_TESTS)
     add_test(NAME dag_gpu_equiv COMMAND $<TARGET_FILE:dag_gpu_equiv_bench> --packets 50000 --bench)
     set_tests_properties(dag_gpu_equiv PROPERTIES LABELS "smoke")
     if(NANOTINS_ENABLE_CUDA AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        # Single-source target -> compile as CUDA via TARGET-level options (same as struct_spec_gpu_smoke).
+        # Single-source target -> compile as CUDA via TARGET-level options (same as wire_spec_gpu_smoke).
         target_compile_definitions(dag_gpu_equiv_bench PRIVATE NANOTINS_ENABLE_CUDA=1)
         target_compile_options(dag_gpu_equiv_bench PRIVATE ${_NT_CUDA_OPTS})
         target_include_directories(dag_gpu_equiv_bench PRIVATE ${CUDAToolkit_INCLUDE_DIRS})

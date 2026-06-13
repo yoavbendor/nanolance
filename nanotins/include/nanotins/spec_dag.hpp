@@ -7,7 +7,7 @@
 //     IPv4     --protocol (gated by frag_offset==0)--> { TCP | UDP }
 //     IPv6     --next_header--> { TCP | UDP }
 //
-// but expressed as a graph of nodes instead of nested branches. A node binds a struct_spec (the header at
+// but expressed as a graph of nodes instead of nested branches. A node binds a wire_spec (the header at
 // the current offset) to two pure functions: advance(p) (header length consumed) and next<Graph>(p) (read
 // a discriminator field, look it up in a compile-time edge table, return the target node id or -1=stop).
 //
@@ -24,7 +24,7 @@
 
 #include "nanotins/protocol_specs.hpp"
 #include "nanotins/protocol_specs_ptp.hpp"
-#include "nanotins/struct_spec.hpp"
+#include "nanotins/wire_spec.hpp"
 
 #include <cstddef>
 #include <cstdint>

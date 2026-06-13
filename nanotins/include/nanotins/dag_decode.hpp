@@ -11,7 +11,7 @@
 // scatter) is a separate, later step; this is the sequential reference + the parity oracle for it.
 
 #include "nanotins/spec_dag.hpp"
-#include "nanotins/struct_spec.hpp"
+#include "nanotins/wire_spec.hpp"
 
 #include <cstddef>
 #include <cstdint>
