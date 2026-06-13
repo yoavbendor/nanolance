@@ -225,11 +225,26 @@ if(NANOLANCE_BUILD_TESTS)
             # as free-standing datasets, stitch them, and verify the result is bit-exact to the single
             # dataset built from the whole range (read back + dumped via nlance2table). Needs nlance_stitch.
             if(TARGET nlance_stitch)
+                set(_stitch_fixture "${CMAKE_CURRENT_SOURCE_DIR}/tests/SRL_front_left_51_short.pcapng")
+                # core/order/uneven/single/decode-l2l3 equivalence: stitch(slices) == full, bit-exact.
                 add_test(NAME pcapng2lance_stitch_equiv
                     COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_stitch_equiv.py"
                             $<TARGET_FILE:pcapng2lance> $<TARGET_FILE:nlance_stitch> $<TARGET_FILE:nlance2table>
-                            "${CMAKE_CURRENT_SOURCE_DIR}/tests/SRL_front_left_51_short.pcapng")
+                            "${_stitch_fixture}")
                 set_tests_properties(pcapng2lance_stitch_equiv PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
+                # External-blob fetch through the stitched dataset (refs still resolve, byte-for-byte).
+                add_test(NAME pcapng2lance_stitch_fetch
+                    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_stitch_fetch.py"
+                            $<TARGET_FILE:pcapng2lance> $<TARGET_FILE:nlance_stitch> $<TARGET_FILE:nlance2table>
+                            "${_stitch_fixture}")
+                set_tests_properties(pcapng2lance_stitch_fetch PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
+                # Stock-Lance (pylance) reads the stitched dataset identically to the full one (skips if absent).
+                add_test(NAME pcapng2lance_stitch_pylance
+                    COMMAND "${NANO_LANCE_WRITER_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_stitch_pylance.py"
+                            $<TARGET_FILE:pcapng2lance> $<TARGET_FILE:nlance_stitch> "${_stitch_fixture}")
+                set_tests_properties(pcapng2lance_stitch_pylance PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
             endif()
         endif()
     endif()
