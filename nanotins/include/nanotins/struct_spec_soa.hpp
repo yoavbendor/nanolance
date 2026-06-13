@@ -34,14 +34,16 @@ struct spec_col {
     static const char* name() { return F::name(); }
 };
 
-template <class Spec>
-struct columns_of_spec_h;
+// Build the column list from the spec's FLATTENED leaf fields (spec_fields_t), so specs composed with
+// embed<> (which expand to leaf fields) get one column per leaf — not one per embed<> group.
+template <class FieldsTuple>
+struct columns_of_fields_h;
 template <class... Fields>
-struct columns_of_spec_h<StructSpec<Fields...>> {
+struct columns_of_fields_h<std::tuple<Fields...>> {
     using type = std::tuple<spec_col<Fields>...>;
 };
 template <class Spec>
-using columns_of_spec = typename columns_of_spec_h<Spec>::type;
+using columns_of_spec = typename columns_of_fields_h<spec_fields_t<Spec>>::type;
 
 // Device-fillable bulk scatter: read every field of `Spec` from `pdu` and write column `i` of the pointer
 // pack `p` (one elem* per column). This is the kernel a CPU pool or a GPU stream runs, unchanged.

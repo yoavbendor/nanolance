@@ -764,7 +764,12 @@ private:
             write_one("_ipv6.lance", std::get<nanotins::node_id_v<nanotins::Ipv6Node, G>>(dag_pdus_)) &
             write_one("_tcp.lance", std::get<nanotins::node_id_v<nanotins::TcpNode, G>>(dag_pdus_)) &
             write_one("_udp.lance", std::get<nanotins::node_id_v<nanotins::UdpNode, G>>(dag_pdus_)) &
-            write_one("_gptp.lance", std::get<nanotins::node_id_v<nanotins::GptpNode, G>>(dag_pdus_));
+            write_one("_gptp.lance", std::get<nanotins::node_id_v<nanotins::GptpNode, G>>(dag_pdus_)) &
+            // gPTP per-message-type bodies (the GptpNode message_type sub-dispatch).
+            write_one("_ptp_timestamp.lance", std::get<nanotins::node_id_v<nanotins::PtpTimestampBody, G>>(dag_pdus_)) &
+            write_one("_ptp_ts_port.lance", std::get<nanotins::node_id_v<nanotins::PtpTsPortBody, G>>(dag_pdus_)) &
+            write_one("_ptp_announce.lance", std::get<nanotins::node_id_v<nanotins::PtpAnnounceBody, G>>(dag_pdus_)) &
+            write_one("_ptp_signaling.lance", std::get<nanotins::node_id_v<nanotins::PtpSignalingBody, G>>(dag_pdus_));
         if (!ok) return 1;
         // The application payload after L4 (for later UDP-internal PDU parsing), as external refs — the
         // same remainder_after_l4 table the staged --stage l4 path emits. Written incrementally through the

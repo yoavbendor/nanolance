@@ -148,6 +148,10 @@ struct Ipv6Node;
 struct TcpNode;
 struct UdpNode;
 struct GptpNode;
+struct PtpTimestampBody;  // Sync / Follow_Up / Delay_Req / Pdelay_Req body
+struct PtpTsPortBody;     // Delay_Resp / Pdelay_Resp / Pdelay_Resp_Follow_Up body
+struct PtpAnnounceBody;   // Announce body
+struct PtpSignalingBody;  // Signaling body
 
 // The post-L2 EtherType dispatch is identical for Ethernet and a VLAN tag's inner type, so both share it.
 template <class Graph>
@@ -229,18 +233,60 @@ struct UdpNode {
     }
 };
 
+// Nested dispatch: a gPTP message's body is selected by the common header's message_type:4 field. Bodies
+// are grouped by wire shape (the gptp table's message_type column disambiguates which message a row is).
+template <class Graph>
+NANOTINS_HD inline int ptp_msgtype_dispatch(std::uint64_t mt) noexcept {
+    return match_edges<Graph,
+                       edge<kPtpMsgSync, PtpTimestampBody>, edge<kPtpMsgFollowUp, PtpTimestampBody>,
+                       edge<kPtpMsgDelayReq, PtpTimestampBody>, edge<kPtpMsgPdelayReq, PtpTimestampBody>,
+                       edge<kPtpMsgDelayResp, PtpTsPortBody>, edge<kPtpMsgPdelayResp, PtpTsPortBody>,
+                       edge<kPtpMsgPdelayRespFollowUp, PtpTsPortBody>, edge<kPtpMsgAnnounce, PtpAnnounceBody>,
+                       edge<kPtpMsgSignaling, PtpSignalingBody>>(mt);
+}
+
 struct GptpNode {
     using spec = PtpHeaderSpec;
     static NANOTINS_HD std::size_t advance(const std::uint8_t*) noexcept { return kPtpHeaderLen; }
     template <class G>
-    static NANOTINS_HD int next(const std::uint8_t*) noexcept {
-        return -1;  // leaf for now; the message_type sub-dispatch is a later milestone
+    static NANOTINS_HD int next(const std::uint8_t* p) noexcept {
+        // emit the common header, then sub-dispatch into the per-message body at byte kPtpHeaderLen.
+        return ptp_msgtype_dispatch<G>(struct_view<PtpHeaderSpec>(p)("message_type"_fld));
     }
 };
 
+// The gPTP body nodes — each emits its body spec at the post-header offset, then stops (leaf). advance is
+// the spec's fixed extent (the body's wire size).
+struct PtpTimestampBody {
+    using spec = PtpTimestampBodySpec;
+    static NANOTINS_HD std::size_t advance(const std::uint8_t*) noexcept { return spec_size<PtpTimestampBodySpec>(); }
+    template <class G>
+    static NANOTINS_HD int next(const std::uint8_t*) noexcept { return -1; }
+};
+struct PtpTsPortBody {
+    using spec = PtpTsPortBodySpec;
+    static NANOTINS_HD std::size_t advance(const std::uint8_t*) noexcept { return spec_size<PtpTsPortBodySpec>(); }
+    template <class G>
+    static NANOTINS_HD int next(const std::uint8_t*) noexcept { return -1; }
+};
+struct PtpAnnounceBody {
+    using spec = PtpAnnounceBodySpec;
+    static NANOTINS_HD std::size_t advance(const std::uint8_t*) noexcept { return spec_size<PtpAnnounceBodySpec>(); }
+    template <class G>
+    static NANOTINS_HD int next(const std::uint8_t*) noexcept { return -1; }
+};
+struct PtpSignalingBody {
+    using spec = PtpSignalingBodySpec;
+    static NANOTINS_HD std::size_t advance(const std::uint8_t*) noexcept { return spec_size<PtpSignalingBodySpec>(); }
+    template <class G>
+    static NANOTINS_HD int next(const std::uint8_t*) noexcept { return -1; }
+};
+
 // The full L2/L3/L4 + gPTP graph. EthNode is the root (id 0). Adding a protocol appends a node here and one
-// edge row in its parent's dispatch — nothing else changes.
-using L2L3Graph = graph<EthNode, VlanNode, Ipv4Node, Ipv6Node, TcpNode, UdpNode, GptpNode>;
+// edge row in its parent's dispatch — nothing else changes. The gPTP message-type bodies are the newest
+// additions (GptpNode -> {timestamp | ts+port | announce | signaling}).
+using L2L3Graph = graph<EthNode, VlanNode, Ipv4Node, Ipv6Node, TcpNode, UdpNode, GptpNode, PtpTimestampBody,
+                        PtpTsPortBody, PtpAnnounceBody, PtpSignalingBody>;
 
 inline constexpr int kEthRoot = node_id_v<EthNode, L2L3Graph>;
 
