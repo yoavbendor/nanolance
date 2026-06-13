@@ -115,6 +115,24 @@ if(NANOLANCE_BUILD_TESTS)
         target_link_libraries(struct_spec_gpu_smoke PRIVATE CUDA::cudart)
     endif()
 
+    # DAG decode equivalence + benchmark: serial == bulk == gpu, bit-exact, with per-mode timing. The CTest
+    # runs a small N (serial==bulk, plus ==gpu on a CUDA build); run the binary with --packets 32000000
+    # --bench on the GPU host for the at-scale check + gpu~=cpu timings.
+    add_executable(dag_gpu_equiv_bench tests/dag_gpu_equiv_bench.cpp)
+    target_link_libraries(dag_gpu_equiv_bench PRIVATE nanotins gputins)
+    add_test(NAME dag_gpu_equiv COMMAND $<TARGET_FILE:dag_gpu_equiv_bench> --packets 50000 --bench)
+    set_tests_properties(dag_gpu_equiv PROPERTIES LABELS "smoke")
+    if(NANOTINS_ENABLE_CUDA AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # Single-source target -> compile as CUDA via TARGET-level options (same as struct_spec_gpu_smoke).
+        target_compile_definitions(dag_gpu_equiv_bench PRIVATE NANOTINS_ENABLE_CUDA=1)
+        target_compile_options(dag_gpu_equiv_bench PRIVATE ${_NT_CUDA_OPTS})
+        target_include_directories(dag_gpu_equiv_bench PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        if(DEFINED CUDAToolkit_LIBRARY_DIR)
+            target_link_directories(dag_gpu_equiv_bench PRIVATE ${CUDAToolkit_LIBRARY_DIR})
+        endif()
+        target_link_libraries(dag_gpu_equiv_bench PRIVATE CUDA::cudart)
+    endif()
+
     # Stock-Lance (pylance) interop + on-disk offset verification. Skips (CTest 77) if pylance absent.
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
