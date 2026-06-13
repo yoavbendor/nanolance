@@ -1,13 +1,13 @@
-// struct_spec GPU smoke (T5): parse headers on the GPU via scatter_spec_pod and assert the columns are
+// wire_spec GPU smoke (T5): parse headers on the GPU via scatter_spec_pod and assert the columns are
 // byte-identical to the CPU spec_soa — for UDP (scalars), IPv4 (bit-fields), and IPv6 (byte-crossing
 // bit-fields + 16-byte fixed-size-binary device columns). Behind NANOTINS_ENABLE_CUDA; a CPU build is a
 // trivial pass (the gputins header compiles to nothing), so the normal suite stays green; the CUDA host
 // runs the real GPU==CPU check. See nanotins/docs/GPU_BULK_INTEGRATION.md.
 
-#include "gputins/struct_spec_gpu.hpp"
+#include "gputins/wire_spec_gpu.hpp"
 
-#include "nanotins/struct_spec.hpp"
-#include "nanotins/struct_spec_soa.hpp"
+#include "nanotins/wire_spec.hpp"
+#include "nanotins/wire_spec_soa.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -20,13 +20,13 @@ using nanotins::wire_endian;
 
 namespace {
 
-using UdpHdrSpec = nanotins::StructSpec<
+using UdpHdrSpec = nanotins::WireSpec<
     nanotins::named_field<decltype("src_port"_fld), 0, std::uint16_t, wire_endian::big>,
     nanotins::named_field<decltype("dst_port"_fld), 2, std::uint16_t, wire_endian::big>,
     nanotins::named_field<decltype("length"_fld), 4, std::uint16_t, wire_endian::big>,
     nanotins::named_field<decltype("checksum"_fld), 6, std::uint16_t, wire_endian::big>>;
 
-using Ipv4Spec = nanotins::StructSpec<
+using Ipv4Spec = nanotins::WireSpec<
     nanotins::named_bit_field<decltype("version"_fld), 0, std::uint8_t, 0, 4, wire_endian::big>,
     nanotins::named_bit_field<decltype("ihl"_fld), 0, std::uint8_t, 4, 4, wire_endian::big>,
     nanotins::named_bit_field<decltype("dscp"_fld), 1, std::uint8_t, 0, 6, wire_endian::big>,
@@ -41,7 +41,7 @@ using Ipv4Spec = nanotins::StructSpec<
     nanotins::named_field<decltype("src_addr"_fld), 12, std::uint32_t, wire_endian::big>,
     nanotins::named_field<decltype("dst_addr"_fld), 16, std::uint32_t, wire_endian::big>>;
 
-using Ipv6Spec = nanotins::StructSpec<
+using Ipv6Spec = nanotins::WireSpec<
     nanotins::named_bit_field<decltype("version"_fld), 0, std::uint32_t, 0, 4, wire_endian::big>,
     nanotins::named_bit_field<decltype("traffic_class"_fld), 0, std::uint32_t, 4, 8, wire_endian::big>,
     nanotins::named_bit_field<decltype("flow_label"_fld), 0, std::uint32_t, 12, 20, wire_endian::big>,
@@ -115,17 +115,17 @@ int main() {
         all = all && c.ok;
     }
     if (!all) {
-        std::fprintf(stderr, "struct_spec_gpu: FAIL — a protocol mismatched\n");
+        std::fprintf(stderr, "wire_spec_gpu: FAIL — a protocol mismatched\n");
         return 1;
     }
-    std::printf("struct_spec_gpu: GPU == CPU over %zu headers each for udp / ipv4 / ipv6\n", N);
+    std::printf("wire_spec_gpu: GPU == CPU over %zu headers each for udp / ipv4 / ipv6\n", N);
     return 0;
 }
 
 #else
 
 int main() {
-    std::printf("struct_spec_gpu: skipped (build with -DNANOTINS_ENABLE_CUDA on a CUDA host)\n");
+    std::printf("wire_spec_gpu: skipped (build with -DNANOTINS_ENABLE_CUDA on a CUDA host)\n");
     return 0;
 }
 

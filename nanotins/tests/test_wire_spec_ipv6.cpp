@@ -1,4 +1,4 @@
-// struct_spec Milestone 3 — the IPv6 header (40 bytes): the hardest bit-field (version:4 /
+// wire_spec Milestone 3 — the IPv6 header (40 bytes): the hardest bit-field (version:4 /
 // traffic_class:8 / flow_label:20 packed in one big-endian u32, crossing byte boundaries), fixed-size
 // byte-array fields (the 16-byte addresses), and next_header — the field that decides the next PDU (the
 // dispatch seam). Cross-checked against protocols::Ipv6 (soatins bits<>).
@@ -7,8 +7,8 @@
 
 #include "nanotins/bulk.hpp"
 #include "nanotins/protocols.hpp"
-#include "nanotins/struct_spec.hpp"
-#include "nanotins/struct_spec_soa.hpp"
+#include "nanotins/wire_spec.hpp"
+#include "nanotins/wire_spec_soa.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -34,7 +34,7 @@ namespace {
         }                                                                      \
     } while (0)
 
-using Ipv6Spec = nanotins::StructSpec<
+using Ipv6Spec = nanotins::WireSpec<
     nanotins::named_bit_field<decltype("version"_fld), 0, std::uint32_t, 0, 4, wire_endian::big>,
     nanotins::named_bit_field<decltype("traffic_class"_fld), 0, std::uint32_t, 4, 8, wire_endian::big>,
     nanotins::named_bit_field<decltype("flow_label"_fld), 0, std::uint32_t, 12, 20, wire_endian::big>,
@@ -137,6 +137,6 @@ int main() {
     CHECK(v("next_header"_fld) == 6);  // -> would dispatch to {l4_table, key=6} = TCP
     CHECK(seq.column<4>()[0] == static_cast<std::uint8_t>(0));  // i=0 -> next_header 0 (hop-by-hop ext)
 
-    std::printf("struct_spec_ipv6: ok (T1 crossing bitfield + FSB vs soatins, T2 bulk==seq, T3 arrow, T4 next_header)\n");
+    std::printf("wire_spec_ipv6: ok (T1 crossing bitfield + FSB vs soatins, T2 bulk==seq, T3 arrow, T4 next_header)\n");
     return 0;
 }

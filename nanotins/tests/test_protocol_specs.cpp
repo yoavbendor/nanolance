@@ -1,11 +1,11 @@
 // M4a: the backbone protocol_specs (Ethernet/VLAN/IPv4/IPv6/TCP/UDP) must read every field identically to
-// the existing protocols:: be<>/bits<> overlay on the same bytes — the guarantee that a struct_spec DAG
+// the existing protocols:: be<>/bits<> overlay on the same bytes — the guarantee that a wire_spec DAG
 // will emit byte-identical Lance tables. Cross-checks struct_view<Spec> vs the reinterpreted struct over
 // deterministic bytes (the values are arbitrary; agreement is the point).
 
 #include "nanotins/protocol_specs.hpp"
 #include "nanotins/protocols.hpp"
-#include "nanotins/struct_spec.hpp"
+#include "nanotins/wire_spec.hpp"
 
 #include <cstdint>
 #include <cstdio>

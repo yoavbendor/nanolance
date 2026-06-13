@@ -92,23 +92,23 @@ if(NANOTINS_BUILD_TESTS)
     add_test(NAME nanotins_gptp COMMAND $<TARGET_FILE:nanotins_gptp_test>)
     set_tests_properties(nanotins_gptp PROPERTIES LABELS "smoke")
 
-    # struct_spec M1: the UDP header (4x u16) wire spec -> contiguous/device read -> bulk SoA -> Arrow.
-    add_executable(nanotins_struct_spec_udp tests/test_struct_spec_udp.cpp)
-    target_link_libraries(nanotins_struct_spec_udp PRIVATE nanotins_protocols)
-    add_test(NAME nanotins_struct_spec_udp COMMAND $<TARGET_FILE:nanotins_struct_spec_udp>)
-    set_tests_properties(nanotins_struct_spec_udp PROPERTIES LABELS "smoke")
+    # wire_spec M1: the UDP header (4x u16) wire spec -> contiguous/device read -> bulk SoA -> Arrow.
+    add_executable(nanotins_wire_spec_udp tests/test_wire_spec_udp.cpp)
+    target_link_libraries(nanotins_wire_spec_udp PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_wire_spec_udp COMMAND $<TARGET_FILE:nanotins_wire_spec_udp>)
+    set_tests_properties(nanotins_wire_spec_udp PROPERTIES LABELS "smoke")
 
-    # struct_spec M2: the IPv4 header (named_bit_field + IHL-driven extent), cross-checked vs soatins bits<>.
-    add_executable(nanotins_struct_spec_ipv4 tests/test_struct_spec_ipv4.cpp)
-    target_link_libraries(nanotins_struct_spec_ipv4 PRIVATE nanotins_protocols)
-    add_test(NAME nanotins_struct_spec_ipv4 COMMAND $<TARGET_FILE:nanotins_struct_spec_ipv4>)
-    set_tests_properties(nanotins_struct_spec_ipv4 PROPERTIES LABELS "smoke")
+    # wire_spec M2: the IPv4 header (named_bit_field + IHL-driven extent), cross-checked vs soatins bits<>.
+    add_executable(nanotins_wire_spec_ipv4 tests/test_wire_spec_ipv4.cpp)
+    target_link_libraries(nanotins_wire_spec_ipv4 PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_wire_spec_ipv4 COMMAND $<TARGET_FILE:nanotins_wire_spec_ipv4>)
+    set_tests_properties(nanotins_wire_spec_ipv4 PROPERTIES LABELS "smoke")
 
-    # struct_spec M3: IPv6 (byte-crossing bit-field + fixed-size-binary addresses + next_header chaining).
-    add_executable(nanotins_struct_spec_ipv6 tests/test_struct_spec_ipv6.cpp)
-    target_link_libraries(nanotins_struct_spec_ipv6 PRIVATE nanotins_protocols)
-    add_test(NAME nanotins_struct_spec_ipv6 COMMAND $<TARGET_FILE:nanotins_struct_spec_ipv6>)
-    set_tests_properties(nanotins_struct_spec_ipv6 PROPERTIES LABELS "smoke")
+    # wire_spec M3: IPv6 (byte-crossing bit-field + fixed-size-binary addresses + next_header chaining).
+    add_executable(nanotins_wire_spec_ipv6 tests/test_wire_spec_ipv6.cpp)
+    target_link_libraries(nanotins_wire_spec_ipv6 PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_wire_spec_ipv6 COMMAND $<TARGET_FILE:nanotins_wire_spec_ipv6>)
+    set_tests_properties(nanotins_wire_spec_ipv6 PROPERTIES LABELS "smoke")
 
     # M4a: the backbone protocol_specs (eth/vlan/ipv4/ipv6/tcp/udp) read identically to protocols:: structs.
     add_executable(nanotins_protocol_specs tests/test_protocol_specs.cpp)
@@ -117,10 +117,10 @@ if(NANOTINS_BUILD_TESTS)
     set_tests_properties(nanotins_protocol_specs PROPERTIES LABELS "smoke")
 
     # M4b: PTPv2 via embed<> spec composition (header parity vs Gptp; embed offsets + name prefixes).
-    add_executable(nanotins_struct_spec_ptp tests/test_struct_spec_ptp.cpp)
-    target_link_libraries(nanotins_struct_spec_ptp PRIVATE nanotins_protocols)
-    add_test(NAME nanotins_struct_spec_ptp COMMAND $<TARGET_FILE:nanotins_struct_spec_ptp>)
-    set_tests_properties(nanotins_struct_spec_ptp PROPERTIES LABELS "smoke")
+    add_executable(nanotins_wire_spec_ptp tests/test_wire_spec_ptp.cpp)
+    target_link_libraries(nanotins_wire_spec_ptp PRIVATE nanotins_protocols)
+    add_test(NAME nanotins_wire_spec_ptp COMMAND $<TARGET_FILE:nanotins_wire_spec_ptp>)
+    set_tests_properties(nanotins_wire_spec_ptp PROPERTIES LABELS "smoke")
 
     # M5a: the spec-driven DAG/FSM reproduces walk_packet's L2/L3/L4 traversal (determinism/parity oracle).
     add_executable(nanotins_spec_dag tests/test_spec_dag.cpp)

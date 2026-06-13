@@ -1,4 +1,4 @@
-// struct_spec Milestone 2 — the IPv4 header (20 bytes, bit-fields + scalars), the first wire PDU with
+// wire_spec Milestone 2 — the IPv4 header (20 bytes, bit-fields + scalars), the first wire PDU with
 // named_bit_field (version:4/ihl:4, dscp:6/ecn:2, flags:3/frag_offset:13) and an IHL-driven extent.
 //   T1 bit-field oracle : struct_view / device read_field == hand-decoded == soatins bits<> overlay
 //   T2 deterministic bulk: sequential scatter == bulk_for_each, bit-field + scalar columns identical
@@ -7,8 +7,8 @@
 
 #include "nanotins/bulk.hpp"
 #include "nanotins/protocols.hpp"  // protocols::Ipv4 (soatins bits<> overlay) — the cross-check oracle
-#include "nanotins/struct_spec.hpp"
-#include "nanotins/struct_spec_soa.hpp"
+#include "nanotins/wire_spec.hpp"
+#include "nanotins/wire_spec_soa.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -34,7 +34,7 @@ namespace {
         }                                                                      \
     } while (0)
 
-using Ipv4Spec = nanotins::StructSpec<
+using Ipv4Spec = nanotins::WireSpec<
     nanotins::named_bit_field<decltype("version"_fld), 0, std::uint8_t, 0, 4, wire_endian::big>,
     nanotins::named_bit_field<decltype("ihl"_fld), 0, std::uint8_t, 4, 4, wire_endian::big>,
     nanotins::named_bit_field<decltype("dscp"_fld), 1, std::uint8_t, 0, 6, wire_endian::big>,
@@ -154,6 +154,6 @@ int main() {
     nanotins::struct_view<Ipv4Spec> vo(with_opts);
     CHECK(vo("ihl"_fld) * 4u == 24u);
 
-    std::printf("struct_spec_ipv4: ok (T1 bitfield oracle vs soatins, T2 bulk==seq, T3 arrow, T4 ihl extent)\n");
+    std::printf("wire_spec_ipv4: ok (T1 bitfield oracle vs soatins, T2 bulk==seq, T3 arrow, T4 ihl extent)\n");
     return 0;
 }

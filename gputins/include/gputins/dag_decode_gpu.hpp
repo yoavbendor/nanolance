@@ -29,7 +29,7 @@
 #include "nanotins/dag_bulk.hpp"
 #include "nanotins/dag_decode.hpp"
 #include "nanotins/spec_dag.hpp"
-#include "nanotins/struct_spec_soa.hpp"  // columns_of_spec
+#include "nanotins/wire_spec_soa.hpp"  // columns_of_spec
 #include "gputins/gpu.hpp"
 
 #ifdef NANOTINS_ENABLE_CUDA

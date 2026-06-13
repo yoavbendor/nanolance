@@ -7,13 +7,13 @@
 // columns_of and carry the same host-order values (verified in test_pdu_table_interop).
 //
 // dag_pdu_table already stores each column contiguously (SoA), so the batch is one bulk ArrowBufferAppend
-// per column (no per-row append) — the same shape as struct_spec_soa::to_arrow_spec, with packet_id
+// per column (no per-row append) — the same shape as wire_spec_soa::to_arrow_spec, with packet_id
 // prepended.
 
 #include "soatins/arrow_glue.hpp"          // nt_set_column_schema
 #include "nanotins/dag_decode.hpp"         // dag_pdu_table
-#include "nanotins/struct_spec.hpp"
-#include "nanotins/struct_spec_soa.hpp"    // spec_col (kind / fixed_width / name)
+#include "nanotins/wire_spec.hpp"
+#include "nanotins/wire_spec_soa.hpp"    // spec_col (kind / fixed_width / name)
 
 #include "nanolance/nano_lance_writer.h"
 

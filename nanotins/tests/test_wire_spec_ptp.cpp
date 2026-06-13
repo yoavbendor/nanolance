@@ -8,7 +8,7 @@
 
 #include "nanotins/gptp.hpp"
 #include "nanotins/protocol_specs_ptp.hpp"
-#include "nanotins/struct_spec.hpp"
+#include "nanotins/wire_spec.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -115,6 +115,6 @@ int main() {
         CHECK(v("time_source"_fld) == b[63]);
     }
 
-    std::printf("struct_spec_ptp: ok (PtpHeaderSpec == Gptp overlay; embed<> offsets + prefixes correct)\n");
+    std::printf("wire_spec_ptp: ok (PtpHeaderSpec == Gptp overlay; embed<> offsets + prefixes correct)\n");
     return 0;
 }

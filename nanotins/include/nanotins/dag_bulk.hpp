@@ -18,8 +18,8 @@
 #include "nanotins/bulk.hpp"
 #include "nanotins/dag_decode.hpp"
 #include "nanotins/spec_dag.hpp"
-#include "nanotins/struct_spec.hpp"
-#include "nanotins/struct_spec_soa.hpp"  // scatter helpers shape
+#include "nanotins/wire_spec.hpp"
+#include "nanotins/wire_spec_soa.hpp"  // scatter helpers shape
 
 #include <algorithm>
 #include <cstddef>
