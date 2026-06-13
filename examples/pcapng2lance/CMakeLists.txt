@@ -220,6 +220,17 @@ if(NANOLANCE_BUILD_TESTS)
                         $<TARGET_FILE:pcapng2lance> $<TARGET_FILE:nlance2table>
                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/SRL_front_left_51_short.pcapng")
             set_tests_properties(pcapng2lance_frag_harmony PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
+            # Dataset-stitch equivalence: cut the capture into 3 contiguous packet slices (--drop/--count)
+            # as free-standing datasets, stitch them, and verify the result is bit-exact to the single
+            # dataset built from the whole range (read back + dumped via nlance2table). Needs nlance_stitch.
+            if(TARGET nlance_stitch)
+                add_test(NAME pcapng2lance_stitch_equiv
+                    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_stitch_equiv.py"
+                            $<TARGET_FILE:pcapng2lance> $<TARGET_FILE:nlance_stitch> $<TARGET_FILE:nlance2table>
+                            "${CMAKE_CURRENT_SOURCE_DIR}/tests/SRL_front_left_51_short.pcapng")
+                set_tests_properties(pcapng2lance_stitch_equiv PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+            endif()
         endif()
     endif()
 endif()

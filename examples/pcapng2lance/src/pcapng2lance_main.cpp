@@ -73,6 +73,8 @@ struct Args {
     std::uint64_t mem_bytes = 0;                                  // enrich budget; 0 = auto-detect free RAM
     std::size_t read_tile_bytes = std::size_t{32} * 1024 * 1024;  // enrich big-read tile (S3 throughput)
     std::size_t prefix_cap = 256;                                 // header bytes carved per row for enrich
+    std::uint64_t drop = 0;                       // -d: skip the first N packets (their packet_id is preserved)
+    std::uint64_t take = UINT64_MAX;              // -c: emit at most N packets after the drop (default: all)
     std::vector<std::string> pos;
 };
 
@@ -130,6 +132,14 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             if (!v) return false;
             a.read_tile_bytes = static_cast<std::size_t>(std::stoull(v));
             if (a.read_tile_bytes == 0) return (err = "--read-tile-bytes must be > 0", false);
+        } else if (s == "-d" || s == "--drop") {
+            const char* v = value(i);
+            if (!v) return false;
+            a.drop = std::stoull(v);
+        } else if (s == "-c" || s == "--count") {
+            const char* v = value(i);
+            if (!v) return false;
+            a.take = std::stoull(v);
         } else {
             a.pos.push_back(s);
         }
@@ -372,6 +382,8 @@ public:
             }
             if (const int rc = process_window(win.bytes(), win.base(), refs)) return rc;
             win.consume(consumed);
+            // --count: once every requested packet has been seen, stop reading the rest of the capture.
+            if (args_.take != UINT64_MAX && global_pid_ >= args_.drop + args_.take) break;
             win.fill();
         }
 
@@ -380,7 +392,7 @@ public:
             nano_lance_writer_close(&writer_);
             ArrowSchemaRelease(&schema_);
         }
-        if (!args_.no_write && args_.decode_l2l3 && global_pid_ > 0) {
+        if (!args_.no_write && args_.decode_l2l3 && emitted_ > 0) {
             if (const int rc = write_pdu_tables()) return rc;
         }
         print_summary();
@@ -516,7 +528,7 @@ private:
     // columns by reflection (no hand-written columns), denormalizing link_type/ts_resol from the section's
     // interface table; the writer/decoder arrays (link_type/poff/psize) come along in the same pass.
     PacketBatch assemble(const std::vector<pcapblocks::EpbView>& parsed,
-                         const std::vector<std::size_t>& packet_section) {
+                         const std::vector<std::size_t>& packet_section, std::uint64_t base_pid) {
         const std::size_t n = parsed.size();
         PacketBatch b;
         b.rows.resize(n);
@@ -530,7 +542,7 @@ private:
                                                                      : std::uint16_t{0};
             const std::uint8_t res = e.interface_id < table.size() ? table[e.interface_id].ts_resol
                                                                    : std::uint8_t{6};
-            b.rows.store(i, PacketRow{global_pid_ + i, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
+            b.rows.store(i, PacketRow{base_pid + i, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
                                       e.epb_flags});
             b.link_type[i] = link;
             b.poff[i] = e.payload_file_offset;
@@ -546,7 +558,7 @@ private:
     // denormalization (link_type/ts_resol) is a host lookup, which is why this is the CPU path; the GPU
     // path keeps parse_packets_gpu -> assemble (device parse, then the host join). Byte-identical output.
     PacketBatch parse_and_assemble(pcapblocks::Bytes wbytes, const std::vector<pcapblocks::BlockRef>& packets,
-                                   const std::vector<std::size_t>& packet_section) {
+                                   const std::vector<std::size_t>& packet_section, std::uint64_t base_pid) {
         const std::size_t n = packets.size();
         PacketBatch b;
         b.rows.resize(n);
@@ -560,7 +572,7 @@ private:
         std::uint16_t* lt = b.link_type.data();
         std::uint64_t* po = b.poff.data();
         std::uint32_t* ps = b.psize.data();
-        const std::uint64_t pid0 = global_pid_;
+        const std::uint64_t pid0 = base_pid;
         auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
         run(std::min<std::size_t>(n, 64), n, [=](std::size_t i) {
             pcapblocks::EpbView e{};
@@ -640,16 +652,41 @@ private:
                 return fail("failed to parse interface description block");
             }
         }
-        const std::size_t n = packets.size();
-        if (n == 0) return 0;  // window held only SHB/IDB/other; nothing to write
+        const std::size_t n_total = packets.size();
+        if (n_total == 0) return 0;  // window held only SHB/IDB/other; nothing to write
+
+        // --drop/--count packet slicing. global_pid_ is the running GLOBAL packet index (it counts every
+        // packet seen, dropped or kept), so a kept packet keeps the same packet_id it would have in a full
+        // run — that is what makes a stitched set of slices a bit-exact replica of the full dataset. Keep
+        // only packets whose global index lies in [drop, drop+take); interface (IDB) state was already
+        // applied above for every block, so dropping packets never corrupts the section tables.
+        const std::uint64_t g0 = global_pid_;
+        global_pid_ += n_total;  // advance over ALL packets in this window (kept or dropped)
+        std::size_t lo = 0, hi = n_total;
+        if (args_.drop > g0) lo = static_cast<std::size_t>(std::min<std::uint64_t>(args_.drop - g0, n_total));
+        if (args_.take != UINT64_MAX) {
+            const std::uint64_t end = args_.drop + args_.take;  // one past the last kept global index
+            hi = end > g0 ? static_cast<std::size_t>(std::min<std::uint64_t>(end - g0, n_total)) : 0;
+        }
+        if (hi < lo) hi = lo;
+        const std::size_t n = hi - lo;  // packets kept from this window
+        if (n == 0) return 0;           // this window is entirely outside the slice
+        const std::uint64_t base_pid = g0 + lo;
+        if (lo != 0 || hi != n_total) {  // narrow to the kept sub-range (contiguous within the window)
+            packets.erase(packets.begin() + hi, packets.end());
+            packets.erase(packets.begin(), packets.begin() + lo);
+            packet_section.erase(packet_section.begin() + hi, packet_section.end());
+            packet_section.erase(packet_section.begin(), packet_section.begin() + lo);
+        }
+        emitted_ += n;
 
         // GPU: device parse -> EpbView D2H -> host join. CPU: one fused parse+scatter pass (no EpbView).
         PacketBatch batch;
         if (args_.gpu) {
             const std::vector<pcapblocks::EpbView> parsed = parse_packets(wbytes, packets);
-            batch = assemble(parsed, packet_section);
+            batch = assemble(parsed, packet_section, base_pid);
         } else {
-            batch = parse_and_assemble(wbytes, packets, packet_section);
+            batch = parse_and_assemble(wbytes, packets, packet_section, base_pid);
         }
         if (!args_.no_write) {  // --no-write isolates Phase B (scan+parse+decode) from the Lance I/O
             if (const int rc = freeze_metadata()) return rc;
@@ -659,18 +696,17 @@ private:
             std::vector<protocols::WalkResult> trailers(n);
             if (args_.gpu) {
                 const std::size_t tasks = args_.threads ? static_cast<std::size_t>(args_.threads) : 256;
-                pcapng2lance::gpu_bridge::decode_window(*gpu_ctx_, tasks, global_pid_,
+                pcapng2lance::gpu_bridge::decode_window(*gpu_ctx_, tasks, base_pid,
                                                         batch.link_type.data(), batch.poff.data(),
                                                         batch.psize.data(), wbytes, n, dag_pdus_, trailers.data());
             } else
             {
                 auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
-                pcapng2lance::dag_decode_window(run, global_pid_, batch.link_type.data(), batch.poff.data(),
+                pcapng2lance::dag_decode_window(run, base_pid, batch.link_type.data(), batch.poff.data(),
                                                 batch.psize.data(), wbytes, n, dag_pdus_, trailers.data());
             }
-            collect_remainder(trailers, batch, wbase);
+            collect_remainder(trailers, batch, wbase, base_pid);
         }
-        global_pid_ += n;
         return 0;
     }
 
@@ -678,7 +714,7 @@ private:
     // as an external blob.v2 ref into the original capture. Only packets that reached L4 and still have
     // bytes left contribute — byte-identical to what the staged --stage l4 path emits.
     void collect_remainder(const std::vector<protocols::WalkResult>& trailers, const PacketBatch& b,
-                           std::uint64_t wbase) {
+                           std::uint64_t wbase, std::uint64_t base_pid) {
         const std::size_t n = b.size();
         if (!rem_sink_) {  // lazily open the chunked remainder writer on the first contributing window
             const auto stem = (output_.parent_path() / output_.stem()).string();
@@ -694,7 +730,7 @@ private:
             const protocols::WalkResult& w = trailers[i];
             if (w.reached_l4 && w.l4_payload_offset < b.psize[i]) {
                 std::string e;
-                if (!rem_sink_->push(staged::RemainderRow{global_pid_ + i, /*next_protocol=*/w.l4_ports,
+                if (!rem_sink_->push(staged::RemainderRow{base_pid + i, /*next_protocol=*/w.l4_ports,
                                                           wbase + b.poff[i] + w.l4_payload_offset,
                                                           b.psize[i] - w.l4_payload_offset},
                                      e)) {
@@ -755,9 +791,17 @@ private:
     }
 
     void print_summary() const {
+        // global_pid_ is the count of packets SEEN (it spans dropped packets so packet_id stays global);
+        // emitted_ is how many rows were actually written (== global_pid_ unless --drop/--count narrowed it).
+        if (emitted_ != global_pid_) {
+            std::fprintf(stderr, "pcapng2lance: emitted %llu of %llu packets (--drop %llu --count %s)\n",
+                         static_cast<unsigned long long>(emitted_), static_cast<unsigned long long>(global_pid_),
+                         static_cast<unsigned long long>(args_.drop),
+                         args_.take == UINT64_MAX ? "all" : std::to_string(args_.take).c_str());
+        }
         std::fprintf(
             stderr, "pcapng2lance: %llu packets, %zu interface(s) across %zu section(s), %zu skipped block(s) -> %s\n",
-            static_cast<unsigned long long>(global_pid_), total_idb_, shb_count_, other_count_,
+            static_cast<unsigned long long>(emitted_), total_idb_, shb_count_, other_count_,
             output_.string().c_str());
     }
 
@@ -774,7 +818,8 @@ private:
     pcapblocks::ScanState st_{};
     std::vector<std::vector<pcapblocks::IdbView>> sections_;  // per-section interface tables
     std::ptrdiff_t cur_section_ = -1;
-    std::uint64_t global_pid_ = 0;
+    std::uint64_t global_pid_ = 0;  // packets SEEN (global index; spans --drop so packet_id stays global)
+    std::uint64_t emitted_ = 0;     // packets actually written (== global_pid_ unless --drop/--count)
     std::size_t shb_count_ = 0, total_idb_ = 0, other_count_ = 0;
     bool schema_meta_set_ = false;
     bool first_commit_ = true;
@@ -815,7 +860,10 @@ int main(int argc, char** argv) {
         std::fprintf(
             stderr,
             "usage: %s [--no-compress] [--decode-l2l3] [--sequential|--threads N|--gpu] [--no-write]\n"
-            "          [--vram-pct P | --vram-bytes B] [--cuda-device D] <input.pcap|pcapng> <output.lance> [payload_uri]\n"
+            "          [--vram-pct P | --vram-bytes B] [--cuda-device D] [-d|--drop N] [-c|--count N]\n"
+            "          <input.pcap|pcapng> <output.lance> [payload_uri]\n"
+            "       (-d/-c select a packet slice: skip the first N, then emit at most N; packet_id stays\n"
+            "        global so slices stitch into a bit-exact replica of the full dataset)\n"
             "       %s --stage l1 <input.pcap|pcapng> <datadir>   (then --stage l2|l3|l4 <datadir>)\n",
             argv[0], argv[0]);
         return 2;
