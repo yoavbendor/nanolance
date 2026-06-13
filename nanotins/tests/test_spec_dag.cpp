@@ -33,6 +33,10 @@ constexpr int kIpv6 = nanotins::node_id_v<nanotins::Ipv6Node, G>;
 constexpr int kTcp = nanotins::node_id_v<nanotins::TcpNode, G>;
 constexpr int kUdp = nanotins::node_id_v<nanotins::UdpNode, G>;
 constexpr int kGptp = nanotins::node_id_v<nanotins::GptpNode, G>;
+constexpr int kPtpTs = nanotins::node_id_v<nanotins::PtpTimestampBody, G>;
+constexpr int kPtpTsPort = nanotins::node_id_v<nanotins::PtpTsPortBody, G>;
+constexpr int kPtpAnnounce = nanotins::node_id_v<nanotins::PtpAnnounceBody, G>;
+constexpr int kPtpSignaling = nanotins::node_id_v<nanotins::PtpSignalingBody, G>;
 
 using Trace = std::vector<std::pair<int, std::size_t>>;  // (node id, offset)
 
@@ -112,16 +116,31 @@ int main() {
         check_parity("eth/ipv4 fragment", b, {{kEth, 0}, {kIpv4, 14}});
     }
 
-    // D: Ethernet / gPTP (walk_packet has no gPTP branch — check the DAG directly) (48 bytes)
+    // D: Ethernet / gPTP — the message_type sub-dispatch routes the common header to the right body node.
+    // GptpNode emits the 34B header at off 14 then dispatches on byte14's low nibble (message_type) to the
+    // body at off 48. Body must fit, so each packet is sized for its body (ts 10, ts+port 20, announce 30).
     {
-        std::vector<std::uint8_t> b(48, 0);
-        put16(b, 12, 0x88F7);  // ethertype PTP
-        b[14] = 0x0B;          // message_type Announce (low nibble) — leaf for now
-        const Trace got = dag_trace(b);
-        CHECK(got.size() == 2);
-        CHECK(got[0].first == kEth && got[0].second == 0);
-        CHECK(got[1].first == kGptp && got[1].second == 14);
-        std::printf("  %-22s ok (%zu PDUs, DAG emits eth->gptp)\n", "eth/gptp", got.size());
+        const auto gptp_case = [&](const char* name, std::uint8_t msgtype, std::size_t total, int body_id,
+                                   std::size_t body_off) {
+            std::vector<std::uint8_t> b(total, 0);
+            put16(b, 12, 0x88F7);                          // ethertype PTP
+            b[14] = static_cast<std::uint8_t>(msgtype & 0x0F);  // message_type = low nibble of header byte 0
+            const Trace got = dag_trace(b);
+            CHECK(got.size() == 3);
+            CHECK(got[0].first == kEth && got[0].second == 0);
+            CHECK(got[1].first == kGptp && got[1].second == 14);
+            CHECK(got[2].first == body_id && got[2].second == body_off);
+            std::printf("  %-22s ok (eth->gptp->body, msgtype 0x%X)\n", name, msgtype);
+        };
+        // body starts at 14 (eth) + 34 (ptp header) = 48
+        gptp_case("gptp/sync", nanotins::kPtpMsgSync, 58, kPtpTs, 48);             // body 10B
+        gptp_case("gptp/follow_up", nanotins::kPtpMsgFollowUp, 58, kPtpTs, 48);
+        gptp_case("gptp/pdelay_req", nanotins::kPtpMsgPdelayReq, 58, kPtpTs, 48);
+        gptp_case("gptp/delay_resp", nanotins::kPtpMsgDelayResp, 68, kPtpTsPort, 48);    // body 20B
+        gptp_case("gptp/pdelay_resp", nanotins::kPtpMsgPdelayResp, 68, kPtpTsPort, 48);
+        gptp_case("gptp/pdelay_resp_fu", nanotins::kPtpMsgPdelayRespFollowUp, 68, kPtpTsPort, 48);
+        gptp_case("gptp/announce", nanotins::kPtpMsgAnnounce, 78, kPtpAnnounce, 48);     // body 30B
+        gptp_case("gptp/signaling", nanotins::kPtpMsgSignaling, 58, kPtpSignaling, 48);  // body 10B
     }
 
     // E: QinQ — two stacked VLAN tags then IPv4/UDP, exercising the VlanNode self-loop (50 bytes)

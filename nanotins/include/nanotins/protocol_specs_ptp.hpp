@@ -96,6 +96,36 @@ inline constexpr std::uint8_t kPtpMsgPdelayReq = 0x2;
 inline constexpr std::uint8_t kPtpMsgPdelayResp = 0x3;
 inline constexpr std::uint8_t kPtpMsgFollowUp = 0x8;
 inline constexpr std::uint8_t kPtpMsgDelayResp = 0x9;
+inline constexpr std::uint8_t kPtpMsgPdelayRespFollowUp = 0xA;
 inline constexpr std::uint8_t kPtpMsgAnnounce = 0xB;
+inline constexpr std::uint8_t kPtpMsgSignaling = 0xC;
+
+// ---- per-messageType BODY specs (decoded at offset kPtpHeaderLen, i.e. body-relative offset 0) --------
+// The DAG's GptpNode emits the common header (PtpHeaderSpec) then dispatches message_type into one of
+// these BODY nodes, which parse at byte kPtpHeaderLen. The bodies are grouped by wire shape — the gptp
+// table's message_type column disambiguates which message a row came from. (The full-message *MsgSpec
+// types above embed the header; these are body-only, for the header+body split the DAG uses.)
+
+// Sync / Follow_Up / Delay_Req / Pdelay_Req: a single 10-byte Timestamp (origin / preciseOrigin).
+using PtpTimestampBodySpec = StructSpec<embed<decltype("ts_"_fld), 0, TimestampSpec>>;
+
+// Delay_Resp / Pdelay_Resp / Pdelay_Resp_Follow_Up: a Timestamp + the requesting PortIdentity (20 bytes).
+using PtpTsPortBodySpec = StructSpec<
+    embed<decltype("ts_"_fld), 0, TimestampSpec>,
+    embed<decltype("req_"_fld), 10, PortIdentitySpec>>;
+
+// Announce body (30 bytes after the header): originTimestamp + the grandmaster fields.
+using PtpAnnounceBodySpec = StructSpec<
+    embed<decltype("origin_"_fld), 0, TimestampSpec>,
+    named_field<decltype("current_utc_offset"_fld), 10, std::int16_t, wire_endian::big>,
+    named_field<decltype("grandmaster_priority1"_fld), 13, std::uint8_t, wire_endian::big>,
+    embed<decltype("grandmaster_"_fld), 14, ClockQualitySpec>,
+    named_field<decltype("grandmaster_priority2"_fld), 18, std::uint8_t, wire_endian::big>,
+    named_bytes_field<decltype("grandmaster_identity"_fld), 19, 8>,
+    named_field<decltype("steps_removed"_fld), 27, std::uint16_t, wire_endian::big>,
+    named_field<decltype("time_source"_fld), 29, std::uint8_t, wire_endian::big>>;
+
+// Signaling: the targetPortIdentity (10 bytes); any trailing TLVs are not decoded.
+using PtpSignalingBodySpec = StructSpec<embed<decltype("target_"_fld), 0, PortIdentitySpec>>;
 
 }  // namespace nanotins
