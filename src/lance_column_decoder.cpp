@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #include "nanolance/lance_column_decoder.hpp"
 
 #include "nanolance/blob_v2_external.hpp"

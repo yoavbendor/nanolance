@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // nlbench: time nanolance's native full-scan read of a dataset it wrote.
 // Usage: nlbench <dataset.lance> [iters]   -> prints rows and avg read milliseconds (JSON).
 #include "nanolance/lance_table_reader.hpp"

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // M6: the DAG-driven PDU tables must be BYTE-IDENTICAL to the current protocols::PduColumn tables — same
 // columns (name + Arrow type + order) and the same data buffers — so swapping the driver's decode path to
 // the DAG produces the same Lance files. We build both Arrow record batches for the same packets (the old

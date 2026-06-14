@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #pragma once
 
 // The all-scalar L1 packet row that flows through the nanotins reflection core (one Lance row per packet).

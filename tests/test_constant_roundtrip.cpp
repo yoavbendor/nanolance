@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // Round-trip test for ConstantLayout: a constant fixed-width column under --compress is stored as a
 // single inline value (zero data buffers) and read back identically.
 #include "nanolance/lance_table_reader.hpp"

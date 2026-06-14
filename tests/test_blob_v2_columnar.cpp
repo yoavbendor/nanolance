@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // Phase 2: the columnar blob.v2 encapsulation. The producer supplies two fixed-width reference columns
 // (position, size) + the shared window URI to nanolance's build_blob_v2_external_array — never touching the
 // lance.blob.v2 struct shape, child order, names, or the `data`/`kind` conventions. The BlobV2ColumnView

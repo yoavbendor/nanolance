@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #pragma once
 
 // The DAG twin of protocols::decode_window — decode one window of packets into the per-node DAG tables and

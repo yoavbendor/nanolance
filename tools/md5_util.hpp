@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #pragma once
 
 // Compact, self-contained MD5 (RFC 1321) — so the blob-fetch benchmark tool needs no extra link deps and

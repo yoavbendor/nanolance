@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // Round-trip test for dictionary + RLE encoding of a low-cardinality run-length string column
 // (the per-minute URI case). Verifies nanolance reads its own dict+RLE output back exactly and the
 // data file is tiny. Lance interop is exercised separately via arrowipc2lance --compress.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // Gather/stitch test: merging N free-standing single-fragment datasets into one master (Option A: relocate
 // fragments into one data/ + one manifest, no data re-encode) must produce a dataset byte-identical — read
 // back through the full Lance reader — to a single dataset written with the same rows in the same order via

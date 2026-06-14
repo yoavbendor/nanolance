@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // Round-trip test for opt-in FastLanes bitpacking of fixed-width integer columns.
 // Writes a >1024-row int64 column (multi-page) with compression enabled, verifies nanolance reads it
 // back exactly, and that the bitpacked data file is smaller. (Lance interop is checked via the

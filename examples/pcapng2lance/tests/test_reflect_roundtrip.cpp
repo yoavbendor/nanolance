@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // M0 gate: a described struct -> soa -> to_arrow -> nano_lance write -> read back, bit-exact.
 // Exercises the genuinely novel parts: the all-scalar path (what the packet row uses), be<>/le<>
 // wire scalars, and bits<> multi-column expansion over a big-endian word. The fixed-size-binary

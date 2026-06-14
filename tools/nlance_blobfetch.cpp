@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // nlance_blobfetch — the nanolance side of the blob-fetch benchmark. Reads a lance.blob.v2 dataset, and
 // for each row (or a chosen subset) calls nano_lance_fetch_external_blob(uri, position, size) — the
 // nimble AWS-C++-SDK path on S3, plain file IO on file:// — then MD5s the bytes and prints one line per

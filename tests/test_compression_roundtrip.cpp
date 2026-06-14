@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // Round-trip test for opt-in zstd compression of variable-width (utf8) columns.
 // Writes a repetitive string column with compression enabled and verifies nanolance reads it back
 // exactly, and that the compressed data file is smaller than the uncompressed one.
