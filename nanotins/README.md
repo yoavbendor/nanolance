@@ -10,6 +10,10 @@ and get, for free:
 - a flattened **column list** (bitfields expanded to named scalar columns),
 - an **SoA** store (`soa<T>`) + a **nanoarrow** schema/array (`arrow_schema<T>()` / `to_arrow<T>()`).
 
+> **📐 New here? Read the [Architecture &amp; Extension Guide](docs/architecture.html)** — an illustrated
+> walkthrough of `wire_spec`, the SoA, and the DAG, plus a step-by-step, checkpointed recipe for adding a new
+> parser (with where new dependencies belong). Open it in a browser.
+
 The **wire_spec** subsystem (files: `wire_spec.hpp`, `wire_spec_soa.hpp`) replaces hand-written
 protocol overlays and gives the **spec_dag** (`spec_dag.hpp`, `dag_decode.hpp`) — a declarative DAG/FSM
 dispatcher — a single source of truth. One walk of the DAG decodes on both host (CPU bulk path via

@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanotins — architecture &amp; how to add a parser</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#161922; --ink:#e6e9ef; --muted:#9aa3b2; --line:#262b38;
+    --accent:#6cb6ff; --accent2:#7ee787; --warn:#ffd479; --code:#0b0d13; --pill:#1f2430;
+    --pink:#ff9bd0; --purple:#c5a3ff;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{display:grid;grid-template-columns:250px minmax(0,1fr);gap:0;max-width:1200px;margin:0 auto}
+  nav{position:sticky;top:0;align-self:start;height:100vh;overflow:auto;padding:28px 18px;
+      border-right:1px solid var(--line)}
+  nav h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:18px 0 8px}
+  nav a{display:block;color:var(--ink);text-decoration:none;padding:4px 8px;border-radius:7px;font-size:14px}
+  nav a:hover{background:var(--pill);color:var(--accent)}
+  main{padding:40px 44px 120px;min-width:0}
+  h1{font-size:34px;margin:.1em 0 .1em;letter-spacing:-.01em}
+  h2{font-size:25px;margin:2.2em 0 .5em;padding-top:.5em;border-top:1px solid var(--line)}
+  h3{font-size:18px;margin:1.6em 0 .4em;color:var(--accent)}
+  h4{color:var(--accent2)}
+  p,li{color:#d7dbe4}
+  .lede{font-size:19px;color:var(--muted);max-width:64ch}
+  code{font-family:"SF Mono",ui-monospace,"Cascadia Code",Consolas,monospace;font-size:.92em;
+       background:var(--pill);padding:1px 6px;border-radius:5px;color:#cfe3ff}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:11px;padding:16px 18px;overflow:auto;
+      font-family:"SF Mono",ui-monospace,"Cascadia Code",Consolas,monospace;font-size:13.5px;line-height:1.55}
+  pre code{background:none;padding:0;color:#d7dbe4}
+  .k{color:#ff7b72}.t{color:#7ee787}.s{color:#a5d6ff}.c{color:#7d8694;font-style:italic}.n{color:#ffd479}.f{color:#d2a8ff}
+  .pill{display:inline-block;background:var(--pill);border:1px solid var(--line);border-radius:999px;
+        padding:2px 11px;font-size:12.5px;color:var(--muted);margin:0 4px 4px 0}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:14px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card h4{margin:.1em 0 .3em;font-size:15px}
+  .card p{margin:.2em 0 0;font-size:14px;color:var(--muted)}
+  .note{border-left:3px solid var(--accent);background:#10151f;border-radius:0 10px 10px 0;padding:12px 16px;margin:16px 0}
+  .note.warn{border-color:var(--warn);background:#1a160d}
+  .note.good{border-color:var(--accent2);background:#0e1612}
+  .note.key{border-color:var(--purple);background:#14101f}
+  a.link{color:var(--accent)}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--panel);color:var(--accent)}
+  .small{font-size:13px;color:var(--muted)}
+  svg{max-width:100%;height:auto;margin:10px 0}
+  .fig{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:18px 0}
+  .fig .cap{font-size:13px;color:var(--muted);margin-top:6px}
+  .step{display:flex;gap:14px;margin:18px 0;align-items:flex-start}
+  .step .num{flex:none;width:34px;height:34px;border-radius:50%;background:var(--accent);color:#06121f;
+       font-weight:700;display:flex;align-items:center;justify-content:center;font-size:16px}
+  .step .body{flex:1;min-width:0}
+  .step h3{margin:.15em 0 .3em}
+  .chk{border-left:3px solid var(--accent2);background:#0e1612;border-radius:0 10px 10px 0;
+       padding:8px 14px;margin:10px 0;font-size:14px}
+  .chk b{color:var(--accent2)}
+  footer{color:var(--muted);font-size:13px;border-top:1px solid var(--line);padding-top:18px;margin-top:40px}
+  .tag{font-size:11px;padding:1px 7px;border-radius:6px;border:1px solid var(--line);color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <strong style="font-size:18px">nano<span style="color:var(--accent2)">tins</span></strong>
+  <div class="small" style="margin:2px 0 10px">architecture &amp; extension guide</div>
+  <h2>Big picture</h2>
+  <a href="#what">What nanotins is</a>
+  <a href="#stack">The three libraries</a>
+  <a href="#onespec">One spec, four faces</a>
+  <h2>The pieces</h2>
+  <a href="#wirespec">1 · wire_spec</a>
+  <a href="#soa">2 · the SoA</a>
+  <a href="#dag">3 · the DAG / FSM</a>
+  <a href="#bulk">4 · bulk &amp; GPU</a>
+  <a href="#pipeline">End-to-end pipeline</a>
+  <h2>Extend it</h2>
+  <a href="#recipe">Add a parser (recipe)</a>
+  <a href="#worked">Worked example</a>
+  <a href="#deps">New dependencies</a>
+  <a href="#layers">The three layers</a>
+  <h2>Reference</h2>
+  <a href="#checkpoints">Checkpoint cheat-sheet</a>
+  <a href="#rules">Rules &amp; gotchas</a>
+  <a href="#files">File map</a>
+</nav>
+<main>
+
+<h1>nanotins architecture</h1>
+<p class="lede">A reusable C++20 library for turning raw <b>pcap/pcapng</b> captures into columnar
+<b>Arrow</b> tables — on the CPU or the GPU, from one declaration per protocol. This guide explains the three
+ideas that make that work (<b>wire_spec</b>, the <b>SoA</b>, the <b>DAG</b>) and gives you a step-by-step,
+checkpointed recipe for adding a new parser.</p>
+
+<div class="note key"><b>The one idea to take away.</b> You describe a protocol header <i>once</i>, as an
+explicit-offset <code>WireSpec</code>. That single declaration then drives <i>everything</i> downstream —
+the host read, the GPU read, the columnar store, and the Arrow schema — and a small declarative
+<b>graph</b> says how one header leads to the next. Adding a protocol is writing one spec and one graph
+edge; the host path, the GPU path, the columns, and the tables all come for free.</p>
+
+<!-- ============================================================ WHAT -->
+<h2 id="what">What nanotins is (and isn't)</h2>
+<p>nanotins answers a narrow question well: <i>given bytes on the wire, produce columnar tables, fast and
+identically on CPU and GPU.</i> It does the <b>framing &amp; field extraction</b> — scan the capture into
+packets, walk each packet's protocol layers, and lay each layer's fields out as columns. It knows nothing
+about Lance, files, or storage; it emits <a class="link" href="https://arrow.apache.org/">nanoarrow</a>
+tables that any backend (Lance, Parquet, Arrow IPC) can persist.</p>
+<div class="grid">
+  <div class="card"><h4>Does</h4><p>pcap/pcapng block scanning · L2/L3/L4 + gPTP decode · explicit wire
+   layouts · SoA columns · Arrow schemas · a scheduler-agnostic bulk path that runs on a CPU pool or an
+   NVIDIA GPU unchanged.</p></div>
+  <div class="card"><h4>Doesn't</h4><p>No Lance/file I/O (that's <code>nanolance</code>). No stateful frame
+   reassembly or numeric reconstruction in the core — those are <a class="link" href="#layers">higher
+   layers</a>. No heuristics: dispatch is exact-key only, so CPU == GPU == bulk by construction.</p></div>
+  <div class="card"><h4>Why it's unusual</h4><p>The same <code>NANOTINS_HD</code> (host+device) reader and
+   walk run inside a GPU kernel <i>and</i> on the host — there is one source of truth for the parse, not a
+   CPU copy and a hand-ported CUDA copy.</p></div>
+</div>
+
+<!-- ============================================================ STACK -->
+<h2 id="stack">The three libraries</h2>
+<p>nanotins is the middle of a three-layer stack. Each layer depends only on the one to its left, so each
+can be vendored on its own.</p>
+<div class="fig">
+<svg viewBox="0 0 860 230" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#6cb6ff"/>
+    </marker>
+  </defs>
+  <!-- soatins -->
+  <rect x="20" y="60" width="220" height="110" rx="12" fill="#0e1612" stroke="#7ee787"/>
+  <text x="130" y="86" fill="#7ee787" font-size="17" font-weight="700" text-anchor="middle">soatins</text>
+  <text x="130" y="110" fill="#9aa3b2" font-size="12.5" text-anchor="middle">reflection nucleus</text>
+  <text x="130" y="130" fill="#d7dbe4" font-size="11.5" text-anchor="middle">be/le · bits · SoA · arrow</text>
+  <text x="130" y="148" fill="#9aa3b2" font-size="11" text-anchor="middle">depends on: nanoarrow, boost</text>
+  <!-- nanotins -->
+  <rect x="320" y="40" width="220" height="150" rx="12" fill="#10151f" stroke="#6cb6ff" stroke-width="2"/>
+  <text x="430" y="66" fill="#6cb6ff" font-size="17" font-weight="700" text-anchor="middle">nanotins</text>
+  <text x="430" y="90" fill="#9aa3b2" font-size="12.5" text-anchor="middle">framing &amp; field extraction</text>
+  <text x="430" y="111" fill="#d7dbe4" font-size="11.5" text-anchor="middle">pcap scanner · wire_spec</text>
+  <text x="430" y="128" fill="#d7dbe4" font-size="11.5" text-anchor="middle">spec_dag · bulk_for_each</text>
+  <text x="430" y="150" fill="#9aa3b2" font-size="11" text-anchor="middle">+ soatins, header-only stdexec</text>
+  <text x="430" y="173" fill="#7d8694" font-size="10.5" text-anchor="middle">header-only · device-safe</text>
+  <!-- gputins -->
+  <rect x="620" y="60" width="220" height="110" rx="12" fill="#14101f" stroke="#c5a3ff"/>
+  <text x="730" y="86" fill="#c5a3ff" font-size="17" font-weight="700" text-anchor="middle">gputins</text>
+  <text x="730" y="110" fill="#9aa3b2" font-size="12.5" text-anchor="middle">CUDA / nvexec executors</text>
+  <text x="730" y="130" fill="#d7dbe4" font-size="11.5" text-anchor="middle">device_buffer · GPU decode</text>
+  <text x="730" y="148" fill="#9aa3b2" font-size="11" text-anchor="middle">behind NANOTINS_ENABLE_CUDA</text>
+  <line x1="245" y1="115" x2="315" y2="115" stroke="#6cb6ff" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="545" y1="115" x2="615" y2="115" stroke="#6cb6ff" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="430" y="218" fill="#7d8694" font-size="12" text-anchor="middle">consumers: nanolance (Lance writer/reader) · examples/pcapng2lance (the converter)</text>
+</svg>
+<div class="cap">Left→right dependency. <code>soatins</code> is the describe-a-struct reflection core;
+<code>nanotins</code> adds packets + the wire_spec/DAG; <code>gputins</code> isolates the CUDA dependency.</div>
+</div>
+
+<!-- ============================================================ ONE SPEC -->
+<h2 id="onespec">One spec, four faces</h2>
+<p>This is the heart of the design. A <code>WireSpec</code> is a compile-time description of bytes on the
+wire. From that one declaration, four different consumers each derive what they need — and because they all
+read the <i>same</i> spec, they can never drift apart.</p>
+<div class="fig">
+<svg viewBox="0 0 820 300" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,sans-serif">
+  <defs>
+    <marker id="a2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#9aa3b2"/></marker>
+  </defs>
+  <rect x="300" y="120" width="220" height="64" rx="12" fill="#10151f" stroke="#6cb6ff" stroke-width="2"/>
+  <text x="410" y="148" fill="#6cb6ff" font-size="16" font-weight="700" text-anchor="middle">WireSpec&lt;…&gt;</text>
+  <text x="410" y="168" fill="#9aa3b2" font-size="12" text-anchor="middle">named_field / bit_field / bytes</text>
+  <!-- four faces -->
+  <g font-size="12.5">
+    <rect x="40" y="20" width="200" height="58" rx="10" fill="#0e1612" stroke="#7ee787"/>
+    <text x="140" y="44" fill="#7ee787" font-size="13.5" font-weight="700" text-anchor="middle">Host read</text>
+    <text x="140" y="63" fill="#9aa3b2" text-anchor="middle">struct_view(p)("x"_fld)</text>
+
+    <rect x="580" y="20" width="200" height="58" rx="10" fill="#14101f" stroke="#c5a3ff"/>
+    <text x="680" y="44" fill="#c5a3ff" font-size="13.5" font-weight="700" text-anchor="middle">Device read</text>
+    <text x="680" y="63" fill="#9aa3b2" text-anchor="middle">read_field&lt;F&gt;(p) · GPU</text>
+
+    <rect x="40" y="226" width="200" height="58" rx="10" fill="#161922" stroke="#ffd479"/>
+    <text x="140" y="250" fill="#ffd479" font-size="13.5" font-weight="700" text-anchor="middle">SoA columns</text>
+    <text x="140" y="269" fill="#9aa3b2" text-anchor="middle">spec_soa&lt;Spec,N&gt; · scatter</text>
+
+    <rect x="580" y="226" width="200" height="58" rx="10" fill="#161922" stroke="#ff9bd0"/>
+    <text x="680" y="250" fill="#ff9bd0" font-size="13.5" font-weight="700" text-anchor="middle">Arrow schema</text>
+    <text x="680" y="269" fill="#9aa3b2" text-anchor="middle">columns_of_spec · to_arrow</text>
+  </g>
+  <line x1="300" y1="140" x2="242" y2="64"  stroke="#9aa3b2" marker-end="url(#a2)"/>
+  <line x1="520" y1="140" x2="578" y2="64"  stroke="#9aa3b2" marker-end="url(#a2)"/>
+  <line x1="300" y1="164" x2="242" y2="240" stroke="#9aa3b2" marker-end="url(#a2)"/>
+  <line x1="520" y1="164" x2="578" y2="240" stroke="#9aa3b2" marker-end="url(#a2)"/>
+</svg>
+<div class="cap">The spec is the shared IR; each face is a fold over its fields. The host read and the
+device read are the <i>same</i> <code>read_field</code>; the SoA and the Arrow schema are derived from the
+same field list. Change a field once and all four follow.</div>
+</div>
+
+<!-- ============================================================ WIRE_SPEC -->
+<h2 id="wirespec">1 · wire_spec — the single source of truth</h2>
+<p>A <code>WireSpec</code> lists named fields with <b>explicit byte offsets</b>. Unlike a packed C struct,
+offsets are spelled out, so unaligned multi-byte fields and byte-crossing bitfields are first-class. Files:
+<code>nanotins/wire_spec.hpp</code> (vocab + reader), <code>wire_spec_soa.hpp</code> (the SoA),
+<code>protocol_specs.hpp</code> / <code>protocol_specs_ptp.hpp</code> (the L2/L3/L4 + PTP specs).</p>
+
+<h3>The three field kinds</h3>
+<table>
+  <tr><th>Field</th><th>For</th><th>Column type</th></tr>
+  <tr><td><code>named_field&lt;tag, offset, T, endian&gt;</code></td><td>a scalar at a byte offset (e.g. a
+    big-endian <code>uint16</code>)</td><td><code>T</code></td></tr>
+  <tr><td><code>named_bit_field&lt;tag, offset, StorageT, bit_offset, width, endian&gt;</code></td>
+    <td>bits inside a word (e.g. IPv4 <code>version:4</code>); MSB-first, may cross bytes</td>
+    <td>smallest uint holding <code>width</code></td></tr>
+  <tr><td><code>named_bytes_field&lt;tag, offset, N&gt;</code></td><td>a fixed blob (MAC, IPv4/IPv6 address)
+    </td><td>fixed-size-binary <code>array&lt;u8,N&gt;</code></td></tr>
+</table>
+
+<h3>Example: the UDP header, in full</h3>
+<pre><code><span class="k">using</span> <span class="t">UdpSpec</span> = <span class="t">WireSpec</span>&lt;
+    <span class="t">named_field</span>&lt;<span class="k">decltype</span>(<span class="s">"src_port"</span>_fld), <span class="n">0</span>, std::<span class="t">uint16_t</span>, wire_endian::big&gt;,
+    <span class="t">named_field</span>&lt;<span class="k">decltype</span>(<span class="s">"dst_port"</span>_fld), <span class="n">2</span>, std::<span class="t">uint16_t</span>, wire_endian::big&gt;,
+    <span class="t">named_field</span>&lt;<span class="k">decltype</span>(<span class="s">"length"</span>_fld),   <span class="n">4</span>, std::<span class="t">uint16_t</span>, wire_endian::big&gt;,
+    <span class="t">named_field</span>&lt;<span class="k">decltype</span>(<span class="s">"checksum"</span>_fld), <span class="n">6</span>, std::<span class="t">uint16_t</span>, wire_endian::big&gt;&gt;;
+
+<span class="c">// read it, anywhere (host or device):</span>
+<span class="t">struct_view</span>&lt;<span class="t">UdpSpec</span>&gt; v(p);          <span class="c">// p = const uint8_t* at the UDP header</span>
+<span class="t">uint16_t</span> sport = v(<span class="s">"src_port"</span>_fld);   <span class="c">// byte-indexed, endian-correct, alignment-safe</span></code></pre>
+
+<div class="fig">
+<svg viewBox="0 0 820 150" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,Consolas,monospace">
+  <!-- byte ruler for ipv4 first 2 bytes -->
+  <text x="10" y="20" fill="#9aa3b2" font-size="12">IPv4 byte 0 — a bitfield that crosses no byte but splits one:</text>
+  <g>
+    <rect x="60" y="40" width="320" height="44" fill="#10151f" stroke="#262b38"/>
+    <line x1="220" y1="40" x2="220" y2="84" stroke="#262b38"/>
+    <text x="140" y="67" fill="#7ee787" font-size="14" text-anchor="middle">version : 4</text>
+    <text x="300" y="67" fill="#ffd479" font-size="14" text-anchor="middle">ihl : 4</text>
+    <text x="140" y="100" fill="#9aa3b2" font-size="11" text-anchor="middle">bits 0–3 (high)</text>
+    <text x="300" y="100" fill="#9aa3b2" font-size="11" text-anchor="middle">bits 4–7 (low)</text>
+    <text x="60" y="34" fill="#7d8694" font-size="10">0x45</text>
+  </g>
+  <text x="430" y="58" fill="#d7dbe4" font-size="12.5">named_bit_field&lt;"version", 0, u8, <tspan fill="#ffd479">bit 0</tspan>, <tspan fill="#7ee787">width 4</tspan>&gt;</text>
+  <text x="430" y="78" fill="#d7dbe4" font-size="12.5">named_bit_field&lt;"ihl",&nbsp;&nbsp;&nbsp;&nbsp;0, u8, <tspan fill="#ffd479">bit 4</tspan>, <tspan fill="#7ee787">width 4</tspan>&gt;</text>
+  <text x="430" y="104" fill="#9aa3b2" font-size="11">MSB-first: 0x45 → version=4, ihl=5</text>
+</svg>
+<div class="cap">Bitfields are declared by (storage word, bit offset, width). MSB-first matches RFC numbering;
+a field may even span two bytes of a big-endian word (IPv6 <code>flow_label:20</code>).</div>
+</div>
+
+<h3>The reader is device-safe by construction</h3>
+<p><code>read_field&lt;F&gt;(p)</code> is a tiny byte-indexed loop — no <code>std::ranges</code>, no misaligned
+word loads, no STL — marked <code>NANOTINS_HD</code> (<code>__host__ __device__</code>). So the
+<i>identical</i> read runs on the host and inside a CUDA kernel. <code>struct_view</code> is just the
+ergonomic named-access wrapper over it.</p>
+
+<h3>Composing specs with <code>embed&lt;&gt;</code></h3>
+<p>Protocols reuse sub-records (a PTP message is a 34-byte header + a per-type body; both reuse a
+<code>Timestamp</code> and a <code>PortIdentity</code>). <code>embed&lt;Prefix, Offset, SubSpec&gt;</code>
+splices a sub-spec's fields at an offset, prefixing their names — so a doubled record stays unambiguous
+(<code>clock_identity</code> vs <code>requesting_clock_identity</code>). It is purely compile-time: the spec
+still flattens to one flat field list, so the readers/SoA/GPU paths are unchanged.</p>
+<pre><code><span class="c">// the 10-byte PTP timestamp, reused everywhere:</span>
+<span class="k">using</span> <span class="t">TimestampSpec</span> = <span class="t">WireSpec</span>&lt;<span class="t">named_field</span>&lt;<span class="k">decltype</span>(<span class="s">"seconds_msb"</span>_fld), <span class="n">0</span>, u16, big&gt;, …&gt;;
+
+<span class="c">// a Sync body = one Timestamp at body offset 0, columns prefixed "origin_":</span>
+<span class="k">using</span> <span class="t">PtpTimestampBodySpec</span> = <span class="t">WireSpec</span>&lt;<span class="t">embed</span>&lt;<span class="k">decltype</span>(<span class="s">"ts_"</span>_fld), <span class="n">0</span>, <span class="t">TimestampSpec</span>&gt;&gt;;</code></pre>
+
+<!-- ============================================================ SOA -->
+<h2 id="soa">2 · the SoA — wire bytes become columns</h2>
+<p>Packets arrive as an array of structs <i>on the wire</i> (each packet's header is contiguous bytes). A
+columnar table is the transpose: one contiguous array per field. <code>wire_spec_soa.hpp</code> derives that
+transpose from the spec — <code>columns_of_spec&lt;Spec&gt;</code> is the column list, and
+<code>scatter</code> writes one packet's fields across the columns.</p>
+<div class="fig">
+<svg viewBox="0 0 820 250" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,sans-serif">
+  <defs><marker id="a3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#9aa3b2"/></marker></defs>
+  <text x="10" y="20" fill="#9aa3b2" font-size="12.5">on the wire (AoS): one packet's fields are contiguous</text>
+  <g font-family="ui-monospace,Consolas,monospace" font-size="11">
+    <rect x="10" y="32" width="60" height="22" fill="#10151f" stroke="#262b38"/><text x="40" y="47" fill="#7ee787" text-anchor="middle">sport</text>
+    <rect x="70" y="32" width="60" height="22" fill="#10151f" stroke="#262b38"/><text x="100" y="47" fill="#ffd479" text-anchor="middle">dport</text>
+    <rect x="130" y="32" width="50" height="22" fill="#10151f" stroke="#262b38"/><text x="155" y="47" fill="#a5d6ff" text-anchor="middle">len</text>
+    <rect x="180" y="32" width="50" height="22" fill="#10151f" stroke="#262b38"/><text x="205" y="47" fill="#ff9bd0" text-anchor="middle">csum</text>
+    <text x="245" y="47" fill="#7d8694">packet 0</text>
+    <rect x="10" y="58" width="60" height="22" fill="#0c0f16" stroke="#262b38"/><text x="40" y="73" fill="#7ee787" text-anchor="middle">sport</text>
+    <rect x="70" y="58" width="60" height="22" fill="#0c0f16" stroke="#262b38"/><text x="100" y="73" fill="#ffd479" text-anchor="middle">dport</text>
+    <rect x="130" y="58" width="50" height="22" fill="#0c0f16" stroke="#262b38"/><text x="155" y="73" fill="#a5d6ff" text-anchor="middle">len</text>
+    <rect x="180" y="58" width="50" height="22" fill="#0c0f16" stroke="#262b38"/><text x="205" y="73" fill="#ff9bd0" text-anchor="middle">csum</text>
+    <text x="245" y="73" fill="#7d8694">packet 1</text>
+  </g>
+  <line x1="120" y1="95" x2="120" y2="125" stroke="#9aa3b2" marker-end="url(#a3)"/>
+  <text x="135" y="115" fill="#9aa3b2" font-size="12">scatter (one fold over the fields)</text>
+  <text x="10" y="150" fill="#9aa3b2" font-size="12.5">SoA: one contiguous column per field — already the Arrow data buffer</text>
+  <g font-family="ui-monospace,Consolas,monospace" font-size="11">
+    <rect x="10" y="162" width="120" height="24" fill="#0e1612" stroke="#7ee787"/><text x="70" y="178" fill="#7ee787" text-anchor="middle">src_port[ ]</text>
+    <rect x="150" y="162" width="120" height="24" fill="#1a160d" stroke="#ffd479"/><text x="210" y="178" fill="#ffd479" text-anchor="middle">dst_port[ ]</text>
+    <rect x="290" y="162" width="120" height="24" fill="#0b1420" stroke="#a5d6ff"/><text x="350" y="178" fill="#a5d6ff" text-anchor="middle">length[ ]</text>
+    <rect x="430" y="162" width="120" height="24" fill="#1a1018" stroke="#ff9bd0"/><text x="490" y="178" fill="#ff9bd0" text-anchor="middle">checksum[ ]</text>
+  </g>
+  <line x1="280" y1="200" x2="280" y2="222" stroke="#9aa3b2" marker-end="url(#a3)"/>
+  <text x="295" y="216" fill="#9aa3b2" font-size="12">to_arrow → one bulk append per column (no per-row work)</text>
+</svg>
+<div class="cap">Because each column is already a contiguous, host-order buffer, turning it into Arrow is one
+<code>ArrowBufferAppend</code> per column — and a Lance table is one step further out.</div>
+</div>
+<div class="note good"><b>Why it matters for adding a parser:</b> you never write column or Arrow code. Declare
+the spec; the SoA, the schema, and the per-column names/types are all generated from it. A bit-field becomes
+its own named column automatically.</div>
+
+<!-- ============================================================ DAG -->
+<h2 id="dag">3 · the DAG / FSM — how one header leads to the next</h2>
+<p>A single packet is many layers: Ethernet → maybe VLAN(s) → IPv4/IPv6 → TCP/UDP, or Ethernet → gPTP →
+a per-message body. Historically that's a nest of hand-written <code>switch</code>es. nanotins expresses it
+as a declarative <b>graph</b> (<code>spec_dag.hpp</code>): a set of <b>nodes</b>, each binding a
+<code>WireSpec</code> to two pure functions, connected by exact-key <b>edges</b>.</p>
+
+<h3>Anatomy of a node</h3>
+<pre><code><span class="k">struct</span> <span class="t">EthNode</span> {
+    <span class="k">using</span> spec = <span class="t">EthernetSpec</span>;                                  <span class="c">// what to parse here</span>
+    <span class="k">static</span> NANOTINS_HD std::<span class="t">size_t</span> <span class="f">advance</span>(<span class="k">const</span> <span class="t">uint8_t</span>*) { <span class="k">return</span> <span class="n">14</span>; }   <span class="c">// header length consumed</span>
+    <span class="k">template</span>&lt;<span class="k">class</span> G&gt; <span class="k">static</span> NANOTINS_HD <span class="t">int</span> <span class="f">next</span>(<span class="k">const</span> <span class="t">uint8_t</span>* p) {     <span class="c">// where to go next</span>
+        <span class="k">return</span> <span class="f">ethertype_dispatch</span>&lt;G&gt;(<span class="t">struct_view</span>&lt;<span class="t">EthernetSpec</span>&gt;(p)(<span class="s">"ethertype"</span>_fld));
+    }
+};</code></pre>
+<ul>
+  <li><b><code>spec</code></b> — the <code>WireSpec</code> parsed at the current byte offset.</li>
+  <li><b><code>advance(p)</code></b> — how many bytes this header consumes (fixed, or computed like IPv4
+    <code>ihl*4</code>).</li>
+  <li><b><code>next&lt;G&gt;(p)</code></b> — read a discriminator field, look it up in a compile-time
+    <b>edge table</b>, return the target node's id (or <code>-1</code> = stop).</li>
+</ul>
+<pre><code><span class="c">// the edge table is the additive registration point — keys are exact, never heuristic:</span>
+<span class="k">template</span>&lt;<span class="k">class</span> G&gt; NANOTINS_HD <span class="t">int</span> <span class="f">ethertype_dispatch</span>(<span class="t">uint16_t</span> et) {
+    <span class="k">return</span> <span class="f">match_edges</span>&lt;G, <span class="t">edge</span>&lt;<span class="n">0x8100</span>, <span class="t">VlanNode</span>&gt;, <span class="t">edge</span>&lt;<span class="n">0x0800</span>, <span class="t">Ipv4Node</span>&gt;,
+                                <span class="t">edge</span>&lt;<span class="n">0x86DD</span>, <span class="t">Ipv6Node</span>&gt;, <span class="t">edge</span>&lt;<span class="n">0x88F7</span>, <span class="t">GptpNode</span>&gt;&gt;(et);
+}
+<span class="c">// the graph is just the ordered set of nodes; a node's id is its index:</span>
+<span class="k">using</span> <span class="t">L2L3Graph</span> = <span class="t">graph</span>&lt;<span class="t">EthNode</span>, <span class="t">VlanNode</span>, <span class="t">Ipv4Node</span>, <span class="t">Ipv6Node</span>, <span class="t">TcpNode</span>, <span class="t">UdpNode</span>, <span class="t">GptpNode</span>, …&gt;;</code></pre>
+
+<div class="fig">
+<svg viewBox="0 0 840 360" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,sans-serif" font-size="12.5">
+  <defs><marker id="e" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#6cb6ff"/></marker></defs>
+  <style> .nd{fill:#10151f;stroke:#6cb6ff} .lf{fill:#0e1612;stroke:#7ee787} .pt{fill:#14101f;stroke:#c5a3ff} .lbl{fill:#9aa3b2;font-size:11px} .nm{fill:#e6e9ef;font-weight:600} </style>
+  <!-- Eth -->
+  <rect class="nd" x="20" y="150" width="86" height="40" rx="9"/><text class="nm" x="63" y="175" text-anchor="middle">Eth</text>
+  <!-- Vlan (self loop) -->
+  <rect class="nd" x="170" y="60" width="90" height="40" rx="9"/><text class="nm" x="215" y="85" text-anchor="middle">Vlan</text>
+  <path d="M215,60 C215,30 255,30 255,60" fill="none" stroke="#6cb6ff" marker-end="url(#e)"/>
+  <text class="lbl" x="265" y="40">QinQ self-loop</text>
+  <!-- Ipv4 / Ipv6 -->
+  <rect class="nd" x="170" y="150" width="90" height="40" rx="9"/><text class="nm" x="215" y="175" text-anchor="middle">Ipv4</text>
+  <rect class="nd" x="170" y="210" width="90" height="40" rx="9"/><text class="nm" x="215" y="235" text-anchor="middle">Ipv6</text>
+  <!-- Gptp -->
+  <rect class="nd" x="170" y="285" width="90" height="40" rx="9"/><text class="nm" x="215" y="310" text-anchor="middle">Gptp</text>
+  <!-- L4 leaves -->
+  <rect class="lf" x="360" y="150" width="90" height="40" rx="9"/><text class="nm" x="405" y="175" text-anchor="middle" fill="#7ee787">Tcp</text>
+  <rect class="lf" x="360" y="210" width="90" height="40" rx="9"/><text class="nm" x="405" y="235" text-anchor="middle" fill="#7ee787">Udp</text>
+  <!-- PTP bodies -->
+  <rect class="pt" x="360" y="270" width="150" height="30" rx="8"/><text x="435" y="290" text-anchor="middle" fill="#c5a3ff" font-size="11">PtpTimestampBody</text>
+  <rect class="pt" x="360" y="305" width="150" height="30" rx="8"/><text x="435" y="325" text-anchor="middle" fill="#c5a3ff" font-size="11">PtpTsPort / Announce / …</text>
+  <!-- edges -->
+  <line x1="106" y1="168" x2="166" y2="86"  stroke="#6cb6ff" marker-end="url(#e)"/>
+  <line x1="106" y1="170" x2="166" y2="170" stroke="#6cb6ff" marker-end="url(#e)"/>
+  <line x1="106" y1="172" x2="166" y2="228" stroke="#6cb6ff" marker-end="url(#e)"/>
+  <line x1="106" y1="178" x2="166" y2="303" stroke="#6cb6ff" marker-end="url(#e)"/>
+  <text class="lbl" x="112" y="120">ethertype</text>
+  <line x1="260" y1="166" x2="356" y2="170" stroke="#6cb6ff" marker-end="url(#e)"/>
+  <line x1="260" y1="174" x2="356" y2="226" stroke="#6cb6ff" marker-end="url(#e)"/>
+  <line x1="260" y1="228" x2="356" y2="222" stroke="#6cb6ff" marker-end="url(#e)"/>
+  <text class="lbl" x="270" y="150">protocol</text>
+  <text class="lbl" x="270" y="200" fill="#7d8694">(IPv4: gated by frag_offset==0)</text>
+  <line x1="260" y1="305" x2="356" y2="288" stroke="#c5a3ff" marker-end="url(#e)"/>
+  <line x1="260" y1="312" x2="356" y2="318" stroke="#c5a3ff" marker-end="url(#e)"/>
+  <text class="lbl" x="270" y="335">message_type</text>
+</svg>
+<div class="cap">The L2/L3/L4 + gPTP graph. Green = leaf (the walk stops). Purple = the gPTP message-type
+sub-dispatch (a two-level dispatch: <code>ethertype</code> → <code>Gptp</code> → <code>message_type</code> →
+body). VLAN self-loops to handle stacked QinQ tags.</div>
+</div>
+
+<h3>The walk — one loop, two faces</h3>
+<p><code>walk&lt;Graph&gt;(root, p, size, visit)</code> is a bounded, allocation-free loop: parse the current
+node's spec, call <code>visit(node_id, offset)</code>, advance, follow the edge, repeat. It's
+<code>NANOTINS_HD</code>, so the same loop runs on the host and inside a GPU kernel — the visitor decides
+what "emit" means (count rows, or scatter columns). Because both the count pass and the scatter pass use the
+same walk, they can never disagree.</p>
+<div class="note key"><b>Reject heuristics — this is a hard rule.</b> Edges match an <i>exact</i> key (an
+ethertype, a protocol number, a message type). There is no "looks like…" guessing. That is what guarantees
+<b>CPU == GPU == bulk</b> bit-for-bit and what makes adding a protocol <i>additive</i> (a new edge can't
+change how existing packets parse). A duplicate key is a build-time error, not a silent ambiguity.</div>
+
+<!-- ============================================================ BULK -->
+<h2 id="bulk">4 · bulk &amp; GPU — count → scan → scatter</h2>
+<p>A packet emits a <i>variable</i> number of rows per table (0 or 1 Ethernet, 0–N VLANs, 0/1 UDP…). The
+data-parallel pattern for that is three passes, identical on CPU and GPU (<code>dag_bulk.hpp</code>):</p>
+<div class="fig">
+<svg viewBox="0 0 820 150" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,sans-serif" font-size="12.5">
+  <defs><marker id="a4" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#9aa3b2"/></marker></defs>
+  <rect x="20" y="45" width="220" height="60" rx="10" fill="#10151f" stroke="#6cb6ff"/>
+  <text x="130" y="70" fill="#6cb6ff" font-weight="700" text-anchor="middle">1 · count</text>
+  <text x="130" y="90" fill="#9aa3b2" font-size="11.5" text-anchor="middle">walk each packet → per-node counts</text>
+  <rect x="300" y="45" width="220" height="60" rx="10" fill="#161922" stroke="#ffd479"/>
+  <text x="410" y="70" fill="#ffd479" font-weight="700" text-anchor="middle">2 · prefix-sum</text>
+  <text x="410" y="90" fill="#9aa3b2" font-size="11.5" text-anchor="middle">exclusive scan → per-packet bases</text>
+  <rect x="580" y="45" width="220" height="60" rx="10" fill="#0e1612" stroke="#7ee787"/>
+  <text x="690" y="70" fill="#7ee787" font-weight="700" text-anchor="middle">3 · scatter</text>
+  <text x="690" y="90" fill="#9aa3b2" font-size="11.5" text-anchor="middle">walk again → write to base+offset</text>
+  <line x1="242" y1="75" x2="298" y2="75" stroke="#9aa3b2" marker-end="url(#a4)"/>
+  <line x1="522" y1="75" x2="578" y2="75" stroke="#9aa3b2" marker-end="url(#a4)"/>
+  <text x="410" y="130" fill="#7d8694" font-size="11.5" text-anchor="middle">every write index = this packet's prefix-summed base + its own emit order → no two packets collide</text>
+</svg>
+</div>
+<p>On the CPU the scan is a host loop and the passes run through <code>bulk_for_each</code> on an
+<code>exec::static_thread_pool</code>; on the GPU the scan becomes a <code>thrust::exclusive_scan</code> and
+the very same kernels run via an <code>nvexec</code> stream. The scatter sink is a plain POD of pointers
+(trivially copyable, so a GPU kernel can capture it), and the parse is the same <code>walk</code>. Result:
+the output tables are byte-identical whether produced serially, on a thread pool, or on the GPU.</p>
+
+<!-- ============================================================ PIPELINE -->
+<h2 id="pipeline">End-to-end pipeline (the pcapng2lance example)</h2>
+<pre><code>capture.pcapng
+   │  pcap_blocks: scan a bounded window → BlockRef[]            <span class="c">(streaming, RAM-bounded)</span>
+   ▼
+ EPB packets ──► L1 SoA columns + a lance.blob.v2 payload_ref    <span class="c">(payload stays external, never copied)</span>
+   │
+   ▼  --decode-l2l3
+ walk&lt;L2L3Graph&gt; per packet  ──►  per-node dag_tables&lt;Graph&gt;     <span class="c">(eth/vlan/ipv4/ipv6/tcp/udp/gptp/…)</span>
+   │                                   serial · CPU pool · GPU — identical output
+   ▼
+ to_arrow per node  ──►  one Lance table per PDU type</code></pre>
+<p>The <code>packet_id</code> column ties every PDU row back to its L1 packet (the join key). Each per-node
+table is written to its own Lance dataset, byte-identical regardless of executor.</p>
+
+<!-- ============================================================ RECIPE -->
+<h2 id="recipe">Adding a new parser — the recipe</h2>
+<p class="lede">The pattern is always the same: <b>spec → node → edge → (table) → verify</b>. Each step has a
+cheap checkpoint so you never debug five things at once. Below, each step names the file, the change, and the
+test that proves it before you move on.</p>
+
+<div class="step"><div class="num">1</div><div class="body">
+  <h3>Write the WireSpec</h3>
+  <p>In <code>nanotins/include/nanotins/protocol_specs*.hpp</code>, declare the header with explicit
+  offsets/endianness. Reuse sub-records with <code>embed&lt;&gt;</code>. Field <i>names</i> become column
+  names, so choose them deliberately.</p>
+  <div class="chk"><b>Checkpoint A — oracle read.</b> Add a unit test (model:
+  <code>nanotins/tests/test_wire_spec_*.cpp</code>) that builds deterministic bytes and asserts
+  <code>struct_view&lt;YourSpec&gt;(p)("field"_fld)</code> equals the value computed by hand (or by the
+  existing <code>protocols::</code> overlay / soatins <code>bits&lt;&gt;</code>). This proves offsets,
+  endianness, and bit math <i>before</i> any graph wiring.</p>
+</div></div>
+
+<div class="step"><div class="num">2</div><div class="body">
+  <h3>Add a DAG node</h3>
+  <p>In <code>spec_dag.hpp</code>: forward-declare the node, then define it with <code>using spec =</code>,
+  an <code>advance()</code> (fixed or computed), and a <code>next&lt;G&gt;()</code>. If it's a terminal
+  protocol, <code>next</code> returns <code>-1</code> (a leaf). Append the node type to the graph alias.</p>
+  <div class="chk"><b>Checkpoint B — routing.</b> Extend <code>nanotins/tests/test_spec_dag.cpp</code>: craft a
+  packet that should reach your node and assert the walk's visited sequence is
+  <code>[…, YourNode@offset]</code>. For an L2/L3/L4 protocol, the test also cross-checks the walk against
+  the hand-written <code>walk_packet</code> for parity.</p>
+</div></div>
+
+<div class="step"><div class="num">3</div><div class="body">
+  <h3>Wire the edge from the parent</h3>
+  <p>Add one <code>edge&lt;KEY, YourNode&gt;</code> row to the parent's dispatch (e.g. a new
+  <code>ip_proto</code> goes in <code>ip_proto_dispatch</code>; a new ethertype in
+  <code>ethertype_dispatch</code>; a new PTP message in <code>ptp_msgtype_dispatch</code>). The key must be
+  <b>exact and unique</b> — siblings are untouched, which is the whole point.</p>
+  <div class="chk"><b>Checkpoint B still passes</b>, and the existing L2/L3/L4 parity cases are unchanged —
+  proof your edge didn't perturb any other packet.</div>
+</div></div>
+
+<div class="step"><div class="num">4</div><div class="body">
+  <h3>Emit the table (driver)</h3>
+  <p>In the example driver (<code>pcapng2lance_main.cpp</code>, <code>write_pdu_tables</code>), add one
+  <code>write_one("_yourpdu.lance", std::get&lt;node_id_v&lt;YourNode, G&gt;&gt;(dag_pdus_))</code>. The
+  table schema + columns are already generated from the spec — no Arrow code.</p>
+  <div class="chk"><b>Checkpoint C — byte-identical &amp; correct.</b> Two independent checks:
+  <code>test_pdu_table_interop</code> (the DAG table equals the reference path's Arrow buffers), and a tshark
+  alignment test (model: <code>test_nlance2table_tshark_ptp.py</code>) that diffs every column against
+  Wireshark's dissection of a real capture. This is the "is the parse actually right?" gate.</p>
+</div></div>
+
+<div class="step"><div class="num">5</div><div class="body">
+  <h3>GPU — nothing to write, just verify</h3>
+  <p>The GPU path (<code>gputins/dag_decode_gpu.hpp</code>) is <b>generic over the graph</b> — it reuses the
+  same <code>count_packet_dag</code> / <code>scatter_packet_dag</code> kernels, so your new node needs <i>no
+  GPU code</i>.</p>
+  <div class="chk"><b>Checkpoint D — determinism.</b> Run <code>dag_gpu_equiv_bench --bench</code> on a CUDA
+  build: it asserts <b>serial == bulk == gpu</b> bit-for-bit and prints throughput. On a CPU-only box the
+  serial==bulk half still runs.</div>
+</div></div>
+
+<div class="note good"><b>That's the whole loop.</b> One spec, one node, one edge, one table line — and four
+checkpoints that each isolate exactly one kind of mistake (read math → routing → output equality → executor
+determinism). You never touch column code, Arrow code, or GPU code.</div>
+
+<!-- ============================================================ WORKED -->
+<h2 id="worked">Worked example: a new L4 protocol (SCTP)</h2>
+<pre><code><span class="c">// 1) protocol_specs.hpp — the 12-byte SCTP common header</span>
+<span class="k">using</span> <span class="t">SctpSpec</span> = <span class="t">WireSpec</span>&lt;
+    <span class="t">named_field</span>&lt;<span class="k">decltype</span>(<span class="s">"src_port"</span>_fld),     <span class="n">0</span>, u16, big&gt;,
+    <span class="t">named_field</span>&lt;<span class="k">decltype</span>(<span class="s">"dst_port"</span>_fld),     <span class="n">2</span>, u16, big&gt;,
+    <span class="t">named_field</span>&lt;<span class="k">decltype</span>(<span class="s">"verification_tag"</span>_fld), <span class="n">4</span>, u32, big&gt;,
+    <span class="t">named_field</span>&lt;<span class="k">decltype</span>(<span class="s">"checksum"</span>_fld),     <span class="n">8</span>, u32, big&gt;&gt;;
+
+<span class="c">// 2) spec_dag.hpp — a leaf node</span>
+<span class="k">struct</span> <span class="t">SctpNode</span> {
+    <span class="k">using</span> spec = <span class="t">SctpSpec</span>;
+    <span class="k">static</span> NANOTINS_HD std::<span class="t">size_t</span> <span class="f">advance</span>(<span class="k">const</span> <span class="t">uint8_t</span>*) { <span class="k">return</span> <span class="n">12</span>; }
+    <span class="k">template</span>&lt;<span class="k">class</span> G&gt; <span class="k">static</span> NANOTINS_HD <span class="t">int</span> <span class="f">next</span>(<span class="k">const</span> <span class="t">uint8_t</span>*) { <span class="k">return</span> -<span class="n">1</span>; }
+};
+<span class="k">using</span> <span class="t">L2L3Graph</span> = <span class="t">graph</span>&lt;…, <span class="t">UdpNode</span>, <span class="t">SctpNode</span>&gt;;            <span class="c">// append it</span>
+
+<span class="c">// 3) the one edge: SCTP is IP protocol 132</span>
+<span class="k">return</span> <span class="f">match_edges</span>&lt;G, <span class="t">edge</span>&lt;<span class="n">6</span>, <span class="t">TcpNode</span>&gt;, <span class="t">edge</span>&lt;<span class="n">17</span>, <span class="t">UdpNode</span>&gt;, <span class="t">edge</span>&lt;<span class="n">132</span>, <span class="t">SctpNode</span>&gt;&gt;(proto);
+
+<span class="c">// 4) driver: write_one("_sctp.lance", std::get&lt;node_id_v&lt;SctpNode, G&gt;&gt;(dag_pdus_));</span></code></pre>
+<p>Total: ~12 lines across three files, plus tests. No column, Arrow, or GPU changes. The
+<code>sctp.lance</code> table — columns <code>packet_id, src_port, dst_port, verification_tag, checksum</code>
+— appears on CPU and GPU, byte-identical.</p>
+<p class="small">A protocol with sub-types (like gPTP's message bodies) is the same recipe one level deeper:
+the node's <code>next</code> dispatches on a discriminator field into a second set of body nodes — see
+<code>GptpNode</code> → <code>ptp_msgtype_dispatch</code> → <code>{PtpTimestampBody, PtpTsPortBody,
+PtpAnnounceBody, PtpSignalingBody}</code>.</p>
+
+<!-- ============================================================ DEPS -->
+<h2 id="deps">When your parser needs new dependencies</h2>
+<p>The core wire_spec/DAG path is deliberately <b>header-only and device-safe</b> — no STL containers in the
+hot path, no allocation, no third-party headers that aren't device-clean. Keep it that way. Where a new
+dependency lives depends on <i>what</i> it is:</p>
+<table>
+  <tr><th>Your parser needs…</th><th>Put it…</th><th>Because</th></tr>
+  <tr><td>just more wire fields / a new layer</td><td>in nanotins (spec + node), header-only</td>
+    <td>stays device-safe; runs on GPU for free</td></tr>
+  <tr><td>cross-packet state (reassembly, PTP offset correlation, sensor frame assembly)</td>
+    <td>a <b>higher layer</b> above nanotins (host-only), consuming the per-node tables by
+    <code>packet_id</code></td><td>stateful logic isn't data-parallel; it must not pollute the device walk</td></tr>
+  <tr><td>heavy numeric reconstruction (floating-point, calibration)</td><td>a separate compute stage on the
+    columnar output</td><td>FP determinism CPU↔GPU is its own battle; isolate it</td></tr>
+  <tr><td>a third-party lib (decompression, crypto…)</td><td>behind an interface in a consumer (e.g. the
+    driver), never in the <code>NANOTINS_HD</code> path</td><td>keeps nanotins vendorable + GPU-buildable</td></tr>
+</table>
+<p>Mechanically: a new header-only dep is a <code>target_link_libraries(nanotins_protocols INTERFACE …)</code>
+or a FetchContent block in <code>nanotins/CMakeLists.txt</code>; a CUDA-only dep goes in
+<code>gputins</code> behind <code>NANOTINS_ENABLE_CUDA</code>; a host-only dep belongs to the consumer.</p>
+
+<!-- ============================================================ LAYERS -->
+<h2 id="layers">The three layers (where things belong)</h2>
+<div class="grid">
+  <div class="card"><span class="tag">layer 1</span><h4>Framing &amp; dispatch</h4><p>wire_spec + spec_dag.
+   Stateless, device-safe, exact-key. <b>This is nanotins.</b> Adding a protocol normally lives entirely
+   here.</p></div>
+  <div class="card"><span class="tag">layer 2</span><h4>Stateful assembly</h4><p>Correlate/Reassemble across
+   packets (PTP sync↔follow-up, fragmentation, sensor frames). Host-only, consumes layer-1 tables. Lives
+   <i>above</i> nanotins.</p></div>
+  <div class="card"><span class="tag">layer 3</span><h4>Numeric reconstruction</h4><p>Turn raw fields into
+   physical values. Separate compute; this is where CPU/GPU floating-point determinism is fought, kept away
+   from the parse.</p></div>
+</div>
+<div class="note"><b>Rule of thumb:</b> if it can be a pure function of one PDU's bytes, it's a layer-1 spec
+field. If it needs to remember another packet, it's layer 2. If it produces a number a physicist cares
+about, it's layer 3.</div>
+
+<!-- ============================================================ CHECKPOINTS -->
+<h2 id="checkpoints">Checkpoint cheat-sheet</h2>
+<table>
+  <tr><th>#</th><th>Proves</th><th>How (model test)</th><th>Runs on</th></tr>
+  <tr><td>A</td><td>the spec reads the right bytes</td><td><code>test_wire_spec_*.cpp</code> — struct_view vs
+    hand-computed</td><td>any box</td></tr>
+  <tr><td>B</td><td>the walk reaches your node (and nothing else changed)</td><td><code>test_spec_dag.cpp</code>
+    — visited sequence + walk_packet parity</td><td>any box</td></tr>
+  <tr><td>C</td><td>the emitted table is correct &amp; byte-identical</td><td><code>test_pdu_table_interop</code>
+    + a tshark diff (<code>test_nlance2table_tshark_*.py</code>)</td><td>any box (tshark optional)</td></tr>
+  <tr><td>D</td><td>serial == bulk == gpu, bit-for-bit</td><td><code>dag_gpu_equiv_bench --bench</code></td>
+    <td>CUDA box for the gpu leg</td></tr>
+</table>
+<p class="small">All are wired into CTest under the <code>smoke</code> / <code>interop</code> labels:
+<code>ctest -L smoke</code> after every change; the tshark/pylance interop tests skip cleanly (exit 77) when
+their external tool is absent.</p>
+
+<!-- ============================================================ RULES -->
+<h2 id="rules">Rules &amp; gotchas</h2>
+<div class="note warn"><b>Device-safety is contagious — protect it.</b> Anything reachable from a node's
+<code>advance</code>/<code>next</code> or the <code>walk</code> visitor must be <code>NANOTINS_HD</code> and
+allocation-free. No <code>std::string</code>, no <code>std::vector</code>, no exceptions in that path. The
+host-side table assembly (which <i>does</i> use <code>std::vector</code>) is separate from the device walk.</div>
+<ul>
+  <li><b>Exact keys only.</b> Never dispatch on a range or a guess. A duplicate edge key is a compile error,
+    by design.</li>
+  <li><b>Bitfields are MSB-first</b> and declared by (storage word, bit offset, width). A field may cross
+    bytes inside its big-endian word.</li>
+  <li><b>Names are the schema.</b> A field's tag is its column name; an <code>embed&lt;&gt;</code> prefix
+    disambiguates repeated sub-records. Pick names you'd want in a Lance table.</li>
+  <li><b>The GPU file is "written-not-compiled" on a CPU box</b> — <code>dag_decode_gpu.hpp</code> compiles
+    only under <code>NANOTINS_ENABLE_CUDA</code>; verify it on the CUDA host with checkpoint D. Generic over
+    the graph, so new protocols need no edits there.</li>
+  <li><b>g++ fold gotcha:</b> don't nest a lambda inside a fold-comma expression (it ICEs older g++); factor
+    per-index work into a helper, as <code>dag_bulk.hpp</code> / <code>dag_decode_gpu.hpp</code> do.</li>
+</ul>
+
+<!-- ============================================================ FILES -->
+<h2 id="files">File map</h2>
+<table>
+  <tr><th>File</th><th>Holds</th></tr>
+  <tr><td><code>nanotins/wire_spec.hpp</code></td><td>spec vocab (<code>WireSpec</code>, <code>named_field</code>,
+    <code>named_bit_field</code>, <code>named_bytes_field</code>, <code>embed</code>) + the reader
+    (<code>read_field</code>, <code>struct_view</code>, <code>spec_size</code>)</td></tr>
+  <tr><td><code>nanotins/wire_spec_soa.hpp</code></td><td><code>columns_of_spec</code>,
+    <code>spec_soa&lt;Spec,N&gt;</code>, <code>scatter_spec</code>, <code>to_arrow_spec</code></td></tr>
+  <tr><td><code>nanotins/protocol_specs.hpp</code> · <code>protocol_specs_ptp.hpp</code></td>
+    <td>Ethernet/VLAN/IPv4/IPv6/TCP/UDP specs · PTPv2 header + body specs</td></tr>
+  <tr><td><code>nanotins/spec_dag.hpp</code></td><td><code>graph</code>, <code>edge</code>,
+    <code>match_edges</code>, <code>walk</code>, and the L2/L3/L4 + gPTP nodes &amp; <code>L2L3Graph</code></td></tr>
+  <tr><td><code>nanotins/dag_decode.hpp</code> · <code>dag_bulk.hpp</code></td><td>per-node
+    <code>dag_tables</code> + serial decode · the count→scan→scatter bulk path (CPU/GPU)</td></tr>
+  <tr><td><code>gputins/wire_spec_gpu.hpp</code> · <code>dag_decode_gpu.hpp</code></td><td>GPU single-spec
+    parse · GPU graph decode (behind <code>NANOTINS_ENABLE_CUDA</code>)</td></tr>
+  <tr><td><code>nanotins/docs/GPU_BULK_INTEGRATION.md</code></td><td>how to build &amp; verify the CUDA path</td></tr>
+</table>
+
+<footer>
+  nanotins — describe the wire once, parse it anywhere (host or GPU), get columns for free. ·
+  See also <a class="link" href="nanotins.html">nanotins.html</a> (the reflection/overlay primer) and the
+  <a class="link" href="../README.md">README</a>.
+</footer>
+
+</main>
+</div>
+</body>
+</html>
