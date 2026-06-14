@@ -232,11 +232,11 @@ else()
     option(NANOLANCE_BUILD_EXAMPLES "Build examples (pcapng2lance + nanotins)" OFF)
 endif()
 # The reflection/parsing stack lives in the sister repo github.com/yoavbendor/nanotins, vendored here as a
-# git submodule under extern/nanotins. Its top-level CMake creates the three layered targets in dependency
+# git submodule under extern/nanotins. Its top-level CMake creates the two layered targets in dependency
 # order (each independently vendorable):
 #   soatins  — the reusable "describe a struct -> SoA + Arrow" nucleus (nanoarrow + boost only).
 #   nanotins — pcap/pcapng + L2/L3/L4 parsing + bulk_for_each (depends on soatins + stdexec).
-#   gputins  — the CUDA (nvexec) executors, header-only + guarded (depends on nanotins; inert without CUDA).
+# (A GPU/CUDA executor layer, gputins, is developed separately and not vendored here for now.)
 # Built whenever the examples that consume them are, or tests are on. Unit tests follow NANOLANCE_BUILD_TESTS
 # (the suite leaves SOATINS_BUILD_TESTS/NANOTINS_BUILD_TESTS to whatever we set here).
 if(NANOLANCE_BUILD_EXAMPLES OR NANOLANCE_BUILD_TESTS)

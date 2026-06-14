@@ -25,14 +25,14 @@ and [`KICKOFF.md`](docs/KICKOFF.md) (build order + traps).
   the complete blocks in each window, and the **scheduler-agnostic bulk parse** runs over resident bytes →
   one Lance fragment per window, committed and freed before the next. Section/interface state and a global
   `packet_id` carry across windows; stored payload offsets are absolute (fetchable from S3 regardless of
-  windowing). `--window-bytes` is the RAM/VRAM budget (default 512 MiB; a small file is one window).
-  `--sequential` or `--threads N` selects the CPU path; `--gpu` (requires CUDA build) selects the GPU path.
+  windowing). `--window-bytes` is the RAM budget (default 512 MiB; a small file is one window).
+  `--sequential` or `--threads N` selects the CPU path. (`--gpu` is a planned future feature.)
   
 - **M3/M6 — L2/L3/L4 decode via wire_spec + spec_dag** (`--decode-l2l3`): The **wire_spec** declarative
   core (nanotins `protocol_specs.hpp`) defines Ethernet / 802.1Q VLAN / IPv4 / IPv6 / TCP / UDP with explicit
   byte offsets; the **spec_dag** DAG/FSM (`spec_dag.hpp`) chains them together (Ethernet → VLAN* → IPv4/IPv6
   → TCP/UDP, honoring `ihl`/`data_offset`). One walk of the DAG (via `dag_decode.hpp`/`dag_bulk.hpp`) decodes
-  both on host (CPU bulk via `dag_decode_bulk`) and on GPU (via `dag_decode_gpu`). Output: **one Lance table
+  serially or as a CPU bulk pass (via `dag_decode_bulk`), bit-identically. Output: **one Lance table
   per PDU type** (`<stem>_ethernet.lance`, `_vlan`, `_ipv4`, `_ipv6`, `_tcp`, `_udp`), each row = `packet_id`
   + the reflected header fields. Also writes `<stem>_remainder_after_l4.lance` — the application payload after
   L4 as external blob.v2 refs. **The DAG-emitted PDU tables are byte-identical to the older hand-written decode**
@@ -41,8 +41,8 @@ and [`KICKOFF.md`](docs/KICKOFF.md) (build order + traps).
   remainder is byte-identical to the one-shot path (guarded by `pcapng2lance_frag_harmony`).
 - **Scheduler-agnostic bulk** (`nanotins/include/nanotins/bulk.hpp`): `bulk_for_each(sched, num_tasks,
   n, kernel)` is a partitioned stdexec `ex::schedule | ex::bulk` — the CPU path passes an
-  `exec::static_thread_pool` scheduler; a CUDA build passes `nvexec::stream_context` and the SAME
-  call runs on the GPU (the only difference, exactly as in `stdexec_gpu_experiment`). 
+  `exec::static_thread_pool` scheduler. The kernel is device-safe (POD captures, no allocation), so the same
+  call could drive a GPU executor layer later with only the scheduler swapped. 
   
   The **L1 Phase-B parse** runs through it: a device-safe kernel (POD captures, no alloc) calls the pure
   `parse_epb` per `BlockRef` and scatters into the SoA columns. stdexec builds and runs on this MinGW
@@ -68,8 +68,8 @@ and [`KICKOFF.md`](docs/KICKOFF.md) (build order + traps).
   (`--threads 4,8,16,32,64,128,164`); pass `--no-write` (a driver flag that runs scan+parse+decode but
   skips the Lance output) to isolate Phase B from the I/O+write cost. Confirmed even with `--no-write`,
   Phase B is flat across thread counts — one thread already saturates memory-read bandwidth, so more
-  threads only contend for it. The bulk path's real payoff is the **GPU** (swap the scheduler to `nvexec`;
-  far higher memory bandwidth + latency hiding), not multicore CPU.
+  threads only contend for it. The bulk path's real payoff would be a **GPU** executor (swap the scheduler;
+  far higher memory bandwidth + latency hiding), not multicore CPU — a planned future addition.
 
 ## Build & run
 
@@ -82,13 +82,13 @@ cmake --build build --target pcapng2lance
 build/examples/pcapng2lance/pcapng2lance capture.pcapng out.lance
 ```
 
-Usage: `pcapng2lance [--no-compress] [--decode-l2l3] [--sequential|--threads N|--gpu] [--window-bytes N] <input.pcap|pcapng> <output.lance> [payload_uri]`.
+Usage: `pcapng2lance [--no-compress] [--decode-l2l3] [--sequential|--threads N] [--window-bytes N] <input.pcap|pcapng> <output.lance> [payload_uri]`.
 
 - `--no-compress` — write uncompressed columns (default: compressed).
 - `--decode-l2l3` — also decode L2/L3/L4 via the wire_spec + spec_dag core; emits `<stem>_<pdu>.lance` tables (Ethernet captures only; non-Ethernet link types pass through as payload-only).
-- `--sequential` — run Phase B in-thread (reference/debug path); `--threads N` (default: hardware concurrency) or `--gpu` (requires CUDA build) select parallelism.
-- `--window-bytes N` (default 512 MiB) — bounds the per-window RAM/VRAM budget; the capture is streamed in windows and written as one fragment per window, so memory stays bounded regardless of capture size.
-- `--gpu` — run Phase B on the GPU (nvexec); also requires `--cuda-device D` (optional, default 0) and either `--vram-bytes B` or `--vram-pct P` (default 80% of free VRAM) to size the per-window VRAM budget.
+- `--sequential` — run Phase B in-thread (reference/debug path); `--threads N` (default: hardware concurrency) selects the CPU thread-pool path.
+- `--window-bytes N` (default 512 MiB) — bounds the per-window RAM budget; the capture is streamed in windows and written as one fragment per window, so memory stays bounded regardless of capture size.
+- `--gpu` — **planned future feature.** GPU bulk decode (via the separately-developed gputins/CUDA layer) is not built into this example yet; the flag reports that and exits.
 - `--stage l1|l2|l3|l4` — staged enrichment (see "Staged / incremental parsing" below).
 - `--mem-bytes B`, `--read-tile-bytes B` — enrich-stage chunking (see "Staged / incremental parsing" below).
 

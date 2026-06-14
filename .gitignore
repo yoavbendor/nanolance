@@ -5,3 +5,7 @@
 *.rej
 CMakeLists.txt.user
 compile_commands.json
+
+# Local-only GPU (gputins) work-in-progress: removed from the public nanotins repo and the
+# pcapng2lance example for now; kept here to develop on a CUDA box. Re-introduce when ready.
+/local-gputins/
