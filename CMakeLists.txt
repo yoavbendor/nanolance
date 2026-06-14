@@ -231,23 +231,10 @@ if(NANOLANCE_STANDALONE)
 else()
     option(NANOLANCE_BUILD_EXAMPLES "Build examples (pcapng2lance + nanotins)" OFF)
 endif()
-# The reflection/parsing stack lives in the sister repo github.com/yoavbendor/nanotins, vendored here as a
-# git submodule under extern/nanotins. Its top-level CMake creates the two layered targets in dependency
-# order (each independently vendorable):
-#   soatins  — the reusable "describe a struct -> SoA + Arrow" nucleus (nanoarrow + boost only).
-#   nanotins — pcap/pcapng + L2/L3/L4 parsing + bulk_for_each (depends on soatins + stdexec).
-# (A GPU/CUDA executor layer, gputins, is developed separately and not vendored here for now.)
-# Built whenever the examples that consume them are, or tests are on. Unit tests follow NANOLANCE_BUILD_TESTS
-# (the suite leaves SOATINS_BUILD_TESTS/NANOTINS_BUILD_TESTS to whatever we set here).
-if(NANOLANCE_BUILD_EXAMPLES OR NANOLANCE_BUILD_TESTS)
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/CMakeLists.txt")
-        message(FATAL_ERROR "extern/nanotins is empty — run: git submodule update --init --recursive")
-    endif()
-    set(SOATINS_BUILD_TESTS ${NANOLANCE_BUILD_TESTS} CACHE BOOL "" FORCE)
-    set(NANOTINS_BUILD_TESTS ${NANOLANCE_BUILD_TESTS} CACHE BOOL "" FORCE)
-    add_subdirectory(extern/nanotins)
-endif()
-
+# The reflection/parsing stack (soatins + nanotins) is NOT a dependency of nanolance itself — nanolance
+# reads/writes Lance using only nanoarrow + zstd + local code. It is a consumer-side dependency of the
+# pcapng2lance example, which vendors it as a git submodule and adds it itself (see
+# examples/pcapng2lance/CMakeLists.txt). A plain nanolance build (library, tools, tests) needs no submodule.
 if(NANOLANCE_BUILD_EXAMPLES)
     add_subdirectory(examples/pcapng2lance)
 endif()
@@ -272,10 +259,11 @@ add_executable(nano_lance_blob_v2_external_test tests/test_blob_v2_external_prep
 target_compile_features(nano_lance_blob_v2_external_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_blob_v2_external_test PRIVATE nanolance)
 
-# Columnar blob.v2 encapsulation: producer fills a soatins soa<BlobRef,N>, nanolance owns the envelope.
+# Columnar blob.v2 encapsulation: producer supplies position/size columns, nanolance owns the envelope.
+# (Depends only on nanolance — no soatins; the reflection stack is the example's concern, not nanolance's.)
 add_executable(nano_lance_blob_v2_columnar_test tests/test_blob_v2_columnar.cpp)
 target_compile_features(nano_lance_blob_v2_columnar_test PRIVATE cxx_std_20)
-target_link_libraries(nano_lance_blob_v2_columnar_test PRIVATE nanolance soatins_core)
+target_link_libraries(nano_lance_blob_v2_columnar_test PRIVATE nanolance)
 
 add_executable(nano_lance_blob_v2_uri_dictionary_test tests/test_blob_v2_uri_dictionary.cpp)
 target_compile_features(nano_lance_blob_v2_uri_dictionary_test PRIVATE cxx_std_20)
