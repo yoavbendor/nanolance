@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #pragma once
 
 // Gather/merge: stitch many free-standing Lance datasets (e.g. one per scatter worker) into a single

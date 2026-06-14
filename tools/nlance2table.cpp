@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // nlance2table — dump a nanolance-written Lance dataset to CSV or NDJSON (full table or first N rows).
 //
 // Deliberately scoped to what *nanolance* writes (not arbitrary Lance encodings/compressions), reusing

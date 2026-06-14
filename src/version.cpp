@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #include "nanolance/version.hpp"
 
 #include "nanolance/version.h"

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // End-to-end test for the opt-in blob v2 URI-dictionary mode (nanolance extension).
 // Writes the same external-ref data twice — dictionary mode on and off — and checks that:
 //   1. both round-trip the per-row URIs identically through the reader, and

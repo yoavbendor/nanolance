@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // M1 end-to-end driver test. Writes a pcapng fixture, runs the pcapng2lance executable on it, then:
 //   - checks the committed manifest (row count + expected columns) via nano_lance_dataset_read_latest,
 //   - verifies the external-payload premise: nano_lance_fetch_external_blob(uri, off, size) returns

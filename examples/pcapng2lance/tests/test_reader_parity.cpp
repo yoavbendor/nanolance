@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // Write/read parity gate: nanolance must read back EVERY fixed-width type it can write, including when
 // a lance.blob.v2 column is present (which forces the reader's per-row decode path — the path that
 // previously only handled u8/u32/u64/i64). Covers signed/unsigned ints 8..64, float, double, bool, and

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #include "nanolance/array_accessor.hpp"
 
 #include <nanoarrow/nanoarrow.h>

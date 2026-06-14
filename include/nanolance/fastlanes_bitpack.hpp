@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #pragma once
 
 // Faithful C++ port of the FastLanes 1024-element bit-packing kernel vendored by Lance

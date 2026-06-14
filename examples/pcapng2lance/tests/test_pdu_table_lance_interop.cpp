@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // M6 (full-pipeline golden, no Python): the DAG PDU tables, written to real Lance and read back, dump
 // identically to the protocols:: tables. For the same packets we write each PDU table both ways (old
 // PduColumn path and new dag_pdu_table path) to actual .lance datasets, then dump each with the

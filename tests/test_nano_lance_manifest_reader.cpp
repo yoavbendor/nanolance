@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #include "nanolance/nano_lance_reader.h"
 #include "nanolance/nano_lance_writer.h"
 

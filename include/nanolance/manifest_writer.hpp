@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #pragma once
 
 #include "nanolance/data_file_writer.hpp"

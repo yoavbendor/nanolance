@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #include "nanolance/schema_mapper.hpp"
 
 #include "lance_minimal.pb.hpp"

@@ -137,3 +137,9 @@ Performance benchmarks (pcap-style columns: run-length URI + monotonic position 
 Version **0.2.0** — macros are generated into `build/include/nanolance/version.h`. Runtime string: `nanolance::library_version()` (declared in `include/nanolance/version.hpp`). `arrowipc2lance --version` includes this string.
 
 Standalone FetchContent pins **nanoarrow** to commit `ffe61d3cd2d02da9e60cfc405cd6c50c512f64b9` for reproducibility (align with a known-good streamingtestapps fetch).
+
+## License
+
+[Apache-2.0](LICENSE). See [NOTICE](NOTICE) and [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) for attributions.
+
+nanolance is an independent C++ implementation of the **Lance** columnar format — it does not link the Rust `lance` crate, but its protobuf message definitions are derived from Lance's Apache-2.0 `.proto` schemas (pinned at `v7.0.0-rc.1`). Apache-2.0 is chosen to align with the Arrow/nanoarrow + Lance ecosystem (all Apache-2.0) and for its explicit patent grant. Build-time deps: nanoarrow (Apache-2.0), zstd (BSD-3-Clause), CLI11 (BSD-3-Clause).

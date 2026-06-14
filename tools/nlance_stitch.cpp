@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // nlance-stitch — gather/merge many free-standing Lance datasets into one self-contained dataset.
 //
 // Globs `<input_dir>/<prefix>*_<item>.lance` worker-output folders, orders them by the integer <item> in

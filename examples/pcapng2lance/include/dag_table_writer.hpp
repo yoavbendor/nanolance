@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #pragma once
 
 // Write one DAG node's columnar table (dag_pdu_table<Spec>) as its own Lance table: a `packet_id` column

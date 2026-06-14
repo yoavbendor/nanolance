@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #pragma once
 
 // Pick a per-chunk row count from this host's memory budget, so an enrich stage running on a different

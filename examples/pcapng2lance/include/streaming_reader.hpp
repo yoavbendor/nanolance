@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 #pragma once
 
 // Bounded, forward-only windowed reader for endless / S3-backed captures. A `Source` yields bytes

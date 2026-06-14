@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // nlance_blobgen — build a Lance dataset of external lance.blob.v2 references that tiles each input
 // object into consecutive, packet-sized random chunks. Models the real workload: N external objects (e.g.
 // one pcapng per hour) each sliced front-to-back into rows, so a single Lance file spans many hours of

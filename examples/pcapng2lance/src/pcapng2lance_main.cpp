@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // pcapng -> Lance converter (step 1). Pipeline, top to bottom:
 //   parse args -> (staged enrich l2/l3/l4) OR (L1Converter: stream the capture in bounded windows ->
 //   scan blocks -> classify -> bulk parse_epb -> SoA scalar columns + a lance.blob.v2 payload_ref

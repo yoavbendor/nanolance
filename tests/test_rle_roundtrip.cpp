@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
 // Round-trip test for run-length encoding of a low-cardinality fixed-width integer column.
 // Writes a column with long runs (incl. runs > 255 to exercise 8-bit sub-run splitting) under
 // --compress, verifies nanolance reads it back exactly and the data file is tiny.
