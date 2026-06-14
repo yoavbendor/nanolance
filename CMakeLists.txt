@@ -160,10 +160,22 @@ target_include_directories(nanolance_reader PUBLIC
 )
 target_link_libraries(nanolance_reader PUBLIC nanolance_proto)
 
+# S3 external-blob reads. Two providers:
+#   1. External AWS-SDK seam (legacy): the parent project supplies NANOLANCE_S3_TARGET + a directory with
+#      s3_aws_sdk_stream.h. Used when NANOLANCE_S3_TARGET is set, so existing embedders are unaffected.
+#   2. Built-in reader (default): a small in-tree libcurl + OpenSSL SigV4 range-GET reader, so nanolance can
+#      read s3:// on its own with no AWS SDK. Used whenever S3 is enabled and no external target is given.
 if(NANOLANCE_ENABLE_S3 AND NANOLANCE_S3_TARGET AND TARGET "${NANOLANCE_S3_TARGET}" AND NANOLANCE_S3_INCLUDE_DIR)
     target_include_directories(nanolance_reader PRIVATE "${NANOLANCE_S3_INCLUDE_DIR}")
     target_link_libraries(nanolance_reader PRIVATE "${NANOLANCE_S3_TARGET}")
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)
+elseif(NANOLANCE_ENABLE_S3)
+    find_package(CURL REQUIRED)
+    find_package(OpenSSL REQUIRED)
+    target_sources(nanolance_reader PRIVATE src/s3_min_reader.cpp)
+    target_link_libraries(nanolance_reader PRIVATE CURL::libcurl OpenSSL::Crypto)
+    target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1 NANO_LANCE_S3_BUILTIN=1)
+    set(NANOLANCE_S3_BUILTIN_ACTIVE ON)
 endif()
 
 add_library(nanolance STATIC
@@ -327,6 +339,13 @@ add_executable(nano_lance_external_blob_test tests/test_nano_lance_external_blob
 target_compile_features(nano_lance_external_blob_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_external_blob_test PRIVATE nanolance_reader)
 
+# Built-in S3 reader: SigV4 signer vectors (no network). Only when the built-in provider is compiled in.
+if(NANOLANCE_S3_BUILTIN_ACTIVE)
+    add_executable(nano_lance_s3_min_sigv4_test tests/test_s3_min_sigv4.cpp)
+    target_compile_features(nano_lance_s3_min_sigv4_test PRIVATE cxx_std_20)
+    target_link_libraries(nano_lance_s3_min_sigv4_test PRIVATE nanolance_reader)
+endif()
+
 if(NANOLANCE_BUILD_TOOLS)
     add_test(NAME app_arrowipc2lance_help COMMAND $<TARGET_FILE:arrowipc2lance> -h)
     set_tests_properties(app_arrowipc2lance_help PROPERTIES LABELS "smoke")
@@ -393,6 +412,11 @@ set_tests_properties(nano_lance_table_roundtrip PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_external_blob COMMAND $<TARGET_FILE:nano_lance_external_blob_test>)
 set_tests_properties(nano_lance_external_blob PROPERTIES LABELS "smoke")
+
+if(NANOLANCE_S3_BUILTIN_ACTIVE)
+    add_test(NAME nano_lance_s3_min_sigv4 COMMAND $<TARGET_FILE:nano_lance_s3_min_sigv4_test>)
+    set_tests_properties(nano_lance_s3_min_sigv4 PROPERTIES LABELS "smoke")
+endif()
 
 add_test(
     NAME nano_lance_golden_python_deps

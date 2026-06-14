@@ -28,7 +28,24 @@ cmake --build build -j
 ctest --test-dir build -L smoke --output-on-failure
 ```
 
-Optional S3 external blobs (you must supply a CMake target and include dir, e.g. from a parent project):
+Optional S3 external blobs — just turn the option on and nanolance reads `s3://` on its own using a small
+built-in reader (libcurl + OpenSSL, AWS SigV4 range GETs — no AWS SDK):
+
+```bash
+cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON
+```
+
+The built-in reader resolves its configuration from the environment, following the usual AWS conventions:
+
+| Variable | Purpose |
+| --- | --- |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Credentials (required). |
+| `AWS_SESSION_TOKEN` | Temporary-credential session token (optional). |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | Region for virtual-hosted addressing (default `us-east-1`). |
+| `AWS_ENDPOINT_URL` | Custom endpoint, e.g. `http://localhost:9000`; when set, requests use path-style addressing for S3-compatible stores (MinIO, etc.). |
+
+Reading credentials from `~/.aws/*` is out of scope — supply them via the environment. To instead reuse an
+existing AWS-SDK-backed S3 helper from a parent project, point nanolance at it (this overrides the built-in):
 
 ```bash
 cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON \

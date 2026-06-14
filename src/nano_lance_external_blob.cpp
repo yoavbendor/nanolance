@@ -14,7 +14,13 @@
 #include <utility>
 
 #ifdef NANO_LANCE_READER_HAS_S3
+#ifdef NANO_LANCE_S3_BUILTIN
+#include "nanolance/s3_min_reader.h"
+using NanoLanceS3Factory = nanolance::S3MinStreamFactory;
+#else
 #include <s3_aws_sdk_stream.h>
+using NanoLanceS3Factory = AwsSdkStreamFactory;
+#endif
 #endif
 
 // External-blob fetch. The workload reads millions of small ranged slices out of each external object
@@ -47,8 +53,8 @@ std::string file_uri_to_path(const std::string& suri) {
 #ifdef NANO_LANCE_READER_HAS_S3
 // Process-lifetime S3 stream factory. Intentionally leaked (never destroyed) so cached S3 streams can
 // always destruct without an SDK-shutdown ordering hazard at program exit; the OS reclaims at exit.
-AwsSdkStreamFactory& s3_factory() {
-    static AwsSdkStreamFactory* factory = new AwsSdkStreamFactory();
+NanoLanceS3Factory& s3_factory() {
+    static NanoLanceS3Factory* factory = new NanoLanceS3Factory();
     return *factory;
 }
 constexpr std::size_t kS3ReadAheadBytes = 32U * 1024U * 1024U;
