@@ -1,11 +1,25 @@
-# pcapng -> Lance example: a thin consumer of the standalone parsing stack, which lives in the sister
-# nanotins repo vendored as a submodule at ../../extern/nanotins (its targets are added by the root
-# CMakeLists before this dir). The be<>/bits<>/SoA/arrow reflection lives in soatins; pcap/pcapng + L2/L3/L4
-# parsing in nanotins. This directory owns only the Lance-writing glue — the CLI driver, streaming windows,
-# the per-PDU Lance table writer, and the staged enrich pipeline.
+# pcapng -> Lance example: a thin consumer of the standalone parsing stack. nanolance itself does NOT depend
+# on that stack (it reads/writes Lance with nanoarrow + local code only); the parsing stack is THIS example's
+# dependency, so the example owns it — vendored as a git submodule under extern/nanotins and added here. The
+# be<>/bits<>/SoA/arrow reflection lives in soatins; pcap/pcapng + L2/L3/L4 parsing in nanotins. This
+# directory owns the Lance-writing glue — the CLI driver, streaming windows, the per-PDU Lance table writer,
+# and the staged enrich pipeline.
 #
 # CPU-only. (A GPU bulk path via the gputins/CUDA layer is a planned future feature; `--gpu` currently
 # reports that and exits.)
+
+# Pull in the sister nanotins stack (soatins::core + nanotins). This is the only place the submodule is
+# referenced — a plain nanolance build never needs it.
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/CMakeLists.txt")
+    message(FATAL_ERROR
+        "examples/pcapng2lance/extern/nanotins is empty — run: git submodule update --init --recursive")
+endif()
+# Build the nanotins/soatins unit tests alongside this example's tests when tests are on.
+if(NANOLANCE_BUILD_TESTS)
+    set(SOATINS_BUILD_TESTS ON CACHE BOOL "" FORCE)
+    set(NANOTINS_BUILD_TESTS ON CACHE BOOL "" FORCE)
+endif()
+add_subdirectory(extern/nanotins)
 
 # The pcapng -> Lance converter.
 add_executable(pcapng2lance src/pcapng2lance_main.cpp)
@@ -51,7 +65,7 @@ if(NANOLANCE_BUILD_TESTS)
     # nanotins submodule's tests dir.
     add_executable(pcapng2lance_driver_test tests/test_pcapng2lance_driver.cpp)
     target_include_directories(pcapng2lance_driver_test PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/extern/nanotins/nanotins/tests")
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/nanotins/tests")
     target_link_libraries(pcapng2lance_driver_test PRIVATE nanotins nanolance)
     add_test(NAME pcapng2lance_driver COMMAND $<TARGET_FILE:pcapng2lance_driver_test> $<TARGET_FILE:pcapng2lance>)
     set_tests_properties(pcapng2lance_driver PROPERTIES LABELS "smoke")
