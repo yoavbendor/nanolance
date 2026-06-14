@@ -1,0 +1,34 @@
+nanolance
+Copyright 2026 Yoav Bendor
+
+Licensed under the Apache License, Version 2.0 (the "License"); see the LICENSE
+file. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+-------------------------------------------------------------------------------
+Lance file format
+-------------------------------------------------------------------------------
+nanolance is an independent C++ implementation of the Lance columnar file format.
+It does NOT link the Lance reference implementation (the Rust `lance` crate); it
+writes/reads the format directly. However, its protobuf message definitions —
+manifests, data files, column/page metadata, and encodings — are derived from the
+Lance project's `.proto` schemas, pinned at tag v7.0.0-rc.1:
+
+    Lance — https://github.com/lance-format/lance
+    Licensed under the Apache License, Version 2.0.
+
+The generated protobuf code (generated/lance_minimal.pb.*) and the proto pin notes
+(third_party/lance_proto/) are based on those Apache-2.0 definitions.
+
+-------------------------------------------------------------------------------
+Other third-party software
+-------------------------------------------------------------------------------
+These are pulled in at build time via CMake FetchContent (not redistributed here):
+
+  - Apache Arrow nanoarrow  - Apache License 2.0  - https://github.com/apache/arrow-nanoarrow
+  - Zstandard (zstd)        - BSD-3-Clause        - https://github.com/facebook/zstd
+  - CLI11                   - BSD-3-Clause        - https://github.com/CLIUtils/CLI11
+
+See THIRD-PARTY-LICENSES.md for details. The pcapng2lance example additionally
+depends on the sister nanotins stack (Apache-2.0); see its own NOTICE.
