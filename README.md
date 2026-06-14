@@ -2,7 +2,9 @@
 
 Standalone C++ Arrow ↔ Lance writer and reader — write **Lance v2.2** datasets with minimal protobuf overhead (no Rust `lance` core), and read back what you wrote. Its headline feature: rows keep large payloads external (referenced by `uri` + offset + size, never copied) — so a Lance table of pcap packets stays single-digit bytes per row of references *regardless of packet size*, while the payload bytes live once in the source capture and are fetched on demand (numbers in [bench/linux-results.md](bench/linux-results.md)).
 
-Built on three layered, reusable libraries: **[soatins](soatins/)** (reflection: describe a struct once → SoA + Arrow), **[nanotins](nanotins/)** (pcap/pcapng + L2/L3/L4 protocol decode + the new wire_spec declarative wire-parsing core + the spec_dag DAG/FSM dispatcher), and **[gputins](gputins/)** (CUDA/nvexec GPU bulk decode, behind `NANOTINS_ENABLE_CUDA`). The `[examples/pcapng2lance](examples/pcapng2lance/)` worked example glues them together into a streaming capture → Lance converter.
+Built on the **[nanotins](https://github.com/yoavbendor/nanotins)** stack — a sister project, vendored here as a git submodule under [`extern/nanotins`](extern/nanotins/) — three layered, reusable libraries: **soatins** (reflection: describe a struct once → SoA + Arrow), **nanotins** (pcap/pcapng + L2/L3/L4 protocol decode + the wire_spec declarative wire-parsing core + the spec_dag DAG/FSM dispatcher), and **gputins** (CUDA/nvexec GPU bulk decode, behind `NANOTINS_ENABLE_CUDA`). The [`examples/pcapng2lance`](examples/pcapng2lance/) worked example glues them together into a streaming capture → Lance converter.
+
+> **Cloning:** this repo uses a submodule. Clone with `git clone --recursive`, or after a plain clone run `git submodule update --init --recursive`.
 
 > Integrating programmatically (or via an AI agent)? See [AGENTS.md](AGENTS.md) for the current
 > include path / CMake targets, the write API, and how to enable each compression measure.

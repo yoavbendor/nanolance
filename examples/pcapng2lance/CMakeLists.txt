@@ -1,6 +1,7 @@
-# pcapng -> Lance example: a thin consumer of the standalone parsing stack (top-level ../../soatins,
-# ../../nanotins, ../../gputins, added by the root CMakeLists before this dir). The be<>/bits<>/SoA/arrow
-# reflection lives in soatins; pcap/pcapng + L2/L3/L4 parsing in nanotins; the CUDA executors in gputins.
+# pcapng -> Lance example: a thin consumer of the standalone parsing stack, which lives in the sister
+# nanotins repo vendored as a submodule at ../../extern/nanotins (its three targets are added by the root
+# CMakeLists before this dir). The be<>/bits<>/SoA/arrow reflection lives in soatins; pcap/pcapng + L2/L3/L4
+# parsing in nanotins; the CUDA executors in gputins.
 # This directory owns only the Lance-writing glue — the CLI driver, streaming windows, the per-PDU Lance
 # table writer, the staged enrich pipeline, and the (optional) CUDA build wiring for the GPU bridge TU.
 
@@ -86,10 +87,11 @@ if(NANOLANCE_BUILD_TESTS)
     endif()
 
     # End-to-end driver self-check (manifest + KV metadata + external-blob premise). Uses the nanotins
-    # pcap scanner (linked via the umbrella target) and the shared pcap_fixtures.hpp from nanotins/tests.
+    # pcap scanner (linked via the umbrella target) and the shared pcap_fixtures.hpp from the vendored
+    # nanotins submodule's tests dir.
     add_executable(pcapng2lance_driver_test tests/test_pcapng2lance_driver.cpp)
     target_include_directories(pcapng2lance_driver_test PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/nanotins/tests")
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/extern/nanotins/nanotins/tests")
     target_link_libraries(pcapng2lance_driver_test PRIVATE nanotins nanolance)
     add_test(NAME pcapng2lance_driver COMMAND $<TARGET_FILE:pcapng2lance_driver_test> $<TARGET_FILE:pcapng2lance>)
     set_tests_properties(pcapng2lance_driver PROPERTIES LABELS "smoke")

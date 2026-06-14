@@ -231,17 +231,21 @@ if(NANOLANCE_STANDALONE)
 else()
     option(NANOLANCE_BUILD_EXAMPLES "Build examples (pcapng2lance + nanotins)" OFF)
 endif()
-# The reflection/parsing stack, layered so each piece can be vendored on its own:
+# The reflection/parsing stack lives in the sister repo github.com/yoavbendor/nanotins, vendored here as a
+# git submodule under extern/nanotins. Its top-level CMake creates the three layered targets in dependency
+# order (each independently vendorable):
 #   soatins  — the reusable "describe a struct -> SoA + Arrow" nucleus (nanoarrow + boost only).
 #   nanotins — pcap/pcapng + L2/L3/L4 parsing + bulk_for_each (depends on soatins + stdexec).
 #   gputins  — the CUDA (nvexec) executors, header-only + guarded (depends on nanotins; inert without CUDA).
-# Built whenever the examples that consume them are, or tests are on. Unit tests follow NANOLANCE_BUILD_TESTS.
+# Built whenever the examples that consume them are, or tests are on. Unit tests follow NANOLANCE_BUILD_TESTS
+# (the suite leaves SOATINS_BUILD_TESTS/NANOTINS_BUILD_TESTS to whatever we set here).
 if(NANOLANCE_BUILD_EXAMPLES OR NANOLANCE_BUILD_TESTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/CMakeLists.txt")
+        message(FATAL_ERROR "extern/nanotins is empty — run: git submodule update --init --recursive")
+    endif()
     set(SOATINS_BUILD_TESTS ${NANOLANCE_BUILD_TESTS} CACHE BOOL "" FORCE)
     set(NANOTINS_BUILD_TESTS ${NANOLANCE_BUILD_TESTS} CACHE BOOL "" FORCE)
-    add_subdirectory(soatins)
-    add_subdirectory(nanotins)
-    add_subdirectory(gputins)
+    add_subdirectory(extern/nanotins)
 endif()
 
 if(NANOLANCE_BUILD_EXAMPLES)
