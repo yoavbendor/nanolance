@@ -18,7 +18,6 @@
 #include "nanotins/spec_dag.hpp"
 #include "staged_pipeline.hpp"
 #include "streaming_reader.hpp"
-#include "pcapng2lance_gpu_bridge.hpp"
 
 #include "nanolance/blob_builder.hpp"
 #include "nanolance/nano_lance_reader.h"
@@ -63,13 +62,9 @@ struct Args {
     bool decode_l2l3 = false;
     bool sequential = false;     // run Phase B in-thread (reference/debug) instead of the ex::bulk pool
     bool no_write = false;       // scan+parse+decode only, skip all Lance writes (isolates Phase B for bench)
-    bool gpu = false;            // run Phase-B L1 parse on the GPU (nvexec); requires a CUDA build
-    unsigned threads = 0;        // ex::bulk pool size (also GPU bulk tasks); 0 = hardware_concurrency
-    int cuda_device = 0;         // GPU index for --gpu
-    std::uint64_t vram_bytes = 0;  // per-window VRAM budget (0 = use --vram-pct of free VRAM)
-    unsigned vram_pct = 0;         // per-window VRAM budget as % of free VRAM (0 -> default 80)
+    unsigned threads = 0;        // ex::bulk pool size; 0 = hardware_concurrency
     std::string stage;           // "" = one-shot; l1 writes packets.lance; l2/l3/l4 enrich a data dir
-    std::size_t window_bytes = std::size_t{512} * 1024 * 1024;    // L1 RAM/VRAM budget per window
+    std::size_t window_bytes = std::size_t{512} * 1024 * 1024;    // L1 RAM budget per window
     std::uint64_t mem_bytes = 0;                                  // enrich budget; 0 = auto-detect free RAM
     std::size_t read_tile_bytes = std::size_t{32} * 1024 * 1024;  // enrich big-read tile (S3 throughput)
     std::size_t prefix_cap = 256;                                 // header bytes carved per row for enrich
@@ -97,23 +92,15 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
         } else if (s == "--no-write") {
             a.no_write = true;
         } else if (s == "--gpu") {
-            a.gpu = true;
+            // GPU bulk decode is a planned future feature: the parsers are device-callable, but the CUDA
+            // executor layer (gputins) is developed separately and not built into this example yet.
+            err = "--gpu (GPU bulk decode) is a planned future feature, not supported in this build; "
+                  "use --threads N or --sequential";
+            return false;
         } else if (s == "--threads") {
             const char* v = value(i);
             if (!v) return false;
             a.threads = static_cast<unsigned>(std::stoul(v));
-        } else if (s == "--cuda-device") {
-            const char* v = value(i);
-            if (!v) return false;
-            a.cuda_device = std::stoi(v);
-        } else if (s == "--vram-bytes") {
-            const char* v = value(i);
-            if (!v) return false;
-            a.vram_bytes = std::stoull(v);
-        } else if (s == "--vram-pct") {
-            const char* v = value(i);
-            if (!v) return false;
-            a.vram_pct = static_cast<unsigned>(std::stoul(v));
         } else if (s == "--stage") {
             const char* v = value(i);
             if (!v) return false;
@@ -339,16 +326,7 @@ public:
         streaming::FileSource source(input);
         if (!source.ok()) return fail("cannot open input file: " + input.string());
 
-        // GPU: create the device context and cap the per-window size to the VRAM budget so each window's
-        // (bytes + refs + EpbView output) device allocation fits. ~70% headroom for refs+output+overhead.
-        std::size_t window_bytes = args_.window_bytes;
-        if (args_.gpu) {
-            gpu_ctx_ = pcapng2lance::gpu_bridge::create_context(args_.cuda_device);
-            const std::uint64_t budget = pcapng2lance::gpu_bridge::vram_budget(args_.vram_bytes, args_.vram_pct);
-            window_bytes = std::min<std::uint64_t>(window_bytes, budget * 7 / 10);
-            std::fprintf(stderr, "pcapng2lance: GPU device %d, VRAM budget %llu B -> window %zu B\n",
-                         args_.cuda_device, static_cast<unsigned long long>(budget), window_bytes);
-        }
+        const std::size_t window_bytes = args_.window_bytes;
         streaming::Window<streaming::FileSource> win(source, window_bytes);
 
         std::string err;
@@ -357,14 +335,9 @@ public:
             if (const int rc = open_writer()) return rc;
         }
         ArrowMetadataBuilderInit(&meta_, nullptr);
-        if (args_.gpu) {
-            std::fprintf(stderr, "pcapng2lance: Phase B = gpu (L1 parse on device, tasks=%zu)\n",
-                         args_.threads ? static_cast<std::size_t>(args_.threads) : std::size_t{256});
-        } else {
-            std::fprintf(stderr, "pcapng2lance: Phase B = %s%s\n",
-                         args_.sequential ? "sequential (1 thread)" : "bulk",
-                         args_.sequential ? "" : (" (" + std::to_string(pool_threads(args_.threads)) + " threads)").c_str());
-        }
+        std::fprintf(stderr, "pcapng2lance: Phase B = %s%s\n",
+                     args_.sequential ? "sequential (1 thread)" : "bulk",
+                     args_.sequential ? "" : (" (" + std::to_string(pool_threads(args_.threads)) + " threads)").c_str());
         if (args_.no_write) std::fprintf(stderr, "pcapng2lance: --no-write (scan+parse+decode only, no Lance output)\n");
 
         win.fill();
@@ -498,65 +471,11 @@ private:
         }
     }
 
-    // Phase B: parse each EPB BlockRef into a whole EpbView, scattered into an AoS vector (the same
-    // device-safe shape — POD captures + the window span — a CUDA scheduler runs unchanged). One struct
-    // assignment per packet; soa<PacketRow> does the columnar fan-out later (see assemble). On --gpu the
-    // identical kernel runs on the GPU over device pointers (see parse_packets_gpu).
-    std::vector<pcapblocks::EpbView> parse_packets(pcapblocks::Bytes wbytes,
-                                                   const std::vector<pcapblocks::BlockRef>& packets) {
-        if (args_.gpu) return parse_packets_gpu(wbytes, packets);
-        const std::size_t n = packets.size();
-        std::vector<pcapblocks::EpbView> parsed(n);
-        const pcapblocks::Bytes wb = wbytes;
-        const pcapblocks::BlockRef* pk = packets.data();
-        pcapblocks::EpbView* out = parsed.data();
-        auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
-        run(std::min<std::size_t>(n, 64), n, [=](std::size_t i) {
-            pcapblocks::EpbView v{};
-            if (pcapblocks::parse_epb(wb, pk[i], v)) out[i] = v;  // whole-struct scatter, like the PDU path
-        });
-        return parsed;
-    }
-
-    std::vector<pcapblocks::EpbView> parse_packets_gpu(pcapblocks::Bytes wbytes,
-                                                       const std::vector<pcapblocks::BlockRef>& packets) {
-        const std::size_t tasks = args_.threads ? static_cast<std::size_t>(args_.threads) : 256;
-        return pcapng2lance::gpu_bridge::parse_packets(*gpu_ctx_, wbytes, packets, tasks);
-    }
-
-    // Assemble the columnar batch from the parsed EpbViews: soa<PacketRow>::store fans each row out into
-    // columns by reflection (no hand-written columns), denormalizing link_type/ts_resol from the section's
-    // interface table; the writer/decoder arrays (link_type/poff/psize) come along in the same pass.
-    PacketBatch assemble(const std::vector<pcapblocks::EpbView>& parsed,
-                         const std::vector<std::size_t>& packet_section, std::uint64_t base_pid) {
-        const std::size_t n = parsed.size();
-        PacketBatch b;
-        b.rows.resize(n);
-        b.link_type.resize(n);
-        b.poff.resize(n);
-        b.psize.resize(n);
-        for (std::size_t i = 0; i < n; ++i) {
-            const pcapblocks::EpbView& e = parsed[i];
-            const auto& table = sections_[packet_section[i]];
-            const std::uint16_t link = e.interface_id < table.size() ? table[e.interface_id].link_type
-                                                                     : std::uint16_t{0};
-            const std::uint8_t res = e.interface_id < table.size() ? table[e.interface_id].ts_resol
-                                                                   : std::uint8_t{6};
-            b.rows.store(i, PacketRow{base_pid + i, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
-                                      e.epb_flags});
-            b.link_type[i] = link;
-            b.poff[i] = e.payload_file_offset;
-            b.psize[i] = e.caplen;
-        }
-        return b;
-    }
-
-    // CPU fast path: parse each EPB and scatter its PacketRow straight into the columns in ONE pass — no
+    // Phase B fast path: parse each EPB and scatter its PacketRow straight into the columns in ONE pass — no
     // intermediate std::vector<EpbView>, no second materialization. soa<PacketRow>::raw() hands the column
-    // pointers to soatins::scatter (the same device-view fill the bulk/GPU kernels use); each task writes
-    // disjoint slots, so it parallelizes exactly like parse_packets did. The interface-table
-    // denormalization (link_type/ts_resol) is a host lookup, which is why this is the CPU path; the GPU
-    // path keeps parse_packets_gpu -> assemble (device parse, then the host join). Byte-identical output.
+    // pointers to soatins::scatter (the same device-view fill the bulk kernels use); each task writes
+    // disjoint slots, so it parallelizes cleanly. The interface-table denormalization (link_type/ts_resol)
+    // is a host lookup. Byte-identical output whether run serially or on the thread pool.
     PacketBatch parse_and_assemble(pcapblocks::Bytes wbytes, const std::vector<pcapblocks::BlockRef>& packets,
                                    const std::vector<std::size_t>& packet_section, std::uint64_t base_pid) {
         const std::size_t n = packets.size();
@@ -680,31 +599,17 @@ private:
         }
         emitted_ += n;
 
-        // GPU: device parse -> EpbView D2H -> host join. CPU: one fused parse+scatter pass (no EpbView).
-        PacketBatch batch;
-        if (args_.gpu) {
-            const std::vector<pcapblocks::EpbView> parsed = parse_packets(wbytes, packets);
-            batch = assemble(parsed, packet_section, base_pid);
-        } else {
-            batch = parse_and_assemble(wbytes, packets, packet_section, base_pid);
-        }
+        // One fused parse+scatter pass over the window (no intermediate EpbView vector).
+        PacketBatch batch = parse_and_assemble(wbytes, packets, packet_section, base_pid);
         if (!args_.no_write) {  // --no-write isolates Phase B (scan+parse+decode) from the Lance I/O
             if (const int rc = freeze_metadata()) return rc;
             if (const int rc = write_batch(batch, wbase)) return rc;
         }
         if (args_.decode_l2l3) {
             std::vector<protocols::WalkResult> trailers(n);
-            if (args_.gpu) {
-                const std::size_t tasks = args_.threads ? static_cast<std::size_t>(args_.threads) : 256;
-                pcapng2lance::gpu_bridge::decode_window(*gpu_ctx_, tasks, base_pid,
-                                                        batch.link_type.data(), batch.poff.data(),
-                                                        batch.psize.data(), wbytes, n, dag_pdus_, trailers.data());
-            } else
-            {
-                auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
-                pcapng2lance::dag_decode_window(run, base_pid, batch.link_type.data(), batch.poff.data(),
-                                                batch.psize.data(), wbytes, n, dag_pdus_, trailers.data());
-            }
+            auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
+            pcapng2lance::dag_decode_window(run, base_pid, batch.link_type.data(), batch.poff.data(),
+                                            batch.psize.data(), wbytes, n, dag_pdus_, trailers.data());
             collect_remainder(trailers, batch, wbase, base_pid);
         }
         return 0;
@@ -814,7 +719,6 @@ private:
     fs::path output_;
     std::string payload_uri_;
     pcapng2lance::PhaseBRunner phase_b_runner_;
-    pcapng2lance::gpu_bridge::context_ptr gpu_ctx_{nullptr, &pcapng2lance::gpu_bridge::destroy_context};
 
     ArrowSchema schema_{};
     NanoLanceWriter writer_{};
@@ -864,9 +768,9 @@ int main(int argc, char** argv) {
     if (args.pos.size() < 2) {
         std::fprintf(
             stderr,
-            "usage: %s [--no-compress] [--decode-l2l3] [--sequential|--threads N|--gpu] [--no-write]\n"
-            "          [--vram-pct P | --vram-bytes B] [--cuda-device D] [-d|--drop N] [-c|--count N]\n"
-            "          <input.pcap|pcapng> <output.lance> [payload_uri]\n"
+            "usage: %s [--no-compress] [--decode-l2l3] [--sequential|--threads N] [--no-write]\n"
+            "          [-d|--drop N] [-c|--count N] <input.pcap|pcapng> <output.lance> [payload_uri]\n"
+            "       (--gpu is a planned future feature; CPU bulk/sequential only for now)\n"
             "       (-d/-c select a packet slice: skip the first N, then emit at most N; packet_id stays\n"
             "        global so slices stitch into a bit-exact replica of the full dataset)\n"
             "       %s --stage l1 <input.pcap|pcapng> <datadir>   (then --stage l2|l3|l4 <datadir>)\n",
