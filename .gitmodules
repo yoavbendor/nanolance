@@ -1,0 +1,3 @@
+[submodule "extern/nanotins"]
+	path = extern/nanotins
+	url = https://github.com/yoavbendor/nanotins.git

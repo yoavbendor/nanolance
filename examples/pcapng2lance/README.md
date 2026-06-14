@@ -12,7 +12,7 @@ and [`KICKOFF.md`](docs/KICKOFF.md) (build order + traps).
 
 ## What's built (M0 + M1 + M2 + M3/M6)
 
-- **M0 — `soatins` reflection core** (now the standalone [`soatins/`](../../soatins) library): `be<>`/`le<>` 
+- **M0 — `soatins` reflection core** (now in the standalone [`soatins/`](../../extern/nanotins/soatins) library, vendored from the sister [nanotins](https://github.com/yoavbendor/nanotins) repo): `be<>`/`le<>` 
   wire scalars, `bits<Word, field<…>…>` bitfields, `column_traits`, `columns_of<T>` (flattened column list),
   `soa<T>`/`store`, `arrow_schema<T>()` + `to_arrow()`. One `BOOST_DESCRIBE_STRUCT` line per row type
   drives SoA storage, an Arrow schema, and a Lance table. Proven bit-exact by `nanotins_roundtrip`.
