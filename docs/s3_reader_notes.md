@@ -1,11 +1,17 @@
-# The built-in S3 reader: credentials, performance, and small static builds
+# The S3 reader: credentials, performance, and small static builds
 
-Engineering notes for the in-tree S3 range reader (`src/s3_min_reader.cpp`,
-`include/nanolance/s3_min_reader.h`). Written so we can page this back in weeks from now without
+> **Status:** the reader has been spun out into its own repo,
+> **[nanos3reader](https://github.com/yoavbendor/nanos3reader)**. nanolance no longer carries it in-tree;
+> it pulls it in via CMake `FetchContent` (see the `NANOLANCE_ENABLE_S3` block in `CMakeLists.txt`). These
+> notes were written while the code lived in nanolance, so file paths like `src/s3_min_reader.cpp` now map
+> to nanos3reader's `src/s3_reader.cpp`, the namespace `nanolance::` → `nanos3reader::`, and the build
+> option `NANOLANCE_S3_CRYPTO` → `NANOS3READER_CRYPTO` (nanolance forwards it). The analysis below — the
+> credential chain, the pylance benchmark, the crypto backend, the static-build numbers — all still holds.
+
+Engineering notes for the S3 range reader. Written so we can page this back in weeks from now without
 re-deriving it. Covers: what the reader is, how it resolves credentials, why it's ~40× faster than
 pylance on the blob-fetch benchmark, the swappable SigV4 crypto backend, what a small static build
-(mbedTLS) actually costs, and what it would take to promote the reader into a standalone library
-(working name **`nanos3reader`**).
+(mbedTLS) actually costs, and how it was promoted into the standalone **`nanos3reader`** library.
 
 ---
 

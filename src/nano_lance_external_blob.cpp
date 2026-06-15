@@ -14,12 +14,12 @@
 #include <utility>
 
 #ifdef NANO_LANCE_READER_HAS_S3
-#ifdef NANO_LANCE_S3_BUILTIN
-#include "nanolance/s3_min_reader.h"
-using NanoLanceS3Factory = nanolance::S3MinStreamFactory;
-#else
+#ifdef NANO_LANCE_S3_AWS_SDK
 #include <s3_aws_sdk_stream.h>
 using NanoLanceS3Factory = AwsSdkStreamFactory;
+#else
+#include "nanos3reader/s3_reader.h"
+using NanoLanceS3Factory = nanos3reader::S3MinStreamFactory;
 #endif
 #endif
 
@@ -168,7 +168,7 @@ int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t 
     }
     in->read(reinterpret_cast<char*>(out_buf), to_read);
     *bytes_read = static_cast<size_t>(std::max<std::streamsize>(0, in->gcount()));
-#ifdef NANO_LANCE_S3_BUILTIN
+#ifdef NANO_LANCE_READER_HAS_S3
     // A range GET that failed mid-read (transport/HTTP error, not a clean EOF) leaves a thread error set.
     // Surface it instead of silently returning a short read.
     if (handle->is_s3 && !s3_factory().error().empty()) {
