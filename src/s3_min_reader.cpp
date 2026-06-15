@@ -404,8 +404,47 @@ bool load_imds(Credentials& cred) {
     return cred.valid();
 }
 
+// Explain why `profile` yielded no static keys (for diagnostics): missing files, missing profile, or a
+// profile that uses a mechanism the built-in reader does not resolve (SSO / credential_process / assume-role
+// — the AWS CLI handles these, so `aws` working while this reader doesn't usually means one of them).
+std::string describe_profile_gap(const std::string& profile) {
+    const std::string home = env_or("HOME", "");
+    const std::string cred_path =
+        env_or("AWS_SHARED_CREDENTIALS_FILE", home.empty() ? "" : home + "/.aws/credentials");
+    const std::string conf_path = env_or("AWS_CONFIG_FILE", home.empty() ? "" : home + "/.aws/config");
+    const bool cred_ok = !cred_path.empty() && std::ifstream(cred_path).good();
+    const bool conf_ok = !conf_path.empty() && std::ifstream(conf_path).good();
+    if (!cred_ok && !conf_ok) {
+        return "no profile files (looked for '" + cred_path + "' and '" + conf_path + "')";
+    }
+    const auto cred_kv = cred_ok ? parse_ini_section(cred_path, profile) : std::map<std::string, std::string>{};
+    const std::string section = (profile == "default") ? "default" : ("profile " + profile);
+    const auto conf_kv = conf_ok ? parse_ini_section(conf_path, section) : std::map<std::string, std::string>{};
+    if (cred_kv.empty() && conf_kv.empty()) {
+        return "profile '" + profile + "' not found in the profile files";
+    }
+    const auto has = [](const std::map<std::string, std::string>& m, const char* k) {
+        return m.find(k) != m.end();
+    };
+    if (has(conf_kv, "credential_process") || has(cred_kv, "credential_process")) {
+        return "profile '" + profile +
+               "' uses credential_process, which the built-in reader does not run — export creds to env";
+    }
+    if (has(conf_kv, "sso_session") || has(conf_kv, "sso_account_id") || has(conf_kv, "sso_start_url")) {
+        return "profile '" + profile +
+               "' uses AWS SSO, which the built-in reader does not resolve — run 'aws sso login', then "
+               "export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN to env";
+    }
+    if (has(conf_kv, "role_arn") || has(conf_kv, "source_profile")) {
+        return "profile '" + profile +
+               "' uses assume-role, which the built-in reader does not perform — export creds to env";
+    }
+    return "profile '" + profile + "' has no aws_access_key_id/aws_secret_access_key";
+}
+
 // Thread-safe provider walking the standard chain, caching the result and refreshing temporary creds a few
-// minutes before they expire. Shared by every stream the (process-singleton) factory opens.
+// minutes before they expire. Shared by every stream the (process-singleton) factory opens. On failure it
+// records a per-source diagnostic (see diagnostic()) so the caller can report *why* no creds were found.
 class CredentialProvider {
 public:
     explicit CredentialProvider(std::string profile) : profile_(std::move(profile)) {}
@@ -423,14 +462,24 @@ public:
         attempted_ = true;
         last_attempt_ = now;
         Credentials fresh;
-        if (resolve(fresh)) {
+        std::string diag;
+        if (resolve(fresh, diag)) {
             cached_ = fresh;
+            diagnostic_.clear();
+        } else {
+            diagnostic_ = diag;
         }
         return cached_;
     }
 
+    // Why the last resolution found nothing — a chain of "source: reason" notes.
+    std::string diagnostic() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return diagnostic_.empty() ? "no AWS credentials found" : diagnostic_;
+    }
+
 private:
-    bool resolve(Credentials& out) {
+    bool resolve(Credentials& out, std::string& diag) {
         const std::string ak = env_or("AWS_ACCESS_KEY_ID", "");
         const std::string sk = env_or("AWS_SECRET_ACCESS_KEY", "");
         if (!ak.empty() && !sk.empty()) {
@@ -440,6 +489,7 @@ private:
             out.expiry = std::nullopt;
             return true;
         }
+        std::string notes = "env: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY not set";
         {
             Credentials prof;
             std::string region_unused;
@@ -449,15 +499,26 @@ private:
                 out = prof;
                 return true;
             }
+            notes += "; profile: " + describe_profile_gap(profile_);
         }
-        if (load_ecs(out)) {
+        if (!env_or("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "").empty() ||
+            !env_or("AWS_CONTAINER_CREDENTIALS_FULL_URI", "").empty()) {
+            if (load_ecs(out)) {
+                return true;
+            }
+            notes += "; ECS: container endpoint returned no usable creds";
+        }
+        if (load_imds(out)) {
             return true;
         }
-        return load_imds(out);
+        notes += "; IMDS: no EC2 instance role (metadata endpoint unreachable or empty)";
+        diag = notes;
+        return false;
     }
 
     std::mutex mutex_;
     Credentials cached_;
+    std::string diagnostic_;
     std::string profile_;
     bool attempted_ = false;
     std::chrono::system_clock::time_point last_attempt_{};
@@ -682,7 +743,7 @@ private:
         }
         const Credentials cred = cfg_->creds->get();
         if (!cred.valid()) {
-            fail("missing AWS credentials (set AWS_* env, configure ~/.aws, or run on an instance role)");
+            fail("missing AWS credentials — " + cfg_->creds->diagnostic());
             return false;
         }
         bool redirected = false;
@@ -859,7 +920,7 @@ std::unique_ptr<std::istream> S3MinStreamFactory::open(const std::string& uri, s
     const std::string key = rest.substr(slash + 1);
 
     if (!config_->creds->get().valid()) {
-        g_last_error = "missing AWS credentials (set AWS_* env, configure ~/.aws, or run on an instance role)";
+        g_last_error = "missing AWS credentials — " + config_->creds->diagnostic();
         return nullptr;
     }
 
