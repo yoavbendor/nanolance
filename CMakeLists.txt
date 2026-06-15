@@ -339,11 +339,18 @@ add_executable(nano_lance_external_blob_test tests/test_nano_lance_external_blob
 target_compile_features(nano_lance_external_blob_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_external_blob_test PRIVATE nanolance_reader)
 
-# Built-in S3 reader: SigV4 signer vectors (no network). Only when the built-in provider is compiled in.
+# Built-in S3 reader tests (only when the built-in provider is compiled in):
+#  - SigV4 signer vectors: pure computation, always runs.
+#  - Live integration: range GETs against a real S3-compatible endpoint; skips unless NANOLANCE_S3_TEST_URI
+#    (+ AWS_* env) is set. tests/s3_minio_integration.sh wires this up against a throwaway MinIO.
 if(NANOLANCE_S3_BUILTIN_ACTIVE)
     add_executable(nano_lance_s3_min_sigv4_test tests/test_s3_min_sigv4.cpp)
     target_compile_features(nano_lance_s3_min_sigv4_test PRIVATE cxx_std_20)
     target_link_libraries(nano_lance_s3_min_sigv4_test PRIVATE nanolance_reader)
+
+    add_executable(nano_lance_s3_min_integration_test tests/test_s3_min_integration.cpp)
+    target_compile_features(nano_lance_s3_min_integration_test PRIVATE cxx_std_20)
+    target_link_libraries(nano_lance_s3_min_integration_test PRIVATE nanolance_reader)
 endif()
 
 if(NANOLANCE_BUILD_TOOLS)
@@ -416,6 +423,11 @@ set_tests_properties(nano_lance_external_blob PROPERTIES LABELS "smoke")
 if(NANOLANCE_S3_BUILTIN_ACTIVE)
     add_test(NAME nano_lance_s3_min_sigv4 COMMAND $<TARGET_FILE:nano_lance_s3_min_sigv4_test>)
     set_tests_properties(nano_lance_s3_min_sigv4 PROPERTIES LABELS "smoke")
+
+    # Live S3 integration: skips (CTest code 77) unless NANOLANCE_S3_TEST_URI + AWS_* env are set. Not in
+    # the smoke set, so the default run never needs network or credentials.
+    add_test(NAME nano_lance_s3_min_integration COMMAND $<TARGET_FILE:nano_lance_s3_min_integration_test>)
+    set_tests_properties(nano_lance_s3_min_integration PROPERTIES LABELS "s3-integration" SKIP_RETURN_CODE 77)
 endif()
 
 add_test(

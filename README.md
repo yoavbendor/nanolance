@@ -48,8 +48,22 @@ The built-in reader resolves its configuration from the environment, following t
 The reader uses connect/stall timeouts (so an unreachable or hung endpoint fails fast instead of blocking),
 auto-corrects a wrong-region bucket once via the `x-amz-bucket-region` redirect hint, and reuses one
 keep-alive connection per object. Reading credentials from `~/.aws/*` is out of scope — supply them via the
-environment. To instead reuse an existing AWS-SDK-backed S3 helper from a parent project, point nanolance at
-it (this overrides the built-in):
+environment.
+
+The SigV4 signer is unit-tested against AWS's published vectors (`nano_lance_s3_min_sigv4`, runs by default).
+A live round-trip test (`nano_lance_s3_min_integration`) is **gated** — it skips unless `NANOLANCE_S3_TEST_URI`
+(+ `AWS_*`) point at a bucket holding the pattern object it expects. To exercise it against a throwaway MinIO:
+
+```bash
+cmake --build build --target nano_lance_s3_min_integration_test
+tests/s3_minio_integration.sh build/nano_lance_s3_min_integration_test   # needs Docker; skips if absent
+```
+
+The script starts MinIO, uploads the object, runs ranged reads + multi-window stitching, and asserts a wrong
+secret is rejected (proving the endpoint really verifies the signature).
+
+To instead reuse an existing AWS-SDK-backed S3 helper from a parent project, point nanolance at it (this
+overrides the built-in):
 
 ```bash
 cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON \
