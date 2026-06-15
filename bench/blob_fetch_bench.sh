@@ -7,7 +7,8 @@
 #   2. nlance_blobgen tiles every object into consecutive random packet-sized chunks -> one dataset,
 #   3. each fetcher emits `index <TAB> md5 <TAB> fetch_nanos` per blob,
 #   4. assert md5 agreement per index across BOTH implementations (correctness),
-#   5. time with a warm/cold-aware schedule: pylance x3 cold, then rounds that rotate which impl goes
+#   5. time with a warm/cold-aware schedule: nanolance x3 cold (it's the quicker impl and surfaces any
+#      nanolance fetch problem before the slow pylance reference), then rounds that rotate which impl goes
 #      first (cancels ordering/warm-up bias), reporting cold vs warm.
 #
 # Local testing uses file:// URIs; on a host with S3 (and nanolance built with S3 support) pass s3:// URIs.
@@ -81,23 +82,25 @@ echo "=================================================================="
 echo "  blob-fetch benchmark   objects=${#URI_ARR[@]}   rounds=$ROUNDS"
 echo "=================================================================="
 
-# --- 3. cold phase: pylance x3 ---
-PY_REF="$TMP/py_ref.tsv"
-echo "-- cold: pylance x3 --"
+# --- 3. cold phase: nanolance x3 (runs first so nanolance problems fail fast, and it's the quicker impl) ---
+NL_REF="$TMP/nl_ref.tsv"
+echo "-- cold: nanolance x3 --"
 for i in 1 2 3; do
-  out="$TMP/py_cold_$i.tsv"
-  if ! run_py "$out"; then
-    rc=$?
-    if [ "$rc" = "77" ]; then echo "pylance unavailable -> skip (77)"; exit 77; fi
-    echo "pylance run failed:"; cat "$out.err" >&2; exit 1
+  out="$TMP/nl_cold_$i.tsv"
+  if ! run_nl "$out"; then
+    echo "nanolance run failed:"; cat "$out.err" >&2; exit 1
   fi
-  printf "   pylance cold #%d : %8s ms  (%s blobs)\n" "$i" "$(total_ms "$out")" "$(nblobs "$out")"
-  cp "$out" "$PY_REF"
+  printf "   nanolance cold #%d : %8s ms  (%s blobs)\n" "$i" "$(total_ms "$out")" "$(nblobs "$out")"
+  cp "$out" "$NL_REF"
 done
 
-# nanolance reference (for md5 cross-check)
-NL_REF="$TMP/nl_ref.tsv"
-run_nl "$NL_REF" || { echo "nanolance run failed:"; cat "$NL_REF.err" >&2; exit 1; }
+# pylance reference (for md5 cross-check)
+PY_REF="$TMP/py_ref.tsv"
+run_py "$PY_REF"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  if [ "$rc" = "77" ]; then echo "pylance unavailable -> skip (77)"; exit 77; fi
+  echo "pylance run failed:"; cat "$PY_REF.err" >&2; exit 1
+fi
 
 echo "-- correctness: md5(nanolance) == md5(pylance) per index --"
 if md5_agree "$NL_REF" "$PY_REF"; then
