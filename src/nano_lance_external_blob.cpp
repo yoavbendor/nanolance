@@ -150,7 +150,15 @@ int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t 
     in->clear();  // a previous read may have set eof/fail; clear before repositioning
     in->seekg(static_cast<std::streamoff>(position), std::ios::beg);
     if (!*in) {
+        const bool was_s3 = handle->is_s3;
         drop_front_handle();  // stale/unsuitable handle — evict so the next call reopens
+#ifdef NANO_LANCE_READER_HAS_S3
+        if (was_s3 && !s3_factory().error().empty()) {
+            set_error(error_message, error_message_capacity, s3_factory().error());
+        } else
+#else
+        (void)was_s3;
+#endif
         set_error(error_message, error_message_capacity, "failed to seek external blob");
         return NANO_LANCE_READER_IO_ERROR;
     }
@@ -160,6 +168,15 @@ int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t 
     }
     in->read(reinterpret_cast<char*>(out_buf), to_read);
     *bytes_read = static_cast<size_t>(std::max<std::streamsize>(0, in->gcount()));
+#ifdef NANO_LANCE_S3_BUILTIN
+    // A range GET that failed mid-read (transport/HTTP error, not a clean EOF) leaves a thread error set.
+    // Surface it instead of silently returning a short read.
+    if (handle->is_s3 && !s3_factory().error().empty()) {
+        drop_front_handle();
+        set_error(error_message, error_message_capacity, s3_factory().error());
+        return NANO_LANCE_READER_IO_ERROR;
+    }
+#endif
     return NANO_LANCE_READER_OK;
 }
 

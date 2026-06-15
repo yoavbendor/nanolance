@@ -4,12 +4,16 @@
 #include "nanolance/s3_min_reader.h"
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <mutex>
+#include <random>
 #include <streambuf>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -120,14 +124,24 @@ struct Config {
     std::string region;
     std::string endpoint;    // empty -> AWS virtual-hosted; non-empty -> path-style against this endpoint
     bool path_style = false;
+    int max_attempts = 3;    // total tries per GET (AWS_MAX_ATTEMPTS), >= 1
 };
 }  // namespace s3detail
 
 namespace {
 
 // Per-thread last-error, surfaced by S3MinStreamFactory::error(). Thread-local because the external-blob
-// handle cache (the sole caller) is itself thread-local and lock-free.
+// handle cache (the sole caller) is itself thread-local and lock-free. Cleared when a window loads cleanly
+// or a logical seek begins, set when a GET ultimately fails — so the caller can read it after a failed
+// seek/read to get the real S3 reason instead of a generic I/O error.
 thread_local std::string g_last_error;
+
+// Network tuning for the range GETs.
+constexpr long kConnectTimeoutSec = 10;   // fail fast if the endpoint is unreachable
+constexpr long kLowSpeedBytes = 1;        // treat <1 B/s ...
+constexpr long kLowSpeedTimeSec = 60;     // ... for 60s as a stall and abort (instead of hanging forever)
+constexpr long kBackoffBaseMs = 100;      // exponential backoff base
+constexpr long kBackoffCapMs = 2000;      // and ceiling, with full jitter
 
 std::string env_or(const char* name, const std::string& fallback) {
     const char* v = std::getenv(name);
@@ -170,6 +184,40 @@ std::string amz_now() {
     return std::string(buf);
 }
 
+// Resolved request target: the Host header value, the full request URL, and the canonical (encoded) path.
+struct Endpoint {
+    std::string host;
+    std::string url;
+    std::string path;
+};
+
+Endpoint build_endpoint(const s3detail::Config& cfg, const std::string& bucket, const std::string& key,
+                        const std::string& region) {
+    Endpoint e;
+    if (cfg.path_style) {
+        // endpoint like "http://localhost:9000" — strip scheme to get the host:port for the Host header.
+        std::string ep = cfg.endpoint;
+        std::string scheme = "https://";
+        if (ep.rfind("http://", 0) == 0) {
+            scheme = "http://";
+            ep = ep.substr(7);
+        } else if (ep.rfind("https://", 0) == 0) {
+            ep = ep.substr(8);
+        }
+        while (!ep.empty() && ep.back() == '/') {
+            ep.pop_back();
+        }
+        e.host = ep;
+        e.path = uri_encode_path("/" + bucket + "/" + key);
+        e.url = scheme + e.host + e.path;
+    } else {
+        e.host = bucket + ".s3." + region + ".amazonaws.com";
+        e.path = uri_encode_path("/" + key);
+        e.url = "https://" + e.host + e.path;
+    }
+    return e;
+}
+
 std::size_t write_to_vector(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
     const std::size_t n = size * nmemb;
     auto* out = static_cast<std::vector<char>*>(userdata);
@@ -177,16 +225,72 @@ std::size_t write_to_vector(char* ptr, std::size_t size, std::size_t nmemb, void
     return n;
 }
 
+// Capture the `x-amz-bucket-region` response header (S3 returns it on wrong-region redirects), so we can
+// re-target and retry against the correct region.
+std::size_t capture_region_header(char* buffer, std::size_t size, std::size_t nitems, void* userdata) {
+    const std::size_t n = size * nitems;
+    auto* region = static_cast<std::string*>(userdata);
+    const std::string kKey = "x-amz-bucket-region:";
+    std::string line(buffer, n);
+    std::string prefix = line.substr(0, std::min(line.size(), kKey.size()));
+    for (char& c : prefix) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (prefix == kKey) {
+        std::string value = line.substr(kKey.size());
+        const auto b = value.find_first_not_of(" \t");
+        const auto e = value.find_last_not_of(" \t\r\n");
+        if (b != std::string::npos) {
+            *region = value.substr(b, e - b + 1);
+        }
+    }
+    return n;
+}
+
+bool is_retriable_curl(CURLcode rc) {
+    switch (rc) {
+        case CURLE_OPERATION_TIMEDOUT:
+        case CURLE_COULDNT_CONNECT:
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_RESOLVE_PROXY:
+        case CURLE_SEND_ERROR:
+        case CURLE_RECV_ERROR:
+        case CURLE_GOT_NOTHING:
+        case CURLE_PARTIAL_FILE:
+        case CURLE_SSL_CONNECT_ERROR:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Full-jitter exponential backoff before retry `attempt` (1-based).
+void sleep_backoff(int attempt) {
+    long ceiling = kBackoffBaseMs;
+    for (int i = 1; i < attempt && ceiling < kBackoffCapMs; ++i) {
+        ceiling <<= 1;
+    }
+    ceiling = std::min(ceiling, kBackoffCapMs);
+    thread_local std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<long> dist(0, ceiling);
+    std::this_thread::sleep_for(std::chrono::milliseconds(dist(rng)));
+}
+
 // Seekable streambuf over S3 range GETs. Each underflow/refetch pulls one read-ahead window so consecutive
 // slices within a window cost no extra GET (matching the access pattern in nano_lance_external_blob.cpp).
+// The single curl handle is reused across windows so the connection stays keep-alive for the object.
 class S3Streambuf : public std::streambuf {
 public:
-    S3Streambuf(std::shared_ptr<const s3detail::Config> cfg, std::string host, std::string url,
+    S3Streambuf(std::shared_ptr<const s3detail::Config> cfg, std::string bucket, std::string key,
                 std::size_t read_ahead)
-        : cfg_(std::move(cfg)), host_(std::move(host)), url_(std::move(url)),
+        : cfg_(std::move(cfg)), bucket_(std::move(bucket)), key_(std::move(key)), region_(cfg_->region),
           read_ahead_(read_ahead == 0 ? 1 : read_ahead) {
         ensure_curl_global_init();
         curl_ = curl_easy_init();
+        const Endpoint e = build_endpoint(*cfg_, bucket_, key_, region_);
+        host_ = e.host;
+        url_ = e.url;
+        path_ = e.path;
     }
 
     ~S3Streambuf() override {
@@ -196,7 +300,6 @@ public:
     }
 
     bool ok() const { return curl_ != nullptr; }
-    const std::string& last_error() const { return last_error_; }
 
 protected:
     int_type underflow() override {
@@ -240,6 +343,9 @@ protected:
         if ((which & std::ios_base::in) == 0) {
             return pos_type(off_type(-1));
         }
+        // The caller seeks before every read, so this is the start of a fresh logical fetch: drop any stale
+        // error so a later error() reflects only this fetch.
+        g_last_error.clear();
         const std::uint64_t target = static_cast<std::uint64_t>(static_cast<off_type>(sp));
         // Inside the live window? Just move the get pointer — no GET.
         if (window_len_ > 0 && target >= window_start_ && target <= window_start_ + window_len_) {
@@ -258,106 +364,164 @@ private:
         return window_start_ + static_cast<std::uint64_t>(gptr() - eback());
     }
 
-    // Fetch [start, start+read_ahead-1] into the window. Returns false only on a real transport/HTTP error
-    // (sets last_error_); an empty/short read at end-of-object is a success that flags reached_eof_.
-    bool load_window(std::uint64_t start) {
-        if (curl_ == nullptr) {
-            last_error_ = "curl init failed";
-            return false;
-        }
-        const std::uint64_t last = start + read_ahead_ - 1;
-        const std::string range = "bytes=" + std::to_string(start) + "-" + std::to_string(last);
-        const std::string amz_date = amz_now();
-
-        std::vector<s3v4::Header> sign_headers = {
-            {"host", host_},
-            {"range", range},
-            {"x-amz-content-sha256", "UNSIGNED-PAYLOAD"},
-            {"x-amz-date", amz_date},
-        };
-        if (!cfg_->session_token.empty()) {
-            sign_headers.push_back({"x-amz-security-token", cfg_->session_token});
-        }
-        s3v4::CanonicalRequest req;
-        req.method = "GET";
-        req.uri = path_;
-        req.query = "";
-        req.headers = sign_headers;
-        req.payload_hash = "UNSIGNED-PAYLOAD";
-        const std::string authz = s3v4::build_authorization(req, cfg_->access_key, cfg_->secret_key,
-                                                            cfg_->region, "s3", amz_date);
-
-        curl_slist* hdrs = nullptr;
-        hdrs = curl_slist_append(hdrs, ("x-amz-date: " + amz_date).c_str());
-        hdrs = curl_slist_append(hdrs, "x-amz-content-sha256: UNSIGNED-PAYLOAD");
-        hdrs = curl_slist_append(hdrs, ("Range: " + range).c_str());
-        if (!cfg_->session_token.empty()) {
-            hdrs = curl_slist_append(hdrs, ("x-amz-security-token: " + cfg_->session_token).c_str());
-        }
-        hdrs = curl_slist_append(hdrs, ("Authorization: " + authz).c_str());
-
-        window_.clear();
-        window_.reserve(read_ahead_);
-        curl_easy_reset(curl_);
-        curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
-        curl_easy_setopt(curl_, CURLOPT_HTTPGET, 1L);
-        curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, hdrs);
-        curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, &write_to_vector);
-        curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &window_);
-        curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 0L);
-        curl_easy_setopt(curl_, CURLOPT_NOSIGNAL, 1L);
-
-        const CURLcode rc = curl_easy_perform(curl_);
-        long code = 0;
-        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
-        curl_slist_free_all(hdrs);
-
-        if (rc != CURLE_OK) {
-            last_error_ = std::string("S3 GET transport error: ") + curl_easy_strerror(rc);
-            window_len_ = 0;
-            setg(nullptr, nullptr, nullptr);
-            return false;
-        }
-        if (code == 416) {  // Range Not Satisfiable: we are at/over the end of the object.
+    // Position the get area after a successful body fetch. A 206 begins at `start`; a 200 means the server
+    // ignored Range and returned the whole object from offset 0 — place the get pointer at the requested
+    // logical offset within it so reads still land correctly.
+    void install_window(std::uint64_t start, bool partial) {
+        char* base = window_.data();
+        if (partial) {  // 206 Partial Content
             window_start_ = start;
-            window_len_ = 0;
+            reached_eof_ = window_.size() < read_ahead_;  // a short window means the object ended here
+        } else {  // 200 OK: full object from offset 0
+            window_start_ = 0;
             reached_eof_ = true;
-            setg(nullptr, nullptr, nullptr);
-            return true;
         }
-        if (code == 200 || code == 206) {
-            window_start_ = start;
-            window_len_ = window_.size();
-            reached_eof_ = window_len_ < read_ahead_;  // a short window means the object ended here
-            char* base = window_.data();
-            setg(base, base, base + window_len_);
-            return true;
+        window_len_ = window_.size();
+        std::uint64_t goff = (start >= window_start_) ? (start - window_start_) : 0;
+        if (goff > window_len_) {
+            goff = window_len_;
         }
-        std::string body(window_.begin(), window_.end());
-        if (body.size() > 512) {
-            body.resize(512);
-        }
-        last_error_ = "S3 GET HTTP " + std::to_string(code) + ": " + body;
+        setg(base, base + goff, base + window_len_);
+    }
+
+    void fail(const std::string& msg) {
+        last_error_ = msg;
+        g_last_error = msg;
         window_len_ = 0;
         setg(nullptr, nullptr, nullptr);
-        return false;
+    }
+
+    // Fetch [start, start+read_ahead-1] into the window, with retry/backoff and one-shot region redirect.
+    // Returns false only on a real transport/HTTP error (sets the thread error); an empty/short read at
+    // end-of-object is a success that flags reached_eof_.
+    bool load_window(std::uint64_t start) {
+        if (curl_ == nullptr) {
+            fail("curl init failed");
+            return false;
+        }
+        bool redirected = false;
+        int attempt = 0;
+        for (;;) {
+            window_.clear();
+            window_.reserve(read_ahead_);
+            region_header_.clear();
+
+            const std::uint64_t last = start + read_ahead_ - 1;
+            const std::string range = "bytes=" + std::to_string(start) + "-" + std::to_string(last);
+            const std::string amz_date = amz_now();  // fresh per attempt: backoff must not skew the signature
+
+            std::vector<s3v4::Header> sign_headers = {
+                {"host", host_},
+                {"range", range},
+                {"x-amz-content-sha256", "UNSIGNED-PAYLOAD"},
+                {"x-amz-date", amz_date},
+            };
+            if (!cfg_->session_token.empty()) {
+                sign_headers.push_back({"x-amz-security-token", cfg_->session_token});
+            }
+            s3v4::CanonicalRequest req;
+            req.method = "GET";
+            req.uri = path_;
+            req.query = "";
+            req.headers = sign_headers;
+            req.payload_hash = "UNSIGNED-PAYLOAD";
+            const std::string authz = s3v4::build_authorization(req, cfg_->access_key, cfg_->secret_key,
+                                                                region_, "s3", amz_date);
+
+            curl_slist* hdrs = nullptr;
+            hdrs = curl_slist_append(hdrs, ("x-amz-date: " + amz_date).c_str());
+            hdrs = curl_slist_append(hdrs, "x-amz-content-sha256: UNSIGNED-PAYLOAD");
+            hdrs = curl_slist_append(hdrs, ("Range: " + range).c_str());
+            if (!cfg_->session_token.empty()) {
+                hdrs = curl_slist_append(hdrs, ("x-amz-security-token: " + cfg_->session_token).c_str());
+            }
+            hdrs = curl_slist_append(hdrs, ("Authorization: " + authz).c_str());
+
+            curl_easy_reset(curl_);  // preserves the live connection + DNS/TLS caches (keep-alive)
+            curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
+            curl_easy_setopt(curl_, CURLOPT_HTTPGET, 1L);
+            curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, hdrs);
+            curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, &write_to_vector);
+            curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &window_);
+            curl_easy_setopt(curl_, CURLOPT_HEADERFUNCTION, &capture_region_header);
+            curl_easy_setopt(curl_, CURLOPT_HEADERDATA, &region_header_);
+            curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 0L);
+            curl_easy_setopt(curl_, CURLOPT_NOSIGNAL, 1L);
+            curl_easy_setopt(curl_, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+            curl_easy_setopt(curl_, CURLOPT_LOW_SPEED_LIMIT, kLowSpeedBytes);
+            curl_easy_setopt(curl_, CURLOPT_LOW_SPEED_TIME, kLowSpeedTimeSec);
+
+            const CURLcode rc = curl_easy_perform(curl_);
+            long code = 0;
+            curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
+            curl_slist_free_all(hdrs);
+
+            if (rc == CURLE_OK && (code == 200 || code == 206)) {
+                install_window(start, code == 206);
+                g_last_error.clear();
+                return true;
+            }
+            if (rc == CURLE_OK && code == 416) {  // Range Not Satisfiable: at/over the end of the object.
+                window_start_ = start;
+                window_len_ = 0;
+                reached_eof_ = true;
+                setg(nullptr, nullptr, nullptr);
+                g_last_error.clear();
+                return true;
+            }
+
+            // Wrong-region redirect (virtual-hosted only): re-target to the region S3 reported and retry
+            // immediately (once), without consuming a backoff attempt.
+            if (rc == CURLE_OK && !cfg_->path_style && (code == 301 || code == 307 || code == 400) &&
+                !region_header_.empty() && region_header_ != region_ && !redirected) {
+                region_ = region_header_;
+                const Endpoint e = build_endpoint(*cfg_, bucket_, key_, region_);
+                host_ = e.host;
+                url_ = e.url;
+                path_ = e.path;
+                redirected = true;
+                continue;
+            }
+
+            const bool http_retriable =
+                rc == CURLE_OK && (code == 500 || code == 502 || code == 503 || code == 504 || code == 429);
+            const bool retriable = is_retriable_curl(rc) || http_retriable;
+            ++attempt;
+            if (retriable && attempt < cfg_->max_attempts) {
+                sleep_backoff(attempt);
+                continue;
+            }
+
+            if (rc != CURLE_OK) {
+                fail(std::string("S3 GET transport error: ") + curl_easy_strerror(rc));
+            } else {
+                std::string body(window_.begin(), window_.end());
+                if (body.size() > 512) {
+                    body.resize(512);
+                }
+                fail("S3 GET HTTP " + std::to_string(code) + ": " + body);
+            }
+            return false;
+        }
     }
 
     std::shared_ptr<const s3detail::Config> cfg_;
+    std::string bucket_;
+    std::string key_;
+    std::string region_;  // effective region (may change once on a wrong-region redirect)
     std::string host_;
     std::string url_;
-    std::string path_;  // percent-encoded canonical path (set by the factory)
+    std::string path_;  // percent-encoded canonical path
     std::size_t read_ahead_;
     CURL* curl_ = nullptr;
+    std::string region_header_;  // x-amz-bucket-region captured from the last response
 
     std::vector<char> window_;
     std::uint64_t window_start_ = 0;
     std::size_t window_len_ = 0;
     bool reached_eof_ = false;
     std::string last_error_;
-
-public:
-    void set_path(std::string p) { path_ = std::move(p); }
 };
 
 // istream that owns its streambuf so the unique_ptr<istream> the factory returns keeps the buffer alive.
@@ -379,6 +543,8 @@ S3MinStreamFactory::S3MinStreamFactory() {
     cfg->region = env_or("AWS_REGION", env_or("AWS_DEFAULT_REGION", "us-east-1"));
     cfg->endpoint = env_or("AWS_ENDPOINT_URL", "");
     cfg->path_style = !cfg->endpoint.empty();
+    const int attempts = std::atoi(env_or("AWS_MAX_ATTEMPTS", "3").c_str());
+    cfg->max_attempts = attempts >= 1 ? attempts : 3;
     config_ = cfg;
 }
 
@@ -404,39 +570,11 @@ std::unique_ptr<std::istream> S3MinStreamFactory::open(const std::string& uri, s
         return nullptr;
     }
 
-    // Resolve host + URL + canonical path for either path-style (custom endpoint) or virtual-hosted (AWS).
-    std::string host;
-    std::string url;
-    std::string path;
-    if (config_->path_style) {
-        // endpoint like "http://localhost:9000" — strip scheme to get the host:port for the Host header.
-        std::string ep = config_->endpoint;
-        std::string scheme = "https://";
-        if (ep.rfind("http://", 0) == 0) {
-            scheme = "http://";
-            host = ep.substr(7);
-        } else if (ep.rfind("https://", 0) == 0) {
-            host = ep.substr(8);
-        } else {
-            host = ep;
-        }
-        while (!host.empty() && host.back() == '/') {
-            host.pop_back();
-        }
-        path = uri_encode_path("/" + bucket + "/" + key);
-        url = scheme + host + path;
-    } else {
-        host = bucket + ".s3." + config_->region + ".amazonaws.com";
-        path = uri_encode_path("/" + key);
-        url = "https://" + host + path;
-    }
-
-    auto buf = std::make_unique<S3Streambuf>(config_, host, url, read_ahead_bytes);
+    auto buf = std::make_unique<S3Streambuf>(config_, bucket, key, read_ahead_bytes);
     if (!buf->ok()) {
         g_last_error = "failed to initialize libcurl handle";
         return nullptr;
     }
-    buf->set_path(path);
     return std::make_unique<S3IStream>(std::move(buf));
 }
 

@@ -43,9 +43,13 @@ The built-in reader resolves its configuration from the environment, following t
 | `AWS_SESSION_TOKEN` | Temporary-credential session token (optional). |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | Region for virtual-hosted addressing (default `us-east-1`). |
 | `AWS_ENDPOINT_URL` | Custom endpoint, e.g. `http://localhost:9000`; when set, requests use path-style addressing for S3-compatible stores (MinIO, etc.). |
+| `AWS_MAX_ATTEMPTS` | Total tries per range GET (default `3`); transient failures (timeouts, dropped connections, `429`/`500`/`502`/`503`/`504`) are retried with full-jitter exponential backoff. |
 
-Reading credentials from `~/.aws/*` is out of scope — supply them via the environment. To instead reuse an
-existing AWS-SDK-backed S3 helper from a parent project, point nanolance at it (this overrides the built-in):
+The reader uses connect/stall timeouts (so an unreachable or hung endpoint fails fast instead of blocking),
+auto-corrects a wrong-region bucket once via the `x-amz-bucket-region` redirect hint, and reuses one
+keep-alive connection per object. Reading credentials from `~/.aws/*` is out of scope — supply them via the
+environment. To instead reuse an existing AWS-SDK-backed S3 helper from a parent project, point nanolance at
+it (this overrides the built-in):
 
 ```bash
 cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON \
