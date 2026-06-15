@@ -28,14 +28,17 @@ cmake --build build -j
 ctest --test-dir build -L smoke --output-on-failure
 ```
 
-Optional S3 external blobs — just turn the option on and nanolance reads `s3://` on its own using a small
-built-in reader (libcurl + OpenSSL, AWS SigV4 range GETs — no AWS SDK):
+Optional S3 external blobs — just turn the option on and nanolance reads `s3://` using
+[nanos3reader](https://github.com/yoavbendor/nanos3reader), a small read-only S3 range reader (libcurl +
+SigV4, no AWS SDK) that nanolance pulls in via CMake `FetchContent`:
 
 ```bash
 cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON
 ```
 
-The built-in reader resolves **credentials** the way the AWS tools do, trying in order: environment
+(Embedders with the legacy AWS-SDK seam can still set `NANOLANCE_S3_TARGET` to use that instead.)
+
+The reader resolves **credentials** the way the AWS tools do, trying in order: environment
 variables → the shared profile files (`~/.aws/credentials` and `~/.aws/config`, honoring `AWS_PROFILE`),
 including a profile's `credential_process` helper → ECS/EKS container credentials → the EC2 instance role
 (IMDSv2). Temporary credentials (session tokens) are supported and refreshed before they expire. When no

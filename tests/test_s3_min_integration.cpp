@@ -14,7 +14,7 @@
 //   NANOLANCE_S3_TEST_SIZE=100000                   (optional; object size, default 100000)
 
 #include "nanolance/nano_lance_reader.h"
-#include "nanolance/s3_min_reader.h"
+#include "nanos3reader/s3_reader.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -79,7 +79,7 @@ int main() {
 
     // 3. Multi-window stitching: a tiny read-ahead forces many sequential 206 GETs over one connection.
     {
-        nanolance::S3MinStreamFactory factory;
+        nanos3reader::S3MinStreamFactory factory;
         auto s = factory.open(uri, 4096);
         if (!s) {
             std::cerr << "FAIL multiwindow open: " << factory.error() << '\n';
