@@ -55,6 +55,10 @@ keep-alive connection per object. `credential_process` profiles are run directly
 profiles are not resolved — for those, export credentials into the environment (e.g. via your AWS tooling)
 before running.
 
+For deeper notes — credential resolution, the blob-fetch performance gap vs pylance, the swappable SigV4
+crypto backend, small static builds (mbedTLS), and the plan to spin the reader out as a standalone library
+— see [docs/s3_reader_notes.md](docs/s3_reader_notes.md).
+
 The SigV4 signer is unit-tested against AWS's published vectors (`nano_lance_s3_min_sigv4`, runs by default).
 A live round-trip test (`nano_lance_s3_min_integration`) is **gated** — it skips unless `NANOLANCE_S3_TEST_URI`
 (+ `AWS_*`) point at a bucket holding the pattern object it expects. To exercise it against a throwaway MinIO:
