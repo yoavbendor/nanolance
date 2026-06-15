@@ -5,7 +5,7 @@ Engineering notes for the in-tree S3 range reader (`src/s3_min_reader.cpp`,
 re-deriving it. Covers: what the reader is, how it resolves credentials, why it's ~40× faster than
 pylance on the blob-fetch benchmark, the swappable SigV4 crypto backend, what a small static build
 (mbedTLS) actually costs, and what it would take to promote the reader into a standalone library
-(working name **`nanoS3reader`**).
+(working name **`nanos3reader`**).
 
 ---
 
@@ -228,10 +228,11 @@ strip -s s3cat_mbedtls   # ~2.16 MB
 
 ---
 
-## 6. Promoting it to a standalone library — `nanoS3reader`
+## 6. Promoting it to a standalone library — `nanos3reader`
 
-**The name fits** the `nano*` family (nanolance, nanotins, nanoarrow): **`nanoS3reader`** reads well and
-says exactly what it is (read-only S3 range reader). Good pick.
+**The name fits** the `nano*` family (nanolance, nanotins, nanoarrow): **`nanos3reader`** (all lowercase —
+the canonical name for repo, CMake target, and namespace) says exactly what it is: a read-only S3 range
+reader.
 
 ### Why it has appeal
 
@@ -247,7 +248,7 @@ not an SDK.
 Already have: SigV4 vector tests, a MinIO integration test, the external-blob test, a clean header, and
 a CMake seam. Remaining:
 
-- Own repo + CMake exporting `nanoS3reader::nanoS3reader`, install rules, `find_package` config +
+- Own repo + CMake exporting `nanos3reader::nanos3reader`, install rules, `find_package` config +
   pkg-config, semver tags. (GitLab: `.gitlab-ci.yml` with a `minio` service for the integration test.)
 - Rename namespace `nanolance::` → `nanos3reader::`; nanolance keeps working via the external-target
   hook + a 2-line typedef shim.
@@ -275,7 +276,7 @@ Ship both as documented presets; CI builds both.
 
 The seam already exists: `nano_lance_external_blob.cpp` goes through the `NanoLanceS3Factory` typedef,
 and CMake already supports an external S3 target (`NANOLANCE_S3_TARGET` / `NANOLANCE_S3_INCLUDE_DIR`) and
-a no-S3 mode. nanolance can consume `nanoS3reader` as an external target with **zero hot-path change**.
+a no-S3 mode. nanolance can consume `nanos3reader` as an external target with **zero hot-path change**.
 Costs to manage: keep the `open()/error()` + `istream` contract stable, pin a version (submodule or
 package), and keep the in-tree copy as a fallback during migration.
 
