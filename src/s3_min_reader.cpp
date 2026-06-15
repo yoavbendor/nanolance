@@ -7,6 +7,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
@@ -351,6 +352,54 @@ void fill_creds_from_json(const std::string& body, Credentials& cred) {
     cred.expiry = parse_iso8601(json_field(body, "Expiration"));
 }
 
+// The `credential_process` command configured for `profile`, if any (credentials file wins over config).
+std::string profile_credential_process(const std::string& profile) {
+    const std::string home = env_or("HOME", "");
+    const std::string cred_path =
+        env_or("AWS_SHARED_CREDENTIALS_FILE", home.empty() ? "" : home + "/.aws/credentials");
+    const std::string conf_path = env_or("AWS_CONFIG_FILE", home.empty() ? "" : home + "/.aws/config");
+    if (!cred_path.empty()) {
+        const auto kv = parse_ini_section(cred_path, profile);
+        if (auto it = kv.find("credential_process"); it != kv.end() && !it->second.empty()) return it->second;
+    }
+    if (!conf_path.empty()) {
+        const std::string section = (profile == "default") ? "default" : ("profile " + profile);
+        const auto kv = parse_ini_section(conf_path, section);
+        if (auto it = kv.find("credential_process"); it != kv.end() && !it->second.empty()) return it->second;
+    }
+    return "";
+}
+
+// Run a profile's credential_process helper and parse its JSON stdout, which has the shape
+//   {"Version":1,"AccessKeyId":..,"SecretAccessKey":..,"SessionToken":..,"Expiration":..}
+// (note "SessionToken", unlike the "Token" the metadata endpoints use). The command is trusted input — it
+// comes from the user's own ~/.aws config, exactly as the AWS CLI treats it.
+bool load_credential_process(const std::string& profile, Credentials& cred) {
+    const std::string cmd = profile_credential_process(profile);
+    if (cmd.empty()) {
+        return false;
+    }
+    std::string out;
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    if (pipe == nullptr) {
+        return false;
+    }
+    char buf[4096];
+    size_t got = 0;
+    while ((got = std::fread(buf, 1, sizeof buf, pipe)) > 0) {
+        out.append(buf, got);
+        if (out.size() > (1u << 20)) {  // 1 MiB cap; the credential JSON is tiny
+            break;
+        }
+    }
+    ::pclose(pipe);  // a failed helper just yields no usable JSON, caught by valid() below
+    cred.access_key = json_field(out, "AccessKeyId");
+    cred.secret_key = json_field(out, "SecretAccessKey");
+    cred.session_token = json_field(out, "SessionToken");
+    cred.expiry = parse_iso8601(json_field(out, "Expiration"));
+    return cred.valid();
+}
+
 // ECS / EKS container credentials (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or _FULL_URI).
 bool load_ecs(Credentials& cred) {
     const std::string rel = env_or("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "");
@@ -428,7 +477,7 @@ std::string describe_profile_gap(const std::string& profile) {
     };
     if (has(conf_kv, "credential_process") || has(cred_kv, "credential_process")) {
         return "profile '" + profile +
-               "' uses credential_process, which the built-in reader does not run — export creds to env";
+               "' credential_process helper failed or returned no usable credentials";
     }
     if (has(conf_kv, "sso_session") || has(conf_kv, "sso_account_id") || has(conf_kv, "sso_start_url")) {
         return "profile '" + profile +
@@ -497,6 +546,9 @@ private:
             if (prof.valid()) {
                 prof.expiry = std::nullopt;  // shared-file creds are static
                 out = prof;
+                return true;
+            }
+            if (load_credential_process(profile_, out)) {  // profile's credential_process helper
                 return true;
             }
             notes += "; profile: " + describe_profile_gap(profile_);

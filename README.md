@@ -36,9 +36,10 @@ cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON
 ```
 
 The built-in reader resolves **credentials** the way the AWS tools do, trying in order: environment
-variables → the shared profile files (`~/.aws/credentials` and `~/.aws/config`, honoring `AWS_PROFILE`) →
-ECS/EKS container credentials → the EC2 instance role (IMDSv2). Temporary credentials (session tokens) are
-supported and refreshed before they expire. Other configuration:
+variables → the shared profile files (`~/.aws/credentials` and `~/.aws/config`, honoring `AWS_PROFILE`),
+including a profile's `credential_process` helper → ECS/EKS container credentials → the EC2 instance role
+(IMDSv2). Temporary credentials (session tokens) are supported and refreshed before they expire. When no
+credentials are found the error names each source it tried and why it failed. Other configuration:
 
 | Variable | Purpose |
 | --- | --- |
@@ -50,8 +51,9 @@ supported and refreshed before they expire. Other configuration:
 
 The reader uses connect/stall timeouts (so an unreachable or hung endpoint fails fast instead of blocking),
 auto-corrects a wrong-region bucket once via the `x-amz-bucket-region` redirect hint, and reuses one
-keep-alive connection per object. SSO / `credential_process` profiles are not resolved directly — for those,
-export credentials into the environment (e.g. via your AWS tooling) before running.
+keep-alive connection per object. `credential_process` profiles are run directly; SSO and assume-role
+profiles are not resolved — for those, export credentials into the environment (e.g. via your AWS tooling)
+before running.
 
 The SigV4 signer is unit-tested against AWS's published vectors (`nano_lance_s3_min_sigv4`, runs by default).
 A live round-trip test (`nano_lance_s3_min_integration`) is **gated** — it skips unless `NANOLANCE_S3_TEST_URI`
