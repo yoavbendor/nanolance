@@ -56,7 +56,10 @@ if(NOT TARGET nanoarrow_static OR NOT DEFINED nanoarrow_SOURCE_DIR)
     FetchContent_Declare(nanoarrow
         GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow.git
         GIT_TAG ffe61d3cd2d02da9e60cfc405cd6c50c512f64b9
-        GIT_SHALLOW TRUE
+        # Pinned to a commit hash: a shallow clone can't check out an arbitrary SHA on many git servers
+        # (corporate mirrors, GitHub Enterprise), which fails standalone configure with "reference is not a
+        # tree". A full clone can, so shallow must stay off here.
+        GIT_SHALLOW FALSE
     )
     FetchContent_Populate(nanoarrow)
     add_subdirectory(${nanoarrow_SOURCE_DIR} ${nanoarrow_BINARY_DIR} EXCLUDE_FROM_ALL)
@@ -160,10 +163,34 @@ target_include_directories(nanolance_reader PUBLIC
 )
 target_link_libraries(nanolance_reader PUBLIC nanolance_proto)
 
+set(NANOLANCE_S3_CRYPTO "openssl" CACHE STRING
+    "SigV4 crypto backend for the built-in S3 reader: openssl (default) | bundled")
+
+# S3 external-blob reads. Two providers:
+#   1. External AWS-SDK seam (legacy): the parent project supplies NANOLANCE_S3_TARGET + a directory with
+#      s3_aws_sdk_stream.h. Used when NANOLANCE_S3_TARGET is set, so existing embedders are unaffected.
+#   2. Built-in reader (default): a small in-tree libcurl + OpenSSL SigV4 range-GET reader, so nanolance can
+#      read s3:// on its own with no AWS SDK. Used whenever S3 is enabled and no external target is given.
 if(NANOLANCE_ENABLE_S3 AND NANOLANCE_S3_TARGET AND TARGET "${NANOLANCE_S3_TARGET}" AND NANOLANCE_S3_INCLUDE_DIR)
     target_include_directories(nanolance_reader PRIVATE "${NANOLANCE_S3_INCLUDE_DIR}")
     target_link_libraries(nanolance_reader PRIVATE "${NANOLANCE_S3_TARGET}")
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)
+elseif(NANOLANCE_ENABLE_S3)
+    find_package(CURL REQUIRED)
+    target_sources(nanolance_reader PRIVATE src/s3_min_reader.cpp)
+    target_link_libraries(nanolance_reader PRIVATE CURL::libcurl)
+    target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1 NANO_LANCE_S3_BUILTIN=1)
+    # SigV4 crypto backend: "openssl" (default, links libcrypto) or "bundled" (in-tree SHA-256, no crypto
+    # link — for small static builds where libcurl supplies TLS via mbedTLS/BearSSL/etc).
+    if(NANOLANCE_S3_CRYPTO STREQUAL "bundled")
+        target_compile_definitions(nanolance_reader PRIVATE NANOLANCE_S3_CRYPTO_BUNDLED=1)
+        message(STATUS "nanolance S3 reader: bundled SHA-256 (no OpenSSL link)")
+    else()
+        find_package(OpenSSL REQUIRED)
+        target_link_libraries(nanolance_reader PRIVATE OpenSSL::Crypto)
+        message(STATUS "nanolance S3 reader: OpenSSL libcrypto SHA-256")
+    endif()
+    set(NANOLANCE_S3_BUILTIN_ACTIVE ON)
 endif()
 
 add_library(nanolance STATIC
@@ -327,6 +354,20 @@ add_executable(nano_lance_external_blob_test tests/test_nano_lance_external_blob
 target_compile_features(nano_lance_external_blob_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_external_blob_test PRIVATE nanolance_reader)
 
+# Built-in S3 reader tests (only when the built-in provider is compiled in):
+#  - SigV4 signer vectors: pure computation, always runs.
+#  - Live integration: range GETs against a real S3-compatible endpoint; skips unless NANOLANCE_S3_TEST_URI
+#    (+ AWS_* env) is set. tests/s3_minio_integration.sh wires this up against a throwaway MinIO.
+if(NANOLANCE_S3_BUILTIN_ACTIVE)
+    add_executable(nano_lance_s3_min_sigv4_test tests/test_s3_min_sigv4.cpp)
+    target_compile_features(nano_lance_s3_min_sigv4_test PRIVATE cxx_std_20)
+    target_link_libraries(nano_lance_s3_min_sigv4_test PRIVATE nanolance_reader)
+
+    add_executable(nano_lance_s3_min_integration_test tests/test_s3_min_integration.cpp)
+    target_compile_features(nano_lance_s3_min_integration_test PRIVATE cxx_std_20)
+    target_link_libraries(nano_lance_s3_min_integration_test PRIVATE nanolance_reader)
+endif()
+
 if(NANOLANCE_BUILD_TOOLS)
     add_test(NAME app_arrowipc2lance_help COMMAND $<TARGET_FILE:arrowipc2lance> -h)
     set_tests_properties(app_arrowipc2lance_help PROPERTIES LABELS "smoke")
@@ -393,6 +434,16 @@ set_tests_properties(nano_lance_table_roundtrip PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_external_blob COMMAND $<TARGET_FILE:nano_lance_external_blob_test>)
 set_tests_properties(nano_lance_external_blob PROPERTIES LABELS "smoke")
+
+if(NANOLANCE_S3_BUILTIN_ACTIVE)
+    add_test(NAME nano_lance_s3_min_sigv4 COMMAND $<TARGET_FILE:nano_lance_s3_min_sigv4_test>)
+    set_tests_properties(nano_lance_s3_min_sigv4 PROPERTIES LABELS "smoke")
+
+    # Live S3 integration: skips (CTest code 77) unless NANOLANCE_S3_TEST_URI + AWS_* env are set. Not in
+    # the smoke set, so the default run never needs network or credentials.
+    add_test(NAME nano_lance_s3_min_integration COMMAND $<TARGET_FILE:nano_lance_s3_min_integration_test>)
+    set_tests_properties(nano_lance_s3_min_integration PROPERTIES LABELS "s3-integration" SKIP_RETURN_CODE 77)
+endif()
 
 add_test(
     NAME nano_lance_golden_python_deps

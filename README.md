@@ -28,7 +28,51 @@ cmake --build build -j
 ctest --test-dir build -L smoke --output-on-failure
 ```
 
-Optional S3 external blobs (you must supply a CMake target and include dir, e.g. from a parent project):
+Optional S3 external blobs — just turn the option on and nanolance reads `s3://` on its own using a small
+built-in reader (libcurl + OpenSSL, AWS SigV4 range GETs — no AWS SDK):
+
+```bash
+cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON
+```
+
+The built-in reader resolves **credentials** the way the AWS tools do, trying in order: environment
+variables → the shared profile files (`~/.aws/credentials` and `~/.aws/config`, honoring `AWS_PROFILE`),
+including a profile's `credential_process` helper → ECS/EKS container credentials → the EC2 instance role
+(IMDSv2). Temporary credentials (session tokens) are supported and refreshed before they expire. When no
+credentials are found the error names each source it tried and why it failed. Other configuration:
+
+| Variable | Purpose |
+| --- | --- |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Credentials via environment (highest precedence; session token optional). |
+| `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | Profile to read from `~/.aws/credentials` + `~/.aws/config` (default `default`). `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE` override the paths. |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | Region for virtual-hosted addressing; also read from the profile's `region`, else defaults to `us-east-1`. |
+| `AWS_ENDPOINT_URL` | Custom endpoint, e.g. `http://localhost:9000`; when set, requests use path-style addressing for S3-compatible stores (MinIO, etc.). |
+| `AWS_MAX_ATTEMPTS` | Total tries per range GET (default `3`); transient failures (timeouts, dropped connections, `429`/`500`/`502`/`503`/`504`) are retried with full-jitter exponential backoff. |
+
+The reader uses connect/stall timeouts (so an unreachable or hung endpoint fails fast instead of blocking),
+auto-corrects a wrong-region bucket once via the `x-amz-bucket-region` redirect hint, and reuses one
+keep-alive connection per object. `credential_process` profiles are run directly; SSO and assume-role
+profiles are not resolved — for those, export credentials into the environment (e.g. via your AWS tooling)
+before running.
+
+For deeper notes — credential resolution, the blob-fetch performance gap vs pylance, the swappable SigV4
+crypto backend, small static builds (mbedTLS), and the plan to spin the reader out as a standalone library
+— see [docs/s3_reader_notes.md](docs/s3_reader_notes.md).
+
+The SigV4 signer is unit-tested against AWS's published vectors (`nano_lance_s3_min_sigv4`, runs by default).
+A live round-trip test (`nano_lance_s3_min_integration`) is **gated** — it skips unless `NANOLANCE_S3_TEST_URI`
+(+ `AWS_*`) point at a bucket holding the pattern object it expects. To exercise it against a throwaway MinIO:
+
+```bash
+cmake --build build --target nano_lance_s3_min_integration_test
+tests/s3_minio_integration.sh build/nano_lance_s3_min_integration_test   # needs Docker; skips if absent
+```
+
+The script starts MinIO, uploads the object, runs ranged reads + multi-window stitching, and asserts a wrong
+secret is rejected (proving the endpoint really verifies the signature).
+
+To instead reuse an existing AWS-SDK-backed S3 helper from a parent project, point nanolance at it (this
+overrides the built-in):
 
 ```bash
 cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON \
