@@ -30,5 +30,11 @@ These are pulled in at build time via CMake FetchContent (not redistributed here
   - Zstandard (zstd)        - BSD-3-Clause        - https://github.com/facebook/zstd
   - CLI11                   - BSD-3-Clause        - https://github.com/CLIUtils/CLI11
 
+The built-in S3 reader (optional, -DNANOLANCE_ENABLE_S3=ON; off by default) additionally links these
+system libraries dynamically (not redistributed here):
+
+  - libcurl                 - curl license (MIT/X11-style)  - https://curl.se
+  - OpenSSL (libcrypto)     - Apache License 2.0 (3.x)      - https://www.openssl.org
+
 See THIRD-PARTY-LICENSES.md for details. The pcapng2lance example additionally
 depends on the sister nanotins stack (Apache-2.0); see its own NOTICE.
