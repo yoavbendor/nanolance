@@ -56,7 +56,10 @@ if(NOT TARGET nanoarrow_static OR NOT DEFINED nanoarrow_SOURCE_DIR)
     FetchContent_Declare(nanoarrow
         GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow.git
         GIT_TAG ffe61d3cd2d02da9e60cfc405cd6c50c512f64b9
-        GIT_SHALLOW TRUE
+        # Pinned to a commit hash: a shallow clone can't check out an arbitrary SHA on many git servers
+        # (corporate mirrors, GitHub Enterprise), which fails standalone configure with "reference is not a
+        # tree". A full clone can, so shallow must stay off here.
+        GIT_SHALLOW FALSE
     )
     FetchContent_Populate(nanoarrow)
     add_subdirectory(${nanoarrow_SOURCE_DIR} ${nanoarrow_BINARY_DIR} EXCLUDE_FROM_ALL)
