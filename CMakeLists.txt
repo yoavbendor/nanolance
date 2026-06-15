@@ -183,7 +183,7 @@ elseif(NANOLANCE_ENABLE_S3)
     set(NANOS3READER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(nanos3reader
         GIT_REPOSITORY https://github.com/yoavbendor/nanos3reader.git
-        GIT_TAG 4f46332365d86e09f9e0d9251009874313141dd2)  # pin; bump to a version tag once released
+        GIT_TAG v0.1.0)
     FetchContent_MakeAvailable(nanos3reader)
     target_link_libraries(nanolance_reader PRIVATE nanos3reader::nanos3reader)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)
