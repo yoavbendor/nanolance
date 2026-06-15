@@ -163,6 +163,9 @@ target_include_directories(nanolance_reader PUBLIC
 )
 target_link_libraries(nanolance_reader PUBLIC nanolance_proto)
 
+set(NANOLANCE_S3_CRYPTO "openssl" CACHE STRING
+    "SigV4 crypto backend for the built-in S3 reader: openssl (default) | bundled")
+
 # S3 external-blob reads. Two providers:
 #   1. External AWS-SDK seam (legacy): the parent project supplies NANOLANCE_S3_TARGET + a directory with
 #      s3_aws_sdk_stream.h. Used when NANOLANCE_S3_TARGET is set, so existing embedders are unaffected.
@@ -174,10 +177,19 @@ if(NANOLANCE_ENABLE_S3 AND NANOLANCE_S3_TARGET AND TARGET "${NANOLANCE_S3_TARGET
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)
 elseif(NANOLANCE_ENABLE_S3)
     find_package(CURL REQUIRED)
-    find_package(OpenSSL REQUIRED)
     target_sources(nanolance_reader PRIVATE src/s3_min_reader.cpp)
-    target_link_libraries(nanolance_reader PRIVATE CURL::libcurl OpenSSL::Crypto)
+    target_link_libraries(nanolance_reader PRIVATE CURL::libcurl)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1 NANO_LANCE_S3_BUILTIN=1)
+    # SigV4 crypto backend: "openssl" (default, links libcrypto) or "bundled" (in-tree SHA-256, no crypto
+    # link — for small static builds where libcurl supplies TLS via mbedTLS/BearSSL/etc).
+    if(NANOLANCE_S3_CRYPTO STREQUAL "bundled")
+        target_compile_definitions(nanolance_reader PRIVATE NANOLANCE_S3_CRYPTO_BUNDLED=1)
+        message(STATUS "nanolance S3 reader: bundled SHA-256 (no OpenSSL link)")
+    else()
+        find_package(OpenSSL REQUIRED)
+        target_link_libraries(nanolance_reader PRIVATE OpenSSL::Crypto)
+        message(STATUS "nanolance S3 reader: OpenSSL libcrypto SHA-256")
+    endif()
     set(NANOLANCE_S3_BUILTIN_ACTIVE ON)
 endif()
 
