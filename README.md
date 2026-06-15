@@ -35,20 +35,23 @@ built-in reader (libcurl + OpenSSL, AWS SigV4 range GETs — no AWS SDK):
 cmake -S . -B build -DNANOLANCE_ENABLE_S3=ON
 ```
 
-The built-in reader resolves its configuration from the environment, following the usual AWS conventions:
+The built-in reader resolves **credentials** the way the AWS tools do, trying in order: environment
+variables → the shared profile files (`~/.aws/credentials` and `~/.aws/config`, honoring `AWS_PROFILE`) →
+ECS/EKS container credentials → the EC2 instance role (IMDSv2). Temporary credentials (session tokens) are
+supported and refreshed before they expire. Other configuration:
 
 | Variable | Purpose |
 | --- | --- |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Credentials (required). |
-| `AWS_SESSION_TOKEN` | Temporary-credential session token (optional). |
-| `AWS_REGION` / `AWS_DEFAULT_REGION` | Region for virtual-hosted addressing (default `us-east-1`). |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Credentials via environment (highest precedence; session token optional). |
+| `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | Profile to read from `~/.aws/credentials` + `~/.aws/config` (default `default`). `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE` override the paths. |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | Region for virtual-hosted addressing; also read from the profile's `region`, else defaults to `us-east-1`. |
 | `AWS_ENDPOINT_URL` | Custom endpoint, e.g. `http://localhost:9000`; when set, requests use path-style addressing for S3-compatible stores (MinIO, etc.). |
 | `AWS_MAX_ATTEMPTS` | Total tries per range GET (default `3`); transient failures (timeouts, dropped connections, `429`/`500`/`502`/`503`/`504`) are retried with full-jitter exponential backoff. |
 
 The reader uses connect/stall timeouts (so an unreachable or hung endpoint fails fast instead of blocking),
 auto-corrects a wrong-region bucket once via the `x-amz-bucket-region` redirect hint, and reuses one
-keep-alive connection per object. Reading credentials from `~/.aws/*` is out of scope — supply them via the
-environment.
+keep-alive connection per object. SSO / `credential_process` profiles are not resolved directly — for those,
+export credentials into the environment (e.g. via your AWS tooling) before running.
 
 The SigV4 signer is unit-tested against AWS's published vectors (`nano_lance_s3_min_sigv4`, runs by default).
 A live round-trip test (`nano_lance_s3_min_integration`) is **gated** — it skips unless `NANOLANCE_S3_TEST_URI`

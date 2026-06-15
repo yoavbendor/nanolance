@@ -70,10 +70,11 @@ std::string build_authorization(const CanonicalRequest& req, const std::string& 
 // --- Stream factory --------------------------------------------------------------------------------
 
 // Opens s3:// objects as seekable, read-ahead-buffered std::istreams backed by libcurl range GETs + SigV4.
-// Configuration (credentials, region, optional endpoint) is resolved once from the environment:
-//   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (optional),
-//   AWS_REGION / AWS_DEFAULT_REGION (default "us-east-1"),
-//   AWS_ENDPOINT_URL (optional; when set, requests use path-style addressing for S3-compatible stores).
+// Credentials are resolved via the standard chain: environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+// AWS_SESSION_TOKEN) -> shared profile files (~/.aws/credentials + ~/.aws/config, honoring AWS_PROFILE) ->
+// ECS/EKS container credentials -> EC2 instance role (IMDSv2); temporary creds are refreshed near expiry.
+// Region comes from AWS_REGION / AWS_DEFAULT_REGION, else the profile, else "us-east-1". AWS_ENDPOINT_URL,
+// when set, selects path-style addressing for S3-compatible stores (MinIO, etc.).
 class S3MinStreamFactory {
 public:
     S3MinStreamFactory();

@@ -9,7 +9,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <fstream>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <streambuf>
 #include <string>
@@ -116,18 +119,6 @@ std::string build_authorization(const CanonicalRequest& req, const std::string& 
 
 // --- factory + stream ------------------------------------------------------------------------------
 
-namespace s3detail {
-struct Config {
-    std::string access_key;
-    std::string secret_key;
-    std::string session_token;
-    std::string region;
-    std::string endpoint;    // empty -> AWS virtual-hosted; non-empty -> path-style against this endpoint
-    bool path_style = false;
-    int max_attempts = 3;    // total tries per GET (AWS_MAX_ATTEMPTS), >= 1
-};
-}  // namespace s3detail
-
 namespace {
 
 // Per-thread last-error, surfaced by S3MinStreamFactory::error(). Thread-local because the external-blob
@@ -143,9 +134,22 @@ constexpr long kLowSpeedTimeSec = 60;     // ... for 60s as a stall and abort (i
 constexpr long kBackoffBaseMs = 100;      // exponential backoff base
 constexpr long kBackoffCapMs = 2000;      // and ceiling, with full jitter
 
+// Metadata (IMDS/ECS) calls must fail fast on non-cloud hosts, not hang.
+constexpr long kMetaConnectMs = 1000;
+constexpr long kMetaTotalMs = 2000;
+
 std::string env_or(const char* name, const std::string& fallback) {
     const char* v = std::getenv(name);
     return (v != nullptr && v[0] != '\0') ? std::string(v) : fallback;
+}
+
+std::string trim_ws(const std::string& s) {
+    const auto b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) {
+        return "";
+    }
+    const auto e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
 }
 
 void ensure_curl_global_init() {
@@ -184,6 +188,295 @@ std::string amz_now() {
     return std::string(buf);
 }
 
+std::size_t write_to_vector(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
+    const std::size_t n = size * nmemb;
+    auto* out = static_cast<std::vector<char>*>(userdata);
+    out->insert(out->end(), ptr, ptr + n);
+    return n;
+}
+
+std::size_t write_to_string(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
+    const std::size_t n = size * nmemb;
+    static_cast<std::string*>(userdata)->append(ptr, n);
+    return n;
+}
+
+// --- credential resolution (env -> shared profile files -> ECS -> EC2 IMDSv2) ----------------------
+
+struct Credentials {
+    std::string access_key;
+    std::string secret_key;
+    std::string session_token;
+    // When set, the creds are temporary and must be refreshed near this instant; nullopt means static.
+    std::optional<std::chrono::system_clock::time_point> expiry;
+    bool valid() const { return !access_key.empty() && !secret_key.empty(); }
+};
+
+std::string aws_profile() {
+    return env_or("AWS_PROFILE", env_or("AWS_DEFAULT_PROFILE", "default"));
+}
+
+// Read the [section] key/value pairs from an AWS INI file (credentials or config). Comments (# / ;) and
+// blank lines are ignored.
+std::map<std::string, std::string> parse_ini_section(const std::string& path, const std::string& section) {
+    std::map<std::string, std::string> kv;
+    std::ifstream f(path);
+    if (!f) {
+        return kv;
+    }
+    std::string line;
+    std::string current;
+    while (std::getline(f, line)) {
+        const std::string s = trim_ws(line);
+        if (s.empty() || s[0] == '#' || s[0] == ';') {
+            continue;
+        }
+        if (s.front() == '[' && s.back() == ']') {
+            current = trim_ws(s.substr(1, s.size() - 2));
+            continue;
+        }
+        if (current != section) {
+            continue;
+        }
+        const auto eq = s.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        kv[trim_ws(s.substr(0, eq))] = trim_ws(s.substr(eq + 1));
+    }
+    return kv;
+}
+
+// Static creds (+ region) for `profile` from ~/.aws/credentials and ~/.aws/config. The credentials file
+// uses [profile]; the config file uses [profile <name>] (or [default]). Credentials file wins.
+void load_profile(const std::string& profile, Credentials& cred, std::string& region_out) {
+    const std::string home = env_or("HOME", "");
+    const std::string cred_path =
+        env_or("AWS_SHARED_CREDENTIALS_FILE", home.empty() ? "" : home + "/.aws/credentials");
+    const std::string conf_path = env_or("AWS_CONFIG_FILE", home.empty() ? "" : home + "/.aws/config");
+
+    if (!cred_path.empty()) {
+        const auto kv = parse_ini_section(cred_path, profile);
+        if (auto it = kv.find("aws_access_key_id"); it != kv.end()) cred.access_key = it->second;
+        if (auto it = kv.find("aws_secret_access_key"); it != kv.end()) cred.secret_key = it->second;
+        if (auto it = kv.find("aws_session_token"); it != kv.end()) cred.session_token = it->second;
+        if (auto it = kv.find("region"); it != kv.end()) region_out = it->second;
+    }
+    if (!conf_path.empty()) {
+        const std::string section = (profile == "default") ? "default" : ("profile " + profile);
+        const auto kv = parse_ini_section(conf_path, section);
+        if (cred.access_key.empty())
+            if (auto it = kv.find("aws_access_key_id"); it != kv.end()) cred.access_key = it->second;
+        if (cred.secret_key.empty())
+            if (auto it = kv.find("aws_secret_access_key"); it != kv.end()) cred.secret_key = it->second;
+        if (cred.session_token.empty())
+            if (auto it = kv.find("aws_session_token"); it != kv.end()) cred.session_token = it->second;
+        if (region_out.empty())
+            if (auto it = kv.find("region"); it != kv.end()) region_out = it->second;
+    }
+}
+
+// Minimal HTTP for the metadata endpoints. Returns true on a 2xx; body is the response.
+bool http_metadata(const std::string& url, const std::vector<std::string>& headers, bool put,
+                   std::string& out) {
+    CURL* c = curl_easy_init();
+    if (c == nullptr) {
+        return false;
+    }
+    out.clear();
+    curl_slist* hdr = nullptr;
+    for (const auto& h : headers) {
+        hdr = curl_slist_append(hdr, h.c_str());
+    }
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    if (put) {
+        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PUT");
+    }
+    if (hdr != nullptr) {
+        curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdr);
+    }
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, &write_to_string);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, kMetaConnectMs);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, kMetaTotalMs);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    const CURLcode rc = curl_easy_perform(c);
+    long code = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    if (hdr != nullptr) {
+        curl_slist_free_all(hdr);
+    }
+    curl_easy_cleanup(c);
+    return rc == CURLE_OK && code >= 200 && code < 300;
+}
+
+// Extract a string value for "key" from a flat AWS JSON metadata response (no nesting/escaping in these).
+std::string json_field(const std::string& body, const char* key) {
+    const std::string needle = std::string("\"") + key + "\"";
+    auto p = body.find(needle);
+    if (p == std::string::npos) {
+        return "";
+    }
+    p = body.find(':', p + needle.size());
+    if (p == std::string::npos) {
+        return "";
+    }
+    ++p;
+    while (p < body.size() && (body[p] == ' ' || body[p] == '\t')) {
+        ++p;
+    }
+    if (p >= body.size() || body[p] != '"') {
+        return "";
+    }
+    ++p;
+    const auto e = body.find('"', p);
+    return e == std::string::npos ? "" : body.substr(p, e - p);
+}
+
+std::optional<std::chrono::system_clock::time_point> parse_iso8601(const std::string& s) {
+    if (s.empty()) {
+        return std::nullopt;
+    }
+    std::tm tm{};
+    if (strptime(s.c_str(), "%Y-%m-%dT%H:%M:%S", &tm) == nullptr) {
+        return std::nullopt;
+    }
+    return std::chrono::system_clock::from_time_t(timegm(&tm));
+}
+
+void fill_creds_from_json(const std::string& body, Credentials& cred) {
+    cred.access_key = json_field(body, "AccessKeyId");
+    cred.secret_key = json_field(body, "SecretAccessKey");
+    cred.session_token = json_field(body, "Token");
+    cred.expiry = parse_iso8601(json_field(body, "Expiration"));
+}
+
+// ECS / EKS container credentials (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or _FULL_URI).
+bool load_ecs(Credentials& cred) {
+    const std::string rel = env_or("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "");
+    const std::string full = env_or("AWS_CONTAINER_CREDENTIALS_FULL_URI", "");
+    std::string url;
+    if (!rel.empty()) {
+        url = "http://169.254.170.2" + rel;
+    } else if (!full.empty()) {
+        url = full;
+    } else {
+        return false;
+    }
+    std::vector<std::string> headers;
+    const std::string token = env_or("AWS_CONTAINER_AUTHORIZATION_TOKEN", "");
+    if (!token.empty()) {
+        headers.push_back("Authorization: " + token);
+    }
+    std::string body;
+    if (!http_metadata(url, headers, false, body)) {
+        return false;
+    }
+    fill_creds_from_json(body, cred);
+    return cred.valid();
+}
+
+// EC2 instance role via IMDSv2 (falls back to IMDSv1 if the token PUT is refused).
+bool load_imds(Credentials& cred) {
+    const std::string base = "http://169.254.169.254";
+    std::string token;
+    http_metadata(base + "/latest/api/token", {"X-aws-ec2-metadata-token-ttl-seconds: 21600"}, true, token);
+    std::vector<std::string> headers;
+    if (!token.empty()) {
+        headers.push_back("X-aws-ec2-metadata-token: " + token);
+    }
+    std::string role;
+    if (!http_metadata(base + "/latest/meta-data/iam/security-credentials/", headers, false, role)) {
+        return false;
+    }
+    role = trim_ws(role);
+    if (const auto nl = role.find('\n'); nl != std::string::npos) {
+        role = trim_ws(role.substr(0, nl));  // first role if several are listed
+    }
+    if (role.empty()) {
+        return false;
+    }
+    std::string body;
+    if (!http_metadata(base + "/latest/meta-data/iam/security-credentials/" + role, headers, false, body)) {
+        return false;
+    }
+    fill_creds_from_json(body, cred);
+    return cred.valid();
+}
+
+// Thread-safe provider walking the standard chain, caching the result and refreshing temporary creds a few
+// minutes before they expire. Shared by every stream the (process-singleton) factory opens.
+class CredentialProvider {
+public:
+    explicit CredentialProvider(std::string profile) : profile_(std::move(profile)) {}
+
+    Credentials get() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto now = std::chrono::system_clock::now();
+        if (cached_.valid() && (!cached_.expiry || now < *cached_.expiry - std::chrono::minutes(5))) {
+            return cached_;
+        }
+        // Don't hammer IMDS when there are simply no creds: back off between failed resolutions.
+        if (!cached_.valid() && attempted_ && now < last_attempt_ + std::chrono::seconds(2)) {
+            return cached_;
+        }
+        attempted_ = true;
+        last_attempt_ = now;
+        Credentials fresh;
+        if (resolve(fresh)) {
+            cached_ = fresh;
+        }
+        return cached_;
+    }
+
+private:
+    bool resolve(Credentials& out) {
+        const std::string ak = env_or("AWS_ACCESS_KEY_ID", "");
+        const std::string sk = env_or("AWS_SECRET_ACCESS_KEY", "");
+        if (!ak.empty() && !sk.empty()) {
+            out.access_key = ak;
+            out.secret_key = sk;
+            out.session_token = env_or("AWS_SESSION_TOKEN", "");
+            out.expiry = std::nullopt;
+            return true;
+        }
+        {
+            Credentials prof;
+            std::string region_unused;
+            load_profile(profile_, prof, region_unused);
+            if (prof.valid()) {
+                prof.expiry = std::nullopt;  // shared-file creds are static
+                out = prof;
+                return true;
+            }
+        }
+        if (load_ecs(out)) {
+            return true;
+        }
+        return load_imds(out);
+    }
+
+    std::mutex mutex_;
+    Credentials cached_;
+    std::string profile_;
+    bool attempted_ = false;
+    std::chrono::system_clock::time_point last_attempt_{};
+};
+
+}  // namespace
+
+namespace s3detail {
+struct Config {
+    std::string region;
+    std::string endpoint;    // empty -> AWS virtual-hosted; non-empty -> path-style against this endpoint
+    bool path_style = false;
+    int max_attempts = 3;    // total tries per GET (AWS_MAX_ATTEMPTS), >= 1
+    std::shared_ptr<CredentialProvider> creds;
+};
+}  // namespace s3detail
+
+namespace {
+
 // Resolved request target: the Host header value, the full request URL, and the canonical (encoded) path.
 struct Endpoint {
     std::string host;
@@ -218,13 +511,6 @@ Endpoint build_endpoint(const s3detail::Config& cfg, const std::string& bucket, 
     return e;
 }
 
-std::size_t write_to_vector(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
-    const std::size_t n = size * nmemb;
-    auto* out = static_cast<std::vector<char>*>(userdata);
-    out->insert(out->end(), ptr, ptr + n);
-    return n;
-}
-
 // Capture the `x-amz-bucket-region` response header (S3 returns it on wrong-region redirects), so we can
 // re-target and retry against the correct region.
 std::size_t capture_region_header(char* buffer, std::size_t size, std::size_t nitems, void* userdata) {
@@ -237,12 +523,7 @@ std::size_t capture_region_header(char* buffer, std::size_t size, std::size_t ni
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
     if (prefix == kKey) {
-        std::string value = line.substr(kKey.size());
-        const auto b = value.find_first_not_of(" \t");
-        const auto e = value.find_last_not_of(" \t\r\n");
-        if (b != std::string::npos) {
-            *region = value.substr(b, e - b + 1);
-        }
+        *region = trim_ws(line.substr(kKey.size()));
     }
     return n;
 }
@@ -399,6 +680,11 @@ private:
             fail("curl init failed");
             return false;
         }
+        const Credentials cred = cfg_->creds->get();
+        if (!cred.valid()) {
+            fail("missing AWS credentials (set AWS_* env, configure ~/.aws, or run on an instance role)");
+            return false;
+        }
         bool redirected = false;
         int attempt = 0;
         for (;;) {
@@ -416,8 +702,8 @@ private:
                 {"x-amz-content-sha256", "UNSIGNED-PAYLOAD"},
                 {"x-amz-date", amz_date},
             };
-            if (!cfg_->session_token.empty()) {
-                sign_headers.push_back({"x-amz-security-token", cfg_->session_token});
+            if (!cred.session_token.empty()) {
+                sign_headers.push_back({"x-amz-security-token", cred.session_token});
             }
             s3v4::CanonicalRequest req;
             req.method = "GET";
@@ -425,15 +711,15 @@ private:
             req.query = "";
             req.headers = sign_headers;
             req.payload_hash = "UNSIGNED-PAYLOAD";
-            const std::string authz = s3v4::build_authorization(req, cfg_->access_key, cfg_->secret_key,
+            const std::string authz = s3v4::build_authorization(req, cred.access_key, cred.secret_key,
                                                                 region_, "s3", amz_date);
 
             curl_slist* hdrs = nullptr;
             hdrs = curl_slist_append(hdrs, ("x-amz-date: " + amz_date).c_str());
             hdrs = curl_slist_append(hdrs, "x-amz-content-sha256: UNSIGNED-PAYLOAD");
             hdrs = curl_slist_append(hdrs, ("Range: " + range).c_str());
-            if (!cfg_->session_token.empty()) {
-                hdrs = curl_slist_append(hdrs, ("x-amz-security-token: " + cfg_->session_token).c_str());
+            if (!cred.session_token.empty()) {
+                hdrs = curl_slist_append(hdrs, ("x-amz-security-token: " + cred.session_token).c_str());
             }
             hdrs = curl_slist_append(hdrs, ("Authorization: " + authz).c_str());
 
@@ -537,10 +823,17 @@ private:
 
 S3MinStreamFactory::S3MinStreamFactory() {
     auto cfg = std::make_shared<s3detail::Config>();
-    cfg->access_key = env_or("AWS_ACCESS_KEY_ID", "");
-    cfg->secret_key = env_or("AWS_SECRET_ACCESS_KEY", "");
-    cfg->session_token = env_or("AWS_SESSION_TOKEN", "");
-    cfg->region = env_or("AWS_REGION", env_or("AWS_DEFAULT_REGION", "us-east-1"));
+    const std::string profile = aws_profile();
+    cfg->creds = std::make_shared<CredentialProvider>(profile);
+
+    // Region precedence: env -> shared-config profile -> default. (Credentials resolve lazily on first use.)
+    std::string region = env_or("AWS_REGION", env_or("AWS_DEFAULT_REGION", ""));
+    if (region.empty()) {
+        Credentials ignore;
+        load_profile(profile, ignore, region);
+    }
+    cfg->region = region.empty() ? "us-east-1" : region;
+
     cfg->endpoint = env_or("AWS_ENDPOINT_URL", "");
     cfg->path_style = !cfg->endpoint.empty();
     const int attempts = std::atoi(env_or("AWS_MAX_ATTEMPTS", "3").c_str());
@@ -565,8 +858,8 @@ std::unique_ptr<std::istream> S3MinStreamFactory::open(const std::string& uri, s
     const std::string bucket = rest.substr(0, slash);
     const std::string key = rest.substr(slash + 1);
 
-    if (config_->access_key.empty() || config_->secret_key.empty()) {
-        g_last_error = "missing AWS credentials (set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)";
+    if (!config_->creds->get().valid()) {
+        g_last_error = "missing AWS credentials (set AWS_* env, configure ~/.aws, or run on an instance role)";
         return nullptr;
     }
 
