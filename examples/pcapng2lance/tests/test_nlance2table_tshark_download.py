@@ -24,17 +24,18 @@ from pathlib import Path
 
 # (name, url) of real captures to fetch at runtime (never committed). Curated for stable raw URLs only.
 #
-#   wireshark_ipv6  — real IPv6 + Hop-by-Hop options (Router-Alert + PadN) + ICMPv6 **MLD**. Covers the
-#                     ext-header chain walk + the option child table AND the MLD case on non-synthetic data.
+#   wireshark_ipv6  — real IPv6 + Hop-by-Hop options (Router-Alert + PadN) + ICMPv6 MLD (GPL-2.0 upstream).
+#   srv6_demo       — real **SRv6**: ICMPv6 ping over SRH, both a reduced SRH (segments_left=0, 1 segment)
+#                     and a 2-segment SRH, plus inner-IPv6 encap (next_header=41). MIT-licensed
+#                     (github.com/sat0ken/go-ping-srv6) — the real SRv6 capture the scapy fixture stood in for.
 #
-# Notably ABSENT from stable public sources (checked: Wireshark SampleCaptures wiki + the repo's
-# test/captures dir):
-#   * SRv6 / SRH        — no public capture anywhere; covered by the committed scapy fixture (srv6_sample.pcap).
-#   * IPv6 AH / IPv6 ESP — none (the only test/captures ESP, esp-bug-12671, is IPv4); AH/ESP are covered by
-#                          the owned unit test (test_ipv6_ext_walk: AH reaches L4, ESP stops cleanly).
-# Add a trusted SRv6 / AH / ESP capture URL here if you obtain one (e.g. a vendor/IETF interop pcap).
+# Still absent from stable public sources (checked Wireshark wiki + test/captures): IPv6 AH / IPv6 ESP
+# (the only upstream ESP, esp-bug-12671, is IPv4) — those are covered by the owned unit test
+# (test_ipv6_ext_walk: AH reaches L4, ESP stops cleanly). Add more trusted URLs below as you find them
+# (e.g. SRPerf trex pcaps, or a vendor SRv6 TI-LFA capture).
 CAPTURES = [
     ("wireshark_ipv6", "https://gitlab.com/wireshark/wireshark/-/raw/master/test/captures/ipv6.pcap"),
+    ("srv6_demo", "https://raw.githubusercontent.com/sat0ken/go-ping-srv6/main/srv6-demo.pcap"),
 ]
 
 
@@ -110,7 +111,8 @@ def check_capture(name, pcap: Path, n2t, conv, tshark, mism):
                 sc += len(ts_addrs)
             if tr.get("ipv6.opt.type", "") != "":
                 ts_types = [int(x, 16) for x in tr["ipv6.opt.type"].split(",") if x != ""]
-                my_types = [int(x["opt_type"]) for x in opts.get(pid, [])]
+                # ipv6.opt.type is Hop-by-Hop (0) + Dest-Opts (60) only; SRH TLVs (container 43) are elsewhere.
+                my_types = [int(x["opt_type"]) for x in opts.get(pid, []) if int(x["container_type"]) in (0, 60)]
                 if my_types != ts_types:
                     mism.append(f"{name} pkt{pid} opt types ours={my_types} tshark={ts_types}")
                 oc += len(ts_types)
