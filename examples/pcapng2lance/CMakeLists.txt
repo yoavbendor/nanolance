@@ -153,6 +153,15 @@ if(NANOLANCE_BUILD_TESTS)
                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/some_ptp_data.pcapng")
             set_tests_properties(nlance2table_tshark_ptp PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
 
+            # IPv6 extension headers + SRv6: our ext-header chain walk + SRH segment list + IPv6 options
+            # (ipv6_routing / ipv6_srh_segment / ipv6_option tables) and the L4 fix, field-checked vs tshark
+            # on a scapy-built capture (srv6_sample.pcap; regenerate with tests/gen_srv6_fixture.py).
+            add_test(NAME nlance2table_tshark_srv6
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nlance2table_tshark_srv6.py"
+                        $<TARGET_FILE:nlance2table> $<TARGET_FILE:pcapng2lance>
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/srv6_sample.pcap")
+            set_tests_properties(nlance2table_tshark_srv6 PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
             # Harmonization: one-shot (--decode-l2l3) and staged (--stage l1->l4) must emit identical PDU
             # tables on a fragmented capture (same IPv4-fragmentation L4 gate in both decode paths).
             add_test(NAME pcapng2lance_frag_harmony
