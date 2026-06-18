@@ -124,7 +124,9 @@ def main(argv: list[str]) -> int:
 
             if tr.get("ipv6.opt.type", "") != "":  # Hop-by-Hop / Dest-Opts options
                 ts_types = [int(x, 16) for x in tr["ipv6.opt.type"].split(",") if x != ""]
-                my_types = [int(x["opt_type"]) for x in opts.get(pid, [])]
+                # tshark's ipv6.opt.type covers Hop-by-Hop (container 0) + Dest-Opts (container 60) only;
+                # SRH TLVs (container 43, e.g. HMAC) live under ipv6.routing.srh.* — exclude them here.
+                my_types = [int(x["opt_type"]) for x in opts.get(pid, []) if int(x["container_type"]) in (0, 60)]
                 ck(my_types == ts_types, f"pkt{pid} opt types ours={my_types} tshark={ts_types}")
                 opt_cells += len(ts_types)
 

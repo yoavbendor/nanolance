@@ -19,7 +19,7 @@ from pathlib import Path
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import UDP, TCP
 from scapy.layers.inet6 import (IPv6, IPv6ExtHdrSegmentRouting, IPv6ExtHdrHopByHop,
-                                IPv6ExtHdrDestOpt, PadN)
+                                IPv6ExtHdrDestOpt, IPv6ExtHdrSegmentRoutingTLVHMAC, PadN)
 from scapy.utils import wrpcap
 
 EM = dict(src="02:00:00:00:00:01", dst="02:00:00:00:00:02")  # explicit MACs (no interface lookup)
@@ -42,6 +42,17 @@ def main() -> None:
             IPv6ExtHdrSegmentRouting(addresses=["2001:db8::1a", "2001:db8::1b"], segleft=2, lastentry=1,
                                      tag=0x4321) /
             IPv6ExtHdrHopByHop(options=[PadN(optdata=b"\x00\x00")]) / TCP(sport=9, dport=10),
+        # p5: SRH carrying an HMAC TLV (exercises the SRH-TLV path -> ipv6_option container 43).
+        Ether(**EM) / IPv6(src=S, dst=D) /
+            IPv6ExtHdrSegmentRouting(addresses=["2001:db8::aa", "2001:db8::bb"], segleft=2, lastentry=1,
+                                     tag=0x55aa, hmac=1,
+                                     tlv_objects=[IPv6ExtHdrSegmentRoutingTLVHMAC()]) / UDP(sport=21, dport=22),
+        # p6: three stacked extension headers (Hop-by-Hop + Routing/SRH + Destination Options) then TCP.
+        Ether(**EM) / IPv6(src=S, dst=D) /
+            IPv6ExtHdrHopByHop(options=[PadN(optdata=b"\x00\x00")]) /
+            IPv6ExtHdrSegmentRouting(addresses=["2001:db8::c1", "2001:db8::c2"], segleft=2, lastentry=1,
+                                     tag=0x0c0c) /
+            IPv6ExtHdrDestOpt(options=[PadN(optdata=b"\x00\x00")]) / TCP(sport=31, dport=32),
     ]
     out = Path(__file__).with_name("srv6_sample.pcap")
     wrpcap(str(out), [bytes(p) and p for p in pkts])  # force-build each packet, then write

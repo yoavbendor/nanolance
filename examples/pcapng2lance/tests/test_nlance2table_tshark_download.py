@@ -22,9 +22,17 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-# (name, url). Wireshark's ipv6.pcap is real-world IPv6 + Hop-by-Hop options + ICMPv6 (MLD) — it exercises
-# the extension-header chain walk + the option child table on non-synthetic data. The Wireshark sample wiki
-# and test/captures currently have NO SRv6/SRH capture; add a trusted SRv6 URL here when one is available.
+# (name, url) of real captures to fetch at runtime (never committed). Curated for stable raw URLs only.
+#
+#   wireshark_ipv6  — real IPv6 + Hop-by-Hop options (Router-Alert + PadN) + ICMPv6 **MLD**. Covers the
+#                     ext-header chain walk + the option child table AND the MLD case on non-synthetic data.
+#
+# Notably ABSENT from stable public sources (checked: Wireshark SampleCaptures wiki + the repo's
+# test/captures dir):
+#   * SRv6 / SRH        — no public capture anywhere; covered by the committed scapy fixture (srv6_sample.pcap).
+#   * IPv6 AH / IPv6 ESP — none (the only test/captures ESP, esp-bug-12671, is IPv4); AH/ESP are covered by
+#                          the owned unit test (test_ipv6_ext_walk: AH reaches L4, ESP stops cleanly).
+# Add a trusted SRv6 / AH / ESP capture URL here if you obtain one (e.g. a vendor/IETF interop pcap).
 CAPTURES = [
     ("wireshark_ipv6", "https://gitlab.com/wireshark/wireshark/-/raw/master/test/captures/ipv6.pcap"),
 ]
