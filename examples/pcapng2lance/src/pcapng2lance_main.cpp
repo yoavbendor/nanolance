@@ -16,6 +16,7 @@
 #include "pdu_table_writer.hpp"
 #include "dag_decode_window.hpp"
 #include "dag_table_writer.hpp"
+#include "ipv6_child_table_writer.hpp"
 #include "nanotins/protocol_decode.hpp"
 #include "nanotins/protocol_decode_bulk.hpp"
 #include "nanotins/spec_dag.hpp"
@@ -612,7 +613,8 @@ private:
             std::vector<protocols::WalkResult> trailers(n);
             auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
             pcapng2lance::dag_decode_window(run, base_pid, batch.link_type.data(), batch.poff.data(),
-                                            batch.psize.data(), wbytes, n, dag_pdus_, trailers.data());
+                                            batch.psize.data(), wbytes, n, dag_pdus_, trailers.data(),
+                                            &ipv6_kids_);
             collect_remainder(trailers, batch, wbase, base_pid);
         }
         return 0;
@@ -677,8 +679,16 @@ private:
             write_one("_ptp_timestamp.lance", std::get<nanotins::node_id_v<nanotins::PtpTimestampBody, G>>(dag_pdus_)) &
             write_one("_ptp_ts_port.lance", std::get<nanotins::node_id_v<nanotins::PtpTsPortBody, G>>(dag_pdus_)) &
             write_one("_ptp_announce.lance", std::get<nanotins::node_id_v<nanotins::PtpAnnounceBody, G>>(dag_pdus_)) &
-            write_one("_ptp_signaling.lance", std::get<nanotins::node_id_v<nanotins::PtpSignalingBody, G>>(dag_pdus_));
+            write_one("_ptp_signaling.lance", std::get<nanotins::node_id_v<nanotins::PtpSignalingBody, G>>(dag_pdus_)) &
+            // IPv6 extension headers (one fixed-field table per type; their variable parts — SRv6 segments
+            // and options — go to the child tables written below).
+            write_one("_ipv6_hopbyhop.lance", std::get<nanotins::node_id_v<nanotins::Ipv6HopByHopNode, G>>(dag_pdus_)) &
+            write_one("_ipv6_routing.lance", std::get<nanotins::node_id_v<nanotins::Ipv6RoutingNode, G>>(dag_pdus_)) &
+            write_one("_ipv6_fragment.lance", std::get<nanotins::node_id_v<nanotins::Ipv6FragmentNode, G>>(dag_pdus_)) &
+            write_one("_ipv6_destopt.lance", std::get<nanotins::node_id_v<nanotins::Ipv6DestOptNode, G>>(dag_pdus_)) &
+            write_one("_ipv6_ah.lance", std::get<nanotins::node_id_v<nanotins::Ipv6AhNode, G>>(dag_pdus_));
         if (!ok) return 1;
+        if (!write_ipv6_child_tables(stem, err)) return 1;
         // The application payload after L4 (for later UDP-internal PDU parsing), as external refs — the
         // same remainder_after_l4 table the staged --stage l4 path emits. Written incrementally through the
         // SoA sink (one shared URI, chunked flush); drain the partial tail and close here.
@@ -701,6 +711,26 @@ private:
             std::get<nanotins::node_id_v<nanotins::UdpNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
             std::get<nanotins::node_id_v<nanotins::GptpNode, nanotins::L2L3Graph>>(dag_pdus_).size(), rem_count_);
         return 0;
+    }
+
+    // The IPv6 variable-length child tables (accumulated across windows in ipv6_kids_): one row per SRv6
+    // segment and one row per IPv6 / SRH option. Written lazily (no empty table).
+    bool write_ipv6_child_tables(const std::string& stem, std::string& err) {
+        if (!pdu_io::write_ipv6_srh_segment_table(stem + "_ipv6_srh_segment.lance", ipv6_kids_.srh_segment,
+                                                  args_.compress, err)) {
+            std::fprintf(stderr, "pcapng2lance: failed to write ipv6_srh_segment: %s\n", err.c_str());
+            return false;
+        }
+        if (!pdu_io::write_ipv6_option_table(stem + "_ipv6_option.lance", ipv6_kids_.opt, args_.compress,
+                                             err)) {
+            std::fprintf(stderr, "pcapng2lance: failed to write ipv6_option: %s\n", err.c_str());
+            return false;
+        }
+        if (ipv6_kids_.srh_segment.size() != 0 || ipv6_kids_.opt.size() != 0) {
+            std::fprintf(stderr, "pcapng2lance: IPv6 children -> srh_segment %zu, option %zu\n",
+                         ipv6_kids_.srh_segment.size(), ipv6_kids_.opt.size());
+        }
+        return true;
     }
 
     void print_summary() const {
@@ -736,6 +766,7 @@ private:
     bool schema_meta_set_ = false;
     bool first_commit_ = true;
     nanotins::dag_tables<nanotins::L2L3Graph> dag_pdus_;  // accumulated only when --decode-l2l3 (spec/DAG)
+    nanotins::ipv6_child_tables ipv6_kids_;  // SRv6 segments + IPv6/SRH options (variable child records)
 
     // remainder_after_l4: filled into a fixed-N SoA and flushed in chunks through the shared-URI writer
     // (no per-row uri string, bounded memory). The sink's flush is bound to rem_appender_->append_chunk.
