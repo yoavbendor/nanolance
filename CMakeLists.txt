@@ -16,6 +16,16 @@ set(NANOLANCE_VERSION_STRING
 if(NANOLANCE_STANDALONE)
     project(nanolance VERSION ${NANOLANCE_VERSION_MAJOR}.${NANOLANCE_VERSION_MINOR}.${NANOLANCE_VERSION_PATCH} LANGUAGES CXX)
     enable_testing()
+
+    # Developer ergonomics for a standalone build (skipped when embedded):
+    #   * compile_commands.json so clangd / IDEs index our sources AND the FetchContent'd deps
+    #     (nanoarrow/zstd/CLI11/nanos3reader) we compile against. (Already gitignored.)
+    #   * park FetchContent's downloads in a stable, IDE-indexable ./.deps that survives `rm -rf build`
+    #     (gitignored). Honour a caller-provided FETCHCONTENT_BASE_DIR (e.g. a CI cache) if already set.
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+    if(NOT DEFINED FETCHCONTENT_BASE_DIR)
+        set(FETCHCONTENT_BASE_DIR "${CMAKE_SOURCE_DIR}/.deps" CACHE PATH "Fetched dependency sources")
+    endif()
 endif()
 
 option(ENABLE_NANO_LANCE_WRITER "Build nanolance (legacy cache name; OFF skips this tree)" ON)
