@@ -162,6 +162,15 @@ if(NANOLANCE_BUILD_TESTS)
                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/srv6_sample.pcap")
             set_tests_properties(nlance2table_tshark_srv6 PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
 
+            # Download-on-demand real-capture golden: fetch real IPv6/ext-header captures (GPL-licensed
+            # upstreams — NOT committed; cached under the build tree) and field-check vs tshark. Skips (77)
+            # if tshark is missing or the downloads fail (offline).
+            add_test(NAME nlance2table_tshark_download
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nlance2table_tshark_download.py"
+                        $<TARGET_FILE:nlance2table> $<TARGET_FILE:pcapng2lance>
+                        "${CMAKE_CURRENT_BINARY_DIR}/ws_capture_cache")
+            set_tests_properties(nlance2table_tshark_download PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
             # Harmonization: one-shot (--decode-l2l3) and staged (--stage l1->l4) must emit identical PDU
             # tables on a fragmented capture (same IPv4-fragmentation L4 gate in both decode paths).
             add_test(NAME pcapng2lance_frag_harmony
