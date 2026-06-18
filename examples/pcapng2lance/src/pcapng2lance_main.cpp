@@ -16,6 +16,7 @@
 #include "pdu_table_writer.hpp"
 #include "dag_decode_window.hpp"
 #include "dag_table_writer.hpp"
+#include "ipv4_child_table_writer.hpp"
 #include "ipv6_child_table_writer.hpp"
 #include "nanotins/protocol_decode.hpp"
 #include "nanotins/protocol_decode_bulk.hpp"
@@ -614,7 +615,7 @@ private:
             auto run = [this](std::size_t nt, std::size_t m, const auto& k) { phase_b(nt, m, k); };
             pcapng2lance::dag_decode_window(run, base_pid, batch.link_type.data(), batch.poff.data(),
                                             batch.psize.data(), wbytes, n, dag_pdus_, trailers.data(),
-                                            &ipv6_kids_);
+                                            &ipv6_kids_, &ipv4_kids_);
             collect_remainder(trailers, batch, wbase, base_pid);
         }
         return 0;
@@ -688,6 +689,7 @@ private:
             write_one("_ipv6_destopt.lance", std::get<nanotins::node_id_v<nanotins::Ipv6DestOptNode, G>>(dag_pdus_)) &
             write_one("_ipv6_ah.lance", std::get<nanotins::node_id_v<nanotins::Ipv6AhNode, G>>(dag_pdus_));
         if (!ok) return 1;
+        if (!write_ipv4_child_tables(stem, err)) return 1;
         if (!write_ipv6_child_tables(stem, err)) return 1;
         // The application payload after L4 (for later UDP-internal PDU parsing), as external refs — the
         // same remainder_after_l4 table the staged --stage l4 path emits. Written incrementally through the
@@ -711,6 +713,20 @@ private:
             std::get<nanotins::node_id_v<nanotins::UdpNode, nanotins::L2L3Graph>>(dag_pdus_).size(),
             std::get<nanotins::node_id_v<nanotins::GptpNode, nanotins::L2L3Graph>>(dag_pdus_).size(), rem_count_);
         return 0;
+    }
+
+    // The IPv4 variable-length option table (accumulated across windows in ipv4_kids_): one row per IPv4
+    // header option. Written lazily (no empty table).
+    bool write_ipv4_child_tables(const std::string& stem, std::string& err) {
+        if (!pdu_io::write_ipv4_option_table(stem + "_ipv4_option.lance", ipv4_kids_.opt, args_.compress,
+                                             err)) {
+            std::fprintf(stderr, "pcapng2lance: failed to write ipv4_option: %s\n", err.c_str());
+            return false;
+        }
+        if (ipv4_kids_.opt.size() != 0) {
+            std::fprintf(stderr, "pcapng2lance: IPv4 options -> %zu\n", ipv4_kids_.opt.size());
+        }
+        return true;
     }
 
     // The IPv6 variable-length child tables (accumulated across windows in ipv6_kids_): one row per SRv6
@@ -767,6 +783,7 @@ private:
     bool first_commit_ = true;
     nanotins::dag_tables<nanotins::L2L3Graph> dag_pdus_;  // accumulated only when --decode-l2l3 (spec/DAG)
     nanotins::ipv6_child_tables ipv6_kids_;  // SRv6 segments + IPv6/SRH options (variable child records)
+    nanotins::ipv4_child_tables ipv4_kids_;  // IPv4 header options (variable child records)
 
     // remainder_after_l4: filled into a fixed-N SoA and flushed in chunks through the shared-URI writer
     // (no per-row uri string, bounded memory). The sink's flush is bound to rem_appender_->append_chunk.

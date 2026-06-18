@@ -16,6 +16,7 @@
 
 #include "nanotins/dag_bulk.hpp"
 #include "nanotins/dag_decode.hpp"
+#include "nanotins/ipv4_children_bulk.hpp"  // ipv4_child_tables, ipv4_children_bulk
 #include "nanotins/ipv6_children_bulk.hpp"  // ipv6_child_tables, ipv6_children_bulk
 #include "nanotins/protocol_decode.hpp"  // protocols::WalkResult, pack_ports, kLinkTypeEthernet
 #include "nanotins/protocol_specs.hpp"
@@ -67,7 +68,8 @@ void dag_decode_window(Runner run_each, std::uint64_t pid_base, const std::uint1
                        const std::uint64_t* poff, const std::uint32_t* psize, pcapblocks::Bytes window,
                        std::size_t n, nanotins::dag_tables<nanotins::L2L3Graph>& out,
                        protocols::WalkResult* trailers = nullptr,
-                       nanotins::ipv6_child_tables* ipv6_kids = nullptr) {
+                       nanotins::ipv6_child_tables* ipv6_kids = nullptr,
+                       nanotins::ipv4_child_tables* ipv4_kids = nullptr) {
     using G = nanotins::L2L3Graph;
     if (n == 0) {
         return;
@@ -95,6 +97,12 @@ void dag_decode_window(Runner run_each, std::uint64_t pid_base, const std::uint1
     // the same packet spans — appended across windows like the node tables.
     if (ipv6_kids != nullptr) {
         nanotins::ipv6_children_bulk<G>(pkts, *ipv6_kids, root,
+                                        [&](std::size_t nt, std::size_t m, auto k) { run_each(nt, m, k); });
+    }
+
+    // IPv4 variable-length option records, same count->scan->scatter over the same packet spans.
+    if (ipv4_kids != nullptr) {
+        nanotins::ipv4_children_bulk<G>(pkts, *ipv4_kids, root,
                                         [&](std::size_t nt, std::size_t m, auto k) { run_each(nt, m, k); });
     }
 

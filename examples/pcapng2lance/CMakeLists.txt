@@ -162,6 +162,15 @@ if(NANOLANCE_BUILD_TESTS)
                         "${CMAKE_CURRENT_SOURCE_DIR}/tests/srv6_sample.pcap")
             set_tests_properties(nlance2table_tshark_srv6 PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
 
+            # IPv4 options: the tlv_cursor ipv4_options walk over [IPv4 base + 20, IHL*4) -> the ipv4_option
+            # child table, field-checked vs tshark's ip.opt.type on a scapy-built capture
+            # (ipv4_options_sample.pcap; regenerate with tests/gen_ipv4_options_fixture.py).
+            add_test(NAME nlance2table_tshark_ipv4_options
+                COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nlance2table_tshark_ipv4_options.py"
+                        $<TARGET_FILE:nlance2table> $<TARGET_FILE:pcapng2lance>
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/ipv4_options_sample.pcap")
+            set_tests_properties(nlance2table_tshark_ipv4_options PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+
             # Download-on-demand real-capture golden: fetch real IPv6/ext-header captures (GPL-licensed
             # upstreams — NOT committed; cached under the build tree) and field-check vs tshark. Skips (77)
             # if tshark is missing or the downloads fail (offline).
