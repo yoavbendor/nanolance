@@ -27,6 +27,23 @@ target_sources(pcapng2lance PRIVATE src/phase_b_runner.cpp)
 target_include_directories(pcapng2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(pcapng2lance PRIVATE nanotins nanolance)
 
+# dpar2lance -> apply DPAR rules to a capture and write each matched rule table to its own Lance dataset
+# (the columnar counterpart to nanotins' NDJSON `dpar` example). Reuses this example's vendored nanotins
+# submodule + the nanolance writer.
+add_executable(dpar2lance src/dpar2lance_main.cpp)
+target_include_directories(dpar2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(dpar2lance PRIVATE nanotins nanolance)
+
+# lldp2lance -> the same DPAR -> Lance sink, but driven by the USER-WRITTEN LldpPalette from the vendored
+# nanotins LLDP example (examples/lldp/lldp.hpp) instead of the built-in DefaultPalette. Demonstrates that
+# a downstream tool can add its own protocol parser and land its table in Lance for "free" — the generic
+# dpar_table_writer carries the example's fixed-binary value_head column unchanged. Needs the example's
+# header dir on the include path (it lives outside the nanotins include tree, as application code).
+add_executable(lldp2lance src/lldp2lance_main.cpp)
+target_include_directories(lldp2lance PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/examples/lldp")
+target_link_libraries(lldp2lance PRIVATE nanotins nanolance)
+
 if(NANOLANCE_BUILD_TESTS)
     # struct -> soa -> arrow -> Lance -> read-back (exercises nanotins reflection through the nanolance
     # writer/reader; stays here because it depends on nanolance, not just nanotins).
@@ -40,6 +57,22 @@ if(NANOLANCE_BUILD_TESTS)
     target_link_libraries(nanotins_reader_parity_test PRIVATE nanotins nanolance)
     add_test(NAME nanotins_reader_parity COMMAND $<TARGET_FILE:nanotins_reader_parity_test>)
     set_tests_properties(nanotins_reader_parity PROPERTIES LABELS "smoke")
+
+    # DPAR rule table -> Arrow -> Lance write -> read-back roundtrip (the dpar2lance sink end to end).
+    add_executable(dpar2lance_roundtrip_test tests/test_dpar2lance_roundtrip.cpp)
+    target_include_directories(dpar2lance_roundtrip_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(dpar2lance_roundtrip_test PRIVATE nanotins nanolance)
+    add_test(NAME dpar2lance_roundtrip COMMAND $<TARGET_FILE:dpar2lance_roundtrip_test>)
+    set_tests_properties(dpar2lance_roundtrip PROPERTIES LABELS "smoke")
+
+    # LldpPalette rule table -> Arrow -> Lance write -> read-back, including the example's decoded typed
+    # columns and the fixed-size-binary value_head (the lldp2lance sink end to end).
+    add_executable(lldp2lance_roundtrip_test tests/test_lldp2lance_roundtrip.cpp)
+    target_include_directories(lldp2lance_roundtrip_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanotins/examples/lldp")
+    target_link_libraries(lldp2lance_roundtrip_test PRIVATE nanotins nanolance)
+    add_test(NAME lldp2lance_roundtrip COMMAND $<TARGET_FILE:lldp2lance_roundtrip_test>)
+    set_tests_properties(lldp2lance_roundtrip PROPERTIES LABELS "smoke")
 
     # M6: the DAG-driven PDU tables are byte-identical (schema + Arrow buffers) to the protocols:: tables,
     # so the driver's decode path can move to the spec/DAG without changing the Lance output.
