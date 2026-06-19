@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# GitLab CI/CD for nanolance — the GitLab translation of .github/workflows/linux-bench.yml's build + test
+# phases (the benchmark/profile/commit-back steps stay GitHub-only). Builds the pcapng -> Lance stack
+# (vendoring nanotins via the recursive submodule, so the IPv4-options parser bumped in
+# examples/pcapng2lance/extern/nanotins is what gets built) and runs the C++ smoke + interop suites. The
+# interop suite includes the IPv4-options tshark golden (nlance2table_tshark_ipv4_options), which skips
+# cleanly (ctest return code 77) when tshark is unavailable.
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+
+stages:
+  - build-test
+
+build-and-test:
+  stage: build-test
+  image: ubuntu:24.04
+  variables:
+    CC: clang
+    CXX: clang++
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq clang cmake ninja-build python3-pip tshark
+    - python3 -m pip install --quiet --break-system-packages pyarrow pylance || python3 -m pip install --quiet pyarrow pylance
+  script:
+    - cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+    - cmake --build build -j
+    - >
+      ctest --test-dir build -L smoke
+      -E "golden|blob_v2_smoke|nonnull|ignore_nullability|inspect|append_smoke|version|help"
+      --output-on-failure
+    - ctest --test-dir build -L interop --output-on-failure
+  artifacts:
+    when: on_failure
+    paths:
+      - build/Testing/
+    expire_in: 1 week
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
