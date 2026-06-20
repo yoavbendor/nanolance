@@ -10,6 +10,23 @@ See the docs/ folder for details: [`DESIGN.md`](docs/DESIGN.md) (architecture + 
 [`NANOTINS_REFLECTION.md`](docs/NANOTINS_REFLECTION.md) (struct → SoA → Arrow → Lance machinery), 
 and [`KICKOFF.md`](docs/KICKOFF.md) (build order + traps).
 
+## At a glance
+
+- **Input:** classic pcap or pcapng (either endianness, multi-section). **Output:** a Lance dataset of
+  per-packet L1 rows, plus (with `--decode-l2l3`) one table per PDU — ethernet / vlan / ipv4 / ipv6 /
+  tcp / udp / ptp / IPv6 ext headers — joined by `packet_id`.
+- **Payloads stay external:** each row stores `(uri, offset, size)` into the *original* capture; bytes
+  are never copied (fetched on demand, including from `s3://`). The Parquet twin,
+  [`pcapng2parquet`](https://github.com/yoavbendor/nanoarrow2parquet/tree/main/examples/pcapng2parquet),
+  is parse-only because Parquet has no external blob store.
+- **Run:** `pcapng2lance [--decode-l2l3] [--no-compress] [--sequential|--threads N] [--window-bytes N]
+  <input> <output.lance> [payload_uri]`. Memory is bounded by `--window-bytes` regardless of capture size.
+- **Gotchas:** L4 (tcp/udp) rows are emitted only on the **first IPv4 fragment** (`frag_offset == 0`);
+  `bool` row fields are unsupported (use `uint8`); the original capture must stay reachable to fetch
+  payloads / run `--stage` enrichment. Cross-checked field-for-field against **tshark**.
+
+The rest of this document is the build history and the milestone/feature detail behind the above.
+
 ## What's built (M0 + M1 + M2 + M3/M6)
 
 - **M0 — `soatins` reflection core** (in the standalone [`soatins/`](extern/nanotins/soatins) library, vendored into this example as a submodule from the sister [nanotins](https://github.com/yoavbendor/nanotins) repo): `be<>`/`le<>` 
