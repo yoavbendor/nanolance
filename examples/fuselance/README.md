@@ -1,40 +1,88 @@
 # fuselance
 
 Mount a Lance table that has a `lance.blob.v2` external-reference column as a **read-only FUSE
-filesystem**. Each row becomes a file: the file name comes from a column you pick, and the file's
-contents are the row's blob payload, fetched on demand from its external URI via
-`nano_lance_fetch_external_blob`.
+filesystem**. Each **distinct value** of a chosen column becomes one file; the file's contents are
+the concatenation of all matching rows' blob payloads, fetched on demand.
 
 ```
-fuselance <lance_table_path> --filename-col <col> [--blob-col <col>] [--sort-col <col>]
+fuselance <lance_table_path> --filename-col <col>
+          [--blob-col <col>] [--join-blob-from <blob_table>] [--sort-col <col>]
 ```
 
-- Mounts at `/tmp/fuse_<basename>` (e.g. `packets.lance` → `/tmp/fuse_packets`).
-- `--filename-col` — column used for file names. String or integer columns are supported
-  (integers are rendered as decimal text). Duplicate names get `_N` suffixes.
-- `--blob-col` — the blob.v2 struct column. Auto-detected when omitted (first struct column with
-  `uri`/`blob_uri` + `position` + `size` children).
-- `--sort-col` — order files by this column (strings lexicographically, integers numerically,
-  ascending). Defaults to the table's row order.
-- The mount is read-only: browsing (`readdir`) and reading (`read`/range reads) only; writes return
-  `EACCES`.
+## Options
 
-Unmount with `fusermount3 -u /tmp/fuse_<basename>` or Ctrl-C on the foreground process.
+| Option | Description |
+|---|---|
+| `--filename-col <col>` | Column whose distinct values become file names (required). |
+| `--blob-col <col>` | blob.v2 struct column. Auto-detected when omitted. |
+| `--join-blob-from <path>` | Read blob refs from a companion table joined on `packet_id`. |
+| `--sort-col <col>` | Order blobs within each file by this column (ascending). |
+
+## Column type rendering
+
+| Type | File name format |
+|---|---|
+| `string` / `large_string` | literal value |
+| integer (`uint8` … `int64`) | decimal text |
+| `fixed_size_binary:4` | dotted-quad IPv4 (`192.168.1.1`) |
+| `fixed_size_binary:16` | colon-hex IPv6 (`fe80::1`) |
+| other binary widths | lowercase hex dump |
+
+## Omitting `--filename-col`
+
+If you provide the table path but omit `--filename-col`, fuselance reads the manifest (schema only,
+no data scan) and prints the available column names so you can pick the right one:
+
+```
+fuselance packets_ipv4.lance
+
+fuselance: --filename-col is required
+
+Columns in 'packets_ipv4.lance':
+  packet_id                (uint64)
+  src                      (fixed_size_binary:4)
+  dst                      (fixed_size_binary:4)
+  ...
+```
+
+## Example: pcapng2lance `--decode-l2l3` output
+
+`pcapng2lance --decode-l2l3` writes separate tables: the L1 packet table (`packets.lance`) holds
+the EPB blob references, and the decoded L3 tables (`_ipv4.lance`, `_ipv6.lance`) hold IP headers.
+They share `packet_id` as a join key. Use `--join-blob-from` to combine them:
+
+```bash
+# Convert a pcap with L2/L3 decode
+pcapng2lance --decode-l2l3 capture.pcap packets.lance
+
+# Mount IPv4 sources — each src IP becomes one file containing all its EPBs
+fuselance packets_ipv4.lance --filename-col src --join-blob-from packets.lance
+```
+
+```
+ls /tmp/fuse_packets_ipv4/
+  10.0.0.1    192.168.1.100   172.16.0.5
+
+cat /tmp/fuse_packets_ipv4/10.0.0.1 | wc -c   # total bytes of all EPBs from 10.0.0.1
+```
+
+Opening a file with tshark will produce a format error (missing SHB/IDB preamble) because the file
+contains raw EPB block bytes — exactly the expected behaviour for a blob-only stream.
 
 ## Building
 
 Requires `libfuse3-dev` (Debian/Ubuntu) or `fuse3-devel` (RPM). Built by default in a standalone
-nanolance build; toggle with `-DNANOLANCE_BUILD_FUSE_EXAMPLE=ON/OFF`. If libfuse3 is not found the
-example skips itself with a status message rather than failing the build.
+nanolance build; disable with `-DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF`. Skips itself gracefully when
+libfuse3 is not installed.
 
 ```bash
 cmake -B build -DNANOLANCE_BUILD_FUSE_EXAMPLE=ON
 cmake --build build -t fuselance
 ```
 
-## Notes
+## Unmounting
 
-The table is read with `nano_lance::lance_table_read_dataset` (writer-parity), so the dataset must
-be one written by nanolance (e.g. via `arrowipc2lance` or the `pcapng2lance` example). Only the
-per-row `(name, uri, position, size)` metadata is held in memory while mounted; the payload bytes
-are fetched lazily on each `read`.
+```bash
+fusermount3 -u /tmp/fuse_<basename>
+# or Ctrl-C on the foreground process
+```
