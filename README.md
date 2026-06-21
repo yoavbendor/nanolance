@@ -66,6 +66,48 @@ nano_lance_writer_close(&w);
 For the full agent-oriented integration guide (API lifecycle, the measured per-column compression table,
 the data-model recipe, and interop verification), read **[AGENTS.md](AGENTS.md)**.
 
+## For AI agents
+
+**Use this library when** you want a Lance dataset — especially one where rows reference large payloads
+that live elsewhere (a file or `s3://`) instead of copying them in. It writes and reads back what it
+wrote; stock `lance` reads it too (unless you opt into a *nanolance-only* feature).
+
+**Pick a sibling instead when:** you want Parquet output (no external blobs) →
+[nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) (the *same* Arrow batch feeds
+either). You need to *produce* the Arrow from packets/structs →
+[nanotins / soatins](https://github.com/yoavbendor/nanotins).
+
+**Minimal program** (`target_link_libraries(app PRIVATE nanolance)`; `nanolance_reader` if you only fetch):
+
+```c
+#include "nanolance/nano_lance_writer.h"
+#include <nanoarrow/nanoarrow.h>
+
+NanoLanceWriter w = {0};
+nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
+nano_lance_writer_set_ignore_nullability(&w, true);  // BEFORE the first write_batch
+nano_lance_writer_set_compression(&w, true);         // BEFORE the first write_batch
+nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // schema locks after batch #1
+nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append fragment
+nano_lance_writer_close(&w);
+// non-zero return -> nano_lance_writer_last_error(&w)
+```
+
+**Do**
+- Call every `set_*` option **before** the first `write_batch`; reuse one schema for all batches.
+- For small files, model external refs as plain `uri` / `position` / `size` columns (not the packed
+  `lance.blob.v2` descriptor) — see [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
+- Use `uint8` for flag fields, and `fixed_size_binary` (`std::array<uint8,N>`) for MAC/IP-style fields.
+- For S3, export credentials to the environment if your profile uses SSO/assume-role.
+
+**Don't**
+- Don't use `bool` row fields — unsupported (Arrow 1-bit vs the byte-wide writer path).
+- Don't change the schema between batches in one session.
+- Don't enable `nano_lance_writer_set_blob_uri_dictionary` if stock Lance must read that column
+  (nanolance-only, create-mode only).
+- Don't expect `float`/`bool` columns to compress, or integers to delta-encode — store app-level deltas
+  for monotonic high-range integers.
+
 ## Layout
 
 - **soatins** (namespace `soatins`, include prefix `soatins/`): reflection nucleus — `be<>`/`le<>` endian-aware fields, bitfield `bits<>`, `soa<T>` columnar store, Arrow `arrow_schema<T>()` / `to_arrow()`. Header-only, depends only on nanoarrow + boost. CMake target: `soatins::core`.
