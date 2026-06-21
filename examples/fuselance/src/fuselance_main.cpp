@@ -8,10 +8,16 @@
 //             [--blob-col <col>]
 //             [--join-blob-from <blob_table_path>]
 //             [--sort-col <col>]
+//             [--frame-col <col>]
 //
 // Each DISTINCT value of --filename-col becomes a file. The file's content is the concatenation
 // of all blob.v2 payloads for rows sharing that value, in row order (or --sort-col order within
 // the group).
+//
+// --frame-col <col> (numerical) adds a second dimension:
+//   Root contains the flat files as usual (all rows), PLUS subdirectories named frame_<N> for
+//   each distinct value of <col>. Each frame_<N>/ directory contains the same set of files but
+//   filtered to rows where <col> == N.
 //
 // --join-blob-from lets the filename column and the blob column live in different tables:
 //   • The positional table is the "name table" (provides --filename-col and optionally --sort-col,
@@ -71,11 +77,54 @@ struct VirtualFile {
     std::vector<BlobSeg> segs;
 };
 
-struct FuseLanceState {
+// One frame directory: an integer label and the files visible inside it.
+struct FrameDir {
+    std::string label;           // "frame_<N>" — the directory name shown in FUSE
     std::vector<VirtualFile> files;
 };
 
+struct FuseLanceState {
+    std::vector<VirtualFile> files;   // root-level flat files (all rows)
+    std::vector<FrameDir>    frames;  // frame_<N> subdirectories (only when --frame-col given)
+};
+
 static FuseLanceState* g_state = nullptr;
+
+// ---------------------------------------------------------------------------
+// File-handle encoding
+//
+// fh bit layout (64-bit):
+//   root files:   0x0000_0000_XXXX_XXXX   (top 32 bits = 0, bottom = file index)
+//   framed files: 0x8000_FFFF_XXXX_XXXX   (bit 63 set; bits [47:32] = frame index; [31:0] = file index)
+//
+// Using bit 63 as "framed" sentinel ensures root indices (top 32 = 0) can never
+// collide with framed indices even if either side has up to 2^31 entries.
+// ---------------------------------------------------------------------------
+
+static constexpr uint64_t kFramedBit = (uint64_t{1} << 63);
+
+static uint64_t encode_root_fh(size_t file_idx) {
+    return static_cast<uint64_t>(file_idx);
+}
+static uint64_t encode_frame_fh(size_t frame_idx, size_t file_idx) {
+    return kFramedBit | (static_cast<uint64_t>(frame_idx) << 32) | static_cast<uint64_t>(file_idx);
+}
+static bool is_framed_fh(uint64_t fh) { return (fh & kFramedBit) != 0; }
+static size_t frame_idx_from_fh(uint64_t fh) { return static_cast<size_t>((fh >> 32) & 0x7FFF'FFFF); }
+static size_t file_idx_from_fh(uint64_t fh) { return static_cast<size_t>(fh & 0xFFFF'FFFF); }
+
+// Resolve fh → VirtualFile&.
+static const VirtualFile* vfile_from_fh(uint64_t fh) {
+    if (is_framed_fh(fh)) {
+        size_t fi = frame_idx_from_fh(fh);
+        size_t vi = file_idx_from_fh(fh);
+        if (fi >= g_state->frames.size() || vi >= g_state->frames[fi].files.size()) return nullptr;
+        return &g_state->frames[fi].files[vi];
+    }
+    size_t vi = file_idx_from_fh(fh);
+    if (vi >= g_state->files.size()) return nullptr;
+    return &g_state->files[vi];
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -168,24 +217,100 @@ static std::string sort_key(const ArrowArrayView* col, int64_t row) {
     return buf;
 }
 
+// Read frame value as a uint64 (sign-extended int columns mapped via two's complement).
+static uint64_t frame_value(const ArrowArrayView* col, int64_t row) {
+    switch (col->storage_type) {
+        case NANOARROW_TYPE_INT8:
+        case NANOARROW_TYPE_INT16:
+        case NANOARROW_TYPE_INT32:
+        case NANOARROW_TYPE_INT64:
+            return static_cast<uint64_t>(ArrowArrayViewGetIntUnsafe(col, row));
+        default:
+            return ArrowArrayViewGetUIntUnsafe(col, row);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path parsing helpers
+// ---------------------------------------------------------------------------
+
+// Determine whether path is a known frame directory, returning its index in g_state->frames.
+// Returns -1 if not a frame dir.
+static int frame_dir_index(const char* path) {
+    if (path[0] != '/' || path[1] == '\0') return -1;
+    const char* name = path + 1;
+    // Must not contain another '/'.
+    if (std::strchr(name, '/') != nullptr) return -1;
+    for (size_t i = 0; i < g_state->frames.size(); ++i) {
+        if (g_state->frames[i].label == name) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// Parse "/frame_<N>/filename" → frame index + file index. Returns false if not that form.
+static bool parse_framed_path(const char* path, size_t& out_fi, size_t& out_vi) {
+    if (path[0] != '/') return false;
+    const char* p = path + 1;
+    const char* slash = std::strchr(p, '/');
+    if (!slash || slash[1] == '\0') return false;
+    std::string dir(p, slash - p);
+    const char* fname = slash + 1;
+    // Must not have a second slash.
+    if (std::strchr(fname, '/') != nullptr) return false;
+    for (size_t fi = 0; fi < g_state->frames.size(); ++fi) {
+        if (g_state->frames[fi].label != dir) continue;
+        const auto& fvec = g_state->frames[fi].files;
+        for (size_t vi = 0; vi < fvec.size(); ++vi) {
+            if (fvec[vi].name == fname) { out_fi = fi; out_vi = vi; return true; }
+        }
+        return false;  // dir matched but file not found
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // FUSE operations
 // ---------------------------------------------------------------------------
 
 static int fl_getattr(const char* path, struct stat* st, struct fuse_file_info* /*fi*/) {
     std::memset(st, 0, sizeof(*st));
+
+    // Root directory.
     if (std::strcmp(path, "/") == 0) {
-        st->st_mode = S_IFDIR | 0555;
-        st->st_nlink = 2 + static_cast<nlink_t>(g_state->files.size());
+        st->st_mode  = S_IFDIR | 0555;
+        st->st_nlink = 2 + static_cast<nlink_t>(g_state->files.size())
+                         + static_cast<nlink_t>(g_state->frames.size());
         return 0;
     }
+
+    // Frame subdirectory: "/frame_<N>"
+    int fdi = frame_dir_index(path);
+    if (fdi >= 0) {
+        st->st_mode  = S_IFDIR | 0555;
+        st->st_nlink = 2 + static_cast<nlink_t>(g_state->frames[static_cast<size_t>(fdi)].files.size());
+        return 0;
+    }
+
+    // Framed file: "/frame_<N>/filename"
+    size_t fi = 0, vi = 0;
+    if (parse_framed_path(path, fi, vi)) {
+        const VirtualFile& f = g_state->frames[fi].files[vi];
+        st->st_mode  = S_IFREG | 0444;
+        st->st_nlink = 1;
+        st->st_size  = static_cast<off_t>(f.total_size);
+        return 0;
+    }
+
+    // Root flat file: "/filename"
     const char* name = path + 1;
-    for (auto& f : g_state->files) {
-        if (f.name == name) {
-            st->st_mode = S_IFREG | 0444;
-            st->st_nlink = 1;
-            st->st_size = static_cast<off_t>(f.total_size);
-            return 0;
+    if (std::strchr(name, '/') == nullptr) {
+        for (const auto& f : g_state->files) {
+            if (f.name == name) {
+                st->st_mode  = S_IFREG | 0444;
+                st->st_nlink = 1;
+                st->st_size  = static_cast<off_t>(f.total_size);
+                return 0;
+            }
         }
     }
     return -ENOENT;
@@ -194,25 +319,59 @@ static int fl_getattr(const char* path, struct stat* st, struct fuse_file_info* 
 static int fl_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
                       off_t /*offset*/, struct fuse_file_info* /*fi*/,
                       enum fuse_readdir_flags /*flags*/) {
-    if (std::strcmp(path, "/") != 0) return -ENOENT;
     filler(buf, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
     filler(buf, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
-    for (auto& f : g_state->files) {
-        struct stat st{};
-        st.st_mode = S_IFREG | 0444;
-        st.st_size = static_cast<off_t>(f.total_size);
-        filler(buf, f.name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
+
+    if (std::strcmp(path, "/") == 0) {
+        // Flat files.
+        for (const auto& f : g_state->files) {
+            struct stat st{};
+            st.st_mode = S_IFREG | 0444;
+            st.st_size = static_cast<off_t>(f.total_size);
+            filler(buf, f.name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
+        }
+        // Frame subdirectories.
+        for (const auto& fr : g_state->frames) {
+            struct stat st{};
+            st.st_mode = S_IFDIR | 0555;
+            filler(buf, fr.label.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
+        }
+        return 0;
     }
-    return 0;
+
+    // Frame subdirectory listing.
+    int fdi = frame_dir_index(path);
+    if (fdi >= 0) {
+        for (const auto& f : g_state->frames[static_cast<size_t>(fdi)].files) {
+            struct stat st{};
+            st.st_mode = S_IFREG | 0444;
+            st.st_size = static_cast<off_t>(f.total_size);
+            filler(buf, f.name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
+        }
+        return 0;
+    }
+
+    return -ENOENT;
 }
 
 static int fl_open(const char* path, struct fuse_file_info* fi) {
     if ((fi->flags & O_ACCMODE) != O_RDONLY) return -EACCES;
+
+    // Framed file: "/frame_<N>/filename"
+    size_t frame_i = 0, file_i = 0;
+    if (parse_framed_path(path, frame_i, file_i)) {
+        fi->fh = encode_frame_fh(frame_i, file_i);
+        return 0;
+    }
+
+    // Root flat file: "/filename"
     const char* name = path + 1;
-    for (size_t i = 0; i < g_state->files.size(); ++i) {
-        if (g_state->files[i].name == name) {
-            fi->fh = static_cast<uint64_t>(i);
-            return 0;
+    if (std::strchr(name, '/') == nullptr) {
+        for (size_t i = 0; i < g_state->files.size(); ++i) {
+            if (g_state->files[i].name == name) {
+                fi->fh = encode_root_fh(i);
+                return 0;
+            }
         }
     }
     return -ENOENT;
@@ -221,13 +380,14 @@ static int fl_open(const char* path, struct fuse_file_info* fi) {
 // Read spanning multiple blob segments transparently.
 static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
                    off_t offset, struct fuse_file_info* fi) {
-    const VirtualFile& f = g_state->files[fi->fh];
-    if (offset < 0 || static_cast<uint64_t>(offset) >= f.total_size) return 0;
+    const VirtualFile* vf = vfile_from_fh(fi->fh);
+    if (!vf) return -EBADF;
+    if (offset < 0 || static_cast<uint64_t>(offset) >= vf->total_size) return 0;
 
     uint64_t file_off = static_cast<uint64_t>(offset);
     size_t total_written = 0;
 
-    for (const BlobSeg& seg : f.segs) {
+    for (const BlobSeg& seg : vf->segs) {
         if (total_written >= buf_size) break;
         if (file_off >= seg.size) { file_off -= seg.size; continue; }  // skip segments before offset
 
@@ -243,7 +403,7 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
             &got, ferr, sizeof(ferr));
         if (rc != NANO_LANCE_READER_OK) {
             std::fprintf(stderr, "fuselance: fetch %s seg @%llu+%llu: %s\n",
-                         f.name.c_str(),
+                         vf->name.c_str(),
                          static_cast<unsigned long long>(seg.position + seg_off),
                          static_cast<unsigned long long>(want), ferr);
             return total_written > 0 ? static_cast<int>(total_written) : -EIO;
@@ -332,6 +492,28 @@ static bool read_blob_table(const std::filesystem::path& path,
     return true;
 }
 
+// Build a sorted VirtualFile list from a groups map.
+static std::vector<VirtualFile> build_virtual_files(
+        std::map<std::string, std::vector<std::pair<std::string, BlobSeg>>>& groups) {
+    std::vector<VirtualFile> files;
+    files.reserve(groups.size());
+    for (auto& [name, entries] : groups) {
+        std::stable_sort(entries.begin(), entries.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        VirtualFile vf;
+        vf.name = name;
+        vf.segs.reserve(entries.size());
+        for (auto& [sk, seg] : entries) {
+            vf.total_size += seg.size;
+            vf.segs.push_back(std::move(seg));
+        }
+        files.push_back(std::move(vf));
+    }
+    std::sort(files.begin(), files.end(),
+              [](const VirtualFile& a, const VirtualFile& b) { return a.name < b.name; });
+    return files;
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -340,6 +522,7 @@ static void usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s <lance_table_path> --filename-col <col>\n"
         "          [--blob-col <col>] [--join-blob-from <blob_table>] [--sort-col <col>]\n"
+        "          [--frame-col <col>]\n"
         "\n"
         "Mounts the Lance table as a read-only FUSE filesystem at /tmp/fuse_<basename>.\n"
         "Each distinct value of --filename-col becomes one file whose content is the\n"
@@ -349,6 +532,8 @@ static void usage(const char* prog) {
         "  --join-blob-from <path>   read blob refs from a companion table joined on packet_id\n"
         "                            (use when --filename-col and the blob live in different tables)\n"
         "  --sort-col <col>          order blobs within each file by this column (ascending)\n"
+        "  --frame-col <col>         numerical column; adds frame_<N>/ subdirectories to root,\n"
+        "                            each containing the same files filtered to rows where <col>==N\n"
         "\n"
         "fixed_size_binary:4  columns are rendered as dotted-quad IPv4 addresses.\n"
         "fixed_size_binary:16 columns are rendered as colon-hex IPv6 addresses.\n"
@@ -366,6 +551,7 @@ int main(int argc, char** argv) {
     const char* blob_col_name   = nullptr;   // nullptr = auto-detect in same table
     const char* join_blob_path  = nullptr;   // nullptr = no join; blobs in same table
     const char* sort_col_name   = nullptr;   // nullptr = row order
+    const char* frame_col_name  = nullptr;   // nullptr = no frame dimension
     std::string err;
 
     for (int i = 1; i < argc; ++i) {
@@ -378,6 +564,7 @@ int main(int argc, char** argv) {
         else if (a == "--blob-col")        { blob_col_name  = need_val("--blob-col");        if (!blob_col_name)  return 2; }
         else if (a == "--join-blob-from")  { join_blob_path = need_val("--join-blob-from");  if (!join_blob_path) return 2; }
         else if (a == "--sort-col")        { sort_col_name  = need_val("--sort-col");        if (!sort_col_name)  return 2; }
+        else if (a == "--frame-col")       { frame_col_name = need_val("--frame-col");       if (!frame_col_name) return 2; }
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         else if (a[0] != '-') {
             if (table_path) { std::fprintf(stderr, "fuselance: unexpected argument: %s\n", argv[i]); return 2; }
@@ -418,7 +605,6 @@ int main(int argc, char** argv) {
     const std::string mountpoint = "/tmp/fuse_" + basename;
 
     // ---- Optional: load blob table for join ---------------------------------
-    // Maps packet_id → BlobSeg; used when --join-blob-from is specified.
     std::map<uint64_t, BlobSeg> join_blobs;
     if (join_blob_path) {
         std::fprintf(stderr, "fuselance: loading blob table %s ...\n", join_blob_path);
@@ -446,7 +632,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Blob indices — only needed when NOT using a join table.
     BlobColIndices bi;
     if (!join_blob_path) {
         if (!resolve_blob_col(schema, blob_col_name, bi, err)) {
@@ -455,7 +640,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // For join mode we need packet_id from the name table.
     const int pid_idx = join_blob_path ? child_index(schema, "packet_id") : -1;
     if (join_blob_path && pid_idx < 0) {
         std::fprintf(stderr, "fuselance: name table missing packet_id join key\n");
@@ -471,14 +655,23 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- Build grouped virtual file map ------------------------------------
-    // We collect all entries into a stable map keyed by the filename value.
-    // Each entry records an optional sort key and a BlobSeg (to be appended in order).
-    struct RowEntry {
-        std::string sk;
-        BlobSeg seg;
-    };
-    std::map<std::string, std::vector<RowEntry>> groups;  // key = filename value
+    int frame_idx = -1;
+    if (frame_col_name) {
+        frame_idx = child_index(schema, frame_col_name);
+        if (frame_idx < 0) {
+            std::fprintf(stderr, "fuselance: frame column '%s' not found\n", frame_col_name);
+            return 1;
+        }
+    }
+
+    // ---- Build grouped virtual file maps ------------------------------------
+    // groups_all: all rows (root-level flat files)
+    // groups_by_frame: per-frame-value groups (frame_<N> directories)
+    using GroupMap = std::map<std::string, std::vector<std::pair<std::string, BlobSeg>>>;
+    GroupMap groups_all;
+    std::map<uint64_t, GroupMap> groups_by_frame;  // keyed by raw frame value
+
+    size_t global_row = 0;  // stable sort key counter across batches
 
     for (auto& batch : batches) {
         ArrowArrayView view{};
@@ -490,12 +683,12 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        const ArrowArrayView* fname_view = view.children[fname_idx];
-        const ArrowArrayView* blob_av    = !join_blob_path ? view.children[bi.blob_idx] : nullptr;
-        const ArrowArrayView* sort_view  = sort_idx >= 0 ? view.children[sort_idx] : nullptr;
-        const ArrowArrayView* pid_view   = pid_idx >= 0  ? view.children[pid_idx]  : nullptr;
+        const ArrowArrayView* fname_view  = view.children[fname_idx];
+        const ArrowArrayView* blob_av     = !join_blob_path ? view.children[bi.blob_idx] : nullptr;
+        const ArrowArrayView* sort_view   = sort_idx  >= 0 ? view.children[sort_idx]  : nullptr;
+        const ArrowArrayView* pid_view    = pid_idx   >= 0 ? view.children[pid_idx]   : nullptr;
+        const ArrowArrayView* frame_view  = frame_idx >= 0 ? view.children[frame_idx] : nullptr;
 
-        // Validate filename column type on first non-empty batch.
         if (view.length > 0) {
             std::string probe;
             if (!cell_to_string(fname_view, 0, probe)) {
@@ -511,10 +704,9 @@ int main(int argc, char** argv) {
 
             BlobSeg seg;
             if (join_blob_path) {
-                // Join on packet_id.
                 uint64_t pid = ArrowArrayViewGetUIntUnsafe(pid_view, r);
                 auto it = join_blobs.find(pid);
-                if (it == join_blobs.end()) continue;  // no blob for this row — skip
+                if (it == join_blobs.end()) continue;
                 seg = it->second;
             } else {
                 ArrowStringView uv = ArrowArrayViewGetStringUnsafe(blob_av->children[bi.c_uri], r);
@@ -527,38 +719,34 @@ int main(int argc, char** argv) {
             if (sort_view) {
                 sk = sort_key(sort_view, r);
             } else {
-                // Stable insertion order: zero-padded global index across all batches.
                 char buf[24];
-                size_t global = 0;
-                for (auto& [k, v] : groups) global += v.size();
-                std::snprintf(buf, sizeof(buf), "%020zu", global);
+                std::snprintf(buf, sizeof(buf), "%020zu", global_row);
                 sk = buf;
             }
 
-            groups[fname].push_back({std::move(sk), std::move(seg)});
+            groups_all[fname].emplace_back(sk, seg);
+
+            if (frame_view) {
+                uint64_t fv = frame_value(frame_view, r);
+                groups_by_frame[fv][fname].emplace_back(sk, seg);
+            }
+
+            ++global_row;
         }
         ArrowArrayViewReset(&view);
     }
 
-    // ---- Sort within each group and build VirtualFile list -----------------
+    // ---- Build FuseLanceState -----------------------------------------------
     FuseLanceState state;
-    state.files.reserve(groups.size());
+    state.files = build_virtual_files(groups_all);
 
-    for (auto& [name, entries] : groups) {
-        std::stable_sort(entries.begin(), entries.end(),
-                         [](const RowEntry& a, const RowEntry& b) { return a.sk < b.sk; });
-        VirtualFile vf;
-        vf.name = name;
-        vf.segs.reserve(entries.size());
-        for (auto& e : entries) {
-            vf.total_size += e.seg.size;
-            vf.segs.push_back(std::move(e.seg));
-        }
-        state.files.push_back(std::move(vf));
+    // Sort frame values numerically and build FrameDir list.
+    for (auto& [fv, gmap] : groups_by_frame) {
+        FrameDir fd;
+        fd.label = "frame_" + std::to_string(fv);
+        fd.files = build_virtual_files(gmap);
+        state.frames.push_back(std::move(fd));
     }
-    // Sort files by name so readdir order is deterministic.
-    std::sort(state.files.begin(), state.files.end(),
-              [](const VirtualFile& a, const VirtualFile& b) { return a.name < b.name; });
 
     g_state = &state;
 
@@ -567,11 +755,20 @@ int main(int argc, char** argv) {
     for (auto& b : batches) { if (b.release) b.release(&b); }
     batches.clear();
 
-    std::fprintf(stderr, "fuselance: %zu distinct file(s) in virtual filesystem\n", state.files.size());
+    std::fprintf(stderr, "fuselance: %zu distinct file(s)", state.files.size());
+    if (!state.frames.empty())
+        std::fprintf(stderr, ", %zu frame director%s", state.frames.size(),
+                     state.frames.size() == 1 ? "y" : "ies");
+    std::fprintf(stderr, " in virtual filesystem\n");
     if (state.files.size() <= 20) {
         for (auto& f : state.files)
             std::fprintf(stderr, "  %-40s  %llu byte(s) across %zu segment(s)\n",
                          f.name.c_str(), static_cast<unsigned long long>(f.total_size), f.segs.size());
+    }
+    if (!state.frames.empty() && state.frames.size() <= 10) {
+        for (auto& fr : state.frames)
+            std::fprintf(stderr, "  [dir] %s/  (%zu file(s))\n",
+                         fr.label.c_str(), fr.files.size());
     }
 
     // ---- Create mountpoint and launch FUSE ---------------------------------
