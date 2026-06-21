@@ -275,8 +275,27 @@ int main(int argc, char** argv) {
 
     if (!table_path) { usage(argv[0]); return 2; }
     if (!filename_col) {
-        std::fprintf(stderr, "fuselance: --filename-col is required\n");
+        // Read the manifest (schema only, no data) and list top-level column names so the user
+        // can pick one for --filename-col on their next invocation.
+        NanoLanceDatasetMetadata meta{};
+        char merr[512];
+        if (nano_lance_dataset_read_latest(table_path, &meta, merr, sizeof(merr)) != NANO_LANCE_READER_OK) {
+            std::fprintf(stderr, "fuselance: --filename-col is required\n");
+            std::fprintf(stderr, "fuselance: (also failed to read schema from '%s': %s)\n", table_path, merr);
+            usage(argv[0]);
+            return 2;
+        }
+        std::fprintf(stderr, "fuselance: --filename-col is required\n\n");
+        std::fprintf(stderr, "Columns in '%s':\n", table_path);
+        for (size_t i = 0; i < meta.fields_len; ++i) {
+            const NanoLanceReaderField& f = meta.fields[i];
+            if (f.parent_id == -1) {  // top-level columns only
+                std::fprintf(stderr, "  %s  (%s)\n", f.name ? f.name : "?", f.logical_type ? f.logical_type : "?");
+            }
+        }
+        std::fprintf(stderr, "\n");
         usage(argv[0]);
+        nano_lance_dataset_metadata_free(&meta);
         return 2;
     }
 
