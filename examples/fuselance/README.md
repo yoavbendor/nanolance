@@ -69,6 +69,29 @@ cat /tmp/fuse_packets_ipv4/10.0.0.1 | wc -c   # total bytes of all EPBs from 10.
 Opening a file with tshark will produce a format error (missing SHB/IDB preamble) because the file
 contains raw EPB block bytes — exactly the expected behaviour for a blob-only stream.
 
+## Quick demo (no pcap needed)
+
+`demo/gen_demo.sh` builds a self-contained dataset: three text files — `letters.txt`
+(`abc…xyz` repeated), `capital_letters.txt` (`ABC…XYZ`), and `numerals.txt`
+(`0123456789`) — referenced by an **interleaved** blob.v2 column (rows cycle
+letters → capital → numerals, and each file is split into several scattered
+segments). Grouping by the `name` column reassembles each file in order:
+
+```bash
+# 1. generate source files + a native .lance (needs pyarrow + pylance for step 1)
+examples/fuselance/demo/gen_demo.sh ./build/arrowipc2lance
+
+# 2. mount and browse
+fuselance /tmp/fuselance_demo/demo.lance --filename-col name
+ls  /tmp/fuse_demo            # capital_letters  letters  numerals
+cat /tmp/fuse_demo/letters    # abcdefghijklmnopqrstuvwxyzabc…  (1040 bytes)
+```
+
+The demo goes through Arrow IPC + `arrowipc2lance` rather than writing a Lance
+dataset with pylance directly: nanolance reads the Lance 2.2 manifest layout, but
+current pylance emits a newer manifest variant nanolance does not decode. The
+native `arrowipc2lance` tool produces a dataset nanolance (and fuselance) reads.
+
 ## Building
 
 Requires `libfuse3-dev` (Debian/Ubuntu) or `fuse3-devel` (RPM). Built by default in a standalone
