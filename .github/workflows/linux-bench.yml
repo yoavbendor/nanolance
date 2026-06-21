@@ -30,7 +30,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang ninja-build valgrind cmake
+          sudo apt-get install -y clang-19 ninja-build valgrind cmake
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-19 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-19 100
           python3 -m pip install --quiet --break-system-packages pyarrow pylance || python3 -m pip install --quiet pyarrow pylance
 
       # Cache the FetchContent downloads + dep builds (a standalone configure parks them in ./.deps).
@@ -39,9 +41,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .deps
-          key: deps-${{ runner.os }}-clang-${{ hashFiles('**/CMakeLists.txt') }}
+          key: deps-${{ runner.os }}-clang19-${{ hashFiles('**/CMakeLists.txt') }}
           restore-keys: |
-            deps-${{ runner.os }}-clang-
+            deps-${{ runner.os }}-clang19-
 
       - name: Configure + build (clang, Release)
         env:
