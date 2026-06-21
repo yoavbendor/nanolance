@@ -27,6 +27,34 @@ and [`KICKOFF.md`](docs/KICKOFF.md) (build order + traps).
 
 The rest of this document is the build history and the milestone/feature detail behind the above.
 
+## For AI agents
+
+**Use this example when** you want a Lance dataset from a capture **with packet payloads kept external**
+(referenced, never copied) and/or **staged, incremental enrichment** (decode one layer per run). It reads
+and writes through the full nanotins → soatins → nanolance stack.
+
+**Pick a sibling instead when:** you want Parquet and don't need payloads → the parse-only Parquet twin
+[`pcapng2parquet`](https://github.com/yoavbendor/nanoarrow2parquet/tree/main/examples/pcapng2parquet).
+You just want human-readable decoded packets →
+[`pcapng2json`](https://github.com/yoavbendor/nanotins/tree/main/examples/pcapng2json).
+
+**Run:** `build/examples/pcapng2lance/pcapng2lance --decode-l2l3 capture.pcapng out.lance` (add a
+`payload_uri` like `s3://…` as the last arg if the dataset will be read on another host).
+
+**Do**
+- Pass `--decode-l2l3` for the per-PDU tables; join each one to the L1 table on `packet_id`.
+- Keep the original capture reachable (`file://` or `s3://`) — payload fetches and every `--stage` run read
+  from it; pass an explicit `payload_uri` when the dataset moves hosts.
+- Bound RAM with `--window-bytes`; pick the CPU path with `--sequential` or `--threads N` — all produce
+  byte-identical tables.
+- Use `uint8` for flag fields and `fixed_size_binary` for MAC/IP fields.
+
+**Don't**
+- Don't use `bool` row fields — forbidden (Arrow 1-bit vs the byte-wide writer path).
+- Don't pass `--gpu` expecting a GPU run — it is a planned feature; the flag reports that and exits.
+- Don't expect a TCP/UDP row on continuation fragments (only `frag_offset == 0`) or cross-fragment payload
+  reassembly — neither is done.
+
 ## What's built (M0 + M1 + M2 + M3/M6)
 
 - **M0 — `soatins` reflection core** (in the standalone [`soatins/`](extern/nanotins/soatins) library, vendored into this example as a submodule from the sister [nanotins](https://github.com/yoavbendor/nanotins) repo): `be<>`/`le<>` 
