@@ -273,6 +273,19 @@ if(NANOLANCE_BUILD_EXAMPLES)
     add_subdirectory(examples/pcapng2lance)
 endif()
 
+# fuselance — mount a Lance blob.v2 table as a read-only FUSE filesystem. Independent of the
+# NANOLANCE_BUILD_EXAMPLES toggle above because that one pulls in pcapng2lance's nanotins submodule;
+# fuselance needs only nanolance_reader + libfuse3, so it gets its own opt-in. Its CMakeLists skips
+# itself gracefully when libfuse3 is not installed.
+if(NANOLANCE_STANDALONE)
+    option(NANOLANCE_BUILD_FUSE_EXAMPLE "Build the fuselance FUSE example (needs libfuse3-dev)" ON)
+else()
+    option(NANOLANCE_BUILD_FUSE_EXAMPLE "Build the fuselance FUSE example (needs libfuse3-dev)" OFF)
+endif()
+if(NANOLANCE_BUILD_FUSE_EXAMPLE)
+    add_subdirectory(examples/fuselance)
+endif()
+
 if(NOT NANOLANCE_BUILD_TESTS)
     return()
 endif()
