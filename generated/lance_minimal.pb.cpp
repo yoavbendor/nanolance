@@ -113,6 +113,18 @@ bool skip_field(const std::vector<std::uint8_t>& data, std::size_t& pos, std::ui
         std::vector<std::uint8_t> ignored;
         return read_bytes(data, pos, ignored);
     }
+    // Wire type 1 = 64-bit fixed (8 bytes), wire type 5 = 32-bit fixed (4 bytes).
+    // Both are valid protobuf wire types that newer Lance manifests may use in unknown fields.
+    if (wire_type == 1U) {
+        if (pos + 8U > data.size()) { return false; }
+        pos += 8U;
+        return true;
+    }
+    if (wire_type == 5U) {
+        if (pos + 4U > data.size()) { return false; }
+        pos += 4U;
+        return true;
+    }
     return false;
 }
 
@@ -292,7 +304,9 @@ bool decode_map_metadata_entry(const std::vector<std::uint8_t>& nested, std::str
             return false;
         }
     }
-    return have_key && have_value;
+    // A map entry with only a key (no value field) is valid protobuf: missing value defaults
+    // to the zero value for its type, which for `bytes` is an empty buffer.
+    return have_key;
 }
 
 bool decode_field_message(const std::vector<std::uint8_t>& bytes, Field& field) {
@@ -368,11 +382,31 @@ bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& 
                 return false;
             }
             file.fields.push_back(static_cast<std::int32_t>(value));
+        } else if (field_number == 2 && wire_type == kWireBytes) {
+            // packed repeated int32 — proto3 default encoding for numeric repeated fields
+            std::vector<std::uint8_t> packed;
+            if (!read_bytes(bytes, pos, packed)) { return false; }
+            std::size_t pp = 0;
+            while (pp < packed.size()) {
+                if (!read_varint(packed, pp, value)) { return false; }
+                if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) { return false; }
+                file.fields.push_back(static_cast<std::int32_t>(value));
+            }
         } else if (field_number == 3 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
             if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
                 return false;
             }
             file.column_indices.push_back(static_cast<std::int32_t>(value));
+        } else if (field_number == 3 && wire_type == kWireBytes) {
+            // packed repeated int32
+            std::vector<std::uint8_t> packed;
+            if (!read_bytes(bytes, pos, packed)) { return false; }
+            std::size_t pp = 0;
+            while (pp < packed.size()) {
+                if (!read_varint(packed, pp, value)) { return false; }
+                if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) { return false; }
+                file.column_indices.push_back(static_cast<std::int32_t>(value));
+            }
         } else if (field_number == 4 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
             if (value > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
                 return false;
