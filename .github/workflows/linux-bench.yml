@@ -49,7 +49,12 @@ jobs:
           CC: clang-19
           CXX: clang++-19
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          # NANOLANCE_BUILD_EXAMPLES=OFF: dpar/lldp2lance_main.cpp trigger clang ICEs on both
+          # clang-18 and clang-19; pcapng2lance also requires the nanotins submodule which CI
+          # does not need for core library tests.
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DNANOLANCE_BUILD_EXAMPLES=OFF \
+            -DNANOLANCE_BUILD_FUSE_EXAMPLE=ON
           cmake --build build -j
 
       - name: C++ smoke tests
