@@ -1,0 +1,78 @@
+{
+  "data_storage_version": "2.2",
+  "extension_name": "lance.blob.v2",
+  "supported_kinds": [
+    3
+  ],
+  "unsupported_kinds": [
+    "inline",
+    "packed",
+    "dedicated"
+  ],
+  "write_field": {
+    "name": "payload_ref",
+    "nullable": true,
+    "storage_children": [
+      {
+        "name": "data",
+        "arrow_type": "large_binary",
+        "nullable": true
+      },
+      {
+        "name": "uri",
+        "arrow_type": "string",
+        "nullable": true
+      },
+      {
+        "name": "position",
+        "arrow_type": "uint64",
+        "nullable": true
+      },
+      {
+        "name": "size",
+        "arrow_type": "uint64",
+        "nullable": true
+      }
+    ]
+  },
+  "companion_columns": [
+    "packet_id"
+  ],
+  "rows": 2,
+  "read_materialized_children": [
+    "kind",
+    "position",
+    "size",
+    "blob_id",
+    "blob_uri"
+  ],
+  "sample_external_kind": 3,
+  "external_only": true,
+  "materialized_children": [
+    "kind",
+    "position",
+    "size",
+    "blob_id",
+    "blob_uri"
+  ],
+  "external_rows": [
+    {
+      "index": 0,
+      "uri": "file:///home/user/nanolance/tests/golden/blob_v2/capture_001.pcapng",
+      "position": 100,
+      "size": 64,
+      "kind": 3,
+      "blob_id": 0,
+      "take_blobs_readable": true
+    },
+    {
+      "index": 1,
+      "uri": "s3://bucket/capture_001.pcapng",
+      "position": 200,
+      "size": 128,
+      "kind": 3,
+      "blob_id": 0,
+      "take_blobs_readable": false
+    }
+  ]
+}
