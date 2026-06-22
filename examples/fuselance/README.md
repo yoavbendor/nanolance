@@ -7,6 +7,7 @@ the concatenation of all matching rows' blob payloads, fetched on demand.
 ```
 fuselance <lance_table_path> --filename-col <col>
           [--blob-col <col>] [--join-blob-from <blob_table>] [--sort-col <col>]
+          [--frame-col <col>]
 ```
 
 ## Options
@@ -17,6 +18,22 @@ fuselance <lance_table_path> --filename-col <col>
 | `--blob-col <col>` | blob.v2 struct column. Auto-detected when omitted. |
 | `--join-blob-from <path>` | Read blob refs from a companion table joined on `packet_id`. |
 | `--sort-col <col>` | Order blobs within each file by this column (ascending). |
+| `--frame-col <col>` | Numerical column; adds `frame_<N>/` subdirectories alongside the flat files. Each `frame_<N>/` contains the same file set filtered to rows where `<col> == N`. |
+
+## Filesystem layout with `--frame-col`
+
+```
+/tmp/fuse_<table>/
+  <file1>          ← all rows (same as without --frame-col)
+  <file2>
+  frame_0/
+    <file1>        ← only rows where frame-col == 0
+    <file2>
+  frame_1/
+    <file1>
+    <file2>
+  …
+```
 
 ## Column type rendering
 
