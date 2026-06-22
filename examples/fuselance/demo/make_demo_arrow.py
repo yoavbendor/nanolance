@@ -55,18 +55,18 @@ def main(argv: list[str]) -> int:
     out_dir: Path = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # name -> (alphabet, repetition count)
+    # name (path-like) -> (alphabet, repetition count, filename for storage)
     specs = {
-        "letters": (string.ascii_lowercase, 40),
-        "capital_letters": (string.ascii_uppercase, 40),
-        "numerals": ("0123456789", 100),
+        "/chars/lower":    (string.ascii_lowercase, 40,  "lower.txt"),
+        "/chars/upper":    (string.ascii_uppercase, 40,  "upper.txt"),
+        "/chars/numerals": ("0123456789",           100, "numerals.txt"),
     }
     files: dict[str, tuple[str, int]] = {}
-    for name, (alphabet, cycles) in specs.items():
-        path = out_dir / f"{name}.txt"
+    for name, (alphabet, cycles, fname) in specs.items():
+        path = out_dir / fname
         path.write_text(alphabet * cycles)
         files[name] = (path.as_uri(), path.stat().st_size)
-        print(f"  {name}.txt: {files[name][1]} bytes")
+        print(f"  {fname}: {files[name][1]} bytes")
 
     segs = max(1, args.segments)
     names: list[str] = []

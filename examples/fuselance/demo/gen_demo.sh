@@ -8,8 +8,8 @@
 #
 # Then mount it:
 #   fuselance <output_dir>/demo.lance --filename-col name
-#   ls    /tmp/fuse_demo
-#   cat   /tmp/fuse_demo/letters
+#   ls    /tmp/fuse_demo/chars
+#   cat   /tmp/fuse_demo/chars/lower
 set -euo pipefail
 
 ARROWIPC2LANCE="${1:?path to the arrowipc2lance tool (build/arrowipc2lance)}"

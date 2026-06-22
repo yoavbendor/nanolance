@@ -54,6 +54,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -166,15 +167,11 @@ static bool format_ip(const uint8_t* bytes, int width, std::string& out) {
     return false;
 }
 
-// Replace '/' with "%2F" so path-like column values become flat FUSE filenames.
-static std::string escape_slashes(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (unsigned char c : s) {
-        if (c == '/') out += "%2F";
-        else          out += static_cast<char>(c);
-    }
-    return out;
+// Strip a single leading '/' so "/proc/info/foo.log" → "proc/info/foo.log".
+// Column values without a leading slash (e.g. "std.err") are kept as-is.
+static std::string strip_leading_slash(const std::string& s) {
+    if (!s.empty() && s[0] == '/') return s.substr(1);
+    return s;
 }
 
 // Render a column cell as a filename-safe display string.
@@ -243,41 +240,92 @@ static uint64_t frame_value(const ArrowArrayView* col, int64_t row) {
 }
 
 // ---------------------------------------------------------------------------
-// Path parsing helpers
+// Path helpers — support multi-level virtual paths from column values
 // ---------------------------------------------------------------------------
 
-// Determine whether path is a known frame directory, returning its index in g_state->frames.
-// Returns -1 if not a frame dir.
-static int frame_dir_index(const char* path) {
-    if (path[0] != '/' || path[1] == '\0') return -1;
-    const char* name = path + 1;
-    // Must not contain another '/'.
-    if (std::strchr(name, '/') != nullptr) return -1;
-    for (size_t i = 0; i < g_state->frames.size(); ++i) {
-        if (g_state->frames[i].label == name) return static_cast<int>(i);
-    }
-    return -1;
+// Convert FUSE absolute path "/a/b/c" to relative "a/b/c" (strips leading '/').
+static std::string_view path_rel(const char* fuse_path) {
+    return (fuse_path[0] == '/' && fuse_path[1] != '\0')
+        ? std::string_view(fuse_path + 1)
+        : std::string_view("");
 }
 
-// Parse "/frame_<N>/filename" → frame index + file index. Returns false if not that form.
-static bool parse_framed_path(const char* path, size_t& out_fi, size_t& out_vi) {
-    if (path[0] != '/') return false;
-    const char* p = path + 1;
-    const char* slash = std::strchr(p, '/');
-    if (!slash || slash[1] == '\0') return false;
-    std::string dir(p, slash - p);
-    const char* fname = slash + 1;
-    // Must not have a second slash.
-    if (std::strchr(fname, '/') != nullptr) return false;
-    for (size_t fi = 0; fi < g_state->frames.size(); ++fi) {
-        if (g_state->frames[fi].label != dir) continue;
-        const auto& fvec = g_state->frames[fi].files;
-        for (size_t vi = 0; vi < fvec.size(); ++vi) {
-            if (fvec[vi].name == fname) { out_fi = fi; out_vi = vi; return true; }
+// True if `file_rel` ("a/b/c") lives under directory `dir_rel` ("a/b"), i.e.
+// file_rel == dir_rel + "/" + something.
+static bool under_dir(std::string_view dir_rel, const std::string& file_rel) {
+    if (dir_rel.empty()) return true;  // everything is under root
+    if (file_rel.size() <= dir_rel.size()) return false;
+    if (file_rel.compare(0, dir_rel.size(), dir_rel) != 0) return false;
+    return file_rel[dir_rel.size()] == '/';
+}
+
+// Given a file at `file_rel` that lives under `dir_rel`, return its direct child
+// name (the next path component), and whether that child is itself a directory.
+// e.g. dir="proc", file="proc/info/foo.log" → child="info", is_dir=true
+//      dir="proc/info", file="proc/info/foo.log" → child="foo.log", is_dir=false
+static std::string direct_child(std::string_view dir_rel, const std::string& file_rel,
+                                bool& out_is_dir) {
+    size_t start = dir_rel.empty() ? 0 : dir_rel.size() + 1;
+    size_t slash = file_rel.find('/', start);
+    out_is_dir = (slash != std::string::npos);
+    return file_rel.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+}
+
+// Emit all direct children of `dir_rel` from `files` into the FUSE filler.
+// Deduplicates subdirectory names. `file_total_size` is used for regular file stat.
+static void fill_dir_children(const std::vector<VirtualFile>& files,
+                               std::string_view dir_rel,
+                               void* buf, fuse_fill_dir_t filler) {
+    std::set<std::string> seen_dirs;
+    for (const auto& f : files) {
+        if (!under_dir(dir_rel, f.name)) continue;
+        bool is_dir;
+        std::string child = direct_child(dir_rel, f.name, is_dir);
+        struct stat st{};
+        if (is_dir) {
+            if (!seen_dirs.insert(child).second) continue;  // already emitted
+            st.st_mode = S_IFDIR | 0555;
+        } else {
+            st.st_mode = S_IFREG | 0444;
+            st.st_size = static_cast<off_t>(f.total_size);
         }
-        return false;  // dir matched but file not found
+        filler(buf, child.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
     }
-    return false;
+}
+
+// For getattr: find a VirtualFile whose relative path exactly matches `rel`,
+// or return nullptr. Also checks if `rel` is a valid intermediate directory.
+// Sets `out_is_dir=true` if rel names a directory prefix.
+static const VirtualFile* find_vfile(const std::vector<VirtualFile>& files,
+                                     std::string_view rel, bool& out_is_dir) {
+    out_is_dir = false;
+    std::string prefix(rel);
+    prefix += '/';
+    for (const auto& f : files) {
+        if (f.name == rel)  return &f;
+        if (f.name.size() > rel.size() &&
+            f.name.compare(0, prefix.size(), prefix) == 0) {
+            out_is_dir = true;  // keep looking for exact match
+        }
+    }
+    return nullptr;
+}
+
+// If `fuse_path` starts with a known frame label ("/frame_N/…"), return the frame index
+// and the remainder relative path within the frame ("proc/info/foo.log").
+// Returns -1 if path doesn't start with a frame label.
+static int split_frame_path(const char* fuse_path, std::string_view& out_rest) {
+    if (fuse_path[0] != '/') return -1;
+    const char* p = fuse_path + 1;
+    const char* slash = std::strchr(p, '/');
+    std::string label = slash ? std::string(p, slash - p) : std::string(p);
+    for (size_t i = 0; i < g_state->frames.size(); ++i) {
+        if (g_state->frames[i].label == label) {
+            out_rest = slash ? std::string_view(slash + 1) : std::string_view("");
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,41 +338,44 @@ static int fl_getattr(const char* path, struct stat* st, struct fuse_file_info* 
     // Root directory.
     if (std::strcmp(path, "/") == 0) {
         st->st_mode  = S_IFDIR | 0555;
-        st->st_nlink = 2 + static_cast<nlink_t>(g_state->files.size())
-                         + static_cast<nlink_t>(g_state->frames.size());
+        st->st_nlink = 2;
         return 0;
     }
 
-    // Frame subdirectory: "/frame_<N>"
-    int fdi = frame_dir_index(path);
+    // Check if path is inside (or is) a frame directory: "/frame_N" or "/frame_N/…"
+    std::string_view frame_rest;
+    int fdi = split_frame_path(path, frame_rest);
     if (fdi >= 0) {
-        st->st_mode  = S_IFDIR | 0555;
-        st->st_nlink = 2 + static_cast<nlink_t>(g_state->frames[static_cast<size_t>(fdi)].files.size());
-        return 0;
+        const auto& ffiles = g_state->frames[static_cast<size_t>(fdi)].files;
+        if (frame_rest.empty()) {
+            // "/frame_N" itself
+            st->st_mode  = S_IFDIR | 0555;
+            st->st_nlink = 2;
+            return 0;
+        }
+        bool is_dir = false;
+        const VirtualFile* vf = find_vfile(ffiles, frame_rest, is_dir);
+        if (vf) {
+            st->st_mode  = S_IFREG | 0444;
+            st->st_nlink = 1;
+            st->st_size  = static_cast<off_t>(vf->total_size);
+            return 0;
+        }
+        if (is_dir) { st->st_mode = S_IFDIR | 0555; st->st_nlink = 2; return 0; }
+        return -ENOENT;
     }
 
-    // Framed file: "/frame_<N>/filename"
-    size_t fi = 0, vi = 0;
-    if (parse_framed_path(path, fi, vi)) {
-        const VirtualFile& f = g_state->frames[fi].files[vi];
+    // Root path: "/a" or "/a/b/c"
+    std::string_view rel = path_rel(path);
+    bool is_dir = false;
+    const VirtualFile* vf = find_vfile(g_state->files, rel, is_dir);
+    if (vf) {
         st->st_mode  = S_IFREG | 0444;
         st->st_nlink = 1;
-        st->st_size  = static_cast<off_t>(f.total_size);
+        st->st_size  = static_cast<off_t>(vf->total_size);
         return 0;
     }
-
-    // Root flat file: "/filename"
-    const char* name = path + 1;
-    if (std::strchr(name, '/') == nullptr) {
-        for (const auto& f : g_state->files) {
-            if (f.name == name) {
-                st->st_mode  = S_IFREG | 0444;
-                st->st_nlink = 1;
-                st->st_size  = static_cast<off_t>(f.total_size);
-                return 0;
-            }
-        }
-    }
+    if (is_dir) { st->st_mode = S_IFDIR | 0555; st->st_nlink = 2; return 0; }
     return -ENOENT;
 }
 
@@ -334,56 +385,53 @@ static int fl_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
     filler(buf, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
     filler(buf, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
 
-    if (std::strcmp(path, "/") == 0) {
-        // Flat files.
-        for (const auto& f : g_state->files) {
-            struct stat st{};
-            st.st_mode = S_IFREG | 0444;
-            st.st_size = static_cast<off_t>(f.total_size);
-            filler(buf, f.name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
-        }
-        // Frame subdirectories.
+    // Check if inside a frame directory.
+    std::string_view frame_rest;
+    int fdi = split_frame_path(path, frame_rest);
+    if (fdi >= 0) {
+        fill_dir_children(g_state->frames[static_cast<size_t>(fdi)].files,
+                          frame_rest, buf, filler);
+        return 0;
+    }
+
+    std::string_view rel = (std::strcmp(path, "/") == 0) ? "" : path_rel(path);
+
+    // Emit frame subdirs at root level.
+    if (rel.empty()) {
         for (const auto& fr : g_state->frames) {
             struct stat st{};
             st.st_mode = S_IFDIR | 0555;
             filler(buf, fr.label.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
         }
-        return 0;
     }
 
-    // Frame subdirectory listing.
-    int fdi = frame_dir_index(path);
-    if (fdi >= 0) {
-        for (const auto& f : g_state->frames[static_cast<size_t>(fdi)].files) {
-            struct stat st{};
-            st.st_mode = S_IFREG | 0444;
-            st.st_size = static_cast<off_t>(f.total_size);
-            filler(buf, f.name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
-        }
-        return 0;
-    }
-
-    return -ENOENT;
+    fill_dir_children(g_state->files, rel, buf, filler);
+    return 0;
 }
 
 static int fl_open(const char* path, struct fuse_file_info* fi) {
     if ((fi->flags & O_ACCMODE) != O_RDONLY) return -EACCES;
 
-    // Framed file: "/frame_<N>/filename"
-    size_t frame_i = 0, file_i = 0;
-    if (parse_framed_path(path, frame_i, file_i)) {
-        fi->fh = encode_frame_fh(frame_i, file_i);
-        return 0;
-    }
-
-    // Root flat file: "/filename"
-    const char* name = path + 1;
-    if (std::strchr(name, '/') == nullptr) {
-        for (size_t i = 0; i < g_state->files.size(); ++i) {
-            if (g_state->files[i].name == name) {
-                fi->fh = encode_root_fh(i);
+    // Framed file: "/frame_N/…/file"
+    std::string_view frame_rest;
+    int fdi = split_frame_path(path, frame_rest);
+    if (fdi >= 0 && !frame_rest.empty()) {
+        const auto& ffiles = g_state->frames[static_cast<size_t>(fdi)].files;
+        for (size_t vi = 0; vi < ffiles.size(); ++vi) {
+            if (ffiles[vi].name == frame_rest) {
+                fi->fh = encode_frame_fh(static_cast<size_t>(fdi), vi);
                 return 0;
             }
+        }
+        return -ENOENT;
+    }
+
+    // Root file: "/a/b/c"
+    std::string_view rel = path_rel(path);
+    for (size_t i = 0; i < g_state->files.size(); ++i) {
+        if (g_state->files[i].name == rel) {
+            fi->fh = encode_root_fh(i);
+            return 0;
         }
     }
     return -ENOENT;
@@ -713,7 +761,7 @@ int main(int argc, char** argv) {
         for (int64_t r = 0; r < view.length; ++r) {
             std::string fname;
             cell_to_string(fname_view, r, fname);
-            fname = escape_slashes(fname);
+            fname = strip_leading_slash(fname);
 
             BlobSeg seg;
             if (join_blob_path) {
