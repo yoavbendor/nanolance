@@ -165,6 +165,17 @@ static bool format_ip(const uint8_t* bytes, int width, std::string& out) {
     return false;
 }
 
+// Replace '/' with "%2F" so path-like column values become flat FUSE filenames.
+static std::string escape_slashes(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c == '/') out += "%2F";
+        else          out += static_cast<char>(c);
+    }
+    return out;
+}
+
 // Render a column cell as a filename-safe display string.
 // Supports: string, integer, and fixed_size_binary:4/16 (rendered as IP addresses).
 // Returns false for unsupported types.
@@ -701,6 +712,7 @@ int main(int argc, char** argv) {
         for (int64_t r = 0; r < view.length; ++r) {
             std::string fname;
             cell_to_string(fname_view, r, fname);
+            fname = escape_slashes(fname);
 
             BlobSeg seg;
             if (join_blob_path) {
