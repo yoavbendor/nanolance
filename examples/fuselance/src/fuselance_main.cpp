@@ -109,19 +109,20 @@ static uint64_t encode_root_fh(size_t file_idx) {
 static uint64_t encode_frame_fh(size_t frame_idx, size_t file_idx) {
     return kFramedBit | (static_cast<uint64_t>(file_idx) << 32) | static_cast<uint64_t>(frame_idx);
 }
-static bool is_framed_fh(uint64_t fh) { return (fh & kFramedBit) != 0; }
-static size_t frame_idx_from_fh(uint64_t fh) { return static_cast<size_t>(fh & 0xFFFF'FFFF); }
-static size_t file_idx_from_fh(uint64_t fh)  { return static_cast<size_t>((fh >> 32) & 0xFFFF); }
+static bool   is_framed_fh(uint64_t fh)           { return (fh & kFramedBit) != 0; }
+static size_t frame_idx_from_fh(uint64_t fh)       { return static_cast<size_t>(fh & 0xFFFF'FFFF); }
+static size_t framed_file_idx_from_fh(uint64_t fh) { return static_cast<size_t>((fh >> 32) & 0xFFFF); }
+static size_t root_file_idx_from_fh(uint64_t fh)   { return static_cast<size_t>(fh & 0xFFFFFFFFULL); }
 
 // Resolve fh → VirtualFile&.
 static const VirtualFile* vfile_from_fh(uint64_t fh) {
     if (is_framed_fh(fh)) {
         size_t fi = frame_idx_from_fh(fh);
-        size_t vi = file_idx_from_fh(fh);
+        size_t vi = framed_file_idx_from_fh(fh);
         if (fi >= g_state->frames.size() || vi >= g_state->frames[fi].files.size()) return nullptr;
         return &g_state->frames[fi].files[vi];
     }
-    size_t vi = file_idx_from_fh(fh);
+    size_t vi = root_file_idx_from_fh(fh);
     if (vi >= g_state->files.size()) return nullptr;
     return &g_state->files[vi];
 }
