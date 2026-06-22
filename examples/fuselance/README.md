@@ -111,9 +111,17 @@ native `arrowipc2lance` tool produces a dataset nanolance (and fuselance) reads.
 
 ## Building
 
-Requires `libfuse3-dev` (Debian/Ubuntu) or `fuse3-devel` (RPM). Built by default in a standalone
-nanolance build; disable with `-DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF`. Skips itself gracefully when
-libfuse3 is not installed.
+fuse3 is resolved in order:
+
+1. **System package** (`libfuse3-dev` / `fuse3-devel`) — picked up automatically via pkg-config.
+2. **Built from source** — if no system package is found, CMake fetches libfuse 3.16.2 from GitHub
+   and builds it as a static library using meson + ninja. No `sudo` required.
+   ```bash
+   pip install meson ninja   # once, no sudo needed
+   cmake -B build -DNANOLANCE_BUILD_FUSE_EXAMPLE=ON
+   cmake --build build -t fuselance
+   ```
+3. **Neither** — cmake prints a status message and skips `fuselance` gracefully (unit tests still build).
 
 ```bash
 cmake -B build -DNANOLANCE_BUILD_FUSE_EXAMPLE=ON
