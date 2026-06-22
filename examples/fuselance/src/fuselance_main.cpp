@@ -97,8 +97,8 @@ static FuseLanceState* g_state = nullptr;
 //   root files:   0x0000_0000_XXXX_XXXX   (top 32 bits = 0, bottom = file index)
 //   framed files: 0x8000_FFFF_XXXX_XXXX   (bit 63 set; bits [47:32] = frame index; [31:0] = file index)
 //
-// Using bit 63 as "framed" sentinel ensures root indices (top 32 = 0) can never
-// collide with framed indices even if either side has up to 2^31 entries.
+// fh layout for framed entries: bit 63 = framed flag | bits [47:32] = file index (uint16, up to 65535 files)
+// | bits [31:0] = frame index (uint32, up to ~4B frames). Root fh = plain file_idx (bit 63 clear).
 // ---------------------------------------------------------------------------
 
 static constexpr uint64_t kFramedBit = (uint64_t{1} << 63);
@@ -107,11 +107,11 @@ static uint64_t encode_root_fh(size_t file_idx) {
     return static_cast<uint64_t>(file_idx);
 }
 static uint64_t encode_frame_fh(size_t frame_idx, size_t file_idx) {
-    return kFramedBit | (static_cast<uint64_t>(frame_idx) << 32) | static_cast<uint64_t>(file_idx);
+    return kFramedBit | (static_cast<uint64_t>(file_idx) << 32) | static_cast<uint64_t>(frame_idx);
 }
 static bool is_framed_fh(uint64_t fh) { return (fh & kFramedBit) != 0; }
-static size_t frame_idx_from_fh(uint64_t fh) { return static_cast<size_t>((fh >> 32) & 0x7FFF'FFFF); }
-static size_t file_idx_from_fh(uint64_t fh) { return static_cast<size_t>(fh & 0xFFFF'FFFF); }
+static size_t frame_idx_from_fh(uint64_t fh) { return static_cast<size_t>(fh & 0xFFFF'FFFF); }
+static size_t file_idx_from_fh(uint64_t fh)  { return static_cast<size_t>((fh >> 32) & 0xFFFF); }
 
 // Resolve fh → VirtualFile&.
 static const VirtualFile* vfile_from_fh(uint64_t fh) {
