@@ -31,7 +31,7 @@ jobs:
         run: |
           sudo apt-get update
           # clang-19 fixes the ICE (exit 139) that clang 18.1.3 hits on dpar/lldp2lance_main.cpp
-          sudo apt-get install -y clang-19 ninja-build valgrind cmake
+          sudo apt-get install -y clang-19 ninja-build valgrind cmake libfuse3-dev
           python3 -m pip install --quiet --break-system-packages pyarrow pylance || python3 -m pip install --quiet pyarrow pylance
 
       # Cache the FetchContent downloads + dep builds (a standalone configure parks them in ./.deps).
