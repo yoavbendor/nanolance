@@ -49,7 +49,9 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -70,6 +72,60 @@ static int g_verbosity = 1;
 #define LOG_INFO(fmt, ...) do { if (g_verbosity >= 1) std::fprintf(stderr, "fuselance: "       fmt "\n", ##__VA_ARGS__); } while(0)
 #define LOG_VERB(fmt, ...) do { if (g_verbosity >= 2) std::fprintf(stderr, "fuselance [V]: "   fmt "\n", ##__VA_ARGS__); } while(0)
 #define LOG_DBG(fmt, ...)  do { if (g_verbosity >= 3) std::fprintf(stderr, "fuselance [DBG]: " fmt "\n", ##__VA_ARGS__); } while(0)
+
+// ---------------------------------------------------------------------------
+// Performance counters
+// ---------------------------------------------------------------------------
+static bool g_perf = false;  // enabled by --perf flag
+
+struct PerfCounters {
+    // Startup phase (measured in main before fuse_main).
+    int64_t  startup_ms = 0;      // total time from argv parse to fuse_main
+
+    // FUSE op counters (updated atomically from FUSE threads).
+    std::atomic<uint64_t> open_ok{0};
+    std::atomic<uint64_t> open_err{0};
+    std::atomic<uint64_t> read_calls{0};
+    std::atomic<uint64_t> read_bytes{0};
+    std::atomic<uint64_t> read_fetch_calls{0};
+    std::atomic<uint64_t> read_fetch_us{0};   // microseconds spent in nano_lance_fetch_external_blob
+    std::atomic<uint64_t> read_err{0};
+    std::atomic<uint64_t> getattr_calls{0};
+    std::atomic<uint64_t> readdir_calls{0};
+};
+
+static PerfCounters g_perf_ctr;
+
+static void perf_dump() {
+    if (!g_perf) return;
+    uint64_t fetch_calls = g_perf_ctr.read_fetch_calls.load();
+    uint64_t fetch_us    = g_perf_ctr.read_fetch_us.load();
+    double   fetch_avg_ms = fetch_calls ? static_cast<double>(fetch_us) / fetch_calls / 1000.0 : 0.0;
+    uint64_t read_bytes  = g_perf_ctr.read_bytes.load();
+    double   read_mib    = static_cast<double>(read_bytes) / (1024.0 * 1024.0);
+
+    std::fprintf(stderr,
+        "\n--- fuselance perf counters ---\n"
+        "  startup:       %lld ms\n"
+        "  getattr calls: %llu\n"
+        "  readdir calls: %llu\n"
+        "  open  ok/err:  %llu / %llu\n"
+        "  read  calls:   %llu  (%.2f MiB total)\n"
+        "  fetch calls:   %llu  (avg %.2f ms each, %llu us total)\n"
+        "  read  errors:  %llu\n"
+        "-------------------------------\n",
+        static_cast<long long>(g_perf_ctr.startup_ms),
+        static_cast<unsigned long long>(g_perf_ctr.getattr_calls.load()),
+        static_cast<unsigned long long>(g_perf_ctr.readdir_calls.load()),
+        static_cast<unsigned long long>(g_perf_ctr.open_ok.load()),
+        static_cast<unsigned long long>(g_perf_ctr.open_err.load()),
+        static_cast<unsigned long long>(g_perf_ctr.read_calls.load()),
+        read_mib,
+        static_cast<unsigned long long>(fetch_calls),
+        fetch_avg_ms,
+        static_cast<unsigned long long>(fetch_us),
+        static_cast<unsigned long long>(g_perf_ctr.read_err.load()));
+}
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -345,6 +401,7 @@ static int split_frame_path(const char* fuse_path, std::string_view& out_rest) {
 // ---------------------------------------------------------------------------
 
 static int fl_getattr(const char* path, struct stat* st, struct fuse_file_info* /*fi*/) {
+    if (g_perf) ++g_perf_ctr.getattr_calls;
     std::memset(st, 0, sizeof(*st));
 
     // Root directory.
@@ -396,6 +453,7 @@ static int fl_getattr(const char* path, struct stat* st, struct fuse_file_info* 
 static int fl_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
                       off_t /*offset*/, struct fuse_file_info* /*fi*/,
                       enum fuse_readdir_flags /*flags*/) {
+    if (g_perf) ++g_perf_ctr.readdir_calls;
     filler(buf, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
     filler(buf, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
 
@@ -426,6 +484,7 @@ static int fl_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
 static int fl_open(const char* path, struct fuse_file_info* fi) {
     if ((fi->flags & O_ACCMODE) != O_RDONLY) {
         LOG_ERR("open rejected (not O_RDONLY): %s", path);
+        if (g_perf) ++g_perf_ctr.open_err;
         return -EACCES;
     }
 
@@ -441,10 +500,12 @@ static int fl_open(const char* path, struct fuse_file_info* fi) {
                          path, (unsigned long long)fi->fh,
                          ffiles[vi].segs.size(),
                          (unsigned long long)ffiles[vi].total_size);
+                if (g_perf) ++g_perf_ctr.open_ok;
                 return 0;
             }
         }
         LOG_ERR("open ENOENT (framed): %s", path);
+        if (g_perf) ++g_perf_ctr.open_err;
         return -ENOENT;
     }
 
@@ -457,10 +518,12 @@ static int fl_open(const char* path, struct fuse_file_info* fi) {
                      path, (unsigned long long)fi->fh,
                      g_state->files[i].segs.size(),
                      (unsigned long long)g_state->files[i].total_size);
+            if (g_perf) ++g_perf_ctr.open_ok;
             return 0;
         }
     }
     LOG_ERR("open ENOENT: %s", path);
+    if (g_perf) ++g_perf_ctr.open_err;
     return -ENOENT;
 }
 
@@ -470,6 +533,8 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
     const VirtualFile* vf = vfile_from_fh(fi->fh);
     if (!vf) return -EBADF;
     if (offset < 0 || static_cast<uint64_t>(offset) >= vf->total_size) return 0;
+
+    if (g_perf) ++g_perf_ctr.read_calls;
 
     uint64_t file_off = static_cast<uint64_t>(offset);
     size_t total_written = 0;
@@ -484,15 +549,25 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
 
         size_t got = 0;
         char ferr[512];
+
+        auto t0 = g_perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         int rc = nano_lance_fetch_external_blob(
             seg.uri.c_str(), seg.position + seg_off, want,
             reinterpret_cast<uint8_t*>(buf + total_written), want,
             &got, ferr, sizeof(ferr));
+        if (g_perf) {
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+            ++g_perf_ctr.read_fetch_calls;
+            g_perf_ctr.read_fetch_us += static_cast<uint64_t>(us);
+        }
+
         if (rc != NANO_LANCE_READER_OK) {
             LOG_ERR("fetch '%s' uri=%s @%llu+%llu: %s",
                     vf->name.c_str(), seg.uri.c_str(),
                     static_cast<unsigned long long>(seg.position + seg_off),
                     static_cast<unsigned long long>(want), ferr);
+            if (g_perf) ++g_perf_ctr.read_err;
             return total_written > 0 ? static_cast<int>(total_written) : -EIO;
         }
         LOG_DBG("read '%s' @%llu+%llu => %zu bytes",
@@ -502,7 +577,12 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
         total_written += got;
         file_off = 0;  // consumed the within-segment offset; subsequent segs start at 0
     }
+    if (g_perf) g_perf_ctr.read_bytes += total_written;
     return static_cast<int>(total_written);
+}
+
+static void fl_destroy(void* /*private_data*/) {
+    perf_dump();
 }
 
 static const fuse_operations fl_ops = [] {
@@ -511,6 +591,7 @@ static const fuse_operations fl_ops = [] {
     ops.readdir = fl_readdir;
     ops.open    = fl_open;
     ops.read    = fl_read;
+    ops.destroy = fl_destroy;
     return ops;
 }();
 
@@ -627,6 +708,8 @@ static void usage(const char* prog) {
         "                            each containing the same files filtered to rows where <col>==N\n"
         "  -v / -vv / -vvv           verbosity: info(default=1) / verbose(2) / debug(3)\n"
         "                            use -q to suppress all but errors (level 0)\n"
+        "  --perf                    print performance counters on unmount (startup ms,\n"
+        "                            open/read/fetch counts, avg fetch latency, total bytes)\n"
         "\n"
         "fixed_size_binary:4  columns are rendered as dotted-quad IPv4 addresses.\n"
         "fixed_size_binary:16 columns are rendered as colon-hex IPv6 addresses.\n"
@@ -639,6 +722,8 @@ static void usage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
+    const auto t_start = std::chrono::steady_clock::now();
+
     const char* table_path      = nullptr;
     const char* filename_col    = nullptr;
     const char* blob_col_name   = nullptr;   // nullptr = auto-detect in same table
@@ -659,6 +744,7 @@ int main(int argc, char** argv) {
         else if (a == "--sort-col")        { sort_col_name  = need_val("--sort-col");        if (!sort_col_name)  return 2; }
         else if (a == "--frame-col")       { frame_col_name = need_val("--frame-col");       if (!frame_col_name) return 2; }
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
+        else if (a == "--perf")            { g_perf = true; }
         else if (a == "-q")                { g_verbosity = 0; }
         else if (a == "-v")                { g_verbosity = 2; }
         else if (a == "-vv")               { g_verbosity = 3; }
@@ -882,6 +968,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     LOG_INFO("mounting at %s (Ctrl-C or fusermount3 -u to unmount)", mountpoint.c_str());
+
+    g_perf_ctr.startup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_start).count();
+    if (g_perf)
+        std::fprintf(stderr, "fuselance [perf]: startup took %lld ms\n",
+                     static_cast<long long>(g_perf_ctr.startup_ms));
 
     const char* fuse_argv[] = {argv[0], "-f", mountpoint.c_str(), nullptr};
     int fuse_argc = 3;

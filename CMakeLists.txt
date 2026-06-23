@@ -258,6 +258,10 @@ if(NANOLANCE_BUILD_TOOLS)
     add_executable(nlance_blobfetch tools/nlance_blobfetch.cpp)
     target_compile_features(nlance_blobfetch PRIVATE cxx_std_20)
     target_link_libraries(nlance_blobfetch PRIVATE CLI11::CLI11 nanolance)
+
+    add_executable(nlance_info tools/nlance_info.cpp)
+    target_compile_features(nlance_info PRIVATE cxx_std_20)
+    target_link_libraries(nlance_info PRIVATE nanolance)
 endif()
 
 if(NANOLANCE_STANDALONE)
