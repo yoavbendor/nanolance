@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nano_lance {
 namespace {
@@ -817,7 +818,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
 
 bool read_data_file_batch(const std::filesystem::path& dataset_path, const pb::DataFile& data_file,
                           const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema, ArrowArray& batch,
-                          std::string& error) {
+                          std::string& error,
+                          const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr) {
     const auto path = dataset_path / "data" / data_file.path;
     pb::FileDescriptor descriptor{};
     LanceDataFileFooterLayout layout{};
@@ -836,6 +838,9 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const pb::D
     std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
     for (std::size_t i = 0; i < data_file.fields.size(); ++i) {
         const auto field_id = data_file.fields[i];
+        // Skip columns not in the projection (if one is set).
+        if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
+
         const auto column_index = data_file.column_indices[i];
         if (column_index < 0 ||
             static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
@@ -888,6 +893,76 @@ bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSc
         for (const auto& data_file : fragment.files) {
             ArrowArray batch{};
             if (!read_data_file_batch(dataset_path, data_file, mapping, out_schema, batch, error)) {
+                ArrowSchemaRelease(&out_schema);
+                return false;
+            }
+            out_batches.push_back(batch);
+        }
+    }
+    return true;
+}
+
+bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_path,
+                                        const std::vector<std::string>& column_names,
+                                        ArrowSchema& out_schema,
+                                        std::vector<ArrowArray>& out_batches,
+                                        std::string& error) {
+    error.clear();
+    out_batches.clear();
+    ArrowSchemaInit(&out_schema);
+
+    pb::Manifest manifest{};
+    std::uint64_t version = 0;
+    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+        return false;
+    }
+    LanceSchemaMapping full_mapping;
+    if (!lance_schema_mapping_from_manifest(manifest, full_mapping, error)) {
+        return false;
+    }
+
+    // Collect IDs of requested top-level columns and ALL their descendants.
+    std::unordered_set<std::int32_t> allowed_ids;
+    for (const auto& col_name : column_names) {
+        // Find root field by name.
+        const LanceField* root = nullptr;
+        for (const auto& f : full_mapping.fields) {
+            if (f.parent_id == -1 && f.name == col_name) { root = &f; break; }
+        }
+        if (root == nullptr) {
+            error = "projected column '" + col_name + "' not found in schema";
+            return false;
+        }
+        // BFS to collect root + all descendants.
+        std::vector<std::int32_t> queue = {root->id};
+        while (!queue.empty()) {
+            auto id = queue.back(); queue.pop_back();
+            allowed_ids.insert(id);
+            for (const auto& f : full_mapping.fields) {
+                if (f.parent_id == id) queue.push_back(f.id);
+            }
+        }
+    }
+
+    // Build a projected LanceSchemaMapping (only allowed fields).
+    LanceSchemaMapping proj_mapping;
+    for (const auto& f : full_mapping.fields) {
+        if (allowed_ids.count(f.id)) proj_mapping.fields.push_back(f);
+    }
+
+    if (!build_schema_from_mapping(proj_mapping, out_schema, error)) {
+        return false;
+    }
+
+    std::vector<pb::DataFragment> fragments = manifest.fragments;
+    std::sort(fragments.begin(), fragments.end(),
+              [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
+
+    for (const auto& fragment : fragments) {
+        for (const auto& data_file : fragment.files) {
+            ArrowArray batch{};
+            if (!read_data_file_batch(dataset_path, data_file, proj_mapping, out_schema, batch, error,
+                                      &allowed_ids)) {
                 ArrowSchemaRelease(&out_schema);
                 return false;
             }
