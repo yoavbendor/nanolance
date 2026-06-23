@@ -785,9 +785,11 @@ int main(int argc, char** argv) {
     }
 
     // Mountpoint derived from the name table's basename.
-    std::filesystem::path tpath(table_path);
+    // Normalise trailing slashes so stem() works on "foo.lance/" too.
+    std::filesystem::path tpath = std::filesystem::path(table_path).lexically_normal();
     std::string basename = tpath.stem().string();
-    if (basename.empty()) basename = tpath.filename().string();
+    if (basename.empty() || basename == ".") basename = tpath.filename().string();
+    if (basename.empty() || basename == ".") basename = "lance";
     const std::string mountpoint = "/tmp/fuse_" + basename;
 
     // ---- Optional: load blob table for join ---------------------------------
@@ -802,12 +804,37 @@ int main(int argc, char** argv) {
     }
 
     // ---- Read the name table ------------------------------------------------
-    LOG_INFO("reading %s ...", table_path);
+    // Collect only the columns fuselance actually needs; skip all others to
+    // avoid decompressing irrelevant column data (huge win for wide tables).
+    std::vector<std::string> proj_cols;
+    proj_cols.push_back(filename_col);
+    if (blob_col_name)   proj_cols.push_back(blob_col_name);
+    if (sort_col_name)   proj_cols.push_back(sort_col_name);
+    if (frame_col_name)  proj_cols.push_back(frame_col_name);
+    // packet_id join key (needed when --join-blob-from is used).
+    if (join_blob_path)  proj_cols.push_back("packet_id");
+    // If blob column not explicitly named, auto-detect after schema load — fall
+    // back to full read so detect_blob_col can scan all columns.
+    const bool can_project = (blob_col_name != nullptr) || join_blob_path;
+
+    LOG_INFO("reading %s ... (projecting %zu column(s)%s)",
+             table_path, proj_cols.size(), can_project ? "" : " — blob-col unknown, reading all");
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
-    if (!nano_lance::lance_table_read_dataset(tpath, schema, batches, err)) {
-        LOG_ERR("read failed: %s", err.c_str());
-        return 1;
+    bool read_ok = can_project
+        ? nano_lance::lance_table_read_dataset_projected(tpath, proj_cols, schema, batches, err)
+        : nano_lance::lance_table_read_dataset(tpath, schema, batches, err);
+    if (!read_ok) {
+        // If projected read failed (e.g. unknown join key), fall back to full read.
+        if (can_project) {
+            LOG_VERB("projected read failed (%s), retrying full read", err.c_str());
+            err.clear();
+            read_ok = nano_lance::lance_table_read_dataset(tpath, schema, batches, err);
+        }
+        if (!read_ok) {
+            LOG_ERR("read failed: %s", err.c_str());
+            return 1;
+        }
     }
     LOG_INFO("loaded %zu batch(es)", batches.size());
 

@@ -16,4 +16,13 @@ namespace nano_lance {
 bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
                               std::vector<ArrowArray>& out_batches, std::string& error);
 
+/// Same as lance_table_read_dataset but only reads the named top-level columns (and their children).
+/// All other columns are skipped during decode — significantly faster when the table has many columns
+/// and only a small subset is needed (e.g. fuselance only needs filename + blob columns).
+bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_path,
+                                        const std::vector<std::string>& column_names,
+                                        ArrowSchema& out_schema,
+                                        std::vector<ArrowArray>& out_batches,
+                                        std::string& error);
+
 }  // namespace nano_lance
