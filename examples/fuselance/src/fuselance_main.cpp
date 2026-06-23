@@ -39,6 +39,7 @@
 
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/nano_lance_reader.h"
+#include "fuselance_version.h"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -58,6 +59,17 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// Verbosity / logging
+// ---------------------------------------------------------------------------
+// Levels: 0=errors only, 1=info (default), 2=verbose, 3=debug
+static int g_verbosity = 1;
+
+#define LOG_ERR(fmt, ...)  std::fprintf(stderr, "fuselance [ERR]: "  fmt "\n", ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...) do { if (g_verbosity >= 1) std::fprintf(stderr, "fuselance: "       fmt "\n", ##__VA_ARGS__); } while(0)
+#define LOG_VERB(fmt, ...) do { if (g_verbosity >= 2) std::fprintf(stderr, "fuselance [V]: "   fmt "\n", ##__VA_ARGS__); } while(0)
+#define LOG_DBG(fmt, ...)  do { if (g_verbosity >= 3) std::fprintf(stderr, "fuselance [DBG]: " fmt "\n", ##__VA_ARGS__); } while(0)
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -362,6 +374,7 @@ static int fl_getattr(const char* path, struct stat* st, struct fuse_file_info* 
             return 0;
         }
         if (is_dir) { st->st_mode = S_IFDIR | 0555; st->st_nlink = 2; return 0; }
+        LOG_DBG("getattr ENOENT: %s", path);
         return -ENOENT;
     }
 
@@ -376,6 +389,7 @@ static int fl_getattr(const char* path, struct stat* st, struct fuse_file_info* 
         return 0;
     }
     if (is_dir) { st->st_mode = S_IFDIR | 0555; st->st_nlink = 2; return 0; }
+    LOG_DBG("getattr ENOENT: %s", path);
     return -ENOENT;
 }
 
@@ -410,7 +424,10 @@ static int fl_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
 }
 
 static int fl_open(const char* path, struct fuse_file_info* fi) {
-    if ((fi->flags & O_ACCMODE) != O_RDONLY) return -EACCES;
+    if ((fi->flags & O_ACCMODE) != O_RDONLY) {
+        LOG_ERR("open rejected (not O_RDONLY): %s", path);
+        return -EACCES;
+    }
 
     // Framed file: "/frame_N/…/file"
     std::string_view frame_rest;
@@ -420,9 +437,14 @@ static int fl_open(const char* path, struct fuse_file_info* fi) {
         for (size_t vi = 0; vi < ffiles.size(); ++vi) {
             if (ffiles[vi].name == frame_rest) {
                 fi->fh = encode_frame_fh(static_cast<size_t>(fdi), vi);
+                LOG_VERB("open framed %s -> fh=%llx (%zu segs, %llu bytes)",
+                         path, (unsigned long long)fi->fh,
+                         ffiles[vi].segs.size(),
+                         (unsigned long long)ffiles[vi].total_size);
                 return 0;
             }
         }
+        LOG_ERR("open ENOENT (framed): %s", path);
         return -ENOENT;
     }
 
@@ -431,9 +453,14 @@ static int fl_open(const char* path, struct fuse_file_info* fi) {
     for (size_t i = 0; i < g_state->files.size(); ++i) {
         if (g_state->files[i].name == rel) {
             fi->fh = encode_root_fh(i);
+            LOG_VERB("open %s -> fh=%llx (%zu segs, %llu bytes)",
+                     path, (unsigned long long)fi->fh,
+                     g_state->files[i].segs.size(),
+                     (unsigned long long)g_state->files[i].total_size);
             return 0;
         }
     }
+    LOG_ERR("open ENOENT: %s", path);
     return -ENOENT;
 }
 
@@ -462,12 +489,16 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
             reinterpret_cast<uint8_t*>(buf + total_written), want,
             &got, ferr, sizeof(ferr));
         if (rc != NANO_LANCE_READER_OK) {
-            std::fprintf(stderr, "fuselance: fetch %s seg @%llu+%llu: %s\n",
-                         vf->name.c_str(),
-                         static_cast<unsigned long long>(seg.position + seg_off),
-                         static_cast<unsigned long long>(want), ferr);
+            LOG_ERR("fetch '%s' uri=%s @%llu+%llu: %s",
+                    vf->name.c_str(), seg.uri.c_str(),
+                    static_cast<unsigned long long>(seg.position + seg_off),
+                    static_cast<unsigned long long>(want), ferr);
             return total_written > 0 ? static_cast<int>(total_written) : -EIO;
         }
+        LOG_DBG("read '%s' @%llu+%llu => %zu bytes",
+                vf->name.c_str(),
+                static_cast<unsigned long long>(seg.position + seg_off),
+                static_cast<unsigned long long>(want), got);
         total_written += got;
         file_off = 0;  // consumed the within-segment offset; subsequent segs start at 0
     }
@@ -582,7 +613,7 @@ static void usage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s <lance_table_path> --filename-col <col>\n"
         "          [--blob-col <col>] [--join-blob-from <blob_table>] [--sort-col <col>]\n"
-        "          [--frame-col <col>]\n"
+        "          [--frame-col <col>] [-v|-vv|-vvv]\n"
         "\n"
         "Mounts the Lance table as a read-only FUSE filesystem at /tmp/fuse_<basename>.\n"
         "Each distinct value of --filename-col becomes one file whose content is the\n"
@@ -594,6 +625,8 @@ static void usage(const char* prog) {
         "  --sort-col <col>          order blobs within each file by this column (ascending)\n"
         "  --frame-col <col>         numerical column; adds frame_<N>/ subdirectories to root,\n"
         "                            each containing the same files filtered to rows where <col>==N\n"
+        "  -v / -vv / -vvv           verbosity: info(default=1) / verbose(2) / debug(3)\n"
+        "                            use -q to suppress all but errors (level 0)\n"
         "\n"
         "fixed_size_binary:4  columns are rendered as dotted-quad IPv4 addresses.\n"
         "fixed_size_binary:16 columns are rendered as colon-hex IPv6 addresses.\n"
@@ -626,6 +659,10 @@ int main(int argc, char** argv) {
         else if (a == "--sort-col")        { sort_col_name  = need_val("--sort-col");        if (!sort_col_name)  return 2; }
         else if (a == "--frame-col")       { frame_col_name = need_val("--frame-col");       if (!frame_col_name) return 2; }
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
+        else if (a == "-q")                { g_verbosity = 0; }
+        else if (a == "-v")                { g_verbosity = 2; }
+        else if (a == "-vv")               { g_verbosity = 3; }
+        else if (a == "-vvv")              { g_verbosity = 4; }
         else if (a[0] != '-') {
             if (table_path) { std::fprintf(stderr, "fuselance: unexpected argument: %s\n", argv[i]); return 2; }
             table_path = argv[i];
@@ -635,18 +672,21 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Version banner always on stderr regardless of verbosity.
+    std::fprintf(stderr, "%s\n", FUSELANCE_VERSION);
+
     if (!table_path) { usage(argv[0]); return 2; }
     if (!filename_col) {
         // List column names from the manifest so the user can pick one.
         NanoLanceDatasetMetadata meta{};
         char merr[512];
         if (nano_lance_dataset_read_latest(table_path, &meta, merr, sizeof(merr)) != NANO_LANCE_READER_OK) {
-            std::fprintf(stderr, "fuselance: --filename-col is required\n");
-            std::fprintf(stderr, "fuselance: (also failed to read schema from '%s': %s)\n", table_path, merr);
+            LOG_ERR("--filename-col is required");
+            LOG_ERR("(also failed to read schema from '%s': %s)", table_path, merr);
             usage(argv[0]);
             return 2;
         }
-        std::fprintf(stderr, "fuselance: --filename-col is required\n\nColumns in '%s':\n", table_path);
+        LOG_ERR("--filename-col is required\n\nColumns in '%s':", table_path);
         for (size_t i = 0; i < meta.fields_len; ++i) {
             const NanoLanceReaderField& f = meta.fields[i];
             if (f.parent_id == -1)
@@ -667,42 +707,42 @@ int main(int argc, char** argv) {
     // ---- Optional: load blob table for join ---------------------------------
     std::map<uint64_t, BlobSeg> join_blobs;
     if (join_blob_path) {
-        std::fprintf(stderr, "fuselance: loading blob table %s ...\n", join_blob_path);
+        LOG_INFO("loading blob table %s ...", join_blob_path);
         if (!read_blob_table(std::filesystem::path(join_blob_path), blob_col_name, join_blobs, err)) {
-            std::fprintf(stderr, "fuselance: blob table error: %s\n", err.c_str());
+            LOG_ERR("blob table error: %s", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "fuselance: joined %zu blob refs\n", join_blobs.size());
+        LOG_INFO("joined %zu blob refs", join_blobs.size());
     }
 
     // ---- Read the name table ------------------------------------------------
-    std::fprintf(stderr, "fuselance: reading %s ...\n", table_path);
+    LOG_INFO("reading %s ...", table_path);
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
     if (!nano_lance::lance_table_read_dataset(tpath, schema, batches, err)) {
-        std::fprintf(stderr, "fuselance: read failed: %s\n", err.c_str());
+        LOG_ERR("read failed: %s", err.c_str());
         return 1;
     }
-    std::fprintf(stderr, "fuselance: loaded %zu batch(es)\n", batches.size());
+    LOG_INFO("loaded %zu batch(es)", batches.size());
 
     // ---- Locate columns in name table ---------------------------------------
     const int fname_idx = child_index(schema, filename_col);
     if (fname_idx < 0) {
-        std::fprintf(stderr, "fuselance: column '%s' not found in schema\n", filename_col);
+        LOG_ERR("column '%s' not found in schema", filename_col);
         return 1;
     }
 
     BlobColIndices bi;
     if (!join_blob_path) {
         if (!resolve_blob_col(schema, blob_col_name, bi, err)) {
-            std::fprintf(stderr, "fuselance: %s\n", err.c_str());
+            LOG_ERR("%s", err.c_str());
             return 1;
         }
     }
 
     const int pid_idx = join_blob_path ? child_index(schema, "packet_id") : -1;
     if (join_blob_path && pid_idx < 0) {
-        std::fprintf(stderr, "fuselance: name table missing packet_id join key\n");
+        LOG_ERR("name table missing packet_id join key");
         return 1;
     }
 
@@ -710,7 +750,7 @@ int main(int argc, char** argv) {
     if (sort_col_name) {
         sort_idx = child_index(schema, sort_col_name);
         if (sort_idx < 0) {
-            std::fprintf(stderr, "fuselance: sort column '%s' not found\n", sort_col_name);
+            LOG_ERR("sort column '%s' not found", sort_col_name);
             return 1;
         }
     }
@@ -719,7 +759,7 @@ int main(int argc, char** argv) {
     if (frame_col_name) {
         frame_idx = child_index(schema, frame_col_name);
         if (frame_idx < 0) {
-            std::fprintf(stderr, "fuselance: frame column '%s' not found\n", frame_col_name);
+            LOG_ERR("frame column '%s' not found", frame_col_name);
             return 1;
         }
     }
@@ -738,7 +778,7 @@ int main(int argc, char** argv) {
         ArrowError ae{};
         if (ArrowArrayViewInitFromSchema(&view, &schema, &ae) != NANOARROW_OK ||
             ArrowArrayViewSetArray(&view, &batch, &ae) != NANOARROW_OK) {
-            std::fprintf(stderr, "fuselance: view init: %s\n", ArrowErrorMessage(&ae));
+            LOG_ERR("view init: %s", ArrowErrorMessage(&ae));
             ArrowArrayViewReset(&view);
             return 1;
         }
@@ -752,7 +792,7 @@ int main(int argc, char** argv) {
         if (view.length > 0) {
             std::string probe;
             if (!cell_to_string(fname_view, 0, probe)) {
-                std::fprintf(stderr, "fuselance: --filename-col '%s' has an unsupported type\n", filename_col);
+                LOG_ERR("--filename-col '%s' has an unsupported type", filename_col);
                 ArrowArrayViewReset(&view);
                 return 1;
             }
@@ -767,7 +807,11 @@ int main(int argc, char** argv) {
             if (join_blob_path) {
                 uint64_t pid = ArrowArrayViewGetUIntUnsafe(pid_view, r);
                 auto it = join_blobs.find(pid);
-                if (it == join_blobs.end()) continue;
+                if (it == join_blobs.end()) {
+                    LOG_VERB("row %lld: packet_id %llu has no blob match, skipping",
+                             static_cast<long long>(r), static_cast<unsigned long long>(pid));
+                    continue;
+                }
                 seg = it->second;
             } else {
                 ArrowStringView uv = ArrowArrayViewGetStringUnsafe(blob_av->children[bi.c_uri], r);
@@ -816,31 +860,28 @@ int main(int argc, char** argv) {
     for (auto& b : batches) { if (b.release) b.release(&b); }
     batches.clear();
 
-    std::fprintf(stderr, "fuselance: %zu distinct file(s)", state.files.size());
-    if (!state.frames.empty())
-        std::fprintf(stderr, ", %zu frame director%s", state.frames.size(),
-                     state.frames.size() == 1 ? "y" : "ies");
-    std::fprintf(stderr, " in virtual filesystem\n");
+    LOG_INFO("%zu distinct file(s)%s in virtual filesystem",
+             state.files.size(),
+             state.frames.empty() ? "" :
+                 (", " + std::to_string(state.frames.size()) + " frame dir(s)").c_str());
     if (state.files.size() <= 20) {
         for (auto& f : state.files)
-            std::fprintf(stderr, "  %-40s  %llu byte(s) across %zu segment(s)\n",
-                         f.name.c_str(), static_cast<unsigned long long>(f.total_size), f.segs.size());
+            LOG_INFO("  %-40s  %llu byte(s) across %zu segment(s)",
+                     f.name.c_str(), static_cast<unsigned long long>(f.total_size), f.segs.size());
     }
     if (!state.frames.empty() && state.frames.size() <= 10) {
         for (auto& fr : state.frames)
-            std::fprintf(stderr, "  [dir] %s/  (%zu file(s))\n",
-                         fr.label.c_str(), fr.files.size());
+            LOG_INFO("  [dir] %s/  (%zu file(s))", fr.label.c_str(), fr.files.size());
     }
 
     // ---- Create mountpoint and launch FUSE ---------------------------------
     std::error_code ec;
     std::filesystem::create_directories(mountpoint, ec);
     if (ec) {
-        std::fprintf(stderr, "fuselance: cannot create mountpoint %s: %s\n",
-                     mountpoint.c_str(), ec.message().c_str());
+        LOG_ERR("cannot create mountpoint %s: %s", mountpoint.c_str(), ec.message().c_str());
         return 1;
     }
-    std::fprintf(stderr, "fuselance: mounting at %s (Ctrl-C or fusermount3 -u to unmount)\n", mountpoint.c_str());
+    LOG_INFO("mounting at %s (Ctrl-C or fusermount3 -u to unmount)", mountpoint.c_str());
 
     const char* fuse_argv[] = {argv[0], "-f", mountpoint.c_str(), nullptr};
     int fuse_argc = 3;
