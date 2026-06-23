@@ -106,3 +106,8 @@ add_executable(fuselance_test_escape_slashes tests/test_escape_slashes.cpp)
 target_compile_features(fuselance_test_escape_slashes PRIVATE cxx_std_20)
 add_test(NAME fuselance_escape_slashes COMMAND fuselance_test_escape_slashes)
 set_tests_properties(fuselance_escape_slashes PROPERTIES LABELS "smoke")
+
+add_executable(fuselance_test_fh_encoding tests/test_fh_encoding.cpp)
+target_compile_features(fuselance_test_fh_encoding PRIVATE cxx_std_20)
+add_test(NAME fuselance_fh_encoding COMMAND fuselance_test_fh_encoding)
+set_tests_properties(fuselance_fh_encoding PROPERTIES LABELS "smoke")

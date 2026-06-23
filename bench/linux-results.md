@@ -13,7 +13,7 @@ cmake version 3.31.6
 ```
 smoke    =   0.14 sec*proc (19 tests)
 
-Total Test time (real) =   0.37 sec
+Total Test time (real) =   0.21 sec
 ```
 
 ## Benchmark (parquet vs rust lance vs nanolance)
@@ -21,17 +21,24 @@ Total Test time (real) =   0.37 sec
 
 ========== pcap_ref  (200000 rows, 3 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         23.55       23.55    5.212      3.63                (1.00x vs pq)
+rust lance              2.54        2.54    8.485      3.33                (1.63x vs pq)
+nanolance              10.24       13.39    9.013     12.01        11.67   (1.73x vs pq)
+
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         29.53       29.53   15.513      7.87                (1.00x vs pq)
+rust lance             16.93       16.93   18.916      5.39                (1.22x vs pq)
+nanolance             150.37      155.14   18.206     15.54        11.60   (1.17x vs pq)
 parquet (zstd)         23.40       23.40    4.189      6.41                (1.00x vs pq)
 rust lance             11.28       11.28    3.472      6.31                (0.83x vs pq)
 nanolance              26.11       34.35    3.643     12.87         8.69   (0.87x vs pq)
 
-========== wide_int  (200000 rows, 4 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
 parquet (zstd)         25.49       25.49    5.212      3.71                (1.00x vs pq)
 rust lance              2.61        2.61    8.485      3.10                (1.63x vs pq)
 nanolance              11.52       15.63    9.013     13.71        11.47   (1.73x vs pq)
 
-========== high_card  (200000 rows, 2 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
 parquet (zstd)         31.15       31.15   15.513      8.53                (1.00x vs pq)
 rust lance             18.24       18.24   18.929      5.75                (1.22x vs pq)
