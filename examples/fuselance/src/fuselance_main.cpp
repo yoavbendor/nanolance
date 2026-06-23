@@ -538,6 +538,9 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
 
     uint64_t file_off = static_cast<uint64_t>(offset);
     size_t total_written = 0;
+    // Target: accumulate at least 64KB per read to stream sequential readers (cat)
+    // smoothly while keeping random/partial readers (head) fast.
+    const size_t target_size = 64 * 1024;
 
     for (const BlobSeg& seg : vf->segs) {
         if (total_written >= buf_size) break;
@@ -576,11 +579,10 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
                 static_cast<unsigned long long>(want), got);
         total_written += got;
         file_off = 0;  // consumed offset; subsequent segs start at 0
-        // Return after the first successful segment fetch rather than trying to fill the whole
-        // buf across multiple segments. Each segment fetch is a separate file open+seek on NFS/S3;
-        // multi-segment filling would block the caller until all fetches complete even when it
-        // only wants a few lines (e.g. `head`). POSIX allows short reads; FUSE handles them.
-        if (got > 0) break;
+        // Return once we've accumulated target_size data (if available). This allows
+        // sequential readers (cat) to buffer ~64KB per read while partial readers
+        // (head) return quickly with just the first few segments.
+        if (total_written >= target_size) break;
     }
     if (g_perf) g_perf_ctr.read_bytes += total_written;
     return static_cast<int>(total_written);
