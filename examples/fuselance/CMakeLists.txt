@@ -92,10 +92,31 @@ else()
     message(STATUS "nanolance: using system fuse3 ${FUSE3_VERSION}")
 endif()
 
+# ── Version header ───────────────────────────────────────────────────────────
+find_package(Git QUIET)
+if(Git_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE _FUSELANCE_GIT_DESC
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+else()
+    set(_FUSELANCE_GIT_DESC "unknown")
+endif()
+string(TIMESTAMP _FUSELANCE_BUILD_DATE "%Y-%m-%d" UTC)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/fuselance_version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/fuselance_version.h"
+    @ONLY
+)
+
 # ── fuselance executable ─────────────────────────────────────────────────────
 add_executable(fuselance src/fuselance_main.cpp)
 # FUSE_USE_VERSION is defined in the source before <fuse3/fuse.h>.
 target_compile_features(fuselance PUBLIC cxx_std_20)
+target_include_directories(fuselance PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(fuselance PRIVATE nanolance_reader nanolance ${_FUSE3_TARGET})
 if(_FUSE3_LINK_OPTS)
     target_link_options(fuselance PRIVATE ${_FUSE3_LINK_OPTS})

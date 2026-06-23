@@ -21,17 +21,24 @@ Total Test time (real) =   0.37 sec
 
 ========== pcap_ref  (200000 rows, 3 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         24.87       24.87    5.212      3.62                (1.00x vs pq)
+rust lance              2.56        2.56    8.485      3.02                (1.63x vs pq)
+nanolance              11.42       15.24    9.013     13.68        10.96   (1.73x vs pq)
+
+engine           write(core) write(proc)    B/row   read ms  read(lance)
+parquet (zstd)         30.92       30.92   15.513      8.14                (1.00x vs pq)
+rust lance             17.99       17.99   18.946      5.03                (1.22x vs pq)
+nanolance             151.26      157.44   18.206     16.76        11.56   (1.17x vs pq)
 parquet (zstd)         25.40       25.40    4.189      7.01                (1.00x vs pq)
 rust lance             11.39       11.39    3.472      6.68                (0.83x vs pq)
 nanolance              25.69       34.43    3.643     12.59        10.50   (0.87x vs pq)
 
-========== wide_int  (200000 rows, 4 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
 parquet (zstd)         27.49       27.49    5.212      3.69                (1.00x vs pq)
 rust lance              2.89        2.89    8.485      3.82                (1.63x vs pq)
 nanolance              11.16       15.31    9.013     12.54        12.30   (1.73x vs pq)
 
-========== high_card  (200000 rows, 2 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
 parquet (zstd)         34.00       34.00   15.513      8.73                (1.00x vs pq)
 rust lance             18.44       18.44   18.924      6.13                (1.22x vs pq)
