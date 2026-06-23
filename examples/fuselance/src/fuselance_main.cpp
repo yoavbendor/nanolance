@@ -575,7 +575,12 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
                 static_cast<unsigned long long>(seg.position + seg_off),
                 static_cast<unsigned long long>(want), got);
         total_written += got;
-        file_off = 0;  // consumed the within-segment offset; subsequent segs start at 0
+        file_off = 0;  // consumed offset; subsequent segs start at 0
+        // Return after the first successful segment fetch rather than trying to fill the whole
+        // buf across multiple segments. Each segment fetch is a separate file open+seek on NFS/S3;
+        // multi-segment filling would block the caller until all fetches complete even when it
+        // only wants a few lines (e.g. `head`). POSIX allows short reads; FUSE handles them.
+        if (got > 0) break;
     }
     if (g_perf) g_perf_ctr.read_bytes += total_written;
     return static_cast<int>(total_written);
