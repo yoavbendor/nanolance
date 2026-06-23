@@ -1,6 +1,6 @@
 # Linux CI results
 
-_2026-06-22 09:45:08 UTC · commit `cd82f96`_
+_2026-06-23 07:59:22 UTC · commit `5698480`_
 
 ## Environment
 ```
@@ -11,9 +11,9 @@ cmake version 3.31.6
 
 ## Tests
 ```
-smoke    =   0.14 sec*proc (19 tests)
+smoke    =   0.14 sec*proc (20 tests)
 
-Total Test time (real) =   0.21 sec
+Total Test time (real) =   0.37 sec
 ```
 
 ## Benchmark (parquet vs rust lance vs nanolance)
@@ -21,28 +21,21 @@ Total Test time (real) =   0.21 sec
 
 ========== pcap_ref  (200000 rows, 3 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
-engine           write(core) write(proc)    B/row   read ms  read(lance)
-parquet (zstd)         23.55       23.55    5.212      3.63                (1.00x vs pq)
-rust lance              2.54        2.54    8.485      3.33                (1.63x vs pq)
-nanolance              10.24       13.39    9.013     12.01        11.67   (1.73x vs pq)
+parquet (zstd)         25.40       25.40    4.189      7.01                (1.00x vs pq)
+rust lance             11.39       11.39    3.472      6.68                (0.83x vs pq)
+nanolance              25.69       34.43    3.643     12.59        10.50   (0.87x vs pq)
 
+========== wide_int  (200000 rows, 4 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
-parquet (zstd)         29.53       29.53   15.513      7.87                (1.00x vs pq)
-rust lance             16.93       16.93   18.916      5.39                (1.22x vs pq)
-nanolance             150.37      155.14   18.206     15.54        11.60   (1.17x vs pq)
-parquet (zstd)         23.40       23.40    4.189      6.41                (1.00x vs pq)
-rust lance             11.28       11.28    3.472      6.31                (0.83x vs pq)
-nanolance              26.11       34.35    3.643     12.87         8.69   (0.87x vs pq)
+parquet (zstd)         27.49       27.49    5.212      3.69                (1.00x vs pq)
+rust lance              2.89        2.89    8.485      3.82                (1.63x vs pq)
+nanolance              11.16       15.31    9.013     12.54        12.30   (1.73x vs pq)
 
+========== high_card  (200000 rows, 2 cols) ==========
 engine           write(core) write(proc)    B/row   read ms  read(lance)
-parquet (zstd)         25.49       25.49    5.212      3.71                (1.00x vs pq)
-rust lance              2.61        2.61    8.485      3.10                (1.63x vs pq)
-nanolance              11.52       15.63    9.013     13.71        11.47   (1.73x vs pq)
-
-engine           write(core) write(proc)    B/row   read ms  read(lance)
-parquet (zstd)         31.15       31.15   15.513      8.53                (1.00x vs pq)
-rust lance             18.24       18.24   18.929      5.75                (1.22x vs pq)
-nanolance             152.25      158.51   18.206     15.50        11.75   (1.17x vs pq)
+parquet (zstd)         34.00       34.00   15.513      8.73                (1.00x vs pq)
+rust lance             18.44       18.44   18.924      6.13                (1.22x vs pq)
+nanolance             153.35      159.82   18.206     16.91        12.42   (1.17x vs pq)
 
 note: best of 5 writes / 7 reads. write(core)=in-process encode work (parquet/lance: the write call; nanolance: ingest+encode+commit, EXCLUDING process startup + Arrow-IPC parse). write(proc)=full wall clock (nanolance includes subprocess startup + IPC parse). read ms=native reader; read(lance)=rust-lance reading the nanolance file.
 ```
@@ -55,9 +48,9 @@ Profile data file '/tmp/cg.out' (creator: callgrind-3.22.0)
 I1 cache: 
 D1 cache: 
 LL cache: 
-Timerange: Basic block 0 - 20194583
+Timerange: Basic block 0 - 20194563
 Trigger: Program termination
-Profiled target:  build/nlbench /tmp/nlb/pcap_ref_nl.lance 1 (PID 3868, part 1)
+Profiled target:  build/nlbench /tmp/nlb/pcap_ref_nl.lance 1 (PID 3845, part 1)
 Events recorded:  Ir
 Events shown:     Ir
 Event sort order: Ir
@@ -69,7 +62,7 @@ Auto-annotation:  on
 --------------------------------------------------------------------------------
 Ir                  
 --------------------------------------------------------------------------------
-39,454,856 (100.0%)  PROGRAM TOTALS
+39,454,782 (100.0%)  PROGRAM TOTALS
 
 --------------------------------------------------------------------------------
 Ir                   file:function
