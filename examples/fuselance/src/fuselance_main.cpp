@@ -538,9 +538,10 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
 
     uint64_t file_off = static_cast<uint64_t>(offset);
     size_t total_written = 0;
-    // Target: accumulate at least 64KB per read to stream sequential readers (cat)
-    // smoothly while keeping random/partial readers (head) fast.
-    const size_t target_size = 64 * 1024;
+    // Target: accumulate large batches (~32MB) per read to amortize S3/network latency.
+    // FUSE buffers limit actual return size; for local files, batches are still reasonably
+    // fast. (Loop exits early on buf_size; if larger, fetches segments until 32MB target.)
+    const size_t target_size = 32 * 1024 * 1024;
 
     for (const BlobSeg& seg : vf->segs) {
         if (total_written >= buf_size) break;
@@ -579,9 +580,9 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
                 static_cast<unsigned long long>(want), got);
         total_written += got;
         file_off = 0;  // consumed offset; subsequent segs start at 0
-        // Return once we've accumulated target_size data (if available). This allows
-        // sequential readers (cat) to buffer ~64KB per read while partial readers
-        // (head) return quickly with just the first few segments.
+        // Return once we've accumulated ~32MB of data (if available and buf_size permits).
+        // This batches S3 requests efficiently while FUSE buffer limits ensure local
+        // responsiveness. Head/tail users get early return if data fits in one request.
         if (total_written >= target_size) break;
     }
     if (g_perf) g_perf_ctr.read_bytes += total_written;
