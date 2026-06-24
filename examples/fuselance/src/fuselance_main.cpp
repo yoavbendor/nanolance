@@ -54,6 +54,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -1080,7 +1081,21 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "fuselance [perf]: startup took %lld ms\n",
                      static_cast<long long>(g_perf_ctr.startup_ms));
 
-    const char* fuse_argv[] = {argv[0], "-f", mountpoint.c_str(), nullptr};
-    int fuse_argc = 3;
-    return fuse_main(fuse_argc, const_cast<char**>(fuse_argv), &fl_ops, nullptr);
+    // -s = single-threaded. The read path issues slow (NFS/S3) blob fetches that
+    // cannot be interrupted; in multithreaded mode a forced `fusermount3 -u` tears
+    // the session down while a worker is still blocked in a fetch, and that detached
+    // worker then writes into an already-freed FUSE reply buffer on wake -> segfault
+    // during shutdown. Single-threaded means there is no worker thread to outlive the
+    // session, so the unmount path is race-free. Reads here are effectively serial per
+    // file anyway, so this costs nothing for the streaming use case.
+    const char* fuse_argv[] = {argv[0], "-f", "-s", mountpoint.c_str(), nullptr};
+    int fuse_argc = 4;
+    int ret = fuse_main(fuse_argc, const_cast<char**>(fuse_argv), &fl_ops, nullptr);
+
+    // Hard-exit without running C++ static destructors. fl_destroy already flushed the
+    // perf counters, the mount is gone, and the process is ending — there is nothing
+    // left to clean up that the OS won't reclaim. Skipping destructor/atexit teardown
+    // closes the last shutdown-race window for good.
+    std::fflush(nullptr);
+    std::_Exit(ret);
 }
