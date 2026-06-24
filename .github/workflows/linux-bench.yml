@@ -1,8 +1,10 @@
 name: linux-bench
 
 # Builds + tests + benchmarks + profiles nanolance on an Ubuntu/clang runner, then commits the
-# results to bench/linux-results.md so they can be pulled back. Path filter excludes bench/ so the
-# results commit (also tagged [skip ci]) does not retrigger.
+# results to bench/linux-ci-results.md so they can be pulled back. This file is CI-owned: only this
+# workflow writes it. Local runs use bench/linux-local-results.md (see bench/run-local-bench.sh) so
+# the two never collide. Path filter excludes bench/ so the results commit (also tagged [skip ci])
+# does not retrigger.
 on:
   push:
     paths:
@@ -85,7 +87,7 @@ jobs:
         run: |
           mkdir -p bench
           {
-            echo "# Linux CI results"
+            echo "# Linux CI results (auto-generated — do not edit)"
             echo
             echo "_$(date -u '+%Y-%m-%d %H:%M:%S UTC') · commit \`$(git rev-parse --short HEAD)\`_"
             echo
@@ -110,12 +112,12 @@ jobs:
             echo '```'
             cat /tmp/callgrind.txt
             echo '```'
-          } > bench/linux-results.md
+          } > bench/linux-ci-results.md
 
       - name: Commit results back
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add bench/linux-results.md
+          git add bench/linux-ci-results.md
           git commit -m "ci: linux benchmark + profile results [skip ci]" || { echo "no changes"; exit 0; }
           git push
