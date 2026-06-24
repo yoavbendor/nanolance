@@ -1,6 +1,6 @@
 # nanolance
 
-Standalone C++ Arrow ↔ Lance writer and reader — write **Lance v2.2** datasets with minimal protobuf overhead (no Rust `lance` core), and read back what you wrote. Its headline feature: rows keep large payloads external (referenced by `uri` + offset + size, never copied) — so a Lance table of pcap packets stays single-digit bytes per row of references *regardless of packet size*, while the payload bytes live once in the source capture and are fetched on demand (numbers in [bench/linux-results.md](bench/linux-results.md)).
+Standalone C++ Arrow ↔ Lance writer and reader — write **Lance v2.2** datasets with minimal protobuf overhead (no Rust `lance` core), and read back what you wrote. Its headline feature: rows keep large payloads external (referenced by `uri` + offset + size, never copied) — so a Lance table of pcap packets stays single-digit bytes per row of references *regardless of packet size*, while the payload bytes live once in the source capture and are fetched on demand (numbers in [bench/linux-ci-results.md](bench/linux-ci-results.md)).
 
 nanolance itself depends only on **nanoarrow + zstd** (and local code) — no packet-parsing machinery. The repo also ships **[`examples/pcapng2lance`](examples/pcapng2lance/)**, a streaming pcapng → Lance converter built on the sister **[nanotins](https://github.com/yoavbendor/nanotins)** parsing stack — **soatins** (reflection: describe a struct once → SoA + Arrow) and **nanotins** (pcap/pcapng + L2/L3/L4 decode via the wire_spec core + the spec_dag DAG/FSM dispatcher). That stack is the **example's** dependency, not the library's: it's vendored as a git submodule under [`examples/pcapng2lance/extern/nanotins`](examples/pcapng2lance/extern/nanotins/). (A GPU/CUDA executor layer is a planned future addition, developed separately.)
 
@@ -177,7 +177,7 @@ Standalone configures use **`GIT_SHALLOW TRUE`** on FetchContent to keep *future
 
 ## Benchmarking
 
-Performance benchmarks (pcap-style columns: run-length URI + monotonic position + constant size) and native-reader profiles are in [bench/linux-results.md](bench/linux-results.md). External blob fetching (nanolance vs. Rust Lance) is in [bench/README_blob_fetch.md](bench/README_blob_fetch.md). The per-column compression ratios and method selection are documented in [AGENTS.md](AGENTS.md#3-enabling-the-compression-that-was-measured).
+Performance benchmarks (pcap-style columns: run-length URI + monotonic position + constant size) and native-reader profiles are in [bench/linux-ci-results.md](bench/linux-ci-results.md) (CI-owned; local runs go to [bench/linux-local-results.md](bench/linux-local-results.md) via `bench/run-local-bench.sh`). External blob fetching (nanolance vs. Rust Lance) is in [bench/README_blob_fetch.md](bench/README_blob_fetch.md). The per-column compression ratios and method selection are documented in [AGENTS.md](AGENTS.md#3-enabling-the-compression-that-was-measured).
 
 ## Version
 

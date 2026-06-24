@@ -1,4 +1,4 @@
-# Linux CI results
+# Linux CI results (auto-generated — do not edit)
 
 _2026-06-24 06:28:06 UTC · commit `67d7d22`_
 

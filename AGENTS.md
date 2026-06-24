@@ -99,8 +99,9 @@ Tips that help the encoders:
 ## 4a. Measured performance vs Parquet and Rust Lance
 
 200k rows, Ubuntu CI, clang Release, best-of-5 writes / best-of-7 reads. Reproduce with
-`tools/bench.py`; the live numbers are committed to `bench/linux-results.md` by the GitHub Actions
-workflow on every push.
+`tools/bench.py`; the live numbers are committed to `bench/linux-ci-results.md` by the GitHub Actions
+workflow on every push (CI-owned file). Local runs write `bench/linux-local-results.md` via
+`bench/run-local-bench.sh` so they never clash with the CI auto-commit.
 
 **pcap-style columns** (run-length URI + monotonic `position` + constant `size`):
 
