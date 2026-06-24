@@ -530,6 +530,14 @@ static int fl_open(const char* path, struct fuse_file_info* fi) {
         return -EACCES;
     }
 
+    // Enable direct I/O for this handle. fl_read streams data one blob segment at a
+    // time and returns short reads (POSIX-legal), relying on the kernel to re-issue
+    // for the remainder. The page-cache path does NOT re-issue — it treats a short
+    // read as EOF and zero-fills — so without direct_io a multi-segment file is
+    // truncated to its first segment. direct_io makes the kernel forward every read
+    // straight to fl_read, which is exactly what the streaming design needs.
+    fi->direct_io = 1;
+
     // Framed file: "/frame_N/…/file"
     std::string_view frame_rest;
     int fdi = split_frame_path(path, frame_rest);
