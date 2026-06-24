@@ -1027,7 +1027,13 @@ int main(int argc, char** argv) {
     }
 
     // ---- Build FuseLanceState -----------------------------------------------
-    FuseLanceState state;
+    // Heap-allocated and intentionally never freed: FUSE worker threads may still
+    // be blocked in a slow (e.g. NFS) fetch when fuse_main returns on unmount. If
+    // this lived on main's stack it would be destroyed the instant main returns,
+    // and any lingering worker thread dereferencing g_state would hit freed memory
+    // (use-after-free segfault on shutdown). Leaking it lets the OS reclaim it at
+    // process exit, after all threads are gone.
+    FuseLanceState& state = *new FuseLanceState();
     state.files = build_virtual_files(groups_all);
 
     // Sort frame values numerically and build FrameDir list.
