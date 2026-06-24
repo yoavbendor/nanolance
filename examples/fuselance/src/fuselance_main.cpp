@@ -92,17 +92,57 @@ struct PerfCounters {
     std::atomic<uint64_t> read_err{0};
     std::atomic<uint64_t> getattr_calls{0};
     std::atomic<uint64_t> readdir_calls{0};
+    std::atomic<uint64_t> fetch_bytes{0};       // bytes fetched from storage
 };
 
 static PerfCounters g_perf_ctr;
+
+// ---------------------------------------------------------------------------
+// Streaming chunk fetch
+//
+// Aligns each fetch to a 32MB boundary so S3/NFS round-trips are amortised,
+// but stores nothing — the local buffer is discarded as soon as the caller's
+// slice is copied out. No caching, no retained memory between calls.
+//
+//   chunk_start = (position / kChunkSize) * kChunkSize
+//   fetch_size  = min(kChunkSize, what the caller actually needs from this chunk)
+// ---------------------------------------------------------------------------
+static constexpr size_t kChunkSize = 32ULL * 1024 * 1024;  // 32 MB fetch granularity
+
+// Fetch bytes uri[position .. position+want) into out[].
+// Internally fetches a 32MB-aligned block; extracts the needed slice; discards the rest.
+// Returns NANO_LANCE_READER_OK and sets `got` on success.
+static int fetch_chunk_streaming(const std::string& uri, uint64_t position, size_t want,
+                                 uint8_t* out, size_t& got, char* ferr, size_t ferr_cap) {
+    const uint64_t chunk_start = (position / kChunkSize) * kChunkSize;
+    const size_t   rel_off     = static_cast<size_t>(position - chunk_start);
+    // Cap fetch to what we actually need (avoids overshooting at small tail segments).
+    const uint64_t need_end    = position + static_cast<uint64_t>(want);
+    const uint64_t chunk_end   = chunk_start + static_cast<uint64_t>(kChunkSize);
+    const size_t   fetch_size  = static_cast<size_t>(std::min(chunk_end, need_end) - chunk_start);
+
+    std::vector<uint8_t> buf(fetch_size);
+    size_t fetched = 0;
+    int rc = nano_lance_fetch_external_blob(
+        uri.c_str(), chunk_start, fetch_size,
+        buf.data(), fetch_size, &fetched, ferr, ferr_cap);
+    if (rc != NANO_LANCE_READER_OK && fetched == 0) return rc;
+
+    if (g_perf) g_perf_ctr.fetch_bytes += fetched;
+
+    if (rel_off >= fetched) { got = 0; return NANO_LANCE_READER_OK; }
+    got = std::min(want, fetched - rel_off);
+    std::memcpy(out, buf.data() + rel_off, got);
+    return NANO_LANCE_READER_OK;
+}
 
 static void perf_dump() {
     if (!g_perf) return;
     uint64_t fetch_calls = g_perf_ctr.read_fetch_calls.load();
     uint64_t fetch_us    = g_perf_ctr.read_fetch_us.load();
     double   fetch_avg_ms = fetch_calls ? static_cast<double>(fetch_us) / fetch_calls / 1000.0 : 0.0;
-    uint64_t read_bytes  = g_perf_ctr.read_bytes.load();
-    double   read_mib    = static_cast<double>(read_bytes) / (1024.0 * 1024.0);
+    double   read_mib    = static_cast<double>(g_perf_ctr.read_bytes.load())  / (1024.0 * 1024.0);
+    double   fetch_mib   = static_cast<double>(g_perf_ctr.fetch_bytes.load()) / (1024.0 * 1024.0);
 
     std::fprintf(stderr,
         "\n--- fuselance perf counters ---\n"
@@ -110,8 +150,9 @@ static void perf_dump() {
         "  getattr calls: %llu\n"
         "  readdir calls: %llu\n"
         "  open  ok/err:  %llu / %llu\n"
-        "  read  calls:   %llu  (%.2f MiB total)\n"
+        "  read  calls:   %llu  (%.2f MiB delivered to clients)\n"
         "  fetch calls:   %llu  (avg %.2f ms each, %llu us total)\n"
+        "  fetch total:   %.2f MiB pulled from storage\n"
         "  read  errors:  %llu\n"
         "-------------------------------\n",
         static_cast<long long>(g_perf_ctr.startup_ms),
@@ -124,6 +165,7 @@ static void perf_dump() {
         static_cast<unsigned long long>(fetch_calls),
         fetch_avg_ms,
         static_cast<unsigned long long>(fetch_us),
+        fetch_mib,
         static_cast<unsigned long long>(g_perf_ctr.read_err.load()));
 }
 
@@ -527,7 +569,18 @@ static int fl_open(const char* path, struct fuse_file_info* fi) {
     return -ENOENT;
 }
 
-// Read spanning multiple blob segments transparently.
+// Streaming read across blob segments.
+//
+// For each segment that overlaps the requested [offset, offset+buf_size) window:
+//   1. Fetch a 32MB-aligned chunk from storage (local buffer, discarded after).
+//   2. Immediately copy this segment's slice into the FUSE output buffer.
+//   3. Return to the caller as soon as buf_size bytes are filled or segments exhausted.
+//
+// POSIX allows short reads — FUSE re-issues for the remainder. This means the
+// client sees data as soon as the first segment's chunk arrives; it does NOT wait
+// for all segments to be fetched before any data is delivered.
+//
+// No caching: the 32MB buffer is heap-allocated per fetch and freed immediately.
 static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
                    off_t offset, struct fuse_file_info* fi) {
     const VirtualFile* vf = vfile_from_fh(fi->fh);
@@ -536,25 +589,29 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
 
     if (g_perf) ++g_perf_ctr.read_calls;
 
-    uint64_t file_off = static_cast<uint64_t>(offset);
-    size_t total_written = 0;
+    uint64_t file_off     = static_cast<uint64_t>(offset);
+    size_t   total_written = 0;
 
     for (const BlobSeg& seg : vf->segs) {
         if (total_written >= buf_size) break;
-        if (file_off >= seg.size) { file_off -= seg.size; continue; }  // skip segments before offset
+        if (file_off >= seg.size) { file_off -= seg.size; continue; }
 
-        uint64_t seg_off = file_off;
-        uint64_t seg_avail = seg.size - seg_off;
-        size_t want = std::min(static_cast<uint64_t>(buf_size - total_written), seg_avail);
+        const uint64_t seg_off   = file_off;
+        const uint64_t seg_avail = seg.size - seg_off;
+        const size_t   want      = static_cast<size_t>(
+            std::min(static_cast<uint64_t>(buf_size - total_written), seg_avail));
 
-        size_t got = 0;
-        char ferr[512];
+        size_t got  = 0;
+        char   ferr[512];
 
-        auto t0 = g_perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        int rc = nano_lance_fetch_external_blob(
-            seg.uri.c_str(), seg.position + seg_off, want,
-            reinterpret_cast<uint8_t*>(buf + total_written), want,
-            &got, ferr, sizeof(ferr));
+        auto t0 = g_perf ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
+
+        // Fetch this segment's slice from storage (streaming — no cache).
+        int rc = fetch_chunk_streaming(
+            seg.uri, seg.position + seg_off, want,
+            reinterpret_cast<uint8_t*>(buf + total_written), got, ferr, sizeof(ferr));
+
         if (g_perf) {
             auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                           std::chrono::steady_clock::now() - t0).count();
@@ -563,25 +620,27 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
         }
 
         if (rc != NANO_LANCE_READER_OK) {
-            LOG_ERR("fetch '%s' uri=%s @%llu+%llu: %s",
+            LOG_ERR("fetch '%s' uri=%s @%llu+%zu: %s",
                     vf->name.c_str(), seg.uri.c_str(),
                     static_cast<unsigned long long>(seg.position + seg_off),
-                    static_cast<unsigned long long>(want), ferr);
+                    want, ferr);
             if (g_perf) ++g_perf_ctr.read_err;
             return total_written > 0 ? static_cast<int>(total_written) : -EIO;
         }
-        LOG_DBG("read '%s' @%llu+%llu => %zu bytes",
+
+        LOG_DBG("read '%s' seg @%llu+%zu => %zu bytes (stream)",
                 vf->name.c_str(),
                 static_cast<unsigned long long>(seg.position + seg_off),
-                static_cast<unsigned long long>(want), got);
+                want, got);
+
         total_written += got;
-        file_off = 0;  // consumed offset; subsequent segs start at 0
-        // Return after the first successful segment fetch rather than trying to fill the whole
-        // buf across multiple segments. Each segment fetch is a separate file open+seek on NFS/S3;
-        // multi-segment filling would block the caller until all fetches complete even when it
-        // only wants a few lines (e.g. `head`). POSIX allows short reads; FUSE handles them.
+        file_off = 0;
+
+        // Return immediately after each segment so the client receives data as
+        // soon as it arrives from storage — FUSE will re-issue for the rest.
         if (got > 0) break;
     }
+
     if (g_perf) g_perf_ctr.read_bytes += total_written;
     return static_cast<int>(total_written);
 }
