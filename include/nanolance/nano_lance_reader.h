@@ -80,6 +80,18 @@ void nano_lance_dataset_metadata_free(NanoLanceDatasetMetadata* metadata);
 int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t size, uint8_t* out_buf, size_t out_cap,
                                    size_t* bytes_read, char* error_message, size_t error_message_capacity);
 
+/// Enable a disk-resident LRU block cache for external blob fetches.
+/// Each 32 MiB aligned block fetched from remote storage is written to \p cache_dir as a flat file;
+/// subsequent requests for the same block are served from disk. Blocks are evicted LRU when the
+/// count exceeds \p max_blocks (range 2–500; 0 = disable, which is the default).
+/// \p cache_dir is created if it does not exist. Call once before the first fetch.
+/// Returns NANO_LANCE_READER_OK on success or NANO_LANCE_READER_INVALID_ARGUMENT on bad args.
+int nano_lance_block_cache_configure(const char* cache_dir, int max_blocks,
+                                     char* error_message, size_t error_message_capacity);
+
+/// Query disk block cache hit/miss counts since the last configure call.
+void nano_lance_block_cache_stats(uint64_t* out_hits, uint64_t* out_misses);
+
 struct ArrowSchema;
 struct ArrowArray;
 
