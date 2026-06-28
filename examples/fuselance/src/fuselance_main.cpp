@@ -47,6 +47,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -97,6 +98,13 @@ struct PerfCounters {
 };
 
 static PerfCounters g_perf_ctr;
+
+// ---------------------------------------------------------------------------
+// Disk LRU block cache (s3:// only). Off unless --local-blocks-lru <N> is given.
+// ---------------------------------------------------------------------------
+static int         g_lru_n = 0;          // requested block slots (0 = off; valid range 2..500)
+static bool        g_lru_active = false; // true once the reader confirmed the cache is enabled
+static std::string g_lru_cache_dir;      // populated when active; removed in fl_destroy
 
 // ---------------------------------------------------------------------------
 // Streaming chunk fetch
@@ -168,6 +176,13 @@ static void perf_dump() {
         static_cast<unsigned long long>(fetch_us),
         fetch_mib,
         static_cast<unsigned long long>(g_perf_ctr.read_err.load()));
+
+    if (g_lru_active) {
+        uint64_t hits = 0, misses = 0;
+        nano_lance_block_cache_stats(&hits, &misses);
+        std::fprintf(stderr, "  lru hits/misses: %llu / %llu\n",
+                     static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +671,10 @@ static int fl_read(const char* /*path*/, char* buf, size_t buf_size,
 
 static void fl_destroy(void* /*private_data*/) {
     perf_dump();
+    if (!g_lru_cache_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(g_lru_cache_dir, ec);  // best-effort; OS reclaims /tmp anyway
+    }
 }
 
 static const fuse_operations fl_ops = [] {
@@ -783,6 +802,9 @@ static void usage(const char* prog) {
         "                            use -q to suppress all but errors (level 0)\n"
         "  --perf                    print performance counters on unmount (startup ms,\n"
         "                            open/read/fetch counts, avg fetch latency, total bytes)\n"
+        "  --local-blocks-lru <N>    disk LRU block cache for s3:// reads: N slots x 32 MiB\n"
+        "                            (0=off, default; range 2-500). Stored in\n"
+        "                            /tmp/fuselance-cache-<pid>/, removed on unmount.\n"
         "\n"
         "fixed_size_binary:4  columns are rendered as dotted-quad IPv4 addresses.\n"
         "fixed_size_binary:16 columns are rendered as colon-hex IPv6 addresses.\n"
@@ -816,6 +838,7 @@ int main(int argc, char** argv) {
         else if (a == "--join-blob-from")  { join_blob_path = need_val("--join-blob-from");  if (!join_blob_path) return 2; }
         else if (a == "--sort-col")        { sort_col_name  = need_val("--sort-col");        if (!sort_col_name)  return 2; }
         else if (a == "--frame-col")       { frame_col_name = need_val("--frame-col");       if (!frame_col_name) return 2; }
+        else if (a == "--local-blocks-lru"){ const char* v = need_val("--local-blocks-lru"); if (!v) return 2; g_lru_n = std::atoi(v); }
         else if (a == "--help" || a == "-h") { usage(argv[0]); return 0; }
         else if (a == "--perf")            { g_perf = true; }
         else if (a == "-q")                { g_verbosity = 0; }
@@ -1073,6 +1096,22 @@ int main(int argc, char** argv) {
         LOG_ERR("cannot create mountpoint %s: %s", mountpoint.c_str(), ec.message().c_str());
         return 1;
     }
+    // ---- Optional: enable the disk LRU block cache (s3:// only) -------------
+    if (g_lru_n > 0) {
+        g_lru_cache_dir = "/tmp/fuselance-cache-" + std::to_string(::getpid());
+        char cerr[512] = {0};
+        int rc = nano_lance_block_cache_configure(g_lru_cache_dir.c_str(), g_lru_n, cerr, sizeof(cerr));
+        if (rc == NANO_LANCE_READER_OK) {
+            g_lru_active = true;
+            LOG_INFO("disk LRU block cache: %d block(s) (<= %d MiB) at %s",
+                     g_lru_n, g_lru_n * 32, g_lru_cache_dir.c_str());
+        } else {
+            // Non-fatal (e.g. built without S3, or nanos3reader < 0.2.0): warn and stream without a cache.
+            LOG_ERR("disk LRU block cache disabled: %s", cerr[0] ? cerr : "unavailable in this build");
+            g_lru_cache_dir.clear();  // nothing was created — don't try to remove it on unmount
+        }
+    }
+
     LOG_INFO("mounting at %s (Ctrl-C or fusermount3 -u to unmount)", mountpoint.c_str());
 
     g_perf_ctr.startup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
