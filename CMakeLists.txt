@@ -191,9 +191,12 @@ elseif(NANOLANCE_ENABLE_S3)
     set(NANOS3READER_CRYPTO "${NANOLANCE_S3_CRYPTO}" CACHE STRING "" FORCE)  # forward the SigV4 crypto backend
     set(NANOS3READER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(NANOS3READER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    # nanos3reader 0.2.0 adds the on-disk LRU block cache (configure_disk_cache) that
+    # nano_lance_block_cache_configure() forwards to. Pinned to the 0.2.0 commit; switch to the v0.2.0 tag
+    # once it is published. An older reader still builds — the wrapper version-gates on NANOS3READER_VERSION.
     FetchContent_Declare(nanos3reader
         GIT_REPOSITORY https://github.com/yoavbendor/nanos3reader.git
-        GIT_TAG v0.1.0)
+        GIT_TAG 21558644771b37b6fefa440ee42ff7e8281c4748)
     FetchContent_MakeAvailable(nanos3reader)
     target_link_libraries(nanolance_reader PRIVATE nanos3reader::nanos3reader)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)

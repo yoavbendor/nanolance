@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -21,6 +22,15 @@ using NanoLanceS3Factory = AwsSdkStreamFactory;
 #include "nanos3reader/s3_reader.h"
 using NanoLanceS3Factory = nanos3reader::S3MinStreamFactory;
 #endif
+#endif
+
+// The on-disk LRU block cache lives in nanos3reader and is only reachable through its provider (not the
+// AWS-SDK seam) and only once that reader is new enough to expose configure_disk_cache (added in 0.2.0).
+// Gate on the version it now publishes so an older or SDK build still compiles — nano_lance_block_cache_*
+// then degrade to a non-fatal "unsupported" instead of failing to link.
+#if defined(NANO_LANCE_READER_HAS_S3) && !defined(NANO_LANCE_S3_AWS_SDK) && \
+    defined(NANOS3READER_VERSION) && NANOS3READER_VERSION >= 200
+#define NANO_LANCE_HAS_BLOCK_CACHE 1
 #endif
 
 // External-blob fetch. The workload reads millions of small ranged slices out of each external object
@@ -178,6 +188,42 @@ int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t 
     }
 #endif
     return NANO_LANCE_READER_OK;
+}
+
+int nano_lance_block_cache_configure(const char* cache_dir, int max_blocks, char* error_message,
+                                     size_t error_message_capacity) {
+#ifdef NANO_LANCE_HAS_BLOCK_CACHE
+    if (max_blocks > 0 && (cache_dir == nullptr || cache_dir[0] == '\0')) {
+        set_error(error_message, error_message_capacity, "block cache: cache_dir is required when max_blocks > 0");
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
+    if (!nanos3reader::configure_disk_cache(cache_dir != nullptr ? cache_dir : "", max_blocks)) {
+        set_error(error_message, error_message_capacity, "block cache: could not create cache directory");
+        return NANO_LANCE_READER_IO_ERROR;
+    }
+    set_error(error_message, error_message_capacity, "");
+    return NANO_LANCE_READER_OK;
+#else
+    (void)cache_dir;
+    if (max_blocks > 0) {
+        // Asked for, but this build can't honor it (no S3, the AWS-SDK seam, or nanos3reader < 0.2.0).
+        // Report it as non-fatal so the caller can warn and keep streaming without a cache.
+        set_error(error_message, error_message_capacity,
+                  "disk block cache unavailable in this build (needs the nanos3reader S3 provider >= 0.2.0)");
+        return NANO_LANCE_READER_UNSUPPORTED;
+    }
+    set_error(error_message, error_message_capacity, "");
+    return NANO_LANCE_READER_OK;  // disabling a cache that was never available is a no-op success
+#endif
+}
+
+void nano_lance_block_cache_stats(uint64_t* out_hits, uint64_t* out_misses) {
+#ifdef NANO_LANCE_HAS_BLOCK_CACHE
+    nanos3reader::disk_cache_stats(out_hits, out_misses);
+#else
+    if (out_hits != nullptr) *out_hits = 0;
+    if (out_misses != nullptr) *out_misses = 0;
+#endif
 }
 
 }  // extern "C"
