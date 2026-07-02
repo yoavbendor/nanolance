@@ -1,3 +1,7 @@
 [submodule "extern/nanotins"]
 	path = examples/pcapng2lance/extern/nanotins
 	url = https://github.com/yoavbendor/nanotins.git
+[submodule "examples/pcapng2lance_nanom/extern/nanom"]
+	path = examples/pcapng2lance_nanom/extern/nanom
+	url = https://github.com/yoavbendor/nanom.git
+	branch = claude/nanom-nanolance-example-m94u92

@@ -280,6 +280,16 @@ if(NANOLANCE_BUILD_EXAMPLES)
     add_subdirectory(examples/pcapng2lance)
 endif()
 
+# pcapng2lance_nanom — the same L1 converter built on nanom instead of nanotins, for a head-to-head
+# benchmark. nanom is an OPTIONAL, non-mandatory dependency pulled in ONLY by this example (its own git
+# submodule under examples/pcapng2lance_nanom/extern/nanom), so this is its own opt-in toggle, OFF by
+# default and independent of NANOLANCE_BUILD_EXAMPLES: a normal build never needs the nanom submodule.
+option(NANOLANCE_BUILD_PCAPNG2LANCE_NANOM
+       "Build the nanom-based pcapng2lance example (needs the nanom submodule)" OFF)
+if(NANOLANCE_BUILD_PCAPNG2LANCE_NANOM)
+    add_subdirectory(examples/pcapng2lance_nanom)
+endif()
+
 # fuselance — mount a Lance blob.v2 table as a read-only FUSE filesystem. Independent of the
 # NANOLANCE_BUILD_EXAMPLES toggle above because that one pulls in pcapng2lance's nanotins submodule;
 # fuselance needs only nanolance_reader + libfuse3, so it gets its own opt-in. Its CMakeLists skips
