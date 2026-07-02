@@ -17,8 +17,11 @@ add_subdirectory(extern/nanom EXCLUDE_FROM_ALL)
 
 add_executable(pcapng2lance_nanom src/pcapng2lance_nanom_main.cpp)
 target_compile_features(pcapng2lance_nanom PRIVATE cxx_std_23)  # nanom requires C++23
-# The nanom pcap/pcapng scanner (nm_pcap.hpp) lives in nanom's parity-example dir, not its include tree.
+# This example's own headers (PDU row types + the generic soa->Lance writer), plus the nanom pcap/pcapng
+# scanner + protocol structs (nm_pcap.hpp / nm_protocols.hpp), which live in nanom's parity-example dir
+# rather than its include tree.
 target_include_directories(pcapng2lance_nanom PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanom/examples/nanotins_parity")
 target_link_libraries(pcapng2lance_nanom PRIVATE nanom::nanom nanolance)
 

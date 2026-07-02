@@ -13,17 +13,24 @@
 // reflection. The Lance write side is unchanged: nanoarrow builds the record
 // batch and nanolance writes the fragment.
 //
-// Scope: the L1 packet table only (the `packets.lance` that `pcapng2lance`
-// writes). L2/L3/L4 PDU decoding, staged enrichment, and windowed streaming are
-// not ported here — this example exists so nanom's scan+parse+tabulate path can
-// be benchmarked head-to-head against nanotins on the exact same output. See
-// README.md.
+// Scope: the L1 packet table (the `packets.lance` that `pcapng2lance` writes)
+// plus, under --decode-l2l3, the full L2/L3/L4 protocol walk (Ethernet -> VLAN*
+// -> IPv4/IPv6 -> TCP/UDP) landed as one Lance table per PDU type +
+// remainder_after_l4 — byte-for-byte identical to the nanotins converter's PDU
+// tables. Not ported: staged enrichment (--stage) and windowed streaming; the
+// capture is read whole. This example exists so nanom's scan+parse+decode path
+// can be checked and benchmarked head-to-head against nanotins on the exact same
+// output. See README.md.
 //
 // Pipeline: read file -> nm scan_blocks (Phase A) -> per-block classify ->
 //   nm parse_epb (Phase B) + option walk (ts_resol / epb_flags) -> soa<PacketRow>
-//   scalar columns + external payload_ref -> one Lance fragment.
+//   scalar columns + external payload_ref -> one Lance fragment; with
+//   --decode-l2l3, each packet also runs nm walk_packet -> per-PDU soa<Row> ->
+//   one Lance table per PDU type.
 
 #include "nm_pcap.hpp"  // nanom pcap/pcapng scanner (from the vendored nanom submodule)
+#include "pdu_tables.hpp"        // per-PDU Lance row types + converters (--decode-l2l3)
+#include "soa_lance_writer.hpp"  // generic nanom soa<Row> -> Lance table writer
 
 #include "nanolance/blob_builder.hpp"
 #include "nanolance/nano_lance_writer.h"
@@ -131,7 +138,8 @@ std::uint32_t epb_flags(nm::bytes file, const nmpcap::BlockRef& ref, std::uint32
 
 struct Args {
     bool compress = true;
-    bool no_write = false;  // scan+parse only, skip the Lance write (isolates Phase A/B for benchmarking)
+    bool no_write = false;     // scan+parse only, skip the Lance write (isolates Phase A/B for benchmarking)
+    bool decode_l2l3 = false;  // also decode L2/L3/L4 via nanom walk_packet -> per-PDU Lance tables
     std::vector<std::string> pos;
 };
 
@@ -142,6 +150,8 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
             a.compress = false;
         } else if (s == "--no-write") {
             a.no_write = true;
+        } else if (s == "--decode-l2l3") {
+            a.decode_l2l3 = true;
         } else if (!s.empty() && s[0] == '-') {
             err = "unknown option '" + s + "'";
             return false;
@@ -243,6 +253,7 @@ public:
                                              epb_flags(file, ref, e.caplen)});
                     payload.push_back(nano_lance::BlobV2Row{/*inline_data=*/std::nullopt, payload_uri_,
                                                             e.payload_file_offset, e.caplen});
+                    if (args_.decode_l2l3) decode_packet(pid_, link, file, e.payload_file_offset, e.caplen);
                     ++pid_;
                     break;
                 }
@@ -256,6 +267,9 @@ public:
             if (const int rc = write_batch(rows, payload)) return rc;
             nano_lance_writer_close(&writer_);
             ArrowSchemaRelease(&schema_);
+            if (args_.decode_l2l3) {
+                if (const int rc = write_pdu_tables()) return rc;
+            }
         }
         std::fprintf(stderr,
                      "pcapng2lance_nanom: %llu packets, %zu interface(s), %zu section(s), %zu other block(s)%s -> %s\n",
@@ -331,6 +345,125 @@ private:
         return 0;
     }
 
+    // ---- L2/L3/L4 decode (--decode-l2l3) ---------------------------------------------------------
+    // One nanom walk_packet traversal per packet: Ethernet -> VLAN* -> IPv4/IPv6 -> TCP/UDP. Each visited
+    // header lands (with this packet's id) in its PDU soa table; the L4 boundary yields a remainder row
+    // (the application payload after L4 as an external blob.v2 ref, never copied).
+    void decode_packet(std::uint64_t pid, std::uint16_t link, nm::bytes file, std::uint64_t poff,
+                       std::uint32_t caplen) {
+        if (poff + caplen > file.size()) return;
+        const nm::bytes pkt = file.subspan(static_cast<std::size_t>(poff), caplen);
+        const auto wr = nmproto::walk_packet(
+            link, pkt, [&](const nmproto::Ethernet& x) { eth_.push(p2l_nanom::make_eth(pid, x)); },
+            [&](const nmproto::VlanTag& x) { vlan_.push(p2l_nanom::make_vlan(pid, x)); },
+            [&](const nmproto::Ipv4& x) { ipv4_.push(p2l_nanom::make_ipv4(pid, x)); },
+            [&](const nmproto::Ipv6& x) { ipv6_.push(p2l_nanom::make_ipv6(pid, x)); },
+            [&](const nmproto::Tcp& x) { tcp_.push(p2l_nanom::make_tcp(pid, x)); },
+            [&](const nmproto::Udp& x) { udp_.push(p2l_nanom::make_udp(pid, x)); });
+        if (wr.reached_l4 && wr.l4_payload_offset < caplen) {
+            rem_pid_.push_back(pid);
+            rem_next_.push_back(wr.l4_ports);
+            rem_pay_.push_back(nano_lance::BlobV2Row{std::nullopt, payload_uri_,
+                                                     poff + wr.l4_payload_offset,
+                                                     caplen - wr.l4_payload_offset});
+        }
+    }
+
+    // Write one Lance table per PDU type (via the generic nanom-soa writer) + remainder_after_l4.
+    int write_pdu_tables() {
+        const std::string stem = (output_.parent_path() / output_.stem()).string();
+        std::string err;
+        const auto w = [&](const char* suffix, const auto& table) -> bool {
+            if (!p2l_nanom::write_soa_table(stem + suffix, table, args_.compress, err)) {
+                fail(std::string("write ") + suffix + ": " + err);
+                return false;
+            }
+            return true;
+        };
+        if (!(w("_ethernet.lance", eth_) & w("_vlan.lance", vlan_) & w("_ipv4.lance", ipv4_) &
+              w("_ipv6.lance", ipv6_) & w("_tcp.lance", tcp_) & w("_udp.lance", udp_))) {
+            return 1;
+        }
+        if (const int rc = write_remainder_table(stem + "_remainder_after_l4.lance")) return rc;
+        std::fprintf(stderr,
+                     "pcapng2lance_nanom: decoded L2/L3/L4 -> eth %zu, vlan %zu, ipv4 %zu, ipv6 %zu, tcp %zu, "
+                     "udp %zu, remainder %zu\n",
+                     eth_.rows(), vlan_.rows(), ipv4_.rows(), ipv6_.rows(), tcp_.rows(), udp_.rows(),
+                     rem_pid_.size());
+        return 0;
+    }
+
+    // remainder_after_l4: packet_id + next_protocol (packed L4 ports) + the external payload_ref of the
+    // bytes past L4. Its own tiny schema (two scalars + the blob.v2 struct); skipped when empty.
+    int write_remainder_table(const std::string& path) {
+        if (rem_pid_.empty()) return 0;
+        std::string err;
+        ArrowSchema schema{};
+        ArrowSchemaInit(&schema);
+        if (ArrowSchemaSetTypeStruct(&schema, 3) != NANOARROW_OK ||
+            ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_UINT64) != NANOARROW_OK ||
+            ArrowSchemaSetName(schema.children[0], "packet_id") != NANOARROW_OK ||
+            ArrowSchemaSetType(schema.children[1], NANOARROW_TYPE_UINT64) != NANOARROW_OK ||
+            ArrowSchemaSetName(schema.children[1], "next_protocol") != NANOARROW_OK) {
+            ArrowSchemaRelease(&schema);
+            return fail("remainder schema");
+        }
+        ArrowSchema blob{};
+        if (!nano_lance::build_blob_v2_payload_schema(blob, err)) {
+            ArrowSchemaRelease(&schema);
+            return fail("remainder blob schema: " + err);
+        }
+        ArrowSchemaRelease(schema.children[2]);
+        std::memcpy(schema.children[2], &blob, sizeof(ArrowSchema));
+        blob.release = nullptr;
+        schema.flags = 0;
+
+        NanoLanceWriter writer{};
+        if (nano_lance_writer_init(&writer, path.c_str(), 3) != NANO_LANCE_OK) {
+            ArrowSchemaRelease(&schema);
+            return fail(std::string("remainder writer init: ") + nano_lance_writer_last_error(&writer));
+        }
+        nano_lance_writer_set_ignore_nullability(&writer, true);
+        nano_lance_writer_set_compression(&writer, args_.compress);
+
+        ArrowArray batch{};
+        if (ArrowArrayInitFromSchema(&batch, &schema, nullptr) != NANOARROW_OK ||
+            ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
+            nano_lance_writer_close(&writer);
+            ArrowSchemaRelease(&schema);
+            return fail("alloc remainder array");
+        }
+        ArrowArray* pay = batch.children[2];
+        for (std::size_t i = 0; i < rem_pid_.size(); ++i) {
+            const nano_lance::BlobV2Row& b = rem_pay_[i];
+            ArrowStringView uri{b.uri->data(), static_cast<int64_t>(b.uri->size())};
+            if (ArrowArrayAppendUInt(batch.children[0], rem_pid_[i]) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(batch.children[1], rem_next_[i]) != NANOARROW_OK ||
+                ArrowArrayAppendNull(pay->children[0], 1) != NANOARROW_OK ||
+                ArrowArrayAppendString(pay->children[1], uri) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(pay->children[2], b.position) != NANOARROW_OK ||
+                ArrowArrayAppendUInt(pay->children[3], b.size) != NANOARROW_OK ||
+                ArrowArrayFinishElement(pay) != NANOARROW_OK ||
+                ArrowArrayFinishElement(&batch) != NANOARROW_OK) {
+                batch.release(&batch);
+                nano_lance_writer_close(&writer);
+                ArrowSchemaRelease(&schema);
+                return fail("append remainder row");
+            }
+        }
+        int rc = 0;
+        if (ArrowArrayFinishBuildingDefault(&batch, nullptr) != NANOARROW_OK) {
+            rc = fail("finalize remainder array");
+        } else if (nano_lance_write_batch(&writer, &batch, &schema) != NANO_LANCE_OK ||
+                   nano_lance_writer_commit(&writer, /*is_append=*/false) != NANO_LANCE_OK) {
+            rc = fail(std::string("remainder write: ") + nano_lance_writer_last_error(&writer));
+        }
+        batch.release(&batch);
+        nano_lance_writer_close(&writer);
+        ArrowSchemaRelease(&schema);
+        return rc;
+    }
+
     Args args_;
     fs::path output_;
     std::string payload_uri_;
@@ -338,6 +471,16 @@ private:
     NanoLanceWriter writer_{};
     std::uint64_t pid_ = 0;
     std::size_t shb_count_ = 0, idb_count_ = 0, other_count_ = 0;
+
+    // --decode-l2l3 accumulators: one nanom soa per PDU type + the remainder_after_l4 columns.
+    nm::soa<p2l_nanom::EthRow> eth_{4096};
+    nm::soa<p2l_nanom::VlanRow> vlan_{4096};
+    nm::soa<p2l_nanom::Ipv4Row> ipv4_{4096};
+    nm::soa<p2l_nanom::Ipv6Row> ipv6_{4096};
+    nm::soa<p2l_nanom::TcpRow> tcp_{4096};
+    nm::soa<p2l_nanom::UdpRow> udp_{4096};
+    std::vector<std::uint64_t> rem_pid_, rem_next_;
+    std::vector<nano_lance::BlobV2Row> rem_pay_;
 };
 
 }  // namespace
@@ -348,7 +491,8 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, args, err)) return fail(err);
     if (args.pos.size() < 2) {
         std::fprintf(stderr,
-                     "usage: %s [--no-compress] [--no-write] <input.pcap|pcapng> <output.lance> [payload_uri]\n",
+                     "usage: %s [--no-compress] [--no-write] [--decode-l2l3] <input.pcap|pcapng> "
+                     "<output.lance> [payload_uri]\n",
                      argv[0]);
         return 2;
     }

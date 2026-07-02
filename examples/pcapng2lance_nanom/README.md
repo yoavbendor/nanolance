@@ -7,9 +7,10 @@ position + size, never copied) — but the entire **parse** side runs through
 of the nanotins reflection stack. The **write** side is unchanged: nanoarrow builds the record batch and
 nanolance writes the fragment.
 
-It exists so nanom's scan + parse + tabulate path can be benchmarked head-to-head against nanotins on the
-**exact same L1 output** — and to show, concretely, that swapping the parser leaves the Lance dataset
-byte-for-byte identical.
+It exists to show, concretely, that nanom has **full network-parsing capability** — swapping the parser
+leaves the Lance dataset byte-for-byte identical, at both L1 (the packet table) and L2/L3/L4 (the per-PDU
+tables) — and so that nanom's scan + parse + decode path can be benchmarked head-to-head against nanotins
+on the exact same output.
 
 ## Not a mandatory build
 
@@ -27,10 +28,11 @@ build/examples/pcapng2lance_nanom/pcapng2lance_nanom capture.pcapng out.lance
 `-DNANOLANCE_BUILD_PCAPNG2LANCE_NANOM=ON` is independent of `NANOLANCE_BUILD_EXAMPLES`; leaving it off (the
 default) keeps the nanom submodule out of the build entirely.
 
-Usage: `pcapng2lance_nanom [--no-compress] [--no-write] <input.pcap|pcapng> <output.lance> [payload_uri]`
+Usage: `pcapng2lance_nanom [--no-compress] [--no-write] [--decode-l2l3] <input.pcap|pcapng> <output.lance> [payload_uri]`
 
 - `--no-compress` — write uncompressed columns (default: compressed).
 - `--no-write` — scan + parse only, skip the Lance write (isolates nanom's Phase A/B for benchmarking).
+- `--decode-l2l3` — also decode L2/L3/L4 and emit one Lance table per PDU type (see below).
 - `payload_uri` — the URI stored in each external `payload_ref`; defaults to a `file://` URI of the input
   (pass an explicit `s3://…` when the dataset will be read elsewhere).
 
@@ -49,19 +51,41 @@ Usage: `pcapng2lance_nanom [--no-compress] [--no-write] <input.pcap|pcapng> <out
 Per-section interface state resets on each SHB, so section-relative `interface_id` denormalizes correctly
 across concatenated sections — verified against the nanotins converter (below).
 
-**Doesn't (yet):** L2/L3/L4 PDU decoding (`--decode-l2l3`), staged enrichment (`--stage`), and windowed
-streaming (`--window-bytes`). Those live in the nanotins example; nanom has the building blocks for them
-(`nm_protocols.hpp` walks Eth→VLAN→IPv4/IPv6→TCP/UDP, and `<nanom/bulk.hpp>` is a data-parallel decode),
-but porting the full multi-table pipeline is future work. The capture is read whole here (no windowing).
+**Also does — `--decode-l2l3` (the full protocol walk):** one nanom `walk_packet` traversal per packet
+(`nm_protocols.hpp`: Ethernet → VLAN* → IPv4/IPv6 → TCP/UDP, honoring `ihl` / `data_offset` and gating L4
+on `frag_offset == 0`), landing **one Lance table per PDU type** — `<stem>_ethernet.lance`, `_vlan`,
+`_ipv4`, `_ipv6`, `_tcp`, `_udp` — each row = `packet_id` + the decoded header fields (nanom `ubits<>` bit
+fields become integer columns; MAC/IP addresses become Arrow fixed-binary). It also writes
+`<stem>_remainder_after_l4.lance`: the application payload after L4 as external `blob.v2` refs. These PDU
+tables are **byte-for-byte identical** to the nanotins converter's (same schema, same values, every
+protocol path — verified in the interop test). Each table is emitted with **zero per-type writer code**:
+a generic `soa<Row>` → Lance writer ([`include/soa_lance_writer.hpp`](include/soa_lance_writer.hpp)) reads
+the columns, names, Arrow types, and widths straight from the one `NANOM_DESCRIBE` on each row struct —
+nanom's "schemas for free → Lance" path, realized end to end.
+
+The PDU tables are byte-identical to nanotins over Ethernet / VLAN / IPv4 (options honored via `ihl`) /
+IPv6 base header / TCP / UDP — verified on crafted captures and the real `ipv4_options_sample.pcap`,
+`SRL_front_left_51_short.pcapng`.
+
+**Doesn't (yet):**
+- **IPv6 extension-header traversal to L4.** nanom's parity walk (`nm_protocols.hpp`) stops at the *base*
+  IPv6 header (`after_l3 = ip->rest`), so for IPv6 packets carrying extension headers — e.g. SRv6 — it does
+  not descend to the TCP/UDP header the way nanotins does (nanotins walks the ext-header chain). On such a
+  capture the `ipv6` and `ethernet` tables still match exactly, but nanom emits no `tcp`/`udp` row for
+  those packets. Closing this is a nanom-side change (extend the `nm_protocols.hpp` walk) — the natural
+  next extension now that the pipeline is proven.
+- **IPv6 ext-header / SRv6 and gPTP child tables**, staged enrichment (`--stage`), and windowed streaming
+  (`--window-bytes`); the capture is read whole here.
 
 ## Equivalence & benchmark
 
-The interop test [`tests/test_pcapng2lance_nanom.py`](tests/test_pcapng2lance_nanom.py) reads the dataset
+The interop test [`tests/test_pcapng2lance_nanom.py`](tests/test_pcapng2lance_nanom.py) reads the datasets
 back with stock **pylance**, checks every external `(uri, position, size)` resolves to the exact source
-bytes, and — when the nanotins `pcapng2lance` binary is also built — asserts the two datasets are
-**byte-for-byte identical** (schema + every column value, including `payload_ref`) on pcap, pcapng, and
-multi-section fixtures. It is registered as `pcapng2lance_nanom_interop` (CTest label `interop`; skips with
-code 77 if pylance is absent).
+bytes, and — when the nanotins `pcapng2lance` binary is also built — asserts they are **byte-for-byte
+identical** to the nanotins output: the L1 table on pcap / pcapng / multi-section fixtures, **and** every
+`--decode-l2l3` PDU table (Ethernet / VLAN / IPv4 / IPv6 / TCP / UDP) on a mixed capture that exercises all
+paths. It is registered as `pcapng2lance_nanom_interop` (CTest label `interop`; skips with code 77 if
+pylance is absent).
 
 [`bench/compare_bench.sh`](bench/compare_bench.sh) times both converters on the same capture and reports
 packets/s, best of N runs, then confirms the outputs match:

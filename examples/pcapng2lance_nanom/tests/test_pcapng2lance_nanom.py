@@ -96,10 +96,84 @@ def to_dict(dataset_path: str) -> dict:
     return lance.dataset(dataset_path).to_table().to_pydict()
 
 
-def run(exe: str, fixture: Path, dataset: Path) -> None:
-    result = subprocess.run([exe, str(fixture), str(dataset)], capture_output=True, text=True)
+def run(exe: str, fixture: Path, dataset: Path, *flags: str) -> None:
+    result = subprocess.run([exe, *flags, str(fixture), str(dataset)], capture_output=True, text=True)
     if result.returncode != 0:
-        raise SystemExit(f"converter failed ({exe}): {result.stderr}")
+        raise SystemExit(f"converter failed ({exe} {' '.join(flags)}): {result.stderr}")
+
+
+def build_mix_pcap() -> bytes:
+    """One classic pcap exercising every walk_packet path: Eth/IPv4/TCP, Eth/IPv6/TCP, Eth/VLAN/IPv4/UDP."""
+    def eth(et: int, pl: bytes) -> bytes:
+        return bytes(range(6)) + bytes(range(10, 16)) + struct.pack(">H", et) + pl
+
+    def ipv4(proto: int, src: bytes, dst: bytes, pl: bytes) -> bytes:
+        return (
+            bytes([0x45, 0])
+            + struct.pack(">HHH", 20 + len(pl), 1, 0)
+            + bytes([64, proto, 0, 0])
+            + src
+            + dst
+            + pl
+        )
+
+    def ipv6(nh: int, src: bytes, dst: bytes, pl: bytes) -> bytes:
+        return struct.pack(">I", 6 << 28) + struct.pack(">H", len(pl)) + bytes([nh, 64]) + src + dst + pl
+
+    def tcp(sp: int, dp: int, pl: bytes) -> bytes:
+        return struct.pack(">HHIIHHHH", sp, dp, 1, 2, 5 << 12, 8192, 0, 0) + pl
+
+    def udp(sp: int, dp: int, pl: bytes) -> bytes:
+        return struct.pack(">HHHH", sp, dp, 8 + len(pl), 0) + pl
+
+    pkts = [
+        eth(0x0800, ipv4(6, bytes([10, 0, 0, 1]), bytes([10, 0, 0, 2]), tcp(1234, 80, b"hi"))),
+        eth(0x86DD, ipv6(6, bytes(range(16)), bytes(range(16, 32)), tcp(5555, 443, b"yo"))),
+        eth(0x8100, struct.pack(">HH", 1, 0x0800) + ipv4(17, bytes([1, 2, 3, 4]), bytes([5, 6, 7, 8]), udp(53, 99, b"dns"))),
+    ]
+    gh = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+    recs = b"".join(struct.pack("<IIII", i, 0, len(p), len(p)) + p for i, p in enumerate(pkts))
+    return gh + recs
+
+
+PDU_TABLES = ["ethernet", "vlan", "ipv4", "ipv6", "tcp", "udp"]
+
+
+def decode_and_check(nm_exe, nt_exe, tmp_path: Path) -> None:
+    """--decode-l2l3 on the mixed capture: the six PDU tables must read back, and (when the nanotins
+    converter is present) be byte-for-byte identical to its per-PDU tables, path for path."""
+    import lance
+
+    fixture = tmp_path / "mix.pcap"
+    fixture.write_bytes(build_mix_pcap())
+    nm_out = tmp_path / "mix_nm.lance"
+    run(nm_exe, fixture, nm_out, "--decode-l2l3")
+
+    def tables(stem: Path) -> dict:
+        out = {}
+        for t in PDU_TABLES:
+            p = stem.with_name(stem.stem + f"_{t}.lance")
+            out[t] = lance.dataset(str(p)).to_table().to_pydict() if p.exists() else None
+        return out
+
+    nm = tables(nm_out)
+    # Every visited protocol produced a table with a packet_id join column.
+    assert nm["tcp"] and nm["tcp"]["src_port"] == [1234, 5555], nm["tcp"]
+    assert nm["ipv6"] and nm["ipv6"]["next_header"] == [6], nm["ipv6"]
+    assert nm["udp"] and nm["udp"]["dst_port"] == [99], nm["udp"]
+    assert nm["vlan"] and nm["vlan"]["vid"] == [1], nm["vlan"]
+
+    if nt_exe:
+        nt_out = tmp_path / "mix_nt.lance"
+        run(nt_exe, fixture, nt_out, "--decode-l2l3")
+        nt = tables(nt_out)
+        for t in PDU_TABLES:
+            assert (nm[t] is None) == (nt[t] is None), f"decode {t}: table presence differs"
+            if nm[t] is None:
+                continue
+            assert list(nm[t].keys()) == list(nt[t].keys()), f"decode {t}: schema {nm[t].keys()} != {nt[t].keys()}"
+            for k in nt[t]:
+                assert nm[t][k] == nt[t][k], f"decode {t}: column '{k}' differs (nanom vs nanotins)"
 
 
 def check_dataset(dataset: Path, fixture: Path, payloads: list[bytes]) -> None:
@@ -159,8 +233,11 @@ def main(argv: list[str]) -> int:
                 run(nt_exe, fixture, nt_ds)
                 assert_identical(nm_ds, nt_ds, name)
 
-    tail = " + byte-identical to nanotins pcapng2lance" if nt_exe else ""
-    print(f"pcapng2lance_nanom interop ok (stock lance read + external offsets{tail})")
+        # L2/L3/L4 decode: the full protocol walk lands in per-PDU Lance tables (parity with nanotins).
+        decode_and_check(nm_exe, nt_exe, tmp_path)
+
+    tail = " + byte-identical to nanotins pcapng2lance (L1 + L2/L3/L4 PDU tables)" if nt_exe else ""
+    print(f"pcapng2lance_nanom interop ok (stock lance read + external offsets + --decode-l2l3{tail})")
     return 0
 
 
