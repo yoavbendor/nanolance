@@ -29,15 +29,20 @@ if(NANOLANCE_BUILD_TESTS)
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         # Stock-Lance (pylance) interop + on-disk offset verification, plus a byte-for-byte cross-check that
-        # this nanom converter's packets.lance equals the nanotins pcapng2lance output when that target is
-        # also built. Skips (CTest 77) if pylance is absent.
-        set(_p2l_nanom_deps $<TARGET_FILE:pcapng2lance_nanom>)
+        # this nanom converter's output equals the nanotins pcapng2lance output — the L1 packet table, the
+        # --decode-l2l3 PDU tables, and (on the real SRv6 capture) the IPv6 extension-header tables — when
+        # those targets are also built. Skips (CTest 77) if pylance is absent.
+        set(_p2l_nanom_args $<TARGET_FILE:pcapng2lance_nanom>)
         if(TARGET pcapng2lance)
-            list(APPEND _p2l_nanom_deps $<TARGET_FILE:pcapng2lance>)
+            list(APPEND _p2l_nanom_args --nanotins $<TARGET_FILE:pcapng2lance>
+                 --srv6 "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanom/examples/nanotins_parity/testdata/srv6_sample.pcap")
+        endif()
+        if(TARGET nlance2table)
+            list(APPEND _p2l_nanom_args --nlance2table $<TARGET_FILE:nlance2table>)
         endif()
         add_test(NAME pcapng2lance_nanom_interop
             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pcapng2lance_nanom.py"
-                    ${_p2l_nanom_deps})
+                    ${_p2l_nanom_args})
         set_tests_properties(pcapng2lance_nanom_interop PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
     endif()
 endif()

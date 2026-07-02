@@ -67,6 +67,27 @@ struct UdpRow {
     u16 src_port, dst_port, length, checksum;
 };
 
+// IPv6 extension-header rows (--decode-l2l3 over SRv6 / ext-header traffic). Schemas match the nanotins
+// converter's ipv6_hopbyhop / ipv6_destopt / ipv6_routing / ipv6_srh_segment / ipv6_option tables.
+struct Ipv6ExtOptRow {  // one shape for both Hop-by-Hop and Destination Options (routed to their tables)
+    u64 packet_id;
+    u8 next_header, hdr_ext_len;
+};
+struct Ipv6RoutingRow {  // Routing header / SRv6 SRH fixed part
+    u64 packet_id;
+    u8 next_header, hdr_ext_len, routing_type, segments_left, last_entry, flags;
+    u16 tag;
+};
+struct Ipv6SrhSegmentRow {  // one row per SRv6 segment (address -> Arrow fixed_size_binary(16))
+    u64 packet_id;
+    u8 srh_order, segment_index;
+    std::array<u8, 16> address;
+};
+struct Ipv6OptionRow {  // one row per IPv6/SRH TLV option
+    u64 packet_id;
+    u8 container_type, opt_type, opt_len;
+};
+
 }  // namespace p2l_nanom
 
 NANOM_DESCRIBE(p2l_nanom::EthRow, packet_id, dst, src, ethertype);
@@ -78,6 +99,11 @@ NANOM_DESCRIBE(p2l_nanom::Ipv6Row, packet_id, version, traffic_class, flow_label
 NANOM_DESCRIBE(p2l_nanom::TcpRow, packet_id, src_port, dst_port, seq, ack, data_offset, reserved, flags,
                window, checksum, urgent_ptr);
 NANOM_DESCRIBE(p2l_nanom::UdpRow, packet_id, src_port, dst_port, length, checksum);
+NANOM_DESCRIBE(p2l_nanom::Ipv6ExtOptRow, packet_id, next_header, hdr_ext_len);
+NANOM_DESCRIBE(p2l_nanom::Ipv6RoutingRow, packet_id, next_header, hdr_ext_len, routing_type, segments_left,
+               last_entry, flags, tag);
+NANOM_DESCRIBE(p2l_nanom::Ipv6SrhSegmentRow, packet_id, srh_order, segment_index, address);
+NANOM_DESCRIBE(p2l_nanom::Ipv6OptionRow, packet_id, container_type, opt_type, opt_len);
 
 namespace p2l_nanom {
 
@@ -115,6 +141,13 @@ inline TcpRow make_tcp(u64 pid, const nmproto::Tcp& t) {
 }
 inline UdpRow make_udp(u64 pid, const nmproto::Udp& u) {
     return UdpRow{pid, u16(u.src_port), u16(u.dst_port), u16(u.length), u16(u.checksum)};
+}
+inline Ipv6ExtOptRow make_ext_opt(u64 pid, const nmproto::Ipv6ExtOpt& h) {
+    return Ipv6ExtOptRow{pid, h.next_header, h.hdr_ext_len};
+}
+inline Ipv6RoutingRow make_ipv6_routing(u64 pid, const nmproto::Ipv6Srh& s) {
+    return Ipv6RoutingRow{pid,           s.next_header, s.hdr_ext_len, s.routing_type,
+                          s.segments_left, s.last_entry,   s.flags,       u16(s.tag)};
 }
 
 }  // namespace p2l_nanom

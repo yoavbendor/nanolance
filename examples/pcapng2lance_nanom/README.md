@@ -51,7 +51,7 @@ Usage: `pcapng2lance_nanom [--no-compress] [--no-write] [--decode-l2l3] <input.p
 Per-section interface state resets on each SHB, so section-relative `interface_id` denormalizes correctly
 across concatenated sections — verified against the nanotins converter (below).
 
-**Also does — `--decode-l2l3` (the full protocol walk):** one nanom `walk_packet` traversal per packet
+**Also does — `--decode-l2l3` (the full protocol walk):** one nanom `walk_packet_ext` traversal per packet
 (`nm_protocols.hpp`: Ethernet → VLAN* → IPv4/IPv6 → TCP/UDP, honoring `ihl` / `data_offset` and gating L4
 on `frag_offset == 0`), landing **one Lance table per PDU type** — `<stem>_ethernet.lance`, `_vlan`,
 `_ipv4`, `_ipv6`, `_tcp`, `_udp` — each row = `packet_id` + the decoded header fields (nanom `ubits<>` bit
@@ -63,19 +63,25 @@ a generic `soa<Row>` → Lance writer ([`include/soa_lance_writer.hpp`](include/
 the columns, names, Arrow types, and widths straight from the one `NANOM_DESCRIBE` on each row struct —
 nanom's "schemas for free → Lance" path, realized end to end.
 
+**IPv6 extension headers / SRv6.** `walk_packet_ext` (added to nanom's `nm_protocols.hpp`) descends the
+full IPv6 extension-header chain — Hop-by-Hop (0), Routing / **SRv6 SRH** (43), Fragment (44), Destination
+Options (60), Authentication Header (51) — to reach the real L4 header, and reports each ext header, each
+SRv6 segment, and each IPv6/SRH TLV option (RFC 8200 length + padding semantics). That yields five more
+Lance tables — `_ipv6_hopbyhop`, `_ipv6_destopt`, `_ipv6_routing`, `_ipv6_srh_segment` (one row per SRv6
+segment, address as fixed-binary(16)), `_ipv6_option` — **all byte-for-byte identical** to nanotins on the
+real `srv6_sample.pcap` (7 packets; eth/ipv6/hopbyhop/destopt/routing/srh_segment/option/tcp/udp tables and
+the L4 reached through the SRH all match). `walk_packet_ext` is additive: nanom's original `walk_packet`
+(which stops at the base IPv6 header, matching nanotins' JSON example) is unchanged, so nanom's own goldens
+still hold.
+
 The PDU tables are byte-identical to nanotins over Ethernet / VLAN / IPv4 (options honored via `ihl`) /
 IPv6 base header / TCP / UDP — verified on crafted captures and the real `ipv4_options_sample.pcap`,
 `SRL_front_left_51_short.pcapng`.
 
-**Doesn't (yet):**
-- **IPv6 extension-header traversal to L4.** nanom's parity walk (`nm_protocols.hpp`) stops at the *base*
-  IPv6 header (`after_l3 = ip->rest`), so for IPv6 packets carrying extension headers — e.g. SRv6 — it does
-  not descend to the TCP/UDP header the way nanotins does (nanotins walks the ext-header chain). On such a
-  capture the `ipv6` and `ethernet` tables still match exactly, but nanom emits no `tcp`/`udp` row for
-  those packets. Closing this is a nanom-side change (extend the `nm_protocols.hpp` walk) — the natural
-  next extension now that the pipeline is proven.
-- **IPv6 ext-header / SRv6 and gPTP child tables**, staged enrichment (`--stage`), and windowed streaming
-  (`--window-bytes`); the capture is read whole here.
+**Doesn't (yet):** gPTP / SOME/IP decode (extra nanotins tables), staged enrichment (`--stage`), and
+windowed streaming (`--window-bytes`); the capture is read whole here. The IPv6 Fragment and Authentication
+headers *are* descended to reach L4, but their fixed rows aren't tabulated (no fixture to verify against);
+adding those tables is mechanical if needed.
 
 ## Equivalence & benchmark
 

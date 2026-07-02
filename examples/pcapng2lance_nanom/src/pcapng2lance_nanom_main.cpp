@@ -15,18 +15,20 @@
 //
 // Scope: the L1 packet table (the `packets.lance` that `pcapng2lance` writes)
 // plus, under --decode-l2l3, the full L2/L3/L4 protocol walk (Ethernet -> VLAN*
-// -> IPv4/IPv6 -> TCP/UDP) landed as one Lance table per PDU type +
-// remainder_after_l4 — byte-for-byte identical to the nanotins converter's PDU
-// tables. Not ported: staged enrichment (--stage) and windowed streaming; the
-// capture is read whole. This example exists so nanom's scan+parse+decode path
-// can be checked and benchmarked head-to-head against nanotins on the exact same
-// output. See README.md.
+// -> IPv4/IPv6 -> TCP/UDP), INCLUDING the IPv6 extension-header chain / SRv6 SRH
+// (Hop-by-Hop, Routing/SRH, Fragment, Dest-Opts, AH), landed as one Lance table
+// per PDU type + the SRv6 segment / IPv6 option child tables + remainder_after_l4
+// — byte-for-byte identical to the nanotins converter's tables. Not ported: gPTP
+// / SOME/IP, staged enrichment (--stage), and windowed streaming; the capture is
+// read whole. This example exists so nanom's scan+parse+decode path can be
+// checked and benchmarked head-to-head against nanotins on the exact same output.
+// See README.md.
 //
 // Pipeline: read file -> nm scan_blocks (Phase A) -> per-block classify ->
 //   nm parse_epb (Phase B) + option walk (ts_resol / epb_flags) -> soa<PacketRow>
 //   scalar columns + external payload_ref -> one Lance fragment; with
-//   --decode-l2l3, each packet also runs nm walk_packet -> per-PDU soa<Row> ->
-//   one Lance table per PDU type.
+//   --decode-l2l3, each packet also runs nm walk_packet_ext (descending the IPv6
+//   ext-header chain) -> per-PDU soa<Row> -> one Lance table per PDU type.
 
 #include "nm_pcap.hpp"  // nanom pcap/pcapng scanner (from the vendored nanom submodule)
 #include "pdu_tables.hpp"        // per-PDU Lance row types + converters (--decode-l2l3)
@@ -346,20 +348,40 @@ private:
     }
 
     // ---- L2/L3/L4 decode (--decode-l2l3) ---------------------------------------------------------
-    // One nanom walk_packet traversal per packet: Ethernet -> VLAN* -> IPv4/IPv6 -> TCP/UDP. Each visited
-    // header lands (with this packet's id) in its PDU soa table; the L4 boundary yields a remainder row
-    // (the application payload after L4 as an external blob.v2 ref, never copied).
+    // Visitor for nanom's ext-aware walk_packet_ext. Each visited header (base layers + the IPv6
+    // extension-header chain: Hop-by-Hop / SRv6 SRH / Fragment / Dest-Opts / AH) lands, with this packet's
+    // id, in its PDU soa table. Every method is optional to walk_packet_ext; the ones we omit (on_fragment
+    // / on_ah) are still *descended* to reach L4 — we just don't tabulate those fixed headers here.
+    struct DecodeVisitor {
+        Converter& c;
+        std::uint64_t pid;
+        void on_eth(const nmproto::Ethernet& x) { c.eth_.push(p2l_nanom::make_eth(pid, x)); }
+        void on_vlan(const nmproto::VlanTag& x) { c.vlan_.push(p2l_nanom::make_vlan(pid, x)); }
+        void on_ipv4(const nmproto::Ipv4& x) { c.ipv4_.push(p2l_nanom::make_ipv4(pid, x)); }
+        void on_ipv6(const nmproto::Ipv6& x) { c.ipv6_.push(p2l_nanom::make_ipv6(pid, x)); }
+        void on_tcp(const nmproto::Tcp& x) { c.tcp_.push(p2l_nanom::make_tcp(pid, x)); }
+        void on_udp(const nmproto::Udp& x) { c.udp_.push(p2l_nanom::make_udp(pid, x)); }
+        void on_ext_opt(nmproto::Ipv6ExtKind kind, const nmproto::Ipv6ExtOpt& x) {
+            (kind == nmproto::Ipv6ExtKind::hop_by_hop ? c.hopbyhop_ : c.destopt_)
+                .push(p2l_nanom::make_ext_opt(pid, x));
+        }
+        void on_srh(const nmproto::Ipv6Srh& x) { c.routing_.push(p2l_nanom::make_ipv6_routing(pid, x)); }
+        void on_srh_segment(std::uint8_t order, std::uint8_t idx, const std::array<std::uint8_t, 16>& a) {
+            c.srh_segment_.push(p2l_nanom::Ipv6SrhSegmentRow{pid, order, idx, a});
+        }
+        void on_ipv6_option(std::uint8_t container, std::uint8_t type, std::uint8_t len) {
+            c.ipv6_opt_.push(p2l_nanom::Ipv6OptionRow{pid, container, type, len});
+        }
+    };
+
+    // One nanom walk_packet_ext traversal per packet; the L4 boundary yields a remainder row (the
+    // application payload after L4 as an external blob.v2 ref, never copied).
     void decode_packet(std::uint64_t pid, std::uint16_t link, nm::bytes file, std::uint64_t poff,
                        std::uint32_t caplen) {
         if (poff + caplen > file.size()) return;
         const nm::bytes pkt = file.subspan(static_cast<std::size_t>(poff), caplen);
-        const auto wr = nmproto::walk_packet(
-            link, pkt, [&](const nmproto::Ethernet& x) { eth_.push(p2l_nanom::make_eth(pid, x)); },
-            [&](const nmproto::VlanTag& x) { vlan_.push(p2l_nanom::make_vlan(pid, x)); },
-            [&](const nmproto::Ipv4& x) { ipv4_.push(p2l_nanom::make_ipv4(pid, x)); },
-            [&](const nmproto::Ipv6& x) { ipv6_.push(p2l_nanom::make_ipv6(pid, x)); },
-            [&](const nmproto::Tcp& x) { tcp_.push(p2l_nanom::make_tcp(pid, x)); },
-            [&](const nmproto::Udp& x) { udp_.push(p2l_nanom::make_udp(pid, x)); });
+        DecodeVisitor visitor{*this, pid};
+        const auto wr = nmproto::walk_packet_ext(link, pkt, visitor);
         if (wr.reached_l4 && wr.l4_payload_offset < caplen) {
             rem_pid_.push_back(pid);
             rem_next_.push_back(wr.l4_ports);
@@ -381,7 +403,10 @@ private:
             return true;
         };
         if (!(w("_ethernet.lance", eth_) & w("_vlan.lance", vlan_) & w("_ipv4.lance", ipv4_) &
-              w("_ipv6.lance", ipv6_) & w("_tcp.lance", tcp_) & w("_udp.lance", udp_))) {
+              w("_ipv6.lance", ipv6_) & w("_tcp.lance", tcp_) & w("_udp.lance", udp_) &
+              w("_ipv6_hopbyhop.lance", hopbyhop_) & w("_ipv6_destopt.lance", destopt_) &
+              w("_ipv6_routing.lance", routing_) & w("_ipv6_srh_segment.lance", srh_segment_) &
+              w("_ipv6_option.lance", ipv6_opt_))) {
             return 1;
         }
         if (const int rc = write_remainder_table(stem + "_remainder_after_l4.lance")) return rc;
@@ -390,6 +415,13 @@ private:
                      "udp %zu, remainder %zu\n",
                      eth_.rows(), vlan_.rows(), ipv4_.rows(), ipv6_.rows(), tcp_.rows(), udp_.rows(),
                      rem_pid_.size());
+        if (routing_.rows() || hopbyhop_.rows() || destopt_.rows()) {
+            std::fprintf(stderr,
+                         "pcapng2lance_nanom: IPv6 ext headers -> hopbyhop %zu, destopt %zu, routing %zu, "
+                         "srh_segment %zu, option %zu\n",
+                         hopbyhop_.rows(), destopt_.rows(), routing_.rows(), srh_segment_.rows(),
+                         ipv6_opt_.rows());
+        }
         return 0;
     }
 
@@ -479,6 +511,12 @@ private:
     nm::soa<p2l_nanom::Ipv6Row> ipv6_{4096};
     nm::soa<p2l_nanom::TcpRow> tcp_{4096};
     nm::soa<p2l_nanom::UdpRow> udp_{4096};
+    // IPv6 extension-header / SRv6 tables (populated only for ext-header traffic).
+    nm::soa<p2l_nanom::Ipv6ExtOptRow> hopbyhop_{4096};
+    nm::soa<p2l_nanom::Ipv6ExtOptRow> destopt_{4096};
+    nm::soa<p2l_nanom::Ipv6RoutingRow> routing_{4096};
+    nm::soa<p2l_nanom::Ipv6SrhSegmentRow> srh_segment_{4096};
+    nm::soa<p2l_nanom::Ipv6OptionRow> ipv6_opt_{4096};
     std::vector<std::uint64_t> rem_pid_, rem_next_;
     std::vector<nano_lance::BlobV2Row> rem_pay_;
 };

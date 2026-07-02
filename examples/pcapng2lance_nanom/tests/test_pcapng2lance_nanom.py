@@ -200,12 +200,72 @@ def assert_identical(nm_ds: Path, nt_ds: Path, label: str) -> None:
         assert nm[k] == nt[k], f"{label}: column '{k}' differs (nanom vs nanotins)"
 
 
+def srh_stem(out: Path, tbl: str) -> Path:
+    return out.with_name(out.stem + f"_{tbl}.lance")
+
+
+def decode_srv6_check(nm_exe, nt_exe, srv6_pcap: str, nlance2table, tmp_path: Path) -> None:
+    """--decode-l2l3 on a real SRv6 capture: nanom must descend the IPv6 extension-header chain (Hop-by-Hop
+    / SRv6 SRH / Dest-Opts) to reach L4, and emit ipv6_{hopbyhop,destopt,routing,srh_segment,option} tables
+    byte-identical to nanotins."""
+    import lance
+
+    fixture = Path(srv6_pcap)
+    nm_out = tmp_path / "srv6_nm.lance"
+    run(nm_exe, fixture, nm_out, "--decode-l2l3")
+
+    # The nanom output must reach L4 through the SRH (this is the whole point of the extension).
+    routing = srh_stem(nm_out, "ipv6_routing")
+    assert routing.exists(), "SRv6: no ipv6_routing table (SRH not decoded)"
+    assert srh_stem(nm_out, "tcp").exists() or srh_stem(nm_out, "udp").exists(), "SRv6: never reached L4"
+
+    if not nt_exe:
+        return
+    nt_out = tmp_path / "srv6_nt.lance"
+    run(nt_exe, fixture, nt_out, "--decode-l2l3")
+
+    # pylance can read these fine; assert byte-identical to nanotins.
+    plain = ["ethernet", "ipv6", "ipv6_hopbyhop", "ipv6_destopt", "ipv6_routing", "ipv6_option", "tcp", "udp"]
+    for t in plain:
+        pn, pt = srh_stem(nm_out, t), srh_stem(nt_out, t)
+        assert pn.exists() == pt.exists(), f"SRv6 {t}: table presence differs"
+        if not pn.exists():
+            continue
+        dn = lance.dataset(str(pn)).to_table().to_pydict()
+        dt = lance.dataset(str(pt)).to_table().to_pydict()
+        assert list(dn.keys()) == list(dt.keys()), f"SRv6 {t}: schema {dn.keys()} != {dt.keys()}"
+        for k in dt:
+            assert dn[k] == dt[k], f"SRv6 {t}: column '{k}' differs (nanom vs nanotins)"
+
+    # ipv6_srh_segment has a fixed_size_binary(16) address column that the stock lance reader currently
+    # panics on, so compare its scalar columns via a projection (no address decode) here, and the full
+    # table — address bytes included — via nlance2table's hex CSV dump when that tool is available.
+    sn, st = srh_stem(nm_out, "ipv6_srh_segment"), srh_stem(nt_out, "ipv6_srh_segment")
+    assert sn.exists() == st.exists(), "SRv6 ipv6_srh_segment: table presence differs"
+    if sn.exists():
+        cols = ["packet_id", "srh_order", "segment_index"]
+        dn = lance.dataset(str(sn)).to_table(columns=cols).to_pydict()
+        dt = lance.dataset(str(st)).to_table(columns=cols).to_pydict()
+        assert dn == dt, "SRv6 ipv6_srh_segment: scalar columns differ"
+        if nlance2table:
+            def dump(p: Path) -> str:
+                r = subprocess.run([nlance2table, str(p), "--format", "csv"], capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise SystemExit(f"nlance2table failed on {p}: {r.stderr}")
+                return r.stdout
+            assert dump(sn) == dump(st), "SRv6 ipv6_srh_segment: address bytes differ (nanom vs nanotins)"
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        print("usage: test_pcapng2lance_nanom.py <pcapng2lance_nanom-exe> [pcapng2lance-exe]", file=sys.stderr)
-        return 2
-    nm_exe = argv[1]
-    nt_exe = argv[2] if len(argv) > 2 else None
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("nm_exe", help="pcapng2lance_nanom binary")
+    ap.add_argument("--nanotins", help="pcapng2lance (nanotins) binary, for byte-identical parity checks")
+    ap.add_argument("--srv6", help="a real SRv6 .pcap for the IPv6 extension-header parity check")
+    ap.add_argument("--nlance2table", help="nlance2table tool, to diff the fixed-binary srh_segment table")
+    args = ap.parse_args(argv[1:])
+    nm_exe, nt_exe = args.nm_exe, args.nanotins
     try:
         import lance  # noqa: F401
         import pyarrow  # noqa: F401
@@ -236,7 +296,12 @@ def main(argv: list[str]) -> int:
         # L2/L3/L4 decode: the full protocol walk lands in per-PDU Lance tables (parity with nanotins).
         decode_and_check(nm_exe, nt_exe, tmp_path)
 
-    tail = " + byte-identical to nanotins pcapng2lance (L1 + L2/L3/L4 PDU tables)" if nt_exe else ""
+        # SRv6 / IPv6 extension headers on a real capture (when supplied).
+        if args.srv6:
+            decode_srv6_check(nm_exe, nt_exe, args.srv6, args.nlance2table, tmp_path)
+
+    srv6 = " + SRv6 ext-header tables" if args.srv6 else ""
+    tail = f" + byte-identical to nanotins (L1 + L2/L3/L4{srv6})" if nt_exe else ""
     print(f"pcapng2lance_nanom interop ok (stock lance read + external offsets + --decode-l2l3{tail})")
     return 0
 
