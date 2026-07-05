@@ -19,6 +19,7 @@
 #include <memory>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -181,6 +182,70 @@ bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
     }
     const std::size_t values_size = split_runs * 4U;  // u32 dictionary indices, one per split run
     return (values_size + split_runs + 32U) <= 32760U;
+}
+
+// Decide whether a structural dictionary (flat bitpacked indices + dictionary buffer) wins for a
+// scattered low-cardinality string column. Mirrors Lance defaults: dict-divisor=2, dict-size-ratio=0.8,
+// min 100 rows, max 100k distinct values.
+bool variable_column_dict_beneficial(const nano_lance::ColumnValues& cv) {
+    constexpr std::size_t kMinRows = 100U;
+    constexpr std::size_t kDictDivisor = 2U;
+    constexpr double kDictSizeRatio = 0.8;
+    constexpr std::size_t kMaxCardinality = 100000U;
+
+    const std::size_t ow = cv.variable.large ? 8U : 4U;
+    if (cv.variable.offsets.size() < 2U * ow) {
+        return false;
+    }
+    auto read_offset = [&](std::size_t index) -> std::int64_t {
+        const auto* p = cv.variable.offsets.data() + index * ow;
+        if (cv.variable.large) {
+            std::int64_t v = 0;
+            std::memcpy(&v, p, 8);
+            return v;
+        }
+        std::int32_t v = 0;
+        std::memcpy(&v, p, 4);
+        return v;
+    };
+    const std::size_t rows = cv.variable.offsets.size() / ow - 1U;
+    if (rows < kMinRows) {
+        return false;
+    }
+    const char* base = reinterpret_cast<const char*>(cv.variable.data.data());
+    const std::size_t data_size = cv.variable.data.size();
+    std::unordered_map<std::string_view, std::uint32_t> dict;
+    dict.reserve(rows / 4U);
+    std::size_t raw_bytes = 0;
+    for (std::size_t i = 0; i < rows; ++i) {
+        const auto s = read_offset(i);
+        const auto e = read_offset(i + 1);
+        if (s < 0 || e < s || static_cast<std::size_t>(e) > data_size) {
+            return false;
+        }
+        const auto len = static_cast<std::size_t>(e - s);
+        raw_bytes += len;
+        const std::string_view val(base + s, len);
+        auto it = dict.find(val);
+        if (it == dict.end()) {
+            if (dict.size() >= kMaxCardinality) {
+                return false;
+            }
+            dict.emplace(val, static_cast<std::uint32_t>(dict.size()));
+        }
+    }
+    if (dict.empty() || dict.size() > rows / kDictDivisor) {
+        return false;
+    }
+    std::size_t dict_data = 0;
+    for (const auto& [val, _] : dict) {
+        dict_data += val.size();
+    }
+    const std::size_t dict_bytes = 8U + (dict.size() + 1U) * 4U + dict_data;
+    const std::size_t index_bytes = rows * 4U;
+    const std::size_t raw_total = raw_bytes + (rows + 1U) * ow;
+    const std::size_t encoded_total = dict_bytes + index_bytes;
+    return encoded_total < static_cast<std::size_t>(static_cast<double>(raw_total) * kDictSizeRatio);
 }
 
 WriterState* state_from(NanoLanceWriter* writer) {
@@ -581,6 +646,17 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
                 for (auto& field : disk_schema.fields) {
                     if (field.id == pf->id) {
                         field.metadata["nanolance:packing"] = "dict-rle";
+                        field.metadata.erase("lance-encoding:compression");
+                        break;
+                    }
+                }
+            } else if (cv.kind == nano_lance::ColumnValues::Kind::VariableWidth &&
+                       variable_column_dict_beneficial(cv)) {
+                // Scattered low-cardinality strings -> structural dictionary + flat indices.
+                for (auto& field : disk_schema.fields) {
+                    if (field.id == pf->id) {
+                        field.metadata["nanolance:packing"] = "dict";
+                        field.metadata.erase("lance-encoding:compression");
                         break;
                     }
                 }
