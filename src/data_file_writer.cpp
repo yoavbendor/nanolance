@@ -219,6 +219,9 @@ std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& c
         out.push_back(0xFEU);
         out.push_back(0xFEU);
         out.insert(out.end(), chunk.bytes.begin(), chunk.bytes.end());
+        while (out.size() % 8U != 0U) {
+            out.push_back(0U);
+        }
     }
     return out;
 }
@@ -332,12 +335,13 @@ std::vector<std::uint8_t> build_multibuffer_chunk(const std::vector<std::vector<
     return out;
 }
 
-// MiniBlockLayout tail (f6 layers, f7 num_buffers, f9 num_items, f10 has_large_chunk=1).
-std::vector<std::uint8_t> miniblock_tail(std::uint64_t num_items, std::uint8_t num_buffers) {
+// MiniBlockLayout tail (f6 layers, f7 num_buffers, f9 num_items, f10 has_large_chunk).
+std::vector<std::uint8_t> miniblock_tail(std::uint64_t num_items, std::uint8_t num_buffers,
+                                         bool has_large_chunk = true) {
     std::vector<std::uint8_t> t{0x32, 0x01, 0x01, 0x38, num_buffers, 0x48};
     append_varint(t, num_items);
     t.push_back(0x50);
-    t.push_back(0x01);
+    t.push_back(has_large_chunk ? 0x01U : 0x00U);
     return t;
 }
 
@@ -375,6 +379,27 @@ std::vector<std::uint8_t> build_dict_variable_block(const std::vector<std::strin
         out.insert(out.end(), s.begin(), s.end());
     }
     return out;
+}
+
+// PageLayout for structural dictionary with flat bitpacked u32 indices (matches stock Lance for
+// scattered low-cardinality strings): value_compression = InlineBitpacking(32), dictionary =
+// Variable+Flat(32) without general compression, num_buffers=1, has_large_chunk=false.
+std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items) {
+    static const std::uint8_t kF3Bitpack[] = {0x1a, 0x04, 0x2a, 0x02, 0x08, 0x20};
+    static const std::uint8_t kF4Dict[] = {0x22, 0x08, 0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20};
+    std::vector<std::uint8_t> structural(kF3Bitpack, kF3Bitpack + sizeof(kF3Bitpack));
+    structural.insert(structural.end(), kF4Dict, kF4Dict + sizeof(kF4Dict));
+    structural.push_back(0x28);  // f5 num_dictionary_items
+    append_varint(structural, num_distinct);
+    const auto tail = miniblock_tail(num_items, 1U, false);
+    structural.insert(structural.end(), tail.begin(), tail.end());
+
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, 1, structural);
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
 }
 
 // PageLayout for a dictionary-encoded low-cardinality column: value_compression = Rle over u32
@@ -876,6 +901,84 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.length = rows;
             page.priority = 0;
             page.encoding = page_layout_bytes_dict_rle(static_cast<std::uint32_t>(distinct.size()), rows);
+            column.pages.push_back(std::move(page));
+            columns.push_back(std::move(column));
+            continue;
+        }
+
+        // Structural dictionary for scattered low-cardinality strings: flat bitpacked u32 indices in
+        // buffer[1], uncompressed dictionary variable block in buffer[2].
+        if (packing_it != field.metadata.end() && packing_it->second == "dict" &&
+            values.kind == ColumnValues::Kind::VariableWidth) {
+            const bool large =
+                field.logical_type == "large_utf8" || field.logical_type == "large_binary";
+            const std::size_t ow = large ? 8U : 4U;
+            const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
+            auto read_offset = [&](std::size_t idx) -> std::int64_t {
+                const auto* p = values.variable.offsets.data() + idx * ow;
+                if (large) {
+                    std::int64_t v = 0;
+                    std::memcpy(&v, p, 8);
+                    return v;
+                }
+                std::int32_t v = 0;
+                std::memcpy(&v, p, 4);
+                return v;
+            };
+            std::map<std::string, std::uint32_t> dict;
+            std::vector<std::string> distinct;
+            std::vector<std::uint32_t> indices;
+            indices.reserve(num_rows);
+            for (std::size_t r = 0; r < num_rows; ++r) {
+                const auto s = read_offset(r);
+                const auto e = read_offset(r + 1);
+                std::string val(reinterpret_cast<const char*>(values.variable.data.data() + s),
+                                static_cast<std::size_t>(e - s));
+                auto it = dict.find(val);
+                if (it == dict.end()) {
+                    const auto id = static_cast<std::uint32_t>(distinct.size());
+                    dict.emplace(val, id);
+                    distinct.push_back(std::move(val));
+                    indices.push_back(id);
+                } else {
+                    indices.push_back(it->second);
+                }
+            }
+            std::vector<MiniblockChunk> index_chunks;
+            for (std::size_t off = 0; off < indices.size(); off += 1024U) {
+                const auto count = std::min<std::size_t>(1024U, indices.size() - off);
+                MiniblockChunk chunk;
+                chunk.value_count = count;
+                chunk.bytes = build_bitpacked_chunk(reinterpret_cast<const std::uint8_t*>(indices.data() + off),
+                                                    count, 4U);
+                index_chunks.push_back(std::move(chunk));
+            }
+            const auto payload = miniblock_payload(index_chunks);
+            const auto control = control_buffer_for(index_chunks);
+            const auto dict_block = build_dict_variable_block(distinct);
+
+            align64(out);
+            const auto control_offset = pos(out);
+            out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
+            align64(out);
+            const auto data_offset = pos(out);
+            out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+            align64(out);
+            const auto dict_offset = pos(out);
+            out.write(reinterpret_cast<const char*>(dict_block.data()), static_cast<std::streamsize>(dict_block.size()));
+
+            pb::ColumnMetadata column;
+            column.encoding = column_encoding_bytes();
+            pb::ColumnPage page;
+            page.buffer_offsets.push_back(control_offset);
+            page.buffer_offsets.push_back(data_offset);
+            page.buffer_offsets.push_back(dict_offset);
+            page.buffer_sizes.push_back(control.size());
+            page.buffer_sizes.push_back(payload.size());
+            page.buffer_sizes.push_back(dict_block.size());
+            page.length = rows;
+            page.priority = 0;
+            page.encoding = page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows);
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
             continue;

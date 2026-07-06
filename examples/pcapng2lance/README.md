@@ -10,6 +10,51 @@ See the docs/ folder for details: [`DESIGN.md`](docs/DESIGN.md) (architecture + 
 [`NANOTINS_REFLECTION.md`](docs/NANOTINS_REFLECTION.md) (struct → SoA → Arrow → Lance machinery), 
 and [`KICKOFF.md`](docs/KICKOFF.md) (build order + traps).
 
+## At a glance
+
+- **Input:** classic pcap or pcapng (either endianness, multi-section). **Output:** a Lance dataset of
+  per-packet L1 rows, plus (with `--decode-l2l3`) one table per PDU — ethernet / vlan / ipv4 / ipv6 /
+  tcp / udp / ptp / IPv6 ext headers — joined by `packet_id`.
+- **Payloads stay external:** each row stores `(uri, offset, size)` into the *original* capture; bytes
+  are never copied (fetched on demand, including from `s3://`). The Parquet twin,
+  [`pcapng2parquet`](https://github.com/yoavbendor/nanoarrow2parquet/tree/main/examples/pcapng2parquet),
+  is parse-only because Parquet has no external blob store.
+- **Run:** `pcapng2lance [--decode-l2l3] [--no-compress] [--sequential|--threads N] [--window-bytes N]
+  <input> <output.lance> [payload_uri]`. Memory is bounded by `--window-bytes` regardless of capture size.
+- **Gotchas:** L4 (tcp/udp) rows are emitted only on the **first IPv4 fragment** (`frag_offset == 0`);
+  `bool` row fields are unsupported (use `uint8`); the original capture must stay reachable to fetch
+  payloads / run `--stage` enrichment. Cross-checked field-for-field against **tshark**.
+
+The rest of this document is the build history and the milestone/feature detail behind the above.
+
+## For AI agents
+
+**Use this example when** you want a Lance dataset from a capture **with packet payloads kept external**
+(referenced, never copied) and/or **staged, incremental enrichment** (decode one layer per run). It reads
+and writes through the full nanotins → soatins → nanolance stack.
+
+**Pick a sibling instead when:** you want Parquet and don't need payloads → the parse-only Parquet twin
+[`pcapng2parquet`](https://github.com/yoavbendor/nanoarrow2parquet/tree/main/examples/pcapng2parquet).
+You just want human-readable decoded packets →
+[`pcapng2json`](https://github.com/yoavbendor/nanotins/tree/main/examples/pcapng2json).
+
+**Run:** `build/examples/pcapng2lance/pcapng2lance --decode-l2l3 capture.pcapng out.lance` (add a
+`payload_uri` like `s3://…` as the last arg if the dataset will be read on another host).
+
+**Do**
+- Pass `--decode-l2l3` for the per-PDU tables; join each one to the L1 table on `packet_id`.
+- Keep the original capture reachable (`file://` or `s3://`) — payload fetches and every `--stage` run read
+  from it; pass an explicit `payload_uri` when the dataset moves hosts.
+- Bound RAM with `--window-bytes`; pick the CPU path with `--sequential` or `--threads N` — all produce
+  byte-identical tables.
+- Use `uint8` for flag fields and `fixed_size_binary` for MAC/IP fields.
+
+**Don't**
+- Don't use `bool` row fields — forbidden (Arrow 1-bit vs the byte-wide writer path).
+- Don't pass `--gpu` expecting a GPU run — it is a planned feature; the flag reports that and exits.
+- Don't expect a TCP/UDP row on continuation fragments (only `frag_offset == 0`) or cross-fragment payload
+  reassembly — neither is done.
+
 ## What's built (M0 + M1 + M2 + M3/M6)
 
 - **M0 — `soatins` reflection core** (in the standalone [`soatins/`](extern/nanotins/soatins) library, vendored into this example as a submodule from the sister [nanotins](https://github.com/yoavbendor/nanotins) repo): `be<>`/`le<>` 

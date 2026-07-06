@@ -9,6 +9,105 @@ nanolance itself depends only on **nanoarrow + zstd** (and local code) — no pa
 > Integrating programmatically (or via an AI agent)? See [AGENTS.md](AGENTS.md) for the current
 > include path / CMake targets, the write API, and how to enable each compression measure.
 
+## At a glance
+
+- **What it is:** a write-centric C++ library that emits **Lance v2.2** datasets and reads back what it
+  wrote — no Rust `lance` core. Everything it writes is readable by stock `lance` (verified vs `lance`
+  7.0.0) **unless** a feature is marked *nanolance-only* below.
+- **Headline benefit:** rows keep big payloads **external** (`uri` + `position` + `size`, never copied),
+  so a packet table costs a few bytes/row regardless of payload size; bytes are fetched on demand (local
+  file or `s3://`).
+- **Type coverage:** the Arrow C scalar types + `fixed_size_binary`, nullable columns, and nested
+  structs (matches [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet), so the same
+  Arrow batch feeds either writer). Reads back every fixed-width type it writes.
+- **Links:** `nanolance` to write; `nanolance_reader` alone if you only fetch external blobs.
+
+### Quick start (write)
+
+```c
+#include "nanolance/nano_lance_writer.h"
+#include <nanoarrow/nanoarrow.h>
+
+NanoLanceWriter w = {0};
+nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
+nano_lance_writer_set_ignore_nullability(&w, true);  // if your Arrow fields are nullable
+nano_lance_writer_set_compression(&w, true);         // Lance-compatible compression (off by default)
+nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // repeatable; schema locks after batch #1
+nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append a fragment
+nano_lance_writer_close(&w);
+// On any non-zero return: nano_lance_writer_last_error(&w). Read back with
+// nano_lance::lance_table_read_dataset(...) or nano_lance_fetch_external_blob(uri, position, size, ...).
+```
+
+### Gotchas & lifecycle
+
+- **Schema locks after the first `write_batch`** — every batch in a session shares it.
+- **Call all `set_*` options before the first `write_batch`** (compression, nullability, URI dictionary).
+- **`bool` row fields are not supported** (Arrow's 1-bit storage vs the byte-wide writer path) — use
+  `uint8` for flags.
+- **Compression is off by default.** One switch (`set_compression`) picks the right Lance encoding per
+  column; see [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured) for the per-type
+  table.
+- **To get small files, model external refs as plain `uri`/`position`/`size` columns**, *not* the packed
+  `lance.blob.v2` descriptor (~41 B/row vs ~3.4 B/row). See [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
+
+### Not yet supported / nanolance-only
+
+- **No compression for `float`/`bool` fixed-width columns** (written raw; Lance uses byte-stream-split).
+- **No transparent delta encoding** — store monotonic high-range integers as app-level deltas to stay
+  small (otherwise they bitpack as absolute values, where Parquet's delta encoding wins).
+- **Read throughput is the known gap** (~2× `lance`; memory-bandwidth bound on column materialization).
+  The flat fixed-width path still caps chunks at 800 bytes (perf TODO — bitpacking is unaffected).
+- **`nano_lance_writer_set_blob_uri_dictionary` is nanolance-only** (dedups identical external URIs;
+  stock Lance cannot read that blob column; create-mode only).
+- **S3:** SSO / assume-role profiles aren't resolved — export credentials to the environment first
+  (`credential_process`, env, shared profiles, ECS/EKS, IMDSv2 *are* supported).
+
+For the full agent-oriented integration guide (API lifecycle, the measured per-column compression table,
+the data-model recipe, and interop verification), read **[AGENTS.md](AGENTS.md)**.
+
+## For AI agents
+
+**Use this library when** you want a Lance dataset — especially one where rows reference large payloads
+that live elsewhere (a file or `s3://`) instead of copying them in. It writes and reads back what it
+wrote; stock `lance` reads it too (unless you opt into a *nanolance-only* feature).
+
+**Pick a sibling instead when:** you want Parquet output (no external blobs) →
+[nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) (the *same* Arrow batch feeds
+either). You need to *produce* the Arrow from packets/structs →
+[nanotins / soatins](https://github.com/yoavbendor/nanotins).
+
+**Minimal program** (`target_link_libraries(app PRIVATE nanolance)`; `nanolance_reader` if you only fetch):
+
+```c
+#include "nanolance/nano_lance_writer.h"
+#include <nanoarrow/nanoarrow.h>
+
+NanoLanceWriter w = {0};
+nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
+nano_lance_writer_set_ignore_nullability(&w, true);  // BEFORE the first write_batch
+nano_lance_writer_set_compression(&w, true);         // BEFORE the first write_batch
+nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // schema locks after batch #1
+nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append fragment
+nano_lance_writer_close(&w);
+// non-zero return -> nano_lance_writer_last_error(&w)
+```
+
+**Do**
+- Call every `set_*` option **before** the first `write_batch`; reuse one schema for all batches.
+- For small files, model external refs as plain `uri` / `position` / `size` columns (not the packed
+  `lance.blob.v2` descriptor) — see [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
+- Use `uint8` for flag fields, and `fixed_size_binary` (`std::array<uint8,N>`) for MAC/IP-style fields.
+- For S3, export credentials to the environment if your profile uses SSO/assume-role.
+
+**Don't**
+- Don't use `bool` row fields — unsupported (Arrow 1-bit vs the byte-wide writer path).
+- Don't change the schema between batches in one session.
+- Don't enable `nano_lance_writer_set_blob_uri_dictionary` if stock Lance must read that column
+  (nanolance-only, create-mode only).
+- Don't expect `float`/`bool` columns to compress, or integers to delta-encode — store app-level deltas
+  for monotonic high-range integers.
+
 ## Layout
 
 - **soatins** (namespace `soatins`, include prefix `soatins/`): reflection nucleus — `be<>`/`le<>` endian-aware fields, bitfield `bits<>`, `soa<T>` columnar store, Arrow `arrow_schema<T>()` / `to_arrow()`. Header-only, depends only on nanoarrow + boost. CMake target: `soatins::core`.
