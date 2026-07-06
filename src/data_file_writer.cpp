@@ -208,6 +208,32 @@ std::vector<std::uint8_t> control_buffer_for(const std::vector<MiniblockChunk>& 
     return out;
 }
 
+// Chunk-meta (control) buffer for a multi-chunk miniblock page with has_large_chunk=false and one
+// value buffer per chunk (the structural-dictionary index chunks). Each u16 word is
+// (wrapped_bytes/8 - 1) << 4 | log2(num_values), where wrapped_bytes is the chunk's full footprint in
+// the value buffer as written by miniblock_payload (8-byte chunk header + buffer, padded to 8). Lance
+// requires every non-final chunk to carry a nonzero log2 (num_values = 1 << log2, so full chunks must
+// be a power of two) and derives the final chunk's value count from the page's total item count. The
+// shared control_buffer_for() writes log2=0 for every chunk and sizes the raw buffer, which only works
+// for single-chunk pages; multi-chunk pages (a >1024-row dictionary column) need this exact layout to
+// be readable by stock Lance.
+std::vector<std::uint8_t> control_buffer_for_index_chunks(const std::vector<MiniblockChunk>& chunks) {
+    std::vector<std::uint8_t> out;
+    out.reserve(chunks.size() * 2U);
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        const std::size_t wrapped = ((8U + chunks[i].bytes.size()) + 7U) / 8U * 8U;
+        const auto divided_minus_one = static_cast<std::uint16_t>(wrapped / 8U - 1U);
+        std::uint16_t log_num_values = 0U;
+        if (i + 1U < chunks.size()) {
+            for (std::size_t v = chunks[i].value_count; v > 1U; v >>= 1U) {
+                ++log_num_values;
+            }
+        }
+        append_le16(out, static_cast<std::uint16_t>((divided_minus_one << 4U) | (log_num_values & 0x0FU)));
+    }
+    return out;
+}
+
 std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& chunks) {
     std::vector<std::uint8_t> out;
     for (const auto& chunk : chunks) {
@@ -954,7 +980,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 index_chunks.push_back(std::move(chunk));
             }
             const auto payload = miniblock_payload(index_chunks);
-            const auto control = control_buffer_for(index_chunks);
+            const auto control = control_buffer_for_index_chunks(index_chunks);
             const auto dict_block = build_dict_variable_block(distinct);
 
             align64(out);
