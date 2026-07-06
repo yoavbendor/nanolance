@@ -21,8 +21,24 @@ nanolance itself depends only on **nanoarrow + zstd** (and local code) — no pa
   structs (matches [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet), so the same
   Arrow batch feeds either writer). Reads back every fixed-width type it writes.
 - **Links:** `nanolance` to write; `nanolance_reader` alone if you only fetch external blobs.
+- **Python:** fast zero-copy bindings — `pip install -e bindings/python` then `import nanolance` (see
+  [bindings/python/README.md](bindings/python/README.md)). Uses the Arrow PyCapsule interface; no hard
+  pyarrow dependency at runtime. Does **not** shadow `import lance` (the official `pylance` SDK).
 
-### Quick start (write)
+### Quick start (Python)
+
+```python
+import pyarrow as pa
+import nanolance
+
+table = pa.table({"id": [1, 2, 3], "name": ["alpha", "beta", "gamma"]})
+nanolance.write_table(table, "out.lance", compression=True)
+assert pa.table(nanolance.read_table("out.lance")).equals(table)
+```
+
+Install for development: `pip install -e "bindings/python[test]"` then `pytest` in that directory.
+
+### Quick start (C write)
 
 ```c
 #include "nanolance/nano_lance_writer.h"

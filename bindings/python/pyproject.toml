@@ -1,0 +1,43 @@
+[build-system]
+requires = ["scikit-build-core >=0.10", "nanobind >=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "nanolance"
+version = "0.1.0"
+description = "Fast zero-copy Python bindings for the nanolance Lance writer/reader"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Yoav Bendor" }]
+keywords = ["arrow", "lance", "zero-copy", "nanoarrow"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pyarrow>=16", "pandas>=2", "polars>=1", "psutil>=5.9", "pylance>=0.17"]
+bench = ["pyarrow>=16", "psutil>=5.9", "pylance>=0.17"]
+
+[project.urls]
+Homepage = "https://github.com/yoavbendor/nanolance"
+Repository = "https://github.com/yoavbendor/nanolance"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+build-dir = "build/{wheel_tag}"
+cmake.source-dir = "."
+wheel.packages = ["nanolance"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "bench: performance/size benchmarks (optional)",
+]

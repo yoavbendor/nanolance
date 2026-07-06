@@ -1,6 +1,7 @@
 # Never commit or ship this tree in source archives — it holds FetchContent clones
 # (nanoarrow/zstd/CLI11 with .git) plus objects; often 100MB+ while the library sources are ~1–2MB.
 /build/
+/bindings/python/build/
 /.deps/
 /.cache/
 *.rej

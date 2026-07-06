@@ -47,6 +47,27 @@ Read back with `nano_lance::lance_table_read_dataset(path, schema, batches, erro
 `nanolance/lance_table_reader.hpp`) or fetch external bytes with
 `nano_lance_fetch_external_blob(uri, position, size, ...)`.
 
+## 2a. Python bindings
+
+First-class Python bindings live in [`bindings/python/`](bindings/python/) (`pip install -e bindings/python`).
+They wrap the same C API via nanobind and the Arrow PyCapsule interface — zero-copy in/out of pyarrow,
+polars, etc. The module is `import nanolance` (not `lance`; that name is the official `pylance` SDK).
+
+```python
+import pyarrow as pa
+import nanolance
+
+table = pa.table({"uri": ["s3://b/f.pcapng"] * 1000, "position": range(1000), "size": [1500] * 1000})
+nanolance.write_table(table, "out.lance", compression=True)
+roundtrip = pa.table(nanolance.read_table("out.lance"))
+```
+
+Key options mirror the C writer: `compression=True`, `WriteOptions(append=True)`, etc. See
+`bindings/python/README.md` for install, tests (`pytest`), and pylance interop checks.
+
+Parquet Python bindings are a separate package in
+[nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) (`nanoarrow_io.parquet`).
+
 ## 3. Enabling the compression that was measured
 
 There is **one switch**: `nano_lance_writer_set_compression(&w, true)` (CLI: `arrowipc2lance
