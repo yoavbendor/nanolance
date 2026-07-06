@@ -93,13 +93,28 @@ bool append_fixed_width(const ArrowArray& array,
         error += field.name;
         return false;
     }
+    out.kind = ColumnValues::Kind::FixedWidth;
+    // Arrow stores boolean values bit-packed (1 bit/value, LSB-first, honoring array.offset), but
+    // nanolance's on-disk layout is one byte per boolean. Expand here rather than memcpy'ing
+    // length bytes out of a length/8-byte buffer (which read far past the buffer and crashed).
+    if (field.logical_type == "bool") {
+        const auto* bits = static_cast<const std::uint8_t*>(array.buffers[1]);
+        const auto base = static_cast<std::size_t>(array.offset);
+        out.fixed.reserve(out.fixed.size() + static_cast<std::size_t>(array.length));
+        for (std::int64_t i = 0; i < array.length; ++i) {
+            const auto bit_index = base + static_cast<std::size_t>(i);
+            const auto byte = bits[bit_index >> 3U];
+            out.fixed.push_back(static_cast<std::uint8_t>((byte >> (bit_index & 7U)) & 1U));
+        }
+        return true;
+    }
     // Use the shared width table so every fixed-width logical type (incl. fixed_size_binary:N) agrees
     // with the decoder; a local table here previously defaulted to 8 and over-read narrow/byte-array
     // columns.
     const std::size_t width = lance_logical_type_value_bytes(field.logical_type);
     const auto byte_count = static_cast<std::size_t>(array.length) * width;
-    const auto* first = static_cast<const std::uint8_t*>(array.buffers[1]);
-    out.kind = ColumnValues::Kind::FixedWidth;
+    const auto* first = static_cast<const std::uint8_t*>(array.buffers[1]) +
+                        static_cast<std::size_t>(array.offset) * width;
     out.fixed.insert(out.fixed.end(), first, first + byte_count);
     return true;
 }
