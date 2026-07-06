@@ -560,4 +560,18 @@ if(NANOLANCE_BUILD_TOOLS)
                 "${NANO_LANCE_WRITER_PYTHON}"
     )
     set_tests_properties(app_dict_pylance_interop_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
+
+    # Negative: nlance-stitch must reject datasets with different schemas. Builds a pcapng2lance L1 table
+    # and an arrowipc2lance (id/score) table and asserts the stitch fails. Lives here because it needs
+    # arrowipc2lance (defined in this block) alongside pcapng2lance + nlance_stitch. Skips if pyarrow absent.
+    if(TARGET pcapng2lance AND TARGET nlance_stitch)
+        add_test(
+            NAME pcapng2lance_stitch_schema_mismatch
+            COMMAND "${NANO_LANCE_WRITER_PYTHON}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2lance/tests/test_pcapng2lance_stitch_schema_mismatch.py"
+                    "$<TARGET_FILE:pcapng2lance>" "$<TARGET_FILE:nlance_stitch>" "$<TARGET_FILE:arrowipc2lance>"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2lance/tests/SRL_front_left_51_short.pcapng"
+        )
+        set_tests_properties(pcapng2lance_stitch_schema_mismatch PROPERTIES LABELS "interop" SKIP_RETURN_CODE 77)
+    endif()
 endif()

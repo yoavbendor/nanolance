@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Dataset-stitch equivalence: stitching N contiguous packet slices of a capture must reproduce, bit-exact,
-the single dataset built from the whole range.
+"""Dataset-stitch equivalence (the core guarantee, several ways).
 
-Drives pcapng2lance's --drop/--count packet slicing to cut the same capture into three contiguous slices
-([0,N), [N,2N), [2N,3N)) as free-standing datasets, plus one full dataset of [0,3N). Because --drop keeps
-the GLOBAL packet_id (a skipped packet still advances the id) and payload offsets are absolute, the slices
-are exact pieces of the full run. nlance-stitch merges the three (Option A: relocate fragments + one
-manifest, no re-encode), and the stitched dataset, read back and dumped via nlance2table, must equal the
-full dataset row-for-row. Also checks packet_id is the contiguous 0..3N-1 after stitching.
+pcapng2lance's --drop/--count cut a capture into packet slices as free-standing datasets; because --drop
+keeps the GLOBAL packet_id and payload offsets are absolute, contiguous slices are exact pieces of the full
+run. nlance-stitch merges them (Option A: relocate fragments + one manifest, no re-encode). Cases:
+
+  core      stitch [0,N)+[N,2N)+[2N,3N)  == full [0,3N)            (bit-exact, read back via nlance2table)
+  order     stitch respects the <item> suffix order, not content/discovery order
+  uneven    slices of unequal sizes stitch == full
+  single    stitch of one slice == that slice (identity)
+  decode    with --decode-l2l3, each per-PDU table (ethernet/ipv4/...) stitches == the full run's table
 
 argv: <pcapng2lance> <nlance_stitch> <nlance2table> <fixture.pcapng>"""
 
@@ -16,7 +18,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-N = 70  # per-slice packet count; 3N must be <= packets in the fixture (SRL_front_left_51_short has 224)
+N = 60  # base slice size; 3N must be <= packets in the fixture (SRL_front_left_51_short has 224)
+PDU_SUFFIXES = ["ethernet", "vlan", "ipv4", "ipv6", "tcp", "udp"]
 
 
 def run(*cmd):
@@ -27,55 +30,131 @@ def run(*cmd):
     return r
 
 
-def dump(n2t, dataset, out):
-    run(n2t, dataset, "-f", "csv", "-o", out)
-    return Path(out).read_text()
+CONV = STITCH = N2T = None
+FIXTURE = None
+
+
+def slice_to(out, drop, count, decode=False):
+    run(CONV, FIXTURE, out, "-d", drop, "-c", count, *(["--decode-l2l3"] if decode else []))
+
+
+def stitch(parts_dir, out):
+    run(STITCH, parts_dir, out, "--prefix", "results_")
+
+
+def dump(dataset):
+    r = run(N2T, dataset, "-f", "csv")
+    return r.stdout
+
+
+def pids(csv_text):
+    rows = csv_text.splitlines()
+    assert rows[0].split(",")[0] == "packet_id", "packet_id must be the first column"
+    return [int(r.split(",", 1)[0]) for r in rows[1:]]
+
+
+def equal_or_die(label, a_csv, b_csv):
+    if a_csv != b_csv:
+        al, bl = a_csv.splitlines(), b_csv.splitlines()
+        print(f"{label}: MISMATCH ({len(al)} vs {len(bl)} rows)", file=sys.stderr)
+        for i, (x, y) in enumerate(zip(al, bl)):
+            if x != y:
+                print(f"  first diff line {i}:\n    got: {x}\n    exp: {y}", file=sys.stderr)
+                break
+        raise SystemExit(1)
+
+
+def case_core(t):
+    parts = t / "core"; parts.mkdir()
+    for k in range(3):
+        slice_to(parts / f"results_{k}.lance", k * N, N)
+    slice_to(t / "core_full.lance", 0, 3 * N)
+    stitch(parts, t / "core_stitched.lance")
+    s, f = dump(t / "core_stitched.lance"), dump(t / "core_full.lance")
+    equal_or_die("core", s, f)
+    assert pids(s) == list(range(3 * N)), "core: packet_id not contiguous 0..3N-1"
+    print(f"  core      ok (stitch 3x{N} == full {3*N}, packet_id 0..{3*N-1})")
+
+
+def case_order(t):
+    # Map item suffix -> which slice's content, permuted: item0<-slice2, item1<-slice0, item2<-slice1.
+    parts = t / "order"; parts.mkdir()
+    content_for_item = {0: 2, 1: 0, 2: 1}  # item k holds slice `content_for_item[k]` ([s*N,(s+1)*N))
+    for item, s in content_for_item.items():
+        slice_to(parts / f"results_{item}.lance", s * N, N)
+    stitch(parts, t / "order_stitched.lance")
+    got = pids(dump(t / "order_stitched.lance"))
+    expect = []  # rows must follow ITEM order (0,1,2) -> contents slice2, slice0, slice1
+    for item in (0, 1, 2):
+        s = content_for_item[item]
+        expect += list(range(s * N, (s + 1) * N))
+    assert got == expect, f"order: row order follows content not item suffix\n got={got[:5]}.. exp={expect[:5]}.."
+    print("  order     ok (row order follows the <item> suffix, not content)")
+
+
+def case_uneven(t):
+    parts = t / "uneven"; parts.mkdir()
+    sizes = [40, 80, 50]  # unequal, contiguous; sum 170 <= 224
+    off = 0
+    for k, c in enumerate(sizes):
+        slice_to(parts / f"results_{k}.lance", off, c)
+        off += c
+    slice_to(t / "uneven_full.lance", 0, sum(sizes))
+    stitch(parts, t / "uneven_stitched.lance")
+    equal_or_die("uneven", dump(t / "uneven_stitched.lance"), dump(t / "uneven_full.lance"))
+    print(f"  uneven    ok (slices {sizes} stitch == full {sum(sizes)})")
+
+
+def case_single(t):
+    parts = t / "single"; parts.mkdir()
+    slice_to(parts / "results_0.lance", 0, N)
+    slice_to(t / "single_ref.lance", 0, N)
+    stitch(parts, t / "single_stitched.lance")
+    equal_or_die("single", dump(t / "single_stitched.lance"), dump(t / "single_ref.lance"))
+    print("  single    ok (stitch of 1 == identity)")
+
+
+def case_decode(t):
+    # Per-PDU tables: slices/full with --decode-l2l3, then stitch each <stem>_<pdu>.lance across slices.
+    work = t / "decode"; work.mkdir()
+    for k in range(3):
+        slice_to(work / f"results_{k}.lance", k * N, N, decode=True)
+    slice_to(work / "full.lance", 0, 3 * N, decode=True)
+    checked = []
+    for pdu in PDU_SUFFIXES:
+        full_tbl = work / f"full_{pdu}.lance"
+        if not full_tbl.exists():
+            continue  # this capture has no PDUs of that type
+        pdir = work / f"{pdu}_parts"; pdir.mkdir()
+        for k in range(3):
+            src = work / f"results_{k}_{pdu}.lance"
+            if src.exists():  # a slice may legitimately have zero PDUs of this type
+                src.rename(pdir / f"results_{k}.lance")
+        stitch(pdir, work / f"stitched_{pdu}.lance")
+        equal_or_die(f"decode/{pdu}", dump(work / f"stitched_{pdu}.lance"), dump(full_tbl))
+        checked.append(pdu)
+    assert checked, "decode: no PDU tables were produced to check"
+    print(f"  decode    ok (--decode-l2l3 per-PDU tables stitch == full: {', '.join(checked)})")
 
 
 def main(argv):
+    global CONV, STITCH, N2T, FIXTURE
     if len(argv) < 5:
         print("usage: test_pcapng2lance_stitch_equiv.py <pcapng2lance> <nlance_stitch> <nlance2table> <fixture>",
               file=sys.stderr)
         return 2
-    conv, stitch, n2t, fixture = argv[1], argv[2], argv[3], Path(argv[4])
-    if not fixture.exists():
-        print(f"fixture not found: {fixture}", file=sys.stderr)
+    CONV, STITCH, N2T, FIXTURE = argv[1], argv[2], argv[3], Path(argv[4])
+    if not FIXTURE.exists():
+        print(f"fixture not found: {FIXTURE}", file=sys.stderr)
         return 1
-
     with tempfile.TemporaryDirectory() as tmp:
         t = Path(tmp)
-        parts = t / "parts"
-        parts.mkdir()
-
-        # three contiguous slices as free-standing datasets, named for nlance-stitch's <prefix>*_<item> order
-        for k in range(3):
-            run(conv, fixture, parts / f"results_{k}.lance", "-d", k * N, "-c", N)
-        # the reference: one dataset spanning the whole [0, 3N) range
-        run(conv, fixture, t / "full.lance", "-d", 0, "-c", 3 * N)
-
-        # stitch the three slices (moves fragments + writes one manifest; consumes the source folders)
-        run(stitch, parts, t / "stitched.lance", "--prefix", "results_")
-
-        stitched = dump(n2t, t / "stitched.lance", t / "stitched.csv")
-        full = dump(n2t, t / "full.lance", t / "full.csv")
-
-        if stitched != full:
-            sl, fl = stitched.splitlines(), full.splitlines()
-            print(f"STITCH MISMATCH: stitched {len(sl)} rows vs full {len(fl)} rows", file=sys.stderr)
-            for i, (a, b) in enumerate(zip(sl, fl)):
-                if a != b:
-                    print(f"  first diff at line {i}:\n    stitched: {a}\n    full:     {b}", file=sys.stderr)
-                    break
-            return 1
-
-        # packet_id is column 0; after stitching it must be the contiguous 0..3N-1, in order
-        rows = stitched.splitlines()
-        header = rows[0].split(",")
-        assert header[0] == "packet_id", f"expected packet_id first, got {header[0]!r}"
-        pids = [int(r.split(",", 1)[0]) for r in rows[1:]]
-        assert pids == list(range(3 * N)), "packet_id is not the contiguous 0..3N-1 after stitching"
-
-    print(f"pcapng2lance stitch-equiv ok: stitch(3 x {N}) == full({3*N}) bit-exact, packet_id 0..{3*N-1}")
+        case_core(t)
+        case_order(t)
+        case_uneven(t)
+        case_single(t)
+        case_decode(t)
+    print("pcapng2lance stitch-equiv ok (core / order / uneven / single / decode-l2l3)")
     return 0
 
 
