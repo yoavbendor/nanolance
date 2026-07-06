@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Python bindings
+
+on:
+  push:
+    branches: [main, "claude/**", "cursor/**"]
+    paths:
+      - "bindings/python/**"
+      - "include/**"
+      - "src/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/bindings-python.yml"
+  pull_request:
+    paths:
+      - "bindings/python/**"
+      - "include/**"
+      - "src/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/bindings-python.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: bindings-python-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13 python3.12-dev
+
+      - name: Cache fetched deps
+        uses: actions/cache@v4
+        with:
+          path: .deps
+          key: deps-bindings-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'bindings/python/CMakeLists.txt') }}
+
+      - name: Install package + test deps
+        working-directory: bindings/python
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e ".[test]"
+
+      - name: Run pytest (parity, full cycle, memory)
+        working-directory: bindings/python
+        run: pytest -m "not bench"
+
+      - name: Run benchmark smoke (informational)
+        working-directory: bindings/python
+        run: pytest -m bench
