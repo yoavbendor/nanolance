@@ -109,7 +109,42 @@ bool parse_miniblock_payload_chunks(const std::vector<std::uint8_t>& payload, st
         }
         out.insert(out.end(), payload.begin() + static_cast<std::ptrdiff_t>(data_start),
                    payload.begin() + static_cast<std::ptrdiff_t>(data_end));
-        offset = data_end;
+        offset = (data_end + 7U) & ~static_cast<std::size_t>(7U);
+    }
+    return true;
+}
+
+bool parse_miniblock_payload_chunk_list(const std::vector<std::uint8_t>& payload,
+                                        std::vector<std::vector<std::uint8_t>>& out, std::string& error) {
+    out.clear();
+    std::size_t offset = 0;
+    while (offset < payload.size()) {
+        if (offset + 8U > payload.size()) {
+            error = "truncated miniblock payload header";
+            return false;
+        }
+        if (payload[offset] != 0U || payload[offset + 1U] != 0U) {
+            error = "unexpected miniblock payload prefix";
+            return false;
+        }
+        std::uint16_t chunk_size = 0;
+        if (!read_le16(payload.data() + offset + 2U, chunk_size)) {
+            error = "failed to read miniblock chunk size";
+            return false;
+        }
+        if (payload[offset + 6U] != 0xFEU || payload[offset + 7U] != 0xFEU) {
+            error = "unexpected miniblock payload marker";
+            return false;
+        }
+        const auto data_start = offset + 8U;
+        const auto data_end = data_start + static_cast<std::size_t>(chunk_size);
+        if (data_end > payload.size()) {
+            error = "miniblock chunk exceeds payload";
+            return false;
+        }
+        out.emplace_back(payload.begin() + static_cast<std::ptrdiff_t>(data_start),
+                         payload.begin() + static_cast<std::ptrdiff_t>(data_end));
+        offset = (data_end + 7U) & ~static_cast<std::size_t>(7U);
     }
     return true;
 }
@@ -495,6 +530,89 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             } else {
                 std::vector<std::uint32_t> offs;
                 expand(offs);
+            }
+        }
+        return true;
+    }
+
+    // Structural dictionary variable-width column: buffer[1] = bitpacked u32 indices, buffer[2] = dictionary.
+    if (field_metadata_equals(on_disk_field, "nanolance:packing", "dict")) {
+        out.kind = ColumnValues::Kind::VariableWidth;
+        out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
+        for (const auto& page : column_metadata.pages) {
+            if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
+                error = "dict page missing buffers";
+                return false;
+            }
+            std::vector<std::uint8_t> payload;
+            std::vector<std::uint8_t> dict_block;
+            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[1], page.buffer_sizes[1], payload,
+                                            error) ||
+                !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_block,
+                                            error)) {
+                return false;
+            }
+            if (dict_block.size() < 8U) {
+                error = "dict block too short";
+                return false;
+            }
+            std::uint32_t bytes_start = 0;
+            std::memcpy(&bytes_start, dict_block.data() + 4U, 4U);
+            if (bytes_start < 12U || bytes_start > dict_block.size() || (bytes_start - 8U) % 4U != 0U) {
+                error = "dict block header invalid";
+                return false;
+            }
+            const std::size_t num_dict = (bytes_start - 8U) / 4U - 1U;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> dict_ranges(num_dict);
+            for (std::size_t d = 0; d < num_dict; ++d) {
+                std::uint32_t a = 0;
+                std::uint32_t b = 0;
+                std::memcpy(&a, dict_block.data() + 8U + d * 4U, 4U);
+                std::memcpy(&b, dict_block.data() + 8U + (d + 1U) * 4U, 4U);
+                if (bytes_start + b > dict_block.size() || b < a) {
+                    error = "dict offsets out of range";
+                    return false;
+                }
+                dict_ranges[d] = {bytes_start + a, b - a};
+            }
+            std::vector<std::vector<std::uint8_t>> chunks;
+            if (!parse_miniblock_payload_chunk_list(payload, chunks, error)) {
+                return false;
+            }
+            if (chunks.empty()) {
+                error = "dict page has no index chunks";
+                return false;
+            }
+            std::vector<std::uint8_t> indices_bytes;
+            std::uint64_t rows_remaining = page.length;
+            for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
+                const auto count = std::min<std::uint64_t>(1024U, rows_remaining);
+                if (!unpack_bitpacked_page_dispatch(chunks[ci], count, 4U, indices_bytes, error)) {
+                    return false;
+                }
+                rows_remaining -= count;
+            }
+            if (rows_remaining != 0U || indices_bytes.size() != page.length * 4U) {
+                error = "dict index count mismatch";
+                return false;
+            }
+            const bool first_page = out.variable.offsets.empty();
+            std::uint64_t cumulative = out.variable.data.size();
+            if (first_page) {
+                append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
+            }
+            for (std::uint64_t r = 0; r < page.length; ++r) {
+                std::uint32_t index = 0;
+                std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
+                if (index >= num_dict) {
+                    error = "dict index out of range";
+                    return false;
+                }
+                const auto [start, len] = dict_ranges[index];
+                out.variable.data.insert(out.variable.data.end(), dict_block.begin() + static_cast<std::ptrdiff_t>(start),
+                                         dict_block.begin() + static_cast<std::ptrdiff_t>(start + len));
+                cumulative += len;
+                append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
             }
         }
         return true;
