@@ -83,11 +83,14 @@ std::size_t value_width_bytes(const LanceField& field) {
 }
 
 constexpr std::uint32_t kMaxEightByteWordsPerMetadata = 4095U;
-constexpr std::uint32_t kMaxUncompressedMiniblockBytes = 800U;
-// Variable-width chunks may be much larger: one chunk = one page here, so a small cap means thousands
-// of tiny pages (huge per-page overhead). The miniblock control word is 12-bit (4095 eight-byte
-// words), so a single chunk can hold up to 4095*8 = 32760 bytes.
+// Flat (uncompressed) fixed-width chunks are capped at the same 32 KB miniblock max as the
+// variable-width path. A previous 800-byte cap turned a 1.6 MB float column into ~2000 tiny chunks,
+// and since one chunk == one page here, that meant ~2000 pages each paying full per-page allocation,
+// protobuf, and stream-position overhead (dominant in profiles for float/int struct columns). The
+// miniblock control word is 12-bit (4095 eight-byte words => 32760 bytes) and the per-chunk size is a
+// u16, so 32760 is the largest chunk that both structures can describe.
 constexpr std::uint32_t kMaxVariableMiniblockBytes = kMaxEightByteWordsPerMetadata * 8U;
+constexpr std::uint32_t kMaxUncompressedMiniblockBytes = kMaxVariableMiniblockBytes;
 
 struct MiniblockChunk {
     std::vector<std::uint8_t> bytes;
@@ -113,7 +116,9 @@ void write_string_field(std::vector<std::uint8_t>& out, std::uint32_t field_numb
 }
 
 std::uint8_t flat_bits_per_value_token(const LanceField& field) {
-    const auto bits = bits_per_value(field);
+    // bool is stored one byte per value on disk (bits_per_value reports the logical 1 bit), so the
+    // flat page must advertise 8-bit values to stay consistent with value_width_bytes()==1.
+    const auto bits = field.logical_type == "bool" ? 8U : bits_per_value(field);
     if (bits == 64U) {
         return 0x40U;
     }
@@ -208,21 +213,44 @@ std::vector<std::uint8_t> control_buffer_for(const std::vector<MiniblockChunk>& 
     return out;
 }
 
+void append_miniblock_chunk(std::vector<std::uint8_t>& out, const MiniblockChunk& chunk) {
+    out.push_back(0U);
+    out.push_back(0U);
+    append_le16(out, static_cast<std::uint16_t>(chunk.bytes.size()));
+    out.push_back(0U);
+    out.push_back(0U);
+    out.push_back(0xFEU);
+    out.push_back(0xFEU);
+    out.insert(out.end(), chunk.bytes.begin(), chunk.bytes.end());
+    while (out.size() % 8U != 0U) {
+        out.push_back(0U);
+    }
+}
+
 std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& chunks) {
     std::vector<std::uint8_t> out;
     for (const auto& chunk : chunks) {
-        out.push_back(0U);
-        out.push_back(0U);
-        append_le16(out, static_cast<std::uint16_t>(chunk.bytes.size()));
-        out.push_back(0U);
-        out.push_back(0U);
-        out.push_back(0xFEU);
-        out.push_back(0xFEU);
-        out.insert(out.end(), chunk.bytes.begin(), chunk.bytes.end());
-        while (out.size() % 8U != 0U) {
-            out.push_back(0U);
-        }
+        append_miniblock_chunk(out, chunk);
     }
+    return out;
+}
+
+// Single-chunk fast paths: nanolance emits one chunk per page, so the general vector-based helpers
+// above would otherwise force callers to wrap each chunk in a temporary one-element vector (an extra
+// heap allocation and copy of the whole chunk on every page). These avoid that entirely.
+std::vector<std::uint8_t> control_buffer_for(const MiniblockChunk& chunk) {
+    std::vector<std::uint8_t> out;
+    const auto words = static_cast<std::uint16_t>((chunk.bytes.size() + 7U) / 8U);
+    append_le16(out, static_cast<std::uint16_t>(words << 4U));
+    out.push_back(0U);
+    out.push_back(0U);
+    return out;
+}
+
+std::vector<std::uint8_t> miniblock_payload(const MiniblockChunk& chunk) {
+    std::vector<std::uint8_t> out;
+    out.reserve(chunk.bytes.size() + 16U);
+    append_miniblock_chunk(out, chunk);
     return out;
 }
 
@@ -1022,18 +1050,16 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         const bool zstd_variable = is_variable && compress;
         pb::ColumnMetadata column;
         column.encoding = column_encoding_bytes();
-        for (const auto& chunk : chunks) {
-            MiniblockChunk stored_chunk = chunk;
+        for (auto& chunk : chunks) {
             if (zstd_variable) {
                 std::vector<std::uint8_t> framed;
                 if (!zstd_frame_buffer(chunk.bytes, compression_level, framed, error)) {
                     return false;
                 }
-                stored_chunk.bytes = std::move(framed);  // value_count unchanged; bytes are now [u64][zstd]
+                chunk.bytes = std::move(framed);  // value_count unchanged; bytes are now [u64][zstd]
             }
-            const std::vector<MiniblockChunk> single_chunk{stored_chunk};
-            const auto control = control_buffer_for(single_chunk);
-            const auto payload = miniblock_payload(single_chunk);
+            const auto control = control_buffer_for(chunk);
+            const auto payload = miniblock_payload(chunk);
 
             align64(out);
             const auto control_offset = pos(out);

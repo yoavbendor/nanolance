@@ -623,8 +623,28 @@ struct ColumnPlan {
 
 // Bulk-fill a fixed-width child array's data buffer from the already-decoded column bytes.
 bool fill_fixed_child(ArrowArray* child, const std::vector<std::uint8_t>& bytes, std::int64_t rows,
-                      std::string& error) {
+                      FixedFmt fmt, std::string& error) {
     ArrowBuffer* data = ArrowArrayBuffer(child, 1);
+    // bool is one byte per value on disk but bit-packed (1 bit/value, LSB-first) in the Arrow buffer,
+    // so it cannot be bulk-copied like the wider fixed types; pack the bits here.
+    if (fmt == FixedFmt::kBool) {
+        const auto packed_bytes = static_cast<std::size_t>((rows + 7) / 8);
+        if (ArrowBufferReserve(data, static_cast<std::int64_t>(packed_bytes)) != NANOARROW_OK) {
+            error = "failed to reserve bool data buffer";
+            return false;
+        }
+        std::vector<std::uint8_t> packed(packed_bytes, 0U);
+        for (std::int64_t i = 0; i < rows; ++i) {
+            if (bytes[static_cast<std::size_t>(i)] != 0U) {
+                packed[static_cast<std::size_t>(i) >> 3U] |=
+                    static_cast<std::uint8_t>(1U << (static_cast<std::size_t>(i) & 7U));
+            }
+        }
+        ArrowBufferAppendUnsafe(data, packed.data(), static_cast<std::int64_t>(packed.size()));
+        child->length = rows;
+        child->null_count = 0;
+        return true;
+    }
     if (ArrowBufferReserve(data, static_cast<std::int64_t>(bytes.size())) != NANOARROW_OK) {
         error = "failed to reserve fixed data buffer";
         return false;
@@ -746,7 +766,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     if (bulk_ok) {
         for (auto& plan : plans) {
             const bool ok = plan.kind == ColumnPlan::Kind::Fixed
-                                ? fill_fixed_child(plan.array, plan.values->fixed, length, error)
+                                ? fill_fixed_child(plan.array, plan.values->fixed, length, plan.fmt, error)
                                 : fill_variable_child(plan.array, plan.values->variable, length, error);
             if (!ok) {
                 ArrowArrayRelease(&batch);

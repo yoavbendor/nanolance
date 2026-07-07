@@ -141,9 +141,10 @@ workflow on every push (CI-owned file). Local runs write `bench/linux-local-resu
 
 Where Parquet wins: high-cardinality strings and monotonic **high-range** integers (Parquet
 delta-encodes; Lance and nanolance bitpack absolute values). Store such columns as app-level deltas to
-recover the win. Known TODO: the **flat** fixed-width path still caps chunks at 800 bytes, so a large
-incompressible integer column becomes many tiny pages — widen it to the 32 KB miniblock max (as the
-variable-width path already is) before trying to store such columns flat instead of bitpacked.
+recover the win. The **flat** fixed-width path (uncompressed floats/doubles and any non-bitpacked
+fixed width) now chunks at the same 32 KB miniblock max as the variable-width path; the old 800-byte
+cap turned a large float column into thousands of tiny one-chunk pages and made float/struct writes
+allocation-bound (fixed — float/struct writes are now at Lance parity or faster).
 
 ## 5. Verifying Lance interop (do this after changes)
 
