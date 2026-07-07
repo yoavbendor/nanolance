@@ -489,7 +489,11 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
         // `state->schema_mapping` is the ingest-shape mapping captured on the first batch; compare the
         // new batch's ingest mapping directly. (Finalization to the packed blob layout happens at commit,
         // not here — finalizing only the candidate made every 2nd+ blob batch look like a schema change.)
-        return set_error(writer, NANO_LANCE_UNSUPPORTED, "schema changes are not supported in this phase");
+        return set_error(writer, NANO_LANCE_UNSUPPORTED,
+                         "all batches in a writer session must share one schema (locked by the first "
+                         "batch); " +
+                             nano_lance::describe_schema_mapping_mismatch(state->schema_mapping,
+                                                                          batch_mapping));
     }
 
     const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;

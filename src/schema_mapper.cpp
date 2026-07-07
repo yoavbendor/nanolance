@@ -348,6 +348,43 @@ bool schema_mappings_equal(const LanceSchemaMapping& left, const LanceSchemaMapp
     return true;
 }
 
+std::string describe_schema_mapping_mismatch(const LanceSchemaMapping& expected,
+                                             const LanceSchemaMapping& actual) {
+    if (expected.fields.size() != actual.fields.size()) {
+        return "column count differs (writer schema has " + std::to_string(expected.fields.size()) +
+               " field(s), new batch has " + std::to_string(actual.fields.size()) + ")";
+    }
+    const auto describe_field = [](const LanceField& f) {
+        std::string type = !f.extension_name.empty() ? f.extension_name
+                           : !f.logical_type.empty() ? f.logical_type
+                                                     : f.arrow_format;
+        return "'" + f.name + "' (" + type + ")";
+    };
+    for (std::size_t i = 0; i < expected.fields.size(); ++i) {
+        const auto& e = expected.fields[i];
+        const auto& a = actual.fields[i];
+        if (mappings_field_equal(e, a)) {
+            continue;
+        }
+        std::string reason;
+        if (e.name != a.name) {
+            reason = "field name/order";
+        } else if (e.logical_type != a.logical_type || e.arrow_format != a.arrow_format ||
+                   e.dictionary_value_logical_type != a.dictionary_value_logical_type) {
+            reason = "type";
+        } else if (e.nullable != a.nullable) {
+            reason = "nullability";
+        } else if (e.extension_name != a.extension_name) {
+            reason = "extension type";
+        } else {
+            reason = "field definition";
+        }
+        return reason + " mismatch at column " + std::to_string(i) + ": writer schema has " +
+               describe_field(e) + ", new batch has " + describe_field(a);
+    }
+    return "schemas differ";
+}
+
 namespace {
 
 std::string disk_logical_type_to_internal(const std::string& disk) {

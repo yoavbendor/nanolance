@@ -361,6 +361,10 @@ add_executable(nano_lance_structural_default_test tests/test_structural_default.
 target_compile_features(nano_lance_structural_default_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_structural_default_test PRIVATE nanolance)
 
+add_executable(nano_lance_schema_change_error_test tests/test_schema_change_error.cpp)
+target_compile_features(nano_lance_schema_change_error_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_schema_change_error_test PRIVATE nanolance)
+
 add_executable(nano_lance_dict_roundtrip_test tests/test_dict_roundtrip.cpp)
 target_compile_features(nano_lance_dict_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_dict_roundtrip_test PRIVATE nanolance)
@@ -455,6 +459,9 @@ set_tests_properties(nano_lance_dict_rle_roundtrip PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_structural_default COMMAND $<TARGET_FILE:nano_lance_structural_default_test>)
 set_tests_properties(nano_lance_structural_default PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_schema_change_error COMMAND $<TARGET_FILE:nano_lance_schema_change_error_test>)
+set_tests_properties(nano_lance_schema_change_error PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_dict_roundtrip COMMAND $<TARGET_FILE:nano_lance_dict_roundtrip_test>)
 set_tests_properties(nano_lance_dict_roundtrip PROPERTIES LABELS "smoke")

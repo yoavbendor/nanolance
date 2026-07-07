@@ -88,6 +88,11 @@ std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& m
 
 bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error, bool ignore_nullability = false);
 bool schema_mappings_equal(const LanceSchemaMapping& left, const LanceSchemaMapping& right);
+/// Human-readable description of the first way `actual` differs from `expected` (column count, or the
+/// first field whose name/order, type, nullability, or extension differs). Returns a generic string if
+/// they compare equal. Used to produce an informative error when a batch's schema changes mid-write.
+std::string describe_schema_mapping_mismatch(const LanceSchemaMapping& expected,
+                                             const LanceSchemaMapping& actual);
 
 /// Rebuild `LanceSchemaMapping` from an on-disk manifest (inverse of manifest_writer field mapping).
 bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchemaMapping& out, std::string& error);
