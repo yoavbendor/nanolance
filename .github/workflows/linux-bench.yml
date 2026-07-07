@@ -1,10 +1,13 @@
 name: linux-bench
 
-# Builds + tests + benchmarks + profiles nanolance on an Ubuntu/clang runner, then commits the
-# results to bench/linux-ci-results.md so they can be pulled back. This file is CI-owned: only this
-# workflow writes it. Local runs use bench/linux-local-results.md (see bench/run-local-bench.sh) so
-# the two never collide. Path filter excludes bench/ so the results commit (also tagged [skip ci])
-# does not retrigger.
+# Builds + tests + benchmarks + profiles nanolance on an Ubuntu/clang runner. On the default branch
+# (main) it commits the results to bench/linux-ci-results.md so they can be pulled back; on every
+# other branch it still runs the full build/test/bench for CI signal but does NOT commit results.
+# This keeps the CI-owned results file out of feature branches entirely, so run-to-run benchmark
+# noise can never produce merge conflicts on that file. This file is CI-owned: only this workflow
+# writes it. Local runs use bench/linux-local-results.md (see bench/run-local-bench.sh) so the two
+# never collide. Path filter excludes bench/ so the results commit (also tagged [skip ci]) does not
+# retrigger.
 on:
   push:
     paths:
@@ -115,6 +118,7 @@ jobs:
           } > bench/linux-ci-results.md
 
       - name: Commit results back
+        if: github.ref == 'refs/heads/main'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
