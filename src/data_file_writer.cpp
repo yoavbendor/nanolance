@@ -13,9 +13,9 @@
 #include <array>
 #include <cstring>
 #include <fstream>
-#include <map>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -385,7 +385,7 @@ std::vector<std::uint8_t> page_layout_bytes_rle(std::uint8_t value_bits, std::ui
 
 // Build the dictionary's inner Variable block (Lance VariableEncoder block format):
 // [u32 bits_per_offset=32][u32 bytes_start_offset][u32 offsets (N+1, relative to data, start 0)][data].
-std::vector<std::uint8_t> build_dict_variable_block(const std::vector<std::string>& distinct) {
+std::vector<std::uint8_t> build_dict_variable_block(const std::vector<std::string_view>& distinct) {
     const std::size_t n = distinct.size();
     const auto bytes_start_offset = static_cast<std::uint32_t>(8U + (n + 1U) * 4U);
     std::vector<std::uint8_t> out;
@@ -857,24 +857,24 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 std::memcpy(&v, p, 4);
                 return v;
             };
-            std::map<std::string, std::uint32_t> dict;
-            std::vector<std::string> distinct;
+            // Dictionary keyed by string_view into the stable column data buffer: no per-row heap
+            // string allocation and hash lookups instead of full-string red-black-tree comparisons.
+            std::unordered_map<std::string_view, std::uint32_t> dict;
+            dict.reserve(num_rows / 4U + 1U);
+            std::vector<std::string_view> distinct;
             std::vector<std::uint32_t> indices;
             indices.reserve(num_rows);
             for (std::size_t r = 0; r < num_rows; ++r) {
                 const auto s = read_offset(r);
                 const auto e = read_offset(r + 1);
-                std::string val(reinterpret_cast<const char*>(values.variable.data.data() + s),
-                                static_cast<std::size_t>(e - s));
-                auto it = dict.find(val);
-                if (it == dict.end()) {
-                    const auto id = static_cast<std::uint32_t>(distinct.size());
-                    dict.emplace(val, id);
-                    distinct.push_back(std::move(val));
-                    indices.push_back(id);
-                } else {
-                    indices.push_back(it->second);
+                const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
+                                           static_cast<std::size_t>(e - s));
+                const auto id = static_cast<std::uint32_t>(distinct.size());
+                const auto [it, inserted] = dict.emplace(val, id);
+                if (inserted) {
+                    distinct.push_back(val);
                 }
+                indices.push_back(it->second);
             }
             // RLE the u32 indices (8-bit sub-runs).
             std::vector<std::uint8_t> run_values;
@@ -947,24 +947,24 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 std::memcpy(&v, p, 4);
                 return v;
             };
-            std::map<std::string, std::uint32_t> dict;
-            std::vector<std::string> distinct;
+            // Dictionary keyed by string_view into the stable column data buffer: no per-row heap
+            // string allocation and hash lookups instead of full-string red-black-tree comparisons.
+            std::unordered_map<std::string_view, std::uint32_t> dict;
+            dict.reserve(num_rows / 4U + 1U);
+            std::vector<std::string_view> distinct;
             std::vector<std::uint32_t> indices;
             indices.reserve(num_rows);
             for (std::size_t r = 0; r < num_rows; ++r) {
                 const auto s = read_offset(r);
                 const auto e = read_offset(r + 1);
-                std::string val(reinterpret_cast<const char*>(values.variable.data.data() + s),
-                                static_cast<std::size_t>(e - s));
-                auto it = dict.find(val);
-                if (it == dict.end()) {
-                    const auto id = static_cast<std::uint32_t>(distinct.size());
-                    dict.emplace(val, id);
-                    distinct.push_back(std::move(val));
-                    indices.push_back(id);
-                } else {
-                    indices.push_back(it->second);
+                const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
+                                           static_cast<std::size_t>(e - s));
+                const auto id = static_cast<std::uint32_t>(distinct.size());
+                const auto [it, inserted] = dict.emplace(val, id);
+                if (inserted) {
+                    distinct.push_back(val);
                 }
+                indices.push_back(it->second);
             }
             std::vector<MiniblockChunk> index_chunks;
             for (std::size_t off = 0; off < indices.size(); off += 1024U) {
