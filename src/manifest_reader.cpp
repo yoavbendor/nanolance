@@ -3,6 +3,8 @@
 
 #include "nanolance/manifest_reader.hpp"
 
+#include "nanolance/read_safety.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <fstream>
@@ -138,6 +140,20 @@ bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifes
     if (!pb::decode_manifest(body, out)) {
         error = "failed to decode manifest protobuf";
         return false;
+    }
+    // Bound element counts as defense-in-depth against a hostile manifest that packs an enormous number
+    // of (possibly tiny/empty) fields/fragments/files to amplify downstream allocations.
+    const auto& limits = default_read_limits();
+    if (out.fields.size() > limits.max_manifest_elements ||
+        out.fragments.size() > limits.max_manifest_elements) {
+        error = "manifest element count exceeds safety limit";
+        return false;
+    }
+    for (const auto& fragment : out.fragments) {
+        if (fragment.files.size() > limits.max_manifest_elements) {
+            error = "manifest fragment file count exceeds safety limit";
+            return false;
+        }
     }
     version_out = v;
     return true;
