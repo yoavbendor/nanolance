@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -30,11 +31,23 @@ struct BlobV2ExternalColumnValues {
     std::unordered_map<std::string, std::uint32_t> uri_to_id;
 };
 
+/// Structural-dictionary plan for a scattered low-cardinality string column, computed once by the
+/// write-side "is dictionary encoding beneficial?" heuristic and reused verbatim by the data-file
+/// encoder so the (dedup + per-row index) scan runs a single time instead of twice. `distinct` and
+/// `indices` are views/ids into the owning `VariableWidthColumnValues::data`, valid only while that
+/// buffer is alive and unmodified (true between the heuristic and the immediately following write).
+struct StructuralDictPlan {
+    bool computed = false;
+    std::vector<std::string_view> distinct;  // distinct values in first-appearance order (id == index)
+    std::vector<std::uint32_t> indices;      // per-row dictionary index into `distinct`
+};
+
 struct ColumnValues {
     enum class Kind { FixedWidth, VariableWidth, BlobV2External } kind = Kind::FixedWidth;
     std::vector<std::uint8_t> fixed;
     VariableWidthColumnValues variable;
     BlobV2ExternalColumnValues blob_v2;
+    StructuralDictPlan structural_dict_plan;
 };
 
 }  // namespace nano_lance

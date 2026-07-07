@@ -925,25 +925,35 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 std::memcpy(&v, p, 4);
                 return v;
             };
-            // Dictionary keyed by string_view into the stable column data buffer: no per-row heap
-            // string allocation and hash lookups instead of full-string red-black-tree comparisons.
-            std::unordered_map<std::string_view, std::uint32_t> dict;
-            dict.reserve(num_rows / 4U + 1U);
-            std::vector<std::string_view> distinct;
-            std::vector<std::uint32_t> indices;
-            indices.reserve(num_rows);
-            for (std::size_t r = 0; r < num_rows; ++r) {
-                const auto s = read_offset(r);
-                const auto e = read_offset(r + 1);
-                const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
-                                           static_cast<std::size_t>(e - s));
-                const auto id = static_cast<std::uint32_t>(distinct.size());
-                const auto [it, inserted] = dict.emplace(val, id);
-                if (inserted) {
-                    distinct.push_back(val);
+            // Reuse the dictionary the write-side heuristic already built for this column when it is
+            // available (the common path via the public writer): the (dedup + per-row index) scan is
+            // identical, so recomputing it here would double the hashing/comparison work for exactly
+            // the columns this encoding targets. Fall back to building it for direct callers of
+            // write_lance_data_file that never ran the heuristic (e.g. some tests).
+            std::unordered_map<std::string_view, std::uint32_t> dict;  // only used on the fallback path
+            std::vector<std::string_view> local_distinct;
+            std::vector<std::uint32_t> local_indices;
+            const bool have_plan = values.structural_dict_plan.computed;
+            if (!have_plan) {
+                dict.reserve(num_rows / 4U + 1U);
+                local_indices.reserve(num_rows);
+                for (std::size_t r = 0; r < num_rows; ++r) {
+                    const auto s = read_offset(r);
+                    const auto e = read_offset(r + 1);
+                    const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
+                                               static_cast<std::size_t>(e - s));
+                    const auto id = static_cast<std::uint32_t>(local_distinct.size());
+                    const auto [it, inserted] = dict.emplace(val, id);
+                    if (inserted) {
+                        local_distinct.push_back(val);
+                    }
+                    local_indices.push_back(it->second);
                 }
-                indices.push_back(it->second);
             }
+            const std::vector<std::string_view>& distinct =
+                have_plan ? values.structural_dict_plan.distinct : local_distinct;
+            const std::vector<std::uint32_t>& indices =
+                have_plan ? values.structural_dict_plan.indices : local_indices;
             std::vector<MiniblockChunk> index_chunks;
             for (std::size_t off = 0; off < indices.size(); off += 1024U) {
                 const auto count = std::min<std::size_t>(1024U, indices.size() - off);
