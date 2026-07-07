@@ -167,33 +167,6 @@ std::size_t max_values_per_uncompressed_chunk(std::size_t bytes_per_value) {
     return std::max<std::size_t>(1U, std::min(by_bytes, by_metadata));
 }
 
-bool build_miniblock_chunks(const std::vector<std::uint8_t>& values,
-                            std::size_t bytes_per_value,
-                            int compression_level,
-                            std::vector<MiniblockChunk>& chunks,
-                            std::string& error) {
-    (void)compression_level;
-    chunks.clear();
-    if (bytes_per_value == 0U || values.empty()) {
-        return true;
-    }
-    const auto total_values = values.size() / bytes_per_value;
-    const auto max_chunk_values = max_values_per_uncompressed_chunk(bytes_per_value);
-    std::size_t offset_values = 0;
-    while (offset_values < total_values) {
-        const auto remaining = total_values - offset_values;
-        const auto chunk_values = std::min(remaining, max_chunk_values);
-        const auto chunk_bytes = chunk_values * bytes_per_value;
-        const auto* chunk_start = values.data() + offset_values * bytes_per_value;
-        MiniblockChunk chunk;
-        chunk.value_count = chunk_values;
-        chunk.bytes.assign(chunk_start, chunk_start + static_cast<std::ptrdiff_t>(chunk_bytes));
-        chunks.push_back(std::move(chunk));
-        offset_values += chunk_values;
-    }
-    return true;
-}
-
 std::vector<std::uint8_t> control_buffer_for(const std::vector<MiniblockChunk>& chunks) {
     std::vector<std::uint8_t> out;
     out.reserve(chunks.size() * 2U);
@@ -252,6 +225,27 @@ std::vector<std::uint8_t> miniblock_payload(const MiniblockChunk& chunk) {
     out.reserve(chunk.bytes.size() + 16U);
     append_miniblock_chunk(out, chunk);
     return out;
+}
+
+// Stream one flat (uncompressed) miniblock chunk straight to `out`: the 8-byte miniblock chunk header,
+// then `chunk_bytes` value bytes copied directly from the column's value buffer, then 8-byte padding.
+// This is byte-identical to miniblock_payload() over a MiniblockChunk holding the same slice, but it
+// avoids materializing the slice into a MiniblockChunk and then again into a payload vector — for a
+// plain fixed-width column the chunk bytes are just a view into values.fixed. Returns bytes written.
+std::uint64_t stream_flat_miniblock_payload(std::ostream& out, const std::uint8_t* data,
+                                            std::size_t chunk_bytes) {
+    const std::array<char, 8> header{0, 0, static_cast<char>(chunk_bytes & 0xFFU),
+                                     static_cast<char>((chunk_bytes >> 8U) & 0xFFU), 0, 0,
+                                     static_cast<char>(0xFE), static_cast<char>(0xFE)};
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(chunk_bytes));
+    std::uint64_t written = 8U + chunk_bytes;
+    const auto pad = (8U - (written % 8U)) % 8U;
+    static constexpr std::array<char, 8> zeros{};
+    if (pad != 0U) {
+        out.write(zeros.data(), static_cast<std::streamsize>(pad));
+    }
+    return written + pad;
 }
 
 std::vector<std::uint8_t> bytes_from_hex(std::string_view hex) {
@@ -1016,11 +1010,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         const bool is_variable = values.kind == ColumnValues::Kind::VariableWidth;
         const bool bitpack = !is_variable && compress && lance_logical_type_is_bitpackable_integer(field.logical_type);
         const auto fixed_bytes_per_value = value_width_bytes(field);
-        if (is_variable) {
-            if (!build_variable_chunks_for_column(values.variable, chunks, error)) {
-                return false;
-            }
-        } else {
+        if (!is_variable) {
             if (values.fixed.size() % fixed_bytes_per_value != 0U) {
                 error = "column value buffer size is not aligned to field width for ";
                 error += field.name;
@@ -1031,19 +1021,64 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 error += field.name;
                 return false;
             }
-            if (bitpack) {
-                // One FastLanes 1024-value chunk per page; each chunk buffer = [bit_width][packed].
-                const auto total = values.fixed.size() / fixed_bytes_per_value;
-                for (std::size_t off = 0; off < total; off += 1024U) {
-                    const auto count = std::min<std::size_t>(1024U, total - off);
-                    MiniblockChunk chunk;
-                    chunk.value_count = count;
-                    chunk.bytes = build_bitpacked_chunk(values.fixed.data() + off * fixed_bytes_per_value, count,
-                                                        fixed_bytes_per_value);
-                    chunks.push_back(std::move(chunk));
-                }
-            } else if (!build_miniblock_chunks(values.fixed, fixed_bytes_per_value, compression_level, chunks, error)) {
+        }
+
+        // Flat (uncompressed) fixed-width column: stream each miniblock chunk directly from the value
+        // buffer. The generic path below would copy the values into a MiniblockChunk and then again
+        // into a payload vector; for a plain fixed-width column the chunk bytes are just a slice of
+        // values.fixed, so both copies are pure overhead (memcpy dominates this path after the chunk
+        // count was reduced). One chunk per page, byte-identical to the generic flat encoding.
+        if (!is_variable && !bitpack) {
+            pb::ColumnMetadata column;
+            column.encoding = column_encoding_bytes();
+            const auto total = values.fixed.size() / fixed_bytes_per_value;
+            const auto max_chunk_values = max_values_per_uncompressed_chunk(fixed_bytes_per_value);
+            for (std::size_t off = 0; off < total;) {
+                const auto count = std::min(max_chunk_values, total - off);
+                const auto chunk_bytes = count * fixed_bytes_per_value;
+                const auto words = static_cast<std::uint16_t>((chunk_bytes + 7U) / 8U);
+                const std::array<char, 4> control{static_cast<char>((words << 4U) & 0xFFU),
+                                                  static_cast<char>(((words << 4U) >> 8U) & 0xFFU), 0, 0};
+
+                align64(out);
+                const auto control_offset = pos(out);
+                out.write(control.data(), static_cast<std::streamsize>(control.size()));
+                align64(out);
+                const auto payload_offset = pos(out);
+                const auto payload_size = stream_flat_miniblock_payload(
+                    out, values.fixed.data() + off * fixed_bytes_per_value, chunk_bytes);
+
+                pb::ColumnPage page;
+                page.buffer_offsets.push_back(control_offset);
+                page.buffer_offsets.push_back(payload_offset);
+                page.buffer_sizes.push_back(control.size());
+                page.buffer_sizes.push_back(payload_size);
+                page.length = count;
+                page.priority = 0;
+                page.encoding = page_layout_bytes(field, count);
+                column.pages.push_back(std::move(page));
+                off += count;
+            }
+            columns.push_back(std::move(column));
+            continue;
+        }
+
+        if (is_variable) {
+            if (!build_variable_chunks_for_column(values.variable, chunks, error)) {
                 return false;
+            }
+        } else {
+            // Only bitpacked fixed-width columns reach here; the flat path streamed above and the
+            // variable path is handled just above. One FastLanes 1024-value chunk per page; each chunk
+            // buffer = [bit_width][packed].
+            const auto total = values.fixed.size() / fixed_bytes_per_value;
+            for (std::size_t off = 0; off < total; off += 1024U) {
+                const auto count = std::min<std::size_t>(1024U, total - off);
+                MiniblockChunk chunk;
+                chunk.value_count = count;
+                chunk.bytes = build_bitpacked_chunk(values.fixed.data() + off * fixed_bytes_per_value, count,
+                                                    fixed_bytes_per_value);
+                chunks.push_back(std::move(chunk));
             }
         }
 
