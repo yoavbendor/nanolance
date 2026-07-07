@@ -49,6 +49,7 @@ void throw_lance_reader(const char* context, int code, const char* err) {
 struct LanceWriterOptions {
     int compression_level = 3;
     bool compression = false;
+    bool structural_encoding = true;
     bool blob_uri_dictionary = false;
     bool ignore_nullability = true;
     bool append = false;
@@ -68,6 +69,12 @@ void write_table(nb::handle table, const std::filesystem::path& path, const Lanc
         rc = nano_lance_writer_set_compression(&writer, true);
         if (rc != NANO_LANCE_OK) {
             throw_lance_writer("nano_lance_writer_set_compression", rc, &writer);
+        }
+    }
+    if (!opts.structural_encoding) {
+        rc = nano_lance_writer_set_structural_encoding(&writer, false);
+        if (rc != NANO_LANCE_OK) {
+            throw_lance_writer("nano_lance_writer_set_structural_encoding", rc, &writer);
         }
     }
     if (opts.blob_uri_dictionary) {
@@ -134,6 +141,7 @@ NB_MODULE(_nanolance, m) {
         .def(nb::init<>())
         .def_rw("compression_level", &LanceWriterOptions::compression_level)
         .def_rw("compression", &LanceWriterOptions::compression)
+        .def_rw("structural_encoding", &LanceWriterOptions::structural_encoding)
         .def_rw("blob_uri_dictionary", &LanceWriterOptions::blob_uri_dictionary)
         .def_rw("ignore_nullability", &LanceWriterOptions::ignore_nullability)
         .def_rw("append", &LanceWriterOptions::append);

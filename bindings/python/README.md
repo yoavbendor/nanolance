@@ -54,7 +54,7 @@ assert lance.dataset("out.lance").to_table().equals(table)
 |----------|-------------|
 | `write_table(table, path, **opts)` | Write an Arrow table to a Lance dataset |
 | `read_table(path)` | Arrow-exportable Lance reader handle |
-| `WriteOptions` | `compression`, `compression_level`, `append`, `blob_uri_dictionary`, `ignore_nullability` |
+| `WriteOptions` | `compression`, `compression_level`, `structural_encoding`, `append`, `blob_uri_dictionary`, `ignore_nullability` |
 
 `write_table` accepts any Arrow-exportable input (pyarrow `Table` / `RecordBatch`, polars via `to_arrow()`, etc.).
 
@@ -66,9 +66,9 @@ assert lance.dataset("out.lance").to_table().equals(table)
 
 | Category | Supported | Notes |
 |----------|-----------|-------|
-| Integers | int8–int64, uint8–uint64 | With `compression=True`: FastLanes bitpacking, RLE, constant layout |
+| Integers | int8–int64, uint8–uint64 | FastLanes bitpacking, RLE, constant layout — **on by default** (`structural_encoding=True`) |
 | Floats | float32, float64 | Written **uncompressed** (no byte-stream-split yet) |
-| Strings / binary | utf8, large_utf8, binary, large_binary, fixed_size_binary | zstd, dict-RLE, structural dictionary, constant layout when `compression=True` |
+| Strings / binary | utf8, large_utf8, binary, large_binary, fixed_size_binary | dict-RLE, structural dictionary, constant layout **on by default**; zstd for high-cardinality columns only with `compression=True` |
 | Structs | nested struct columns | Same type coverage as [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) |
 | Nullability | nullable columns | Default `ignore_nullability=True` maps nullable Arrow fields to required Lance fields |
 | Append | `WriteOptions(append=True)` or `append=True` kwarg | Adds a fragment to an existing dataset |
@@ -80,7 +80,12 @@ assert lance.dataset("out.lance").to_table().equals(table)
 | **list, map, union** Arrow types | Flatten or serialize to string/binary |
 | **`lance.blob.v2` + URI dictionary** (`blob_uri_dictionary=True`) | nanolance-only; stock `lance` cannot read those blob columns |
 
-Turn on Lance-compatible compression with `compression=True` (off by default). See the root [README compression section](../../README.md#compression-lance-compatible) and [AGENTS.md §3](../../AGENTS.md#3-enabling-the-compression-that-was-measured) for per-type encodings.
+Two independent knobs control encoding: **structural** (lossless bitpacking / constant / RLE /
+dictionary / dict-RLE) is **on by default** (`structural_encoding=True`) and needs no `compression`;
+**zstd** for high-cardinality string/binary columns is opt-in via `compression=True` (off by default,
+with `compression_level`). Set `structural_encoding=False` for plain "raw" pages. Both stay
+stock-`lance`-readable. See the root [README compression section](../../README.md#compression-lance-compatible)
+and [AGENTS.md §3](../../AGENTS.md#3-enabling-the-compression-that-was-measured) for per-type encodings.
 
 ### Read (`read_table`)
 
