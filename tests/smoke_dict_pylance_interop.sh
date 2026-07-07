@@ -23,7 +23,11 @@ with open("$ipc_path", "wb") as sink:
         writer.write_table(table)
 PY
 
-"$bin" -o "$dataset_path" -c -l 3 < "$ipc_path"
+# --compress selects the structural-dictionary encoding for this scattered low-cardinality column.
+# Without it the writer emits a plain (zstd) string column and this test would not exercise the
+# dictionary path at all. The 50000 rows span many 1024-value index chunks, so this also covers the
+# multi-chunk miniblock chunk-meta layout that stock Lance must be able to read.
+"$bin" -o "$dataset_path" -c --compress -l 3 < "$ipc_path"
 
 "$python_bin" - "$dataset_path" <<'PY'
 import sys
