@@ -187,12 +187,13 @@ bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
 // Decide whether a structural dictionary (flat bitpacked indices + dictionary buffer) wins for a
 // scattered low-cardinality string column. Mirrors Lance defaults: dict-divisor=2, dict-size-ratio=0.8,
 // min 100 rows, max 100k distinct values.
-bool variable_column_dict_beneficial(const nano_lance::ColumnValues& cv) {
+bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv) {
     constexpr std::size_t kMinRows = 100U;
     constexpr std::size_t kDictDivisor = 2U;
     constexpr double kDictSizeRatio = 0.8;
     constexpr std::size_t kMaxCardinality = 100000U;
 
+    cv.structural_dict_plan = {};
     const std::size_t ow = cv.variable.large ? 8U : 4U;
     if (cv.variable.offsets.size() < 2U * ow) {
         return false;
@@ -214,9 +215,15 @@ bool variable_column_dict_beneficial(const nano_lance::ColumnValues& cv) {
     }
     const char* base = reinterpret_cast<const char*>(cv.variable.data.data());
     const std::size_t data_size = cv.variable.data.size();
+    // Build the dictionary (distinct values + per-row indices) exactly as the data-file encoder would,
+    // so on success the encoder can reuse this scan instead of repeating the dedup + index pass.
     std::unordered_map<std::string_view, std::uint32_t> dict;
     dict.reserve(rows / 4U);
+    std::vector<std::string_view> distinct;
+    std::vector<std::uint32_t> indices;
+    indices.reserve(rows);
     std::size_t raw_bytes = 0;
+    std::size_t dict_data = 0;
     for (std::size_t i = 0; i < rows; ++i) {
         const auto s = read_offset(i);
         const auto e = read_offset(i + 1);
@@ -226,26 +233,31 @@ bool variable_column_dict_beneficial(const nano_lance::ColumnValues& cv) {
         const auto len = static_cast<std::size_t>(e - s);
         raw_bytes += len;
         const std::string_view val(base + s, len);
-        auto it = dict.find(val);
-        if (it == dict.end()) {
-            if (dict.size() >= kMaxCardinality) {
+        const auto id = static_cast<std::uint32_t>(distinct.size());
+        const auto [it, inserted] = dict.emplace(val, id);
+        if (inserted) {
+            if (distinct.size() >= kMaxCardinality) {
                 return false;
             }
-            dict.emplace(val, static_cast<std::uint32_t>(dict.size()));
+            distinct.push_back(val);
+            dict_data += len;
         }
+        indices.push_back(it->second);
     }
-    if (dict.empty() || dict.size() > rows / kDictDivisor) {
+    if (distinct.empty() || distinct.size() > rows / kDictDivisor) {
         return false;
     }
-    std::size_t dict_data = 0;
-    for (const auto& [val, _] : dict) {
-        dict_data += val.size();
-    }
-    const std::size_t dict_bytes = 8U + (dict.size() + 1U) * 4U + dict_data;
+    const std::size_t dict_bytes = 8U + (distinct.size() + 1U) * 4U + dict_data;
     const std::size_t index_bytes = rows * 4U;
     const std::size_t raw_total = raw_bytes + (rows + 1U) * ow;
     const std::size_t encoded_total = dict_bytes + index_bytes;
-    return encoded_total < static_cast<std::size_t>(static_cast<double>(raw_total) * kDictSizeRatio);
+    if (encoded_total >= static_cast<std::size_t>(static_cast<double>(raw_total) * kDictSizeRatio)) {
+        return false;
+    }
+    cv.structural_dict_plan.computed = true;
+    cv.structural_dict_plan.distinct = std::move(distinct);
+    cv.structural_dict_plan.indices = std::move(indices);
+    return true;
 }
 
 WriterState* state_from(NanoLanceWriter* writer) {
@@ -597,7 +609,7 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
             if (!pf->extension_name.empty()) {
                 continue;
             }
-            const auto& cv = commit_columns[i];
+            auto& cv = commit_columns[i];
             std::vector<std::uint8_t> value;
             bool constant = false;
             if (cv.kind == nano_lance::ColumnValues::Kind::FixedWidth) {
