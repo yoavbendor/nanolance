@@ -47,7 +47,7 @@ Install for development: `pip install -e "bindings/python[test]"` then `pytest` 
 NanoLanceWriter w = {0};
 nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
 nano_lance_writer_set_ignore_nullability(&w, true);  // if your Arrow fields are nullable
-nano_lance_writer_set_compression(&w, true);         // Lance-compatible compression (off by default)
+nano_lance_writer_set_compression(&w, true);         // opt-in zstd for high-card strings (off by default)
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // repeatable; schema locks after batch #1
 nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append a fragment
 nano_lance_writer_close(&w);
@@ -59,10 +59,12 @@ nano_lance_writer_close(&w);
 
 - **Schema locks after the first `write_batch`** — every batch in a session shares it.
 - **Call all `set_*` options before the first `write_batch`** (compression, nullability, URI dictionary).
-- **`bool` row fields are not supported** (Arrow's 1-bit storage vs the byte-wide writer path) — use
-  `uint8` for flags.
-- **Compression is off by default.** One switch (`set_compression`) picks the right Lance encoding per
-  column; see [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured) for the per-type
+- **`bool` row fields are supported** — Arrow's 1-bit storage is expanded on write and re-packed on
+  read, round-tripping exactly (incl. under stock `lance`).
+- **Two independent knobs.** Lossless *structural* encodings (bitpacking / constant / RLE / dictionary /
+  dict-RLE) are **on by default** (`set_structural_encoding`, or `--no-structural` to disable); *zstd*
+  for high-cardinality string/binary columns is opt-in via `set_compression` (`--compress`), off by
+  default. See [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured) for the per-type
   table.
 - **To get small files, model external refs as plain `uri`/`position`/`size` columns**, *not* the packed
   `lance.blob.v2` descriptor (~41 B/row vs ~3.4 B/row). See [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
@@ -117,7 +119,6 @@ nano_lance_writer_close(&w);
 - For S3, export credentials to the environment if your profile uses SSO/assume-role.
 
 **Don't**
-- Don't use `bool` row fields — unsupported (Arrow 1-bit vs the byte-wide writer path).
 - Don't change the schema between batches in one session.
 - Don't enable `nano_lance_writer_set_blob_uri_dictionary` if stock Lance must read that column
   (nanolance-only, create-mode only).
@@ -247,18 +248,26 @@ transparently, so the data you read back is identical either way.
 
 ## Compression (Lance-compatible)
 
-`nano_lance_writer_set_compression(&writer, true)` (CLI: `--compress`) turns on Lance-compatible
-compression, off by default. The output stays readable by stock `lance` (verified against `lance`
-7.0.0); nanolance's own reader decodes it transparently.
+Encoding is controlled by two independent knobs. Both stay readable by stock `lance` (verified against
+`lance` 7.0.0); nanolance's own reader decodes them transparently.
 
-- **String / binary columns → zstd.** Each chunk's value buffer is stored as `[uint64 LE
-  uncompressed size][zstd frame]` and the `PageLayout` advertises `General(ZSTD)`, exactly as the
-  Lance reference writer does. A 5000-row repetitive string column round-trips identically and is
-  ~2.7× smaller. The zstd level is the writer's `compression_level`.
+**Structural encodings — on by default** (`nano_lance_writer_set_structural_encoding(&w, true)`; disable
+with `--no-structural`). These are lossless and cheap, so you get small files *without* `--compress`:
+
 - **Integer columns (8/16/32/64-bit) → FastLanes bitpacking.** Values are packed in 1024-element
   blocks at the minimum bit width, emitting `InlineBitpacking` (a faithful port of Lance's vendored
   `spiraldb/fastlanes` kernel). A 5000-row int64 column with ~10-bit values is ~6.4× smaller and
   reads back identically under stock `lance`.
+- **Constant / low-cardinality columns → ConstantLayout / RLE / dictionary / dict-RLE**, fixed-width or
+  string. A run-length URI column drops to ~0.03 B/row; a constant column to ~0.
+
+**zstd — opt-in** via `nano_lance_writer_set_compression(&writer, true)` (CLI `--compress`), off by
+default, for genuinely high-cardinality string/binary columns:
+
+- Each chunk's value buffer is stored as `[uint64 LE uncompressed size][zstd frame]` and the
+  `PageLayout` advertises `General(ZSTD)`, exactly as the Lance reference writer does. A 5000-row
+  repetitive string column round-trips identically and is ~2.7× smaller. The zstd level is the writer's
+  `compression_level` (it applies only to this path; structural encodings ignore it).
 
 Float/bool fixed-width columns are written uncompressed (Lance uses byte-stream-split / other
 schemes there, not yet implemented).

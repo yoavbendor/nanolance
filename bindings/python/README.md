@@ -68,6 +68,7 @@ assert lance.dataset("out.lance").to_table().equals(table)
 |----------|-----------|-------|
 | Integers | int8–int64, uint8–uint64 | FastLanes bitpacking, RLE, constant layout — **on by default** (`structural_encoding=True`) |
 | Floats | float32, float64 | Written **uncompressed** (no byte-stream-split yet) |
+| Bool | bool | Arrow's 1-bit layout expanded on write / re-packed on read; round-trips exactly |
 | Strings / binary | utf8, large_utf8, binary, large_binary, fixed_size_binary | dict-RLE, structural dictionary, constant layout **on by default**; zstd for high-cardinality columns only with `compression=True` |
 | Structs | nested struct columns | Same type coverage as [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) |
 | Nullability | nullable columns | Default `ignore_nullability=True` maps nullable Arrow fields to required Lance fields |
@@ -76,7 +77,6 @@ assert lance.dataset("out.lance").to_table().equals(table)
 
 | Not supported on write | Workaround |
 |------------------------|------------|
-| **`bool` columns** | Use `uint8` (0/1) — Arrow's 1-bit layout vs nanolance's byte-wide path |
 | **list, map, union** Arrow types | Flatten or serialize to string/binary |
 | **`lance.blob.v2` + URI dictionary** (`blob_uri_dictionary=True`) | nanolance-only; stock `lance` cannot read those blob columns |
 
