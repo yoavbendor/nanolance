@@ -37,8 +37,11 @@ jobs:
 
       - name: Install toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13
+          # Tolerate flaky third-party apt repos on the runner (azure-cli mirror occasionally 404s).
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13 python3 python3-pip
+          # pyarrow drives the arrowipc2lance smoke tests; missing it makes them error rather than skip.
+          python3 -m pip install --break-system-packages pyarrow
 
       - name: Cache fetched deps
         uses: actions/cache@v4
@@ -74,7 +77,7 @@ jobs:
 
       - name: Install toolchain
         run: |
-          sudo apt-get update
+          sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends cmake ninja-build clang-18 libclang-rt-18-dev
 
       - name: Cache fetched deps
