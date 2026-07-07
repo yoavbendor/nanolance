@@ -40,8 +40,9 @@ jobs:
           # Tolerate flaky third-party apt repos on the runner (azure-cli mirror occasionally 404s).
           sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13 python3 python3-pip
-          # pyarrow drives the arrowipc2lance smoke tests; missing it makes them error rather than skip.
-          python3 -m pip install --break-system-packages pyarrow
+          # pyarrow + pylance drive the arrowipc2lance / interop smoke tests (they error, not skip, when
+          # missing). Mirrors the bench workflow's setup so the same suite runs under sanitizers.
+          python3 -m pip install --quiet --break-system-packages pyarrow pylance || python3 -m pip install --quiet pyarrow pylance
 
       - name: Cache fetched deps
         uses: actions/cache@v4
