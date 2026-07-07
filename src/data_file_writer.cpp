@@ -658,15 +658,20 @@ bool build_variable_chunks(const VariableWidthColumnValues& column,
         return true;
     }
     const auto total_values = offsets.size() - 1U;
+    const auto offset_width = sizeof(OffsetType);
     std::size_t first_value = 0;
     while (first_value < total_values) {
-        std::size_t last_value = first_value + 1U;
+        // Grow the chunk as far as it fits, computing the packed size in O(1) per step directly from
+        // the offsets: packed = pad8((num_values + 1) * offset_width + (offsets[end] - offsets[first])).
+        // The previous version rebuilt (and memcpy'd) the whole growing chunk on every candidate value
+        // just to measure it, which is O(n^2) in the chunk length and dominated uncompressed
+        // variable-width writes. The full buffer is now materialized exactly once per finalized chunk.
+        std::size_t last_value = first_value + 1U;  // at least one value per chunk (a lone oversized value gets its own)
         while (last_value < total_values) {
-            std::vector<std::uint8_t> probe;
-            if (!build_variable_chunk_bytes(offsets, column.data, first_value, last_value + 1U, probe)) {
-                break;
-            }
-            if (probe.size() > kMaxVariableMiniblockBytes) {
+            const auto num_values = (last_value + 1U) - first_value;
+            const auto data_bytes = static_cast<std::size_t>(offsets[last_value + 1U] - offsets[first_value]);
+            const auto packed = padded_size((num_values + 1U) * offset_width + data_bytes, 8U);
+            if (packed > kMaxVariableMiniblockBytes) {
                 break;
             }
             last_value++;
