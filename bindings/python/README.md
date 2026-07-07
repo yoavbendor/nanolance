@@ -48,15 +48,47 @@ import lance
 assert lance.dataset("out.lance").to_table().equals(table)
 ```
 
+### Streaming / chunked writes
+
+For datasets too large to hold as one Arrow table, use `LanceWriter` as a context manager and feed one
+`RecordBatch` at a time — only a single chunk stays in memory. Set `max_rows_per_fragment` to flush a
+fragment (and free the writer's buffer) periodically, bounding memory; the multi-fragment result reads
+back as one table (a fragment is the Lance analogue of a Parquet row group).
+
+```python
+import pyarrow as pa
+import nanolance
+
+schema = pa.schema([("id", pa.int64()), ("value", pa.float64())])
+with nanolance.LanceWriter("big.lance", max_rows_per_fragment=1_000_000) as writer:
+    for chunk_id in range(10_000):
+        batch = pa.record_batch(
+            {
+                "id": pa.array(range(chunk_id * 5_000, (chunk_id + 1) * 5_000)),
+                "value": pa.array([float(i) for i in range(5_000)]),
+            },
+            schema=schema,
+        )
+        writer.write_batch(batch)
+        del batch  # only one chunk in memory at a time
+# close() (on __exit__) commits pending rows → a valid multi-fragment dataset
+
+# Read back chunk by chunk (one batch per fragment) without materializing one big array:
+reader = pa.RecordBatchReader.from_stream(nanolance.read_table("big.lance"))
+for batch in reader:
+    ...  # process one fragment's rows at a time
+```
+
 ## API
 
 | Function | Description |
 |----------|-------------|
-| `write_table(table, path, **opts)` | Write an Arrow table to a Lance dataset |
-| `read_table(path)` | Arrow-exportable Lance reader handle |
+| `write_table(table, path, **opts)` | Write an Arrow table to a Lance dataset (one fragment per input batch) |
+| `LanceWriter(path, *, max_rows_per_fragment=0, **opts)` | Streaming context-manager writer: `write_batch(batch)`, `flush()`, `close()` |
+| `read_table(path)` | Arrow-exportable Lance reader handle (exports an Arrow C stream, one batch per fragment) |
 | `WriteOptions` | `compression`, `compression_level`, `structural_encoding`, `append`, `blob_uri_dictionary`, `ignore_nullability` |
 
-`write_table` accepts any Arrow-exportable input (pyarrow `Table` / `RecordBatch`, polars via `to_arrow()`, etc.).
+`write_table` and `LanceWriter.write_batch` accept any Arrow-exportable input (pyarrow `Table` / `RecordBatch`, polars via `to_arrow()`, etc.). `LanceWriter` takes the same encoding options as `write_table` plus `max_rows_per_fragment` (0 = single fragment committed on close).
 
 ---
 
