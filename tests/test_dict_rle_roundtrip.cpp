@@ -58,6 +58,8 @@ void write_strings(const std::filesystem::path& ds, bool compress, const std::ve
     require(nano_lance_writer_init(&writer, ds.string().c_str(), 3) == NANO_LANCE_OK, "init");
     require(nano_lance_writer_set_ignore_nullability(&writer, true) == NANO_LANCE_OK, "ignore null");
     require(nano_lance_writer_set_compression(&writer, compress) == NANO_LANCE_OK, "compress");
+    // Structural encodings (incl. dict+RLE) are on by default; the plain baseline must disable them.
+    require(nano_lance_writer_set_structural_encoding(&writer, compress) == NANO_LANCE_OK, "set structural");
     require(nano_lance_write_batch(&writer, &source, &schema) == NANO_LANCE_OK, "write");
     require(nano_lance_writer_commit(&writer, false) == NANO_LANCE_OK, "commit");
     require(nano_lance_writer_close(&writer) == NANO_LANCE_OK, "close");

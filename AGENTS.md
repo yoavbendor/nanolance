@@ -70,20 +70,33 @@ Parquet Python bindings are a separate package in
 
 ## 3. Enabling the compression that was measured
 
-There is **one switch**: `nano_lance_writer_set_compression(&w, true)` (CLI: `arrowipc2lance
---compress`). It is **off by default** and picks the right Lance-compatible encoding per column type.
-All of these stay readable by stock `lance`; nanolance's own reader decodes them transparently.
+There are **two independent knobs** (this changed — there used to be one `--compress` switch):
 
-| Column type | Encoding applied | Measured (50k pcap-like rows) |
-|---|---|---|
-| Integer 8/16/32/64-bit | FastLanes **InlineBitpacking** (1024-value blocks) | int64 ~10-bit values: 84 → 3.4 B/row |
-| Constant column (all rows equal), fixed **or** string/binary | **ConstantLayout** (value stored once; ~0 data bytes) | constant int → 0.007, constant URI string → 0.009 B/row |
-| Low-cardinality run-length column, fixed **or** string | **RLE** (ints) / **Dictionary+RLE** (strings) | run-length URI: 2.90 → 0.033 B/row (87×); run-length int: → 0.027 B/row |
-| String / binary (non-constant, high-cardinality) | **zstd** (`General(ZSTD)`, `[u64 len][zstd]` per chunk) | repetitive string: 7.6 → ~3 B/row |
-| float / bool fixed-width | left uncompressed (Lance uses other schemes) | — |
+- **Structural encodings** — bitpacking, ConstantLayout, RLE, dictionary, dict+RLE. These are lossless
+  and cheap (usually *faster* to write than plain, always smaller), so they are **ON by default**:
+  `nano_lance_writer_set_structural_encoding(&w, true)` (default). Disable with the setter, or
+  `arrowipc2lance --no-structural`, to emit plain flat/variable-width pages ("raw" Lance output).
+- **zstd** — a real CPU-for-size tradeoff, applied to high-cardinality variable-width (string/binary)
+  columns only. **Off by default**: `nano_lance_writer_set_compression(&w, true)` (CLI `--compress`).
 
-`compression_level` is the zstd level (also used as a hint; 0 = zstd default). Bitpacking/constant
-ignore it.
+Both stay readable by stock `lance`; nanolance's own reader decodes them transparently. The picked
+encoding per column type:
+
+| Column type | Encoding applied | Knob | Measured (50k pcap-like rows) |
+|---|---|---|---|
+| Integer 8/16/32/64-bit | FastLanes **InlineBitpacking** (1024-value blocks) | structural (default) | int64 ~10-bit values: 84 → 3.4 B/row |
+| Constant column (all rows equal), fixed **or** string/binary | **ConstantLayout** (value stored once; ~0 data bytes) | structural (default) | constant int → 0.007, constant URI string → 0.009 B/row |
+| Low-cardinality run-length column, fixed **or** string | **RLE** (ints) / **Dictionary+RLE** (strings) | structural (default) | run-length URI: 2.90 → 0.033 B/row (87×); run-length int: → 0.027 B/row |
+| String / binary (non-constant, high-cardinality) | **zstd** (`General(ZSTD)`, `[u64 len][zstd]` per chunk) | `--compress` (opt-in) | repetitive string: 7.6 → ~3 B/row |
+| float / bool fixed-width | left uncompressed (Lance uses other schemes) | — | — |
+
+So a blob.v2 run-length URI column is now tiny **without** `--compress`; `--compress` only adds zstd on
+top for the genuinely high-cardinality string columns. `--compress` output is byte-identical to the
+old single-switch `--compress` (structural was always part of it); the default (no `--compress`) output
+now carries the structural encodings instead of plain pages.
+
+`compression_level` is the zstd level (also used as a hint; 0 = zstd default) and applies only to the
+zstd path; structural encodings ignore it.
 
 ### nanolance-only option: external-URI dictionary
 

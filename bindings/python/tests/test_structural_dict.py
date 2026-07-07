@@ -17,8 +17,10 @@ def test_structural_dict_roundtrip_and_size(tmp_path):
     plain_path = tmp_path / "plain.lance"
     dict_path = tmp_path / "dict.lance"
 
-    nanolance.write_table(table, plain_path, compression=False)
-    nanolance.write_table(table, dict_path, compression=True)
+    # Structural encodings are on by default now, so a true "plain" baseline must disable them; the
+    # dictionary encoding applies WITHOUT zstd (compression=False) since it is a structural encoding.
+    nanolance.write_table(table, plain_path, structural_encoding=False)
+    nanolance.write_table(table, dict_path, compression=False)
 
     back = pa.table(nanolance.read_table(dict_path))
     assert back.column("s").to_pylist() == vals

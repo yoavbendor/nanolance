@@ -19,6 +19,9 @@ from nanolance import _nanolance
 class WriteOptions:
     compression_level: int = 3
     compression: bool = False
+    # Structural, lossless re-encodings (integer bitpacking, ConstantLayout, RLE, string dictionary and
+    # dictionary+RLE). On by default and independent of ``compression`` (which controls only zstd).
+    structural_encoding: bool = True
     blob_uri_dictionary: bool = False
     ignore_nullability: bool = True
     append: bool = False
@@ -31,6 +34,7 @@ def write_table(
     options: WriteOptions | None = None,
     compression_level: int | None = None,
     compression: bool | None = None,
+    structural_encoding: bool | None = None,
     append: bool | None = None,
 ) -> None:
     """Write an Arrow table to a Lance dataset directory."""
@@ -39,11 +43,14 @@ def write_table(
         opts.compression_level = compression_level
     if compression is not None:
         opts.compression = compression
+    if structural_encoding is not None:
+        opts.structural_encoding = structural_encoding
     if append is not None:
         opts.append = append
     native = _nanolance.WriteOptions()
     native.compression_level = opts.compression_level
     native.compression = opts.compression
+    native.structural_encoding = opts.structural_encoding
     native.blob_uri_dictionary = opts.blob_uri_dictionary
     native.ignore_nullability = opts.ignore_nullability
     native.append = opts.append

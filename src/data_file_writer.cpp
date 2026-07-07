@@ -1049,7 +1049,11 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
 
         std::vector<MiniblockChunk> chunks;
         const bool is_variable = values.kind == ColumnValues::Kind::VariableWidth;
-        const bool bitpack = !is_variable && compress && lance_logical_type_is_bitpackable_integer(field.logical_type);
+        // Bitpacking is a structural encoding, signalled by the writer's packing tag (independent of the
+        // zstd `compress` flag, which now gates only the variable-width zstd path below).
+        const bool bitpack = !is_variable && packing_it != field.metadata.end() &&
+                             packing_it->second == "bitpack" &&
+                             lance_logical_type_is_bitpackable_integer(field.logical_type);
         const auto fixed_bytes_per_value = value_width_bytes(field);
         if (!is_variable) {
             if (values.fixed.size() % fixed_bytes_per_value != 0U) {
