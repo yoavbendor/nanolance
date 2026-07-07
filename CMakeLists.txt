@@ -337,6 +337,10 @@ add_executable(nano_lance_compression_roundtrip_test tests/test_compression_roun
 target_compile_features(nano_lance_compression_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_compression_roundtrip_test PRIVATE nanolance)
 
+add_executable(nano_lance_bool_roundtrip_test tests/test_bool_roundtrip.cpp)
+target_compile_features(nano_lance_bool_roundtrip_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_bool_roundtrip_test PRIVATE nanolance)
+
 add_executable(nano_lance_bitpacking_roundtrip_test tests/test_bitpacking_roundtrip.cpp)
 target_compile_features(nano_lance_bitpacking_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_bitpacking_roundtrip_test PRIVATE nanolance)
@@ -429,6 +433,9 @@ set_tests_properties(nano_lance_blob_v2_uri_dictionary PROPERTIES LABELS "smoke"
 
 add_test(NAME nano_lance_compression_roundtrip COMMAND $<TARGET_FILE:nano_lance_compression_roundtrip_test>)
 set_tests_properties(nano_lance_compression_roundtrip PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_bool_roundtrip COMMAND $<TARGET_FILE:nano_lance_bool_roundtrip_test>)
+set_tests_properties(nano_lance_bool_roundtrip PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_bitpacking_roundtrip COMMAND $<TARGET_FILE:nano_lance_bitpacking_roundtrip_test>)
 set_tests_properties(nano_lance_bitpacking_roundtrip PROPERTIES LABELS "smoke")
