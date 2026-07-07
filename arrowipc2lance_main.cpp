@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
     bool append = false;
     bool ignore_nullability = false;
     bool compress = false;
+    bool no_structural = false;
     int compression_level = 3;
 
     app.add_option("-o,--output", output_path, "Output Lance dataset path");
@@ -70,6 +71,8 @@ int main(int argc, char** argv) {
                  "Treat fixed-width nullable Arrow fields as non-null Lance fields and copy null slot bytes as-is");
     app.add_flag("--compress", compress,
                  "zstd-compress variable-width (string/binary) columns (Lance-compatible)");
+    app.add_flag("--no-structural", no_structural,
+                 "Disable structural encodings (bitpacking/constant/RLE/dictionary); emit plain pages");
     app.add_option("-l,--compression-level", compression_level, "Zstd compression level")->default_val(3);
 
     try {
@@ -168,6 +171,12 @@ int main(int argc, char** argv) {
         std::cerr << nano_lance_writer_last_error(&writer) << '\n';
         nano_lance_writer_close(&writer);
         return compression_status;
+    }
+    const int structural_status = nano_lance_writer_set_structural_encoding(&writer, !no_structural);
+    if (structural_status != NANO_LANCE_OK) {
+        std::cerr << nano_lance_writer_last_error(&writer) << '\n';
+        nano_lance_writer_close(&writer);
+        return structural_status;
     }
 
     ArrowIpcInputStream ipc_input{};

@@ -36,6 +36,10 @@ struct WriterState {
     bool ignore_nullability = false;
     bool blob_uri_dictionary = false;
     bool compression = false;
+    // Structural (lossless) re-encodings — bitpacking, ConstantLayout, RLE, dictionary, dict-RLE — are
+    // independent of zstd byte compression and on by default: they shrink files and usually speed up
+    // writes, and stay stock-Lance-readable. `compression` (set_compression) now controls ONLY zstd.
+    bool structural = true;
     bool has_schema = false;
     /// After the first successful manifest write, further commits must pass `is_append=true`.
     bool append_only_commits = false;
@@ -439,6 +443,20 @@ int nano_lance_writer_set_compression(NanoLanceWriter* writer, bool enable) {
     return NANO_LANCE_OK;
 }
 
+int nano_lance_writer_set_structural_encoding(NanoLanceWriter* writer, bool enable) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (state->pending_batches != 0 || state->pending_rows != 0) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE,
+                         "structural encoding must be set before writing batches");
+    }
+    state->structural = enable;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
 int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, struct ArrowSchema* schema) {
     auto* state = state_from(writer);
     if (state == nullptr) {
@@ -561,19 +579,21 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
         }
     }
 
-    // When compressing, tag each variable-width physical field so the reader knows to zstd-decompress.
-    // (Stock Lance reads the encoding from the data-file PageLayout; this metadata is nanolance's own
-    // read-side signal and is an inert write hint to Lance.)
-    if (state->compression) {
-        for (auto& field : disk_schema.fields) {
-            if (!nano_lance::lance_field_is_physical(field) || !field.extension_name.empty()) {
-                continue;
-            }
-            if (nano_lance::lance_field_is_variable_width(field.logical_type)) {
+    // Tag fields for encoding. zstd (a real CPU-for-size tradeoff) is opt-in via set_compression and
+    // only applies to variable-width columns. Integer bitpacking is a structural, lossless re-encoding
+    // and is enabled by the (default-on) structural switch. (Stock Lance reads the encoding from the
+    // data-file PageLayout; this metadata is nanolance's own read-side signal and an inert write hint
+    // to Lance.)
+    for (auto& field : disk_schema.fields) {
+        if (!nano_lance::lance_field_is_physical(field) || !field.extension_name.empty()) {
+            continue;
+        }
+        if (nano_lance::lance_field_is_variable_width(field.logical_type)) {
+            if (state->compression) {
                 field.metadata["lance-encoding:compression"] = "zstd";
-            } else if (nano_lance::lance_logical_type_is_bitpackable_integer(field.logical_type)) {
-                field.metadata["nanolance:packing"] = "bitpack";
             }
+        } else if (state->structural && nano_lance::lance_logical_type_is_bitpackable_integer(field.logical_type)) {
+            field.metadata["nanolance:packing"] = "bitpack";
         }
     }
 
@@ -601,8 +621,9 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
 
     // Constant fixed-width columns -> ConstantLayout (value inline in the page descriptor, zero data
     // bytes). Overrides the bitpack tag for those columns. Tags disk_schema so both the manifest and
-    // the data-file descriptor carry packing=constant + the raw value bytes for the reader.
-    if (state->compression) {
+    // the data-file descriptor carry packing=constant + the raw value bytes for the reader. These
+    // (constant / RLE / dictionary / dict-RLE) are structural encodings, independent of zstd.
+    if (state->structural) {
         const auto physical = nano_lance::lance_physical_fields(disk_schema);
         for (std::size_t i = 0; i < physical.size() && i < commit_columns.size(); ++i) {
             const auto* pf = physical[i];

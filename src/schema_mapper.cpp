@@ -269,10 +269,33 @@ bool map_field(const ArrowSchema& field,
     return true;
 }
 
+// Physical encoding annotations the writer stamps onto fields at commit (packing, zstd hint, const
+// value). They are per-fragment choices, not part of the logical schema, so they must be ignored when
+// deciding whether the user changed the schema between batches — otherwise an appended batch (whose
+// schema was reloaded from a manifest that carries these tags) would look like a schema change.
+bool is_encoding_metadata_key(const std::string& key) {
+    return key.rfind("nanolance:", 0) == 0 || key.rfind("lance-encoding:", 0) == 0;
+}
+
+bool metadata_equal_ignoring_encoding(const std::map<std::string, std::string>& lhs,
+                                      const std::map<std::string, std::string>& rhs) {
+    auto logical_only = [](const std::map<std::string, std::string>& m) {
+        std::map<std::string, std::string> out;
+        for (const auto& [k, v] : m) {
+            if (!is_encoding_metadata_key(k)) {
+                out.emplace(k, v);
+            }
+        }
+        return out;
+    };
+    return logical_only(lhs) == logical_only(rhs);
+}
+
 bool mappings_field_equal(const LanceField& lhs, const LanceField& rhs) {
     return lhs.name == rhs.name && lhs.logical_type == rhs.logical_type && lhs.arrow_format == rhs.arrow_format &&
            lhs.id == rhs.id && lhs.parent_id == rhs.parent_id && lhs.column_index == rhs.column_index &&
-           lhs.nullable == rhs.nullable && lhs.extension_name == rhs.extension_name && lhs.metadata == rhs.metadata &&
+           lhs.nullable == rhs.nullable && lhs.extension_name == rhs.extension_name &&
+           metadata_equal_ignoring_encoding(lhs.metadata, rhs.metadata) &&
            lhs.is_dictionary_index == rhs.is_dictionary_index &&
            lhs.dictionary_value_logical_type == rhs.dictionary_value_logical_type;
 }
