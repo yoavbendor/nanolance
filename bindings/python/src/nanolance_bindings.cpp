@@ -13,6 +13,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/string_view.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -117,6 +118,138 @@ void write_table(nb::handle table, const std::filesystem::path& path, const Lanc
     }
 }
 
+// Streaming, context-managed writer: feed one RecordBatch at a time and only hold a single chunk in
+// Python memory. Each committed fragment is written to disk immediately, so with `max_rows_per_fragment`
+// set the writer's own buffered column data stays bounded too (nanolance buffers batches until a commit;
+// a commit flushes them to a fragment and frees the buffer). A fragment is the Lance analogue of a
+// Parquet row group; close() commits any pending rows and finalizes the dataset.
+class LanceWriter {
+public:
+    LanceWriter(const std::filesystem::path& path, const LanceWriterOptions& opts,
+                std::int64_t max_rows_per_fragment)
+        : max_rows_per_fragment_(max_rows_per_fragment), append_mode_(opts.append) {
+        int rc = opts.append
+                     ? nano_lance_writer_init_append(&writer_, path.string().c_str(), opts.compression_level)
+                     : nano_lance_writer_init(&writer_, path.string().c_str(), opts.compression_level);
+        if (rc != NANO_LANCE_OK) {
+            throw_lance_writer("nano_lance_writer_init", rc, &writer_);
+        }
+        initialized_ = true;
+        if (opts.compression) {
+            rc = nano_lance_writer_set_compression(&writer_, true);
+            if (rc != NANO_LANCE_OK) {
+                throw_lance_writer("nano_lance_writer_set_compression", rc, &writer_);
+            }
+        }
+        if (!opts.structural_encoding) {
+            rc = nano_lance_writer_set_structural_encoding(&writer_, false);
+            if (rc != NANO_LANCE_OK) {
+                throw_lance_writer("nano_lance_writer_set_structural_encoding", rc, &writer_);
+            }
+        }
+        if (opts.blob_uri_dictionary) {
+            rc = nano_lance_writer_set_blob_uri_dictionary(&writer_, true);
+            if (rc != NANO_LANCE_OK) {
+                throw_lance_writer("nano_lance_writer_set_blob_uri_dictionary", rc, &writer_);
+            }
+        }
+        if (opts.ignore_nullability) {
+            rc = nano_lance_writer_set_ignore_nullability(&writer_, true);
+            if (rc != NANO_LANCE_OK) {
+                throw_lance_writer("nano_lance_writer_set_ignore_nullability", rc, &writer_);
+            }
+        }
+        // In append mode the dataset already exists, so every commit is an append.
+        committed_ = opts.append;
+    }
+
+    ~LanceWriter() {
+        if (initialized_ && !closed_) {
+            nano_lance_writer_close(&writer_);
+        }
+    }
+
+    LanceWriter(const LanceWriter&) = delete;
+    LanceWriter& operator=(const LanceWriter&) = delete;
+
+    void write_batch(nb::handle batch) {
+        if (closed_) {
+            throw std::runtime_error("write_batch on a closed LanceWriter");
+        }
+        auto imported = nanolance_py::arrow_capsule::import_batch(batch);
+        const std::int64_t rows = imported.second->length;
+        int rc = nano_lance_write_batch(&writer_, imported.second.get(), imported.first.get());
+        if (rc != NANO_LANCE_OK) {
+            throw_lance_writer("nano_lance_write_batch", rc, &writer_);
+        }
+        pending_rows_ += rows;
+        if (max_rows_per_fragment_ > 0 && pending_rows_ >= max_rows_per_fragment_) {
+            flush();
+        }
+    }
+
+    // Commit any buffered rows as a fragment (a no-op when nothing is pending). Lets callers force a
+    // fragment boundary; called automatically when max_rows_per_fragment is reached and on close().
+    void flush() {
+        if (closed_) {
+            throw std::runtime_error("flush on a closed LanceWriter");
+        }
+        if (pending_rows_ == 0) {
+            return;
+        }
+        int rc = nano_lance_writer_commit(&writer_, /*is_append=*/committed_);
+        if (rc != NANO_LANCE_OK) {
+            throw_lance_writer("nano_lance_writer_commit", rc, &writer_);
+        }
+        committed_ = true;
+        pending_rows_ = 0;
+    }
+
+    void close() {
+        if (closed_) {
+            return;
+        }
+        flush();
+        if (!committed_) {
+            // Create-mode writer that never received a batch — no manifest was written.
+            closed_ = true;
+            nano_lance_writer_close(&writer_);
+            throw std::runtime_error("cannot close LanceWriter with no batches written");
+        }
+        closed_ = true;
+        int rc = nano_lance_writer_close(&writer_);
+        if (rc != NANO_LANCE_OK) {
+            throw_lance_writer("nano_lance_writer_close", rc, &writer_);
+        }
+    }
+
+    LanceWriter* enter() { return this; }
+
+    bool exit(nb::handle exc_type, nb::handle /*exc*/, nb::handle /*tb*/) {
+        if (closed_) {
+            return false;
+        }
+        if (!exc_type.is_none()) {
+            // An exception is propagating: release the writer without committing partial data and
+            // without masking the original error.
+            closed_ = true;
+            nano_lance_writer_close(&writer_);
+            return false;
+        }
+        close();
+        return false;
+    }
+
+private:
+    NanoLanceWriter writer_{};
+    std::int64_t max_rows_per_fragment_ = 0;
+    std::int64_t pending_rows_ = 0;
+    bool append_mode_ = false;
+    bool committed_ = false;
+    bool initialized_ = false;
+    bool closed_ = false;
+};
+
 ExportedTable read_table(const std::filesystem::path& path) {
     ArrowSchema schema{};
     ArrowArray* batches = nullptr;
@@ -153,6 +286,21 @@ NB_MODULE(_nanolance, m) {
         },
         nb::arg("table"), nb::arg("path"), nb::arg("options") = LanceWriterOptions{},
         "Write an Arrow table to a Lance dataset directory.");
+
+    nb::class_<LanceWriter>(m, "LanceWriter")
+        .def(nb::init<const std::filesystem::path&, const LanceWriterOptions&, std::int64_t>(),
+             nb::arg("path"), nb::arg("options") = LanceWriterOptions{},
+             nb::arg("max_rows_per_fragment") = 0,
+             "Streaming Lance writer. Feed record batches with write_batch(); close() commits and "
+             "finalizes. Use as a context manager. max_rows_per_fragment>0 flushes a fragment once that "
+             "many rows are buffered, bounding memory for very large writes.")
+        .def("write_batch", &LanceWriter::write_batch, nb::arg("batch"),
+             "Append one Arrow RecordBatch (imported via the Arrow C array PyCapsule).")
+        .def("flush", &LanceWriter::flush, "Commit buffered rows as a fragment (forces a boundary).")
+        .def("close", &LanceWriter::close, "Commit pending rows and finalize the dataset.")
+        .def("__enter__", &LanceWriter::enter, nb::rv_policy::reference_internal)
+        .def("__exit__", &LanceWriter::exit, nb::arg("exc_type").none(), nb::arg("exc_value").none(),
+             nb::arg("traceback").none());
 
     nb::class_<ExportedTable>(m, "LanceTable")
         .def("__arrow_c_stream__", &ExportedTable::arrow_c_stream, nb::arg("requested_schema") = nb::none(),
