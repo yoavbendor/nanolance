@@ -6,6 +6,7 @@
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
+#include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <zstd.h>
@@ -41,18 +42,27 @@ const std::vector<std::uint8_t>* field_metadata_bytes(const pb::Field& field, co
 
 // Append `count` copies of an vlen-byte value via one resize + tight memcpy loop. Much leaner than
 // count separate std::vector::insert calls (whose per-call machinery dominated the read profile).
-void append_repeated_value(std::vector<std::uint8_t>& out, const std::uint8_t* val, std::size_t vlen,
-                           std::size_t count) {
+// Returns false (without touching `out`) if the resulting size would overflow — `count` can derive
+// from untrusted on-disk run/row counts, so the multiply must not wrap into a small allocation.
+[[nodiscard]] bool append_repeated_value(std::vector<std::uint8_t>& out, const std::uint8_t* val,
+                                         std::size_t vlen, std::size_t count) {
     if (count == 0U || vlen == 0U) {
-        return;
+        return true;
+    }
+    std::uint64_t added = 0;
+    std::uint64_t new_size = 0;
+    if (!checked_mul(vlen, count, added) || !checked_add(out.size(), added, new_size) ||
+        !fits_size_t(new_size)) {
+        return false;
     }
     const std::size_t base = out.size();
-    out.resize(base + vlen * count);
+    out.resize(static_cast<std::size_t>(new_size));
     std::uint8_t* dst = out.data() + base;
     for (std::size_t i = 0; i < count; ++i) {
         std::memcpy(dst, val, vlen);
         dst += vlen;
     }
+    return true;
 }
 
 // Inverse of zstd_frame_buffer: [u64 LE uncompressed size][zstd frame] -> raw bytes.
@@ -61,12 +71,23 @@ bool zstd_unframe_buffer(const std::vector<std::uint8_t>& framed, std::vector<st
         error = "zstd frame shorter than size header";
         return false;
     }
-    std::uint64_t uncompressed = 0;
-    for (int i = 0; i < 8; ++i) {
-        uncompressed |= static_cast<std::uint64_t>(framed[static_cast<std::size_t>(i)]) << (8 * i);
+    const std::uint64_t uncompressed = load_le<std::uint64_t>(framed.data());
+    // The declared uncompressed size is attacker-controlled: cap it (DoS/OOM) and never allocate more
+    // than the platform can index. Also cross-check it against the zstd frame's own content size when
+    // the frame records one, so a lie in the header can't drive a giant allocation.
+    if (uncompressed > default_read_limits().max_uncompressed_bytes || !fits_size_t(uncompressed)) {
+        error = "zstd uncompressed size exceeds safety limit";
+        return false;
     }
-    out.assign(uncompressed, 0U);
-    const auto got = ZSTD_decompress(out.data(), uncompressed, framed.data() + 8U, framed.size() - 8U);
+    const unsigned long long content =
+        ZSTD_getFrameContentSize(framed.data() + 8U, framed.size() - 8U);
+    if (content != ZSTD_CONTENTSIZE_UNKNOWN && content != ZSTD_CONTENTSIZE_ERROR &&
+        content != uncompressed) {
+        error = "zstd frame content size disagrees with declared size";
+        return false;
+    }
+    out.assign(static_cast<std::size_t>(uncompressed), 0U);
+    const auto got = ZSTD_decompress(out.data(), out.size(), framed.data() + 8U, framed.size() - 8U);
     if (ZSTD_isError(got) != 0U || got != uncompressed) {
         error = "zstd decompress failed for variable-width column";
         return false;
@@ -298,6 +319,21 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     error.clear();
     out = ColumnValues{};
 
+    // The per-page row count comes from the untrusted protobuf. Bound the declared total up front
+    // (overflow-safe) so no decode branch below can be tricked into a runaway allocation; the inner
+    // loops then run without re-checking.
+    std::uint64_t declared_rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        if (!checked_add(declared_rows, page.length, declared_rows)) {
+            error = "column page row count overflows";
+            return false;
+        }
+    }
+    if (declared_rows > default_read_limits().max_rows_per_column) {
+        error = "column row count exceeds safety limit";
+        return false;
+    }
+
     const bool blob_packed = field_metadata_is_true(on_disk_field, "lance-encoding:blob");
     if (blob_packed) {
         out.kind = ColumnValues::Kind::BlobV2External;
@@ -349,7 +385,10 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                                  on_disk_field.logical_type == "large_binary";
             const std::size_t len = value->size();
             const auto rows = static_cast<std::size_t>(total_rows);
-            append_repeated_value(out.variable.data, value->data(), len, rows);  // every row = value
+            if (!append_repeated_value(out.variable.data, value->data(), len, rows)) {  // every row = value
+                error = "constant column expansion overflows";
+                return false;
+            }
             // offsets are arithmetic (0, len, 2*len, ...); build typed then one bulk copy.
             if (out.variable.large) {
                 std::vector<std::uint64_t> offs(rows + 1U);
@@ -365,7 +404,11 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             return true;
         }
         out.kind = ColumnValues::Kind::FixedWidth;
-        append_repeated_value(out.fixed, value->data(), value->size(), static_cast<std::size_t>(total_rows));
+        if (!append_repeated_value(out.fixed, value->data(), value->size(),
+                                   static_cast<std::size_t>(total_rows))) {
+            error = "constant column expansion overflows";
+            return false;
+        }
         return true;
     }
 
@@ -417,7 +460,10 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             for (std::size_t r = 0; r < num_runs; ++r) {
                 const std::uint64_t run = run_length_at(r);
                 const auto* vptr = data.data() + values_off + r * bpv;
-                append_repeated_value(out.fixed, vptr, bpv, static_cast<std::size_t>(run));  // one fill per run
+                if (!append_repeated_value(out.fixed, vptr, bpv, static_cast<std::size_t>(run))) {
+                    error = "rle run expansion overflows";
+                    return false;
+                }
             }
         }
         return true;
@@ -503,7 +549,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             std::uint64_t cumulative = out.variable.data.size();  // byte offset (continues across pages)
 
             // Expand: bulk-fill data once per run; collect offsets in a typed temp, then one bulk copy.
-            auto expand = [&](auto& offs) {
+            auto expand = [&](auto& offs) -> bool {
                 offs.reserve(total_rows + (first_page ? 1U : 0U));
                 using OT = typename std::decay_t<decltype(offs)>::value_type;
                 if (first_page) {
@@ -514,7 +560,9 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                     std::memcpy(&index, data.data() + voff + r * 4U, 4U);
                     const std::uint8_t run = data[loff + r];
                     const auto [start, len] = dict_ranges[index];
-                    append_repeated_value(out.variable.data, dict_block.data() + start, len, run);
+                    if (!append_repeated_value(out.variable.data, dict_block.data() + start, len, run)) {
+                        return false;
+                    }
                     for (std::uint8_t c = 0; c < run; ++c) {
                         cumulative += len;
                         offs.push_back(static_cast<OT>(cumulative));
@@ -523,13 +571,19 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 const std::size_t base = out.variable.offsets.size();
                 out.variable.offsets.resize(base + offs.size() * sizeof(OT));
                 std::memcpy(out.variable.offsets.data() + base, offs.data(), offs.size() * sizeof(OT));
+                return true;
             };
+            bool ok = false;
             if (out.variable.large) {
                 std::vector<std::uint64_t> offs;
-                expand(offs);
+                ok = expand(offs);
             } else {
                 std::vector<std::uint32_t> offs;
-                expand(offs);
+                ok = expand(offs);
+            }
+            if (!ok) {
+                error = "dict-rle expansion overflows";
+                return false;
             }
         }
         return true;

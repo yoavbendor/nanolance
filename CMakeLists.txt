@@ -50,6 +50,36 @@ option(NANOLANCE_ENABLE_S3 "S3 external blob support (needs NANOLANCE_S3_TARGET 
 set(NANOLANCE_S3_TARGET "" CACHE STRING "Target for S3 reads (e.g. stream_helper_s3)")
 set(NANOLANCE_S3_INCLUDE_DIR "" CACHE PATH "Dir containing s3_aws_sdk_stream.h")
 
+# ── Memory-safety / hardening build knobs (opt-in; used by the safety CI jobs) ────────────────────
+# The reader parses untrusted on-disk bytes, so these let CI (and users) run the read path under
+# sanitizers and fuzz it. They are OFF/empty by default and never affect a normal build.
+set(NANOLANCE_SANITIZER "" CACHE STRING "Sanitizers to enable for all targets, e.g. 'address,undefined' or 'thread'")
+option(NANOLANCE_WERROR "Treat warnings as errors on nanolance's own targets" OFF)
+option(NANOLANCE_BUILD_FUZZERS "Build libFuzzer harnesses over the untrusted decode path (needs Clang)" OFF)
+
+if(NANOLANCE_SANITIZER)
+    message(STATUS "nanolance: sanitizers enabled: ${NANOLANCE_SANITIZER}")
+    add_compile_options(-fsanitize=${NANOLANCE_SANITIZER} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${NANOLANCE_SANITIZER})
+endif()
+
+if(NANOLANCE_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "NANOLANCE_BUILD_FUZZERS requires a Clang toolchain (needs -fsanitize=fuzzer)")
+    endif()
+    message(STATUS "nanolance: building libFuzzer harnesses (coverage + address,undefined)")
+    # Instrument the whole library for coverage feedback + ASan/UBSan; the harness executables add the
+    # libFuzzer driver itself via -fsanitize=fuzzer at link.
+    add_compile_options(-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+if(NANOLANCE_WERROR)
+    set(NANOLANCE_WARNING_FLAGS -Wall -Wextra -Werror)
+else()
+    set(NANOLANCE_WARNING_FLAGS)
+endif()
+
 include(FetchContent)
 
 # --- nanoarrow ---
@@ -234,6 +264,23 @@ target_link_libraries(nanolance PUBLIC
 
 add_library(nanolance::nanolance ALIAS nanolance)
 
+# Apply our own warning policy (opt-in via NANOLANCE_WERROR) only to nanolance's targets, not to the
+# FetchContent'd dependencies.
+if(NANOLANCE_WARNING_FLAGS)
+    target_compile_options(nanolance_proto PRIVATE ${NANOLANCE_WARNING_FLAGS})
+    target_compile_options(nanolance_reader PRIVATE ${NANOLANCE_WARNING_FLAGS})
+    target_compile_options(nanolance PRIVATE ${NANOLANCE_WARNING_FLAGS})
+endif()
+
+# ── libFuzzer harness over the untrusted decode path (opt-in, Clang only) ─────────────────────────
+# Defined here (not in the test block) so it builds independently of NANOLANCE_BUILD_TESTS.
+if(NANOLANCE_BUILD_FUZZERS)
+    add_executable(nanolance_fuzz_decode tests/fuzz/fuzz_decode.cpp)
+    target_compile_features(nanolance_fuzz_decode PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_decode PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_decode PRIVATE -fsanitize=fuzzer)
+endif()
+
 if(NANOLANCE_BUILD_TOOLS)
     add_executable(arrowipc2lance arrowipc2lance_main.cpp)
     target_compile_features(arrowipc2lance PRIVATE cxx_std_20)
@@ -365,6 +412,10 @@ add_executable(nano_lance_schema_change_error_test tests/test_schema_change_erro
 target_compile_features(nano_lance_schema_change_error_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_schema_change_error_test PRIVATE nanolance)
 
+add_executable(nano_lance_read_safety_test tests/test_read_safety.cpp)
+target_compile_features(nano_lance_read_safety_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_read_safety_test PRIVATE nanolance)
+
 add_executable(nano_lance_dict_roundtrip_test tests/test_dict_roundtrip.cpp)
 target_compile_features(nano_lance_dict_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_dict_roundtrip_test PRIVATE nanolance)
@@ -462,6 +513,9 @@ set_tests_properties(nano_lance_structural_default PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_schema_change_error COMMAND $<TARGET_FILE:nano_lance_schema_change_error_test>)
 set_tests_properties(nano_lance_schema_change_error PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_read_safety COMMAND $<TARGET_FILE:nano_lance_read_safety_test>)
+set_tests_properties(nano_lance_read_safety PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_dict_roundtrip COMMAND $<TARGET_FILE:nano_lance_dict_roundtrip_test>)
 set_tests_properties(nano_lance_dict_roundtrip PROPERTIES LABELS "smoke")

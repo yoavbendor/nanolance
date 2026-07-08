@@ -3,6 +3,8 @@
 
 #include "nanolance/data_file_reader.hpp"
 
+#include "nanolance/read_safety.hpp"
+
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -116,9 +118,12 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
         error = "data file footer global_offsets_start mismatch";
         return false;
     }
-    if (descriptor_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
-        global_buffer_offset > file_size || global_buffer_offset + descriptor_size > file_size) {
+    if (!fits_size_t(descriptor_size) || !range_in_bounds(global_buffer_offset, descriptor_size, file_size)) {
         error = "invalid data file descriptor bounds";
+        return false;
+    }
+    if (num_columns > default_read_limits().max_columns) {
+        error = "data file column count exceeds safety limit";
         return false;
     }
 
@@ -148,7 +153,7 @@ bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::ui
                                 const std::uint64_t size, std::vector<std::uint8_t>& out, std::string& error) {
     error.clear();
     out.clear();
-    if (size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    if (!fits_size_t(size)) {
         error = "read size overflow";
         return false;
     }
@@ -158,7 +163,7 @@ bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::ui
         error = "failed to stat data file: " + ec.message();
         return false;
     }
-    if (offset > file_size || offset + size > file_size) {
+    if (!range_in_bounds(offset, size, static_cast<std::uint64_t>(file_size))) {
         error = "read range exceeds data file size";
         return false;
     }

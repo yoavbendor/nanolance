@@ -66,6 +66,9 @@ nano_lance_writer_close(&w);
   table.
 - **To get small files, model external refs as plain `uri`/`position`/`size` columns**, *not* the packed
   `lance.blob.v2` descriptor (~41 B/row vs ~3.4 B/row). See [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
+- **The reader is hardened against untrusted files** — bounds/overflow-checked decode, allocation
+  budgets, ASan+UBSan CI, and continuous fuzzing. See [docs/SAFETY.md](docs/SAFETY.md) for the threat
+  model and reviewer checklist.
 
 ### Not yet supported / nanolance-only
 
