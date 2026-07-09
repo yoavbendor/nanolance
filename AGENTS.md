@@ -184,6 +184,17 @@ on-disk size shrank.
   with undefined `__security_cookie`. Force the source build:
   `-DCMAKE_DISABLE_FIND_PACKAGE_zstd=ON`.
 - Tools (`arrowipc2lance`) need CLI11; turn off with `-DNANOLANCE_BUILD_TOOLS=OFF` if unavailable.
+- **`-DNANOLANCE_ENABLE_AVX2=ON`** compiles nanolance's own targets (not FetchContent'd dependencies)
+  with `-march=haswell` (AVX2 + BMI2 + FMA). Off by default because it raises the minimum supported CPU
+  to Haswell-class (~2013+ Intel/AMD) for whoever links the library — a real portability tradeoff, not a
+  free win, so it must be opted into explicitly. Measured (callgrind, this repo's own benchmark
+  datasets): bitpack-heavy columns ~11-20% fewer instructions on write/read; zstd-heavy high-cardinality
+  string columns ~4-11% (zstd's own compiled-in dispatch is unaffected — the win here is nanolance's own
+  auto-vectorizable loops); float/bool paths see negligible change (already memory-bound). A *scoped*
+  per-function `[[gnu::target("avx2")]]`/`target_clones` dispatch was tried and measured to give no
+  benefit on the FastLanes pack/unpack kernels specifically, because it blocks inlining across the
+  attribute boundary — the win only shows up compiling the whole translation unit at this target, which
+  is what this flag does.
 
 ## 7. When adding a new Lance encoding (how this codebase does it)
 

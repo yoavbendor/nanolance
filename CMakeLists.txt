@@ -46,6 +46,14 @@ else()
 endif()
 option(NANOLANCE_BUILD_TOOLS "Build arrowipc2lance CLI" ON)
 option(NANOLANCE_ENABLE_S3 "S3 external blob support (needs NANOLANCE_S3_TARGET + NANOLANCE_S3_INCLUDE_DIR)" OFF)
+# Raises the minimum supported CPU to Haswell-class (AVX2 + BMI2 + FMA, ubiquitous on x86_64 hardware
+# since ~2013, including all current GitHub-hosted Actions runners). OFF by default: this is a real
+# portability tradeoff for anyone embedding nanolance, not a free win, so it must be opted into
+# explicitly rather than silently raised. Measured to meaningfully speed up the FastLanes bitpack
+# pack_1024/unpack_1024 kernels (and whatever else the compiler can auto-vectorize wider) when the
+# *whole* translation unit is compiled at this target -- unlike a scoped per-function target attribute,
+# which was measured to give no benefit here since it blocks inlining across the attribute boundary.
+option(NANOLANCE_ENABLE_AVX2 "Compile with -march=haswell (AVX2+BMI2+FMA); raises minimum CPU requirement" OFF)
 
 set(NANOLANCE_S3_TARGET "" CACHE STRING "Target for S3 reads (e.g. stream_helper_s3)")
 set(NANOLANCE_S3_INCLUDE_DIR "" CACHE PATH "Dir containing s3_aws_sdk_stream.h")
@@ -270,6 +278,13 @@ if(NANOLANCE_WARNING_FLAGS)
     target_compile_options(nanolance_proto PRIVATE ${NANOLANCE_WARNING_FLAGS})
     target_compile_options(nanolance_reader PRIVATE ${NANOLANCE_WARNING_FLAGS})
     target_compile_options(nanolance PRIVATE ${NANOLANCE_WARNING_FLAGS})
+endif()
+
+if(NANOLANCE_ENABLE_AVX2)
+    message(STATUS "nanolance: -march=haswell enabled (NANOLANCE_ENABLE_AVX2) -- minimum CPU raised to AVX2+BMI2+FMA")
+    target_compile_options(nanolance_proto PRIVATE -march=haswell)
+    target_compile_options(nanolance_reader PRIVATE -march=haswell)
+    target_compile_options(nanolance PRIVATE -march=haswell)
 endif()
 
 # ── libFuzzer harness over the untrusted decode path (opt-in, Clang only) ─────────────────────────
