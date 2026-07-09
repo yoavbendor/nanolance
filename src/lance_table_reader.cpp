@@ -8,10 +8,12 @@
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/path_safety.hpp"
+#include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -893,13 +895,30 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const pb::D
     return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id, length, batch, error);
 }
 
+// Release out_schema and every ArrowArray already pushed into out_batches, then clear out_batches. Used
+// on every failure path after the loop has started building batches, so a mid-read error (a later
+// fragment/data-file fails to decode) can't leak the batches successfully built before it.
+void release_partial_read(ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches) {
+    ArrowSchemaRelease(&out_schema);
+    for (auto& batch : out_batches) {
+        ArrowArrayRelease(&batch);
+    }
+    out_batches.clear();
+}
+
 }  // namespace
 
 bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
-                              std::vector<ArrowArray>& out_batches, std::string& error) {
+                              std::vector<ArrowArray>& out_batches, std::string& error,
+                              bool trusted_input) {
     error.clear();
     out_batches.clear();
     ArrowSchemaInit(&out_schema);
+
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
 
     pb::Manifest manifest{};
     std::uint64_t version = 0;
@@ -922,7 +941,7 @@ bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSc
         for (const auto& data_file : fragment.files) {
             ArrowArray batch{};
             if (!read_data_file_batch(dataset_path, data_file, mapping, out_schema, batch, error)) {
-                ArrowSchemaRelease(&out_schema);
+                release_partial_read(out_schema, out_batches);
                 return false;
             }
             out_batches.push_back(batch);
@@ -935,10 +954,15 @@ bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_pat
                                         const std::vector<std::string>& column_names,
                                         ArrowSchema& out_schema,
                                         std::vector<ArrowArray>& out_batches,
-                                        std::string& error) {
+                                        std::string& error, bool trusted_input) {
     error.clear();
     out_batches.clear();
     ArrowSchemaInit(&out_schema);
+
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
 
     pb::Manifest manifest{};
     std::uint64_t version = 0;
@@ -992,7 +1016,7 @@ bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_pat
             ArrowArray batch{};
             if (!read_data_file_batch(dataset_path, data_file, proj_mapping, out_schema, batch, error,
                                       &allowed_ids)) {
-                ArrowSchemaRelease(&out_schema);
+                release_partial_read(out_schema, out_batches);
                 return false;
             }
             out_batches.push_back(batch);

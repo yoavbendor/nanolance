@@ -109,6 +109,16 @@ int nano_lance_table_read_dataset(const char* dataset_path, struct ArrowSchema* 
                                   struct ArrowArray** out_batches, size_t* out_batch_count, char* error_message,
                                   size_t error_message_capacity);
 
+/// Same as nano_lance_table_read_dataset, with an explicit trusted_input flag. Pass 0 for the default,
+/// fully-checked read (identical to nano_lance_table_read_dataset). Pass nonzero to opt a known-good,
+/// self-produced dataset out of the untrusted-input DoS/OOM budget checks (declared zstd size,
+/// row/column/manifest-element counts) — every bounds check (offset/size validated against the real
+/// buffer with overflow-safe arithmetic) still runs unconditionally either way. Never pass nonzero for a
+/// dataset that could have come from another party.
+int nano_lance_table_read_dataset_ex(const char* dataset_path, int trusted_input, struct ArrowSchema* out_schema,
+                                     struct ArrowArray** out_batches, size_t* out_batch_count, char* error_message,
+                                     size_t error_message_capacity);
+
 void nano_lance_table_read_result_free(struct ArrowSchema* schema, struct ArrowArray* batches, size_t batch_count);
 
 #ifdef __cplusplus

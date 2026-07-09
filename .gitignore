@@ -4,6 +4,7 @@
 /build-*/
 /bindings/python/build/
 /.deps/
+/.deps-*/
 /.cache/
 *.rej
 CMakeLists.txt.user

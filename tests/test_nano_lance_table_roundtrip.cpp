@@ -93,6 +93,46 @@ void test_int64_roundtrip() {
     ArrowArrayRelease(&batches[0]);
 }
 
+// trusted_input's only effect is skipping the DoS/OOM budget checks; bounds checks still run, so a
+// well-formed, self-produced dataset reads back byte-identical either way.
+void test_int64_roundtrip_trusted_input() {
+    const auto ds = temp_dataset("int64_trusted");
+    ArrowSchema field{};
+    field.format = "l";
+    field.name = "x";
+    field.flags = 0;
+    const std::int64_t values[] = {20, 21, 22, 23, 24};
+    ArrowArray source{};
+    const void* buffers[] = {nullptr, values};
+    source.length = 5;
+    source.n_buffers = 2;
+    source.buffers = buffers;
+
+    {
+        NanoLanceWriter writer{};
+        require(nano_lance_writer_init(&writer, ds.string().c_str(), 0) == NANO_LANCE_OK, "init");
+        require(nano_lance_write_batch(&writer, &source, &field) == NANO_LANCE_OK, "write");
+        require(nano_lance_writer_commit(&writer, false) == NANO_LANCE_OK, "commit");
+        require(nano_lance_writer_close(&writer) == NANO_LANCE_OK, "close");
+    }
+
+    ArrowSchema read_schema{};
+    std::vector<ArrowArray> batches;
+    std::string error;
+    require(nano_lance::lance_table_read_dataset(ds, read_schema, batches, error, /*trusted_input=*/true),
+            error.c_str());
+    require(batches.size() == 1U, "expected one batch");
+    const ArrowArray* col = first_column_array(batches[0]);
+    require(col->length == source.length, "row count mismatch under trusted_input");
+    const auto* read_vals = static_cast<const std::int64_t*>(col->buffers[1]);
+    for (int64_t i = 0; i < source.length; ++i) {
+        require(read_vals[i] == values[static_cast<std::size_t>(i)], "int64 value mismatch under trusted_input");
+    }
+
+    ArrowSchemaRelease(&read_schema);
+    ArrowArrayRelease(&batches[0]);
+}
+
 void test_utf8_roundtrip() {
     const auto ds = temp_dataset("utf8");
     ArrowSchema schema{};
@@ -135,6 +175,7 @@ void test_utf8_roundtrip() {
 
 int main() {
     test_int64_roundtrip();
+    test_int64_roundtrip_trusted_input();
     test_utf8_roundtrip();
     return 0;
 }

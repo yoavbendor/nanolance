@@ -139,6 +139,63 @@ void test_garbage_protobuf_no_crash() {
     check(true, "protobuf decoders survive garbage (ASan enforces no OOB)");
 }
 
+void test_trusted_mode_skips_budget_cap_only() {
+    // Same footer as test_footer_column_cap: num_columns beyond the safety cap, otherwise well-formed
+    // (empty descriptor). Under default limits it's rejected by the column-count budget check.
+    const auto path = write_temp(make_footer(/*gbo=*/0, /*desc=*/0, /*num_columns=*/0xFFFFFFFFU), "trusted_cols");
+    {
+        nano_lance::pb::FileDescriptor desc;
+        nano_lance::LanceDataFileFooterLayout layout;
+        std::string error;
+        const bool ok = nano_lance::read_lance_data_file_footer_and_descriptor(path, desc, layout, error);
+        check(!ok && error.find("column count") != std::string::npos,
+              "default limits still reject the oversized column count");
+    }
+    {
+        // trusted_input's ONLY effect: the four DoS-budget comparisons no longer trigger. With the cap
+        // out of the way this footer is otherwise well-formed (empty descriptor), so the read succeeds.
+        nano_lance::ScopedReadLimits trusted(nano_lance::trusted_read_limits());
+        nano_lance::pb::FileDescriptor desc;
+        nano_lance::LanceDataFileFooterLayout layout;
+        std::string error;
+        const bool ok = nano_lance::read_lance_data_file_footer_and_descriptor(path, desc, layout, error);
+        check(ok, "trusted mode skips the column-count budget check");
+        check(layout.num_columns == 0xFFFFFFFFU, "trusted mode preserves the declared column count");
+    }
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+void test_trusted_mode_still_bounds_checked() {
+    // Same footer as test_footer_descriptor_overflow: offset+size wraps. This is a BOUNDS violation, not
+    // a budget cap, so trusted mode must still reject it via the overflow-safe range check.
+    const auto path = write_temp(
+        make_footer(/*gbo=*/8, /*desc=*/std::numeric_limits<std::uint64_t>::max(), /*num_columns=*/1),
+        "trusted_ovf");
+    nano_lance::ScopedReadLimits trusted(nano_lance::trusted_read_limits());
+    nano_lance::pb::FileDescriptor desc;
+    nano_lance::LanceDataFileFooterLayout layout;
+    std::string error;
+    const bool ok = nano_lance::read_lance_data_file_footer_and_descriptor(path, desc, layout, error);
+    check(!ok, "trusted mode still rejects overflowing descriptor bounds");
+    check(error.find("descriptor bounds") != std::string::npos,
+          "trusted mode still reports the descriptor-bounds error, not a silent pass");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+void test_scoped_read_limits_restores_previous() {
+    const auto& before = nano_lance::active_read_limits();
+    const auto before_columns = before.max_columns;
+    {
+        nano_lance::ScopedReadLimits trusted(nano_lance::trusted_read_limits());
+        check(nano_lance::active_read_limits().max_columns == std::numeric_limits<std::uint32_t>::max(),
+              "ScopedReadLimits applies the trusted limits while in scope");
+    }
+    check(nano_lance::active_read_limits().max_columns == before_columns,
+          "ScopedReadLimits restores the previous limits on scope exit");
+}
+
 void test_path_jail() {
     namespace fs = std::filesystem;
     const fs::path base = fs::path("/dataset") / "data";
@@ -168,6 +225,9 @@ int main() {
     test_footer_column_cap();
     test_footer_descriptor_overflow();
     test_garbage_protobuf_no_crash();
+    test_trusted_mode_skips_budget_cap_only();
+    test_trusted_mode_still_bounds_checked();
+    test_scoped_read_limits_restores_previous();
     test_path_jail();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d read-safety checks failed\n", g_failures);

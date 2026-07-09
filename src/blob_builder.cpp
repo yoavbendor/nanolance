@@ -124,6 +124,11 @@ bool build_epb_table_schema(ArrowSchema& schema, std::string& error) {
         ArrowSchemaRelease(&schema);
         return false;
     }
+    // schema.children[1] was already initialized by init_child_schema() above (release callback +
+    // an allocated "" name). build_blob_v2_payload_schema() calls ArrowSchemaInit() on its target,
+    // which unconditionally overwrites the struct without releasing whatever it held — release the
+    // live child first so its allocation isn't orphaned.
+    ArrowSchemaRelease(schema.children[1]);
     if (!build_blob_v2_payload_schema(*schema.children[1], error)) {
         ArrowSchemaRelease(&schema);
         return false;
