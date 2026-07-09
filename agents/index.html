@@ -1194,6 +1194,17 @@ on-disk size shrank.</p>
   with undefined <code>__security_cookie</code>. Force the source build:
   <code>-DCMAKE_DISABLE_FIND_PACKAGE_zstd=ON</code>.</li>
 <li>Tools (<code>arrowipc2lance</code>) need CLI11; turn off with <code>-DNANOLANCE_BUILD_TOOLS=OFF</code> if unavailable.</li>
+<li><strong><code>-DNANOLANCE_ENABLE_AVX2=ON</code></strong> compiles nanolance's own targets (not FetchContent'd dependencies)
+  with <code>-march=haswell</code> (AVX2 + BMI2 + FMA). Off by default because it raises the minimum supported CPU
+  to Haswell-class (~2013+ Intel/AMD) for whoever links the library — a real portability tradeoff, not a
+  free win, so it must be opted into explicitly. Measured (callgrind, this repo's own benchmark
+  datasets): bitpack-heavy columns ~11-20% fewer instructions on write/read; zstd-heavy high-cardinality
+  string columns ~4-11% (zstd's own compiled-in dispatch is unaffected — the win here is nanolance's own
+  auto-vectorizable loops); float/bool paths see negligible change (already memory-bound). A <em>scoped</em>
+  per-function <code>[[gnu::target("avx2")]]</code>/<code>target_clones</code> dispatch was tried and measured to give no
+  benefit on the FastLanes pack/unpack kernels specifically, because it blocks inlining across the
+  attribute boundary — the win only shows up compiling the whole translation unit at this target, which
+  is what this flag does.</li>
 </ul>
 <h2 id="7-when-adding-a-new-lance-encoding-how-this-codebase-does-it">7. When adding a new Lance encoding (how this codebase does it)<a class="headerlink" href="#7-when-adding-a-new-lance-encoding-how-this-codebase-does-it" title="Permanent link">&para;</a></h2>
 <ol>
