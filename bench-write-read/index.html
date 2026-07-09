@@ -833,35 +833,35 @@
 
 
 <h1 id="linux-ci-results-auto-generated-do-not-edit">Linux CI results (auto-generated — do not edit)<a class="headerlink" href="#linux-ci-results-auto-generated-do-not-edit" title="Permanent link">&para;</a></h1>
-<p><em>2026-07-09 13:53:29 UTC · commit <code>318dac6</code></em></p>
+<p><em>2026-07-09 18:00:29 UTC · commit <code>460e227</code></em></p>
 <h2 id="environment">Environment<a class="headerlink" href="#environment" title="Permanent link">&para;</a></h2>
 <div class="language-text highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>Linux runnervm5mmn9 6.17.0-1018-azure #18~24.04.1-Ubuntu SMP Thu May 28 16:39:11 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>Ubuntu clang version 19.1.1 (1ubuntu1~24.04.2)
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>cmake version 3.31.6
 </code></pre></div>
 <h2 id="tests">Tests<a class="headerlink" href="#tests" title="Permanent link">&para;</a></h2>
-<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>smoke    =   1.79 sec*proc (26 tests)
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>smoke    =   3.32 sec*proc (27 tests)
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>Total Test time (real) =   1.91 sec
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>Total Test time (real) =   3.40 sec
 </code></pre></div>
 <h2 id="benchmark-parquet-vs-rust-lance-vs-nanolance">Benchmark (parquet vs rust lance vs nanolance)<a class="headerlink" href="#benchmark-parquet-vs-rust-lance-vs-nanolance" title="Permanent link">&para;</a></h2>
 <div class="language-text highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>========== pcap_ref  (200000 rows, 3 cols) ==========
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>engine           write(core) write(proc)    B/row   read ms  read(lance)
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>parquet (zstd)         22.52       22.52    4.189      5.80                (1.00x vs pq)
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>rust lance             10.66       10.66    3.472      5.53                (0.83x vs pq)
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>nanolance              15.51       23.05    3.643     11.79         8.93   (0.87x vs pq)
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>parquet (zstd)         22.95       22.95    4.189      6.31                (1.00x vs pq)
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>rust lance             11.01       11.01    3.472      6.29                (0.83x vs pq)
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>nanolance              15.74       23.72    3.643     10.91         9.16   (0.87x vs pq)
 <a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>
 <a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>========== wide_int  (200000 rows, 4 cols) ==========
 <a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>engine           write(core) write(proc)    B/row   read ms  read(lance)
-<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>parquet (zstd)         23.56       23.56    5.212      3.49                (1.00x vs pq)
-<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>rust lance              2.70        2.70    8.485      3.36                (1.63x vs pq)
-<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>nanolance              10.48       13.66    9.013     10.07        11.28   (1.73x vs pq)
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>parquet (zstd)         24.65       24.65    5.212      3.68                (1.00x vs pq)
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>rust lance              2.85        2.85    8.485      3.46                (1.63x vs pq)
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>nanolance              10.49       14.24    9.013     10.28        12.06   (1.73x vs pq)
 <a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>
 <a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>========== high_card  (200000 rows, 2 cols) ==========
 <a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>engine           write(core) write(proc)    B/row   read ms  read(lance)
-<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>parquet (zstd)         29.52       29.52   15.513      7.85                (1.00x vs pq)
-<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>rust lance             17.01       17.01   18.943      5.14                (1.22x vs pq)
-<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>nanolance              44.25       49.27   18.206     15.26        11.86   (1.17x vs pq)
+<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>parquet (zstd)         30.83       30.83   15.513      8.28                (1.00x vs pq)
+<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>rust lance             17.94       17.94   18.993      5.51                (1.22x vs pq)
+<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>nanolance              44.30       50.25   18.206     15.36        11.94   (1.17x vs pq)
 <a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>
 <a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>note: best of 5 writes / 7 reads. write(core)=in-process encode work (parquet/lance: the write call; nanolance: ingest+encode+commit, EXCLUDING process startup + Arrow-IPC parse). write(proc)=full wall clock (nanolance includes subprocess startup + IPC parse). read ms=native reader; read(lance)=rust-lance reading the nanolance file.
 </code></pre></div>
@@ -872,9 +872,9 @@
 <a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>I1 cache: 
 <a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>D1 cache: 
 <a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>LL cache: 
-<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>Timerange: Basic block 0 - 19245156
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>Timerange: Basic block 0 - 19245259
 <a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>Trigger: Program termination
-<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>Profiled target:  build/nlbench /tmp/nlb/pcap_ref_nl.lance 1 (PID 4551, part 1)
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>Profiled target:  build/nlbench /tmp/nlb/pcap_ref_nl.lance 1 (PID 3934, part 1)
 <a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>Events recorded:  Ir
 <a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a>Events shown:     Ir
 <a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a>Event sort order: Ir
@@ -886,16 +886,16 @@
 <a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a>--------------------------------------------------------------------------------
 <a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a>Ir                  
 <a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a>--------------------------------------------------------------------------------
-<a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a>37,535,844 (100.0%)  PROGRAM TOTALS
+<a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a>37,536,227 (100.0%)  PROGRAM TOTALS
 <a id="__codelineno-3-22" name="__codelineno-3-22" href="#__codelineno-3-22"></a>
 <a id="__codelineno-3-23" name="__codelineno-3-23" href="#__codelineno-3-23"></a>--------------------------------------------------------------------------------
 <a id="__codelineno-3-24" name="__codelineno-3-24" href="#__codelineno-3-24"></a>Ir                   file:function
 <a id="__codelineno-3-25" name="__codelineno-3-25" href="#__codelineno-3-25"></a>--------------------------------------------------------------------------------
 <a id="__codelineno-3-26" name="__codelineno-3-26" href="#__codelineno-3-26"></a>12,440,099 (33.14%)  ./string/../sysdeps/x86_64/multiarch/memset-vec-unaligned-erms.S:__memset_avx2_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
-<a id="__codelineno-3-27" name="__codelineno-3-27" href="#__codelineno-3-27"></a> 9,593,140 (25.56%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
+<a id="__codelineno-3-27" name="__codelineno-3-27" href="#__codelineno-3-27"></a> 9,593,151 (25.56%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms [/usr/lib/x86_64-linux-gnu/libc.so.6]
 <a id="__codelineno-3-28" name="__codelineno-3-28" href="#__codelineno-3-28"></a> 7,146,944 (19.04%)  ???:void nano_lance::fastlanes::unpack_1024&lt;unsigned long&gt;(unsigned int, unsigned long const*, unsigned long*) [/home/runner/work/nanolance/nanolance/build/nlbench]
 <a id="__codelineno-3-29" name="__codelineno-3-29" href="#__codelineno-3-29"></a> 3,700,683 ( 9.86%)  ???:bool nano_lance::decode_lance_physical_column(std::filesystem::__cxx11::path const&amp;, nano_lance::pb::Field const&amp;, nano_lance::pb::ColumnMetadata const&amp;, nano_lance::ColumnValues&amp;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;&amp;)::$_0::operator()&lt;std::vector&lt;unsigned int, std::allocator&lt;unsigned int&gt; &gt; &gt;(std::vector&lt;unsigned int, std::allocator&lt;unsigned int&gt; &gt;&amp;) const [/home/runner/work/nanolance/nanolance/build/nlbench]
-<a id="__codelineno-3-30" name="__codelineno-3-30" href="#__codelineno-3-30"></a> 1,421,991 ( 3.79%)  ???:nano_lance::decode_lance_physical_column(std::filesystem::__cxx11::path const&amp;, nano_lance::pb::Field const&amp;, nano_lance::pb::ColumnMetadata const&amp;, nano_lance::ColumnValues&amp;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;&amp;) [/home/runner/work/nanolance/nanolance/build/nlbench]
+<a id="__codelineno-3-30" name="__codelineno-3-30" href="#__codelineno-3-30"></a> 1,422,003 ( 3.79%)  ???:nano_lance::decode_lance_physical_column(std::filesystem::__cxx11::path const&amp;, nano_lance::pb::Field const&amp;, nano_lance::pb::ColumnMetadata const&amp;, nano_lance::ColumnValues&amp;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;&amp;) [/home/runner/work/nanolance/nanolance/build/nlbench]
 <a id="__codelineno-3-31" name="__codelineno-3-31" href="#__codelineno-3-31"></a>   533,258 ( 1.42%)  ./elf/./elf/dl-lookup.c:do_lookup_x [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
 <a id="__codelineno-3-32" name="__codelineno-3-32" href="#__codelineno-3-32"></a>   512,596 ( 1.37%)  ./elf/../sysdeps/generic/dl-new-hash.h:_dl_lookup_symbol_x
 <a id="__codelineno-3-33" name="__codelineno-3-33" href="#__codelineno-3-33"></a>   192,920 ( 0.51%)  ./elf/./elf/dl-lookup.c:_dl_lookup_symbol_x [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
@@ -903,14 +903,14 @@
 <a id="__codelineno-3-35" name="__codelineno-3-35" href="#__codelineno-3-35"></a>   117,530 ( 0.31%)  ./elf/./elf/dl-lookup.c:check_match [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
 <a id="__codelineno-3-36" name="__codelineno-3-36" href="#__codelineno-3-36"></a>   111,853 ( 0.30%)  ./elf/../sysdeps/x86_64/dl-machine.h:_dl_relocate_object
 <a id="__codelineno-3-37" name="__codelineno-3-37" href="#__codelineno-3-37"></a>   110,503 ( 0.29%)  ./elf/./elf/do-rel.h:_dl_relocate_object
-<a id="__codelineno-3-38" name="__codelineno-3-38" href="#__codelineno-3-38"></a>   109,994 ( 0.29%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+<a id="__codelineno-3-38" name="__codelineno-3-38" href="#__codelineno-3-38"></a>   110,048 ( 0.29%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
 <a id="__codelineno-3-39" name="__codelineno-3-39" href="#__codelineno-3-39"></a>   102,435 ( 0.27%)  ???:nano_lance::pb::decode_column_metadata(std::vector&lt;unsigned char, std::allocator&lt;unsigned char&gt; &gt; const&amp;, nano_lance::pb::ColumnMetadata&amp;) [/home/runner/work/nanolance/nanolance/build/nlbench]
 <a id="__codelineno-3-40" name="__codelineno-3-40" href="#__codelineno-3-40"></a>    85,561 ( 0.23%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
-<a id="__codelineno-3-41" name="__codelineno-3-41" href="#__codelineno-3-41"></a>    81,949 ( 0.22%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+<a id="__codelineno-3-41" name="__codelineno-3-41" href="#__codelineno-3-41"></a>    81,994 ( 0.22%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
 <a id="__codelineno-3-42" name="__codelineno-3-42" href="#__codelineno-3-42"></a>    73,880 ( 0.20%)  ./string/../sysdeps/x86_64/multiarch/../multiarch/strcmp-sse2.S:strcmp [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
 <a id="__codelineno-3-43" name="__codelineno-3-43" href="#__codelineno-3-43"></a>    68,289 ( 0.18%)  ./elf/./elf/dl-tunables.c:__GI___tunables_init [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
 <a id="__codelineno-3-44" name="__codelineno-3-44" href="#__codelineno-3-44"></a>    58,824 ( 0.16%)  ???:nano_lance::pb::(anonymous namespace)::read_varint(std::vector&lt;unsigned char, std::allocator&lt;unsigned char&gt; &gt; const&amp;, unsigned long&amp;, unsigned long&amp;) [/home/runner/work/nanolance/nanolance/build/nlbench]
-<a id="__codelineno-3-45" name="__codelineno-3-45" href="#__codelineno-3-45"></a>    52,679 ( 0.14%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+<a id="__codelineno-3-45" name="__codelineno-3-45" href="#__codelineno-3-45"></a>    52,707 ( 0.14%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
 <a id="__codelineno-3-46" name="__codelineno-3-46" href="#__codelineno-3-46"></a>    46,635 ( 0.12%)  ???:nano_lance::read_lance_data_file_bytes(std::filesystem::__cxx11::path const&amp;, unsigned long, unsigned long, std::vector&lt;unsigned char, std::allocator&lt;unsigned char&gt; &gt;&amp;, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;&amp;) [/home/runner/work/nanolance/nanolance/build/nlbench]
 <a id="__codelineno-3-47" name="__codelineno-3-47" href="#__codelineno-3-47"></a>    41,526 ( 0.11%)  ???:std::vector&lt;unsigned char, std::allocator&lt;unsigned char&gt; &gt;::resize(unsigned long) [/home/runner/work/nanolance/nanolance/build/nlbench]
 <a id="__codelineno-3-48" name="__codelineno-3-48" href="#__codelineno-3-48"></a>    37,118 ( 0.10%)  ???:void std::vector&lt;unsigned char, std::allocator&lt;unsigned char&gt; &gt;::_M_assign_aux&lt;__gnu_cxx::__normal_iterator&lt;unsigned char const*, std::vector&lt;unsigned char, std::allocator&lt;unsigned char&gt; &gt; &gt; &gt;(__gnu_cxx::__normal_iterator&lt;unsigned char const*, std::vector&lt;unsigned char, std::allocator&lt;unsigned char&gt; &gt; &gt;, __gnu_cxx::__normal_iterator&lt;unsigned char const*, std::vector&lt;unsigned char, std::allocator&lt;unsigned char&gt; &gt; &gt;, std::forward_iterator_tag) [/home/runner/work/nanolance/nanolance/build/nlbench]

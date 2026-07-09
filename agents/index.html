@@ -1086,9 +1086,9 @@ encoding per column type:</p>
 </tr>
 <tr>
 <td><code>bool</code> fixed-width</td>
-<td>left uncompressed, 1 byte/value (stock Lance bitpacks to 1 bit/value)</td>
-<td>—</td>
-<td>—</td>
+<td><strong>bit-packed</strong> (<code>Flat{bits_per_value:1}</code>, LSB-first, same as stock Lance)</td>
+<td>always on</td>
+<td>200k rows: ~200 KB → ~25 KB (8×)</td>
 </tr>
 </tbody>
 </table>
