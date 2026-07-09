@@ -4,6 +4,7 @@
 #include "nanolance/lance_column_decoder.hpp"
 
 #include "nanolance/blob_v2_external.hpp"
+#include "nanolance/byte_stream_split.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
 #include "nanolance/read_safety.hpp"
@@ -697,6 +698,38 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 cumulative += len;
                 append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
             }
+        }
+        return true;
+    }
+
+    // Byte-stream-split + zstd fixed-width column (float/double): each page's payload is a zstd frame
+    // of vlen contiguous byte-planes; un-zstd then inverse-transpose to reconstruct the original bytes.
+    if (field_metadata_equals(on_disk_field, "nanolance:packing", "bss-zstd")) {
+        out.kind = ColumnValues::Kind::FixedWidth;
+        const auto bytes_per_value = lance_logical_type_value_bytes(on_disk_field.logical_type);
+        std::vector<std::uint8_t> control;
+        std::vector<std::uint8_t> payload;
+        std::vector<std::uint8_t> chunk_bytes;
+        std::vector<std::uint8_t> raw;
+        for (const auto& page : column_metadata.pages) {
+            if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
+                return false;
+            }
+            if (!parse_miniblock_payload_chunks(payload, chunk_bytes, error)) {
+                return false;
+            }
+            if (!zstd_unframe_buffer(chunk_bytes, raw, error)) {
+                return false;
+            }
+            std::swap(chunk_bytes, raw);
+            if (chunk_bytes.size() != page.length * bytes_per_value) {
+                error = "bss-zstd page byte count mismatch";
+                return false;
+            }
+            const auto base = out.fixed.size();
+            out.fixed.resize(base + chunk_bytes.size());
+            bss::untranspose(chunk_bytes.data(), bytes_per_value, static_cast<std::size_t>(page.length),
+                             out.fixed.data() + base);
         }
         return true;
     }
