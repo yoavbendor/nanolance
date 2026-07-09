@@ -7,6 +7,7 @@
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
+#include "nanolance/path_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <algorithm>
@@ -840,7 +841,15 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const pb::D
                           const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema, ArrowArray& batch,
                           std::string& error,
                           const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr) {
-    const auto path = dataset_path / "data" / data_file.path;
+    // data_file.path is attacker-controlled (it comes out of the untrusted manifest). Confine it under
+    // <dataset>/data/ so a hostile ".."/absolute path can't make the reader open a file outside the
+    // dataset. The writer only ever stores a bare filename here, so legitimate datasets are unaffected.
+    const auto jailed = safe_join_under(dataset_path / "data", data_file.path);
+    if (!jailed) {
+        error = "data file path escapes the dataset directory";
+        return false;
+    }
+    const auto& path = *jailed;
     pb::FileDescriptor descriptor{};
     LanceDataFileFooterLayout layout{};
     if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {

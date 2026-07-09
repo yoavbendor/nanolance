@@ -6,6 +6,7 @@
 // ASan+UBSan in CI, they turn "the reader is safe against malformed files" into an enforced property.
 
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/path_safety.hpp"
 #include "nanolance/read_safety.hpp"
 
 #include "lance_minimal.pb.hpp"
@@ -138,6 +139,28 @@ void test_garbage_protobuf_no_crash() {
     check(true, "protobuf decoders survive garbage (ASan enforces no OOB)");
 }
 
+void test_path_jail() {
+    namespace fs = std::filesystem;
+    const fs::path base = fs::path("/dataset") / "data";
+
+    // Legitimate: a bare filename (exactly what the writer stores) resolves under base.
+    const auto ok = nano_lance::safe_join_under(base, fs::path("fragment-0.lance"));
+    check(ok.has_value() && *ok == base / "fragment-0.lance", "bare filename is allowed");
+
+    // A nested-but-contained path is still fine.
+    check(nano_lance::safe_join_under(base, fs::path("0/fragment-0.lance")).has_value(),
+          "contained subpath is allowed");
+
+    // Hostile: traversal, absolute paths, and root escapes must all be rejected.
+    check(!nano_lance::safe_join_under(base, fs::path("../../etc/passwd")).has_value(),
+          "parent traversal rejected");
+    check(!nano_lance::safe_join_under(base, fs::path("a/../../b")).has_value(),
+          "embedded traversal rejected");
+    check(!nano_lance::safe_join_under(base, fs::path("/etc/passwd")).has_value(),
+          "absolute path rejected");
+    check(!nano_lance::safe_join_under(base, fs::path("")).has_value(), "empty path rejected");
+}
+
 }  // namespace
 
 int main() {
@@ -145,6 +168,7 @@ int main() {
     test_footer_column_cap();
     test_footer_descriptor_overflow();
     test_garbage_protobuf_no_crash();
+    test_path_jail();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d read-safety checks failed\n", g_failures);
         return 1;

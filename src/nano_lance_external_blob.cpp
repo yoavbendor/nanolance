@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <list>
@@ -58,6 +60,33 @@ std::string file_uri_to_path(const std::string& suri) {
         path.erase(0, 1);
     }
     return path;
+}
+
+// Validate a file:// blob path before opening it. The (uri, position, size) triple is attacker-controlled
+// (it comes out of the untrusted file), so a hostile file must not be able to steer the fetch to an
+// arbitrary path. Two defenses, neither of which affects the normal absolute-path workload:
+//   * always reject any ".." component — canonical URIs never contain one, and it's the classic escape;
+//   * an OPTIONAL jail: when NANO_LANCE_BLOB_BASE_DIR is set, confine every fetch under that directory.
+// Returns false and fills `reason` when the path is rejected.
+bool file_blob_path_allowed(const std::string& path, std::string& reason) {
+    const std::filesystem::path fs_path(path);
+    for (const auto& part : fs_path) {
+        if (part == "..") {
+            reason = "file:// blob path contains a '..' traversal component";
+            return false;
+        }
+    }
+    const char* base_env = std::getenv("NANO_LANCE_BLOB_BASE_DIR");
+    if (base_env != nullptr && base_env[0] != '\0') {
+        const std::filesystem::path base = std::filesystem::path(base_env).lexically_normal();
+        const std::filesystem::path norm = fs_path.lexically_normal();
+        const std::filesystem::path rel = norm.lexically_relative(base);
+        if (rel.empty() || *rel.begin() == "..") {
+            reason = "file:// blob path is outside NANO_LANCE_BLOB_BASE_DIR";
+            return false;
+        }
+    }
+    return true;
 }
 
 #ifdef NANO_LANCE_READER_HAS_S3
@@ -133,7 +162,13 @@ int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t 
         auto fresh = std::make_unique<BlobHandle>();
         if (is_file) {
             fresh->is_s3 = false;
-            fresh->file.open(file_uri_to_path(suri), std::ios::binary);
+            const std::string fpath = file_uri_to_path(suri);
+            std::string reject_reason;
+            if (!file_blob_path_allowed(fpath, reject_reason)) {
+                set_error(error_message, error_message_capacity, reject_reason);
+                return NANO_LANCE_READER_INVALID_ARGUMENT;
+            }
+            fresh->file.open(fpath, std::ios::binary);
             if (!fresh->file) {
                 set_error(error_message, error_message_capacity, "failed to open file:// path");
                 return NANO_LANCE_READER_IO_ERROR;

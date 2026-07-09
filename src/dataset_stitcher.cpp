@@ -6,6 +6,7 @@
 #include "lance_minimal.pb.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/manifest_writer.hpp"
+#include "nanolance/path_safety.hpp"
 
 #include <limits>
 #include <system_error>
@@ -110,8 +111,14 @@ bool stitch_datasets(const std::filesystem::path& master_path,
                     new_name += "-" + std::to_string(k);
                 }
                 new_name += ".lance";
-                if (!relocate(src / "data" / in_file.path, master_path / "data" / new_name, options.move_files,
-                              error)) {
+                // in_file.path comes from an untrusted source manifest; confine it under <src>/data/ so a
+                // hostile ".."/absolute path can't make the stitcher relocate a file outside the dataset.
+                const auto in_path = safe_join_under(src / "data", in_file.path);
+                if (!in_path) {
+                    error = "stitch: data file path escapes the dataset directory";
+                    return false;
+                }
+                if (!relocate(*in_path, master_path / "data" / new_name, options.move_files, error)) {
                     return false;
                 }
                 pb::DataFile out_file = in_file;  // keep field ids / column indices / size / version
