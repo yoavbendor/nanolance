@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+name: pages
+
+# Build the documentation site (MkDocs Material) and publish it to the gh-pages branch.
+#
+# One-time manual step to go live: Settings -> Pages -> Source = "Deploy from a branch" ->
+# gh-pages / (root). After that + a push to main, the site is public at
+# https://yoavbendor.github.io/nanolance/
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "llms.txt"
+      - "AGENTS.md"
+      - "README.md"
+      - "bench/linux-ci-results.md"
+      - "bench/read_parity_results.md"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # peaceiris pushes the built site to the gh-pages branch
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install tooling
+        run: python3 -m pip install --upgrade mkdocs-material
+
+      - name: build MkDocs site (prose) -> site/
+        run: |
+          # AGENTS.md and the auto-generated bench result files live at their canonical repo paths;
+          # copy them into docs/ so they become site pages without duplicating content in the repo.
+          cp AGENTS.md docs/agents.md
+          cp bench/linux-ci-results.md docs/bench-write-read.md
+          cp bench/read_parity_results.md docs/bench-trusted-parity.md
+          mkdocs build --strict
+
+      - name: add machine-readable llms.txt to the site
+        run: cp llms.txt site/llms.txt
+
+      - name: deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site

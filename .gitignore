@@ -14,3 +14,10 @@ compile_commands.json
 # pcapng2lance example for now; kept here to develop on a CUDA box. Re-introduce when ready.
 /local-gputins/
 build2/
+
+# MkDocs build output + docs pages copied in at deploy time from their canonical location
+# (.github/workflows/pages.yml) — never committed, always freshly generated from main.
+/site/
+docs/agents.md
+docs/bench-write-read.md
+docs/bench-trusted-parity.md

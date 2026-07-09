@@ -1,0 +1,81 @@
+site_name: nanolance
+site_description: >-
+  A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large
+  payloads external (uri + offset + size, never copied); the reader is hardened against untrusted
+  files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).
+site_url: https://yoavbendor.github.io/nanolance/
+repo_url: https://github.com/yoavbendor/nanolance
+repo_name: yoavbendor/nanolance
+edit_uri: edit/main/docs/
+copyright: Apache-2.0
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.code.annotate
+    - search.suggest
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+nav:
+  - Home: index.md
+  - Memory safety & Rust reviewers: SAFETY.md
+  - Getting started: getting-started.md
+  - AI agent integration: agents.md
+  - Benchmarks:
+      - Overview: bench.md
+      - Write/read vs Parquet & Rust lance: bench-write-read.md
+      - Safety-parity (trusted vs default): bench-trusted-parity.md
+  - Internals:
+      - S3 reader notes: s3_reader_notes.md
+      - Disk LRU block cache: disk-lru-block-cache.md
+      - Table reader design notes: lance_table_reader_plan.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/yoavbendor/nanolance
