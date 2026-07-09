@@ -46,6 +46,18 @@ def make_datasets():
         "id": pa.array([random.getrandbits(64) for _ in range(N)], pa.uint64()),
         "label": pa.array([f"obj-{random.getrandbits(40):010x}" for _ in range(N)], pa.string()),
     })
+    # D4: float/double — byte-stream-split + zstd path (Phase B). A smooth signal (not random) so
+    # byte-transpose actually helps zstd, the shape stock Lance itself targets with ByteStreamSplit.
+    import math
+    ds["float_smooth"] = pa.table({
+        "reading": pa.array([math.sin(i * 0.001) * 1000.0 for i in range(N)], pa.float64()),
+        "gain": pa.array([math.cos(i * 0.0007) * 10.0 for i in range(N)], pa.float32()),
+    })
+    # D5: bool — 1-bit-per-value packing path (Phase C). Mixed true/false, not constant/run-length, so
+    # neither ConstantLayout nor RLE short-circuits it and the bitpack path is actually exercised.
+    ds["bool_flags"] = pa.table({
+        "flag": pa.array([random.random() < 0.37 for _ in range(N)], pa.bool_()),
+    })
     return ds, N
 
 WRITE_ITERS = 5
