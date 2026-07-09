@@ -13,6 +13,7 @@
 
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace nano_lance {
 namespace {
@@ -86,7 +87,9 @@ bool zstd_unframe_buffer(const std::vector<std::uint8_t>& framed, std::vector<st
         error = "zstd frame content size disagrees with declared size";
         return false;
     }
-    out.assign(static_cast<std::size_t>(uncompressed), 0U);
+    // resize() (not assign(n, 0)) so a reused `out` across many page calls of similar size isn't
+    // re-zeroed every time — ZSTD_decompress below unconditionally overwrites all out.size() bytes.
+    out.resize(static_cast<std::size_t>(uncompressed));
     const auto got = ZSTD_decompress(out.data(), out.size(), framed.data() + 8U, framed.size() - 8U);
     if (ZSTD_isError(got) != 0U || got != uncompressed) {
         error = "zstd decompress failed for variable-width column";
@@ -280,7 +283,12 @@ bool unpack_bitpacked_page(const std::vector<std::uint8_t>& chunk, std::uint64_t
         error = "bitpacked chunk size does not match bit width";
         return false;
     }
-    std::vector<T> packed(packed_words, 0);
+    // thread_local + resize (not a fresh (packed_words, 0)-initialized vector every call): packed_words is
+    // bounded by <=1024 (one FastLanes block), so this reused buffer's capacity converges after the first
+    // max-sized call, and resize() only zero-inits a growing delta rather than the whole buffer every time
+    // — the memcpy right below unconditionally overwrites all packed_words elements regardless.
+    thread_local std::vector<T> packed;
+    packed.resize(packed_words);
     if (packed_words != 0U) {
         std::memcpy(packed.data(), chunk.data() + sizeof(T), packed_words * sizeof(T));
     }
@@ -355,9 +363,11 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     const bool blob_packed = field_metadata_is_true(on_disk_field, "lance-encoding:blob");
     if (blob_packed) {
         out.kind = ColumnValues::Kind::BlobV2External;
+        // Hoisted out of the loop (not freshly declared per page): read_lance_data_file_bytes reuses
+        // whatever capacity/bytes are already here rather than re-zeroing a fresh buffer every page.
+        std::vector<std::uint8_t> control;
+        std::vector<std::uint8_t> values;
         for (const auto& page : column_metadata.pages) {
-            std::vector<std::uint8_t> control;
-            std::vector<std::uint8_t> values;
             if (!read_page_buffers(data_file_path, page, true, control, values, error)) {
                 return false;
             }
@@ -439,9 +449,9 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         }
         const auto bpv = lance_logical_type_value_bytes(internal);
         const std::size_t length_bytes = 1U;  // Lance RLE uses 8-bit run lengths
+        std::vector<std::uint8_t> control;
+        std::vector<std::uint8_t> data;
         for (const auto& page : column_metadata.pages) {
-            std::vector<std::uint8_t> control;
-            std::vector<std::uint8_t> data;
             if (!read_page_buffers(data_file_path, page, false, control, data, error)) {
                 return false;
             }
@@ -491,20 +501,20 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     if (field_metadata_equals(on_disk_field, "nanolance:packing", "dict-rle")) {
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
+        std::vector<std::uint8_t> data;       // buffer[1]: RLE chunk of indices
+        std::vector<std::uint8_t> dict_frame;  // buffer[2]: dictionary
+        std::vector<std::uint8_t> dict_block;
         for (const auto& page : column_metadata.pages) {
             if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
                 error = "dict-rle page missing buffers";
                 return false;
             }
-            std::vector<std::uint8_t> data;       // buffer[1]: RLE chunk of indices
-            std::vector<std::uint8_t> dict_frame;  // buffer[2]: dictionary
             if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[1], page.buffer_sizes[1], data, error) ||
                 !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_frame,
                                             error)) {
                 return false;
             }
             // Decode the dictionary: un-zstd -> [u32 32][u32 bytes_start][u32 offsets][data].
-            std::vector<std::uint8_t> dict_block;
             if (!zstd_unframe_buffer(dict_frame, dict_block, error)) {
                 return false;
             }
@@ -611,13 +621,14 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     if (field_metadata_equals(on_disk_field, "nanolance:packing", "dict")) {
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
+        std::vector<std::uint8_t> payload;
+        std::vector<std::uint8_t> dict_block;
+        std::vector<std::uint8_t> indices_bytes;
         for (const auto& page : column_metadata.pages) {
             if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
                 error = "dict page missing buffers";
                 return false;
             }
-            std::vector<std::uint8_t> payload;
-            std::vector<std::uint8_t> dict_block;
             if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[1], page.buffer_sizes[1], payload,
                                             error) ||
                 !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_block,
@@ -655,7 +666,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 error = "dict page has no index chunks";
                 return false;
             }
-            std::vector<std::uint8_t> indices_bytes;
+            indices_bytes.clear();  // hoisted out of the loop; accumulates fresh per page via insert()
             std::uint64_t rows_remaining = page.length;
             for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
                 const auto count = std::min<std::uint64_t>(1024U, rows_remaining);
@@ -695,23 +706,25 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
         const bool zstd = field_metadata_equals(on_disk_field, "lance-encoding:compression", "zstd");
+        std::vector<std::uint8_t> control;
+        std::vector<std::uint8_t> payload;
+        std::vector<std::uint8_t> chunk_bytes;
+        std::vector<std::uint8_t> raw;
         for (const auto& page : column_metadata.pages) {
-            std::vector<std::uint8_t> control;
-            std::vector<std::uint8_t> payload;
             if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
                 return false;
             }
-            std::vector<std::uint8_t> chunk_bytes;
             if (!parse_miniblock_payload_chunks(payload, chunk_bytes, error)) {
                 return false;
             }
             if (zstd) {
                 // One chunk per page in nanolance's writer, so the payload holds one [u64][zstd] frame.
-                std::vector<std::uint8_t> raw;
                 if (!zstd_unframe_buffer(chunk_bytes, raw, error)) {
                     return false;
                 }
-                chunk_bytes = std::move(raw);
+                // swap (not move): a move would leave `raw` empty every iteration, discarding its
+                // capacity right when the next page's zstd_unframe_buffer call could have reused it.
+                std::swap(chunk_bytes, raw);
             }
             if (!decode_variable_width_page(chunk_bytes, page.length, out.variable.large, out.variable.offsets,
                                           out.variable.data, error)) {
@@ -728,13 +741,13 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     }
     const auto bytes_per_value = lance_logical_type_value_bytes(internal_type);
     const bool bitpacked = field_metadata_equals(on_disk_field, "nanolance:packing", "bitpack");
+    std::vector<std::uint8_t> control;
+    std::vector<std::uint8_t> payload;
+    std::vector<std::uint8_t> chunk_bytes;
     for (const auto& page : column_metadata.pages) {
-        std::vector<std::uint8_t> control;
-        std::vector<std::uint8_t> payload;
         if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
             return false;
         }
-        std::vector<std::uint8_t> chunk_bytes;
         if (!parse_miniblock_payload_chunks(payload, chunk_bytes, error)) {
             return false;
         }
