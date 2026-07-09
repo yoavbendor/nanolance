@@ -2,24 +2,36 @@
 // Copyright (c) 2026 Yoav Bendor
 
 // nlbench: time nanolance's native full-scan read of a dataset it wrote.
-// Usage: nlbench <dataset.lance> [iters]   -> prints rows and avg read milliseconds (JSON).
+// Usage: nlbench <dataset.lance> [iters] [--trusted]
+//   -> prints rows and avg/best read milliseconds (JSON). --trusted reads with trusted_input=true (skips
+//      the untrusted-input DoS/OOM budget checks; bounds checks are unconditional and always run) — used
+//      to produce the safety-vs-trusted parity table in docs/SAFETY.md (see bench/read_parity_bench.sh).
 #include "nanolance/lance_table_reader.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "usage: nlbench <dataset.lance> [iters]\n";
+        std::cerr << "usage: nlbench <dataset.lance> [iters] [--trusted]\n";
         return 2;
     }
     const std::string path = argv[1];
-    const int iters = argc >= 3 ? std::atoi(argv[2]) : 5;
+    int iters = 5;
+    bool trusted_input = false;
+    for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--trusted") == 0) {
+            trusted_input = true;
+        } else {
+            iters = std::atoi(argv[i]);
+        }
+    }
 
     std::int64_t rows = 0;
     double best_ms = 1e30;
@@ -29,7 +41,7 @@ int main(int argc, char** argv) {
         std::vector<ArrowArray> batches;
         std::string error;
         const auto t0 = std::chrono::steady_clock::now();
-        if (!nano_lance::lance_table_read_dataset(path, schema, batches, error)) {
+        if (!nano_lance::lance_table_read_dataset(path, schema, batches, error, trusted_input)) {
             std::cerr << "read failed: " << error << '\n';
             return 1;
         }
@@ -46,7 +58,7 @@ int main(int argc, char** argv) {
             ArrowArrayRelease(&b);
         }
     }
-    std::cout << "{\"rows\": " << rows << ", \"best_ms\": " << best_ms
-              << ", \"avg_ms\": " << (total_ms / iters) << "}\n";
+    std::cout << "{\"rows\": " << rows << ", \"trusted_input\": " << (trusted_input ? "true" : "false")
+              << ", \"best_ms\": " << best_ms << ", \"avg_ms\": " << (total_ms / iters) << "}\n";
     return 0;
 }

@@ -29,11 +29,9 @@ int map_status(const std::string& error) {
     return NANO_LANCE_READER_PARSE_ERROR;
 }
 
-}  // namespace
-
-extern "C" int nano_lance_table_read_dataset(const char* dataset_path, struct ArrowSchema* out_schema,
-                                             struct ArrowArray** out_batches, size_t* out_batch_count,
-                                             char* error_message, size_t error_message_capacity) {
+int read_dataset_impl(const char* dataset_path, bool trusted_input, struct ArrowSchema* out_schema,
+                      struct ArrowArray** out_batches, size_t* out_batch_count, char* error_message,
+                      size_t error_message_capacity) {
     if (out_schema == nullptr || out_batches == nullptr || out_batch_count == nullptr) {
         set_error(error_message, error_message_capacity, "out_schema, out_batches, and out_batch_count are required");
         return NANO_LANCE_READER_INVALID_ARGUMENT;
@@ -49,7 +47,8 @@ extern "C" int nano_lance_table_read_dataset(const char* dataset_path, struct Ar
 
     std::vector<ArrowArray> batches;
     std::string error;
-    if (!nano_lance::lance_table_read_dataset(std::filesystem::path(dataset_path), *out_schema, batches, error)) {
+    if (!nano_lance::lance_table_read_dataset(std::filesystem::path(dataset_path), *out_schema, batches, error,
+                                              trusted_input)) {
         ArrowSchemaRelease(out_schema);
         set_error(error_message, error_message_capacity, error);
         return map_status(error);
@@ -77,6 +76,23 @@ extern "C" int nano_lance_table_read_dataset(const char* dataset_path, struct Ar
     *out_batches = heap_batches;
     *out_batch_count = batches.size();
     return NANO_LANCE_READER_OK;
+}
+
+}  // namespace
+
+extern "C" int nano_lance_table_read_dataset(const char* dataset_path, struct ArrowSchema* out_schema,
+                                             struct ArrowArray** out_batches, size_t* out_batch_count,
+                                             char* error_message, size_t error_message_capacity) {
+    return read_dataset_impl(dataset_path, /*trusted_input=*/false, out_schema, out_batches, out_batch_count,
+                             error_message, error_message_capacity);
+}
+
+extern "C" int nano_lance_table_read_dataset_ex(const char* dataset_path, int trusted_input,
+                                                struct ArrowSchema* out_schema, struct ArrowArray** out_batches,
+                                                size_t* out_batch_count, char* error_message,
+                                                size_t error_message_capacity) {
+    return read_dataset_impl(dataset_path, trusted_input != 0, out_schema, out_batches, out_batch_count,
+                             error_message, error_message_capacity);
 }
 
 extern "C" void nano_lance_table_read_result_free(struct ArrowSchema* schema, struct ArrowArray* batches,

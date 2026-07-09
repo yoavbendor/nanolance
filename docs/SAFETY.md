@@ -78,6 +78,32 @@ buffer in a prologue; the tight `memcpy`/materialization loop that follows carri
 safety cost is therefore O(pages), not O(values) — invisible next to the bytes moved. (The reader's
 throughput benchmark is unchanged by this work.)
 
+### Trusted-input mode: the escape hatch that proves the point
+
+`lance_table_read_dataset(..., trusted_input = true)` (C API: `nano_lance_table_read_dataset_ex`) lets a
+self-produced pipeline — round-tripping your own writer output, never a file from another party — opt
+out of the four untrusted-input DoS/OOM *budget* checks (declared zstd size, row/column/manifest-element
+counts vs. `ReadLimits`). It does **not** disable a single bounds check: `checked_add`/`checked_mul`/
+`range_in_bounds` and every offset/size compare built on them are unconditional code, not gated by this
+flag, so they run exactly the same whether or not the caller trusts the input.
+
+Because those budget checks were already free (validated once per page/header, not per value), turning
+them off measures as noise, not a speedup — which is the whole point: default is already fast, so there's
+no safety/speed tradeoff to make. `bench/read_parity_bench.sh` proves it on a synthetic dataset mixing
+plain fixed-width, low-/high-cardinality utf8, and constant columns (the writer auto-picks
+bitpack/RLE/dict-RLE/constant/plain per column):
+
+```
+mode           |    best ms |     avg ms
+---------------+------------+-----------
+default        |    92.0356 |    98.0309
+trusted_input  |     90.682 |    99.1971
+```
+
+trusted/default best-ms ratio: **0.985x** (1,000,000 rows, best of 9 reads each — regenerate with
+`bench/read_parity_bench.sh [build_dir] [rows]`; results land in
+[`bench/read_parity_results.md`](../bench/read_parity_results.md)).
+
 ## How it's proven
 
 Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](../.github/workflows/memory-safety.yml)):
@@ -115,10 +141,10 @@ UBSAN_OPTIONS=halt_on_error=1 ASAN_OPTIONS=detect_leaks=1 ctest --test-dir build
 - [x] Read path is ASan + UBSan + LSan clean and continuously fuzzed in CI.
 - [x] A mid-read failure releases every batch already built, not just the schema.
 - [x] Malformed inputs are rejected with an error return, never a crash or unbounded allocation.
+- [x] `trusted_input` only skips DoS-budget checks, never a bounds check — and measures as no faster.
 
 ## Known follow-ups (tracked, not yet landed)
 
-- **Strict/trusted mode** (`trusted_input` reader option that skips the untrusted-input budget checks
-  for a self-produced pipeline, keeping the bounds checks) and a published before/after read-throughput
-  parity table are the next hardening phase (see the project's memory-safety plan). External blob range
-  validation currently relies on read/EOF behavior.
+- External blob range validation currently relies on read/EOF behavior rather than an upfront
+  `position + size` check against the source's known length (cheap for `file://`, not always available
+  for `s3://` without an extra HEAD request).

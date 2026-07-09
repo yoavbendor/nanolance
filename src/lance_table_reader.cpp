@@ -8,10 +8,12 @@
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/path_safety.hpp"
+#include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -907,10 +909,16 @@ void release_partial_read(ArrowSchema& out_schema, std::vector<ArrowArray>& out_
 }  // namespace
 
 bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
-                              std::vector<ArrowArray>& out_batches, std::string& error) {
+                              std::vector<ArrowArray>& out_batches, std::string& error,
+                              bool trusted_input) {
     error.clear();
     out_batches.clear();
     ArrowSchemaInit(&out_schema);
+
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
 
     pb::Manifest manifest{};
     std::uint64_t version = 0;
@@ -946,10 +954,15 @@ bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_pat
                                         const std::vector<std::string>& column_names,
                                         ArrowSchema& out_schema,
                                         std::vector<ArrowArray>& out_batches,
-                                        std::string& error) {
+                                        std::string& error, bool trusted_input) {
     error.clear();
     out_batches.clear();
     ArrowSchemaInit(&out_schema);
+
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
 
     pb::Manifest manifest{};
     std::uint64_t version = 0;
