@@ -9,10 +9,73 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <list>
+#include <utility>
 #include <vector>
 
 namespace nano_lance {
 namespace {
+
+// Small per-thread LRU of open (path -> stream, file_size, mtime), so a column's many page-buffer reads
+// reuse one handle instead of re-running std::ifstream's open() (its own stat + buffer/locale setup, far
+// heavier than a plain stat) on every single call — mirrors the LRU pattern already used for external
+// blob fetches (nano_lance_external_blob.cpp). thread_local, so concurrent reads on different threads
+// never share (or contend over) a stream.
+//
+// A Lance data file is immutable once *committed*, but the exact same path can legitimately be reused by
+// a *later, unrelated* file: fragment file names are assigned deterministically from the lowest unused
+// suffix (data_file_writer.cpp), so wiping a dataset directory and rewriting it reproduces the very same
+// "fragment-0.lance" path with different bytes (this is exactly what nanolance's own test suite does
+// across sequential test cases sharing one temp directory). So every lookup — hit or miss — re-stats
+// size + mtime and reopens if either changed, trading back part of the stat-avoidance win for
+// correctness against file replacement, while still skipping the much heavier open() when unchanged.
+struct OpenDataFile {
+    std::ifstream stream;
+    std::uint64_t file_size = 0;
+    std::filesystem::file_time_type mtime{};
+};
+constexpr std::size_t kMaxOpenDataFiles = 4;
+thread_local std::list<std::pair<std::filesystem::path, OpenDataFile>> g_open_data_files;
+
+OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::string& error) {
+    std::error_code ec;
+    const auto file_size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        error = "failed to stat data file: " + ec.message();
+        return nullptr;
+    }
+    const auto mtime = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        error = "failed to stat data file: " + ec.message();
+        return nullptr;
+    }
+
+    for (auto it = g_open_data_files.begin(); it != g_open_data_files.end(); ++it) {
+        if (it->first == path) {
+            if (it->second.file_size == static_cast<std::uint64_t>(file_size) && it->second.mtime == mtime) {
+                g_open_data_files.splice(g_open_data_files.begin(), g_open_data_files, it);
+                return &g_open_data_files.front().second;
+            }
+            // Stale — same path, different underlying file. Drop it rather than leaving a shadowed,
+            // still-open duplicate entry sitting in the LRU until it ages out.
+            g_open_data_files.erase(it);
+            break;
+        }
+    }
+    OpenDataFile fresh;
+    fresh.stream.open(path, std::ios::binary);
+    if (!fresh.stream) {
+        error = "failed to open data file for read";
+        return nullptr;
+    }
+    fresh.file_size = static_cast<std::uint64_t>(file_size);
+    fresh.mtime = mtime;
+    g_open_data_files.emplace_front(path, std::move(fresh));
+    if (g_open_data_files.size() > kMaxOpenDataFiles) {
+        g_open_data_files.pop_back();
+    }
+    return &g_open_data_files.front().second;
+}
 
 bool read_le16(const unsigned char* p, std::uint16_t& v) {
     v = static_cast<std::uint16_t>(static_cast<unsigned>(p[0]) | (static_cast<unsigned>(p[1]) << 8U));
@@ -151,27 +214,25 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
 
 bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::uint64_t offset,
                                 const std::uint64_t size, std::vector<std::uint8_t>& out, std::string& error) {
+    // Deliberately no `out.clear()` here: callers commonly reuse the same `out` vector across many
+    // page reads in a loop, and `resize()` below both sets the exact final size and, when reused across
+    // calls of similar size, avoids re-zeroing bytes the very next line's ifstream::read() is about to
+    // overwrite anyway (clear()+resize() would force a fresh zero-fill of the whole buffer every call).
     error.clear();
-    out.clear();
     if (!fits_size_t(size)) {
         error = "read size overflow";
         return false;
     }
-    std::error_code ec;
-    const auto file_size = std::filesystem::file_size(path, ec);
-    if (ec) {
-        error = "failed to stat data file: " + ec.message();
+    auto* file = find_or_open_data_file(path, error);
+    if (file == nullptr) {
         return false;
     }
-    if (!range_in_bounds(offset, size, static_cast<std::uint64_t>(file_size))) {
+    if (!range_in_bounds(offset, size, file->file_size)) {
         error = "read range exceeds data file size";
         return false;
     }
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        error = "failed to open data file for read";
-        return false;
-    }
+    auto& in = file->stream;
+    in.clear();  // a previous read on this cached stream may have set eof/fail; clear before repositioning
     in.seekg(static_cast<std::streamoff>(offset));
     out.resize(static_cast<std::size_t>(size));
     in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(size));

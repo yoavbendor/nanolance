@@ -108,8 +108,8 @@ nano_lance_writer_close(&w);
 - **No compression for `float`/`bool` fixed-width columns** (written raw; Lance uses byte-stream-split).
 - **No transparent delta encoding** — store monotonic high-range integers as app-level deltas to stay
   small (otherwise they bitpack as absolute values, where Parquet's delta encoding wins).
-- **Read throughput is the known gap** (~2× `lance`; memory-bandwidth bound on column materialization).
-  The flat fixed-width path still caps chunks at 800 bytes (perf TODO — bitpacking is unaffected).
+- **Read throughput is the known gap** (currently ~2–3.5× `lance`, memory-bandwidth bound on column
+  materialization — see [bench/linux-ci-results.md](bench/linux-ci-results.md) for current numbers).
 - **`nano_lance_writer_set_blob_uri_dictionary` is nanolance-only** (dedups identical external URIs;
   stock Lance cannot read that blob column; create-mode only).
 - **S3:** SSO / assume-role profiles aren't resolved — export credentials to the environment first
