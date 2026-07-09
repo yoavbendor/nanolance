@@ -105,7 +105,9 @@ nano_lance_writer_close(&w);
 
 ### Not yet supported / nanolance-only
 
-- **No compression for `float`/`bool` fixed-width columns** (written raw; Lance uses byte-stream-split).
+- **`bool` fixed-width columns aren't compressed** (written one byte per value; stock Lance bitpacks to
+  1 bit/value). `float`/`double` columns *are* compressed when `set_compression(true)` is set — via
+  byte-stream-split + zstd, the same technique stock Lance uses, verified byte-for-byte readable by it.
 - **No transparent delta encoding** — store monotonic high-range integers as app-level deltas to stay
   small (otherwise they bitpack as absolute values, where Parquet's delta encoding wins).
 - **Read throughput is the known gap** (currently ~2–3.5× `lance`, memory-bandwidth bound on column

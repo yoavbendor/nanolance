@@ -5,6 +5,7 @@
 
 #include "lance_minimal.pb.hpp"
 #include "nanolance/blob_v2_external.hpp"
+#include "nanolance/byte_stream_split.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
 #include "nanolance/schema_mapper.hpp"
 
@@ -350,6 +351,43 @@ std::vector<std::uint8_t> variable_width_structural_payload_zstd(std::uint8_t bi
 std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_token, std::uint64_t rows) {
     std::vector<std::uint8_t> page_layout;
     write_length_delimited(page_layout, 1, variable_width_structural_payload_zstd(bits_token, rows));
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
+// Fixed-width CompressiveEncoding wrapped General(ZSTD) -> ByteStreamSplit -> Flat, matching what stock
+// Lance emits for a zstd-compressed, byte-stream-split float/double column. The field-tag numbers below
+// were verified byte-for-byte against a real `lance` 8.0.0-written file (written via pylance with
+// `lance-encoding:compression=zstd` + `lance-encoding:bss=on` field metadata, data_storage_version=2.2)
+// by hex-dumping its on-disk page.encoding bytes and walking the protobuf wire format field by field;
+// they are NOT guessed. Restricted to 32/64-bit values (bits_token 0x20/0x40) — matches stock Lance's
+// own ByteStreamSplit restriction ("only supports 32-bit (f32) or 64-bit (f64) values").
+//   CompressiveEncoding{ f1 Flat{f1 bits} }                          -- innermost
+//   -> ByteStreamSplit{ f1 values = above }                          -- f9 of CompressiveEncoding
+//   -> General{ f1 BufferCompression{f1 scheme=ZSTD(2)}, f3 values = above }   -- f10 of CompressiveEncoding
+//   -> MiniBlockLayout.value_compression (f3) = CompressiveEncoding{ f10 General = above }
+std::vector<std::uint8_t> fixed_width_structural_payload_bss_zstd(std::uint8_t bits_token, std::uint64_t rows) {
+    const std::vector<std::uint8_t> flat_ce{0x0a, 0x02, 0x08, bits_token};
+    std::vector<std::uint8_t> bss{0x0a, static_cast<std::uint8_t>(flat_ce.size())};
+    bss.insert(bss.end(), flat_ce.begin(), flat_ce.end());
+    std::vector<std::uint8_t> bss_ce{0x4a, static_cast<std::uint8_t>(bss.size())};
+    bss_ce.insert(bss_ce.end(), bss.begin(), bss.end());
+    std::vector<std::uint8_t> general{0x0a, 0x02, 0x08, 0x02, 0x1a, static_cast<std::uint8_t>(bss_ce.size())};
+    general.insert(general.end(), bss_ce.begin(), bss_ce.end());
+    std::vector<std::uint8_t> value_comp{0x52, static_cast<std::uint8_t>(general.size())};
+    value_comp.insert(value_comp.end(), general.begin(), general.end());
+    std::vector<std::uint8_t> out{0x1a, static_cast<std::uint8_t>(value_comp.size())};
+    out.insert(out.end(), value_comp.begin(), value_comp.end());
+    const auto mini = build_mini_block_layout(bits_token, rows);
+    out.insert(out.end(), mini.begin() + 6, mini.end());
+    return out;
+}
+
+std::vector<std::uint8_t> page_layout_bytes_bss_zstd(std::uint8_t bits_token, std::uint64_t rows) {
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, 1, fixed_width_structural_payload_bss_zstd(bits_token, rows));
     std::vector<std::uint8_t> encoding;
     write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
     write_length_delimited(encoding, 2, page_layout);
@@ -1054,6 +1092,9 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         const bool bitpack = !is_variable && packing_it != field.metadata.end() &&
                              packing_it->second == "bitpack" &&
                              lance_logical_type_is_bitpackable_integer(field.logical_type);
+        // Byte-stream-split + zstd: float/double, tagged when set_compression(true) (writer.cpp).
+        const bool bss_zstd = !is_variable && packing_it != field.metadata.end() &&
+                              packing_it->second == "bss-zstd";
         const auto fixed_bytes_per_value = value_width_bytes(field);
         if (!is_variable) {
             if (values.fixed.size() % fixed_bytes_per_value != 0U) {
@@ -1073,7 +1114,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         // into a payload vector; for a plain fixed-width column the chunk bytes are just a slice of
         // values.fixed, so both copies are pure overhead (memcpy dominates this path after the chunk
         // count was reduced). One chunk per page, byte-identical to the generic flat encoding.
-        if (!is_variable && !bitpack) {
+        if (!is_variable && !bitpack && !bss_zstd) {
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
             const auto total = values.fixed.size() / fixed_bytes_per_value;
@@ -1112,10 +1153,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             if (!build_variable_chunks_for_column(values.variable, chunks, error)) {
                 return false;
             }
-        } else {
-            // Only bitpacked fixed-width columns reach here; the flat path streamed above and the
-            // variable path is handled just above. One FastLanes 1024-value chunk per page; each chunk
-            // buffer = [bit_width][packed].
+        } else if (bitpack) {
+            // One FastLanes 1024-value chunk per page; each chunk buffer = [bit_width][packed].
             const auto total = values.fixed.size() / fixed_bytes_per_value;
             for (std::size_t off = 0; off < total; off += 1024U) {
                 const auto count = std::min<std::size_t>(1024U, total - off);
@@ -1125,13 +1164,29 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                                                     fixed_bytes_per_value);
                 chunks.push_back(std::move(chunk));
             }
+        } else {
+            // Only byte-stream-split+zstd fixed-width columns reach here (the flat path streamed above,
+            // bitpack and variable are handled above). Byte-transpose each chunk (mantissa/exponent
+            // bytes grouped together) so the zstd framing below compresses it meaningfully; zstd itself
+            // is applied uniformly for every non-bitpack chunk kind further down.
+            const auto total = values.fixed.size() / fixed_bytes_per_value;
+            const auto max_chunk_values = max_values_per_uncompressed_chunk(fixed_bytes_per_value);
+            for (std::size_t off = 0; off < total;) {
+                const auto count = std::min(max_chunk_values, total - off);
+                MiniblockChunk chunk;
+                chunk.value_count = count;
+                chunk.bytes = bss::transpose(values.fixed.data() + off * fixed_bytes_per_value,
+                                             fixed_bytes_per_value, count);
+                chunks.push_back(std::move(chunk));
+                off += count;
+            }
         }
 
         const bool zstd_variable = is_variable && compress;
         pb::ColumnMetadata column;
         column.encoding = column_encoding_bytes();
         for (auto& chunk : chunks) {
-            if (zstd_variable) {
+            if (zstd_variable || bss_zstd) {
                 std::vector<std::uint8_t> framed;
                 if (!zstd_frame_buffer(chunk.bytes, compression_level, framed, error)) {
                     return false;
@@ -1165,7 +1220,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 page.encoding = page_layout_bytes_inline_bitpacking(
                     static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), chunk.value_count);
             } else {
-                page.encoding = page_layout_bytes(field, chunk.value_count);
+                // Only bss_zstd reaches here (is_variable and bitpack excluded above).
+                page.encoding = page_layout_bytes_bss_zstd(flat_bits_per_value_token(field), chunk.value_count);
             }
             column.pages.push_back(std::move(page));
         }

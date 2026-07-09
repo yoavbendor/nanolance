@@ -584,10 +584,12 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
     }
 
     // Tag fields for encoding. zstd (a real CPU-for-size tradeoff) is opt-in via set_compression and
-    // only applies to variable-width columns. Integer bitpacking is a structural, lossless re-encoding
-    // and is enabled by the (default-on) structural switch. (Stock Lance reads the encoding from the
-    // data-file PageLayout; this metadata is nanolance's own read-side signal and an inert write hint
-    // to Lance.)
+    // applies to variable-width columns and, for float/double, as byte-stream-split + zstd (splitting
+    // each value into its mantissa/exponent byte planes before compressing — the same technique stock
+    // Lance uses for these types, since compressing already-interleaved float bytes barely helps).
+    // Integer bitpacking is a structural, lossless re-encoding and is enabled by the (default-on)
+    // structural switch. (Stock Lance reads the encoding from the data-file PageLayout; this metadata
+    // is nanolance's own read-side signal and an inert write hint to Lance.)
     for (auto& field : disk_schema.fields) {
         if (!nano_lance::lance_field_is_physical(field) || !field.extension_name.empty()) {
             continue;
@@ -598,6 +600,8 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
             }
         } else if (state->structural && nano_lance::lance_logical_type_is_bitpackable_integer(field.logical_type)) {
             field.metadata["nanolance:packing"] = "bitpack";
+        } else if (state->compression && (field.logical_type == "float" || field.logical_type == "double")) {
+            field.metadata["nanolance:packing"] = "bss-zstd";
         }
     }
 

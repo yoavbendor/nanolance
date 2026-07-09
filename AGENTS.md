@@ -77,7 +77,9 @@ There are **two independent knobs** (this changed — there used to be one `--co
   `nano_lance_writer_set_structural_encoding(&w, true)` (default). Disable with the setter, or
   `arrowipc2lance --no-structural`, to emit plain flat/variable-width pages ("raw" Lance output).
 - **zstd** — a real CPU-for-size tradeoff, applied to high-cardinality variable-width (string/binary)
-  columns only. **Off by default**: `nano_lance_writer_set_compression(&w, true)` (CLI `--compress`).
+  columns, and to `float`/`double` fixed-width columns (byte-stream-split + zstd — the same technique
+  stock Lance itself uses for these types, since compressing already-interleaved float bytes barely
+  helps). **Off by default**: `nano_lance_writer_set_compression(&w, true)` (CLI `--compress`).
 
 Both stay readable by stock `lance`; nanolance's own reader decodes them transparently. The picked
 encoding per column type:
@@ -88,7 +90,8 @@ encoding per column type:
 | Constant column (all rows equal), fixed **or** string/binary | **ConstantLayout** (value stored once; ~0 data bytes) | structural (default) | constant int → 0.007, constant URI string → 0.009 B/row |
 | Low-cardinality run-length column, fixed **or** string | **RLE** (ints) / **Dictionary+RLE** (strings) | structural (default) | run-length URI: 2.90 → 0.033 B/row (87×); run-length int: → 0.027 B/row |
 | String / binary (non-constant, high-cardinality) | **zstd** (`General(ZSTD)`, `[u64 len][zstd]` per chunk) | `--compress` (opt-in) | repetitive string: 7.6 → ~3 B/row |
-| float / bool fixed-width | left uncompressed (Lance uses other schemes) | — | — |
+| `float` / `double` fixed-width | **byte-stream-split + zstd** (`General(ZSTD){ ByteStreamSplit{ Flat } }`) | `--compress` (opt-in) | smooth double column: ~23% smaller |
+| `bool` fixed-width | left uncompressed, 1 byte/value (stock Lance bitpacks to 1 bit/value) | — | — |
 
 So a blob.v2 run-length URI column is now tiny **without** `--compress`; `--compress` only adds zstd on
 top for the genuinely high-cardinality string columns. `--compress` output is byte-identical to the
