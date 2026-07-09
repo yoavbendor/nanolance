@@ -221,6 +221,40 @@ bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv) {
     }
     const char* base = reinterpret_cast<const char*>(cv.variable.data.data());
     const std::size_t data_size = cv.variable.data.size();
+
+    // Cheap pre-check on a prefix sample before committing to the full scan below: building the real
+    // dictionary means one heap-allocating hash-map insert per distinct value, and for a genuinely
+    // high-cardinality column (near-unique IDs, free-text labels) that means tens of thousands of
+    // allocations just to conclude "not beneficial" and throw the whole map away. A column's
+    // cardinality is normally fairly uniform across a write batch, so a small prefix sample is a
+    // reasonable predictor of the full-column ratio; only skip the full scan when the sample already
+    // shows the ratio decisively blown (not merely close), to keep false negatives rare -- the cost of
+    // a false negative here is a slightly larger encoding (falls back to zstd/plain), never wrong data.
+    // Sample distinct-count via sort+unique (one vector allocation total) rather than a hash set (one
+    // heap allocation per distinct element even for this small sample) -- no per-row allocation at all.
+    constexpr std::size_t kSampleRows = 4096U;
+    constexpr double kSampleRejectMargin = 1.5;  // require the sample ratio to exceed the real cutoff by 50%
+    if (rows > kSampleRows * 4U) {
+        std::vector<std::string_view> sample;
+        sample.reserve(kSampleRows);
+        for (std::size_t i = 0; i < kSampleRows; ++i) {
+            const auto s = read_offset(i);
+            const auto e = read_offset(i + 1);
+            if (s < 0 || e < s || static_cast<std::size_t>(e) > data_size) {
+                return false;
+            }
+            sample.emplace_back(base + s, static_cast<std::size_t>(e - s));
+        }
+        std::sort(sample.begin(), sample.end());
+        const auto sample_distinct_count =
+            static_cast<std::size_t>(std::unique(sample.begin(), sample.end()) - sample.begin());
+        const auto sample_threshold =
+            static_cast<double>(kSampleRows) / static_cast<double>(kDictDivisor) * kSampleRejectMargin;
+        if (static_cast<double>(sample_distinct_count) > sample_threshold) {
+            return false;
+        }
+    }
+
     // Build the dictionary (distinct values + per-row indices) exactly as the data-file encoder would,
     // so on success the encoder can reuse this scan instead of repeating the dedup + index pass.
     std::unordered_map<std::string_view, std::uint32_t> dict;
