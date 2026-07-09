@@ -140,10 +140,12 @@ bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vec
 
 // Decide whether dictionary + RLE wins for a variable-width column, and on success build the plan the
 // data-file encoder needs (distinct values + per-run dictionary index), so the encoder doesn't have to
-// rebuild it from a second, per-ROW hashmap scan. dict-RLE only helps when the per-row values form long
-// runs (the per-minute URI case); since distinct values <= number of runs, "run-friendly" already
-// implies "low cardinality", so the dictionary here is built with one hash-map insert per RUN (typically
-// far fewer than the row count), not one per row.
+// rebuild it from a second, per-ROW hashmap scan. Two passes: the first is the original cheap,
+// zero-allocation run-only scan (needed since most columns -- e.g. a near-unique/high-cardinality
+// string column -- fail this check, and building a dictionary for a column we're about to reject would
+// be wasted allocation on the common path); only once that pass confirms the column is genuinely
+// run-friendly does a second pass build the dictionary, with one hash-map insert per RUN (using the
+// row/length boundaries the first pass already found, so no re-scanning for run boundaries), not per row.
 bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
     cv.structural_dict_rle_plan = {};
     const std::size_t ow = cv.variable.large ? 8U : 4U;
@@ -167,9 +169,10 @@ bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
     }
     const char* base = reinterpret_cast<const char*>(cv.variable.data.data());
     const std::size_t data_size = cv.variable.data.size();
-    std::unordered_map<std::string_view, std::uint32_t> dict;
-    std::vector<std::string_view> distinct;
-    std::vector<std::pair<std::uint32_t, std::uint64_t>> runs;
+
+    // Pass 1: cheap run-boundary detection only (memcmp, no hashing/allocation beyond the run list
+    // itself, which is at most one entry per run -- far fewer than `rows` for anything run-friendly).
+    std::vector<std::pair<std::size_t, std::uint64_t>> row_runs;  // (row start, run length)
     std::size_t split_runs = 0;
     std::size_t i = 0;
     while (i < rows) {
@@ -195,18 +198,29 @@ bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
         if (split_runs * 2U >= rows) {
             return false;  // not run-friendly (and therefore not low-cardinality)
         }
-        const std::string_view val(base + s0, len0);
+        row_runs.emplace_back(i, run);
+        i += run;
+    }
+    const std::size_t values_size = split_runs * 4U;  // u32 dictionary indices, one per split run
+    if ((values_size + split_runs + 32U) > 32760U) {
+        return false;
+    }
+
+    // Pass 2 (only reached once genuinely beneficial): build the run-keyed dictionary.
+    std::unordered_map<std::string_view, std::uint32_t> dict;
+    std::vector<std::string_view> distinct;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> runs;
+    runs.reserve(row_runs.size());
+    for (const auto& [row, run] : row_runs) {
+        const auto s0 = read_offset(row);
+        const auto e0 = read_offset(row + 1);
+        const std::string_view val(base + s0, static_cast<std::size_t>(e0 - s0));
         const auto id = static_cast<std::uint32_t>(distinct.size());
         const auto [it, inserted] = dict.emplace(val, id);
         if (inserted) {
             distinct.push_back(val);
         }
         runs.emplace_back(it->second, run);
-        i += run;
-    }
-    const std::size_t values_size = split_runs * 4U;  // u32 dictionary indices, one per split run
-    if ((values_size + split_runs + 32U) > 32760U) {
-        return false;
     }
     cv.structural_dict_rle_plan.computed = true;
     cv.structural_dict_rle_plan.distinct = std::move(distinct);
