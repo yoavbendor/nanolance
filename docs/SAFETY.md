@@ -57,6 +57,19 @@ File *paths* on the read path are attacker-controlled too, so they get the same 
   optional base-directory jail (`NANO_LANCE_BLOB_BASE_DIR`) confines every `file://` fetch under a
   configured root when set. `s3://` fetches are unchanged.
 
+### Error-path resource safety
+
+Leaks are a memory-safety story too, especially in a library other people embed:
+
+- **Partial multi-batch reads release everything on failure.** `lance_table_read_dataset[_projected]`
+  build one `ArrowArray` batch per data file; if a *later* file fails to decode, the batches already
+  pushed for earlier files are no longer silently leaked — the read path releases every batch built so
+  far (and the schema) before returning the error, restoring the "failure means empty output, not
+  partial ownership" contract the C API (`nano_lance_table_read_dataset`) already assumed.
+- **`build_epb_table_schema`** (the pcapng2lance blob-table schema builder) no longer leaks a
+  one-byte allocation per call: it re-initialized an already-initialized child `ArrowSchema` slot
+  (via a nested `ArrowSchemaInit`) without releasing it first.
+
 ## Why it isn't slower
 
 Every hot decode loop is *per value*. The rule we follow: **validate once per page/chunk/header, then
@@ -69,8 +82,9 @@ throughput benchmark is unchanged by this work.)
 
 Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](../.github/workflows/memory-safety.yml)):
 
-- **ASan + UBSan over the whole test suite.** UBSan halts on any undefined behavior; ASan catches
-  out-of-bounds and use-after-free. The read path is clean (no OOB / UAF / UB).
+- **ASan + UBSan + LSan over the whole test suite.** UBSan halts on any undefined behavior; ASan
+  catches out-of-bounds and use-after-free; LSan (`detect_leaks=1`) catches leaks. The whole suite —
+  read path and writer — is clean.
 - **libFuzzer over the decode chain** ([`tests/fuzz/fuzz_decode.cpp`](../tests/fuzz/fuzz_decode.cpp)) —
   feeds arbitrary bytes to the manifest / file-descriptor / column-metadata protobuf decoders and,
   via a temp file, to the data-file footer + column-metadata reader. A local 45s run did 1.1M
@@ -88,7 +102,7 @@ Reproduce the sanitizer run locally:
 ```
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DNANOLANCE_SANITIZER=address,undefined
 cmake --build build-asan -j
-UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-asan -L smoke
+UBSAN_OPTIONS=halt_on_error=1 ASAN_OPTIONS=detect_leaks=1 ctest --test-dir build-asan -L smoke
 ```
 
 ## Reviewer checklist (for Rust folks)
@@ -98,14 +112,13 @@ UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-asan -L smoke
       use.
 - [x] Declared allocation sizes (zstd, row counts, column counts) capped by a tunable budget.
 - [x] Manifest-derived file paths are confined under the dataset; `..`/absolute paths are rejected.
-- [x] Read path is ASan + UBSan clean and continuously fuzzed in CI.
+- [x] Read path is ASan + UBSan + LSan clean and continuously fuzzed in CI.
+- [x] A mid-read failure releases every batch already built, not just the schema.
 - [x] Malformed inputs are rejected with an error return, never a crash or unbounded allocation.
 
 ## Known follow-ups (tracked, not yet landed)
 
-- **LSan (leak) checking** is staged off in the sanitizer CI job: a few small leaks remain in
-  *writer-side test harnesses* (e.g. Arrow schemas built in tests and not released). The read path is
-  leak-clean; enabling LSan globally is a cleanup task.
-- **Error-path Arrow release** on partial reads (releasing already-built `ArrowArray`/`ArrowSchema`
-  when a multi-column read fails midway) is the next hardening phase (see the project's memory-safety
-  plan). External blob range validation currently relies on read/EOF behavior.
+- **Strict/trusted mode** (`trusted_input` reader option that skips the untrusted-input budget checks
+  for a self-produced pipeline, keeping the bounds checks) and a published before/after read-throughput
+  parity table are the next hardening phase (see the project's memory-safety plan). External blob range
+  validation currently relies on read/EOF behavior.

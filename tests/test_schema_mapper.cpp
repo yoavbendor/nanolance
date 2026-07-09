@@ -196,6 +196,12 @@ void test_extension_struct() {
     require(uri_field != nullptr && uri_field->logical_type == "utf8", "uri logical type mismatch");
 
     require(nano_lance::lance_physical_fields(mapping).size() == 4, "extension struct physical field count mismatch");
+
+    // `payload` is a hand-built ArrowSchema (no release callback), so set_metadata()'s
+    // ArrowSchemaSetMetadata() allocation is never freed by an owning release() call. Free it directly.
+    if (payload.metadata != nullptr) {
+        ArrowFree(const_cast<char*>(payload.metadata));
+    }
 }
 
 void test_top_level_named_struct_maps_as_field() {

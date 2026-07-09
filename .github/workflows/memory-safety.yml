@@ -61,13 +61,12 @@ jobs:
       - name: Build
         run: cmake --build build-asan -j
 
-      # UBSan halts on any undefined behavior; ASan catches OOB/use-after-free across the whole suite.
-      # LSan leak-checking is staged off for now (a few small pre-existing leaks in writer-side test
-      # harnesses); the read path itself is leak-clean. Tracked in docs/SAFETY.md.
+      # UBSan halts on any undefined behavior; ASan catches OOB/use-after-free; LSan (detect_leaks=1)
+      # catches leaks — across the whole suite.
       - name: Run test suite under sanitizers
         env:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
         run: ctest --test-dir build-asan -L smoke --output-on-failure
 
   fuzz:
