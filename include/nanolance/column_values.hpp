@@ -55,6 +55,16 @@ struct StructuralDictRlePlan {
     std::vector<std::pair<std::uint32_t, std::uint64_t>> runs;
 };
 
+/// RLE plan for a run-length-friendly fixed-width column, computed once by the write-side "is RLE
+/// beneficial?" heuristic (which already detects each maximal adjacent run while deciding) and reused
+/// verbatim by the data-file encoder. `runs` holds one (row index of the run's first element, run
+/// length) pair per detected run -- the row index is a view into the owning `ColumnValues::fixed`
+/// buffer (valid only while that buffer is alive and unmodified), avoiding a value-bytes copy per run.
+struct FixedRlePlan {
+    bool computed = false;
+    std::vector<std::pair<std::size_t, std::uint64_t>> runs;
+};
+
 struct ColumnValues {
     enum class Kind { FixedWidth, VariableWidth, BlobV2External } kind = Kind::FixedWidth;
     std::vector<std::uint8_t> fixed;
@@ -62,6 +72,7 @@ struct ColumnValues {
     BlobV2ExternalColumnValues blob_v2;
     StructuralDictPlan structural_dict_plan;
     StructuralDictRlePlan structural_dict_rle_plan;
+    FixedRlePlan fixed_rle_plan;
 };
 
 }  // namespace nano_lance

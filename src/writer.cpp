@@ -63,11 +63,13 @@ int set_error(NanoLanceWriter* writer, int code, const std::string& message) {
 
 // Decide whether RLE beats bitpacking for a fixed-width column. Lance requires 8-bit run lengths, so
 // runs longer than 255 are split into <=255 sub-runs; we count those split runs.
-bool fixed_column_rle_plan(const nano_lance::ColumnValues& cv, std::size_t bpv) {
+bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv) {
+    cv.fixed_rle_plan = {};
     if (bpv == 0U || cv.fixed.empty() || cv.fixed.size() % bpv != 0U) {
         return false;
     }
     const std::size_t n = cv.fixed.size() / bpv;
+    std::vector<std::pair<std::size_t, std::uint64_t>> runs;
     std::size_t split_runs = 0;
     std::size_t i = 0;
     while (i < n) {
@@ -83,6 +85,7 @@ bool fixed_column_rle_plan(const nano_lance::ColumnValues& cv, std::size_t bpv) 
         if (split_runs * 2U >= n) {
             return false;
         }
+        runs.emplace_back(i, run);
         i += run;
     }
     // One chunk for the whole column: run buffers must fit the miniblock (12-bit word => 32760 bytes).
@@ -91,6 +94,8 @@ bool fixed_column_rle_plan(const nano_lance::ColumnValues& cv, std::size_t bpv) 
     if ((values_size + lengths_size + 32U) > 32760U) {
         return false;
     }
+    cv.fixed_rle_plan.computed = true;
+    cv.fixed_rle_plan.runs = std::move(runs);
     return true;
 }
 
