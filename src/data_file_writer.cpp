@@ -5,6 +5,7 @@
 
 #include "lance_minimal.pb.hpp"
 #include "nanolance/blob_v2_external.hpp"
+#include "nanolance/bool_bitpack.hpp"
 #include "nanolance/byte_stream_split.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
 #include "nanolance/schema_mapper.hpp"
@@ -92,6 +93,9 @@ constexpr std::uint32_t kMaxEightByteWordsPerMetadata = 4095U;
 // u16, so 32760 is the largest chunk that both structures can describe.
 constexpr std::uint32_t kMaxVariableMiniblockBytes = kMaxEightByteWordsPerMetadata * 8U;
 constexpr std::uint32_t kMaxUncompressedMiniblockBytes = kMaxVariableMiniblockBytes;
+// Bool is bit-packed (1 bit/value) at the on-disk boundary; a chunk's packed payload must stay within
+// the same 32760-byte miniblock cap as every other chunk kind, so it can hold 8x as many values.
+constexpr std::size_t kMaxBoolValuesPerChunk = static_cast<std::size_t>(kMaxUncompressedMiniblockBytes) * 8U;
 
 struct MiniblockChunk {
     std::vector<std::uint8_t> bytes;
@@ -117,14 +121,15 @@ void write_string_field(std::vector<std::uint8_t>& out, std::uint32_t field_numb
 }
 
 std::uint8_t flat_bits_per_value_token(const LanceField& field) {
-    // bool is stored one byte per value on disk (bits_per_value reports the logical 1 bit), so the
-    // flat page must advertise 8-bit values to stay consistent with value_width_bytes()==1.
-    const auto bits = field.logical_type == "bool" ? 8U : bits_per_value(field);
+    const auto bits = bits_per_value(field);
     if (bits == 64U) {
         return 0x40U;
     }
     if (bits == 8U) {
         return 0x08U;
+    }
+    if (bits == 1U) {
+        return 0x01U;
     }
     return 0x20U;
 }
@@ -1095,6 +1100,9 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         // Byte-stream-split + zstd: float/double, tagged when set_compression(true) (writer.cpp).
         const bool bss_zstd = !is_variable && packing_it != field.metadata.end() &&
                               packing_it->second == "bss-zstd";
+        // bool is always stored bit-packed (1 bit/value, LSB-first) on disk, matching stock Lance's own
+        // Flat{bits_per_value:1} representation (verified empirically) -- not gated by any opt-in flag.
+        const bool bool_pack = !is_variable && field.logical_type == "bool";
         const auto fixed_bytes_per_value = value_width_bytes(field);
         if (!is_variable) {
             if (values.fixed.size() % fixed_bytes_per_value != 0U) {
@@ -1114,7 +1122,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         // into a payload vector; for a plain fixed-width column the chunk bytes are just a slice of
         // values.fixed, so both copies are pure overhead (memcpy dominates this path after the chunk
         // count was reduced). One chunk per page, byte-identical to the generic flat encoding.
-        if (!is_variable && !bitpack && !bss_zstd) {
+        if (!is_variable && !bitpack && !bss_zstd && !bool_pack) {
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
             const auto total = values.fixed.size() / fixed_bytes_per_value;
@@ -1164,9 +1172,21 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                                                     fixed_bytes_per_value);
                 chunks.push_back(std::move(chunk));
             }
+        } else if (bool_pack) {
+            // Bit-pack LSB-first into ceil(count/8)-byte chunks; no zstd wrapping (stock Lance doesn't
+            // compress on top of 1-bit packing either). values.fixed is still one byte per value here.
+            const auto total = values.fixed.size();
+            for (std::size_t off = 0; off < total;) {
+                const auto count = std::min<std::size_t>(kMaxBoolValuesPerChunk, total - off);
+                MiniblockChunk chunk;
+                chunk.value_count = count;
+                chunk.bytes = boolpack::pack_lsb_first(values.fixed.data() + off, count);
+                chunks.push_back(std::move(chunk));
+                off += count;
+            }
         } else {
             // Only byte-stream-split+zstd fixed-width columns reach here (the flat path streamed above,
-            // bitpack and variable are handled above). Byte-transpose each chunk (mantissa/exponent
+            // bitpack, bool, and variable are handled above). Byte-transpose each chunk (mantissa/exponent
             // bytes grouped together) so the zstd framing below compresses it meaningfully; zstd itself
             // is applied uniformly for every non-bitpack chunk kind further down.
             const auto total = values.fixed.size() / fixed_bytes_per_value;
@@ -1219,8 +1239,11 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             } else if (bitpack) {
                 page.encoding = page_layout_bytes_inline_bitpacking(
                     static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), chunk.value_count);
+            } else if (bool_pack) {
+                // Plain Flat{bits_per_value:1} -- no CompressiveEncoding wrapper, matching stock Lance.
+                page.encoding = page_layout_bytes(flat_bits_per_value_token(field), chunk.value_count, false);
             } else {
-                // Only bss_zstd reaches here (is_variable and bitpack excluded above).
+                // Only bss_zstd reaches here (is_variable, bitpack, and bool excluded above).
                 page.encoding = page_layout_bytes_bss_zstd(flat_bits_per_value_token(field), chunk.value_count);
             }
             column.pages.push_back(std::move(page));
