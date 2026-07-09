@@ -63,11 +63,13 @@ int set_error(NanoLanceWriter* writer, int code, const std::string& message) {
 
 // Decide whether RLE beats bitpacking for a fixed-width column. Lance requires 8-bit run lengths, so
 // runs longer than 255 are split into <=255 sub-runs; we count those split runs.
-bool fixed_column_rle_plan(const nano_lance::ColumnValues& cv, std::size_t bpv) {
+bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv) {
+    cv.fixed_rle_plan = {};
     if (bpv == 0U || cv.fixed.empty() || cv.fixed.size() % bpv != 0U) {
         return false;
     }
     const std::size_t n = cv.fixed.size() / bpv;
+    std::vector<std::pair<std::size_t, std::uint64_t>> runs;
     std::size_t split_runs = 0;
     std::size_t i = 0;
     while (i < n) {
@@ -77,11 +79,14 @@ bool fixed_column_rle_plan(const nano_lance::ColumnValues& cv, std::size_t bpv) 
             ++run;
         }
         split_runs += (run + 254U) / 255U;  // each sub-run holds at most 255
+        // Early exit (mirrors variable_column_dict_rle_beneficial's identical check inside its scan
+        // loop): split_runs only grows, so once it crosses the threshold the final verdict is already
+        // decided -- no need to keep memcmp-scanning a scattered (non-run-length) column to the end.
+        if (split_runs * 2U >= n) {
+            return false;
+        }
+        runs.emplace_back(i, run);
         i += run;
-    }
-    // RLE pays off only with substantial repetition (Lance uses runs < 50% of values).
-    if (split_runs * 2U >= n) {
-        return false;
     }
     // One chunk for the whole column: run buffers must fit the miniblock (12-bit word => 32760 bytes).
     const std::size_t values_size = split_runs * bpv;
@@ -89,6 +94,8 @@ bool fixed_column_rle_plan(const nano_lance::ColumnValues& cv, std::size_t bpv) 
     if ((values_size + lengths_size + 32U) > 32760U) {
         return false;
     }
+    cv.fixed_rle_plan.computed = true;
+    cv.fixed_rle_plan.runs = std::move(runs);
     return true;
 }
 
@@ -131,11 +138,16 @@ bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vec
     return true;
 }
 
-// Decide whether dictionary + RLE wins for a variable-width column. dict-RLE only helps when the
-// per-row values form long runs (the per-minute URI case); since distinct values <= number of runs,
-// "run-friendly" already implies "low cardinality", so this needs NO dictionary build — just a cheap
-// consecutive-value run scan that bails the moment it stops being run-friendly. Zero allocation.
-bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
+// Decide whether dictionary + RLE wins for a variable-width column, and on success build the plan the
+// data-file encoder needs (distinct values + per-run dictionary index), so the encoder doesn't have to
+// rebuild it from a second, per-ROW hashmap scan. Two passes: the first is the original cheap,
+// zero-allocation run-only scan (needed since most columns -- e.g. a near-unique/high-cardinality
+// string column -- fail this check, and building a dictionary for a column we're about to reject would
+// be wasted allocation on the common path); only once that pass confirms the column is genuinely
+// run-friendly does a second pass build the dictionary, with one hash-map insert per RUN (using the
+// row/length boundaries the first pass already found, so no re-scanning for run boundaries), not per row.
+bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
+    cv.structural_dict_rle_plan = {};
     const std::size_t ow = cv.variable.large ? 8U : 4U;
     if (cv.variable.offsets.size() < 2U * ow) {
         return false;
@@ -157,6 +169,10 @@ bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
     }
     const char* base = reinterpret_cast<const char*>(cv.variable.data.data());
     const std::size_t data_size = cv.variable.data.size();
+
+    // Pass 1: cheap run-boundary detection only (memcmp, no hashing/allocation beyond the run list
+    // itself, which is at most one entry per run -- far fewer than `rows` for anything run-friendly).
+    std::vector<std::pair<std::size_t, std::uint64_t>> row_runs;  // (row start, run length)
     std::size_t split_runs = 0;
     std::size_t i = 0;
     while (i < rows) {
@@ -182,10 +198,34 @@ bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
         if (split_runs * 2U >= rows) {
             return false;  // not run-friendly (and therefore not low-cardinality)
         }
+        row_runs.emplace_back(i, run);
         i += run;
     }
     const std::size_t values_size = split_runs * 4U;  // u32 dictionary indices, one per split run
-    return (values_size + split_runs + 32U) <= 32760U;
+    if ((values_size + split_runs + 32U) > 32760U) {
+        return false;
+    }
+
+    // Pass 2 (only reached once genuinely beneficial): build the run-keyed dictionary.
+    std::unordered_map<std::string_view, std::uint32_t> dict;
+    std::vector<std::string_view> distinct;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> runs;
+    runs.reserve(row_runs.size());
+    for (const auto& [row, run] : row_runs) {
+        const auto s0 = read_offset(row);
+        const auto e0 = read_offset(row + 1);
+        const std::string_view val(base + s0, static_cast<std::size_t>(e0 - s0));
+        const auto id = static_cast<std::uint32_t>(distinct.size());
+        const auto [it, inserted] = dict.emplace(val, id);
+        if (inserted) {
+            distinct.push_back(val);
+        }
+        runs.emplace_back(it->second, run);
+    }
+    cv.structural_dict_rle_plan.computed = true;
+    cv.structural_dict_rle_plan.distinct = std::move(distinct);
+    cv.structural_dict_rle_plan.runs = std::move(runs);
+    return true;
 }
 
 // Decide whether a structural dictionary (flat bitpacked indices + dictionary buffer) wins for a
@@ -219,6 +259,40 @@ bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv) {
     }
     const char* base = reinterpret_cast<const char*>(cv.variable.data.data());
     const std::size_t data_size = cv.variable.data.size();
+
+    // Cheap pre-check on a prefix sample before committing to the full scan below: building the real
+    // dictionary means one heap-allocating hash-map insert per distinct value, and for a genuinely
+    // high-cardinality column (near-unique IDs, free-text labels) that means tens of thousands of
+    // allocations just to conclude "not beneficial" and throw the whole map away. A column's
+    // cardinality is normally fairly uniform across a write batch, so a small prefix sample is a
+    // reasonable predictor of the full-column ratio; only skip the full scan when the sample already
+    // shows the ratio decisively blown (not merely close), to keep false negatives rare -- the cost of
+    // a false negative here is a slightly larger encoding (falls back to zstd/plain), never wrong data.
+    // Sample distinct-count via sort+unique (one vector allocation total) rather than a hash set (one
+    // heap allocation per distinct element even for this small sample) -- no per-row allocation at all.
+    constexpr std::size_t kSampleRows = 4096U;
+    constexpr double kSampleRejectMargin = 1.5;  // require the sample ratio to exceed the real cutoff by 50%
+    if (rows > kSampleRows * 4U) {
+        std::vector<std::string_view> sample;
+        sample.reserve(kSampleRows);
+        for (std::size_t i = 0; i < kSampleRows; ++i) {
+            const auto s = read_offset(i);
+            const auto e = read_offset(i + 1);
+            if (s < 0 || e < s || static_cast<std::size_t>(e) > data_size) {
+                return false;
+            }
+            sample.emplace_back(base + s, static_cast<std::size_t>(e - s));
+        }
+        std::sort(sample.begin(), sample.end());
+        const auto sample_distinct_count =
+            static_cast<std::size_t>(std::unique(sample.begin(), sample.end()) - sample.begin());
+        const auto sample_threshold =
+            static_cast<double>(kSampleRows) / static_cast<double>(kDictDivisor) * kSampleRejectMargin;
+        if (static_cast<double>(sample_distinct_count) > sample_threshold) {
+            return false;
+        }
+    }
+
     // Build the dictionary (distinct values + per-row indices) exactly as the data-file encoder would,
     // so on success the encoder can reuse this scan instead of repeating the dedup + index pass.
     std::unordered_map<std::string_view, std::uint32_t> dict;
@@ -245,10 +319,18 @@ bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv) {
             }
             distinct.push_back(val);
             dict_data += len;
+            // Early exit: distinct.size() only grows, so once it crosses rows/kDictDivisor the final
+            // cardinality check below is already decided -- no need to keep building the hash map (and
+            // the indices/distinct vectors) for a column that's already too high-cardinality to dict,
+            // e.g. a near-unique string column, which would otherwise pay for a full O(n) hash+insert
+            // scan just to be thrown away.
+            if (distinct.size() > rows / kDictDivisor) {
+                return false;
+            }
         }
         indices.push_back(it->second);
     }
-    if (distinct.empty() || distinct.size() > rows / kDictDivisor) {
+    if (distinct.empty()) {
         return false;
     }
     const std::size_t dict_bytes = 8U + (distinct.size() + 1U) * 4U + dict_data;
