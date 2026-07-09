@@ -1,13 +1,46 @@
 # nanolance
 
+[![linux-bench](https://github.com/yoavbendor/nanolance/actions/workflows/linux-bench.yml/badge.svg)](https://github.com/yoavbendor/nanolance/actions/workflows/linux-bench.yml) [![memory-safety](https://github.com/yoavbendor/nanolance/actions/workflows/memory-safety.yml/badge.svg)](https://github.com/yoavbendor/nanolance/actions/workflows/memory-safety.yml) [![Python bindings](https://github.com/yoavbendor/nanolance/actions/workflows/bindings-python.yml/badge.svg)](https://github.com/yoavbendor/nanolance/actions/workflows/bindings-python.yml) [![docs](https://img.shields.io/badge/docs-yoavbendor.github.io%2Fnanolance-indigo)](https://yoavbendor.github.io/nanolance/)
+
 Standalone C++ Arrow ↔ Lance writer and reader — write **Lance v2.2** datasets with minimal protobuf overhead (no Rust `lance` core), and read back what you wrote. Its headline feature: rows keep large payloads external (referenced by `uri` + offset + size, never copied) — so a Lance table of pcap packets stays single-digit bytes per row of references *regardless of packet size*, while the payload bytes live once in the source capture and are fetched on demand (numbers in [bench/linux-ci-results.md](bench/linux-ci-results.md)).
 
 nanolance itself depends only on **nanoarrow + zstd** (and local code) — no packet-parsing machinery. The repo also ships **[`examples/pcapng2lance`](examples/pcapng2lance/)**, a streaming pcapng → Lance converter built on the sister **[nanotins](https://github.com/yoavbendor/nanotins)** parsing stack — **soatins** (reflection: describe a struct once → SoA + Arrow) and **nanotins** (pcap/pcapng + L2/L3/L4 decode via the wire_spec core + the spec_dag DAG/FSM dispatcher). That stack is the **example's** dependency, not the library's: it's vendored as a git submodule under [`examples/pcapng2lance/extern/nanotins`](examples/pcapng2lance/extern/nanotins/). (A GPU/CUDA executor layer is a planned future addition, developed separately.)
+
+📖 **[Documentation site](https://yoavbendor.github.io/nanolance/)** ·
+🛡️ **[Memory safety & Rust reviewers](docs/SAFETY.md)** ·
+🤖 **[AI agent integration guide](AGENTS.md)** ·
+📊 **[Benchmarks](bench/linux-ci-results.md)** ·
+🤖 **[llms.txt](llms.txt)** (machine-readable index)
 
 > **Cloning:** building the `pcapng2lance` example needs the nanotins submodule — clone with `git clone --recursive`, or run `git submodule update --init --recursive`. Building nanolance itself (library, tools, tests) needs no submodule.
 
 > Integrating programmatically (or via an AI agent)? See [AGENTS.md](AGENTS.md) for the current
 > include path / CMake targets, the write API, and how to enable each compression measure.
+
+## Rust roots, hardened read path
+
+nanolance's format is Lance — a Rust-native columnar format. If you're weighing this C++ implementation
+against reaching for the Rust crate directly, the question is always the same one: does the C++ side
+give up Rust's memory-safety guarantees to get there? The **writer is trusted** (it serializes your own
+in-memory Arrow data); the **reader** — the only code that touches untrusted bytes, whether an on-disk
+manifest/data-file or an external blob fetched by `(uri, position, size)` — is hardened the same way a
+Rust parser would be, and it's proven, not asserted:
+
+- Overflow-checked bounds arithmetic on every disk-derived size/offset before it drives an allocation or
+  `memcpy` — no `checked_add`/`checked_mul` wraps into a too-small buffer that a later copy overflows.
+- No `reinterpret_cast` of disk bytes to a typed pointer — multi-byte integers load via byte-assembly +
+  `std::bit_cast`.
+- A tunable allocation budget caps what a hostile file can make the reader allocate (declared zstd size,
+  row/column/manifest-element counts).
+- A path jail confines every manifest-derived data-file path under the dataset directory; the external
+  `file://` blob fetch rejects `..` traversal.
+- Mid-read failures release everything already built — no leaked `ArrowArray`/`ArrowSchema`.
+- Continuous **ASan + UBSan + LSan CI** and a **libFuzzer** harness over the full decode chain.
+
+All of it validates once per page/header, not once per value, so the safety cost doesn't show up in a
+profile — proven by a read-throughput parity benchmark (`trusted_input=true`, which skips only the
+untrusted-input DoS budget checks, measures **0.985x** vs. the default fully-checked read — noise, not a
+speedup). Full details, the threat model, and a reviewer checklist: **[docs/SAFETY.md](docs/SAFETY.md)**.
 
 ## At a glance
 

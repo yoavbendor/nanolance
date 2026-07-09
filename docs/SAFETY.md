@@ -21,7 +21,7 @@ So the hardening effort — and this document — is about the **read path**.
 ## What's defended (and where)
 
 All read-path size/offset/count fields are attacker-controlled, so before any allocation, `memcpy`,
-or slice we validate them. The primitives live in [`include/nanolance/read_safety.hpp`](../include/nanolance/read_safety.hpp):
+or slice we validate them. The primitives live in [`include/nanolance/read_safety.hpp`](https://github.com/yoavbendor/nanolance/blob/main/include/nanolance/read_safety.hpp):
 
 - **Overflow-checked arithmetic** — `checked_add` / `checked_mul` return `false` instead of wrapping.
   Used for every `offset + size`, `rows * width`, and run/row accumulator that feeds a `resize`,
@@ -47,7 +47,7 @@ decoders already length-bound every field against the remaining input.
 ### Path & blob-fetch jail
 
 File *paths* on the read path are attacker-controlled too, so they get the same treatment
-([`include/nanolance/path_safety.hpp`](../include/nanolance/path_safety.hpp)):
+([`include/nanolance/path_safety.hpp`](https://github.com/yoavbendor/nanolance/blob/main/include/nanolance/path_safety.hpp)):
 
 - **Data-file path jail** — `safe_join_under(base, relative)` confines a manifest's `data_file.path`
   under `<dataset>/data/`. A hostile `..`/absolute path (which `path::operator/` would otherwise let
@@ -102,16 +102,16 @@ trusted_input  |     90.682 |    99.1971
 
 trusted/default best-ms ratio: **0.985x** (1,000,000 rows, best of 9 reads each — regenerate with
 `bench/read_parity_bench.sh [build_dir] [rows]`; results land in
-[`bench/read_parity_results.md`](../bench/read_parity_results.md)).
+[`bench/read_parity_results.md`](https://github.com/yoavbendor/nanolance/blob/main/bench/read_parity_results.md)).
 
 ## How it's proven
 
-Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](../.github/workflows/memory-safety.yml)):
+Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](https://github.com/yoavbendor/nanolance/blob/main/.github/workflows/memory-safety.yml)):
 
 - **ASan + UBSan + LSan over the whole test suite.** UBSan halts on any undefined behavior; ASan
   catches out-of-bounds and use-after-free; LSan (`detect_leaks=1`) catches leaks. The whole suite —
   read path and writer — is clean.
-- **libFuzzer over the decode chain** ([`tests/fuzz/fuzz_decode.cpp`](../tests/fuzz/fuzz_decode.cpp)) —
+- **libFuzzer over the decode chain** ([`tests/fuzz/fuzz_decode.cpp`](https://github.com/yoavbendor/nanolance/blob/main/tests/fuzz/fuzz_decode.cpp)) —
   feeds arbitrary bytes to the manifest / file-descriptor / column-metadata protobuf decoders and,
   via a temp file, to the data-file footer + column-metadata reader. A local 45s run did 1.1M
   executions with **no crash and bounded RSS** (direct evidence the DoS caps hold). Build it yourself:
@@ -120,7 +120,7 @@ Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](../.gi
   cmake --build build-fuzz --target nanolance_fuzz_decode
   ./build-fuzz/nanolance_fuzz_decode -max_total_time=60 corpus/
   ```
-- **Negative-corpus tests** ([`tests/test_read_safety.cpp`](../tests/test_read_safety.cpp)) — hand-built
+- **Negative-corpus tests** ([`tests/test_read_safety.cpp`](https://github.com/yoavbendor/nanolance/blob/main/tests/test_read_safety.cpp)) — hand-built
   malformed footers (oversized column count, overflowing descriptor bounds) and garbage protobuf must
   be *rejected cleanly*, and the checked-math/`load_le` helpers are unit-tested.
 
