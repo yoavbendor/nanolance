@@ -231,35 +231,39 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
         error = "variable-width chunk data base out of range";
         return false;
     }
-
-    if (out_offsets.empty()) {
-        for (std::uint64_t i = 0; i <= num_values; ++i) {
-            append_list_offset(out_offsets, read_list_offset(chunk_bytes, i, large) - data_base_in_chunk, large);
-        }
-        // Append only the value bytes [data_base, terminal_offset); the chunk is padded to 8 bytes at
-        // the end, and including that padding would misalign every subsequent page's data.
-        const auto data_end_in_chunk = read_list_offset(chunk_bytes, num_values, large);
-        if (data_end_in_chunk < data_base_in_chunk ||
-            static_cast<std::size_t>(data_end_in_chunk) > chunk_bytes.size()) {
-            error = "variable-width chunk terminal offset out of range";
-            return false;
-        }
-        out_data.insert(out_data.end(), chunk_bytes.begin() + static_cast<std::ptrdiff_t>(data_base_in_chunk),
-                        chunk_bytes.begin() + static_cast<std::ptrdiff_t>(data_end_in_chunk));
-        return true;
+    // Append only the value bytes [data_base, terminal_offset); the chunk is padded to 8 bytes at the
+    // end, and including that padding would misalign every subsequent page's data.
+    const auto data_end_in_chunk = read_list_offset(chunk_bytes, num_values, large);
+    if (data_end_in_chunk < data_base_in_chunk ||
+        static_cast<std::size_t>(data_end_in_chunk) > chunk_bytes.size()) {
+        error = "variable-width chunk terminal offset out of range";
+        return false;
     }
 
-    for (std::uint64_t i = 0; i < num_values; ++i) {
-        const auto rel_start = read_list_offset(chunk_bytes, i, large) - data_base_in_chunk;
-        const auto rel_end = read_list_offset(chunk_bytes, i + 1U, large) - data_base_in_chunk;
-        if (rel_start < 0 || rel_end < rel_start || static_cast<std::size_t>(rel_end) > chunk_bytes.size()) {
+    // Validate every row's [start,end) lies within [data_base_in_chunk, data_end_in_chunk) and is
+    // non-decreasing (same checks a per-row copy loop would make), as a pre-pass so the actual byte copy
+    // below can be one bulk insert instead of one insert per row -- the per-row insert dominated the
+    // read profile for every page after a variable-width column's first (only the first page took a
+    // bulk-copy fast path; every later page fell into the slow per-row loop).
+    std::int64_t prev = data_base_in_chunk;
+    for (std::uint64_t i = 1; i <= num_values; ++i) {
+        const auto off = read_list_offset(chunk_bytes, i, large);
+        if (off < prev || static_cast<std::size_t>(off) > chunk_bytes.size()) {
             error = "variable-width chunk string bounds out of range";
             return false;
         }
-        out_data.insert(out_data.end(),
-                        chunk_bytes.begin() + static_cast<std::ptrdiff_t>(data_base_in_chunk + rel_start),
-                        chunk_bytes.begin() + static_cast<std::ptrdiff_t>(data_base_in_chunk + rel_end));
-        append_list_offset(out_offsets, static_cast<std::int64_t>(out_data.size()), large);
+        prev = off;
+    }
+
+    const auto cumulative_base = static_cast<std::int64_t>(out_data.size());
+    out_data.insert(out_data.end(), chunk_bytes.begin() + static_cast<std::ptrdiff_t>(data_base_in_chunk),
+                    chunk_bytes.begin() + static_cast<std::ptrdiff_t>(data_end_in_chunk));
+
+    // First page for this column: also emit the leading offset 0 (i=0); later pages continue an
+    // already-started offsets buffer, so only the per-row terminal offsets (i=1..num_values) are new.
+    for (std::uint64_t i = (out_offsets.empty() ? 0U : 1U); i <= num_values; ++i) {
+        const auto off = read_list_offset(chunk_bytes, i, large) - data_base_in_chunk;
+        append_list_offset(out_offsets, cumulative_base + off, large);
     }
     return true;
 }
@@ -451,6 +455,14 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         }
         const auto bpv = lance_logical_type_value_bytes(internal);
         const std::size_t length_bytes = 1U;  // Lance RLE uses 8-bit run lengths
+        // Reserve the whole column upfront: without this, each run's append_repeated_value() call
+        // resize()s out.fixed to an exact new size (no growth slack), so libstdc++ reallocates and
+        // re-copies everything already written on essentially every run -- O(n^2) memcpy for a column
+        // with many runs. declared_rows is already validated against the safety limit above.
+        std::uint64_t reserve_bytes = 0;
+        if (checked_mul(declared_rows, static_cast<std::uint64_t>(bpv), reserve_bytes) && fits_size_t(reserve_bytes)) {
+            out.fixed.reserve(static_cast<std::size_t>(reserve_bytes));
+        }
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> data;
         for (const auto& page : column_metadata.pages) {
@@ -708,6 +720,13 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     if (field_metadata_equals(on_disk_field, "nanolance:packing", "bss-zstd")) {
         out.kind = ColumnValues::Kind::FixedWidth;
         const auto bytes_per_value = lance_logical_type_value_bytes(on_disk_field.logical_type);
+        {
+            std::uint64_t reserve_bytes = 0;
+            if (checked_mul(declared_rows, static_cast<std::uint64_t>(bytes_per_value), reserve_bytes) &&
+                fits_size_t(reserve_bytes)) {
+                out.fixed.reserve(static_cast<std::size_t>(reserve_bytes));
+            }
+        }
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> chunk_bytes;
@@ -740,6 +759,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     // data_file_writer.cpp's bool_pack). nanolance's internal representation stays one byte per value.
     if (on_disk_field.logical_type == "bool") {
         out.kind = ColumnValues::Kind::FixedWidth;
+        out.fixed.reserve(static_cast<std::size_t>(declared_rows));
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> chunk_bytes;
@@ -803,6 +823,14 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     }
     const auto bytes_per_value = lance_logical_type_value_bytes(internal_type);
     const bool bitpacked = field_metadata_equals(on_disk_field, "nanolance:packing", "bitpack");
+    // Reserve the whole column upfront: unpack_bitpacked_page() (and the plain-copy branch below) grow
+    // out.fixed one FastLanes chunk (<=1024 values) at a time via insert(), so without this a column of
+    // many chunks reallocates and re-copies everything already written on almost every chunk.
+    std::uint64_t reserve_bytes = 0;
+    if (checked_mul(declared_rows, static_cast<std::uint64_t>(bytes_per_value), reserve_bytes) &&
+        fits_size_t(reserve_bytes)) {
+        out.fixed.reserve(static_cast<std::size_t>(reserve_bytes));
+    }
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;
     std::vector<std::uint8_t> chunk_bytes;
