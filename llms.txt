@@ -1,0 +1,58 @@
+# nanolance
+
+> A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust `lance` core. Depends only on
+> nanoarrow + zstd. Its headline feature is external-payload rows: large payloads are referenced by
+> `uri` + `position` + `size` and never copied into the file, so a table of large-payload rows costs
+> single-digit bytes per row regardless of payload size. Everything nanolance writes is readable by
+> stock `lance` (verified against `lance` 7.0.0) unless a feature is explicitly marked nanolance-only.
+> The **writer is trusted** (it serializes your own in-memory Arrow data); the **reader is hardened
+> against untrusted on-disk bytes** — overflow-checked bounds arithmetic, no `reinterpret_cast` of disk
+> bytes, a tunable allocation budget, a path jail for manifest-derived file paths, and continuous
+> ASan+UBSan+LSan CI plus libFuzzer over the full decode chain. See the memory-safety doc below for
+> the threat model, defenses, and how they're proven.
+
+The library is a small set of headers under `include/nanolance/`: the writer (`nano_lance_writer.h`,
+C ABI), the reader (`nano_lance_reader.h`, C ABI, and `lance_table_reader.hpp`, C++), and the
+read-path safety substrate (`read_safety.hpp`, `path_safety.hpp`) that every decode call site uses.
+CMake targets are `nanolance` (writer + reader), `nanolance_reader` (reader only, if you only fetch
+external blobs), and `nanolance_proto`. All source is Apache-2.0 at
+https://github.com/yoavbendor/nanolance.
+
+**Start here:** the documentation site — getting-started, the memory-safety model, the AI-agent
+integration guide, and benchmarks, all as flat crawlable HTML — is at
+**https://yoavbendor.github.io/nanolance/** (this file is its machine-readable index).
+
+## Documentation
+
+- [Documentation site](https://yoavbendor.github.io/nanolance/): **start here** — getting-started, memory safety, AI-agent integration, benchmarks
+- [README](https://raw.githubusercontent.com/yoavbendor/nanolance/main/README.md): overview, quick start (C and Python), library layout, gotchas
+- [AGENTS.md](https://raw.githubusercontent.com/yoavbendor/nanolance/main/AGENTS.md): **integration guide written for AI agents** — API lifecycle, the measured per-type compression table, the data-model recipe for small files, interop verification
+- [Memory safety](https://raw.githubusercontent.com/yoavbendor/nanolance/main/docs/SAFETY.md): threat model, defenses and where they live in source, how they're proven (fuzzing, sanitizer CI, negative-corpus tests), reviewer checklist for Rust users, the trusted-input read-throughput parity benchmark
+
+## Benchmarks (falsifiable)
+
+- [Write/read vs Parquet & Rust lance](https://raw.githubusercontent.com/yoavbendor/nanolance/main/bench/linux-ci-results.md): auto-generated on every push to main
+- [Safety-parity: trusted vs default read](https://raw.githubusercontent.com/yoavbendor/nanolance/main/bench/read_parity_results.md): proves `trusted_input=true` is not measurably faster than the default fully-checked read
+
+## Source (headers)
+
+- [nano_lance_writer.h](https://raw.githubusercontent.com/yoavbendor/nanolance/main/include/nanolance/nano_lance_writer.h): the C ABI write API — init/set_*/write_batch/commit/close
+- [nano_lance_reader.h](https://raw.githubusercontent.com/yoavbendor/nanolance/main/include/nanolance/nano_lance_reader.h): the C ABI read API (table read, external blob fetch, S3 block cache), including the trusted_input variant
+- [lance_table_reader.hpp](https://raw.githubusercontent.com/yoavbendor/nanolance/main/include/nanolance/lance_table_reader.hpp): the C++ table-read entry points (`lance_table_read_dataset[_projected]`, `trusted_input` parameter)
+- [read_safety.hpp](https://raw.githubusercontent.com/yoavbendor/nanolance/main/include/nanolance/read_safety.hpp): checked_add/checked_mul/range_in_bounds/load_le, ReadLimits, trusted-mode substrate
+- [path_safety.hpp](https://raw.githubusercontent.com/yoavbendor/nanolance/main/include/nanolance/path_safety.hpp): safe_join_under — confines untrusted manifest-derived paths under the dataset directory
+- [version.hpp](https://raw.githubusercontent.com/yoavbendor/nanolance/main/include/nanolance/version.hpp): library version macros
+
+## Examples
+
+- [arrowipc2lance](https://raw.githubusercontent.com/yoavbendor/nanolance/main/arrowipc2lance_main.cpp): Arrow IPC stream -> Lance dataset CLI tool
+- [pcapng2lance](https://github.com/yoavbendor/nanolance/tree/main/examples/pcapng2lance): streaming pcapng -> Lance converter built on the sister nanotins parsing stack, modeling external blobs as uri/position/size columns
+- [fuselance](https://github.com/yoavbendor/nanolance/tree/main/examples/fuselance): FUSE filesystem exposing a Lance dataset's external blobs as regular files
+
+## Python bindings
+
+- [bindings/python/README.md](https://raw.githubusercontent.com/yoavbendor/nanolance/main/bindings/python/README.md): `pip install -e bindings/python`, zero-copy via the Arrow PyCapsule interface, does not shadow `import lance`
+
+## Optional
+
+- [Third-party licenses](https://raw.githubusercontent.com/yoavbendor/nanolance/main/THIRD-PARTY-LICENSES.md)

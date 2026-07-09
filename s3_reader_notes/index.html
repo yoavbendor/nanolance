@@ -1,0 +1,1733 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/s3_reader_notes/">
+      
+      
+        <link rel="prev" href="../bench-trusted-parity/">
+      
+      
+        <link rel="next" href="../disk-lru-block-cache/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>S3 reader notes - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#the-s3-reader-credentials-performance-and-small-static-builds" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              S3 reader notes
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-what-it-is" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. What it is
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-credential-resolution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Credential resolution
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Credential resolution">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#not-resolved-by-design" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Not resolved (by design)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#self-explaining-failures" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Self-explaining failures
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#context-credential_process-matters-more-than-youd-think" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context: credential_process matters more than you'd think
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-performance-40-faster-than-pylance-on-blob-fetch" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Performance: ~40× faster than pylance on blob-fetch
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Performance: ~40× faster than pylance on blob-fetch">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#why-and-what-we-ruled-out" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why — and what we ruled out
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#honest-caveats-dont-over-quote-the-40" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Honest caveats (don't over-quote the 40×)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#reproduce-the-env-creds-trick" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reproduce / the env-creds trick
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#known-bug-spotted-along-the-way" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Known bug spotted along the way
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-sigv4-crypto-backend-dnanolance_s3_crypto" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. SigV4 crypto backend (-DNANOLANCE_S3_CRYPTO)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-small-static-builds-with-mbedtls-parked-but-measured" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Small static builds with mbedTLS (parked, but measured)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Small static builds with mbedTLS (parked, but measured)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#tls-backend-reality" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TLS-backend reality
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#gotcha-curl-mbedtls-version-match" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Gotcha: curl ↔ mbedTLS version match
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#recipe-what-we-ran" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recipe (what we ran)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-promoting-it-to-a-standalone-library-nanos3reader" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Promoting it to a standalone library — nanos3reader
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Promoting it to a standalone library — nanos3reader">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#why-it-has-appeal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why it has appeal
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-it-takes-most-of-it-already-exists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What it takes (most of it already exists)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dependency-strategy-the-real-decision" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dependency strategy (the real decision)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#does-splitting-hurt-nanolance-no" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Does splitting hurt nanolance? No
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#licenses-all-permissive-no-copyleft-no-gpl-friction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Licenses (all permissive — no copyleft, no GPL friction)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-quick-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Quick reference
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-what-it-is" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. What it is
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-credential-resolution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Credential resolution
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Credential resolution">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#not-resolved-by-design" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Not resolved (by design)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#self-explaining-failures" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Self-explaining failures
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#context-credential_process-matters-more-than-youd-think" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context: credential_process matters more than you'd think
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-performance-40-faster-than-pylance-on-blob-fetch" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Performance: ~40× faster than pylance on blob-fetch
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Performance: ~40× faster than pylance on blob-fetch">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#why-and-what-we-ruled-out" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why — and what we ruled out
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#honest-caveats-dont-over-quote-the-40" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Honest caveats (don't over-quote the 40×)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#reproduce-the-env-creds-trick" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reproduce / the env-creds trick
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#known-bug-spotted-along-the-way" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Known bug spotted along the way
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-sigv4-crypto-backend-dnanolance_s3_crypto" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. SigV4 crypto backend (-DNANOLANCE_S3_CRYPTO)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-small-static-builds-with-mbedtls-parked-but-measured" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Small static builds with mbedTLS (parked, but measured)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Small static builds with mbedTLS (parked, but measured)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#tls-backend-reality" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TLS-backend reality
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#gotcha-curl-mbedtls-version-match" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Gotcha: curl ↔ mbedTLS version match
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#recipe-what-we-ran" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recipe (what we ran)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-promoting-it-to-a-standalone-library-nanos3reader" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Promoting it to a standalone library — nanos3reader
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Promoting it to a standalone library — nanos3reader">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#why-it-has-appeal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why it has appeal
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#what-it-takes-most-of-it-already-exists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What it takes (most of it already exists)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dependency-strategy-the-real-decision" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dependency strategy (the real decision)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#does-splitting-hurt-nanolance-no" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Does splitting hurt nanolance? No
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#licenses-all-permissive-no-copyleft-no-gpl-friction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Licenses (all permissive — no copyleft, no GPL friction)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-quick-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Quick reference
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="the-s3-reader-credentials-performance-and-small-static-builds">The S3 reader: credentials, performance, and small static builds<a class="headerlink" href="#the-s3-reader-credentials-performance-and-small-static-builds" title="Permanent link">&para;</a></h1>
+<blockquote>
+<p><strong>Status:</strong> the reader has been spun out into its own repo,
+<strong><a href="https://github.com/yoavbendor/nanos3reader">nanos3reader</a></strong>. nanolance no longer carries it in-tree;
+it pulls it in via CMake <code>FetchContent</code> (see the <code>NANOLANCE_ENABLE_S3</code> block in <code>CMakeLists.txt</code>). These
+notes were written while the code lived in nanolance, so file paths like <code>src/s3_min_reader.cpp</code> now map
+to nanos3reader's <code>src/s3_reader.cpp</code>, the namespace <code>nanolance::</code> → <code>nanos3reader::</code>, and the build
+option <code>NANOLANCE_S3_CRYPTO</code> → <code>NANOS3READER_CRYPTO</code> (nanolance forwards it). The analysis below — the
+credential chain, the pylance benchmark, the crypto backend, the static-build numbers — all still holds.</p>
+</blockquote>
+<p>Engineering notes for the S3 range reader. Written so we can page this back in weeks from now without
+re-deriving it. Covers: what the reader is, how it resolves credentials, why it's ~40× faster than
+pylance on the blob-fetch benchmark, the swappable SigV4 crypto backend, what a small static build
+(mbedTLS) actually costs, and how it was promoted into the standalone <strong><code>nanos3reader</code></strong> library.</p>
+<hr />
+<h2 id="1-what-it-is">1. What it is<a class="headerlink" href="#1-what-it-is" title="Permanent link">&para;</a></h2>
+<p><code>nanolance</code> only needs to <strong>read byte ranges</strong> out of external blobs (see
+<code>src/nano_lance_external_blob.cpp</code>). The built-in reader provides exactly that and nothing more:</p>
+<ul>
+<li>A <code>S3MinStreamFactory</code> that opens <code>s3://bucket/key</code> as a <strong>seekable, read-ahead-buffered
+  <code>std::istream</code></strong> backed by libcurl range <code>GET</code>s + AWS SigV4 signing.</li>
+<li>Dependencies: <strong>libcurl</strong> (HTTP/HTTPS) + a tiny bit of crypto for SigV4 (SHA-256/HMAC). No AWS SDK.</li>
+<li>Scope: <strong>read-only, <code>GET</code> only.</strong> No <code>PUT</code>/multipart/<code>LIST</code>. That's deliberate — it keeps the
+  surface tiny and is all the engine needs.</li>
+</ul>
+<p>It's a drop-in for the old <code>AwsSdkStreamFactory</code> seam: <code>nano_lance_external_blob.cpp</code> talks to it
+through a typedef (<code>NanoLanceS3Factory</code>) over a stable <code>open()/error()</code> → <code>std::unique_ptr&lt;std::istream&gt;</code>
+contract, and the CMake already supports built-in / external / no-S3 providers.</p>
+<hr />
+<h2 id="2-credential-resolution">2. Credential resolution<a class="headerlink" href="#2-credential-resolution" title="Permanent link">&para;</a></h2>
+<p>The reader resolves credentials the way the AWS tools do, trying in order:</p>
+<ol>
+<li><strong>Environment</strong> — <code>AWS_ACCESS_KEY_ID</code> / <code>AWS_SECRET_ACCESS_KEY</code> / <code>AWS_SESSION_TOKEN</code>.</li>
+<li><strong>Shared profile files</strong> — <code>~/.aws/credentials</code> and <code>~/.aws/config</code>, honoring <code>AWS_PROFILE</code>
+   (<code>AWS_SHARED_CREDENTIALS_FILE</code> / <code>AWS_CONFIG_FILE</code> override the paths). This includes a profile's
+   <strong><code>credential_process</code></strong> helper: the reader runs the command and parses its JSON
+   (<code>AccessKeyId</code> / <code>SecretAccessKey</code> / <code>SessionToken</code> / <code>Expiration</code> — note <code>SessionToken</code>, <em>not</em>
+   the <code>Token</code> key the metadata endpoints use).</li>
+<li><strong>ECS/EKS container credentials</strong> (<code>AWS_CONTAINER_CREDENTIALS_RELATIVE_URI</code> / <code>_FULL_URI</code>).</li>
+<li><strong>EC2 instance role</strong> via IMDSv2.</li>
+</ol>
+<p>Temporary credentials (session tokens) are honored and refreshed shortly before they expire. The
+resolved result is cached process-wide, so a single run resolves once and reuses it across every
+fetch — this matters for performance (see §3).</p>
+<h3 id="not-resolved-by-design">Not resolved (by design)<a class="headerlink" href="#not-resolved-by-design" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>AWS SSO</strong> profiles and <strong>assume-role</strong> profiles. The AWS CLI resolves these; we don't. For those,
+  run your normal AWS login and export the resolved creds to the environment first.</li>
+</ul>
+<h3 id="self-explaining-failures">Self-explaining failures<a class="headerlink" href="#self-explaining-failures" title="Permanent link">&para;</a></h3>
+<p>When no credentials are found, the error names <strong>each source it tried and why</strong>, e.g.:</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>missing AWS credentials — env: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY not set;
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>  profile: profile &#39;default&#39; uses AWS SSO, which the built-in reader does not resolve — run
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>  &#39;aws sso login&#39;, then export AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN to env;
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>  IMDS: no EC2 instance role (metadata endpoint unreachable or empty)
+</code></pre></div>
+<p>It specifically detects profiles that use SSO / <code>credential_process</code> / assume-role, a profile that
+isn't found, and absent <code>~/.aws</code> files. This is the fastest way to diagnose "the <code>aws</code> CLI works but
+nanolance says no credentials" — it's almost always SSO or <code>credential_process</code>.</p>
+<h3 id="context-credential_process-matters-more-than-youd-think">Context: <code>credential_process</code> matters more than you'd think<a class="headerlink" href="#context-credential_process-matters-more-than-youd-think" title="Permanent link">&para;</a></h3>
+<p>Apache <code>arrow-rs object_store</code> (the storage layer behind pylance / Lance) <strong>does not support
+<code>credential_process</code></strong> — the feature request was closed "not planned"
+(<a href="https://github.com/apache/arrow-rs-object-store/issues/47">apache/arrow-rs-object-store#47</a>). So our
+native <code>credential_process</code> support is a real differentiator for corporate setups that use it.</p>
+<hr />
+<h2 id="3-performance-40-faster-than-pylance-on-blob-fetch">3. Performance: ~40× faster than pylance on blob-fetch<a class="headerlink" href="#3-performance-40-faster-than-pylance-on-blob-fetch" title="Permanent link">&para;</a></h2>
+<p>Benchmark: <code>bench/blob_fetch_bench.sh</code> builds a <code>lance.blob.v2</code> dataset of external references and
+fetches every blob two ways — <strong>nanolance</strong> (<code>nano_lance_fetch_external_blob</code>) vs <strong>pylance</strong>
+(<code>take_blobs().read()</code>, the Rust core) — then MD5-compares the bytes per index.</p>
+<p>Real run (epgd068, 690 blobs across 2 S3 objects, warm mean):</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>total</th>
+<th>per blob</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>nanolance</strong></td>
+<td>~2.6–3.0 s</td>
+<td><strong>~4 ms</strong></td>
+</tr>
+<tr>
+<td><strong>pylance</strong> <code>take_blobs</code></td>
+<td>~119–121 s</td>
+<td><strong>~180 ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p>→ <strong>~40–47×</strong>, bytes verified identical.</p>
+<h3 id="why-and-what-we-ruled-out">Why — and what we ruled out<a class="headerlink" href="#why-and-what-we-ruled-out" title="Permanent link">&para;</a></h3>
+<p>Both drivers fetch the same 690 ranges <strong>serially, one at a time</strong> (<code>tools/nlance_blobfetch.cpp</code> and
+<code>bench/fetch_pylance.py</code>), so it's a clean per-blob latency comparison. We chased the gap to ground:</p>
+<ul>
+<li>❌ <strong>Credentials.</strong> Exported static env creds (<code>key=ASIA</code>, 760-char token) so both sides skip
+  <code>credential_process</code> → pylance still ~119 s. Not it.</li>
+<li>❌ <strong>Warmup.</strong> pylance per-blob distribution: <code>min 151 / p50 179 / p90 242 / max 876</code> ms. The 876 ms
+  is <strong>only idx 0</strong> (dataset + first-object open).</li>
+<li>❌ <strong>Per-object setup.</strong> Only the object-boundary blob (idx 481) showed a bump (~382 ms); everything
+  else sits at the steady ~180 ms.</li>
+<li>✅ <strong>Per-blob read cost with no reuse.</strong> ~97% of pylance's time is a uniform ~180 ms/blob that does
+  <strong>not</strong> amortize. nanolance reuses <strong>one keep-alive HTTPS connection per object</strong> and pays ~4 ms/blob.</li>
+</ul>
+<p>The ~4 ms/blob also tells us the RTT to the bucket is tiny (same-region/Direct-Connect), so pylance's
+~180 ms is ~45× a single round-trip — i.e. per-blob overhead inside <code>take_blobs</code> (each <code>BlobFile</code>
+opening its own reader/connection), not the network.</p>
+<h3 id="honest-caveats-dont-over-quote-the-40">Honest caveats (don't over-quote the 40×)<a class="headerlink" href="#honest-caveats-dont-over-quote-the-40" title="Permanent link">&para;</a></h3>
+<ul>
+<li>It's specific to <strong>many small reads from few objects</strong>. For a few large reads it shrinks toward parity.</li>
+<li><code>take_blobs</code> is the lazy random-access API; pylance's <em>bulk</em> path (a scan / <code>to_table</code> over the blob
+  column, which coalesces) was <strong>not</strong> measured and would likely be much faster. The fair framing is
+  "nanolance is ~40× faster than pylance's lazy <code>take_blobs</code> for this fetch-by-reference pattern."</li>
+<li>2 objects, one host/region/session. Worth re-running with 10–20 objects.</li>
+</ul>
+<h3 id="reproduce-the-env-creds-trick">Reproduce / the env-creds trick<a class="headerlink" href="#reproduce-the-env-creds-trick" title="Permanent link">&para;</a></h3>
+<p>If your profile uses <code>credential_process</code> and your AWS CLI is too old for
+<code>aws configure export-credentials</code> (added in v2.7.5), materialize creds straight from the helper:</p>
+<div class="language-bash highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nv">PYBIN</span><span class="o">=</span>/path/to/.venv/bin/python<span class="w">   </span><span class="c1"># any python3 (stdlib json only; no botocore needed)</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nb">eval</span><span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span><span class="nb">eval</span><span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span>aws<span class="w"> </span>configure<span class="w"> </span>get<span class="w"> </span>credential_process<span class="k">)</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PYBIN</span><span class="s2">&quot;</span><span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="s1">import sys, json</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="s1">d = json.load(sys.stdin)</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="s1">print(&quot;export AWS_ACCESS_KEY_ID=&quot;     + d[&quot;AccessKeyId&quot;])</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="s1">print(&quot;export AWS_SECRET_ACCESS_KEY=&quot; + d[&quot;SecretAccessKey&quot;])</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="s1">print(&quot;export AWS_SESSION_TOKEN=&quot;     + d.get(&quot;SessionToken&quot;, &quot;&quot;))</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="s1">&#39;</span><span class="k">)</span><span class="s2">&quot;</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;key=</span><span class="si">${</span><span class="nv">AWS_ACCESS_KEY_ID</span><span class="p">:</span><span class="nv">0</span><span class="p">:</span><span class="nv">4</span><span class="si">}</span><span class="s2">  token_len=</span><span class="si">${#</span><span class="nv">AWS_SESSION_TOKEN</span><span class="si">}</span><span class="s2">&quot;</span><span class="w">   </span><span class="c1"># sanity check</span>
+</code></pre></div>
+<h3 id="known-bug-spotted-along-the-way">Known bug spotted along the way<a class="headerlink" href="#known-bug-spotted-along-the-way" title="Permanent link">&para;</a></h3>
+<p><code>ds.take_blobs(col, indices=[0,1,2,5,...])</code> with a <strong>sparse/non-contiguous</strong> index list panics in the
+Lance Rust core (<code>Invalid size</code>, <code>lance-encoding/.../bytepack.rs</code>). The full contiguous range works,
+which is why the bench uses it. This is upstream Lance, orthogonal to nanolance — file a minimal repro
+if it ever bites.</p>
+<hr />
+<h2 id="4-sigv4-crypto-backend-dnanolance_s3_crypto">4. SigV4 crypto backend (<code>-DNANOLANCE_S3_CRYPTO</code>)<a class="headerlink" href="#4-sigv4-crypto-backend-dnanolance_s3_crypto" title="Permanent link">&para;</a></h2>
+<p>SigV4 needs only SHA-256 (+ HMAC). HMAC is the standard ipad/opad construction, so it's implemented
+generically over a single swappable <code>sha256</code> primitive. Two backends, chosen at build time:</p>
+<table>
+<thead>
+<tr>
+<th><code>-DNANOLANCE_S3_CRYPTO=</code></th>
+<th>SHA-256 from</th>
+<th>Links</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>openssl</code> (default)</td>
+<td>OpenSSL <code>libcrypto</code></td>
+<td><code>OpenSSL::Crypto</code></td>
+</tr>
+<tr>
+<td><code>bundled</code></td>
+<td>compact in-tree SHA-256</td>
+<td><strong>no crypto library</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Both produce <strong>byte-identical signatures</strong> — verified by the SigV4 known-answer test against AWS's
+published vectors (<code>nano_lance_s3_min_sigv4</code>), which passes on both backends.</p>
+<p>Why bother: it decouples our code from <code>libcrypto</code>. Proof (object-level):</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>nm -uC s3_min_reader.o  (openssl)  -&gt;  U SHA256        # depends on libcrypto
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>nm -uC s3_min_reader.o  (bundled)  -&gt;  (no crypto syms) # links nothing
+</code></pre></div>
+<p>Cost: <strong>+1.1 KB</strong> of code (<code>.text</code> 83,429 → 84,568 bytes). This is the prerequisite for a small static
+build — otherwise <code>libcrypto</code> (~4.5 MB static) gets pulled in just for our SHA-256.</p>
+<blockquote>
+<p>Note: in a <em>normal dynamic</em> build, <code>libcrypto</code> still arrives via <strong>libcurl's TLS backend</strong> (system
+curl is OpenSSL-backed). <code>bundled</code> only pays off when curl itself uses a non-OpenSSL TLS — see §5.</p>
+</blockquote>
+<hr />
+<h2 id="5-small-static-builds-with-mbedtls-parked-but-measured">5. Small static builds with mbedTLS (parked, but measured)<a class="headerlink" href="#5-small-static-builds-with-mbedtls-parked-but-measured" title="Permanent link">&para;</a></h2>
+<p><strong>Status: parked. Not wired into the build — this section is the recipe + the numbers.</strong></p>
+<p>The ~4.5 MB of static OpenSSL <code>libcrypto</code> is the bloat, and it enters via <strong>both</strong> our SigV4 and
+<strong>libcurl's TLS</strong>. To shed it you need both <code>bundled</code> crypto <strong>and</strong> a libcurl built against a small
+TLS backend. We measured it end-to-end with a standalone <code>s3cat</code> (open a URI, read first bytes), fully
+static for TLS+curl+reader (only glibc dynamic):</p>
+<table>
+<thead>
+<tr>
+<th>Build</th>
+<th>Stripped</th>
+<th>Unstripped</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>mbedTLS curl + bundled SHA-256</strong> (zero OpenSSL)</td>
+<td><strong>2.16 MB</strong></td>
+<td>2.68 MB</td>
+</tr>
+<tr>
+<td><strong>OpenSSL curl + OpenSSL SHA-256</strong></td>
+<td><strong>6.72 MB</strong></td>
+<td>7.84 MB</td>
+</tr>
+</tbody>
+</table>
+<p>→ <strong>mbedTLS is ~4.6 MB smaller: 3.1× / ~68% off.</strong> <code>ldd</code> confirms no dynamic curl/tls/crypto deps in
+either. Component sizes: trimmed <code>libcurl.a</code> ≈ 1.0 MB; mbedTLS static stack ≈ 1.3 MB
+(<code>libmbedcrypto.a</code> 856 KB + <code>libmbedtls.a</code> 318 KB + <code>libmbedx509.a</code> 162 KB) vs OpenSSL <code>libcrypto.a</code>
+≈ 4.5 MB.</p>
+<h3 id="tls-backend-reality">TLS-backend reality<a class="headerlink" href="#tls-backend-reality" title="Permanent link">&para;</a></h3>
+<p>curl's well-supported <strong>small</strong> TLS backends are <strong>mbedTLS</strong> and <strong>wolfSSL</strong>. curl's BearSSL support
+has been spotty/removed — don't count on it. mbedTLS (Apache-2.0) is the pragmatic small choice.</p>
+<h3 id="gotcha-curl-mbedtls-version-match">Gotcha: curl ↔ mbedTLS version match<a class="headerlink" href="#gotcha-curl-mbedtls-version-match" title="Permanent link">&para;</a></h3>
+<p>Ubuntu ships <strong>mbedTLS 2.28 LTS</strong>. <strong>curl 8.8.0</strong> calls <code>mbedtls_ssl_get_ciphersuite_id_from_ssl</code> (a
+mbedTLS 3.x function) unguarded and fails to build against 2.28 (fixed by a version guard in 8.9). Use
+<strong>curl 8.7.1</strong> (predates that call) or mbedTLS 3.x. We used curl 8.7.1 + mbedTLS 2.28.8.</p>
+<h3 id="recipe-what-we-ran">Recipe (what we ran)<a class="headerlink" href="#recipe-what-we-ran" title="Permanent link">&para;</a></h3>
+<div class="language-bash highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>libmbedtls-dev<span class="w"> </span>zlib1g-dev
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="c1"># curl.se is blocked here; fetch from GitHub:</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>curl<span class="w"> </span>-fsSL<span class="w"> </span>-o<span class="w"> </span>curl.tar.xz<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span>https://github.com/curl/curl/releases/download/curl-8_7_1/curl-8.7.1.tar.xz
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>tar<span class="w"> </span>xf<span class="w"> </span>curl.tar.xz<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>curl-8.7.1
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="c1"># HTTP/HTTPS only, everything else off:</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>./configure<span class="w"> </span>--disable-shared<span class="w"> </span>--enable-static<span class="w"> </span>--with-mbedtls<span class="o">=</span>/usr<span class="w"> </span>--without-openssl<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="w">  </span>--disable-ldap<span class="w"> </span>--disable-ldaps<span class="w"> </span>--disable-rtsp<span class="w"> </span>--disable-dict<span class="w"> </span>--disable-telnet<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="w">  </span>--disable-tftp<span class="w"> </span>--disable-pop3<span class="w"> </span>--disable-imap<span class="w"> </span>--disable-smtp<span class="w"> </span>--disable-gopher<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="w">  </span>--disable-mqtt<span class="w"> </span>--disable-smb<span class="w"> </span>--disable-ftp<span class="w"> </span>--disable-file<span class="w"> </span>--disable-ntlm<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="w">  </span>--disable-unix-sockets<span class="w"> </span>--disable-manual<span class="w"> </span>--disable-libcurl-option<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="w">  </span>--without-libpsl<span class="w"> </span>--without-nghttp2<span class="w"> </span>--without-libidn2<span class="w"> </span>--without-brotli<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="w">  </span>--without-zstd<span class="w"> </span>--without-librtmp<span class="w"> </span>--without-libssh2<span class="w"> </span>--without-zlib
+<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>make<span class="w"> </span>-C<span class="w"> </span>lib<span class="w"> </span>-j<span class="s2">&quot;</span><span class="k">$(</span>nproc<span class="k">)</span><span class="s2">&quot;</span><span class="w">          </span><span class="c1"># -&gt; lib/.libs/libcurl.a  (~1 MB)</span>
+<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a>
+<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a><span class="c1"># Link the standalone example with bundled crypto + the mbedTLS curl, zero OpenSSL:</span>
+<a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a><span class="nv">M</span><span class="o">=</span>/usr/lib/x86_64-linux-gnu
+<a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a>g++<span class="w"> </span>-std<span class="o">=</span>gnu++20<span class="w"> </span>-O2<span class="w"> </span>-I<span class="w"> </span>nanolance/include<span class="w"> </span>-DNANOLANCE_S3_CRYPTO_BUNDLED<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a><span class="w">  </span>nanolance/src/s3_min_reader.cpp<span class="w"> </span>s3cat.cpp<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a><span class="w">  </span>-static-libstdc++<span class="w"> </span>-static-libgcc<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-22" name="__codelineno-3-22" href="#__codelineno-3-22"></a><span class="w">  </span>curl-8.7.1/lib/.libs/libcurl.a<span class="w"> </span><span class="nv">$M</span>/libmbedtls.a<span class="w"> </span><span class="nv">$M</span>/libmbedx509.a<span class="w"> </span><span class="nv">$M</span>/libmbedcrypto.a<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-23" name="__codelineno-3-23" href="#__codelineno-3-23"></a><span class="w">  </span>-lpthread<span class="w"> </span>-ldl<span class="w"> </span>-o<span class="w"> </span>s3cat_mbedtls
+<a id="__codelineno-3-24" name="__codelineno-3-24" href="#__codelineno-3-24"></a>strip<span class="w"> </span>-s<span class="w"> </span>s3cat_mbedtls<span class="w">   </span><span class="c1"># ~2.16 MB</span>
+</code></pre></div>
+<hr />
+<h2 id="6-promoting-it-to-a-standalone-library-nanos3reader">6. Promoting it to a standalone library — <code>nanos3reader</code><a class="headerlink" href="#6-promoting-it-to-a-standalone-library-nanos3reader" title="Permanent link">&para;</a></h2>
+<p><strong>The name fits</strong> the <code>nano*</code> family (nanolance, nanotins, nanoarrow): <strong><code>nanos3reader</code></strong> (all lowercase —
+the canonical name for repo, CMake target, and namespace) says exactly what it is: a read-only S3 range
+reader.</p>
+<h3 id="why-it-has-appeal">Why it has appeal<a class="headerlink" href="#why-it-has-appeal" title="Permanent link">&para;</a></h3>
+<p>The pitch: <em>"Read byte-ranges from S3 (and MinIO/R2/any S3-compatible) as a seekable <code>std::istream</code>,
+with SigV4 + the full AWS credential chain — in ~1k LOC and just libcurl + a TLS lib, no AWS SDK."</em> The
+AWS SDK for C++ is the thing people flee (100s of MB, huge dep tree, slow builds). A focused, permissive,
+static-friendly <strong>reader</strong> with the credential chain (incl. <code>credential_process</code>, which <code>arrow-rs</code>
+lacks) is a real sweet spot for data engines, edge/embedded, and CLIs. Scope it honestly as a <em>reader</em>,
+not an SDK.</p>
+<h3 id="what-it-takes-most-of-it-already-exists">What it takes (most of it already exists)<a class="headerlink" href="#what-it-takes-most-of-it-already-exists" title="Permanent link">&para;</a></h3>
+<p>Already have: SigV4 vector tests, a MinIO integration test, the external-blob test, a clean header, and
+a CMake seam. Remaining:</p>
+<ul>
+<li>Own repo + CMake exporting <code>nanos3reader::nanos3reader</code>, install rules, <code>find_package</code> config +
+  pkg-config, semver tags. (GitLab: <code>.gitlab-ci.yml</code> with a <code>minio</code> service for the integration test.)</li>
+<li>Rename namespace <code>nanolance::</code> → <code>nanos3reader::</code>; nanolance keeps working via the external-target
+  hook + a 2-line typedef shim.</li>
+<li>README (quickstart, credential chain, MinIO/<code>AWS_ENDPOINT_URL</code>, build options, <strong>limitations</strong>), API
+  reference, and the <code>s3cat</code> example (doubles as a smoke test).</li>
+<li>Optional, high-leverage: a thin <strong>C API</strong> (<code>s3_open/read/close</code>) so Python/Rust/Go can FFI to it.</li>
+</ul>
+<p>Rough effort: ~2–4 focused days to a credible v0.1.</p>
+<h3 id="dependency-strategy-the-real-decision">Dependency strategy (the real decision)<a class="headerlink" href="#dependency-strategy-the-real-decision" title="Permanent link">&para;</a></h3>
+<p><strong>Make it a build option; don't hard-vendor.</strong> Deciding factor: <strong>who owns CVE updates.</strong></p>
+<ul>
+<li><strong>Default = <code>find_package(CURL)</code> + <code>find_package(OpenSSL)</code></strong> (dynamic, system-managed). Smallest
+  source; the distro patches curl/TLS CVEs. This is what most C++ libs do.</li>
+<li><strong>Opt-in <code>-DNANOS3READER_BUNDLED_DEPS=ON</code></strong> = <code>FetchContent</code>/<code>ExternalProject</code> a <strong>pinned</strong> curl +
+  mbedTLS built statically, plus the <code>bundled</code> SHA-256 → the ~2.2 MB self-contained artifact from §5.
+  For users who want a single static binary (containers/distroless/edge) <strong>and accept owning the patch
+  treadmill</strong> — that's the tradeoff: a static vendored networking stack means <em>you</em> rebuild and
+  re-release for every curl/TLS CVE.</li>
+</ul>
+<p>Ship both as documented presets; CI builds both.</p>
+<h3 id="does-splitting-hurt-nanolance-no">Does splitting hurt nanolance? No<a class="headerlink" href="#does-splitting-hurt-nanolance-no" title="Permanent link">&para;</a></h3>
+<p>The seam already exists: <code>nano_lance_external_blob.cpp</code> goes through the <code>NanoLanceS3Factory</code> typedef,
+and CMake already supports an external S3 target (<code>NANOLANCE_S3_TARGET</code> / <code>NANOLANCE_S3_INCLUDE_DIR</code>) and
+a no-S3 mode. nanolance can consume <code>nanos3reader</code> as an external target with <strong>zero hot-path change</strong>.
+Costs to manage: keep the <code>open()/error()</code> + <code>istream</code> contract stable, pin a version (submodule or
+package), and keep the in-tree copy as a fallback during migration.</p>
+<h3 id="licenses-all-permissive-no-copyleft-no-gpl-friction">Licenses (all permissive — no copyleft, no GPL friction)<a class="headerlink" href="#licenses-all-permissive-no-copyleft-no-gpl-friction" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Our code: <strong>Apache-2.0</strong>.</li>
+<li><strong>libcurl</strong>: curl/MIT-style — static-link fine; ship the short license + copyright.</li>
+<li><strong>OpenSSL 3.x</strong>: Apache-2.0 (compatible). Avoid pinning ≤1.1.1 (old OpenSSL/SSLeay BSD-with-advertising
+  clause).</li>
+<li><strong>mbedTLS</strong>: Apache-2.0. <strong>zlib</strong> (if ever enabled): zlib license.</li>
+</ul>
+<p>Static linking is legally clean; the entire compliance burden is shipping a <code>THIRD-PARTY-LICENSES</code> /
+<code>NOTICE</code> file with the curl + TLS attributions. The classic "OpenSSL + GPL" headache does not apply
+because nothing here is GPL.</p>
+<hr />
+<h2 id="7-quick-reference">7. Quick reference<a class="headerlink" href="#7-quick-reference" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Knob</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AWS_PROFILE</code> / <code>AWS_DEFAULT_PROFILE</code></td>
+<td>profile to read from <code>~/.aws/*</code></td>
+</tr>
+<tr>
+<td><code>AWS_REGION</code> / <code>AWS_DEFAULT_REGION</code></td>
+<td>region for virtual-hosted addressing (else profile, else <code>us-east-1</code>)</td>
+</tr>
+<tr>
+<td><code>AWS_ENDPOINT_URL</code></td>
+<td>custom endpoint (MinIO etc.); switches to path-style addressing</td>
+</tr>
+<tr>
+<td><code>AWS_MAX_ATTEMPTS</code></td>
+<td>tries per range GET (default 3; full-jitter backoff on transient failures)</td>
+</tr>
+<tr>
+<td><code>-DNANOLANCE_S3_CRYPTO=openssl\|bundled</code></td>
+<td>SigV4 SHA-256 backend (default <code>openssl</code>)</td>
+</tr>
+<tr>
+<td><code>-DNANOLANCE_ENABLE_S3=ON</code></td>
+<td>enable the S3 provider</td>
+</tr>
+<tr>
+<td><code>NANOLANCE_S3_TARGET</code> / <code>_INCLUDE_DIR</code></td>
+<td>use an external S3 reader instead of the built-in one</td>
+</tr>
+</tbody>
+</table>
+<p>Source of truth: <code>src/s3_min_reader.cpp</code>, <code>include/nanolance/s3_min_reader.h</code>,
+<code>src/nano_lance_external_blob.cpp</code>, <code>bench/blob_fetch_bench.sh</code>, <code>bench/fetch_pylance.py</code>.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../bench-trusted-parity/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Safety-parity (trusted vs default)">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Safety-parity (trusted vs default)
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../disk-lru-block-cache/" class="md-footer__link md-footer__link--next" aria-label="Next: Disk LRU block cache">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Disk LRU block cache
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>
