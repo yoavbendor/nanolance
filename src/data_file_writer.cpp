@@ -931,40 +931,56 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 std::memcpy(&v, p, 4);
                 return v;
             };
-            // Dictionary keyed by string_view into the stable column data buffer: no per-row heap
-            // string allocation and hash lookups instead of full-string red-black-tree comparisons.
-            std::unordered_map<std::string_view, std::uint32_t> dict;
-            dict.reserve(num_rows / 4U + 1U);
             std::vector<std::string_view> distinct;
-            std::vector<std::uint32_t> indices;
-            indices.reserve(num_rows);
-            for (std::size_t r = 0; r < num_rows; ++r) {
-                const auto s = read_offset(r);
-                const auto e = read_offset(r + 1);
-                const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
-                                           static_cast<std::size_t>(e - s));
-                const auto id = static_cast<std::uint32_t>(distinct.size());
-                const auto [it, inserted] = dict.emplace(val, id);
-                if (inserted) {
-                    distinct.push_back(val);
-                }
-                indices.push_back(it->second);
-            }
-            // RLE the u32 indices (8-bit sub-runs).
             std::vector<std::uint8_t> run_values;
             std::vector<std::uint8_t> run_lengths;
-            for (std::size_t r = 0; r < indices.size();) {
-                std::size_t run = 1;
-                while (r + run < indices.size() && indices[r + run] == indices[r]) {
-                    ++run;
+            const bool have_rle_plan = values.structural_dict_rle_plan.computed;
+            if (have_rle_plan) {
+                // The write-side "is dict-RLE beneficial?" heuristic already detected every run and
+                // built the (run-keyed, not row-keyed) dictionary while deciding -- reuse it verbatim
+                // instead of re-scanning row-by-row and re-running RLE detection from scratch.
+                distinct = values.structural_dict_rle_plan.distinct;
+                for (const auto& [index, run_length] : values.structural_dict_rle_plan.runs) {
+                    for (std::uint64_t remaining = run_length; remaining > 0;) {
+                        const auto take = static_cast<std::uint8_t>(std::min<std::uint64_t>(255U, remaining));
+                        append_le32(run_values, index);
+                        run_lengths.push_back(take);
+                        remaining -= take;
+                    }
                 }
-                for (std::size_t remaining = run; remaining > 0;) {
-                    const std::size_t take = std::min<std::size_t>(255U, remaining);
-                    append_le32(run_values, indices[r]);
-                    run_lengths.push_back(static_cast<std::uint8_t>(take));
-                    remaining -= take;
+            } else {
+                // Dictionary keyed by string_view into the stable column data buffer: no per-row heap
+                // string allocation and hash lookups instead of full-string red-black-tree comparisons.
+                std::unordered_map<std::string_view, std::uint32_t> dict;
+                dict.reserve(num_rows / 4U + 1U);
+                std::vector<std::uint32_t> indices;
+                indices.reserve(num_rows);
+                for (std::size_t r = 0; r < num_rows; ++r) {
+                    const auto s = read_offset(r);
+                    const auto e = read_offset(r + 1);
+                    const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
+                                               static_cast<std::size_t>(e - s));
+                    const auto id = static_cast<std::uint32_t>(distinct.size());
+                    const auto [it, inserted] = dict.emplace(val, id);
+                    if (inserted) {
+                        distinct.push_back(val);
+                    }
+                    indices.push_back(it->second);
                 }
-                r += run;
+                // RLE the u32 indices (8-bit sub-runs).
+                for (std::size_t r = 0; r < indices.size();) {
+                    std::size_t run = 1;
+                    while (r + run < indices.size() && indices[r + run] == indices[r]) {
+                        ++run;
+                    }
+                    for (std::size_t remaining = run; remaining > 0;) {
+                        const std::size_t take = std::min<std::size_t>(255U, remaining);
+                        append_le32(run_values, indices[r]);
+                        run_lengths.push_back(static_cast<std::uint8_t>(take));
+                        remaining -= take;
+                    }
+                    r += run;
+                }
             }
             const auto chunk_bytes = build_multibuffer_chunk({run_values, run_lengths});
             MiniblockChunk chunk;

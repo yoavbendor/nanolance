@@ -133,11 +133,14 @@ bool variable_column_constant_value(const nano_lance::ColumnValues& cv, std::vec
     return true;
 }
 
-// Decide whether dictionary + RLE wins for a variable-width column. dict-RLE only helps when the
-// per-row values form long runs (the per-minute URI case); since distinct values <= number of runs,
-// "run-friendly" already implies "low cardinality", so this needs NO dictionary build — just a cheap
-// consecutive-value run scan that bails the moment it stops being run-friendly. Zero allocation.
-bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
+// Decide whether dictionary + RLE wins for a variable-width column, and on success build the plan the
+// data-file encoder needs (distinct values + per-run dictionary index), so the encoder doesn't have to
+// rebuild it from a second, per-ROW hashmap scan. dict-RLE only helps when the per-row values form long
+// runs (the per-minute URI case); since distinct values <= number of runs, "run-friendly" already
+// implies "low cardinality", so the dictionary here is built with one hash-map insert per RUN (typically
+// far fewer than the row count), not one per row.
+bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
+    cv.structural_dict_rle_plan = {};
     const std::size_t ow = cv.variable.large ? 8U : 4U;
     if (cv.variable.offsets.size() < 2U * ow) {
         return false;
@@ -159,6 +162,9 @@ bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
     }
     const char* base = reinterpret_cast<const char*>(cv.variable.data.data());
     const std::size_t data_size = cv.variable.data.size();
+    std::unordered_map<std::string_view, std::uint32_t> dict;
+    std::vector<std::string_view> distinct;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> runs;
     std::size_t split_runs = 0;
     std::size_t i = 0;
     while (i < rows) {
@@ -184,10 +190,23 @@ bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
         if (split_runs * 2U >= rows) {
             return false;  // not run-friendly (and therefore not low-cardinality)
         }
+        const std::string_view val(base + s0, len0);
+        const auto id = static_cast<std::uint32_t>(distinct.size());
+        const auto [it, inserted] = dict.emplace(val, id);
+        if (inserted) {
+            distinct.push_back(val);
+        }
+        runs.emplace_back(it->second, run);
         i += run;
     }
     const std::size_t values_size = split_runs * 4U;  // u32 dictionary indices, one per split run
-    return (values_size + split_runs + 32U) <= 32760U;
+    if ((values_size + split_runs + 32U) > 32760U) {
+        return false;
+    }
+    cv.structural_dict_rle_plan.computed = true;
+    cv.structural_dict_rle_plan.distinct = std::move(distinct);
+    cv.structural_dict_rle_plan.runs = std::move(runs);
+    return true;
 }
 
 // Decide whether a structural dictionary (flat bitpacked indices + dictionary buffer) wins for a

@@ -42,12 +42,26 @@ struct StructuralDictPlan {
     std::vector<std::uint32_t> indices;      // per-row dictionary index into `distinct`
 };
 
+/// Dictionary+RLE plan for a run-length-friendly variable-width column, computed once by the write-side
+/// "is dict-RLE beneficial?" heuristic (which already detects each maximal adjacent run while deciding)
+/// and reused verbatim by the data-file encoder, so building the (run-keyed, not row-keyed) dictionary
+/// and the run sequence happens once instead of being fully rebuilt from a per-row scan. `distinct` is
+/// a view into the owning `VariableWidthColumnValues::data`, valid only while that buffer is alive and
+/// unmodified. `runs` holds one (dictionary index, run length) pair per detected run, in row order, with
+/// run length *not* yet split at Lance's 255-per-sub-run cap (the encoder does that).
+struct StructuralDictRlePlan {
+    bool computed = false;
+    std::vector<std::string_view> distinct;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> runs;
+};
+
 struct ColumnValues {
     enum class Kind { FixedWidth, VariableWidth, BlobV2External } kind = Kind::FixedWidth;
     std::vector<std::uint8_t> fixed;
     VariableWidthColumnValues variable;
     BlobV2ExternalColumnValues blob_v2;
     StructuralDictPlan structural_dict_plan;
+    StructuralDictRlePlan structural_dict_rle_plan;
 };
 
 }  // namespace nano_lance
