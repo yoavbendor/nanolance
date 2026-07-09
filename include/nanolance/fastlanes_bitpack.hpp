@@ -41,6 +41,13 @@ inline T fl_mask(unsigned width) {
 
 /// Pack `in[0..1024]` into `out` at `width` bits per value (width in 0..=8*sizeof(T)).
 /// `out` must hold 1024*width/(8*sizeof(T)) words of type T.
+///
+/// Row-outer, lane-inner loop order -- same rationale as unpack_1024 below: fl_index(row,lane) is
+/// contiguous in `lane` for a fixed row, so every inner loop here walks a contiguous run the compiler
+/// can auto-vectorize, instead of the lane-outer order's serial per-lane accumulator chain. pack has it
+/// even easier than unpack: every input value is already available (no reload-on-boundary needed), so
+/// the accumulator is just a small per-lane array carried across rows. Verified byte-identical to the
+/// lane-outer version across every (T, width) combination, and round-tripped through unpack_1024.
 template <class T>
 inline void pack_1024(unsigned width, const T* in, T* out) {
     constexpr unsigned kBits = sizeof(T) * 8U;
@@ -50,28 +57,35 @@ inline void pack_1024(unsigned width, const T* in, T* out) {
     }
     if (width == kBits) {
         for (unsigned row = 0; row < kBits; ++row) {
-            for (std::size_t lane = 0; lane < kLanes; ++lane) {
-                out[kLanes * row + lane] = in[fl_index(row, lane)];
-            }
+            std::memcpy(out + kLanes * row, in + fl_index(row, 0), kLanes * sizeof(T));
         }
         return;
     }
     const T mask = fl_mask<T>(width);
-    for (std::size_t lane = 0; lane < kLanes; ++lane) {
-        T tmp = 0;
-        for (unsigned row = 0; row < kBits; ++row) {
-            const T src = static_cast<T>(in[fl_index(row, lane)] & mask);
-            if (row == 0U) {
-                tmp = src;
-            } else {
-                tmp = static_cast<T>(tmp | static_cast<T>(src << ((row * width) % kBits)));
+    T tmp[128];  // kLanes <= 1024/8 = 128 (the T=uint8_t case)
+    for (unsigned row = 0; row < kBits; ++row) {
+        const T* in_row = in + fl_index(row, 0);
+        const unsigned shift = (row * width) % kBits;
+        const unsigned curr_word = (row * width) / kBits;
+        const unsigned next_word = ((row + 1U) * width) / kBits;
+        if (row == 0U) {
+            for (std::size_t lane = 0; lane < kLanes; ++lane) {
+                tmp[lane] = static_cast<T>(in_row[lane] & mask);
             }
-            const unsigned curr_word = (row * width) / kBits;
-            const unsigned next_word = ((row + 1U) * width) / kBits;
-            if (next_word > curr_word) {
-                out[kLanes * curr_word + lane] = tmp;
-                const unsigned remaining = ((row + 1U) * width) % kBits;
-                tmp = static_cast<T>(src >> (width - remaining));
+        } else {
+            for (std::size_t lane = 0; lane < kLanes; ++lane) {
+                tmp[lane] = static_cast<T>(tmp[lane] | static_cast<T>(static_cast<T>(in_row[lane] & mask) << shift));
+            }
+        }
+        if (next_word > curr_word) {
+            T* out_word = out + kLanes * curr_word;
+            for (std::size_t lane = 0; lane < kLanes; ++lane) {
+                out_word[lane] = tmp[lane];
+            }
+            const unsigned remaining = ((row + 1U) * width) % kBits;
+            const unsigned rshift = width - remaining;
+            for (std::size_t lane = 0; lane < kLanes; ++lane) {
+                tmp[lane] = static_cast<T>(static_cast<T>(in_row[lane] & mask) >> rshift);
             }
         }
     }
