@@ -203,7 +203,18 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
         return true;
     }
     const auto offset_width = large ? 8U : 4U;
-    const auto offsets_bytes = static_cast<std::size_t>(num_values + 1U) * offset_width;
+    // num_values comes from the untrusted page.length: compute the offset-table size with overflow-safe
+    // math so a hostile count can't wrap `(num_values + 1) * offset_width` into a small value that then
+    // passes the bounds check below and lets read_list_offset() over-read the chunk.
+    std::uint64_t offset_entries = 0;
+    std::uint64_t offsets_bytes64 = 0;
+    if (!checked_add(num_values, 1U, offset_entries) ||
+        !checked_mul(offset_entries, offset_width, offsets_bytes64) ||
+        !fits_size_t(offsets_bytes64)) {
+        error = "variable-width offset table size overflow";
+        return false;
+    }
+    const auto offsets_bytes = static_cast<std::size_t>(offsets_bytes64);
     if (chunk_bytes.size() < offsets_bytes) {
         error = "variable-width chunk smaller than offset table";
         return false;
@@ -272,6 +283,13 @@ bool unpack_bitpacked_page(const std::vector<std::uint8_t>& chunk, std::uint64_t
     std::vector<T> packed(packed_words, 0);
     if (packed_words != 0U) {
         std::memcpy(packed.data(), chunk.data() + sizeof(T), packed_words * sizeof(T));
+    }
+    // A FastLanes chunk unpacks into exactly 1024 values. `num_values` is attacker-controlled (it comes
+    // from page.length on the untrusted read path), so it MUST NOT exceed the block size — otherwise the
+    // copy below over-reads the `values` stack buffer. The last chunk legitimately emits fewer.
+    if (num_values > 1024U) {
+        error = "bitpacked chunk value count exceeds FastLanes block size";
+        return false;
     }
     T values[1024];
     nano_lance::fastlanes::unpack_1024<T>(width, packed.data(), values);

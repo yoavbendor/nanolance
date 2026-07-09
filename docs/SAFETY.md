@@ -40,8 +40,22 @@ or slice we validate them. The primitives live in [`include/nanolance/read_safet
   - `max_manifest_elements` (default 2^24) — bounds manifest field/fragment/file counts.
 
 Concretely, the hardened spots include: the zstd unframer, `append_repeated_value` (constant / RLE /
-dict-RLE expansion), the data-file footer descriptor/column-count/offset math, and the manifest
-element counts. The protobuf decoders already length-bound every field against the remaining input.
+dict-RLE expansion), the variable-width offset-table sizing, the FastLanes bitpacked-chunk value count,
+the data-file footer descriptor/column-count/offset math, and the manifest element counts. The protobuf
+decoders already length-bound every field against the remaining input.
+
+### Path & blob-fetch jail
+
+File *paths* on the read path are attacker-controlled too, so they get the same treatment
+([`include/nanolance/path_safety.hpp`](../include/nanolance/path_safety.hpp)):
+
+- **Data-file path jail** — `safe_join_under(base, relative)` confines a manifest's `data_file.path`
+  under `<dataset>/data/`. A hostile `..`/absolute path (which `path::operator/` would otherwise let
+  escape the tree) is rejected before the reader opens anything; the same jail guards the dataset
+  stitcher. The writer only ever stores a bare filename here, so real datasets are unaffected.
+- **External `file://` blob fetch** — the fetch always rejects a `..` traversal component, and an
+  optional base-directory jail (`NANO_LANCE_BLOB_BASE_DIR`) confines every `file://` fetch under a
+  configured root when set. `s3://` fetches are unchanged.
 
 ## Why it isn't slower
 
@@ -83,6 +97,7 @@ UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-asan -L smoke
 - [x] Every disk-derived size/offset validated against the real buffer with overflow-safe math before
       use.
 - [x] Declared allocation sizes (zstd, row counts, column counts) capped by a tunable budget.
+- [x] Manifest-derived file paths are confined under the dataset; `..`/absolute paths are rejected.
 - [x] Read path is ASan + UBSan clean and continuously fuzzed in CI.
 - [x] Malformed inputs are rejected with an error return, never a crash or unbounded allocation.
 
@@ -91,6 +106,6 @@ UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-asan -L smoke
 - **LSan (leak) checking** is staged off in the sanitizer CI job: a few small leaks remain in
   *writer-side test harnesses* (e.g. Arrow schemas built in tests and not released). The read path is
   leak-clean; enabling LSan globally is a cleanup task.
-- **Path/blob-fetch jail** (canonicalize `data_file.path` under the dataset, restrict `file://` blob
-  URIs) and **error-path Arrow release** on partial reads are the next hardening phases (see the
-  project's memory-safety plan). External blob range validation currently relies on read/EOF behavior.
+- **Error-path Arrow release** on partial reads (releasing already-built `ArrowArray`/`ArrowSchema`
+  when a multi-column read fails midway) is the next hardening phase (see the project's memory-safety
+  plan). External blob range validation currently relies on read/EOF behavior.
