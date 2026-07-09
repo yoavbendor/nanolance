@@ -105,9 +105,10 @@ nano_lance_writer_close(&w);
 
 ### Not yet supported / nanolance-only
 
-- **`bool` fixed-width columns aren't compressed** (written one byte per value; stock Lance bitpacks to
-  1 bit/value). `float`/`double` columns *are* compressed when `set_compression(true)` is set — via
-  byte-stream-split + zstd, the same technique stock Lance uses, verified byte-for-byte readable by it.
+- **`bool` fixed-width columns are bit-packed on disk** (1 bit/value, LSB-first, same as stock Lance —
+  always on, not gated by `set_compression`). `float`/`double` columns *are* compressed when
+  `set_compression(true)` is set — via byte-stream-split + zstd, the same technique stock Lance uses.
+  Both are verified byte-for-byte readable by stock Lance.
 - **No transparent delta encoding** — store monotonic high-range integers as app-level deltas to stay
   small (otherwise they bitpack as absolute values, where Parquet's delta encoding wins).
 - **Read throughput is the known gap** (currently ~2–3.5× `lance`, memory-bandwidth bound on column
@@ -159,8 +160,8 @@ nano_lance_writer_close(&w);
 - Don't change the schema between batches in one session.
 - Don't enable `nano_lance_writer_set_blob_uri_dictionary` if stock Lance must read that column
   (nanolance-only, create-mode only).
-- Don't expect `float`/`bool` columns to compress, or integers to delta-encode — store app-level deltas
-  for monotonic high-range integers.
+- Don't expect integers to delta-encode — store app-level deltas for monotonic high-range integers
+  (`float`/`bool` columns *are* compressed automatically).
 
 ## Layout
 
@@ -298,8 +299,9 @@ compression, off by default. The output stays readable by stock `lance` (verifie
   `spiraldb/fastlanes` kernel). A 5000-row int64 column with ~10-bit values is ~6.4× smaller and
   reads back identically under stock `lance`.
 
-Float/bool fixed-width columns are written uncompressed (Lance uses byte-stream-split / other
-schemes there, not yet implemented).
+- **Float/double columns → byte-stream-split + zstd** (opt-in via `set_compression(true)`), and
+  **bool columns → 1-bit-per-value packing** (always on) — both match the technique stock Lance itself
+  uses for these types and round-trip byte-for-byte readable by it.
 
 ## Embedded in streamingtestapps
 

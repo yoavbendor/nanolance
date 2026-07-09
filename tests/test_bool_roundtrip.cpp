@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
-// Regression test for boolean columns. Arrow stores booleans bit-packed (1 bit/value) but nanolance
-// stores one byte per value on disk; a large column previously over-read the bit-packed input buffer
-// and crashed, and the bulk read path copied the byte-per-value data straight into Arrow's bit-packed
-// buffer (decoding to garbage). This verifies a large boolean column round-trips exactly.
+// Regression test for boolean columns. nanolance stores bool bit-packed on disk (1 bit/value,
+// LSB-first), matching stock Lance's own Flat{bits_per_value:1} representation; its internal
+// ColumnValues::fixed representation stays one byte per value. A large column previously over-read the
+// bit-packed input buffer and crashed, and the bulk read path copied byte-per-value data straight into
+// Arrow's bit-packed buffer (decoding to garbage). This verifies a large boolean column round-trips
+// exactly and that the on-disk file is close to the 1-bit-per-value size (not 1 byte/value).
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/nano_lance_writer.h"
 
@@ -92,9 +94,22 @@ int main() {
         const auto ds = temp_dataset(compress ? "zstd" : "plain");
         write_bools(ds, compress, vals);
         require(read_bools(ds) == vals, "boolean column must round-trip exactly");
+
+        // Bit-packed (1 bit/value, ~25000 B for 200000 rows plus small chunk headers) must be far
+        // smaller than the old 1 byte/value on-disk shape (~200000 B) -- catches an accidental
+        // regression back to the byte-per-value flat path.
+        std::uintmax_t data_bytes = 0;
+        std::error_code size_ec;
+        for (const auto& entry : std::filesystem::directory_iterator(ds / "data", size_ec)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".lance") {
+                data_bytes += std::filesystem::file_size(entry.path(), size_ec);
+            }
+        }
+        require(data_bytes < vals.size() / 4U, "bool column must be bit-packed, not byte-per-value");
+
         std::error_code ec;
         std::filesystem::remove_all(ds, ec);
     }
-    std::cerr << "bool round-trip: 200000 values OK (plain + compressed)\n";
+    std::cerr << "bool round-trip: 200000 values OK (plain + compressed, bit-packed on disk)\n";
     return 0;
 }

@@ -91,7 +91,7 @@ encoding per column type:
 | Low-cardinality run-length column, fixed **or** string | **RLE** (ints) / **Dictionary+RLE** (strings) | structural (default) | run-length URI: 2.90 → 0.033 B/row (87×); run-length int: → 0.027 B/row |
 | String / binary (non-constant, high-cardinality) | **zstd** (`General(ZSTD)`, `[u64 len][zstd]` per chunk) | `--compress` (opt-in) | repetitive string: 7.6 → ~3 B/row |
 | `float` / `double` fixed-width | **byte-stream-split + zstd** (`General(ZSTD){ ByteStreamSplit{ Flat } }`) | `--compress` (opt-in) | smooth double column: ~23% smaller |
-| `bool` fixed-width | left uncompressed, 1 byte/value (stock Lance bitpacks to 1 bit/value) | — | — |
+| `bool` fixed-width | **bit-packed** (`Flat{bits_per_value:1}`, LSB-first, same as stock Lance) | always on | 200k rows: ~200 KB → ~25 KB (8×) |
 
 So a blob.v2 run-length URI column is now tiny **without** `--compress`; `--compress` only adds zstd on
 top for the genuinely high-cardinality string columns. `--compress` output is byte-identical to the

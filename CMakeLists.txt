@@ -648,6 +648,14 @@ if(NANOLANCE_BUILD_TOOLS)
     )
     set_tests_properties(app_bss_zstd_pylance_interop_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
 
+    add_test(
+        NAME app_bool_pylance_interop_smoke
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_bool_pylance_interop.sh"
+                "$<TARGET_FILE:arrowipc2lance>"
+                "${NANO_LANCE_WRITER_PYTHON}"
+    )
+    set_tests_properties(app_bool_pylance_interop_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
+
     # Negative: nlance-stitch must reject datasets with different schemas. Builds a pcapng2lance L1 table
     # and an arrowipc2lance (id/score) table and asserts the stitch fails. Lives here because it needs
     # arrowipc2lance (defined in this block) alongside pcapng2lance + nlance_stitch. Skips if pyarrow absent.

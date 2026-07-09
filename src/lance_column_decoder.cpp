@@ -4,6 +4,7 @@
 #include "nanolance/lance_column_decoder.hpp"
 
 #include "nanolance/blob_v2_external.hpp"
+#include "nanolance/bool_bitpack.hpp"
 #include "nanolance/byte_stream_split.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
@@ -730,6 +731,34 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             out.fixed.resize(base + chunk_bytes.size());
             bss::untranspose(chunk_bytes.data(), bytes_per_value, static_cast<std::size_t>(page.length),
                              out.fixed.data() + base);
+        }
+        return true;
+    }
+
+    // bool is always bit-packed on disk (1 bit/value, LSB-first), matching stock Lance's own
+    // Flat{bits_per_value:1} representation -- the writer never tags it, since it's not opt-in (see
+    // data_file_writer.cpp's bool_pack). nanolance's internal representation stays one byte per value.
+    if (on_disk_field.logical_type == "bool") {
+        out.kind = ColumnValues::Kind::FixedWidth;
+        std::vector<std::uint8_t> control;
+        std::vector<std::uint8_t> payload;
+        std::vector<std::uint8_t> chunk_bytes;
+        for (const auto& page : column_metadata.pages) {
+            if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
+                return false;
+            }
+            if (!parse_miniblock_payload_chunks(payload, chunk_bytes, error)) {
+                return false;
+            }
+            const auto expected = (static_cast<std::size_t>(page.length) + 7U) / 8U;
+            if (chunk_bytes.size() != expected) {
+                error = "bool page byte count mismatch";
+                return false;
+            }
+            const auto base = out.fixed.size();
+            out.fixed.resize(base + static_cast<std::size_t>(page.length));
+            boolpack::unpack_lsb_first(chunk_bytes.data(), static_cast<std::size_t>(page.length),
+                                       out.fixed.data() + base);
         }
         return true;
     }
