@@ -1038,7 +1038,9 @@ polars, etc. The module is <code>import nanolance</code> (not <code>lance</code>
   <code>nano_lance_writer_set_structural_encoding(&amp;w, true)</code> (default). Disable with the setter, or
   <code>arrowipc2lance --no-structural</code>, to emit plain flat/variable-width pages ("raw" Lance output).</li>
 <li><strong>zstd</strong> — a real CPU-for-size tradeoff, applied to high-cardinality variable-width (string/binary)
-  columns only. <strong>Off by default</strong>: <code>nano_lance_writer_set_compression(&amp;w, true)</code> (CLI <code>--compress</code>).</li>
+  columns, and to <code>float</code>/<code>double</code> fixed-width columns (byte-stream-split + zstd — the same technique
+  stock Lance itself uses for these types, since compressing already-interleaved float bytes barely
+  helps). <strong>Off by default</strong>: <code>nano_lance_writer_set_compression(&amp;w, true)</code> (CLI <code>--compress</code>).</li>
 </ul>
 <p>Both stay readable by stock <code>lance</code>; nanolance's own reader decodes them transparently. The picked
 encoding per column type:</p>
@@ -1077,8 +1079,14 @@ encoding per column type:</p>
 <td>repetitive string: 7.6 → ~3 B/row</td>
 </tr>
 <tr>
-<td>float / bool fixed-width</td>
-<td>left uncompressed (Lance uses other schemes)</td>
+<td><code>float</code> / <code>double</code> fixed-width</td>
+<td><strong>byte-stream-split + zstd</strong> (<code>General(ZSTD){ ByteStreamSplit{ Flat } }</code>)</td>
+<td><code>--compress</code> (opt-in)</td>
+<td>smooth double column: ~23% smaller</td>
+</tr>
+<tr>
+<td><code>bool</code> fixed-width</td>
+<td>left uncompressed, 1 byte/value (stock Lance bitpacks to 1 bit/value)</td>
 <td>—</td>
 <td>—</td>
 </tr>
