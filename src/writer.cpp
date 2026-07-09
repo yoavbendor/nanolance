@@ -77,11 +77,13 @@ bool fixed_column_rle_plan(const nano_lance::ColumnValues& cv, std::size_t bpv) 
             ++run;
         }
         split_runs += (run + 254U) / 255U;  // each sub-run holds at most 255
+        // Early exit (mirrors variable_column_dict_rle_beneficial's identical check inside its scan
+        // loop): split_runs only grows, so once it crosses the threshold the final verdict is already
+        // decided -- no need to keep memcmp-scanning a scattered (non-run-length) column to the end.
+        if (split_runs * 2U >= n) {
+            return false;
+        }
         i += run;
-    }
-    // RLE pays off only with substantial repetition (Lance uses runs < 50% of values).
-    if (split_runs * 2U >= n) {
-        return false;
     }
     // One chunk for the whole column: run buffers must fit the miniblock (12-bit word => 32760 bytes).
     const std::size_t values_size = split_runs * bpv;
@@ -245,10 +247,18 @@ bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv) {
             }
             distinct.push_back(val);
             dict_data += len;
+            // Early exit: distinct.size() only grows, so once it crosses rows/kDictDivisor the final
+            // cardinality check below is already decided -- no need to keep building the hash map (and
+            // the indices/distinct vectors) for a column that's already too high-cardinality to dict,
+            // e.g. a near-unique string column, which would otherwise pay for a full O(n) hash+insert
+            // scan just to be thrown away.
+            if (distinct.size() > rows / kDictDivisor) {
+                return false;
+            }
         }
         indices.push_back(it->second);
     }
-    if (distinct.empty() || distinct.size() > rows / kDictDivisor) {
+    if (distinct.empty()) {
         return false;
     }
     const std::size_t dict_bytes = 8U + (distinct.size() + 1U) * 4U + dict_data;
