@@ -61,37 +61,84 @@ int set_error(NanoLanceWriter* writer, int code, const std::string& message) {
     return code;
 }
 
+// One RLE scan pass over `n` fixed-width values of size sizeof(T) at `data`. With `runs_out == nullptr`
+// it only counts split runs (Lance caps a run at 255, so a run of length L counts as ceil(L/255)) and
+// rejects early -- zero allocation, single inlined load-and-compare per row instead of a libc memcmp
+// call per row (which dominated the write profile for scattered integer columns). With `runs_out` set
+// it records one (row index, run length) pair per run and never rejects (only already-accepted columns
+// take that pass).
+template <class T>
+bool typed_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t& split_runs_out,
+                    std::vector<std::pair<std::size_t, std::uint64_t>>* runs_out) {
+    std::size_t split_runs = 0;
+    std::size_t i = 0;
+    while (i < n) {
+        T head;
+        std::memcpy(&head, data + i * sizeof(T), sizeof(T));
+        std::size_t run = 1;
+        while (i + run < n) {
+            T next;
+            std::memcpy(&next, data + (i + run) * sizeof(T), sizeof(T));
+            if (next != head) {
+                break;
+            }
+            ++run;
+        }
+        split_runs += (run + 254U) / 255U;
+        if (runs_out == nullptr && split_runs * 2U >= n) {
+            return false;  // not run-friendly; counting pass bails the moment the verdict is decided
+        }
+        if (runs_out != nullptr) {
+            runs_out->emplace_back(i, run);
+        }
+        i += run;
+    }
+    split_runs_out = split_runs;
+    return true;
+}
+
+bool dispatch_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t bpv,
+                       std::size_t& split_runs_out,
+                       std::vector<std::pair<std::size_t, std::uint64_t>>* runs_out) {
+    switch (bpv) {
+        case 1U:
+            return typed_rle_scan<std::uint8_t>(data, n, split_runs_out, runs_out);
+        case 2U:
+            return typed_rle_scan<std::uint16_t>(data, n, split_runs_out, runs_out);
+        case 4U:
+            return typed_rle_scan<std::uint32_t>(data, n, split_runs_out, runs_out);
+        case 8U:
+            return typed_rle_scan<std::uint64_t>(data, n, split_runs_out, runs_out);
+        default:
+            return false;  // caller gates on bitpackable integer types, so bpv is always 1/2/4/8
+    }
+}
+
 // Decide whether RLE beats bitpacking for a fixed-width column. Lance requires 8-bit run lengths, so
-// runs longer than 255 are split into <=255 sub-runs; we count those split runs.
+// runs longer than 255 are split into <=255 sub-runs; we count those split runs. Two passes (same
+// structure as variable_column_dict_rle_beneficial): pass 1 counts only, with the reject-early exit
+// and zero allocation -- the common case is a scattered column that fails, and the previous version
+// recorded ~n/2 (row, run) pairs into a vector before bailing, all thrown away. Pass 2 records the
+// runs for the encoder's plan and only runs for genuinely beneficial columns.
 bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv) {
     cv.fixed_rle_plan = {};
     if (bpv == 0U || cv.fixed.empty() || cv.fixed.size() % bpv != 0U) {
         return false;
     }
     const std::size_t n = cv.fixed.size() / bpv;
-    std::vector<std::pair<std::size_t, std::uint64_t>> runs;
     std::size_t split_runs = 0;
-    std::size_t i = 0;
-    while (i < n) {
-        std::size_t run = 1;
-        while (i + run < n &&
-               std::memcmp(cv.fixed.data() + (i + run) * bpv, cv.fixed.data() + i * bpv, bpv) == 0) {
-            ++run;
-        }
-        split_runs += (run + 254U) / 255U;  // each sub-run holds at most 255
-        // Early exit (mirrors variable_column_dict_rle_beneficial's identical check inside its scan
-        // loop): split_runs only grows, so once it crosses the threshold the final verdict is already
-        // decided -- no need to keep memcmp-scanning a scattered (non-run-length) column to the end.
-        if (split_runs * 2U >= n) {
-            return false;
-        }
-        runs.emplace_back(i, run);
-        i += run;
+    if (!dispatch_rle_scan(cv.fixed.data(), n, bpv, split_runs, nullptr)) {
+        return false;
     }
     // One chunk for the whole column: run buffers must fit the miniblock (12-bit word => 32760 bytes).
     const std::size_t values_size = split_runs * bpv;
     const std::size_t lengths_size = split_runs;  // 1 byte each
     if ((values_size + lengths_size + 32U) > 32760U) {
+        return false;
+    }
+    std::vector<std::pair<std::size_t, std::uint64_t>> runs;
+    std::size_t split_runs_again = 0;
+    if (!dispatch_rle_scan(cv.fixed.data(), n, bpv, split_runs_again, &runs)) {
         return false;
     }
     cv.fixed_rle_plan.computed = true;
@@ -726,13 +773,12 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
             if (cv.kind == nano_lance::ColumnValues::Kind::FixedWidth) {
                 const auto bpv = nano_lance::lance_logical_type_value_bytes(pf->logical_type);
                 if (bpv != 0U && cv.fixed.size() >= bpv && cv.fixed.size() % bpv == 0U) {
-                    constant = true;
-                    for (std::size_t off = bpv; off + bpv <= cv.fixed.size(); off += bpv) {
-                        if (std::memcmp(cv.fixed.data(), cv.fixed.data() + off, bpv) != 0) {
-                            constant = false;
-                            break;
-                        }
-                    }
+                    // A buffer is all-one-value iff it equals itself shifted by one element, so ONE
+                    // overlapped memcmp over the whole column replaces the previous
+                    // one-libc-call-per-row loop (memcmp only reads, so overlap is fine; a 1-row
+                    // column compares 0 bytes and is correctly constant).
+                    constant = std::memcmp(cv.fixed.data(), cv.fixed.data() + bpv,
+                                           cv.fixed.size() - bpv) == 0;
                     if (constant) {
                         value.assign(cv.fixed.begin(), cv.fixed.begin() + static_cast<std::ptrdiff_t>(bpv));
                     }
