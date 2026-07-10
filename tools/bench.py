@@ -58,18 +58,38 @@ def make_datasets():
     ds["bool_flags"] = pa.table({
         "flag": pa.array([random.random() < 0.37 for _ in range(N)], pa.bool_()),
     })
-    return ds, N
+    # Fairness override for the rust-lance write of float_smooth: nanolance runs with --compress
+    # (byte-stream-split + zstd on float/double), but rust lance's DEFAULT leaves floats essentially
+    # uncompressed (~raw 12 B/row) — so without this, the bench compared our compressed write time
+    # against rust's uncompressed one. Rust only applies BSS+zstd when BOTH field-metadata hints are
+    # set (verified against lance 8.0.0), which is what this per-field metadata does. Only the rust
+    # write uses this table; nanolance/parquet still consume the plain `tbl` (the metadata keys would
+    # otherwise be inert hints carried through the Arrow IPC schema).
+    bss_md = {b"lance-encoding:compression": b"zstd", b"lance-encoding:bss": b"on"}
+    fs = ds["float_smooth"]
+    rust_overrides = {
+        "float_smooth": pa.Table.from_arrays(
+            [fs.column(0), fs.column(1)],
+            schema=pa.schema([
+                pa.field("reading", pa.float64(), nullable=False, metadata=bss_md),
+                pa.field("gain", pa.float32(), nullable=False, metadata=bss_md),
+            ]),
+        )
+    }
+    return ds, N, rust_overrides
 
 WRITE_ITERS = 5
 
 def best_of(fn, iters):
     return min(fn() for _ in range(iters))
 
-def run_one(name, tbl, N):
+def run_one(name, tbl, N, rust_tbl=None):
     print(f"\n========== {name}  ({N} rows, {tbl.num_columns} cols) ==========")
     arrow_path = f"{TMP}/{name}.arrow"
     with ipc.new_stream(arrow_path, tbl.schema) as w:
         w.write_table(tbl)
+    if rust_tbl is None:
+        rust_tbl = tbl
 
     rows = []
 
@@ -88,7 +108,7 @@ def run_one(name, tbl, N):
     lf = f"{TMP}/{name}_lance.lance"
     def w_lance():
         shutil.rmtree(lf, ignore_errors=True)
-        t0=time.perf_counter(); lance.write_dataset(tbl, lf, mode="create", data_storage_version="2.2"); return (time.perf_counter()-t0)*1000
+        t0=time.perf_counter(); lance.write_dataset(rust_tbl, lf, mode="create", data_storage_version="2.2"); return (time.perf_counter()-t0)*1000
     wl = best_of(w_lance, WRITE_ITERS)
     szl = dsize(lf+"/data/*.lance")
     rl = best_read(lambda: lance.dataset(lf).to_table())
@@ -126,9 +146,9 @@ def run_one(name, tbl, N):
     return rows
 
 def main():
-    ds, N = make_datasets()
+    ds, N, rust_overrides = make_datasets()
     for name, tbl in ds.items():
-        run_one(name, tbl, N)
+        run_one(name, tbl, N, rust_overrides.get(name))
     print(f"\nnote: best of {WRITE_ITERS} writes / {READ_ITERS} reads. write(core)=in-process encode work "
           "(parquet/lance: the write call; nanolance: ingest+encode+commit, EXCLUDING process startup + "
           "Arrow-IPC parse). write(proc)=full wall clock (nanolance includes subprocess startup + IPC parse). "

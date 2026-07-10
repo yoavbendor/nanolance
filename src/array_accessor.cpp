@@ -162,22 +162,26 @@ bool append_variable_width(const ArrowArray& array,
         error += field.name;
         return false;
     }
+    // Rebase this batch's offsets by `base` writing straight into a single resize()d extension --
+    // one vector::insert call PER ROW here previously made multi-batch string ingest per-row-bound
+    // (each 4/8-byte insert pays the full call + growth-check machinery).
+    const std::size_t add_offsets = expected_offsets - offset_width;  // batch offset 0 is not re-emitted
+    const std::size_t existing = out.variable.offsets.size();
+    out.variable.offsets.resize(existing + add_offsets);
+    std::uint8_t* dst = out.variable.offsets.data() + existing;
     for (std::size_t i = 1; i < expected_offsets / offset_width; ++i) {
         if (large) {
             std::int64_t value = 0;
             std::memcpy(&value, offsets + i * offset_width, offset_width);
             value += static_cast<std::int64_t>(base);
-            out.variable.offsets.insert(out.variable.offsets.end(),
-                                        reinterpret_cast<const std::uint8_t*>(&value),
-                                        reinterpret_cast<const std::uint8_t*>(&value) + offset_width);
+            std::memcpy(dst, &value, offset_width);
         } else {
             std::int32_t value = 0;
             std::memcpy(&value, offsets + i * offset_width, offset_width);
             value += static_cast<std::int32_t>(base);
-            out.variable.offsets.insert(out.variable.offsets.end(),
-                                        reinterpret_cast<const std::uint8_t*>(&value),
-                                        reinterpret_cast<const std::uint8_t*>(&value) + offset_width);
+            std::memcpy(dst, &value, offset_width);
         }
+        dst += offset_width;
     }
     out.variable.data.insert(out.variable.data.end(), data, data + data_bytes);
     return true;

@@ -13,13 +13,37 @@
 
 namespace nano_lance::boolpack {
 
-inline std::vector<std::uint8_t> pack_lsb_first(const std::uint8_t* values, std::size_t count) {
-    std::vector<std::uint8_t> out((count + 7U) / 8U, 0U);
-    for (std::size_t i = 0; i < count; ++i) {
-        if (values[i] != 0U) {
-            out[i / 8U] |= static_cast<std::uint8_t>(1U << (i % 8U));
+// Pack `count` byte-per-value bools into ceil(count/8) LSB-first bytes, into `out`. Each output byte
+// is composed in a register and written exactly once, so no pre-zeroing of `out` is needed -- a caller
+// reusing `out` across chunks pays no per-chunk zero-fill (unlike the previous set-bits-via-|= shape,
+// which required a zeroed buffer).
+inline void pack_lsb_first(const std::uint8_t* values, std::size_t count, std::vector<std::uint8_t>& out) {
+    const std::size_t out_bytes = (count + 7U) / 8U;
+    out.resize(out_bytes);
+    const std::size_t full_bytes = count / 8U;
+    for (std::size_t j = 0; j < full_bytes; ++j) {
+        const std::uint8_t* v = values + j * 8U;
+        std::uint8_t b = 0;
+        for (unsigned k = 0; k < 8U; ++k) {
+            b = static_cast<std::uint8_t>(b | static_cast<std::uint8_t>((v[k] != 0U ? 1U : 0U) << k));
         }
+        out[j] = b;
     }
+    if (full_bytes < out_bytes) {
+        std::uint8_t b = 0;
+        for (std::size_t i = full_bytes * 8U; i < count; ++i) {
+            if (values[i] != 0U) {
+                b = static_cast<std::uint8_t>(b | static_cast<std::uint8_t>(1U << (i % 8U)));
+            }
+        }
+        out[full_bytes] = b;
+    }
+}
+
+// Convenience overload returning a fresh buffer (one-shot callers / tests).
+inline std::vector<std::uint8_t> pack_lsb_first(const std::uint8_t* values, std::size_t count) {
+    std::vector<std::uint8_t> out;
+    pack_lsb_first(values, count, out);
     return out;
 }
 
