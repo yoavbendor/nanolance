@@ -634,7 +634,11 @@ std::vector<std::uint8_t> build_bitpacked_chunk(const std::uint8_t* src, std::si
 bool zstd_frame_buffer(const std::vector<std::uint8_t>& raw, int level, std::vector<std::uint8_t>& out,
                        std::string& error) {
     const auto bound = ZSTD_compressBound(raw.size());
-    out.assign(8U + bound, 0U);
+    // resize() (not assign(n, 0)): the 8-byte header is filled byte-by-byte below and ZSTD_compress
+    // unconditionally overwrites the rest, so this only needs to zero a growing size delta (or nothing,
+    // if the caller reuses `out` across calls of similar or shrinking size) rather than always
+    // re-touching all n bytes the way assign(n, val) is specified to.
+    out.resize(8U + bound);
     const std::uint64_t uncompressed = raw.size();
     for (int i = 0; i < 8; ++i) {
         out[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((uncompressed >> (8 * i)) & 0xFFU);
@@ -1231,13 +1235,16 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         const bool zstd_variable = is_variable && compress;
         pb::ColumnMetadata column;
         column.encoding = column_encoding_bytes();
+        // Hoisted out of the loop (not freshly declared per chunk): zstd_frame_buffer's resize() only
+        // avoids re-zeroing already-there bytes when the buffer is reused across calls of similar size,
+        // which requires swap (not move) below so `framed`'s capacity survives being handed off.
+        std::vector<std::uint8_t> framed;
         for (auto& chunk : chunks) {
             if (zstd_variable || bss_zstd) {
-                std::vector<std::uint8_t> framed;
                 if (!zstd_frame_buffer(chunk.bytes, compression_level, framed, error)) {
                     return false;
                 }
-                chunk.bytes = std::move(framed);  // value_count unchanged; bytes are now [u64][zstd]
+                std::swap(chunk.bytes, framed);  // value_count unchanged; bytes are now [u64][zstd]
             }
             const auto control = control_buffer_for(chunk);
             const auto payload = miniblock_payload(chunk);
