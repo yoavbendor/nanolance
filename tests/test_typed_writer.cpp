@@ -36,7 +36,8 @@ int main() {
     using PacketSchema = nt::schema<nt::column<std::uint64_t, "ts", nt::encoding::bitpack>,
                                     nt::column<double, "gain", nt::encoding::bss_zstd>,
                                     nt::column<bool, "flag">,
-                                    nt::column<std::string_view, "uri">>;
+                                    nt::column<std::string_view, "uri">,
+                                    nt::column<std::array<std::uint8_t, 6>, "mac">>;
 
     const std::size_t n = 60000;  // multi-page for every encoding involved
     std::vector<std::uint64_t> ts(n);
@@ -46,6 +47,7 @@ int main() {
     std::vector<std::string_view> uri(n);
     std::vector<bool> flags_vb(n);
     std::unique_ptr<bool[]> flags(new bool[n]);
+    std::vector<std::array<std::uint8_t, 6>> mac(n);
     for (std::size_t i = 0; i < n; ++i) {
         ts[i] = 1700000000000000ULL + i * 1500U + (i * 2654435761ULL) % 200U;
         gain[i] = std::sin(static_cast<double>(i) * 0.001) * 10.0;
@@ -53,6 +55,9 @@ int main() {
         flag_bytes[i] = flags[i] ? 1U : 0U;
         uri_storage[i] = "s3://bucket/capture_" + std::to_string(i % 11U) + ".pcapng";
         uri[i] = uri_storage[i];
+        for (std::size_t b = 0; b < 6U; ++b) {
+            mac[i][b] = static_cast<std::uint8_t>((i * 31U + b * 7U) & 0xFFU);
+        }
     }
 
     const auto ds = std::filesystem::temp_directory_path() / "nano_lance_typed_writer_test";
@@ -68,12 +73,14 @@ int main() {
         require(w.write_batch(std::span<const std::uint64_t>(ts.data(), half),
                               std::span<const double>(gain.data(), half),
                               std::span<const bool>(flags.get(), half),
-                              std::span<const std::string_view>(uri.data(), half)),
+                              std::span<const std::string_view>(uri.data(), half),
+                              std::span<const std::array<std::uint8_t, 6>>(mac.data(), half)),
                 w.last_error());
         require(w.write_batch(std::span<const std::uint64_t>(ts.data() + half, n - half),
                               std::span<const double>(gain.data() + half, n - half),
                               std::span<const bool>(flags.get() + half, n - half),
-                              std::span<const std::string_view>(uri.data() + half, n - half)),
+                              std::span<const std::string_view>(uri.data() + half, n - half),
+                              std::span<const std::array<std::uint8_t, 6>>(mac.data() + half, n - half)),
                 w.last_error());
         require(w.commit(), w.last_error());
         require(w.close(), "close");
@@ -88,7 +95,8 @@ int main() {
         require(!w.write_batch(std::span<const std::uint64_t>(ts.data(), 10),
                                std::span<const double>(gain.data(), 9),
                                std::span<const bool>(flags.get(), 10),
-                               std::span<const std::string_view>(uri.data(), 10)),
+                               std::span<const std::string_view>(uri.data(), 10),
+                               std::span<const std::array<std::uint8_t, 6>>(mac.data(), 10)),
                 "mismatched span lengths must fail write_batch");
         std::filesystem::remove_all(ds_bad, ec);
     }
@@ -98,11 +106,12 @@ int main() {
     std::string error;
     require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error.c_str());
     require(batches.size() == 1U, "one batch");
-    require(batches[0].n_children == 4, "four columns");
+    require(batches[0].n_children == 5, "five columns");
     const ArrowArray& col_ts = *batches[0].children[0];
     const ArrowArray& col_gain = *batches[0].children[1];
     const ArrowArray& col_flag = *batches[0].children[2];
     const ArrowArray& col_uri = *batches[0].children[3];
+    const ArrowArray& col_mac = *batches[0].children[4];
     require(static_cast<std::size_t>(col_ts.length) == n, "row count");
 
     require(std::memcmp(col_ts.buffers[1], ts.data(), n * 8U) == 0, "ts values");
@@ -119,9 +128,11 @@ int main() {
         require(got == uri[i], "uri values");
     }
 
+    require(std::memcmp(col_mac.buffers[1], mac.data(), n * 6U) == 0, "mac values (fixed_size_binary)");
+
     ArrowSchemaRelease(&schema);
     ArrowArrayRelease(&batches[0]);
     std::filesystem::remove_all(ds, ec);
-    std::cerr << "typed writer: 4-column compile-time schema round-trips OK (borrow + declarations)\n";
+    std::cerr << "typed writer: 5-column compile-time schema round-trips OK (borrow + declarations)\n";
     return 0;
 }

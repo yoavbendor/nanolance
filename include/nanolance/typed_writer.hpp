@@ -79,6 +79,33 @@ struct ArrowArray {
 
 #endif  // ARROW_C_DATA_INTERFACE
 
+// The stream interface is defined alongside the data interface: some Arrow implementations
+// (nanoarrow among them) skip ALL of their canonical struct definitions when they see the data
+// interface already defined, so leaving this one out would break "this header first" include order.
+#ifndef ARROW_C_STREAM_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
+
+struct ArrowArrayStream {
+    // Callback to get the stream type (same for all arrays in the stream).
+    // Return value: 0 if successful, an `errno`-compatible error code otherwise.
+    int (*get_schema)(struct ArrowArrayStream*, struct ArrowSchema* out);
+
+    // Callback to get the next array (if no error and the array is released, the stream has ended).
+    // Return value: 0 if successful, an `errno`-compatible error code otherwise.
+    int (*get_next)(struct ArrowArrayStream*, struct ArrowArray* out);
+
+    // Callback to get optional detailed error information; only valid to call if the last stream
+    // operation failed with a non-0 return code. Returned pointer valid until the next operation.
+    const char* (*get_last_error)(struct ArrowArrayStream*);
+
+    // Release callback: release the stream's own resources (arrays from get_next are independent).
+    void (*release)(struct ArrowArrayStream*);
+    // Opaque producer-specific data
+    void* private_data;
+};
+
+#endif  // ARROW_C_STREAM_INTERFACE
+
 namespace nano_lance::typed {
 
 /// NTTP string so column names live in the schema TYPE.
@@ -120,6 +147,36 @@ template <> struct arrow_format<double>           { static constexpr const char*
 template <> struct arrow_format<bool>             { static constexpr const char* value = "b"; };
 template <> struct arrow_format<std::string_view> { static constexpr const char* value = "u"; };
 // clang-format on
+
+// std::array<uint8_t, N> columns map to Arrow fixed_size_binary ("w:N") -- the recommended shape for
+// MAC/IP-style fields (AGENTS.md section 4). The "w:N" string is composed at compile time.
+template <std::size_t N>
+struct fsb_format_storage {
+    static constexpr std::size_t digits() {
+        std::size_t d = 1;
+        for (std::size_t v = N; v >= 10; v /= 10) {
+            ++d;
+        }
+        return d;
+    }
+    static constexpr auto make() {
+        std::array<char, 2 + digits() + 1> out{};
+        out[0] = 'w';
+        out[1] = ':';
+        std::size_t v = N;
+        for (std::size_t i = digits(); i > 0; --i) {
+            out[1 + i] = static_cast<char>('0' + v % 10);
+            v /= 10;
+        }
+        return out;
+    }
+    static constexpr auto storage = make();
+};
+
+template <std::size_t N>
+struct arrow_format<std::array<std::uint8_t, N>> {
+    static constexpr const char* value = fsb_format_storage<N>::storage.data();
+};
 
 template <class T>
 inline constexpr bool is_bitpackable_v = std::is_integral_v<T> && !std::is_same_v<T, bool>;

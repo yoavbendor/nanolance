@@ -3,24 +3,29 @@
 
 #pragma once
 
-// A generic nanom-soa -> Lance table writer. Given any nanom `soa<Row>` (already filled), it builds the
-// Arrow schema straight from nanom's own per-column Arrow C-Data format strings (`column_info::arrow`,
-// e.g. "C"/"S"/"I"/"L" for u8/u16/u32/u64 and "w:4"/"w:16" for fixed-size-binary address columns) and
-// copies each row's values out of nanom's contiguous per-column chunk buffers into a nanoarrow record
-// batch, then writes it as one Lance fragment via nanolance. This is the "schemas for free -> Lance" path
-// from nanom's README, realized: nothing about the row type is hand-coded here — the columns, names,
-// types, and byte widths all come from the single NANOM_DESCRIBE on the row struct.
+// A generic nanom-soa -> Lance table writer built on nanolance's compile-time typed facade
+// (nanolance/typed_writer.hpp). The Lance schema is derived at COMPILE TIME from the row struct's
+// single NANOM_DESCRIBE registration: each described field becomes one typed column -- scalars as
+// their decoded host type (be<u16> -> uint16_t, ubits<4> -> uint8_t), byte arrays as Arrow
+// fixed_size_binary (std::array<uint8_t, 4/6/16> for IPv4/MAC/IPv6 addresses). Column names, types,
+// and Arrow formats are all checked when this header is instantiated, not when the file is written.
 //
-// Used by the --decode-l2l3 path to emit one Lance table per PDU type (ethernet/vlan/ipv4/ipv6/tcp/udp)
-// with zero per-type writer code.
+// The write itself is zero-copy: soa<Row> already stores each column as a contiguous host-order
+// buffer per chunk, which is exactly the span shape writer::write_batch takes, and the writer's
+// default borrow-buffers mode encodes straight out of those chunk buffers (they outlive commit()
+// because the caller's soa does). No nanoarrow builder, no per-cell appends.
+//
+// Used by the --decode-l2l3 path to emit one Lance table per PDU type (ethernet/vlan/ipv4/ipv6/
+// tcp/udp/...) with zero per-type writer code.
 
-#include "nanolance/nano_lance_writer.h"
+#include "nanolance/typed_writer.hpp"
 
-#include <nanoarrow/nanoarrow.h>
-
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <string>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 
 #include <nanom/nanom.hpp>
 
@@ -29,124 +34,68 @@ namespace p2l_nanom {
 namespace nm = nanom;
 
 static_assert(std::endian::native == std::endian::little,
-              "soa_lance_writer copies nanom's host-order column bytes assuming little-endian native "
-              "(matches Arrow's on-wire layout); a big-endian host would need a byte swap here.");
+              "soa_lance_writer hands nanom's host-order column bytes to Lance assuming little-endian "
+              "native (matches Arrow's on-wire layout); a big-endian host would need a byte swap here.");
 
-// Append one column value at `off` bytes into a nanom column buffer to the matching Arrow child.
-inline bool append_cell(ArrowArray* child, nm::dkind kind, const std::byte* p, std::size_t elem_bytes) {
-    switch (kind) {
-        case nm::dkind::fixed_bin: {
-            ArrowBufferView v{{reinterpret_cast<const uint8_t*>(p)}, static_cast<int64_t>(elem_bytes)};
-            return ArrowArrayAppendBytes(child, v) == NANOARROW_OK;
-        }
-        case nm::dkind::f32: {
-            float f = 0;
-            std::memcpy(&f, p, 4);
-            return ArrowArrayAppendDouble(child, f) == NANOARROW_OK;
-        }
-        case nm::dkind::f64: {
-            double d = 0;
-            std::memcpy(&d, p, 8);
-            return ArrowArrayAppendDouble(child, d) == NANOARROW_OK;
-        }
-        case nm::dkind::i8:
-        case nm::dkind::i16:
-        case nm::dkind::i32:
-        case nm::dkind::i64: {
-            std::int64_t s = 0;
-            std::memcpy(&s, p, elem_bytes);  // sign-extend from the top bit of the stored width
-            const unsigned bits = static_cast<unsigned>(elem_bytes) * 8U;
-            if (bits < 64 && (s & (std::int64_t{1} << (bits - 1)))) s |= -(std::int64_t{1} << bits);
-            return ArrowArrayAppendInt(child, s) == NANOARROW_OK;
-        }
-        default: {  // u8/u16/u32/u64
-            std::uint64_t u = 0;
-            std::memcpy(&u, p, elem_bytes);  // zero-extend (little-endian native)
-            return ArrowArrayAppendUInt(child, u) == NANOARROW_OK;
-        }
-    }
-}
+namespace detail {
 
-// Build the struct schema (one child per nanom column) from the soa's column_info list.
+// One described field of Row, resolved at compile time: its typed-facade column value type (the
+// nanom wire-decoded type -- also exactly how soa<Row> lays the column out in memory) and its name
+// converted from nanom's fixed_string to the facade's NTTP fixed_string.
+template <class Row, std::size_t I>
+struct field_at {
+    using fld = std::remove_cvref_t<decltype(std::get<I>(nm::describe<Row>::fields()))>;
+    using member = nm::detail::member_t<fld::mem_ptr>;
+    static_assert(!nm::Described<member>,
+                  "typed soa bridge supports flat row structs only (nested described structs would "
+                  "need dotted-name flattening; keep PDU rows flat)");
+    using value = typename nm::detail::wire<member>::decoded;
+    static constexpr auto name = nano_lance::typed::fixed_string(fld::name.data);
+};
+
+template <class Row, class Seq>
+struct schema_for_impl;
+template <class Row, std::size_t... I>
+struct schema_for_impl<Row, std::index_sequence<I...>> {
+    using type = nano_lance::typed::schema<
+        nano_lance::typed::column<typename field_at<Row, I>::value, field_at<Row, I>::name>...>;
+};
+
 template <class Row>
-bool build_soa_schema(const nm::soa<Row>& table, ArrowSchema& schema, std::string& err) {
-    const auto& cols = table.columns();
-    ArrowSchemaInit(&schema);
-    if (ArrowSchemaSetTypeStruct(&schema, static_cast<int64_t>(cols.size())) != NANOARROW_OK) {
-        return (err = "alloc struct schema", false);
-    }
-    for (std::size_t i = 0; i < cols.size(); ++i) {
-        if (ArrowSchemaSetFormat(schema.children[i], cols[i].arrow.c_str()) != NANOARROW_OK ||
-            ArrowSchemaSetName(schema.children[i], cols[i].name.c_str()) != NANOARROW_OK) {
-            return (err = "schema column: " + cols[i].name, false);
-        }
-    }
-    schema.flags = 0;
-    return true;
+constexpr std::size_t field_count = nm::detail::field_count_v<Row>;
+
+/// The typed-facade schema for a described row struct, one column per registered field.
+template <class Row>
+using schema_for = typename schema_for_impl<Row, std::make_index_sequence<field_count<Row>>>::type;
+
+template <class Row, std::size_t... I>
+bool write_chunk(nano_lance::typed::writer<schema_for<Row>>& w, const typename nm::soa<Row>::chunk& ch,
+                 std::index_sequence<I...>) {
+    return w.write_batch(ch.template as<typename field_at<Row, I>::value>(I)...);
 }
+
+}  // namespace detail
 
 // Write one filled soa<Row> to `path` as a single-fragment Lance dataset. An empty table is skipped
 // (no file), matching the nanotins example's lazy per-PDU tables.
 template <class Row>
 bool write_soa_table(const std::string& path, const nm::soa<Row>& table, bool compress, std::string& err) {
     if (table.rows() == 0) return true;
-    const auto& cols = table.columns();
 
-    ArrowSchema schema{};
-    if (!build_soa_schema(table, schema, err)) return false;
-
-    ArrowArray batch{};
-    if (ArrowArrayInitFromSchema(&batch, &schema, nullptr) != NANOARROW_OK ||
-        ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
-        ArrowSchemaRelease(&schema);
-        return (err = "alloc array", false);
-    }
-
-    bool ok = true;
-    table.for_each_chunk([&](const auto& ch) {
-        for (std::size_t r = 0; ok && r < ch.rows; ++r) {
-            for (std::size_t c = 0; c < cols.size(); ++c) {
-                const std::byte* base = ch.cols[c].data() + r * cols[c].elem_bytes;
-                if (!append_cell(batch.children[c], cols[c].kind, base, cols[c].elem_bytes)) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (ok && ArrowArrayFinishElement(&batch) != NANOARROW_OK) ok = false;
-        }
-    });
-    if (!ok) {
-        batch.release(&batch);
-        ArrowSchemaRelease(&schema);
-        return (err = "append rows to " + path, false);
-    }
-    if (ArrowArrayFinishBuildingDefault(&batch, nullptr) != NANOARROW_OK) {
-        batch.release(&batch);
-        ArrowSchemaRelease(&schema);
-        return (err = "finalize array for " + path, false);
-    }
-
-    NanoLanceWriter writer{};
-    if (nano_lance_writer_init(&writer, path.c_str(), 3) != NANO_LANCE_OK) {
-        err = std::string("writer init: ") + nano_lance_writer_last_error(&writer);
-        batch.release(&batch);
-        ArrowSchemaRelease(&schema);
+    nano_lance::typed::writer<detail::schema_for<Row>> w(path.c_str(),
+                                                         {.compression_level = 3, .compress = compress});
+    if (!w.ok()) {
+        err = std::string("writer init: ") + w.last_error();
         return false;
     }
-    // nanoarrow marks every field nullable by default; the columns carry no nulls, so tell the writer to
-    // accept the nullable flag rather than rejecting it (same knob the L1 blob path uses).
-    nano_lance_writer_set_ignore_nullability(&writer, true);
-    nano_lance_writer_set_compression(&writer, compress);
-    const int wrote = nano_lance_write_batch(&writer, &batch, &schema);
-    if (wrote == NANO_LANCE_OK) {
-        nano_lance_writer_commit(&writer, /*is_append=*/false);
-    } else {
-        err = std::string("write_batch: ") + nano_lance_writer_last_error(&writer);
-    }
-    nano_lance_writer_close(&writer);
-    batch.release(&batch);
-    ArrowSchemaRelease(&schema);
-    return wrote == NANO_LANCE_OK;
+    bool ok = true;
+    table.for_each_chunk([&](const auto& ch) {
+        ok = ok && detail::write_chunk<Row>(w, ch, std::make_index_sequence<detail::field_count<Row>>{});
+    });
+    ok = ok && w.commit();
+    if (!ok) err = std::string("write ") + path + ": " + w.last_error();
+    w.close();
+    return ok;
 }
 
 }  // namespace p2l_nanom

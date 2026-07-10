@@ -301,7 +301,10 @@ private:
     }
 
     // Build the combined Arrow record batch (8 scalar columns + external payload_ref) and commit it as
-    // one Lance fragment — the same on-disk shape pcapng2lance's write_batch produces.
+    // one Lance fragment — the same on-disk shape pcapng2lance's write_batch produces. This table (and
+    // the remainder table below) stays on the C API + nanoarrow: its lance.blob.v2 payload_ref is a
+    // nested struct column, which the flat typed facade (used for the per-PDU tables via
+    // soa_lance_writer.hpp) cannot express.
     int write_batch(const std::vector<PacketRow>& rows, const std::vector<nano_lance::BlobV2Row>& payload) {
         const std::size_t n = rows.size();
         ArrowArray batch{};
