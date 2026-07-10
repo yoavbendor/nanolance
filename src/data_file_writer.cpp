@@ -883,14 +883,14 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         if (packing_it != field.metadata.end() && packing_it->second == "rle" &&
             values.kind == ColumnValues::Kind::FixedWidth) {
             const auto bpv = value_width_bytes(field);
-            const std::size_t n = values.fixed.size() / bpv;
+            const std::size_t n = values.fixed_size() / bpv;
             std::vector<std::uint8_t> run_values;
             std::vector<std::uint8_t> run_lengths;  // Lance requires 8-bit run lengths
             auto emit_run = [&](std::size_t row, std::uint64_t run) {
                 for (std::uint64_t remaining = run; remaining > 0;) {
                     const auto take = static_cast<std::uint8_t>(std::min<std::uint64_t>(255U, remaining));
-                    run_values.insert(run_values.end(), values.fixed.begin() + static_cast<std::ptrdiff_t>(row * bpv),
-                                      values.fixed.begin() + static_cast<std::ptrdiff_t>((row + 1U) * bpv));
+                    run_values.insert(run_values.end(), values.fixed_data() + row * bpv,
+                                      values.fixed_data() + (row + 1U) * bpv);
                     run_lengths.push_back(take);
                     remaining -= take;
                 }
@@ -905,8 +905,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 std::size_t i = 0;
                 while (i < n) {
                     std::size_t run = 1;
-                    while (i + run < n && std::memcmp(values.fixed.data() + (i + run) * bpv,
-                                                      values.fixed.data() + i * bpv, bpv) == 0) {
+                    while (i + run < n && std::memcmp(values.fixed_data() + (i + run) * bpv,
+                                                      values.fixed_data() + i * bpv, bpv) == 0) {
                         ++run;
                     }
                     emit_run(i, run);
@@ -1152,12 +1152,12 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         const bool bool_pack = !is_variable && field.logical_type == "bool";
         const auto fixed_bytes_per_value = value_width_bytes(field);
         if (!is_variable) {
-            if (values.fixed.size() % fixed_bytes_per_value != 0U) {
+            if (values.fixed_size() % fixed_bytes_per_value != 0U) {
                 error = "column value buffer size is not aligned to field width for ";
                 error += field.name;
                 return false;
             }
-            if (values.fixed.size() / fixed_bytes_per_value != static_cast<std::size_t>(rows)) {
+            if (values.fixed_size() / fixed_bytes_per_value != static_cast<std::size_t>(rows)) {
                 error = "column value count does not match row count for ";
                 error += field.name;
                 return false;
@@ -1172,7 +1172,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         if (!is_variable && !bitpack && !bss_zstd && !bool_pack) {
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
-            const auto total = values.fixed.size() / fixed_bytes_per_value;
+            const auto total = values.fixed_size() / fixed_bytes_per_value;
             const auto max_chunk_values = max_values_per_uncompressed_chunk(fixed_bytes_per_value);
             // Every full chunk of a column produces IDENTICAL page-encoding bytes (only the row-count
             // varint differs, and full chunks all carry max_chunk_values rows) -- build them once and
@@ -1191,7 +1191,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 align64(out);
                 const auto payload_offset = pos(out);
                 const auto payload_size = stream_flat_miniblock_payload(
-                    out, values.fixed.data() + off * fixed_bytes_per_value, chunk_bytes);
+                    out, values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes);
 
                 pb::ColumnPage page;
                 page.buffer_offsets.push_back(control_offset);
@@ -1226,7 +1226,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         if (bitpack || bool_pack || bss_zstd) {
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
-            const auto total = bool_pack ? values.fixed.size() : values.fixed.size() / fixed_bytes_per_value;
+            const auto total = bool_pack ? values.fixed_size() : values.fixed_size() / fixed_bytes_per_value;
             const std::size_t step = bitpack      ? 1024U  // one FastLanes block per page
                                      : bool_pack ? kMaxBoolValuesPerChunk
                                                  : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
@@ -1250,16 +1250,16 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 const auto count = std::min(step, total - off);
                 if (bitpack) {
                     // Each chunk buffer = [bit_width][FastLanes packed 1024 values].
-                    build_bitpacked_chunk(values.fixed.data() + off * fixed_bytes_per_value, count,
+                    build_bitpacked_chunk(values.fixed_data() + off * fixed_bytes_per_value, count,
                                           fixed_bytes_per_value, scratch);
                 } else if (bool_pack) {
                     // Bit-pack LSB-first, ceil(count/8) bytes; no zstd on top (stock Lance doesn't
                     // compress 1-bit-packed bool either). values.fixed is one byte per value here.
-                    boolpack::pack_lsb_first(values.fixed.data() + off, count, scratch);
+                    boolpack::pack_lsb_first(values.fixed_data() + off, count, scratch);
                 } else {
                     // Byte-transpose (mantissa/exponent bytes grouped) so the zstd frame compresses
                     // meaningfully, then frame it: bytes become [u64 raw size][zstd].
-                    bss::transpose(values.fixed.data() + off * fixed_bytes_per_value,
+                    bss::transpose(values.fixed_data() + off * fixed_bytes_per_value,
                                    fixed_bytes_per_value, count, scratch);
                     if (!zstd_frame_buffer(scratch, compression_level, framed, error)) {
                         return false;

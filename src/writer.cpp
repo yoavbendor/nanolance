@@ -40,6 +40,12 @@ struct WriterState {
     // independent of zstd byte compression and on by default: they shrink files and usually speed up
     // writes, and stay stock-Lance-readable. `compression` (set_compression) now controls ONLY zstd.
     bool structural = true;
+    /// Per-field encoding declarations (set_column_encoding): "plain"/"bitpack"/"bss-zstd"/"zstd".
+    /// A declared column skips the commit-time detection scans entirely. Absent == "auto".
+    std::map<std::string, std::string> column_encodings;
+    /// Borrow the caller's fixed-width Arrow buffers until commit instead of copying (zero-copy
+    /// ingest for single-batch columns; multi-batch columns silently fall back to copying).
+    bool borrow_buffers = false;
     bool has_schema = false;
     /// After the first successful manifest write, further commits must pass `is_append=true`.
     bool append_only_commits = false;
@@ -123,10 +129,10 @@ bool dispatch_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t bpv,
 // runs for the encoder's plan and only runs for genuinely beneficial columns.
 bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv) {
     cv.fixed_rle_plan = {};
-    if (bpv == 0U || cv.fixed.empty() || cv.fixed.size() % bpv != 0U) {
+    if (bpv == 0U || cv.fixed_size() == 0U || cv.fixed_size() % bpv != 0U) {
         return false;
     }
-    const std::size_t n = cv.fixed.size() / bpv;
+    const std::size_t n = cv.fixed_size() / bpv;
     // Prefix-sample pre-check (same pattern as variable_column_dict_beneficial's sampling): even with
     // the reject-early exit, a scattered column scans ~n/2 rows before failing (split_runs grows one
     // per row, crossing n/2 halfway through). A 4096-row prefix predicts that verdict at ~1/25 the
@@ -136,14 +142,14 @@ bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv) {
     constexpr std::size_t kSampleRows = 4096U;
     if (n > kSampleRows * 4U) {
         std::size_t sample_split_runs = 0;
-        if (!dispatch_rle_scan(cv.fixed.data(), kSampleRows, bpv, kSampleRows * 3U / 4U,
+        if (!dispatch_rle_scan(cv.fixed_data(), kSampleRows, bpv, kSampleRows * 3U / 4U,
                                sample_split_runs, nullptr)) {
             return false;
         }
     }
     std::size_t split_runs = 0;
     // reject_at == ceil(n/2) is exactly the previous `split_runs * 2 >= n` cutoff.
-    if (!dispatch_rle_scan(cv.fixed.data(), n, bpv, (n + 1U) / 2U, split_runs, nullptr)) {
+    if (!dispatch_rle_scan(cv.fixed_data(), n, bpv, (n + 1U) / 2U, split_runs, nullptr)) {
         return false;
     }
     // One chunk for the whole column: run buffers must fit the miniblock (12-bit word => 32760 bytes).
@@ -154,7 +160,7 @@ bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv) {
     }
     std::vector<std::pair<std::size_t, std::uint64_t>> runs;
     std::size_t split_runs_again = 0;
-    if (!dispatch_rle_scan(cv.fixed.data(), n, bpv, n + 1U, split_runs_again, &runs)) {
+    if (!dispatch_rle_scan(cv.fixed_data(), n, bpv, n + 1U, split_runs_again, &runs)) {
         return false;
     }
     cv.fixed_rle_plan.computed = true;
@@ -602,6 +608,46 @@ int nano_lance_writer_set_structural_encoding(NanoLanceWriter* writer, bool enab
     return NANO_LANCE_OK;
 }
 
+int nano_lance_writer_set_column_encoding(NanoLanceWriter* writer, const char* field_name,
+                                          const char* encoding) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (state->pending_batches != 0 || state->pending_rows != 0) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE,
+                         "column encodings must be set before writing batches");
+    }
+    if (field_name == nullptr || field_name[0] == '\0') {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "field name must not be empty");
+    }
+    const std::string enc = encoding != nullptr ? encoding : "";
+    if (enc == "auto") {
+        state->column_encodings.erase(field_name);
+    } else if (enc == "plain" || enc == "bitpack" || enc == "bss-zstd" || enc == "zstd") {
+        state->column_encodings[field_name] = enc;
+    } else {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT,
+                         "unknown column encoding (expected auto/plain/bitpack/bss-zstd/zstd): " + enc);
+    }
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_borrow_buffers(NanoLanceWriter* writer, bool enable) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (state->pending_batches != 0 || state->pending_rows != 0) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE,
+                         "borrow_buffers must be set before writing batches");
+    }
+    state->borrow_buffers = enable;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
 int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, struct ArrowSchema* schema) {
     auto* state = state_from(writer);
     if (state == nullptr) {
@@ -646,7 +692,8 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
                                                 state->schema_mapping,
                                                 state->column_values,
                                                 error,
-                                                blob_parent_id)) {
+                                                blob_parent_id,
+                                                state->borrow_buffers)) {
         return set_error(writer, NANO_LANCE_UNSUPPORTED, error);
     }
     if (state->blob_field != nullptr) {
@@ -739,6 +786,43 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
         if (!nano_lance::lance_field_is_physical(field) || !field.extension_name.empty()) {
             continue;
         }
+        // Declared encodings (set_column_encoding) override the automatic tagging below and later skip
+        // the detection scans entirely -- the caller vouched for the column's shape at compile/config
+        // time, so nanolance doesn't re-derive it from a full data scan. Type compatibility is checked
+        // here so a bad declaration fails the commit loudly instead of writing a broken file.
+        const auto declared_it = state->column_encodings.find(field.name);
+        if (declared_it != state->column_encodings.end()) {
+            const auto& declared = declared_it->second;
+            const bool variable = nano_lance::lance_field_is_variable_width(field.logical_type);
+            if (declared == "plain") {
+                continue;  // no tags: flat/variable pages, no structural encoding, no zstd
+            }
+            if (declared == "bitpack") {
+                if (!nano_lance::lance_logical_type_is_bitpackable_integer(field.logical_type)) {
+                    return set_error(writer, NANO_LANCE_INVALID_ARGUMENT,
+                                     "column encoding 'bitpack' requires an integer column: " + field.name);
+                }
+                field.metadata["nanolance:packing"] = "bitpack";
+                continue;
+            }
+            if (declared == "bss-zstd") {
+                if (field.logical_type != "float" && field.logical_type != "double") {
+                    return set_error(writer, NANO_LANCE_INVALID_ARGUMENT,
+                                     "column encoding 'bss-zstd' requires a float/double column: " + field.name);
+                }
+                field.metadata["nanolance:packing"] = "bss-zstd";
+                continue;
+            }
+            // declared == "zstd"
+            if (!variable) {
+                return set_error(writer, NANO_LANCE_INVALID_ARGUMENT,
+                                 "column encoding 'zstd' requires a string/binary column: " + field.name);
+            }
+            if (state->compression) {
+                field.metadata["lance-encoding:compression"] = "zstd";
+            }
+            continue;
+        }
         if (nano_lance::lance_field_is_variable_width(field.logical_type)) {
             if (state->compression) {
                 field.metadata["lance-encoding:compression"] = "zstd";
@@ -783,20 +867,25 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
             if (!pf->extension_name.empty()) {
                 continue;
             }
+            // Declared columns (set_column_encoding) skip ALL detection scans -- the encoding was
+            // decided by the caller; these scans are exactly the work the declaration saves.
+            if (state->column_encodings.find(pf->name) != state->column_encodings.end()) {
+                continue;
+            }
             auto& cv = commit_columns[i];
             std::vector<std::uint8_t> value;
             bool constant = false;
             if (cv.kind == nano_lance::ColumnValues::Kind::FixedWidth) {
                 const auto bpv = nano_lance::lance_logical_type_value_bytes(pf->logical_type);
-                if (bpv != 0U && cv.fixed.size() >= bpv && cv.fixed.size() % bpv == 0U) {
+                if (bpv != 0U && cv.fixed_size() >= bpv && cv.fixed_size() % bpv == 0U) {
                     // A buffer is all-one-value iff it equals itself shifted by one element, so ONE
                     // overlapped memcmp over the whole column replaces the previous
                     // one-libc-call-per-row loop (memcmp only reads, so overlap is fine; a 1-row
                     // column compares 0 bytes and is correctly constant).
-                    constant = std::memcmp(cv.fixed.data(), cv.fixed.data() + bpv,
-                                           cv.fixed.size() - bpv) == 0;
+                    constant = std::memcmp(cv.fixed_data(), cv.fixed_data() + bpv,
+                                           cv.fixed_size() - bpv) == 0;
                     if (constant) {
-                        value.assign(cv.fixed.begin(), cv.fixed.begin() + static_cast<std::ptrdiff_t>(bpv));
+                        value.assign(cv.fixed_data(), cv.fixed_data() + bpv);
                     }
                 }
             } else if (cv.kind == nano_lance::ColumnValues::Kind::VariableWidth) {

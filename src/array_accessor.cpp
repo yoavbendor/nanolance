@@ -87,13 +87,21 @@ const ArrowArray* resolve_field_array_impl(const ArrowArray& batch,
 bool append_fixed_width(const ArrowArray& array,
                         const LanceField& field,
                         ColumnValues& out,
-                        std::string& error) {
+                        std::string& error,
+                        bool borrow = false) {
     if (array.n_buffers < 2 || array.buffers == nullptr || array.buffers[1] == nullptr) {
         error = "fixed-width array is missing values buffer for ";
         error += field.name;
         return false;
     }
     out.kind = ColumnValues::Kind::FixedWidth;
+    // A borrowed column receiving another batch materializes back into the copying path first: copy
+    // the borrowed view into `fixed`, drop the view, then append the new batch below as usual.
+    if (out.fixed_borrowed != nullptr) {
+        out.fixed.assign(out.fixed_borrowed, out.fixed_borrowed + out.fixed_borrowed_size);
+        out.fixed_borrowed = nullptr;
+        out.fixed_borrowed_size = 0;
+    }
     // Arrow stores boolean values bit-packed (1 bit/value, LSB-first, honoring array.offset), but
     // nanolance's on-disk layout is one byte per boolean. Expand here rather than memcpy'ing
     // length bytes out of a length/8-byte buffer (which read far past the buffer and crashed).
@@ -115,6 +123,13 @@ bool append_fixed_width(const ArrowArray& array,
     const auto byte_count = static_cast<std::size_t>(array.length) * width;
     const auto* first = static_cast<const std::uint8_t*>(array.buffers[1]) +
                         static_cast<std::size_t>(array.offset) * width;
+    // Zero-copy ingest (set_borrow_buffers): the first batch of a column records a view of the
+    // caller's buffer instead of copying; the caller guarantees it outlives commit.
+    if (borrow && out.fixed.empty()) {
+        out.fixed_borrowed = first;
+        out.fixed_borrowed_size = byte_count;
+        return true;
+    }
     out.fixed.insert(out.fixed.end(), first, first + byte_count);
     return true;
 }
@@ -206,7 +221,8 @@ bool append_batch_column_values(const ArrowArray& batch,
                                 const LanceSchemaMapping& mapping,
                                 std::vector<ColumnValues>& columns,
                                 std::string& error,
-                                std::int32_t skip_blob_parent_id) {
+                                std::int32_t skip_blob_parent_id,
+                                bool borrow_fixed_buffers) {
     const auto physical = lance_physical_fields(mapping);
     std::vector<const LanceField*> selected;
     selected.reserve(physical.size());
@@ -236,7 +252,7 @@ bool append_batch_column_values(const ArrowArray& batch,
                 return false;
             }
         } else {
-            if (!append_fixed_width(*array, field, columns[i], error)) {
+            if (!append_fixed_width(*array, field, columns[i], error, borrow_fixed_buffers)) {
                 return false;
             }
         }

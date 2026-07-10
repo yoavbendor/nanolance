@@ -49,6 +49,28 @@ int nano_lance_writer_set_compression(NanoLanceWriter* writer, bool enable);
 /// set_compression (zstd). Disable to emit plain flat/variable-width pages ("raw" Lance output). Must
 /// be set before any batch is written.
 int nano_lance_writer_set_structural_encoding(NanoLanceWriter* writer, bool enable);
+/// Declare a column's encoding up front, skipping the commit-time detection scans for it entirely
+/// (constant / RLE / dictionary detection are data scans over the whole column; a caller that already
+/// knows a column's shape can save that work). `encoding` is one of:
+///   "auto"     -- default: detect as usual.
+///   "plain"    -- flat pages, no structural encoding and no zstd for this column.
+///   "bitpack"  -- FastLanes InlineBitpacking; integer columns (int/uint 8..64) only.
+///   "bss-zstd" -- byte-stream-split + zstd; float/double columns only (implies zstd for this column
+///                 even if set_compression is off).
+///   "zstd"     -- variable-width (string/binary) columns: skip dictionary/constant detection and
+///                 zstd the pages (requires set_compression(true) to actually compress).
+/// All hinted encodings remain stock-Lance-readable and are valid for ANY data of the right type --
+/// hints can cost size (e.g. bitpacking a constant column) but never correctness. Type compatibility
+/// is validated at commit. Must be called before any batch is written.
+int nano_lance_writer_set_column_encoding(NanoLanceWriter* writer, const char* field_name,
+                                          const char* encoding);
+/// Opt in to borrowing the caller's Arrow buffers instead of copying them at write_batch time, for
+/// fixed-width columns (except bool). Contract: every buffer passed to write_batch must remain valid
+/// and unmodified until commit/close. A column written in a single batch is encoded straight from the
+/// caller's memory (zero-copy ingest); if a second batch arrives for a column, that column silently
+/// falls back to the copying path (correct, just not zero-copy). Variable-width and bool columns
+/// always copy. Off by default; must be set before any batch is written.
+int nano_lance_writer_set_borrow_buffers(NanoLanceWriter* writer, bool enable);
 int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, struct ArrowSchema* schema);
 int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append);
 int nano_lance_writer_close(NanoLanceWriter* writer);
