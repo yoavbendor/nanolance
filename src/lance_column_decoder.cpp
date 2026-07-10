@@ -15,6 +15,7 @@
 
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <utility>
 
 namespace nano_lance {
@@ -92,7 +93,15 @@ bool zstd_unframe_buffer(const std::vector<std::uint8_t>& framed, std::vector<st
     // resize() (not assign(n, 0)) so a reused `out` across many page calls of similar size isn't
     // re-zeroed every time — ZSTD_decompress below unconditionally overwrites all out.size() bytes.
     out.resize(static_cast<std::size_t>(uncompressed));
-    const auto got = ZSTD_decompress(out.data(), out.size(), framed.data() + 8U, framed.size() - 8U);
+    // Reused per-thread decompression context: one-shot ZSTD_decompress() allocates and zeroes a fresh
+    // context on every call; ZSTD_decompressDCtx on a reused context skips that setup per page (same
+    // reuse rationale as the writer's zstd_frame_buffer, identical output).
+    thread_local std::unique_ptr<ZSTD_DCtx, std::size_t (*)(ZSTD_DCtx*)> dctx(ZSTD_createDCtx(),
+                                                                              &ZSTD_freeDCtx);
+    const auto got = dctx != nullptr
+                         ? ZSTD_decompressDCtx(dctx.get(), out.data(), out.size(), framed.data() + 8U,
+                                               framed.size() - 8U)
+                         : ZSTD_decompress(out.data(), out.size(), framed.data() + 8U, framed.size() - 8U);
     if (ZSTD_isError(got) != 0U || got != uncompressed) {
         error = "zstd decompress failed for variable-width column";
         return false;

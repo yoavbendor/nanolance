@@ -19,15 +19,26 @@
 
 namespace nano_lance::bss {
 
-// Split `count` `vlen`-byte values at `data` into `vlen` contiguous byte-planes.
-inline std::vector<std::uint8_t> transpose(const std::uint8_t* data, std::size_t vlen, std::size_t count) {
-    std::vector<std::uint8_t> out(vlen * count);
+// Split `count` `vlen`-byte values at `data` into `vlen` contiguous byte-planes, into `out`. Every
+// byte of `out` is unconditionally overwritten, so a caller reusing `out` across equal-sized chunks
+// pays no re-zeroing at all after the first call (resize() to the same or a smaller size touches
+// nothing) -- a fresh std::vector per chunk instead zero-fills the whole buffer and then immediately
+// throws that work away (measured at ~44% of a float-column write's instructions).
+inline void transpose(const std::uint8_t* data, std::size_t vlen, std::size_t count,
+                      std::vector<std::uint8_t>& out) {
+    out.resize(vlen * count);
     for (std::size_t b = 0; b < vlen; ++b) {
         std::uint8_t* plane = out.data() + b * count;
         for (std::size_t i = 0; i < count; ++i) {
             plane[i] = data[i * vlen + b];
         }
     }
+}
+
+// Convenience overload returning a fresh buffer (one-shot callers / tests).
+inline std::vector<std::uint8_t> transpose(const std::uint8_t* data, std::size_t vlen, std::size_t count) {
+    std::vector<std::uint8_t> out;
+    transpose(data, vlen, count, out);
     return out;
 }
 

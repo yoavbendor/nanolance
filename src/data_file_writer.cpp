@@ -15,6 +15,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -597,36 +598,43 @@ unsigned chunk_bit_width(const std::uint8_t* src, std::size_t count, std::size_t
     return bits;
 }
 
-// Build one bitpacked chunk buffer: [bit_width as one width_bytes word][FastLanes packed 1024 values].
-// `count` (<=1024) values are read from `src`; the rest of the 1024-block is zero-padded.
+// Build one bitpacked chunk buffer: [bit_width as one width_bytes word][FastLanes packed 1024 values],
+// into `out`. `count` (<=1024) values are read from `src`; the rest of the 1024-block is zero-padded.
+// Every byte of `out` is unconditionally overwritten, so callers reusing `out` across chunks pay no
+// per-chunk allocation or zero-fill. Staging into `in` is one bulk memcpy (src is contiguous typed
+// data), zeroing only the tail of the final partial chunk instead of the whole 1024-block every call.
 template <class T>
-std::vector<std::uint8_t> build_bitpacked_chunk_typed(const std::uint8_t* src, std::size_t count) {
-    T in[1024] = {};
-    for (std::size_t i = 0; i < count; ++i) {
-        std::memcpy(&in[i], src + i * sizeof(T), sizeof(T));
+void build_bitpacked_chunk_typed(const std::uint8_t* src, std::size_t count, std::vector<std::uint8_t>& out) {
+    T in[1024];
+    std::memcpy(in, src, count * sizeof(T));
+    if (count < 1024U) {
+        std::memset(in + count, 0, (1024U - count) * sizeof(T));
     }
     unsigned width = chunk_bit_width(src, count, sizeof(T));
-    std::vector<T> packed(nano_lance::fastlanes::packed_words_1024<T>(width), T(0));
+    // thread_local + resize (not a fresh zero-filled vector per chunk): bounded by <=1024 words, fully
+    // overwritten by pack_1024 below -- same reuse precedent as unpack_bitpacked_page on the read side.
+    thread_local std::vector<T> packed;
+    packed.resize(nano_lance::fastlanes::packed_words_1024<T>(width));
     nano_lance::fastlanes::pack_1024<T>(width, in, packed.data());
-    std::vector<std::uint8_t> out(sizeof(T) * (1U + packed.size()));
+    out.resize(sizeof(T) * (1U + packed.size()));
     const T width_word = static_cast<T>(width);
     std::memcpy(out.data(), &width_word, sizeof(T));
     if (!packed.empty()) {
         std::memcpy(out.data() + sizeof(T), packed.data(), packed.size() * sizeof(T));
     }
-    return out;
 }
 
-std::vector<std::uint8_t> build_bitpacked_chunk(const std::uint8_t* src, std::size_t count, std::size_t width_bytes) {
+void build_bitpacked_chunk(const std::uint8_t* src, std::size_t count, std::size_t width_bytes,
+                           std::vector<std::uint8_t>& out) {
     switch (width_bytes) {
         case 1U:
-            return build_bitpacked_chunk_typed<std::uint8_t>(src, count);
+            return build_bitpacked_chunk_typed<std::uint8_t>(src, count, out);
         case 2U:
-            return build_bitpacked_chunk_typed<std::uint16_t>(src, count);
+            return build_bitpacked_chunk_typed<std::uint16_t>(src, count, out);
         case 4U:
-            return build_bitpacked_chunk_typed<std::uint32_t>(src, count);
+            return build_bitpacked_chunk_typed<std::uint32_t>(src, count, out);
         default:
-            return build_bitpacked_chunk_typed<std::uint64_t>(src, count);
+            return build_bitpacked_chunk_typed<std::uint64_t>(src, count, out);
     }
 }
 
@@ -643,7 +651,16 @@ bool zstd_frame_buffer(const std::vector<std::uint8_t>& raw, int level, std::vec
     for (int i = 0; i < 8; ++i) {
         out[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((uncompressed >> (8 * i)) & 0xFFU);
     }
-    const auto csize = ZSTD_compress(out.data() + 8U, bound, raw.data(), raw.size(), level);
+    // Reused per-thread compression context: one-shot ZSTD_compress() allocates AND ZEROES a fresh
+    // multi-hundred-KB context (hash/chain tables, window) on every call, which callgrind showed as
+    // ~40% of a compressed float column's write instructions across its ~150 per-chunk calls -- far
+    // more than the actual compression work. ZSTD_compressCCtx on a reused context skips that setup
+    // cost and produces byte-identical output (same algorithm, same level).
+    thread_local std::unique_ptr<ZSTD_CCtx, std::size_t (*)(ZSTD_CCtx*)> cctx(ZSTD_createCCtx(),
+                                                                              &ZSTD_freeCCtx);
+    const auto csize = cctx != nullptr
+                           ? ZSTD_compressCCtx(cctx.get(), out.data() + 8U, bound, raw.data(), raw.size(), level)
+                           : ZSTD_compress(out.data() + 8U, bound, raw.data(), raw.size(), level);
     if (ZSTD_isError(csize) != 0U) {
         error = std::string("zstd compress failed: ") + ZSTD_getErrorName(csize);
         return false;
@@ -1085,8 +1102,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 const auto count = std::min<std::size_t>(1024U, indices.size() - off);
                 MiniblockChunk chunk;
                 chunk.value_count = count;
-                chunk.bytes = build_bitpacked_chunk(reinterpret_cast<const std::uint8_t*>(indices.data() + off),
-                                                    count, 4U);
+                build_bitpacked_chunk(reinterpret_cast<const std::uint8_t*>(indices.data() + off), count, 4U,
+                                      chunk.bytes);
                 index_chunks.push_back(std::move(chunk));
             }
             const auto payload = miniblock_payload(index_chunks);
@@ -1187,52 +1204,85 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             continue;
         }
 
-        if (is_variable) {
-            if (!build_variable_chunks_for_column(values.variable, chunks, error)) {
-                return false;
-            }
-        } else if (bitpack) {
-            // One FastLanes 1024-value chunk per page; each chunk buffer = [bit_width][packed].
-            const auto total = values.fixed.size() / fixed_bytes_per_value;
-            for (std::size_t off = 0; off < total; off += 1024U) {
-                const auto count = std::min<std::size_t>(1024U, total - off);
-                MiniblockChunk chunk;
-                chunk.value_count = count;
-                chunk.bytes = build_bitpacked_chunk(values.fixed.data() + off * fixed_bytes_per_value, count,
-                                                    fixed_bytes_per_value);
-                chunks.push_back(std::move(chunk));
-            }
-        } else if (bool_pack) {
-            // Bit-pack LSB-first into ceil(count/8)-byte chunks; no zstd wrapping (stock Lance doesn't
-            // compress on top of 1-bit packing either). values.fixed is still one byte per value here.
-            const auto total = values.fixed.size();
+        // Bitpack / bool / byte-stream-split+zstd fixed-width columns: STREAM one chunk at a time
+        // through hoisted, loop-reused scratch buffers (build chunk -> write control+payload -> reuse),
+        // mirroring the flat path above. The previous two-phase shape (materialize every chunk into a
+        // std::vector<MiniblockChunk>, then write) paid a fresh zero-initialized allocation per chunk
+        // whose fill was immediately overwritten; with reuse, resize() touches nothing after the first
+        // chunk since chunks are equal-sized. Output is byte-identical to the two-phase code:
+        // stream_flat_miniblock_payload == miniblock_payload over a single chunk, and the 4-byte
+        // control word below is the same single-chunk encoding control_buffer_for(chunk) produced.
+        if (bitpack || bool_pack || bss_zstd) {
+            pb::ColumnMetadata column;
+            column.encoding = column_encoding_bytes();
+            const auto total = bool_pack ? values.fixed.size() : values.fixed.size() / fixed_bytes_per_value;
+            const std::size_t step = bitpack      ? 1024U  // one FastLanes block per page
+                                     : bool_pack ? kMaxBoolValuesPerChunk
+                                                 : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
+            std::vector<std::uint8_t> scratch;  // built chunk bytes, reused across chunks
+            std::vector<std::uint8_t> framed;   // zstd frame (bss-zstd only), reused across chunks
             for (std::size_t off = 0; off < total;) {
-                const auto count = std::min<std::size_t>(kMaxBoolValuesPerChunk, total - off);
-                MiniblockChunk chunk;
-                chunk.value_count = count;
-                chunk.bytes = boolpack::pack_lsb_first(values.fixed.data() + off, count);
-                chunks.push_back(std::move(chunk));
+                const auto count = std::min(step, total - off);
+                if (bitpack) {
+                    // Each chunk buffer = [bit_width][FastLanes packed 1024 values].
+                    build_bitpacked_chunk(values.fixed.data() + off * fixed_bytes_per_value, count,
+                                          fixed_bytes_per_value, scratch);
+                } else if (bool_pack) {
+                    // Bit-pack LSB-first, ceil(count/8) bytes; no zstd on top (stock Lance doesn't
+                    // compress 1-bit-packed bool either). values.fixed is one byte per value here.
+                    boolpack::pack_lsb_first(values.fixed.data() + off, count, scratch);
+                } else {
+                    // Byte-transpose (mantissa/exponent bytes grouped) so the zstd frame compresses
+                    // meaningfully, then frame it: bytes become [u64 raw size][zstd].
+                    bss::transpose(values.fixed.data() + off * fixed_bytes_per_value,
+                                   fixed_bytes_per_value, count, scratch);
+                    if (!zstd_frame_buffer(scratch, compression_level, framed, error)) {
+                        return false;
+                    }
+                }
+                const auto& chunk_bytes = bss_zstd ? framed : scratch;
+                const auto words = static_cast<std::uint16_t>((chunk_bytes.size() + 7U) / 8U);
+                const std::array<char, 4> control{static_cast<char>((words << 4U) & 0xFFU),
+                                                  static_cast<char>(((words << 4U) >> 8U) & 0xFFU), 0, 0};
+
+                align64(out);
+                const auto control_offset = pos(out);
+                out.write(control.data(), static_cast<std::streamsize>(control.size()));
+                align64(out);
+                const auto payload_offset = pos(out);
+                const auto payload_size =
+                    stream_flat_miniblock_payload(out, chunk_bytes.data(), chunk_bytes.size());
+
+                pb::ColumnPage page;
+                page.buffer_offsets.push_back(control_offset);
+                page.buffer_offsets.push_back(payload_offset);
+                page.buffer_sizes.push_back(control.size());
+                page.buffer_sizes.push_back(payload_size);
+                page.length = count;
+                page.priority = 0;
+                if (bitpack) {
+                    page.encoding = page_layout_bytes_inline_bitpacking(
+                        static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), count);
+                } else if (bool_pack) {
+                    // Plain Flat{bits_per_value:1} -- no CompressiveEncoding wrapper, matching stock Lance.
+                    page.encoding = page_layout_bytes(flat_bits_per_value_token(field), count, false);
+                } else {
+                    page.encoding = page_layout_bytes_bss_zstd(flat_bits_per_value_token(field), count);
+                }
+                column.pages.push_back(std::move(page));
                 off += count;
             }
-        } else {
-            // Only byte-stream-split+zstd fixed-width columns reach here (the flat path streamed above,
-            // bitpack, bool, and variable are handled above). Byte-transpose each chunk (mantissa/exponent
-            // bytes grouped together) so the zstd framing below compresses it meaningfully; zstd itself
-            // is applied uniformly for every non-bitpack chunk kind further down.
-            const auto total = values.fixed.size() / fixed_bytes_per_value;
-            const auto max_chunk_values = max_values_per_uncompressed_chunk(fixed_bytes_per_value);
-            for (std::size_t off = 0; off < total;) {
-                const auto count = std::min(max_chunk_values, total - off);
-                MiniblockChunk chunk;
-                chunk.value_count = count;
-                chunk.bytes = bss::transpose(values.fixed.data() + off * fixed_bytes_per_value,
-                                             fixed_bytes_per_value, count);
-                chunks.push_back(std::move(chunk));
-                off += count;
-            }
+            columns.push_back(std::move(column));
+            continue;
         }
 
-        const bool zstd_variable = is_variable && compress;
+        // Variable-width columns keep the two-phase build (chunks are unequal-sized, driven by the
+        // offsets math in build_variable_chunks_for_column).
+        if (!build_variable_chunks_for_column(values.variable, chunks, error)) {
+            return false;
+        }
+
+        const bool zstd_variable = compress;
         pb::ColumnMetadata column;
         column.encoding = column_encoding_bytes();
         // Hoisted out of the loop (not freshly declared per chunk): zstd_frame_buffer's resize() only
@@ -1240,7 +1290,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         // which requires swap (not move) below so `framed`'s capacity survives being handed off.
         std::vector<std::uint8_t> framed;
         for (auto& chunk : chunks) {
-            if (zstd_variable || bss_zstd) {
+            if (zstd_variable) {
                 if (!zstd_frame_buffer(chunk.bytes, compression_level, framed, error)) {
                     return false;
                 }
@@ -1264,21 +1314,10 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.buffer_sizes.push_back(payload.size());
             page.length = chunk.value_count;
             page.priority = 0;
-            if (is_variable) {
-                const auto bits_token =
-                    values.variable.large ? static_cast<std::uint8_t>(0x40U) : static_cast<std::uint8_t>(0x20U);
-                page.encoding = zstd_variable ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count)
-                                              : page_layout_bytes(bits_token, chunk.value_count, true);
-            } else if (bitpack) {
-                page.encoding = page_layout_bytes_inline_bitpacking(
-                    static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), chunk.value_count);
-            } else if (bool_pack) {
-                // Plain Flat{bits_per_value:1} -- no CompressiveEncoding wrapper, matching stock Lance.
-                page.encoding = page_layout_bytes(flat_bits_per_value_token(field), chunk.value_count, false);
-            } else {
-                // Only bss_zstd reaches here (is_variable, bitpack, and bool excluded above).
-                page.encoding = page_layout_bytes_bss_zstd(flat_bits_per_value_token(field), chunk.value_count);
-            }
+            const auto bits_token =
+                values.variable.large ? static_cast<std::uint8_t>(0x40U) : static_cast<std::uint8_t>(0x20U);
+            page.encoding = zstd_variable ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count)
+                                          : page_layout_bytes(bits_token, chunk.value_count, true);
             column.pages.push_back(std::move(page));
         }
         columns.push_back(std::move(column));
