@@ -1130,44 +1130,49 @@ becomes constant/low-range → ~0); Lance has no transparent delta encoding. Tru
 <code>tools/bench.py</code>; the live numbers are committed to <code>bench/linux-ci-results.md</code> by the GitHub Actions
 workflow on every push (CI-owned file). Local runs write <code>bench/linux-local-results.md</code> via
 <code>bench/run-local-bench.sh</code> so they never clash with the CI auto-commit.</p>
-<p><strong>pcap-style columns</strong> (run-length URI + monotonic <code>position</code> + constant <code>size</code>):</p>
+<p><strong>Write-core ratio vs rust lance per dataset</strong> (after the write-path optimization rounds — scan
+early-exits, plan reuse, chunk streaming through reused scratch buffers, reused zstd contexts):</p>
 <table>
 <thead>
 <tr>
-<th>metric</th>
-<th>nanolance</th>
-<th>rust lance</th>
-<th>parquet (zstd)</th>
+<th>dataset</th>
+<th>nanolance vs rust lance (write core)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>size (B/row)</td>
-<td><strong>3.64</strong></td>
-<td>3.47</td>
-<td>4.19</td>
+<td><code>float_smooth</code> (byte-stream-split + zstd)</td>
+<td><strong>~0.75× — faster</strong></td>
 </tr>
 <tr>
-<td>write core (ms)</td>
-<td>~26</td>
-<td>~11</td>
-<td>~23</td>
+<td><code>bool_flags</code> (1-bit packing)</td>
+<td><strong>~0.4× — faster</strong></td>
 </tr>
 <tr>
-<td>read native (ms)</td>
-<td>~12</td>
-<td>~6</td>
-<td>~6</td>
+<td><code>pcap_ref</code> (dict-RLE URI + bitpack + constant)</td>
+<td><strong>~1.05× — parity</strong></td>
+</tr>
+<tr>
+<td><code>wide_int</code> (integer bitpack)</td>
+<td>~1.2×</td>
+</tr>
+<tr>
+<td><code>high_card</code> (zstd strings)</td>
+<td>~1.5× (remaining gap)</td>
 </tr>
 </tbody>
 </table>
 <ul>
 <li><strong>Size:</strong> at Lance parity, <strong>beats Parquet</strong> — the design goal.</li>
-<li><strong>Write:</strong> ~Parquet-parity for the core encode, ~2.4× Lance. <code>write(core)</code> excludes subprocess
-  startup + Arrow-IPC parse (3–9 ms of the CLI's wall clock); <code>write(proc)</code> in the bench includes them.</li>
-<li><strong>Read:</strong> nanolance's own reader is ~2× Lance after optimization (was ~5×); nanolance files read
-  <em>by</em> Rust Lance are fast (~8.5 ms). The native reader is a simple writer-parity decoder — read
-  throughput is the known remaining gap (memory-bandwidth bound on column materialization).</li>
+<li><strong>Fair-comparison note (floats):</strong> rust lance's <em>default</em> leaves floats essentially uncompressed
+  (~raw 12 B/row); <code>tools/bench.py</code> sets <code>lance-encoding:compression=zstd</code> + <code>lance-encoding:bss=on</code>
+  field metadata on the rust write of <code>float_smooth</code> so both engines do byte-stream-split + zstd
+  (~8.4-8.7 B/row) — without that, the bench compared our compressed write to rust's uncompressed one.</li>
+<li><strong>Write:</strong> <code>write(core)</code> excludes subprocess startup + Arrow-IPC parse (3–9 ms of the CLI's wall
+  clock); <code>write(proc)</code> in the bench includes them.</li>
+<li><strong>Read:</strong> float/bool reads are at or beyond rust-lance parity (nanolance reads compressed floats
+  ~2.5× faster than rust reads its own); integer-bitpack reads ~1.3×; string-heavy reads ~1.6-1.8×
+  remain the gap (memory-bandwidth bound on column materialization).</li>
 </ul>
 <p>Where Parquet wins: high-cardinality strings and monotonic <strong>high-range</strong> integers (Parquet
 delta-encodes; Lance and nanolance bitpack absolute values). Store such columns as app-level deltas to
