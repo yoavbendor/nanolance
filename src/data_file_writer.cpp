@@ -1174,6 +1174,10 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             column.encoding = column_encoding_bytes();
             const auto total = values.fixed.size() / fixed_bytes_per_value;
             const auto max_chunk_values = max_values_per_uncompressed_chunk(fixed_bytes_per_value);
+            // Every full chunk of a column produces IDENTICAL page-encoding bytes (only the row-count
+            // varint differs, and full chunks all carry max_chunk_values rows) -- build them once and
+            // copy per page instead of re-encoding the whole protobuf tree per page.
+            std::vector<std::uint8_t> full_chunk_encoding;
             for (std::size_t off = 0; off < total;) {
                 const auto count = std::min(max_chunk_values, total - off);
                 const auto chunk_bytes = count * fixed_bytes_per_value;
@@ -1196,7 +1200,14 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 page.buffer_sizes.push_back(payload_size);
                 page.length = count;
                 page.priority = 0;
-                page.encoding = page_layout_bytes(field, count);
+                if (count == max_chunk_values) {
+                    if (full_chunk_encoding.empty()) {
+                        full_chunk_encoding = page_layout_bytes(field, count);
+                    }
+                    page.encoding = full_chunk_encoding;
+                } else {
+                    page.encoding = page_layout_bytes(field, count);
+                }
                 column.pages.push_back(std::move(page));
                 off += count;
             }
@@ -1221,6 +1232,20 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                                                  : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
             std::vector<std::uint8_t> scratch;  // built chunk bytes, reused across chunks
             std::vector<std::uint8_t> framed;   // zstd frame (bss-zstd only), reused across chunks
+            // Every full chunk of a column produces IDENTICAL page-encoding bytes (only the row-count
+            // varint differs, and full chunks all carry `step` rows) -- build once, copy per page.
+            std::vector<std::uint8_t> full_chunk_encoding;
+            auto build_page_encoding = [&](std::size_t count) {
+                if (bitpack) {
+                    return page_layout_bytes_inline_bitpacking(
+                        static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), count);
+                }
+                if (bool_pack) {
+                    // Plain Flat{bits_per_value:1} -- no CompressiveEncoding wrapper, matching stock Lance.
+                    return page_layout_bytes(flat_bits_per_value_token(field), count, false);
+                }
+                return page_layout_bytes_bss_zstd(flat_bits_per_value_token(field), count);
+            };
             for (std::size_t off = 0; off < total;) {
                 const auto count = std::min(step, total - off);
                 if (bitpack) {
@@ -1260,14 +1285,13 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 page.buffer_sizes.push_back(payload_size);
                 page.length = count;
                 page.priority = 0;
-                if (bitpack) {
-                    page.encoding = page_layout_bytes_inline_bitpacking(
-                        static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), count);
-                } else if (bool_pack) {
-                    // Plain Flat{bits_per_value:1} -- no CompressiveEncoding wrapper, matching stock Lance.
-                    page.encoding = page_layout_bytes(flat_bits_per_value_token(field), count, false);
+                if (count == step) {
+                    if (full_chunk_encoding.empty()) {
+                        full_chunk_encoding = build_page_encoding(count);
+                    }
+                    page.encoding = full_chunk_encoding;
                 } else {
-                    page.encoding = page_layout_bytes_bss_zstd(flat_bits_per_value_token(field), count);
+                    page.encoding = build_page_encoding(count);
                 }
                 column.pages.push_back(std::move(page));
                 off += count;

@@ -63,12 +63,13 @@ int set_error(NanoLanceWriter* writer, int code, const std::string& message) {
 
 // One RLE scan pass over `n` fixed-width values of size sizeof(T) at `data`. With `runs_out == nullptr`
 // it only counts split runs (Lance caps a run at 255, so a run of length L counts as ceil(L/255)) and
-// rejects early -- zero allocation, single inlined load-and-compare per row instead of a libc memcmp
-// call per row (which dominated the write profile for scattered integer columns). With `runs_out` set
-// it records one (row index, run length) pair per run and never rejects (only already-accepted columns
-// take that pass).
+// rejects as soon as split_runs reaches `reject_at` -- zero allocation, single inlined
+// load-and-compare per row instead of a libc memcmp call per row (which dominated the write profile
+// for scattered integer columns). With `runs_out` set it records one (row index, run length) pair per
+// run and never rejects (only already-accepted columns take that pass).
 template <class T>
-bool typed_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t& split_runs_out,
+bool typed_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t reject_at,
+                    std::size_t& split_runs_out,
                     std::vector<std::pair<std::size_t, std::uint64_t>>* runs_out) {
     std::size_t split_runs = 0;
     std::size_t i = 0;
@@ -85,7 +86,7 @@ bool typed_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t& split_
             ++run;
         }
         split_runs += (run + 254U) / 255U;
-        if (runs_out == nullptr && split_runs * 2U >= n) {
+        if (runs_out == nullptr && split_runs >= reject_at) {
             return false;  // not run-friendly; counting pass bails the moment the verdict is decided
         }
         if (runs_out != nullptr) {
@@ -97,18 +98,18 @@ bool typed_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t& split_
     return true;
 }
 
-bool dispatch_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t bpv,
+bool dispatch_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t bpv, std::size_t reject_at,
                        std::size_t& split_runs_out,
                        std::vector<std::pair<std::size_t, std::uint64_t>>* runs_out) {
     switch (bpv) {
         case 1U:
-            return typed_rle_scan<std::uint8_t>(data, n, split_runs_out, runs_out);
+            return typed_rle_scan<std::uint8_t>(data, n, reject_at, split_runs_out, runs_out);
         case 2U:
-            return typed_rle_scan<std::uint16_t>(data, n, split_runs_out, runs_out);
+            return typed_rle_scan<std::uint16_t>(data, n, reject_at, split_runs_out, runs_out);
         case 4U:
-            return typed_rle_scan<std::uint32_t>(data, n, split_runs_out, runs_out);
+            return typed_rle_scan<std::uint32_t>(data, n, reject_at, split_runs_out, runs_out);
         case 8U:
-            return typed_rle_scan<std::uint64_t>(data, n, split_runs_out, runs_out);
+            return typed_rle_scan<std::uint64_t>(data, n, reject_at, split_runs_out, runs_out);
         default:
             return false;  // caller gates on bitpackable integer types, so bpv is always 1/2/4/8
     }
@@ -126,8 +127,23 @@ bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv) {
         return false;
     }
     const std::size_t n = cv.fixed.size() / bpv;
+    // Prefix-sample pre-check (same pattern as variable_column_dict_beneficial's sampling): even with
+    // the reject-early exit, a scattered column scans ~n/2 rows before failing (split_runs grows one
+    // per row, crossing n/2 halfway through). A 4096-row prefix predicts that verdict at ~1/25 the
+    // cost. Reject only when the sample DECISIVELY fails -- split_runs over 3/4 of the sample, a 1.5x
+    // margin above the real n/2 cutoff -- to keep false negatives rare; the cost of one is a valid,
+    // slightly larger bitpack fallback, never wrong data.
+    constexpr std::size_t kSampleRows = 4096U;
+    if (n > kSampleRows * 4U) {
+        std::size_t sample_split_runs = 0;
+        if (!dispatch_rle_scan(cv.fixed.data(), kSampleRows, bpv, kSampleRows * 3U / 4U,
+                               sample_split_runs, nullptr)) {
+            return false;
+        }
+    }
     std::size_t split_runs = 0;
-    if (!dispatch_rle_scan(cv.fixed.data(), n, bpv, split_runs, nullptr)) {
+    // reject_at == ceil(n/2) is exactly the previous `split_runs * 2 >= n` cutoff.
+    if (!dispatch_rle_scan(cv.fixed.data(), n, bpv, (n + 1U) / 2U, split_runs, nullptr)) {
         return false;
     }
     // One chunk for the whole column: run buffers must fit the miniblock (12-bit word => 32760 bytes).
@@ -138,7 +154,7 @@ bool fixed_column_rle_plan(nano_lance::ColumnValues& cv, std::size_t bpv) {
     }
     std::vector<std::pair<std::size_t, std::uint64_t>> runs;
     std::size_t split_runs_again = 0;
-    if (!dispatch_rle_scan(cv.fixed.data(), n, bpv, split_runs_again, &runs)) {
+    if (!dispatch_rle_scan(cv.fixed.data(), n, bpv, n + 1U, split_runs_again, &runs)) {
         return false;
     }
     cv.fixed_rle_plan.computed = true;
