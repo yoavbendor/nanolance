@@ -4,12 +4,12 @@ The nanom sibling of [`../pcapng2lance`](../pcapng2lance). It converts pcap / pc
 dataset — one row per packet, payloads kept **external** (a `lance.blob.v2` `payload_ref` of `uri` +
 position + size, never copied) — but the entire **parse** side runs through
 [**nanom**](https://github.com/yoavbendor/nanom), a single-header C++23 parser-combinator library, instead
-of the nanotins reflection stack. The **write** side pairs it with nanolance's compile-time typed facade:
-the per-PDU tables derive their Lance schema at compile time from each row struct's single
+of the nanotins reflection stack. The **write** side runs entirely on nanolance's compile-time typed
+facade: the per-PDU tables derive their Lance schema at compile time from each row struct's single
 `NANOM_DESCRIBE` (see [`include/soa_lance_writer.hpp`](include/soa_lance_writer.hpp)) and write nanom's
-columnar chunk buffers zero-copy — no nanoarrow builder, no per-cell appends. Only the L1 packet table
-and the remainder table still build a nanoarrow batch, because their `lance.blob.v2` nested struct
-column isn't expressible in the flat typed schema.
+columnar chunk buffers zero-copy, and the L1 packet table and remainder table declare their schemas as
+types too — including the `lance.blob.v2` external `payload_ref`, via the facade's `blob_ref_column`.
+No nanoarrow builder, no per-cell appends, anywhere in this example.
 
 It exists to show, concretely, that nanom has **full network-parsing capability** — swapping the parser
 leaves the Lance dataset byte-for-byte identical, at both L1 (the packet table) and L2/L3/L4 (the per-PDU

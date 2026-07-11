@@ -419,6 +419,10 @@ add_executable(nano_lance_typed_writer_test tests/test_typed_writer.cpp)
 target_compile_features(nano_lance_typed_writer_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_typed_writer_test PRIVATE nanolance)
 
+add_executable(nano_lance_typed_blob_writer_test tests/test_typed_blob_writer.cpp)
+target_compile_features(nano_lance_typed_blob_writer_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_typed_blob_writer_test PRIVATE nanolance)
+
 add_executable(nano_lance_constant_roundtrip_test tests/test_constant_roundtrip.cpp)
 target_compile_features(nano_lance_constant_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_constant_roundtrip_test PRIVATE nanolance)
@@ -528,6 +532,9 @@ set_tests_properties(nano_lance_writer_options PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_typed_writer COMMAND $<TARGET_FILE:nano_lance_typed_writer_test>)
 set_tests_properties(nano_lance_typed_writer PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_typed_blob_writer COMMAND $<TARGET_FILE:nano_lance_typed_blob_writer_test>)
+set_tests_properties(nano_lance_typed_blob_writer PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_bitpacking_roundtrip COMMAND $<TARGET_FILE:nano_lance_bitpacking_roundtrip_test>)
 set_tests_properties(nano_lance_bitpacking_roundtrip PROPERTIES LABELS "smoke")
