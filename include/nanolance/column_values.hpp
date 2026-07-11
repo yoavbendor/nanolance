@@ -73,6 +73,17 @@ struct ColumnValues {
     StructuralDictPlan structural_dict_plan;
     StructuralDictRlePlan structural_dict_rle_plan;
     FixedRlePlan fixed_rle_plan;
+
+    /// Write-side zero-copy ingest (nano_lance_writer_set_borrow_buffers): a single-batch fixed-width
+    /// column borrows the caller's Arrow buffer instead of copying it into `fixed`. When set, this
+    /// view -- NOT `fixed` -- holds the column's bytes; the caller guarantees the memory outlives
+    /// commit. All write-side consumers must go through fixed_data()/fixed_size(). The read side never
+    /// sets this, so decoded columns behave exactly as before.
+    const std::uint8_t* fixed_borrowed = nullptr;
+    std::size_t fixed_borrowed_size = 0;
+
+    const std::uint8_t* fixed_data() const { return fixed_borrowed != nullptr ? fixed_borrowed : fixed.data(); }
+    std::size_t fixed_size() const { return fixed_borrowed != nullptr ? fixed_borrowed_size : fixed.size(); }
 };
 
 }  // namespace nano_lance
