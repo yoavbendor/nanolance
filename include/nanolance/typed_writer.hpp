@@ -22,6 +22,11 @@
 // zero-copy straight from the caller's memory and MUST remain valid and unmodified until commit().
 // Set borrow_buffers=false to copy at write_batch time instead (the classic contract). String and
 // bool columns are always copied at write_batch time regardless (they need Arrow-layout staging).
+//
+// lance.blob.v2: blob_ref_column<"payload_ref"> declares an external-blob-reference column (Arrow
+// struct with the lance.blob.v2 extension metadata); its write_batch parameter is a
+// std::span<const blob_ref> of {uri, position, size}. External refs only (the native writer rejects
+// inline blob data), at most one per schema, always copied at write_batch time.
 
 #pragma once
 
@@ -222,9 +227,73 @@ struct column {
     static constexpr bool checked = detail::check_encoding<T, Enc>();
 };
 
+/// One external lance.blob.v2 reference: the payload lives in the file at `uri`, at byte `position`,
+/// `size` bytes long. The uri string must stay valid until the write_batch call returns (the values
+/// are staged/copied there -- blob columns never borrow).
+struct blob_ref {
+    std::string_view uri;
+    std::uint64_t position = 0;
+    std::uint64_t size = 0;
+};
+
+/// A `lance.blob.v2` external-reference column (Arrow struct `payload_ref` with children
+/// data/uri/position/size and the ARROW:extension:name metadata). External refs only -- the native
+/// writer rejects inline blob data. At most one blob column per schema, and its span is always
+/// copied at write_batch time (AoS blob_refs are split into the four child buffers).
+template <fixed_string Name>
+struct blob_ref_column {
+    using value_type = blob_ref;
+    static constexpr auto name = Name;
+    static constexpr encoding enc = encoding::auto_detect;
+};
+
+namespace detail {
+
+template <class Column>
+struct is_blob_column : std::false_type {};
+template <fixed_string Name>
+struct is_blob_column<blob_ref_column<Name>> : std::true_type {};
+template <class Column>
+inline constexpr bool is_blob_column_v = is_blob_column<Column>::value;
+
+// The Arrow C binary metadata blob for {"ARROW:extension:name": "lance.blob.v2"}, composed at
+// compile time: little-endian int32 pair count, then int32 key length + key + int32 value length +
+// value (the format ArrowMetadataGetValue parses).
+struct blob_v2_metadata_storage {
+    static constexpr std::string_view key = "ARROW:extension:name";
+    static constexpr std::string_view val = "lance.blob.v2";
+    static constexpr std::array<char, 12 + key.size() + val.size()> make() {
+        std::array<char, 12 + key.size() + val.size()> out{};
+        std::size_t p = 0;
+        auto put_i32 = [&](std::size_t v) {
+            for (unsigned i = 0; i < 4U; ++i) {
+                out[p++] = static_cast<char>((v >> (8U * i)) & 0xFFU);
+            }
+        };
+        put_i32(1);
+        put_i32(key.size());
+        for (const char c : key) {
+            out[p++] = c;
+        }
+        put_i32(val.size());
+        for (const char c : val) {
+            out[p++] = c;
+        }
+        return out;
+    }
+};
+// Out-of-class so make() is complete when the initializer runs (the class is not a template, unlike
+// fsb_format_storage, so an in-class `storage = make()` would be ill-formed).
+inline constexpr auto blob_v2_metadata = blob_v2_metadata_storage::make();
+
+}  // namespace detail
+
 template <class... Columns>
 struct schema {
     static constexpr std::size_t column_count = sizeof...(Columns);
+    static_assert((std::size_t(detail::is_blob_column_v<Columns>) + ... + 0U) <= 1U,
+                  "at most one lance.blob.v2 column per schema (the writer supports a single "
+                  "root-level blob field)");
 };
 
 template <class Schema>
@@ -336,6 +405,19 @@ private:
         std::array<std::vector<std::int32_t>, kColumns> string_offsets;
         std::array<std::string, kColumns> string_data;
         std::array<std::vector<std::uint8_t>, kColumns> bool_bits;
+        // One nested level for the (at most one) blob column: the payload_ref struct's four children
+        // data/uri/position/size, plus their staged buffers. The `data` child is all-empty non-null
+        // (int64 offsets of zeros over a dummy data pointer) -- external refs carry no inline bytes.
+        std::array<ArrowSchema, 4> blob_child_schemas{};
+        std::array<ArrowArray, 4> blob_child_arrays{};
+        std::array<ArrowSchema*, 4> blob_schema_children{};
+        std::array<ArrowArray*, 4> blob_array_children{};
+        std::array<std::array<const void*, 3>, 4> blob_buffers{};
+        std::vector<std::int64_t> blob_data_offsets;
+        std::vector<std::int32_t> blob_uri_offsets;
+        std::string blob_uri_data;
+        std::vector<std::uint64_t> blob_positions;
+        std::vector<std::uint64_t> blob_sizes;
     };
 
     template <class Column>
@@ -349,6 +431,83 @@ private:
 
     template <class Column, class T>
     void fill_column(std::span<const T> values, BatchStorage& storage, std::size_t& index) {
+        if constexpr (detail::is_blob_column_v<Column>) {
+            fill_blob_column<Column>(values, storage, index);
+            return;
+        } else {
+            fill_flat_column<Column>(values, storage, index);
+        }
+    }
+
+    template <class Column>
+    void fill_blob_column(std::span<const blob_ref> values, BatchStorage& storage, std::size_t& index) {
+        const std::size_t n = values.size();
+        // Stage the AoS refs into the four child buffers (blob columns are always copied here).
+        storage.blob_data_offsets.assign(n + 1U, 0);
+        storage.blob_positions.resize(n);
+        storage.blob_sizes.resize(n);
+        auto& uri_offsets = storage.blob_uri_offsets;
+        auto& uri_data = storage.blob_uri_data;
+        uri_offsets.reserve(n + 1U);
+        uri_offsets.push_back(0);
+        std::size_t total = 0;
+        for (const auto& v : values) {
+            total += v.uri.size();
+        }
+        uri_data.reserve(total);
+        for (std::size_t i = 0; i < n; ++i) {
+            uri_data.append(values[i].uri.data(), values[i].uri.size());
+            uri_offsets.push_back(static_cast<std::int32_t>(uri_data.size()));
+            storage.blob_positions[i] = values[i].position;
+            storage.blob_sizes[i] = values[i].size;
+        }
+
+        // Child schemas/arrays in the canonical blob.v2 order (the ingest matches children by name).
+        static constexpr const char* kChildNames[4] = {"data", "uri", "position", "size"};
+        static constexpr const char* kChildFormats[4] = {"Z", "u", "L", "L"};
+        static constexpr std::uint8_t kDummyByte = 0;  // non-null pointer for the all-empty data child
+        for (std::size_t c = 0; c < 4U; ++c) {
+            auto& csch = storage.blob_child_schemas[c];
+            csch.format = kChildFormats[c];
+            csch.name = kChildNames[c];
+            storage.blob_schema_children[c] = &csch;
+            auto& carr = storage.blob_child_arrays[c];
+            carr.length = static_cast<std::int64_t>(n);
+            carr.buffers = storage.blob_buffers[c].data();
+            storage.blob_buffers[c][0] = nullptr;
+            storage.blob_array_children[c] = &carr;
+        }
+        storage.blob_buffers[0][1] = storage.blob_data_offsets.data();
+        storage.blob_buffers[0][2] = &kDummyByte;
+        storage.blob_child_arrays[0].n_buffers = 3;
+        storage.blob_buffers[1][1] = uri_offsets.data();
+        storage.blob_buffers[1][2] = uri_data.data();
+        storage.blob_child_arrays[1].n_buffers = 3;
+        storage.blob_buffers[2][1] = storage.blob_positions.data();
+        storage.blob_child_arrays[2].n_buffers = 2;
+        storage.blob_buffers[3][1] = storage.blob_sizes.data();
+        storage.blob_child_arrays[3].n_buffers = 2;
+
+        auto& sch = storage.child_schemas[index];
+        sch.format = "+s";
+        sch.name = Column::name.c_str();
+        sch.metadata = detail::blob_v2_metadata.data();
+        sch.n_children = 4;
+        sch.children = storage.blob_schema_children.data();
+
+        auto& arr = storage.child_arrays[index];
+        auto& bufs = storage.buffers[index];
+        bufs[0] = nullptr;
+        arr.length = static_cast<std::int64_t>(n);
+        arr.n_buffers = 1;
+        arr.buffers = bufs.data();
+        arr.n_children = 4;
+        arr.children = storage.blob_array_children.data();
+        ++index;
+    }
+
+    template <class Column, class T>
+    void fill_flat_column(std::span<const T> values, BatchStorage& storage, std::size_t& index) {
         auto& sch = storage.child_schemas[index];
         auto& arr = storage.child_arrays[index];
         auto& bufs = storage.buffers[index];

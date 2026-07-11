@@ -10,8 +10,10 @@
 // pcap/pcapng block scanner and the per-EPB field decode — runs through nanom's
 // parser-combinator core (`nm::strct<T>(order)` over structs described with one
 // `NANOM_DESCRIBE`) rather than nanotins' hand-rolled readers + soatins
-// reflection. The Lance write side is unchanged: nanoarrow builds the record
-// batch and nanolance writes the fragment.
+// reflection. The Lance write side runs entirely on nanolance's compile-time
+// typed facade: the L1 and remainder tables declare their schema (including the
+// lance.blob.v2 payload_ref via blob_ref_column) as a type, and the per-PDU
+// tables derive theirs from each row struct's NANOM_DESCRIBE.
 //
 // Scope: the L1 packet table (the `packets.lance` that `pcapng2lance` writes)
 // plus, under --decode-l2l3, the full L2/L3/L4 protocol walk (Ethernet -> VLAN*
@@ -34,28 +36,26 @@
 #include "pdu_tables.hpp"        // per-PDU Lance row types + converters (--decode-l2l3)
 #include "soa_lance_writer.hpp"  // generic nanom soa<Row> -> Lance table writer
 
-#include "nanolance/blob_builder.hpp"
-#include "nanolance/nano_lance_writer.h"
-
-#include <nanoarrow/nanoarrow.h>
+#include "nanolance/typed_writer.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
 namespace nm = nanom;
+namespace nt = nano_lance::typed;
 
 namespace {
 
 // The L1 packet row — byte-for-byte the same schema pcapng2lance writes (see
-// examples/pcapng2lance/include/packet_row.hpp). Described once for nanom; the
-// nanom `soa<PacketRow>` gives the Arrow format string per column for free, but
-// here we hand the columns straight to nanoarrow so the on-disk schema matches
-// the nanotins example exactly (field order + Arrow types).
+// examples/pcapng2lance/include/packet_row.hpp): eight scalar columns + the
+// lance.blob.v2 external payload_ref, declared as a compile-time typed schema
+// (field order + Arrow types match the nanotins example exactly).
 struct PacketRow {
     std::uint64_t packet_id;
     std::uint32_t interface_id;
@@ -66,6 +66,20 @@ struct PacketRow {
     std::uint8_t ts_resol;
     std::uint32_t epb_flags;
 };
+
+using L1Schema = nt::schema<nt::column<std::uint64_t, "packet_id">,
+                            nt::column<std::uint32_t, "interface_id">,
+                            nt::column<std::uint64_t, "ts_raw">,
+                            nt::column<std::uint32_t, "caplen">,
+                            nt::column<std::uint32_t, "origlen">,
+                            nt::column<std::uint16_t, "link_type">,
+                            nt::column<std::uint8_t, "ts_resol">,
+                            nt::column<std::uint32_t, "epb_flags">,
+                            nt::blob_ref_column<"payload_ref">>;
+
+using RemainderSchema = nt::schema<nt::column<std::uint64_t, "packet_id">,
+                                   nt::column<std::uint64_t, "next_protocol">,
+                                   nt::blob_ref_column<"payload_ref">>;
 
 int fail(const std::string& msg) {
     std::fprintf(stderr, "pcapng2lance_nanom: %s\n", msg.c_str());
@@ -164,42 +178,6 @@ bool parse_args(int argc, char** argv, Args& a, std::string& err) {
     return true;
 }
 
-// ---- Arrow schema (8 scalar columns + external payload_ref), identical to pcapng2lance -----------
-
-struct ScalarCol {
-    const char* name;
-    ArrowType type;
-};
-constexpr ScalarCol kScalars[] = {
-    {"packet_id", NANOARROW_TYPE_UINT64},    {"interface_id", NANOARROW_TYPE_UINT32},
-    {"ts_raw", NANOARROW_TYPE_UINT64},       {"caplen", NANOARROW_TYPE_UINT32},
-    {"origlen", NANOARROW_TYPE_UINT32},      {"link_type", NANOARROW_TYPE_UINT16},
-    {"ts_resol", NANOARROW_TYPE_UINT8},      {"epb_flags", NANOARROW_TYPE_UINT32},
-};
-constexpr std::size_t kScalarCols = sizeof(kScalars) / sizeof(kScalars[0]);
-
-bool build_schema(ArrowSchema& schema, std::string& err) {
-    ArrowSchemaInit(&schema);
-    if (ArrowSchemaSetTypeStruct(&schema, static_cast<int64_t>(kScalarCols + 1)) != NANOARROW_OK) {
-        return (err = "alloc combined schema", false);
-    }
-    for (std::size_t i = 0; i < kScalarCols; ++i) {
-        if (ArrowSchemaSetType(schema.children[i], kScalars[i].type) != NANOARROW_OK ||
-            ArrowSchemaSetName(schema.children[i], kScalars[i].name) != NANOARROW_OK) {
-            return (err = std::string("scalar schema: ") + kScalars[i].name, false);
-        }
-    }
-    ArrowSchema blob{};
-    if (!nano_lance::build_blob_v2_payload_schema(blob, err)) {
-        return (err = "blob schema: " + err, false);
-    }
-    ArrowSchemaRelease(schema.children[kScalarCols]);  // swap the placeholder child for the blob struct
-    std::memcpy(schema.children[kScalarCols], &blob, sizeof(ArrowSchema));
-    blob.release = nullptr;
-    schema.flags = 0;
-    return true;
-}
-
 // ---- the converter -------------------------------------------------------------------------------
 
 class Converter {
@@ -217,14 +195,9 @@ public:
         std::string err;
         if (!nmpcap::scan_blocks(file, refs, err)) return fail("scan: " + err);
 
-        if (!args_.no_write) {
-            if (!build_schema(schema_, err)) return fail(err);
-            if (const int rc = open_writer()) return rc;
-        }
-
         // Phase B: classify + parse each packet, tabulate into the row buffers.
         std::vector<PacketRow> rows;
-        std::vector<nano_lance::BlobV2Row> payload;
+        std::vector<nt::blob_ref> payload;
         std::vector<std::uint16_t> iface_link;  // link_type per interface, in the current section
         std::vector<std::uint8_t> iface_res;    // ts_resol per interface, in the current section
         for (const auto& ref : refs) {
@@ -253,8 +226,7 @@ public:
                         e.interface_id < iface_res.size() ? iface_res[e.interface_id] : std::uint8_t{6};
                     rows.push_back(PacketRow{pid_, e.interface_id, e.ts_raw, e.caplen, e.origlen, link, res,
                                              epb_flags(file, ref, e.caplen)});
-                    payload.push_back(nano_lance::BlobV2Row{/*inline_data=*/std::nullopt, payload_uri_,
-                                                            e.payload_file_offset, e.caplen});
+                    payload.push_back(nt::blob_ref{payload_uri_, e.payload_file_offset, e.caplen});
                     if (args_.decode_l2l3) decode_packet(pid_, link, file, e.payload_file_offset, e.caplen);
                     ++pid_;
                     break;
@@ -267,8 +239,6 @@ public:
 
         if (!args_.no_write) {
             if (const int rc = write_batch(rows, payload)) return rc;
-            nano_lance_writer_close(&writer_);
-            ArrowSchemaRelease(&schema_);
             if (args_.decode_l2l3) {
                 if (const int rc = write_pdu_tables()) return rc;
             }
@@ -291,62 +261,43 @@ private:
         return true;
     }
 
-    int open_writer() {
-        if (nano_lance_writer_init(&writer_, output_.string().c_str(), 3) != NANO_LANCE_OK) {
-            return fail(std::string("writer init: ") + nano_lance_writer_last_error(&writer_));
-        }
-        nano_lance_writer_set_ignore_nullability(&writer_, true);  // blob.v2 data child is null for externals
-        nano_lance_writer_set_compression(&writer_, args_.compress);
-        return 0;
-    }
-
-    // Build the combined Arrow record batch (8 scalar columns + external payload_ref) and commit it as
-    // one Lance fragment — the same on-disk shape pcapng2lance's write_batch produces. This table (and
-    // the remainder table below) stays on the C API + nanoarrow: its lance.blob.v2 payload_ref is a
-    // nested struct column, which the flat typed facade (used for the per-PDU tables via
-    // soa_lance_writer.hpp) cannot express.
-    int write_batch(const std::vector<PacketRow>& rows, const std::vector<nano_lance::BlobV2Row>& payload) {
+    // Write the L1 packet table (8 scalar columns + external payload_ref) as one Lance fragment — the
+    // same on-disk shape pcapng2lance's write_batch produces. The AoS PacketRow accumulator is
+    // transposed into per-column buffers (one linear pass) and handed to the compile-time typed
+    // writer; the blob_ref span carries the shared capture URI per row.
+    int write_batch(const std::vector<PacketRow>& rows, const std::vector<nt::blob_ref>& payload) {
         const std::size_t n = rows.size();
-        ArrowArray batch{};
-        if (ArrowArrayInitFromSchema(&batch, &schema_, nullptr) != NANOARROW_OK ||
-            ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
-            return fail("alloc combined array");
-        }
-        ArrowArray* pay = batch.children[kScalarCols];
+        std::vector<std::uint64_t> packet_id(n), ts_raw(n);
+        std::vector<std::uint32_t> interface_id(n), caplen(n), origlen(n), epb(n);
+        std::vector<std::uint16_t> link_type(n);
+        std::vector<std::uint8_t> ts_resol(n);
         for (std::size_t i = 0; i < n; ++i) {
             const PacketRow& r = rows[i];
-            if (ArrowArrayAppendUInt(batch.children[0], r.packet_id) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(batch.children[1], r.interface_id) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(batch.children[2], r.ts_raw) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(batch.children[3], r.caplen) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(batch.children[4], r.origlen) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(batch.children[5], r.link_type) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(batch.children[6], r.ts_resol) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(batch.children[7], r.epb_flags) != NANOARROW_OK) {
-                return fail("append scalar columns");
-            }
-            const nano_lance::BlobV2Row& b = payload[i];
-            ArrowStringView uri{b.uri->data(), static_cast<int64_t>(b.uri->size())};
-            if (ArrowArrayAppendNull(pay->children[0], 1) != NANOARROW_OK ||
-                ArrowArrayAppendString(pay->children[1], uri) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(pay->children[2], b.position) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(pay->children[3], b.size) != NANOARROW_OK) {
-                return fail("append payload_ref");
-            }
-            if (ArrowArrayFinishElement(pay) != NANOARROW_OK ||
-                ArrowArrayFinishElement(&batch) != NANOARROW_OK) {
-                return fail("finish element");
-            }
+            packet_id[i] = r.packet_id;
+            interface_id[i] = r.interface_id;
+            ts_raw[i] = r.ts_raw;
+            caplen[i] = r.caplen;
+            origlen[i] = r.origlen;
+            link_type[i] = r.link_type;
+            ts_resol[i] = r.ts_resol;
+            epb[i] = r.epb_flags;
         }
-        if (ArrowArrayFinishBuildingDefault(&batch, nullptr) != NANOARROW_OK) return fail("finalize array");
-        const int wrote = nano_lance_write_batch(&writer_, &batch, &schema_);
-        batch.release(&batch);
-        if (wrote != NANO_LANCE_OK) {
-            return fail(std::string("write_batch: ") + nano_lance_writer_last_error(&writer_));
+        nt::writer<L1Schema> w(output_.string().c_str(),
+                               {.compression_level = 3, .compress = args_.compress});
+        if (!w.ok()) return fail(std::string("writer init: ") + w.last_error());
+        if (!w.write_batch(std::span<const std::uint64_t>(packet_id),
+                           std::span<const std::uint32_t>(interface_id),
+                           std::span<const std::uint64_t>(ts_raw),
+                           std::span<const std::uint32_t>(caplen),
+                           std::span<const std::uint32_t>(origlen),
+                           std::span<const std::uint16_t>(link_type),
+                           std::span<const std::uint8_t>(ts_resol),
+                           std::span<const std::uint32_t>(epb),
+                           std::span<const nt::blob_ref>(payload))) {
+            return fail(std::string("write_batch: ") + w.last_error());
         }
-        if (nano_lance_writer_commit(&writer_, /*is_append=*/false) != NANO_LANCE_OK) {
-            return fail(std::string("commit: ") + nano_lance_writer_last_error(&writer_));
-        }
+        if (!w.commit()) return fail(std::string("commit: ") + w.last_error());
+        w.close();
         return 0;
     }
 
@@ -388,9 +339,8 @@ private:
         if (wr.reached_l4 && wr.l4_payload_offset < caplen) {
             rem_pid_.push_back(pid);
             rem_next_.push_back(wr.l4_ports);
-            rem_pay_.push_back(nano_lance::BlobV2Row{std::nullopt, payload_uri_,
-                                                     poff + wr.l4_payload_offset,
-                                                     caplen - wr.l4_payload_offset});
+            rem_pay_.push_back(nt::blob_ref{payload_uri_, poff + wr.l4_payload_offset,
+                                            caplen - wr.l4_payload_offset});
         }
     }
 
@@ -429,81 +379,24 @@ private:
     }
 
     // remainder_after_l4: packet_id + next_protocol (packed L4 ports) + the external payload_ref of the
-    // bytes past L4. Its own tiny schema (two scalars + the blob.v2 struct); skipped when empty.
+    // bytes past L4. Its own tiny typed schema (two scalars + the blob.v2 struct); skipped when empty.
     int write_remainder_table(const std::string& path) {
         if (rem_pid_.empty()) return 0;
-        std::string err;
-        ArrowSchema schema{};
-        ArrowSchemaInit(&schema);
-        if (ArrowSchemaSetTypeStruct(&schema, 3) != NANOARROW_OK ||
-            ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_UINT64) != NANOARROW_OK ||
-            ArrowSchemaSetName(schema.children[0], "packet_id") != NANOARROW_OK ||
-            ArrowSchemaSetType(schema.children[1], NANOARROW_TYPE_UINT64) != NANOARROW_OK ||
-            ArrowSchemaSetName(schema.children[1], "next_protocol") != NANOARROW_OK) {
-            ArrowSchemaRelease(&schema);
-            return fail("remainder schema");
+        nt::writer<RemainderSchema> w(path.c_str(), {.compression_level = 3, .compress = args_.compress});
+        if (!w.ok()) return fail(std::string("remainder writer init: ") + w.last_error());
+        if (!w.write_batch(std::span<const std::uint64_t>(rem_pid_),
+                           std::span<const std::uint64_t>(rem_next_),
+                           std::span<const nt::blob_ref>(rem_pay_)) ||
+            !w.commit()) {
+            return fail(std::string("remainder write: ") + w.last_error());
         }
-        ArrowSchema blob{};
-        if (!nano_lance::build_blob_v2_payload_schema(blob, err)) {
-            ArrowSchemaRelease(&schema);
-            return fail("remainder blob schema: " + err);
-        }
-        ArrowSchemaRelease(schema.children[2]);
-        std::memcpy(schema.children[2], &blob, sizeof(ArrowSchema));
-        blob.release = nullptr;
-        schema.flags = 0;
-
-        NanoLanceWriter writer{};
-        if (nano_lance_writer_init(&writer, path.c_str(), 3) != NANO_LANCE_OK) {
-            ArrowSchemaRelease(&schema);
-            return fail(std::string("remainder writer init: ") + nano_lance_writer_last_error(&writer));
-        }
-        nano_lance_writer_set_ignore_nullability(&writer, true);
-        nano_lance_writer_set_compression(&writer, args_.compress);
-
-        ArrowArray batch{};
-        if (ArrowArrayInitFromSchema(&batch, &schema, nullptr) != NANOARROW_OK ||
-            ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
-            nano_lance_writer_close(&writer);
-            ArrowSchemaRelease(&schema);
-            return fail("alloc remainder array");
-        }
-        ArrowArray* pay = batch.children[2];
-        for (std::size_t i = 0; i < rem_pid_.size(); ++i) {
-            const nano_lance::BlobV2Row& b = rem_pay_[i];
-            ArrowStringView uri{b.uri->data(), static_cast<int64_t>(b.uri->size())};
-            if (ArrowArrayAppendUInt(batch.children[0], rem_pid_[i]) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(batch.children[1], rem_next_[i]) != NANOARROW_OK ||
-                ArrowArrayAppendNull(pay->children[0], 1) != NANOARROW_OK ||
-                ArrowArrayAppendString(pay->children[1], uri) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(pay->children[2], b.position) != NANOARROW_OK ||
-                ArrowArrayAppendUInt(pay->children[3], b.size) != NANOARROW_OK ||
-                ArrowArrayFinishElement(pay) != NANOARROW_OK ||
-                ArrowArrayFinishElement(&batch) != NANOARROW_OK) {
-                batch.release(&batch);
-                nano_lance_writer_close(&writer);
-                ArrowSchemaRelease(&schema);
-                return fail("append remainder row");
-            }
-        }
-        int rc = 0;
-        if (ArrowArrayFinishBuildingDefault(&batch, nullptr) != NANOARROW_OK) {
-            rc = fail("finalize remainder array");
-        } else if (nano_lance_write_batch(&writer, &batch, &schema) != NANO_LANCE_OK ||
-                   nano_lance_writer_commit(&writer, /*is_append=*/false) != NANO_LANCE_OK) {
-            rc = fail(std::string("remainder write: ") + nano_lance_writer_last_error(&writer));
-        }
-        batch.release(&batch);
-        nano_lance_writer_close(&writer);
-        ArrowSchemaRelease(&schema);
-        return rc;
+        w.close();
+        return 0;
     }
 
     Args args_;
     fs::path output_;
     std::string payload_uri_;
-    ArrowSchema schema_{};
-    NanoLanceWriter writer_{};
     std::uint64_t pid_ = 0;
     std::size_t shb_count_ = 0, idb_count_ = 0, other_count_ = 0;
 
@@ -521,7 +414,7 @@ private:
     nm::soa<p2l_nanom::Ipv6SrhSegmentRow> srh_segment_{4096};
     nm::soa<p2l_nanom::Ipv6OptionRow> ipv6_opt_{4096};
     std::vector<std::uint64_t> rem_pid_, rem_next_;
-    std::vector<nano_lance::BlobV2Row> rem_pay_;
+    std::vector<nt::blob_ref> rem_pay_;
 };
 
 }  // namespace
