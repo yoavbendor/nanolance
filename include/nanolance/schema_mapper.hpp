@@ -51,11 +51,29 @@ inline bool lance_logical_type_has_large_offsets(const std::string& logical_type
            logical_type == "large_binary";
 }
 
+/// Temporal types backed by a 32-bit integer on the wire (`date32:day`, `time32:s`, `time32:ms`).
+/// Everything else temporal -- timestamps, `date64:ms`, `time64:*` -- is 64-bit.
+inline bool lance_logical_type_is_32bit_temporal(const std::string& logical_type) {
+    return logical_type.rfind("date32:", 0) == 0 || logical_type.rfind("time32:", 0) == 0;
+}
+
+/// Is this a temporal type? They are integers on the wire, so every fixed-width encoding applies.
+inline bool lance_logical_type_is_temporal(const std::string& logical_type) {
+    return logical_type.rfind("timestamp:", 0) == 0 || logical_type.rfind("date32:", 0) == 0 ||
+           logical_type.rfind("date64:", 0) == 0 || logical_type.rfind("time32:", 0) == 0 ||
+           logical_type.rfind("time64:", 0) == 0;
+}
+
 /// Integer logical types (8/16/32/64-bit) eligible for Lance InlineBitpacking. Excludes bool/float.
 inline bool lance_logical_type_is_bitpackable_integer(const std::string& logical_type) {
+    // Temporal types are included deliberately: they are integers on the wire, they are usually
+    // monotonic (so they bitpack extremely well), and stock Lance bitpacks them too -- a pylance
+    // timestamp column's page descriptor reads InlineBitpacking(64). Decimals are excluded: they are
+    // 16/32 bytes wide, beyond the FastLanes kernel's 8/16/32/64-bit widths.
     return logical_type == "int8" || logical_type == "uint8" || logical_type == "int16" ||
            logical_type == "uint16" || logical_type == "int32" || logical_type == "uint32" ||
-           logical_type == "int64" || logical_type == "uint64";
+           logical_type == "int64" || logical_type == "uint64" ||
+           lance_logical_type_is_temporal(logical_type);
 }
 
 /// Lance `file.Field.encoding`: 1 = fixed-width, 2 = variable-width.
@@ -76,6 +94,16 @@ inline std::size_t lance_logical_type_value_bytes(const std::string& logical_typ
     }
     if (logical_type == "int32" || logical_type == "uint32" || logical_type == "float") {
         return 4U;
+    }
+    if (lance_logical_type_is_32bit_temporal(logical_type)) {
+        return 4U;
+    }
+    // "decimal:<bits>:<precision>:<scale>" -- the storage width is the bit width, not the precision.
+    if (logical_type.rfind("decimal:256:", 0) == 0) {
+        return 32U;
+    }
+    if (logical_type.rfind("decimal:128:", 0) == 0) {
+        return 16U;
     }
     if (logical_type.rfind("fixed_size_binary:", 0) == 0) {
         return static_cast<std::size_t>(std::stoul(logical_type.substr(18)));  // strlen("fixed_size_binary:")

@@ -59,22 +59,15 @@ void align64(std::ostream& out) {
 }
 
 std::uint32_t bits_per_value(const LanceField& field) {
+    // bool is the one type whose on-disk width is not a whole number of bytes: 1 bit per value,
+    // LSB-first, matching stock Lance. Everything else derives from the single shared width table --
+    // this used to be a second copy of it that fell through to 64 bits for anything it did not
+    // recognize, which silently gave every temporal type 8 bytes and every decimal 8 instead of
+    // 16/32, and surfaced as "column value buffer size is not aligned to field width".
     if (field.logical_type == "bool") {
         return 1;
     }
-    if (field.logical_type == "int8" || field.logical_type == "uint8") {
-        return 8;
-    }
-    if (field.logical_type == "int16" || field.logical_type == "uint16") {
-        return 16;
-    }
-    if (field.logical_type == "int32" || field.logical_type == "uint32" || field.logical_type == "float") {
-        return 32;
-    }
-    if (field.logical_type.rfind("fixed_size_binary:", 0) == 0) {
-        return static_cast<std::uint32_t>(lance_logical_type_value_bytes(field.logical_type) * 8U);
-    }
-    return 64;
+    return static_cast<std::uint32_t>(lance_logical_type_value_bytes(field.logical_type) * 8U);
 }
 
 std::size_t value_width_bytes(const LanceField& field) {
@@ -121,38 +114,60 @@ void write_string_field(std::vector<std::uint8_t>& out, std::uint32_t field_numb
     write_length_delimited(out, field_number, std::vector<std::uint8_t>(value.begin(), value.end()));
 }
 
-std::uint8_t flat_bits_per_value_token(const LanceField& field) {
-    const auto bits = bits_per_value(field);
-    if (bits == 64U) {
-        return 0x40U;
-    }
-    if (bits == 8U) {
-        return 0x08U;
-    }
-    if (bits == 1U) {
-        return 0x01U;
-    }
-    return 0x20U;
+/// Declared bits per value for a flat page. This is what tells every reader how wide each value is,
+/// so it must be the REAL width, not a nearby one.
+///
+/// It used to snap anything it did not recognize to 32, which silently mis-declared two types the
+/// library already claimed to support: a 16-bit column was written as 32 bits (stock Lance panicked
+/// with "range end index 12 out of range for slice of length 6"), and fixed_size_binary(N) for any N
+/// but 4 likewise -- including the 6-byte MAC address README.md recommends the type for. With the
+/// default structural encodings an integer column escapes through InlineBitpacking, which declares
+/// its own width, so int16 happened to survive; fixed_size_binary is not bitpackable and did not.
+std::uint32_t flat_bits_per_value(const LanceField& field) {
+    return bits_per_value(field);
 }
 
-std::vector<std::uint8_t> build_mini_block_layout(std::uint8_t bits_token, std::uint64_t num_items) {
+/// MiniBlockLayout for a flat page:
+///   f3 value_compression = CompressiveEncoding{ f1 Flat{ f1 bits_per_value } }
+///   f6 layers = 1, f7 num_buffers = 1, f9 num_items, f10 has_large_chunk = 1
+///
+/// Lengths are computed rather than hardcoded: `bits_per_value` is a varint, so a width of 128 or
+/// 256 (decimal128 / decimal256) is two bytes, and the nested message lengths in front of it shift
+/// accordingly. The previous hand-written byte string baked in a one-byte width.
+std::vector<std::uint8_t> build_mini_block_layout(std::uint32_t bits_per_value_token, std::uint64_t num_items) {
+    std::vector<std::uint8_t> flat;                  // Flat{ f1 bits_per_value }
+    flat.push_back(0x08U);
+    append_varint(flat, bits_per_value_token);
+
+    std::vector<std::uint8_t> compressive;           // CompressiveEncoding{ f1 Flat }
+    write_length_delimited(compressive, 1, flat);
+
     std::vector<std::uint8_t> mini;
-    mini.push_back(0x1aU);
-    mini.push_back(0x04U);
-    mini.push_back(0x0aU);
-    mini.push_back(0x02U);
-    mini.push_back(0x08U);
-    mini.push_back(bits_token);
-    mini.push_back(0x32U);
+    write_length_delimited(mini, 3, compressive);    // f3 value_compression
+    mini.push_back(0x32U);                           // f6 layers
     mini.push_back(0x01U);
     mini.push_back(0x01U);
-    mini.push_back(0x38U);
+    mini.push_back(0x38U);                           // f7 num_buffers
     mini.push_back(0x01U);
-    mini.push_back(0x48U);
+    mini.push_back(0x48U);                           // f9 num_items
     append_varint(mini, num_items);
-    mini.push_back(0x50U);
+    mini.push_back(0x50U);                           // f10 has_large_chunk
     mini.push_back(0x01U);
     return mini;
+}
+
+/// Byte length of the f3 value_compression submessage that build_mini_block_layout emits, i.e. how
+/// much of its output the variable-width wrappers below replace. Derived rather than assumed: the
+/// wrappers used to skip a fixed 6 bytes, which only held while the width was a single byte.
+std::size_t mini_block_value_compression_prefix(std::uint32_t bits_per_value_token) {
+    std::vector<std::uint8_t> flat;
+    flat.push_back(0x08U);
+    append_varint(flat, bits_per_value_token);
+    std::vector<std::uint8_t> compressive;
+    write_length_delimited(compressive, 1, flat);
+    std::vector<std::uint8_t> prefix;
+    write_length_delimited(prefix, 3, compressive);
+    return prefix.size();
 }
 
 void append_le16(std::vector<std::uint8_t>& out, std::uint16_t value) {
@@ -295,7 +310,7 @@ std::vector<std::uint8_t> column_encoding_bytes() {
     return bytes_from_hex("0a1f2f6c616e63652e656e636f64696e67732e436f6c756d6e456e636f64696e6712020a00");
 }
 
-std::vector<std::uint8_t> variable_width_structural_payload(std::uint8_t bits_token, std::uint64_t rows) {
+std::vector<std::uint8_t> variable_width_structural_payload(std::uint32_t bits_token, std::uint64_t rows) {
     const auto mini_block = build_mini_block_layout(bits_token, rows);
     if (mini_block.size() < 6U) {
         return mini_block;
@@ -312,11 +327,14 @@ std::vector<std::uint8_t> variable_width_structural_payload(std::uint8_t bits_to
     wrapped.push_back(0x02U);
     wrapped.push_back(0x08U);
     wrapped.push_back(bits_token);
-    wrapped.insert(wrapped.end(), mini_block.begin() + 6, mini_block.end());
+    wrapped.insert(wrapped.end(),
+                   mini_block.begin() + static_cast<std::ptrdiff_t>(
+                                            mini_block_value_compression_prefix(bits_token)),
+                   mini_block.end());
     return wrapped;
 }
 
-std::vector<std::uint8_t> page_layout_bytes(std::uint8_t bits_token, std::uint64_t rows, bool variable_width) {
+std::vector<std::uint8_t> page_layout_bytes(std::uint32_t bits_token, std::uint64_t rows, bool variable_width) {
     std::vector<std::uint8_t> page_layout;
     if (variable_width) {
         write_length_delimited(page_layout, 1, variable_width_structural_payload(bits_token, rows));
@@ -331,7 +349,7 @@ std::vector<std::uint8_t> page_layout_bytes(std::uint8_t bits_token, std::uint64
 }
 
 std::vector<std::uint8_t> page_layout_bytes(const LanceField& field, std::uint64_t rows) {
-    return page_layout_bytes(flat_bits_per_value_token(field), rows, false);
+    return page_layout_bytes(flat_bits_per_value(field), rows, false);
 }
 
 // Variable-width structural payload whose value_compression is wrapped in General(ZSTD), so the
@@ -350,7 +368,9 @@ std::vector<std::uint8_t> variable_width_structural_payload_zstd(std::uint8_t bi
     std::vector<std::uint8_t> out{0x1a, static_cast<std::uint8_t>(value_comp.size())};
     out.insert(out.end(), value_comp.begin(), value_comp.end());
     const auto mini = build_mini_block_layout(bits_token, rows);
-    out.insert(out.end(), mini.begin() + 6, mini.end());
+    out.insert(out.end(),
+               mini.begin() + static_cast<std::ptrdiff_t>(mini_block_value_compression_prefix(bits_token)),
+               mini.end());
     return out;
 }
 
@@ -387,7 +407,9 @@ std::vector<std::uint8_t> fixed_width_structural_payload_bss_zstd(std::uint8_t b
     std::vector<std::uint8_t> out{0x1a, static_cast<std::uint8_t>(value_comp.size())};
     out.insert(out.end(), value_comp.begin(), value_comp.end());
     const auto mini = build_mini_block_layout(bits_token, rows);
-    out.insert(out.end(), mini.begin() + 6, mini.end());
+    out.insert(out.end(),
+               mini.begin() + static_cast<std::ptrdiff_t>(mini_block_value_compression_prefix(bits_token)),
+               mini.end());
     return out;
 }
 
@@ -572,7 +594,9 @@ std::vector<std::uint8_t> page_layout_bytes_inline_bitpacking(std::uint8_t uncom
     std::vector<std::uint8_t> structural{0x1a, static_cast<std::uint8_t>(ce.size())};  // MiniBlockLayout f3
     structural.insert(structural.end(), ce.begin(), ce.end());
     const auto mini = build_mini_block_layout(0x40U, rows);  // token irrelevant; reuse the f6/f7/f9/f10 tail
-    structural.insert(structural.end(), mini.begin() + 6, mini.end());
+    structural.insert(structural.end(),
+                      mini.begin() + static_cast<std::ptrdiff_t>(mini_block_value_compression_prefix(0x40U)),
+                      mini.end());
 
     std::vector<std::uint8_t> page_layout;
     write_length_delimited(page_layout, 1, structural);
@@ -1242,9 +1266,10 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 }
                 if (bool_pack) {
                     // Plain Flat{bits_per_value:1} -- no CompressiveEncoding wrapper, matching stock Lance.
-                    return page_layout_bytes(flat_bits_per_value_token(field), count, false);
+                    return page_layout_bytes(flat_bits_per_value(field), count, false);
                 }
-                return page_layout_bytes_bss_zstd(flat_bits_per_value_token(field), count);
+                // byte-stream-split is restricted to 32/64-bit values, so the cast is safe.
+                return page_layout_bytes_bss_zstd(static_cast<std::uint8_t>(flat_bits_per_value(field)), count);
             };
             for (std::size_t off = 0; off < total;) {
                 const auto count = std::min(step, total - off);

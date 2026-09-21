@@ -20,6 +20,9 @@ constexpr const char* kArrowExtensionNameKey = "ARROW:extension:name";
 struct ParsedFormat {
     std::string logical_type;
     bool supported = false;
+    /// Set when the format is understood but deliberately refused, so the caller can report WHY
+    /// instead of the generic "unsupported Arrow C format".
+    std::string rejection;
 };
 
 bool starts_with(std::string_view value, std::string_view prefix) {
@@ -116,6 +119,88 @@ ParsedFormat parse_format(const char* format) {
         out.supported = true;
         return out;
     }
+    // ── Temporal and decimal types ───────────────────────────────────────────────────────────────
+    //
+    // All of these are plain fixed-width integers on the wire, so no encoder work is involved: the
+    // only reason they were rejected is that nothing mapped their Arrow format strings. The Lance
+    // logical-type names below are not invented -- each was read back out of a manifest written by
+    // pylance 12.0.0, so a column nanolance writes is described exactly as stock Lance describes its
+    // own. They carry every parameter (unit, timezone, precision, scale), which is why they are used
+    // verbatim as the internal logical type too: no lossy translation table to keep in step.
+    //
+    // Arrow C format reference: timestamp "ts{s,m,u,n}:<tz>", date "tdD"/"tdm",
+    // time "tts"/"ttm"/"ttu"/"ttn", decimal "d:<precision>,<scale>[,<bits>]".
+    if (starts_with(format, "ts") && std::strlen(format) >= 4U && format[3] == ':') {
+        const char* unit = nullptr;
+        switch (format[2]) {
+            case 's': unit = "s"; break;
+            case 'm': unit = "ms"; break;
+            case 'u': unit = "us"; break;
+            case 'n': unit = "ns"; break;
+            default: break;
+        }
+        if (unit != nullptr) {
+            const std::string tz(format + 4);
+            // Lance only understands IANA zone NAMES ("UTC", "Europe/Berlin"). Given an offset form
+            // like "+05:30" its schema layer raises "Unsupported timestamp type" -- and pylance
+            // surfaces that as a Rust panic, on read AND on write, so it cannot produce such a file
+            // either. Refuse here rather than emit one no reference reader will open.
+            if (!tz.empty() && (tz[0] == '+' || tz[0] == '-')) {
+                out.rejection =
+                    "timestamp timezone '" + tz +
+                    "' is a UTC offset; Lance supports only IANA zone names (e.g. \"UTC\", "
+                    "\"Europe/Berlin\") and panics on offsets. Convert the column to a named zone "
+                    "or to a naive timestamp first.";
+                return out;
+            }
+            // Lance spells "no timezone" as "-", never as an empty field.
+            out.logical_type = std::string("timestamp:") + unit + ":" + (tz.empty() ? "-" : tz);
+            out.supported = true;
+            return out;
+        }
+    }
+    if (std::strcmp(format, "tdD") == 0) {
+        out.logical_type = "date32:day";
+        out.supported = true;
+        return out;
+    }
+    if (std::strcmp(format, "tdm") == 0) {
+        out.logical_type = "date64:ms";
+        out.supported = true;
+        return out;
+    }
+    if (std::strcmp(format, "tts") == 0 || std::strcmp(format, "ttm") == 0) {
+        out.logical_type = std::string("time32:") + (format[2] == 's' ? "s" : "ms");
+        out.supported = true;
+        return out;
+    }
+    if (std::strcmp(format, "ttu") == 0 || std::strcmp(format, "ttn") == 0) {
+        out.logical_type = std::string("time64:") + (format[2] == 'u' ? "us" : "ns");
+        out.supported = true;
+        return out;
+    }
+    if (starts_with(format, "d:")) {
+        // "d:precision,scale" is 128-bit; "d:precision,scale,bits" names the width explicitly.
+        const std::string spec(format + 2);
+        const auto comma = spec.find(',');
+        if (comma != std::string::npos) {
+            const auto precision = spec.substr(0, comma);
+            auto rest = spec.substr(comma + 1U);
+            std::string bits = "128";
+            const auto second = rest.find(',');
+            if (second != std::string::npos) {
+                bits = rest.substr(second + 1U);
+                rest = rest.substr(0, second);
+            }
+            if (!precision.empty() && !rest.empty() && (bits == "128" || bits == "256")) {
+                out.logical_type = "decimal:" + bits + ":" + precision + ":" + rest;
+                out.supported = true;
+                return out;
+            }
+        }
+        return out;  // unsupported decimal width, or a malformed spec: refuse rather than guess
+    }
+
     if (starts_with(format, "w:")) {
         // Carry the byte width through (Lance's own logical type is "fixed_size_binary:<N>"), so it can
         // be recovered from the manifest on read.
@@ -213,10 +298,15 @@ bool map_field(const ArrowSchema& field,
     const char* format = field.format == nullptr ? "" : field.format;
     const auto parsed = parse_format(format);
     if (!parsed.supported) {
-        error = "unsupported Arrow C format for field ";
+        error = "column '";
         error += field.name == nullptr ? "<unnamed>" : field.name;
-        error += ": ";
-        error += format;
+        error += "': ";
+        if (!parsed.rejection.empty()) {
+            error += parsed.rejection;
+        } else {
+            error += "unsupported Arrow C format: ";
+            error += format;
+        }
         return false;
     }
     std::string extension_name;
@@ -511,6 +601,63 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
         arrow_format = "+s";
         return true;
     }
+    // Inverse of the temporal/decimal mapping in parse_format. Reconstructed from the Lance logical
+    // type alone, which carries every parameter, so a column read back from a manifest gets its unit,
+    // timezone, precision and scale -- not just its storage width.
+    if (logical_type.rfind("timestamp:", 0) == 0) {
+        const std::string rest = logical_type.substr(std::strlen("timestamp:"));
+        const auto colon = rest.find(':');
+        if (colon == std::string::npos) {
+            error = "malformed timestamp logical type: " + logical_type;
+            return false;
+        }
+        const auto unit = rest.substr(0, colon);
+        const auto tz = rest.substr(colon + 1U);
+        const char* code = unit == "s" ? "s" : unit == "ms" ? "m" : unit == "us" ? "u" : unit == "ns" ? "n" : nullptr;
+        if (code == nullptr) {
+            error = "unsupported timestamp unit in logical type: " + logical_type;
+            return false;
+        }
+        // Lance's "-" means no timezone; Arrow spells that as an empty field after the colon.
+        arrow_format = std::string("ts") + code + ":" + (tz == "-" ? "" : tz);
+        return true;
+    }
+    if (logical_type == "date32:day") {
+        arrow_format = "tdD";
+        return true;
+    }
+    if (logical_type == "date64:ms") {
+        arrow_format = "tdm";
+        return true;
+    }
+    if (logical_type == "time32:s" || logical_type == "time32:ms") {
+        arrow_format = logical_type == "time32:s" ? "tts" : "ttm";
+        return true;
+    }
+    if (logical_type == "time64:us" || logical_type == "time64:ns") {
+        arrow_format = logical_type == "time64:us" ? "ttu" : "ttn";
+        return true;
+    }
+    if (logical_type.rfind("decimal:", 0) == 0) {
+        // decimal:<bits>:<precision>:<scale> -> Arrow "d:<precision>,<scale>[,256]"
+        const std::string rest = logical_type.substr(std::strlen("decimal:"));
+        const auto first = rest.find(':');
+        const auto second = first == std::string::npos ? std::string::npos : rest.find(':', first + 1U);
+        if (second == std::string::npos) {
+            error = "malformed decimal logical type: " + logical_type;
+            return false;
+        }
+        const auto bits = rest.substr(0, first);
+        const auto precision = rest.substr(first + 1U, second - first - 1U);
+        const auto scale = rest.substr(second + 1U);
+        if (bits != "128" && bits != "256") {
+            error = "unsupported decimal width in logical type: " + logical_type;
+            return false;
+        }
+        arrow_format = "d:" + precision + "," + scale + (bits == "256" ? ",256" : "");
+        return true;
+    }
+
     if (logical_type.rfind("fixed_size_binary:", 0) == 0) {
         arrow_format = "w:" + logical_type.substr(std::strlen("fixed_size_binary:"));
         return true;

@@ -43,10 +43,12 @@ Lifecycle rules:
   validity information, so a null has nowhere to go. Fill or drop nulls first. Nullable-flagged
   *schemas* are accepted (pyarrow marks essentially everything nullable) — it is a null *value* that
   is refused. `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility.
-- Types nanolance cannot round-trip are refused at `write_batch` rather than written:
-  `timestamp`/`date`/`time`, `decimal`, `list`, `large_utf8`/`large_binary`, Arrow `dictionary`
-  columns, and Arrow's `null` type. Supported: int/uint 8–64, `float`, `double`, `bool`, `utf8`,
-  `binary`, `fixed_size_binary(N)`, nested `struct`, and `lance.blob.v2` external references.
+- Types nanolance cannot round-trip are refused at `write_batch` rather than written: `list`,
+  `large_utf8`/`large_binary`, Arrow `dictionary` columns, Arrow's `null` type, and a `timestamp`
+  whose timezone is a UTC offset rather than an IANA name (Lance panics on those). Supported:
+  int/uint 8–64, `float`, `double`, `bool`, `utf8`, `binary`, `fixed_size_binary(N)`, `timestamp`
+  (s/ms/us/ns, optionally with an IANA timezone), `date32/64`, `time32/64`, `decimal128/256`,
+  nested `struct`, and `lance.blob.v2` external references.
 - nanolance reads back everything it writes, but is **not** a general Lance reader yet — most
   datasets written by the Rust `lance` crate do not decode (see README "What nanolance can read").
 - `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
