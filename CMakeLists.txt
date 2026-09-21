@@ -343,6 +343,11 @@ if(NANOLANCE_BUILD_TOOLS)
     target_compile_features(nlance_blobfetch PRIVATE cxx_std_20)
     target_link_libraries(nlance_blobfetch PRIVATE CLI11::CLI11 nanolance)
 
+    add_executable(nlance_pagelayout tools/nlance_pagelayout.cpp)
+    target_compile_features(nlance_pagelayout PRIVATE cxx_std_20)
+    target_link_libraries(nlance_pagelayout PRIVATE nanolance)
+    set_target_properties(nlance_pagelayout PROPERTIES OUTPUT_NAME nlance-pagelayout)
+
     add_executable(nlance_info tools/nlance_info.cpp)
     target_compile_features(nlance_info PRIVATE cxx_std_20)
     target_link_libraries(nlance_info PRIVATE nanolance)
@@ -597,6 +602,13 @@ set_tests_properties(nano_lance_read_safety PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_dict_roundtrip COMMAND $<TARGET_FILE:nano_lance_dict_roundtrip_test>)
 set_tests_properties(nano_lance_dict_roundtrip PROPERTIES LABELS "smoke")
+
+if(TARGET nlance_pagelayout AND NANOLANCE_PYTHON)
+    add_test(NAME app_pagelayout_pylance_interop_smoke
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_pagelayout_pylance_interop.sh"
+                     "$<TARGET_FILE:nlance_pagelayout>" "${NANOLANCE_PYTHON}")
+    set_tests_properties(app_pagelayout_pylance_interop_smoke PROPERTIES LABELS smoke)
+endif()
 
 add_test(NAME nano_lance_page_layout
          COMMAND $<TARGET_FILE:nano_lance_page_layout_test> "${CMAKE_CURRENT_BINARY_DIR}/page_layout_probe")
