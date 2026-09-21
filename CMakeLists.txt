@@ -20,11 +20,22 @@ if(NANOLANCE_STANDALONE)
     # Developer ergonomics for a standalone build (skipped when embedded):
     #   * compile_commands.json so clangd / IDEs index our sources AND the FetchContent'd deps
     #     (nanoarrow/zstd/CLI11/nanos3reader) we compile against. (Already gitignored.)
-    #   * park FetchContent's downloads in a stable, IDE-indexable ./.deps that survives `rm -rf build`
-    #     (gitignored). Honour a caller-provided FETCHCONTENT_BASE_DIR (e.g. a CI cache) if already set.
+    #   * park FetchContent's downloads in a stable, IDE-indexable ./.deps-<generator> that survives
+    #     `rm -rf build` (gitignored). Honour a caller-provided FETCHCONTENT_BASE_DIR (e.g. a CI
+    #     cache) if already set.
+    #
+    # The directory is keyed by generator on purpose. FetchContent's sub-build trees bake in the
+    # generator that created them, so a single shared ./.deps is poisoned the moment two generators
+    # are used against the same source tree -- which is the DEFAULT path for a new user:
+    # `pip install -e bindings/python` runs scikit-build-core (Ninja), and the documented
+    # `cmake -S . -B build` then uses Makefiles and dies with "Does not match the generator used
+    # previously: Ninja". Keying by generator lets both coexist.
     set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
     if(NOT DEFINED FETCHCONTENT_BASE_DIR)
-        set(FETCHCONTENT_BASE_DIR "${CMAKE_SOURCE_DIR}/.deps" CACHE PATH "Fetched dependency sources")
+        string(REGEX REPLACE "[^A-Za-z0-9_.-]+" "_" _nanolance_generator_slug "${CMAKE_GENERATOR}")
+        set(FETCHCONTENT_BASE_DIR "${CMAKE_SOURCE_DIR}/.deps-${_nanolance_generator_slug}"
+            CACHE PATH "Fetched dependency sources")
+        unset(_nanolance_generator_slug)
     endif()
 endif()
 
@@ -342,8 +353,19 @@ endif()
 # reads/writes Lance using only nanoarrow + zstd + local code. It is a consumer-side dependency of the
 # pcapng2lance example, which vendors it as a git submodule and adds it itself (see
 # examples/pcapng2lance/CMakeLists.txt). A plain nanolance build (library, tools, tests) needs no submodule.
+# Skip (don't fail) when the submodule is absent: a plain `git clone` without --recursive is the
+# documented way to build the library, and EXAMPLES defaults ON for standalone builds, so a hard
+# error here would break the quick start in README.md / docs/getting-started.md. Same graceful-skip
+# posture fuselance already takes when libfuse3 is missing.
 if(NANOLANCE_BUILD_EXAMPLES)
-    add_subdirectory(examples/pcapng2lance)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2lance/extern/nanotins/CMakeLists.txt")
+        add_subdirectory(examples/pcapng2lance)
+    else()
+        message(STATUS
+            "nanolance: skipping the pcapng2lance example -- its nanotins submodule is not checked "
+            "out. The library, tools and tests build fine without it. To build the example, run: "
+            "git submodule update --init --recursive")
+    endif()
 endif()
 
 # pcapng2lance_nanom — the same L1 converter built on nanom instead of nanotins, for a head-to-head
