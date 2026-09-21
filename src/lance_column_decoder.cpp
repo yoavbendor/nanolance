@@ -17,6 +17,7 @@
 
 #include <cstring>
 #include <limits>
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <memory>
@@ -174,6 +175,44 @@ bool read_miniblock_chunk_header(const std::vector<std::uint8_t>& payload, std::
     if (offset + 8U + out.data_size() > payload.size()) {
         error = "miniblock chunk exceeds payload";
         return false;
+    }
+    return true;
+}
+
+/// One decoded chunk: its values buffer, and its definition levels when it carries any.
+struct MiniBlockChunkView {
+    std::vector<std::uint8_t> values;
+    std::vector<std::uint8_t> repdef;
+    std::uint32_t repdef_values = 0;
+};
+
+/// Split a page's payload into its chunks without concatenating them.
+///
+/// A page is NOT one chunk. nanolance's own writer happens to emit exactly one chunk per page, which
+/// is why treating the payload as a single chunk worked on its own files; stock Lance packs many
+/// (a 5000-row int64 page arrives as five 1024-value chunks), so the concatenated buffer failed the
+/// per-chunk size check with "bitpacked chunk size does not match bit width".
+bool split_miniblock_payload(const std::vector<std::uint8_t>& payload, std::vector<MiniBlockChunkView>& out,
+                             std::string& error) {
+    out.clear();
+    std::size_t offset = 0;
+    while (offset < payload.size()) {
+        MiniBlockChunkHeader header;
+        if (!read_miniblock_chunk_header(payload, offset, header, error)) {
+            return false;
+        }
+        const auto data_start = offset + 8U;
+        MiniBlockChunkView chunk;
+        if (header.has_repdef()) {
+            chunk.repdef_values = header.repdef_values;
+            chunk.repdef.assign(payload.begin() + static_cast<std::ptrdiff_t>(data_start),
+                                payload.begin() + static_cast<std::ptrdiff_t>(data_start + header.repdef_size()));
+        }
+        const auto values_start = data_start + header.values_offset();
+        chunk.values.assign(payload.begin() + static_cast<std::ptrdiff_t>(values_start),
+                            payload.begin() + static_cast<std::ptrdiff_t>(values_start + header.values_size()));
+        out.push_back(std::move(chunk));
+        offset = (data_start + header.data_size() + 7U) & ~static_cast<std::size_t>(7U);
     }
     return true;
 }
@@ -540,6 +579,9 @@ struct ColumnEncodingPlan {
     /// kMiniBlock with a definition-level layer: how those levels are encoded. Null when the column
     /// has no nulls, which is the common case and costs nothing.
     std::shared_ptr<page_layout::Compressive> repdef;
+    /// kConstant whose layers declare definition levels and which carries no value: Lance's spelling
+    /// of a column where every row is null.
+    bool constant_all_null = false;
     /// Set when the descriptor named something this build does not model, so the error can say what.
     std::string unsupported_reason;
 };
@@ -560,6 +602,11 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
     if (layout.kind == page_layout::LayoutKind::kConstant) {
         out.kind = ColumnEncodingKind::kConstant;
         out.constant_inline_value = layout.constant.inline_value;
+        // A ConstantLayout that declares definition levels and holds no value is how Lance writes a
+        // column whose every row is null -- there is no repeated value to store, only the fact that
+        // there is none.
+        out.constant_all_null =
+            !layout.constant.inline_value && page_layout::layers_have_definition_levels(layout.constant.layers);
         return true;
     }
     if (layout.kind != page_layout::LayoutKind::kMiniBlock) {
@@ -747,6 +794,37 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         // stock-Lance table decoded and a 5000-row one did not.
         error = "column '" + on_disk_field.name + "': " + encoding_plan.unsupported_reason;
         return false;
+    }
+
+    if (encoding_plan.kind == ColumnEncodingKind::kConstant && encoding_plan.constant_all_null) {
+        // Every row is null. There are no value bytes on disk, so materialize the column's zeroed
+        // storage and an all-clear validity bitmap.
+        std::uint64_t total_rows = 0;
+        for (const auto& page : column_metadata.pages) {
+            total_rows += page.length;
+        }
+        const bool variable = lance_field_is_variable_width(on_disk_field.logical_type);
+        out.kind = variable ? ColumnValues::Kind::VariableWidth : ColumnValues::Kind::FixedWidth;
+        if (variable) {
+            out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+            const auto offset_width = out.variable.large ? 8U : 4U;
+            out.variable.offsets.assign(static_cast<std::size_t>(total_rows + 1U) * offset_width, 0U);
+        } else {
+            std::string internal = on_disk_field.logical_type;
+            if (internal == "string") {
+                internal = "utf8";
+            }
+            const auto bpv = lance_logical_type_value_bytes(internal);
+            std::uint64_t bytes = 0;
+            if (!checked_mul(total_rows, static_cast<std::uint64_t>(bpv), bytes) || !fits_size_t(bytes)) {
+                error = "all-null column size overflows";
+                return false;
+            }
+            out.fixed.assign(static_cast<std::size_t>(bytes), 0U);
+        }
+        out.validity.assign(static_cast<std::size_t>((total_rows + 7U) / 8U), 0U);
+        out.null_count = total_rows;
+        return true;
     }
 
     if (encoding_plan.kind == ColumnEncodingKind::kConstant) {
@@ -1200,45 +1278,71 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     }
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;
-    std::vector<std::uint8_t> chunk_bytes;
-    // Only allocated when the column actually has nulls.
-    std::vector<std::vector<std::uint8_t>> repdef_chunks;
-    std::vector<std::uint32_t> repdef_counts;
+    std::vector<MiniBlockChunkView> chunks;
     const bool nullable = encoding_plan.repdef != nullptr;
     std::uint64_t validity_rows = 0;
     for (const auto& page : column_metadata.pages) {
         if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
             return false;
         }
-        if (!parse_miniblock_payload_chunks(payload, chunk_bytes, error,
-                                            nullable ? &repdef_chunks : nullptr,
-                                            nullable ? &repdef_counts : nullptr)) {
+        if (!split_miniblock_payload(payload, chunks, error)) {
             return false;
         }
-        if (nullable) {
-            if (repdef_chunks.size() != repdef_counts.size()) {
-                error = "definition-level chunk count does not match its value counts";
+        // How many values a chunk holds depends on how it is encoded, and the header only states it
+        // when the chunk carries definition levels:
+        //   * with definition levels, the header's count is authoritative;
+        //   * bit-packed chunks are one FastLanes block each (1024 values), the last one short;
+        //   * flat chunks are sized by bytes -- the writer fills them to a byte budget, not to a
+        //     value count, so a flat int64 chunk holds whatever fits.
+        std::uint64_t remaining = page.length;
+        for (const auto& chunk : chunks) {
+            std::uint32_t chunk_values = 0;
+            if (nullable) {
+                chunk_values = chunk.repdef_values;
+            } else if (bitpacked) {
+                chunk_values = static_cast<std::uint32_t>(std::min<std::uint64_t>(remaining, 1024U));
+            } else {
+                if (bytes_per_value == 0U || chunk.values.size() % bytes_per_value != 0U) {
+                    error = "fixed-width page byte count mismatch";
+                    return false;
+                }
+                chunk_values = static_cast<std::uint32_t>(chunk.values.size() / bytes_per_value);
+            }
+            if (chunk_values == 0U || chunk_values > remaining) {
+                error = "miniblock chunk covers " + std::to_string(chunk_values) +
+                        " values with " + std::to_string(remaining) + " left in the page";
                 return false;
             }
-            for (std::size_t i = 0; i < repdef_chunks.size(); ++i) {
-                if (!append_definition_levels(repdef_chunks[i], *encoding_plan.repdef, repdef_counts[i],
+            if (nullable) {
+                if (chunk.repdef.empty()) {
+                    error = "column declares definition levels but a chunk carries none";
+                    return false;
+                }
+                if (!append_definition_levels(chunk.repdef, *encoding_plan.repdef, chunk.repdef_values,
                                               validity_rows, out.validity, out.null_count, error)) {
                     return false;
                 }
-                validity_rows += repdef_counts[i];
+                validity_rows += chunk.repdef_values;
             }
-        }
-        if (bitpacked) {
-            if (!unpack_bitpacked_page_dispatch(chunk_bytes, page.length, bytes_per_value, out.fixed, error)) {
-                return false;
+            if (bitpacked) {
+                if (!unpack_bitpacked_page_dispatch(chunk.values, chunk_values, bytes_per_value, out.fixed,
+                                                    error)) {
+                    return false;
+                }
+            } else {
+                if (chunk.values.size() != static_cast<std::size_t>(chunk_values) * bytes_per_value) {
+                    error = "fixed-width page byte count mismatch";
+                    return false;
+                }
+                out.fixed.insert(out.fixed.end(), chunk.values.begin(), chunk.values.end());
             }
-            continue;
+            remaining -= chunk_values;
         }
-        if (chunk_bytes.size() != page.length * bytes_per_value) {
-            error = "fixed-width page byte count mismatch";
+        if (remaining != 0U) {
+            error = "miniblock page chunks cover " + std::to_string(page.length - remaining) +
+                    " of " + std::to_string(page.length) + " rows";
             return false;
         }
-        out.fixed.insert(out.fixed.end(), chunk_bytes.begin(), chunk_bytes.end());
     }
     if (nullable && validity_rows != declared_rows) {
         error = "definition levels cover " + std::to_string(validity_rows) + " rows but the column has " +

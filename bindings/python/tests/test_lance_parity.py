@@ -309,3 +309,67 @@ def test_offset_timezone_is_refused(tmp_path):
     path = tmp_path / "named_tz.lance"
     nanolance.write_table(named, path)
     assert pa.table(nanolance.read_table(path)).column(0).equals(named.column(0))
+
+
+# ── Reading nullable columns written by stock Lance ──────────────────────────────────────────────
+# Lance stores one definition level per value, FastLanes-bit-packed, where level 1 means NULL -- the
+# opposite polarity to Arrow's validity bit. The levels live in a second buffer inside each miniblock
+# chunk, announced by the chunk header's first u16 (the value count the levels cover) and by
+# MiniBlockLayout.layers == [3]. None of that was read before, so every nullable stock-Lance column
+# failed with "unexpected miniblock payload prefix".
+
+
+@pytest.mark.parametrize(
+    "pattern, name",
+    [
+        pytest.param(lambda i: i % 3 == 0, "one_in_three", id="one_in_three"),
+        pytest.param(lambda i: i % 2 == 0, "alternating", id="alternating"),
+        pytest.param(lambda i: (i * 7) % 10 == 0, "scattered_10pct", id="scattered_10pct"),
+        pytest.param(lambda i: False, "no_nulls", id="no_nulls"),
+        pytest.param(lambda i: True, "all_null", id="all_null"),
+    ],
+)
+def test_reads_nullable_columns_written_by_stock_lance(pattern, name, tmp_path):
+    lance = require_pylance()
+    n = 3000  # spans several 1024-value chunks, including a short final one
+    values = [None if pattern(i) else i for i in range(n)]
+    table = pa.table({"v": pa.array(values, type=pa.int64())})
+    path = tmp_path / f"{name}.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+
+    back = pa.table(nanolance.read_table(path))
+    assert back.column(0).null_count == table.column(0).null_count
+    assert back.column(0).to_pylist() == values
+
+
+def test_reads_multi_chunk_pages_written_by_stock_lance(tmp_path):
+    """A page is not a chunk.
+
+    nanolance's writer emits exactly one chunk per page, so treating a page's payload as a single
+    chunk worked on its own files. Stock Lance packs many -- a 5000-row int64 page arrives as five
+    1024-value chunks -- and the concatenated buffer failed the per-chunk size check with
+    "bitpacked chunk size does not match bit width". This is the plainest possible stock-Lance
+    column, and it did not decode.
+    """
+    lance = require_pylance()
+    table = pa.table({"v": pa.array(list(range(5000)), type=pa.int64())})
+    path = tmp_path / "multichunk.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+    assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == list(range(5000))
+
+
+def test_run_length_encoded_definition_levels_are_refused_by_name(tmp_path):
+    """Not yet supported -- but refused explicitly, not misread.
+
+    Lance run-length-encodes the definition levels when nulls come in runs (or are very sparse), so a
+    column with a single null takes a different repdef encoding from one with scattered nulls. Until
+    that decodes, the descriptor is read far enough to say so.
+    """
+    lance = require_pylance()
+    values = [None if i == 7 else i for i in range(5000)]
+    table = pa.table({"v": pa.array(values, type=pa.int64())})
+    path = tmp_path / "rle_levels.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+    with pytest.raises(RuntimeError) as excinfo:
+        nanolance.read_table(path)
+    assert "definition-level encoding" in str(excinfo.value)
