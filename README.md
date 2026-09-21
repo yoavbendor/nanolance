@@ -131,21 +131,22 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 
 ### What nanolance can read
 
-nanolance reads back **everything it writes**. It is *not* yet a general Lance reader: it dispatches
-on its own field metadata rather than on the `lance.encodings21.PageLayout` descriptor it writes, so
-most datasets produced by the Rust `lance` crate do not decode. Measured against `pylance` 12.0.0 at
-5 000 rows:
+nanolance reads back **everything it writes**, and a growing subset of what the Rust `lance` crate
+writes. Measured against `pylance` 12.0.0 at 5 000 rows:
 
-| stock-Lance dataset | nanolance reads it |
+| stock-Lance column | nanolance reads it |
 |---|---|
+| `int64` and the other fixed-width integers | yes |
 | `float64`, `bool` | yes |
 | `timestamp`, `date32/64`, `time32/64`, `decimal128/256` | yes |
-| `int64`, `utf8`, nullable columns, `list`, `dictionary`, `struct` | no |
+| nullable columns (scattered nulls, and all-null) | yes |
+| nullable columns whose nulls come in **runs** | no — the definition levels are run-length encoded |
+| `utf8` | no — `CompressiveEncoding` variant 6, and the variable-width chunk framing differs |
+| `list`, `dictionary`, `struct` | no — not mapped at the manifest level |
 
-A 3-row version of some of these *does* decode, which makes a small smoke test misleading — assume
-no until it is in the "yes" row. Closing this is the largest item in
-[docs/OPTIMIZATION_PLAN.md](docs/OPTIMIZATION_PLAN.md) §6, and it needs no writer change: the writer
-already emits the standards-compliant descriptors a general reader would dispatch on.
+Anything in a "no" row is **refused by name**, not misread. Closing the rest is
+[docs/OPTIMIZATION_PLAN.md](docs/OPTIMIZATION_PLAN.md) §6 step 3; it needs no writer change, because
+the writer already emits the standards-compliant descriptors the reader now dispatches on.
 
 ### Not yet supported / nanolance-only
 

@@ -16,13 +16,13 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 0.5 Repo slim-down | done for the unambiguous 5.5 MB; the 15.4 MB capture left in place by decision |
 | **Phase 1.3 — read stock-Lance files** | **steps 1 and 2 of 3 done** (parse, oracle, dispatch) |
 | Fuzz coverage for the descriptor parser | done — found one real bug in 25 executions |
-| 1.1 Real nullability | not started |
+| 1.1 Real nullability | **read side done**; write side still refuses nulls |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | not started |
 | Phase 3 — streaming read, projection in Python | not started |
 | Phase 4 — read-path optimization | not started (deliberately last) |
 
-Test suite: **46 ctest** (was 42) and **78 pytest** (was 22), all passing.
+Test suite: **46 ctest** (was 42) and **90 pytest** (was 22), all passing.
 
 Fuzzers: `nanolance_fuzz_decode` and `nanolance_fuzz_page_layout`, both clean; the longest
 campaign run here was 95,896,936 executions.
@@ -187,16 +187,16 @@ Unknown encodings are refused **by name** before any buffer byte is interpreted.
 was worse than it looked: a stock-Lance int64 page was misparsed under nanolance's layout
 assumptions and only caught later by a length check — hence 3 rows decoding and 5000 not.
 
-**What stock-Lance files do now.** They still do not decode, but the failures are accurate and
-located rather than guessed:
+**What stock-Lance files do now** (after 1.1's read half and 1.2 — see below):
 
 | stock-Lance column | result |
 |---|---|
-| `float64`, `bool` | decodes |
-| plain `int64` | right branch selected; `InlineBitpacking` chunk framing differs |
-| nullable `int64` | "unexpected miniblock payload prefix" — the validity layer |
-| `utf8` | refused by name: `CompressiveEncoding` field 6, unmodeled |
-| `timestamp`, `list`, `dictionary`, `struct` | fail earlier, in logical-type mapping, not encoding |
+| fixed-width integers, `float64`, `bool` | decodes |
+| `timestamp`, `date`, `time`, `decimal` | decodes |
+| nullable columns, including all-null | decodes |
+| nullable with nulls in runs | refused — RLE'd definition levels |
+| `utf8` | refused by name: `CompressiveEncoding` field 6 |
+| `list`, `dictionary`, `struct` | refused at manifest mapping |
 
 **Step 3 remains**, and is now a specific list rather than an open question: `CompressiveEncoding`
 field 6, the `InlineBitpacking` and miniblock chunk framing differences, `AllNull`, validity levels
@@ -225,6 +225,36 @@ recommends the type for. Integers escaped through `InlineBitpacking` (which decl
 so `int16` happened to survive with default options; `fixed_size_binary` is not bitpackable and did
 not. The root cause was a second copy of the width table inside the writer plus MiniBlockLayout byte
 strings with hardcoded submessage lengths; both are now derived.
+
+### Phase 1.1 (read half): nullable stock-Lance columns
+
+The on-disk validity format is not documented anywhere nanolance could consult, so it was established
+by reading real pylance 12.0.0 output:
+
+- `MiniBlockLayout.f6 layers` is `[1]` without nulls, `[3]` with. `ConstantLayout.f5` says the same,
+  and `[3]` with no inline value is how an **all-null** column is spelled.
+- `MiniBlockLayout.f2` carries the levels' encoding — `CompressiveEncoding` field 4 (a bit-width
+  wrapper) around `Flat(1)` when the only levels are 0 and 1.
+- A chunk's 8-byte header is **four** little-endian `u16` slots, not the single size the reader
+  assumed: the repdef value count followed by three buffer sizes, `0xFEFE` marking an unused slot.
+- The levels are FastLanes-bit-packed — the same kernel integer columns already use — and
+  **level 1 means NULL**, the opposite polarity to Arrow's validity bit.
+- Values are dense over every row: a null still occupies a value slot.
+
+Confirmed rather than assumed: unpacking reproduces a 1024-row alternating pattern bit for bit and a
+scattered 10%-null pattern both bit for bit and in count (103 of 1024); the chunk arithmetic
+reproduces every boundary of a 5000-row column.
+
+**This also fixed plain `int64` from stock Lance, which had nothing to do with nulls**: a page is not
+a chunk. nanolance's writer emits one chunk per page, so treating a page as a single chunk worked on
+its own files; stock Lance packs five 1024-value chunks into one 5000-row page.
+
+**A severe pre-existing bug surfaced on the way.** Any read that failed — a truncated file, a missing
+manifest, or an encoding nanolance does not implement — **segfaulted the process** through the C API
+and the Python bindings. `lance_table_read_dataset` released `out_schema` on one failure path and the
+C shim released it again; `ArrowSchemaRelease` nulls `release` and then dereferences it. The C++ tests
+never caught it because they call the C++ entry point directly, and the Python tests only ever read
+files nanolance had just written. The ownership contract is now uniform and documented.
 
 ### Fuzzing the descriptor parser
 
