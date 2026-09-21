@@ -4,7 +4,9 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "nanolance"
-version = "0.1.0"
+# Keep in step with NANOLANCE_VERSION_* in the top-level CMakeLists.txt: this wheel ships
+# that library, so two different numbers for one artifact only confuse.
+version = "0.2.0"
 description = "Fast zero-copy Python bindings for the nanolance Lance writer/reader"
 readme = "README.md"
 requires-python = ">=3.9"

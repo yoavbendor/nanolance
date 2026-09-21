@@ -14,7 +14,10 @@ set(NANOLANCE_VERSION_STRING
     "${NANOLANCE_VERSION_MAJOR}.${NANOLANCE_VERSION_MINOR}.${NANOLANCE_VERSION_PATCH}")
 
 if(NANOLANCE_STANDALONE)
-    project(nanolance VERSION ${NANOLANCE_VERSION_MAJOR}.${NANOLANCE_VERSION_MINOR}.${NANOLANCE_VERSION_PATCH} LANGUAGES CXX)
+    # C is enabled so tests/test_readme_quickstart.c can compile the documented C snippet as real
+    # C -- nano_lance_writer.h is an extern "C" header whose only other consumers are C++, so
+    # nothing else in the tree would notice it drifting into C++-only syntax.
+    project(nanolance VERSION ${NANOLANCE_VERSION_MAJOR}.${NANOLANCE_VERSION_MINOR}.${NANOLANCE_VERSION_PATCH} LANGUAGES C CXX)
     enable_testing()
 
     # Developer ergonomics for a standalone build (skipped when embedded):
@@ -473,6 +476,10 @@ add_executable(nano_lance_dict_roundtrip_test tests/test_dict_roundtrip.cpp)
 target_compile_features(nano_lance_dict_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_dict_roundtrip_test PRIVATE nanolance)
 
+add_executable(nano_lance_readme_quickstart_test tests/test_readme_quickstart.c)
+target_link_libraries(nano_lance_readme_quickstart_test PRIVATE nanolance)
+set_property(TARGET nano_lance_readme_quickstart_test PROPERTY C_STANDARD 99)
+
 add_executable(nano_lance_null_rejection_test tests/test_null_rejection.cpp)
 target_link_libraries(nano_lance_null_rejection_test PRIVATE nanolance)
 target_compile_features(nano_lance_null_rejection_test PRIVATE cxx_std_20)
@@ -585,6 +592,11 @@ set_tests_properties(nano_lance_read_safety PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_dict_roundtrip COMMAND $<TARGET_FILE:nano_lance_dict_roundtrip_test>)
 set_tests_properties(nano_lance_dict_roundtrip PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_readme_quickstart
+         COMMAND $<TARGET_FILE:nano_lance_readme_quickstart_test>
+                 "${CMAKE_CURRENT_BINARY_DIR}/readme_quickstart.lance")
+set_tests_properties(nano_lance_readme_quickstart PROPERTIES LABELS smoke)
 
 add_test(NAME nano_lance_null_rejection COMMAND $<TARGET_FILE:nano_lance_null_rejection_test>)
 set_tests_properties(nano_lance_null_rejection PROPERTIES LABELS smoke)

@@ -47,7 +47,6 @@ hard `pyarrow` runtime dependency (uses the Arrow PyCapsule interface); does not
 
 NanoLanceWriter w = {0};
 nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
-nano_lance_writer_set_ignore_nullability(&w, true);  // if your Arrow fields are nullable
 nano_lance_writer_set_compression(&w, true);         // Lance-compatible compression (off by default)
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // repeatable; schema locks after batch #1
 nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append a fragment

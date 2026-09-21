@@ -28,7 +28,7 @@ Matches current writer output (Sdx2Lance / `arrowipc2lance` with `--ignore-nulla
 | Fixed-width columns | `lance_on_disk_field_encoding` = 1; zstd miniblocks; one `ColumnPage` per miniblock chunk; `PageLayout` from `column_encoding_bytes()` |
 | Variable-width (`string` / utf8) | Encoding 2; int32 offsets (large_utf8 not used by Sdx2Lance today) |
 | Blob v2 external packed | Single physical column; raw payload + control buffer; `blob_v2_page_layout_encoding()` pages |
-| Nullability | **Non-null only** (same as typical writer ingest with `ignore_nullability`) |
+| Nullability | **Non-null only** — the writer refuses a batch containing a null, so no validity information is ever written or read |
 | Arrow extension | `lance.blob.v2` on ingest struct; on disk manifest uses materialized children — reader exposes **write-side Arrow shape** for `payload_ref` (`data`/`uri`/`position`/`size`) when reading `entries.lance` |
 
 ## Explicitly out of scope until writer supports them

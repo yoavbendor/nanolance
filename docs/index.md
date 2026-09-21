@@ -89,7 +89,6 @@ comparison against Parquet and Rust `lance`.
 
 NanoLanceWriter w = {0};
 nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
-nano_lance_writer_set_ignore_nullability(&w, true);  // BEFORE the first write_batch
 nano_lance_writer_set_compression(&w, true);         // BEFORE the first write_batch
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // schema locks after batch #1
 nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append a fragment

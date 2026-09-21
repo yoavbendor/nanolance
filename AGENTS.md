@@ -7,7 +7,7 @@ path and CMake targets changed.
 nanolance is the "nanoarrow of Lance": a small C++ library that **writes Lance v2.2 datasets** (and
 reads back what it wrote) with no Rust `lance` core. Its headline feature is pointing rows at raw
 bytes that live elsewhere (local file or S3) instead of copying them in. Everything it writes is
-readable by stock `lance` (verified against `lance` 7.0.0), unless a feature is explicitly marked
+readable by stock `lance` (verified against `pylance` 12.0.0), unless a feature is explicitly marked
 "nanolance-only" below.
 
 ## 1. What changed (breaking)
@@ -29,7 +29,6 @@ readable by stock `lance` (verified against `lance` 7.0.0), unless a feature is 
 
 NanoLanceWriter w = {0};
 nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
-nano_lance_writer_set_ignore_nullability(&w, true);  // if your Arrow fields are nullable
 nano_lance_writer_set_compression(&w, true);         // enable Lance-compatible compression (see §3)
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // call repeatedly; schema is fixed after #1
 nano_lance_writer_commit(&w, /*is_append=*/false);
@@ -40,6 +39,16 @@ nano_lance_writer_close(&w);
 Lifecycle rules:
 - Schema is locked after the first batch; all batches in a writer session share it.
 - All `set_*` options must be called **before the first `write_batch`**.
+- A batch containing a **null** is refused, naming the column and row: nanolance writes no Lance
+  validity information, so a null has nowhere to go. Fill or drop nulls first. Nullable-flagged
+  *schemas* are accepted (pyarrow marks essentially everything nullable) — it is a null *value* that
+  is refused. `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility.
+- Types nanolance cannot round-trip are refused at `write_batch` rather than written:
+  `timestamp`/`date`/`time`, `decimal`, `list`, `large_utf8`/`large_binary`, Arrow `dictionary`
+  columns, and Arrow's `null` type. Supported: int/uint 8–64, `float`, `double`, `bool`, `utf8`,
+  `binary`, `fixed_size_binary(N)`, nested `struct`, and `lance.blob.v2` external references.
+- nanolance reads back everything it writes, but is **not** a general Lance reader yet — most
+  datasets written by the Rust `lance` crate do not decode (see README "What nanolance can read").
 - `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
   adds a fragment to an existing dataset.
 

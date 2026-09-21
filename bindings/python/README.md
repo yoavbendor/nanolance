@@ -102,7 +102,7 @@ for batch in reader:
 | Floats | float32, float64 | Written **uncompressed** (no byte-stream-split yet) |
 | Strings / binary | utf8, large_utf8, binary, large_binary, fixed_size_binary | dict-RLE, structural dictionary, constant layout **on by default**; zstd for high-cardinality columns only with `compression=True` |
 | Structs | nested struct columns | Same type coverage as [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) |
-| Nullability | nullable columns | Default `ignore_nullability=True` maps nullable Arrow fields to required Lance fields |
+| Nullability | nullable *schemas* only | A nullable-flagged schema is fine (pyarrow marks everything nullable). A table that actually **contains** a null is refused, naming the column and row — nanolance writes no validity information. Fill or drop first (`col.fill_null(...)`, `table.drop_null()`). `ignore_nullability` is a no-op kept for compatibility. |
 | Append | `WriteOptions(append=True)` or `append=True` kwarg | Adds a fragment to an existing dataset |
 | Multi-batch tables | yes | Streams all record batches from the input |
 
