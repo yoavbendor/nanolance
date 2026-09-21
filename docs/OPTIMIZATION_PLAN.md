@@ -271,19 +271,9 @@ supported type, at 5k+ rows so the encoders actually engage.
 is `schema_mapper` format parsing plus logical-type strings plus reader mapping, not new encoders.
 `timestamp` alone unlocks the majority of real parquet files.
 
-**1.3 Decode stock-Lance encodings.** The strategic decision this plan asks for. Today's
-"writer-parity only" policy (`docs/lance_table_reader_plan.md`) is what makes §2.2 a wall of FAILs.
-Proposal: keep the policy's *safety* discipline (every new decode path fuzzed, budgeted,
-bounds-checked) and drop its *scope* restriction. Concretely, work down §2.2 in frequency order —
-rust-lance's miniblock layouts for plain int/string first (that is the `int64` and `utf8` rows),
-then nulls, then timestamp, then list/dict/struct. Each one is an isolated decoder addition with a
-golden file from pylance and a fuzz target.
-
-   This is the largest item in the plan and the one I would most want a decision on before
-   starting, because it changes what nanolance *is*: from "a fast Lance writer with a verification
-   reader" to "a C++ Lance implementation." The alternative — staying writer-parity-only — is
-   coherent, but then the rust-lance switching story should be dropped from the README rather than
-   led with, and the project should be positioned purely as a writer.
+**1.3 Decode stock-Lance files by parsing the descriptor the writer already emits.** See §6 —
+this turned out to be far smaller and far safer than "implement a general Lance reader," and it
+needs no writer change at all.
 
 **1.4 CI that proves it.** A matrix job that, for each supported Arrow type: writes with pylance →
 reads with nanolance → compares; and writes with nanolance → reads with pylance → compares. Pin the
@@ -373,7 +363,8 @@ trap for the next person optimizing this file.
 Phase 0 first and immediately — it is days of work and it is the difference between "silently wrong"
 and "trustworthy." Then Phase 2 (wheels) and Phase 1 (nullability + types) in parallel, since they
 are independent and together they are what make the project installable *and* useful. Phase 1.3
-(stock-Lance decode) needs the scope decision in §3/1.3 before it starts. Phase 3 follows Phase 1.
+(stock-Lance decode) is detailed in §6 and can start immediately — it is additive and needs no
+writer change. Phase 3 follows Phase 1.
 Phase 4 last, for the reason stated there.
 
 ## 5. Explicit non-goals
@@ -384,3 +375,128 @@ Phase 4 last, for the reason stated there.
   sizes; adding encodings for their own sake trades simplicity for nothing.
 - Dropping the safety posture to win the read benchmark. `bench/read_parity_results.md` shows the
   checks cost ~1.0×; that result is worth protecting, and any mmap work (4.4) must preserve it.
+
+---
+
+## 6. Generalizing the reader without touching the writer
+
+_Added after the initial review, in answer to: can the reader be made general while the writer stays
+as-is and the verification-reader promise is preserved? **Yes — and it is mostly a dispatch change,
+not new decoders.**_
+
+### 6.1 The actual root cause
+
+The writer and the reader speak different languages about the same file.
+
+**The writer already speaks Lance properly.** For every encoding it emits, it writes a real
+`/lance.encodings21.PageLayout` message into `ColumnPage` field 4 — `MiniBlockLayout` wrapping a
+`CompressiveEncoding` tree (Flat, Variable, Constant, RLE, Dictionary, InlineBitpacking,
+ByteStreamSplit, General{ZSTD}). That is exactly why stock Lance reads nanolance output.
+
+**The reader ignores all of it.** `pb::decode_column_page` parses fields 1, 2, 3 and 5 and *skips
+field 4* — the encoding descriptor is written and never read back. `decode_lance_physical_column`
+instead branches on a nanolance-private side channel in the field metadata:
+
+```cpp
+field_metadata_equals(on_disk_field, "nanolance:packing", "constant")   // :415
+field_metadata_equals(on_disk_field, "nanolance:packing", "rle")        // :459
+field_metadata_equals(on_disk_field, "nanolance:packing", "dict-rle")   // :524
+field_metadata_equals(on_disk_field, "nanolance:packing", "dict")       // :644
+field_metadata_equals(on_disk_field, "nanolance:packing", "bss-zstd")   // :729
+field_metadata_equals(on_disk_field, "nanolance:packing", "bitpack")    // :834
+```
+
+A file from stock Lance carries none of those keys, so it falls through to a flat-page assumption
+that does not match, and dies on a size check.
+
+### 6.2 How close the two writers actually are
+
+Both writers emit the *same* descriptor namespaces — verified by `strings` on the data files:
+
+```
+pylance 12.0.0 :  /lance.encodings.ColumnEncoding   /lance.encodings21.PageLayout
+nanolance      :  /lance.encodings.ColumnEncoding   /lance.encodings21.PageLayout
+```
+
+And for the case that failed hardest in §2.2 — a plain 5000-row `int64` — the PageLayout bodies are
+**byte-identical apart from the chunk row count**:
+
+```
+pylance   int64 : 12 12 0a 10 1a 04 2a 02 08 40 32 01 01 38 01 48 88 27 50 01   (0x2788 = 5000 rows)
+nanolance int64 : 12 12 0a 10 1a 04 2a 02 08 40 32 01 01 38 01 48 80 08 50 01   (0x0880 = 1024 rows)
+                                    ^^^^^^^^^^^
+                     CompressiveEncoding{ f5 InlineBitpacking{ bits = 64 } }
+```
+
+That node is `InlineBitpacking` — which nanolance **already writes**
+(`data_file_writer.cpp:571`, `ce = {0x2a, 0x02, 0x08, bits}`) and **already decodes**
+(`unpack_bitpacked_page`, the FastLanes port, fuzzed and ASan-clean).
+
+So the failure on stock-Lance `int64` is not a missing decoder. It is a working decoder that never
+gets called, because dispatch asks the field metadata instead of reading the descriptor sitting in
+the page. Several of the §2.2 FAILs are this same shape.
+
+### 6.3 The change
+
+Three steps, strictly additive, writer untouched:
+
+1. **Parse `ColumnPage` field 4.** Add a real `PageLayout` / `CompressiveEncoding` decoder to
+   `lance_minimal.pb`, generated from the pinned Lance `encodings_v2_1.proto`. This is the mirror of
+   serializers the writer already has, and it is what `proto/README.md` has said to do since the
+   scaffold went in ("replace or extend that scaffold with nanopb output generated from the pinned
+   Lance `v7.0.0-rc.1` files ... `encodings_v2_1.proto`"). The proto dirs are still README-only.
+2. **Re-root dispatch on the parsed tree.** Walk `MiniBlockLayout → CompressiveEncoding` and call
+   the existing leaf kernels. No kernel is rewritten: FastLanes unpack, RLE expansion, dictionary
+   expansion, byte-stream-split and zstd-unframe all stay exactly as they are and as they are
+   fuzzed. This is a routing change.
+3. **Then** add only what nanolance genuinely never writes: `FullZipLayout`, `AllNullLayout`,
+   validity/definition levels (which is the same work as the null support in 1.1), and the logical
+   types in 1.2. This is the one genuinely new decoding work, and it is an enumerable list rather
+   than an open-ended "support all of Lance."
+
+Steps 1–2 alone should clear the `int64` and `utf8` rows of §2.2 — the two that matter most, since
+they are what a rust-lance user's first smoke test contains.
+
+### 6.4 The verification promise survives — and gets stronger
+
+The promise worth keeping is: *everything nanolance writes, nanolance reads back exactly; anything
+it cannot handle is a clear error, never silent wrong data.* That is a **test property**. The
+current policy enforces it with a **scope restriction** ("only decode what we write"), and the scope
+restriction is the part that blocks generality. Swap the mechanism, keep the property:
+
+**A differential oracle, free of charge.** During the transition, keep both decoders. For every file
+the writer produces, decode it via the legacy `nanolance:packing` path *and* via the new PageLayout
+path and assert the resulting `ColumnValues` are byte-identical. Run it over the whole existing test
+corpus, the golden files, and the fuzz corpus. That is an exhaustive proof that the general path
+agrees with the verified path on 100% of writer output — a much stronger guarantee than "we only
+wrote code for our own files," and something very few parsers get to have when they generalize. When
+it is green everywhere, delete the legacy path. The writer can keep emitting the `nanolance:*`
+metadata indefinitely; it costs a few bytes and keeps old files readable.
+
+**"Clear error, never best-effort" gets sharper, not weaker.** Today's behaviour is worse than the
+policy advertises. `fixed-width page byte count mismatch` on a stock-Lance `int64` is not the reader
+recognising a foreign format and declining it — it is the reader *misparsing* foreign bytes under
+nanolance layout assumptions and getting caught by a downstream size check. That is why a 3-row
+table reads "fine" and a 5000-row one fails: the luck runs out, not the validation. Dispatching on a
+typed descriptor replaces that with an honest, named refusal — "unsupported CompressiveEncoding
+variant 7" — decided before a single byte is interpreted.
+
+**The safety posture is unchanged and the budget applies as-is.** Every new node goes through the
+same `read_safety` overflow-checked bounds and allocation budget; the descriptor is itself untrusted
+input and gets validated like any other. Seed `tests/fuzz/fuzz_decode.cpp` with pylance-written
+files and coverage goes up, not down. `bench/read_parity_results.md` (~1.0× trusted vs default)
+should be re-run after the change and is expected to hold — these checks are per-page, not per-value.
+
+### 6.5 What this does *not* do
+
+It does not make nanolance a general Lance *writer*, and it should not. The writer's encoder set
+already hits Lance file sizes; leave it alone. It also does not, by itself, fix nulls (1.1) or the
+missing logical types (1.2) — those are genuine feature work that happens to share the
+validity-decoding step with 6.3's step 3.
+
+### 6.6 Positioning
+
+With this, the honest claim becomes: **"writes a deliberately small, fast subset of Lance; reads
+Lance."** That is a coherent and attractive place to stand — the same shape as the writer/reader
+asymmetry argument nanoarrow2parquet's README already makes, inverted. It gives a rust-lance user
+something to actually switch *to*, without asking the writer to grow.
