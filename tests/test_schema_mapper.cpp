@@ -110,7 +110,10 @@ void test_nullable_flag_is_accepted() {
     std::string error;
     require(nano_lance::map_arrow_schema(nullable, mapping, error), "nullable flag should map by default");
     require(mapping.fields.size() == 1, "nullable field count mismatch");
-    require(!mapping.fields[0].nullable, "nullable flag should produce a non-null Lance field");
+    // The Lance field mirrors the Arrow flag, as pylance's does. It was hardcoded false while nulls
+    // were refused outright; now that they are stored, a column with nulls under a field declared
+    // non-nullable makes stock Lance reject the file.
+    require(mapping.fields[0].nullable, "nullable Arrow flag should produce a nullable Lance field");
 
     // The legacy argument is accepted and ignored, so old call sites keep compiling and behave the same.
     nano_lance::LanceSchemaMapping legacy;

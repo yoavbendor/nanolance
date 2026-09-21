@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Nullability: what is accepted, and what is refused.
+# Nullability, end to end.
 #
-#   1. A nullable-flagged schema with NO nulls writes normally, WITHOUT --ignore-nullability, and
-#      round-trips through stock Lance. pyarrow marks essentially every field nullable, so this is
-#      the overwhelmingly common shape; requiring a flag for it rejected almost every real table.
-#   2. --ignore-nullability is still accepted (now a no-op) so existing scripts keep working.
-#   3. A batch containing a REAL null is refused, with or without the flag, and says which column,
-#      which row and what to do. This assertion used to run the other way: the test pinned the old
-#      behaviour of copying the null slot's raw bytes, asserting [10, None, 30, 40] came back as
-#      [10, 0, 30, 40]. That was silent data loss, and stock Lance read the wrong values back
-#      without complaint.
+#   1. A nullable-flagged schema with no nulls writes normally, WITHOUT --ignore-nullability.
+#   2. --ignore-nullability is still accepted (a no-op) so existing scripts keep working.
+#   3. A fixed-width column containing REAL nulls is written with Lance's definition-level layer and
+#      read back by STOCK LANCE with the nulls in the right places.
+#
+# This file has now asserted three different behaviours for case 3, which is the whole history of
+# the bug: it first pinned the silent corruption (asserting [10, None, 30, 40] came back as
+# [10, 0, 30, 40]), then the refusal that replaced it, and now the real thing.
 set -euo pipefail
 
 bin="${1:?arrowipc2lance binary path required}"
@@ -65,28 +64,28 @@ import lance
 
 table = lance.dataset("$dataset_path").to_table()
 assert table.num_rows == 4, table.num_rows
-assert not table.schema.field("frame_ts").nullable
-assert not table.schema.field("score").nullable
+# The manifest's nullable flag mirrors the ARROW SCHEMA, not whether nulls are present -- which is
+# what pylance does too. This schema is nullable-flagged, so the field is nullable even though every
+# value is set. (It read `not ... .nullable` while the flag was hardcoded false.)
+assert table.schema.field("frame_ts").nullable
+assert table.schema.field("score").nullable
+assert table.column("frame_ts").null_count == 0
 assert table.column("frame_ts").to_pylist() == [10, 20, 30, 40]
 assert table.column("score").to_pylist() == [1.0, 2.0, 3.0, 4.0]
 PY
 
-# 3. An actual null -> refused, whether or not the legacy flag is passed. Accepting a nullable
-#    *schema* must never mean silently dropping a null *value*.
-for flag in "" "--ignore-nullability"; do
-    if "$bin" $flag -o "$tmpdir/nulls.lance" -c -l 3 < "$with_nulls" 2>"$tmpdir/nulls.err"; then
-        echo "batch containing real nulls unexpectedly succeeded (flag='$flag')" >&2
-        exit 1
-    fi
-done
-# The message must name the offending column, the row, and the remedy.
-grep -q "frame_ts" "$tmpdir/nulls.err"
-grep -q "null at row 1" "$tmpdir/nulls.err"
-grep -q "fill_null" "$tmpdir/nulls.err"
-# And nothing may have been left behind for a reader to pick up.
-if [ -e "$tmpdir/nulls.lance" ]; then
-    echo "a rejected write left a dataset behind at $tmpdir/nulls.lance" >&2
-    exit 1
-fi
+# 3. Real nulls are stored, and stock Lance reads them back in the right places.
+"$bin" -o "$tmpdir/nulls.lance" -c -l 3 < "$with_nulls"
 
-echo "nullability smoke: nullable schema accepted by default, null values refused"
+"$python_bin" - <<PY
+import lance
+
+table = lance.dataset("$tmpdir/nulls.lance").to_table()
+assert table.num_rows == 4, table.num_rows
+# The manifest's nullable flag now mirrors the Arrow schema, so stock Lance sees a nullable field.
+assert table.schema.field("frame_ts").nullable
+assert table.column("frame_ts").to_pylist() == [10, None, 30, 40]
+assert table.column("score").to_pylist() == [1.0, 2.0, None, 4.0]
+PY
+
+echo "nullability smoke: nullable schema accepted, null values stored and read back by stock Lance"

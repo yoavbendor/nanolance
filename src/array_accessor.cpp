@@ -7,6 +7,7 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace nano_lance {
 namespace {
@@ -142,34 +143,92 @@ std::int64_t first_null_row(const ArrowArray& array) {
     return -1;
 }
 
-/// Reject `field` (and any ancestor struct, whose null makes every child row null) carrying real
-/// nulls. The message names the column, the row, and what to do about it -- a user hitting this is
-/// usually one `fill_null` away from a correct write.
-bool reject_actual_nulls(const ArrowArray& batch,
-                         const LanceSchemaMapping& mapping,
-                         const LanceField& field,
-                         std::string& error) {
+/// Is row `i` of `array` null? Callers have already established that a validity buffer exists.
+bool row_is_null(const ArrowArray& array, std::int64_t i) {
+    const auto* validity = static_cast<const std::uint8_t*>(array.buffers[0]);
+    const auto bit = static_cast<std::uint64_t>(array.offset + i);
+    return ((validity[bit >> 3U] >> (bit & 7U)) & 1U) == 0U;
+}
+
+/// Accumulate `field`'s validity for this batch into `out`, at the rows following the ones already
+/// appended. A null on an ANCESTOR struct makes every one of its descendant rows null without any
+/// bit being clear on the child itself, so the whole chain is folded together here.
+///
+/// The bitmap follows Arrow's convention (bit SET == valid) and is left EMPTY while every row so far
+/// is valid, so a column with no nulls -- the overwhelmingly common case -- carries no bitmap and
+/// costs nothing. It materializes lazily the first time a null shows up, back-filling the rows
+/// already seen as valid.
+bool append_validity(const ArrowArray& batch,
+                     const LanceSchemaMapping& mapping,
+                     const LanceField& field,
+                     std::int64_t length,
+                     ColumnValues& out,
+                     std::string& error) {
+    // Collect the arrays along the chain that actually carry nulls; usually none do.
+    std::vector<const ArrowArray*> nullable_levels;
     for (const LanceField* f = &field; f != nullptr;
          f = f->parent_id < 0 ? nullptr : find_field_by_id(mapping, f->parent_id)) {
         const auto* array = resolve_field_array_impl(batch, mapping, *f);
         if (array == nullptr) {
             continue;
         }
-        const auto row = first_null_row(*array);
-        if (row < 0) {
-            continue;
+        if (first_null_row(*array) >= 0) {
+            if (array->length < length) {
+                error = "column '" + f->name + "' is shorter than the batch it belongs to";
+                return false;
+            }
+            // A null on an ANCESTOR means the struct itself is null, which is not the same thing as
+            // a struct whose every field is null -- Lance distinguishes them with a deeper
+            // definition level, and nanolance only writes the one level. Folding the parent's nulls
+            // into the child would silently turn "no struct here" into "a struct with nothing in
+            // it", so refuse instead.
+            if (f != &field) {
+                error = "column '" + f->name + "' is a struct with a null at row " +
+                        std::to_string(first_null_row(*array)) +
+                        "; nanolance can store nulls on a field but not on the struct that contains "
+                        "it (that needs a second definition level). Flatten the struct, or fill it "
+                        "in and null its fields instead.";
+                return false;
+            }
+            nullable_levels.push_back(array);
         }
-        error = "column '";
-        error += f->name;
-        error += "' has a null at row " + std::to_string(row);
-        if (f != &field) {
-            error += " (the enclosing struct of '" + field.name + "')";
+    }
+
+    const auto base = out.rows;
+    if (nullable_levels.empty()) {
+        // Nothing null in this batch. Only extend an existing bitmap; do not create one.
+        if (!out.validity.empty()) {
+            out.validity.resize(static_cast<std::size_t>((base + static_cast<std::uint64_t>(length) + 7U) / 8U), 0U);
+            for (std::int64_t i = 0; i < length; ++i) {
+                const auto row = base + static_cast<std::uint64_t>(i);
+                out.validity[static_cast<std::size_t>(row >> 3U)] |=
+                    static_cast<std::uint8_t>(1U << (row & 7U));
+            }
         }
-        error +=
-            "; nanolance cannot store nulls yet -- it writes no validity information, so a null slot "
-            "would be silently written as 0 / \"\" and read back as a real value. Fill or drop nulls "
-            "before writing (pyarrow: col.fill_null(...), or table.drop_null()).";
-        return false;
+        return true;
+    }
+
+    // First null ever seen for this column: materialize the bitmap and mark every earlier row valid.
+    if (out.validity.empty() && base != 0U) {
+        out.validity.assign(static_cast<std::size_t>((base + 7U) / 8U), 0xFFU);
+        // Clear any padding bits above `base` so they cannot be mistaken for real rows.
+        for (std::uint64_t row = base; row < ((base + 7U) / 8U) * 8U; ++row) {
+            out.validity[static_cast<std::size_t>(row >> 3U)] &=
+                static_cast<std::uint8_t>(~(1U << (row & 7U)));
+        }
+    }
+    out.validity.resize(static_cast<std::size_t>((base + static_cast<std::uint64_t>(length) + 7U) / 8U), 0U);
+    for (std::int64_t i = 0; i < length; ++i) {
+        bool is_null = false;
+        for (const auto* level : nullable_levels) {
+            is_null = is_null || row_is_null(*level, i);
+        }
+        const auto row = base + static_cast<std::uint64_t>(i);
+        if (is_null) {
+            ++out.null_count;
+        } else {
+            out.validity[static_cast<std::size_t>(row >> 3U)] |= static_cast<std::uint8_t>(1U << (row & 7U));
+        }
     }
     return true;
 }
@@ -338,10 +397,9 @@ bool append_batch_column_values(const ArrowArray& batch,
             error += field.name;
             return false;
         }
-        // Unconditional, not gated on ignore_nullability: a validity bitmap with a bit cleared means
-        // data we cannot represent, whatever the schema's nullable flag claims. Costs nothing when
-        // Arrow reports null_count (pyarrow always does).
-        if (!reject_actual_nulls(batch, mapping, field, error)) {
+        // Validity first: it is recorded against the rows already appended, so it has to be taken
+        // before the value append advances them.
+        if (!append_validity(batch, mapping, field, array->length, columns[i], error)) {
             return false;
         }
         if (lance_field_is_variable_width(field.logical_type)) {
@@ -353,6 +411,7 @@ bool append_batch_column_values(const ArrowArray& batch,
                 return false;
             }
         }
+        columns[i].rows += static_cast<std::uint64_t>(array->length);
     }
     return true;
 }

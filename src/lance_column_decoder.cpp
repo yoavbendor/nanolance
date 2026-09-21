@@ -722,6 +722,41 @@ bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& 
     return read_lance_data_file_bytes(path, second_offset, second_size, second, error);
 }
 
+
+/// Read one page's chunks, appending each chunk's definition levels to `out` when the column has
+/// them. Returns the chunks so the caller can decode their values.
+[[nodiscard]] bool read_page_chunks_with_validity(const std::vector<std::uint8_t>& payload,
+                                                  const ColumnEncodingPlan& plan, std::uint64_t page_rows,
+                                                  std::vector<MiniBlockChunkView>& chunks,
+                                                  std::uint64_t& validity_rows, ColumnValues& out,
+                                                  std::string& error) {
+    if (!split_miniblock_payload(payload, chunks, error)) {
+        return false;
+    }
+    if (plan.repdef == nullptr) {
+        return true;
+    }
+    std::uint64_t covered = 0;
+    for (const auto& chunk : chunks) {
+        if (chunk.repdef.empty()) {
+            error = "column declares definition levels but a chunk carries none";
+            return false;
+        }
+        if (!append_definition_levels(chunk.repdef, *plan.repdef, chunk.repdef_values, validity_rows,
+                                      out.validity, out.null_count, error)) {
+            return false;
+        }
+        validity_rows += chunk.repdef_values;
+        covered += chunk.repdef_values;
+    }
+    if (covered != page_rows) {
+        error = "definition levels cover " + std::to_string(covered) + " of the page's " +
+                std::to_string(page_rows) + " rows";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
@@ -1175,27 +1210,40 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         }
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
-        std::vector<std::uint8_t> chunk_bytes;
+        std::vector<MiniBlockChunkView> chunks;
         std::vector<std::uint8_t> raw;
+        std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
             if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
                 return false;
             }
-            if (!parse_miniblock_payload_chunks(payload, chunk_bytes, error)) {
+            if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows,
+                                                out, error)) {
                 return false;
             }
-            if (!zstd_unframe_buffer(chunk_bytes, raw, error)) {
+            std::uint64_t remaining = page.length;
+            for (const auto& chunk : chunks) {
+                if (!zstd_unframe_buffer(chunk.values, raw, error)) {
+                    return false;
+                }
+                if (bytes_per_value == 0U || raw.size() % bytes_per_value != 0U) {
+                    error = "bss-zstd page byte count mismatch";
+                    return false;
+                }
+                const auto chunk_values = raw.size() / bytes_per_value;
+                if (chunk_values == 0U || chunk_values > remaining) {
+                    error = "bss-zstd chunk covers more values than the page has left";
+                    return false;
+                }
+                const auto base = out.fixed.size();
+                out.fixed.resize(base + raw.size());
+                bss::untranspose(raw.data(), bytes_per_value, chunk_values, out.fixed.data() + base);
+                remaining -= chunk_values;
+            }
+            if (remaining != 0U) {
+                error = "bss-zstd page chunks cover fewer rows than the page declares";
                 return false;
             }
-            std::swap(chunk_bytes, raw);
-            if (chunk_bytes.size() != page.length * bytes_per_value) {
-                error = "bss-zstd page byte count mismatch";
-                return false;
-            }
-            const auto base = out.fixed.size();
-            out.fixed.resize(base + chunk_bytes.size());
-            bss::untranspose(chunk_bytes.data(), bytes_per_value, static_cast<std::size_t>(page.length),
-                             out.fixed.data() + base);
         }
         return true;
     }
@@ -1208,23 +1256,39 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         out.fixed.reserve(static_cast<std::size_t>(declared_rows));
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
-        std::vector<std::uint8_t> chunk_bytes;
+        std::vector<MiniBlockChunkView> chunks;
+        std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
             if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
                 return false;
             }
-            if (!parse_miniblock_payload_chunks(payload, chunk_bytes, error)) {
+            if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows,
+                                                out, error)) {
                 return false;
             }
-            const auto expected = (static_cast<std::size_t>(page.length) + 7U) / 8U;
-            if (chunk_bytes.size() != expected) {
-                error = "bool page byte count mismatch";
+            std::uint64_t remaining = page.length;
+            for (const auto& chunk : chunks) {
+                // A bool chunk's byte count only bounds its value count (the last byte is partial),
+                // so the exact count comes from the levels when present and from what is left in the
+                // page otherwise.
+                const auto chunk_values = static_cast<std::size_t>(
+                    encoding_plan.repdef != nullptr
+                        ? chunk.repdef_values
+                        : std::min<std::uint64_t>(remaining, chunk.values.size() * 8U));
+                if (chunk_values == 0U || chunk_values > remaining ||
+                    chunk.values.size() != (chunk_values + 7U) / 8U) {
+                    error = "bool page byte count mismatch";
+                    return false;
+                }
+                const auto base = out.fixed.size();
+                out.fixed.resize(base + chunk_values);
+                boolpack::unpack_lsb_first(chunk.values.data(), chunk_values, out.fixed.data() + base);
+                remaining -= chunk_values;
+            }
+            if (remaining != 0U) {
+                error = "bool page chunks cover fewer rows than the page declares";
                 return false;
             }
-            const auto base = out.fixed.size();
-            out.fixed.resize(base + static_cast<std::size_t>(page.length));
-            boolpack::unpack_lsb_first(chunk_bytes.data(), static_cast<std::size_t>(page.length),
-                                       out.fixed.data() + base);
         }
         return true;
     }

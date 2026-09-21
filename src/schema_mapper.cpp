@@ -366,7 +366,12 @@ bool map_field(const ArrowSchema& field,
     out.arrow_format = format;
     out.id = next_id++;
     out.parent_id = parent_id;
-    out.nullable = false;
+    // Mirrors the Arrow schema's flag, which is what pylance writes too (it marks a field nullable
+    // even when the column happens to contain no nulls). Writing false unconditionally used to be
+    // harmless only because nulls were refused outright; now that they are stored, a column with
+    // nulls under a field declared non-nullable makes stock Lance reject the file with "Found
+    // unmasked nulls for non-nullable StructArray".
+    out.nullable = is_nullable(field);
     out.extension_name = extension_name;
     copy_metadata(field, out.metadata);
 

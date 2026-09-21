@@ -70,10 +70,15 @@ struct ColumnValues {
 
     /// Arrow-convention validity bitmap (LSB-first, bit SET means the row is VALID), or empty when
     /// every row is valid. Note the inversion against the wire format: Lance stores a definition
-    /// level per value where level 1 means NULL, so decoding flips it.
+    /// level per value where level 1 means NULL, so both encoding and decoding flip it.
     std::vector<std::uint8_t> validity;
     /// Number of rows whose validity bit is clear. Zero whenever `validity` is empty.
     std::uint64_t null_count = 0;
+    /// Rows accumulated so far. Needed on the write side because validity arrives one batch at a
+    /// time and each batch's bits must land at the right absolute row offset -- the value buffers
+    /// cannot supply that for a variable-width column, and for a borrowed fixed-width column there
+    /// is no owned buffer to measure at all.
+    std::uint64_t rows = 0;
     std::vector<std::uint8_t> fixed;
     VariableWidthColumnValues variable;
     BlobV2ExternalColumnValues blob_v2;

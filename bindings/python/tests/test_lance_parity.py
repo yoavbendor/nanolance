@@ -36,32 +36,21 @@ def test_nullable_schema_without_nulls_roundtrips(nullable_table, tmp_path):
     "column, arrow_type",
     [
         ("a", pa.int32()),
-        ("s", pa.string()),
         ("f", pa.bool_()),
     ],
 )
-def test_null_values_are_refused(column, arrow_type, tmp_path):
-    """A null *value* must never be written.
+def test_null_values_are_stored(column, arrow_type, tmp_path):
+    """A null *value* round-trips.
 
-    nanolance writes no Lance validity information, so a null slot has nowhere to go. This used to
-    copy the slot's raw bytes instead: [10, None, 30] came back as [10, 0, 30], and stock Lance read
-    those wrong values without complaint. The predecessor of this test asserted only on a null-free
-    control column, so it passed throughout.
+    This test has asserted three different behaviours in turn, which is the history of the bug: the
+    original silent corruption ([10, None, 30] came back as [10, 0, 30], and stock Lance read those
+    wrong values without complaint), then the refusal that replaced it, and now the real thing.
     """
     values = [None if i == 1 else _sample_value(arrow_type, i) for i in range(4)]
     table = pa.table({column: pa.array(values, type=arrow_type)})
     path = tmp_path / "nulls.lance"
-
-    with pytest.raises(RuntimeError) as excinfo:
-        nanolance.write_table(table, path)
-
-    message = str(excinfo.value)
-    # The message has to be actionable: which column, which row, and what to do.
-    assert column in message
-    assert "null at row 1" in message
-    assert "fill_null" in message
-    # A refused write must not leave a half-built dataset a reader could pick up.
-    assert not path.exists()
+    nanolance.write_table(table, path)
+    assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == values
 
 
 def _sample_value(arrow_type, i):
@@ -72,8 +61,14 @@ def _sample_value(arrow_type, i):
     return i * 10
 
 
-def test_null_in_nested_struct_is_refused(tmp_path):
-    """A null on a parent struct makes every child row null with no child validity bit set."""
+def test_null_struct_is_refused(tmp_path):
+    """A null STRUCT is not the same as a struct whose fields are all null.
+
+    Lance distinguishes them with a deeper definition level; nanolance writes only one. Folding the
+    parent's nulls into its children would silently turn "no struct here" into "a struct with
+    nothing in it", so this is refused rather than approximated. A null on a struct's FIELD is fine
+    and is covered above.
+    """
     table = pa.table(
         {
             "st": pa.array(
@@ -84,7 +79,9 @@ def test_null_in_nested_struct_is_refused(tmp_path):
     )
     with pytest.raises(RuntimeError) as excinfo:
         nanolance.write_table(table, tmp_path / "struct_nulls.lance")
-    assert "null at row 1" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "struct with a null at row 1" in message
+    assert "second definition level" in message
 
 
 def test_lance_pylance_reader(pylance_interop_table, tmp_path):
@@ -373,3 +370,99 @@ def test_run_length_encoded_definition_levels_are_refused_by_name(tmp_path):
     with pytest.raises(RuntimeError) as excinfo:
         nanolance.read_table(path)
     assert "definition-level encoding" in str(excinfo.value)
+
+
+# ── Writing nulls ────────────────────────────────────────────────────────────────────────────────
+# nanolance now emits Lance's definition-level layer for fixed-width columns: layers = [3], the
+# repdef encoding in MiniBlockLayout.f2, and a per-chunk level buffer ahead of the values. Level 1
+# means NULL, the inverse of Arrow's validity bit.
+
+NULLABLE_FIXED_WIDTH = [
+    pytest.param(pa.int64(), lambda i: i, id="int64"),
+    pytest.param(pa.int16(), lambda i: i % 100, id="int16"),
+    pytest.param(pa.uint8(), lambda i: i % 200, id="uint8"),
+    pytest.param(pa.float64(), lambda i: i * 0.5, id="float64"),
+    pytest.param(pa.bool_(), lambda i: i % 2 == 0, id="bool"),
+    pytest.param(pa.timestamp("ms"), lambda i: 1_700_000_000_000 + i, id="timestamp"),
+    pytest.param(pa.date32(), lambda i: i, id="date32"),
+    pytest.param(pa.decimal128(18, 4), lambda i: __import__("decimal").Decimal("1.50"), id="decimal128"),
+    pytest.param(pa.binary(4), lambda i: bytes([i % 256]) * 4, id="fixed_size_binary"),
+]
+
+
+@pytest.mark.parametrize("arrow_type, value_for", NULLABLE_FIXED_WIDTH)
+@pytest.mark.parametrize("compression", [False, True], ids=["plain", "zstd"])
+@pytest.mark.parametrize(
+    "null_at",
+    [
+        pytest.param(lambda i: i % 13 == 0, id="scattered"),
+        pytest.param(lambda i: i == 0, id="first_row_only"),
+        pytest.param(lambda i: False, id="none"),
+    ],
+)
+def test_nullable_fixed_width_roundtrip(arrow_type, value_for, compression, null_at, tmp_path):
+    """Nulls survive nanolance's own round trip AND are read back correctly by stock Lance.
+
+    3000 rows spans several 1024-value chunks including a short final one -- a chunk carrying
+    definition levels is capped at one FastLanes block, which is narrower than the byte budget a
+    plain chunk uses, so the chunking differs from the no-nulls case.
+    """
+    lance = require_pylance()
+    n = 3000
+    values = [None if null_at(i) else value_for(i) for i in range(n)]
+    table = pa.table({"v": pa.array(values, type=arrow_type)})
+    path = tmp_path / "nullable.lance"
+    nanolance.write_table(table, path, compression=compression)
+
+    # Compare against the source COLUMN, not the raw python list: to_pylist() converts a timestamp
+    # to datetime and a date32 to date, so the list of ints they were built from never matches.
+    back = pa.table(nanolance.read_table(path))
+    assert back.column(0).null_count == table.column(0).null_count
+    assert back.column(0).equals(table.column(0))
+
+    ref = lance.dataset(str(path)).to_table()
+    assert ref.column(0).null_count == table.column(0).null_count
+    assert ref.column(0).equals(table.column(0))
+
+
+def test_nullable_multi_column_table(tmp_path):
+    """Several nullable columns with different null patterns in one table."""
+    lance = require_pylance()
+    n = 4000
+    table = pa.table(
+        {
+            "id": pa.array([None if i % 97 == 0 else i for i in range(n)], type=pa.int64()),
+            "score": pa.array([None if i % 13 == 0 else i * 0.5 for i in range(n)], type=pa.float64()),
+            "flag": pa.array([None if i % 7 == 0 else (i % 2 == 0) for i in range(n)]),
+            "solid": pa.array(list(range(n)), type=pa.int64()),  # no nulls at all
+        }
+    )
+    path = tmp_path / "multi.lance"
+    nanolance.write_table(table, path)
+    back = pa.table(nanolance.read_table(path))
+    ref = lance.dataset(str(path)).to_table()
+    for name in table.column_names:
+        assert back.column(name).to_pylist() == table.column(name).to_pylist(), name
+        assert ref.column(name).to_pylist() == table.column(name).to_pylist(), name
+
+
+def test_nulls_appearing_in_a_later_chunk(tmp_path):
+    """The validity bitmap materializes lazily; a column whose first null is far in must still work."""
+    lance = require_pylance()
+    n = 5000
+    values = [i if i < 4000 else None for i in range(n)]
+    table = pa.table({"v": pa.array(values, type=pa.int64())})
+    path = tmp_path / "late.lance"
+    nanolance.write_table(table, path)
+    assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == values
+    assert lance.dataset(str(path)).to_table().column(0).to_pylist() == values
+
+
+def test_string_column_with_nulls_is_refused(tmp_path):
+    """Variable-width columns do not carry definition levels yet -- refused, not silently dropped."""
+    table = pa.table({"s": pa.array(["x", None, "zz"])})
+    with pytest.raises(RuntimeError) as excinfo:
+        nanolance.write_table(table, tmp_path / "strnull.lance")
+    message = str(excinfo.value)
+    assert "string/binary column containing nulls" in message
+    assert "fill_null" in message
