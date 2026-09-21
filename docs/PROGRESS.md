@@ -17,12 +17,12 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | **Phase 1.3 — read stock-Lance files** | **steps 1 and 2 of 3 done** (parse, oracle, dispatch) |
 | Fuzz coverage for the descriptor parser | done — found one real bug in 25 executions |
 | 1.1 Real nullability | not started |
-| 1.2 timestamp / date / time / decimal | not started |
+| 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | not started |
 | Phase 3 — streaming read, projection in Python | not started |
 | Phase 4 — read-path optimization | not started (deliberately last) |
 
-Test suite: **46 ctest** (was 42) and **27 pytest** (was 22), all passing.
+Test suite: **46 ctest** (was 42) and **78 pytest** (was 22), all passing.
 
 Fuzzers: `nanolance_fuzz_decode` and `nanolance_fuzz_page_layout`, both clean; the longest
 campaign run here was 95,896,936 executions.
@@ -202,6 +202,29 @@ located rather than guessed:
 field 6, the `InlineBitpacking` and miniblock chunk framing differences, `AllNull`, validity levels
 (shared with 1.1), and the logical-type mappings from 1.2. `FullZip` (PageLayout field 3) is what
 blob-v2 packed pages use and is already handled by its own path.
+
+### Phase 1.2: temporal and decimal types
+
+`timestamp`, `date32/64`, `time32/64`, `decimal128/256` were rejected at write, which made nanolance
+unusable for most real parquet data. They are fixed-width integers on the wire, so no encoder work
+was involved — what was missing was the Arrow format strings and the Lance logical-type names. Those
+names were read back out of manifests written by pylance 12.0.0 rather than invented, so a column
+nanolance writes is described exactly as stock Lance describes its own.
+
+Verified in all three directions, 14 type/unit/timezone combinations each: nanolance round-trip,
+nanolance → stock Lance, and **stock Lance → nanolance**. The last is new — these columns previously
+failed at manifest mapping.
+
+A UTC-offset timezone (`+05:30`) is refused, because Lance supports IANA zone names only and *panics*
+on offsets — pylance cannot write one either.
+
+**It also exposed a pre-existing corruption.** A flat page's declared bits-per-value snapped anything
+unrecognised to 32, so a 16-bit column and `fixed_size_binary(N != 4)` were mis-declared; stock Lance
+panicked on the first and errored on the second — including the 6-byte MAC address README.md
+recommends the type for. Integers escaped through `InlineBitpacking` (which declares its own width)
+so `int16` happened to survive with default options; `fixed_size_binary` is not bitpackable and did
+not. The root cause was a second copy of the width table inside the writer plus MiniBlockLayout byte
+strings with hardcoded submessage lengths; both are now derived.
 
 ### Fuzzing the descriptor parser
 
