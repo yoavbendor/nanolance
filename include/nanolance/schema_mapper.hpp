@@ -86,7 +86,13 @@ inline std::string lance_on_disk_logical_type(const std::string& logical_type) {
 
 std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& mapping);
 
-bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error, bool ignore_nullability = false);
+/// \p ignore_nullability is accepted and ignored; it is kept so existing callers still compile.
+/// Nullable-flagged fields are always accepted now -- pyarrow marks essentially every field nullable,
+/// so gating on the flag rejected almost every real table while protecting nothing. What actually
+/// needed guarding is a null *value*, and that is refused unconditionally during ingest
+/// (see append_batch_column_values), where the data is.
+bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
+                      bool ignore_nullability = false);
 bool schema_mappings_equal(const LanceSchemaMapping& left, const LanceSchemaMapping& right);
 /// Human-readable description of the first way `actual` differs from `expected` (column count, or the
 /// first field whose name/order, type, nullability, or extension differs). Returns a generic string if

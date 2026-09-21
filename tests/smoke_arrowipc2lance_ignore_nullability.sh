@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# What --ignore-nullability does, and what it deliberately no longer does.
+# Nullability: what is accepted, and what is refused.
 #
-#   1. Without the flag, a nullable-flagged schema is refused (unchanged).
-#   2. With the flag, a nullable-flagged schema whose columns contain NO nulls writes normally and
-#      round-trips through stock Lance. This is the case the flag exists for -- pyarrow marks
-#      essentially every field nullable.
-#   3. With the flag, a batch that contains a REAL null is refused with an actionable message.
-#      This assertion used to run the other way: the test pinned the old behaviour of copying the
-#      null slot's raw bytes, asserting [10, None, 30, 40] came back as [10, 0, 30, 40]. That was
-#      silent data loss, and stock Lance read the wrong values back without complaint.
+#   1. A nullable-flagged schema with NO nulls writes normally, WITHOUT --ignore-nullability, and
+#      round-trips through stock Lance. pyarrow marks essentially every field nullable, so this is
+#      the overwhelmingly common shape; requiring a flag for it rejected almost every real table.
+#   2. --ignore-nullability is still accepted (now a no-op) so existing scripts keep working.
+#   3. A batch containing a REAL null is refused, with or without the flag, and says which column,
+#      which row and what to do. This assertion used to run the other way: the test pinned the old
+#      behaviour of copying the null slot's raw bytes, asserting [10, None, 30, 40] came back as
+#      [10, 0, 30, 40]. That was silent data loss, and stock Lance read the wrong values back
+#      without complaint.
 set -euo pipefail
 
 bin="${1:?arrowipc2lance binary path required}"
@@ -53,15 +54,11 @@ for path, table in (("$with_nulls", with_nulls), ("$no_nulls", no_nulls)):
             writer.write_table(table)
 PY
 
-# 1. No flag -> refused, and the message names the flag.
-if "$bin" -o "$tmpdir/should_fail.lance" -c -l 3 < "$no_nulls" 2>"$tmpdir/no_flag.err"; then
-    echo "nullable schema unexpectedly succeeded without --ignore-nullability" >&2
-    exit 1
-fi
-grep -q -- "--ignore-nullability" "$tmpdir/no_flag.err"
+# 1. No flag, nullable schema, no null values -> writes. This is the pyarrow default shape.
+"$bin" -o "$dataset_path" -c -l 3 < "$no_nulls"
 
-# 2. Flag + no actual nulls -> writes, and stock Lance reads the real values back.
-"$bin" --ignore-nullability -o "$dataset_path" -c -l 3 < "$no_nulls"
+# 2. The legacy flag is still accepted (no-op) so existing scripts do not break.
+"$bin" --ignore-nullability -o "$tmpdir/legacy_flag.lance" -c -l 3 < "$no_nulls"
 
 "$python_bin" - <<PY
 import lance
@@ -74,13 +71,14 @@ assert table.column("frame_ts").to_pylist() == [10, 20, 30, 40]
 assert table.column("score").to_pylist() == [1.0, 2.0, 3.0, 4.0]
 PY
 
-# 3. Flag + an actual null -> refused. The flag accepts a nullable *schema*; it must never silently
-#    drop a null *value*.
-if "$bin" --ignore-nullability -o "$tmpdir/nulls.lance" -c -l 3 < "$with_nulls" \
-        2>"$tmpdir/nulls.err"; then
-    echo "batch containing real nulls unexpectedly succeeded" >&2
-    exit 1
-fi
+# 3. An actual null -> refused, whether or not the legacy flag is passed. Accepting a nullable
+#    *schema* must never mean silently dropping a null *value*.
+for flag in "" "--ignore-nullability"; do
+    if "$bin" $flag -o "$tmpdir/nulls.lance" -c -l 3 < "$with_nulls" 2>"$tmpdir/nulls.err"; then
+        echo "batch containing real nulls unexpectedly succeeded (flag='$flag')" >&2
+        exit 1
+    fi
+done
 # The message must name the offending column, the row, and the remedy.
 grep -q "frame_ts" "$tmpdir/nulls.err"
 grep -q "null at row 1" "$tmpdir/nulls.err"
@@ -91,4 +89,4 @@ if [ -e "$tmpdir/nulls.lance" ]; then
     exit 1
 fi
 
-echo "ignore_nullability smoke: schema accepted, null values refused"
+echo "nullability smoke: nullable schema accepted by default, null values refused"

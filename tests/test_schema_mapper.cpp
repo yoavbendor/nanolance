@@ -87,7 +87,11 @@ void test_flat_schema() {
     require(nano_lance::lance_physical_fields(mapping).size() == 2, "flat physical field count mismatch");
 }
 
-void test_nullability_ignore() {
+// Mapping a nullable-FLAGGED field always succeeds, with or without the legacy ignore_nullability
+// argument. It used to be rejected unless the flag was passed, which rejected essentially every
+// pyarrow table (pyarrow marks all fields nullable) while protecting nothing -- what needs guarding
+// is a null VALUE, and ingest refuses those unconditionally (tests/test_null_rejection.cpp).
+void test_nullable_flag_is_accepted() {
     ArrowSchema nullable{};
     nullable.format = "l";
     nullable.name = "nullable";
@@ -95,10 +99,16 @@ void test_nullability_ignore() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(!nano_lance::map_arrow_schema(nullable, mapping, error), "nullable type should fail");
-    require(nano_lance::map_arrow_schema(nullable, mapping, error, true), "nullable type should pass with ignore flag");
-    require(mapping.fields.size() == 1, "nullable ignore field count mismatch");
-    require(!mapping.fields[0].nullable, "nullable ignore should produce non-null Lance field");
+    require(nano_lance::map_arrow_schema(nullable, mapping, error), "nullable flag should map by default");
+    require(mapping.fields.size() == 1, "nullable field count mismatch");
+    require(!mapping.fields[0].nullable, "nullable flag should produce a non-null Lance field");
+
+    // The legacy argument is accepted and ignored, so old call sites keep compiling and behave the same.
+    nano_lance::LanceSchemaMapping legacy;
+    require(nano_lance::map_arrow_schema(nullable, legacy, error, true),
+            "nullable flag should still map with the legacy ignore argument");
+    require(legacy.fields.size() == mapping.fields.size(), "legacy argument changed the mapping");
+    require(legacy.fields[0].nullable == mapping.fields[0].nullable, "legacy argument changed nullability");
 }
 
 void test_fixed_size_binary() {
@@ -278,7 +288,7 @@ void test_golden_blob_ipc_schema() {
 
 int main() {
     test_flat_schema();
-    test_nullability_ignore();
+    test_nullable_flag_is_accepted();
     test_fixed_size_binary();
     test_dictionary_schema();
     test_extension_struct();

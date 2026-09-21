@@ -178,7 +178,6 @@ bool map_field(const ArrowSchema& field,
                std::int32_t parent_id,
                std::int32_t& next_id,
                std::int32_t& next_column,
-               bool ignore_nullability,
                LanceSchemaMapping& mapping,
                std::string& error);
 
@@ -186,8 +185,7 @@ bool map_struct_children(const ArrowSchema& field,
                          std::int32_t parent_id,
                          std::int32_t& next_id,
                          std::int32_t& next_column,
-                         bool ignore_nullability,
-                         LanceSchemaMapping& mapping,
+                                   LanceSchemaMapping& mapping,
                          std::string& error) {
     if (field.n_children <= 0 || field.children == nullptr) {
         error = "struct field has no children: ";
@@ -199,7 +197,7 @@ bool map_struct_children(const ArrowSchema& field,
             error = "struct field has null child";
             return false;
         }
-        if (!map_field(*field.children[i], parent_id, next_id, next_column, ignore_nullability, mapping, error)) {
+        if (!map_field(*field.children[i], parent_id, next_id, next_column, mapping, error)) {
             return false;
         }
     }
@@ -210,7 +208,6 @@ bool map_field(const ArrowSchema& field,
                std::int32_t parent_id,
                std::int32_t& next_id,
                std::int32_t& next_column,
-               bool ignore_nullability,
                LanceSchemaMapping& mapping,
                std::string& error) {
     const char* format = field.format == nullptr ? "" : field.format;
@@ -222,12 +219,6 @@ bool map_field(const ArrowSchema& field,
         error += format;
         return false;
     }
-    if (is_nullable(field) && !ignore_nullability) {
-        error = "nullable fields are not supported without --ignore-nullability: ";
-        error += field.name == nullptr ? "<unnamed>" : field.name;
-        return false;
-    }
-
     std::string extension_name;
     read_metadata_key(field, kArrowExtensionNameKey, extension_name);
 
@@ -264,7 +255,7 @@ bool map_field(const ArrowSchema& field,
     mapping.fields.push_back(out);
 
     if (is_struct) {
-        return map_struct_children(field, out.id, next_id, next_column, ignore_nullability, mapping, error);
+        return map_struct_children(field, out.id, next_id, next_column, mapping, error);
     }
     return true;
 }
@@ -313,7 +304,8 @@ std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& m
     return out;
 }
 
-bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error, bool ignore_nullability) {
+bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
+                      bool /*ignore_nullability*/) {
     mapping.fields.clear();
     error.clear();
 
@@ -326,14 +318,14 @@ bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, st
                 error = "schema has null child";
                 return false;
             }
-            if (!map_field(*schema.children[i], -1, next_id, next_column, ignore_nullability, mapping, error)) {
+            if (!map_field(*schema.children[i], -1, next_id, next_column, mapping, error)) {
                 return false;
             }
         }
         return true;
     }
 
-    return map_field(schema, -1, next_id, next_column, ignore_nullability, mapping, error);
+    return map_field(schema, -1, next_id, next_column, mapping, error);
 }
 
 bool schema_mappings_equal(const LanceSchemaMapping& left, const LanceSchemaMapping& right) {
