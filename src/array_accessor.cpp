@@ -6,6 +6,7 @@
 #include <nanoarrow/nanoarrow.h>
 
 #include <cstring>
+#include <string>
 
 namespace nano_lance {
 namespace {
@@ -83,6 +84,96 @@ const ArrowArray* resolve_field_array_impl(const ArrowArray& batch,
     }
     return child_by_mapped_name(*parent_array, mapping, field.parent_id, field.name);
 }
+
+// --- Null detection -------------------------------------------------------------------------
+//
+// nanolance does not write Lance validity/definition information yet, so a null slot has nowhere to
+// go. Historically `ignore_nullability` meant "copy the null slot's raw bytes as-is", which turned
+// [10, null, 30] into [10, 0, 30] and ["x", null] into ["x", ""] with no error and no warning --
+// silent data loss, and the worst kind, because stock Lance reads the result back happily and just
+// reports wrong values. Ingest now refuses a batch that actually contains a null. `ignore_nullability`
+// keeps its job of accepting a *nullable-flagged* field (pyarrow marks essentially everything
+// nullable), but it can no longer cost you data.
+
+/// First row index in [0, length) that is null, or -1 when the array has no nulls.
+/// Arrow's `null_count` is authoritative when non-negative; -1 means "not computed" and we scan the
+/// validity bitmap ourselves. Absent validity buffer == every slot valid.
+std::int64_t first_null_row(const ArrowArray& array) {
+    if (array.length <= 0 || array.null_count == 0) {
+        return -1;
+    }
+    if (array.n_buffers < 1 || array.buffers == nullptr || array.buffers[0] == nullptr) {
+        // No validity buffer. A positive null_count here would be malformed; treat the buffer as the
+        // source of truth and report the array as all-valid rather than inventing a row index.
+        return -1;
+    }
+    const auto* validity = static_cast<const std::uint8_t*>(array.buffers[0]);
+    const auto base = static_cast<std::uint64_t>(array.offset);
+    const auto length = static_cast<std::uint64_t>(array.length);
+    // Scan whole bytes where the window is byte-aligned (the overwhelmingly common case, and what
+    // makes this O(n/8) rather than O(n) for the all-valid-but-null_count-unknown path); the
+    // unaligned head/tail fall back to bit tests.
+    std::uint64_t i = 0;
+    while (i < length && ((base + i) & 7U) != 0U) {
+        const auto bit = base + i;
+        if (((validity[bit >> 3U] >> (bit & 7U)) & 1U) == 0U) {
+            return static_cast<std::int64_t>(i);
+        }
+        ++i;
+    }
+    while (i + 8U <= length) {
+        const auto byte = validity[(base + i) >> 3U];
+        if (byte != 0xFFU) {
+            for (std::uint64_t b = 0; b < 8U; ++b) {
+                if (((byte >> b) & 1U) == 0U) {
+                    return static_cast<std::int64_t>(i + b);
+                }
+            }
+        }
+        i += 8U;
+    }
+    while (i < length) {
+        const auto bit = base + i;
+        if (((validity[bit >> 3U] >> (bit & 7U)) & 1U) == 0U) {
+            return static_cast<std::int64_t>(i);
+        }
+        ++i;
+    }
+    return -1;
+}
+
+/// Reject `field` (and any ancestor struct, whose null makes every child row null) carrying real
+/// nulls. The message names the column, the row, and what to do about it -- a user hitting this is
+/// usually one `fill_null` away from a correct write.
+bool reject_actual_nulls(const ArrowArray& batch,
+                         const LanceSchemaMapping& mapping,
+                         const LanceField& field,
+                         std::string& error) {
+    for (const LanceField* f = &field; f != nullptr;
+         f = f->parent_id < 0 ? nullptr : find_field_by_id(mapping, f->parent_id)) {
+        const auto* array = resolve_field_array_impl(batch, mapping, *f);
+        if (array == nullptr) {
+            continue;
+        }
+        const auto row = first_null_row(*array);
+        if (row < 0) {
+            continue;
+        }
+        error = "column '";
+        error += f->name;
+        error += "' has a null at row " + std::to_string(row);
+        if (f != &field) {
+            error += " (the enclosing struct of '" + field.name + "')";
+        }
+        error +=
+            "; nanolance cannot store nulls yet -- it writes no validity information, so a null slot "
+            "would be silently written as 0 / \"\" and read back as a real value. Fill or drop nulls "
+            "before writing (pyarrow: col.fill_null(...), or table.drop_null()).";
+        return false;
+    }
+    return true;
+}
+
 
 bool append_fixed_width(const ArrowArray& array,
                         const LanceField& field,
@@ -245,6 +336,12 @@ bool append_batch_column_values(const ArrowArray& batch,
         if (array == nullptr) {
             error = "missing ArrowArray for mapped field ";
             error += field.name;
+            return false;
+        }
+        // Unconditional, not gated on ignore_nullability: a validity bitmap with a bit cleared means
+        // data we cannot represent, whatever the schema's nullable flag claims. Costs nothing when
+        // Arrow reports null_count (pyarrow always does).
+        if (!reject_actual_nulls(batch, mapping, field, error)) {
             return false;
         }
         if (lance_field_is_variable_width(field.logical_type)) {

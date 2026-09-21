@@ -473,6 +473,10 @@ add_executable(nano_lance_dict_roundtrip_test tests/test_dict_roundtrip.cpp)
 target_compile_features(nano_lance_dict_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_dict_roundtrip_test PRIVATE nanolance)
 
+add_executable(nano_lance_null_rejection_test tests/test_null_rejection.cpp)
+target_link_libraries(nano_lance_null_rejection_test PRIVATE nanolance)
+target_compile_features(nano_lance_null_rejection_test PRIVATE cxx_std_20)
+
 add_executable(nano_lance_array_accessor_test tests/test_array_accessor.cpp)
 target_compile_features(nano_lance_array_accessor_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_array_accessor_test PRIVATE nanolance)
@@ -581,6 +585,9 @@ set_tests_properties(nano_lance_read_safety PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_dict_roundtrip COMMAND $<TARGET_FILE:nano_lance_dict_roundtrip_test>)
 set_tests_properties(nano_lance_dict_roundtrip PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_null_rejection COMMAND $<TARGET_FILE:nano_lance_null_rejection_test>)
+set_tests_properties(nano_lance_null_rejection PROPERTIES LABELS smoke)
 
 add_test(NAME nano_lance_array_accessor COMMAND $<TARGET_FILE:nano_lance_array_accessor_test>)
 set_tests_properties(nano_lance_array_accessor PROPERTIES LABELS "smoke")

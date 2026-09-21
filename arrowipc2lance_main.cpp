@@ -68,7 +68,8 @@ int main(int argc, char** argv) {
     app.add_flag("-a,--append", append, "Append to an existing dataset");
     app.add_flag("--ignore-nullability",
                  ignore_nullability,
-                 "Treat fixed-width nullable Arrow fields as non-null Lance fields and copy null slot bytes as-is");
+                 "Accept nullable-flagged Arrow fields (writing them as non-null Lance fields). Batches that "
+                 "actually contain a null are still refused -- nanolance cannot store nulls yet.");
     app.add_flag("--compress", compress,
                  "zstd-compress variable-width (string/binary) columns (Lance-compatible)");
     app.add_flag("--no-structural", no_structural,

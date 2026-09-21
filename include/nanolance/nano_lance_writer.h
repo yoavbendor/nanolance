@@ -30,6 +30,14 @@ typedef struct NanoLanceWriter {
 int nano_lance_writer_init(NanoLanceWriter* writer, const char* path, int compression_level);
 /// Open an existing dataset for more fragments (reloads schema from latest manifest; commits must use `is_append=true`).
 int nano_lance_writer_init_append(NanoLanceWriter* writer, const char* path, int compression_level);
+/// Accept fields whose Arrow schema sets ARROW_FLAG_NULLABLE. Off by default, so a nullable-flagged
+/// schema is rejected; pyarrow marks essentially every field nullable, so most callers want this on.
+///
+/// This accepts a nullable *schema*, never a null *value*. nanolance writes no Lance validity
+/// information, so a null slot has nowhere to go; a batch that actually contains one is refused at
+/// write_batch with a message naming the column and row, whatever this flag is set to. (It used to
+/// copy the null slot's raw bytes instead, which silently turned [10, null, 30] into [10, 0, 30] --
+/// and stock Lance read the wrong values back without complaint.) Fill or drop nulls before writing.
 int nano_lance_writer_set_ignore_nullability(NanoLanceWriter* writer, bool ignore_nullability);
 /// Opt in to URI-dictionary encoding for `lance.blob.v2` external columns: store each distinct URI
 /// once and reference it per row by index. Much smaller when many rows point at one object, but the

@@ -23,6 +23,10 @@ class WriteOptions:
     # dictionary+RLE). On by default and independent of ``compression`` (which controls only zstd).
     structural_encoding: bool = True
     blob_uri_dictionary: bool = False
+    # Accept nullable-flagged Arrow fields. On by default because pyarrow marks essentially every
+    # field nullable. It accepts a nullable *schema*, never a null *value*: a table that actually
+    # contains a null is refused with a message naming the column and row, since nanolance writes no
+    # validity information and would otherwise store 0 / "" in its place.
     ignore_nullability: bool = True
     append: bool = False
 
