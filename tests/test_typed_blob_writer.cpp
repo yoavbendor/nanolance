@@ -30,6 +30,14 @@ void require(bool ok, const char* msg) {
     }
 }
 
+// NB: `require(f(error), error)` is a trap. The two arguments are evaluated in unspecified
+// order, so c_str() can capture a pointer into the EMPTY string before f() runs; when f() then fails
+// and assigns a long message, the string reallocates and that pointer dangles. Real failures printed
+// a stray letter instead of their message. Pass the string itself.
+void require(bool ok, const std::string& msg) {
+    require(ok, msg.c_str());
+}
+
 std::filesystem::path temp_dataset(const char* suffix) {
     auto p = std::filesystem::temp_directory_path() / ("nano_lance_typed_blob_" + std::string(suffix));
     std::error_code ec;
@@ -76,9 +84,9 @@ int main() {
     const auto ds_c = temp_dataset("c_api");
     {
         ArrowSchema schema{};
-        require(nano_lance::build_epb_table_schema(schema, error), error.c_str());
+        require(nano_lance::build_epb_table_schema(schema, error), error);
         ArrowArray batch{};
-        require(nano_lance::build_epb_table_array(packet_ids, rows, batch, error), error.c_str());
+        require(nano_lance::build_epb_table_array(packet_ids, rows, batch, error), error);
         NanoLanceWriter w{};
         require(nano_lance_writer_init(&w, ds_c.string().c_str(), 3) == NANO_LANCE_OK, "c init");
         require(nano_lance_writer_set_ignore_nullability(&w, true) == NANO_LANCE_OK, "c nullability");

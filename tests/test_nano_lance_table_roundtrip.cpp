@@ -22,6 +22,14 @@ void require(bool ok, const char* msg) {
     }
 }
 
+// NB: `require(f(error), error)` is a trap. The two arguments are evaluated in unspecified
+// order, so c_str() can capture a pointer into the EMPTY string before f() runs; when f() then fails
+// and assigns a long message, the string reallocates and that pointer dangles. Real failures printed
+// a stray letter instead of their message. Pass the string itself.
+void require(bool ok, const std::string& msg) {
+    require(ok, msg.c_str());
+}
+
 std::filesystem::path temp_dataset(const char* suffix) {
     auto p = std::filesystem::temp_directory_path() / ("nano_lance_table_rt_" + std::string(suffix));
     std::error_code ec;
@@ -80,7 +88,7 @@ void test_int64_roundtrip() {
     ArrowSchema read_schema{};
     std::vector<ArrowArray> batches;
     std::string error;
-    require(nano_lance::lance_table_read_dataset(ds, read_schema, batches, error), error.c_str());
+    require(nano_lance::lance_table_read_dataset(ds, read_schema, batches, error), error);
     require(batches.size() == 1U, "expected one batch");
     const ArrowArray* col = first_column_array(batches[0]);
     require(col->length == source.length, "row count mismatch");
@@ -120,7 +128,7 @@ void test_int64_roundtrip_trusted_input() {
     std::vector<ArrowArray> batches;
     std::string error;
     require(nano_lance::lance_table_read_dataset(ds, read_schema, batches, error, /*trusted_input=*/true),
-            error.c_str());
+            error);
     require(batches.size() == 1U, "expected one batch");
     const ArrowArray* col = first_column_array(batches[0]);
     require(col->length == source.length, "row count mismatch under trusted_input");
@@ -160,7 +168,7 @@ void test_utf8_roundtrip() {
     ArrowSchema read_schema{};
     std::vector<ArrowArray> batches;
     std::string error;
-    require(nano_lance::lance_table_read_dataset(ds, read_schema, batches, error), error.c_str());
+    require(nano_lance::lance_table_read_dataset(ds, read_schema, batches, error), error);
     require(batches.size() == 1U, "expected one batch");
     const ArrowArray* read_col = first_column_array(batches[0]);
     require(utf8_diff_count(source, *read_col) == 0U, "source-read diff must be zero for utf8");

@@ -22,7 +22,7 @@ void require(bool condition, const char* message) {
     }
 }
 
-// `require(f(error), error.c_str())` is a trap: the two arguments are evaluated in unspecified
+// `require(f(error), error)` is a trap: the two arguments are evaluated in unspecified
 // order, so c_str() can capture a pointer into the EMPTY string before f() runs. When f() then fails
 // and assigns a long message, the string reallocates and the captured pointer dangles -- a real
 // failure printed a stray "N" instead of its message. Taking the string by reference and calling
@@ -83,7 +83,7 @@ void test_flat_schema() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(root, mapping, error), error.c_str());
+    require(nano_lance::map_arrow_schema(root, mapping, error), error);
     require(mapping.fields.size() == 2, "expected two fields");
     require(mapping.fields[0].name == "id", "id field name mismatch");
     require(mapping.fields[0].logical_type == "int64", "id logical type mismatch");
@@ -128,7 +128,7 @@ void test_fixed_size_binary() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(mac, mapping, error), error.c_str());
+    require(nano_lance::map_arrow_schema(mac, mapping, error), error);
     // The width is carried in the logical type (Lance's own form is "fixed_size_binary:<N>") so it can
     // be recovered from the manifest on read.
     require(mapping.fields[0].logical_type == "fixed_size_binary:6", "fixed size binary logical type mismatch");
@@ -202,7 +202,7 @@ void test_extension_struct() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(root, mapping, error), error.c_str());
+    require(nano_lance::map_arrow_schema(root, mapping, error), error);
     require(mapping.fields.size() == 5, "extension struct field count mismatch");
 
     const auto* parent = find_field(mapping, "payload_ref");
@@ -245,7 +245,7 @@ void test_top_level_named_struct_maps_as_field() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(payload, mapping, error), error.c_str());
+    require(nano_lance::map_arrow_schema(payload, mapping, error), error);
     require(mapping.fields.size() == 2, "named top-level struct should map parent and child");
     require(mapping.fields[0].name == "payload_ref", "named top-level struct parent missing");
     require(mapping.fields[0].column_index == -1, "named top-level struct should be logical-only");
@@ -277,7 +277,7 @@ void test_golden_blob_ipc_schema() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(schema, mapping, error, true), error.c_str());
+    require(nano_lance::map_arrow_schema(schema, mapping, error, true), error);
 
     const auto* packet_id = find_field(mapping, "packet_id");
     const auto* payload_ref = find_field(mapping, "payload_ref");

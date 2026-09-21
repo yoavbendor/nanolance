@@ -3,6 +3,8 @@
 
 #include "nanolance/lance_column_decoder.hpp"
 
+#include "nanolance/page_layout.hpp"
+
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/bool_bitpack.hpp"
 #include "nanolance/byte_stream_split.hpp"
@@ -15,6 +17,7 @@
 
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <memory>
 #include <utility>
 
@@ -337,6 +340,187 @@ bool unpack_bitpacked_page_dispatch(const std::vector<std::uint8_t>& chunk, std:
     }
 }
 
+
+
+/// Inverse of the writer's encode_scalar_variable_value: a Lance scalar value buffer holding a
+/// length-1 string/binary array, laid out as [u32 num_buffers][u32 buffer_len ...][buffers]. For
+/// utf8/binary that is two buffers -- offsets [0, len] and the data -- and the value we want is the
+/// data buffer whole. Every length is untrusted, so each is bounds-checked before use.
+[[nodiscard]] bool decode_scalar_variable_value(const std::vector<std::uint8_t>& buffer,
+                                                std::vector<std::uint8_t>& out, std::string& error) {
+    if (buffer.size() < 4U) {
+        error = "constant value buffer shorter than its header";
+        return false;
+    }
+    const auto num_buffers = load_le<std::uint32_t>(buffer.data());
+    if (num_buffers != 2U) {
+        error = "constant value buffer declares " + std::to_string(num_buffers) +
+                " buffers; expected 2 (offsets + data)";
+        return false;
+    }
+    std::uint64_t header = 0;
+    if (!checked_mul(num_buffers, 4U, header) || !checked_add(header, 4U, header) || header > buffer.size()) {
+        error = "constant value buffer header exceeds the buffer";
+        return false;
+    }
+    const auto offsets_len = load_le<std::uint32_t>(buffer.data() + 4U);
+    const auto data_len = load_le<std::uint32_t>(buffer.data() + 8U);
+    std::uint64_t data_start = 0;
+    std::uint64_t data_end = 0;
+    if (!checked_add(header, offsets_len, data_start) || !checked_add(data_start, data_len, data_end) ||
+        data_end > buffer.size()) {
+        error = "constant value buffer's data range exceeds the buffer";
+        return false;
+    }
+    out.assign(buffer.begin() + static_cast<std::ptrdiff_t>(data_start),
+               buffer.begin() + static_cast<std::ptrdiff_t>(data_end));
+    return true;
+}
+
+// ── Encoding selection ───────────────────────────────────────────────────────────────────────────
+//
+// Which decode path a column takes used to be read off nanolance-private field metadata
+// (`nanolance:packing`). The writer also records the same fact in each page's
+// /lance.encodings21.PageLayout descriptor, in the form every Lance implementation uses -- and a file
+// from the Rust lance crate carries ONLY that. Selecting from the descriptor is therefore what makes
+// those files reachable; tests/test_page_layout.cpp is the differential oracle proving the two
+// signals agree across the writer's whole output space.
+//
+// The metadata remains the fallback for a page with no descriptor, so files written before the
+// descriptor was read back keep decoding unchanged.
+
+enum class ColumnEncodingKind {
+    kBlobPacked,
+    kConstant,
+    kRle,
+    kDictRle,
+    kDict,
+    kBssZstd,
+    kBoolPacked,
+    kVariable,
+    kBitpack,
+    kFlat,
+    kUnsupported,
+};
+
+struct ColumnEncodingPlan {
+    ColumnEncodingKind kind = ColumnEncodingKind::kFlat;
+    bool zstd = false;  // variable-width only: value bytes are [u64 len][zstd frame]
+    /// kConstant: the repeated value, when the descriptor carried it inline. A fixed-width constant
+    /// page stores its value here and has no data buffers at all; a variable-width one leaves this
+    /// empty and puts the value in the page's single buffer. Reading it from the descriptor rather
+    /// than from `nanolance:const-value` is what lets a constant column from any writer decode.
+    std::optional<std::vector<std::uint8_t>> constant_inline_value;
+    /// Set when the descriptor named something this build does not model, so the error can say what.
+    std::string unsupported_reason;
+};
+
+/// Classify from the page descriptor alone. Returns false when the column carries no descriptor (an
+/// older nanolance file), leaving the caller to fall back to the field metadata.
+bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnEncodingPlan& out) {
+    if (column_metadata.pages.empty() || column_metadata.pages.front().encoding.empty()) {
+        return false;
+    }
+    page_layout::PageLayout layout;
+    std::string parse_error;
+    if (!page_layout::decode_page_layout(column_metadata.pages.front().encoding, layout, parse_error)) {
+        out.kind = ColumnEncodingKind::kUnsupported;
+        out.unsupported_reason = parse_error;
+        return true;
+    }
+    if (layout.kind == page_layout::LayoutKind::kConstant) {
+        out.kind = ColumnEncodingKind::kConstant;
+        out.constant_inline_value = layout.constant.inline_value;
+        return true;
+    }
+    if (layout.kind != page_layout::LayoutKind::kMiniBlock) {
+        out.kind = ColumnEncodingKind::kUnsupported;
+        out.unsupported_reason = "unsupported page layout: " + page_layout::describe(layout);
+        return true;
+    }
+
+    const auto* values = layout.mini_block.value_compression.get();
+    if (values == nullptr) {
+        out.kind = ColumnEncodingKind::kUnsupported;
+        out.unsupported_reason = "page layout has no value compression";
+        return true;
+    }
+    const bool has_dictionary = layout.mini_block.dictionary != nullptr;
+
+    // General{scheme, inner} is a wrapper: unwrap it and remember whether it compresses.
+    const page_layout::Compressive* inner = values;
+    if (inner->kind == page_layout::CompressiveKind::kGeneral) {
+        out.zstd = inner->scheme == page_layout::BufferScheme::kZstd;
+        if (inner->values == nullptr) {
+            out.kind = ColumnEncodingKind::kUnsupported;
+            out.unsupported_reason = "General encoding has no inner values";
+            return true;
+        }
+        if (inner->values->kind == page_layout::CompressiveKind::kByteStreamSplit) {
+            out.kind = ColumnEncodingKind::kBssZstd;
+            return true;
+        }
+        inner = inner->values.get();
+    }
+
+    switch (inner->kind) {
+        case page_layout::CompressiveKind::kRle:
+            out.kind = has_dictionary ? ColumnEncodingKind::kDictRle : ColumnEncodingKind::kRle;
+            return true;
+        case page_layout::CompressiveKind::kInlineBitpacking:
+            out.kind = has_dictionary ? ColumnEncodingKind::kDict : ColumnEncodingKind::kBitpack;
+            return true;
+        case page_layout::CompressiveKind::kVariable:
+            out.kind = ColumnEncodingKind::kVariable;
+            return true;
+        case page_layout::CompressiveKind::kFlat:
+            // bool is Flat{bits_per_value: 1}; that IS how stock Lance represents it, so the
+            // descriptor distinguishes it from a byte-wide flat column with no help from metadata.
+            out.kind = inner->bits_per_value == 1U ? ColumnEncodingKind::kBoolPacked : ColumnEncodingKind::kFlat;
+            return true;
+        default:
+            out.kind = ColumnEncodingKind::kUnsupported;
+            out.unsupported_reason =
+                "unsupported encoding " + page_layout::describe(layout) +
+                " (CompressiveEncoding variant " + std::to_string(inner->wire_field) + ")";
+            return true;
+    }
+}
+
+/// The legacy classification, from nanolance-private field metadata. Kept as the fallback.
+ColumnEncodingPlan classify_from_metadata(const pb::Field& field) {
+    ColumnEncodingPlan plan;
+    if (field_metadata_equals(field, "nanolance:packing", "constant")) {
+        plan.kind = ColumnEncodingKind::kConstant;
+    } else if (field_metadata_equals(field, "nanolance:packing", "rle")) {
+        plan.kind = ColumnEncodingKind::kRle;
+    } else if (field_metadata_equals(field, "nanolance:packing", "dict-rle")) {
+        plan.kind = ColumnEncodingKind::kDictRle;
+    } else if (field_metadata_equals(field, "nanolance:packing", "dict")) {
+        plan.kind = ColumnEncodingKind::kDict;
+    } else if (field_metadata_equals(field, "nanolance:packing", "bss-zstd")) {
+        plan.kind = ColumnEncodingKind::kBssZstd;
+    } else if (field.logical_type == "bool") {
+        plan.kind = ColumnEncodingKind::kBoolPacked;
+    } else if (field.encoding == 2) {
+        plan.kind = ColumnEncodingKind::kVariable;
+        plan.zstd = field_metadata_equals(field, "lance-encoding:compression", "zstd");
+    } else if (field_metadata_equals(field, "nanolance:packing", "bitpack")) {
+        plan.kind = ColumnEncodingKind::kBitpack;
+    } else {
+        plan.kind = ColumnEncodingKind::kFlat;
+    }
+    return plan;
+}
+
+ColumnEncodingPlan classify_column_encoding(const pb::Field& field, const pb::ColumnMetadata& column_metadata) {
+    ColumnEncodingPlan plan;
+    if (classify_from_descriptor(column_metadata, plan)) {
+        return plan;
+    }
+    return classify_from_metadata(field);
+}
+
 bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& page, bool blob_layout,
                        std::vector<std::uint8_t>& first, std::vector<std::uint8_t>& second, std::string& error) {
     if (page.buffer_offsets.size() < 2U || page.buffer_sizes.size() < 2U) {
@@ -375,6 +559,10 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         return false;
     }
 
+    // `lance-encoding:blob` is checked FIRST and stays a metadata check. It is a Lance-standard key
+    // (stock Lance writes it too) describing the COLUMN's role rather than a page's encoding, and a
+    // blob-v2 packed page uses FullZipLayout (PageLayout field 3), which the descriptor classifier
+    // below does not model -- classifying first would refuse the library's headline feature.
     const bool blob_packed = field_metadata_is_true(on_disk_field, "lance-encoding:blob");
     if (blob_packed) {
         out.kind = ColumnValues::Kind::BlobV2External;
@@ -412,10 +600,44 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     }
 
     // Constant column: the single value is stored once in field metadata; expand to one value per row.
-    if (field_metadata_equals(on_disk_field, "nanolance:packing", "constant")) {
-        const auto* value = field_metadata_bytes(on_disk_field, "nanolance:const-value");
+    // Selected from the page descriptor when there is one, from the legacy field metadata otherwise.
+    const auto encoding_plan = classify_column_encoding(on_disk_field, column_metadata);
+    if (encoding_plan.kind == ColumnEncodingKind::kUnsupported) {
+        // Refuse by name, before a single buffer byte is interpreted. The old code had no way to do
+        // this: with no descriptor read, an encoding it did not implement fell through to the flat
+        // path and was misparsed, surfacing later as a size mismatch -- which is why a 3-row
+        // stock-Lance table decoded and a 5000-row one did not.
+        error = "column '" + on_disk_field.name + "': " + encoding_plan.unsupported_reason;
+        return false;
+    }
+
+    if (encoding_plan.kind == ColumnEncodingKind::kConstant) {
+        // Resolve the repeated value, preferring the sources any writer produces over nanolance's
+        // own metadata: the descriptor's inline value (fixed-width), then the page's single data
+        // buffer (variable-width), then `nanolance:const-value` for files predating the descriptor
+        // being read back.
+        std::vector<std::uint8_t> constant_value;
+        const std::vector<std::uint8_t>* value = nullptr;
+        if (encoding_plan.constant_inline_value) {
+            constant_value = *encoding_plan.constant_inline_value;
+            value = &constant_value;
+        } else if (!column_metadata.pages.empty() && !column_metadata.pages.front().buffer_offsets.empty() &&
+                   !column_metadata.pages.front().buffer_sizes.empty()) {
+            const auto& page = column_metadata.pages.front();
+            std::vector<std::uint8_t> scalar_buffer;
+            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[0], page.buffer_sizes[0],
+                                            scalar_buffer, error) ||
+                !decode_scalar_variable_value(scalar_buffer, constant_value, error)) {
+                return false;
+            }
+            value = &constant_value;
+        } else {
+            value = field_metadata_bytes(on_disk_field, "nanolance:const-value");
+        }
         if (value == nullptr) {
-            error = "constant column missing nanolance:const-value";
+            error = "constant column '" + on_disk_field.name +
+                    "' has no value: the page descriptor carries none inline, the page has no data "
+                    "buffer, and nanolance:const-value is absent";
             return false;
         }
         std::uint64_t total_rows = 0;
@@ -455,7 +677,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     }
 
     // Run-length encoded fixed-width column: one chunk with two buffers (run values + run lengths).
-    if (field_metadata_equals(on_disk_field, "nanolance:packing", "rle")) {
+    if (encoding_plan.kind == ColumnEncodingKind::kRle) {
         out.kind = ColumnValues::Kind::FixedWidth;
         std::string internal = on_disk_field.logical_type;
         if (internal == "string") {
@@ -520,7 +742,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     }
 
     // Dictionary + RLE variable-width column: buffer[1] = RLE'd u32 indices, buffer[2] = dictionary.
-    if (field_metadata_equals(on_disk_field, "nanolance:packing", "dict-rle")) {
+    if (encoding_plan.kind == ColumnEncodingKind::kDictRle) {
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
         std::vector<std::uint8_t> data;       // buffer[1]: RLE chunk of indices
@@ -640,7 +862,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     }
 
     // Structural dictionary variable-width column: buffer[1] = bitpacked u32 indices, buffer[2] = dictionary.
-    if (field_metadata_equals(on_disk_field, "nanolance:packing", "dict")) {
+    if (encoding_plan.kind == ColumnEncodingKind::kDict) {
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
         std::vector<std::uint8_t> payload;
@@ -725,7 +947,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
 
     // Byte-stream-split + zstd fixed-width column (float/double): each page's payload is a zstd frame
     // of vlen contiguous byte-planes; un-zstd then inverse-transpose to reconstruct the original bytes.
-    if (field_metadata_equals(on_disk_field, "nanolance:packing", "bss-zstd")) {
+    if (encoding_plan.kind == ColumnEncodingKind::kBssZstd) {
         out.kind = ColumnValues::Kind::FixedWidth;
         const auto bytes_per_value = lance_logical_type_value_bytes(on_disk_field.logical_type);
         {
@@ -765,7 +987,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     // bool is always bit-packed on disk (1 bit/value, LSB-first), matching stock Lance's own
     // Flat{bits_per_value:1} representation -- the writer never tags it, since it's not opt-in (see
     // data_file_writer.cpp's bool_pack). nanolance's internal representation stays one byte per value.
-    if (on_disk_field.logical_type == "bool") {
+    if (encoding_plan.kind == ColumnEncodingKind::kBoolPacked) {
         out.kind = ColumnValues::Kind::FixedWidth;
         out.fixed.reserve(static_cast<std::size_t>(declared_rows));
         std::vector<std::uint8_t> control;
@@ -791,11 +1013,10 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         return true;
     }
 
-    const bool variable = on_disk_field.encoding == 2;
-    if (variable) {
+    if (encoding_plan.kind == ColumnEncodingKind::kVariable) {
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-        const bool zstd = field_metadata_equals(on_disk_field, "lance-encoding:compression", "zstd");
+        const bool zstd = encoding_plan.zstd;
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> chunk_bytes;
@@ -830,7 +1051,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         internal_type = "utf8";
     }
     const auto bytes_per_value = lance_logical_type_value_bytes(internal_type);
-    const bool bitpacked = field_metadata_equals(on_disk_field, "nanolance:packing", "bitpack");
+    const bool bitpacked = encoding_plan.kind == ColumnEncodingKind::kBitpack;
     // Reserve the whole column upfront: unpack_bitpacked_page() (and the plain-copy branch below) grow
     // out.fixed one FastLanes chunk (<=1024 values) at a time via insert(), so without this a column of
     // many chunks reallocates and re-copies everything already written on almost every chunk.

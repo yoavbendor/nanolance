@@ -20,6 +20,14 @@ void require(bool condition, const char* message) {
     }
 }
 
+// NB: `require(f(error), error)` is a trap. The two arguments are evaluated in unspecified
+// order, so c_str() can capture a pointer into the EMPTY string before f() runs; when f() then fails
+// and assigns a long message, the string reallocates and that pointer dangles. Real failures printed
+// a stray letter instead of their message. Pass the string itself.
+void require(bool ok, const std::string& message) {
+    require(ok, message.c_str());
+}
+
 bool build_two_column_schema(ArrowSchema& schema) {
     ArrowSchemaInit(&schema);
     if (ArrowSchemaSetTypeStruct(&schema, 2) != NANOARROW_OK) {
@@ -84,7 +92,7 @@ int main() {
     require(build_two_column_schema(schema), "schema init failed");
 
     nano_lance::LanceSchemaMapping mapping;
-    require(nano_lance::map_arrow_schema(schema, mapping, error, true), error.c_str());
+    require(nano_lance::map_arrow_schema(schema, mapping, error, true), error);
     const auto physical = nano_lance::lance_physical_fields(mapping);
     require(physical.size() == 2, "expected two physical columns");
 
@@ -92,7 +100,7 @@ int main() {
 
     ArrowArray batch1{};
     require(build_batch(batch1, schema, {{1, "aa"}, {2, "b"}}), "batch1 build failed");
-    require(nano_lance::append_batch_column_values(batch1, mapping, columns, error), error.c_str());
+    require(nano_lance::append_batch_column_values(batch1, mapping, columns, error), error);
     ArrowArrayRelease(&batch1);
 
     require(columns[0].kind == nano_lance::ColumnValues::Kind::FixedWidth, "id column not fixed");
@@ -102,7 +110,7 @@ int main() {
 
     ArrowArray batch2{};
     require(build_batch(batch2, schema, {{3, "xyz"}}), "batch2 build failed");
-    require(nano_lance::append_batch_column_values(batch2, mapping, columns, error), error.c_str());
+    require(nano_lance::append_batch_column_values(batch2, mapping, columns, error), error);
     ArrowArrayRelease(&batch2);
 
     require(columns[0].fixed.size() == 24, "id fixed width after batch2");

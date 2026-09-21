@@ -25,6 +25,14 @@ void require(bool ok, const char* msg) {
     }
 }
 
+// NB: `require(f(error), error)` is a trap. The two arguments are evaluated in unspecified
+// order, so c_str() can capture a pointer into the EMPTY string before f() runs; when f() then fails
+// and assigns a long message, the string reallocates and that pointer dangles. Real failures printed
+// a stray letter instead of their message. Pass the string itself.
+void require(bool ok, const std::string& msg) {
+    require(ok, msg.c_str());
+}
+
 std::filesystem::path temp_dataset(const char* suffix) {
     auto p = std::filesystem::temp_directory_path() / ("nano_lance_rle_" + std::string(suffix));
     std::error_code ec;
@@ -67,7 +75,7 @@ std::vector<std::int64_t> read_int64(const std::filesystem::path& ds) {
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
     std::string error;
-    require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error.c_str());
+    require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error);
     const ArrowArray* col = (batches[0].n_children > 0) ? batches[0].children[0] : &batches[0];
     const auto* v = static_cast<const std::int64_t*>(col->buffers[1]);
     std::vector<std::int64_t> out(v, v + col->length);

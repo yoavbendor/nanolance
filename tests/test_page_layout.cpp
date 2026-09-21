@@ -19,6 +19,7 @@
 // It doubles as the conformance test for the parser itself, including the malformed-input cases
 // (these bytes are untrusted like everything else on the read path).
 
+#include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/nano_lance_writer.h"
@@ -175,6 +176,84 @@ std::filesystem::path write_dataset(const std::filesystem::path& root, const std
     nano_lance_writer_close(&w);
     ArrowSchemaRelease(&schema);
     return path;
+}
+
+/// THE decisive test for step 2 of the plan.
+///
+/// Decode every column twice: once normally, and once with EVERY nanolance-private key stripped from
+/// the on-disk field -- exactly what a file written by the Rust lance crate looks like. If the two
+/// agree byte for byte, decode genuinely selects its path from the page descriptor and no longer
+/// depends on the private side channel. If it still read the metadata, the stripped run would take
+/// the wrong branch (or the flat fallback) and disagree.
+void check_metadata_is_not_load_bearing(const std::filesystem::path& dataset, const std::string& label) {
+    nano_lance::pb::Manifest manifest;
+    std::uint64_t version = 0;
+    std::string error;
+    require(nano_lance::load_latest_manifest(dataset, manifest, version, error),
+            label + ": load manifest: " + error);
+    require(!manifest.fragments.empty() && !manifest.fragments[0].files.empty(), label + ": no data file");
+    const auto data_file = dataset / "data" / manifest.fragments[0].files[0].path;
+
+    nano_lance::pb::FileDescriptor descriptor;
+    nano_lance::LanceDataFileFooterLayout layout{};
+    require(nano_lance::read_lance_data_file_footer_and_descriptor(data_file, descriptor, layout, error),
+            label + ": footer: " + error);
+    std::vector<nano_lance::pb::ColumnMetadata> columns;
+    require(nano_lance::read_lance_data_file_column_metadatas(data_file, layout, columns, error),
+            label + ": column metadata: " + error);
+
+    std::size_t col = 0;
+    for (const auto& field : descriptor.fields) {
+        if (field.logical_type == "struct") {
+            continue;
+        }
+        require(col < columns.size(), label + ": more fields than columns");
+        const std::string where = label + "/" + field.name;
+
+        nano_lance::ColumnValues with_metadata;
+        std::string with_error;
+        const bool with_ok =
+            nano_lance::decode_lance_physical_column(data_file, field, columns[col], with_metadata, with_error);
+        check(with_ok, where + ": decode failed: " + with_error);
+
+        // Strip every nanolance:* key. `lance-encoding:*` keys stay -- those are Lance-standard and a
+        // stock-Lance file carries them too.
+        nano_lance::pb::Field stripped = field;
+        std::size_t removed = 0;
+        for (auto it = stripped.metadata.begin(); it != stripped.metadata.end();) {
+            if (it->first.rfind("nanolance:", 0) == 0) {
+                it = stripped.metadata.erase(it);
+                ++removed;
+            } else {
+                ++it;
+            }
+        }
+
+        nano_lance::ColumnValues without_metadata;
+        std::string without_error;
+        const bool without_ok = nano_lance::decode_lance_physical_column(data_file, stripped, columns[col],
+                                                                        without_metadata, without_error);
+        check(without_ok, where + ": decode WITHOUT nanolance metadata failed (" +
+                              std::to_string(removed) + " keys stripped): " + without_error);
+        if (!with_ok || !without_ok) {
+            ++col;
+            continue;
+        }
+
+        check(with_metadata.kind == without_metadata.kind,
+              where + ": column kind changed when the private metadata was stripped");
+        check(with_metadata.fixed == without_metadata.fixed,
+              where + ": fixed bytes differ without the private metadata (" +
+                  std::to_string(with_metadata.fixed.size()) + " vs " +
+                  std::to_string(without_metadata.fixed.size()) + ")");
+        check(with_metadata.variable.data == without_metadata.variable.data,
+              where + ": variable data differs without the private metadata");
+        check(with_metadata.variable.offsets == without_metadata.variable.offsets,
+              where + ": variable offsets differ without the private metadata");
+        check(with_metadata.variable.large == without_metadata.variable.large,
+              where + ": offset width differs without the private metadata");
+        ++col;
+    }
 }
 
 /// Read every page of every column and compare the parsed descriptor against the legacy metadata.
@@ -387,6 +466,7 @@ int main(int argc, char** argv) {
                                       },
                                       compress);
         check_dataset(ds, "mixed" + suffix, compress);
+        check_metadata_is_not_load_bearing(ds, "mixed" + suffix);
     }
 
     check_malformed_inputs();
@@ -395,6 +475,7 @@ int main(int argc, char** argv) {
         std::cerr << g_failures << " check(s) failed\n";
         return 1;
     }
-    std::cout << "page layout: descriptor agrees with nanolance:packing on every page\n";
+    std::cout << "page layout: descriptor agrees with nanolance:packing on every page, and\n"
+                 "            every column decodes identically with that metadata stripped\n";
     return 0;
 }

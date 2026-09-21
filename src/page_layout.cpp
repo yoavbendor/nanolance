@@ -448,8 +448,10 @@ bool decode_page_layout_into(const std::vector<std::uint8_t>& encoding, PageLayo
             out.kind = LayoutKind::kConstant;
             return parse_constant(sub, out.constant, error);
         }
-        // FullZip, AllNull, and anything else Lance adds later. Parsed, not modeled: record the
-        // field so a caller refuses by name rather than misreading the page's buffers.
+        // Field 3 is FullZipLayout -- that is what a lance.blob.v2 packed column's pages use, and
+        // what nanolance's own blob writer emits. Field 4 and beyond (AllNull, and whatever Lance
+        // adds later) are likewise parsed but not modeled: record the field so a caller refuses by
+        // name rather than misreading the page's buffers.
         out.kind = LayoutKind::kNone;
         out.unknown_layout_field = field;
         return true;
