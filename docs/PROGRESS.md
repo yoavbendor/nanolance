@@ -16,13 +16,13 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 0.5 Repo slim-down | done for the unambiguous 5.5 MB; the 15.4 MB capture left in place by decision |
 | **Phase 1.3 — read stock-Lance files** | **steps 1 and 2 of 3 done** (parse, oracle, dispatch) |
 | Fuzz coverage for the descriptor parser | done — found one real bug in 25 executions |
-| 1.1 Real nullability | **read side done**; write side still refuses nulls |
+| 1.1 Real nullability | **done for fixed-width columns**, read and write; strings and null structs still refused |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | not started |
 | Phase 3 — streaming read, projection in Python | not started |
 | Phase 4 — read-path optimization | not started (deliberately last) |
 
-Test suite: **46 ctest** (was 42) and **90 pytest** (was 22), all passing.
+Test suite: **46 ctest** (was 42) and **146 pytest** (was 22), all passing.
 
 Fuzzers: `nanolance_fuzz_decode` and `nanolance_fuzz_page_layout`, both clean; the longest
 campaign run here was 95,896,936 executions.
@@ -226,7 +226,7 @@ so `int16` happened to survive with default options; `fixed_size_binary` is not 
 not. The root cause was a second copy of the width table inside the writer plus MiniBlockLayout byte
 strings with hardcoded submessage lengths; both are now derived.
 
-### Phase 1.1 (read half): nullable stock-Lance columns
+### Phase 1.1: nullability, read and write
 
 The on-disk validity format is not documented anywhere nanolance could consult, so it was established
 by reading real pylance 12.0.0 output:
@@ -248,6 +248,13 @@ reproduces every boundary of a 5000-row column.
 **This also fixed plain `int64` from stock Lance, which had nothing to do with nulls**: a page is not
 a chunk. nanolance's writer emits one chunk per page, so treating a page as a single chunk worked on
 its own files; stock Lance packs five 1024-value chunks into one 5000-row page.
+
+**The write side followed**, using the format above in reverse. Three things had to change beyond the
+encoding itself: the manifest's `nullable` flag (hardcoded false, which makes stock Lance reject a
+file whose column actually has nulls); the per-chunk control word (derived from the value bytes
+alone, which agreed with the real formula only by coincidence); and the chunk size cap, since the
+flat path's 4095-value chunks overran a 1024-entry level array — a stack smash found by running a
+realistic nullable dataframe, not by any test.
 
 **A severe pre-existing bug surfaced on the way.** Any read that failed — a truncated file, a missing
 manifest, or an encoding nanolance does not implement — **segfaulted the process** through the C API

@@ -94,10 +94,9 @@ nano_lance_writer_close(&w);
 
 - **Schema locks after the first `write_batch`** — every batch in a session shares it.
 - **Call all `set_*` options before the first `write_batch`** (compression, URI dictionary).
-- **Nulls are refused, not dropped.** nanolance writes no Lance validity information, so a batch
-  containing a null fails with the offending column and row. Fill or drop them first
-  (`col.fill_null(...)` / `table.drop_null()`). Nullable-flagged *schemas* are fine — pyarrow marks
-  essentially everything nullable — it is a null *value* that has nowhere to go.
+- **Nulls are stored** in fixed-width columns (int, float, bool, temporal, decimal,
+  `fixed_size_binary`), using Lance's definition-level layer, and stock Lance reads them back. A
+  null in a `utf8`/`binary` column is still refused with a clear message — fill or drop those first.
 - **Compression is off by default.** One switch (`set_compression`) picks the right Lance encoding per
   column; see [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured) for the per-type
   table.
@@ -119,7 +118,9 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 | `utf8`, `binary`, `fixed_size_binary(N)` | round-trips |
 | `struct` (nested, arbitrarily deep) | round-trips |
 | `lance.blob.v2` external references | round-trips (the headline feature) |
-| **any column containing a null** | **refused** — no validity information is written; fill or drop first |
+| nulls in a fixed-width column (int, float, bool, temporal, decimal, `fixed_size_binary`) | round-trips |
+| nulls in a `utf8`/`binary` column | **refused** — variable-width pages do not carry the definition-level layer yet |
+| a null **struct** (as opposed to a null field inside one) | **refused** — needs a second definition level |
 | `null` type | **refused** — all-null by definition |
 | `timestamp` (s/ms/us/ns, with or without an IANA timezone) | round-trips |
 | `date32`, `date64`, `time32` (s/ms), `time64` (us/ns) | round-trips |
@@ -196,7 +197,7 @@ nano_lance_writer_close(&w);
 
 **Do**
 - Call every `set_*` option **before** the first `write_batch`; reuse one schema for all batches.
-- Fill or drop nulls before writing — nanolance refuses a batch that contains one.
+- Nulls are fine in fixed-width columns; fill or drop them in string columns.
 - For small files, model external refs as plain `uri` / `position` / `size` columns (not the packed
   `lance.blob.v2` descriptor) — see [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
 - Use `bool` for flags (bit-packed on disk, and faster than rust-lance on the `bool_flags` bench) and
@@ -204,9 +205,9 @@ nano_lance_writer_close(&w);
 - For S3, export credentials to the environment if your profile uses SSO/assume-role.
 
 **Don't**
-- Don't pass columns containing nulls, or `list`/`large_utf8`/dictionary columns — all are refused
-  at `write_batch` (see [Type coverage](#type-coverage)). Timestamps are supported, but their
-  timezone must be an IANA name, not a UTC offset.
+- Don't pass `list`/`large_utf8`/dictionary columns, nulls in a string column, or a null struct —
+  all are refused at `write_batch` (see [Type coverage](#type-coverage)). Timestamps are supported,
+  but their timezone must be an IANA name, not a UTC offset.
 - Don't change the schema between batches in one session.
 - Don't enable `nano_lance_writer_set_blob_uri_dictionary` if stock Lance must read that column
   (nanolance-only, create-mode only).
