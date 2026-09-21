@@ -14,7 +14,8 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 0.3 Fix the quick start | done, guarded by a new CI workflow |
 | 0.4 Correct the docs | done, plus the C snippet is now a compiled test |
 | 0.5 Repo slim-down | done for the unambiguous 5.5 MB; the 15.4 MB capture left in place by decision |
-| **Phase 1.3 — read stock-Lance files** | **step 1 of 3 done** (parse + oracle) |
+| **Phase 1.3 — read stock-Lance files** | **steps 1 and 2 of 3 done** (parse, oracle, dispatch) |
+| Fuzz coverage for the descriptor parser | done — found one real bug in 25 executions |
 | 1.1 Real nullability | not started |
 | 1.2 timestamp / date / time / decimal | not started |
 | Phase 2 — wheels, CMake install | not started |
@@ -22,6 +23,9 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Phase 4 — read-path optimization | not started (deliberately last) |
 
 Test suite: **46 ctest** (was 42) and **27 pytest** (was 22), all passing.
+
+Fuzzers: `nanolance_fuzz_decode` and `nanolance_fuzz_page_layout`, both clean; the longest
+campaign run here was 95,896,936 executions.
 
 ---
 
@@ -166,10 +170,55 @@ as an open-ended "work down the list". The descriptors say **seven of the eight 
 nanolance already implements and already writes itself**. The read gap is one unmodeled
 `CompressiveEncoding` variant plus the dispatch change — not a pile of missing decoders.
 
-**Steps 2 and 3 remain.** Step 2 re-roots `decode_lance_physical_column` onto the parsed tree, reusing
-every existing leaf kernel unmodified, with the oracle above as the net. Step 3 adds what nanolance
-genuinely never writes: `CompressiveEncoding` field 6, `FullZip`, `AllNull`, and validity levels
-(shared with 1.1).
+**Step 2 (done): select the decode path from the descriptor.**
+
+`decode_lance_physical_column` now walks the parsed tree instead of reading `nanolance:packing`.
+Every decode block is byte-identical; only the selector changed. The metadata remains the fallback
+for pages with no descriptor, so older files decode unchanged.
+
+The test that makes this real: every column of every generated dataset is decoded twice — once
+normally, once with **every `nanolance:*` key stripped**, which is what a stock-Lance file looks like
+— and the two must agree byte for byte. That caught the one branch genuinely still depending on the
+private channel (constant columns read their value from `nanolance:const-value`); the value is now
+taken from the descriptor's inline value, or from the page's own Lance scalar value buffer, in
+preference to the metadata.
+
+Unknown encodings are refused **by name** before any buffer byte is interpreted. The old failure mode
+was worse than it looked: a stock-Lance int64 page was misparsed under nanolance's layout
+assumptions and only caught later by a length check — hence 3 rows decoding and 5000 not.
+
+**What stock-Lance files do now.** They still do not decode, but the failures are accurate and
+located rather than guessed:
+
+| stock-Lance column | result |
+|---|---|
+| `float64`, `bool` | decodes |
+| plain `int64` | right branch selected; `InlineBitpacking` chunk framing differs |
+| nullable `int64` | "unexpected miniblock payload prefix" — the validity layer |
+| `utf8` | refused by name: `CompressiveEncoding` field 6, unmodeled |
+| `timestamp`, `list`, `dictionary`, `struct` | fail earlier, in logical-type mapping, not encoding |
+
+**Step 3 remains**, and is now a specific list rather than an open question: `CompressiveEncoding`
+field 6, the `InlineBitpacking` and miniblock chunk framing differences, `AllNull`, validity levels
+(shared with 1.1), and the logical-type mappings from 1.2. `FullZip` (PageLayout field 3) is what
+blob-v2 packed pages use and is already handled by its own path.
+
+### Fuzzing the descriptor parser
+
+`page_layout.cpp` parses untrusted input that will drive decoder selection, so it got its own
+libFuzzer target asserting contracts rather than just absence of crashes: a refusal always carries a
+reason, a refused parse leaves no output behind, `describe()` is total, and parsing is deterministic
+across calls.
+
+**It found a real bug in 25 executions.** `decode_page_layout` picked the layout kind before parsing
+its body, so a malformed body returned `false` with `kind` already set to `kMiniBlock` — and step 2's
+dispatch reads exactly that field. The parse now builds into a scratch value and publishes only on
+success.
+
+It also surfaced a bug in this branch's own earlier FetchContent change: keying the shared `.deps`
+directory by generator was not enough, because nanoarrow still compiled into it, so a
+sanitizer/fuzzer tree and a plain tree shared object files. nanoarrow now builds into the current
+build tree, matching what zstd already did.
 
 ---
 
@@ -182,6 +231,6 @@ genuinely never writes: `CompressiveEncoding` field 6, `FullZip`, `AllNull`, and
 - **`tests/test_framed.pcapng` (15.4 MB) stays.** Replacing a real capture with a synthetic fixture
   would change what the pcapng2lance tests cover, and those tests cannot be built without the
   nanotins submodule. Tracked size is ~18 MB, down from 22.8 MB.
-- **Not yet verified on this branch:** macOS and Windows (CI is Linux-only), and the ASan/UBSan and
-  libFuzzer workflows, which run in CI rather than here. The new `page_layout.cpp` parses untrusted
-  input and should be added to the fuzz harness before step 2 lands.
+- **Not yet verified on this branch:** macOS and Windows (CI is Linux-only), and the ASan/UBSan
+  workflow, which runs in CI rather than here. The libFuzzer workflow's targets were built and run
+  locally (see above).
