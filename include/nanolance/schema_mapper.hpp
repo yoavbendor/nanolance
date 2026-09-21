@@ -41,7 +41,14 @@ inline bool lance_field_is_physical(const LanceField& field) {
 
 inline bool lance_field_is_variable_width(const std::string& logical_type) {
     return logical_type == "utf8" || logical_type == "large_utf8" || logical_type == "string" ||
-           logical_type == "binary" || logical_type == "large_binary";
+           logical_type == "large_string" || logical_type == "binary" || logical_type == "large_binary";
+}
+
+/// Does this logical type use 64-bit (rather than 32-bit) offsets? Accepts both the in-memory names
+/// (`large_utf8`) and the on-disk ones (`large_string`), since the same predicate runs on both sides.
+inline bool lance_logical_type_has_large_offsets(const std::string& logical_type) {
+    return logical_type == "large_utf8" || logical_type == "large_string" ||
+           logical_type == "large_binary";
 }
 
 /// Integer logical types (8/16/32/64-bit) eligible for Lance InlineBitpacking. Excludes bool/float.
@@ -77,9 +84,18 @@ inline std::size_t lance_logical_type_value_bytes(const std::string& logical_typ
 }
 
 /// Map Arrow-style logical type names to Lance on-disk schema strings.
+///
+/// `large_utf8` must NOT collapse to "string": the data file writes 64-bit offsets for it, and a
+/// field declared "string" tells every reader to parse 32-bit ones. That produced a genuinely corrupt
+/// file -- stock Lance rejected it outright ("expected 32-bit offsets but got 64-bit offsets") and
+/// nanolance's own reader failed with "terminal offset out of range". Lance's on-disk name is
+/// "large_string", which is what pylance writes for a pa.large_string() column.
 inline std::string lance_on_disk_logical_type(const std::string& logical_type) {
-    if (logical_type == "utf8" || logical_type == "large_utf8") {
+    if (logical_type == "utf8") {
         return "string";
+    }
+    if (logical_type == "large_utf8") {
+        return "large_string";
     }
     return logical_type;
 }

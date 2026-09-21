@@ -225,6 +225,51 @@ bool map_field(const ArrowSchema& field,
     const bool is_struct = parsed.logical_type == "struct";
     const bool is_dictionary = field.dictionary != nullptr;
 
+    // large_utf8 / large_binary produce a file stock Lance rejects as corrupt. nanolance writes the
+    // 64-bit Arrow offsets straight into the miniblock chunk, but Lance v2.2 miniblock pages require
+    // the u32 chunk grammar ("expected 32-bit offsets but got 64-bit offsets"). Lance keeps u32
+    // offsets INSIDE the chunk for large types too and signals the 64-bit Arrow width only in the
+    // page layout's Variable{offsets = Flat{bits}} node -- pylance's string and large_string page
+    // descriptors are byte-identical apart from that one token (0x20 vs 0x40). Supporting these
+    // properly therefore means decoupling the chunk offset width from the declared Arrow width
+    // across every variable-width page path (plain, zstd, dict, dict+RLE, constant); until that
+    // lands, refuse rather than emit a file no reader accepts.
+    //
+    // Scoped to columns that go through the generic variable-width page path. A lance.blob.v2
+    // struct's `data` child is declared large_binary but is encoded by the blob-v2 packed writer,
+    // which never builds a miniblock chunk, so it is unaffected and must keep working.
+    const LanceField* mapped_parent = nullptr;
+    for (const auto& candidate : mapping.fields) {
+        if (parent_id >= 0 && candidate.id == parent_id) {
+            mapped_parent = &candidate;
+            break;
+        }
+    }
+    const bool under_blob_v2 = mapped_parent != nullptr && mapped_parent->extension_name == "lance.blob.v2";
+    // The Arrow null type is an all-null column by definition, so it runs into the same wall as any
+    // other null: nanolance writes no validity information and has nothing to store. Say so here
+    // rather than letting ingest fail later with "fixed-width array is missing values buffer".
+    if (parsed.logical_type == "null") {
+        error = "column '";
+        error += field.name == nullptr ? "<unnamed>" : field.name;
+        error +=
+            "' has Arrow's null type, which is all-null by definition; nanolance cannot store nulls "
+            "yet (it writes no validity information). Drop the column, or give it a concrete type "
+            "and a fill value.";
+        return false;
+    }
+
+    if (!under_blob_v2 && (parsed.logical_type == "large_utf8" || parsed.logical_type == "large_binary")) {
+        error = "column '";
+        error += field.name == nullptr ? "<unnamed>" : field.name;
+        error += "' has type " + parsed.logical_type +
+                 ", which nanolance cannot write yet (it would emit 64-bit offsets inside a Lance "
+                 "v2.2 miniblock page, which requires the u32 chunk grammar, and stock Lance "
+                 "rejects the result as corrupt). Use utf8 / binary instead (pyarrow: "
+                 "col.cast(pa.string()) / col.cast(pa.binary())).";
+        return false;
+    }
+
     LanceField out;
     out.name = field.name == nullptr ? "" : field.name;
     out.logical_type = parsed.logical_type;
@@ -235,15 +280,23 @@ bool map_field(const ArrowSchema& field,
     out.extension_name = extension_name;
     copy_metadata(field, out.metadata);
 
+    // An Arrow dictionary column used to be written as a bare index column with the dictionary
+    // VALUES stored nowhere at all: pa.array(["a","b","a"]).dictionary_encode() became an int32
+    // column reading back [0, 1, 0], with no record of what 0 and 1 meant. Nothing downstream could
+    // detect the loss -- the file is a perfectly valid int32 column to every reader. Refuse it.
+    //
+    // The remedy costs nothing on disk: nanolance already dictionary-encodes low-cardinality string
+    // columns on its own (structural dict / dict+RLE, on by default), so casting to plain utf8 gives
+    // the same file size without the Arrow-level dictionary.
     if (is_dictionary) {
-        const auto value_parsed = parse_format(field.dictionary->format);
-        if (!value_parsed.supported) {
-            error = "unsupported dictionary value format for field ";
-            error += out.name;
-            return false;
-        }
-        out.is_dictionary_index = true;
-        out.dictionary_value_logical_type = value_parsed.logical_type;
+        error = "dictionary-encoded column '";
+        error += out.name;
+        error +=
+            "' is not supported: nanolance would store only the integer indices and discard the "
+            "dictionary values. Cast it to its value type first (pyarrow: "
+            "col.cast(pa.string()), or table.cast(...)); nanolance dictionary-encodes "
+            "low-cardinality string columns on disk by itself, so the file stays the same size.";
+        return false;
     }
 
     if (is_struct || !extension_name.empty()) {
@@ -382,6 +435,9 @@ namespace {
 std::string disk_logical_type_to_internal(const std::string& disk) {
     if (disk == "string") {
         return "utf8";
+    }
+    if (disk == "large_string") {
+        return "large_utf8";
     }
     return disk;
 }

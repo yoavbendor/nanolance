@@ -861,7 +861,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.priority = 0;
             if (lance_field_is_variable_width(field.logical_type)) {
                 const bool large =
-                    field.logical_type == "large_utf8" || field.logical_type == "large_binary";
+                    lance_logical_type_has_large_offsets(field.logical_type);
                 const auto scalar_buffer = encode_scalar_variable_value(value, large);
                 align64(out);
                 const auto value_offset = pos(out);
@@ -948,7 +948,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         if (packing_it != field.metadata.end() && packing_it->second == "dict-rle" &&
             values.kind == ColumnValues::Kind::VariableWidth) {
             const bool large =
-                field.logical_type == "large_utf8" || field.logical_type == "large_binary";
+                lance_logical_type_has_large_offsets(field.logical_type);
             const std::size_t ow = large ? 8U : 4U;
             const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
             auto read_offset = [&](std::size_t idx) -> std::int64_t {
@@ -1054,7 +1054,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         if (packing_it != field.metadata.end() && packing_it->second == "dict" &&
             values.kind == ColumnValues::Kind::VariableWidth) {
             const bool large =
-                field.logical_type == "large_utf8" || field.logical_type == "large_binary";
+                lance_logical_type_has_large_offsets(field.logical_type);
             const std::size_t ow = large ? 8U : 4U;
             const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
             auto read_offset = [&](std::size_t idx) -> std::int64_t {

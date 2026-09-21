@@ -22,6 +22,15 @@ void require(bool condition, const char* message) {
     }
 }
 
+// `require(f(error), error.c_str())` is a trap: the two arguments are evaluated in unspecified
+// order, so c_str() can capture a pointer into the EMPTY string before f() runs. When f() then fails
+// and assigns a long message, the string reallocates and the captured pointer dangles -- a real
+// failure printed a stray "N" instead of its message. Taking the string by reference and calling
+// c_str() only after the condition is known fixes it.
+void require(bool condition, const std::string& message) {
+    require(condition, message.c_str());
+}
+
 void release_schema(ArrowSchema& schema) {
     if (schema.release != nullptr) {
         schema.release(&schema);
@@ -138,13 +147,19 @@ void test_dictionary_schema() {
     dictionary_values.flags = 0;
     uri_index.dictionary = &dictionary_values;
 
+    // An Arrow dictionary column is refused. It used to map to a bare index column: LanceField
+    // recorded is_dictionary_index / dictionary_value_logical_type, but those are read ONLY by the
+    // schema-equality comparison -- no writer path ever stored the dictionary VALUES, so
+    // pa.array(["a","b","a"]).dictionary_encode() became an int32 column reading back [0, 1, 0] with
+    // no record of what the indices meant.
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(uri_index, mapping, error), error.c_str());
-    require(mapping.fields.size() == 1, "dictionary field count mismatch");
-    require(mapping.fields[0].is_dictionary_index, "dictionary index flag mismatch");
-    require(mapping.fields[0].dictionary_value_logical_type == "utf8", "dictionary value type mismatch");
-    require(mapping.fields[0].column_index == 0, "dictionary column index mismatch");
+    require(!nano_lance::map_arrow_schema(uri_index, mapping, error),
+            "dictionary-encoded column should be refused");
+    require(error.find("dictionary") != std::string::npos,
+            "dictionary rejection should say what was refused, got: " + error);
+    require(error.find("cast") != std::string::npos,
+            "dictionary rejection should suggest casting, got: " + error);
 }
 
 void test_extension_struct() {

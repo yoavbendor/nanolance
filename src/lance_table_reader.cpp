@@ -32,6 +32,21 @@ const LanceField* find_mapping_field_by_name(const LanceSchemaMapping& mapping, 
     return nullptr;
 }
 
+/// Same lookup scoped to one parent, so a struct child named `id` does not resolve to a top-level
+/// `id`. `parent_id` is -1 for top-level fields, matching LanceField::parent_id.
+const LanceField* find_mapping_field_by_name_under(const LanceSchemaMapping& mapping, const char* name,
+                                                   std::int32_t parent_id) {
+    if (name == nullptr) {
+        return nullptr;
+    }
+    for (const auto& field : mapping.fields) {
+        if (field.parent_id == parent_id && field.name == name) {
+            return &field;
+        }
+    }
+    return nullptr;
+}
+
 const pb::Field* find_descriptor_field(const pb::FileDescriptor& descriptor, const std::int32_t id) {
     for (const auto& field : descriptor.fields) {
         if (field.id == id) {
@@ -707,40 +722,62 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
 
     // Resolve every column's decode plan ONCE (field lookup, kind, width, format, dict) so the row
     // loop does zero per-row metadata/string work — this was ~27% of read instructions (callgrind).
-    std::vector<ColumnPlan> plans(static_cast<std::size_t>(batch_schema.n_children));
-    for (int64_t c = 0; c < batch_schema.n_children; ++c) {
-        const auto* child_schema = batch_schema.children[c];
-        auto* child_array = batch.children[c];
-        if (child_schema == nullptr || child_schema->name == nullptr || child_array == nullptr) {
-            error = "batch schema child is missing";
-            ArrowArrayRelease(&batch);
+    //
+    // `plans` is flat over LEAF columns wherever they sit in the schema. A plain struct column
+    // (anything but the lance.blob.v2 extension, which has its own packed representation) is not a
+    // leaf: its data lives in its children's columns, exactly as the writer laid it out, so it
+    // contributes its descendants here and is recorded in `struct_nodes` for its length to be set
+    // once the leaves are filled. The writer already produces a correct, stock-Lance-readable file
+    // for these -- pylance reads a nanolance struct column fine -- so refusing them here (the old
+    // "nested struct children are not supported in this reader build") made nanolance unable to read
+    // back a file it had just written correctly, for a feature README.md advertises.
+    std::vector<ColumnPlan> plans;
+    std::vector<ArrowArray*> struct_nodes;
+    plans.reserve(static_cast<std::size_t>(batch_schema.n_children));
+
+    std::string collect_error;
+    const auto collect = [&](auto&& self, const ArrowSchema* node_schema, ArrowArray* node_array,
+                             std::int32_t parent_id) -> bool {
+        if (node_schema == nullptr || node_schema->name == nullptr || node_array == nullptr) {
+            collect_error = "batch schema child is missing";
             return false;
         }
-        const auto* field = find_mapping_field_by_name(mapping, child_schema->name);
+        const auto* field = find_mapping_field_by_name_under(mapping, node_schema->name, parent_id);
         if (field == nullptr) {
-            error = "mapping field not found for schema child ";
-            error += child_schema->name;
-            ArrowArrayRelease(&batch);
+            collect_error = "mapping field not found for schema child ";
+            collect_error += node_schema->name;
             return false;
         }
-        auto& plan = plans[static_cast<std::size_t>(c)];
-        plan.array = child_array;
-        plan.field = field;
         const bool is_blob = field->extension_name == "lance.blob.v2";
-        if (!is_blob && child_schema->format != nullptr && child_schema->format[0] == '+') {
-            error = "nested struct children are not supported in this reader build";
-            ArrowArrayRelease(&batch);
-            return false;
+        const bool is_struct = !is_blob && node_schema->format != nullptr && node_schema->format[0] == '+';
+
+        if (is_struct) {
+            struct_nodes.push_back(node_array);
+            for (std::int64_t i = 0; i < node_schema->n_children; ++i) {
+                if (node_array->children == nullptr || i >= node_array->n_children) {
+                    collect_error = "struct array is missing children for ";
+                    collect_error += field->name;
+                    return false;
+                }
+                if (!self(self, node_schema->children[i], node_array->children[i], field->id)) {
+                    return false;
+                }
+            }
+            return true;
         }
+
+        ColumnPlan plan;
+        plan.array = node_array;
+        plan.field = field;
         if (!is_blob && field->column_index < 0) {
             plan.kind = ColumnPlan::Kind::Skip;
-            continue;
+            plans.push_back(plan);
+            return true;
         }
         const auto col_it = decoded_by_field_id.find(field->id);
         if (col_it == decoded_by_field_id.end()) {
-            error = "missing decoded column for ";
-            error += field->name;
-            ArrowArrayRelease(&batch);
+            collect_error = "missing decoded column for ";
+            collect_error += field->name;
             return false;
         }
         plan.values = &col_it->second;
@@ -753,6 +790,16 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             plan.kind = ColumnPlan::Kind::Fixed;
             plan.width = lance_logical_type_value_bytes(field->logical_type);
             plan.fmt = fixed_fmt_code(field->arrow_format);
+        }
+        plans.push_back(plan);
+        return true;
+    };
+
+    for (int64_t c = 0; c < batch_schema.n_children; ++c) {
+        if (!collect(collect, batch_schema.children[c], batch.children[c], -1)) {
+            error = collect_error;
+            ArrowArrayRelease(&batch);
+            return false;
         }
     }
 
@@ -776,6 +823,12 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                 return false;
             }
         }
+        // A struct node owns no buffers of its own -- its leaves were just filled above -- but Arrow
+        // still needs its length, and validation checks it against every child's.
+        for (auto* node : struct_nodes) {
+            node->length = length;
+            node->null_count = 0;
+        }
         batch.length = length;
         batch.null_count = 0;
         ArrowError arrow_error;
@@ -788,7 +841,18 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         return true;
     }
 
-    // Per-row fallback (blob struct columns or skipped logical fields): needs the append machinery.
+    // Per-row fallback (blob columns or skipped logical fields): needs the append machinery, which
+    // drives nesting through ArrowArrayFinishElement on the ROOT only. A plain struct column mixed
+    // into such a batch would therefore have its own FinishElement skipped, so refuse that
+    // combination explicitly rather than emit a subtly malformed array. Struct-only batches take the
+    // bulk path above and are fine.
+    if (!struct_nodes.empty()) {
+        error =
+            "a plain struct column cannot be read back in the same batch as a lance.blob.v2 column "
+            "or a skipped logical field (the per-row append path drives nesting from the root only)";
+        ArrowArrayRelease(&batch);
+        return false;
+    }
     if (ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
         error = "failed to start batch append";
         ArrowArrayRelease(&batch);

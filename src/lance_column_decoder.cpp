@@ -424,8 +424,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         }
         if (on_disk_field.encoding == 2) {  // variable-width
             out.kind = ColumnValues::Kind::VariableWidth;
-            out.variable.large = on_disk_field.logical_type == "large_utf8" ||
-                                 on_disk_field.logical_type == "large_binary";
+            out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
             const std::size_t len = value->size();
             const auto rows = static_cast<std::size_t>(total_rows);
             if (!append_repeated_value(out.variable.data, value->data(), len, rows)) {  // every row = value
@@ -523,7 +522,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     // Dictionary + RLE variable-width column: buffer[1] = RLE'd u32 indices, buffer[2] = dictionary.
     if (field_metadata_equals(on_disk_field, "nanolance:packing", "dict-rle")) {
         out.kind = ColumnValues::Kind::VariableWidth;
-        out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
+        out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
         std::vector<std::uint8_t> data;       // buffer[1]: RLE chunk of indices
         std::vector<std::uint8_t> dict_frame;  // buffer[2]: dictionary
         std::vector<std::uint8_t> dict_block;
@@ -643,7 +642,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     // Structural dictionary variable-width column: buffer[1] = bitpacked u32 indices, buffer[2] = dictionary.
     if (field_metadata_equals(on_disk_field, "nanolance:packing", "dict")) {
         out.kind = ColumnValues::Kind::VariableWidth;
-        out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
+        out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> dict_block;
         std::vector<std::uint8_t> indices_bytes;
@@ -795,7 +794,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     const bool variable = on_disk_field.encoding == 2;
     if (variable) {
         out.kind = ColumnValues::Kind::VariableWidth;
-        out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
+        out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
         const bool zstd = field_metadata_equals(on_disk_field, "lance-encoding:compression", "zstd");
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;

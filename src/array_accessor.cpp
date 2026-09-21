@@ -229,7 +229,7 @@ bool append_variable_width(const ArrowArray& array,
                            const LanceField& field,
                            ColumnValues& out,
                            std::string& error) {
-    const bool large = field.logical_type == "large_binary" || field.logical_type == "large_utf8";
+    const bool large = lance_logical_type_has_large_offsets(field.logical_type);
     const std::size_t offset_width = large ? 8U : 4U;
     if (array.n_buffers < 3 || array.buffers == nullptr || array.buffers[1] == nullptr ||
         array.buffers[2] == nullptr) {
