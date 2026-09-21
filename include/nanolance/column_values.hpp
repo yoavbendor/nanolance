@@ -67,6 +67,13 @@ struct FixedRlePlan {
 
 struct ColumnValues {
     enum class Kind { FixedWidth, VariableWidth, BlobV2External } kind = Kind::FixedWidth;
+
+    /// Arrow-convention validity bitmap (LSB-first, bit SET means the row is VALID), or empty when
+    /// every row is valid. Note the inversion against the wire format: Lance stores a definition
+    /// level per value where level 1 means NULL, so decoding flips it.
+    std::vector<std::uint8_t> validity;
+    /// Number of rows whose validity bit is clear. Zero whenever `validity` is empty.
+    std::uint64_t null_count = 0;
     std::vector<std::uint8_t> fixed;
     VariableWidthColumnValues variable;
     BlobV2ExternalColumnValues blob_v2;

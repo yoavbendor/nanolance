@@ -37,3 +37,37 @@ def test_large_single_batch_write(tmp_path):
     gc.collect()
     after = _rss_mb()
     assert after - before < 300
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(lambda p: (p / "_versions").rename(p / "_gone"), id="manifest_missing"),
+        pytest.param(
+            lambda p: next((p / "data").glob("*.lance")).write_bytes(b"not a lance file"),
+            id="data_file_garbage",
+        ),
+        pytest.param(
+            lambda p: next((p / "data").glob("*.lance")).write_bytes(b""),
+            id="data_file_empty",
+        ),
+    ],
+)
+def test_failed_read_raises_instead_of_crashing(corrupt, tmp_path):
+    """A read that fails must raise, not take the interpreter down with it.
+
+    lance_table_read_dataset releases out_schema on its mid-read failure path; the C shim released it
+    a second time. ArrowSchemaRelease dereferences `release` unconditionally and releasing nulls it,
+    so the second call jumped through a null pointer -- EVERY failed read through the C API or these
+    bindings segfaulted rather than reporting its error. A library that crashes the process on a bad
+    file is worse than one that rejects it, and it undercut the whole hardened-reader posture.
+    """
+    path = tmp_path / "victim.lance"
+    nanolance.write_table(pa.table({"a": pa.array([1, 2, 3], type=pa.int64())}), path)
+    corrupt(path)
+    with pytest.raises(RuntimeError):
+        nanolance.read_table(path)
+    # Still here, and the process is still healthy enough to do real work.
+    ok = tmp_path / "after.lance"
+    nanolance.write_table(pa.table({"a": pa.array([4, 5], type=pa.int64())}), ok)
+    assert pa.table(nanolance.read_table(ok)).column(0).to_pylist() == [4, 5]

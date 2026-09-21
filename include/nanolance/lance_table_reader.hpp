@@ -22,6 +22,10 @@ namespace nano_lance {
 /// path. Because those budget checks already cost nothing measurable (validated once per page/header,
 /// not per value — see docs/SAFETY.md), this is an escape hatch for exotic legitimate files that exceed
 /// the default budget, not a speed option.
+/// On failure `out_schema` is left RELEASED and `out_batches` empty -- the caller must not release
+/// either again. (Releasing an ArrowSchema twice jumps through a null `release` pointer; the C shim
+/// used to do exactly that, so every failed read through the C API or the Python bindings segfaulted
+/// instead of reporting an error.)
 bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
                               std::vector<ArrowArray>& out_batches, std::string& error,
                               bool trusted_input = false);

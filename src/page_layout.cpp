@@ -261,6 +261,16 @@ bool parse_compressive(Cursor c, Compressive& out, int depth, std::string& error
                     return false;
                 }
                 break;
+            case 4U:
+                // The wrapper Lance puts around a definition-level buffer: f1 is the level's
+                // uncompressed width (16 bits), f3 how the levels are actually stored (Flat(1) when
+                // the only levels are 0 and 1, i.e. a plain nullable column).
+                out.kind = CompressiveKind::kBitpacked;
+                if (!parse_bits_node(sub, out.bits_per_value, error) ||
+                    !parse_wrapper_node(sub, 3U, out.values, depth, error)) {
+                    return false;
+                }
+                break;
             case 5U:
                 out.kind = CompressiveKind::kInlineBitpacking;
                 if (!parse_bits_node(sub, out.bits_per_value, error)) {
@@ -305,7 +315,7 @@ bool parse_mini_block(Cursor c, MiniBlock& out, std::string& error) {
         }
         const auto field = static_cast<std::uint32_t>(key >> 3U);
         const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (wire == kWireBytes && (field == 3U || field == 4U)) {
+        if (wire == kWireBytes && (field == 2U || field == 3U || field == 4U)) {
             Cursor sub;
             if (!read_submessage(c, sub)) {
                 error = "page layout: truncated MiniBlockLayout encoding";
@@ -315,7 +325,14 @@ bool parse_mini_block(Cursor c, MiniBlock& out, std::string& error) {
             if (!parse_compressive(sub, *node, 0, error)) {
                 return false;
             }
-            (field == 3U ? out.value_compression : out.dictionary) = std::move(node);
+            (field == 2U   ? out.repdef_compression
+             : field == 3U ? out.value_compression
+                           : out.dictionary) = std::move(node);
+        } else if (wire == kWireBytes && field == 6U) {
+            if (!read_bytes(c, out.layers)) {
+                error = "page layout: truncated MiniBlockLayout layers";
+                return false;
+            }
         } else if (wire == kWireVarint && (field == 5U || field == 7U || field == 9U || field == 10U)) {
             std::uint64_t value = 0;
             if (!read_varint(c, value)) {
@@ -353,9 +370,9 @@ bool parse_constant(Cursor c, Constant& out, std::string& error) {
         }
         const auto field = static_cast<std::uint32_t>(key >> 3U);
         const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (field == 5U && wire == kWireVarint) {
-            if (!read_varint(c, out.layers)) {
-                error = "page layout: malformed ConstantLayout layers";
+        if (field == 5U && wire == kWireBytes) {
+            if (!read_bytes(c, out.layers)) {
+                error = "page layout: truncated ConstantLayout layers";
                 return false;
             }
         } else if (field == 6U && wire == kWireBytes) {
@@ -496,6 +513,11 @@ void describe_compressive(const Compressive* node, std::string& out) {
         case CompressiveKind::kInlineBitpacking:
             out += "InlineBitpacking(" + std::to_string(node->bits_per_value) + ")";
             return;
+        case CompressiveKind::kBitpacked:
+            out += "Bitpacked(" + std::to_string(node->bits_per_value) + ",";
+            describe_compressive(node->values.get(), out);
+            out += ")";
+            return;
         case CompressiveKind::kVariable:
             out += "Variable{offsets=";
             describe_compressive(node->values.get(), out);
@@ -537,6 +559,13 @@ std::string describe(const PageLayout& layout) {
         case LayoutKind::kMiniBlock: {
             out = "MiniBlock{values=";
             describe_compressive(layout.mini_block.value_compression.get(), out);
+            if (layout.mini_block.repdef_compression) {
+                out += ",repdef=";
+                describe_compressive(layout.mini_block.repdef_compression.get(), out);
+            }
+            if (layers_have_definition_levels(layout.mini_block.layers)) {
+                out += ",nullable";
+            }
             if (layout.mini_block.dictionary) {
                 out += ",dict=";
                 describe_compressive(layout.mini_block.dictionary.get(), out);
@@ -550,7 +579,8 @@ std::string describe(const PageLayout& layout) {
         case LayoutKind::kConstant:
             out = "Constant{";
             out += layout.constant.inline_value ? "inline " + std::to_string(layout.constant.inline_value->size()) + "B"
-                                                : "buffered";
+                   : layers_have_definition_levels(layout.constant.layers) ? "all-null"
+                                                                          : "buffered";
             out += "}";
             return out;
         case LayoutKind::kNone:

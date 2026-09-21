@@ -49,7 +49,9 @@ int read_dataset_impl(const char* dataset_path, bool trusted_input, struct Arrow
     std::string error;
     if (!nano_lance::lance_table_read_dataset(std::filesystem::path(dataset_path), *out_schema, batches, error,
                                               trusted_input)) {
-        ArrowSchemaRelease(out_schema);
+        // lance_table_read_dataset already released the schema (see its declaration). Releasing it
+        // again here called through a null `release` pointer -- every failed read from the C API or
+        // the Python bindings segfaulted the process instead of returning this status.
         set_error(error_message, error_message_capacity, error);
         return map_status(error);
     }

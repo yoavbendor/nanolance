@@ -640,6 +640,28 @@ struct ColumnPlan {
 };
 
 // Bulk-fill a fixed-width child array's data buffer from the already-decoded column bytes.
+/// Attach a decoded validity bitmap to `child`. Arrow buffer 0 is the validity bitmap in exactly the
+/// layout the decoder produces (LSB-first, bit set == valid), so this is a straight copy.
+bool fill_validity(ArrowArray* child, const ColumnValues& values, std::int64_t rows, std::string& error) {
+    if (values.validity.empty()) {
+        child->null_count = 0;
+        return true;
+    }
+    const auto expected = static_cast<std::size_t>((rows + 7) / 8);
+    if (values.validity.size() < expected) {
+        error = "validity bitmap covers fewer rows than the column has";
+        return false;
+    }
+    ArrowBuffer* validity = ArrowArrayBuffer(child, 0);
+    if (ArrowBufferReserve(validity, static_cast<std::int64_t>(expected)) != NANOARROW_OK) {
+        error = "failed to reserve validity buffer";
+        return false;
+    }
+    ArrowBufferAppendUnsafe(validity, values.validity.data(), static_cast<std::int64_t>(expected));
+    child->null_count = static_cast<std::int64_t>(values.null_count);
+    return true;
+}
+
 bool fill_fixed_child(ArrowArray* child, const std::vector<std::uint8_t>& bytes, std::int64_t rows,
                       FixedFmt fmt, std::string& error) {
     ArrowBuffer* data = ArrowArrayBuffer(child, 1);
@@ -660,7 +682,6 @@ bool fill_fixed_child(ArrowArray* child, const std::vector<std::uint8_t>& bytes,
         }
         ArrowBufferAppendUnsafe(data, packed.data(), static_cast<std::int64_t>(packed.size()));
         child->length = rows;
-        child->null_count = 0;
         return true;
     }
     if (ArrowBufferReserve(data, static_cast<std::int64_t>(bytes.size())) != NANOARROW_OK) {
@@ -669,7 +690,6 @@ bool fill_fixed_child(ArrowArray* child, const std::vector<std::uint8_t>& bytes,
     }
     ArrowBufferAppendUnsafe(data, bytes.data(), static_cast<std::int64_t>(bytes.size()));
     child->length = rows;
-    child->null_count = 0;
     return true;
 }
 
@@ -686,7 +706,6 @@ bool fill_variable_child(ArrowArray* child, const VariableWidthColumnValues& v, 
     ArrowBufferAppendUnsafe(offsets, v.offsets.data(), static_cast<std::int64_t>(v.offsets.size()));
     ArrowBufferAppendUnsafe(data, v.data.data(), static_cast<std::int64_t>(v.data.size()));
     child->length = rows;
-    child->null_count = 0;
     return true;
 }
 
@@ -815,13 +834,17 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     }
     if (bulk_ok) {
         for (auto& plan : plans) {
-            const bool ok = plan.kind == ColumnPlan::Kind::Fixed
-                                ? fill_fixed_child(plan.array, plan.values->fixed, length, plan.fmt, error)
-                                : fill_variable_child(plan.array, plan.values->variable, length, error);
+            // Validity first: nanoarrow expects buffer 0 filled before the data buffers it sizes
+            // against, and both fill_* helpers set child->length/null_count at the end.
+            const bool ok = fill_validity(plan.array, *plan.values, length, error) &&
+                            (plan.kind == ColumnPlan::Kind::Fixed
+                                 ? fill_fixed_child(plan.array, plan.values->fixed, length, plan.fmt, error)
+                                 : fill_variable_child(plan.array, plan.values->variable, length, error));
             if (!ok) {
                 ArrowArrayRelease(&batch);
                 return false;
             }
+            plan.array->null_count = static_cast<std::int64_t>(plan.values->null_count);
         }
         // A struct node owns no buffers of its own -- its leaves were just filled above -- but Arrow
         // still needs its length, and validation checks it against every child's.
@@ -959,11 +982,20 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const pb::D
     return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id, length, batch, error);
 }
 
+/// ArrowSchemaRelease dereferences `release` unconditionally, and releasing sets it to null, so
+/// calling it twice on the same schema jumps through a null pointer. Every failure path below leaves
+/// the schema released exactly once by going through here.
+void release_schema_if_held(ArrowSchema& schema) {
+    if (schema.release != nullptr) {
+        ArrowSchemaRelease(&schema);
+    }
+}
+
 // Release out_schema and every ArrowArray already pushed into out_batches, then clear out_batches. Used
 // on every failure path after the loop has started building batches, so a mid-read error (a later
 // fragment/data-file fails to decode) can't leak the batches successfully built before it.
 void release_partial_read(ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches) {
-    ArrowSchemaRelease(&out_schema);
+    release_schema_if_held(out_schema);
     for (auto& batch : out_batches) {
         ArrowArrayRelease(&batch);
     }
@@ -987,13 +1019,16 @@ bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSc
     pb::Manifest manifest{};
     std::uint64_t version = 0;
     if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+        release_schema_if_held(out_schema);
         return false;
     }
     LanceSchemaMapping mapping;
     if (!lance_schema_mapping_from_manifest(manifest, mapping, error)) {
+        release_schema_if_held(out_schema);
         return false;
     }
     if (!build_schema_from_mapping(mapping, out_schema, error)) {
+        release_schema_if_held(out_schema);
         return false;
     }
 
@@ -1031,6 +1066,7 @@ bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_pat
     pb::Manifest manifest{};
     std::uint64_t version = 0;
     if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+        release_schema_if_held(out_schema);
         return false;
     }
     LanceSchemaMapping full_mapping;
@@ -1068,6 +1104,7 @@ bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_pat
     }
 
     if (!build_schema_from_mapping(proj_mapping, out_schema, error)) {
+        release_schema_if_held(out_schema);
         return false;
     }
 

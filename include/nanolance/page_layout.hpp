@@ -41,6 +41,7 @@ enum class CompressiveKind {
     kUnknown = 0,   ///< a variant this build does not model; decode must refuse, never guess
     kFlat = 1,      ///< f1  Flat{ f1 bits_per_value }
     kVariable = 2,  ///< f2  Variable{ f1 offsets }
+    kBitpacked = 4,          ///< f4  Bitpacked{ f1 uncompressed_bits_per_value, f3 values }
     kInlineBitpacking = 5,   ///< f5  InlineBitpacking{ f1 uncompressed_bits_per_value }
     kRle = 8,                ///< f8  Rle{ f1 values, f2 lengths }
     kByteStreamSplit = 9,    ///< f9  ByteStreamSplit{ f1 values }
@@ -83,17 +84,36 @@ struct Compressive {
 struct MiniBlock {
     std::unique_ptr<Compressive> value_compression;
     std::unique_ptr<Compressive> dictionary;
+    /// f2: how the repetition/definition layer is stored, when there is one. A simple nullable
+    /// column uses `CompressiveEncoding` field 4 (bit-width wrapper) around `Flat(1)`; a column whose
+    /// nulls come in runs uses `Rle{Flat(16), Flat(8)}`.
+    std::unique_ptr<Compressive> repdef_compression;
     std::uint64_t num_dictionary_items = 0;
     std::uint64_t num_items = 0;
     std::uint32_t num_buffers = 0;
     bool has_large_chunk = false;
+    /// f6 `layers`: [1] for a column with no nulls, [3] when a definition-level layer is present.
+    /// Stored raw because it is a length-delimited field rather than a plain varint.
+    std::vector<std::uint8_t> layers;
 };
+
+/// Does this layer set declare a definition-level layer? Lance writes [3] for a nullable column and
+/// [1] for one with no nulls.
+inline bool layers_have_definition_levels(const std::vector<std::uint8_t>& layers) {
+    for (const auto layer : layers) {
+        if (layer == 3U) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /// PageLayout f2. A fixed-width constant carries its value inline in the descriptor (no data
 /// buffers); a variable-width constant omits `inline_value` and stores the single value in a buffer.
 struct Constant {
     std::optional<std::vector<std::uint8_t>> inline_value;
-    std::uint64_t layers = 0;
+    /// f5 `layers`, raw. [3] with no inline value is how Lance spells an all-null column.
+    std::vector<std::uint8_t> layers;
 };
 
 enum class LayoutKind { kNone, kMiniBlock, kConstant };
