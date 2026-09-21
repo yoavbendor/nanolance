@@ -124,7 +124,16 @@ if(NOT TARGET nanoarrow_static OR NOT DEFINED nanoarrow_SOURCE_DIR)
         GIT_SHALLOW FALSE
     )
     FetchContent_Populate(nanoarrow)
-    add_subdirectory(${nanoarrow_SOURCE_DIR} ${nanoarrow_BINARY_DIR} EXCLUDE_FROM_ALL)
+    # Build into THIS build tree, not ${nanoarrow_BINARY_DIR} -- that lives under the shared
+    # FETCHCONTENT_BASE_DIR, so two build trees would compile nanoarrow into the same object
+    # directory. Keying that directory by generator is not enough: a sanitizer/fuzzer build
+    # (-DNANOLANCE_BUILD_FUZZERS=ON adds -fsanitize=... globally) and a plain build share a generator
+    # but must not share objects. Left shared, the fuzzer build's instrumented nanoarrow leaked into
+    # the plain build, which then failed to link on __sanitizer_cov_* / __asan_* symbols. Sharing the
+    # SOURCE checkout is the point of .deps and stays; sharing compiled output never was.
+    # (_nanolance_zstd below already builds into CMAKE_CURRENT_BINARY_DIR for the same reason.)
+    add_subdirectory(${nanoarrow_SOURCE_DIR} "${CMAKE_CURRENT_BINARY_DIR}/_nanolance_nanoarrow_build"
+                     EXCLUDE_FROM_ALL)
     set(nanoarrow_SOURCE_DIR "${nanoarrow_SOURCE_DIR}" CACHE PATH "Nanoarrow source for nanolance" FORCE)
 endif()
 
@@ -309,6 +318,13 @@ if(NANOLANCE_BUILD_FUZZERS)
     target_compile_features(nanolance_fuzz_decode PRIVATE cxx_std_20)
     target_link_libraries(nanolance_fuzz_decode PRIVATE nanolance)
     target_link_options(nanolance_fuzz_decode PRIVATE -fsanitize=fuzzer)
+
+    # The PageLayout descriptor gets its own target: libFuzzer's coverage feedback works best aimed
+    # at one grammar, and descriptor bytes look nothing like a data file.
+    add_executable(nanolance_fuzz_page_layout tests/fuzz/fuzz_page_layout.cpp)
+    target_compile_features(nanolance_fuzz_page_layout PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_page_layout PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_page_layout PRIVATE -fsanitize=fuzzer)
 endif()
 
 if(NANOLANCE_BUILD_TOOLS)

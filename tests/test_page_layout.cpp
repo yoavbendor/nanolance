@@ -287,6 +287,44 @@ void check_malformed_inputs() {
         check(!ok || !err.empty(), "refusal #" + std::to_string(i) + " should carry a reason");
     }
 
+    // A failed parse must leave NOTHING behind. The layout kind is chosen before its body is parsed
+    // (PageLayout field 1 means MiniBlock whether or not the MiniBlock parses), so an earlier version
+    // returned false with kind already set to kMiniBlock and an empty body. Decode dispatch reads the
+    // kind to pick a decoder, so that would have selected one from a descriptor that did not parse.
+    // Found by tests/fuzz/fuzz_page_layout.cpp: a well-formed MiniBlock header followed by a tag with
+    // wire type 6.
+    {
+        const std::vector<std::uint8_t> truncated_miniblock{
+            0x0a, 0x1d, '/',  'l',  'a',  'n',  'c',  'e',  '.',  'e',  'n',  'c',  'o',  'd',  'i',
+            'n',  'g',  's',  '2',  '1',  '.',  'P',  'a',  'g',  'e',  'L',  'a',  'y',  'o',  'u',
+            't',  0x12, 0x1c, 0x0a, 0x1a, 0x1a, 0x0e, 0x42, 0x0c, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x40,
+            0x12, 0x04, 0x0a, 0x02, 0x08, 0x08, 0xce, 0xfe, 0xfe, 0xc7, 0x02, 0x48, 0xa0, 0x1f, 0x50,
+            0x01};
+        pl::PageLayout parsed;
+        std::string err;
+        check(!pl::decode_page_layout(truncated_miniblock, parsed, err),
+              "a MiniBlock body with an invalid wire type should be refused");
+        check(parsed.kind == pl::LayoutKind::kNone,
+              "a refused parse must leave kind == kNone, got " +
+                  std::to_string(static_cast<int>(parsed.kind)));
+        check(parsed.mini_block.value_compression == nullptr,
+              "a refused parse must not leave a partial encoding tree behind");
+    }
+
+    // Same guarantee when a previously-successful parse is reused: the output is reset, not merged.
+    {
+        pl::PageLayout reused;
+        std::string err;
+        const std::vector<std::uint8_t> good{
+            0x0a, 0x1d, '/',  'l',  'a',  'n',  'c',  'e',  '.',  'e',  'n',  'c', 'o',  'd',  'i',
+            'n',  'g',  's',  '2',  '1',  '.',  'P',  'a',  'g',  'e',  'L',  'a', 'y',  'o',  'u',
+            't',  0x12, 0x08, 0x0a, 0x06, 0x1a, 0x04, 0x2a, 0x02, 0x08, 0x40};
+        check(pl::decode_page_layout(good, reused, err), "well-formed bitpacking descriptor: " + err);
+        check(reused.kind == pl::LayoutKind::kMiniBlock, "expected a MiniBlock layout");
+        check(pl::decode_page_layout({0x0a}, reused, err) == false, "malformed reuse should be refused");
+        check(reused.kind == pl::LayoutKind::kNone, "a refused reuse must clear the previous result");
+    }
+
     // A type url that is not a PageLayout is refused by name rather than parsed as one.
     std::vector<std::uint8_t> wrong_url{0x0a, 0x05};
     for (char ch : std::string("hello")) {

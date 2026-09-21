@@ -10,19 +10,40 @@
 // the decoder and never look at the descriptor that would have selected it".
 //
 //   nlance-pagelayout <dataset.lance> [more.lance ...]
+//   nlance-pagelayout --dump-corpus <dir> <dataset.lance> [...]
+//
+// --dump-corpus writes each distinct descriptor to <dir> as its own file, which is how the fuzz
+// corpus is seeded (tests/fuzz/fuzz_page_layout.cpp). Starting libFuzzer from real descriptors --
+// nanolance's AND pylance's -- means it mutates valid grammar instead of spending its budget
+// rediscovering the wrapper.
 
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/page_layout.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
 #include <vector>
 
 namespace pl = nano_lance::page_layout;
 
 namespace {
+
+/// When set, descriptors are written here instead of (as well as) being printed.
+std::filesystem::path g_corpus_dir;
+std::set<std::vector<std::uint8_t>> g_seen;
+
+void maybe_dump(const std::vector<std::uint8_t>& encoding) {
+    if (g_corpus_dir.empty() || !g_seen.insert(encoding).second) {
+        return;  // deduplicated: identical descriptors are common across pages and columns
+    }
+    const auto path = g_corpus_dir / ("descriptor_" + std::to_string(g_seen.size()) + ".bin");
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(encoding.data()), static_cast<std::streamsize>(encoding.size()));
+}
 
 int report(const std::filesystem::path& dataset) {
     const auto label = dataset.filename().string();
@@ -68,12 +89,20 @@ int report(const std::filesystem::path& dataset) {
             std::cout << label << "  " << name << ": no pages\n";
             continue;
         }
+        if (!g_corpus_dir.empty()) {
+            // Seeding wants every page: later pages of a column carry different row counts and, for
+            // the last chunk, different bit widths.
+            for (const auto& page : columns[c].pages) {
+                maybe_dump(page.encoding);
+            }
+        }
         const auto& encoding = columns[c].pages[0].encoding;
         if (encoding.empty()) {
             std::cout << label << "  " << name << ": no PageLayout descriptor\n";
             ++failures;
             continue;
         }
+        maybe_dump(encoding);
         pl::PageLayout parsed;
         std::string parse_error;
         if (!pl::decode_page_layout(encoding, parsed, parse_error)) {
@@ -89,13 +118,27 @@ int report(const std::filesystem::path& dataset) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cerr << "usage: nlance-pagelayout <dataset.lance> [more.lance ...]\n";
+    int first = 1;
+    if (argc >= 3 && std::string(argv[1]) == "--dump-corpus") {
+        g_corpus_dir = argv[2];
+        std::error_code ec;
+        std::filesystem::create_directories(g_corpus_dir, ec);
+        if (ec) {
+            std::cerr << "cannot create corpus dir " << g_corpus_dir << ": " << ec.message() << '\n';
+            return 2;
+        }
+        first = 3;
+    }
+    if (argc <= first) {
+        std::cerr << "usage: nlance-pagelayout [--dump-corpus <dir>] <dataset.lance> [more.lance ...]\n";
         return 2;
     }
     int failures = 0;
-    for (int i = 1; i < argc; ++i) {
+    for (int i = first; i < argc; ++i) {
         failures += report(argv[i]);
+    }
+    if (!g_corpus_dir.empty()) {
+        std::cout << "wrote " << g_seen.size() << " distinct descriptors to " << g_corpus_dir << '\n';
     }
     return failures == 0 ? 0 : 1;
 }

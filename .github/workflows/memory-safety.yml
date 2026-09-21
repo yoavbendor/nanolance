@@ -70,7 +70,7 @@ jobs:
         run: ctest --test-dir build-asan -L smoke --output-on-failure
 
   fuzz:
-    name: libFuzzer (decode chain)
+    name: libFuzzer (decode chain + PageLayout)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -95,10 +95,10 @@ jobs:
             -DNANOLANCE_BUILD_TESTS=OFF -DNANOLANCE_BUILD_TOOLS=OFF \
             -DNANOLANCE_BUILD_EXAMPLES=OFF -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
 
-      - name: Build fuzzer
-        run: cmake --build build-fuzz --target nanolance_fuzz_decode -j
+      - name: Build fuzzers
+        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout -j
 
-      # 2 minutes per push is enough to catch regressions; extend for a scheduled nightly run.
+      # 2 minutes per push per target is enough to catch regressions; extend for a nightly run.
       - name: Fuzz the decode chain
         env:
           UBSAN_OPTIONS: halt_on_error=1
@@ -106,6 +106,53 @@ jobs:
         run: |
           mkdir -p corpus
           ./build-fuzz/nanolance_fuzz_decode -max_total_time=120 -print_final_stats=1 corpus
+
+      # Seed the PageLayout corpus with REAL descriptors before fuzzing. Starting from valid grammar
+      # is worth far more than the two minutes of budget it saves: from random bytes the fuzzer
+      # spends most of its time rediscovering the type-url wrapper instead of mutating encoding
+      # trees. The tools build is a separate, non-instrumented tree -- nlance-pagelayout only needs
+      # to WRITE the corpus, and building it with sanitizers would just slow it down.
+      - name: Seed the PageLayout corpus
+        run: |
+          cmake -S . -B build-seed -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DNANOLANCE_BUILD_TESTS=OFF -DNANOLANCE_BUILD_EXAMPLES=OFF \
+            -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
+          cmake --build build-seed --target nlance_pagelayout arrowipc2lance -j
+          python3 -m pip install --quiet pyarrow
+          mkdir -p seed-datasets
+          python3 - <<'PY'
+          import pyarrow as pa, pyarrow.ipc as ipc, random
+          random.seed(3)
+          n = 4000
+          cols = {
+              "wide": pa.array([i * 7919 for i in range(n)], type=pa.int64()),
+              "constant": pa.array([42] * n, type=pa.int64()),
+              "runs": pa.array([i // 500 for i in range(n)], type=pa.int64()),
+              "smooth": pa.array([i * 0.25 for i in range(n)], type=pa.float64()),
+              "flags": pa.array([i % 2 == 0 for i in range(n)]),
+              "high_card": pa.array(["v%d" % random.randrange(10**6) for _ in range(n)]),
+              "low_card": pa.array(["alpha", "beta", "gamma"] * (n // 3) + ["alpha"] * (n % 3)),
+              "const_str": pa.array(["file:///capture.pcapng"] * n),
+          }
+          table = pa.table(cols)
+          with open("seed-datasets/input.arrow", "wb") as sink:
+              with ipc.new_stream(sink, table.schema) as w:
+                  w.write_table(table)
+          PY
+          ./build-seed/arrowipc2lance -c -o seed-datasets/plain.lance < seed-datasets/input.arrow
+          ./build-seed/arrowipc2lance -c --compress -o seed-datasets/zstd.lance < seed-datasets/input.arrow
+          mkdir -p corpus-page-layout
+          ./build-seed/nlance-pagelayout --dump-corpus corpus-page-layout \
+            seed-datasets/plain.lance seed-datasets/zstd.lance
+
+      - name: Fuzz the PageLayout descriptor parser
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-page-layout-found
+          ./build-fuzz/nanolance_fuzz_page_layout -max_total_time=120 -print_final_stats=1 \
+            corpus-page-layout-found corpus-page-layout
 
       - name: Upload crash reproducers
         if: failure()

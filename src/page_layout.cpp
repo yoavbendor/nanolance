@@ -375,12 +375,11 @@ bool parse_constant(Cursor c, Constant& out, std::string& error) {
 
 }  // namespace
 
-bool decode_page_layout(const std::vector<std::uint8_t>& encoding, PageLayout& out, std::string& error) {
-    out = PageLayout{};
-    error.clear();
-    if (encoding.empty()) {
-        return true;  // no descriptor recorded; caller falls back
-    }
+namespace {
+
+/// Parse into `out`, which the caller has already reset. Split from decode_page_layout so that
+/// function can build into a scratch value and publish it only on success -- see the note there.
+bool decode_page_layout_into(const std::vector<std::uint8_t>& encoding, PageLayout& out, std::string& error) {
 
     // Outer wrapper: f1 type_url string, f2 the PageLayout payload.
     Cursor c{encoding.data(), encoding.size(), 0};
@@ -455,6 +454,29 @@ bool decode_page_layout(const std::vector<std::uint8_t>& encoding, PageLayout& o
         out.unknown_layout_field = field;
         return true;
     }
+    return true;
+}
+
+}  // namespace
+
+bool decode_page_layout(const std::vector<std::uint8_t>& encoding, PageLayout& out, std::string& error) {
+    out = PageLayout{};
+    error.clear();
+    if (encoding.empty()) {
+        return true;  // no descriptor recorded; caller falls back
+    }
+
+    // Build into a scratch value and publish only on success. The layout KIND is picked before its
+    // body is parsed (a PageLayout field 1 means MiniBlock whether or not the MiniBlock parses), so
+    // writing straight into `out` left a failed parse reporting kind = kMiniBlock with an empty body.
+    // A caller that checks the kind before the return value -- which is exactly how decode dispatch
+    // will read this -- would then select a decoder from a descriptor that did not parse. Found by
+    // tests/fuzz/fuzz_page_layout.cpp, 25 executions in.
+    PageLayout scratch;
+    if (!decode_page_layout_into(encoding, scratch, error)) {
+        return false;  // `out` stays reset
+    }
+    out = std::move(scratch);
     return true;
 }
 
