@@ -36,6 +36,40 @@ minimum-version = "0.10"
 build-dir = "build/{wheel_tag}"
 cmake.source-dir = "."
 wheel.packages = ["nanolance"]
+# Package only what nanolance installs. Without this, any dependency whose install() rules run ends
+# up inside the wheel -- nanoarrow and zstd shipped 2 MB of headers into site-packages/include/ and
+# two unused shared libraries before this was pinned down.
+install.components = ["nanolance_python"]
+
+# ── Wheels ───────────────────────────────────────────────────────────────────────────────────────
+# `pip install nanolance` is the whole on-ramp for the audience this library is trying to reach, and
+# nothing else reaches them without it: the alternative is CMake, a C++20 toolchain, and network for
+# FetchContent.
+#
+# The build fetches nanoarrow and zstd and links them STATICALLY, so a wheel needs no shared library
+# at runtime and auditwheel/delocate have nothing to bundle. It does need `git` and network inside
+# the build container, which every manylinux image has.
+[tool.cibuildwheel]
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+# 32-bit and PyPy: nanolance assumes a 64-bit size_t in several decode-path bounds checks, and PyPy
+# is untested with nanobind here. Neither is worth claiming support for without a CI job behind it.
+skip = ["*_i686", "*-win32", "pp*"]
+build-frontend = "build"
+test-requires = ["pyarrow"]
+# Deliberately not the pytest suite: that needs pylance, polars and pandas, which would be testing
+# THEIR wheels. See tests/wheel_smoke.py for what this checks instead.
+test-command = "python {project}/tests/wheel_smoke.py"
+
+[tool.cibuildwheel.linux]
+# manylinux_2_28 for a C++20 toolchain (GCC 12); the older manylinux2014 image's GCC 10 cannot build
+# this tree.
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+
+[tool.cibuildwheel.macos]
+# 11.0 is the first target where the C++ standard library ships the C++17/20 filesystem and charconv
+# bits this tree uses without a back-deployment shim.
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

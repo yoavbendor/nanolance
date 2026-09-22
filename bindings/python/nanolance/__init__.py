@@ -14,6 +14,18 @@ from typing import Union
 
 from nanolance import _nanolance
 
+# The installed distribution's version, so `nanolance.__version__` answers the first question anyone
+# asks a wheel. Read from the package metadata rather than duplicated here: pyproject.toml already
+# has to stay in step with NANOLANCE_VERSION_* in the top-level CMakeLists.txt, and a third copy
+# would be a third thing to forget. "0+unknown" is what you get running from a source tree that was
+# never installed.
+try:  # pragma: no cover - trivial, and the fallback only fires outside an install
+    from importlib.metadata import PackageNotFoundError, version as _dist_version
+
+    __version__ = _dist_version("nanolance")
+except (ImportError, PackageNotFoundError):  # pragma: no cover
+    __version__ = "0+unknown"
+
 
 @dataclass
 class WriteOptions:
@@ -158,4 +170,4 @@ def read_table(path: Union[str, os.PathLike]):
     return _nanolance.read_table(Path(path))
 
 
-__all__ = ["write_table", "read_table", "WriteOptions", "LanceWriter"]
+__all__ = ["write_table", "read_table", "WriteOptions", "LanceWriter", "__version__"]

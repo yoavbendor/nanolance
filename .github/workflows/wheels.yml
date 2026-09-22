@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Builds the `pip install nanolance` on-ramp.
+#
+# Without wheels, installing means CMake, a C++20 toolchain and network for FetchContent -- which the
+# audience this library is trying to reach will not do. The build links nanoarrow and zstd
+# statically, so each wheel is self-contained and auditwheel/delocate have nothing to bundle.
+#
+# Publishing happens only on a version tag, through PyPI's trusted publishing (no API token in
+# repository secrets). Everything else -- a push that touches packaging, a manual run -- builds and
+# TESTS the wheels without publishing, so the release path is exercised long before a tag.
+#
+# Windows is not in the matrix yet. nanolance has never been built there; see the `windows` job in
+# ci-platforms.yml, which is the thing that has to go green first. Once it does, adding Windows here
+# is deleting "*-win32" from `skip` in pyproject.toml and adding windows-2022 below.
+name: wheels
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main, "claude/**", "cursor/**"]
+    paths:
+      - "bindings/python/pyproject.toml"
+      - "bindings/python/CMakeLists.txt"
+      - "bindings/python/nanolance/**"
+      - "bindings/python/tests/wheel_smoke.py"
+      - ".github/workflows/wheels.yml"
+  pull_request:
+    paths:
+      - "bindings/python/pyproject.toml"
+      - "bindings/python/CMakeLists.txt"
+      - "bindings/python/nanolance/**"
+      - "bindings/python/tests/wheel_smoke.py"
+      - ".github/workflows/wheels.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }} ${{ matrix.archs }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            archs: x86_64
+          - os: macos-14
+            archs: arm64
+          - os: macos-13
+            archs: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pypa/cibuildwheel@v2.21.3
+        with:
+          package-dir: bindings/python
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
+          # Each wheel recompiles nanoarrow, zstd and nanolance from scratch; the runners have more
+          # cores than cibuildwheel's default of one.
+          CMAKE_BUILD_PARALLEL_LEVEL: "4"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.archs }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: pipx run build --sdist bindings/python --outdir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    # Tags only, and only once every wheel and the sdist are built and their smoke test has passed.
+    needs: [build, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write  # PyPI trusted publishing; no API token stored in this repository
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -20,18 +20,29 @@ endif()
 
 include(FetchContent)
 
+# nanoarrow and zstd are brought in with add_subdirectory(... EXCLUDE_FROM_ALL), NOT
+# FetchContent_MakeAvailable, and the reason is the WHEEL. MakeAvailable runs a dependency's own
+# install() rules as part of ours, and scikit-build-core packages whatever `cmake --install` writes.
+# The result shipped 2 MB of nanoarrow/zstd HEADERS into site-packages/include/, plus
+# lib/cmake/*Config.cmake, lib/pkgconfig/*.pc, and two libnanoarrow*_shared.so that nothing loads --
+# the extension links the static libraries. EXCLUDE_FROM_ALL suppresses those install rules (and
+# stops the unused shared libraries being built at all), leaving a wheel that is just the extension
+# and the Python package.
+#
 # --- nanoarrow with IPC (required by nanolance) ---
 set(NANOARROW_IPC ON CACHE BOOL "" FORCE)
 set(NANOARROW_IPC_WITH_ZSTD OFF CACHE BOOL "" FORCE)
 set(NANOARROW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(NANOARROW_BUILD_APPS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     nanoarrow
     GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow.git
     GIT_TAG ffe61d3cd2d02da9e60cfc405cd6c50c512f64b9
     GIT_SHALLOW FALSE
 )
-FetchContent_MakeAvailable(nanoarrow)
+FetchContent_Populate(nanoarrow)
+add_subdirectory("${nanoarrow_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/_nanolance_nanoarrow_build" EXCLUDE_FROM_ALL)
 
 # --- zstd ---
 if(NOT TARGET libzstd_static)
@@ -43,9 +54,11 @@ if(NOT TARGET libzstd_static)
         _nanolance_py_zstd
         GIT_REPOSITORY https://github.com/facebook/zstd.git
         GIT_TAG v1.5.6
-        SOURCE_SUBDIR build/cmake
+        GIT_SHALLOW TRUE
     )
-    FetchContent_MakeAvailable(_nanolance_py_zstd)
+    FetchContent_Populate(_nanolance_py_zstd)
+    add_subdirectory("${_nanolance_py_zstd_SOURCE_DIR}/build/cmake"
+                     "${CMAKE_BINARY_DIR}/_nanolance_zstd_build" EXCLUDE_FROM_ALL)
 endif()
 
 # --- nanolance library (in-tree when building from this repo) ---
@@ -69,4 +82,7 @@ nanobind_add_module(_nanolance STABLE_ABI NB_STATIC src/nanolance_bindings.cpp)
 target_include_directories(_nanolance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(_nanolance PRIVATE nanolance::nanolance)
 
-install(TARGETS _nanolance LIBRARY DESTINATION nanolance)
+# COMPONENT + install.components in pyproject.toml: a second guard on the same problem as the
+# EXCLUDE_FROM_ALL above. If a dependency ever does install unconditionally, naming the component
+# keeps it out of the wheel rather than quietly adding megabytes to it.
+install(TARGETS _nanolance LIBRARY DESTINATION nanolance COMPONENT nanolance_python)

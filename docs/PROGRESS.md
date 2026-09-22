@@ -18,7 +18,7 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Fuzz coverage for the descriptor parser | done — found one real bug in 25 executions |
 | 1.1 Real nullability | **done**, read and write, fixed- and variable-width; a null struct is still refused |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
-| Phase 2 — wheels, CMake install | not started |
+| Phase 2 — wheels, CMake install | **2.1 wheels and 2.3 CI done**; 2.2 install/export deliberately not |
 | Phase 3 — streaming read, projection in Python | not started |
 | Phase 4 — read-path optimization | not started (deliberately last) |
 
@@ -421,6 +421,55 @@ It also surfaced a bug in this branch's own earlier FetchContent change: keying 
 directory by generator was not enough, because nanoarrow still compiled into it, so a
 sanitizer/fuzzer tree and a plain tree shared object files. nanoarrow now builds into the current
 build tree, matching what zstd already did.
+
+## Phase 2: distribution
+
+### 2.1 Wheels
+
+`pip install nanolance` is the entire on-ramp for the audience this library is trying to reach, and
+nothing else in the plan reaches them without it -- the alternative is CMake, a C++20 toolchain and
+network access for FetchContent.
+
+`.github/workflows/wheels.yml` builds manylinux_2_28 x86_64 and macOS arm64/x86_64 wheels for CPython
+3.9-3.13 with `cibuildwheel`, tests each one in a fresh interpreter, and publishes to PyPI on a
+version tag through trusted publishing (no API token in repository secrets). Non-tag runs build and
+test without publishing, so the release path is exercised long before a tag exists.
+
+**Building one locally turned up a real packaging bug.** The wheel was **1.92 MB, and about half of
+it was not nanolance**: 2 MB of nanoarrow and zstd *headers* installed into `site-packages/include/`,
+`lib/cmake/nanoarrowConfig.cmake`, `lib/pkgconfig/libzstd.pc`, and two `libnanoarrow*_shared.so` that
+nothing loads (the extension links the static libraries). `FetchContent_MakeAvailable` runs a
+dependency's own `install()` rules as part of ours, and scikit-build-core packages whatever
+`cmake --install` writes. The Python build now uses `add_subdirectory(... EXCLUDE_FROM_ALL)` like the
+top-level tree already did -- which also stops the unused shared libraries being built at all -- and
+the install is scoped to a named component as a second guard. **1.92 MB -> 912 KB**, containing
+exactly the extension and the package.
+
+The wheel's test is `bindings/python/tests/wheel_smoke.py`, deliberately not the pytest suite: that
+needs pylance, polars and pandas, which would be testing *their* wheels. What matters is that the
+extension loads with no zstd or nanoarrow on the system and that a round trip -- nulls included --
+gives back what went in.
+
+Also: `nanolance.__version__` now exists, read from the installed distribution's metadata rather than
+being a third copy of the version number.
+
+### 2.3 Wider CI
+
+`.github/workflows/ci-platforms.yml` builds and runs the full ctest suite on **macOS** on every push;
+that claim has been in the docs untested since the branch opened, because every other workflow here
+is Linux. **Windows is `workflow_dispatch` only**, on purpose: the tree has never been built there,
+and a job that is red on every push teaches people to ignore red. Turning it green is what unlocks
+Windows wheels, and the comment in each file says so.
+
+### Not done: 2.2 CMake install/export
+
+`find_package(nanolance)` from an install tree is still missing. It is not a matter of adding
+`install(TARGETS ... EXPORT)`: nanolance's public headers include nanoarrow's, and both nanoarrow and
+zstd arrive as FetchContent'd static libraries whose own interface include directories point into the
+build tree, so exporting nanolance means deciding how to ship *them* -- and a vendored copy of
+nanoarrow's headers on a consumer's include path is a real decision, not a mechanical one. The
+audience for it also already has a working path (`FetchContent_Declare(nanolance)`), unlike the
+wheel audience, which had none. Left for a deliberate pass rather than done halfway.
 
 ---
 

@@ -13,13 +13,19 @@ import lance       # official SDK (pip install pylance)
 import nanolance   # fast C++ nanolance bindings (this package)
 ```
 
-## Install (development)
+## Install
+
+Wheels are built for manylinux (x86_64) and macOS (arm64, x86_64) on CPython 3.9–3.13 and published
+to PyPI on a version tag; each one links nanoarrow and zstd statically, so there is nothing to
+install alongside it. Until the first tag, install from source:
 
 ```bash
 cd bindings/python
 python -m pip install -e ".[test]"
 pytest
 ```
+
+That needs CMake, a C++20 toolchain, and network access (the build fetches nanoarrow and zstd).
 
 Optional interoperability tests also need the official SDK:
 

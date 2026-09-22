@@ -55,7 +55,8 @@ speedup). Full details, the threat model, and a reviewer checklist: **[docs/SAFE
   `date32/64`, `time32/64`), `decimal128/256`, and nested structs. Everything it writes, it reads
   back; every type it cannot round-trip is **refused at `write_batch`** rather than written. See
   [Type coverage](#type-coverage) for the exact list, including what is *not* supported yet
-  (nulls, `list`, `large_utf8`, Arrow dictionary columns).
+  (`list`, `large_utf8`, Arrow dictionary columns). **Nulls are stored**, in fixed- and
+  variable-width columns alike.
 - **Links:** `nanolance` to write; `nanolance_reader` alone if you only fetch external blobs.
 - **Python:** fast zero-copy bindings — `pip install -e bindings/python` then `import nanolance` (see
   [bindings/python/README.md](bindings/python/README.md)). Uses the Arrow PyCapsule interface; no hard
@@ -73,6 +74,9 @@ assert pa.table(nanolance.read_table("out.lance")).equals(table)
 ```
 
 Install for development: `pip install -e "bindings/python[test]"` then `pytest` in that directory.
+Self-contained wheels (nanoarrow and zstd linked in statically, nothing to install alongside) are
+built for manylinux and macOS by [`.github/workflows/wheels.yml`](.github/workflows/wheels.yml) and
+published to PyPI on a version tag; until the first tag, the development install above is the way in.
 
 ### Quick start (C write)
 
