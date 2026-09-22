@@ -204,11 +204,21 @@ example hard-`FATAL_ERROR`s. This is the first command a new user runs, and the 
 
 ### 2.7 Python API gaps
 
-- `read_table` calls `nano_lance_table_read_dataset`, which materializes **every** batch, then
-  copies them into `ExportedTable`, then frees the originals
-  (`bindings/python/src/nanolance_bindings.cpp:253`). Peak memory ≈ 2× the dataset. The docstring's
-  promise that a reader "can consume it chunk by chunk" is true of the handle and false of the
-  memory profile.
+- `read_table` calls `nano_lance_table_read_dataset`, which materializes **every** batch before
+  handing back a handle (`bindings/python/src/nanolance_bindings.cpp:253`). The docstring's promise
+  that a reader "can consume it chunk by chunk" is true of the handle and false of the memory
+  profile.
+
+  **Measured peak is 2.01× the dataset — but not for the reason stated here originally.** On a
+  61 MiB, 4M-row table: one fragment → **2.01×**; the same data across 16 fragments → **1.10×**. So
+  the 2× is *not* batches accumulating, and `ExportedTable::from_read_result` is not a copy (it is
+  `ArrowArrayMove`). It is **within one fragment's decode**: the decoder fills `ColumnValues`
+  buffers and then copies them into the ArrowArray, so both exist at once. Split across 16 fragments
+  the transient is 1/16 of the data and the peak collapses.
+
+  This changes what fixes it. Streaming (3.1) removes the *accumulation*, which only bites on
+  many-fragment datasets; the 2× on an ordinary single-fragment dataset is removed by **4.1,
+  decoding straight into `ArrowBuffer`**.
 - `lance_table_read_dataset_projected` exists in C++ and is **not exposed to Python**. Column
   projection is the first thing a parquet user reaches for.
 - No row-range / slice / `take`, no filter, no `count_rows`, no schema-only peek.
@@ -298,9 +308,13 @@ Add a consumer smoke test that builds a tiny program against an installed nanola
 ### Phase 3 — The Python API a parquet user expects (weeks)
 
 **3.1 Streaming read.** Replace the materialize-everything `read_table` with a real
-`ArrowArrayStream` that decodes fragment by fragment. Removes the 2× peak and makes
-larger-than-memory datasets work. This is also a C++-side improvement
+`ArrowArrayStream` that decodes fragment by fragment. This is also a C++-side improvement
 (`lance_table_read_dataset` has the same shape).
+
+What it buys, corrected by measurement (see 2.7): **larger-than-memory datasets and time-to-first-
+batch**, not the 2× peak. A single-fragment dataset still peaks at 2× after this change, because
+that 2× lives inside one fragment's decode. Pair it with 4.1 to get ~1× for any dataset — and note
+that 4.1 is the one with the headline number, despite being sequenced later.
 
 **3.2 Expose projection**, then add row-range/slice and `count_rows`/schema-peek. Projection already
 exists in C++ (`lance_table_read_dataset_projected`) and just needs binding.
@@ -318,6 +332,9 @@ non-stdin mode to `arrowipc2lance` (it currently only reads stdin, which surpris
 
 Sequenced last deliberately: correctness and reach move adoption, and optimizing decode paths that
 are about to be rewritten for nullability (1.1) and stock-Lance layouts (1.3) is wasted work.
+
+**That rewrite has now happened** (1.1 and 1.3 are done), so the reason to defer 4.1 is spent. And
+the measurement in §2.7 moved 4.1 up in value: it, not 3.1, is what removes the 2× read peak.
 
 **4.1 Decode straight into `ArrowBuffer`.** Delete the `ColumnValues` → `ArrowBuffer` copy (§2.4
 cause 2). Largest single win; ~59 MB of redundant traffic on the 1M-row bench.

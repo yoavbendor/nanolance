@@ -501,6 +501,31 @@ The Python README's read section was rewritten at the same time. It still said i
 vs lance 7.0.0" and that pylance -> nanolance was "best-effort only for simple schemas", which
 stopped being true several commits ago.
 
+### A plan claim, measured — and it changed the sequencing
+
+Before building 3.1 on top of it, I measured the "peak memory ≈ 2× the dataset" claim in the plan's
+§2.7. Reading the code suggested it was wrong (`ExportedTable::from_read_result` is `ArrowArrayMove`,
+not a copy). **The measurement said otherwise, and the measurement won:**
+
+| 61 MiB, 4M-row table | peak RSS / dataset |
+|---|---|
+| written as **1 fragment** | **2.01×** |
+| the same data as **16 fragments** | **1.10×** |
+
+So the 2× is real, but not for the reason the plan gave. It is not batches accumulating — it is
+**inside one fragment's decode**: the decoder fills `ColumnValues` buffers and then copies them into
+the ArrowArray, so both exist at once. Across 16 fragments that transient is 1/16 of the data and the
+peak collapses.
+
+**This changes what to do next.** Plan item 3.1 says streaming "removes the 2× peak". It does not:
+streaming removes the *accumulation*, which only bites on many-fragment datasets. An ordinary
+single-fragment dataset would still peak at 2× after 3.1. The thing that removes it is **4.1,
+decoding straight into `ArrowBuffer`** — sequenced last in the plan, on the reasoning that the decode
+paths were about to be rewritten for 1.1 and 1.3. Those rewrites are done, so that reason is spent.
+
+Both §2.7 and §3.1 of the plan now say this, so the next person to read it is not misled the way I
+nearly was.
+
 ---
 
 ## Deviations from the plan, and open items
