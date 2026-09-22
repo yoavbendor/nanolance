@@ -6,6 +6,7 @@
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/deletion_vector.hpp"
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/path_safety.hpp"
@@ -761,15 +762,23 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     return true;
 }
 
-/// One data file, and which of its rows this read wants.
+/// One fragment, and which of its rows this read wants.
 ///
-/// `skip`/`take` are how a row range reaches the decoder. A file the range does not touch at all is
-/// never put in the plan, so it is never opened -- that, not the trimming, is where the saving is.
+/// `skip`/`take` are how a row range reaches the decoder. A fragment the range does not touch at all
+/// is never put in the plan, so it is never opened -- that, not the trimming, is where the saving is.
+///
+/// A fragment can hold SEVERAL data files, and they are not more rows: they are more COLUMNS of the
+/// same rows. `add_columns` produces exactly that -- the computed column lands in a second file
+/// beside the original. Treating each file as its own batch (which this used to do) silently dropped
+/// every column after the first file's.
 struct PlannedFile {
-    pb::DataFile file;
-    std::uint64_t rows = 0;   // rows this file holds, according to the manifest
-    std::uint64_t skip = 0;   // rows to drop from the front
-    std::uint64_t take = 0;   // rows to keep
+    std::vector<pb::DataFile> files;
+    std::uint64_t fragment_id = 0;
+    pb::DeletionFile deletion_file;    // `present` false when the fragment has no deletions
+    std::uint64_t physical_rows = 0;   // rows on disk, before deletions
+    std::uint64_t rows = 0;            // LOGICAL rows: physical minus deleted. What a read returns.
+    std::uint64_t skip = 0;            // logical rows to drop from the front
+    std::uint64_t take = 0;            // logical rows to keep
 
     bool partial() const { return skip != 0U || take != rows; }
 };
@@ -778,63 +787,113 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
                           const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema, ArrowArray& batch,
                           std::string& error,
                           const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr) {
-    const pb::DataFile& data_file = planned.file;
-    // data_file.path is attacker-controlled (it comes out of the untrusted manifest). Confine it under
-    // <dataset>/data/ so a hostile ".."/absolute path can't make the reader open a file outside the
-    // dataset. The writer only ever stores a bare filename here, so legitimate datasets are unaffected.
-    const auto jailed = safe_join_under(dataset_path / "data", data_file.path);
-    if (!jailed) {
-        error = "data file path escapes the dataset directory";
-        return false;
-    }
-    const auto& path = *jailed;
-    pb::FileDescriptor descriptor{};
-    LanceDataFileFooterLayout layout{};
-    if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
-        return false;
-    }
-    std::vector<pb::ColumnMetadata> column_metadatas;
-    if (!read_lance_data_file_column_metadatas(path, layout, column_metadatas, error)) {
-        return false;
-    }
-    if (data_file.fields.size() != data_file.column_indices.size()) {
-        error = "data file field/column index mismatch";
+    if (planned.files.empty()) {
+        error = "fragment has no data files";
         return false;
     }
 
+    // One fragment, one batch -- however many files its columns are split across.
     std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
-    for (std::size_t i = 0; i < data_file.fields.size(); ++i) {
-        const auto field_id = data_file.fields[i];
-        // Skip columns not in the projection (if one is set).
-        if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
+    std::int64_t length = -1;
+    for (const auto& data_file : planned.files) {
+        // data_file.path is attacker-controlled (it comes out of the untrusted manifest). Confine it
+        // under <dataset>/data/ so a hostile ".."/absolute path can't make the reader open a file
+        // outside the dataset. The writer only ever stores a bare filename here, so legitimate
+        // datasets are unaffected.
+        const auto jailed = safe_join_under(dataset_path / "data", data_file.path);
+        if (!jailed) {
+            error = "data file path escapes the dataset directory";
+            return false;
+        }
+        const auto& path = *jailed;
+        pb::FileDescriptor descriptor{};
+        LanceDataFileFooterLayout layout{};
+        if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
+            return false;
+        }
+        std::vector<pb::ColumnMetadata> column_metadatas;
+        if (!read_lance_data_file_column_metadatas(path, layout, column_metadatas, error)) {
+            return false;
+        }
+        if (data_file.fields.size() != data_file.column_indices.size()) {
+            error = "data file field/column index mismatch";
+            return false;
+        }
+        // Every file of a fragment describes the SAME rows. A disagreement means the manifest and the
+        // files are out of step, and merging them would silently pad or truncate a column.
+        if (length < 0) {
+            length = static_cast<std::int64_t>(descriptor.length);
+        } else if (static_cast<std::uint64_t>(length) != descriptor.length) {
+            error = "data files within one fragment disagree on their row count";
+            return false;
+        }
 
-        const auto column_index = data_file.column_indices[i];
-        if (column_index < 0 ||
-            static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
-            error = "data file column index out of range";
-            return false;
+        for (std::size_t i = 0; i < data_file.fields.size(); ++i) {
+            const auto field_id = data_file.fields[i];
+            // Skip columns not in the projection (if one is set).
+            if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
+
+            const auto column_index = data_file.column_indices[i];
+            if (column_index < 0 ||
+                static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
+                error = "data file column index out of range";
+                return false;
+            }
+            const auto* on_disk = find_descriptor_field(descriptor, field_id);
+            if (on_disk == nullptr) {
+                error = "data file references unknown field id";
+                return false;
+            }
+            ColumnValues values;
+            if (!decode_lance_physical_column(path, *on_disk,
+                                              column_metadatas[static_cast<std::size_t>(column_index)],
+                                              values, error)) {
+                return false;
+            }
+            decoded_by_field_id.emplace(field_id, std::move(values));
         }
-        const auto* on_disk = find_descriptor_field(descriptor, field_id);
-        if (on_disk == nullptr) {
-            error = "data file references unknown field id";
-            return false;
-        }
-        ColumnValues values;
-        if (!decode_lance_physical_column(path, *on_disk, column_metadatas[static_cast<std::size_t>(column_index)],
-                                          values, error)) {
-            return false;
-        }
-        decoded_by_field_id.emplace(field_id, std::move(values));
     }
 
-    auto length = static_cast<std::int64_t>(descriptor.length);
+    // Deletions first, then the row range: a range is expressed in LOGICAL row numbers, which only
+    // exist once the deleted rows are gone.
+    if (planned.deletion_file.present) {
+        if (static_cast<std::uint64_t>(length) != planned.physical_rows) {
+            error = "data file holds " + std::to_string(length) +
+                    " rows but the manifest claims " + std::to_string(planned.physical_rows) +
+                    "; refusing to apply a deletion vector against rows that do not line up";
+            return false;
+        }
+        std::vector<std::uint32_t> deleted;
+        if (!read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
+            return false;
+        }
+        std::vector<std::uint8_t> keep(static_cast<std::size_t>(length), 1U);
+        for (const auto row : deleted) {
+            if (row >= static_cast<std::uint64_t>(length)) {
+                error = "deletion file names row " + std::to_string(row) + " but the fragment holds " +
+                        std::to_string(length);
+                return false;
+            }
+            keep[row] = 0U;
+        }
+        for (auto& [field_id, values] : decoded_by_field_id) {
+            const auto* field = find_mapping_field(mapping, field_id);
+            const std::size_t value_bytes =
+                field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            if (!compact_column_values(values, keep, static_cast<std::uint64_t>(length), value_bytes,
+                                       error)) {
+                return false;
+            }
+        }
+        length = static_cast<std::int64_t>(planned.rows);
+    }
 
     if (planned.partial()) {
         // The plan's skip/take came from the MANIFEST's per-fragment row count, while the rows are
         // here in the data file. If the two disagree, the arithmetic that decided which files to skip
         // was wrong, and a silently misaligned row range is exactly the failure this must not have.
-        if (descriptor.length != planned.rows) {
-            error = "data file holds " + std::to_string(descriptor.length) +
+        if (static_cast<std::uint64_t>(length) != planned.rows) {
+            error = "data file holds " + std::to_string(length) +
                     " rows but the manifest claims " + std::to_string(planned.rows) +
                     "; refusing to guess which rows a range covers";
             return false;
@@ -843,8 +902,8 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
             const auto* field = find_mapping_field(mapping, field_id);
             const std::size_t value_bytes =
                 field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
-            if (!slice_column_values(values, planned.skip, planned.take, descriptor.length, value_bytes,
-                                     error)) {
+            if (!slice_column_values(values, planned.skip, planned.take,
+                                     static_cast<std::uint64_t>(length), value_bytes, error)) {
                 return false;
             }
         }
@@ -966,24 +1025,18 @@ bool open_read_plan(const std::filesystem::path& dataset_path,
         if (fragment.files.empty()) {
             continue;
         }
-        // One batch is emitted per data file, so the reader's row model is "each file holds its own
-        // rows". The manifest only records rows per FRAGMENT, so a multi-file fragment gives no way
-        // to say which rows live in which file. Reading it whole is unaffected; a row range over it
-        // would have to guess, so it is refused by name instead.
-        if (fragment.files.size() > 1U) {
-            if (ranged) {
-                release_schema_if_held(out_schema);
-                error = "cannot read a row range from a dataset whose fragments span several data "
-                        "files: the manifest records rows per fragment, not per file";
-                return false;
-            }
-            for (auto& data_file : fragment.files) {
-                plan.files.push_back(PlannedFile{std::move(data_file), 0U, 0U, 0U});
-            }
-            continue;
+        // Deleted rows are not rows any more: a range, a count and a full read all have to agree,
+        // and a full read does not return them. So the plan counts in LOGICAL rows throughout and
+        // the deletion filter runs before the range is applied.
+        if (fragment.deletion_file.present &&
+            fragment.deletion_file.num_deleted_rows > fragment.physical_rows) {
+            release_schema_if_held(out_schema);
+            error = "fragment claims more deleted rows than it holds";
+            return false;
         }
-
-        const auto rows = fragment.physical_rows;
+        const auto rows = fragment.physical_rows - (fragment.deletion_file.present
+                                                        ? fragment.deletion_file.num_deleted_rows
+                                                        : 0U);
         const auto first_row = cursor;
         if (rows > std::numeric_limits<std::uint64_t>::max() - cursor) {
             release_schema_if_held(out_schema);
@@ -992,8 +1045,17 @@ bool open_read_plan(const std::filesystem::path& dataset_path,
         }
         cursor += rows;
 
+        PlannedFile planned;
+        planned.fragment_id = fragment.id;
+        planned.deletion_file = fragment.deletion_file;
+        planned.physical_rows = fragment.physical_rows;
+        planned.rows = rows;
+
         if (!ranged) {
-            plan.files.push_back(PlannedFile{std::move(fragment.files[0]), rows, 0U, rows});
+            planned.files = std::move(fragment.files);
+            planned.skip = 0U;
+            planned.take = rows;
+            plan.files.push_back(std::move(planned));
             continue;
         }
 
@@ -1011,7 +1073,10 @@ bool open_read_plan(const std::filesystem::path& dataset_path,
         if (begin >= end) {
             continue;
         }
-        plan.files.push_back(PlannedFile{std::move(fragment.files[0]), rows, begin - first_row, end - begin});
+        planned.files = std::move(fragment.files);
+        planned.skip = begin - first_row;
+        planned.take = end - begin;
+        plan.files.push_back(std::move(planned));
     }
 
     if (ranged && range.offset > cursor) {
@@ -1194,14 +1259,24 @@ bool lance_table_count_rows(const std::filesystem::path& dataset_path, std::uint
         return false;
     }
     // Summed from the fragments rather than taken from a total field: the count has to agree with
-    // what a read actually returns, and a read walks these same fragments.
+    // what a read actually returns, and a read walks these same fragments. That is also why deleted
+    // rows are subtracted -- a read does not return them, so counting them would make count_rows
+    // disagree with len(read_table(...)), which is the one thing it must never do.
     for (const auto& fragment : manifest.fragments) {
-        if (fragment.physical_rows > UINT64_MAX - out_rows) {
+        const auto deleted =
+            fragment.deletion_file.present ? fragment.deletion_file.num_deleted_rows : 0U;
+        if (deleted > fragment.physical_rows) {
+            error = "fragment claims more deleted rows than it holds";
+            out_rows = 0;
+            return false;
+        }
+        const auto live = fragment.physical_rows - deleted;
+        if (live > UINT64_MAX - out_rows) {
             error = "dataset row count overflows a 64-bit integer";
             out_rows = 0;
             return false;
         }
-        out_rows += fragment.physical_rows;
+        out_rows += live;
     }
     return true;
 }

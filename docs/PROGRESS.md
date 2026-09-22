@@ -22,7 +22,7 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Phase 3 — the Python API a parquet user expects | **complete** — streaming, projection, row ranges, `count_rows`/`read_schema`, `nanolance convert` |
 | Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
 
-Test suite: **50 ctest** (was 42) and **388 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **50 ctest** (was 42) and **399 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout`, `nanolance_fuzz_fsst` and
@@ -761,6 +761,91 @@ Two details the change turned up:
   the fast path.
 
 The matrix no longer excludes `struct` from its sliced case, which is what let this through.
+
+## Reading Lance datasets that pylance has MODIFIED
+
+An audit of nanolance against *mutated* pylance datasets -- not just freshly written ones -- found
+five silent wrong answers. Every stock-Lance test in the suite wrote its dataset exactly once, and
+that turned out to be load-bearing.
+
+| pylance operation | pylance sees | nanolance returned |
+|---|---|---|
+| `write` + `append` | 4 rows | 2 rows |
+| `write` + `overwrite` | 2 rows | 3 rows (the pre-overwrite data) |
+| `delete("id < 10")` | 90 rows | 100 rows -- deleted rows returned |
+| `update(...)` | new values | stale values |
+| `add_columns({"b": "a * 2"})` | 10 rows / 2 cols | 10 rows / 1 col -- column dropped |
+
+No error in any case. Three independent causes.
+
+### 1. Manifest naming, which sorts in opposite directions
+
+Lance has two schemes (`rust/lance-table/src/io/commit.rs`, `ManifestNamingScheme`):
+
+    V1: _versions/{version}.manifest              <- what nanolance writes
+    V2: _versions/{u64::MAX - version}.manifest   <- what pylance writes, 20-digit zero-padded,
+                                                     so the NEWEST version sorts FIRST
+
+Picking the numerically largest filename is right under V1 and **exactly backwards** under V2, so
+every multi-version pylance dataset read back as version 1. Confirmed by renaming a dataset's
+manifests into V1 form, after which the same reads came back correct.
+
+The **writer** mattered as much as the reader, in two ways I did not anticipate:
+
+- `next_version` carried its own private copy of the naive scan, so appending to a pylance dataset
+  numbered the new manifest `u64::MAX` -- which reads back as version 0, behind everything.
+- Stock Lance **refuses** a directory holding both schemes ("Found multiple manifest naming schemes
+  in the same directory"). Writing nanolance's V1 names into a pylance dataset made it unreadable by
+  the tool that created it. `publish_manifest` now adopts whichever scheme is already present.
+
+### 2. Deletion files were not read at all
+
+Lance records deleted rows in `_deletions/{fragment}-{read_version}-{id}.{suffix}` and picks the
+shape by density: an **Arrow IPC file** of u32 offsets when sparse, a **roaring bitmap** above 5000.
+
+Both are parsed directly, in `src/deletion_vector.cpp`, rather than through a library. The Arrow
+route would otherwise mean enabling nanoarrow's `NANOARROW_IPC_WITH_ZSTD`, which pulls a
+`find_package(zstd REQUIRED)` into a build that deliberately vendors zstd -- a portability
+regression on exactly the platforms CI had only just started covering. So the file carries a minimal
+flatbuffer table reader (Message and RecordBatch, a handful of fields, vtable walked directly) and a
+roaring reader covering array, bitmap and run containers.
+
+Two details worth keeping:
+
+- The Arrow IPC **file** pads its magic to the writer's alignment -- pyarrow and arrow-rs pad to 64,
+  not the 8 the format requires -- so the first message is not at a fixed offset. The parser skips
+  forward over **zeros only**, never arbitrary bytes.
+- Arrow prefixes each compressed buffer with its uncompressed length, and writes **-1** when the
+  buffer did not compress. Both spellings occur in practice for these small files.
+
+If the vector's length disagrees with the manifest's `num_deleted_rows`, the read is **refused**:
+filtering by a vector that does not match would silently return the wrong number of rows, which is
+the failure class this whole effort exists to close.
+
+Applying them is `compact_column_values`, beside `slice_column_values` and for the same reason --
+everything at that stage is byte-addressed except the validity bitmap, which is the one buffer that
+has to be re-packed. Deletions run **before** any row range, because a range counts logical rows and
+those only exist once the deleted rows are gone. `count_rows` subtracts them too, or it would
+disagree with `len(read_table(...))`.
+
+### 3. A fragment can span several data files
+
+`add_columns` writes the computed column to its own file *beside* the original. Those files are not
+more rows -- they are more **columns of the same rows**. The reader emitted one batch per file,
+which dropped everything after the first file's columns; and the schema mapping compounded it by
+deriving "is this field materialized" from `files[0]` alone, so the added column looked absent
+entirely. A fragment is now one batch however many files it spans, and the files must agree on their
+row count or the read is refused.
+
+That also retired the row-range restriction added with ranges: multi-file fragments no longer need
+refusing, because each fragment maps to exactly one batch with a known row count.
+
+### Found on the way, NOT fixed
+
+Reading a pylance **nullable string** column fails at some sizes with
+`unsupported definition-level encoding: InlineBitpacking(16)` -- reproducible at 400 rows, fine at
+100 and at 2000. It is a loud refusal rather than a wrong answer, and it is an encoding gap rather
+than a lifecycle one, so it is recorded here rather than fixed alongside the above.
 
 ## Closing the gaps that let those bugs through
 

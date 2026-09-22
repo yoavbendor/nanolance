@@ -483,6 +483,33 @@ bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& 
     return true;
 }
 
+bool decode_deletion_file_message(const std::vector<std::uint8_t>& bytes, DeletionFile& out) {
+    out = DeletionFile{};
+    out.present = true;
+    std::size_t pos = 0;
+    while (pos < bytes.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(bytes, pos, key)) {
+            return false;
+        }
+        const auto field_number = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        std::uint64_t value = 0;
+        if (field_number == 1 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
+            out.file_type = static_cast<std::uint32_t>(value);
+        } else if (field_number == 2 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
+            out.read_version = value;
+        } else if (field_number == 3 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
+            out.id = value;
+        } else if (field_number == 4 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
+            out.num_deleted_rows = value;
+        } else if (!skip_field(bytes, pos, wire_type)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool decode_data_fragment_message(const std::vector<std::uint8_t>& bytes, DataFragment& fragment) {
     fragment = DataFragment{};
     std::size_t pos = 0;
@@ -506,6 +533,14 @@ bool decode_data_fragment_message(const std::vector<std::uint8_t>& bytes, DataFr
                 return false;
             }
             fragment.files.push_back(std::move(df));
+        } else if (field_number == 3 && wire_type == kWireBytes) {
+            std::vector<std::uint8_t> nested;
+            if (!read_bytes(bytes, pos, nested)) {
+                return false;
+            }
+            if (!decode_deletion_file_message(nested, fragment.deletion_file)) {
+                return false;
+            }
         } else if (field_number == 4 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
             fragment.physical_rows = value;
         } else if (!skip_field(bytes, pos, wire_type)) {

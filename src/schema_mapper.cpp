@@ -675,13 +675,36 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
     return false;
 }
 
-const pb::DataFile* pick_latest_data_file(const pb::Manifest& manifest) {
+/// Which fields the newest fragment materializes, and at what column index within its own file.
+///
+/// A fragment's columns can be split across SEVERAL data files -- `add_columns` puts the computed
+/// column in a file of its own beside the original -- so every file of that fragment has to be
+/// consulted. Reading only `files[0]` marked every later file's fields as unmaterialized
+/// (column_index -1), and the reader then quietly dropped them from the batch.
+///
+/// The index recorded here is only used as "is this field materialized at all?". Which column of
+/// which file actually holds it is resolved per file when the fragment is read.
+bool latest_fragment_column_indices(const pb::Manifest& manifest,
+                                    std::unordered_map<std::int32_t, std::int32_t>& out,
+                                    std::string& error) {
+    out.clear();
     for (auto it = manifest.fragments.rbegin(); it != manifest.fragments.rend(); ++it) {
-        if (!it->files.empty()) {
-            return &it->files[0];
+        if (it->files.empty()) {
+            continue;
         }
+        for (const auto& file : it->files) {
+            if (file.fields.size() != file.column_indices.size()) {
+                error = "manifest data file field id / column index length mismatch";
+                return false;
+            }
+            for (std::size_t i = 0; i < file.fields.size(); ++i) {
+                out.emplace(file.fields[i], file.column_indices[i]);
+            }
+        }
+        return true;
     }
-    return nullptr;
+    error = "manifest has no data files";
+    return false;
 }
 
 bool dematerialize_blob_v2_for_arrow_append(LanceSchemaMapping& mapping, std::string& error) {
@@ -746,19 +769,9 @@ bool dematerialize_blob_v2_for_arrow_append(LanceSchemaMapping& mapping, std::st
 bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchemaMapping& out, std::string& error) {
     out.fields.clear();
     error.clear();
-    const auto* data_file = pick_latest_data_file(manifest);
-    if (data_file == nullptr) {
-        error = "manifest has no data files";
-        return false;
-    }
-    if (data_file->fields.size() != data_file->column_indices.size()) {
-        error = "manifest data file field id / column index length mismatch";
-        return false;
-    }
     std::unordered_map<std::int32_t, std::int32_t> id_to_column;
-    id_to_column.reserve(data_file->fields.size());
-    for (std::size_t i = 0; i < data_file->fields.size(); ++i) {
-        id_to_column.emplace(data_file->fields[i], data_file->column_indices[i]);
+    if (!latest_fragment_column_indices(manifest, id_to_column, error)) {
+        return false;
     }
 
     for (const auto& pf : manifest.fields) {

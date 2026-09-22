@@ -271,6 +271,7 @@ add_library(nanolance STATIC
     src/blob_v2_external.cpp
     src/column_slice.cpp
     src/data_file_reader.cpp
+    src/deletion_vector.cpp
     src/data_file_writer.cpp
     src/fsst.cpp
     src/lz4_block.cpp

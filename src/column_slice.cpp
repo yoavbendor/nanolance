@@ -194,4 +194,139 @@ bool slice_column_values(ColumnValues& values, std::uint64_t first, std::uint64_
     return true;
 }
 
+bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>& keep,
+                           std::uint64_t total, std::size_t value_bytes, std::string& error) {
+    if (keep.size() != total) {
+        error = "keep mask does not cover the column's rows";
+        return false;
+    }
+    if (values.fixed_borrowed != nullptr) {
+        error = "cannot compact a column holding a borrowed buffer";
+        return false;
+    }
+
+    std::vector<std::uint64_t> kept;
+    kept.reserve(static_cast<std::size_t>(total));
+    for (std::uint64_t i = 0; i < total; ++i) {
+        if (keep[static_cast<std::size_t>(i)] != 0U) {
+            kept.push_back(i);
+        }
+    }
+    if (kept.size() == total) {
+        return true;  // nothing deleted in this column's rows; leave every buffer untouched
+    }
+    const auto count = static_cast<std::uint64_t>(kept.size());
+
+    // Validate before mutating, so a rejected compaction leaves the column as it was.
+    if (!values.validity.empty() && values.validity.size() < bitmap_bytes(total)) {
+        error = "validity bitmap covers fewer rows than the column claims";
+        return false;
+    }
+    switch (values.kind) {
+        case ColumnValues::Kind::FixedWidth:
+            if (!values.fixed.empty() && (value_bytes == 0U || values.fixed.size() / value_bytes < total)) {
+                error = "fixed-width buffer is shorter than the rows the column claims";
+                return false;
+            }
+            break;
+        case ColumnValues::Kind::VariableWidth: {
+            const std::size_t offset_width = values.variable.large ? 8U : 4U;
+            if (values.variable.offsets.size() < (total + 1U) * offset_width) {
+                error = "variable-width offsets cover fewer rows than the column claims";
+                return false;
+            }
+            break;
+        }
+        case ColumnValues::Kind::BlobV2External:
+            if (values.blob_v2.row_packed_sizes.size() < total) {
+                error = "blob column has fewer packed rows than it claims";
+                return false;
+            }
+            break;
+    }
+
+    if (!values.validity.empty()) {
+        std::vector<std::uint8_t> bitmap(bitmap_bytes(count), 0U);
+        std::uint64_t nulls = 0;
+        for (std::uint64_t i = 0; i < count; ++i) {
+            if (bit_set(values.validity, kept[static_cast<std::size_t>(i)])) {
+                bitmap[static_cast<std::size_t>(i >> 3U)] |= static_cast<std::uint8_t>(1U << (i & 7U));
+            } else {
+                ++nulls;
+            }
+        }
+        values.null_count = nulls;
+        values.validity = nulls == 0U ? std::vector<std::uint8_t>{} : std::move(bitmap);
+    }
+
+    switch (values.kind) {
+        case ColumnValues::Kind::FixedWidth: {
+            if (!values.fixed.empty()) {
+                std::vector<std::uint8_t> out(static_cast<std::size_t>(count) * value_bytes);
+                for (std::uint64_t i = 0; i < count; ++i) {
+                    std::memcpy(out.data() + static_cast<std::size_t>(i) * value_bytes,
+                                values.fixed.data() + static_cast<std::size_t>(kept[static_cast<std::size_t>(i)]) * value_bytes,
+                                value_bytes);
+                }
+                values.fixed = std::move(out);
+            }
+            break;
+        }
+        case ColumnValues::Kind::VariableWidth: {
+            const bool large = values.variable.large;
+            const std::size_t offset_width = large ? 8U : 4U;
+            std::vector<std::uint8_t> offsets((count + 1U) * offset_width);
+            std::vector<std::uint8_t> data;
+            std::uint64_t cumulative = 0;
+            write_offset(offsets.data(), 0U, large);
+            for (std::uint64_t i = 0; i < count; ++i) {
+                const auto row = kept[static_cast<std::size_t>(i)];
+                const auto begin = read_offset(values.variable.offsets, row, large);
+                const auto end = read_offset(values.variable.offsets, row + 1U, large);
+                if (end < begin || end > values.variable.data.size()) {
+                    error = "variable-width offset runs past the data buffer";
+                    return false;
+                }
+                data.insert(data.end(), values.variable.data.begin() + static_cast<std::ptrdiff_t>(begin),
+                            values.variable.data.begin() + static_cast<std::ptrdiff_t>(end));
+                cumulative += end - begin;
+                write_offset(offsets.data() + static_cast<std::size_t>(i + 1U) * offset_width, cumulative, large);
+            }
+            values.variable.offsets = std::move(offsets);
+            values.variable.data = std::move(data);
+            break;
+        }
+        case ColumnValues::Kind::BlobV2External: {
+            std::vector<std::uint64_t> starts(static_cast<std::size_t>(total) + 1U, 0U);
+            for (std::uint64_t i = 0; i < total; ++i) {
+                starts[static_cast<std::size_t>(i) + 1U] =
+                    starts[static_cast<std::size_t>(i)] + values.blob_v2.row_packed_sizes[static_cast<std::size_t>(i)];
+            }
+            if (starts.back() > values.blob_v2.packed_payload.size()) {
+                error = "blob packed rows run past the payload buffer";
+                return false;
+            }
+            std::vector<std::uint8_t> payload;
+            std::vector<std::uint32_t> sizes;
+            sizes.reserve(static_cast<std::size_t>(count));
+            for (std::uint64_t i = 0; i < count; ++i) {
+                const auto row = static_cast<std::size_t>(kept[static_cast<std::size_t>(i)]);
+                payload.insert(payload.end(),
+                               values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(starts[row]),
+                               values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(starts[row + 1U]));
+                sizes.push_back(values.blob_v2.row_packed_sizes[row]);
+            }
+            values.blob_v2.packed_payload = std::move(payload);
+            values.blob_v2.row_packed_sizes = std::move(sizes);
+            break;
+        }
+    }
+
+    values.rows = count;
+    values.structural_dict_plan = StructuralDictPlan{};
+    values.structural_dict_rle_plan = StructuralDictRlePlan{};
+    values.fixed_rle_plan = FixedRlePlan{};
+    return true;
+}
+
 }  // namespace nano_lance

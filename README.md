@@ -167,6 +167,12 @@ Lance's string compressor switches on):
 | a low-cardinality (categorical) string column, with or without nulls | yes — including its LZ4-compressed dictionary |
 | `list`, `struct` | no — not mapped at the manifest level |
 
+nanolance also reads Lance datasets pylance has **modified**: multiple versions, `append`,
+`overwrite`, `update`, `delete` (both the Arrow-IPC and roaring-bitmap deletion formats) and
+`add_columns` (a fragment whose columns span several data files). A nullable **string** column
+written by stock Lance is refused at some sizes with `unsupported definition-level encoding:
+InlineBitpacking(16)` — refused by name, not misread.
+
 Anything in a "no" row is **refused by name**, not misread. Closing the rest is
 [docs/OPTIMIZATION_PLAN.md](docs/OPTIMIZATION_PLAN.md) §6; `list` and `struct` are the remaining gap
 and they sit at the manifest/schema layer, not in page decoding. None of this needed a writer change:

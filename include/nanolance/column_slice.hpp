@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace nano_lance {
 
@@ -33,5 +34,17 @@ namespace nano_lance {
 /// rows it claims to hold; `values` is then left untouched rather than half-trimmed.
 bool slice_column_values(ColumnValues& values, std::uint64_t first, std::uint64_t count,
                          std::uint64_t total, std::size_t value_bytes, std::string& error);
+
+/// Drop the rows `keep` marks false, compacting the survivors to the front.
+///
+/// This is how a Lance deletion file is applied. It sits beside `slice_column_values` and shares its
+/// argument: everything at this stage is byte-addressed except the validity bitmap, which is the one
+/// thing that has to be re-packed.
+///
+/// `keep` holds one entry per row (non-zero = keep) and must be `total` long. The two compose in one
+/// order only -- deletions first, then a row range -- because a row range is expressed in LOGICAL
+/// row numbers, which only exist once the deleted rows are gone.
+bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>& keep,
+                           std::uint64_t total, std::size_t value_bytes, std::string& error);
 
 }  // namespace nano_lance
