@@ -9,6 +9,7 @@ import pyarrow as pa
 import pytest
 
 import nanolance
+from tests.support import require_pylance
 
 
 def _make_batch(schema, chunk_id, rows):
@@ -144,3 +145,83 @@ def test_matches_write_table_output(tmp_path):
         pa.table(nanolance.read_table(stream_path)).column("id").to_pylist()
         == pa.table(nanolance.read_table(bulk_path)).column("id").to_pylist()
     )
+
+
+def test_sliced_batches_of_a_string_column_roundtrip(tmp_path):
+    """A batch that is a SLICE of a bigger array must contribute its own rows, not the first batch's.
+
+    `Table.to_batches()` -- the obvious way to feed this writer, and what every example here does --
+    does not copy: each batch shares one contiguous buffer and addresses its rows through
+    `array.offset`. The variable-width ingest path ignored that offset (the fixed-width path always
+    applied it), so from row `max_chunksize` on, every utf8/binary column silently re-ingested the
+    FIRST batch's offsets and data. Silent corruption, and stock Lance read back the same wrong
+    values -- the bytes on disk were wrong, not the reader.
+
+    Fixed-width columns are written alongside as the control: they were correct throughout, so a
+    failure here is specific to the string/binary path.
+    """
+    n, chunk = 30_000, 2_500
+    table = pa.table(
+        {
+            "id": pa.array(range(n), type=pa.int64()),
+            "s": pa.array([f"v{i}" for i in range(n)], type=pa.utf8()),
+            "b": pa.array([f"v{i}".encode() for i in range(n)], type=pa.binary()),
+            "nullable": pa.array(
+                [None if i % 7 == 0 else f"v{i}" for i in range(n)], type=pa.utf8()
+            ),
+        }
+    )
+    path = tmp_path / "sliced.lance"
+    with nanolance.LanceWriter(path, max_rows_per_fragment=10_000) as w:
+        for batch in table.to_batches(max_chunksize=chunk):
+            assert batch.column(1).offset or batch.num_rows == chunk  # slices, not copies
+            w.write_batch(batch)
+
+    assert pa.table(nanolance.read_table(path)).to_pydict() == table.to_pydict()
+
+
+def test_a_sliced_first_batch_is_not_rebased_to_row_zero(tmp_path):
+    """The offset also has to be honoured on the FIRST batch, which takes a separate fast path."""
+    source = pa.array([f"v{i}" for i in range(1_000)], type=pa.utf8())
+    sliced = source.slice(400, 100)
+    path = tmp_path / "sliced_first.lance"
+    with nanolance.LanceWriter(path) as w:
+        w.write_batch(pa.record_batch({"s": sliced}))
+
+    assert pa.table(nanolance.read_table(path)).column("s").to_pylist() == sliced.to_pylist()
+
+
+def test_empty_batches_between_populated_ones(tmp_path):
+    """A zero-length batch must neither be skipped wrongly nor shift the offsets that follow."""
+    path = tmp_path / "empty_mixed.lance"
+    with nanolance.LanceWriter(path) as w:
+        w.write_batch(pa.record_batch({"s": pa.array(["x", "y"], type=pa.utf8())}))
+        w.write_batch(pa.record_batch({"s": pa.array([], type=pa.utf8())}))
+        w.write_batch(pa.record_batch({"s": pa.array(["z"], type=pa.utf8())}))
+
+    assert pa.table(nanolance.read_table(path)).column("s").to_pylist() == ["x", "y", "z"]
+
+
+def test_stock_lance_reads_sliced_batches_correctly(tmp_path):
+    """The cross-check that identified the sliced-batch bug as a WRITER bug, kept as a guard.
+
+    When the variable-width ingest path ignored `array.offset`, nanolance and pylance read back the
+    same wrong values -- agreement between the two readers is what proved the bytes on disk were
+    wrong. So the guard has to be here, on stock Lance, and not only on our own round trip.
+    """
+    lance = require_pylance()
+    n = 30_000
+    table = pa.table(
+        {
+            "s": pa.array([f"v{i}" for i in range(n)], type=pa.utf8()),
+            "nullable": pa.array(
+                [None if i % 7 == 0 else f"v{i}" for i in range(n)], type=pa.utf8()
+            ),
+        }
+    )
+    path = tmp_path / "sliced_parity.lance"
+    with nanolance.LanceWriter(path, max_rows_per_fragment=10_000) as writer:
+        for batch in table.to_batches(max_chunksize=2_500):
+            writer.write_batch(batch)
+
+    assert lance.dataset(str(path)).to_table().to_pydict() == table.to_pydict()

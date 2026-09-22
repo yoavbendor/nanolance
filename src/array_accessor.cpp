@@ -297,59 +297,71 @@ bool append_variable_width(const ArrowArray& array,
         error += field.name;
         return false;
     }
-    const auto expected_offsets =
-        static_cast<std::size_t>(array.length + 1) * offset_width;
-    const auto* offsets = static_cast<const std::uint8_t*>(array.buffers[1]);
-    const auto* data = static_cast<const std::uint8_t*>(array.buffers[2]);
-    std::size_t data_bytes = 0;
-    if (array.length > 0) {
-        if (large) {
-            const auto* last =
-                reinterpret_cast<const std::int64_t*>(offsets + static_cast<std::size_t>(array.length) * 8U);
-            data_bytes = static_cast<std::size_t>(*last);
-        } else {
-            const auto* last =
-                reinterpret_cast<const std::int32_t*>(offsets + static_cast<std::size_t>(array.length) * 4U);
-            data_bytes = static_cast<std::size_t>(*last);
-        }
-    }
     out.kind = ColumnValues::Kind::VariableWidth;
-    out.variable.large = large;
-
-    if (out.variable.offsets.empty()) {
-        out.variable.offsets.assign(offsets, offsets + expected_offsets);
-        out.variable.data.assign(data, data + data_bytes);
-        return true;
-    }
-
-    const std::size_t base = out.variable.data.size();
-    if (out.variable.large != large) {
+    if (!out.variable.offsets.empty() && out.variable.large != large) {
         error = "cannot mix offset widths in column ";
         error += field.name;
         return false;
     }
-    // Rebase this batch's offsets by `base` writing straight into a single resize()d extension --
-    // one vector::insert call PER ROW here previously made multi-batch string ingest per-row-bound
-    // (each 4/8-byte insert pays the full call + growth-check machinery).
-    const std::size_t add_offsets = expected_offsets - offset_width;  // batch offset 0 is not re-emitted
-    const std::size_t existing = out.variable.offsets.size();
-    out.variable.offsets.resize(existing + add_offsets);
-    std::uint8_t* dst = out.variable.offsets.data() + existing;
-    for (std::size_t i = 1; i < expected_offsets / offset_width; ++i) {
+    out.variable.large = large;
+
+    // A sliced batch shares its parent's buffers and addresses them through array.offset -- both the
+    // offsets buffer AND, transitively, the data buffer, whose live region starts at offsets[offset].
+    // Ignoring that made every batch after the first re-ingest the FIRST batch's values: to_batches()
+    // hands out slices of one contiguous array, so a multi-batch utf8/binary column was silently
+    // corrupted from row `chunksize` on (fixed-width columns were always correct -- they apply
+    // array.offset above).
+    const auto* offsets = static_cast<const std::uint8_t*>(array.buffers[1]) +
+                          static_cast<std::size_t>(array.offset) * offset_width;
+    const auto* data = static_cast<const std::uint8_t*>(array.buffers[2]);
+    const auto count = static_cast<std::size_t>(array.length);
+
+    const auto raw_offset = [&](std::size_t i) -> std::uint64_t {
+        const std::uint8_t* p = offsets + i * offset_width;
         if (large) {
             std::int64_t value = 0;
-            std::memcpy(&value, offsets + i * offset_width, offset_width);
-            value += static_cast<std::int64_t>(base);
-            std::memcpy(dst, &value, offset_width);
+            std::memcpy(&value, p, sizeof(value));
+            return static_cast<std::uint64_t>(value);
+        }
+        std::int32_t value = 0;
+        std::memcpy(&value, p, sizeof(value));
+        return static_cast<std::uint64_t>(value);
+    };
+    // Only touch offsets[0]/offsets[count] when there is a value to bound; a zero-length batch is
+    // allowed to carry an empty offsets buffer.
+    std::uint64_t data_begin = 0;
+    std::uint64_t data_end = 0;
+    if (count > 0) {
+        data_begin = raw_offset(0);
+        data_end = raw_offset(count);
+    }
+
+    const std::size_t base = out.variable.data.size();
+    const bool first = out.variable.offsets.empty();
+    // Rebase this batch's offsets onto the accumulated buffer (subtract the slice's own start, add
+    // what we already hold) writing straight into a single resize()d extension -- one vector::insert
+    // call PER ROW here previously made multi-batch string ingest per-row-bound.
+    const std::size_t add = (first ? 1U : 0U) + count;
+    const std::size_t existing = out.variable.offsets.size();
+    out.variable.offsets.resize(existing + add * offset_width);
+    std::uint8_t* dst = out.variable.offsets.data() + existing;
+    const auto write_offset = [&](std::uint64_t value) {
+        if (large) {
+            const auto narrowed = static_cast<std::int64_t>(value);
+            std::memcpy(dst, &narrowed, sizeof(narrowed));
         } else {
-            std::int32_t value = 0;
-            std::memcpy(&value, offsets + i * offset_width, offset_width);
-            value += static_cast<std::int32_t>(base);
-            std::memcpy(dst, &value, offset_width);
+            const auto narrowed = static_cast<std::int32_t>(value);
+            std::memcpy(dst, &narrowed, sizeof(narrowed));
         }
         dst += offset_width;
+    };
+    if (first) {
+        write_offset(base);  // 0, but spelled as the invariant the rebasing keeps
     }
-    out.variable.data.insert(out.variable.data.end(), data, data + data_bytes);
+    for (std::size_t i = 1; i <= count; ++i) {
+        write_offset(raw_offset(i) - data_begin + base);
+    }
+    out.variable.data.insert(out.variable.data.end(), data + data_begin, data + data_end);
     return true;
 }
 
