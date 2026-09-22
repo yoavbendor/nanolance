@@ -482,6 +482,18 @@ wheel audience, which had none. Left for a deliberate pass rather than done half
 - **`tests/test_framed.pcapng` (15.4 MB) stays.** Replacing a real capture with a synthetic fixture
   would change what the pcapng2lance tests cover, and those tests cannot be built without the
   nanotins submodule. Tracked size is ~18 MB, down from 22.8 MB.
+- **GitHub Actions is not running on this repository right now.** Every workflow run on this branch
+  — including long-standing ones untouched by this work (`linux-bench` #229, `Memory safety` #77,
+  `Python bindings` #125) — completes as a failure within 3–7 seconds and produces no downloadable
+  logs at all (the log endpoint 404s). That is what an account- or repository-level Actions problem
+  looks like (spending limit, Actions disabled, no runner minutes), not a workflow defect: it
+  predates the workflows added here and hits jobs whose files have not changed in weeks. Nothing in
+  this document that says "verified" rests on CI — the ctest, pytest and fuzzer numbers were all
+  produced locally — but the **macOS job and the wheel builds specifically cannot be confirmed until
+  Actions runs again**, because there is no local macOS or manylinux to run them on. The Linux wheel
+  itself WAS built and installed into a clean virtualenv locally; what is unverified is cibuildwheel
+  driving that across CPython 3.9–3.13 and macOS.
+
 - **Not yet verified on this branch:** macOS and Windows (CI is Linux-only), and the ASan/UBSan
   workflow, which runs in CI rather than here. The libFuzzer workflow's targets were built and run
   locally (see above).
