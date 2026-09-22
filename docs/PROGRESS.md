@@ -19,10 +19,10 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 1.1 Real nullability | **done**, read and write, fixed- and variable-width; a null struct is still refused |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | **2.1 wheels and 2.3 CI done**; 2.2 install/export deliberately not |
-| Phase 3 — the Python API a parquet user expects | **3.1–3.4 all done** — streaming, projection, pyarrow-shaped docs, `nanolance convert` |
+| Phase 3 — the Python API a parquet user expects | **3.1–3.4 all done** — streaming, projection, `count_rows`/`read_schema`, `nanolance convert`; row-range/slice open |
 | Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
 
-Test suite: **49 ctest** (was 42) and **218 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **49 ctest** (was 42) and **224 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout`, `nanolance_fuzz_fsst` and
@@ -621,6 +621,32 @@ For 3.3 the API was already `pyarrow.parquet`-shaped; what was missing was sayin
 README now has a side-by-side migration table and the four differences worth knowing first (the read
 returns a handle rather than a `pa.Table`; a projection comes back in dataset order;
 `compression=True` is a boolean, not a codec name; unsupported types are refused at write time).
+
+### count_rows and read_schema: the cheap questions
+
+`nanolance.count_rows(path)` and `nanolance.read_schema(path)`, the remaining half of 3.2. Both
+answer from the manifest and never open a data file:
+
+| on a 200k-row dataset | |
+|---|---|
+| `count_rows` | 0.18 ms |
+| `read_schema` | 0.12 ms |
+| full `read_table` | 16 ms |
+
+The regression guard is not a timing assertion -- "cheap" is not testable that way. It **deletes the
+data files** and checks both still return the right answers, while a real read of the same dataset
+now raises. That tests the actual claim.
+
+Two details:
+
+- `count_rows` sums the fragments rather than reading a total field, because the number has to be
+  the one a read would give and a read walks those same fragments. A test asserts the two agree.
+- The schema handle is **re-exportable**, unlike the single-shot stream handle: a schema is
+  copyable, so each `__arrow_c_schema__` hands out a fresh deep copy. Getting that wrong would be a
+  use-after-free rather than an error -- the first export would give away the handle's only
+  `ArrowSchema` and the second would read released memory -- so it has its own test.
+
+`nanolance inspect` was rewritten onto them; it used to stream every batch just to count rows.
 
 ### The dictionary encoding that made whole FILES unreadable
 

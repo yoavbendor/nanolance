@@ -5,6 +5,7 @@
 
 #include <nanoarrow/nanoarrow.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -39,6 +40,18 @@ bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_pat
                                         ArrowSchema& out_schema,
                                         std::vector<ArrowArray>& out_batches,
                                         std::string& error, bool trusted_input = false);
+
+/// The dataset's Arrow schema, read from the manifest alone -- no data file is opened.
+///
+/// This is the cheap "what is in here?" call: opening a dataset to look at its columns should not
+/// cost a decode. On failure `out_schema` is left released, as the read functions leave it.
+bool lance_table_read_schema(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
+                             std::string& error);
+
+/// The dataset's row count, summed from the manifest's fragments. O(fragments), not O(rows): no data
+/// file is opened, so this stays constant-time as the dataset grows.
+bool lance_table_count_rows(const std::filesystem::path& dataset_path, std::uint64_t& out_rows,
+                            std::string& error);
 
 /// A fragment-at-a-time reader: the same decode as lance_table_read_dataset, but one data file per
 /// `next()` instead of all of them before you get anything.

@@ -330,8 +330,14 @@ predicted — a throughput-neutral win in peak memory and latency, on top of 4.1
 exists in C++ (`lance_table_read_dataset_projected`) and just needs binding.
 
 **DONE** for projection: `read_table(path, columns=[...])` and `open_stream(path, columns=[...])`,
-pushed down to the decoder so unprojected columns are never touched. Row-range/slice,
-`count_rows` and schema-peek are still open.
+pushed down to the decoder so unprojected columns are never touched. **`count_rows(path)` and
+`read_schema(path)` are done too**, both answered from the manifest without opening a data file
+(0.18 ms against 16 ms for a full read of the same 200k-row dataset).
+
+**Row-range/slice is the one piece still open**, deliberately. Doing it honestly means teaching the
+`ReadPlan` each data file's row offset so fragments outside the range are never opened, and then
+slicing the two boundary batches -- a Python-level `table.slice()` after a full read would buy
+nothing and is not worth an API that implies otherwise.
 
 **3.3 Shape the API like the thing it is replacing.** `nanolance.read_table(path, columns=[...])`,
 `nanolance.write_table(table, path, compression=...)` — deliberately `pyarrow.parquet`-shaped, so

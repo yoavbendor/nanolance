@@ -293,6 +293,65 @@ struct ExportState {
 ///
 /// Export is single-shot, as it has to be: a stream is consumed, not copied. The second
 /// `__arrow_c_stream__` raises rather than handing out a stream someone else is already draining.
+/// A bare Arrow schema handed out through the PyCapsule interface, for the schema-only peek.
+///
+/// Unlike ExportedStream this is NOT single-shot: a schema is copyable, so every export hands out a
+/// fresh deep copy and the handle stays usable. `pa.schema(nanolance.read_schema(p))` twice is fine.
+class ExportedSchema {
+public:
+    ExportedSchema() = default;
+
+    /// Takes ownership of `schema` (which must be a valid, initialized ArrowSchema).
+    static ExportedSchema adopt(ArrowSchema&& schema) {
+        ExportedSchema out;
+        std::memcpy(&out.schema_, &schema, sizeof(ArrowSchema));
+        std::memset(&schema, 0, sizeof(ArrowSchema));
+        return out;
+    }
+
+    nb::capsule arrow_c_schema() {
+        if (schema_.release == nullptr) {
+            throw std::runtime_error("this nanolance schema handle is empty");
+        }
+        auto* copy = static_cast<ArrowSchema*>(std::malloc(sizeof(ArrowSchema)));
+        if (copy == nullptr) {
+            throw std::bad_alloc();
+        }
+        std::memset(copy, 0, sizeof(ArrowSchema));
+        if (ArrowSchemaDeepCopy(&schema_, copy) != NANOARROW_OK) {
+            std::free(copy);
+            throw std::runtime_error("failed to copy the dataset schema for export");
+        }
+        return detail::make_schema_capsule(copy);
+    }
+
+    ~ExportedSchema() {
+        if (schema_.release != nullptr) {
+            ArrowSchemaRelease(&schema_);
+        }
+    }
+
+    ExportedSchema(ExportedSchema&& other) noexcept {
+        std::memcpy(&schema_, &other.schema_, sizeof(ArrowSchema));
+        std::memset(&other.schema_, 0, sizeof(ArrowSchema));
+    }
+    ExportedSchema& operator=(ExportedSchema&& other) noexcept {
+        if (this != &other) {
+            if (schema_.release != nullptr) {
+                ArrowSchemaRelease(&schema_);
+            }
+            std::memcpy(&schema_, &other.schema_, sizeof(ArrowSchema));
+            std::memset(&other.schema_, 0, sizeof(ArrowSchema));
+        }
+        return *this;
+    }
+    ExportedSchema(const ExportedSchema&) = delete;
+    ExportedSchema& operator=(const ExportedSchema&) = delete;
+
+private:
+    ArrowSchema schema_{};
+};
+
 class ExportedStream {
 public:
     ExportedStream() = default;

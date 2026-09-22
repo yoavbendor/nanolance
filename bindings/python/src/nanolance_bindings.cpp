@@ -24,6 +24,7 @@
 
 namespace nb = nanobind;
 using nanolance_py::arrow_capsule::BatchIterator;
+using nanolance_py::arrow_capsule::ExportedSchema;
 using nanolance_py::arrow_capsule::ExportedStream;
 using nanolance_py::arrow_capsule::ExportedTable;
 using nanolance_py::arrow_capsule::detail::OwnedArray;
@@ -275,6 +276,29 @@ ExportedStream read_table_stream(const std::filesystem::path& path,
     return ExportedStream::adopt(std::move(stream));
 }
 
+/// Schema-only peek: reads the manifest, never a data file.
+ExportedSchema read_schema(const std::filesystem::path& path) {
+    ArrowSchema schema{};
+    char err[512] = {};
+    const int rc =
+        nano_lance_table_read_schema(path.string().c_str(), &schema, err, sizeof(err));
+    if (rc != NANO_LANCE_READER_OK) {
+        throw_lance_reader("nano_lance_table_read_schema", rc, err);
+    }
+    return ExportedSchema::adopt(std::move(schema));
+}
+
+/// Row count from the manifest's fragments: O(fragments), not O(rows).
+std::uint64_t count_rows(const std::filesystem::path& path) {
+    std::uint64_t rows = 0;
+    char err[512] = {};
+    const int rc = nano_lance_table_count_rows(path.string().c_str(), &rows, err, sizeof(err));
+    if (rc != NANO_LANCE_READER_OK) {
+        throw_lance_reader("nano_lance_table_count_rows", rc, err);
+    }
+    return rows;
+}
+
 ExportedTable read_table_eager(const std::filesystem::path& path, std::optional<std::vector<std::string>> columns) {
     ArrowSchema schema{};
     ArrowArray* batches = nullptr;
@@ -356,6 +380,16 @@ NB_MODULE(_nanolance, m) {
              "Arrow PyCapsule stream export. Single-shot: a stream is consumed, not copied.")
         .def("__arrow_c_array_stream__", &ExportedStream::arrow_c_stream,
              nb::arg("requested_schema") = nb::none());
+
+    nb::class_<ExportedSchema>(m, "LanceSchema")
+        .def("__arrow_c_schema__", &ExportedSchema::arrow_c_schema,
+             "Arrow PyCapsule schema export. Re-exportable: each call hands out a fresh copy.");
+
+    m.def("read_schema", &read_schema, nb::arg("path"),
+          "The dataset's Arrow schema, from the manifest alone -- no data file is opened.");
+
+    m.def("count_rows", &count_rows, nb::arg("path"),
+          "The dataset's row count, from the manifest's fragments. O(fragments), not O(rows).");
 
     m.def("read_table", &read_table_eager, nb::arg("path"), nb::arg("columns") = nb::none(),
           "Read a Lance dataset, decoding every batch up front. `columns` names the top-level columns "

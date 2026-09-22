@@ -124,16 +124,15 @@ def _convert(args: argparse.Namespace) -> int:
 def _inspect(args: argparse.Namespace) -> int:
     import pyarrow as pa
 
-    from . import open_stream
+    from . import count_rows, read_schema
 
     path = Path(args.dataset)
     if not path.is_dir():
         raise SystemExit(f"not a Lance dataset directory: {path}")
-    # The stream's schema is available before any batch is decoded, which is the whole point of
-    # asking it rather than reading the table.
-    reader = pa.RecordBatchReader.from_stream(open_stream(path))
-    schema = reader.schema
-    rows = sum(batch.num_rows for batch in reader)
+    # Manifest only -- neither of these opens a data file, so `inspect` costs the same on a 200k-row
+    # dataset as on a 200M-row one. (It used to stream every batch just to count them.)
+    rows = count_rows(path)
+    schema = pa.schema(read_schema(path))
 
     print(f"{path}")
     print(f"  rows   : {rows:,}")

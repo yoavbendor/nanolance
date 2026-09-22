@@ -66,6 +66,8 @@ The API is deliberately `pyarrow.parquet`-shaped, so the migration is a one-line
 | `pq.read_table(p, columns=["ts", "level"])` | `nanolance.read_table(p, columns=["ts", "level"])` |
 | `pq.ParquetFile(p).iter_batches()` | `nanolance.open_stream(p)` |
 | `pq.ParquetWriter(p, schema)` + `write_table` | `nanolance.LanceWriter(p)` + `write_batch` |
+| `pq.ParquetFile(p).schema_arrow` | `nanolance.read_schema(p)` |
+| `pq.ParquetFile(p).metadata.num_rows` | `nanolance.count_rows(p)` |
 | row group | **fragment** (`max_rows_per_fragment=`) |
 
 Differences worth knowing before you switch:
@@ -136,6 +138,8 @@ already decoded them all by the time it returns.
 | `LanceWriter(path, *, max_rows_per_fragment=0, **opts)` | Streaming context-manager writer: `write_batch(batch)`, `flush()`, `close()` |
 | `read_table(path, columns=None)` | Read eagerly; returns an Arrow-exportable handle (an Arrow C stream, one batch per fragment). `columns` projects |
 | `open_stream(path, columns=None)` | Same, but decoded one fragment per pull: bounded peak memory, larger-than-memory datasets, fast first batch. Single-shot |
+| `read_schema(path)` | The dataset's Arrow schema, from the manifest alone -- no data file opened |
+| `count_rows(path)` | The dataset's row count, from the manifest's fragments. O(fragments), not O(rows) |
 | `WriteOptions` | `compression`, `compression_level`, `structural_encoding`, `append`, `blob_uri_dictionary`, `ignore_nullability` |
 
 `write_table` and `LanceWriter.write_batch` accept any Arrow-exportable input (pyarrow `Table` / `RecordBatch`, polars via `to_arrow()`, etc.). `LanceWriter` takes the same encoding options as `write_table` plus `max_rows_per_fragment` (0 = single fragment committed on close).
@@ -201,6 +205,17 @@ stated here because they are easy to trip over:
 
 That is why it is a separate function rather than a flag on `read_table` -- `read_table` keeps its
 eager, raise-at-call-time contract.
+
+### Peeking without reading
+
+```python
+nanolance.count_rows("events.lance")            # -> 200000
+pa.schema(nanolance.read_schema("events.lance"))  # -> the Arrow schema
+```
+
+Both answer from the manifest and never open a data file, so they cost the same on a 200k-row
+dataset as on a 200M-row one (0.18 ms against 16 ms for the full read, measured on the same 200k-row
+dataset). The schema handle is re-exportable, unlike the single-shot stream handle.
 
 **Scope.** nanolance reads back everything it writes, and now every non-nested column type stock
 Lance writes:

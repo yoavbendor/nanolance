@@ -239,6 +239,48 @@ extern "C" int nano_lance_table_open_stream(const char* dataset_path, const char
     return NANO_LANCE_READER_OK;
 }
 
+extern "C" int nano_lance_table_read_schema(const char* dataset_path, struct ArrowSchema* out_schema,
+                                           char* error_message, size_t error_message_capacity) {
+    if (out_schema == nullptr) {
+        set_error(error_message, error_message_capacity, "out_schema is required");
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
+    std::memset(out_schema, 0, sizeof(*out_schema));
+    if (dataset_path == nullptr) {
+        set_error(error_message, error_message_capacity, "dataset_path is required");
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
+    std::string error;
+    if (!nano_lance::lance_table_read_schema(std::filesystem::path(dataset_path), *out_schema, error)) {
+        // The C++ side leaves out_schema released on failure; zero it so the caller cannot be tempted
+        // to release it a second time. Double-releasing a schema is what used to segfault every failed
+        // read through this shim.
+        std::memset(out_schema, 0, sizeof(*out_schema));
+        set_error(error_message, error_message_capacity, error);
+        return map_status(error);
+    }
+    return NANO_LANCE_READER_OK;
+}
+
+extern "C" int nano_lance_table_count_rows(const char* dataset_path, uint64_t* out_rows,
+                                           char* error_message, size_t error_message_capacity) {
+    if (out_rows == nullptr) {
+        set_error(error_message, error_message_capacity, "out_rows is required");
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
+    *out_rows = 0;
+    if (dataset_path == nullptr) {
+        set_error(error_message, error_message_capacity, "dataset_path is required");
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
+    std::string error;
+    if (!nano_lance::lance_table_count_rows(std::filesystem::path(dataset_path), *out_rows, error)) {
+        set_error(error_message, error_message_capacity, error);
+        return map_status(error);
+    }
+    return NANO_LANCE_READER_OK;
+}
+
 extern "C" void nano_lance_table_read_result_free(struct ArrowSchema* schema, struct ArrowArray* batches,
                                                   size_t batch_count) {
     if (schema != nullptr && schema->release != nullptr) {

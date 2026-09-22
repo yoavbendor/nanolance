@@ -232,4 +232,41 @@ def open_stream(path: Union[str, os.PathLike], columns: Optional[Sequence[str]] 
     return _nanolance.open_stream(Path(path), _normalize_columns(columns))
 
 
-__all__ = ["write_table", "read_table", "open_stream", "WriteOptions", "LanceWriter", "__version__"]
+def read_schema(path: Union[str, os.PathLike]):
+    """The dataset's Arrow schema, without reading a single row.
+
+    Only the manifest is opened, so this stays cheap however large the dataset
+    is -- it is the "what is in here?" call that should not cost a decode::
+
+        import pyarrow as pa
+
+        schema = pa.schema(nanolance.read_schema("events.lance"))
+        print(schema.names)
+
+    The returned handle exports ``__arrow_c_schema__``, and unlike
+    :func:`open_stream` it is *not* single-shot: a schema is copyable, so it can
+    be exported as many times as you like.
+    """
+    return _nanolance.read_schema(Path(path))
+
+
+def count_rows(path: Union[str, os.PathLike]) -> int:
+    """The dataset's row count, without reading a single row.
+
+    Summed from the manifest's fragment records, so the cost is O(fragments)
+    rather than O(rows) -- ``pq.ParquetFile(p).metadata.num_rows`` is the
+    equivalent you are probably replacing.
+    """
+    return int(_nanolance.count_rows(Path(path)))
+
+
+__all__ = [
+    "write_table",
+    "read_table",
+    "open_stream",
+    "read_schema",
+    "count_rows",
+    "WriteOptions",
+    "LanceWriter",
+    "__version__",
+]

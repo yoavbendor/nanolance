@@ -153,6 +153,16 @@ int nano_lance_table_open_stream(const char* dataset_path, const char* const* co
                                  struct ArrowArrayStream* out_stream, char* error_message,
                                  size_t error_message_capacity);
 
+/// The dataset's Arrow schema, from the manifest alone -- no data file is opened, so this is the
+/// cheap way to ask what columns a dataset has. The CALLER releases \p out_schema on success; on
+/// failure it is left zeroed and must not be released.
+int nano_lance_table_read_schema(const char* dataset_path, struct ArrowSchema* out_schema,
+                                 char* error_message, size_t error_message_capacity);
+
+/// The dataset's row count, summed from the manifest's fragments. O(fragments), not O(rows).
+int nano_lance_table_count_rows(const char* dataset_path, uint64_t* out_rows, char* error_message,
+                                size_t error_message_capacity);
+
 void nano_lance_table_read_result_free(struct ArrowSchema* schema, struct ArrowArray* batches, size_t batch_count);
 
 #ifdef __cplusplus

@@ -88,6 +88,9 @@ for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")
 Key options mirror the C writer: `compression=True`, `WriteOptions(append=True)`, etc. See
 `bindings/python/README.md` for install, tests (`pytest`), and pylance interop checks.
 
+`nanolance.count_rows(path)` and `nanolance.read_schema(path)` answer from the manifest without
+opening a data file -- use them instead of reading a table to find out how big it is or what is in it.
+
 `read_table` decodes up front and raises at call time; `open_stream` decodes one fragment per pull,
 so errors surface from the first pull instead (as `OSError`) and the handle is single-shot. Prefer
 `open_stream` for bounded peak memory (measured 0.09x the dataset against 1.01x) and a fast first

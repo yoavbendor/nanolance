@@ -206,6 +206,42 @@ int main() {
         require(stream.release == nullptr, "a refused projection must leave out_stream zeroed");
     }
 
+    // Schema and row count from the manifest alone -- no data file opened.
+    {
+        ArrowSchema peek{};
+        require(nano_lance_table_read_schema(path.string().c_str(), &peek, error, sizeof(error)) ==
+                    NANO_LANCE_READER_OK,
+                error);
+        require(peek.n_children == 2, "peeked schema lost a column");
+        require(std::strcmp(peek.children[0]->name, "id") == 0, "peeked schema column 0");
+        require(std::strcmp(peek.children[1]->name, "tag") == 0, "peeked schema column 1");
+        ArrowSchemaRelease(&peek);
+
+        std::uint64_t rows = 0;
+        require(nano_lance_table_count_rows(path.string().c_str(), &rows, error, sizeof(error)) ==
+                    NANO_LANCE_READER_OK,
+                error);
+        require(rows == static_cast<std::uint64_t>(kFragments * kRowsPerFragment),
+                "count_rows disagrees with what a read returns");
+    }
+
+    // Both report a missing dataset rather than returning an empty answer, and leave their outputs
+    // in a state the caller must not release.
+    {
+        const auto missing = path.string() + "-does-not-exist";
+        ArrowSchema peek{};
+        require(nano_lance_table_read_schema(missing.c_str(), &peek, error, sizeof(error)) !=
+                    NANO_LANCE_READER_OK,
+                "read_schema must fail on a missing dataset");
+        require(peek.release == nullptr, "a failed read_schema must leave out_schema zeroed");
+
+        std::uint64_t rows = 12345;
+        require(nano_lance_table_count_rows(missing.c_str(), &rows, error, sizeof(error)) !=
+                    NANO_LANCE_READER_OK,
+                "count_rows must fail on a missing dataset");
+        require(rows == 0, "a failed count_rows must not leave a stale count behind");
+    }
+
     ArrowSchemaRelease(&schema);
     std::filesystem::remove_all(path, ec);
     std::cout << "table stream ok\n";

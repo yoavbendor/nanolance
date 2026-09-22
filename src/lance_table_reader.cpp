@@ -1248,4 +1248,51 @@ bool LanceTableStream::next(ArrowArray& out_batch, std::string& error) {
     return true;
 }
 
+
+bool lance_table_read_schema(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
+                             std::string& error) {
+    error.clear();
+    ArrowSchemaInit(&out_schema);
+
+    pb::Manifest manifest{};
+    std::uint64_t version = 0;
+    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    LanceSchemaMapping mapping;
+    if (!lance_schema_mapping_from_manifest(manifest, mapping, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    if (!build_schema_from_mapping(mapping, out_schema, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    return true;
+}
+
+bool lance_table_count_rows(const std::filesystem::path& dataset_path, std::uint64_t& out_rows,
+                            std::string& error) {
+    error.clear();
+    out_rows = 0;
+
+    pb::Manifest manifest{};
+    std::uint64_t version = 0;
+    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+        return false;
+    }
+    // Summed from the fragments rather than taken from a total field: the count has to agree with
+    // what a read actually returns, and a read walks these same fragments.
+    for (const auto& fragment : manifest.fragments) {
+        if (fragment.physical_rows > UINT64_MAX - out_rows) {
+            error = "dataset row count overflows a 64-bit integer";
+            out_rows = 0;
+            return false;
+        }
+        out_rows += fragment.physical_rows;
+    }
+    return true;
+}
+
 }  // namespace nano_lance
