@@ -338,9 +338,21 @@ pushed down to the decoder so unprojected columns are never touched. Row-range/s
 the migration from `pq.write_table` is a one-line diff. Document it that way: a side-by-side
 "coming from pyarrow.parquet" table beats any benchmark for this audience.
 
+**DONE** for the API shape (it already was) and for the documentation: bindings/python/README.md now
+carries a "Coming from `pyarrow.parquet`" side-by-side table, the four differences worth knowing
+before switching, and the `nanolance convert` one-liner.
+
 **3.4 A `parquet2lance` entry point.** The single most persuasive demo for the target user is
 `python -m nanolance convert in.parquet out.lance` followed by a size comparison. Also add a
 non-stdin mode to `arrowipc2lance` (it currently only reads stdin, which surprised me).
+
+**DONE.** `nanolance convert in.parquet out.lance` (and `python -m nanolance convert ...`), plus
+`nanolance inspect`. It converts a batch at a time, so a file larger than memory converts fine, and
+it prints both sizes. `arrowipc2lance -i/--input FILE` now exists; stdin stays the default.
+
+The demo immediately found something the plan did not anticipate: the converted dataset was
+unreadable by stock Lance. See "The dictionary encoding that made whole FILES unreadable" in
+PROGRESS -- an item that only surfaced because 3.4 exercised a realistic table.
 
 ### Phase 4 — Close the read gap (weeks, after Phase 1)
 

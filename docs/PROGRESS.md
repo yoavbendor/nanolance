@@ -19,10 +19,11 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 1.1 Real nullability | **done**, read and write, fixed- and variable-width; a null struct is still refused |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | **2.1 wheels and 2.3 CI done**; 2.2 install/export deliberately not |
-| Phase 3 — streaming read, projection in Python | **3.1 streaming and 3.2 projection done**; 3.3 API polish, 3.4 parquet2lance next |
+| Phase 3 — the Python API a parquet user expects | **3.1–3.4 all done** — streaming, projection, pyarrow-shaped docs, `nanolance convert` |
 | Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
 
-Test suite: **49 ctest** (was 42) and **209 pytest** (was 22), all passing.
+Test suite: **49 ctest** (was 42) and **218 pytest** (was 22), all passing -- and nothing skipped: the one
+ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout`, `nanolance_fuzz_fsst` and
 `nanolance_fuzz_lz4`, all clean; the longest campaign run here was 95,896,936 executions. Between
@@ -600,6 +601,58 @@ trip `to_batches()` output for `utf8`, `binary` and nullable `utf8`, plus a slic
 empty batches in between; and one of them cross-checks through stock Lance, since reader agreement is
 what proved where the bug lived. Each was verified to fail against the unfixed code.
 
+### 3.3 / 3.4: the parquet on-ramp, and the bug it found
+
+`nanolance convert in.parquet out.lance` (also `python -m nanolance convert ...`), plus
+`nanolance inspect`. Conversion streams: `ParquetFile.iter_batches` into `LanceWriter`, so a file
+larger than memory converts in bounded memory, and it prints the comparison that is the whole point:
+
+```console
+$ nanolance convert events.parquet events.lance --compress
+200,000 rows  events.parquet -> events.lance
+  parquet :    2.0 MiB
+  lance   :  530.3 KiB   (3.92x smaller)
+```
+
+`arrowipc2lance` grew `-i/--input FILE`; stdin stays the default. Reading only from stdin meant
+`arrowipc2lance -i in.arrow` did not work and a shell-less subprocess call could not feed it at all.
+
+For 3.3 the API was already `pyarrow.parquet`-shaped; what was missing was saying so. The Python
+README now has a side-by-side migration table and the four differences worth knowing first (the read
+returns a handle rather than a `pa.Table`; a projection comes back in dataset order;
+`compression=True` is a boolean, not a codec name; unsupported types are refused at write time).
+
+### The dictionary encoding that made whole FILES unreadable
+
+Writing the 3.4 demo and reading it back with pylance is what found this, and it is the strongest
+argument for building the demo at all: no existing test wrote a table of this shape.
+
+A scattered low-cardinality string column (`"INFO"/"WARN"/"ERROR"`) picks the structural-dictionary
+encoding. Its page declared `has_large_chunk = false` -- the u16 chunk-meta grammar. Lance v2.2's
+`validate_page_layout` refuses **any** miniblock page that does:
+
+    Invalid user input: Lance v2.2 miniblock pages require the u32 chunk grammar
+
+and it validates the file's whole page table before decoding anything. So one dictionary-encoded
+column made **every other column in the same dataset** unreadable by stock Lance -- reading just the
+`id` column of a three-column table failed. The README's claim that everything nanolance writes is
+Lance-readable was wrong for any table containing such a column, which is an ordinary shape.
+
+The word layout is identical in both grammars -- `(word >> 4) + 1` eight-byte units of chunk size,
+`word & 0x0F` as log2 of the value count -- so only the *width* changed: u16 words to u32, and
+`has_large_chunk = 1` in the layout. The chunk headers needed nothing: `append_miniblock_chunk`
+writes `[u16 0][u16 size][u16 0][u16 0xFEFE]`, and Lance's u32 reader takes bytes 2..6 as the buffer
+size, which is `size | (0 << 16)`. That is why every other miniblock column already passed.
+
+**How it stayed quiet for months.** `tests/smoke_dict_pylance_interop.sh` wrapped its pylance read in
+`except Exception: sys.exit(77)`, and ctest reports 77 as a SKIP. The suite said
+`49/49 tests passed`, with one line of "did not run" underneath. That is the same failure mode as
+the `smoke_pagelayout_pylance_interop.sh` exit-0 found earlier on this branch: a test that reports
+success for a genuine failure is worse than no test. The `try`/`except` is gone, so the script fails
+if this regresses, and `test_stock_lance_reads_a_dictionary_encoded_column` asserts it from pytest
+too -- including reading a neighbouring int column on its own, since that is what the whole-file
+validation broke.
+
 ## Phase 4.1: decode into the Arrow buffer instead of copying into it
 
 Taken next, out of plan order, because the measurement above showed this -- not streaming -- is what
@@ -661,17 +714,6 @@ between C++ and Arrow by hand; `fuzz_decode` clean over 1,106,008 runs.
   Actions runs again**, because there is no local macOS or manylinux to run them on. The Linux wheel
   itself WAS built and installed into a clean virtualenv locally; what is unverified is cibuildwheel
   driving that across CPython 3.9–3.13 and macOS.
-
-- **Found, not fixed: the structural-dictionary string encoding is not readable by stock Lance.**
-  `tests/smoke_dict_pylance_interop.sh` writes a scattered low-cardinality string column with
-  `--compress` and pylance 12.0.0 refuses it: *"Lance v2.2 miniblock pages require the u32 chunk
-  grammar"*. The script catches that and exits 77, so ctest reports a **skip**, not a failure — which
-  is how it stayed quiet. It is pre-existing (the skip predates this branch, commit `5996e92` on
-  `main`) and independent of everything here, but it contradicts the README's claim that everything
-  nanolance writes is Lance-readable unless marked nanolance-only, and a test that reports "skip" for
-  a genuine interop failure will keep it quiet indefinitely. Two things to do, neither done here:
-  emit the u32 chunk grammar for miniblock pages, and make that script fail rather than skip once it
-  can pass.
 
 - **Not yet verified on this branch:** macOS and Windows (CI is Linux-only), and the ASan/UBSan
   workflow, which runs in CI rather than here. The libFuzzer workflow's targets were built and run

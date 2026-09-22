@@ -23,6 +23,11 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
+[project.scripts]
+# `python -m nanolance` works from the package alone; this makes `nanolance convert a.parquet b.lance`
+# work straight after `pip install nanolance`, which is the form the docs show.
+nanolance = "nanolance.__main__:main"
+
 [project.optional-dependencies]
 test = ["pytest>=7", "pyarrow>=16", "pandas>=2", "polars>=1", "psutil>=5.9", "pylance>=0.17"]
 bench = ["pyarrow>=16", "psutil>=5.9", "pylance>=0.17"]

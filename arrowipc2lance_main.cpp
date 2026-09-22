@@ -50,10 +50,11 @@ void set_stdin_binary() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    CLI::App app{"Convert Arrow IPC streams from stdin to Lance v2.2 datasets"};
+    CLI::App app{"Convert Arrow IPC streams (from a file or stdin) to Lance v2.2 datasets"};
     app.set_version_flag("--version", std::string("arrowipc2lance (nanolance ") + nanolance::library_version() + ")");
 
     std::string output_path;
+    std::string input_path;
     std::string inspect_path;
     bool create = false;
     bool append = false;
@@ -63,6 +64,8 @@ int main(int argc, char** argv) {
     int compression_level = 3;
 
     app.add_option("-o,--output", output_path, "Output Lance dataset path");
+    app.add_option("-i,--input", input_path,
+                   "Read the Arrow IPC stream from this file instead of stdin");
     app.add_option("--inspect", inspect_path, "Print latest manifest metadata as JSON and exit (no IPC conversion)");
     app.add_flag("-c,--create", create, "Create a new dataset");
     app.add_flag("-a,--append", append, "Append to an existing dataset");
@@ -149,44 +152,76 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // Reading only from stdin is a surprising default for a converter: `arrowipc2lance -i in.arrow`
+    // is what anyone tries first, and `< in.arrow` is not available at all in a subprocess call that
+    // does not go through a shell. Opening the file here (rather than requiring a redirect) also
+    // gives a real error message for a missing or unreadable input.
+    FILE* input_file = stdin;
+    bool close_input = false;
+    if (!input_path.empty()) {
+        input_file = std::fopen(input_path.c_str(), "rb");
+        if (input_file == nullptr) {
+            std::cerr << "cannot open input file: " << input_path << '\n';
+            return 1;
+        }
+        close_input = true;
+    }
+
     if (!install_signal_handlers()) {
         std::cerr << "failed to install signal handlers\n";
         return 1;
     }
-    set_stdin_binary();
+    if (!close_input) {
+        set_stdin_binary();
+    }
+
+    // Every early return between here and ArrowIpcInputStreamInitFile has to close the input; after
+    // that call the stream owns it (close_on_release below).
+    const auto close_input_if_owned = [&]() {
+        if (close_input && input_file != nullptr) {
+            std::fclose(input_file);
+            input_file = nullptr;
+        }
+    };
 
     NanoLanceWriter writer{};
     const int init_status = nano_lance_writer_init(&writer, output_path.c_str(), compression_level);
     if (init_status != NANO_LANCE_OK) {
         std::cerr << nano_lance_writer_last_error(&writer) << '\n';
+        close_input_if_owned();
         return init_status;
     }
     const int nullability_status = nano_lance_writer_set_ignore_nullability(&writer, ignore_nullability);
     if (nullability_status != NANO_LANCE_OK) {
         std::cerr << nano_lance_writer_last_error(&writer) << '\n';
         nano_lance_writer_close(&writer);
+        close_input_if_owned();
         return nullability_status;
     }
     const int compression_status = nano_lance_writer_set_compression(&writer, compress);
     if (compression_status != NANO_LANCE_OK) {
         std::cerr << nano_lance_writer_last_error(&writer) << '\n';
         nano_lance_writer_close(&writer);
+        close_input_if_owned();
         return compression_status;
     }
     const int structural_status = nano_lance_writer_set_structural_encoding(&writer, !no_structural);
     if (structural_status != NANO_LANCE_OK) {
         std::cerr << nano_lance_writer_last_error(&writer) << '\n';
         nano_lance_writer_close(&writer);
+        close_input_if_owned();
         return structural_status;
     }
 
     ArrowIpcInputStream ipc_input{};
-    int err = ArrowIpcInputStreamInitFile(&ipc_input, stdin, 0);
+    int err = ArrowIpcInputStreamInitFile(&ipc_input, input_file, close_input ? 1 : 0);
     if (err != NANOARROW_OK) {
         std::cerr << "ArrowIpcInputStreamInitFile failed\n";
         nano_lance_writer_close(&writer);
+        close_input_if_owned();
         return 1;
     }
+    close_input = false;  // the IPC stream owns the FILE* now and closes it on release
 
     ArrowArrayStream ipc_stream{};
     ArrowIpcArrayStreamReaderOptions options{};

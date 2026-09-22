@@ -54,6 +54,44 @@ import lance
 assert lance.dataset("out.lance").to_table().equals(table)
 ```
 
+### Coming from `pyarrow.parquet`
+
+The API is deliberately `pyarrow.parquet`-shaped, so the migration is a one-line diff:
+
+| `pyarrow.parquet` | nanolance |
+|---|---|
+| `pq.write_table(table, "out.parquet")` | `nanolance.write_table(table, "out.lance")` |
+| `pq.write_table(table, p, compression="zstd")` | `nanolance.write_table(table, p, compression=True)` |
+| `pq.read_table("in.parquet")` | `pa.table(nanolance.read_table("in.lance"))` |
+| `pq.read_table(p, columns=["ts", "level"])` | `nanolance.read_table(p, columns=["ts", "level"])` |
+| `pq.ParquetFile(p).iter_batches()` | `nanolance.open_stream(p)` |
+| `pq.ParquetWriter(p, schema)` + `write_table` | `nanolance.LanceWriter(p)` + `write_batch` |
+| row group | **fragment** (`max_rows_per_fragment=`) |
+
+Differences worth knowing before you switch:
+
+- `read_table` returns an Arrow-exportable **handle**, not a `pa.Table`. Wrap it: `pa.table(...)`.
+  That is what keeps the read zero-copy; nothing forces pyarrow on a caller who does not want it.
+- A projected read comes back in the **dataset's** column order, not the order you listed.
+- `compression=True` is a boolean, not a codec name: the codec per column type is chosen for you
+  (zstd on strings, byte-stream-split + zstd on floats). Structural encodings -- bitpacking,
+  constant, RLE, dictionary -- are on by default and independent of it.
+- Types nanolance will not round-trip are **refused at write time**, by name, rather than written in
+  a shape it cannot read back: `list`, `large_utf8`/`large_binary`, Arrow `dictionary` columns and
+  Arrow's `null` type.
+
+Already have parquet files? Convert one and compare:
+
+```console
+$ nanolance convert events.parquet events.lance --compress
+200,000 rows  events.parquet -> events.lance
+  parquet :    2.0 MiB
+  lance   :  530.3 KiB   (3.92x smaller)
+```
+
+(Also `python -m nanolance convert ...`. Conversion reads and writes a batch at a time, so a file
+larger than memory converts fine; `nanolance inspect events.lance` prints rows, size and schema.)
+
 ### Streaming / chunked writes
 
 For datasets too large to hold as one Arrow table, use `LanceWriter` as a context manager and feed one

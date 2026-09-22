@@ -59,6 +59,8 @@ Lifecycle rules:
 - `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
   adds a fragment to an existing dataset.
 
+`arrowipc2lance` reads its Arrow IPC stream from `-i/--input FILE` or, with neither given, stdin.
+
 Read back with `nano_lance::lance_table_read_dataset(path, schema, batches, error)` (C++,
 `nanolance/lance_table_reader.hpp`) or fetch external bytes with
 `nano_lance_fetch_external_blob(uri, position, size, ...)`.
@@ -90,6 +92,17 @@ Key options mirror the C writer: `compression=True`, `WriteOptions(append=True)`
 so errors surface from the first pull instead (as `OSError`) and the handle is single-shot. Prefer
 `open_stream` for bounded peak memory (measured 0.09x the dataset against 1.01x) and a fast first
 batch; prefer `read_table` when you want the whole thing and up-front errors.
+
+The package also installs a CLI, `nanolance` (equivalently `python -m nanolance`):
+
+```bash
+nanolance convert in.parquet out.lance --compress   # batch at a time; prints both sizes
+nanolance inspect out.lance                         # rows, on-disk bytes, schema
+```
+
+`convert` takes `--columns`, `--rows-per-fragment`, `--batch-size`, `--no-structural`,
+`-l/--compression-level` and `--overwrite`. It refuses a non-parquet extension and an existing output
+by name rather than guessing.
 
 Parquet Python bindings are a separate package in
 [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) (`nanoarrow_io.parquet`).

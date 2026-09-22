@@ -78,6 +78,18 @@ for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")
     ...
 ```
 
+Already have parquet? Convert it and compare, without writing any code:
+
+```console
+$ nanolance convert events.parquet events.lance --compress   # or: python -m nanolance convert ...
+200,000 rows  events.parquet -> events.lance
+  parquet :    2.0 MiB
+  lance   :  530.3 KiB   (3.92x smaller)
+```
+
+It converts a batch at a time, so a file larger than memory is fine, and `nanolance inspect
+events.lance` prints rows, size and schema.
+
 Install for development: `pip install -e "bindings/python[test]"` then `pytest` in that directory.
 Self-contained wheels (nanoarrow and zstd linked in statically, nothing to install alongside) are
 built for manylinux and macOS by [`.github/workflows/wheels.yml`](.github/workflows/wheels.yml) and
