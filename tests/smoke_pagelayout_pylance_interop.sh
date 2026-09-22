@@ -12,10 +12,10 @@ set -euo pipefail
 tool="${1:?nlance-pagelayout binary path required}"
 python_bin="${2:?python interpreter path required}"
 
-if ! "$python_bin" -c "import lance, pyarrow" >/dev/null 2>&1; then
-    echo "pylance/pyarrow not available; skipping"
-    exit 0
-fi
+# exit 77, not 0: ctest reports 77 as SKIPPED. Exiting 0 made this test report PASS while having
+# checked nothing, which is the one outcome worse than a failure.
+. "$(dirname "$0")/smoke_python_deps.sh"
+require_python_modules "$python_bin" pyarrow lance
 
 tmpdir="$(mktemp -d)"
 command -v cygpath >/dev/null 2>&1 && tmpdir="$(cygpath -m "$tmpdir")"

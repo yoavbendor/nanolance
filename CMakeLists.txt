@@ -643,7 +643,7 @@ if(TARGET nlance_pagelayout AND NANOLANCE_PYTHON)
     add_test(NAME app_pagelayout_pylance_interop_smoke
              COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_pagelayout_pylance_interop.sh"
                      "$<TARGET_FILE:nlance_pagelayout>" "${NANOLANCE_PYTHON}")
-    set_tests_properties(app_pagelayout_pylance_interop_smoke PROPERTIES LABELS smoke)
+    set_tests_properties(app_pagelayout_pylance_interop_smoke PROPERTIES LABELS smoke SKIP_RETURN_CODE 77)
 endif()
 
 add_test(NAME nano_lance_page_layout
@@ -738,7 +738,7 @@ if(NANOLANCE_BUILD_TOOLS)
                 "${NANO_LANCE_WRITER_PYTHON}"
                 "${NANO_LANCE_BLOB_V2_GOLDEN_DIR}"
     )
-    set_tests_properties(app_arrowipc2lance_blob_v2_smoke PROPERTIES LABELS "smoke" DEPENDS nano_lance_blob_v2_golden_generate)
+    set_tests_properties(app_arrowipc2lance_blob_v2_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77 DEPENDS nano_lance_blob_v2_golden_generate)
 
     add_test(
         NAME app_arrowipc2lance_nonnull_smoke
@@ -746,7 +746,7 @@ if(NANOLANCE_BUILD_TOOLS)
                 "$<TARGET_FILE:arrowipc2lance>"
                 "${NANO_LANCE_WRITER_PYTHON}"
     )
-    set_tests_properties(app_arrowipc2lance_nonnull_smoke PROPERTIES LABELS "smoke")
+    set_tests_properties(app_arrowipc2lance_nonnull_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
 
     add_test(
         NAME app_arrowipc2lance_ignore_nullability_smoke
@@ -754,7 +754,7 @@ if(NANOLANCE_BUILD_TOOLS)
                 "$<TARGET_FILE:arrowipc2lance>"
                 "${NANO_LANCE_WRITER_PYTHON}"
     )
-    set_tests_properties(app_arrowipc2lance_ignore_nullability_smoke PROPERTIES LABELS "smoke")
+    set_tests_properties(app_arrowipc2lance_ignore_nullability_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
 
     add_test(
         NAME app_arrowipc2lance_inspect_smoke
@@ -762,7 +762,7 @@ if(NANOLANCE_BUILD_TOOLS)
                 "$<TARGET_FILE:arrowipc2lance>"
                 "${NANO_LANCE_WRITER_PYTHON}"
     )
-    set_tests_properties(app_arrowipc2lance_inspect_smoke PROPERTIES LABELS "smoke")
+    set_tests_properties(app_arrowipc2lance_inspect_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
 
     add_test(
         NAME app_arrowipc2lance_append_smoke
@@ -770,7 +770,7 @@ if(NANOLANCE_BUILD_TOOLS)
                 "$<TARGET_FILE:arrowipc2lance>"
                 "${NANO_LANCE_WRITER_PYTHON}"
     )
-    set_tests_properties(app_arrowipc2lance_append_smoke PROPERTIES LABELS "smoke")
+    set_tests_properties(app_arrowipc2lance_append_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
 
     add_test(
         NAME app_dict_pylance_interop_smoke

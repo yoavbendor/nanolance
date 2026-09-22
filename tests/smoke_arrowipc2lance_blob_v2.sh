@@ -3,6 +3,10 @@ set -euo pipefail
 
 ARROWIPC2LANCE="${1:?arrowipc2lance path}"
 PYTHON="${2:?python path}"
+
+. "$(dirname "$0")/smoke_python_deps.sh"
+require_python_modules "$PYTHON" pyarrow
+
 GOLDEN_DIR="${3:?golden dir}"
 
 if [[ ! -f "${GOLDEN_DIR}/input.arrow" ]]; then

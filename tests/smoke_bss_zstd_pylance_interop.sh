@@ -3,6 +3,10 @@ set -euo pipefail
 
 bin="${1:?arrowipc2lance binary path required}"
 python_bin="${2:?python interpreter path required}"
+
+. "$(dirname "$0")/smoke_python_deps.sh"
+require_python_modules "$python_bin" pyarrow lance
+
 tmpdir="$(mktemp -d)"
 command -v cygpath >/dev/null 2>&1 && tmpdir="$(cygpath -m "$tmpdir")"
 trap 'rm -rf "$tmpdir"' EXIT

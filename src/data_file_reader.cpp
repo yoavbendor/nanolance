@@ -5,6 +5,7 @@
 
 #include "nanolance/read_safety.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -111,8 +112,13 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
         return false;
     }
 
-    constexpr std::uint64_t kTailBytes = 512;
-    const auto tail_len = static_cast<std::streamsize>(std::min(kTailBytes, file_size));
+    // std::min<std::uintmax_t>, explicitly: std::filesystem::file_size returns uintmax_t, and on
+    // macOS libc++ that is `unsigned long` while std::uint64_t is `unsigned long long` -- two
+    // distinct types, so template argument deduction fails. On Linux/glibc they are the same type
+    // and the bare call compiles by coincidence, which is why this only showed up the first time the
+    // macOS CI job actually ran.
+    constexpr std::uintmax_t kTailBytes = 512;
+    const auto tail_len = static_cast<std::streamsize>(std::min<std::uintmax_t>(kTailBytes, file_size));
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         error = "failed to open data file";
