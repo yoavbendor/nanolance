@@ -153,6 +153,27 @@ int nano_lance_table_open_stream(const char* dataset_path, const char* const* co
                                  struct ArrowArrayStream* out_stream, char* error_message,
                                  size_t error_message_capacity);
 
+/// Read rows [offset, offset + length) -- a negative \p length means "to the end of the dataset".
+///
+/// \p column_names / \p column_count project; NULL/0 reads every column. (That differs from
+/// nano_lance_table_read_dataset_projected, which refuses a zero-column projection: there an empty
+/// list is a caller mistake, here it is the ordinary "no projection" case.)
+///
+/// Fragments the range does not touch are never opened, so the I/O saved is proportional to the
+/// fragments skipped rather than to the rows dropped. The row semantics are exact either way.
+int nano_lance_table_read_dataset_range(const char* dataset_path, const char* const* column_names,
+                                        size_t column_count, uint64_t offset, int64_t length,
+                                        int trusted_input, struct ArrowSchema* out_schema,
+                                        struct ArrowArray** out_batches, size_t* out_batch_count,
+                                        char* error_message, size_t error_message_capacity);
+
+/// nano_lance_table_open_stream restricted to a row range; see
+/// nano_lance_table_read_dataset_range for what a range costs.
+int nano_lance_table_open_stream_range(const char* dataset_path, const char* const* column_names,
+                                       size_t column_count, uint64_t offset, int64_t length,
+                                       int trusted_input, struct ArrowArrayStream* out_stream,
+                                       char* error_message, size_t error_message_capacity);
+
 /// The dataset's Arrow schema, from the manifest alone -- no data file is opened, so this is the
 /// cheap way to ask what columns a dataset has. The CALLER releases \p out_schema on success; on
 /// failure it is left zeroed and must not be released.

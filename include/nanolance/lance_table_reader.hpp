@@ -13,6 +13,26 @@
 
 namespace nano_lance {
 
+/// A half-open row range: rows `[offset, offset + length)`.
+///
+/// What this buys is honest but specific: fragments the range does not touch are **never opened**,
+/// so the I/O saved is proportional to the fragments skipped, not to the rows dropped. The row
+/// semantics are exact -- you get precisely the rows you asked for -- but a range inside a single
+/// fragment still decodes that whole fragment. Datasets written with `max_rows_per_fragment` get the
+/// full benefit; a one-fragment dataset gets none.
+///
+/// A range that runs past the end is clamped to the end; an `offset` past the end is an error rather
+/// than an empty result, since it almost always means the caller's arithmetic is wrong.
+struct LanceRowRange {
+    static constexpr std::uint64_t kAllRows = ~std::uint64_t{0};
+
+    std::uint64_t offset = 0;
+    std::uint64_t length = kAllRows;
+
+    bool is_whole_dataset() const { return offset == 0U && length == kAllRows; }
+};
+
+
 /// Read all committed rows from a nano_lance_writer dataset into Arrow batches (writer parity only).
 /// Rebuilds ingest-shaped schemas (e.g. dematerialized `lance.blob.v2` children).
 ///
@@ -40,6 +60,14 @@ bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_pat
                                         ArrowSchema& out_schema,
                                         std::vector<ArrowArray>& out_batches,
                                         std::string& error, bool trusted_input = false);
+
+/// Read rows `[range.offset, range.offset + range.length)`, optionally projected.
+/// `column_names` may be null to read every column. See `LanceRowRange` for what a range costs.
+bool lance_table_read_dataset_range(const std::filesystem::path& dataset_path,
+                                    const std::vector<std::string>* column_names,
+                                    const LanceRowRange& range, ArrowSchema& out_schema,
+                                    std::vector<ArrowArray>& out_batches, std::string& error,
+                                    bool trusted_input = false);
 
 /// The dataset's Arrow schema, read from the manifest alone -- no data file is opened.
 ///
@@ -93,6 +121,12 @@ public:
     static bool open(const std::filesystem::path& dataset_path,
                      const std::vector<std::string>* column_names, ArrowSchema& out_schema,
                      LanceTableStream& out, std::string& error, bool trusted_input = false);
+
+    /// As `open`, restricted to `range`. Fragments outside it are never opened.
+    static bool open_range(const std::filesystem::path& dataset_path,
+                           const std::vector<std::string>* column_names, const LanceRowRange& range,
+                           ArrowSchema& out_schema, LanceTableStream& out, std::string& error,
+                           bool trusted_input = false);
 
     /// Decode the next data file. Returns false on failure; on success with no data left,
     /// `out_batch.release` is null. The caller owns each batch it receives.

@@ -19,10 +19,10 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 1.1 Real nullability | **done**, read and write, fixed- and variable-width; a null struct is still refused |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | **2.1 wheels and 2.3 CI done**; 2.2 install/export deliberately not |
-| Phase 3 — the Python API a parquet user expects | **3.1–3.4 all done** — streaming, projection, `count_rows`/`read_schema`, `nanolance convert`; row-range/slice open |
+| Phase 3 — the Python API a parquet user expects | **complete** — streaming, projection, row ranges, `count_rows`/`read_schema`, `nanolance convert` |
 | Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
 
-Test suite: **49 ctest** (was 42) and **291 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **50 ctest** (was 42) and **388 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout`, `nanolance_fuzz_fsst` and
@@ -678,6 +678,89 @@ success for a genuine failure is worse than no test. The `try`/`except` is gone,
 if this regresses, and `test_stock_lance_reads_a_dictionary_encoded_column` asserts it from pytest
 too -- including reading a neighbouring int column on its own, since that is what the whole-file
 validation broke.
+
+### Row ranges: `read_table(..., offset=, length=)`
+
+The last piece of 3.2. Measured on a 61 MiB dataset in 16 fragments of 250k rows:
+
+| | time | vs full read |
+|---|---|---|
+| full read (4M rows) | 72.1 ms | — |
+| 1,000 rows mid-dataset | 2.5 ms | **29x faster** |
+| 500,000 rows (2 fragments) | 7.3 ms | 9.9x |
+| half the dataset (8 fragments) | 35.1 ms | 2.1x |
+
+Peak memory for the 1,000-row range: 1.8 MiB, **0.03x** the dataset.
+
+**The claim is deliberately narrow.** The rows returned are exactly the rows asked for, but the work
+saved is proportional to *fragments skipped*, not rows dropped -- a range inside one fragment still
+decodes that fragment, and a single-fragment dataset saves nothing. The docs say this rather than
+implying a row-granular win, because a `table.slice()` dressed up as a range would be worse than not
+having one.
+
+**Where the slicing happens, and why there.** On `ColumnValues` -- the decoder's output, *before* the
+Arrow arrays are built -- not on a decoded `ArrowArray`.
+
+That was the whole safety argument. Setting `ArrowArray::offset` on a decoded batch would mean
+producing offsets from a reader that has never produced them, with `bool` (bits, not bytes), validity
+bitmaps (also bits) and struct children (offset applied at exactly one level, or it double-counts)
+each needing separate care. That is the same class of mistake as the writer's `array.offset` bug, two
+of which this branch already found. Slicing `ColumnValues` instead makes every value buffer
+byte-addressed -- `bool` is a *byte* per value until the Arrow buffer is assembled -- leaving exactly
+one thing that needs bit arithmetic: the validity bitmap.
+
+So `slice_column_values` is one function in one file, and `tests/test_column_slice.cpp` brute-forces
+it: every `(total, first, count)` combination up to 40 rows, across fixed-width, 32- and 64-bit
+variable-width, nullable and not, compared bit by bit against a reference built from plain per-row
+vectors. 40 rows spans five bitmap bytes, so every `first % 8` and `count % 8` pair appears many
+times. Validity is compared bit by bit rather than byte by byte, so the last byte's padding cannot
+hide a wrong answer or fail a right one.
+
+**Skipping is validated where it can be.** `skip`/`take` come from the manifest's per-fragment row
+counts, but the rows are in the data file. When a file is partially covered the two are compared, and
+a disagreement is an error -- a silently misaligned range is precisely the failure this must not
+have. A fragment spanning several data files has no per-file row count in the manifest at all, so a
+range over one is refused by name rather than guessed at.
+
+**The test that proves the feature does anything.** `test_fragments_outside_the_range_are_never_opened`
+**deletes** the data files the range does not need and checks the read still succeeds. That is the
+only way to tell a real range from `read_table(...).slice(...)`, and it also fails if the plan is
+merely sloppy -- opening one extra fragment breaks it.
+
+Everything else is checked against `full_read.slice(offset, length)` as the oracle: a 32-point sweep
+of offsets and lengths (on, inside and either side of every fragment boundary, most not multiples of
+8) over a dataset holding *every* encoding at once, eager and streamed, plus each encoding on its own
+so a failure names the encoding rather than the dataset.
+
+### The struct bug the range tests found
+
+Writing the range tests needed a struct column fed through `to_batches()`, and that had never been
+done:
+
+    RuntimeError: column value count does not match row count for a
+
+Arrow does not slice a struct's children when the struct is sliced -- the parent carries the offset
+and the children keep their full extent. `resolve_field_array` returned the child pointer directly,
+so a sliced struct column reported the wrong rows *and* the wrong count, and the writer refused the
+batch. Loud rather than silent, unlike the flat-column version of this bug fixed earlier on this
+branch, but it meant `to_batches()` -- the obvious way to feed the streaming writer -- could not
+write a struct column at all.
+
+Field resolution now returns a **rebased, borrowed view** whose `offset`/`length` compose every
+enclosing array's slice, so the ordinary `array.offset + row` arithmetic keeps working everywhere
+downstream. Both conventions compose correctly: pyarrow puts the offset on each column, while a
+producer that slices the record batch itself puts it on the root.
+
+Two details the change turned up:
+
+- **ASan earned its keep.** The first version stored pointers to per-iteration view locals in a
+  vector that outlived the loop. The plain build passed 50/50 with a live stack-use-after-scope;
+  the sanitizer build caught it immediately. The views are stored by value now.
+- A narrowed view's `null_count` no longer describes it, so it becomes -1 ("not computed") and
+  callers scan the window. Zero stays zero -- a null-free column has null-free windows, which keeps
+  the fast path.
+
+The matrix no longer excludes `struct` from its sliced case, which is what let this through.
 
 ## Closing the gaps that let those bugs through
 

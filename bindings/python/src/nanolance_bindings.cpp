@@ -257,8 +257,10 @@ private:
 };
 
 /// The streaming reader: one batch decoded per consumer pull, instead of every batch up front.
+/// `length < 0` means "to the end of the dataset".
 ExportedStream read_table_stream(const std::filesystem::path& path,
-                                 std::optional<std::vector<std::string>> columns) {
+                                 std::optional<std::vector<std::string>> columns,
+                                 std::uint64_t offset, std::int64_t length) {
     std::vector<const char*> names;
     if (columns) {
         names.reserve(columns->size());
@@ -268,10 +270,11 @@ ExportedStream read_table_stream(const std::filesystem::path& path,
     }
     ArrowArrayStream stream{};
     char err[512] = {};
-    const int rc = nano_lance_table_open_stream(path.string().c_str(), names.empty() ? nullptr : names.data(),
-                                                names.size(), /*trusted_input=*/0, &stream, err, sizeof(err));
+    const int rc = nano_lance_table_open_stream_range(
+        path.string().c_str(), names.empty() ? nullptr : names.data(), names.size(), offset, length,
+        /*trusted_input=*/0, &stream, err, sizeof(err));
     if (rc != NANO_LANCE_READER_OK) {
-        throw_lance_reader("nano_lance_table_open_stream", rc, err);
+        throw_lance_reader("nano_lance_table_open_stream_range", rc, err);
     }
     return ExportedStream::adopt(std::move(stream));
 }
@@ -299,33 +302,28 @@ std::uint64_t count_rows(const std::filesystem::path& path) {
     return rows;
 }
 
-ExportedTable read_table_eager(const std::filesystem::path& path, std::optional<std::vector<std::string>> columns) {
+ExportedTable read_table_eager(const std::filesystem::path& path,
+                               std::optional<std::vector<std::string>> columns, std::uint64_t offset,
+                               std::int64_t length) {
     ArrowSchema schema{};
     ArrowArray* batches = nullptr;
     std::size_t batch_count = 0;
     char err[512] = {};
 
-    int rc = 0;
-    const char* what = nullptr;
+    // Hold the char* views alongside the strings: the C entry point copies them, but it reads them
+    // first, so the std::strings must outlive the call.
+    std::vector<const char*> names;
     if (columns) {
-        // Hold the char* views alongside the strings: the C entry point copies them, but it reads
-        // them first, so the std::strings must outlive the call.
-        std::vector<const char*> names;
         names.reserve(columns->size());
         for (const auto& name : *columns) {
             names.push_back(name.c_str());
         }
-        what = "nano_lance_table_read_dataset_projected";
-        rc = nano_lance_table_read_dataset_projected(path.string().c_str(), names.data(), names.size(),
-                                                      /*trusted_input=*/0, &schema, &batches, &batch_count,
-                                                      err, sizeof(err));
-    } else {
-        what = "nano_lance_table_read_dataset";
-        rc = nano_lance_table_read_dataset(path.string().c_str(), &schema, &batches, &batch_count, err,
-                                            sizeof(err));
     }
+    const int rc = nano_lance_table_read_dataset_range(
+        path.string().c_str(), names.empty() ? nullptr : names.data(), names.size(), offset, length,
+        /*trusted_input=*/0, &schema, &batches, &batch_count, err, sizeof(err));
     if (rc != NANO_LANCE_READER_OK) {
-        throw_lance_reader(what, rc, err);
+        throw_lance_reader("nano_lance_table_read_dataset_range", rc, err);
     }
     ExportedTable out = ExportedTable::from_read_result(&schema, batches, batch_count);
     nano_lance_table_read_result_free(&schema, batches, batch_count);
@@ -392,9 +390,11 @@ NB_MODULE(_nanolance, m) {
           "The dataset's row count, from the manifest's fragments. O(fragments), not O(rows).");
 
     m.def("read_table", &read_table_eager, nb::arg("path"), nb::arg("columns") = nb::none(),
+          nb::arg("offset") = 0, nb::arg("length") = -1,
           "Read a Lance dataset, decoding every batch up front. `columns` names the top-level columns "
           "to read; the rest are skipped during decode rather than decoded and discarded.");
     m.def("open_stream", &read_table_stream, nb::arg("path"), nb::arg("columns") = nb::none(),
+          nb::arg("offset") = 0, nb::arg("length") = -1,
           "Open a Lance dataset as a streaming Arrow handle: one batch decoded per pull, so peak "
           "memory tracks one fragment rather than the dataset.");
 }

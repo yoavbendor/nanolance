@@ -68,6 +68,7 @@ The API is deliberately `pyarrow.parquet`-shaped, so the migration is a one-line
 | `pq.ParquetWriter(p, schema)` + `write_table` | `nanolance.LanceWriter(p)` + `write_batch` |
 | `pq.ParquetFile(p).schema_arrow` | `nanolance.read_schema(p)` |
 | `pq.ParquetFile(p).metadata.num_rows` | `nanolance.count_rows(p)` |
+| `pq.read_table(p).slice(off, n)` | `nanolance.read_table(p, offset=off, length=n)` (skips whole fragments) |
 | row group | **fragment** (`max_rows_per_fragment=`) |
 
 Differences worth knowing before you switch:
@@ -136,8 +137,8 @@ already decoded them all by the time it returns.
 |----------|-------------|
 | `write_table(table, path, **opts)` | Write an Arrow table to a Lance dataset (one fragment per input batch) |
 | `LanceWriter(path, *, max_rows_per_fragment=0, **opts)` | Streaming context-manager writer: `write_batch(batch)`, `flush()`, `close()` |
-| `read_table(path, columns=None)` | Read eagerly; returns an Arrow-exportable handle (an Arrow C stream, one batch per fragment). `columns` projects |
-| `open_stream(path, columns=None)` | Same, but decoded one fragment per pull: bounded peak memory, larger-than-memory datasets, fast first batch. Single-shot |
+| `read_table(path, columns=None, *, offset=0, length=None)` | Read eagerly; returns an Arrow-exportable handle (an Arrow C stream, one batch per fragment). `columns` projects |
+| `open_stream(path, columns=None, *, offset=0, length=None)` | Same, but decoded one fragment per pull: bounded peak memory, larger-than-memory datasets, fast first batch. Single-shot |
 | `read_schema(path)` | The dataset's Arrow schema, from the manifest alone -- no data file opened |
 | `count_rows(path)` | The dataset's row count, from the manifest's fragments. O(fragments), not O(rows) |
 | `WriteOptions` | `compression`, `compression_level`, `structural_encoding`, `append`, `blob_uri_dictionary`, `ignore_nullability` |
@@ -216,6 +217,36 @@ pa.schema(nanolance.read_schema("events.lance"))  # -> the Arrow schema
 Both answer from the manifest and never open a data file, so they cost the same on a 200k-row
 dataset as on a 200M-row one (0.18 ms against 16 ms for the full read, measured on the same 200k-row
 dataset). The schema handle is re-exportable, unlike the single-shot stream handle.
+
+### Reading a row range
+
+```python
+nanolance.read_table("events.lance", offset=2_000_000, length=1_000)
+nanolance.open_stream("events.lance", offset=2_000_000, length=1_000)  # same, streamed
+```
+
+Spelled like `pyarrow.Table.slice`, and the rows you get back are exactly the rows you asked for.
+What it *saves* is more specific, and worth understanding before you rely on it: **fragments the
+range does not touch are never opened**, so the I/O avoided is proportional to the fragments
+skipped, not to the rows dropped. A range inside a single fragment still decodes that whole
+fragment, and a one-fragment dataset saves nothing -- write with `max_rows_per_fragment` if you
+intend to read ranges.
+
+Measured on a 61 MiB dataset in 16 fragments of 250k rows:
+
+| | time | vs full read |
+|---|---|---|
+| full read (4M rows) | 72.1 ms | — |
+| 1,000 rows mid-dataset | 2.5 ms | **29x faster** |
+| 500,000 rows (2 fragments) | 7.3 ms | 9.9x |
+| half the dataset (8 fragments) | 35.1 ms | 2.1x |
+
+Peak memory for the 1,000-row range was 1.8 MiB, 0.03x the dataset.
+
+`length=None` reads to the end, and a length running past the end is clamped. An `offset` past the
+end is an **error**, not an empty table -- it nearly always means the caller's arithmetic is wrong.
+Negative values are refused rather than given `[-10:]` semantics, which would need the row count and
+would otherwise read the wrong rows silently.
 
 **Scope.** nanolance reads back everything it writes, and now every non-nested column type stock
 Lance writes:

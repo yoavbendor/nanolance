@@ -173,7 +173,32 @@ def _normalize_columns(columns: Optional[Sequence[str]]) -> Optional[list]:
     return names
 
 
-def read_table(path: Union[str, os.PathLike], columns: Optional[Sequence[str]] = None):
+def _normalize_range(offset: int, length: Optional[int]) -> tuple:
+    """Validate a row range once, for every entry point that takes one.
+
+    ``length=None`` means "to the end", which the native layer spells as a negative length. A
+    negative ``offset`` or ``length`` is refused rather than reinterpreted: ``[-10:]`` semantics
+    would need the row count, and silently reading the wrong rows is the failure this whole feature
+    has to avoid.
+    """
+    offset = int(offset)
+    if offset < 0:
+        raise ValueError("offset must not be negative")
+    if length is None:
+        return offset, -1
+    length = int(length)
+    if length < 0:
+        raise ValueError("length must not be negative; pass length=None to read to the end")
+    return offset, length
+
+
+def read_table(
+    path: Union[str, os.PathLike],
+    columns: Optional[Sequence[str]] = None,
+    *,
+    offset: int = 0,
+    length: Optional[int] = None,
+):
     """Read a Lance dataset.
 
     Returns an Arrow-exportable handle. Pass to ``pyarrow.table()`` or
@@ -196,11 +221,33 @@ def read_table(path: Union[str, os.PathLike], columns: Optional[Sequence[str]] =
     One difference from ``pyarrow.parquet``: the result is in the dataset's own
     column order, not the order you listed. ``columns=["c", "a"]`` gives back
     ``["a", "c"]``. Reorder afterwards (``table.select([...])``) if it matters.
+
+    ``offset``/``length`` read a row range, spelled like :meth:`pyarrow.Table.slice`::
+
+        nanolance.read_table("events.lance", offset=1_000_000, length=1_000)
+
+    The rows you get back are exactly the rows you asked for. What it *saves* is
+    more specific: fragments the range does not touch are never opened, so the
+    I/O avoided is proportional to the fragments skipped, not to the rows
+    dropped. A range inside one fragment still decodes that whole fragment, and
+    a single-fragment dataset saves nothing -- write with
+    ``max_rows_per_fragment`` if you intend to read ranges.
+
+    ``length=None`` reads to the end. A range running past the end is clamped;
+    an ``offset`` past the end is an error, since it nearly always means the
+    caller's arithmetic is wrong.
     """
-    return _nanolance.read_table(Path(path), _normalize_columns(columns))
+    start, count = _normalize_range(offset, length)
+    return _nanolance.read_table(Path(path), _normalize_columns(columns), start, count)
 
 
-def open_stream(path: Union[str, os.PathLike], columns: Optional[Sequence[str]] = None):
+def open_stream(
+    path: Union[str, os.PathLike],
+    columns: Optional[Sequence[str]] = None,
+    *,
+    offset: int = 0,
+    length: Optional[int] = None,
+):
     """Open a Lance dataset as a *streaming* Arrow handle.
 
     Same decode as :func:`read_table`, but one batch per fragment decoded when the
@@ -227,9 +274,12 @@ def open_stream(path: Union[str, os.PathLike], columns: Optional[Sequence[str]] 
     * **The handle is single-shot.** A stream is consumed, not copied, so
       exporting it twice raises. Call ``open_stream`` again for a second pass.
 
-    ``columns`` projects exactly as it does for :func:`read_table`.
+    ``columns``, ``offset`` and ``length`` behave exactly as they do for
+    :func:`read_table` -- including that a row range skips whole fragments
+    rather than saving work inside one.
     """
-    return _nanolance.open_stream(Path(path), _normalize_columns(columns))
+    start, count = _normalize_range(offset, length)
+    return _nanolance.open_stream(Path(path), _normalize_columns(columns), start, count)
 
 
 def read_schema(path: Union[str, os.PathLike]):

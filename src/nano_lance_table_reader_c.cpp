@@ -35,8 +35,41 @@ int map_status(const std::string& error) {
 /// rest are skipped entirely (see lance_table_read_dataset_projected). Everything else about the two
 /// paths is identical, so they share this body rather than duplicating the ownership contract -- the
 /// part that, when it was duplicated, segfaulted every failed read.
+/// Collect `column_names` into owned strings. NULL/0 means "every column" and yields an empty vector,
+/// which callers pass as a null `columns` pointer.
+int collect_columns(const char* const* column_names, size_t column_count, std::vector<std::string>& out,
+                    char* error_message, size_t error_message_capacity) {
+    out.clear();
+    if (column_count == 0) {
+        return NANO_LANCE_READER_OK;
+    }
+    if (column_names == nullptr) {
+        set_error(error_message, error_message_capacity,
+                  "column_names is required when column_count is nonzero");
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
+    out.reserve(column_count);
+    for (size_t i = 0; i < column_count; ++i) {
+        if (column_names[i] == nullptr) {
+            set_error(error_message, error_message_capacity, "column_names contains a null entry");
+            return NANO_LANCE_READER_INVALID_ARGUMENT;
+        }
+        out.emplace_back(column_names[i]);
+    }
+    return NANO_LANCE_READER_OK;
+}
+
+/// A negative `length` means "to the end of the dataset" -- the usual C convention, and clearer at a
+/// call site than spelling out a sentinel like UINT64_MAX.
+nano_lance::LanceRowRange make_range(uint64_t offset, int64_t length) {
+    nano_lance::LanceRowRange range;
+    range.offset = offset;
+    range.length = length < 0 ? nano_lance::LanceRowRange::kAllRows : static_cast<uint64_t>(length);
+    return range;
+}
+
 int read_dataset_impl(const char* dataset_path, bool trusted_input, const std::vector<std::string>* columns,
-                      struct ArrowSchema* out_schema,
+                      const nano_lance::LanceRowRange& range, struct ArrowSchema* out_schema,
                       struct ArrowArray** out_batches, size_t* out_batch_count, char* error_message,
                       size_t error_message_capacity) {
     if (out_schema == nullptr || out_batches == nullptr || out_batch_count == nullptr) {
@@ -54,12 +87,9 @@ int read_dataset_impl(const char* dataset_path, bool trusted_input, const std::v
 
     std::vector<ArrowArray> batches;
     std::string error;
-    const bool ok =
-        columns == nullptr
-            ? nano_lance::lance_table_read_dataset(std::filesystem::path(dataset_path), *out_schema, batches,
-                                                   error, trusted_input)
-            : nano_lance::lance_table_read_dataset_projected(std::filesystem::path(dataset_path), *columns,
-                                                             *out_schema, batches, error, trusted_input);
+    const bool ok = nano_lance::lance_table_read_dataset_range(std::filesystem::path(dataset_path), columns,
+                                                               range, *out_schema, batches, error,
+                                                               trusted_input);
     if (!ok) {
         // lance_table_read_dataset already released the schema (see its declaration). Releasing it
         // again here called through a null `release` pointer -- every failed read from the C API or
@@ -97,16 +127,18 @@ int read_dataset_impl(const char* dataset_path, bool trusted_input, const std::v
 extern "C" int nano_lance_table_read_dataset(const char* dataset_path, struct ArrowSchema* out_schema,
                                              struct ArrowArray** out_batches, size_t* out_batch_count,
                                              char* error_message, size_t error_message_capacity) {
-    return read_dataset_impl(dataset_path, /*trusted_input=*/false, /*columns=*/nullptr, out_schema,
-                             out_batches, out_batch_count, error_message, error_message_capacity);
+    return read_dataset_impl(dataset_path, /*trusted_input=*/false, /*columns=*/nullptr,
+                             nano_lance::LanceRowRange{}, out_schema, out_batches, out_batch_count,
+                             error_message, error_message_capacity);
 }
 
 extern "C" int nano_lance_table_read_dataset_ex(const char* dataset_path, int trusted_input,
                                                 struct ArrowSchema* out_schema, struct ArrowArray** out_batches,
                                                 size_t* out_batch_count, char* error_message,
                                                 size_t error_message_capacity) {
-    return read_dataset_impl(dataset_path, trusted_input != 0, /*columns=*/nullptr, out_schema, out_batches,
-                             out_batch_count, error_message, error_message_capacity);
+    return read_dataset_impl(dataset_path, trusted_input != 0, /*columns=*/nullptr,
+                             nano_lance::LanceRowRange{}, out_schema, out_batches, out_batch_count,
+                             error_message, error_message_capacity);
 }
 
 extern "C" int nano_lance_table_read_dataset_projected(const char* dataset_path,
@@ -123,16 +155,34 @@ extern "C" int nano_lance_table_read_dataset_projected(const char* dataset_path,
         return NANO_LANCE_READER_INVALID_ARGUMENT;
     }
     std::vector<std::string> columns;
-    columns.reserve(column_count);
-    for (size_t i = 0; i < column_count; ++i) {
-        if (column_names[i] == nullptr) {
-            set_error(error_message, error_message_capacity, "column_names contains a null entry");
-            return NANO_LANCE_READER_INVALID_ARGUMENT;
-        }
-        columns.emplace_back(column_names[i]);
+    if (const int rc = collect_columns(column_names, column_count, columns, error_message,
+                                       error_message_capacity);
+        rc != NANO_LANCE_READER_OK) {
+        return rc;
     }
-    return read_dataset_impl(dataset_path, trusted_input != 0, &columns, out_schema, out_batches,
-                             out_batch_count, error_message, error_message_capacity);
+    return read_dataset_impl(dataset_path, trusted_input != 0, &columns, nano_lance::LanceRowRange{},
+                             out_schema, out_batches, out_batch_count, error_message,
+                             error_message_capacity);
+}
+
+extern "C" int nano_lance_table_read_dataset_range(const char* dataset_path,
+                                                   const char* const* column_names, size_t column_count,
+                                                   uint64_t offset, int64_t length, int trusted_input,
+                                                   struct ArrowSchema* out_schema,
+                                                   struct ArrowArray** out_batches, size_t* out_batch_count,
+                                                   char* error_message, size_t error_message_capacity) {
+    // NULL/0 here means "every column", matching nano_lance_table_open_stream. That differs from
+    // nano_lance_table_read_dataset_projected, which refuses a zero-column projection -- there an
+    // empty list is a caller mistake, here it is the ordinary "no projection" case.
+    std::vector<std::string> columns;
+    if (const int rc = collect_columns(column_names, column_count, columns, error_message,
+                                       error_message_capacity);
+        rc != NANO_LANCE_READER_OK) {
+        return rc;
+    }
+    return read_dataset_impl(dataset_path, trusted_input != 0, columns.empty() ? nullptr : &columns,
+                             make_range(offset, length), out_schema, out_batches, out_batch_count,
+                             error_message, error_message_capacity);
 }
 
 namespace {
@@ -189,10 +239,12 @@ void stream_release(struct ArrowArrayStream* stream) {
 
 }  // namespace
 
-extern "C" int nano_lance_table_open_stream(const char* dataset_path, const char* const* column_names,
-                                            size_t column_count, int trusted_input,
-                                            struct ArrowArrayStream* out_stream, char* error_message,
-                                            size_t error_message_capacity) {
+namespace {
+
+int open_stream_impl(const char* dataset_path, const char* const* column_names, size_t column_count,
+                     const nano_lance::LanceRowRange& range, int trusted_input,
+                     struct ArrowArrayStream* out_stream, char* error_message,
+                     size_t error_message_capacity) {
     if (out_stream == nullptr) {
         set_error(error_message, error_message_capacity, "out_stream is required");
         return NANO_LANCE_READER_INVALID_ARGUMENT;
@@ -204,27 +256,18 @@ extern "C" int nano_lance_table_open_stream(const char* dataset_path, const char
     }
 
     std::vector<std::string> columns;
-    if (column_count != 0) {
-        if (column_names == nullptr) {
-            set_error(error_message, error_message_capacity,
-                      "column_names is required when column_count is nonzero");
-            return NANO_LANCE_READER_INVALID_ARGUMENT;
-        }
-        columns.reserve(column_count);
-        for (size_t i = 0; i < column_count; ++i) {
-            if (column_names[i] == nullptr) {
-                set_error(error_message, error_message_capacity, "column_names contains a null entry");
-                return NANO_LANCE_READER_INVALID_ARGUMENT;
-            }
-            columns.emplace_back(column_names[i]);
-        }
+    if (const int rc = collect_columns(column_names, column_count, columns, error_message,
+                                       error_message_capacity);
+        rc != NANO_LANCE_READER_OK) {
+        return rc;
     }
 
     auto self = std::make_unique<StreamPrivate>();
     std::string error;
-    if (!nano_lance::LanceTableStream::open(std::filesystem::path(dataset_path),
-                                            columns.empty() ? nullptr : &columns, self->schema,
-                                            self->stream, error, trusted_input != 0)) {
+    if (!nano_lance::LanceTableStream::open_range(std::filesystem::path(dataset_path),
+                                                  columns.empty() ? nullptr : &columns, range,
+                                                  self->schema, self->stream, error,
+                                                  trusted_input != 0)) {
         // open() already released the schema on failure (see its declaration), and ~StreamPrivate
         // checks `release` before touching it, so unwinding here is safe.
         set_error(error_message, error_message_capacity, error);
@@ -237,6 +280,25 @@ extern "C" int nano_lance_table_open_stream(const char* dataset_path, const char
     out_stream->release = &stream_release;
     out_stream->private_data = self.release();
     return NANO_LANCE_READER_OK;
+}
+
+}  // namespace
+
+extern "C" int nano_lance_table_open_stream(const char* dataset_path, const char* const* column_names,
+                                            size_t column_count, int trusted_input,
+                                            struct ArrowArrayStream* out_stream, char* error_message,
+                                            size_t error_message_capacity) {
+    return open_stream_impl(dataset_path, column_names, column_count, nano_lance::LanceRowRange{},
+                            trusted_input, out_stream, error_message, error_message_capacity);
+}
+
+extern "C" int nano_lance_table_open_stream_range(const char* dataset_path,
+                                                  const char* const* column_names, size_t column_count,
+                                                  uint64_t offset, int64_t length, int trusted_input,
+                                                  struct ArrowArrayStream* out_stream, char* error_message,
+                                                  size_t error_message_capacity) {
+    return open_stream_impl(dataset_path, column_names, column_count, make_range(offset, length),
+                            trusted_input, out_stream, error_message, error_message_capacity);
 }
 
 extern "C" int nano_lance_table_read_schema(const char* dataset_path, struct ArrowSchema* out_schema,

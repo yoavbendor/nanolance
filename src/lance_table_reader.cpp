@@ -4,6 +4,7 @@
 #include "nanolance/lance_table_reader.hpp"
 
 #include "nanolance/blob_v2_external.hpp"
+#include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,6 +31,15 @@ const LanceField* find_mapping_field_by_name_under(const LanceSchemaMapping& map
     }
     for (const auto& field : mapping.fields) {
         if (field.parent_id == parent_id && field.name == name) {
+            return &field;
+        }
+    }
+    return nullptr;
+}
+
+const LanceField* find_mapping_field(const LanceSchemaMapping& mapping, std::int32_t id) {
+    for (const auto& field : mapping.fields) {
+        if (field.id == id) {
             return &field;
         }
     }
@@ -750,10 +761,24 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     return true;
 }
 
-bool read_data_file_batch(const std::filesystem::path& dataset_path, const pb::DataFile& data_file,
+/// One data file, and which of its rows this read wants.
+///
+/// `skip`/`take` are how a row range reaches the decoder. A file the range does not touch at all is
+/// never put in the plan, so it is never opened -- that, not the trimming, is where the saving is.
+struct PlannedFile {
+    pb::DataFile file;
+    std::uint64_t rows = 0;   // rows this file holds, according to the manifest
+    std::uint64_t skip = 0;   // rows to drop from the front
+    std::uint64_t take = 0;   // rows to keep
+
+    bool partial() const { return skip != 0U || take != rows; }
+};
+
+bool read_data_file_batch(const std::filesystem::path& dataset_path, const PlannedFile& planned,
                           const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema, ArrowArray& batch,
                           std::string& error,
                           const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr) {
+    const pb::DataFile& data_file = planned.file;
     // data_file.path is attacker-controlled (it comes out of the untrusted manifest). Confine it under
     // <dataset>/data/ so a hostile ".."/absolute path can't make the reader open a file outside the
     // dataset. The writer only ever stores a bare filename here, so legitimate datasets are unaffected.
@@ -802,7 +827,30 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const pb::D
         decoded_by_field_id.emplace(field_id, std::move(values));
     }
 
-    const auto length = static_cast<std::int64_t>(descriptor.length);
+    auto length = static_cast<std::int64_t>(descriptor.length);
+
+    if (planned.partial()) {
+        // The plan's skip/take came from the MANIFEST's per-fragment row count, while the rows are
+        // here in the data file. If the two disagree, the arithmetic that decided which files to skip
+        // was wrong, and a silently misaligned row range is exactly the failure this must not have.
+        if (descriptor.length != planned.rows) {
+            error = "data file holds " + std::to_string(descriptor.length) +
+                    " rows but the manifest claims " + std::to_string(planned.rows) +
+                    "; refusing to guess which rows a range covers";
+            return false;
+        }
+        for (auto& [field_id, values] : decoded_by_field_id) {
+            const auto* field = find_mapping_field(mapping, field_id);
+            const std::size_t value_bytes =
+                field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            if (!slice_column_values(values, planned.skip, planned.take, descriptor.length, value_bytes,
+                                     error)) {
+                return false;
+            }
+        }
+        length = static_cast<std::int64_t>(planned.take);
+    }
+
     return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id, length, batch, error);
 }
 
@@ -840,7 +888,7 @@ namespace {
 struct ReadPlan {
     std::filesystem::path dataset_path;
     LanceSchemaMapping mapping;
-    std::vector<pb::DataFile> data_files;  // flattened in fragment-id order
+    std::vector<PlannedFile> files;  // flattened in fragment-id order, range-filtered
     std::unordered_set<std::int32_t> allowed_ids;
     bool projected = false;
 
@@ -849,8 +897,8 @@ struct ReadPlan {
 
 /// Parse the manifest and build the Arrow schema. `column_names` null means every column.
 bool open_read_plan(const std::filesystem::path& dataset_path,
-                    const std::vector<std::string>* column_names, ReadPlan& plan,
-                    ArrowSchema& out_schema, std::string& error) {
+                    const std::vector<std::string>* column_names, const LanceRowRange& range,
+                    ReadPlan& plan, ArrowSchema& out_schema, std::string& error) {
     plan.dataset_path = dataset_path;
 
     pb::Manifest manifest{};
@@ -911,10 +959,65 @@ bool open_read_plan(const std::filesystem::path& dataset_path,
     std::vector<pb::DataFragment> fragments = manifest.fragments;
     std::sort(fragments.begin(), fragments.end(),
               [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
+
+    const bool ranged = !range.is_whole_dataset();
+    std::uint64_t cursor = 0;  // absolute row index of the next fragment's first row
     for (auto& fragment : fragments) {
-        for (auto& data_file : fragment.files) {
-            plan.data_files.push_back(std::move(data_file));
+        if (fragment.files.empty()) {
+            continue;
         }
+        // One batch is emitted per data file, so the reader's row model is "each file holds its own
+        // rows". The manifest only records rows per FRAGMENT, so a multi-file fragment gives no way
+        // to say which rows live in which file. Reading it whole is unaffected; a row range over it
+        // would have to guess, so it is refused by name instead.
+        if (fragment.files.size() > 1U) {
+            if (ranged) {
+                release_schema_if_held(out_schema);
+                error = "cannot read a row range from a dataset whose fragments span several data "
+                        "files: the manifest records rows per fragment, not per file";
+                return false;
+            }
+            for (auto& data_file : fragment.files) {
+                plan.files.push_back(PlannedFile{std::move(data_file), 0U, 0U, 0U});
+            }
+            continue;
+        }
+
+        const auto rows = fragment.physical_rows;
+        const auto first_row = cursor;
+        if (rows > std::numeric_limits<std::uint64_t>::max() - cursor) {
+            release_schema_if_held(out_schema);
+            error = "dataset row count overflows a 64-bit integer";
+            return false;
+        }
+        cursor += rows;
+
+        if (!ranged) {
+            plan.files.push_back(PlannedFile{std::move(fragment.files[0]), rows, 0U, rows});
+            continue;
+        }
+
+        // Half-open intersection of [first_row, first_row + rows) with the requested range. An empty
+        // intersection means the file is dropped from the plan entirely and never opened.
+        const auto want_begin = range.offset;
+        const auto want_end = range.length == LanceRowRange::kAllRows
+                                  ? std::numeric_limits<std::uint64_t>::max()
+                                  : (range.offset > std::numeric_limits<std::uint64_t>::max() - range.length
+                                         ? std::numeric_limits<std::uint64_t>::max()
+                                         : range.offset + range.length);
+        const auto file_end = first_row + rows;
+        const auto begin = std::max(want_begin, first_row);
+        const auto end = std::min(want_end, file_end);
+        if (begin >= end) {
+            continue;
+        }
+        plan.files.push_back(PlannedFile{std::move(fragment.files[0]), rows, begin - first_row, end - begin});
+    }
+
+    if (ranged && range.offset > cursor) {
+        release_schema_if_held(out_schema);
+        error = "row range starts past the end of the dataset (" + std::to_string(cursor) + " rows)";
+        return false;
     }
     return true;
 }
@@ -922,9 +1025,9 @@ bool open_read_plan(const std::filesystem::path& dataset_path,
 /// Decode every data file up front. The eager reads' second half.
 bool read_all_batches(const ReadPlan& plan, ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
                       std::string& error) {
-    for (const auto& data_file : plan.data_files) {
+    for (const auto& planned : plan.files) {
         ArrowArray batch{};
-        if (!read_data_file_batch(plan.dataset_path, data_file, plan.mapping, out_schema, batch, error,
+        if (!read_data_file_batch(plan.dataset_path, planned, plan.mapping, out_schema, batch, error,
                                   plan.allowed())) {
             release_partial_read(out_schema, out_batches);
             return false;
@@ -935,8 +1038,9 @@ bool read_all_batches(const ReadPlan& plan, ArrowSchema& out_schema, std::vector
 }
 
 bool read_dataset_eager(const std::filesystem::path& dataset_path,
-                        const std::vector<std::string>* column_names, ArrowSchema& out_schema,
-                        std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+                        const std::vector<std::string>* column_names, const LanceRowRange& range,
+                        ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
+                        std::string& error, bool trusted_input) {
     error.clear();
     out_batches.clear();
     ArrowSchemaInit(&out_schema);
@@ -946,7 +1050,7 @@ bool read_dataset_eager(const std::filesystem::path& dataset_path,
         trusted_scope.emplace(trusted_read_limits());
     }
     ReadPlan plan;
-    if (!open_read_plan(dataset_path, column_names, plan, out_schema, error)) {
+    if (!open_read_plan(dataset_path, column_names, range, plan, out_schema, error)) {
         return false;
     }
     return read_all_batches(plan, out_schema, out_batches, error);
@@ -957,15 +1061,25 @@ bool read_dataset_eager(const std::filesystem::path& dataset_path,
 bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
                               std::vector<ArrowArray>& out_batches, std::string& error,
                               bool trusted_input) {
-    return read_dataset_eager(dataset_path, /*column_names=*/nullptr, out_schema, out_batches, error,
-                              trusted_input);
+    return read_dataset_eager(dataset_path, /*column_names=*/nullptr, LanceRowRange{}, out_schema,
+                              out_batches, error, trusted_input);
 }
 
 bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_path,
                                         const std::vector<std::string>& column_names,
                                         ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
                                         std::string& error, bool trusted_input) {
-    return read_dataset_eager(dataset_path, &column_names, out_schema, out_batches, error, trusted_input);
+    return read_dataset_eager(dataset_path, &column_names, LanceRowRange{}, out_schema, out_batches,
+                              error, trusted_input);
+}
+
+bool lance_table_read_dataset_range(const std::filesystem::path& dataset_path,
+                                    const std::vector<std::string>* column_names,
+                                    const LanceRowRange& range, ArrowSchema& out_schema,
+                                    std::vector<ArrowArray>& out_batches, std::string& error,
+                                    bool trusted_input) {
+    return read_dataset_eager(dataset_path, column_names, range, out_schema, out_batches, error,
+                              trusted_input);
 }
 
 /// The stream's state. Held by pointer so the public header stays free of the manifest and schema
@@ -987,6 +1101,13 @@ LanceTableStream& LanceTableStream::operator=(LanceTableStream&&) noexcept = def
 bool LanceTableStream::open(const std::filesystem::path& dataset_path,
                             const std::vector<std::string>* column_names, ArrowSchema& out_schema,
                             LanceTableStream& out, std::string& error, bool trusted_input) {
+    return open_range(dataset_path, column_names, LanceRowRange{}, out_schema, out, error, trusted_input);
+}
+
+bool LanceTableStream::open_range(const std::filesystem::path& dataset_path,
+                                  const std::vector<std::string>* column_names,
+                                  const LanceRowRange& range, ArrowSchema& out_schema,
+                                  LanceTableStream& out, std::string& error, bool trusted_input) {
     error.clear();
     ArrowSchemaInit(&out_schema);
 
@@ -997,7 +1118,7 @@ bool LanceTableStream::open(const std::filesystem::path& dataset_path,
 
     auto impl = std::make_unique<Impl>();
     impl->trusted_input = trusted_input;
-    if (!open_read_plan(dataset_path, column_names, impl->plan, out_schema, error)) {
+    if (!open_read_plan(dataset_path, column_names, range, impl->plan, out_schema, error)) {
         return false;
     }
     // The stream keeps its own schema: read_data_file_batch builds each batch against one, and the
@@ -1018,7 +1139,7 @@ bool LanceTableStream::next(ArrowArray& out_batch, std::string& error) {
         error = "stream is not open";
         return false;
     }
-    if (impl_->cursor >= impl_->plan.data_files.size()) {
+    if (impl_->cursor >= impl_->plan.files.size()) {
         return true;  // end of stream: out_batch.release stays null
     }
 
@@ -1028,8 +1149,8 @@ bool LanceTableStream::next(ArrowArray& out_batch, std::string& error) {
     if (impl_->trusted_input) {
         trusted_scope.emplace(trusted_read_limits());
     }
-    const auto& data_file = impl_->plan.data_files[impl_->cursor];
-    if (!read_data_file_batch(impl_->plan.dataset_path, data_file, impl_->plan.mapping, impl_->schema,
+    const auto& planned = impl_->plan.files[impl_->cursor];
+    if (!read_data_file_batch(impl_->plan.dataset_path, planned, impl_->plan.mapping, impl_->schema,
                               out_batch, error, impl_->plan.allowed())) {
         out_batch = ArrowArray{};
         return false;

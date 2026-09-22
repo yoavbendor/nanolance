@@ -334,10 +334,10 @@ pushed down to the decoder so unprojected columns are never touched. **`count_ro
 `read_schema(path)` are done too**, both answered from the manifest without opening a data file
 (0.18 ms against 16 ms for a full read of the same 200k-row dataset).
 
-**Row-range/slice is the one piece still open**, deliberately. Doing it honestly means teaching the
-`ReadPlan` each data file's row offset so fragments outside the range are never opened, and then
-slicing the two boundary batches -- a Python-level `table.slice()` after a full read would buy
-nothing and is not worth an API that implies otherwise.
+**Row-range/slice is DONE too**, built the honest way described here: the `ReadPlan` now knows each
+data file's row span, fragments outside the range are never opened, and only the one or two files a
+range partially covers are trimmed. Measured on a 61 MiB / 16-fragment dataset: a 1,000-row range
+reads in 2.5 ms against 72.1 ms for the whole table (**29x**), at 0.03x the peak memory.
 
 **3.3 Shape the API like the thing it is replacing.** `nanolance.read_table(path, columns=[...])`,
 `nanolance.write_table(table, path, compression=...)` — deliberately `pyarrow.parquet`-shaped, so
