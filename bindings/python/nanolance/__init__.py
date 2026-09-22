@@ -24,9 +24,9 @@ class WriteOptions:
     structural_encoding: bool = True
     blob_uri_dictionary: bool = False
     # Deprecated no-op, kept so existing keyword arguments still work. Nullable-flagged fields are
-    # accepted unconditionally now. A table that actually CONTAINS a null is refused either way, with
-    # a message naming the column and row: nanolance writes no validity information and would
-    # otherwise store 0 / "" in its place.
+    # accepted unconditionally now, and a null VALUE is stored rather than refused -- nanolance writes
+    # Lance's definition-level layer. The few nulls that are still refused (a null struct, a null in a
+    # lance.blob.v2 column) are refused either way, naming the column and row.
     ignore_nullability: bool = True
     append: bool = False
 

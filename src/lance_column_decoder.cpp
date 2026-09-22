@@ -217,47 +217,6 @@ bool split_miniblock_payload(const std::vector<std::uint8_t>& payload, std::vect
     return true;
 }
 
-/// Concatenate every chunk's VALUES buffer, and (when `out_repdef` is given) every chunk's
-/// definition-level buffer alongside it, with one entry per chunk in `out_repdef_counts` so the
-/// caller knows how many values each repdef buffer covers.
-bool parse_miniblock_payload_chunks(const std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& out,
-                                    std::string& error,
-                                    std::vector<std::vector<std::uint8_t>>* out_repdef = nullptr,
-                                    std::vector<std::uint32_t>* out_repdef_counts = nullptr) {
-    out.clear();
-    if (out_repdef != nullptr) {
-        out_repdef->clear();
-    }
-    if (out_repdef_counts != nullptr) {
-        out_repdef_counts->clear();
-    }
-    std::size_t offset = 0;
-    while (offset < payload.size()) {
-        MiniBlockChunkHeader header;
-        if (!read_miniblock_chunk_header(payload, offset, header, error)) {
-            return false;
-        }
-        const auto data_start = offset + 8U;
-        if (header.has_repdef()) {
-            if (out_repdef == nullptr) {
-                error = "miniblock chunk carries definition levels on a path that cannot use them";
-                return false;
-            }
-            out_repdef->emplace_back(payload.begin() + static_cast<std::ptrdiff_t>(data_start),
-                                     payload.begin() +
-                                         static_cast<std::ptrdiff_t>(data_start + header.repdef_size()));
-            if (out_repdef_counts != nullptr) {
-                out_repdef_counts->push_back(header.repdef_values);
-            }
-        }
-        const auto values_start = data_start + header.values_offset();
-        out.insert(out.end(), payload.begin() + static_cast<std::ptrdiff_t>(values_start),
-                   payload.begin() + static_cast<std::ptrdiff_t>(values_start + header.values_size()));
-        offset = (data_start + header.data_size() + 7U) & ~static_cast<std::size_t>(7U);
-    }
-    return true;
-}
-
 bool parse_miniblock_payload_chunk_list(const std::vector<std::uint8_t>& payload,
                                         std::vector<std::vector<std::uint8_t>>& out, std::string& error) {
     out.clear();
@@ -1297,28 +1256,64 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
         const bool zstd = encoding_plan.zstd;
+        const bool nullable = encoding_plan.repdef != nullptr;
+        const auto offset_width = static_cast<std::uint64_t>(out.variable.large ? 8U : 4U);
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
-        std::vector<std::uint8_t> chunk_bytes;
+        std::vector<MiniBlockChunkView> chunks;
         std::vector<std::uint8_t> raw;
+        std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
             if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
                 return false;
             }
-            if (!parse_miniblock_payload_chunks(payload, chunk_bytes, error)) {
+            if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows,
+                                                out, error)) {
                 return false;
             }
-            if (zstd) {
-                // One chunk per page in nanolance's writer, so the payload holds one [u64][zstd] frame.
-                if (!zstd_unframe_buffer(chunk_bytes, raw, error)) {
+            std::uint64_t remaining = page.length;
+            for (auto& chunk : chunks) {
+                if (zstd) {
+                    // The value buffer is a [u64 uncompressed size][zstd frame] envelope.
+                    if (!zstd_unframe_buffer(chunk.values, raw, error)) {
+                        return false;
+                    }
+                    // swap (not move): a move would leave `raw` empty every iteration, discarding its
+                    // capacity right when the next chunk's zstd_unframe_buffer call could have reused it.
+                    std::swap(chunk.values, raw);
+                }
+                // How many values the chunk holds. With definition levels the chunk header states it.
+                // Without them it is still derivable from the chunk itself rather than assumed: a
+                // variable-width chunk starts with an (n+1)-entry offset table and offsets[0] is the
+                // byte position where the data begins, i.e. exactly (n+1) * offset_width. Deriving it
+                // is what lets a multi-chunk page written by stock Lance decode at all -- the previous
+                // code concatenated every chunk and handed the whole page to one offset table, which
+                // only ever worked because nanolance's writer emits one chunk per page.
+                std::uint64_t chunk_values = 0;
+                if (nullable) {
+                    chunk_values = chunk.repdef_values;
+                } else {
+                    const auto data_base = read_list_offset(chunk.values, 0, out.variable.large);
+                    if (data_base < static_cast<std::int64_t>(offset_width) ||
+                        static_cast<std::uint64_t>(data_base) % offset_width != 0U) {
+                        error = "variable-width chunk has no usable offset table";
+                        return false;
+                    }
+                    chunk_values = static_cast<std::uint64_t>(data_base) / offset_width - 1U;
+                }
+                if (chunk_values == 0U || chunk_values > remaining) {
+                    error = "variable-width chunk covers " + std::to_string(chunk_values) +
+                            " values with " + std::to_string(remaining) + " left in the page";
                     return false;
                 }
-                // swap (not move): a move would leave `raw` empty every iteration, discarding its
-                // capacity right when the next page's zstd_unframe_buffer call could have reused it.
-                std::swap(chunk_bytes, raw);
+                if (!decode_variable_width_page(chunk.values, chunk_values, out.variable.large,
+                                                out.variable.offsets, out.variable.data, error)) {
+                    return false;
+                }
+                remaining -= chunk_values;
             }
-            if (!decode_variable_width_page(chunk_bytes, page.length, out.variable.large, out.variable.offsets,
-                                          out.variable.data, error)) {
+            if (remaining != 0U) {
+                error = "variable-width page chunks cover fewer rows than the page declares";
                 return false;
             }
         }

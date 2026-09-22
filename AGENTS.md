@@ -39,11 +39,12 @@ nano_lance_writer_close(&w);
 Lifecycle rules:
 - Schema is locked after the first batch; all batches in a writer session share it.
 - All `set_*` options must be called **before the first `write_batch`**.
-- **Nulls are stored** in fixed-width columns (int, float, bool, timestamp/date/time, decimal,
-  `fixed_size_binary`) via Lance's definition-level layer, and stock Lance reads them back. Still
-  refused, by name: a null in a `utf8`/`binary` column, and a null **struct** (as opposed to a null
-  field inside one). `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility;
-  the manifest's nullable flag now mirrors the Arrow schema, as pylance's does.
+- **Nulls are stored** via Lance's definition-level layer, and stock Lance reads them back: in
+  fixed-width columns (int, float, bool, timestamp/date/time, decimal, `fixed_size_binary`) and in
+  variable-width ones (`utf8`, `binary`). Still refused, by name: a null **struct** (as opposed to a
+  null field inside one), and a null in a `lance.blob.v2` external-reference column.
+  `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility; the manifest's
+  nullable flag now mirrors the Arrow schema, as pylance's does.
 - Types nanolance cannot round-trip are refused at `write_batch` rather than written: `list`,
   `large_utf8`/`large_binary`, Arrow `dictionary` columns, Arrow's `null` type, and a `timestamp`
   whose timezone is a UTC offset rather than an IANA name (Lance panics on those). Supported:

@@ -88,13 +88,14 @@ const ArrowArray* resolve_field_array_impl(const ArrowArray& batch,
 
 // --- Null detection -------------------------------------------------------------------------
 //
-// nanolance does not write Lance validity/definition information yet, so a null slot has nowhere to
-// go. Historically `ignore_nullability` meant "copy the null slot's raw bytes as-is", which turned
+// Historically `ignore_nullability` meant "copy the null slot's raw bytes as-is", which turned
 // [10, null, 30] into [10, 0, 30] and ["x", null] into ["x", ""] with no error and no warning --
 // silent data loss, and the worst kind, because stock Lance reads the result back happily and just
-// reports wrong values. Ingest now refuses a batch that actually contains a null. `ignore_nullability`
-// keeps its job of accepting a *nullable-flagged* field (pyarrow marks essentially everything
-// nullable), but it can no longer cost you data.
+// reports wrong values. Ingest now CAPTURES a validity bitmap per column, which the writer turns
+// into Lance's definition-level layer; the few shapes that layer cannot express (a null struct, a
+// null in a lance.blob.v2 column) are refused by name in data_file_writer.cpp rather than dropped.
+// `ignore_nullability` keeps only its job of accepting a *nullable-flagged* field (pyarrow marks
+// essentially everything nullable), and can no longer cost you data.
 
 /// First row index in [0, length) that is null, or -1 when the array has no nulls.
 /// Arrow's `null_count` is authoritative when non-negative; -1 means "not computed" and we scan the

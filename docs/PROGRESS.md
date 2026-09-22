@@ -16,13 +16,13 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 0.5 Repo slim-down | done for the unambiguous 5.5 MB; the 15.4 MB capture left in place by decision |
 | **Phase 1.3 — read stock-Lance files** | **steps 1 and 2 of 3 done** (parse, oracle, dispatch) |
 | Fuzz coverage for the descriptor parser | done — found one real bug in 25 executions |
-| 1.1 Real nullability | **done for fixed-width columns**, read and write; strings and null structs still refused |
+| 1.1 Real nullability | **done**, read and write, fixed- and variable-width; a null struct is still refused |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | not started |
 | Phase 3 — streaming read, projection in Python | not started |
 | Phase 4 — read-path optimization | not started (deliberately last) |
 
-Test suite: **46 ctest** (was 42) and **146 pytest** (was 22), all passing.
+Test suite: **46 ctest** (was 42) and **168 pytest** (was 22), all passing.
 
 Fuzzers: `nanolance_fuzz_decode` and `nanolance_fuzz_page_layout`, both clean; the longest
 campaign run here was 95,896,936 executions.
@@ -262,6 +262,41 @@ and the Python bindings. `lance_table_read_dataset` released `out_schema` on one
 C shim released it again; `ArrowSchemaRelease` nulls `release` and then dereferences it. The C++ tests
 never caught it because they call the C++ entry point directly, and the Python tests only ever read
 files nanolance had just written. The ownership contract is now uniform and documented.
+
+### Phase 1.1b: nulls in string and binary columns
+
+The definition-level layer built in 1.1 was fixed-width only, which left the most common thing a
+pandas or pyarrow user does — a text column with missing values — refused. It now works, both
+directions, plain and zstd:
+
+```python
+>>> nanolance.write_table(pa.table({"s": ["x", None, "zz"]}), "out.lance")
+>>> lance.dataset("out.lance").to_table().column(0).to_pylist()
+['x', None, 'zz']
+```
+
+On the write side this is the same layer applied to a different value encoding: the variable-width
+`MiniBlockLayout` gains the `f2` repdef encoding and `layers = [3]`, and each chunk gains its level
+buffer ahead of the offsets. The one structural difference is chunking. A variable-width chunk is
+sized by the offsets math rather than by a value count, so a nullable one is additionally capped at
+one FastLanes block (1024 values), the same cap the flat path needed.
+
+Assembling the variable-width `PageLayout` was also **hand-written protobuf with a hardcoded
+submessage length**, in a function that skipped a computed prefix of the fixed-width layout to reuse
+its tail. It now builds the message the same way every other page path does, which is what let the
+nullable variant exist at all.
+
+**The read side got more general than the feature needed.** The variable-width branch concatenated
+every chunk in a page and handed the result to one offset table — correct only because nanolance's
+own writer emits one chunk per page. It now decodes chunk by chunk, and where a fixed-width chunk's
+value count has to be inferred from its byte size, a variable-width chunk's is *derivable*: the chunk
+opens with an `(n+1)`-entry offset table whose first entry is the byte position where the data
+begins, so `n = offsets[0] / offset_width - 1`. That removes an assumption about the writer rather
+than adding a special case for nulls.
+
+Verified on 3000-row string and binary columns across five null patterns (scattered, first row only,
+straddling the 1023/1024/1025 chunk boundary, all-null, none) with compression on and off, plus the
+one-row all-null page, against nanolance's own reader **and** stock Lance in every combination.
 
 ### Fuzzing the descriptor parser
 

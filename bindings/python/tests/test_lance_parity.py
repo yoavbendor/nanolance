@@ -37,6 +37,7 @@ def test_nullable_schema_without_nulls_roundtrips(nullable_table, tmp_path):
     [
         ("a", pa.int32()),
         ("f", pa.bool_()),
+        ("s", pa.string()),
     ],
 )
 def test_null_values_are_stored(column, arrow_type, tmp_path):
@@ -458,11 +459,53 @@ def test_nulls_appearing_in_a_later_chunk(tmp_path):
     assert lance.dataset(str(path)).to_table().column(0).to_pylist() == values
 
 
-def test_string_column_with_nulls_is_refused(tmp_path):
-    """Variable-width columns do not carry definition levels yet -- refused, not silently dropped."""
-    table = pa.table({"s": pa.array(["x", None, "zz"])})
-    with pytest.raises(RuntimeError) as excinfo:
-        nanolance.write_table(table, tmp_path / "strnull.lance")
-    message = str(excinfo.value)
-    assert "string/binary column containing nulls" in message
-    assert "fill_null" in message
+# Variable-width columns carry the same definition-level layer. Their chunks are sized by the
+# offsets math rather than a value count, so a nullable one is additionally capped at one FastLanes
+# block (1024 values) -- which is what makes the boundary cases below worth spelling out.
+
+@pytest.mark.parametrize("arrow_type", [pa.string(), pa.binary()], ids=["utf8", "binary"])
+@pytest.mark.parametrize("compression", [False, True], ids=["plain", "zstd"])
+@pytest.mark.parametrize(
+    "null_at",
+    [
+        pytest.param(lambda i: i % 13 == 0, id="scattered"),
+        pytest.param(lambda i: i == 0, id="first_row_only"),
+        pytest.param(lambda i: i in (1023, 1024, 1025), id="chunk_boundary"),
+        pytest.param(lambda i: True, id="all_null"),
+        pytest.param(lambda i: False, id="none"),
+    ],
+)
+def test_nullable_variable_width_roundtrip(arrow_type, compression, null_at, tmp_path):
+    """Nulls in a string/binary column survive nanolance's round trip and stock Lance's."""
+    lance = require_pylance()
+    n = 3000
+
+    def value_for(i):
+        # Deliberately ragged, including empty values: a null and an empty string are distinct rows
+        # that both occupy zero data bytes, so an offsets bug that conflates them shows up here.
+        raw = ("v%d" % i) * (i % 4)
+        return raw if arrow_type == pa.string() else raw.encode()
+
+    values = [None if null_at(i) else value_for(i) for i in range(n)]
+    table = pa.table({"s": pa.array(values, type=arrow_type)})
+    path = tmp_path / "nullable_var.lance"
+    nanolance.write_table(table, path, compression=compression)
+
+    back = pa.table(nanolance.read_table(path))
+    assert back.column(0).null_count == table.column(0).null_count
+    assert back.column(0).to_pylist() == values
+
+    ref = lance.dataset(str(path)).to_table()
+    assert ref.column(0).null_count == table.column(0).null_count
+    assert ref.column(0).to_pylist() == values
+
+
+@pytest.mark.parametrize("compression", [False, True], ids=["plain", "zstd"])
+def test_nullable_variable_width_single_row(compression, tmp_path):
+    """One row, and that row null: the smallest page that still has to carry a level buffer."""
+    lance = require_pylance()
+    table = pa.table({"s": pa.array([None], type=pa.string())})
+    path = tmp_path / "one_null.lance"
+    nanolance.write_table(table, path, compression=compression)
+    assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == [None]
+    assert lance.dataset(str(path)).to_table().column(0).to_pylist() == [None]

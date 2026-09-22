@@ -176,20 +176,6 @@ std::vector<std::uint8_t> build_mini_block_layout(std::uint32_t bits_per_value_t
     return mini;
 }
 
-/// Byte length of the f3 value_compression submessage that build_mini_block_layout emits, i.e. how
-/// much of its output the variable-width wrappers below replace. Derived rather than assumed: the
-/// wrappers used to skip a fixed 6 bytes, which only held while the width was a single byte.
-std::size_t mini_block_value_compression_prefix(std::uint32_t bits_per_value_token) {
-    std::vector<std::uint8_t> flat;
-    flat.push_back(0x08U);
-    append_varint(flat, bits_per_value_token);
-    std::vector<std::uint8_t> compressive;
-    write_length_delimited(compressive, 1, flat);
-    std::vector<std::uint8_t> prefix;
-    write_length_delimited(prefix, 3, compressive);
-    return prefix.size();
-}
-
 /// page_layout_bytes for a flat page, with the nullable flag threaded through.
 std::vector<std::uint8_t> page_layout_bytes_flat(std::uint32_t bits_token, std::uint64_t rows, bool nullable) {
     std::vector<std::uint8_t> page_layout;
@@ -345,10 +331,11 @@ std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& c
 // Single-chunk fast paths: nanolance emits one chunk per page, so the general vector-based helpers
 // above would otherwise force callers to wrap each chunk in a temporary one-element vector (an extra
 // heap allocation and copy of the whole chunk on every page). These avoid that entirely.
+std::uint16_t miniblock_control_word(std::size_t repdef_bytes, std::size_t value_bytes);
+
 std::vector<std::uint8_t> control_buffer_for(const MiniblockChunk& chunk) {
     std::vector<std::uint8_t> out;
-    const auto words = static_cast<std::uint16_t>((chunk.bytes.size() + 7U) / 8U);
-    append_le16(out, static_cast<std::uint16_t>(words << 4U));
+    append_le16(out, miniblock_control_word(chunk.repdef.size(), chunk.bytes.size()));
     out.push_back(0U);
     out.push_back(0U);
     return out;
@@ -436,36 +423,33 @@ std::vector<std::uint8_t> column_encoding_bytes() {
     return bytes_from_hex("0a1f2f6c616e63652e656e636f64696e67732e436f6c756d6e456e636f64696e6712020a00");
 }
 
-std::vector<std::uint8_t> variable_width_structural_payload(std::uint32_t bits_token, std::uint64_t rows) {
-    const auto mini_block = build_mini_block_layout(bits_token, rows);
-    if (mini_block.size() < 6U) {
-        return mini_block;
+/// MiniBlockLayout for a variable-width (utf8/binary) column: the value buffer holds the offsets
+/// followed by the bytes, so value_compression is CompressiveEncoding{ f2 Variable{ f1 offsets } }
+/// rather than the Flat encoding a fixed-width column uses. Matches IPC2Lance / the Lance reference
+/// PageLayout. `nullable` adds the f2 repdef_compression and the layers=[3] marker in the tail, in
+/// the same places variable_width_structural_payload_zstd puts them.
+std::vector<std::uint8_t> variable_width_structural_payload(std::uint32_t bits_token, std::uint64_t rows,
+                                                            bool nullable) {
+    // CompressiveEncoding{ f2 Variable{ f1 offsets = Flat{ f1 bits } } }.
+    const std::vector<std::uint8_t> value_comp{
+        0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, static_cast<std::uint8_t>(bits_token)};
+    std::vector<std::uint8_t> out;
+    if (nullable) {
+        write_length_delimited(out, 2, repdef_encoding_bytes());
     }
-    // Matches IPC2Lance / Lance reference PageLayout for utf8/binary columns.
-    std::vector<std::uint8_t> wrapped;
-    wrapped.push_back(0x1aU);
-    wrapped.push_back(0x08U);
-    wrapped.push_back(0x12U);
-    wrapped.push_back(0x06U);
-    wrapped.push_back(0x0aU);
-    wrapped.push_back(0x04U);
-    wrapped.push_back(0x0aU);
-    wrapped.push_back(0x02U);
-    wrapped.push_back(0x08U);
-    wrapped.push_back(bits_token);
-    wrapped.insert(wrapped.end(),
-                   mini_block.begin() + static_cast<std::ptrdiff_t>(
-                                            mini_block_value_compression_prefix(bits_token)),
-                   mini_block.end());
-    return wrapped;
+    write_length_delimited(out, 3, value_comp);
+    const auto tail = mini_block_tail(rows, 1U, nullable);
+    out.insert(out.end(), tail.begin(), tail.end());
+    return out;
 }
 
-std::vector<std::uint8_t> page_layout_bytes(std::uint32_t bits_token, std::uint64_t rows, bool variable_width) {
+std::vector<std::uint8_t> page_layout_bytes(std::uint32_t bits_token, std::uint64_t rows, bool variable_width,
+                                            bool nullable = false) {
     std::vector<std::uint8_t> page_layout;
     if (variable_width) {
-        write_length_delimited(page_layout, 1, variable_width_structural_payload(bits_token, rows));
+        write_length_delimited(page_layout, 1, variable_width_structural_payload(bits_token, rows, nullable));
     } else {
-        write_length_delimited(page_layout, 1, build_mini_block_layout(bits_token, rows));
+        write_length_delimited(page_layout, 1, build_mini_block_layout(bits_token, rows, nullable));
     }
 
     std::vector<std::uint8_t> encoding;
@@ -481,7 +465,8 @@ std::vector<std::uint8_t> page_layout_bytes(const LanceField& field, std::uint64
 // Variable-width structural payload whose value_compression is wrapped in General(ZSTD), so the
 // chunk's value buffer is interpreted as [u64 LE uncompressed size][zstd frame]. Byte layout mirrors
 // what lance 7.0 emits for a zstd variable-width column (see memory: lance-zstd-variable-encoding).
-std::vector<std::uint8_t> variable_width_structural_payload_zstd(std::uint8_t bits_token, std::uint64_t rows) {
+std::vector<std::uint8_t> variable_width_structural_payload_zstd(std::uint8_t bits_token, std::uint64_t rows,
+                                                                 bool nullable) {
     // Uncompressed variable CompressiveEncoding body: f2 Variable{ f1 offsets = Flat{ f1 bits } }.
     const std::vector<std::uint8_t> inner_ce{0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, bits_token};
     // General{ f1 BufferCompression{ f1 scheme = ZSTD(2) }, f3 values = inner_ce }.
@@ -490,19 +475,23 @@ std::vector<std::uint8_t> variable_width_structural_payload_zstd(std::uint8_t bi
     // value_compression CompressiveEncoding{ f10 General }.
     std::vector<std::uint8_t> value_comp{0x52, static_cast<std::uint8_t>(general.size())};
     value_comp.insert(value_comp.end(), general.begin(), general.end());
-    // MiniBlockLayout f3 = value_compression, followed by the unchanged f6/f7/f9/f10 tail.
-    std::vector<std::uint8_t> out{0x1a, static_cast<std::uint8_t>(value_comp.size())};
+    // MiniBlockLayout [f2 repdef,] f3 = value_compression, then the tail.
+    std::vector<std::uint8_t> out;
+    if (nullable) {
+        write_length_delimited(out, 2, repdef_encoding_bytes());
+    }
+    out.push_back(0x1aU);
+    out.push_back(static_cast<std::uint8_t>(value_comp.size()));
     out.insert(out.end(), value_comp.begin(), value_comp.end());
-    const auto mini = build_mini_block_layout(bits_token, rows);
-    out.insert(out.end(),
-               mini.begin() + static_cast<std::ptrdiff_t>(mini_block_value_compression_prefix(bits_token)),
-               mini.end());
+    const auto tail = mini_block_tail(rows, 1U, nullable);
+    out.insert(out.end(), tail.begin(), tail.end());
     return out;
 }
 
-std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_token, std::uint64_t rows) {
+std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_token, std::uint64_t rows,
+                                                          bool nullable = false) {
     std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, variable_width_structural_payload_zstd(bits_token, rows));
+    write_length_delimited(page_layout, 1, variable_width_structural_payload_zstd(bits_token, rows, nullable));
     std::vector<std::uint8_t> encoding;
     write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
     write_length_delimited(encoding, 2, page_layout);
@@ -867,7 +856,8 @@ bool build_variable_chunk_bytes(const std::vector<OffsetType>& offsets,
 template <typename OffsetType>
 bool build_variable_chunks(const VariableWidthColumnValues& column,
                            std::vector<MiniblockChunk>& chunks,
-                           std::string& error) {
+                           std::string& error,
+                           std::size_t max_values_per_chunk = 0U) {
     std::vector<OffsetType> offsets;
     if (!read_offsets(column.offsets, offsets, error)) {
         return false;
@@ -889,6 +879,11 @@ bool build_variable_chunks(const VariableWidthColumnValues& column,
         // variable-width writes. The full buffer is now materialized exactly once per finalized chunk.
         std::size_t last_value = first_value + 1U;  // at least one value per chunk (a lone oversized value gets its own)
         while (last_value < total_values) {
+            // A chunk carrying definition levels is limited to one FastLanes block; callers pass
+            // that cap in. Without nulls the chunk is bounded only by its byte budget.
+            if (max_values_per_chunk != 0U && (last_value - first_value) >= max_values_per_chunk) {
+                break;
+            }
             const auto num_values = (last_value + 1U) - first_value;
             const auto data_bytes = static_cast<std::size_t>(offsets[last_value + 1U] - offsets[first_value]);
             const auto packed = padded_size((num_values + 1U) * offset_width + data_bytes, 8U);
@@ -911,11 +906,12 @@ bool build_variable_chunks(const VariableWidthColumnValues& column,
 
 bool build_variable_chunks_for_column(const VariableWidthColumnValues& column,
                                       std::vector<MiniblockChunk>& chunks,
-                                      std::string& error) {
+                                      std::string& error,
+                                      std::size_t max_values_per_chunk = 0U) {
     if (column.large) {
-        return build_variable_chunks<std::int64_t>(column, chunks, error);
+        return build_variable_chunks<std::int64_t>(column, chunks, error, max_values_per_chunk);
     }
-    return build_variable_chunks<std::int32_t>(column, chunks, error);
+    return build_variable_chunks<std::int32_t>(column, chunks, error, max_values_per_chunk);
 }
 
 }  // namespace
@@ -971,13 +967,6 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             if (values.kind == ColumnValues::Kind::BlobV2External) {
                 error = "column '" + field.name +
                         "' is a lance.blob.v2 external reference and cannot carry nulls yet";
-                return false;
-            }
-            if (lance_field_is_variable_width(field.logical_type)) {
-                error = "column '" + field.name +
-                        "' is a string/binary column containing nulls, which nanolance cannot write "
-                        "yet (only fixed-width columns carry definition levels so far). Fill or drop "
-                        "the nulls first (pyarrow: col.fill_null(...), table.drop_null()).";
                 return false;
             }
             if (values.validity.empty()) {
@@ -1517,9 +1506,18 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         }
 
         // Variable-width columns keep the two-phase build (chunks are unequal-sized, driven by the
-        // offsets math in build_variable_chunks_for_column).
-        if (!build_variable_chunks_for_column(values.variable, chunks, error)) {
+        // offsets math in build_variable_chunks_for_column). A nullable column additionally caps each
+        // chunk at one FastLanes block, since that is what a definition-level buffer covers.
+        if (!build_variable_chunks_for_column(values.variable, chunks, error,
+                                              column_has_nulls ? 1024U : 0U)) {
             return false;
+        }
+        if (column_has_nulls) {
+            std::uint64_t row = 0;
+            for (auto& chunk : chunks) {
+                chunk.repdef = pack_definition_levels(values.validity, row, chunk.value_count);
+                row += chunk.value_count;
+            }
         }
 
         const bool zstd_variable = compress;
@@ -1556,8 +1554,10 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.priority = 0;
             const auto bits_token =
                 values.variable.large ? static_cast<std::uint8_t>(0x40U) : static_cast<std::uint8_t>(0x20U);
-            page.encoding = zstd_variable ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count)
-                                          : page_layout_bytes(bits_token, chunk.value_count, true);
+            page.encoding = zstd_variable
+                                ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count,
+                                                                  column_has_nulls)
+                                : page_layout_bytes(bits_token, chunk.value_count, true, column_has_nulls);
             column.pages.push_back(std::move(page));
         }
         columns.push_back(std::move(column));

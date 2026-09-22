@@ -94,9 +94,9 @@ nano_lance_writer_close(&w);
 
 - **Schema locks after the first `write_batch`** — every batch in a session shares it.
 - **Call all `set_*` options before the first `write_batch`** (compression, URI dictionary).
-- **Nulls are stored** in fixed-width columns (int, float, bool, temporal, decimal,
-  `fixed_size_binary`), using Lance's definition-level layer, and stock Lance reads them back. A
-  null in a `utf8`/`binary` column is still refused with a clear message — fill or drop those first.
+- **Nulls are stored**, using Lance's definition-level layer, and stock Lance reads them back —
+  fixed-width (int, float, bool, temporal, decimal, `fixed_size_binary`) and variable-width
+  (`utf8`, `binary`) alike. A null **struct** is still refused with a clear message.
 - **Compression is off by default.** One switch (`set_compression`) picks the right Lance encoding per
   column; see [AGENTS.md §3](AGENTS.md#3-enabling-the-compression-that-was-measured) for the per-type
   table.
