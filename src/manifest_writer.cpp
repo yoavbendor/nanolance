@@ -5,6 +5,8 @@
 
 #include "lance_minimal.pb.hpp"
 #include "nanolance/manifest_reader.hpp"
+#include <sstream>
+#include <iomanip>
 #include "nanolance/schema_mapper.hpp"
 
 #include <array>
@@ -38,8 +40,26 @@ void write_le64(std::ostream& out, std::uint64_t value) {
     }
 }
 
-std::uint64_t next_version(const std::filesystem::path& versions_dir) {
+/// Lance's V2 manifest filename: `u64::MAX - version`, zero-padded to 20 digits.
+std::string manifest_filename(std::uint64_t version, bool v2) {
+    if (!v2) {
+        return std::to_string(version) + ".manifest";
+    }
+    std::ostringstream name;
+    name << std::setfill('0') << std::setw(20)
+         << (std::numeric_limits<std::uint64_t>::max() - version);
+    return name.str() + ".manifest";
+}
+
+/// Next version, and which naming scheme the directory already uses.
+///
+/// The scheme matters as much as the number: stock Lance REFUSES to open a `_versions` directory
+/// holding both schemes ("Found multiple manifest naming schemes in the same directory"). So an
+/// append onto a pylance dataset has to keep writing pylance's names, or nanolance would make the
+/// dataset unreadable by the tool that created it. A fresh dataset keeps nanolance's own V1 naming.
+std::uint64_t next_version(const std::filesystem::path& versions_dir, bool& v2_out) {
     std::uint64_t max_version = 0;
+    v2_out = false;
     std::error_code ec;
     if (!std::filesystem::exists(versions_dir, ec)) {
         return 1;
@@ -48,13 +68,17 @@ std::uint64_t next_version(const std::filesystem::path& versions_dir) {
         if (ec || !entry.is_regular_file()) {
             continue;
         }
+        // Shared with the reader on purpose: this used to be a private copy that parsed the digits
+        // literally, so appending to a pylance dataset (whose manifests are named u64::MAX - version)
+        // numbered the new manifest u64::MAX -- which reads back as version 0, behind everything.
         const auto name = entry.path().filename().string();
-        if (name.size() <= 9 || name.substr(name.size() - 9) != ".manifest") {
-            continue;
-        }
-        try {
-            max_version = std::max(max_version, static_cast<std::uint64_t>(std::stoull(name.substr(0, name.size() - 9))));
-        } catch (...) {
+        std::uint64_t version = 0;
+        if (parse_manifest_version(name, version)) {
+            max_version = std::max(max_version, version);
+            // 20 digits + ".manifest" is V2; see manifest_filename above.
+            if (name.size() == 20U + 9U) {
+                v2_out = true;
+            }
         }
     }
     return max_version + 1;
@@ -74,8 +98,11 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     }
 
     const auto manifest_bytes = pb::encode_manifest(manifest);
-    const auto temp_path = versions_dir / (std::to_string(manifest.version) + ".manifest.tmp");
-    const auto final_path = versions_dir / (std::to_string(manifest.version) + ".manifest");
+    bool existing_is_v2 = false;
+    (void)next_version(versions_dir, existing_is_v2);
+    const auto name = manifest_filename(manifest.version, existing_is_v2);
+    const auto temp_path = versions_dir / (name + ".tmp");
+    const auto final_path = versions_dir / name;
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
         error = "failed to open manifest temp file";
@@ -120,7 +147,8 @@ bool write_dataset_manifest(const std::filesystem::path& dataset_path,
         return false;
     }
 
-    version = next_version(versions_dir);
+    bool unused_v2 = false;
+    version = next_version(versions_dir, unused_v2);
     if (is_append && version == 1) {
         error = "append requested but no manifest version exists";
         return false;
