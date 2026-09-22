@@ -633,7 +633,7 @@ struct ColumnPlan {
     enum class Kind { Skip, Blob, Variable, Fixed } kind = Kind::Skip;
     ArrowArray* array = nullptr;
     const LanceField* field = nullptr;      // Blob path needs the full field
-    const ColumnValues* values = nullptr;
+    ColumnValues* values = nullptr;
     const std::vector<std::string>* dict = nullptr;
     std::size_t width = 0;                   // Fixed
     FixedFmt fmt = FixedFmt::kUnsupported;   // Fixed
@@ -642,7 +642,47 @@ struct ColumnPlan {
 // Bulk-fill a fixed-width child array's data buffer from the already-decoded column bytes.
 /// Attach a decoded validity bitmap to `child`. Arrow buffer 0 is the validity bitmap in exactly the
 /// layout the decoder produces (LSB-first, bit set == valid), so this is a straight copy.
-bool fill_validity(ArrowArray* child, const ColumnValues& values, std::int64_t rows, std::string& error) {
+/// Deallocator for a buffer whose memory is owned by a heap `std::vector<uint8_t>`.
+/// nanoarrow hands `allocator->private_data` straight back to us; it is the vector itself.
+void release_adopted_vector(struct ArrowBufferAllocator* allocator, std::uint8_t* /*ptr*/,
+                            std::int64_t /*size*/) {
+    delete static_cast<std::vector<std::uint8_t>*>(allocator->private_data);
+}
+
+/// Hand a decoded vector's memory to `out` WITHOUT copying it.
+///
+/// This is the whole of plan item 4.1. The decoder produces each column into a std::vector, and every
+/// fill_* helper below used to ArrowBufferAppend it into the Arrow buffer -- so the decoded column and
+/// its Arrow copy were both live, and a single-fragment read peaked at 2.01x the dataset (measured; see
+/// docs/PROGRESS.md). Adopting the vector's storage instead makes that a move.
+///
+/// nanoarrow documents ArrowBufferDeallocator for exactly this ("avoid copying an existing buffer that
+/// was not allocated using the infrastructure provided here"). The vector moves to the heap and the
+/// ArrowBuffer owns it from here on.
+///
+/// An EMPTY vector is deliberately not adopted: ArrowBufferReset only calls the deallocator when
+/// `data != NULL`, so a zero-length vector would leak the heap object it was moved into. An empty
+/// Arrow buffer is already the correct representation, so there is nothing to do.
+bool adopt_into_buffer(std::vector<std::uint8_t>&& bytes, ArrowBuffer* out, std::string& error) {
+    if (bytes.empty()) {
+        return true;
+    }
+    auto* owned = new std::vector<std::uint8_t>(std::move(bytes));
+    if (ArrowBufferSetAllocator(out, ArrowBufferDeallocator(&release_adopted_vector, owned)) !=
+        NANOARROW_OK) {
+        // Only possible if the buffer already holds data, which would mean this column was filled
+        // twice. Refuse rather than leak or double-own.
+        delete owned;
+        error = "cannot adopt a decoded buffer into an Arrow buffer that already holds data";
+        return false;
+    }
+    out->data = owned->data();
+    out->size_bytes = static_cast<std::int64_t>(owned->size());
+    out->capacity_bytes = static_cast<std::int64_t>(owned->capacity());
+    return true;
+}
+
+bool fill_validity(ArrowArray* child, ColumnValues& values, std::int64_t rows, std::string& error) {
     if (values.validity.empty()) {
         child->null_count = 0;
         return true;
@@ -652,27 +692,25 @@ bool fill_validity(ArrowArray* child, const ColumnValues& values, std::int64_t r
         error = "validity bitmap covers fewer rows than the column has";
         return false;
     }
-    ArrowBuffer* validity = ArrowArrayBuffer(child, 0);
-    if (ArrowBufferReserve(validity, static_cast<std::int64_t>(expected)) != NANOARROW_OK) {
-        error = "failed to reserve validity buffer";
+    // The decoder sizes the bitmap to whole bytes over the rows it appended, which can exceed
+    // `expected` only by trailing padding bits Arrow ignores. Trim before adopting so the buffer's
+    // length is exactly what Arrow expects.
+    values.validity.resize(expected);
+    if (!adopt_into_buffer(std::move(values.validity), ArrowArrayBuffer(child, 0), error)) {
         return false;
     }
-    ArrowBufferAppendUnsafe(validity, values.validity.data(), static_cast<std::int64_t>(expected));
     child->null_count = static_cast<std::int64_t>(values.null_count);
     return true;
 }
 
-bool fill_fixed_child(ArrowArray* child, const std::vector<std::uint8_t>& bytes, std::int64_t rows,
+bool fill_fixed_child(ArrowArray* child, std::vector<std::uint8_t>&& bytes, std::int64_t rows,
                       FixedFmt fmt, std::string& error) {
     ArrowBuffer* data = ArrowArrayBuffer(child, 1);
-    // bool is one byte per value on disk but bit-packed (1 bit/value, LSB-first) in the Arrow buffer,
-    // so it cannot be bulk-copied like the wider fixed types; pack the bits here.
+    // bool is the one fixed type that cannot be adopted: it is a byte per value on disk and a BIT per
+    // value in the Arrow buffer, so the bits have to be packed somewhere. They are packed into a fresh
+    // vector, which is then adopted -- so this path still copies once (unavoidably) rather than twice.
     if (fmt == FixedFmt::kBool) {
         const auto packed_bytes = static_cast<std::size_t>((rows + 7) / 8);
-        if (ArrowBufferReserve(data, static_cast<std::int64_t>(packed_bytes)) != NANOARROW_OK) {
-            error = "failed to reserve bool data buffer";
-            return false;
-        }
         std::vector<std::uint8_t> packed(packed_bytes, 0U);
         for (std::int64_t i = 0; i < rows; ++i) {
             if (bytes[static_cast<std::size_t>(i)] != 0U) {
@@ -680,37 +718,32 @@ bool fill_fixed_child(ArrowArray* child, const std::vector<std::uint8_t>& bytes,
                     static_cast<std::uint8_t>(1U << (static_cast<std::size_t>(i) & 7U));
             }
         }
-        ArrowBufferAppendUnsafe(data, packed.data(), static_cast<std::int64_t>(packed.size()));
+        if (!adopt_into_buffer(std::move(packed), data, error)) {
+            return false;
+        }
         child->length = rows;
         return true;
     }
-    if (ArrowBufferReserve(data, static_cast<std::int64_t>(bytes.size())) != NANOARROW_OK) {
-        error = "failed to reserve fixed data buffer";
+    if (!adopt_into_buffer(std::move(bytes), data, error)) {
         return false;
     }
-    ArrowBufferAppendUnsafe(data, bytes.data(), static_cast<std::int64_t>(bytes.size()));
     child->length = rows;
     return true;
 }
 
 // Bulk-fill a variable-width child array's offsets+data buffers from the decoded column.
-bool fill_variable_child(ArrowArray* child, const VariableWidthColumnValues& v, std::int64_t rows,
+bool fill_variable_child(ArrowArray* child, VariableWidthColumnValues& v, std::int64_t rows,
                          std::string& error) {
-    ArrowBuffer* offsets = ArrowArrayBuffer(child, 1);
-    ArrowBuffer* data = ArrowArrayBuffer(child, 2);
-    if (ArrowBufferReserve(offsets, static_cast<std::int64_t>(v.offsets.size())) != NANOARROW_OK ||
-        ArrowBufferReserve(data, static_cast<std::int64_t>(v.data.size())) != NANOARROW_OK) {
-        error = "failed to reserve variable buffers";
+    if (!adopt_into_buffer(std::move(v.offsets), ArrowArrayBuffer(child, 1), error) ||
+        !adopt_into_buffer(std::move(v.data), ArrowArrayBuffer(child, 2), error)) {
         return false;
     }
-    ArrowBufferAppendUnsafe(offsets, v.offsets.data(), static_cast<std::int64_t>(v.offsets.size()));
-    ArrowBufferAppendUnsafe(data, v.data.data(), static_cast<std::int64_t>(v.data.size()));
     child->length = rows;
     return true;
 }
 
 bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaMapping& mapping,
-                             const std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id,
+                             std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id,
                              const std::int64_t length, ArrowArray& batch, std::string& error) {
     if (ArrowArrayInitFromSchema(&batch, &batch_schema, nullptr) != NANOARROW_OK) {
         error = "failed to init batch array from schema";
@@ -838,7 +871,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             // against, and both fill_* helpers set child->length/null_count at the end.
             const bool ok = fill_validity(plan.array, *plan.values, length, error) &&
                             (plan.kind == ColumnPlan::Kind::Fixed
-                                 ? fill_fixed_child(plan.array, plan.values->fixed, length, plan.fmt, error)
+                                 ? fill_fixed_child(plan.array, std::move(plan.values->fixed), length,
+                                                    plan.fmt, error)
                                  : fill_variable_child(plan.array, plan.values->variable, length, error));
             if (!ok) {
                 ArrowArrayRelease(&batch);

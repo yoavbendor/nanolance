@@ -20,9 +20,9 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | **2.1 wheels and 2.3 CI done**; 2.2 install/export deliberately not |
 | Phase 3 — streaming read, projection in Python | **3.2 projection done**; 3.1 streaming, 3.4 parquet2lance next |
-| Phase 4 — read-path optimization | not started (deliberately last) |
+| Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
 
-Test suite: **48 ctest** (was 42) and **197 pytest** (was 22), all passing.
+Test suite: **48 ctest** (was 42) and **198 pytest** (was 22), all passing.
 
 Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout`, `nanolance_fuzz_fsst` and
 `nanolance_fuzz_lz4`, all clean; the longest campaign run here was 95,896,936 executions. Between
@@ -525,6 +525,45 @@ paths were about to be rewritten for 1.1 and 1.3. Those rewrites are done, so th
 
 Both §2.7 and §3.1 of the plan now say this, so the next person to read it is not misled the way I
 nearly was.
+
+## Phase 4.1: decode into the Arrow buffer instead of copying into it
+
+Taken next, out of plan order, because the measurement above showed this -- not streaming -- is what
+removes the 2x read peak.
+
+The decoder produces each column into a `std::vector<uint8_t>`, and every `fill_*` helper then
+`ArrowBufferAppend`ed it into the Arrow buffer. Both were live at once. They now **adopt** the
+vector's storage instead: the vector moves to the heap and the `ArrowBuffer` takes ownership of it
+through `ArrowBufferDeallocator`, which nanoarrow documents for exactly this ("avoid copying an
+existing buffer that was not allocated using the infrastructure provided here"). The copy becomes a
+move.
+
+Measured on a 61 MiB, 4M-row table, and on a 103 MiB table for the timings:
+
+| | before | after |
+|---|---|---|
+| peak RSS, 1 fragment | 2.01x | **1.01x** |
+| peak RSS, 16 fragments | 1.10x | **0.94x** |
+| read, median of 7 | 201 ms | **160 ms** |
+
+So ~20% off the read as well, which is the one benchmark where nanolance still trailed `lance`.
+
+Two details worth keeping:
+
+- **An empty vector is deliberately not adopted.** `ArrowBufferReset` only calls the deallocator when
+  `data != NULL`, so adopting a zero-length vector would leak the heap object it was moved into. An
+  empty Arrow buffer is already the right representation.
+- **`bool` still copies once, unavoidably.** It is a byte per value on disk and a *bit* per value in
+  Arrow, so the bits must be packed somewhere; they are packed into a fresh vector which is then
+  adopted. One copy instead of two.
+
+The regression guard is `test_read_peak_is_about_one_copy_of_the_dataset`, and it was checked in both
+directions: it fails at 2.00x against the old build and passes at 1.01x against the new one. It uses
+a 4M-row table on purpose -- at ~30 MiB the old build measured only 1.50x, close enough to the 1.5x
+threshold to pass by luck on another machine.
+
+Verified under ASan/UBSan/LSan (46/46) as well as the plain build, since this hands raw ownership
+between C++ and Arrow by hand; `fuzz_decode` clean over 1,106,008 runs.
 
 ---
 

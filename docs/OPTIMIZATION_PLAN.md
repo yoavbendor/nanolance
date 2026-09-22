@@ -339,6 +339,11 @@ the measurement in §2.7 moved 4.1 up in value: it, not 3.1, is what removes the
 **4.1 Decode straight into `ArrowBuffer`.** Delete the `ColumnValues` → `ArrowBuffer` copy (§2.4
 cause 2). Largest single win; ~59 MB of redundant traffic on the 1M-row bench.
 
+**DONE**, and taken out of order — see §2.7: this, not 3.1, is what removes the 2× peak. Implemented
+by *adopting* the decoded vector's storage into the `ArrowBuffer` (`ArrowBufferDeallocator`) rather
+than rewriting the decoder to emit `ArrowBuffer`s, which gets the same zero-copy result for a fraction
+of the change. Measured: peak 2.01× → 1.01× (one fragment), read 201 ms → 160 ms.
+
 **4.2 Do not materialize constant columns row-by-row.** Fill the destination buffer once (§2.4
 cause 3), or expose Arrow REE/dictionary where the consumer accepts it. Targets exactly the
 external-blob workload the project is built around.
