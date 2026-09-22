@@ -337,8 +337,9 @@ bool decode_column_page(const std::vector<std::uint8_t>& bytes, ColumnPage& page
 bool decode_map_metadata_entry(const std::vector<std::uint8_t>& nested, std::string& map_key, std::vector<std::uint8_t>& map_value) {
     map_key.clear();
     map_value.clear();
+    // Only the key is tracked: the comment at the return explains why a missing value is legal, and
+    // nothing reads a have_value flag.
     bool have_key = false;
-    bool have_value = false;
     std::size_t pos = 0;
     while (pos < nested.size()) {
         std::uint64_t key = 0;
@@ -356,7 +357,6 @@ bool decode_map_metadata_entry(const std::vector<std::uint8_t>& nested, std::str
             if (!read_bytes(nested, pos, map_value)) {
                 return false;
             }
-            have_value = true;
         } else if (!skip_field(nested, pos, wire_type)) {
             return false;
         }

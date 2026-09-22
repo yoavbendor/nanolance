@@ -208,34 +208,15 @@ std::size_t max_values_per_uncompressed_chunk(std::size_t bytes_per_value) {
     return std::max<std::size_t>(1U, std::min(by_bytes, by_metadata));
 }
 
-std::vector<std::uint8_t> control_buffer_for(const std::vector<MiniblockChunk>& chunks) {
-    std::vector<std::uint8_t> out;
-    out.reserve(chunks.size() * 2U);
-    for (std::size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
-        const auto& chunk = chunks[chunk_index];
-        const auto words = static_cast<std::uint16_t>((chunk.bytes.size() + 7U) / 8U);
-        std::uint16_t entry = static_cast<std::uint16_t>(words << 4U);
-        const bool is_last = chunk_index + 1U == chunks.size();
-        (void)chunk.value_count;
-        entry |= 0U;
-        append_le16(out, entry);
-    }
-    if (out.size() < 4U) {
-        out.push_back(0U);
-        out.push_back(0U);
-    }
-    return out;
-}
-
 // Chunk-meta (control) buffer for a multi-chunk miniblock page with one value buffer per chunk (the
 // structural-dictionary index chunks). Each word is
 // (wrapped_bytes/8 - 1) << 4 | log2(num_values), where wrapped_bytes is the chunk's full footprint in
 // the value buffer as written by miniblock_payload (8-byte chunk header + buffer, padded to 8). Lance
 // requires every non-final chunk to carry a nonzero log2 (num_values = 1 << log2, so full chunks must
-// be a power of two) and derives the final chunk's value count from the page's total item count. The
-// shared control_buffer_for() writes log2=0 for every chunk and sizes the raw buffer, which only works
-// for single-chunk pages; multi-chunk pages (a >1024-row dictionary column) need this exact layout to
-// be readable by stock Lance.
+// be a power of two) and derives the final chunk's value count from the page's total item count.
+// The single-chunk control_buffer_for() below cannot serve here: it always writes log2=0, which is
+// correct only because the one chunk it describes is by definition the final one. A multi-chunk page
+// (a >1024-row dictionary column) needs this exact layout to be readable by stock Lance.
 //
 // The words are u32, matching has_large_chunk=1 in the page layout. They used to be u16 with
 // has_large_chunk=0, and stock Lance rejects that outright: v2_2's validate_page_layout refuses ANY
@@ -358,9 +339,11 @@ std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& c
     return out;
 }
 
-// Single-chunk fast paths: nanolance emits one chunk per page, so the general vector-based helpers
-// above would otherwise force callers to wrap each chunk in a temporary one-element vector (an extra
-// heap allocation and copy of the whole chunk on every page). These avoid that entirely.
+// Single-chunk fast paths: nanolance emits one chunk per page on most paths, so the vector-based
+// miniblock_payload() above would otherwise force callers to wrap each chunk in a temporary
+// one-element vector (an extra heap allocation and copy of the whole chunk on every page). These
+// avoid that entirely. The chunk they describe is always the page's final one, which is why the
+// control word's log2 nibble is unconditionally 0 -- see miniblock_control_word.
 std::uint16_t miniblock_control_word(std::size_t repdef_bytes, std::size_t value_bytes);
 
 std::vector<std::uint8_t> control_buffer_for(const MiniblockChunk& chunk) {
@@ -494,10 +477,6 @@ std::vector<std::uint8_t> page_layout_bytes(std::uint32_t bits_token, std::uint6
     write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
     write_length_delimited(encoding, 2, page_layout);
     return encoding;
-}
-
-std::vector<std::uint8_t> page_layout_bytes(const LanceField& field, std::uint64_t rows) {
-    return page_layout_bytes(flat_bits_per_value(field), rows, false);
 }
 
 // Variable-width structural payload whose value_compression is wrapped in General(ZSTD), so the

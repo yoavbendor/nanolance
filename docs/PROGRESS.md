@@ -22,7 +22,7 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Phase 3 — the Python API a parquet user expects | **3.1–3.4 all done** — streaming, projection, `count_rows`/`read_schema`, `nanolance convert`; row-range/slice open |
 | Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
 
-Test suite: **49 ctest** (was 42) and **224 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **49 ctest** (was 42) and **291 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout`, `nanolance_fuzz_fsst` and
@@ -678,6 +678,76 @@ success for a genuine failure is worse than no test. The `try`/`except` is gone,
 if this regresses, and `test_stock_lance_reads_a_dictionary_encoded_column` asserts it from pytest
 too -- including reading a neighbouring int column on its own, since that is what the whole-file
 validation broke.
+
+## Closing the gaps that let those bugs through
+
+Two silent-corruption bugs landed on this branch within a day of each other. Both were found by
+accident -- one by a streaming test, one by writing the conversion demo -- and neither had to be.
+This section is about why, and what now prevents a third.
+
+### A write -> pylance matrix, because "no test wrote that shape" is the root cause
+
+The dictionary bug survived for months because nothing in the suite wrote a scattered low-cardinality
+string column. Individual encodings had tests; the *matrix* did not exist.
+
+`test_write_encoding_matrix.py` is now that matrix: 21 shapes x 3 write modes (`structural`,
+`--compress`, `--no-structural`), each written and read back by **both** nanolance and stock Lance.
+21 encodings covered -- integer bitpacking, RLE, constant, string constant, scattered dictionary,
+dictionary+RLE, high-cardinality string and binary, float32/64 byte-stream-split, 1-bit bool,
+fixed_size_binary, struct -- plus a nullable variant of each path that has one, since the
+definition-level layer sits in front of the value encoding and is a different code path, not the
+same one with a bitmap.
+
+Three things it asserts that a narrower test would not:
+
+- **Every column read on its own**, not just the whole table. The dictionary bug's signature was an
+  *unrelated* column failing to read, because Lance validates the entire page table before decoding.
+  A whole-table assertion alone reports that as a mystery.
+- **One dataset holding every shape at once.** Writing each shape to its own file cannot catch a
+  column taking its neighbours down with it -- which is precisely what happened.
+- **The same shapes fed as sliced, multi-fragment writes.** Encoding choice and batch slicing are
+  independent axes and the `ArrowArray::offset` bug lived in their product.
+
+Verified in both directions: with the dictionary fix reverted, 7 of the 67 cases fail -- including
+`struct` (its string child picks the dictionary) and both combined-dataset cases. Today all 67 pass.
+
+### The warning ratchet was never switched on
+
+`NANOLANCE_WERROR` defaults `OFF` and **no CI workflow set it**, so every job compiled nanolance's
+own targets with warnings entirely disabled. That is the family the macOS `std::min` break came from.
+
+Turning it on cost 8 findings, all of them dead code or vestigial:
+
+| | |
+|---|---|
+| `control_buffer_for(vector<MiniblockChunk>&)` | dead overload; `control_buffer_for({chunk})` resolves to the scalar one |
+| `page_layout_bytes(const LanceField&, uint64_t)` | dead |
+| `build_array_from_field` + `append_string_values` + `append_fixed_values` | 200 lines left behind by the 4.1/3.1 refactors |
+| `find_mapping_field_by_name` | dead, and containing unreachable `return true;` after `return nullptr;` |
+| `append_varint` in blob_v2_external.cpp | dead |
+| `have_value` in the generated protobuf reader | set, never read |
+| `ArrowBufferView view{value.data(), size}` | clang `-Wmissing-braces`: `data` is a **union**, so the flat form picks its first member by accident rather than intent |
+
+No latent correctness bugs -- which is the point: the ratchet is cheap to close *now* and gets more
+expensive with every month it stays open. It is enabled in `linux-bench.yml` (clang-19) and
+`memory-safety.yml` (gcc-13), so both compilers are covered, and verified clean locally under gcc,
+clang and the ASan/UBSan configuration.
+
+The option stays `OFF` by default on purpose: a downstream build on an unknown compiler must not
+fail because of a warning nanolance's CI has never seen. The scope is nanolance's own three library
+targets -- not FetchContent'd dependencies, the tools or the tests. (`tools/nlance_pagelayout.cpp`
+trips a GCC 13 false positive from inside libstdc++'s `stl_algobase.h`, which is exactly why the
+policy does not extend there.)
+
+### Two more tests that reported success for failure
+
+`smoke_bool_pylance_interop.sh` and `smoke_bss_zstd_pylance_interop.sh` still carried the
+`except Exception: sys.exit(77)` removed from the dict script -- ctest reports 77 as a SKIP. Both
+pass today, so the handler was dormant, but it was a live tripwire that would turn a future
+regression into a green build. Gone. That is the third and fourth instance of this pattern found on
+this branch (after the dict script and `smoke_pagelayout_pylance_interop.sh`'s exit-0), so it is
+worth stating as a rule: **in this repo a test may skip for a missing dependency and for nothing
+else.**
 
 ## Phase 4.1: decode into the Arrow buffer instead of copying into it
 

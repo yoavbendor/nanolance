@@ -255,3 +255,17 @@ on-disk size shrank.
    `encoding` and `nanolance:*` metadata tags set by the writer (Lance ignores those tags and reads the
    real `PageLayout`).
 4. Validate both directions: nanolance write → nanolance read, **and** nanolance write → `lance` read.
+5. **Add the shape to `bindings/python/tests/test_write_encoding_matrix.py`.** That file writes one
+   table of every shape the writer's heuristics can pick, under all three write modes, and asserts
+   both readers agree -- whole table and every column on its own. A dictionary-page bug once made
+   every *other* column in the same file unreadable by Lance and survived for months because no test
+   wrote that shape; the matrix is what closes that gap.
+
+Two repo rules that came out of the same incident:
+
+- **A test may skip for a missing optional dependency and for nothing else.** Four tests here once
+  reported success for a genuine failure (`exit 0`, or `except Exception: sys.exit(77)` which ctest
+  reports as SKIP). Do not add a handler that turns a red result green.
+- **CI builds with `-DNANOLANCE_WERROR=ON`** (`-Wall -Wextra -Werror` on nanolance's own three
+  library targets), in `linux-bench.yml` under clang and `memory-safety.yml` under gcc. The option
+  defaults OFF so a downstream build on an unknown compiler cannot be broken by a new warning.

@@ -62,7 +62,10 @@ bool append_string_child(ArrowArray& array, const std::string& value) {
 }
 
 bool append_large_bytes_child(ArrowArray& array, const std::vector<std::uint8_t>& value) {
-    ArrowBufferView view{value.data(), static_cast<int64_t>(value.size())};
+    // The braces around value.data() are not optional style: ArrowBufferView::data is a UNION, so
+    // the flat form initializes its first member by accident rather than by intent (clang
+    // -Wmissing-braces).
+    ArrowBufferView view{{value.data()}, static_cast<int64_t>(value.size())};
     return ArrowArrayAppendBytes(&array, view) == NANOARROW_OK;
 }
 

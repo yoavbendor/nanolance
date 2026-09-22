@@ -45,14 +45,6 @@ void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
 }
 
-void append_varint(std::vector<std::uint8_t>& out, std::uint64_t value) {
-    while (value >= 0x80U) {
-        out.push_back(static_cast<std::uint8_t>((value & 0x7FU) | 0x80U));
-        value >>= 7U;
-    }
-    out.push_back(static_cast<std::uint8_t>(value));
-}
-
 bool arrow_row_is_null(const ArrowArray& array, std::int64_t row_index) {
     if (array.buffers == nullptr || array.buffers[0] == nullptr) {
         return false;

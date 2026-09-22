@@ -52,9 +52,12 @@ jobs:
 
       - name: Configure (address,undefined)
         run: |
+          # NANOLANCE_WERROR=ON: the gcc side of the warning ratchet (linux-bench.yml is the clang
+          # side). Only nanolance's own three library targets are covered; see CMakeLists.
           cmake -S . -B build-asan -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13 \
+            -DNANOLANCE_WERROR=ON \
             -DNANOLANCE_SANITIZER=address,undefined \
             -DNANOLANCE_BUILD_EXAMPLES=OFF -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
 

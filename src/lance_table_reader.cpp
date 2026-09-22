@@ -20,18 +20,6 @@
 namespace nano_lance {
 namespace {
 
-const LanceField* find_mapping_field_by_name(const LanceSchemaMapping& mapping, const char* name) {
-    if (name == nullptr) {
-        return nullptr;
-    }
-    for (const auto& field : mapping.fields) {
-        if (field.name == name) {
-            return &field;
-        }
-    }
-    return nullptr;
-}
-
 /// Same lookup scoped to one parent, so a struct child named `id` does not resolve to a top-level
 /// `id`. `parent_id` is -1 for top-level fields, matching LanceField::parent_id.
 const LanceField* find_mapping_field_by_name_under(const LanceSchemaMapping& mapping, const char* name,
@@ -220,62 +208,10 @@ bool append_fixed_raw(ArrowArray& array, const std::uint8_t* data, const std::si
     return true;
 }
 
-bool append_fixed_values(ArrowArray& array, const std::vector<std::uint8_t>& bytes, const std::size_t bytes_per_value,
-                         const std::string& arrow_format, std::string& error) {
-    if (bytes.size() % bytes_per_value != 0U) {
-        error = "fixed column bytes not aligned";
-        return false;
-    }
-    const auto num_values = bytes.size() / bytes_per_value;
-    for (std::size_t i = 0; i < num_values; ++i) {
-        if (!append_fixed_raw(array, bytes.data() + i * bytes_per_value, bytes_per_value, arrow_format, error)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool append_one_string(ArrowArray& array, std::string_view value, std::string& error) {
     if (ArrowArrayAppendString(&array, {value.data(), static_cast<int64_t>(value.size())}) != NANOARROW_OK) {
         error = "failed to append string value";
         return false;
-    }
-    return true;
-}
-
-bool append_string_values(ArrowArray& array, const VariableWidthColumnValues& column, std::string& error) {
-    const bool large = column.large;
-    const auto offset_width = large ? 8U : 4U;
-    if (column.offsets.size() % offset_width != 0U) {
-        error = "string offsets not aligned";
-        return false;
-    }
-    const auto num_values = column.offsets.size() / offset_width - 1U;
-    for (std::size_t i = 0; i < num_values; ++i) {
-        std::int64_t start = 0;
-        std::int64_t end = 0;
-        const auto* off = column.offsets.data() + i * offset_width;
-        if (large) {
-            std::memcpy(&start, off, sizeof(start));
-            std::memcpy(&end, off + 8U, sizeof(end));
-        } else {
-            std::int32_t s = 0;
-            std::int32_t e = 0;
-            std::memcpy(&s, off, sizeof(s));
-            std::memcpy(&e, off + 4U, sizeof(e));
-            start = s;
-            end = e;
-        }
-        if (start < 0 || end < start || static_cast<std::size_t>(end) > column.data.size()) {
-            error = "string bounds invalid";
-            return false;
-        }
-        if (!append_one_string(array,
-                               {reinterpret_cast<const char*>(column.data.data() + static_cast<std::size_t>(start)),
-                                static_cast<std::size_t>(end - start)},
-                               error)) {
-            return false;
-        }
     }
     return true;
 }
@@ -355,152 +291,6 @@ bool append_blob_v2_row(ArrowArray& struct_array, const std::vector<std::uint8_t
         error = "failed to finish blob struct element";
         return false;
     }
-    return true;
-}
-
-bool build_array_from_field(const LanceField& field, const LanceSchemaMapping& mapping,
-                            const std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id,
-                            const std::int64_t length, ArrowArray& array, std::string& error) {
-    ArrowSchema schema;
-    if (!init_schema_from_field(field, mapping, schema, error)) {
-        return false;
-    }
-    if (ArrowArrayInitFromSchema(&array, &schema, nullptr) != NANOARROW_OK) {
-        error = "failed to init array from schema";
-        ArrowSchemaRelease(&schema);
-        return false;
-    }
-    ArrowSchemaRelease(&schema);
-    if (ArrowArrayStartAppending(&array) != NANOARROW_OK) {
-        error = "failed to start appending array";
-        ArrowArrayRelease(&array);
-        return false;
-    }
-
-    if (field.logical_type == "struct") {
-        std::vector<const LanceField*> children;
-        for (const auto& candidate : mapping.fields) {
-            if (candidate.parent_id == field.id) {
-                children.push_back(&candidate);
-            }
-        }
-        std::unordered_map<std::string, std::size_t> child_index_by_name;
-        for (std::int64_t c = 0; c < schema.n_children; ++c) {
-            if (schema.children[c]->name != nullptr) {
-                child_index_by_name.emplace(schema.children[c]->name, static_cast<std::size_t>(c));
-            }
-        }
-
-        const ColumnValues* blob_packed = nullptr;
-        const auto blob_col_it = decoded_by_field_id.find(field.id);
-        if (blob_col_it != decoded_by_field_id.end() &&
-            blob_col_it->second.kind == ColumnValues::Kind::BlobV2External) {
-            blob_packed = &blob_col_it->second;
-        }
-
-        std::size_t blob_payload_offset = 0;
-        for (std::int64_t row = 0; row < length; ++row) {
-            for (const auto* child : children) {
-                const auto idx_it = child_index_by_name.find(child->name);
-                if (idx_it == child_index_by_name.end()) {
-                    error = "struct child missing from schema: " + child->name;
-                    ArrowArrayRelease(&array);
-                    return false;
-                }
-                auto* child_array = array.children[static_cast<int64_t>(idx_it->second)];
-                if (child->extension_name == "lance.blob.v2") {
-                    if (blob_packed == nullptr) {
-                        error = "missing packed blob values for " + child->name;
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                    if (row >= static_cast<std::int64_t>(blob_packed->blob_v2.row_packed_sizes.size())) {
-                        error = "blob row index out of range";
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                    const auto row_size = blob_packed->blob_v2.row_packed_sizes[static_cast<std::size_t>(row)];
-                    if (blob_payload_offset + row_size > blob_packed->blob_v2.packed_payload.size()) {
-                        error = "blob packed row out of range";
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                    const std::vector<std::uint8_t> row_bytes(
-                        blob_packed->blob_v2.packed_payload.begin() +
-                            static_cast<std::ptrdiff_t>(blob_payload_offset),
-                        blob_packed->blob_v2.packed_payload.begin() +
-                            static_cast<std::ptrdiff_t>(blob_payload_offset + row_size));
-                    if (!append_blob_v2_row(*child_array, row_bytes, nullptr, error)) {
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                    blob_payload_offset += row_size;
-                    continue;
-                }
-                if (child->column_index < 0) {
-                    continue;
-                }
-                const auto col_it = decoded_by_field_id.find(child->id);
-                if (col_it == decoded_by_field_id.end()) {
-                    error = "missing decoded column for child " + child->name;
-                    ArrowArrayRelease(&array);
-                    return false;
-                }
-                if (lance_field_is_variable_width(child->logical_type)) {
-                    if (!append_string_at_row(*child_array, col_it->second.variable, static_cast<std::size_t>(row),
-                                              error)) {
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                } else {
-                    const auto width = lance_logical_type_value_bytes(child->logical_type);
-                    const auto& bytes = col_it->second.fixed;
-                    if (bytes.size() < (static_cast<std::size_t>(row) + 1U) * width) {
-                        error = "fixed column too short for row";
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                    if (!append_fixed_raw(*child_array,
-                                          bytes.data() + static_cast<std::size_t>(row) * width, width,
-                                          child->arrow_format, error)) {
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                }
-            }
-            if (ArrowArrayFinishElement(&array) != NANOARROW_OK) {
-                error = "failed to finish struct element";
-                ArrowArrayRelease(&array);
-                return false;
-            }
-        }
-    } else {
-        const auto col_it = decoded_by_field_id.find(field.id);
-        if (col_it == decoded_by_field_id.end()) {
-            error = "missing decoded values for " + field.name;
-            ArrowArrayRelease(&array);
-            return false;
-        }
-        if (lance_field_is_variable_width(field.logical_type)) {
-            if (!append_string_values(array, col_it->second.variable, error)) {
-                ArrowArrayRelease(&array);
-                return false;
-            }
-        } else {
-            if (!append_fixed_values(array, col_it->second.fixed,
-                                    lance_logical_type_value_bytes(field.logical_type), field.arrow_format, error)) {
-                ArrowArrayRelease(&array);
-                return false;
-            }
-        }
-    }
-
-    if (ArrowArrayFinishBuildingDefault(&array, nullptr) != NANOARROW_OK) {
-        error = "failed to finish building array";
-        ArrowArrayRelease(&array);
-        return false;
-    }
-    array.length = length;
     return true;
 }
 

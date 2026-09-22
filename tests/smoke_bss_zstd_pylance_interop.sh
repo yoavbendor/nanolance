@@ -41,11 +41,12 @@ import lance
 random.seed(1)
 n = 20000
 vals = [random.uniform(-1e6, 1e6) for _ in range(n)]
-try:
-    table = lance.dataset(sys.argv[1]).to_table()
-except Exception as exc:
-    print(f"bss-zstd interop skipped: {exc}", file=sys.stderr)
-    sys.exit(77)
+# No try/except around this read. It used to swallow any exception and exit 77, which ctest reports
+# as a SKIP -- a green result for a real interop failure. That is exactly how the dictionary page's
+# u16-chunk-grammar bug stayed quiet in the sibling dict script for months. If stock Lance cannot
+# read the byte-stream-split+zstd float column nanolance just wrote, that is a regression and must be
+# reported as one.
+table = lance.dataset(sys.argv[1]).to_table()
 
 assert table.num_rows == n, table.num_rows
 got = table.column(0).to_pylist()
