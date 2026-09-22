@@ -602,6 +602,12 @@ void describe_compressive(const Compressive* node, std::string& out) {
 
 }  // namespace
 
+std::string describe_encoding(const Compressive& node) {
+    std::string out;
+    describe_compressive(&node, out);
+    return out;
+}
+
 std::string describe(const PageLayout& layout) {
     std::string out;
     switch (layout.kind) {

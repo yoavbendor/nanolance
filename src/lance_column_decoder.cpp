@@ -500,6 +500,105 @@ bool unpack_bitpacked_page_dispatch(const std::vector<std::uint8_t>& chunk, std:
 }
 
 
+/// Turn `count` decoded levels into validity bits. Rows accumulate across chunks into one contiguous
+/// bitmap, so a chunk whose row count is not a multiple of 8 leaves the next chunk starting mid-byte;
+/// each bit therefore goes at its ABSOLUTE row index rather than at a per-chunk offset.
+bool append_levels_to_validity(const std::uint16_t* levels, std::uint32_t count,
+                               std::uint64_t rows_already_appended, std::vector<std::uint8_t>& out_validity,
+                               std::uint64_t& out_null_count) {
+    const auto total_rows = rows_already_appended + count;
+    out_validity.resize(static_cast<std::size_t>((total_rows + 7U) / 8U), 0U);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (levels[i] != 0U) {
+            ++out_null_count;  // level 1 == null; the bit stays clear
+            continue;
+        }
+        const auto row = rows_already_appended + i;
+        out_validity[static_cast<std::size_t>(row >> 3U)] |= static_cast<std::uint8_t>(1U << (row & 7U));
+    }
+    return true;
+}
+
+/// Run-length-encoded definition levels, which is what Lance picks when the nulls come in runs or
+/// are very sparse -- a column with a single null in 5000 rows takes this path, not the bit-packed
+/// one. The block is `[u64 LE values_size][run values][run lengths]`, the two widths named by the
+/// descriptor's `Rle{ Flat(value_bits), Flat(length_bits) }`. A run longer than the length type can
+/// hold is split into several entries carrying the same value, so decoding is a plain expansion.
+[[nodiscard]] bool decode_rle_definition_levels(const std::vector<std::uint8_t>& repdef,
+                                                const page_layout::Compressive& encoding,
+                                                std::uint32_t count, std::uint16_t* levels,
+                                                std::string& error) {
+    const auto* values_node = encoding.values.get();
+    const auto* lengths_node = encoding.lengths.get();
+    if (values_node == nullptr || lengths_node == nullptr ||
+        values_node->kind != page_layout::CompressiveKind::kFlat ||
+        lengths_node->kind != page_layout::CompressiveKind::kFlat) {
+        error = "unsupported definition-level encoding: " + page_layout::describe_encoding(encoding);
+        return false;
+    }
+    const auto value_bits = values_node->bits_per_value;
+    const auto length_bits = lengths_node->bits_per_value;
+    if ((value_bits != 8U && value_bits != 16U) ||
+        (length_bits != 8U && length_bits != 16U && length_bits != 32U)) {
+        error = "run-length-encoded definition levels declare unsupported widths (" +
+                std::to_string(value_bits) + "-bit values, " + std::to_string(length_bits) +
+                "-bit run lengths)";
+        return false;
+    }
+    const std::size_t value_bytes = value_bits / 8U;
+    const std::size_t length_bytes = length_bits / 8U;
+
+    if (repdef.size() < 8U) {
+        error = "run-length definition-level buffer is too short for its header";
+        return false;
+    }
+    const auto values_size64 = load_le<std::uint64_t>(repdef.data());
+    if (!fits_size_t(values_size64) || static_cast<std::size_t>(values_size64) > repdef.size() - 8U) {
+        error = "run-length definition-level values buffer runs past the end of the block";
+        return false;
+    }
+    const auto values_size = static_cast<std::size_t>(values_size64);
+    if (values_size % value_bytes != 0U) {
+        error = "run-length definition-level values buffer is not a whole number of values";
+        return false;
+    }
+    const auto runs = values_size / value_bytes;
+    const auto lengths_size = repdef.size() - 8U - values_size;
+    if (lengths_size != runs * length_bytes) {
+        error = "run-length definition-level block has " + std::to_string(runs) + " run values but " +
+                std::to_string(lengths_size) + " bytes of run lengths";
+        return false;
+    }
+
+    const auto* values = repdef.data() + 8U;
+    const auto* lengths = values + values_size;
+    std::uint64_t written = 0;
+    for (std::size_t r = 0; r < runs; ++r) {
+        const std::uint16_t level = value_bytes == 1U ? values[r] : load_le<std::uint16_t>(values + r * 2U);
+        std::uint64_t run = 0;
+        switch (length_bytes) {
+            case 1U: run = lengths[r]; break;
+            case 2U: run = load_le<std::uint16_t>(lengths + r * 2U); break;
+            default: run = load_le<std::uint32_t>(lengths + r * 4U); break;
+        }
+        if (run > count || written + run > count) {
+            error = "run-length definition levels cover more than the chunk's " + std::to_string(count) +
+                    " values";
+            return false;
+        }
+        for (std::uint64_t i = 0; i < run; ++i) {
+            levels[written + i] = level;
+        }
+        written += run;
+    }
+    if (written != count) {
+        error = "run-length definition levels cover " + std::to_string(written) + " of the chunk's " +
+                std::to_string(count) + " values";
+        return false;
+    }
+    return true;
+}
+
 /// Decode one chunk's definition-level buffer, appending one bit per row to `out_validity` (an
 /// Arrow-convention bitmap: LSB-first, bit SET means VALID) and counting the nulls.
 ///
@@ -520,10 +619,17 @@ bool unpack_bitpacked_page_dispatch(const std::vector<std::uint8_t>& chunk, std:
         error = "definition-level chunk covers more than one FastLanes block";
         return false;
     }
+    std::uint16_t levels[1024];
+    if (encoding.kind == page_layout::CompressiveKind::kRle) {
+        if (!decode_rle_definition_levels(repdef, encoding, count, levels, error)) {
+            return false;
+        }
+        return append_levels_to_validity(levels, count, rows_already_appended, out_validity,
+                                         out_null_count);
+    }
     if (encoding.kind != page_layout::CompressiveKind::kBitpacked || encoding.values == nullptr ||
         encoding.values->kind != page_layout::CompressiveKind::kFlat) {
-        error = "unsupported definition-level encoding (only a bit-packed level buffer is decoded "
-                "today; run-length-encoded levels are not)";
+        error = "unsupported definition-level encoding: " + page_layout::describe_encoding(encoding);
         return false;
     }
     const auto width = encoding.values->bits_per_value;
@@ -543,7 +649,6 @@ bool unpack_bitpacked_page_dispatch(const std::vector<std::uint8_t>& chunk, std:
         return false;
     }
     const auto words = repdef.size() / sizeof(std::uint16_t);
-    std::uint16_t levels[1024];
     if (count < 1024U && words == count) {
         std::memcpy(levels, repdef.data(), repdef.size());
     } else if (words == packed_words) {
@@ -557,20 +662,7 @@ bool unpack_bitpacked_page_dispatch(const std::vector<std::uint8_t>& chunk, std:
         return false;
     }
 
-    // Rows accumulate across chunks into one contiguous bitmap, so a chunk whose row count is not a
-    // multiple of 8 leaves the next chunk starting mid-byte. Grow to cover the new rows, then set
-    // each valid bit at its absolute row index.
-    const auto total_rows = rows_already_appended + count;
-    out_validity.resize(static_cast<std::size_t>((total_rows + 7U) / 8U), 0U);
-    for (std::uint32_t i = 0; i < count; ++i) {
-        if (levels[i] != 0U) {
-            ++out_null_count;  // level 1 == null; the bit stays clear
-            continue;
-        }
-        const auto row = rows_already_appended + i;
-        out_validity[static_cast<std::size_t>(row >> 3U)] |= static_cast<std::uint8_t>(1U << (row & 7U));
-    }
-    return true;
+    return append_levels_to_validity(levels, count, rows_already_appended, out_validity, out_null_count);
 }
 
 // ── Encoding selection ───────────────────────────────────────────────────────────────────────────

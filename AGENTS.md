@@ -53,9 +53,9 @@ Lifecycle rules:
   nested `struct`, and `lance.blob.v2` external references.
 - nanolance reads back everything it writes, and now most single-column datasets the Rust `lance`
   crate writes: every fixed-width and temporal type, nullable columns, and `utf8`/`large_utf8`/
-  `binary` including FSST-compressed ones. Still refused **by name**, not misread: run-length-encoded
-  definition levels, an LZ4-compressed dictionary block, and `list`/`struct` columns (see README
-  "What nanolance can read").
+  `binary` including FSST-compressed ones. Still refused **by name**, not misread: an LZ4-compressed
+  buffer (which is how Lance stores a low-cardinality string column's dictionary) and `list`/`struct`
+  columns (see README "What nanolance can read").
 - `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
   adds a fragment to an existing dataset.
 

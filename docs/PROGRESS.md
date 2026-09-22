@@ -22,7 +22,7 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Phase 3 — streaming read, projection in Python | not started |
 | Phase 4 — read-path optimization | not started (deliberately last) |
 
-Test suite: **47 ctest** (was 42) and **177 pytest** (was 22), all passing.
+Test suite: **47 ctest** (was 42) and **183 pytest** (was 22), all passing.
 
 Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout` and `nanolance_fuzz_fsst`, all
 clean; the longest campaign run here was 95,896,936 executions.
@@ -348,6 +348,24 @@ New coverage: `tests/test_fsst.cpp` (refusals, escapes, passthrough, accumulatio
 most 8x, passthrough copies exactly, decoding appends and is deterministic), and the safety
 workflow's PageLayout corpus is now seeded from **stock-Lance-written** datasets too -- FSST strings,
 LZ4 dictionaries and run-length levels are the grammar nanolance's own writer never produces.
+
+### Run-length-encoded definition levels
+
+Lance picks between two encodings for a chunk's definition levels on its own, and the choice is not
+about the column: it is about the *shape* of the nulls. A null every 13th row bit-packs; nulls that
+come in runs, or that are very sparse, are run-length encoded instead. That makes **"one null in 5000
+rows"** -- probably the most ordinary nullable column there is -- a different on-disk encoding from
+"a null every 13th row", and only the second one decoded.
+
+The block is `[u64 LE values_size][run values][run lengths]`, with the two widths named by the
+descriptor's `Rle{ Flat(16), Flat(8) }`. A run longer than the length type can hold is split into
+several entries carrying the same value, so decoding is a plain expansion with no special case.
+
+Verified against pylance across six null shapes -- a single null, two runs, one-in-997, a leading
+run, a trailing run, and alternating -- on `int64` and on an FSST-compressed string column. The
+alternating case is deliberately kept in the same test: Lance chooses the encoding itself, so a test
+fed only run-shaped nulls would quietly stop covering the bit-packed path the day that heuristic
+changed.
 
 ### Fuzzing the descriptor parser
 

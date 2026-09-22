@@ -358,23 +358,6 @@ def test_reads_multi_chunk_pages_written_by_stock_lance(tmp_path):
     assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == list(range(5000))
 
 
-def test_run_length_encoded_definition_levels_are_refused_by_name(tmp_path):
-    """Not yet supported -- but refused explicitly, not misread.
-
-    Lance run-length-encodes the definition levels when nulls come in runs (or are very sparse), so a
-    column with a single null takes a different repdef encoding from one with scattered nulls. Until
-    that decodes, the descriptor is read far enough to say so.
-    """
-    lance = require_pylance()
-    values = [None if i == 7 else i for i in range(5000)]
-    table = pa.table({"v": pa.array(values, type=pa.int64())})
-    path = tmp_path / "rle_levels.lance"
-    lance.write_dataset(table, str(path), mode="overwrite")
-    with pytest.raises(RuntimeError) as excinfo:
-        nanolance.read_table(path)
-    assert "definition-level encoding" in str(excinfo.value)
-
-
 # ── Reading string columns written by stock Lance (FSST) ─────────────────────────────────────────
 # Stock Lance wraps every variable-width column in FSST (CompressiveEncoding field 6), whether or not
 # it actually compressed: below 32 KiB of input the encoder declines and the "compressed" bytes are
@@ -440,6 +423,55 @@ def test_reads_empty_and_null_strings_written_by_stock_lance(tmp_path):
     values = ["" if i % 3 == 0 else (None if i % 5 == 0 else _fsst_sentence(i)) for i in range(n)]
     table = pa.table({"s": pa.array(values, type=pa.string())})
     path = tmp_path / "empties.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+    assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == values
+
+
+# ── Run-length-encoded definition levels ─────────────────────────────────────────────────────────
+# Lance run-length-encodes the definition levels whenever the nulls come in runs or are very sparse,
+# which makes "one null in 5000 rows" a *different* repdef encoding from "a null every 13th row" --
+# `Rle{Flat(16), Flat(8)}` rather than the bit-packed block. The block is
+# [u64 values_size][run values][run lengths]; a run too long for the length type is split into
+# several entries carrying the same value, so decoding is a plain expansion.
+
+
+@pytest.mark.parametrize(
+    "null_at, name",
+    [
+        pytest.param(lambda i: i == 7, "one_null", id="one_null"),
+        pytest.param(lambda i: 100 <= i < 400 or 3000 <= i < 3100, "runs", id="two_runs"),
+        pytest.param(lambda i: i % 997 == 0, "sparse", id="very_sparse"),
+        pytest.param(lambda i: i < 1500, "leading", id="leading_run"),
+        pytest.param(lambda i: i >= 4200, "trailing", id="trailing_run"),
+        pytest.param(lambda i: i % 2 == 0, "alternating", id="alternating"),
+    ],
+)
+def test_reads_run_length_encoded_definition_levels(null_at, name, tmp_path):
+    """Whichever repdef encoding Lance picks, the values and the nulls must both come back.
+
+    `alternating` is here to keep the bit-packed path covered by the same assertions: Lance chooses
+    between the two on its own, so a test that only fed it run-shaped nulls would stop exercising it
+    the day that heuristic changed.
+    """
+    lance = require_pylance()
+    n = 5000
+    values = [None if null_at(i) else i for i in range(n)]
+    table = pa.table({"v": pa.array(values, type=pa.int64())})
+    path = tmp_path / f"{name}.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+
+    back = pa.table(nanolance.read_table(path))
+    assert back.column(0).null_count == table.column(0).null_count
+    assert back.column(0).to_pylist() == values
+
+
+def test_reads_run_length_definition_levels_on_a_string_column(tmp_path):
+    """The levels are decoded before the values, so the two encodings combine independently."""
+    lance = require_pylance()
+    n = 20000
+    values = [None if 500 <= i < 900 else _fsst_sentence(i) for i in range(n)]
+    table = pa.table({"s": pa.array(values, type=pa.string())})
+    path = tmp_path / "rle_levels_fsst.lance"
     lance.write_dataset(table, str(path), mode="overwrite")
     assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == values
 

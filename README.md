@@ -141,9 +141,8 @@ Lance's string compressor switches on):
 | `int64` and the other fixed-width integers | yes |
 | `float64`, `bool`, `fixed_size_binary` | yes |
 | `timestamp`, `date32/64`, `time32/64`, `decimal128/256` | yes |
-| nullable columns (scattered nulls, and all-null) | yes |
+| nullable columns — scattered, all-null, and nulls in **runs** | yes |
 | `utf8`, `large_utf8`, `binary` — including FSST-compressed and nullable | yes |
-| nullable columns whose nulls come in **runs** | no — the definition levels are run-length encoded |
 | a low-cardinality string column | no — Lance stores the dictionary LZ4-compressed |
 | `list`, `struct` | no — not mapped at the manifest level |
 

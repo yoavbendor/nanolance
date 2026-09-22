@@ -141,4 +141,8 @@ bool decode_page_layout(const std::vector<std::uint8_t>& encoding, PageLayout& o
 /// Human-readable one-line summary, for error messages and the differential test's diagnostics.
 std::string describe(const PageLayout& layout);
 
+/// The same, for one encoding subtree -- so a refusal deep in the decode path can name the exact
+/// node it does not implement instead of describing the symptom.
+std::string describe_encoding(const Compressive& node);
+
 }  // namespace nano_lance::page_layout
