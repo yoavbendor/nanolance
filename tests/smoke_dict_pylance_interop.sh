@@ -39,11 +39,12 @@ import lance
 
 n = 50000
 vals = [f"row-{i % 500}" for i in range(n)]
-try:
-    table = lance.dataset(sys.argv[1]).to_table()
-except Exception as exc:
-    print(f"dict interop skipped: {exc}", file=sys.stderr)
-    sys.exit(77)
+# No try/except around this read. It used to swallow any exception and exit 77, which ctest reports
+# as a SKIP -- and it was skipping for a real reason: the dictionary page declared the u16 chunk
+# grammar and stock Lance refuses every miniblock page that does. A green "skip" is exactly how that
+# stayed quiet. The page now declares u32 like the rest, so an exception here is a regression and
+# must be reported as one.
+table = lance.dataset(sys.argv[1]).to_table()
 
 assert table.num_rows == n, table.num_rows
 got = table.column(0).to_pylist()

@@ -187,6 +187,8 @@ std::vector<std::uint8_t> page_layout_bytes_flat(std::uint32_t bits_token, std::
     return encoding;
 }
 
+void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value);  // defined with the other buffer writers
+
 void append_le16(std::vector<std::uint8_t>& out, std::uint16_t value) {
     out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
     out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
@@ -225,8 +227,8 @@ std::vector<std::uint8_t> control_buffer_for(const std::vector<MiniblockChunk>& 
     return out;
 }
 
-// Chunk-meta (control) buffer for a multi-chunk miniblock page with has_large_chunk=false and one
-// value buffer per chunk (the structural-dictionary index chunks). Each u16 word is
+// Chunk-meta (control) buffer for a multi-chunk miniblock page with one value buffer per chunk (the
+// structural-dictionary index chunks). Each word is
 // (wrapped_bytes/8 - 1) << 4 | log2(num_values), where wrapped_bytes is the chunk's full footprint in
 // the value buffer as written by miniblock_payload (8-byte chunk header + buffer, padded to 8). Lance
 // requires every non-final chunk to carry a nonzero log2 (num_values = 1 << log2, so full chunks must
@@ -234,19 +236,26 @@ std::vector<std::uint8_t> control_buffer_for(const std::vector<MiniblockChunk>& 
 // shared control_buffer_for() writes log2=0 for every chunk and sizes the raw buffer, which only works
 // for single-chunk pages; multi-chunk pages (a >1024-row dictionary column) need this exact layout to
 // be readable by stock Lance.
+//
+// The words are u32, matching has_large_chunk=1 in the page layout. They used to be u16 with
+// has_large_chunk=0, and stock Lance rejects that outright: v2_2's validate_page_layout refuses ANY
+// miniblock page without the u32 chunk grammar, before it looks at a single byte. Because that check
+// runs over the whole file's page table, one dictionary-encoded column made every OTHER column in the
+// same dataset unreadable by Lance too. The word's own layout is identical either way -- only the
+// width changes -- so nothing else about the page moved.
 std::vector<std::uint8_t> control_buffer_for_index_chunks(const std::vector<MiniblockChunk>& chunks) {
     std::vector<std::uint8_t> out;
-    out.reserve(chunks.size() * 2U);
+    out.reserve(chunks.size() * 4U);
     for (std::size_t i = 0; i < chunks.size(); ++i) {
         const std::size_t wrapped = ((8U + chunks[i].bytes.size()) + 7U) / 8U * 8U;
-        const auto divided_minus_one = static_cast<std::uint16_t>(wrapped / 8U - 1U);
-        std::uint16_t log_num_values = 0U;
+        const auto divided_minus_one = static_cast<std::uint32_t>(wrapped / 8U - 1U);
+        std::uint32_t log_num_values = 0U;
         if (i + 1U < chunks.size()) {
             for (std::size_t v = chunks[i].value_count; v > 1U; v >>= 1U) {
                 ++log_num_values;
             }
         }
-        append_le16(out, static_cast<std::uint16_t>((divided_minus_one << 4U) | (log_num_values & 0x0FU)));
+        append_le32(out, (divided_minus_one << 4U) | (log_num_values & 0x0FU));
     }
     return out;
 }
@@ -646,7 +655,8 @@ std::vector<std::uint8_t> build_dict_variable_block(const std::vector<std::strin
 
 // PageLayout for structural dictionary with flat bitpacked u32 indices (matches stock Lance for
 // scattered low-cardinality strings): value_compression = InlineBitpacking(32), dictionary =
-// Variable+Flat(32) without general compression, num_buffers=1, has_large_chunk=false.
+// Variable+Flat(32) without general compression, num_buffers=1, has_large_chunk=true (the chunk-meta
+// words are u32 to match -- see control_buffer_for_index_chunks).
 std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items) {
     static const std::uint8_t kF3Bitpack[] = {0x1a, 0x04, 0x2a, 0x02, 0x08, 0x20};
     static const std::uint8_t kF4Dict[] = {0x22, 0x08, 0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20};
@@ -654,7 +664,7 @@ std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std
     structural.insert(structural.end(), kF4Dict, kF4Dict + sizeof(kF4Dict));
     structural.push_back(0x28);  // f5 num_dictionary_items
     append_varint(structural, num_distinct);
-    const auto tail = miniblock_tail(num_items, 1U, false);
+    const auto tail = miniblock_tail(num_items, 1U);
     structural.insert(structural.end(), tail.begin(), tail.end());
 
     std::vector<std::uint8_t> page_layout;
