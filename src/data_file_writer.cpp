@@ -267,6 +267,13 @@ void append_miniblock_chunk(std::vector<std::uint8_t>& out, const MiniblockChunk
         append_le16(out, static_cast<std::uint16_t>(chunk.bytes.size()));      // values
         append_le16(out, 0U);
         out.insert(out.end(), chunk.repdef.begin(), chunk.repdef.end());
+        // Every buffer is padded to 8 bytes after it is written, the header recording the UNPADDED
+        // length. Invisible while a level buffer was always a 128-byte packed block; a short chunk's
+        // raw levels can be any even size, and stock Lance then read the values from the wrong offset
+        // ("Inline bitpacking width 67108864 exceeds 64-bit values").
+        while (out.size() % 8U != 0U) {
+            out.push_back(0U);
+        }
         out.insert(out.end(), chunk.bytes.begin(), chunk.bytes.end());
     }
     while (out.size() % 8U != 0U) {
@@ -295,7 +302,20 @@ std::vector<std::uint8_t> pack_definition_levels(const std::vector<std::uint8_t>
         const bool valid = (validity[static_cast<std::size_t>(row >> 3U)] >> (row & 7U)) & 1U;
         levels[i] = valid ? 0U : 1U;
     }
+    // A short final chunk has two legal spellings, and the choice is not ours: Lance's decoder infers
+    // which one it is FROM THE BUFFER LENGTH, so writing the wrong one is silently misread rather
+    // than rejected. Its rule is to pad up to a full block only when padding costs fewer bits than
+    // packing saves; otherwise the levels go in raw, as plain u16 words. At width 1 that means a tail
+    // of 64 or fewer values is raw -- and 64 is exactly the packed size, so a padded 64-value chunk
+    // is indistinguishable from a raw one and would come back as 64 arbitrary levels.
     const auto packed_words = nano_lance::fastlanes::packed_words_1024<std::uint16_t>(1);
+    const std::size_t padding_cost = 1U * (1024U - count);
+    const std::size_t pack_savings = (16U - 1U) * count;
+    if (count < 1024U && padding_cost >= pack_savings) {
+        std::vector<std::uint8_t> out(count * sizeof(std::uint16_t));
+        std::memcpy(out.data(), levels, out.size());
+        return out;
+    }
     std::vector<std::uint16_t> packed(packed_words);
     nano_lance::fastlanes::pack_1024<std::uint16_t>(1, levels, packed.data());
     std::vector<std::uint8_t> out(packed_words * sizeof(std::uint16_t));
@@ -369,7 +389,10 @@ std::vector<std::uint8_t> miniblock_payload(const MiniblockChunk& chunk) {
 /// definition-level buffer broke that coincidence and stock Lance panicked with "the offset + length
 /// of the sliced Buffer cannot exceed the existing length".
 std::uint16_t miniblock_control_word(std::size_t repdef_bytes, std::size_t value_bytes) {
-    const auto footprint = ((8U + repdef_bytes + value_bytes) + 7U) / 8U;
+    // Each buffer is padded to 8 bytes in the chunk, so the level buffer's padding counts toward the
+    // footprint too -- see append_miniblock_chunk.
+    const auto padded_repdef = (repdef_bytes + 7U) & ~static_cast<std::size_t>(7U);
+    const auto footprint = ((8U + padded_repdef + value_bytes) + 7U) / 8U;
     return static_cast<std::uint16_t>((footprint - 1U) << 4U);
 }
 
@@ -381,12 +404,17 @@ std::uint64_t stream_miniblock_payload_with_repdef(std::ostream& out, const std:
     append_le16(header, static_cast<std::uint16_t>(repdef.size()));
     append_le16(header, static_cast<std::uint16_t>(chunk_bytes));
     append_le16(header, 0U);
+    static constexpr std::array<char, 8> zeros{};
     out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
     out.write(reinterpret_cast<const char*>(repdef.data()), static_cast<std::streamsize>(repdef.size()));
+    // The level buffer is padded to 8 bytes before the values start (see append_miniblock_chunk).
+    const auto repdef_pad = (8U - (repdef.size() % 8U)) % 8U;
+    if (repdef_pad != 0U) {
+        out.write(zeros.data(), static_cast<std::streamsize>(repdef_pad));
+    }
     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(chunk_bytes));
-    std::uint64_t written = 8U + repdef.size() + chunk_bytes;
+    std::uint64_t written = 8U + repdef.size() + repdef_pad + chunk_bytes;
     const auto pad = (8U - (written % 8U)) % 8U;
-    static constexpr std::array<char, 8> zeros{};
     if (pad != 0U) {
         out.write(zeros.data(), static_cast<std::streamsize>(pad));
     }

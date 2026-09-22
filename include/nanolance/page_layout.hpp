@@ -43,6 +43,7 @@ enum class CompressiveKind {
     kVariable = 2,  ///< f2  Variable{ f1 offsets }
     kBitpacked = 4,          ///< f4  Bitpacked{ f1 uncompressed_bits_per_value, f3 values }
     kInlineBitpacking = 5,   ///< f5  InlineBitpacking{ f1 uncompressed_bits_per_value }
+    kFsst = 6,               ///< f6  Fsst{ f1 symbol_table, f2 values }
     kRle = 8,                ///< f8  Rle{ f1 values, f2 lengths }
     kByteStreamSplit = 9,    ///< f9  ByteStreamSplit{ f1 values }
     kGeneral = 10,           ///< f10 General{ f1 BufferCompression{ f1 scheme }, f3 values }
@@ -73,7 +74,11 @@ struct Compressive {
     /// `wire_field`: an unsupported scheme should be refused by number, not silently treated as raw.
     std::uint32_t wire_scheme = 0;
 
-    /// Variable::offsets, ByteStreamSplit::values, General::values, Rle::values.
+    /// Fsst: the serialized symbol table (a fixed 2312 bytes; see nanolance/fsst.hpp). Carried in
+    /// the descriptor rather than the page, because one table covers the whole page.
+    std::vector<std::uint8_t> symbol_table;
+
+    /// Variable::offsets, ByteStreamSplit::values, General::values, Rle::values, Fsst::values.
     std::unique_ptr<Compressive> values;
     /// Rle::lengths.
     std::unique_ptr<Compressive> lengths;

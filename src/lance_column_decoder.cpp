@@ -10,6 +10,7 @@
 #include "nanolance/byte_stream_split.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
+#include "nanolance/fsst.hpp"
 #include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
@@ -135,21 +136,32 @@ bool read_le16(const std::uint8_t* p, std::uint16_t& v) {
 // chunk boundary of a 5000-row column exactly, across the plain, scattered-null and single-null
 // cases. The previous reader hardcoded the no-repdef shape (slots 0 and 2 zero, slot 3 == 0xFEFE),
 // which is why every nullable stock-Lance column failed with "unexpected miniblock payload prefix".
+/// Every buffer inside a miniblock chunk is padded up to 8 bytes AFTER it is written, and the header
+/// records the unpadded length. The padding was invisible while the only level buffer nanolance
+/// produced or met was a full 128-byte packed block; a short chunk's raw level buffer (see
+/// append_definition_levels) can be any even size, and then the values start at the next multiple of
+/// 8, not immediately after the levels.
+constexpr std::size_t kMiniblockAlignment = 8U;
+
+constexpr std::size_t align_to_miniblock(std::size_t bytes) {
+    return (bytes + kMiniblockAlignment - 1U) & ~(kMiniblockAlignment - 1U);
+}
+
 struct MiniBlockChunkHeader {
     std::uint16_t repdef_values = 0;
     std::uint16_t slots[3] = {0, 0, 0};
 
     bool has_repdef() const { return repdef_values != 0U; }
     /// Byte offset of the values buffer relative to the end of the header.
-    std::size_t values_offset() const { return has_repdef() ? slots[0] : 0U; }
+    std::size_t values_offset() const { return has_repdef() ? align_to_miniblock(slots[0]) : 0U; }
     std::size_t values_size() const { return has_repdef() ? slots[1] : slots[0]; }
     std::size_t repdef_size() const { return has_repdef() ? slots[0] : 0U; }
-    /// Total payload bytes the chunk occupies after its header.
+    /// Total payload bytes the chunk occupies after its header, padding included.
     std::size_t data_size() const {
         std::size_t total = 0;
         for (const auto slot : slots) {
             if (slot != 0xFEFEU) {
-                total += slot;
+                total += align_to_miniblock(slot);
             }
         }
         return total;
@@ -345,6 +357,51 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
     return true;
 }
 
+/// Expand one FSST-compressed chunk. `offsets`/`data` are what decode_variable_width_page produced
+/// from the COMPRESSED block -- a dense (num_values + 1) offset table starting at 0 -- and this walks
+/// them, decompressing each value onto the column's own offsets/data buffers.
+///
+/// The two offset widths are deliberately separate: the compressed block's offsets index compressed
+/// bytes and come from the descriptor (`Fsst.values = Variable{Flat(bits)}`), while the output's
+/// index decoded bytes and follow the column's Arrow type.
+[[nodiscard]] bool expand_fsst_values(const fsst::SymbolTable& table,
+                                      const std::vector<std::uint8_t>& offsets, bool offsets_large,
+                                      const std::vector<std::uint8_t>& data, std::uint64_t num_values,
+                                      bool out_large, std::vector<std::uint8_t>& out_offsets,
+                                      std::vector<std::uint8_t>& out_data, std::string& error) {
+    if (num_values == 0U) {
+        return true;
+    }
+    // First chunk of the column also emits the leading 0; later ones continue the buffer.
+    if (out_offsets.empty()) {
+        append_list_offset(out_offsets, 0, out_large);
+    }
+    const auto base = read_list_offset(offsets, 0, offsets_large);
+    for (std::uint64_t i = 0; i < num_values; ++i) {
+        // decode_variable_width_page already proved this table is non-decreasing and inside `data`.
+        const auto start = read_list_offset(offsets, i, offsets_large) - base;
+        const auto end = read_list_offset(offsets, i + 1U, offsets_large) - base;
+        if (start < 0 || end < start || static_cast<std::size_t>(end) > data.size()) {
+            error = "FSST value bounds out of range";
+            return false;
+        }
+        if (!fsst::decompress_value(table, data.data() + start, static_cast<std::size_t>(end - start),
+                                    out_data, error)) {
+            return false;
+        }
+        // A 32-bit offsets column cannot address more than 2 GiB of decoded bytes. FSST expands, so
+        // this is reachable from a file that was itself well under the limit -- check it per value
+        // rather than discovering it as a wrapped negative offset later.
+        if (out_data.size() > default_read_limits().max_uncompressed_bytes ||
+            (!out_large && out_data.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
+            error = "FSST-decoded column exceeds the decoded-size limit";
+            return false;
+        }
+        append_list_offset(out_offsets, static_cast<std::int64_t>(out_data.size()), out_large);
+    }
+    return true;
+}
+
 // Decode one bitpacked page chunk ([bit_width word][FastLanes packed 1024]) into `num_values`
 // little-endian fixed-width values appended to out_fixed.
 template <class T>
@@ -474,16 +531,31 @@ bool unpack_bitpacked_page_dispatch(const std::vector<std::uint8_t>& chunk, std:
         error = "definition levels declare an unsupported width of " + std::to_string(width) + " bits";
         return false;
     }
+    // A chunk shorter than one FastLanes block has two legal spellings, and Lance's own decoder
+    // tells them apart by the buffer's LENGTH: if it holds exactly `count` u16 words the levels are
+    // raw, otherwise it is a padded, packed block. (The encoder pads only when padding costs fewer
+    // bits than packing saves, so at width 1 a tail of 64 or fewer values is always raw.) A 20000-row
+    // nullable binary column from pylance ends in a 32-value chunk, whose 64-byte level buffer this
+    // used to reject outright as "expected 128".
     const auto packed_words = nano_lance::fastlanes::packed_words_1024<std::uint16_t>(width);
-    if (repdef.size() != packed_words * sizeof(std::uint16_t)) {
-        error = "definition-level buffer is " + std::to_string(repdef.size()) + " bytes, expected " +
-                std::to_string(packed_words * sizeof(std::uint16_t));
+    if (repdef.size() % sizeof(std::uint16_t) != 0U) {
+        error = "definition-level buffer is not a whole number of 16-bit words";
         return false;
     }
-    std::vector<std::uint16_t> packed(packed_words);
-    std::memcpy(packed.data(), repdef.data(), repdef.size());
+    const auto words = repdef.size() / sizeof(std::uint16_t);
     std::uint16_t levels[1024];
-    nano_lance::fastlanes::unpack_1024<std::uint16_t>(width, packed.data(), levels);
+    if (count < 1024U && words == count) {
+        std::memcpy(levels, repdef.data(), repdef.size());
+    } else if (words == packed_words) {
+        std::vector<std::uint16_t> packed(packed_words);
+        std::memcpy(packed.data(), repdef.data(), repdef.size());
+        nano_lance::fastlanes::unpack_1024<std::uint16_t>(width, packed.data(), levels);
+    } else {
+        error = "definition-level buffer is " + std::to_string(repdef.size()) + " bytes, expected " +
+                std::to_string(packed_words * sizeof(std::uint16_t)) + " packed or " +
+                std::to_string(count * sizeof(std::uint16_t)) + " raw";
+        return false;
+    }
 
     // Rows accumulate across chunks into one contiguous bitmap, so a chunk whose row count is not a
     // multiple of 8 leaves the next chunk starting mid-byte. Grow to cover the new rows, then set
@@ -541,6 +613,14 @@ struct ColumnEncodingPlan {
     /// kConstant whose layers declare definition levels and which carries no value: Lance's spelling
     /// of a column where every row is null.
     bool constant_all_null = false;
+    /// kVariable written by stock Lance: the page's FSST symbol table, parsed once per column. Empty
+    /// `symbol_count` with `passthrough` set is the ordinary case for a small file -- Lance skips FSST
+    /// below 32 KiB of input but still wraps the page in the encoding.
+    std::optional<fsst::SymbolTable> fsst;
+    /// kVariable: the offset width the descriptor declares for the value block, in bits. Only the
+    /// FSST path consults it -- there the block being decoded is the COMPRESSED one, whose offsets
+    /// index compressed bytes and need not share the column's own offset width.
+    std::uint32_t variable_offset_bits = 0;
     /// Set when the descriptor named something this build does not model, so the error can say what.
     std::string unsupported_reason;
 };
@@ -590,6 +670,29 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
         return true;
     }
     const bool has_dictionary = layout.mini_block.dictionary != nullptr;
+    if (has_dictionary) {
+        // The dictionary block is read as a variable-width (or flat) block, optionally behind one
+        // zstd frame -- that is exactly what nanolance's own `dict` and `dict-rle` pages carry.
+        // Stock Lance may compress it with something else: a unicode-heavy string column comes back
+        // as General{LZ4, Variable}, and decoding that as raw produced "dict block header invalid",
+        // which names the symptom rather than the cause. Refuse by encoding instead.
+        const auto* dict = layout.mini_block.dictionary.get();
+        if (dict->kind == page_layout::CompressiveKind::kGeneral) {
+            if (dict->scheme != page_layout::BufferScheme::kZstd &&
+                dict->scheme != page_layout::BufferScheme::kNone) {
+                out.kind = ColumnEncodingKind::kUnsupported;
+                out.unsupported_reason = "unsupported dictionary encoding in " + page_layout::describe(layout);
+                return true;
+            }
+            dict = dict->values.get();
+        }
+        if (dict == nullptr || (dict->kind != page_layout::CompressiveKind::kVariable &&
+                                dict->kind != page_layout::CompressiveKind::kFlat)) {
+            out.kind = ColumnEncodingKind::kUnsupported;
+            out.unsupported_reason = "unsupported dictionary encoding in " + page_layout::describe(layout);
+            return true;
+        }
+    }
 
     // General{scheme, inner} is a wrapper: unwrap it and remember whether it compresses.
     const page_layout::Compressive* inner = values;
@@ -607,6 +710,36 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
         inner = inner->values.get();
     }
 
+    // Fsst{symbol_table, values} wraps the real value encoding. Unwrap it the same way General is
+    // unwrapped, keeping the symbol table for the decode loop: stock Lance puts every string and
+    // binary column inside this, so refusing it was refusing utf8 from pylance outright.
+    if (inner->kind == page_layout::CompressiveKind::kFsst) {
+        fsst::SymbolTable table;
+        std::string table_error;
+        if (!fsst::parse_symbol_table(inner->symbol_table, table, table_error)) {
+            out.kind = ColumnEncodingKind::kUnsupported;
+            out.unsupported_reason = table_error;
+            return true;
+        }
+        out.fsst = table;
+        if (inner->values == nullptr) {
+            out.kind = ColumnEncodingKind::kUnsupported;
+            out.unsupported_reason = "Fsst encoding has no inner values";
+            return true;
+        }
+        inner = inner->values.get();
+        // Fsst's own values may in turn be General(zstd)-wrapped.
+        if (inner->kind == page_layout::CompressiveKind::kGeneral) {
+            out.zstd = inner->scheme == page_layout::BufferScheme::kZstd;
+            if (inner->values == nullptr) {
+                out.kind = ColumnEncodingKind::kUnsupported;
+                out.unsupported_reason = "General encoding has no inner values";
+                return true;
+            }
+            inner = inner->values.get();
+        }
+    }
+
     switch (inner->kind) {
         case page_layout::CompressiveKind::kRle:
             out.kind = has_dictionary ? ColumnEncodingKind::kDictRle : ColumnEncodingKind::kRle;
@@ -616,6 +749,7 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             return true;
         case page_layout::CompressiveKind::kVariable:
             out.kind = ColumnEncodingKind::kVariable;
+            out.variable_offset_bits = inner->values == nullptr ? 0U : inner->values->bits_per_value;
             return true;
         case page_layout::CompressiveKind::kFlat:
             // bool is Flat{bits_per_value: 1}; that IS how stock Lance represents it, so the
@@ -1257,11 +1391,21 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
         const bool zstd = encoding_plan.zstd;
         const bool nullable = encoding_plan.repdef != nullptr;
-        const auto offset_width = static_cast<std::uint64_t>(out.variable.large ? 8U : 4U);
+        // The offset width of the block actually stored in the chunk. Without FSST that is the
+        // column's own (utf8 -> 32-bit, large_utf8 -> 64-bit). With FSST the stored block is the
+        // COMPRESSED one, whose offsets index compressed bytes and whose width the descriptor
+        // declares independently (Fsst.values = Variable{Flat(bits)}).
+        const bool stored_offsets_large = encoding_plan.fsst && encoding_plan.variable_offset_bits != 0U
+                                              ? encoding_plan.variable_offset_bits == 64U
+                                              : out.variable.large;
+        const auto offset_width = static_cast<std::uint64_t>(stored_offsets_large ? 8U : 4U);
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
         std::vector<MiniBlockChunkView> chunks;
         std::vector<std::uint8_t> raw;
+        // Scratch for the FSST path only; hoisted so their capacity is reused across chunks.
+        std::vector<std::uint8_t> fsst_offsets;
+        std::vector<std::uint8_t> fsst_data;
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
             if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
@@ -1293,7 +1437,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 if (nullable) {
                     chunk_values = chunk.repdef_values;
                 } else {
-                    const auto data_base = read_list_offset(chunk.values, 0, out.variable.large);
+                    const auto data_base = read_list_offset(chunk.values, 0, stored_offsets_large);
                     if (data_base < static_cast<std::int64_t>(offset_width) ||
                         static_cast<std::uint64_t>(data_base) % offset_width != 0U) {
                         error = "variable-width chunk has no usable offset table";
@@ -1306,8 +1450,22 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                             " values with " + std::to_string(remaining) + " left in the page";
                     return false;
                 }
-                if (!decode_variable_width_page(chunk.values, chunk_values, out.variable.large,
-                                                out.variable.offsets, out.variable.data, error)) {
+                if (encoding_plan.fsst) {
+                    // The FSST-compressed bytes are themselves a variable-width block, so decode
+                    // that into scratch buffers first and then expand each value onto the column's.
+                    fsst_offsets.clear();
+                    fsst_data.clear();
+                    if (!decode_variable_width_page(chunk.values, chunk_values, stored_offsets_large,
+                                                    fsst_offsets, fsst_data, error)) {
+                        return false;
+                    }
+                    if (!expand_fsst_values(*encoding_plan.fsst, fsst_offsets, stored_offsets_large,
+                                            fsst_data, chunk_values, out.variable.large,
+                                            out.variable.offsets, out.variable.data, error)) {
+                        return false;
+                    }
+                } else if (!decode_variable_width_page(chunk.values, chunk_values, out.variable.large,
+                                                       out.variable.offsets, out.variable.data, error)) {
                     return false;
                 }
                 remaining -= chunk_values;

@@ -14,7 +14,7 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 0.3 Fix the quick start | done, guarded by a new CI workflow |
 | 0.4 Correct the docs | done, plus the C snippet is now a compiled test |
 | 0.5 Repo slim-down | done for the unambiguous 5.5 MB; the 15.4 MB capture left in place by decision |
-| **Phase 1.3 — read stock-Lance files** | **steps 1 and 2 of 3 done** (parse, oracle, dispatch) |
+| **Phase 1.3 — read stock-Lance files** | **all three steps done** (parse, oracle, dispatch, FSST) |
 | Fuzz coverage for the descriptor parser | done — found one real bug in 25 executions |
 | 1.1 Real nullability | **done**, read and write, fixed- and variable-width; a null struct is still refused |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
@@ -22,10 +22,10 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Phase 3 — streaming read, projection in Python | not started |
 | Phase 4 — read-path optimization | not started (deliberately last) |
 
-Test suite: **46 ctest** (was 42) and **168 pytest** (was 22), all passing.
+Test suite: **47 ctest** (was 42) and **177 pytest** (was 22), all passing.
 
-Fuzzers: `nanolance_fuzz_decode` and `nanolance_fuzz_page_layout`, both clean; the longest
-campaign run here was 95,896,936 executions.
+Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout` and `nanolance_fuzz_fsst`, all
+clean; the longest campaign run here was 95,896,936 executions.
 
 ---
 
@@ -129,7 +129,7 @@ C++-only syntax.
 
 ---
 
-## Phase 1.3: the reader generalization, step 1 of 3
+## Phase 1.3: the reader generalization
 
 **Step 1 (done): parse the descriptor, and prove it agrees with the current dispatch.**
 
@@ -297,6 +297,57 @@ than adding a special case for nulls.
 Verified on 3000-row string and binary columns across five null patterns (scattered, first row only,
 straddling the 1023/1024/1025 chunk boundary, all-null, none) with compression on and off, plus the
 one-row all-null page, against nanolance's own reader **and** stock Lance in every combination.
+
+### Phase 1.3 step 3: FSST, and stock Lance's string columns
+
+`utf8` was the last common type a pylance file could carry that nanolance could not read *at all*.
+The reason was one protobuf field: stock Lance wraps every variable-width column in
+`CompressiveEncoding` field 6, which is **FSST** (Fast Static Symbol Table), with the real value
+encoding nested inside it.
+
+nanolance now decompresses FSST (`src/fsst.cpp`, ~90 lines). Only the decoder: the symbol-table
+*construction* is the whole algorithm, the decode is a table lookup, and nanolance has no reason to
+produce FSST when the uncompressed `Variable` pages it already writes are what stock Lance reads.
+
+Two things about the format were worth the trouble to get exactly right:
+
+- **The lengths follow the symbols, not the 256 slots.** The table is a fixed 2312 bytes
+  (`[u64 header][256 u64 symbols][256 u8 lengths]`), but the encoder writes `n_symbols` symbols and
+  then `n_symbols` lengths *immediately after them*. A 120-symbol table's lengths sit at byte
+  `8 + 120*8`, not `8 + 256*8`.
+- **`encoder_switch = 0` means the bytes are not compressed at all.** Lance skips FSST below 32 KiB
+  of input but still writes the wrapper, so the passthrough case is most small files rather than an
+  edge case.
+
+**A short chunk's definition levels have two legal spellings, and the length tells them apart.**
+Lance packs a level buffer into full 1024-value FastLanes blocks and then either pads the tail up to
+a block or appends it raw as plain `u16` words -- whichever costs fewer bits. At width 1 that means a
+tail of 64 or fewer values is always raw. Its decoder infers which from the buffer's length, so this
+is not a hint: a 20 000-row nullable binary column from pylance ends in a 32-value chunk whose
+64-byte level buffer nanolance rejected outright as "expected 128". The writer now follows the same
+rule, which in turn required the padding below.
+
+**Every buffer inside a miniblock chunk is padded to 8 bytes, and the header records the unpadded
+length.** That was invisible while a level buffer was always a 128-byte block. It is not optional:
+with a raw 62-byte tail and no padding, stock Lance read the values from the wrong offset and died
+with "Inline bitpacking width 67108864 exceeds 64-bit values".
+
+**Also generalized on the way**, because the same code had to be touched:
+
+- Multi-chunk variable-width pages (see 1.1b).
+- The dictionary block's own encoding is now checked. A unicode-heavy string column from Lance is a
+  dictionary page whose dictionary is `General{LZ4, Variable}`; nanolance read it raw and failed with
+  "dict block header invalid", naming the symptom rather than the missing decoder. It now refuses by
+  encoding. (LZ4 itself is still not implemented.)
+
+The stock-Lance read matrix, re-measured column by column, is in the README. What is left: run-length
+definition levels, LZ4 buffers, and `list`/`struct` at the manifest level.
+
+New coverage: `tests/test_fsst.cpp` (refusals, escapes, passthrough, accumulation),
+`tests/fuzz/fuzz_fsst.cpp` (contract-asserting: a refusal carries a reason, a decode expands by at
+most 8x, passthrough copies exactly, decoding appends and is deterministic), and the safety
+workflow's PageLayout corpus is now seeded from **stock-Lance-written** datasets too -- FSST strings,
+LZ4 dictionaries and run-length levels are the grammar nanolance's own writer never produces.
 
 ### Fuzzing the descriptor parser
 

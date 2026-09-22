@@ -51,8 +51,11 @@ Lifecycle rules:
   int/uint 8–64, `float`, `double`, `bool`, `utf8`, `binary`, `fixed_size_binary(N)`, `timestamp`
   (s/ms/us/ns, optionally with an IANA timezone), `date32/64`, `time32/64`, `decimal128/256`,
   nested `struct`, and `lance.blob.v2` external references.
-- nanolance reads back everything it writes, but is **not** a general Lance reader yet — most
-  datasets written by the Rust `lance` crate do not decode (see README "What nanolance can read").
+- nanolance reads back everything it writes, and now most single-column datasets the Rust `lance`
+  crate writes: every fixed-width and temporal type, nullable columns, and `utf8`/`large_utf8`/
+  `binary` including FSST-compressed ones. Still refused **by name**, not misread: run-length-encoded
+  definition levels, an LZ4-compressed dictionary block, and `list`/`struct` columns (see README
+  "What nanolance can read").
 - `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
   adds a fragment to an existing dataset.
 

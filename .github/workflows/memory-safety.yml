@@ -96,7 +96,7 @@ jobs:
             -DNANOLANCE_BUILD_EXAMPLES=OFF -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
 
       - name: Build fuzzers
-        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout -j
+        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst -j
 
       # 2 minutes per push per target is enough to catch regressions; extend for a nightly run.
       - name: Fuzz the decode chain
@@ -141,9 +141,32 @@ jobs:
           PY
           ./build-seed/arrowipc2lance -c -o seed-datasets/plain.lance < seed-datasets/input.arrow
           ./build-seed/arrowipc2lance -c --compress -o seed-datasets/zstd.lance < seed-datasets/input.arrow
+          # Also seed from datasets STOCK Lance wrote. Their descriptors are the ones nanolance's own
+          # writer never produces -- FSST-wrapped strings, LZ4-compressed dictionaries, run-length
+          # definition levels -- which is exactly the grammar the parser has to survive. Best-effort:
+          # a pylance that will not install must not fail the safety job.
+          python3 -m pip install --quiet pylance || true
+          python3 - <<'PY' || true
+          import random, lance, pyarrow as pa
+          random.seed(5)
+          words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+          n = 20000
+          text = [" ".join(random.choice(words) for _ in range(random.randint(3, 12))) + " %d" % i
+                  for i in range(n)]
+          lance.write_dataset(pa.table({
+              "fsst": pa.array(text),
+              "fsst_null": pa.array([None if i % 11 == 0 else text[i] for i in range(n)]),
+              "dict": pa.array([("h\u00e9llo w\u00f6rld " * (i % 5 + 1)) for i in range(n)]),
+              "ints": pa.array([None if i % 13 == 0 else i for i in range(n)], type=pa.int64()),
+          }), "seed-datasets/stock.lance")
+          PY
           mkdir -p corpus-page-layout
           ./build-seed/nlance-pagelayout --dump-corpus corpus-page-layout \
-            seed-datasets/plain.lance seed-datasets/zstd.lance
+            seed-datasets/plain.lance seed-datasets/zstd.lance || true
+          if [ -d seed-datasets/stock.lance ]; then
+            ./build-seed/nlance-pagelayout --dump-corpus corpus-page-layout \
+              seed-datasets/stock.lance || true
+          fi
 
       - name: Fuzz the PageLayout descriptor parser
         env:
@@ -153,6 +176,14 @@ jobs:
           mkdir -p corpus-page-layout-found
           ./build-fuzz/nanolance_fuzz_page_layout -max_total_time=120 -print_final_stats=1 \
             corpus-page-layout-found corpus-page-layout
+
+      - name: Fuzz the FSST decompressor
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-fsst
+          ./build-fuzz/nanolance_fuzz_fsst -max_total_time=120 -print_final_stats=1 corpus-fsst
 
       - name: Upload crash reproducers
         if: failure()

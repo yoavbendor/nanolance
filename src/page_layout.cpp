@@ -179,6 +179,42 @@ bool parse_rle(Cursor c, Compressive& out, int depth, std::string& error) {
     return true;
 }
 
+/// Fsst{ f1 symbol_table (bytes), f2 values (CompressiveEncoding) }. The symbol table is kept raw:
+/// validating it is fsst::parse_symbol_table's job, and a descriptor parser that also rejected a
+/// malformed table would report the wrong kind of error for a page nothing is going to read anyway.
+bool parse_fsst(Cursor c, Compressive& out, int depth, std::string& error) {
+    while (!c.done()) {
+        std::uint64_t key = 0;
+        if (!read_varint(c, key)) {
+            error = "page layout: malformed tag in Fsst";
+            return false;
+        }
+        const auto field = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
+        if (field == 1U && wire == kWireBytes) {
+            if (!read_bytes(c, out.symbol_table)) {
+                error = "page layout: truncated Fsst symbol table";
+                return false;
+            }
+        } else if (field == 2U && wire == kWireBytes) {
+            Cursor sub;
+            if (!read_submessage(c, sub)) {
+                error = "page layout: truncated Fsst values";
+                return false;
+            }
+            auto node = std::make_unique<Compressive>();
+            if (!parse_compressive(sub, *node, depth + 1, error)) {
+                return false;
+            }
+            out.values = std::move(node);
+        } else if (!skip_field(c, wire)) {
+            error = "page layout: malformed Fsst";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool parse_general(Cursor c, Compressive& out, int depth, std::string& error) {
     while (!c.done()) {
         std::uint64_t key = 0;
@@ -274,6 +310,12 @@ bool parse_compressive(Cursor c, Compressive& out, int depth, std::string& error
             case 5U:
                 out.kind = CompressiveKind::kInlineBitpacking;
                 if (!parse_bits_node(sub, out.bits_per_value, error)) {
+                    return false;
+                }
+                break;
+            case 6U:
+                out.kind = CompressiveKind::kFsst;
+                if (!parse_fsst(sub, out, depth, error)) {
                     return false;
                 }
                 break;
@@ -528,6 +570,13 @@ void describe_compressive(const Compressive* node, std::string& out) {
             describe_compressive(node->values.get(), out);
             out += ",lengths=";
             describe_compressive(node->lengths.get(), out);
+            out += "}";
+            return;
+        case CompressiveKind::kFsst:
+            // The symbol table's SIZE, not its bytes: it is 2312 bytes of table, and the one thing a
+            // reader of this line wants to know is whether one is present and well-sized.
+            out += "Fsst{symbols=" + std::to_string(node->symbol_table.size()) + "B,values=";
+            describe_compressive(node->values.get(), out);
             out += "}";
             return;
         case CompressiveKind::kByteStreamSplit:

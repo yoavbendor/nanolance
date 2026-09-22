@@ -133,17 +133,19 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 ### What nanolance can read
 
 nanolance reads back **everything it writes**, and a growing subset of what the Rust `lance` crate
-writes. Measured against `pylance` 12.0.0 at 5 000 rows:
+writes. Measured against `pylance` 12.0.0 at 5 000 rows (20 000 for the FSST cases, which is where
+Lance's string compressor switches on):
 
 | stock-Lance column | nanolance reads it |
 |---|---|
 | `int64` and the other fixed-width integers | yes |
-| `float64`, `bool` | yes |
+| `float64`, `bool`, `fixed_size_binary` | yes |
 | `timestamp`, `date32/64`, `time32/64`, `decimal128/256` | yes |
 | nullable columns (scattered nulls, and all-null) | yes |
+| `utf8`, `large_utf8`, `binary` — including FSST-compressed and nullable | yes |
 | nullable columns whose nulls come in **runs** | no — the definition levels are run-length encoded |
-| `utf8` | no — `CompressiveEncoding` variant 6, and the variable-width chunk framing differs |
-| `list`, `dictionary`, `struct` | no — not mapped at the manifest level |
+| a low-cardinality string column | no — Lance stores the dictionary LZ4-compressed |
+| `list`, `struct` | no — not mapped at the manifest level |
 
 Anything in a "no" row is **refused by name**, not misread. Closing the rest is
 [docs/OPTIMIZATION_PLAN.md](docs/OPTIMIZATION_PLAN.md) §6 step 3; it needs no writer change, because

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 import pyarrow as pa
 import pytest
 
@@ -371,6 +373,93 @@ def test_run_length_encoded_definition_levels_are_refused_by_name(tmp_path):
     with pytest.raises(RuntimeError) as excinfo:
         nanolance.read_table(path)
     assert "definition-level encoding" in str(excinfo.value)
+
+
+# ── Reading string columns written by stock Lance (FSST) ─────────────────────────────────────────
+# Stock Lance wraps every variable-width column in FSST (CompressiveEncoding field 6), whether or not
+# it actually compressed: below 32 KiB of input the encoder declines and the "compressed" bytes are
+# the originals, but the wrapper is there either way. nanolance refused the whole variant, which made
+# `utf8` the last common type a pylance file could carry that nanolance could not read at all.
+
+# Repetitive sentences from a small vocabulary, so the total comfortably clears the 32 KiB threshold
+# and FSST really does build a symbol table (120 symbols, in practice) rather than passing through.
+# Every value ends in its own row number: without that the column is low-cardinality enough that
+# Lance picks a *dictionary* page instead and FSST never appears.
+_FSST_WORDS = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"]
+
+
+def _fsst_sentence(i):
+    rng = random.Random(i)
+    words = " ".join(rng.choice(_FSST_WORDS) for _ in range(rng.randint(3, 12)))
+    return f"{words} {i}"
+
+
+@pytest.mark.parametrize("arrow_type", [pa.string(), pa.large_string(), pa.binary()],
+                         ids=["utf8", "large_utf8", "binary"])
+@pytest.mark.parametrize(
+    "null_at",
+    [
+        pytest.param(lambda i: False, id="none"),
+        pytest.param(lambda i: i % 11 == 0, id="scattered"),
+    ],
+)
+def test_reads_fsst_string_columns_written_by_stock_lance(arrow_type, null_at, tmp_path):
+    lance = require_pylance()
+    n = 20000
+
+    def value_for(i):
+        text = _fsst_sentence(i)
+        return text.encode() if arrow_type == pa.binary() else text
+
+    values = [None if null_at(i) else value_for(i) for i in range(n)]
+    table = pa.table({"s": pa.array(values, type=arrow_type)})
+    path = tmp_path / "fsst.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+
+    back = pa.table(nanolance.read_table(path))
+    assert back.column(0).null_count == table.column(0).null_count
+    assert back.column(0).to_pylist() == values
+
+
+def test_reads_small_string_columns_written_by_stock_lance(tmp_path):
+    """Under 32 KiB Lance still writes the FSST wrapper, with an empty symbol table and the encoder
+    switched off -- so the bytes are verbatim. That passthrough case is most small files, not an
+    edge case."""
+    lance = require_pylance()
+    values = [f"s{i}" for i in range(500)]
+    table = pa.table({"s": pa.array(values, type=pa.string())})
+    path = tmp_path / "small.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+    assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == values
+
+
+def test_reads_empty_and_null_strings_written_by_stock_lance(tmp_path):
+    """An empty string and a null are distinct rows that both occupy zero data bytes."""
+    lance = require_pylance()
+    n = 20000
+    values = ["" if i % 3 == 0 else (None if i % 5 == 0 else _fsst_sentence(i)) for i in range(n)]
+    table = pa.table({"s": pa.array(values, type=pa.string())})
+    path = tmp_path / "empties.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+    assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == values
+
+
+def test_lz4_compressed_dictionary_is_refused_by_name(tmp_path):
+    """Not yet supported -- but refused explicitly, not misread.
+
+    A unicode-heavy string column comes back from Lance as a dictionary page whose dictionary block
+    is General{LZ4, Variable}. nanolance reads a dictionary block raw, so it used to die on the
+    block's header with "dict block header invalid", which describes the symptom rather than the
+    missing decoder.
+    """
+    lance = require_pylance()
+    values = [("h\u00e9llo w\u00f6rld \u00fcn\u00efcode " * (i % 5 + 1)) for i in range(20000)]
+    table = pa.table({"s": pa.array(values, type=pa.string())})
+    path = tmp_path / "lz4_dict.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+    with pytest.raises(RuntimeError) as excinfo:
+        nanolance.read_table(path)
+    assert "unsupported dictionary encoding" in str(excinfo.value)
 
 
 # ── Writing nulls ────────────────────────────────────────────────────────────────────────────────
