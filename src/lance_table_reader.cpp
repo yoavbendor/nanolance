@@ -1038,64 +1038,30 @@ void release_partial_read(ArrowSchema& out_schema, std::vector<ArrowArray>& out_
 
 }  // namespace
 
-bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
-                              std::vector<ArrowArray>& out_batches, std::string& error,
-                              bool trusted_input) {
-    error.clear();
-    out_batches.clear();
-    ArrowSchemaInit(&out_schema);
+namespace {
 
-    std::optional<ScopedReadLimits> trusted_scope;
-    if (trusted_input) {
-        trusted_scope.emplace(trusted_read_limits());
-    }
-
-    pb::Manifest manifest{};
-    std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
-        release_schema_if_held(out_schema);
-        return false;
-    }
+/// Everything a read needs after the manifest has been parsed: where the data files are, how the
+/// on-disk fields map to Arrow, and (for a projected read) which field ids survive.
+///
+/// This exists because the eager read, the projected eager read and the stream below are all the same
+/// two steps -- open, then walk the data files -- and were three copies of the first step. The stream
+/// needs to keep that state alive between `next()` calls, which is what made the duplication worth
+/// removing rather than adding a fourth copy.
+struct ReadPlan {
+    std::filesystem::path dataset_path;
     LanceSchemaMapping mapping;
-    if (!lance_schema_mapping_from_manifest(manifest, mapping, error)) {
-        release_schema_if_held(out_schema);
-        return false;
-    }
-    if (!build_schema_from_mapping(mapping, out_schema, error)) {
-        release_schema_if_held(out_schema);
-        return false;
-    }
+    std::vector<pb::DataFile> data_files;  // flattened in fragment-id order
+    std::unordered_set<std::int32_t> allowed_ids;
+    bool projected = false;
 
-    std::vector<pb::DataFragment> fragments = manifest.fragments;
-    std::sort(fragments.begin(), fragments.end(),
-              [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
+    const std::unordered_set<std::int32_t>* allowed() const { return projected ? &allowed_ids : nullptr; }
+};
 
-    for (const auto& fragment : fragments) {
-        for (const auto& data_file : fragment.files) {
-            ArrowArray batch{};
-            if (!read_data_file_batch(dataset_path, data_file, mapping, out_schema, batch, error)) {
-                release_partial_read(out_schema, out_batches);
-                return false;
-            }
-            out_batches.push_back(batch);
-        }
-    }
-    return true;
-}
-
-bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_path,
-                                        const std::vector<std::string>& column_names,
-                                        ArrowSchema& out_schema,
-                                        std::vector<ArrowArray>& out_batches,
-                                        std::string& error, bool trusted_input) {
-    error.clear();
-    out_batches.clear();
-    ArrowSchemaInit(&out_schema);
-
-    std::optional<ScopedReadLimits> trusted_scope;
-    if (trusted_input) {
-        trusted_scope.emplace(trusted_read_limits());
-    }
+/// Parse the manifest and build the Arrow schema. `column_names` null means every column.
+bool open_read_plan(const std::filesystem::path& dataset_path,
+                    const std::vector<std::string>* column_names, ReadPlan& plan,
+                    ArrowSchema& out_schema, std::string& error) {
+    plan.dataset_path = dataset_path;
 
     pb::Manifest manifest{};
     std::uint64_t version = 0;
@@ -1105,39 +1071,49 @@ bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_pat
     }
     LanceSchemaMapping full_mapping;
     if (!lance_schema_mapping_from_manifest(manifest, full_mapping, error)) {
+        release_schema_if_held(out_schema);
         return false;
     }
 
-    // Collect IDs of requested top-level columns and ALL their descendants.
-    std::unordered_set<std::int32_t> allowed_ids;
-    for (const auto& col_name : column_names) {
-        // Find root field by name.
-        const LanceField* root = nullptr;
-        for (const auto& f : full_mapping.fields) {
-            if (f.parent_id == -1 && f.name == col_name) { root = &f; break; }
-        }
-        if (root == nullptr) {
-            error = "projected column '" + col_name + "' not found in schema";
-            return false;
-        }
-        // BFS to collect root + all descendants.
-        std::vector<std::int32_t> queue = {root->id};
-        while (!queue.empty()) {
-            auto id = queue.back(); queue.pop_back();
-            allowed_ids.insert(id);
+    if (column_names == nullptr) {
+        plan.mapping = std::move(full_mapping);
+    } else {
+        // Collect the requested top-level columns and ALL their descendants: a projected struct
+        // column is only meaningful together with the children that hold its data.
+        for (const auto& col_name : *column_names) {
+            const LanceField* root = nullptr;
             for (const auto& f : full_mapping.fields) {
-                if (f.parent_id == id) queue.push_back(f.id);
+                if (f.parent_id == -1 && f.name == col_name) {
+                    root = &f;
+                    break;
+                }
+            }
+            if (root == nullptr) {
+                release_schema_if_held(out_schema);
+                error = "projected column '" + col_name + "' not found in schema";
+                return false;
+            }
+            std::vector<std::int32_t> queue = {root->id};
+            while (!queue.empty()) {
+                const auto id = queue.back();
+                queue.pop_back();
+                plan.allowed_ids.insert(id);
+                for (const auto& f : full_mapping.fields) {
+                    if (f.parent_id == id) {
+                        queue.push_back(f.id);
+                    }
+                }
+            }
+        }
+        plan.projected = true;
+        for (const auto& f : full_mapping.fields) {
+            if (plan.allowed_ids.count(f.id) != 0U) {
+                plan.mapping.fields.push_back(f);
             }
         }
     }
 
-    // Build a projected LanceSchemaMapping (only allowed fields).
-    LanceSchemaMapping proj_mapping;
-    for (const auto& f : full_mapping.fields) {
-        if (allowed_ids.count(f.id)) proj_mapping.fields.push_back(f);
-    }
-
-    if (!build_schema_from_mapping(proj_mapping, out_schema, error)) {
+    if (!build_schema_from_mapping(plan.mapping, out_schema, error)) {
         release_schema_if_held(out_schema);
         return false;
     }
@@ -1145,18 +1121,130 @@ bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_pat
     std::vector<pb::DataFragment> fragments = manifest.fragments;
     std::sort(fragments.begin(), fragments.end(),
               [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
-
-    for (const auto& fragment : fragments) {
-        for (const auto& data_file : fragment.files) {
-            ArrowArray batch{};
-            if (!read_data_file_batch(dataset_path, data_file, proj_mapping, out_schema, batch, error,
-                                      &allowed_ids)) {
-                release_partial_read(out_schema, out_batches);
-                return false;
-            }
-            out_batches.push_back(batch);
+    for (auto& fragment : fragments) {
+        for (auto& data_file : fragment.files) {
+            plan.data_files.push_back(std::move(data_file));
         }
     }
+    return true;
+}
+
+/// Decode every data file up front. The eager reads' second half.
+bool read_all_batches(const ReadPlan& plan, ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
+                      std::string& error) {
+    for (const auto& data_file : plan.data_files) {
+        ArrowArray batch{};
+        if (!read_data_file_batch(plan.dataset_path, data_file, plan.mapping, out_schema, batch, error,
+                                  plan.allowed())) {
+            release_partial_read(out_schema, out_batches);
+            return false;
+        }
+        out_batches.push_back(batch);
+    }
+    return true;
+}
+
+bool read_dataset_eager(const std::filesystem::path& dataset_path,
+                        const std::vector<std::string>* column_names, ArrowSchema& out_schema,
+                        std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+    error.clear();
+    out_batches.clear();
+    ArrowSchemaInit(&out_schema);
+
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
+    ReadPlan plan;
+    if (!open_read_plan(dataset_path, column_names, plan, out_schema, error)) {
+        return false;
+    }
+    return read_all_batches(plan, out_schema, out_batches, error);
+}
+
+}  // namespace
+
+bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
+                              std::vector<ArrowArray>& out_batches, std::string& error,
+                              bool trusted_input) {
+    return read_dataset_eager(dataset_path, /*column_names=*/nullptr, out_schema, out_batches, error,
+                              trusted_input);
+}
+
+bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_path,
+                                        const std::vector<std::string>& column_names,
+                                        ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
+                                        std::string& error, bool trusted_input) {
+    return read_dataset_eager(dataset_path, &column_names, out_schema, out_batches, error, trusted_input);
+}
+
+/// The stream's state. Held by pointer so the public header stays free of the manifest and schema
+/// mapping types.
+struct LanceTableStream::Impl {
+    ReadPlan plan;
+    ArrowSchema schema{};   // the stream's own copy; the caller got a deep copy at open()
+    std::size_t cursor = 0;
+    bool trusted_input = false;
+
+    ~Impl() { release_schema_if_held(schema); }
+};
+
+LanceTableStream::LanceTableStream() = default;
+LanceTableStream::~LanceTableStream() = default;
+LanceTableStream::LanceTableStream(LanceTableStream&&) noexcept = default;
+LanceTableStream& LanceTableStream::operator=(LanceTableStream&&) noexcept = default;
+
+bool LanceTableStream::open(const std::filesystem::path& dataset_path,
+                            const std::vector<std::string>* column_names, ArrowSchema& out_schema,
+                            LanceTableStream& out, std::string& error, bool trusted_input) {
+    error.clear();
+    ArrowSchemaInit(&out_schema);
+
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
+
+    auto impl = std::make_unique<Impl>();
+    impl->trusted_input = trusted_input;
+    if (!open_read_plan(dataset_path, column_names, impl->plan, out_schema, error)) {
+        return false;
+    }
+    // The stream keeps its own schema: read_data_file_batch builds each batch against one, and the
+    // caller owns (and may release) the schema it was handed the moment open() returns.
+    if (ArrowSchemaDeepCopy(&out_schema, &impl->schema) != NANOARROW_OK) {
+        release_schema_if_held(out_schema);
+        error = "failed to copy the dataset schema for the stream";
+        return false;
+    }
+    out.impl_ = std::move(impl);
+    return true;
+}
+
+bool LanceTableStream::next(ArrowArray& out_batch, std::string& error) {
+    error.clear();
+    out_batch = ArrowArray{};
+    if (impl_ == nullptr) {
+        error = "stream is not open";
+        return false;
+    }
+    if (impl_->cursor >= impl_->plan.data_files.size()) {
+        return true;  // end of stream: out_batch.release stays null
+    }
+
+    // The limits are per-thread and scoped, so a trusted stream has to re-establish them on every
+    // next() -- open()'s scope ended when open() returned.
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (impl_->trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
+    const auto& data_file = impl_->plan.data_files[impl_->cursor];
+    if (!read_data_file_batch(impl_->plan.dataset_path, data_file, impl_->plan.mapping, impl_->schema,
+                              out_batch, error, impl_->plan.allowed())) {
+        out_batch = ArrowArray{};
+        return false;
+    }
+    ++impl_->cursor;
     return true;
 }
 

@@ -114,6 +114,11 @@ import nanolance
 table = pa.table({"id": [1, 2, 3], "name": ["alpha", "beta", "gamma"]})
 nanolance.write_table(table, "out.lance", compression=True)
 assert pa.table(nanolance.read_table("out.lance")).equals(table)
+
+# Column projection, and a fragment-at-a-time stream for datasets bigger than memory:
+nanolance.read_table("out.lance", columns=["name"])
+for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")):
+    ...
 ```
 
 Read on: **[Getting started](getting-started.md)** · **[Memory safety](SAFETY.md)** ·

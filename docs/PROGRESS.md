@@ -19,10 +19,10 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 1.1 Real nullability | **done**, read and write, fixed- and variable-width; a null struct is still refused |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | **2.1 wheels and 2.3 CI done**; 2.2 install/export deliberately not |
-| Phase 3 — streaming read, projection in Python | **3.2 projection done**; 3.1 streaming, 3.4 parquet2lance next |
+| Phase 3 — streaming read, projection in Python | **3.1 streaming and 3.2 projection done**; 3.3 API polish, 3.4 parquet2lance next |
 | Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
 
-Test suite: **48 ctest** (was 42) and **198 pytest** (was 22), all passing.
+Test suite: **49 ctest** (was 42) and **209 pytest** (was 22), all passing.
 
 Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout`, `nanolance_fuzz_fsst` and
 `nanolance_fuzz_lz4`, all clean; the longest campaign run here was 95,896,936 executions. Between
@@ -526,6 +526,80 @@ paths were about to be rewritten for 1.1 and 1.3. Those rewrites are done, so th
 Both §2.7 and §3.1 of the plan now say this, so the next person to read it is not misled the way I
 nearly was.
 
+### 3.1 Streaming read
+
+`nanolance.open_stream(path, columns=None)` returns an Arrow C stream that decodes **one fragment per
+pull** instead of every fragment up front.
+
+Measured on a 61 MiB / 16-fragment dataset:
+
+| | eager `read_table` | `open_stream` |
+|---|---|---|
+| peak RSS | 61.4 MiB (1.01x) | **5.6 MiB (0.09x)** |
+| time to first batch | 66.5 ms | **3.2 ms** |
+
+Which is exactly what the corrected §2.7 predicted: streaming buys **larger-than-memory datasets and
+latency**, and 4.1 is what bought the 1.01x. Neither subsumes the other, and together a read now
+costs about one fragment.
+
+**The design decision worth recording: this is a new entry point, not a change to `read_table`.**
+
+My first attempt made `read_table` itself stream, which looked like a free win — same signature, same
+result, less memory. Two existing tests failed, and they were right to:
+
+- `test_failed_read_raises_instead_of_crashing` — a corrupt dataset used to raise from
+  `read_table(...)`. Streaming defers the decode, so the open succeeds and the error surfaces later,
+  from whoever pulls a batch. Anyone with `try: read_table(...) except:` around the call gets an
+  uncaught exception from somewhere else entirely.
+- the exception *type* changes too: `RuntimeError` from our own error path becomes `OSError`, raised
+  by pyarrow when the stream's `get_next` reports a failure.
+
+Both are silent API breaks — the kind that passes review because the diff looks like a pure
+improvement. So `read_table` keeps its eager contract and its up-front errors, `open_stream` is a
+separate function, and its docstring states the two differences outright. A caller who wants the
+memory profile opts into the different error behaviour explicitly.
+
+**How it is built.** The eager and streaming paths share one `ReadPlan` (dataset path, schema
+mapping, data files, projected field ids) produced by `open_read_plan`; `read_dataset_eager` loops it
+to completion, `LanceTableStream` holds it and advances a cursor per `next()`. So projection,
+validation and the read limits are defined once. Two details that bit:
+
+- **`ScopedReadLimits` is thread-local and scoped**, so the stream re-establishes it inside every
+  `next()` rather than once at open — otherwise the limits silently stopped applying to every batch
+  after the first.
+- **The stream owns a deep copy of the schema** (`ArrowSchemaDeepCopy`), and `get_schema` hands out a
+  fresh copy per call, because the C data interface lets a consumer call it more than once and
+  release each result.
+
+On the Python side `ExportedStream` is single-shot: exporting the capsule twice raises "already been
+consumed" instead of handing out a second owner of the same `ArrowArrayStream`.
+
+This work is also what found the `ArrowArray::offset` writer bug fixed in the preceding commit — the
+streaming tests were the first in the repo to feed the writer sliced batches.
+
+### The writer bug the streaming tests found
+
+Worth its own entry, because it was silent data corruption of the same class this branch opened with.
+
+`test_stream_yields_the_same_rows_as_a_full_read` failed. The stream and the eager read agreed with
+each other and both disagreed with the source table, from exactly one row index on. Reading it
+through pylance gave the **same wrong value** — so the bytes on disk were wrong and this was never a
+reader bug. A type probe narrowed it to `utf8` and `binary`; `int64`, `float64`, `bool` and
+`fixed_size_binary` were all correct.
+
+A sliced Arrow array shares its parent's buffers and addresses its rows through `ArrowArray::offset`.
+`append_fixed_width` applied that offset. `append_variable_width` did not — it read the offsets
+buffer from index 0 and the data buffer from byte 0. `Table.to_batches()` returns slices of one
+contiguous array, so **every batch after the first re-ingested the first batch's strings**, and a
+mixed table came back looking plausible: the integer columns lined up, only the strings were shifted.
+
+The existing chunked-writer tests missed it because their batch helper allocates a fresh array per
+batch, so every batch had `offset == 0`. The new guards deliberately do not: the C++ one hands the
+ingest a borrowed shallow slice, as a first batch and as an accumulating one; the Python ones round
+trip `to_batches()` output for `utf8`, `binary` and nullable `utf8`, plus a sliced *first* batch and
+empty batches in between; and one of them cross-checks through stock Lance, since reader agreement is
+what proved where the bug lived. Each was verified to fail against the unfixed code.
+
 ## Phase 4.1: decode into the Arrow buffer instead of copying into it
 
 Taken next, out of plan order, because the measurement above showed this -- not streaming -- is what
@@ -587,6 +661,17 @@ between C++ and Arrow by hand; `fuzz_decode` clean over 1,106,008 runs.
   Actions runs again**, because there is no local macOS or manylinux to run them on. The Linux wheel
   itself WAS built and installed into a clean virtualenv locally; what is unverified is cibuildwheel
   driving that across CPython 3.9–3.13 and macOS.
+
+- **Found, not fixed: the structural-dictionary string encoding is not readable by stock Lance.**
+  `tests/smoke_dict_pylance_interop.sh` writes a scattered low-cardinality string column with
+  `--compress` and pylance 12.0.0 refuses it: *"Lance v2.2 miniblock pages require the u32 chunk
+  grammar"*. The script catches that and exits 77, so ctest reports a **skip**, not a failure — which
+  is how it stayed quiet. It is pre-existing (the skip predates this branch, commit `5996e92` on
+  `main`) and independent of everything here, but it contradicts the README's claim that everything
+  nanolance writes is Lance-readable unless marked nanolance-only, and a test that reports "skip" for
+  a genuine interop failure will keep it quiet indefinitely. Two things to do, neither done here:
+  emit the u32 chunk grammar for miniblock pages, and make that script fail rather than skip once it
+  can pass.
 
 - **Not yet verified on this branch:** macOS and Windows (CI is Linux-only), and the ASan/UBSan
   workflow, which runs in CI rather than here. The libFuzzer workflow's targets were built and run

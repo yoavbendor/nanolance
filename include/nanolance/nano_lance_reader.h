@@ -135,6 +135,24 @@ int nano_lance_table_read_dataset_projected(const char* dataset_path, const char
                                             size_t* out_batch_count, char* error_message,
                                             size_t error_message_capacity);
 
+/// Open a dataset as a streaming Arrow reader: one batch per data file, decoded on demand, instead
+/// of every batch materialized before the caller sees any of them.
+///
+/// This is what makes a larger-than-memory dataset readable, and it is what gets you a first batch
+/// without waiting for the last. It is NOT a way to halve peak memory on an ordinary single-fragment
+/// dataset -- there is only one batch there either way.
+///
+/// \p column_names / \p column_count project, exactly as
+/// nano_lance_table_read_dataset_projected does; pass NULL / 0 to read every column.
+///
+/// On success \p out_stream is a valid ArrowArrayStream that the CALLER releases
+/// (`out_stream->release(out_stream)`), which also closes the dataset. On failure it is left zeroed,
+/// so releasing it is unnecessary and calling through it is not possible.
+int nano_lance_table_open_stream(const char* dataset_path, const char* const* column_names,
+                                 size_t column_count, int trusted_input,
+                                 struct ArrowArrayStream* out_stream, char* error_message,
+                                 size_t error_message_capacity);
+
 void nano_lance_table_read_result_free(struct ArrowSchema* schema, struct ArrowArray* batches, size_t batch_count);
 
 #ifdef __cplusplus

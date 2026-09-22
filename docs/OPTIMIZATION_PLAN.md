@@ -307,8 +307,8 @@ Add a consumer smoke test that builds a tiny program against an installed nanola
 
 ### Phase 3 — The Python API a parquet user expects (weeks)
 
-**3.1 Streaming read.** Replace the materialize-everything `read_table` with a real
-`ArrowArrayStream` that decodes fragment by fragment. This is also a C++-side improvement
+**3.1 Streaming read.** Add a real `ArrowArrayStream` that decodes fragment by fragment, next to
+the materialize-everything `read_table`. This is also a C++-side improvement
 (`lance_table_read_dataset` has the same shape).
 
 What it buys, corrected by measurement (see 2.7): **larger-than-memory datasets and time-to-first-
@@ -316,8 +316,22 @@ batch**, not the 2× peak. A single-fragment dataset still peaks at 2× after th
 that 2× lives inside one fragment's decode. Pair it with 4.1 to get ~1× for any dataset — and note
 that 4.1 is the one with the headline number, despite being sequenced later.
 
+**DONE**, as a *separate* entry point rather than a replacement. Making `read_table` stream would
+have been a silent contract change: streaming moves error reporting from open to consumption, and
+a corrupt file that used to raise `RuntimeError` from `read_table(...)` instead raises `OSError`
+from whoever pulls the first batch. Two existing tests caught it. So `open_stream()` is its own
+function and `read_table` keeps its eager contract.
+
+Measured on a 61 MiB / 16-fragment dataset: peak **5.6 MiB (0.09×)** against 61.4 MiB (1.01×)
+eager, and **3.2 ms** to the first batch against 66.5 ms. Exactly what the correction above
+predicted — a throughput-neutral win in peak memory and latency, on top of 4.1's 1.01×.
+
 **3.2 Expose projection**, then add row-range/slice and `count_rows`/schema-peek. Projection already
 exists in C++ (`lance_table_read_dataset_projected`) and just needs binding.
+
+**DONE** for projection: `read_table(path, columns=[...])` and `open_stream(path, columns=[...])`,
+pushed down to the decoder so unprojected columns are never touched. Row-range/slice,
+`count_rows` and schema-peek are still open.
 
 **3.3 Shape the API like the thing it is replacing.** `nanolance.read_table(path, columns=[...])`,
 `nanolance.write_table(table, path, compression=...)` — deliberately `pyarrow.parquet`-shaped, so

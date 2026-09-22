@@ -76,10 +76,20 @@ import nanolance
 table = pa.table({"uri": ["s3://b/f.pcapng"] * 1000, "position": range(1000), "size": [1500] * 1000})
 nanolance.write_table(table, "out.lance", compression=True)
 roundtrip = pa.table(nanolance.read_table("out.lance"))
+
+# Projection, and a fragment-at-a-time stream for datasets larger than memory:
+subset = pa.table(nanolance.read_table("out.lance", columns=["uri", "size"]))
+for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")):
+    ...
 ```
 
 Key options mirror the C writer: `compression=True`, `WriteOptions(append=True)`, etc. See
 `bindings/python/README.md` for install, tests (`pytest`), and pylance interop checks.
+
+`read_table` decodes up front and raises at call time; `open_stream` decodes one fragment per pull,
+so errors surface from the first pull instead (as `OSError`) and the handle is single-shot. Prefer
+`open_stream` for bounded peak memory (measured 0.09x the dataset against 1.01x) and a fast first
+batch; prefer `read_table` when you want the whole thing and up-front errors.
 
 Parquet Python bindings are a separate package in
 [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) (`nanoarrow_io.parquet`).

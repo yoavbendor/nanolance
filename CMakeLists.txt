@@ -564,6 +564,10 @@ add_executable(nano_lance_table_roundtrip_test tests/test_nano_lance_table_round
 target_compile_features(nano_lance_table_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_table_roundtrip_test PRIVATE nanolance)
 
+add_executable(nano_lance_table_stream_test tests/test_table_stream.cpp)
+target_compile_features(nano_lance_table_stream_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_table_stream_test PRIVATE nanolance)
+
 add_executable(nano_lance_external_blob_test tests/test_nano_lance_external_blob.cpp)
 target_compile_features(nano_lance_external_blob_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_external_blob_test PRIVATE nanolance_reader)
@@ -689,6 +693,9 @@ set_tests_properties(nano_lance_data_file_reader PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_table_roundtrip COMMAND $<TARGET_FILE:nano_lance_table_roundtrip_test>)
 set_tests_properties(nano_lance_table_roundtrip PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_table_stream COMMAND $<TARGET_FILE:nano_lance_table_stream_test>)
+set_tests_properties(nano_lance_table_stream PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_external_blob COMMAND $<TARGET_FILE:nano_lance_external_blob_test>)
 set_tests_properties(nano_lance_external_blob PROPERTIES LABELS "smoke")

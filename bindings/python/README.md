@@ -80,10 +80,15 @@ with nanolance.LanceWriter("big.lance", max_rows_per_fragment=1_000_000) as writ
 # close() (on __exit__) commits pending rows → a valid multi-fragment dataset
 
 # Read back chunk by chunk (one batch per fragment) without materializing one big array:
-reader = pa.RecordBatchReader.from_stream(nanolance.read_table("big.lance"))
+reader = pa.RecordBatchReader.from_stream(nanolance.open_stream("big.lance"))
 for batch in reader:
     ...  # process one fragment's rows at a time
 ```
+
+`open_stream` decodes a fragment per pull, so peak memory is one fragment rather than the whole
+dataset. Measured on a 61 MiB / 16-fragment dataset: **5.6 MiB peak against 61.4 MiB**, and **3.2 ms
+to the first batch against 66.5 ms**. `read_table` also exports one batch per fragment, but it has
+already decoded them all by the time it returns.
 
 ## API
 
@@ -91,7 +96,8 @@ for batch in reader:
 |----------|-------------|
 | `write_table(table, path, **opts)` | Write an Arrow table to a Lance dataset (one fragment per input batch) |
 | `LanceWriter(path, *, max_rows_per_fragment=0, **opts)` | Streaming context-manager writer: `write_batch(batch)`, `flush()`, `close()` |
-| `read_table(path, columns=None)` | Arrow-exportable Lance reader handle (exports an Arrow C stream, one batch per fragment); `columns` projects |
+| `read_table(path, columns=None)` | Read eagerly; returns an Arrow-exportable handle (an Arrow C stream, one batch per fragment). `columns` projects |
+| `open_stream(path, columns=None)` | Same, but decoded one fragment per pull: bounded peak memory, larger-than-memory datasets, fast first batch. Single-shot |
 | `WriteOptions` | `compression`, `compression_level`, `structural_encoding`, `append`, `blob_uri_dictionary`, `ignore_nullability` |
 
 `write_table` and `LanceWriter.write_batch` accept any Arrow-exportable input (pyarrow `Table` / `RecordBatch`, polars via `to_arrow()`, etc.). `LanceWriter` takes the same encoding options as `write_table` plus `max_rows_per_fragment` (0 = single fragment committed on close).
@@ -125,7 +131,7 @@ with `compression_level`). Set `structural_encoding=False` for plain "raw" pages
 stock-`lance`-readable. See the root [README compression section](../../README.md#compression-lance-compatible)
 and [AGENTS.md §3](../../AGENTS.md#3-enabling-the-compression-that-was-measured) for per-type encodings.
 
-### Read (`read_table`)
+### Read (`read_table`, `open_stream`)
 
 ```python
 nanolance.read_table("events.lance")                          # every column
@@ -137,6 +143,26 @@ ask for are **skipped during decode** rather than decoded and thrown away, which
 worth using — column materialization is where a read spends its time. Naming a column that does not
 exist is an error, not a silently empty result. One difference from pyarrow: the result comes back in
 the dataset's column order, not the order you listed.
+
+For a dataset larger than memory, or when you want the first rows quickly, use `open_stream` instead:
+
+```python
+reader = pa.RecordBatchReader.from_stream(nanolance.open_stream("events.lance", columns=["ts"]))
+for batch in reader:
+    ...
+```
+
+It takes the same `columns=`. Two differences from `read_table`, both inherent to streaming and
+stated here because they are easy to trip over:
+
+- **Errors surface late.** A corrupt or unreadable dataset raises from the first pull, not from
+  `open_stream(...)`, and pyarrow reports it as `OSError` rather than `RuntimeError`. `read_table`
+  decodes up front, so it still raises at call time.
+- **The handle is single-shot.** Exporting it twice raises; call `open_stream` again for a second
+  pass.
+
+That is why it is a separate function rather than a flag on `read_table` -- `read_table` keeps its
+eager, raise-at-call-time contract.
 
 **Scope.** nanolance reads back everything it writes, and now every non-nested column type stock
 Lance writes:

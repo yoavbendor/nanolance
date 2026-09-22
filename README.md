@@ -71,6 +71,11 @@ import nanolance
 table = pa.table({"id": [1, 2, 3], "name": ["alpha", "beta", "gamma"]})
 nanolance.write_table(table, "out.lance", compression=True)
 assert pa.table(nanolance.read_table("out.lance")).equals(table)
+
+# Read a column subset, and larger-than-memory datasets a fragment at a time:
+nanolance.read_table("out.lance", columns=["name"])
+for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")):
+    ...
 ```
 
 Install for development: `pip install -e "bindings/python[test]"` then `pytest` in that directory.

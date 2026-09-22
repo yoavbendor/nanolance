@@ -611,6 +611,106 @@ def test_bad_projections_are_refused_by_name(columns, exc, needle, projection_ta
     assert needle in str(excinfo.value)
 
 
+# ── Streaming reads ──────────────────────────────────────────────────────────────────────────────
+# `open_stream` decodes one batch per pull instead of every batch up front. It is a SEPARATE entry
+# point from read_table on purpose: streaming moves error reporting from open to consumption, and
+# quietly changing read_table's contract would break anyone catching around it.
+
+
+def _write_fragments(path, table, rows_per_fragment):
+    with nanolance.LanceWriter(path, max_rows_per_fragment=rows_per_fragment) as writer:
+        for batch in table.to_batches(max_chunksize=rows_per_fragment):
+            writer.write_batch(batch)
+
+
+@pytest.fixture
+def fragmented_dataset(tmp_path):
+    n, frag = 60_000, 10_000
+    table = pa.table(
+        {
+            "a": pa.array(range(n), type=pa.int64()),
+            "s": pa.array([None if i % 7 == 0 else f"v{i}" for i in range(n)], type=pa.string()),
+        }
+    )
+    path = tmp_path / "fragmented.lance"
+    _write_fragments(path, table, frag)
+    return path, table, n // frag
+
+
+def test_stream_yields_the_same_rows_as_a_full_read(fragmented_dataset):
+    path, table, _ = fragmented_dataset
+    streamed = pa.RecordBatchReader.from_stream(nanolance.open_stream(path)).read_all()
+    assert streamed.to_pydict() == table.to_pydict()
+    assert streamed.to_pydict() == pa.table(nanolance.read_table(path)).to_pydict()
+
+
+def test_stream_delivers_one_batch_per_fragment(fragmented_dataset):
+    """The point of the exercise: batches arrive as they are decoded, not all at the end."""
+    path, table, fragments = fragmented_dataset
+    sizes = [b.num_rows for b in pa.RecordBatchReader.from_stream(nanolance.open_stream(path))]
+    assert len(sizes) == fragments
+    assert sum(sizes) == table.num_rows
+
+
+def test_stream_projects(fragmented_dataset):
+    path, table, _ = fragmented_dataset
+    streamed = pa.RecordBatchReader.from_stream(nanolance.open_stream(path, columns=["s"])).read_all()
+    assert streamed.column_names == ["s"]
+    assert streamed.column("s").to_pylist() == table.column("s").to_pylist()
+
+
+def test_stream_handle_is_single_shot(fragmented_dataset):
+    """A stream is consumed, not copied. Exporting twice must say so, not hand out a drained one."""
+    path, _, _ = fragmented_dataset
+    handle = nanolance.open_stream(path)
+    pa.RecordBatchReader.from_stream(handle).read_all()
+    with pytest.raises(RuntimeError) as excinfo:
+        pa.RecordBatchReader.from_stream(handle)
+    assert "already been consumed" in str(excinfo.value)
+
+
+def test_stream_can_be_abandoned_midway(fragmented_dataset):
+    """Dropping a partly-consumed reader must release the dataset, not leak or crash."""
+    path, _, _ = fragmented_dataset
+    reader = pa.RecordBatchReader.from_stream(nanolance.open_stream(path))
+    first = next(iter(reader))
+    assert first.num_rows > 0
+    del reader
+    # Still usable afterwards.
+    assert pa.RecordBatchReader.from_stream(nanolance.open_stream(path)).read_all().num_rows > 0
+
+
+def test_stream_reports_a_corrupt_data_file_at_consumption(tmp_path):
+    """The documented difference from read_table, pinned so it cannot drift.
+
+    Opening validates the manifest and schema; a corrupt data file is only found when the batch
+    containing it is pulled. read_table reports it at call time because it decodes everything there.
+    Either way the process must survive and the message must be accurate.
+    """
+    path = tmp_path / "victim.lance"
+    nanolance.write_table(pa.table({"a": pa.array([1, 2, 3], type=pa.int64())}), path)
+    next((path / "data").glob("*.lance")).write_bytes(b"not a lance file")
+
+    handle = nanolance.open_stream(path)  # opening alone does NOT raise
+    with pytest.raises(Exception) as excinfo:
+        pa.RecordBatchReader.from_stream(handle).read_all()
+    assert "data file" in str(excinfo.value)
+
+    # read_table still reports the same corruption eagerly, which is why it stayed a separate call.
+    with pytest.raises(RuntimeError):
+        nanolance.read_table(path)
+
+
+def test_stream_of_a_stock_lance_dataset(tmp_path):
+    lance = require_pylance()
+    n = 20000
+    table = pa.table({"s": pa.array([None if i % 11 == 0 else _fsst_sentence(i) for i in range(n)])})
+    path = tmp_path / "stock_stream.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+    streamed = pa.RecordBatchReader.from_stream(nanolance.open_stream(path)).read_all()
+    assert streamed.column("s").to_pylist() == table.column("s").to_pylist()
+
+
 # ── Writing nulls ────────────────────────────────────────────────────────────────────────────────
 # nanolance now emits Lance's definition-level layer for fixed-width columns: layers = [3], the
 # repdef encoding in MiniBlockLayout.f2, and a per-chunk level buffer ahead of the values. Level 1
@@ -747,3 +847,4 @@ def test_nullable_variable_width_single_row(compression, tmp_path):
     nanolance.write_table(table, path, compression=compression)
     assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == [None]
     assert lance.dataset(str(path)).to_table().column(0).to_pylist() == [None]
+

@@ -284,6 +284,66 @@ struct ExportState {
     ExportState& operator=(const ExportState&) = delete;
 };
 
+/// A handle over a LIVE ArrowArrayStream, exported to Python once.
+///
+/// The difference from ExportedTable is when the decode happens. ExportedTable holds batches that
+/// have already been decoded; this holds an open dataset and decodes a batch each time the consumer
+/// asks for one, which is what makes a larger-than-memory dataset readable and what gets a first
+/// batch out without waiting for the last.
+///
+/// Export is single-shot, as it has to be: a stream is consumed, not copied. The second
+/// `__arrow_c_stream__` raises rather than handing out a stream someone else is already draining.
+class ExportedStream {
+public:
+    ExportedStream() = default;
+
+    /// Takes ownership of `stream` (which must be a valid, open ArrowArrayStream).
+    static ExportedStream adopt(ArrowArrayStream&& stream) {
+        ExportedStream out;
+        out.stream_ = static_cast<ArrowArrayStream*>(std::malloc(sizeof(ArrowArrayStream)));
+        if (out.stream_ == nullptr) {
+            throw std::bad_alloc();
+        }
+        std::memcpy(out.stream_, &stream, sizeof(ArrowArrayStream));
+        std::memset(&stream, 0, sizeof(ArrowArrayStream));
+        return out;
+    }
+
+    nb::capsule arrow_c_stream(nb::object /*requested_schema*/) {
+        if (stream_ == nullptr) {
+            throw std::runtime_error(
+                "this nanolance reader has already been consumed; call read_table() again for a "
+                "second pass (a stream is consumed, not copied)");
+        }
+        auto* stream = stream_;
+        stream_ = nullptr;  // the capsule owns it now, and releases it when Python drops it
+        return detail::make_stream_capsule(stream);
+    }
+
+    ~ExportedStream() {
+        // Only runs when the handle was never exported; after export the capsule owns the stream.
+        if (stream_ != nullptr) {
+            if (stream_->release != nullptr) {
+                stream_->release(stream_);
+            }
+            std::free(stream_);
+        }
+    }
+
+    ExportedStream(ExportedStream&& other) noexcept : stream_(other.stream_) { other.stream_ = nullptr; }
+    ExportedStream& operator=(ExportedStream&& other) noexcept {
+        if (this != &other) {
+            std::swap(stream_, other.stream_);
+        }
+        return *this;
+    }
+    ExportedStream(const ExportedStream&) = delete;
+    ExportedStream& operator=(const ExportedStream&) = delete;
+
+private:
+    ArrowArrayStream* stream_ = nullptr;
+};
+
 class ExportedTable {
 public:
     ExportedTable() = default;

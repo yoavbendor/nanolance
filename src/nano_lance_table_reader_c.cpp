@@ -4,7 +4,9 @@
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/nano_lance_reader.h"
 
+#include <cerrno>
 #include <cstring>
+#include <memory>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -131,6 +133,110 @@ extern "C" int nano_lance_table_read_dataset_projected(const char* dataset_path,
     }
     return read_dataset_impl(dataset_path, trusted_input != 0, &columns, out_schema, out_batches,
                              out_batch_count, error_message, error_message_capacity);
+}
+
+namespace {
+
+/// Backing state for the ArrowArrayStream handed out by nano_lance_table_open_stream.
+struct StreamPrivate {
+    nano_lance::LanceTableStream stream;
+    ArrowSchema schema{};     // served by get_schema; deep-copied per call, as the interface requires
+    std::string last_error;
+
+    ~StreamPrivate() {
+        if (schema.release != nullptr) {
+            ArrowSchemaRelease(&schema);
+        }
+    }
+};
+
+StreamPrivate* stream_private(struct ArrowArrayStream* stream) {
+    return static_cast<StreamPrivate*>(stream->private_data);
+}
+
+int stream_get_schema(struct ArrowArrayStream* stream, struct ArrowSchema* out) {
+    auto* self = stream_private(stream);
+    // A deep copy every call: the Arrow C stream interface lets a consumer call get_schema more than
+    // once and take ownership of each result, so handing out our only copy would be a use-after-free
+    // the second time.
+    if (ArrowSchemaDeepCopy(&self->schema, out) != NANOARROW_OK) {
+        self->last_error = "failed to copy the dataset schema";
+        return EIO;
+    }
+    return 0;
+}
+
+int stream_get_next(struct ArrowArrayStream* stream, struct ArrowArray* out) {
+    auto* self = stream_private(stream);
+    std::string error;
+    if (!self->stream.next(*out, error)) {
+        self->last_error = error;
+        return EIO;
+    }
+    return 0;  // end of stream leaves out->release null, which is what the interface expects
+}
+
+const char* stream_get_last_error(struct ArrowArrayStream* stream) {
+    auto* self = stream_private(stream);
+    return self->last_error.empty() ? nullptr : self->last_error.c_str();
+}
+
+void stream_release(struct ArrowArrayStream* stream) {
+    delete stream_private(stream);
+    stream->private_data = nullptr;
+    stream->release = nullptr;
+}
+
+}  // namespace
+
+extern "C" int nano_lance_table_open_stream(const char* dataset_path, const char* const* column_names,
+                                            size_t column_count, int trusted_input,
+                                            struct ArrowArrayStream* out_stream, char* error_message,
+                                            size_t error_message_capacity) {
+    if (out_stream == nullptr) {
+        set_error(error_message, error_message_capacity, "out_stream is required");
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
+    std::memset(out_stream, 0, sizeof(*out_stream));
+    if (dataset_path == nullptr) {
+        set_error(error_message, error_message_capacity, "dataset_path is required");
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
+
+    std::vector<std::string> columns;
+    if (column_count != 0) {
+        if (column_names == nullptr) {
+            set_error(error_message, error_message_capacity,
+                      "column_names is required when column_count is nonzero");
+            return NANO_LANCE_READER_INVALID_ARGUMENT;
+        }
+        columns.reserve(column_count);
+        for (size_t i = 0; i < column_count; ++i) {
+            if (column_names[i] == nullptr) {
+                set_error(error_message, error_message_capacity, "column_names contains a null entry");
+                return NANO_LANCE_READER_INVALID_ARGUMENT;
+            }
+            columns.emplace_back(column_names[i]);
+        }
+    }
+
+    auto self = std::make_unique<StreamPrivate>();
+    std::string error;
+    if (!nano_lance::LanceTableStream::open(std::filesystem::path(dataset_path),
+                                            columns.empty() ? nullptr : &columns, self->schema,
+                                            self->stream, error, trusted_input != 0)) {
+        // open() already released the schema on failure (see its declaration), and ~StreamPrivate
+        // checks `release` before touching it, so unwinding here is safe.
+        set_error(error_message, error_message_capacity, error);
+        return map_status(error);
+    }
+
+    out_stream->get_schema = &stream_get_schema;
+    out_stream->get_next = &stream_get_next;
+    out_stream->get_last_error = &stream_get_last_error;
+    out_stream->release = &stream_release;
+    out_stream->private_data = self.release();
+    return NANO_LANCE_READER_OK;
 }
 
 extern "C" void nano_lance_table_read_result_free(struct ArrowSchema* schema, struct ArrowArray* batches,

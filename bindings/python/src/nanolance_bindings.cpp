@@ -24,6 +24,7 @@
 
 namespace nb = nanobind;
 using nanolance_py::arrow_capsule::BatchIterator;
+using nanolance_py::arrow_capsule::ExportedStream;
 using nanolance_py::arrow_capsule::ExportedTable;
 using nanolance_py::arrow_capsule::detail::OwnedArray;
 using nanolance_py::arrow_capsule::detail::OwnedSchema;
@@ -254,7 +255,27 @@ private:
     bool closed_ = false;
 };
 
-ExportedTable read_table(const std::filesystem::path& path, std::optional<std::vector<std::string>> columns) {
+/// The streaming reader: one batch decoded per consumer pull, instead of every batch up front.
+ExportedStream read_table_stream(const std::filesystem::path& path,
+                                 std::optional<std::vector<std::string>> columns) {
+    std::vector<const char*> names;
+    if (columns) {
+        names.reserve(columns->size());
+        for (const auto& name : *columns) {
+            names.push_back(name.c_str());
+        }
+    }
+    ArrowArrayStream stream{};
+    char err[512] = {};
+    const int rc = nano_lance_table_open_stream(path.string().c_str(), names.empty() ? nullptr : names.data(),
+                                                names.size(), /*trusted_input=*/0, &stream, err, sizeof(err));
+    if (rc != NANO_LANCE_READER_OK) {
+        throw_lance_reader("nano_lance_table_open_stream", rc, err);
+    }
+    return ExportedStream::adopt(std::move(stream));
+}
+
+ExportedTable read_table_eager(const std::filesystem::path& path, std::optional<std::vector<std::string>> columns) {
     ArrowSchema schema{};
     ArrowArray* batches = nullptr;
     std::size_t batch_count = 0;
@@ -330,7 +351,16 @@ NB_MODULE(_nanolance, m) {
         .def("__arrow_c_array_stream__", &ExportedTable::arrow_c_stream,
              nb::arg("requested_schema") = nb::none());
 
-    m.def("read_table", &read_table, nb::arg("path"), nb::arg("columns") = nb::none(),
-          "Read a Lance dataset as an Arrow-exportable handle. `columns` names the top-level columns "
+    nb::class_<ExportedStream>(m, "LanceStream")
+        .def("__arrow_c_stream__", &ExportedStream::arrow_c_stream, nb::arg("requested_schema") = nb::none(),
+             "Arrow PyCapsule stream export. Single-shot: a stream is consumed, not copied.")
+        .def("__arrow_c_array_stream__", &ExportedStream::arrow_c_stream,
+             nb::arg("requested_schema") = nb::none());
+
+    m.def("read_table", &read_table_eager, nb::arg("path"), nb::arg("columns") = nb::none(),
+          "Read a Lance dataset, decoding every batch up front. `columns` names the top-level columns "
           "to read; the rest are skipped during decode rather than decoded and discarded.");
+    m.def("open_stream", &read_table_stream, nb::arg("path"), nb::arg("columns") = nb::none(),
+          "Open a Lance dataset as a streaming Arrow handle: one batch decoded per pull, so peak "
+          "memory tracks one fragment rather than the dataset.");
 }
