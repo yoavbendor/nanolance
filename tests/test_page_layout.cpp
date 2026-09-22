@@ -174,6 +174,10 @@ std::filesystem::path write_dataset(const std::filesystem::path& root, const std
     require(nano_lance_writer_commit(&w, false) == NANO_LANCE_OK,
             std::string("commit: ") + nano_lance_writer_last_error(&w));
     nano_lance_writer_close(&w);
+    // Both, and in this order. An ArrowArray owns its buffers and its children; releasing only the
+    // schema leaks every one of them. Caught by the ASan/UBSan CI job (LeakSanitizer), which found it
+    // the first time that job was able to run.
+    ArrowArrayRelease(&array);
     ArrowSchemaRelease(&schema);
     return path;
 }

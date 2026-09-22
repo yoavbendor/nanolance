@@ -92,10 +92,15 @@ int main(int argc, char** argv) {
                 return 1;
             }
             nano_lance_writer_close(&checked);
+            /* Both, and in this order: an ArrowArray owns its buffers and children, so releasing
+             * only the schema leaks them. (The documented snippet does not build the batch, so this
+             * is the test's own bookkeeping -- but LeakSanitizer is right about it.) */
+            ArrowArrayRelease(&array2);
             ArrowSchemaRelease(&schema2);
         }
     }
 
+    ArrowArrayRelease(&arrow_array);
     ArrowSchemaRelease(&arrow_schema);
     printf("README C quick start: ok\n");
     return 0;
