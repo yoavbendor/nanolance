@@ -272,6 +272,7 @@ add_library(nanolance STATIC
     src/data_file_reader.cpp
     src/data_file_writer.cpp
     src/fsst.cpp
+    src/lz4_block.cpp
     src/lance_column_decoder.cpp
     src/lance_table_reader.cpp
     src/page_layout.cpp
@@ -331,6 +332,11 @@ if(NANOLANCE_BUILD_FUZZERS)
     target_compile_features(nanolance_fuzz_fsst PRIVATE cxx_std_20)
     target_link_libraries(nanolance_fuzz_fsst PRIVATE nanolance)
     target_link_options(nanolance_fuzz_fsst PRIVATE -fsanitize=fuzzer)
+
+    add_executable(nanolance_fuzz_lz4 tests/fuzz/fuzz_lz4.cpp)
+    target_compile_features(nanolance_fuzz_lz4 PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_lz4 PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_lz4 PRIVATE -fsanitize=fuzzer)
 endif()
 
 if(NANOLANCE_BUILD_TOOLS)
@@ -512,6 +518,10 @@ add_executable(nano_lance_fsst_test tests/test_fsst.cpp)
 target_link_libraries(nano_lance_fsst_test PRIVATE nanolance)
 target_compile_features(nano_lance_fsst_test PRIVATE cxx_std_20)
 
+add_executable(nano_lance_lz4_block_test tests/test_lz4_block.cpp)
+target_link_libraries(nano_lance_lz4_block_test PRIVATE nanolance)
+target_compile_features(nano_lance_lz4_block_test PRIVATE cxx_std_20)
+
 add_executable(nano_lance_readme_quickstart_test tests/test_readme_quickstart.c)
 target_link_libraries(nano_lance_readme_quickstart_test PRIVATE nanolance)
 set_property(TARGET nano_lance_readme_quickstart_test PROPERTY C_STANDARD 99)
@@ -642,6 +652,9 @@ set_tests_properties(nano_lance_page_layout PROPERTIES LABELS smoke)
 
 add_test(NAME nano_lance_fsst COMMAND $<TARGET_FILE:nano_lance_fsst_test>)
 set_tests_properties(nano_lance_fsst PROPERTIES LABELS smoke)
+
+add_test(NAME nano_lance_lz4_block COMMAND $<TARGET_FILE:nano_lance_lz4_block_test>)
+set_tests_properties(nano_lance_lz4_block PROPERTIES LABELS smoke)
 
 add_test(NAME nano_lance_readme_quickstart
          COMMAND $<TARGET_FILE:nano_lance_readme_quickstart_test>

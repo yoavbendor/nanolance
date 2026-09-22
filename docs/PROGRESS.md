@@ -22,10 +22,11 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Phase 3 — streaming read, projection in Python | not started |
 | Phase 4 — read-path optimization | not started (deliberately last) |
 
-Test suite: **47 ctest** (was 42) and **183 pytest** (was 22), all passing.
+Test suite: **48 ctest** (was 42) and **187 pytest** (was 22), all passing.
 
-Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout` and `nanolance_fuzz_fsst`, all
-clean; the longest campaign run here was 95,896,936 executions.
+Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout`, `nanolance_fuzz_fsst` and
+`nanolance_fuzz_lz4`, all clean; the longest campaign run here was 95,896,936 executions. Between
+them they have found three real bugs on this branch.
 
 ---
 
@@ -366,6 +367,43 @@ run, a trailing run, and alternating -- on `int64` and on an FSST-compressed str
 alternating case is deliberately kept in the same test: Lance chooses the encoding itself, so a test
 fed only run-shaped nulls would quietly stop covering the bit-packed path the day that heuristic
 changed.
+
+### LZ4 dictionaries, and nullable categorical columns
+
+The last non-nested stock-Lance shape that would not read was the most ordinary one a dataframe has:
+a string column with few distinct values. Lance writes it as a dictionary page whose dictionary block
+is `General{LZ4, Variable}`, and nanolance read that block raw and died on its header with "dict
+block header invalid" -- naming the symptom rather than the missing decoder.
+
+**LZ4 is now decompressed in-tree** (`src/lz4_block.cpp`, ~90 lines), with no new dependency. This is
+the LZ4 *block* format, not the framed one: a token byte, a run of literals, and a back-reference,
+with no entropy coder and no checksums. Vendoring a library to read that would have cost more than it
+saved -- nanolance carries zstd only because zstd genuinely needs it. Lance's wrapper around the
+block is `[u32 LE uncompressed size][block]`, from the `lz4` crate's prepend_size mode.
+
+The unit test is **differential against the reference encoder**: its vectors are liblz4's own output
+(via python-lz4), so the decoder is checked against the real thing rather than against my reading of
+the spec. Malformed cases are hand-built, because no encoder produces one.
+
+**The fuzzer found a real bug in 38 executions.** `decompress_block` reserved the declared
+uncompressed size before touching the block, so an 8-byte buffer declaring 3.7 GB allocated 3.7 GB --
+under the 8 GiB per-buffer read limit, so the budget never fired. The declared size is now checked
+against what the block could possibly produce first: literals are copied 1:1, and a match costs at
+least one extension byte per 255 output bytes, so no LZ4 block expands by more than 255x.
+
+**Two more generalizations came with it**, both of the same kind -- a decode branch was deciding
+something the descriptor already says:
+
+- *How the dictionary block is compressed* was hardcoded per branch: `dict` read it raw, `dict-rle`
+  un-zstd'd it. That happened to match what nanolance's own writer does. It now comes from the
+  descriptor, so raw, zstd and LZ4 all decode from one unwrap.
+- *A nullable dictionary column* -- a categorical column with missing values -- failed with
+  "unexpected miniblock payload prefix", because the dictionary path had its own chunk parser that
+  predated definition levels. It now uses the same splitter as every other miniblock path, so the
+  levels decode on the way and that parser is gone.
+
+Relatedly, an unrecognized `General{scheme}` no longer silently falls through as "not zstd, therefore
+raw". It is refused by number, which is what the descriptor-dispatch work was for in the first place.
 
 ### Fuzzing the descriptor parser
 

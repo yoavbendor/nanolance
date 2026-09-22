@@ -476,22 +476,58 @@ def test_reads_run_length_definition_levels_on_a_string_column(tmp_path):
     assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == values
 
 
-def test_lz4_compressed_dictionary_is_refused_by_name(tmp_path):
-    """Not yet supported -- but refused explicitly, not misread.
+# ── LZ4-compressed dictionary blocks ─────────────────────────────────────────────────────────────
+# A string column with few distinct values -- a categorical column -- comes back from Lance as a
+# dictionary page whose dictionary block is General{LZ4, Variable}. nanolance read that block raw and
+# died on its header with "dict block header invalid", which named the symptom rather than the
+# missing decoder. It now decompresses it (src/lz4_block.cpp; the LZ4 *block* format, not the framed
+# one, and no new dependency: decompression is a token, a literal run and a back-reference).
 
-    A unicode-heavy string column comes back from Lance as a dictionary page whose dictionary block
-    is General{LZ4, Variable}. nanolance reads a dictionary block raw, so it used to die on the
-    block's header with "dict block header invalid", which describes the symptom rather than the
-    missing decoder.
+
+@pytest.mark.parametrize(
+    "values_for, name",
+    [
+        pytest.param(lambda n: ["alpha", "beta", "gamma"] * (n // 3) + ["alpha"] * (n % 3),
+                     "few_values", id="few_values"),
+        pytest.param(lambda n: [("h\u00e9llo w\u00f6rld \u00fcn\u00efcode " * (i % 5 + 1)) for i in range(n)],
+                     "unicode", id="unicode"),
+        pytest.param(lambda n: [("category_%d " % (i % 50)) * 20 for i in range(n)],
+                     "long_values", id="long_values"),
+    ],
+)
+def test_reads_lz4_compressed_dictionaries_written_by_stock_lance(values_for, name, tmp_path):
+    lance = require_pylance()
+    values = values_for(20000)
+    table = pa.table({"s": pa.array(values, type=pa.string())})
+    path = tmp_path / f"{name}.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+    assert pa.table(nanolance.read_table(path)).column(0).to_pylist() == values
+
+
+@pytest.mark.parametrize(
+    "null_at",
+    [
+        pytest.param(lambda i: i % 23 == 0, id="scattered"),
+        pytest.param(lambda i: 500 <= i < 900, id="one_run"),
+    ],
+)
+def test_reads_nullable_dictionary_columns_written_by_stock_lance(null_at, tmp_path):
+    """A categorical column WITH missing values -- the shape the encoding exists for.
+
+    Its index chunks carry definition levels like any other miniblock page, but the dictionary path
+    had its own chunk parser that rejected them with "unexpected miniblock payload prefix". It now
+    goes through the same splitter as everything else, so the levels (bit-packed here, run-length
+    encoded for the one-run case) decode on the way.
     """
     lance = require_pylance()
-    values = [("h\u00e9llo w\u00f6rld \u00fcn\u00efcode " * (i % 5 + 1)) for i in range(20000)]
+    n = 20000
+    values = [None if null_at(i) else ["alpha", "beta", "gamma", "delta"][i % 4] for i in range(n)]
     table = pa.table({"s": pa.array(values, type=pa.string())})
-    path = tmp_path / "lz4_dict.lance"
+    path = tmp_path / "nullable_dict.lance"
     lance.write_dataset(table, str(path), mode="overwrite")
-    with pytest.raises(RuntimeError) as excinfo:
-        nanolance.read_table(path)
-    assert "unsupported dictionary encoding" in str(excinfo.value)
+    back = pa.table(nanolance.read_table(path))
+    assert back.column(0).null_count == table.column(0).null_count
+    assert back.column(0).to_pylist() == values
 
 
 # ── Writing nulls ────────────────────────────────────────────────────────────────────────────────

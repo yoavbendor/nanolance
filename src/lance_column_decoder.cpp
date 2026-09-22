@@ -11,6 +11,7 @@
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
 #include "nanolance/fsst.hpp"
+#include "nanolance/lz4_block.hpp"
 #include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
@@ -225,41 +226,6 @@ bool split_miniblock_payload(const std::vector<std::uint8_t>& payload, std::vect
                             payload.begin() + static_cast<std::ptrdiff_t>(values_start + header.values_size()));
         out.push_back(std::move(chunk));
         offset = (data_start + header.data_size() + 7U) & ~static_cast<std::size_t>(7U);
-    }
-    return true;
-}
-
-bool parse_miniblock_payload_chunk_list(const std::vector<std::uint8_t>& payload,
-                                        std::vector<std::vector<std::uint8_t>>& out, std::string& error) {
-    out.clear();
-    std::size_t offset = 0;
-    while (offset < payload.size()) {
-        if (offset + 8U > payload.size()) {
-            error = "truncated miniblock payload header";
-            return false;
-        }
-        if (payload[offset] != 0U || payload[offset + 1U] != 0U) {
-            error = "unexpected miniblock payload prefix";
-            return false;
-        }
-        std::uint16_t chunk_size = 0;
-        if (!read_le16(payload.data() + offset + 2U, chunk_size)) {
-            error = "failed to read miniblock chunk size";
-            return false;
-        }
-        if (payload[offset + 6U] != 0xFEU || payload[offset + 7U] != 0xFEU) {
-            error = "unexpected miniblock payload marker";
-            return false;
-        }
-        const auto data_start = offset + 8U;
-        const auto data_end = data_start + static_cast<std::size_t>(chunk_size);
-        if (data_end > payload.size()) {
-            error = "miniblock chunk exceeds payload";
-            return false;
-        }
-        out.emplace_back(payload.begin() + static_cast<std::ptrdiff_t>(data_start),
-                         payload.begin() + static_cast<std::ptrdiff_t>(data_end));
-        offset = (data_end + 7U) & ~static_cast<std::size_t>(7U);
     }
     return true;
 }
@@ -693,6 +659,10 @@ enum class ColumnEncodingKind {
 
 struct ColumnEncodingPlan {
     ColumnEncodingKind kind = ColumnEncodingKind::kFlat;
+    /// How the page's VALUE buffer is compressed, from the descriptor's `General{scheme}` wrapper.
+    /// kNone means the bytes are the values. Anything this build cannot decompress is refused in
+    /// classification, so no decode branch ever has to treat an unknown scheme as raw.
+    page_layout::BufferScheme value_scheme = page_layout::BufferScheme::kNone;
     bool zstd = false;  // variable-width only: value bytes are [u64 len][zstd frame]
     /// kConstant: the repeated value, when the descriptor carried it inline. A fixed-width constant
     /// page stores its value here and has no data buffers at all; a variable-width one leaves this
@@ -709,6 +679,10 @@ struct ColumnEncodingPlan {
     /// `symbol_count` with `passthrough` set is the ordinary case for a small file -- Lance skips FSST
     /// below 32 KiB of input but still wraps the page in the encoding.
     std::optional<fsst::SymbolTable> fsst;
+    /// kDict / kDictRle: how the dictionary block itself is compressed. nanolance writes it raw for
+    /// `dict` and zstd-framed for `dict-rle`; stock Lance uses LZ4 for a low-cardinality string
+    /// column. Reading it from the descriptor is what makes all three decode from the same branch.
+    page_layout::BufferScheme dict_scheme = page_layout::BufferScheme::kNone;
     /// kVariable: the offset width the descriptor declares for the value block, in bits. Only the
     /// FSST path consults it -- there the block being decoded is the COMPRESSED one, whose offsets
     /// index compressed bytes and need not share the column's own offset width.
@@ -716,6 +690,27 @@ struct ColumnEncodingPlan {
     /// Set when the descriptor named something this build does not model, so the error can say what.
     std::string unsupported_reason;
 };
+
+/// A dictionary block is stored raw, zstd-framed or LZ4-framed depending on who wrote the file:
+/// nanolance writes `dict` raw and `dict-rle` zstd-framed, stock Lance uses LZ4 for a
+/// low-cardinality string column. The scheme comes from the descriptor (or, for a file with no
+/// descriptor, from the fallback classifier), so both dictionary branches share one unwrap.
+[[nodiscard]] bool decompress_dictionary_block(page_layout::BufferScheme scheme,
+                                               const std::vector<std::uint8_t>& stored,
+                                               std::vector<std::uint8_t>& out, std::string& error) {
+    switch (scheme) {
+        case page_layout::BufferScheme::kNone:
+            out.assign(stored.begin(), stored.end());
+            return true;
+        case page_layout::BufferScheme::kZstd:
+            return zstd_unframe_buffer(stored, out, error);
+        case page_layout::BufferScheme::kLz4:
+            return lz4_block::decompress_sized(stored, out, error);
+        default:
+            error = "unsupported dictionary buffer compression";
+            return false;
+    }
+}
 
 /// Classify from the page descriptor alone. Returns false when the column carries no descriptor (an
 /// older nanolance file), leaving the caller to fall back to the field metadata.
@@ -770,11 +765,17 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
         // which names the symptom rather than the cause. Refuse by encoding instead.
         const auto* dict = layout.mini_block.dictionary.get();
         if (dict->kind == page_layout::CompressiveKind::kGeneral) {
-            if (dict->scheme != page_layout::BufferScheme::kZstd &&
-                dict->scheme != page_layout::BufferScheme::kNone) {
-                out.kind = ColumnEncodingKind::kUnsupported;
-                out.unsupported_reason = "unsupported dictionary encoding in " + page_layout::describe(layout);
-                return true;
+            switch (dict->scheme) {
+                case page_layout::BufferScheme::kNone:
+                case page_layout::BufferScheme::kZstd:
+                case page_layout::BufferScheme::kLz4:
+                    out.dict_scheme = dict->scheme;
+                    break;
+                default:
+                    out.kind = ColumnEncodingKind::kUnsupported;
+                    out.unsupported_reason =
+                        "unsupported dictionary encoding in " + page_layout::describe(layout);
+                    return true;
             }
             dict = dict->values.get();
         }
@@ -789,6 +790,12 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
     // General{scheme, inner} is a wrapper: unwrap it and remember whether it compresses.
     const page_layout::Compressive* inner = values;
     if (inner->kind == page_layout::CompressiveKind::kGeneral) {
+        if (inner->scheme == page_layout::BufferScheme::kUnknownScheme) {
+            out.kind = ColumnEncodingKind::kUnsupported;
+            out.unsupported_reason = "unsupported buffer compression in " + page_layout::describe(layout);
+            return true;
+        }
+        out.value_scheme = inner->scheme;
         out.zstd = inner->scheme == page_layout::BufferScheme::kZstd;
         if (inner->values == nullptr) {
             out.kind = ColumnEncodingKind::kUnsupported;
@@ -796,6 +803,14 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             return true;
         }
         if (inner->values->kind == page_layout::CompressiveKind::kByteStreamSplit) {
+            // The byte-stream-split path un-zstds the page itself; it has no other framing to fall
+            // back on, so a differently-compressed one is refused rather than read as raw planes.
+            if (!out.zstd) {
+                out.kind = ColumnEncodingKind::kUnsupported;
+                out.unsupported_reason =
+                    "unsupported buffer compression in " + page_layout::describe(layout);
+                return true;
+            }
             out.kind = ColumnEncodingKind::kBssZstd;
             return true;
         }
@@ -822,6 +837,12 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
         inner = inner->values.get();
         // Fsst's own values may in turn be General(zstd)-wrapped.
         if (inner->kind == page_layout::CompressiveKind::kGeneral) {
+            if (inner->scheme == page_layout::BufferScheme::kUnknownScheme) {
+                out.kind = ColumnEncodingKind::kUnsupported;
+                out.unsupported_reason = "unsupported buffer compression in " + page_layout::describe(layout);
+                return true;
+            }
+            out.value_scheme = inner->scheme;
             out.zstd = inner->scheme == page_layout::BufferScheme::kZstd;
             if (inner->values == nullptr) {
                 out.kind = ColumnEncodingKind::kUnsupported;
@@ -866,6 +887,7 @@ ColumnEncodingPlan classify_from_metadata(const pb::Field& field) {
         plan.kind = ColumnEncodingKind::kRle;
     } else if (field_metadata_equals(field, "nanolance:packing", "dict-rle")) {
         plan.kind = ColumnEncodingKind::kDictRle;
+        plan.dict_scheme = page_layout::BufferScheme::kZstd;  // what page_layout_bytes_dict_rle writes
     } else if (field_metadata_equals(field, "nanolance:packing", "dict")) {
         plan.kind = ColumnEncodingKind::kDict;
     } else if (field_metadata_equals(field, "nanolance:packing", "bss-zstd")) {
@@ -1194,8 +1216,8 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                                             error)) {
                 return false;
             }
-            // Decode the dictionary: un-zstd -> [u32 32][u32 bytes_start][u32 offsets][data].
-            if (!zstd_unframe_buffer(dict_frame, dict_block, error)) {
+            // Decode the dictionary: unwrap -> [u32 32][u32 bytes_start][u32 offsets][data].
+            if (!decompress_dictionary_block(encoding_plan.dict_scheme, dict_frame, dict_block, error)) {
                 return false;
             }
             if (dict_block.size() < 8U) {
@@ -1302,8 +1324,11 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
         std::vector<std::uint8_t> payload;
+        std::vector<std::uint8_t> dict_stored;
         std::vector<std::uint8_t> dict_block;
         std::vector<std::uint8_t> indices_bytes;
+        std::vector<MiniBlockChunkView> index_chunks;
+        std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
             if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
                 error = "dict page missing buffers";
@@ -1311,8 +1336,11 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             }
             if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[1], page.buffer_sizes[1], payload,
                                             error) ||
-                !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_block,
+                !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
                                             error)) {
+                return false;
+            }
+            if (!decompress_dictionary_block(encoding_plan.dict_scheme, dict_stored, dict_block, error)) {
                 return false;
             }
             if (dict_block.size() < 8U) {
@@ -1338,19 +1366,31 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 }
                 dict_ranges[d] = {bytes_start + a, b - a};
             }
-            std::vector<std::vector<std::uint8_t>> chunks;
-            if (!parse_miniblock_payload_chunk_list(payload, chunks, error)) {
+            // The index chunks go through the same splitter every other miniblock path uses, so a
+            // nullable dictionary column (a categorical column with missing values -- the shape this
+            // encoding exists for) carries its definition levels here like anywhere else. The
+            // dedicated chunk-list parser this replaced rejected the level buffer outright with
+            // "unexpected miniblock payload prefix".
+            if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, index_chunks,
+                                                validity_rows, out, error)) {
                 return false;
             }
-            if (chunks.empty()) {
+            if (index_chunks.empty()) {
                 error = "dict page has no index chunks";
                 return false;
             }
             indices_bytes.clear();  // hoisted out of the loop; accumulates fresh per page via insert()
             std::uint64_t rows_remaining = page.length;
-            for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
-                const auto count = std::min<std::uint64_t>(1024U, rows_remaining);
-                if (!unpack_bitpacked_page_dispatch(chunks[ci], count, 4U, indices_bytes, error)) {
+            for (const auto& chunk : index_chunks) {
+                const auto count = encoding_plan.repdef != nullptr
+                                       ? static_cast<std::uint64_t>(chunk.repdef_values)
+                                       : std::min<std::uint64_t>(1024U, rows_remaining);
+                if (count == 0U || count > rows_remaining) {
+                    error = "dict index chunk covers " + std::to_string(count) + " values with " +
+                            std::to_string(rows_remaining) + " left in the page";
+                    return false;
+                }
+                if (!unpack_bitpacked_page_dispatch(chunk.values, count, 4U, indices_bytes, error)) {
                     return false;
                 }
                 rows_remaining -= count;
@@ -1481,7 +1521,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     if (encoding_plan.kind == ColumnEncodingKind::kVariable) {
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-        const bool zstd = encoding_plan.zstd;
+        const auto value_scheme = encoding_plan.value_scheme;
         const bool nullable = encoding_plan.repdef != nullptr;
         // The offset width of the block actually stored in the chunk. Without FSST that is the
         // column's own (utf8 -> 32-bit, large_utf8 -> 64-bit). With FSST the stored block is the
@@ -1509,13 +1549,19 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             }
             std::uint64_t remaining = page.length;
             for (auto& chunk : chunks) {
-                if (zstd) {
+                if (value_scheme == page_layout::BufferScheme::kZstd) {
                     // The value buffer is a [u64 uncompressed size][zstd frame] envelope.
                     if (!zstd_unframe_buffer(chunk.values, raw, error)) {
                         return false;
                     }
                     // swap (not move): a move would leave `raw` empty every iteration, discarding its
-                    // capacity right when the next chunk's zstd_unframe_buffer call could have reused it.
+                    // capacity right when the next chunk's call could have reused it.
+                    std::swap(chunk.values, raw);
+                } else if (value_scheme == page_layout::BufferScheme::kLz4) {
+                    // LZ4's envelope is [u32 uncompressed size][block] -- see lz4_block.hpp.
+                    if (!lz4_block::decompress_sized(chunk.values, raw, error)) {
+                        return false;
+                    }
                     std::swap(chunk.values, raw);
                 }
                 // How many values the chunk holds. With definition levels the chunk header states it.

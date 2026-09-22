@@ -96,7 +96,7 @@ jobs:
             -DNANOLANCE_BUILD_EXAMPLES=OFF -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
 
       - name: Build fuzzers
-        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst -j
+        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst nanolance_fuzz_lz4 -j
 
       # 2 minutes per push per target is enough to catch regressions; extend for a nightly run.
       - name: Fuzz the decode chain
@@ -184,6 +184,14 @@ jobs:
         run: |
           mkdir -p corpus-fsst
           ./build-fuzz/nanolance_fuzz_fsst -max_total_time=120 -print_final_stats=1 corpus-fsst
+
+      - name: Fuzz the LZ4 block decompressor
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-lz4
+          ./build-fuzz/nanolance_fuzz_lz4 -max_total_time=120 -print_final_stats=1 corpus-lz4
 
       - name: Upload crash reproducers
         if: failure()

@@ -143,12 +143,13 @@ Lance's string compressor switches on):
 | `timestamp`, `date32/64`, `time32/64`, `decimal128/256` | yes |
 | nullable columns — scattered, all-null, and nulls in **runs** | yes |
 | `utf8`, `large_utf8`, `binary` — including FSST-compressed and nullable | yes |
-| a low-cardinality string column | no — Lance stores the dictionary LZ4-compressed |
+| a low-cardinality (categorical) string column, with or without nulls | yes — including its LZ4-compressed dictionary |
 | `list`, `struct` | no — not mapped at the manifest level |
 
 Anything in a "no" row is **refused by name**, not misread. Closing the rest is
-[docs/OPTIMIZATION_PLAN.md](docs/OPTIMIZATION_PLAN.md) §6 step 3; it needs no writer change, because
-the writer already emits the standards-compliant descriptors the reader now dispatches on.
+[docs/OPTIMIZATION_PLAN.md](docs/OPTIMIZATION_PLAN.md) §6; `list` and `struct` are the remaining gap
+and they sit at the manifest/schema layer, not in page decoding. None of this needed a writer change:
+the writer already emits the standards-compliant descriptors the reader dispatches on.
 
 ### Not yet supported / nanolance-only
 

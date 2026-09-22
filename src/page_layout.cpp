@@ -236,8 +236,9 @@ bool parse_general(Cursor c, Compressive& out, int depth, std::string& error) {
             }
             out.wire_scheme = scheme;
             out.scheme = scheme == static_cast<std::uint32_t>(BufferScheme::kZstd)  ? BufferScheme::kZstd
-                         : scheme == 0U                                            ? BufferScheme::kNone
-                                                                                   : BufferScheme::kUnknownScheme;
+                         : scheme == static_cast<std::uint32_t>(BufferScheme::kLz4) ? BufferScheme::kLz4
+                         : scheme == 0U                                             ? BufferScheme::kNone
+                                                                                    : BufferScheme::kUnknownScheme;
         } else if (field == 3U && wire == kWireBytes) {  // values
             Cursor sub;
             if (!read_submessage(c, sub)) {
@@ -587,6 +588,7 @@ void describe_compressive(const Compressive* node, std::string& out) {
         case CompressiveKind::kGeneral:
             out += "General{";
             out += node->scheme == BufferScheme::kZstd   ? "ZSTD"
+                   : node->scheme == BufferScheme::kLz4  ? "LZ4"
                    : node->scheme == BufferScheme::kNone ? "NONE"
                                                          : "scheme " + std::to_string(node->wire_scheme);
             out += ",";

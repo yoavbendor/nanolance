@@ -49,10 +49,12 @@ enum class CompressiveKind {
     kGeneral = 10,           ///< f10 General{ f1 BufferCompression{ f1 scheme }, f3 values }
 };
 
-/// Buffer-compression schemes inside `General`. Only the ones nanolance can actually decode are
-/// named; anything else stays kUnknownScheme so the caller refuses rather than mis-decodes.
+/// Buffer-compression schemes inside `General`, numbered as Lance's `CompressionScheme` enum does.
+/// Only the ones nanolance can actually decode are named; anything else stays kUnknownScheme so the
+/// caller refuses rather than mis-decodes.
 enum class BufferScheme {
     kNone = 0,
+    kLz4 = 1,
     kZstd = 2,
     kUnknownScheme = 255,
 };
