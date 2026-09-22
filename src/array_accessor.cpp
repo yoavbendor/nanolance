@@ -58,32 +58,72 @@ std::int64_t top_level_batch_child_index(const LanceSchemaMapping& mapping, cons
     return -1;
 }
 
-const ArrowArray* resolve_field_array_impl(const ArrowArray& batch,
-                                           const LanceSchemaMapping& mapping,
-                                           const LanceField& field) {
+/// Narrow `child` to the rows an enclosing array's `[enclosing_offset, +enclosing_length)` window
+/// covers, as a borrowed shallow view.
+///
+/// Arrow does NOT slice a struct's children when the struct is sliced: the parent carries the
+/// offset and the children keep their full extent. So a child's own `offset`/`length` describe the
+/// whole column, and reading them directly returns the wrong rows AND the wrong count. Composing
+/// the windows here is what makes `field.parent_id` chains slice-correct.
+bool narrow_to(const ArrowArray& child, std::int64_t enclosing_offset, std::int64_t enclosing_length,
+               ArrowArray& out) {
+    const auto offset = child.offset + enclosing_offset;
+    if (offset < child.offset || enclosing_length < 0 ||
+        offset + enclosing_length > child.offset + child.length) {
+        return false;  // the window is not inside the child; a malformed batch, not a slice
+    }
+    out = child;
+    out.offset = offset;
+    out.length = enclosing_length;
+    // `null_count` described the whole child, not this window. -1 is the interface's "not computed"
+    // and makes callers scan the bitmap over the window instead. Zero stays zero: a null-free column
+    // has null-free windows, and keeping it preserves the fast path.
+    if (out.null_count != 0) {
+        out.null_count = -1;
+    }
+    // A view borrows everything it points at. Blanking `release` makes an accidental release a loud
+    // null dereference rather than a silent double free of the real batch.
+    out.release = nullptr;
+    return true;
+}
+
+bool resolve_field_array_impl(const ArrowArray& batch, const LanceSchemaMapping& mapping,
+                              const LanceField& field, ArrowArray& out) {
     if (field.parent_id < 0) {
         const auto index = top_level_batch_child_index(mapping, field);
         if (index < 0) {
-            return nullptr;
+            return false;
         }
         if (batch.n_children > 0 && batch.children != nullptr) {
             if (index >= batch.n_children || batch.children[index] == nullptr) {
-                return nullptr;
+                return false;
             }
-            return batch.children[index];
+            // Both conventions have to work: pyarrow slices each COLUMN (offset on the child, root
+            // at 0), while a producer that slices the record batch itself puts the offset on the
+            // ROOT and leaves children whole. Composing them adds zero in each case.
+            return narrow_to(*batch.children[index], batch.offset, batch.length, out);
         }
-        return index == 0 ? &batch : nullptr;
+        if (index != 0) {
+            return false;
+        }
+        out = batch;
+        out.release = nullptr;
+        return true;
     }
 
     const auto* parent_field = find_field_by_id(mapping, field.parent_id);
     if (parent_field == nullptr) {
-        return nullptr;
+        return false;
     }
-    const auto* parent_array = resolve_field_array_impl(batch, mapping, *parent_field);
-    if (parent_array == nullptr) {
-        return nullptr;
+    ArrowArray parent_view{};
+    if (!resolve_field_array_impl(batch, mapping, *parent_field, parent_view)) {
+        return false;
     }
-    return child_by_mapped_name(*parent_array, mapping, field.parent_id, field.name);
+    const auto* child = child_by_mapped_name(parent_view, mapping, field.parent_id, field.name);
+    if (child == nullptr) {
+        return false;
+    }
+    return narrow_to(*child, parent_view.offset, parent_view.length, out);
 }
 
 // --- Null detection -------------------------------------------------------------------------
@@ -166,13 +206,19 @@ bool append_validity(const ArrowArray& batch,
                      ColumnValues& out,
                      std::string& error) {
     // Collect the arrays along the chain that actually carry nulls; usually none do.
-    std::vector<const ArrowArray*> nullable_levels;
+    //
+    // BY VALUE, not by pointer. These are rebased views built per iteration, so a vector of pointers
+    // into them dangles the moment the loop body ends -- which is what it did, and what ASan caught
+    // as a stack-use-after-scope. An ArrowArray is a small POD header; copying it is free and the
+    // buffers it points at belong to the batch either way.
+    std::vector<ArrowArray> nullable_levels;
     for (const LanceField* f = &field; f != nullptr;
          f = f->parent_id < 0 ? nullptr : find_field_by_id(mapping, f->parent_id)) {
-        const auto* array = resolve_field_array_impl(batch, mapping, *f);
-        if (array == nullptr) {
+        ArrowArray view{};
+        if (!resolve_field_array_impl(batch, mapping, *f, view)) {
             continue;
         }
+        const ArrowArray* array = &view;
         if (first_null_row(*array) >= 0) {
             if (array->length < length) {
                 error = "column '" + f->name + "' is shorter than the batch it belongs to";
@@ -191,7 +237,7 @@ bool append_validity(const ArrowArray& batch,
                         "in and null its fields instead.";
                 return false;
             }
-            nullable_levels.push_back(array);
+            nullable_levels.push_back(view);
         }
     }
 
@@ -221,8 +267,8 @@ bool append_validity(const ArrowArray& batch,
     out.validity.resize(static_cast<std::size_t>((base + static_cast<std::uint64_t>(length) + 7U) / 8U), 0U);
     for (std::int64_t i = 0; i < length; ++i) {
         bool is_null = false;
-        for (const auto* level : nullable_levels) {
-            is_null = is_null || row_is_null(*level, i);
+        for (const auto& level : nullable_levels) {
+            is_null = is_null || row_is_null(level, i);
         }
         const auto row = base + static_cast<std::uint64_t>(i);
         if (is_null) {
@@ -367,10 +413,10 @@ bool append_variable_width(const ArrowArray& array,
 
 }  // namespace
 
-const ArrowArray* resolve_field_array(const ArrowArray& batch,
-                                      const LanceSchemaMapping& mapping,
-                                      const LanceField& field) {
-    return resolve_field_array_impl(batch, mapping, field);
+bool resolve_field_array(const ArrowArray& batch, const LanceSchemaMapping& mapping,
+                         const LanceField& field, ArrowArray& out) {
+    out = ArrowArray{};
+    return resolve_field_array_impl(batch, mapping, field, out);
 }
 
 bool append_batch_column_values(const ArrowArray& batch,
@@ -404,12 +450,13 @@ bool append_batch_column_values(const ArrowArray& batch,
     }
     for (std::size_t i = 0; i < selected.size(); ++i) {
         const auto& field = *selected[i];
-        const auto* array = resolve_field_array(batch, mapping, field);
-        if (array == nullptr) {
+        ArrowArray view{};
+        if (!resolve_field_array(batch, mapping, field, view)) {
             error = "missing ArrowArray for mapped field ";
             error += field.name;
             return false;
         }
+        const ArrowArray* array = &view;
         // Validity first: it is recorded against the rows already appended, so it has to be taken
         // before the value append advances them.
         if (!append_validity(batch, mapping, field, array->length, columns[i], error)) {

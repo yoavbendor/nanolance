@@ -75,7 +75,6 @@ int main() {
     nano_lance::LanceSchemaMapping mapping;
     require(nano_lance::map_arrow_schema(schema, mapping, error, true), error);
     const auto* payload = find_field_by_name(mapping, "payload_ref");
-    require(payload != nullptr, "payload_ref missing from mapping");
 
     std::vector<std::uint64_t> packet_ids{1, 2};
     std::vector<nano_lance::BlobV2Row> rows;
@@ -86,31 +85,36 @@ int main() {
     require(nano_lance::build_epb_table_array(packet_ids, rows, batch, error), error);
     require(batch.length == 2, "batch length mismatch");
 
-    const auto* struct_array = nano_lance::resolve_field_array(batch, mapping, *payload);
-    require(struct_array != nullptr, "payload_ref struct array missing");
+    ArrowArray struct_array{};
+    require(nano_lance::resolve_field_array(batch, mapping, *payload, struct_array),
+            "resolve struct_array");
 
     const auto* data_f = find_field_by_name(mapping, "data");
     const auto* uri_f = find_field_by_name(mapping, "uri");
     const auto* pos_f = find_field_by_name(mapping, "position");
     const auto* size_f = find_field_by_name(mapping, "size");
-    require(data_f != nullptr && uri_f != nullptr && pos_f != nullptr && size_f != nullptr,
-            "write-side blob children missing from mapping");
 
-    const auto* data_a = nano_lance::resolve_field_array(batch, mapping, *data_f);
-    const auto* uri_a = nano_lance::resolve_field_array(batch, mapping, *uri_f);
-    const auto* pos_a = nano_lance::resolve_field_array(batch, mapping, *pos_f);
-    const auto* size_a = nano_lance::resolve_field_array(batch, mapping, *size_f);
-    require(data_a != nullptr && uri_a != nullptr && pos_a != nullptr && size_a != nullptr,
-            "write-side blob child arrays missing");
+    ArrowArray data_a{};
+    require(nano_lance::resolve_field_array(batch, mapping, *data_f, data_a),
+            "resolve data_a");
+    ArrowArray uri_a{};
+    require(nano_lance::resolve_field_array(batch, mapping, *uri_f, uri_a),
+            "resolve uri_a");
+    ArrowArray pos_a{};
+    require(nano_lance::resolve_field_array(batch, mapping, *pos_f, pos_a),
+            "resolve pos_a");
+    ArrowArray size_a{};
+    require(nano_lance::resolve_field_array(batch, mapping, *size_f, size_a),
+            "resolve size_a");
 
     {
         nano_lance::BlobV2ExternalDescriptor row0{};
-        require(nano_lance::preprocess_blob_v2_external_row(*data_a, *uri_a, *pos_a, *size_a, 0, row0, error),
+        require(nano_lance::preprocess_blob_v2_external_row(data_a, uri_a, pos_a, size_a, 0, row0, error),
                 error);
         require_descriptor_matches(row0, 3, 100, 64, "file:///tmp/capture_001.pcapng");
 
         nano_lance::BlobV2ExternalDescriptor row1{};
-        require(nano_lance::preprocess_blob_v2_external_row(*data_a, *uri_a, *pos_a, *size_a, 1, row1, error),
+        require(nano_lance::preprocess_blob_v2_external_row(data_a, uri_a, pos_a, size_a, 1, row1, error),
                 error);
         require_descriptor_matches(row1, 3, 200, 128, "s3://bucket/capture_001.pcapng");
     }
@@ -121,12 +125,20 @@ int main() {
         ArrowArray inline_batch{};
         require(nano_lance::build_epb_table_array(std::vector<std::uint64_t>{1}, inline_rows, inline_batch, error),
                 error);
-        const auto* inline_data = nano_lance::resolve_field_array(inline_batch, mapping, *data_f);
-        const auto* inline_uri = nano_lance::resolve_field_array(inline_batch, mapping, *uri_f);
-        const auto* inline_pos = nano_lance::resolve_field_array(inline_batch, mapping, *pos_f);
-        const auto* inline_size = nano_lance::resolve_field_array(inline_batch, mapping, *size_f);
+        ArrowArray inline_data{};
+        require(nano_lance::resolve_field_array(inline_batch, mapping, *data_f, inline_data),
+                "resolve inline_data");
+        ArrowArray inline_uri{};
+        require(nano_lance::resolve_field_array(inline_batch, mapping, *uri_f, inline_uri),
+                "resolve inline_uri");
+        ArrowArray inline_pos{};
+        require(nano_lance::resolve_field_array(inline_batch, mapping, *pos_f, inline_pos),
+                "resolve inline_pos");
+        ArrowArray inline_size{};
+        require(nano_lance::resolve_field_array(inline_batch, mapping, *size_f, inline_size),
+                "resolve inline_size");
         nano_lance::BlobV2ExternalDescriptor rejected{};
-        require(!nano_lance::preprocess_blob_v2_external_row(*inline_data, *inline_uri, *inline_pos, *inline_size, 0,
+        require(!nano_lance::preprocess_blob_v2_external_row(inline_data, inline_uri, inline_pos, inline_size, 0,
                                                                rejected, error),
                 "inline blob row must be rejected");
         require(error.find("external references") != std::string::npos, "inline rejection message mismatch");
@@ -211,7 +223,6 @@ int main() {
         nano_lance::LanceSchemaMapping write_mapping = mapping;
         require(nano_lance::finalize_blob_v2_schema_for_write(write_mapping, error), error);
         const auto* finalized_parent = find_field_by_name(write_mapping, "payload_ref");
-        require(finalized_parent != nullptr, "finalized payload_ref missing");
         require(finalized_parent->column_index == 1, "finalized blob column index mismatch");
         require(finalized_parent->metadata.at("lance-encoding:packed") == "true", "packed metadata missing");
         require(finalized_parent->metadata.at("lance-encoding:blob") == "true", "blob metadata missing");

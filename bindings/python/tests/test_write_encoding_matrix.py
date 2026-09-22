@@ -113,12 +113,7 @@ def test_one_dataset_holding_every_shape_at_once(tmp_path):
     column with a bad page layout takes its neighbours down with it. Writing each shape to its own
     dataset (above) cannot catch that, and neither can reading only the column under test.
     """
-    columns = {}
-    for name, table, _ in SHAPES:
-        if name == "struct":
-            continue  # a struct child would collide with the flat naming below
-        columns[name] = table.column("c")
-    combined = pa.table(columns)
+    combined = pa.table({name: table.column("c") for name, table, _ in SHAPES})
 
     path = tmp_path / "everything.lance"
     nanolance.write_table(combined, path, compression=True)
@@ -134,8 +129,7 @@ def test_every_shape_survives_sliced_multi_batch_writes(options, tmp_path):
     from row `chunksize` on. Encoding choice and batch slicing are independent axes, and the bug
     lived in their product -- so the matrix has to cover it, not just the single-batch write above.
     """
-    columns = {name: table.column("c") for name, table, _ in SHAPES if name != "struct"}
-    combined = pa.table(columns)
+    combined = pa.table({name: table.column("c") for name, table, _ in SHAPES})
 
     path = tmp_path / "sliced.lance"
     with nanolance.LanceWriter(path, options=nanolance.WriteOptions(**options), max_rows_per_fragment=6_000) as writer:
@@ -143,3 +137,39 @@ def test_every_shape_survives_sliced_multi_batch_writes(options, tmp_path):
             writer.write_batch(batch)
 
     _assert_both_readers_agree(path, combined)
+
+
+def test_a_sliced_struct_column_keeps_its_own_rows(tmp_path):
+    """A sliced STRUCT is the case a sliced flat column does not cover.
+
+    Arrow does not slice a struct's children when the struct is sliced: the parent carries the
+    offset and the children keep their full extent. Reading a child array directly therefore took
+    the wrong rows AND the wrong count, and the writer refused the batch outright:
+
+        RuntimeError: column value count does not match row count for a
+
+    Loud rather than silent, unlike the flat-column version of this bug -- but it meant
+    `to_batches()`, the obvious way to feed the streaming writer, could not write a struct column at
+    all. No test wrote one, because the matrix above used to exclude struct from its sliced case.
+    """
+    n = 2_000
+    table = pa.table(
+        {
+            "s": pa.array([{"a": i, "b": f"v{i % 13}"} for i in range(n)]),
+            "flat": pa.array(range(n), type=pa.int64()),
+        }
+    )
+
+    # A single batch that is itself a slice: the narrowest form of the bug.
+    one = tmp_path / "one_slice.lance"
+    sliced = table.to_batches()[0].slice(500, 700)
+    with nanolance.LanceWriter(one) as writer:
+        writer.write_batch(sliced)
+    assert pa.table(nanolance.read_table(one)).to_pydict() == pa.Table.from_batches([sliced]).to_pydict()
+
+    # ...and the ordinary to_batches() loop across fragments.
+    many = tmp_path / "many_slices.lance"
+    with nanolance.LanceWriter(many, max_rows_per_fragment=800) as writer:
+        for batch in table.to_batches(max_chunksize=250):
+            writer.write_batch(batch)
+    _assert_both_readers_agree(many, table)
