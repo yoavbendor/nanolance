@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Union
+from typing import Optional, Sequence, Union
 
 from nanolance import _nanolance
 
@@ -159,15 +159,40 @@ class LanceWriter:
         return self._writer.__exit__(exc_type, exc, tb)
 
 
-def read_table(path: Union[str, os.PathLike]):
-    """Read a nanolance-written Lance dataset.
+def read_table(path: Union[str, os.PathLike], columns: Optional[Sequence[str]] = None):
+    """Read a Lance dataset.
 
     Returns an Arrow-exportable handle. Pass to ``pyarrow.table()`` or
     ``polars.from_arrow()`` for a zero-copy view. The handle exports an Arrow C
     stream that yields one batch per fragment, so a reader can consume it chunk
     by chunk (e.g. ``for batch in pa.RecordBatchReader.from_stream(handle): ...``).
+
+    ``columns`` names the top-level columns to read, the same way
+    ``pyarrow.parquet.read_table(..., columns=[...])`` does::
+
+        nanolance.read_table("events.lance", columns=["ts", "level"])
+
+    This is a real projection, not a post-filter: the columns you do not ask for
+    are skipped during decode rather than decoded and thrown away. Column
+    materialization is where a read spends its time, so on a wide table read for
+    a few columns that skipped work IS the cost. Naming a column that does not
+    exist is an error, not a silently empty result, and so is an empty list --
+    pass ``columns=None`` to read everything.
+
+    One difference from ``pyarrow.parquet``: the result is in the dataset's own
+    column order, not the order you listed. ``columns=["c", "a"]`` gives back
+    ``["a", "c"]``. Reorder afterwards (``table.select([...])``) if it matters.
     """
-    return _nanolance.read_table(Path(path))
+    if columns is None:
+        return _nanolance.read_table(Path(path))
+    # list(): the C++ side wants a sequence of str, and a generator or a bare str would each go
+    # wrong in a different quiet way -- a str is a Sequence[str] of its own characters.
+    if isinstance(columns, str):
+        raise TypeError("columns must be a sequence of column names, not a single string")
+    names = [str(name) for name in columns]
+    if not names:
+        raise ValueError("columns must name at least one column; pass columns=None to read them all")
+    return _nanolance.read_table(Path(path), names)
 
 
 __all__ = ["write_table", "read_table", "WriteOptions", "LanceWriter", "__version__"]

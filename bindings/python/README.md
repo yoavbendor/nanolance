@@ -91,7 +91,7 @@ for batch in reader:
 |----------|-------------|
 | `write_table(table, path, **opts)` | Write an Arrow table to a Lance dataset (one fragment per input batch) |
 | `LanceWriter(path, *, max_rows_per_fragment=0, **opts)` | Streaming context-manager writer: `write_batch(batch)`, `flush()`, `close()` |
-| `read_table(path)` | Arrow-exportable Lance reader handle (exports an Arrow C stream, one batch per fragment) |
+| `read_table(path, columns=None)` | Arrow-exportable Lance reader handle (exports an Arrow C stream, one batch per fragment); `columns` projects |
 | `WriteOptions` | `compression`, `compression_level`, `structural_encoding`, `append`, `blob_uri_dictionary`, `ignore_nullability` |
 
 `write_table` and `LanceWriter.write_batch` accept any Arrow-exportable input (pyarrow `Table` / `RecordBatch`, polars via `to_arrow()`, etc.). `LanceWriter` takes the same encoding options as `write_table` plus `max_rows_per_fragment` (0 = single fragment committed on close).
@@ -127,22 +127,38 @@ and [AGENTS.md §3](../../AGENTS.md#3-enabling-the-compression-that-was-measured
 
 ### Read (`read_table`)
 
-**Scope:** writer-parity reader — reliably reads datasets **written by nanolance** (this package or the C++ library). This is not a full Lance SDK; arbitrary `pylance`-written files that use encodings we never emit may fail.
+```python
+nanolance.read_table("events.lance")                          # every column
+nanolance.read_table("events.lance", columns=["ts", "level"])  # just these two
+```
+
+`columns=` is a real projection, shaped like `pyarrow.parquet.read_table`: the columns you do not
+ask for are **skipped during decode** rather than decoded and thrown away, which is what makes it
+worth using — column materialization is where a read spends its time. Naming a column that does not
+exist is an error, not a silently empty result. One difference from pyarrow: the result comes back in
+the dataset's column order, not the order you listed.
+
+**Scope.** nanolance reads back everything it writes, and now every non-nested column type stock
+Lance writes:
 
 | Readable | Notes |
 |----------|-------|
-| Datasets written by `nanolance.write_table` | Round-trip tested (parity tests) |
-| Encodings we write | Flat fixed-width, zstd strings, bitpacking, RLE, constant, dict-RLE, structural dictionary |
-| Struct columns | Yes |
-| Append fragments | Yes (reads latest manifest) |
+| Datasets written by `nanolance.write_table` | Round-trip tested |
+| Fixed-width, temporal and decimal columns from stock Lance | int/uint 8–64, float, bool, timestamp/date/time, decimal128/256, `fixed_size_binary` |
+| `utf8` / `large_utf8` / `binary` from stock Lance | Including FSST-compressed |
+| Nullable columns from stock Lance | Bit-packed *and* run-length-encoded definition levels |
+| Categorical columns from stock Lance | Including their LZ4-compressed dictionary |
+| Struct columns written by nanolance, append fragments | Yes (reads latest manifest) |
 
-| Not guaranteed | Use instead |
+| Not supported | Use instead |
 |----------------|-------------|
-| Arbitrary third-party Lance files | `pylance` (`import lance`) |
+| `list` and `struct` columns written by **stock Lance** | `pylance` — these are unmapped at the manifest layer, and refused by name |
 | `blob_uri_dictionary` blob columns | nanolance reader only (not stock `lance`) |
-| On-disk encodings we do not implement | `pylance` |
 
-**Interop rule of thumb:** everything nanolance writes with default Lance-compatible options is readable by **both** `nanolance.read_table` and `lance.dataset()` (verified vs `lance` 7.0.0). The reverse (pylance write → nanolance read) is best-effort only for simple schemas.
+**Interop rule of thumb:** everything nanolance writes with default Lance-compatible options is
+readable by **both** `nanolance.read_table` and `lance.dataset()` (verified against `pylance` 12.0.0).
+The reverse now holds for every non-nested column shape; anything still missing is **refused by
+name**, never misread.
 
 ---
 

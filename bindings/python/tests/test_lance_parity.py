@@ -530,6 +530,87 @@ def test_reads_nullable_dictionary_columns_written_by_stock_lance(null_at, tmp_p
     assert back.column(0).to_pylist() == values
 
 
+# ── Column projection ────────────────────────────────────────────────────────────────────────────
+# `columns=` is the first thing a pyarrow.parquet user reaches for. It is a real projection: the
+# columns not asked for are skipped during decode rather than decoded and discarded, which matters
+# because column materialization is where a read spends its time.
+
+
+@pytest.fixture
+def projection_table():
+    return pa.table(
+        {
+            "a": pa.array([1, 2, 3], type=pa.int64()),
+            "b": pa.array(["x", None, "z"], type=pa.string()),
+            "c": pa.array([1.5, 2.5, 3.5], type=pa.float64()),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "columns", [["a"], ["b"], ["a", "c"], ["a", "b", "c"]],
+    ids=["one_fixed", "one_variable", "subset", "all_named"],
+)
+def test_projection_reads_exactly_the_named_columns(columns, projection_table, tmp_path):
+    path = tmp_path / "projected.lance"
+    nanolance.write_table(projection_table, path)
+    back = pa.table(nanolance.read_table(path, columns=columns))
+    assert back.column_names == columns
+    for name in columns:
+        assert back.column(name).to_pylist() == projection_table.column(name).to_pylist()
+
+
+def test_projection_returns_dataset_order_not_requested_order(projection_table, tmp_path):
+    """Documented difference from pyarrow.parquet, pinned so it cannot drift silently."""
+    path = tmp_path / "order.lance"
+    nanolance.write_table(projection_table, path)
+    assert pa.table(nanolance.read_table(path, columns=["c", "a"])).column_names == ["a", "c"]
+
+
+def test_projection_matches_a_full_read(projection_table, tmp_path):
+    """The projected path must not be a second, subtly different decoder."""
+    path = tmp_path / "same.lance"
+    nanolance.write_table(projection_table, path, compression=True)
+    full = pa.table(nanolance.read_table(path))
+    for name in projection_table.column_names:
+        projected = pa.table(nanolance.read_table(path, columns=[name]))
+        assert projected.column(name).equals(full.column(name))
+
+
+def test_projection_of_a_stock_lance_dataset(tmp_path):
+    """Projection is orthogonal to who wrote the file."""
+    lance = require_pylance()
+    n = 20000
+    table = pa.table(
+        {
+            "keep": pa.array([None if i % 11 == 0 else _fsst_sentence(i) for i in range(n)]),
+            "drop": pa.array(list(range(n)), type=pa.int64()),
+        }
+    )
+    path = tmp_path / "stock_projected.lance"
+    lance.write_dataset(table, str(path), mode="overwrite")
+    back = pa.table(nanolance.read_table(path, columns=["keep"]))
+    assert back.column_names == ["keep"]
+    assert back.column("keep").to_pylist() == table.column("keep").to_pylist()
+
+
+@pytest.mark.parametrize(
+    "columns, exc, needle",
+    [
+        pytest.param(["nope"], RuntimeError, "not found", id="unknown_column"),
+        pytest.param([], ValueError, "at least one column", id="empty_list"),
+        pytest.param("a", TypeError, "not a single string", id="bare_string"),
+    ],
+)
+def test_bad_projections_are_refused_by_name(columns, exc, needle, projection_table, tmp_path):
+    """A bare string is the trap worth a test: str IS a Sequence[str], of its own characters."""
+    path = tmp_path / "bad.lance"
+    nanolance.write_table(projection_table, path)
+    with pytest.raises(exc) as excinfo:
+        nanolance.read_table(path, columns=columns)
+    assert needle in str(excinfo.value)
+
+
 # ── Writing nulls ────────────────────────────────────────────────────────────────────────────────
 # nanolance now emits Lance's definition-level layer for fixed-width columns: layers = [3], the
 # repdef encoding in MiniBlockLayout.f2, and a per-chunk level buffer ahead of the values. Level 1

@@ -19,10 +19,10 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | 1.1 Real nullability | **done**, read and write, fixed- and variable-width; a null struct is still refused |
 | 1.2 timestamp / date / time / decimal | **done** — plus a pre-existing width-declaration bug it exposed |
 | Phase 2 — wheels, CMake install | **2.1 wheels and 2.3 CI done**; 2.2 install/export deliberately not |
-| Phase 3 — streaming read, projection in Python | not started |
+| Phase 3 — streaming read, projection in Python | **3.2 projection done**; 3.1 streaming, 3.4 parquet2lance next |
 | Phase 4 — read-path optimization | not started (deliberately last) |
 
-Test suite: **48 ctest** (was 42) and **187 pytest** (was 22), all passing.
+Test suite: **48 ctest** (was 42) and **197 pytest** (was 22), all passing.
 
 Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout`, `nanolance_fuzz_fsst` and
 `nanolance_fuzz_lz4`, all clean; the longest campaign run here was 95,896,936 executions. Between
@@ -470,6 +470,36 @@ build tree, so exporting nanolance means deciding how to ship *them* -- and a ve
 nanoarrow's headers on a consumer's include path is a real decision, not a mechanical one. The
 audience for it also already has a working path (`FetchContent_Declare(nanolance)`), unlike the
 wheel audience, which had none. Left for a deliberate pass rather than done halfway.
+
+## Phase 3: the Python API a parquet user expects
+
+### 3.2 Column projection
+
+`nanolance.read_table(path, columns=["ts", "level"])` now works, shaped like
+`pyarrow.parquet.read_table` so the migration is a one-line diff.
+
+This is a real projection, not a post-filter: `lance_table_read_dataset_projected` already existed in
+C++ and skips the unasked-for columns **during decode**. That is the whole point — column
+materialization is where a read spends its time, so on a wide table read for a few columns the
+skipped work IS the cost. It reached Python through a new
+`nano_lance_table_read_dataset_projected` C entry point that shares `read_dataset_impl` with the
+full read rather than duplicating it; the duplicated version of that ownership contract is what used
+to segfault every failed read.
+
+Three edges are refused by name rather than guessed at:
+
+- an unknown column name (an error, not a silently empty result);
+- an empty list (`columns=None` reads everything; `columns=[]` reaching the schema mapper came back
+  as "schema mapping has no root fields", which tells a caller nothing);
+- a bare string -- the trap worth a test, since `str` *is* a `Sequence[str]`, of its own characters.
+
+**One documented difference from pyarrow**, pinned by a test so it cannot drift silently: the result
+is in the dataset's column order, not the order you listed. `columns=["c", "a"]` gives back
+`["a", "c"]`.
+
+The Python README's read section was rewritten at the same time. It still said interop was "verified
+vs lance 7.0.0" and that pylance -> nanolance was "best-effort only for simple schemas", which
+stopped being true several commits ago.
 
 ---
 

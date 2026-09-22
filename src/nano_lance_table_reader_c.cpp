@@ -29,7 +29,12 @@ int map_status(const std::string& error) {
     return NANO_LANCE_READER_PARSE_ERROR;
 }
 
-int read_dataset_impl(const char* dataset_path, bool trusted_input, struct ArrowSchema* out_schema,
+/// `columns` is null for "every column"; otherwise it names the top-level columns to decode and the
+/// rest are skipped entirely (see lance_table_read_dataset_projected). Everything else about the two
+/// paths is identical, so they share this body rather than duplicating the ownership contract -- the
+/// part that, when it was duplicated, segfaulted every failed read.
+int read_dataset_impl(const char* dataset_path, bool trusted_input, const std::vector<std::string>* columns,
+                      struct ArrowSchema* out_schema,
                       struct ArrowArray** out_batches, size_t* out_batch_count, char* error_message,
                       size_t error_message_capacity) {
     if (out_schema == nullptr || out_batches == nullptr || out_batch_count == nullptr) {
@@ -47,8 +52,13 @@ int read_dataset_impl(const char* dataset_path, bool trusted_input, struct Arrow
 
     std::vector<ArrowArray> batches;
     std::string error;
-    if (!nano_lance::lance_table_read_dataset(std::filesystem::path(dataset_path), *out_schema, batches, error,
-                                              trusted_input)) {
+    const bool ok =
+        columns == nullptr
+            ? nano_lance::lance_table_read_dataset(std::filesystem::path(dataset_path), *out_schema, batches,
+                                                   error, trusted_input)
+            : nano_lance::lance_table_read_dataset_projected(std::filesystem::path(dataset_path), *columns,
+                                                             *out_schema, batches, error, trusted_input);
+    if (!ok) {
         // lance_table_read_dataset already released the schema (see its declaration). Releasing it
         // again here called through a null `release` pointer -- every failed read from the C API or
         // the Python bindings segfaulted the process instead of returning this status.
@@ -85,16 +95,42 @@ int read_dataset_impl(const char* dataset_path, bool trusted_input, struct Arrow
 extern "C" int nano_lance_table_read_dataset(const char* dataset_path, struct ArrowSchema* out_schema,
                                              struct ArrowArray** out_batches, size_t* out_batch_count,
                                              char* error_message, size_t error_message_capacity) {
-    return read_dataset_impl(dataset_path, /*trusted_input=*/false, out_schema, out_batches, out_batch_count,
-                             error_message, error_message_capacity);
+    return read_dataset_impl(dataset_path, /*trusted_input=*/false, /*columns=*/nullptr, out_schema,
+                             out_batches, out_batch_count, error_message, error_message_capacity);
 }
 
 extern "C" int nano_lance_table_read_dataset_ex(const char* dataset_path, int trusted_input,
                                                 struct ArrowSchema* out_schema, struct ArrowArray** out_batches,
                                                 size_t* out_batch_count, char* error_message,
                                                 size_t error_message_capacity) {
-    return read_dataset_impl(dataset_path, trusted_input != 0, out_schema, out_batches, out_batch_count,
-                             error_message, error_message_capacity);
+    return read_dataset_impl(dataset_path, trusted_input != 0, /*columns=*/nullptr, out_schema, out_batches,
+                             out_batch_count, error_message, error_message_capacity);
+}
+
+extern "C" int nano_lance_table_read_dataset_projected(const char* dataset_path,
+                                                       const char* const* column_names, size_t column_count,
+                                                       int trusted_input, struct ArrowSchema* out_schema,
+                                                       struct ArrowArray** out_batches, size_t* out_batch_count,
+                                                       char* error_message, size_t error_message_capacity) {
+    if (column_names == nullptr || column_count == 0) {
+        // A zero-column projection reaches the schema mapper as "no root fields" and comes back with
+        // that internal wording, which tells a caller nothing about what they did. Refuse it here
+        // instead. (Reading zero columns to get just a row count needs its own entry point, not an
+        // empty projection.)
+        set_error(error_message, error_message_capacity, "at least one column name is required");
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
+    std::vector<std::string> columns;
+    columns.reserve(column_count);
+    for (size_t i = 0; i < column_count; ++i) {
+        if (column_names[i] == nullptr) {
+            set_error(error_message, error_message_capacity, "column_names contains a null entry");
+            return NANO_LANCE_READER_INVALID_ARGUMENT;
+        }
+        columns.emplace_back(column_names[i]);
+    }
+    return read_dataset_impl(dataset_path, trusted_input != 0, &columns, out_schema, out_batches,
+                             out_batch_count, error_message, error_message_capacity);
 }
 
 extern "C" void nano_lance_table_read_result_free(struct ArrowSchema* schema, struct ArrowArray* batches,
