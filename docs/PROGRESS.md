@@ -1510,6 +1510,47 @@ types x sizes found all of it in one run.
 
 ---
 
+## The type surface, swept in both directions
+
+Asked whether encoders or decoders were still missing, and specifically about lists, I swept every
+Arrow type through both directions rather than answer from the backlog.
+
+**Round-trips through nanolance, and stock Lance reads the result** (24): every int and uint width,
+`float32`/`float64`, `bool`, `string`, `binary`, `fixed_size_binary`, `date32`/`date64`,
+`time32`/`time64`, `timestamp` with and without a timezone, `decimal128`, `decimal256`, `struct`, and
+nested `struct`.
+
+**Refused on write, cleanly and by name** (12): `float16`, `duration`, `large_string`,
+`large_binary`, Arrow `dictionary`, Arrow `null`, and every list shape — `list`, `large_list`,
+`fixed_size_list`, `list<struct>`, `struct<list>`, `map`. No crashes and no silent corruption
+anywhere, which is the property that matters most: writing a type it cannot represent is the failure
+this project has already had once.
+
+**Three read/write asymmetries, all deliberate:** `large_string`, `large_binary` and Arrow's `null`
+type **read back correctly from a pylance dataset** while being refused on write. For the large
+types the reason is recorded at the refusal — Lance keeps u32 offsets *inside* the chunk and signals
+the 64-bit Arrow width only in the descriptor, so writing them means decoupling two widths across
+five page paths; reading them needs none of that. For `null`, the reader already understands Lance's
+all-null `ConstantLayout` and the writer has no path to emit it.
+
+### Lists: no, and they fail earlier than expected
+
+Not supported in either direction, and the read side does not fail in a decoder — it fails at the
+**manifest's schema**, before a page is touched: `unsupported on-disk logical type for manifest
+recovery: list`. Lance's repetition layer is parsed only far enough to know it exists
+(`has_repetition`, which the chunk header arithmetic needs); nothing consumes it.
+
+That makes lists the largest single type gap, and a bigger piece of work than the three read gaps
+above it: repetition levels are a whole layer, not a missing branch. Every nested shape built on one
+goes with it — `list<struct>`, `struct<list>` and `map` (which Lance represents as a list of
+key/value structs).
+
+`test_type_support_matrix.py` pins all of the above: the round-trips both ways, a clean named
+refusal for each unsupported type, the three read-only asymmetries, and the unreadable set by
+message. It is the project's capability statement, executable.
+
+---
+
 ## Deviations from the plan, and open items
 
 Kept honest: everything here was found and reproduced during this work. Ordered by what a new user
@@ -1544,8 +1585,16 @@ is most likely to hit.
 6. **Arrow dictionary columns are refused.** Deliberate and explained in the error (nanolance would
    keep the indices and drop the values), with a working remedy — cast to the value type and let
    nanolance's own on-disk dictionary do it. Worth revisiting only if a user hits it.
-7. **`list` types are unsupported end to end.** Lance's repetition layer is parsed only far enough to
-   know it is there (`has_repetition`), which is what the chunk header needs; nothing decodes it.
+7. **`list` types are unsupported end to end, and so is everything built on one.** Lance's
+   repetition layer is parsed only far enough to know it exists (`has_repetition`, which the chunk
+   header needs); nothing consumes it. On write a list never reaches an encoder; on read it fails at
+   the manifest's schema, before any page. `list`, `large_list`, `fixed_size_list`, `list<struct>`,
+   `struct<list>` and `map` all go together — Lance represents a map as a list of key/value structs.
+   This is the largest type gap and a bigger piece than items 1-6: repetition levels are a layer, not
+   a branch.
+
+   Also missing, and much smaller: `float16` and `duration`, neither of which has a decoder or an
+   encoder, both refused cleanly.
 
 ### Ergonomics
 

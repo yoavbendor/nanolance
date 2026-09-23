@@ -1,0 +1,201 @@
+"""Which Arrow types nanolance supports, in each direction, as an executable statement.
+
+Three things this pins that prose cannot:
+
+1. **A refused type must refuse, not corrupt.** The worst failure this project has had was writing a
+   type it could not represent and producing a file that read back wrong (see the nullability work).
+   Every entry in ``REFUSED_ON_WRITE`` asserts a clean, named refusal -- so a future change that makes
+   one of them "work" fails here instead of silently shipping bad files.
+2. **The read and write surfaces are not the same, on purpose.** `large_string`, `large_binary`,
+   `decimal256` and Arrow's `null` type all READ correctly from a pylance dataset and are REFUSED on
+   write. Those asymmetries are deliberate and each has a reason recorded where it is raised; pinning
+   them stops someone "tidying up" one side.
+3. **Lists are unsupported in both directions**, and fail at the earliest possible point -- the
+   manifest's schema, before any page is touched. That is the single largest type gap.
+
+Types are exercised at 200 rows: enough for Lance to make real encoding choices, small enough that
+the whole matrix runs in a couple of seconds. Row-count sensitivity is `test_lance_read_matrix.py`'s
+job, not this file's.
+"""
+
+from __future__ import annotations
+
+import datetime
+import decimal
+
+import pyarrow as pa
+import pytest
+
+import nanolance
+from tests.support import require_pylance
+
+N = 200
+
+
+def _t(arrow_type, values):
+    return pa.table({"c": pa.array(values, arrow_type)})
+
+
+def _ints():
+    out = {}
+    for width in (8, 16, 32, 64):
+        out[f"int{width}"] = _t(getattr(pa, f"int{width}")(), [i % 100 for i in range(N)])
+        out[f"uint{width}"] = _t(getattr(pa, f"uint{width}")(), [i % 100 for i in range(N)])
+    return out
+
+
+ROUNDTRIPS = {
+    **_ints(),
+    "float32": _t(pa.float32(), [i * 0.5 for i in range(N)]),
+    "float64": _t(pa.float64(), [i * 0.125 for i in range(N)]),
+    "bool": _t(pa.bool_(), [i % 3 == 0 for i in range(N)]),
+    "string": _t(pa.utf8(), [f"s{i}" for i in range(N)]),
+    "binary": _t(pa.binary(), [b"b%d" % i for i in range(N)]),
+    "fixed_size_binary": _t(pa.binary(4), [b"%04d" % i for i in range(N)]),
+    "date32": _t(pa.date32(), [datetime.date(2026, 1, 1) + datetime.timedelta(days=i) for i in range(N)]),
+    "date64": _t(pa.date64(), [datetime.date(2026, 1, 1) + datetime.timedelta(days=i) for i in range(N)]),
+    "time32_s": _t(pa.time32("s"), [datetime.time(i % 24, i % 60) for i in range(N)]),
+    "time64_us": _t(pa.time64("us"), [datetime.time(i % 24, i % 60) for i in range(N)]),
+    "timestamp_us": _t(
+        pa.timestamp("us"),
+        [datetime.datetime(2026, 1, 1) + datetime.timedelta(seconds=i) for i in range(N)],
+    ),
+    "timestamp_utc": _t(
+        pa.timestamp("us", tz="UTC"),
+        [datetime.datetime(2026, 1, 1) + datetime.timedelta(seconds=i) for i in range(N)],
+    ),
+    "decimal128": _t(pa.decimal128(12, 2), [decimal.Decimal(f"{i}.{i % 100:02d}") for i in range(N)]),
+    "decimal256": _t(pa.decimal256(40, 2), [decimal.Decimal(f"{i}.{i % 100:02d}") for i in range(N)]),
+    "struct": pa.table({"c": pa.array([{"a": i, "b": f"s{i}"} for i in range(N)])}),
+    "struct_nested": pa.table({"c": pa.array([{"a": {"x": i}} for i in range(N)])}),
+}
+
+# Refused at write_batch, each with a message naming the column. The fragment is what the refusal has
+# to keep saying; a change that makes any of these WRITE must come here and justify itself.
+REFUSED_ON_WRITE = {
+    "float16": (_t(pa.float16(), [float(i % 10) for i in range(N)]), "unsupported Arrow C format"),
+    "duration_us": (
+        _t(pa.duration("us"), [datetime.timedelta(seconds=i) for i in range(N)]),
+        "unsupported Arrow C format",
+    ),
+    "large_string": (_t(pa.large_utf8(), [f"s{i}" for i in range(N)]), "large_utf8"),
+    "large_binary": (_t(pa.large_binary(), [b"b%d" % i for i in range(N)]), "large_binary"),
+    "dictionary": (
+        pa.table({"c": pa.array([f"d{i % 5}" for i in range(N)]).dictionary_encode()}),
+        "dictionary-encoded column",
+    ),
+    "null": (_t(pa.null(), [None] * N), "null type"),
+    "list": (_t(pa.list_(pa.int64()), [[i, i + 1] for i in range(N)]), "unsupported Arrow C format"),
+    "large_list": (
+        _t(pa.large_list(pa.int64()), [[i, i + 1] for i in range(N)]),
+        "unsupported Arrow C format",
+    ),
+    "fixed_size_list": (
+        _t(pa.list_(pa.int64(), 2), [[i, i + 1] for i in range(N)]),
+        "unsupported Arrow C format",
+    ),
+    "list_of_struct": (
+        _t(pa.list_(pa.struct([("a", pa.int64())])), [[{"a": i}] for i in range(N)]),
+        "unsupported Arrow C format",
+    ),
+    "struct_of_list": (
+        _t(pa.struct([("a", pa.list_(pa.int64()))]), [{"a": [i]} for i in range(N)]),
+        "unsupported Arrow C format",
+    ),
+    "map": (
+        _t(pa.map_(pa.utf8(), pa.int64()), [[("k%d" % i, i)] for i in range(N)]),
+        "unsupported Arrow C format",
+    ),
+}
+
+# Written by pylance, read correctly by nanolance, but refused on OUR write side. Each asymmetry is
+# deliberate; see the refusal sites for why.
+READ_ONLY = ("large_string", "large_binary", "null")
+
+# Written by pylance and NOT readable. Pinned by message so each fails loudly when implemented.
+UNREADABLE_FROM_PYLANCE = {
+    "float16": "unsupported on-disk logical type",
+    "duration_us": "unsupported on-disk logical type",
+    "list": "unsupported on-disk logical type",
+    "large_list": "unsupported on-disk logical type",
+    "fixed_size_list": "unsupported on-disk logical type",
+    "map": "unsupported on-disk logical type",
+    "dictionary": "unsupported on-disk logical type",
+    "struct": "struct field has no children in mapping",
+}
+
+
+@pytest.mark.parametrize("name", sorted(ROUNDTRIPS))
+def test_type_roundtrips_through_nanolance(tmp_path, name):
+    table = ROUNDTRIPS[name]
+    path = tmp_path / f"{name}.lance"
+    nanolance.write_table(table, path)
+    assert pa.table(nanolance.read_table(path)).to_pydict() == table.to_pydict()
+
+
+@pytest.mark.parametrize("name", sorted(ROUNDTRIPS))
+def test_stock_lance_reads_what_nanolance_wrote(tmp_path, name):
+    """The other half of "supported": a file only counts if Lance itself can read it."""
+    lance_mod = require_pylance()
+    table = ROUNDTRIPS[name]
+    path = tmp_path / f"{name}.lance"
+    nanolance.write_table(table, path)
+    assert lance_mod.dataset(str(path)).to_table().to_pydict() == table.to_pydict()
+
+
+@pytest.mark.parametrize("name", sorted(REFUSED_ON_WRITE))
+def test_unsupported_type_is_refused_not_corrupted(tmp_path, name):
+    table, fragment = REFUSED_ON_WRITE[name]
+    path = tmp_path / f"{name}.lance"
+    with pytest.raises(Exception) as excinfo:
+        nanolance.write_table(table, path)
+    message = str(excinfo.value)
+    assert fragment in message, f"{name} refused with an unexpected message: {message}"
+    assert "'c'" in message or "column" in message, f"{name}'s refusal does not name the column: {message}"
+
+
+@pytest.mark.parametrize("name", READ_ONLY)
+def test_read_only_types_read_back_from_stock_lance(tmp_path, name):
+    """Refused on write, correct on read. Pinning this stops the asymmetry being 'tidied up'."""
+    lance_mod = require_pylance()
+    table = REFUSED_ON_WRITE[name][0]
+    path = str(tmp_path / f"{name}.lance")
+    lance_mod.write_dataset(table, path)
+    expected = lance_mod.dataset(path).to_table()
+    assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
+
+
+@pytest.mark.parametrize("name", sorted(UNREADABLE_FROM_PYLANCE))
+def test_unreadable_types_fail_by_name(tmp_path, name):
+    lance_mod = require_pylance()
+    table = REFUSED_ON_WRITE[name][0] if name in REFUSED_ON_WRITE else ROUNDTRIPS[name]
+    path = str(tmp_path / f"{name}.lance")
+    lance_mod.write_dataset(table, path)
+    with pytest.raises(Exception) as excinfo:
+        pa.table(nanolance.read_table(path))
+    assert UNREADABLE_FROM_PYLANCE[name] in str(excinfo.value), (
+        f"{name} now fails differently: {excinfo.value}. If it was implemented, move it out of "
+        f"UNREADABLE_FROM_PYLANCE."
+    )
+
+
+def test_lists_are_unsupported_in_both_directions(tmp_path):
+    """The single largest type gap, stated once in one place.
+
+    Lance's repetition layer is parsed only far enough to know it exists (`has_repetition`, which the
+    chunk header needs); nothing decodes it. On the write side a list never reaches an encoder -- the
+    schema mapper refuses the Arrow format string. On the read side it fails even earlier, at the
+    manifest's schema, before a page is touched.
+    """
+    lance_mod = require_pylance()
+    table = _t(pa.list_(pa.int64()), [[i, i + 1] for i in range(N)])
+
+    with pytest.raises(Exception) as write_err:
+        nanolance.write_table(table, tmp_path / "w.lance")
+    assert "unsupported Arrow C format" in str(write_err.value)
+
+    path = str(tmp_path / "r.lance")
+    lance_mod.write_dataset(table, path)
+    with pytest.raises(Exception) as read_err:
+        pa.table(nanolance.read_table(path))
+    assert "unsupported on-disk logical type" in str(read_err.value)
