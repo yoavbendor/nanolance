@@ -1577,6 +1577,12 @@ lived in the product of two axes that were each covered alone. That is the same 
 struct bug, and it is worth stating as a rule: **when two axes each have their own matrix, the bugs
 are in the cells neither one visits.**
 
+The same cell was missing from the *write* matrix. It turns out to be correct there — 144 cases, 6
+types x 4 null patterns x 2 sizes x 3 modes, all round-tripping through nanolance and through
+pylance — so the fix is on the read side only. `null_int_constant`, `null_str_constant` and
+`null_float_constant` are now in the write matrix anyway: "we checked and it was fine" is worth
+keeping as an assertion rather than as a memory.
+
 ---
 
 ## A dictionary block has four shapes, not one

@@ -69,6 +69,14 @@ SHAPES = [
     ("null_bool", _table([None if _null(i) else i % 3 == 0 for i in range(N)], pa.bool_()), "1-bit + def levels"),
     ("null_float64", _table([None if _null(i) else i * 0.125 for i in range(N)], pa.float64()), "bss + def levels"),
     ("null_fixed_size_binary", _table([None if _null(i) else f"{i:08d}".encode() for i in range(N)], pa.binary(8)), "flat + def levels"),
+    # Constant AND nullable. This cell was missing from both matrices for as long as they existed:
+    # every constant shape above has no nulls, and every nullable shape has more than one distinct
+    # value, so nothing ever produced a page that was both. On the READ side that product held a
+    # silent wrong answer in each direction -- see test_lance_constant_nulls.py. The write side turns
+    # out to be correct; this pins that rather than leaving it unstated.
+    ("null_int_constant", _table([None if _null(i) else 7 for i in range(N)], pa.int64()), "constant + def levels"),
+    ("null_str_constant", _table([None if _null(i) else "same" for i in range(N)], pa.utf8()), "constant + def levels"),
+    ("null_float_constant", _table([None if _null(i) else 1.5 for i in range(N)], pa.float64()), "constant + def levels"),
 ]
 
 MODES = [
