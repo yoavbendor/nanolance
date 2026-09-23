@@ -380,8 +380,40 @@ of the change. Measured: peak 2.01× → 1.01× (one fragment), read 201 ms → 
 cause 3), or expose Arrow REE/dictionary where the consumer accepts it. Targets exactly the
 external-blob workload the project is built around.
 
-**4.3 Default-init byte buffers.** The measured ~6.5% from §2.4. Cheap, self-contained, and the
-patch already exists — but land it *after* 4.1/4.2, since those change which buffers still exist.
+**DONE**, and widened. The constant path now writes the value once and doubles it forward
+(`log2(N)` memcpys instead of `N`): constant int64 over 4M rows 12.3 ms → 4.5 ms. Constant *strings*
+barely move (69 ms → 66 ms) and that is the honest result — 4M copies of a 26-byte value is ~100 MiB
+of stores and the fill already runs at ~1.7 GB/s, so that case is memory-bandwidth bound. Only an
+encoding that never materializes the bytes (Arrow REE or dictionary) would help, and that changes
+the output type, so it is deferred rather than smuggled in.
+
+Profiling the result turned up a bigger, unlisted target: `decode_variable_width_page` appended each
+row's offset through its own `vector::resize()`, which callgrind put at **32% of a whole read's
+instruction count**. A page's offsets are now grown in one resize and written through a typed
+pointer. On a 1M-row int64 + double + string dataset read three times: 373.0M → 235.6M instructions
+(−37%), 87 ms → 77 ms wall clock (best of 20, interleaved). memcpy is now 53% of the profile, which
+is the floor for a reader that materializes Arrow buffers.
+
+**4.3 Default-init byte buffers. CLOSED — not worth doing.** §2.4 measured ~6.5% for this *before*
+4.1 and 4.2. It does not survive them. After 4.2 the remaining zero-fill is the one in
+`decode_variable_width_page`'s offset resize, and callgrind still bills it at 5.1% of instructions —
+but that number is an artifact: callgrind counts `rep stosb` once **per byte**, so it reports ~12 MB
+of zeroing as ~12M instructions. Timed rather than counted, it is free.
+
+The experiment: the same function rewritten to `insert()` the page's offsets (copy, no zero-init)
+and shift them in place, which gets the default-init saving with no allocator and no public type
+change. Best of 20, interleaved against the resize version on the same dataset:
+
+```
+resize + write   80 ms
+insert + shift   81 ms
+```
+
+Indistinguishable. So the version in the tree is the simpler one, and the allocator-parameterised
+`ColumnValues` this item asked for — a custom allocator leaking into a public type, in a library
+whose pitch is that it does not do that — buys nothing. This is the second time in this document
+that an instruction profile promised a win that wall clock did not pay; §2.4 already warned about
+exactly this fix, and the warning was if anything too mild.
 
 **4.4 mmap the data file.** Replaces `ifstream` page reads: no zero-fill, no kernel→heap copy, and
 for plain fixed-width columns a genuinely zero-copy `ArrowBuffer` pointing into the mapping.

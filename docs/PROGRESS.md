@@ -958,6 +958,62 @@ between C++ and Arrow by hand; `fuzz_decode` clean over 1,106,008 runs.
 
 ---
 
+## Phase 4.2 — two per-row loops, and one measurement that said "stop"
+
+`append_repeated_value` (constant-encoded columns) wrote one value at a time. It now writes the
+value once and doubles it forward, so a page of N identical values costs `log2(N)` memcpys:
+
+| 4M rows | before | after |
+|---|---|---|
+| constant int64 | 12.3 ms | **4.5 ms** |
+| constant string (26 bytes) | 69 ms | **66 ms** |
+
+The string row is the interesting one, and it is reported rather than buried: 4M copies of a 26-byte
+value is ~100 MiB of stores, and the fill already ran at ~1.7 GB/s (3.8 MiB / 4.0 ms, 91.6 MiB /
+50.8 ms, 381.5 MiB / 224.8 ms — linear). That path is memory-bandwidth bound. Only an encoding that
+never materializes the bytes (Arrow REE, or a dictionary array) would move it, and that changes the
+column's Arrow type, so it is a separate decision rather than something to slip in here.
+
+Profiling the result found a larger target that was not on the plan. `decode_variable_width_page`
+appended each row's offset through its own `vector::resize()`; callgrind put that one function at
+**32% of a whole read's instruction count** — not the four bytes it copies, but the size/capacity
+round trip per call. A page's offsets are now grown in one resize and written through a typed
+pointer. The two paths that genuinely cannot batch — FSST, and dictionary indices, where a row's
+length is only known once the value is resolved — keep the per-row append but reserve once per page.
+
+Reading a 1M-row `int64 + double + string` dataset three times:
+
+| | before | after |
+|---|---|---|
+| instructions | 373.0M | **235.6M** (−37%) |
+| wall clock | 87 ms | **77 ms** (best of 20, interleaved) |
+
+`memcpy` is now 53% of the profile, which is the honest floor for a reader that materializes Arrow
+buffers.
+
+### 4.3 was closed by measuring it, not by implementing it
+
+The plan's next item was a default-initializing allocator for the byte buffers, sized at ~6.5% by a
+measurement taken *before* 4.1 and 4.2. It does not survive them.
+
+After 4.2 the remaining zero-fill is the offset resize above, and callgrind still bills it at 5.1%
+of instructions. That number is an artifact: **callgrind counts `rep stosb` once per byte**, so it
+reports ~12 MB of zeroing as ~12M instructions. The same function was rewritten to `insert()` the
+page's offsets (a copy, with no zero-init) and shift them in place — which gets the whole
+default-init saving with no allocator and no change to a public type. Interleaved, best of 20:
+
+```
+resize + write   80 ms
+insert + shift   81 ms
+```
+
+Indistinguishable. So the tree keeps the simpler version, and `ColumnValues` does not grow a custom
+allocator parameter for nothing. This is the second time in this work that an instruction profile
+promised a win wall clock refused to pay — the plan's own §2.4 warned about this exact fix, and the
+warning was too mild.
+
+---
+
 ## Deviations from the plan, and open items
 
 - **The nullable opt-out was not needed** (see above) — simpler than planned.
