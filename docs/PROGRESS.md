@@ -1527,6 +1527,58 @@ types x sizes found all of it in one run.
 
 ---
 
+## A constant column can have nulls, and we returned the wrong data twice
+
+Found while checking something else: an all-zero `int64` column with a null every eleventh row read
+back with **no nulls at all**. No exception, no warning — just different data from what pylance
+returns out of the same file. That is this project's worst failure class, and it had been there the
+whole time.
+
+Lance writes a constant column as `ConstantLayout`, and the layout is decided by the inline value's
+presence and the page's buffer count **together**:
+
+| inline value | buffers | meaning |
+|---|---|---|
+| yes | 0 | the value, no levels |
+| yes | 2 | the value; buffer 0 = rep, buffer 1 = def |
+| no | 1 | buffer 0 = the value, no levels |
+| no | 3 | buffer 0 = the value; buffer 1 = rep, buffer 2 = def |
+
+`ConstantPageScheduler::try_new` refuses every other combination. Reading only half of that table
+produced two separate wrong answers, in opposite directions:
+
+1. **A fixed-width nullable constant lost its nulls.** The definition buffer was never read —
+   `def_compression` and `num_def_values` were not even parsed out of the descriptor. Every row came
+   back as the value.
+2. **A variable-width nullable constant lost its values.** "All null" was inferred from *no inline
+   value AND a definition layer*. But a variable-width constant **never** has an inline value — it
+   keeps its value in a buffer — so every nullable string or binary constant read back entirely
+   null. The rule is the buffer count, not the inline value.
+
+The second one is the more instructive. The original code was not a missing case; it was a correct
+observation ("Lance spells an all-null column with a definition layer and no inline value") promoted
+to a rule it could not support. It held for every column anyone had tested because fixed-width
+constants do carry their value inline.
+
+The levels are raw u16, one per row, always. `ConstantLayout.def_compression` exists in the proto but
+applies only to the all-null path; a page carrying a value borrows the buffer as a `u16` slice and
+nothing else. pylance also leaves `num_def_values` at 0 there, so the page's row count is the only
+statement of how many levels exist — the descriptor genuinely cannot answer this on its own.
+
+`test_lance_constant_nulls.py` pins it: 9 types x 5 null patterns x 3 row counts, plus a direct check
+on `null_count`, since a bitmap that is right row by row but carries a stale count is a malformed
+Arrow array that a `to_pydict()` comparison cannot see. Both halves were verified by reverting them
+separately — 82 cells fail without the first, 18 without the second.
+
+**What this says about the testing.** Every null test in the suite used a column with more than one
+distinct value, so no test ever produced a page that was constant *and* nullable. The encoding
+matrix had `int_constant` and `str_constant`; the nullable matrix had `int64` and `string`. The bug
+lived in the product of two axes that were each covered alone. That is the same shape as the sliced-
+struct bug, and it is worth stating as a rule: **when two axes each have their own matrix, the bugs
+are in the cells neither one visits.**
+
+---
+
 ## A dictionary block has four shapes, not one
 
 The three read gaps were supposed to be three fixes. The third one turned into a fifth and a sixth,

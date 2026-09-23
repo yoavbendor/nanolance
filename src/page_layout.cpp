@@ -435,6 +435,27 @@ bool parse_constant(Cursor c, Constant& out, std::string& error) {
                 return false;
             }
             out.inline_value = std::move(value);
+        } else if (wire == kWireBytes && (field == 7U || field == 8U)) {
+            // A constant page can be nullable: the same value in every non-null row, with the
+            // definition levels in a buffer of their own. Skipping these fields meant a nullable
+            // constant column read back with every row valid -- silent corruption, not a refusal.
+            Cursor sub;
+            if (!read_submessage(c, sub)) {
+                error = "page layout: truncated ConstantLayout level encoding";
+                return false;
+            }
+            auto node = std::make_unique<Compressive>();
+            if (!parse_compressive(sub, *node, 0, error)) {
+                return false;
+            }
+            (field == 7U ? out.rep_compression : out.def_compression) = std::move(node);
+        } else if (wire == kWireVarint && (field == 9U || field == 10U)) {
+            std::uint64_t value = 0;
+            if (!read_varint(c, value)) {
+                error = "page layout: malformed ConstantLayout level count";
+                return false;
+            }
+            (field == 9U ? out.num_rep_values : out.num_def_values) = value;
         } else if (!skip_field(c, wire)) {
             error = "page layout: malformed ConstantLayout";
             return false;
@@ -648,6 +669,16 @@ std::string describe(const PageLayout& layout) {
             out += layout.constant.inline_value ? "inline " + std::to_string(layout.constant.inline_value->size()) + "B"
                    : layers_have_definition_levels(layout.constant.layers) ? "all-null"
                                                                           : "buffered";
+            // A constant page with definition levels is the nullable case -- the same value in every
+            // non-null row. Worth naming in the dump: it reads identically to the non-null case
+            // everywhere except the validity bitmap, which is exactly how it went unnoticed.
+            if (layout.constant.num_def_values != 0U || layout.constant.def_compression != nullptr) {
+                out += ",def=";
+                out += layout.constant.def_compression != nullptr
+                           ? describe_encoding(*layout.constant.def_compression)
+                           : "raw u16";
+                out += "x" + std::to_string(layout.constant.num_def_values);
+            }
             out += "}";
             return out;
         case LayoutKind::kNone:

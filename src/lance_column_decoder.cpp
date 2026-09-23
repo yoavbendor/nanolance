@@ -947,9 +947,12 @@ struct ColumnEncodingPlan {
     /// kMiniBlock with a definition-level layer: how those levels are encoded. Null when the column
     /// has no nulls, which is the common case and costs nothing.
     std::shared_ptr<page_layout::Compressive> repdef;
-    /// kConstant whose layers declare definition levels and which carries no value: Lance's spelling
-    /// of a column where every row is null.
-    bool constant_all_null = false;
+    /// kConstant whose layers declare a definition layer. That alone does NOT say the column is
+    /// all-null: it is equally how an ordinary nullable constant column is spelled, the same value in
+    /// every non-null row. Which of the two a page is depends on whether it carries a value, and that
+    /// is a property of the PAGE (its buffer count), not of the descriptor -- so it is decided at
+    /// decode time. See `constant_def_buffer_index`.
+    bool constant_declares_levels = false;
     /// kVariable written by stock Lance: the page's FSST symbol table, parsed once per column. Empty
     /// `symbol_count` with `passthrough` set is the ordinary case for a small file -- Lance skips FSST
     /// below 32 KiB of input but still wraps the page in the encoding.
@@ -1140,8 +1143,7 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
         // A ConstantLayout that declares definition levels and holds no value is how Lance writes a
         // column whose every row is null -- there is no repeated value to store, only the fact that
         // there is none.
-        out.constant_all_null =
-            !layout.constant.inline_value && page_layout::layers_have_definition_levels(layout.constant.layers);
+        out.constant_declares_levels = page_layout::layers_have_definition_levels(layout.constant.layers);
         return true;
     }
     if (layout.kind != page_layout::LayoutKind::kMiniBlock) {
@@ -1422,6 +1424,101 @@ bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& 
     return true;
 }
 
+/// Which of a constant page's buffers holds its definition levels, or -1 for none.
+///
+/// Lance decides this from the inline value's presence and the buffer count together
+/// (`ConstantPageScheduler::try_new`), and only four combinations are legal:
+///
+///     inline, 0 buffers  -> the value, no levels
+///     inline, 2 buffers  -> the value; buffer 0 = rep, buffer 1 = def
+///     no inline, 1       -> buffer 0 = the value, no levels
+///     no inline, 3       -> buffer 0 = the value; buffer 1 = rep, buffer 2 = def
+///
+/// Anything else is malformed and refused rather than guessed at, exactly as Lance refuses it. A
+/// zero-length def buffer means the layer is absent even though the slot exists.
+[[nodiscard]] bool constant_def_buffer_index(bool has_inline_value, std::size_t buffer_count,
+                                             std::ptrdiff_t& out_index, std::string& error) {
+    if (has_inline_value && buffer_count == 0U) {
+        out_index = -1;
+        return true;
+    }
+    if (has_inline_value && buffer_count == 2U) {
+        out_index = 1;
+        return true;
+    }
+    if (!has_inline_value && buffer_count == 1U) {
+        out_index = -1;
+        return true;
+    }
+    if (!has_inline_value && buffer_count == 3U) {
+        out_index = 2;
+        return true;
+    }
+    error = "constant page has " + std::to_string(buffer_count) + " buffers with" +
+            (has_inline_value ? " an" : "out an") + " inline value, which is not a layout Lance writes";
+    return false;
+}
+
+/// Read a constant page's definition levels and fold them into the column's validity bitmap.
+///
+/// These levels are RAW u16, one per row, always. `ConstantLayout.def_compression` exists in the
+/// proto but applies only to the all-null path (`ComplexAllNullScheduler`); a constant page that
+/// carries a value goes through `ConstantPageScheduler`, which borrows the buffer as a u16 slice and
+/// nothing else. `num_def_values` is likewise not populated on this path -- pylance leaves it 0 --
+/// so the row count is what says how many levels there are.
+[[nodiscard]] bool apply_constant_definition_levels(const std::filesystem::path& data_file_path,
+                                                    const pb::ColumnPage& page, bool has_inline_value,
+                                                    std::uint64_t rows_already_appended, ColumnValues& out,
+                                                    std::string& error) {
+    std::ptrdiff_t def_index = -1;
+    if (!constant_def_buffer_index(has_inline_value, page.buffer_sizes.size(), def_index, error)) {
+        return false;
+    }
+    if (def_index < 0 || page.buffer_sizes[static_cast<std::size_t>(def_index)] == 0U) {
+        // The slot exists but the layer does not: every row in this page is valid. Still has to be
+        // reflected, because a LATER page may carry levels and the bitmap is built across all of them.
+        out.validity.resize(static_cast<std::size_t>((rows_already_appended + page.length + 7U) / 8U), 0U);
+        for (std::uint64_t i = 0; i < page.length; ++i) {
+            const auto row = rows_already_appended + i;
+            out.validity[static_cast<std::size_t>(row >> 3U)] |= static_cast<std::uint8_t>(1U << (row & 7U));
+        }
+        return true;
+    }
+    std::uint64_t expected_bytes = 0;
+    if (!checked_mul(page.length, 2U, expected_bytes) ||
+        page.buffer_sizes[static_cast<std::size_t>(def_index)] != expected_bytes) {
+        error = "constant page's definition buffer is " +
+                std::to_string(page.buffer_sizes[static_cast<std::size_t>(def_index)]) +
+                " bytes, expected " + std::to_string(expected_bytes) + " for " +
+                std::to_string(page.length) + " raw 16-bit levels";
+        return false;
+    }
+    std::vector<std::uint8_t> levels;
+    if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[static_cast<std::size_t>(def_index)],
+                                    page.buffer_sizes[static_cast<std::size_t>(def_index)], levels, error)) {
+        return false;
+    }
+    // The buffer is read into a fresh vector, so its data() carries the alignment operator new gives
+    // -- enough for u16 -- and the length was just checked to be exactly two bytes per row.
+    const auto* typed = reinterpret_cast<const std::uint16_t*>(levels.data());
+    std::uint64_t remaining = page.length;
+    std::uint64_t at = 0;
+    // append_levels_to_validity takes a u32 count; a page's row count is u64, so walk it in slices
+    // rather than assuming it fits.
+    while (remaining != 0U) {
+        const auto slice = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(remaining, std::numeric_limits<std::uint32_t>::max()));
+        if (!append_levels_to_validity(typed + at, slice, rows_already_appended + at, out.validity,
+                                       out.null_count)) {
+            error = "constant page definition levels could not be applied";
+            return false;
+        }
+        at += slice;
+        remaining -= slice;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
@@ -1496,7 +1593,20 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         return false;
     }
 
-    if (encoding_plan.kind == ColumnEncodingKind::kConstant && encoding_plan.constant_all_null) {
+    // A constant page carries a value when the descriptor has an inline one, or when the page has 1
+    // or 3 buffers (value; value + rep + def). 0 or 2 buffers with no inline value is how Lance says
+    // every row is null. This is `ConstantPageScheduler::try_new`'s `has_scalar_value` inverted, and
+    // it has to be read off the PAGE: a definition layer in the descriptor is equally how a nullable
+    // constant column is spelled, so keying "all null" off the layers alone made every nullable
+    // string constant read back entirely null. Fixed-width columns escaped it only because they
+    // carry their value inline.
+    const std::size_t constant_buffer_count =
+        column_metadata.pages.empty() ? 0U : column_metadata.pages.front().buffer_sizes.size();
+    const bool constant_has_value = encoding_plan.constant_inline_value.has_value() ||
+                                    constant_buffer_count == 1U || constant_buffer_count == 3U;
+    const bool constant_all_null = encoding_plan.constant_declares_levels && !constant_has_value;
+
+    if (encoding_plan.kind == ColumnEncodingKind::kConstant && constant_all_null) {
         // Every row is null. There are no value bytes on disk, so materialize the column's zeroed
         // storage and an all-clear validity bitmap.
         std::uint64_t total_rows = 0;
@@ -1559,6 +1669,17 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         std::uint64_t total_rows = 0;
         for (const auto& page : column_metadata.pages) {
             total_rows += page.length;
+        }
+        if (encoding_plan.constant_declares_levels) {
+            std::uint64_t rows_so_far = 0;
+            for (const auto& page : column_metadata.pages) {
+                if (!apply_constant_definition_levels(data_file_path, page,
+                                                      encoding_plan.constant_inline_value.has_value(), rows_so_far,
+                                                      out, error)) {
+                    return false;
+                }
+                rows_so_far += page.length;
+            }
         }
         if (on_disk_field.encoding == 2) {  // variable-width
             out.kind = ColumnValues::Kind::VariableWidth;

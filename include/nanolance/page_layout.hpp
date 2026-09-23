@@ -121,10 +121,30 @@ inline bool layers_have_definition_levels(const std::vector<std::uint8_t>& layer
 
 /// PageLayout f2. A fixed-width constant carries its value inline in the descriptor (no data
 /// buffers); a variable-width constant omits `inline_value` and stores the single value in a buffer.
+///
+/// A constant page can ALSO be nullable -- the same value in every non-null row -- and then it
+/// carries definition levels in a buffer of their own. Lance's buffer map (see
+/// `ConstantPageScheduler::try_new`) is decided by the inline value's presence and the buffer count
+/// together, and there are exactly four legal combinations:
+///
+///     inline, 0 buffers  -> the value, no levels
+///     inline, 2 buffers  -> the value; buffer 0 = rep, buffer 1 = def
+///     no inline, 1       -> buffer 0 = the value, no levels
+///     no inline, 3       -> buffer 0 = the value; buffer 1 = rep, buffer 2 = def
+///
+/// A zero-length rep or def buffer means that layer is absent.
 struct Constant {
     std::optional<std::vector<std::uint8_t>> inline_value;
     /// f5 `layers`, raw. [3] with no inline value is how Lance spells an all-null column.
     std::vector<std::uint8_t> layers;
+    /// f7 / f8: how the repetition / definition buffers are compressed. Absent means the levels are
+    /// stored as raw u16 values -- which is a spelling the miniblock path never has to handle,
+    /// because there a `CompressiveEncoding` is always present.
+    std::unique_ptr<Compressive> rep_compression;
+    std::unique_ptr<Compressive> def_compression;
+    /// f9 / f10: how many levels each buffer holds once decompressed.
+    std::uint64_t num_rep_values = 0;
+    std::uint64_t num_def_values = 0;
 };
 
 enum class LayoutKind { kNone, kMiniBlock, kConstant };
