@@ -1165,6 +1165,74 @@ Two stale claims surfaced while wiring this up, and were corrected rather than c
 
 ---
 
+## Reading pylance's nullable columns: one gap closed, two found
+
+The stock-Lance suite had been testing nulls at one or two sizes. Nulls are the wrong axis to spot
+check: Lance does not have *a* definition-level encoding, it has several, and which one a column gets
+depends on the row count and the null pattern rather than on anything the writer was asked for.
+Walking the cross-product of five types x five null patterns x five sizes, each cell compared against
+**pylance's own read**, found three distinct failures — one of which made ordinary datasets
+unreadable.
+
+### Closed: `InlineBitpacking(16)` definition levels
+
+A nullable string column of a few hundred rows was refused outright:
+
+```
+unsupported definition-level encoding: InlineBitpacking(16)
+```
+
+The note in PROGRESS said this happened "at 400 rows, fine at 100 and 2000", which undersold it
+badly. Measured: **200, 300, 400, 500, 700 and 1000 rows all fail**; 100 and 2000 happen not to. That
+is not an exotic corner, it is a normal dataset.
+
+`InlineBitpacking(16)` is the same FastLanes block a bitpacked *value* page carries, with its bit
+width stored as the buffer's first `u16` instead of in the page descriptor — which is what "inline"
+means. Confirmed on disk before writing any code: a 200-row page's level buffer is 130 bytes, and
+`[u16 width=1][64 u16 packed words]` is exactly 130. `unpack_bitpacked_page<uint16_t>` already
+decodes that shape for value pages, so the fix is to route the levels through it. The 16 is the
+uncompressed element width and Lance's levels are `u16`, so it is the only width that can occur;
+anything else is still refused by name rather than guessed at.
+
+All 13 sizes from 100 to 20000 now match pylance exactly.
+
+### Still open, and now precisely characterised
+
+The other two failures are both the **chunk header**, and reading `decode_miniblock_chunk` in
+`rust/lance-encoding/src/encodings/logical/primitive.rs` settled what the real grammar is:
+
+```
+[u16 num_levels]
+[u16 rep_size]                    only when rep_compression is present
+[u16 def_size]                    only when def_compression is present
+[num_buffers x (u32 if has_large_chunk else u16)]
+pad to 8
+[rep] pad8  [def] pad8  [buffer_0] pad8  [buffer_1] pad8 ...
+```
+
+nanolance reads a **fixed** `[u16 num_levels][u16][u16][u16]`. That is the right 8 bytes exactly when
+there is no repetition layer, two value buffers and `has_large_chunk` is false — which covers
+everything it has been tested on, and silently misreads the rest.
+
+1. **A `float64` column with a run-shaped null pattern** (`rle chunk buffer sizes invalid`, at 200
+   and 400 rows). Lance RLEs both values and levels, so the page declares `has_large_chunk=1` and the
+   buffer sizes are `u32`: the real header is `[u16 200][u16 def_size=14][u32 1208][u32 151]` plus
+   `fe fe fe fe` padding to 16. Read as four `u16`s, the definition block is located 8 bytes early.
+2. **A `bool` column over 1024 rows** (`definition-level chunk covers more than one FastLanes
+   block`). Bools pack densely enough that one chunk holds 1025 values, so the level buffer is a full
+   FastLanes block followed by a raw `u16` tail — 128 + 2 = 130 bytes, which is what the 1025-row page
+   actually contains. The decoder handles exactly one block.
+
+Both are fixable and neither is guesswork any more, but they are a change to the chunk header parse
+on the untrusted read path, which needs its own fuzz pass rather than a quick patch.
+
+`bindings/python/tests/test_lance_nullable_matrix.py` holds the whole cross-product, and the two open
+cells are asserted to fail **with their specific message** rather than skipped. A skip rots quietly;
+an assertion that a gap still exists fails the moment someone fixes it, which is exactly when it
+should be revisited.
+
+---
+
 ## Deviations from the plan, and open items
 
 - **The nullable opt-out was not needed** (see above) — simpler than planned.
@@ -1185,6 +1253,12 @@ Two stale claims surfaced while wiring this up, and were corrected rather than c
   Actions runs again**, because there is no local macOS or manylinux to run them on. The Linux wheel
   itself WAS built and installed into a clean virtualenv locally; what is unverified is cibuildwheel
   driving that across CPython 3.9–3.13 and macOS.
+
+- **Two pylance nullable-column shapes still unreadable**, both the miniblock chunk header: a
+  `float64` column whose nulls come in runs (`has_large_chunk` makes the buffer sizes `u32`, and the
+  header is parsed as fixed `u16`s), and a `bool` column over 1024 rows (one chunk carries more than
+  one FastLanes block of levels). The on-disk grammar for both is decoded above; what is missing is
+  the header parse and a fuzz pass over it.
 
 - **No way to split fragments within one `nanolance import` run.** The run commits exactly one
   fragment regardless of how many Arrow IPC batches it reads, so a large input becomes one large

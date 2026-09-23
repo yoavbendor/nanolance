@@ -157,13 +157,12 @@ def test_deletions_compose_with_projection_and_nulls(lance_mod, tmp_path):
     """Deletions, a projection and a nullable column together -- the validity bitmap is the one
     buffer the deletion gather has to re-pack bit by bit.
 
-    n is 2000 rather than a few hundred on purpose: at some sizes pylance encodes a nullable string
-    column's definition levels as InlineBitpacking(16), which nanolance refuses by name (an
-    unrelated, pre-existing read gap -- see PROGRESS). Using a size that avoids it keeps this test
-    about deletions instead of failing for a reason it is not testing.
+    n is 400 on purpose now: at a few hundred rows pylance encodes a nullable string column's
+    definition levels as InlineBitpacking(16), which nanolance used to refuse by name. This test was
+    written at 2000 to step around that gap; with the gap closed it is more useful standing on it.
     """
     path = str(tmp_path / "proj.lance")
-    n = 2_000
+    n = 400
     lance_mod.write_dataset(
         pa.table(
             {

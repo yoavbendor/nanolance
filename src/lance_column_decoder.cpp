@@ -635,6 +635,29 @@ bool append_levels_to_validity(const std::uint16_t* levels, std::uint32_t count,
         return append_levels_to_validity(levels, count, rows_already_appended, out_validity,
                                          out_null_count);
     }
+    // InlineBitpacking(16): the same FastLanes block a bitpacked *value* page carries, with its bit
+    // width as the first u16 of the buffer rather than in the descriptor -- which is what "inline"
+    // means. Lance picks this over Bitpacked{Flat(bits)} for the definition levels of some page
+    // sizes; empirically, a pylance nullable string column of 200..1000 rows lands here while 100 and
+    // 2000 do not, so refusing it made a common, unremarkable dataset unreadable.
+    //
+    // The 16 is the uncompressed element width, and Lance's definition levels are u16, so it is the
+    // only width that can appear. Anything else is refused by name rather than guessed at.
+    if (encoding.kind == page_layout::CompressiveKind::kInlineBitpacking) {
+        if (encoding.bits_per_value != 16U) {
+            error = "definition levels declare InlineBitpacking(" +
+                    std::to_string(encoding.bits_per_value) + "); only 16-bit levels exist";
+            return false;
+        }
+        thread_local std::vector<std::uint8_t> unpacked;
+        unpacked.clear();
+        if (!unpack_bitpacked_page<std::uint16_t>(repdef, count, unpacked, error)) {
+            return false;
+        }
+        std::memcpy(levels, unpacked.data(), unpacked.size());
+        return append_levels_to_validity(levels, count, rows_already_appended, out_validity,
+                                         out_null_count);
+    }
     if (encoding.kind != page_layout::CompressiveKind::kBitpacked || encoding.values == nullptr ||
         encoding.values->kind != page_layout::CompressiveKind::kFlat) {
         error = "unsupported definition-level encoding: " + page_layout::describe_encoding(encoding);
