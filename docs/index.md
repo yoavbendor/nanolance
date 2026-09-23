@@ -87,9 +87,11 @@ comparison against Parquet and Rust `lance`.
 #include "nanolance/nano_lance_writer.h"
 #include <nanoarrow/nanoarrow.h>
 
+NanoLanceWriteOptions options = {0};                 // zeroed == the defaults
 NanoLanceWriter w = {0};
-nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
-nano_lance_writer_set_compression(&w, true);         // BEFORE the first write_batch
+options.compression_level = 3;
+options.compression = true;
+nano_lance_writer_open(&w, "out.lance", &options);
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // schema locks after batch #1
 nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append a fragment
 nano_lance_writer_close(&w);

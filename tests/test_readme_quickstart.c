@@ -63,9 +63,11 @@ int main(int argc, char** argv) {
 
     /* ---- BEGIN documented snippet (keep in step with README.md "Quick start (C write)") ---- */
     {
+        NanoLanceWriteOptions options = {0};         /* zeroed == the defaults */
         NanoLanceWriter w = {0};
-        nano_lance_writer_init(&w, out_path, /*compression_level=*/3);
-        nano_lance_writer_set_compression(&w, true); /* Lance-compatible compression (off by default) */
+        options.compression_level = 3;
+        options.compression = true;                  /* Lance-compatible compression (off by default) */
+        nano_lance_writer_open(&w, out_path, &options);
         nano_lance_write_batch(&w, &arrow_array, &arrow_schema); /* repeatable; schema locks after #1 */
         nano_lance_writer_commit(&w, /*is_append=*/false);       /* false = create, true = append */
         nano_lance_writer_close(&w);
@@ -76,6 +78,7 @@ int main(int argc, char** argv) {
          * checking so this test actually fails when a step breaks. */
         {
             NanoLanceWriter checked = {0};
+            NanoLanceWriteOptions checked_options = {0};
             struct ArrowSchema schema2;
             struct ArrowArray array2;
             char checked_path[512];
@@ -84,8 +87,9 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "failed to rebuild the sample batch\n");
                 return 1;
             }
-            if (nano_lance_writer_init(&checked, checked_path, 3) != NANO_LANCE_OK ||
-                nano_lance_writer_set_compression(&checked, true) != NANO_LANCE_OK ||
+            checked_options.compression_level = 3;
+            checked_options.compression = true;
+            if (nano_lance_writer_open(&checked, checked_path, &checked_options) != NANO_LANCE_OK ||
                 nano_lance_write_batch(&checked, &array2, &schema2) != NANO_LANCE_OK ||
                 nano_lance_writer_commit(&checked, false) != NANO_LANCE_OK) {
                 fprintf(stderr, "quick start failed: %s\n", nano_lance_writer_last_error(&checked));

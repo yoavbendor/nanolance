@@ -27,6 +27,58 @@ typedef struct NanoLanceWriter {
     char last_error[512];
 } NanoLanceWriter;
 
+/// One column's declared encoding, for NanoLanceWriteOptions::column_encodings.
+/// `encoding` takes the same values as nano_lance_writer_set_column_encoding.
+typedef struct NanoLanceColumnEncoding {
+    const char* field_name;
+    const char* encoding;
+} NanoLanceColumnEncoding;
+
+/// Everything a writer needs to know before its first batch, in one place.
+///
+/// The setters below each have to be called after init and before write_batch, and each returns
+/// INVALID_STATE when it is not -- an ordering rule that can only be documented and checked at
+/// runtime. Passing this struct to nano_lance_writer_open makes that ordering unrepresentable
+/// instead: there is no "after" for the options to be in.
+///
+/// **A zero-initialized struct means the defaults.** `NanoLanceWriteOptions options = {0};` is the
+/// same writer that `nano_lance_writer_init(w, path, 0)` gives you, and it stays that way as fields
+/// are added. That is why the one option that is ON by default is spelled as a negation:
+/// `disable_structural_encoding` rather than `structural_encoding`. `nano_lance_write_options_init`
+/// does the same thing for callers who would rather say it out loud.
+typedef struct NanoLanceWriteOptions {
+    /// zstd level 0..22; 0 means zstd's own default. Applies to whatever compression is enabled.
+    int compression_level;
+    /// Open an existing dataset for more fragments instead of creating one. The schema is reloaded
+    /// from the latest manifest, and commits must pass is_append=true.
+    bool append;
+    /// zstd-compress variable-width (string/binary) column pages. See set_compression.
+    bool compression;
+    /// Turn OFF structural re-encodings (bitpacking, constant, RLE, dictionary), which are otherwise
+    /// on. Negated so that a zeroed struct keeps the default. See set_structural_encoding.
+    bool disable_structural_encoding;
+    /// URI-dictionary encoding for `lance.blob.v2` external columns. nanolance-only layout; create
+    /// mode only. See set_blob_uri_dictionary.
+    bool blob_uri_dictionary;
+    /// Borrow the caller's fixed-width Arrow buffers until commit instead of copying them. The
+    /// buffers must stay valid and unmodified until commit/close. See set_borrow_buffers.
+    bool borrow_buffers;
+    /// Per-column encoding declarations; may be NULL when count is 0. The array and the strings it
+    /// points at are read during this call only, and need not outlive it.
+    const NanoLanceColumnEncoding* column_encodings;
+    size_t num_column_encodings;
+} NanoLanceWriteOptions;
+
+/// Fill `options` with the defaults. Equivalent to zero-initializing it.
+void nano_lance_write_options_init(NanoLanceWriteOptions* options);
+
+/// Open a writer with all of its options at once. `options` may be NULL, meaning the defaults.
+///
+/// This is the entry point to reach for; `nano_lance_writer_init`, `nano_lance_writer_init_append`
+/// and the `set_*` calls below are the older, order-dependent spelling of the same thing and now
+/// delegate here.
+int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const NanoLanceWriteOptions* options);
+
 int nano_lance_writer_init(NanoLanceWriter* writer, const char* path, int compression_level);
 /// Open an existing dataset for more fragments (reloads schema from latest manifest; commits must use `is_append=true`).
 int nano_lance_writer_init_append(NanoLanceWriter* writer, const char* path, int compression_level);

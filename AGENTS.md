@@ -27,18 +27,26 @@ readable by stock `lance` (verified against `pylance` 12.0.0), unless a feature 
 #include "nanolance/nano_lance_writer.h"
 #include <nanoarrow/nanoarrow.h>
 
+NanoLanceWriteOptions options = {0};                 // zeroed == the defaults
 NanoLanceWriter w = {0};
-nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
-nano_lance_writer_set_compression(&w, true);         // enable Lance-compatible compression (see §3)
+options.compression_level = 3;
+options.compression = true;                          // Lance-compatible compression (see §3)
+nano_lance_writer_open(&w, "out.lance", &options);
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // call repeatedly; schema is fixed after #1
 nano_lance_writer_commit(&w, /*is_append=*/false);
 nano_lance_writer_close(&w);
 // On any non-zero return, read nano_lance_writer_last_error(&w).
 ```
 
+From C++, `nano_lance::Writer` (`nanolance/writer.hpp`) is the same thing with the handle owned:
+`open(path, {.compression_level = 3, .compression = true})`, then `write_batch` / `commit`, and the
+destructor closes it.
+
 Lifecycle rules:
 - Schema is locked after the first batch; all batches in a writer session share it.
-- All `set_*` options must be called **before the first `write_batch`**.
+- Options go to `nano_lance_writer_open`. The older `nano_lance_writer_init` / `init_append` plus
+  `set_*` calls still work and produce byte-identical files, but each `set_*` must precede the first
+  `write_batch` and only says so at runtime (`INVALID_STATE`).
 - **Nulls are stored** via Lance's definition-level layer, and stock Lance reads them back: in
   fixed-width columns (int, float, bool, timestamp/date/time, decimal, `fixed_size_binary`) and in
   variable-width ones (`utf8`, `binary`). Still refused, by name: a null **struct** (as opposed to a

@@ -101,9 +101,12 @@ published to PyPI on a version tag; until the first tag, the development install
 #include "nanolance/nano_lance_writer.h"
 #include <nanoarrow/nanoarrow.h>
 
+NanoLanceWriteOptions options = {0};                 // zeroed == the defaults
+options.compression_level = 3;
+options.compression = true;                          // Lance-compatible compression (off by default)
+
 NanoLanceWriter w = {0};
-nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
-nano_lance_writer_set_compression(&w, true);         // Lance-compatible compression (off by default)
+nano_lance_writer_open(&w, "out.lance", &options);   // every option, before there is anything to order it against
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // repeatable; schema locks after batch #1
 nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append a fragment
 nano_lance_writer_close(&w);
@@ -111,10 +114,22 @@ nano_lance_writer_close(&w);
 // nano_lance::lance_table_read_dataset(...) or nano_lance_fetch_external_blob(uri, position, size, ...).
 ```
 
+In C++, `nano_lance::Writer` ([`writer.hpp`](include/nanolance/writer.hpp)) owns the handle, so an
+early return closes it for you:
+
+```cpp
+nano_lance::Writer writer;
+if (!writer.open("out.lance", {.compression_level = 3, .compression = true})) { return writer.error(); }
+if (!writer.write_batch(&arrow_array, &arrow_schema)) { return writer.error(); }
+if (!writer.commit()) { return writer.error(); }     // is_append follows what open() was given
+```
+
 ### Gotchas & lifecycle
 
 - **Schema locks after the first `write_batch`** — every batch in a session shares it.
-- **Call all `set_*` options before the first `write_batch`** (compression, URI dictionary).
+- **Pass options to `nano_lance_writer_open`.** The older `nano_lance_writer_init` + `set_*` calls
+  still work and behave identically, but every one of them has to come before the first
+  `write_batch` and says so only at runtime, with `INVALID_STATE`.
 - **Nulls are stored**, using Lance's definition-level layer, and stock Lance reads them back —
   fixed-width (int, float, bool, temporal, decimal, `fixed_size_binary`) and variable-width
   (`utf8`, `binary`) alike. A null **struct** is still refused with a clear message.
@@ -215,9 +230,12 @@ either). You need to *produce* the Arrow from packets/structs →
 #include "nanolance/nano_lance_writer.h"
 #include <nanoarrow/nanoarrow.h>
 
+NanoLanceWriteOptions options = {0};
+options.compression_level = 3;
+options.compression = true;
+
 NanoLanceWriter w = {0};
-nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
-nano_lance_writer_set_compression(&w, true);         // BEFORE the first write_batch
+nano_lance_writer_open(&w, "out.lance", &options);
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // schema locks after batch #1
 nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append fragment
 nano_lance_writer_close(&w);
@@ -225,7 +243,9 @@ nano_lance_writer_close(&w);
 ```
 
 **Do**
-- Call every `set_*` option **before** the first `write_batch`; reuse one schema for all batches.
+- Pass options to `nano_lance_writer_open` (or `nano_lance::Writer::open`); reuse one schema for all
+  batches. The `set_*` calls are still there and still work, but they must precede the first
+  `write_batch`.
 - Nulls are fine in fixed-width columns; fill or drop them in string columns.
 - For small files, model external refs as plain `uri` / `position` / `size` columns (not the packed
   `lance.blob.v2` descriptor) — see [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
@@ -341,11 +361,10 @@ std::string err;
 nano_lance::build_epb_table_schema(schema, err);
 nano_lance::build_epb_table_array(packet_ids, refs, batch, err);
 
-NanoLanceWriter writer{};
-nano_lance_writer_init(&writer, "capture.lance", /*compression_level=*/3);
-nano_lance_write_batch(&writer, &batch, &schema);
-nano_lance_writer_commit(&writer, /*is_append=*/false);
-nano_lance_writer_close(&writer);
+nano_lance::Writer writer;
+writer.open("capture.lance", {.compression_level = 3});
+writer.write_batch(&batch, &schema);
+writer.commit();   // ...and the destructor closes it
 // Read the referenced bytes back later with nano_lance_fetch_external_blob(uri, position, size, ...).
 ```
 

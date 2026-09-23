@@ -478,8 +478,28 @@ must all precede `write_batch`, enforced at runtime with `INVALID_STATE`. An opt
 to `writer_init` makes the ordering constraint unrepresentable instead of documented. Keep the C ABI
 stable; add the struct form alongside and let the setters delegate.
 
+**DONE.** `NanoLanceWriteOptions` + `nano_lance_writer_open`. The setters and both `init` forms stay,
+and now delegate, so nothing that compiled before stops compiling.
+
+One decision worth recording: **a zeroed struct means the defaults**, and stays meaning them as
+fields are added. That forced `disable_structural_encoding` to be spelled as a negation, because
+structural encoding is the one option that is ON by default. A positive `structural_encoding` field
+would have made `NanoLanceWriteOptions options = {0}` silently disable it — the exact class of trap
+this item exists to remove. The C++ `WriteOptions` has member initializers and so spells it
+positively.
+
 **5.2 A `nano_lance::Writer` RAII type** wrapping init/commit/close, since every C++ example in the
 repo hand-rolls the same lifecycle and `close()`-on-exception is currently the caller's problem.
+
+**DONE.** `nanolance/writer.hpp`. Errors stay in the house style (`bool` + `error()`, not exceptions);
+only the lifetime changes. `commit()` defaults `is_append` to whatever `open()` was given, and flips
+to `true` after the first successful commit, so the one argument that was easy to get wrong now has a
+right answer by default.
+
+Both are guarded by `tests/test_writer_api.cpp`, which asserts **byte-identical data files** between
+the old spelling and the new one — for the options struct, for a zeroed struct against plain `init`,
+for a NULL options pointer, and for the RAII type against the hand-rolled C sequence. A second way to
+write files would be worse than none; the test is there to keep it the same way.
 
 **5.3 Fold `nlance_info`/`nlance2table`/`nlance_stitch`/`arrowipc2lance` into one `nanolance`
 CLI** with subcommands. Four binaries with four naming conventions is a discoverability tax; one

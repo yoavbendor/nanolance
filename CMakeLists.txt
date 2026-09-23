@@ -283,6 +283,7 @@ add_library(nanolance STATIC
     src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp
+    src/writer_cxx.cpp
 )
 target_compile_features(nanolance PUBLIC cxx_std_20)
 target_include_directories(nanolance PUBLIC
@@ -476,6 +477,10 @@ add_executable(nano_lance_writer_options_test tests/test_writer_options.cpp)
 target_compile_features(nano_lance_writer_options_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_writer_options_test PRIVATE nanolance)
 
+add_executable(nano_lance_writer_api_test tests/test_writer_api.cpp)
+target_compile_features(nano_lance_writer_api_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_writer_api_test PRIVATE nanolance nanolance_reader)
+
 add_executable(nano_lance_typed_writer_test tests/test_typed_writer.cpp)
 target_compile_features(nano_lance_typed_writer_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_typed_writer_test PRIVATE nanolance)
@@ -618,6 +623,9 @@ set_tests_properties(nano_lance_bool_roundtrip PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_writer_options COMMAND $<TARGET_FILE:nano_lance_writer_options_test>)
 set_tests_properties(nano_lance_writer_options PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_writer_api COMMAND $<TARGET_FILE:nano_lance_writer_api_test>)
+set_tests_properties(nano_lance_writer_api PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_typed_writer COMMAND $<TARGET_FILE:nano_lance_typed_writer_test>)
 set_tests_properties(nano_lance_typed_writer PROPERTIES LABELS "smoke")

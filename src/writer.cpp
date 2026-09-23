@@ -484,72 +484,113 @@ std::uint64_t next_fragment_numeric_suffix(const std::filesystem::path& dataset_
 
 extern "C" {
 
-int nano_lance_writer_init(NanoLanceWriter* writer, const char* path, int compression_level) {
-    if (writer == nullptr) {
-        return NANO_LANCE_INVALID_ARGUMENT;
+void nano_lance_write_options_init(NanoLanceWriteOptions* options) {
+    if (options != nullptr) {
+        *options = NanoLanceWriteOptions{};
     }
-    writer->private_data = nullptr;
-    clear_error(writer);
-
-    if (path == nullptr || path[0] == '\0') {
-        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "dataset path must not be empty");
-    }
-    if (compression_level < 0 || compression_level > 22) {
-        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "zstd compression level must be in range 0..22");
-    }
-
-    auto state = std::make_unique<WriterState>();
-    state->dataset_path = path;
-    state->compression_level = compression_level;
-    state->append_only_commits = false;
-    writer->private_data = state.release();
-    return NANO_LANCE_OK;
 }
 
-int nano_lance_writer_init_append(NanoLanceWriter* writer, const char* path, int compression_level) {
+int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const NanoLanceWriteOptions* options) {
     if (writer == nullptr) {
         return NANO_LANCE_INVALID_ARGUMENT;
     }
     if (writer->private_data != nullptr) {
-        return set_error(writer, NANO_LANCE_INVALID_STATE, "close writer before init_append");
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "close writer before opening another dataset");
     }
-    writer->private_data = nullptr;
     clear_error(writer);
+
+    // A NULL options pointer and a zeroed struct mean the same thing, and both mean the defaults.
+    const NanoLanceWriteOptions defaults{};
+    const NanoLanceWriteOptions& opts = options != nullptr ? *options : defaults;
 
     if (path == nullptr || path[0] == '\0') {
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "dataset path must not be empty");
     }
-    if (compression_level < 0 || compression_level > 22) {
+    if (opts.compression_level < 0 || opts.compression_level > 22) {
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "zstd compression level must be in range 0..22");
+    }
+    if (opts.num_column_encodings != 0U && opts.column_encodings == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT,
+                         "column_encodings is NULL but num_column_encodings is not zero");
+    }
+    if (opts.append && opts.blob_uri_dictionary) {
+        // Same refusal, same code, as set_blob_uri_dictionary on an append writer.
+        return set_error(writer, NANO_LANCE_UNSUPPORTED,
+                         "blob URI dictionary mode is not supported for append datasets");
     }
 
     auto state = std::make_unique<WriterState>();
     state->dataset_path = path;
-    state->compression_level = compression_level;
-    state->append_only_commits = true;
+    state->compression_level = opts.compression_level;
+    state->compression = opts.compression;
+    state->structural = !opts.disable_structural_encoding;
+    state->blob_uri_dictionary = opts.blob_uri_dictionary;
+    state->borrow_buffers = opts.borrow_buffers;
+    state->append_only_commits = opts.append;
 
-    std::error_code ec;
-    if (!std::filesystem::exists(state->dataset_path / "_versions", ec)) {
-        return set_error(writer, NANO_LANCE_IO_ERROR, "init_append requires an existing dataset with _versions");
+    for (std::size_t i = 0; i < opts.num_column_encodings; ++i) {
+        const auto& entry = opts.column_encodings[i];
+        if (entry.field_name == nullptr || entry.field_name[0] == '\0') {
+            return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "field name must not be empty");
+        }
+        const std::string enc = entry.encoding != nullptr ? entry.encoding : "";
+        if (enc == "auto") {
+            state->column_encodings.erase(entry.field_name);
+        } else if (enc == "plain" || enc == "bitpack" || enc == "bss-zstd" || enc == "zstd") {
+            state->column_encodings[entry.field_name] = enc;
+        } else {
+            return set_error(writer, NANO_LANCE_INVALID_ARGUMENT,
+                             "unknown column encoding (expected auto/plain/bitpack/bss-zstd/zstd): " + enc);
+        }
     }
 
-    nano_lance::pb::Manifest manifest{};
-    std::uint64_t manifest_version = 0;
-    std::string load_error;
-    if (!nano_lance::load_latest_manifest(state->dataset_path, manifest, manifest_version, load_error)) {
-        return set_error(writer, NANO_LANCE_IO_ERROR, load_error);
-    }
-    if (!nano_lance::lance_schema_mapping_from_manifest(manifest, state->schema_mapping, load_error)) {
-        return set_error(writer, NANO_LANCE_UNSUPPORTED, load_error);
-    }
+    if (opts.append) {
+        std::error_code ec;
+        if (!std::filesystem::exists(state->dataset_path / "_versions", ec)) {
+            return set_error(writer, NANO_LANCE_IO_ERROR, "init_append requires an existing dataset with _versions");
+        }
 
-    state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
-    const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
-    state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
-    state->has_schema = true;
+        nano_lance::pb::Manifest manifest{};
+        std::uint64_t manifest_version = 0;
+        std::string load_error;
+        if (!nano_lance::load_latest_manifest(state->dataset_path, manifest, manifest_version, load_error)) {
+            return set_error(writer, NANO_LANCE_IO_ERROR, load_error);
+        }
+        if (!nano_lance::lance_schema_mapping_from_manifest(manifest, state->schema_mapping, load_error)) {
+            return set_error(writer, NANO_LANCE_UNSUPPORTED, load_error);
+        }
+
+        state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
+        const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
+        state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
+        state->has_schema = true;
+    }
 
     writer->private_data = state.release();
     return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_init(NanoLanceWriter* writer, const char* path, int compression_level) {
+    if (writer == nullptr) {
+        return NANO_LANCE_INVALID_ARGUMENT;
+    }
+    // Historically this reset private_data without looking at it, so a caller that re-inits without
+    // closing leaks rather than being told. Kept, because changing it would break those callers.
+    writer->private_data = nullptr;
+    NanoLanceWriteOptions options{};
+    options.compression_level = compression_level;
+    return nano_lance_writer_open(writer, path, &options);
+}
+
+int nano_lance_writer_init_append(NanoLanceWriter* writer, const char* path, int compression_level) {
+    NanoLanceWriteOptions options{};
+    options.compression_level = compression_level;
+    options.append = true;
+    const auto rc = nano_lance_writer_open(writer, path, &options);
+    if (rc == NANO_LANCE_INVALID_STATE && writer != nullptr && writer->private_data != nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "close writer before init_append");
+    }
+    return rc;
 }
 
 int nano_lance_writer_set_ignore_nullability(NanoLanceWriter* writer, bool ignore_nullability) {
