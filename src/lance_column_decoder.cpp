@@ -845,6 +845,15 @@ struct ColumnEncodingPlan {
     /// `dict` and zstd-framed for `dict-rle`; stock Lance uses LZ4 for a low-cardinality string
     /// column. Reading it from the descriptor is what makes all three decode from the same branch.
     page_layout::BufferScheme dict_scheme = page_layout::BufferScheme::kNone;
+    /// kDict: bits per entry when the dictionary block holds FIXED-WIDTH values (`Flat(64)` for a
+    /// time64 column, `Flat(128)` for decimal128), and 0 when it holds a variable-width block. The
+    /// two are completely different blocks -- a variable-width one starts with an offset header, a
+    /// flat one is just the values end to end -- so this is what picks the branch, not a guess from
+    /// the column's logical type.
+    std::uint32_t dict_value_bits = 0;
+    /// kDict: `num_dictionary_items` from the descriptor. Authoritative for a fixed-width dictionary,
+    /// whose block carries no count of its own.
+    std::uint64_t dict_items = 0;
     /// kVariable: the offset width the descriptor declares for the value block, in bits. Only the
     /// FSST path consults it -- there the block being decoded is the COMPRESSED one, whose offsets
     /// index compressed bytes and need not share the column's own offset width.
@@ -961,6 +970,21 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             out.kind = ColumnEncodingKind::kUnsupported;
             out.unsupported_reason = "unsupported dictionary encoding in " + page_layout::describe(layout);
             return true;
+        }
+        if (dict->kind == page_layout::CompressiveKind::kFlat) {
+            // A dictionary of fixed-width values. Lance builds these once a temporal or decimal
+            // column's cardinality justifies it -- `Flat(64)` for time64 past 1024 rows,
+            // `Flat(128)` for decimal128 past 20000 -- and the block is then just the values, with
+            // none of the offset header the variable-width path reads.
+            if (dict->bits_per_value == 0U || dict->bits_per_value % 8U != 0U) {
+                out.kind = ColumnEncodingKind::kUnsupported;
+                out.unsupported_reason =
+                    "dictionary values are " + std::to_string(dict->bits_per_value) +
+                    " bits, which is not a whole number of bytes, in " + page_layout::describe(layout);
+                return true;
+            }
+            out.dict_value_bits = dict->bits_per_value;
+            out.dict_items = layout.mini_block.num_dictionary_items;
         }
     }
 
@@ -1495,9 +1519,30 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         return true;
     }
 
-    // Structural dictionary variable-width column: buffer[1] = bitpacked u32 indices, buffer[2] = dictionary.
+    // Structural dictionary column: buffer[1] = bitpacked u32 indices, buffer[2] = dictionary.
+    //
+    // The dictionary block comes in two shapes and the descriptor says which. `Variable` is a block
+    // with an offset header, which is what a low-cardinality string column gets. `Flat(N)` is N-bit
+    // values end to end with no header at all, which is what Lance builds for a time64 or decimal128
+    // column once its cardinality justifies a dictionary. Reading a flat block as a variable-width
+    // one read the first value as an offset header and refused with "dict block header invalid".
     if (encoding_plan.kind == ColumnEncodingKind::kDict) {
-        out.kind = ColumnValues::Kind::VariableWidth;
+        const bool fixed_dict = encoding_plan.dict_value_bits != 0U;
+        const std::size_t dict_value_bytes = encoding_plan.dict_value_bits / 8U;
+        if (fixed_dict) {
+            // The descriptor and the schema have to agree about how wide a value is. They always do
+            // in a file Lance wrote; a file where they disagree is the one case where trusting
+            // either would silently produce shifted values, so refuse instead.
+            const auto schema_bytes = lance_logical_type_value_bytes(on_disk_field.logical_type);
+            if (dict_value_bytes != schema_bytes) {
+                error = "dictionary declares " + std::to_string(dict_value_bytes) +
+                        "-byte values but the column's type is " + std::to_string(schema_bytes) + " bytes wide";
+                return false;
+            }
+            out.kind = ColumnValues::Kind::FixedWidth;
+        } else {
+            out.kind = ColumnValues::Kind::VariableWidth;
+        }
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> dict_stored;
@@ -1519,28 +1564,46 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             if (!decompress_dictionary_block(encoding_plan.dict_scheme, dict_stored, dict_block, error)) {
                 return false;
             }
-            if (dict_block.size() < 8U) {
-                error = "dict block too short";
-                return false;
-            }
-            std::uint32_t bytes_start = 0;
-            std::memcpy(&bytes_start, dict_block.data() + 4U, 4U);
-            if (bytes_start < 12U || bytes_start > dict_block.size() || (bytes_start - 8U) % 4U != 0U) {
-                error = "dict block header invalid";
-                return false;
-            }
-            const std::size_t num_dict = (bytes_start - 8U) / 4U - 1U;
-            std::vector<std::pair<std::uint32_t, std::uint32_t>> dict_ranges(num_dict);
-            for (std::size_t d = 0; d < num_dict; ++d) {
-                std::uint32_t a = 0;
-                std::uint32_t b = 0;
-                std::memcpy(&a, dict_block.data() + 8U + d * 4U, 4U);
-                std::memcpy(&b, dict_block.data() + 8U + (d + 1U) * 4U, 4U);
-                if (bytes_start + b > dict_block.size() || b < a) {
-                    error = "dict offsets out of range";
+            std::size_t num_dict = 0;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> dict_ranges;
+            if (fixed_dict) {
+                // No header: the block is entries of `dict_value_bytes`, and the descriptor's
+                // `num_dictionary_items` is the only statement of how many. Lance pads the block, so
+                // it may be longer than the entries need -- it must never be shorter.
+                num_dict = static_cast<std::size_t>(encoding_plan.dict_items);
+                std::uint64_t needed = 0;
+                if (num_dict == 0U ||
+                    !checked_mul(encoding_plan.dict_items, static_cast<std::uint64_t>(dict_value_bytes), needed) ||
+                    !fits_size_t(needed) || static_cast<std::size_t>(needed) > dict_block.size()) {
+                    error = "dictionary declares " + std::to_string(encoding_plan.dict_items) + " entries of " +
+                            std::to_string(dict_value_bytes) + " bytes but the block holds " +
+                            std::to_string(dict_block.size());
                     return false;
                 }
-                dict_ranges[d] = {bytes_start + a, b - a};
+            } else {
+                if (dict_block.size() < 8U) {
+                    error = "dict block too short";
+                    return false;
+                }
+                std::uint32_t bytes_start = 0;
+                std::memcpy(&bytes_start, dict_block.data() + 4U, 4U);
+                if (bytes_start < 12U || bytes_start > dict_block.size() || (bytes_start - 8U) % 4U != 0U) {
+                    error = "dict block header invalid";
+                    return false;
+                }
+                num_dict = (bytes_start - 8U) / 4U - 1U;
+                dict_ranges.resize(num_dict);
+                for (std::size_t d = 0; d < num_dict; ++d) {
+                    std::uint32_t a = 0;
+                    std::uint32_t b = 0;
+                    std::memcpy(&a, dict_block.data() + 8U + d * 4U, 4U);
+                    std::memcpy(&b, dict_block.data() + 8U + (d + 1U) * 4U, 4U);
+                    if (bytes_start + b > dict_block.size() || b < a) {
+                        error = "dict offsets out of range";
+                        return false;
+                    }
+                    dict_ranges[d] = {bytes_start + a, b - a};
+                }
             }
             // The index chunks go through the same splitter every other miniblock path uses, so a
             // nullable dictionary column (a categorical column with missing values -- the shape this
@@ -1574,6 +1637,25 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             if (rows_remaining != 0U || indices_bytes.size() != page.length * 4U) {
                 error = "dict index count mismatch";
                 return false;
+            }
+            if (fixed_dict) {
+                // Every row is the same width, so the destination is sized once and written through
+                // a pointer -- no per-row growth, and no offsets to maintain.
+                const std::size_t base = out.fixed.size();
+                out.fixed.resize(base + static_cast<std::size_t>(page.length) * dict_value_bytes);
+                std::uint8_t* dest = out.fixed.data() + base;
+                for (std::uint64_t r = 0; r < page.length; ++r) {
+                    std::uint32_t index = 0;
+                    std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
+                    if (index >= num_dict) {
+                        error = "dict index out of range";
+                        return false;
+                    }
+                    std::memcpy(dest, dict_block.data() + static_cast<std::size_t>(index) * dict_value_bytes,
+                                dict_value_bytes);
+                    dest += dict_value_bytes;
+                }
+                continue;
             }
             const bool first_page = out.variable.offsets.empty();
             std::uint64_t cumulative = out.variable.data.size();

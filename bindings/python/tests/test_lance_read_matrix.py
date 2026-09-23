@@ -73,11 +73,6 @@ SIZES = (1, 100, 1024, 1025, 5000, 20_000)
 # Known read gaps, each reproduced by this matrix and each a distinct missing decoder. Recorded as
 # (predicate, message fragment); see docs/PROGRESS.md for the page descriptors behind them.
 KNOWN_GAPS = (
-    # A dictionary whose VALUES are fixed-width -- `General{LZ4, Flat(64)}` for time64,
-    # `Flat(128)` for decimal128. nanolance's dictionary path assumes a variable-width block, so it
-    # reads the header of a block that has none.
-    (lambda n, k: k == "time64_us" and n >= 1024, "dict block header invalid"),
-    (lambda n, k: k == "decimal128" and n >= 20_000, "dict block header invalid"),
     # A dictionary with RLE'd indices, where the dictionary itself is LZ4-compressed
     # (`Rle{Flat(32), Flat(8)}` over `General{LZ4, Variable}`). nanolance writes dict+RLE with a zstd
     # dictionary and reads that; this combination lands in the wrong branch and mis-sizes the buffer.
@@ -123,3 +118,32 @@ def test_the_gap_list_is_not_stale(lance_mod, tmp_path):
         assert any(predicate(n, k) for n in SIZES for k in KINDS), (
             f"KNOWN_GAPS[{index}] ({message!r}) matches no cell in the matrix"
         )
+
+
+# A dictionary whose entries are fixed-width values rather than a variable-width block. Lance builds
+# one for a temporal or decimal column once the cardinality justifies it, and the block it writes has
+# NO header -- it is the values end to end. The variable-width dictionary path read the first value as
+# an offset header and refused with "dict block header invalid".
+#
+# The matrix above covers the non-null case at the two sizes where it first appears. These are the
+# axes it does not cross: the nullable variant (definition levels in front of the indices), 16-byte
+# and 32-byte entries, and enough rows for the dictionary to span several pages.
+FIXED_WIDTH_DICTIONARY = {
+    "time64": (pa.time64("us"), lambda i: datetime.time(i % 24, (i * 7) % 60)),
+    "timestamp": (pa.timestamp("us"), lambda i: datetime.datetime(2026, 1, 1) + datetime.timedelta(seconds=i % 500)),
+    "date32": (pa.date32(), lambda i: datetime.date(2026, 1, 1) + datetime.timedelta(days=i % 300)),
+    "decimal128": (pa.decimal128(12, 2), lambda i: decimal.Decimal(f"{i % 10000}.{i % 100:02d}")),
+    "decimal256": (pa.decimal256(40, 2), lambda i: decimal.Decimal(f"{i % 5000}.{i % 100:02d}")),
+}
+
+
+@pytest.mark.parametrize("n", (1024, 20_000, 65_536))
+@pytest.mark.parametrize("nullable", (False, True), ids=("nonnull", "nullable"))
+@pytest.mark.parametrize("name", sorted(FIXED_WIDTH_DICTIONARY))
+def test_fixed_width_dictionary_reads_back(lance_mod, tmp_path, name, nullable, n):
+    arrow_type, value = FIXED_WIDTH_DICTIONARY[name]
+    values = [None if nullable and i % 11 == 0 else value(i) for i in range(n)]
+    path = str(tmp_path / f"{name}_{n}_{nullable}.lance")
+    lance_mod.write_dataset(pa.table({"c": pa.array(values, arrow_type)}), path)
+    expected = lance_mod.dataset(path).to_table()
+    assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()

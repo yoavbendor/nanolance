@@ -1491,10 +1491,21 @@ written**, in four classes, none of which any existing test touched:
 Three distinct causes behind them:
 
 1. **Structs written by pylance** — **fixed**, and not for the reason the descriptor suggested. See
-   the section below: it was a protobuf defaulting bug, not a missing decoder.
-2. **Dictionaries whose values are fixed-width.** nanolance's dictionary path assumes a
-   variable-width block and reads the header of a block that has none. Lance builds these for
-   temporal and decimal columns once the cardinality justifies it.
+   below: it was a protobuf defaulting bug, not a missing decoder.
+2. **Dictionaries whose values are fixed-width** — **fixed**. The dictionary block comes in two
+   shapes and the descriptor says which. `Variable` is a block with an offset header, which is what a
+   low-cardinality string column gets. `Flat(N)` is N-bit values end to end with **no header at
+   all**, which is what Lance builds for a temporal or decimal column once its cardinality justifies
+   a dictionary. One branch read both, so a flat block's first value was read as an offset header and
+   refused with `dict block header invalid` — a message naming the symptom, not the cause.
+
+   The descriptor already carried everything needed: `Flat`'s `bits_per_value` for the entry width
+   and `num_dictionary_items` for the count, since a headerless block states neither itself. The
+   decode then sizes its output once and writes through a pointer rather than maintaining offsets,
+   because every row is the same width. Two checks guard it: the descriptor's entry width must equal
+   the width the column's logical type implies (they always agree in a file Lance wrote, and
+   trusting either one alone when they disagree would silently shift every value), and the block must
+   be long enough for the entries it claims — Lance pads it, so longer is fine and shorter is not.
 3. **Dictionary + RLE'd indices over an LZ4 dictionary.** nanolance writes dict+RLE with a *zstd*
    dictionary and reads that shape; this combination lands in the wrong branch.
 
@@ -1607,11 +1618,10 @@ is most likely to hit.
 
 ### Correctness / reach — worth doing next
 
-1. **Two read gaps for pylance-written columns**, both found by `test_lance_read_matrix.py` and both
-   pinned there: fixed-width dictionaries (`General{LZ4,Flat(64|128)}`, hit by `time64` and
-   `decimal128`) and dict+RLE over an LZ4 dictionary (hit by a repetitive string column at 5000+
-   rows). These are the most user-visible items on this list: each makes an ordinary pylance dataset
-   unreadable. The third, structs, is **fixed** — see the post-mortem above.
+1. **One read gap left for pylance-written columns**, found by `test_lance_read_matrix.py` and
+   pinned there: dict+RLE over an LZ4 dictionary, hit by a repetitive string column at 5000+ rows.
+   It makes an ordinary pylance dataset unreadable, which is what keeps it at the top of this list.
+   The other two — structs and fixed-width dictionaries — are **fixed**; see above.
 
 2. **No FSST on write.** The direct answer to the one bench shape nanolance still loses
    (`high_card`: 7.67 ms vs rust-lance 5.12 ms). zstd is ~48% of that read; rust-lance avoids it by
