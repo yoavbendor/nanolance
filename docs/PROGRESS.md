@@ -1014,6 +1014,79 @@ warning was too mild.
 
 ---
 
+## Phase 4.4 — the profiler was hiding the biggest win
+
+4.4 was "mmap the data file", on the theory that the cost of `ifstream` page reads is the zero-fill
+and the kernel→heap copy. `strace -c` disagreed. Three reads of the 1M-row dataset:
+
+```
+ 48.17%   19,065   newfstatat
+ 26.68%    9,544   read
+ 23.00%    9,546   lseek
+```
+
+Nearly half the syscall time was `stat`, and none of it was doing anything. The reader keeps a small
+LRU of open data files and re-validates size + mtime on lookup, because a path can legitimately name
+a *different* file later — fragment names come from the lowest unused suffix, so rewriting a dataset
+directory reproduces `fragment-0.lance` with other bytes, which nanolance's own test suite does. That
+check is right. Running it on **every page-buffer read** is not: the answer cannot change partway
+through a single read.
+
+`DataFileReadScope` marks a batch read as one operation. A file is validated on its first lookup
+inside the scope and reused for the rest of it. Outside any scope the epoch is 0, which never matches
+a stamped entry, so every lookup validates exactly as before — the fast path is opt-in, not something
+a caller loses by forgetting to opt out. The reader also remembers where the stream is, so a page
+that starts where the last one stopped skips its seek.
+
+```
+newfstatat   19,065 -> 15
+lseek         9,546 -> 8,793
+wall clock    78 ms -> 68 ms      (best of 15, interleaved)
+```
+
+`tests/test_data_file_reader.cpp` guards it, and the guard took two attempts. The first version
+replaced the file with `ofstream` truncation and passed even with validation ripped out entirely —
+truncating in place keeps the inode, and a cached handle follows the inode, so nothing was being
+tested. It now unlinks first, and checks both directions of the stale-size bound: a read past a
+*shrunken* replacement's end must be refused rather than served from the old inode, and a read inside
+a *grown* replacement must be allowed rather than refused by the old length. Against a
+never-revalidate build it fails on the first of those; against a never-seek build it fails on the
+forward jump.
+
+### And then mmap was closed, by pricing what was left
+
+With the stats gone, the whole remaining file-read path — seek, read, copy into the page buffer —
+prices at **~5% of a read** (every page read run twice: 74 ms → 78 ms over three reads). That is
+mmap's entire ceiling, against a `docs/SAFETY.md` rewrite, its own fuzz pass, and SIGBUS on a
+truncated file. Closed.
+
+Same verdict, same method, for a refactor that was not on the plan at all: `MiniBlockChunkView` is
+named "View" but copies each chunk out of the page payload, and callgrind blamed those copies for
+**25.6%** of a read's instructions. Running the split twice priced them at 3.8% (78 ms → 81 ms). The
+refactor would thread a span type through six decoder helper signatures and give up the
+`std::swap(chunk.values, raw)` the zstd and LZ4 paths rely on. Not at that price.
+
+### What Phase 4 actually taught
+
+Three reads of a 1M-row `int64 + double + string` dataset: **87 ms → 68 ms (−22%)**, on top of 4.1's
+201 ms → 160 ms and 2.01× → 1.01× peak RSS.
+
+Every item in this phase was decided by wall clock, and **the instruction profile was wrong about all
+four of them**:
+
+| | callgrind said | wall clock said |
+|---|---|---|
+| per-row offset append | 32% | 11% — worth doing |
+| chunk-view refactor | 25.6% | 3.8% — not worth doing |
+| default-init buffers (4.3) | 5.1% | 0% — not worth doing |
+| file-read path (4.4) | 3.9% | ~24% — the largest win left |
+
+`rep stosb` and `rep movsb` are counted once per byte, so memset and memcpy look enormous; syscalls
+are one instruction to count and microseconds to make, so they vanish. Use `callgrind_annotate` to
+find candidates. Never to size them.
+
+---
+
 ## Deviations from the plan, and open items
 
 - **The nullable opt-out was not needed** (see above) — simpler than planned.

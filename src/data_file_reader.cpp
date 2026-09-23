@@ -27,18 +27,39 @@ namespace {
 // a *later, unrelated* file: fragment file names are assigned deterministically from the lowest unused
 // suffix (data_file_writer.cpp), so wiping a dataset directory and rewriting it reproduces the very same
 // "fragment-0.lance" path with different bytes (this is exactly what nanolance's own test suite does
-// across sequential test cases sharing one temp directory). So every lookup — hit or miss — re-stats
-// size + mtime and reopens if either changed, trading back part of the stat-avoidance win for
-// correctness against file replacement, while still skipping the much heavier open() when unchanged.
+// across sequential test cases sharing one temp directory). So a lookup re-stats size + mtime and
+// reopens if either changed, trading back part of the stat-avoidance win for correctness against file
+// replacement, while still skipping the much heavier open() when unchanged.
+//
+// That re-stat used to run on EVERY lookup, which meant two `stat` syscalls per page-buffer read:
+// 19,065 of them (48% of all syscall time) for three reads of a 1M-row, three-column dataset. A
+// `DataFileReadScope` marks one read operation, and within it a file is validated on its first
+// lookup only — the file cannot become a different file partway through a single read in any way the
+// reader could act on. Outside a scope the epoch is 0, which never matches a stamped entry, so every
+// lookup validates exactly as it did before.
 struct OpenDataFile {
     std::ifstream stream;
     std::uint64_t file_size = 0;
     std::filesystem::file_time_type mtime{};
+    /// Read scope this entry was last validated in; 0 means "not validated in any scope".
+    std::uint64_t checked_epoch = 0;
+    /// Where `stream`'s get pointer is, so a page read that continues where the last one stopped --
+    /// which is the common case, pages of a column are laid out in order -- can skip the seek.
+    std::uint64_t position = 0;
 };
 constexpr std::size_t kMaxOpenDataFiles = 4;
 thread_local std::list<std::pair<std::filesystem::path, OpenDataFile>> g_open_data_files;
+thread_local std::uint64_t g_read_epoch = 0;
+thread_local std::uint64_t g_next_read_epoch = 1;
 
 OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::string& error) {
+    for (auto it = g_open_data_files.begin(); it != g_open_data_files.end(); ++it) {
+        if (it->first == path && g_read_epoch != 0 && it->second.checked_epoch == g_read_epoch) {
+            g_open_data_files.splice(g_open_data_files.begin(), g_open_data_files, it);
+            return &g_open_data_files.front().second;
+        }
+    }
+
     std::error_code ec;
     const auto file_size = std::filesystem::file_size(path, ec);
     if (ec) {
@@ -54,6 +75,7 @@ OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::str
     for (auto it = g_open_data_files.begin(); it != g_open_data_files.end(); ++it) {
         if (it->first == path) {
             if (it->second.file_size == static_cast<std::uint64_t>(file_size) && it->second.mtime == mtime) {
+                it->second.checked_epoch = g_read_epoch;
                 g_open_data_files.splice(g_open_data_files.begin(), g_open_data_files, it);
                 return &g_open_data_files.front().second;
             }
@@ -71,6 +93,7 @@ OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::str
     }
     fresh.file_size = static_cast<std::uint64_t>(file_size);
     fresh.mtime = mtime;
+    fresh.checked_epoch = g_read_epoch;
     g_open_data_files.emplace_front(path, std::move(fresh));
     if (g_open_data_files.size() > kMaxOpenDataFiles) {
         g_open_data_files.pop_back();
@@ -98,6 +121,11 @@ bool read_le64(const unsigned char* p, std::uint64_t& v) {
 }
 
 }  // namespace
+
+DataFileReadScope::DataFileReadScope() : saved_(g_read_epoch) { g_read_epoch = g_next_read_epoch++; }
+
+DataFileReadScope::~DataFileReadScope() { g_read_epoch = saved_; }
+
 
 bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& path, pb::FileDescriptor& descriptor,
                                                 LanceDataFileFooterLayout& layout, std::string& error) {
@@ -239,14 +267,24 @@ bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::ui
     }
     auto& in = file->stream;
     in.clear();  // a previous read on this cached stream may have set eof/fail; clear before repositioning
-    in.seekg(static_cast<std::streamoff>(offset));
+    // Skip the seek when the stream is already there. libstdc++'s seekg() discards the filebuf and
+    // always issues an lseek, and a column's pages are read in file order, so most of those seeks were
+    // asking the kernel to move the offset to where it already was.
+    if (file->position != offset) {
+        in.seekg(static_cast<std::streamoff>(offset));
+        file->position = offset;
+    }
     out.resize(static_cast<std::size_t>(size));
     in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(size));
     if (!in || static_cast<std::uint64_t>(in.gcount()) != size) {
         error = "failed to read data file byte range";
+        // The stream's position is now wherever the short read left it, and `in` is in a failed state
+        // that the next call clears — forget it rather than trusting the cached value.
+        file->position = std::numeric_limits<std::uint64_t>::max();
         out.clear();
         return false;
     }
+    file->position = offset + size;
     return true;
 }
 

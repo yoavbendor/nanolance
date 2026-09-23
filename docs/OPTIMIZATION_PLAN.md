@@ -415,14 +415,61 @@ whose pitch is that it does not do that — buys nothing. This is the second tim
 that an instruction profile promised a win that wall clock did not pay; §2.4 already warned about
 exactly this fix, and the warning was if anything too mild.
 
-**4.4 mmap the data file.** Replaces `ifstream` page reads: no zero-fill, no kernel→heap copy, and
-for plain fixed-width columns a genuinely zero-copy `ArrowBuffer` pointing into the mapping.
-Interacts with the safety model — every bound is still checked, but the "read into a sized buffer"
-invariant changes, so this needs its own fuzz pass and a `docs/SAFETY.md` update.
+**4.4 mmap the data file. CLOSED — the win was in syscalls, and it was not the ones mmap removes.**
+The item assumed the cost of `ifstream` page reads was the zero-fill and the kernel→heap copy.
+`strace -c` said otherwise. Three reads of the 1M-row dataset issued **38,315 syscalls**, and the
+single largest line was not read at all:
+
+```
+ 48.17%   19,065   newfstatat
+ 26.68%    9,544   read
+ 23.00%    9,546   lseek
+```
+
+The 19,065 stats were the open-file LRU re-validating size and mtime on *every page-buffer read* —
+two syscalls per page, to re-answer a question ("is this still the same file?") that cannot change
+partway through one read. `DataFileReadScope` marks a batch read as one operation so each file is
+validated on first touch; outside a scope every lookup still validates, so the guarantee is opt-in
+rather than something a caller loses by forgetting. The reader also remembers where the stream is and
+skips the seek when the next page starts there.
+
+```
+newfstatat   19,065 -> 15
+lseek         9,546 -> 8,793
+wall clock    78 ms -> 68 ms      (best of 15, interleaved)
+```
+
+With those gone, the *entire* remaining file-read path — seek, read, and the copy into the page
+buffer — prices at **~5% of a read**, measured by doing every page read twice and taking the
+difference (74 ms -> 78 ms over three reads). That is mmap's whole ceiling, against a `docs/SAFETY.md`
+rewrite, its own fuzz pass, and SIGBUS on a truncated file. Not worth it.
+
+The lseeks that remain are real: Lance pads each page buffer to 8 bytes, so the next buffer usually
+starts a few bytes past where the last read stopped. Coalescing a page's two buffers into one read
+would remove them, and is worth doing only if that ~5% ever becomes the top of the profile.
+
+**Also measured and rejected: making `MiniBlockChunkView` an actual view.** It is named "View" but
+copies each chunk out of the page payload, and callgrind blamed those copies for **25.6%** of a
+read's instructions. Priced by running the split twice: 78 ms -> 81 ms over three reads, so removing
+it entirely is worth ~3.8%. The refactor would thread a span type through six decoder helper
+signatures and give up the `std::swap(chunk.values, raw)` that the zstd and LZ4 paths use. Not a good
+trade at that price; revisit only with the coalescing above.
 
 **4.5 Re-profile.** Publish the new callgrind breakdown alongside the bench, the way CI already
 does. State the ratio honestly — parity with rust-lance on read is the goal, and if 4.1–4.4 land it
 looks reachable.
+
+**Where Phase 4 landed.** Three reads of a 1M-row `int64 + double + string` dataset: **87 ms → 68 ms
+(−22%)**, on top of 4.1's 201 ms → 160 ms and its 2.01× → 1.01× peak RSS.
+
+The method mattered more than any single change here, so it is worth stating plainly: **every item
+in this phase was decided by wall clock, and the instruction profile was wrong about all four of
+them.** It over-sold 4.3 (5.1% of instructions, 0% of time — callgrind counts `rep stosb` once per
+byte). It over-sold the chunk-view refactor (25.6% of instructions, 3.8% of time). It under-sold the
+file-read path badly enough to hide the largest remaining win entirely (3.9% of instructions, ~24% of
+time — syscalls are cheap to count and expensive to make). It was right only about the per-row offset
+append, and even there the 32% of instructions paid out as 11% of time. Read `callgrind_annotate` to
+find *candidates*; never to size them.
 
 ### Phase 5 — Simplicity (opportunistic)
 

@@ -792,6 +792,10 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
         return false;
     }
 
+    // One batch is one read operation, so each data file it touches is validated once here rather
+    // than once per page buffer (see DataFileReadScope).
+    const DataFileReadScope read_scope;
+
     // One fragment, one batch -- however many files its columns are split across.
     std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
     std::int64_t length = -1;
