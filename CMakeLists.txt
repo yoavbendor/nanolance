@@ -340,6 +340,11 @@ if(NANOLANCE_BUILD_FUZZERS)
     target_compile_features(nanolance_fuzz_lz4 PRIVATE cxx_std_20)
     target_link_libraries(nanolance_fuzz_lz4 PRIVATE nanolance)
     target_link_options(nanolance_fuzz_lz4 PRIVATE -fsanitize=fuzzer)
+
+    add_executable(nanolance_fuzz_deletion_vector tests/fuzz/fuzz_deletion_vector.cpp)
+    target_compile_features(nanolance_fuzz_deletion_vector PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_deletion_vector PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_deletion_vector PRIVATE -fsanitize=fuzzer)
 endif()
 
 if(NANOLANCE_BUILD_TOOLS)

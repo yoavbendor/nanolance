@@ -120,6 +120,40 @@ Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](https:
   cmake --build build-fuzz --target nanolance_fuzz_decode
   ./build-fuzz/nanolance_fuzz_decode -max_total_time=60 corpus/
   ```
+- **A fuzzer per parser, not just per entry point.** `fuzz_decode` stops at the data file's footer
+  and column metadata, so each format reached only *after* that point needs its own target, and CI
+  runs all five on every push ([`.github/workflows/memory-safety.yml`](https://github.com/yoavbendor/nanolance/blob/main/.github/workflows/memory-safety.yml)):
+
+  | target | covers | why `fuzz_decode` does not reach it |
+  |---|---|---|
+  | `nanolance_fuzz_page_layout` | the `/lance.encodings21.PageLayout` descriptor | seeded from real pylance descriptors — FSST, LZ4 dictionaries, RLE levels — which nanolance's own writer never emits |
+  | `nanolance_fuzz_fsst` | the FSST symbol-table decompressor | only runs once a value buffer is being decompressed |
+  | `nanolance_fuzz_lz4` | the LZ4 block decompressor | same |
+  | `nanolance_fuzz_deletion_vector` | `_deletions/*.arrow` (Arrow IPC framing + flatbuffer vtable walk) and `_deletions/*.bin` (roaring bitmap) | a deletion file is never opened by the data-file path |
+
+  The deletion-file target is the newest, and it earned its place three times over. The roaring
+  format amplifies up to ~65,000x — a four-byte run container can emit 65,536 values — and nothing
+  budgeted it, so roughly 640 KiB of crafted input bought 16 GiB of allocation. The parser now sums
+  the containers' declared cardinalities and checks that total **before materializing anything**,
+  capped by the manifest's own `num_deleted_rows`; a bitmap container whose popcount, or a run
+  container whose expansion, disagrees with its declared cardinality is refused outright; and the
+  output reserve is capped rather than trusting the declared total, because the fuzzer turned that
+  trust into a 4 GiB `malloc` from a few kilobytes. `tests/test_read_safety.cpp` pins the budget with
+  a 41 KB input that asks for a gigabyte.
+
+  The same target then found the Arrow IPC side: a buffer's int64 uncompressed-length prefix was
+  trusted up to the generic 8 GiB ceiling, so a 328-byte file could ask for 4 GiB.
+  `materialize_ipc_buffer` now cross-checks it against `ZSTD_getFrameContentSize` before allocating,
+  the way `zstd_unframe_buffer` always has. Both reproducers are checked in at
+  [`tests/fuzz/corpus/deletion_vector/`](https://github.com/yoavbendor/nanolance/tree/main/tests/fuzz/corpus/deletion_vector)
+  and replayed by CI on every push.
+
+  With those allocations bounded, the same target reached far deeper and found a real crash:
+  `std::length_error` escaping the parser because the record batch's int64 row count was checked with
+  `values.size() < rows * 4`, which overflows uint64 past 2^62. An uncaught exception from a
+  malformed file is a crash, not a refusal; it uses `checked_mul` now. Its reproducer is checked in
+  beside the others.
+
 - **Negative-corpus tests** ([`tests/test_read_safety.cpp`](https://github.com/yoavbendor/nanolance/blob/main/tests/test_read_safety.cpp)) — hand-built
   malformed footers (oversized column count, overflowing descriptor bounds) and garbage protobuf must
   be *rejected cleanly*, and the checked-math/`load_le` helpers are unit-tested.

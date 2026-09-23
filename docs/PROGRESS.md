@@ -1296,6 +1296,133 @@ piece of work (an FSST encoder), not a tweak — so it is listed below rather th
 
 ---
 
+## The one parser with no fuzzer had an unbounded expansion in it
+
+Asked whether nanolance should be using `nanom` (the sister parser-combinator library) for its binary
+parsing, I went looking at what the hand-rolled parsers actually are. The audit's most useful output
+was not an answer about nanom: it was noticing that `src/deletion_vector.cpp` — 547 lines of
+untrusted-input parsing added in this same session — was **the only parser in the tree without a
+libFuzzer target**. `fuzz_decode`, `fuzz_page_layout`, `fuzz_fsst` and `fuzz_lz4` cover everything
+else, and none of them reach a deletion file: `fuzz_decode` stops at the data file and never opens
+one.
+
+`fuzz_deletion_vector` now covers both entry points. It found something within minutes.
+
+### A 4-byte run container can emit 65,536 values
+
+The roaring format amplifies violently, and nothing bounded it:
+
+| container | bytes on disk | values out | amplification |
+|---|---|---|---|
+| run | **4** | up to 65,536 | **~65,000x** |
+| bitmap | 8,192 | up to 65,536 | 32x |
+| array | 2 per value | 1 per value | 2x |
+
+With up to 65,536 containers, roughly **640 KiB of crafted input buys 16 GiB of allocation**. The
+fuzzer reached 614 MiB of RSS on inputs under 8 KiB. Every other decode path in the reader budgets
+its output against `default_read_limits()`; this one did not.
+
+The `num_deleted_rows` cross-check at the end of `read_deletion_vector` does not help: it catches the
+bad file only *after* the allocation it was supposed to prevent. A budget is only a budget if it is
+checked before each expansion, so the check now sits inside the container loop — and the real caller
+passes the manifest's `num_deleted_rows` as the cap, which is not a heuristic but the exact number of
+values an honest file will produce.
+
+Getting that right took three passes, and the middle one is worth recording because it looked fine.
+
+The first version budgeted a bitmap container at its 65,536 maximum rather than its real count, which
+refused a perfectly ordinary pylance dataset of 9,000 deleted rows. Fixing that was free and
+stricter: the descriptive header already states each container's cardinality, and for a bitmap
+container that *is* its popcount — so the parser counts the bits, **refuses a container whose bit
+count disagrees with its own header**, and budgets on the true value.
+
+Then a re-fuzz said peak RSS had gone from 614 MiB to **1047 MiB** — worse, not better. (A mid-run
+reading of 403 MiB had looked like an improvement; it was not the peak, and reporting it was a
+mistake.) The reason was the *default* budget: the standalone entry point falls back to the reader's
+generic per-buffer limit, `max_uncompressed_bytes / 4` — 2.1 billion values. Consistent with the rest
+of the reader, and meaningless as a bound on a deletion vector.
+
+So the check moved to where the answer already was. The descriptive header states every container's
+cardinality, so the total is summed and checked **once, before any value is materialized**, and two
+per-container invariants keep that header honest — a bitmap container's popcount and a run
+container's expansion must each equal the cardinality it declared. Without the second, a run
+container could claim a cardinality of 1, sail through the up-front total, and then expand 65,536
+values per run.
+
+That version also reserved the output vector to the declared total, which the fuzzer refused to let
+stand: **it found a 4 GiB `malloc` from an input of a few kilobytes on the next run.** The declared
+total is a number the *file* chose; passing the budget proves it is permitted, not that it is real,
+so reserving it hands a small file a huge allocation directly. The reserve is now capped at 1M
+offsets (4 MiB, past any real deletion file) and everything beyond that is paid for one container at
+a time, each measured against the budget before it expands.
+
+### ...and then it found a second one, in the other parser
+
+With the roaring path bounded, the next run produced two reproducers that both began `ARROW1`. The
+Arrow IPC reader trusts each buffer's int64 uncompressed-length prefix, checked only against the
+reader's generic 8 GiB ceiling — so **a 328-byte file declaring 4 GiB got a 4 GiB zeroed
+allocation**.
+
+The fix was already written, in another file: `zstd_unframe_buffer` in `lance_column_decoder.cpp` has
+always cross-checked the declared size against `ZSTD_getFrameContentSize` before allocating. This
+parser simply did not, which is a better argument for one shared decompression helper than any
+amount of style discussion. `materialize_ipc_buffer` now asks the frame header what it really holds,
+refuses a disagreement by name, and refuses a frame with no declared content size at all (Arrow
+compresses each buffer in one shot, so every writer nanolance targets emits one).
+
+Both reproducers are checked in at `tests/fuzz/corpus/deletion_vector/` and CI passes that directory
+to the fuzzer, so they are replayed on every push rather than waiting to be rediscovered.
+
+### ...and with the allocations no longer hiding it, a crash
+
+The next run reached 528,552 executions and produced a `deadly signal`: `std::length_error` escaping
+`parse_arrow_ipc_uint32_column`. **An uncaught exception from a malformed file is a crash, not a
+refusal** — the function's whole contract is to return `false` with a message.
+
+The record batch's int64 row count was validated as `values.size() < rows * 4`. `rows` is already
+known non-negative, but past 2^62 that product **overflows uint64 and wraps small**, so the check
+passes and the `resize` that follows throws. It now uses `checked_mul`, the helper the rest of the
+reader has used all along.
+
+This is the overflow-naive spelling the nanom audit noticed a few paragraphs above and judged "safe
+given their input ranges, but by argument rather than by construction". That judgement was right
+about the roaring parser and wrong here — which is the whole reason the distinction matters.
+
+### What the exercise says
+
+Five rounds, and the fuzzer found something in each: a missing budget, a budget that rejected honest
+files, a 4 GiB reserve the *fix itself* introduced, the same allocation bug in the other parser, and
+then a genuine crash that the allocation bugs had been masking. None would have been found by a test
+someone thought to write.
+
+That is the argument for the harness, more than any individual finding — and it reframes the question
+that started this. "Should the core use nanom?" matters much less than "does every parser have a
+fuzzer?", which until today was **no**.
+
+### And the nanom question itself
+
+Not today, and mostly for reasons that are not about nanom's quality:
+
+- **The biggest piece is protobuf**, and nanom has no varint/LEB128 combinator. `lance_minimal.pb.cpp`
+  (784 lines) and `page_layout.cpp` (661) are protobuf wire-format parsers — 1,445 of the ~2,300
+  hand-rolled lines are in the one shape nanom does not cover.
+- **nanom is C++23; nanolance is C++20**, and `ci-platforms` (macOS 14 + Windows 2022) has only just
+  gone green. Raising the standard for the core library is a real portability cost.
+- **README line 7 is a promise**: "nanolance itself depends only on nanoarrow + zstd". Parsing stacks
+  are deliberately framed as an *example's* dependency, not the library's — which is exactly how
+  nanom is already wired in (`examples/pcapng2lance_nanom`, opt-in submodule, OFF by default).
+- Most honestly: **the bugs this session found were grammar bugs, not bounds bugs.** A combinator
+  parser with the wrong idea of the chunk header is just as wrong as a hand-rolled one. nanom would
+  have helped with the *duplicated* RLE chunk parser, and would make the bounds-check style uniform —
+  the tree currently mixes overflow-safe (`size - min(pos, size)`) and overflow-naive (`pos + n >
+  size`) spellings, all of which happen to be safe given their input ranges, but by argument rather
+  than by construction.
+
+If that changes, `deletion_vector.cpp` is the candidate, not the protobuf paths: Arrow IPC framing and
+roaring containers map cleanly onto `length_data` / `length_count` / `take` / `verify`.
+
+---
+
 ## Deviations from the plan, and open items
 
 Kept honest: everything here was found and reproduced during this work. Ordered by what a new user
@@ -1329,18 +1456,21 @@ is most likely to hit.
 
 ### Ergonomics
 
-7. **No way to split fragments within one `nanolance import` run.** It commits exactly one fragment
+7. **`nanom` is not used by the core library, deliberately** — see the section above. Revisit only
+   if nanolance moves to C++23 for other reasons; `deletion_vector.cpp` would be the first candidate,
+   and the protobuf paths the last (nanom has no varint combinator).
+8. **No way to split fragments within one `nanolance import` run.** It commits exactly one fragment
    however many Arrow IPC batches it reads, so a large input becomes one large fragment — which
    `nanolance info` then warns about. Splitting means re-running per chunk with `--append`. Found
    while correcting a hint that advertised a `--rows-per-fragment` flag no tool has ever had.
-8. **Plan item 2.2, CMake install/export, is still not done.** There is no `install()` rule in the
+9. **Plan item 2.2, CMake install/export, is still not done.** There is no `install()` rule in the
    tree at all, so `find_package(nanolance)` cannot work and the only way to consume the library is
    to vendor it or point at a build tree. Deferred during Phase 2 and never picked back up; it is the
    oldest genuinely-open item here.
 
 ### Verification gaps
 
-9. **The wheel build has never completed on this branch.** Actions itself is healthy now — the
+10. **The wheel build has never completed on this branch.** Actions itself is healthy now — the
    earlier note that it was dead is obsolete, and `ci-platforms` (macOS 14 + Windows 2022) passes —
    but every `wheels` run is queued or cancelled, because the workflow cancels in-progress runs and
    this branch has been pushed to faster than cibuildwheel's matrix takes. So manylinux/macOS wheels

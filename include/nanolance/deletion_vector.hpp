@@ -33,8 +33,15 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
                           std::vector<std::uint32_t>& out_sorted_offsets, std::string& error);
 
 /// Parse a roaring bitmap in the portable serialization format. Exposed for testing.
+///
+/// `max_values` caps how many offsets the parse may produce before it gives up. It matters because
+/// this format amplifies: a run container is four bytes on disk and can emit 65,536 values, and a
+/// bitmap holds up to 65,536 containers -- roughly 640 KiB of input for 16 GiB of output. Every other
+/// decode path budgets its output against `default_read_limits()`; 0 means "use that budget", and the
+/// real caller passes the manifest's `num_deleted_rows`, which is exact.
 bool parse_roaring_bitmap(const std::vector<std::uint8_t>& bytes,
-                          std::vector<std::uint32_t>& out_sorted_values, std::string& error);
+                          std::vector<std::uint32_t>& out_sorted_values, std::string& error,
+                          std::uint64_t max_values = 0);
 
 /// Parse an Arrow IPC file holding a single non-null `uint32` column. Exposed for testing.
 bool parse_arrow_ipc_uint32_column(const std::vector<std::uint8_t>& bytes,

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <bit>
 #include <limits>
 
 namespace nano_lance {
@@ -151,6 +152,30 @@ bool materialize_ipc_buffer(const std::vector<std::uint8_t>& body, std::size_t o
     const auto& limits = default_read_limits();
     if (static_cast<std::uint64_t>(uncompressed) > limits.max_uncompressed_bytes) {
         error = "deletion file declares an implausible uncompressed size";
+        return false;
+    }
+    // Ask the zstd frame how big it really is before allocating what the Arrow prefix CLAIMS. The
+    // prefix is attacker-controlled and the limit above is the reader's generic 8 GiB ceiling, so a
+    // 300-byte file could declare 4 GiB and get it -- which is exactly what fuzz_deletion_vector
+    // found. The frame header is the authority and it costs nothing to read.
+    //
+    // zstd_unframe_buffer in lance_column_decoder.cpp has done this since it was written; this parser
+    // simply did not, which is the argument for one decompression helper rather than two.
+    const auto content = ZSTD_getFrameContentSize(body.data() + payload, payload_len);
+    if (content == ZSTD_CONTENTSIZE_ERROR) {
+        error = "deletion file buffer is not a valid zstd frame";
+        return false;
+    }
+    if (content == ZSTD_CONTENTSIZE_UNKNOWN) {
+        // Arrow compresses each buffer in one shot, so the size is always present. A frame without
+        // one is not something any writer nanolance targets produces -- refuse it by name rather than
+        // decompress into a guess.
+        error = "deletion file buffer's zstd frame declares no content size";
+        return false;
+    }
+    if (content != static_cast<unsigned long long>(uncompressed)) {
+        error = "deletion file buffer's zstd frame holds " + std::to_string(content) +
+                " bytes but its Arrow prefix declares " + std::to_string(uncompressed);
         return false;
     }
     out.assign(static_cast<std::size_t>(uncompressed), 0U);
@@ -333,7 +358,15 @@ bool parse_arrow_ipc_uint32_column(const std::vector<std::uint8_t>& bytes,
                                         static_cast<std::size_t>(values_length), compressed, values, error)) {
                 return false;
             }
-            if (values.size() < static_cast<std::uint64_t>(rows) * 4U) {
+            // `rows` is an int64 straight off the wire. It is already known non-negative, but
+            // `rows * 4` OVERFLOWS uint64 once rows exceeds 2^62 -- the product wraps to something
+            // small, the comparison below passes, and the resize then throws std::length_error out of
+            // a function whose contract is to return false. An uncaught exception from a malformed
+            // file is a crash, not a refusal. fuzz_deletion_vector found this after the allocation
+            // limits above stopped hiding it.
+            std::uint64_t needed_bytes = 0;
+            if (!checked_mul(static_cast<std::uint64_t>(rows), 4U, needed_bytes) ||
+                values.size() < needed_bytes || !fits_size_t(static_cast<std::uint64_t>(rows))) {
                 error = "Arrow IPC values buffer is shorter than its row count";
                 return false;
             }
@@ -354,7 +387,8 @@ bool parse_arrow_ipc_uint32_column(const std::vector<std::uint8_t>& bytes,
 }
 
 bool parse_roaring_bitmap(const std::vector<std::uint8_t>& bytes,
-                          std::vector<std::uint32_t>& out_sorted_values, std::string& error) {
+                          std::vector<std::uint32_t>& out_sorted_values, std::string& error,
+                          std::uint64_t max_values) {
     out_sorted_values.clear();
     error.clear();
 
@@ -432,6 +466,41 @@ bool parse_roaring_bitmap(const std::vector<std::uint8_t>& bytes,
         pos += offset_bytes;
     }
 
+    // This format amplifies violently: a run container is FOUR bytes on disk and can emit 65,536
+    // values, and there can be 65,536 containers -- about 640 KiB of input for 16 GiB of output. The
+    // `num_deleted_rows` cross-check at the end of read_deletion_vector catches a bad file, but only
+    // after the allocation it was supposed to prevent; a budget is only a budget if it is checked
+    // before each expansion. Found by fuzz_deletion_vector, which reached 614 MiB of RSS on inputs
+    // under 8 KiB.
+    const std::uint64_t budget =
+        max_values != 0U ? max_values
+                         : default_read_limits().max_uncompressed_bytes / sizeof(std::uint32_t);
+    const auto within_budget = [&](std::uint64_t extra) {
+        return static_cast<std::uint64_t>(out_sorted_values.size()) + extra <= budget;
+    };
+    const char* const kOverBudget = "deletion bitmap expands past the read budget";
+
+    // The descriptive header already states every container's cardinality, so the total is known
+    // before a single value is materialized -- check it once, here, instead of discovering it by
+    // growing into it. Each container costs four header bytes, so this total is backed by real input
+    // rather than by a number the file made up.
+    std::uint64_t declared_total = 0;
+    for (const auto& descriptor : descriptors) {
+        declared_total += descriptor.cardinality;
+    }
+    if (declared_total > budget) {
+        error = kOverBudget;
+        return false;
+    }
+    // Reserve a working amount, NOT the declared total. `declared_total` is a number the file chose;
+    // passing the budget check above proves it is allowed, not that it is real, and reserving it
+    // hands a small file a huge allocation directly -- fuzz_deletion_vector caught exactly that as a
+    // 4 GiB malloc from an input of a few kilobytes, introduced by an earlier version of this very
+    // check. Growth past this point is paid for one container at a time, and every container is
+    // measured against the budget before it expands.
+    constexpr std::uint64_t kReserveCap = 1U << 20U;  // 1M offsets = 4 MiB, past any real deletion file
+    out_sorted_values.reserve(static_cast<std::size_t>(std::min(declared_total, kReserveCap)));
+
     for (std::uint32_t i = 0; i < container_count; ++i) {
         const std::uint32_t base = static_cast<std::uint32_t>(descriptors[i].key) << 16U;
         const bool is_run =
@@ -443,6 +512,7 @@ bool parse_roaring_bitmap(const std::vector<std::uint8_t>& bytes,
                 return false;
             }
             pos += 2U;
+            const std::size_t container_start = out_sorted_values.size();
             for (std::uint16_t r = 0; r < run_count; ++r) {
                 std::uint16_t start = 0;
                 std::uint16_t length_minus_one = 0;
@@ -451,14 +521,47 @@ bool parse_roaring_bitmap(const std::vector<std::uint8_t>& bytes,
                     return false;
                 }
                 pos += 4U;
+                if (!within_budget(static_cast<std::uint64_t>(length_minus_one) + 1U)) {
+                    error = kOverBudget;
+                    return false;
+                }
                 for (std::uint32_t v = start; v <= static_cast<std::uint32_t>(start) + length_minus_one; ++v) {
                     out_sorted_values.push_back(base | v);
                 }
+            }
+            // Same invariant the bitmap container is held to: a container must produce exactly the
+            // number of values its own header declared. Without this a run container could claim a
+            // cardinality of 1 in the header -- passing the up-front budget -- and then expand 65,536
+            // values per run.
+            const std::uint64_t produced = out_sorted_values.size() - container_start;
+            if (produced != descriptors[i].cardinality) {
+                error = "deletion bitmap run container holds " + std::to_string(produced) +
+                        " values but its header declares " + std::to_string(descriptors[i].cardinality);
+                return false;
             }
         } else if (descriptors[i].cardinality > 4096U) {
             // Bitmap container: a fixed 8192-byte bitset, one bit per value in the 16-bit key space.
             if (pos + kBitmapContainerBytes > bytes.size()) {
                 error = "deletion bitmap container is truncated";
+                return false;
+            }
+            // Count the bits before expanding them. The descriptive header already states this
+            // container's cardinality, and for a bitmap container that IS its popcount, so a
+            // disagreement means the file is inconsistent with itself -- worth refusing on its own,
+            // and it is what makes the budget check below exact rather than a guess at the
+            // container's 65,536-value maximum (which would reject an honest file whose budget is
+            // its real, much smaller, deleted-row count).
+            std::uint32_t set_bits = 0;
+            for (std::size_t b = 0; b < kBitmapContainerBytes; ++b) {
+                set_bits += static_cast<std::uint32_t>(std::popcount(bytes[pos + b]));
+            }
+            if (set_bits != descriptors[i].cardinality) {
+                error = "deletion bitmap container holds " + std::to_string(set_bits) +
+                        " values but its header declares " + std::to_string(descriptors[i].cardinality);
+                return false;
+            }
+            if (!within_budget(set_bits)) {
+                error = kOverBudget;
                 return false;
             }
             for (std::uint32_t bit = 0; bit < 65536U; ++bit) {
@@ -472,6 +575,10 @@ bool parse_roaring_bitmap(const std::vector<std::uint8_t>& bytes,
             const std::size_t needed = static_cast<std::size_t>(descriptors[i].cardinality) * 2U;
             if (pos + needed > bytes.size()) {
                 error = "deletion bitmap array container is truncated";
+                return false;
+            }
+            if (!within_budget(descriptors[i].cardinality)) {
+                error = kOverBudget;
                 return false;
             }
             for (std::uint32_t v = 0; v < descriptors[i].cardinality; ++v) {
@@ -520,7 +627,9 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
     }
 
     if (bitmap) {
-        if (!parse_roaring_bitmap(bytes, out_sorted_offsets, error)) {
+        // The manifest's count is the exact answer, so it is also the exact budget -- a file that
+        // needs more than it claims is already wrong, and this refuses it before it allocates.
+        if (!parse_roaring_bitmap(bytes, out_sorted_offsets, error, deletion_file.num_deleted_rows)) {
             return false;
         }
     } else {

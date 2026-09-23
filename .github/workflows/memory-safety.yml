@@ -99,7 +99,7 @@ jobs:
             -DNANOLANCE_BUILD_EXAMPLES=OFF -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
 
       - name: Build fuzzers
-        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst nanolance_fuzz_lz4 -j
+        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst nanolance_fuzz_lz4 nanolance_fuzz_deletion_vector -j
 
       # 2 minutes per push per target is enough to catch regressions; extend for a nightly run.
       - name: Fuzz the decode chain
@@ -195,6 +195,21 @@ jobs:
         run: |
           mkdir -p corpus-lz4
           ./build-fuzz/nanolance_fuzz_lz4 -max_total_time=120 -print_final_stats=1 corpus-lz4
+
+      # The deletion-file parsers: an Arrow IPC file (framing + flatbuffer vtable walk + zstd body)
+      # and a roaring bitmap. Not reachable from fuzz_decode, which stops at the data file and never
+      # opens a deletion file.
+      - name: Fuzz the deletion-file parsers
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          # Seeded from tests/fuzz/corpus/deletion_vector, which holds the minimized reproducers for
+          # everything this target has already caught. libFuzzer replays a seed directory before it
+          # mutates, so those bugs fail the job immediately if they come back.
+          mkdir -p corpus-deletion-vector
+          ./build-fuzz/nanolance_fuzz_deletion_vector -max_total_time=120 -print_final_stats=1 \
+            corpus-deletion-vector tests/fuzz/corpus/deletion_vector
 
       - name: Upload crash reproducers
         if: failure()

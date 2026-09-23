@@ -6,6 +6,7 @@
 // ASan+UBSan in CI, they turn "the reader is safe against malformed files" into an enforced property.
 
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/deletion_vector.hpp"
 #include "nanolance/path_safety.hpp"
 #include "nanolance/read_safety.hpp"
 
@@ -218,6 +219,76 @@ void test_path_jail() {
     check(!nano_lance::safe_join_under(base, fs::path("")).has_value(), "empty path rejected");
 }
 
+/// A roaring deletion bitmap must not be able to buy an enormous allocation with a tiny file.
+///
+/// The format amplifies harder than anything else the reader parses: a RUN container is four bytes on
+/// disk -- a start and a length -- and can emit 65,536 values, and a bitmap holds up to 65,536
+/// containers. The input built here is 41 KB and asks for 4096 x 65,536 = 268 million offsets, just
+/// over a gigabyte. Before the budget existed the parser produced them; fuzz_deletion_vector found it
+/// as 614 MiB of RSS on inputs under 8 KiB.
+///
+/// The budget has to be checked BEFORE each expansion, which is what this pins. read_deletion_vector
+/// also cross-checks the final count against the manifest's num_deleted_rows, but that catches the
+/// bad file only after the allocation it was meant to prevent.
+void test_roaring_bitmap_expansion_is_budgeted() {
+    constexpr std::uint32_t kContainers = 4096;
+    std::vector<std::uint8_t> bytes;
+    const auto put16 = [&bytes](std::uint16_t v) {
+        bytes.push_back(static_cast<std::uint8_t>(v & 0xFFU));
+        bytes.push_back(static_cast<std::uint8_t>(v >> 8U));
+    };
+    const auto put32 = [&bytes](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            bytes.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFU));
+        }
+    };
+
+    put32(12347U | ((kContainers - 1U) << 16U));  // the with-runs cookie, count in the high half
+    for (std::uint32_t i = 0; i < (kContainers + 7U) / 8U; ++i) {
+        bytes.push_back(0xFFU);  // every container is a run container
+    }
+    for (std::uint32_t i = 0; i < kContainers; ++i) {
+        put16(static_cast<std::uint16_t>(i));  // key
+        put16(0xFFFFU);                        // cardinality - 1
+    }
+    for (std::uint32_t i = 0; i < kContainers; ++i) {
+        put16(1U);       // one run
+        put16(0U);       // start
+        put16(0xFFFFU);  // length - 1  => 65,536 values from four bytes
+    }
+
+    std::vector<std::uint32_t> out;
+    std::string error;
+    const bool accepted = nano_lance::parse_roaring_bitmap(bytes, out, error, /*max_values=*/1000);
+    check(!accepted, "an over-budget deletion bitmap is refused");
+    check(!error.empty(), "the refusal says why");
+    check(out.size() <= 1000U, "nothing past the budget is materialized");
+
+    // ...and the budget is a budget, not a ban: a bitmap within its cap still parses. Built with the
+    // no-runs cookie (12346), whose layout is
+    // [u32 cookie][u32 container_count][per-container u16 key, u16 cardinality-1][u32 offsets][containers].
+    bytes.clear();
+    put32(12346U);
+    put32(1U);       // one container
+    put16(0U);       // key
+    put16(2U);       // cardinality - 1  => three values
+    put32(0U);       // offset header, present for this cookie; containers follow in order anyway
+    for (std::uint16_t v = 0; v < 3U; ++v) {
+        put16(v);    // array container: the values themselves
+    }
+
+    std::vector<std::uint32_t> ok_out;
+    std::string ok_error;
+    // Evaluated in two statements on purpose: `check(f(error), error.c_str())` leaves the argument
+    // order unspecified, so the message can be captured before f() has written it.
+    const bool ok = nano_lance::parse_roaring_bitmap(bytes, ok_out, ok_error, /*max_values=*/1000);
+    if (!ok) {
+        std::fprintf(stderr, "within-budget bitmap refused: %s\n", ok_error.c_str());
+    }
+    check(ok, "a within-budget bitmap still parses");
+    check(ok_out.size() == 3U, "and returns its three values");
+}
+
 }  // namespace
 
 int main() {
@@ -229,6 +300,7 @@ int main() {
     test_trusted_mode_still_bounds_checked();
     test_scoped_read_limits_restores_previous();
     test_path_jail();
+    test_roaring_bitmap_expansion_is_budgeted();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d read-safety checks failed\n", g_failures);
         return 1;
