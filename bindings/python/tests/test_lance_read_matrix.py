@@ -8,11 +8,17 @@ comes back flat at 100 rows, dictionary-encoded at 1024, and RLE'd at 5000.
 
 So this walks types x sizes and compares against pylance's own read of the same dataset. It is the
 counterpart to the write matrix, and it found four failures the day it was written -- none of which
-any existing test touched.
+any existing test touched. All four are now fixed, and `KNOWN_GAPS` is empty.
 
-The known-failing cells are asserted to fail **with their specific message** rather than skipped. A
-skip rots quietly; an assertion that a gap still exists fails the moment someone closes it, which is
-exactly when this file should be revisited.
+A known-failing cell is asserted to fail **with its specific message** rather than skipped. A skip
+rots quietly; an assertion that a gap still exists fails the moment someone closes it, which is
+exactly when this file should be revisited. That is not hypothetical -- it is how each of the four
+came off the list.
+
+Row count is not the only axis the writer decides on. **Cardinality** is another, and the dedicated
+tests below exist because of it: a dictionary block has four different shapes depending on how many
+distinct values a column has and how wide they are, and two of them were found only by varying the
+number of distinct values while holding the type fixed.
 """
 
 from __future__ import annotations
@@ -40,6 +46,10 @@ KINDS = {
     "int16": lambda n: pa.array([i % 30000 for i in range(n)], pa.int16()),
     "uint8": lambda n: pa.array([i % 250 for i in range(n)], pa.uint8()),
     "int64_constant": lambda n: pa.array([7] * n, pa.int64()),
+    # Runs, not just low cardinality: past 20000 rows Lance encodes this as RLE'd indices over a
+    # FIXED-WIDTH dictionary, `Rle{Flat(32),Flat(8)}` over `General{LZ4,Flat(64)}`. The matrix had a
+    # run-shaped string column but no run-shaped integer one, and they take different branches.
+    "int64_runs": lambda n: pa.array([i // 400 for i in range(n)], pa.int64()),
     "float32": lambda n: pa.array([i * 0.5 for i in range(n)], pa.float32()),
     "float64": lambda n: pa.array([i * 0.125 for i in range(n)], pa.float64()),
     "bool": lambda n: pa.array([i % 3 == 0 for i in range(n)], pa.bool_()),
@@ -70,14 +80,13 @@ KINDS = {
 SIZES = (1, 100, 1024, 1025, 5000, 20_000)
 
 
-# Known read gaps, each reproduced by this matrix and each a distinct missing decoder. Recorded as
-# (predicate, message fragment); see docs/PROGRESS.md for the page descriptors behind them.
-KNOWN_GAPS = (
-    # A dictionary with RLE'd indices, where the dictionary itself is LZ4-compressed
-    # (`Rle{Flat(32), Flat(8)}` over `General{LZ4, Variable}`). nanolance writes dict+RLE with a zstd
-    # dictionary and reads that; this combination lands in the wrong branch and mis-sizes the buffer.
-    (lambda n, k: k == "str_runs" and n >= 5000, "Expected string array buffer"),
-)
+# Known read gaps: (predicate, message fragment), each reproduced by this matrix.
+#
+# EMPTY, and that is the point of keeping it. The matrix opened with four entries -- structs,
+# fixed-width dictionaries at two widths, and dict+RLE over an LZ4 dictionary -- and each one failed
+# this file the moment it was fixed, because it is pinned by its specific message. A new gap goes
+# here with the message it actually produces; it does not get an xfail or a skip.
+KNOWN_GAPS = ()
 
 
 def _expected_gap(n, kind):
@@ -142,6 +151,72 @@ FIXED_WIDTH_DICTIONARY = {
 @pytest.mark.parametrize("name", sorted(FIXED_WIDTH_DICTIONARY))
 def test_fixed_width_dictionary_reads_back(lance_mod, tmp_path, name, nullable, n):
     arrow_type, value = FIXED_WIDTH_DICTIONARY[name]
+    values = [None if nullable and i % 11 == 0 else value(i) for i in range(n)]
+    path = str(tmp_path / f"{name}_{n}_{nullable}.lance")
+    lance_mod.write_dataset(pa.table({"c": pa.array(values, arrow_type)}), path)
+    expected = lance_mod.dataset(path).to_table()
+    assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
+
+
+# Dictionary-encoded indices that are themselves RUN-LENGTH encoded: `Rle{Flat(32), Flat(8)}` over a
+# dictionary, which Lance picks for any column whose values come in runs. Both dictionary shapes
+# occur -- `Variable` for strings, `Flat(N)` for integers, temporals and decimals -- and they produce
+# different output kinds, so both are covered here.
+#
+# The branch this exercises used to read the page as ONE chunk with nanolance's own private framing.
+# Lance writes the ordinary miniblock grammar with as many chunks as the page needs, so a page past
+# 1024 values decoded short and failed downstream with a buffer-size mismatch naming nothing useful.
+DICT_RLE = {
+    "string": (pa.utf8(), lambda i: f"run-{i // 400}"),
+    "int64": (pa.int64(), lambda i: i // 400),
+    "time64": (pa.time64("us"), lambda i: datetime.time((i // 400) % 24, (i // 400) % 60)),
+    "decimal128": (pa.decimal128(12, 2), lambda i: decimal.Decimal(f"{i // 400}.00")),
+}
+
+
+@pytest.mark.parametrize("n", (5000, 20_000, 65_536))
+@pytest.mark.parametrize("nullable", (False, True), ids=("nonnull", "nullable"))
+@pytest.mark.parametrize("name", sorted(DICT_RLE))
+def test_dictionary_with_rle_indices_reads_back(lance_mod, tmp_path, name, nullable, n):
+    arrow_type, value = DICT_RLE[name]
+    values = [None if nullable and i % 11 == 0 else value(i) for i in range(n)]
+    path = str(tmp_path / f"{name}_{n}_{nullable}.lance")
+    lance_mod.write_dataset(pa.table({"c": pa.array(values, arrow_type)}), path)
+    expected = lance_mod.dataset(path).to_table()
+    assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
+
+
+# A fixed-width dictionary whose entries are themselves FastLanes bit-packed, which Lance picks once
+# they are narrow enough for packing to pay. It has TWO spellings and they differ only in where the
+# bit width is written:
+#
+#   InlineBitpacking(64)        -- a width word at the head of each 1024-value block
+#   Bitpacked{64, Flat(width)}  -- the width in the descriptor, no word in the buffer
+#
+# An int64 column with runs moves from one to the other as its dictionary grows: ~164 entries gets
+# the inline spelling, ~3000 the out-of-line one. Both need a multi-block walk past 1024 entries,
+# and the out-of-line tail has two legal encodings (packed-and-padded, or raw words) told apart by
+# the buffer's total length alone.
+#
+# `distinct` is what selects the spelling, so it is the axis here -- the row count only has to be
+# large enough to reach the dictionary at all.
+@pytest.mark.parametrize(
+    "n, distinct",
+    (
+        (65_536, 164),      # inline, one block
+        (300_000, 3_000),   # out-of-line, three blocks
+        (500_000, 10_000),  # out-of-line, ten blocks
+    ),
+)
+@pytest.mark.parametrize("nullable", (False, True), ids=("nonnull", "nullable"))
+@pytest.mark.parametrize("name", ("int64", "timestamp"))
+def test_bitpacked_dictionary_reads_back(lance_mod, tmp_path, name, nullable, n, distinct):
+    run = n // distinct
+    if name == "int64":
+        arrow_type, value = pa.int64(), lambda i: i // run
+    else:
+        arrow_type = pa.timestamp("us")
+        value = lambda i: datetime.datetime(2026, 1, 1) + datetime.timedelta(seconds=i // run)
     values = [None if nullable and i % 11 == 0 else value(i) for i in range(n)]
     path = str(tmp_path / f"{name}_{n}_{nullable}.lance")
     lance_mod.write_dataset(pa.table({"c": pa.array(values, arrow_type)}), path)

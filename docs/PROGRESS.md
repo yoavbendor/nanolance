@@ -1466,7 +1466,7 @@ roaring containers map cleanly onto `length_data` / `length_count` / `take` / `v
 
 ---
 
-## The read matrix, and the four gaps it found immediately
+## The read matrix, and the gaps it found
 
 Asked where coverage was thin, the honest way to answer was to look at where the bugs had actually
 been, not at which files lacked a test named after them. Every stock-Lance defect in this project has
@@ -1477,7 +1477,7 @@ column is flat at 100 rows, dictionary-encoded at 1024 and run-length encoded at
 The write direction was well covered — `test_write_encoding_matrix.py`, 21 shapes x 3 modes, both
 readers agreeing. The read direction had spot tests and the nullable matrix, nothing systematic.
 
-`test_lance_read_matrix.py` is the counterpart: 19 column shapes x 6 row counts, each written by
+`test_lance_read_matrix.py` is the counterpart: 20 column shapes x 6 row counts, each written by
 pylance and compared against pylance's own read. **It failed 14 of 114 cells the day it was
 written**, in four classes, none of which any existing test touched:
 
@@ -1506,8 +1506,15 @@ Three distinct causes behind them:
    the width the column's logical type implies (they always agree in a file Lance wrote, and
    trusting either one alone when they disagree would silently shift every value), and the block must
    be long enough for the entries it claims — Lance pads it, so longer is fine and shorter is not.
-3. **Dictionary + RLE'd indices over an LZ4 dictionary.** nanolance writes dict+RLE with a *zstd*
-   dictionary and reads that shape; this combination lands in the wrong branch.
+3. **Dictionary + RLE'd indices** — **fixed**. The branch read the page as ONE chunk in nanolance's
+   own private framing (`[u16 num_levels][u32 size0][u32 size1]`). Lance writes the ordinary
+   miniblock grammar, with as many chunks as the page needs, so a page past 1024 values decoded short
+   and then failed downstream with a buffer-size mismatch that named nothing useful. It now goes
+   through the same chunk splitter every other miniblock path uses, which also means a nullable
+   column's definition levels are read rather than mistaken for run data.
+
+   Chasing it turned up **two more dictionary shapes the matrix had never reached**, and neither was
+   exotic: an ordinary `int64` column with runs. See below.
 
 All four were pinned in the matrix by their **specific** message, so each fails loudly the moment it
 is fixed — which is exactly what happened to the struct entry. `test_the_gap_list_is_not_stale` additionally asserts every entry still matches a cell the
@@ -1517,6 +1524,54 @@ gap nobody reproduces.
 The general point, which is the answer to "what needs more tests": **a format reader's coverage axis
 is the writer's choices, not the reader's types.** Enumerating types found none of this; enumerating
 types x sizes found all of it in one run.
+
+---
+
+## A dictionary block has four shapes, not one
+
+The three read gaps were supposed to be three fixes. The third one turned into a fifth and a sixth,
+and the way that happened is the useful part.
+
+The dictionary branch had one idea of what a dictionary block is: a variable-width block with an
+offset header, `[u32][u32 bytes_start][u32 offsets...][bytes]`. That is what a low-cardinality
+**string** column gets, and strings were the only dictionary anyone had tested. Lance picks a
+dictionary for any column whose cardinality justifies one, and for a fixed-width column it writes
+something else entirely. There are four shapes, and only the page descriptor distinguishes them:
+
+| descriptor | block | who gets it |
+|---|---|---|
+| `Variable{offsets=Flat(32)}` | offset header, then bytes | a low-cardinality string column |
+| `Flat(N)` | N-bit entries end to end, no header | `time64` ≥1024 rows, `decimal128` ≥20000 |
+| `InlineBitpacking(N)` | FastLanes blocks, width word per block | `int64` with runs, ~164 entries |
+| `Bitpacked{N, Flat(w)}` | FastLanes blocks, width in the descriptor | `int64` with runs, ~3000 entries |
+
+Any of them may in turn sit inside `General{LZ4, ...}`.
+
+The last two are the same encoding with the bit width written in two different places, and **Lance
+switches between them as the dictionary grows**. That is why enumerating types would not have found
+them: `int64` with runs is one column shape, and which spelling it produces depends on how many
+distinct values it happens to have. 65,536 rows of `i // 400` gets the inline one; 300,000 rows of
+`i // 100` gets the out-of-line one. Both were unreadable, and an integer column with runs is about
+as ordinary as a column gets.
+
+Two pieces of code already existed and neither was reachable from here. `unpack_bitpacked_page`
+decodes a single inline block, which is right for a miniblock chunk (the chunk splitter has already
+cut the buffer up) and wrong for a dictionary buffer, which holds however many blocks its entries
+need and has to be walked. And the out-of-line tail arithmetic — Lance's `unpack_out_of_line` rule,
+where a tail is packed-and-padded or raw depending on the buffer's total length — was sitting inside
+`append_definition_levels`, specialised to `u16`. It is now a template both callers share, because
+this is precisely the kind of subtle arithmetic that two copies get wrong separately.
+
+Likewise the dictionary-block parse itself, which the plain-index and RLE'd-index branches held two
+copies of. They had already drifted: the fixed-width fix landed in one and not the other, which is
+why the RLE'd-index branch still could not read a `time64` column with runs after fixed-width
+dictionaries were "done". One `DictionaryBlock` now serves both.
+
+**How they were found.** Not by reading the format spec — by widening a test until it broke. A
+row-count axis found the first gaps; a *cardinality* axis found these. Both are the writer's
+decision variables, which is the same lesson as before in a new dimension: **enumerate what the
+writer chooses between, not what the reader has branches for.** A sweep of 13 types x 3 run
+densities x 3 row counts x nullable — 234 cases — now passes end to end against pylance.
 
 ---
 
@@ -1600,8 +1655,8 @@ Not supported in either direction, and the read side does not fail in a decoder 
 recovery: list`. Lance's repetition layer is parsed only far enough to know it exists
 (`has_repetition`, which the chunk header arithmetic needs); nothing consumes it.
 
-That makes lists the largest single type gap, and a bigger piece of work than the three read gaps
-above it: repetition levels are a whole layer, not a missing branch. Every nested shape built on one
+That makes lists the largest single type gap, and now the largest read gap of any kind, the three
+above it being fixed: repetition levels are a whole layer, not a missing branch. Every nested shape built on one
 goes with it — `list<struct>`, `struct<list>` and `map` (which Lance represents as a list of
 key/value structs).
 
@@ -1618,10 +1673,10 @@ is most likely to hit.
 
 ### Correctness / reach — worth doing next
 
-1. **One read gap left for pylance-written columns**, found by `test_lance_read_matrix.py` and
-   pinned there: dict+RLE over an LZ4 dictionary, hit by a repetitive string column at 5000+ rows.
-   It makes an ordinary pylance dataset unreadable, which is what keeps it at the top of this list.
-   The other two — structs and fixed-width dictionaries — are **fixed**; see above.
+1. **No known read gaps for pylance-written columns.** All three are fixed, and `KNOWN_GAPS` in
+   `test_lance_read_matrix.py` is now empty — deliberately kept, rather than deleted, so the next one
+   has an obvious home and cannot be parked as an xfail. What replaced them at the top of this list
+   is lists and `map` (below): a whole missing layer rather than a missing branch.
 
 2. **No FSST on write.** The direct answer to the one bench shape nanolance still loses
    (`high_card`: 7.67 ms vs rust-lance 5.12 ms). zstd is ~48% of that read; rust-lance avoids it by

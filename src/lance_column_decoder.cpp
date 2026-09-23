@@ -539,6 +539,166 @@ bool unpack_bitpacked_page_dispatch(const std::vector<std::uint8_t>& chunk, std:
 
 
 
+/// Unpack a buffer that is a SERIES of inline-bitpacked FastLanes blocks into `count` values.
+///
+/// `unpack_bitpacked_page` above decodes exactly one block, because that is what a miniblock chunk
+/// carries -- the chunk splitter has already cut the buffer up. A dictionary buffer has no such
+/// splitter: it is one buffer holding however many blocks its entries need, each with its own bit
+/// width word, so the blocks have to be walked. Widths differ per block, so the block size cannot be
+/// computed up front; the position advances as each header is read.
+template <class T>
+[[nodiscard]] bool unpack_inline_bitpacked_series(const std::vector<std::uint8_t>& buffer, std::size_t count,
+                                                  std::vector<std::uint8_t>& out, std::string& error) {
+    out.clear();
+    out.reserve(count * sizeof(T));
+    thread_local std::vector<T> packed;
+    T values[1024];
+    std::size_t at = 0;
+    std::size_t done = 0;
+    while (done < count) {
+        if (buffer.size() - at < sizeof(T)) {
+            error = "inline-bitpacked dictionary ends before its " + std::to_string(count) + " entries do";
+            return false;
+        }
+        T width_word = 0;
+        std::memcpy(&width_word, buffer.data() + at, sizeof(T));
+        at += sizeof(T);
+        const auto width = static_cast<unsigned>(width_word);
+        if (width > sizeof(T) * 8U) {
+            error = "inline-bitpacked dictionary block has invalid bit width " + std::to_string(width);
+            return false;
+        }
+        const auto packed_words = nano_lance::fastlanes::packed_words_1024<T>(width);
+        const std::size_t block_bytes = packed_words * sizeof(T);
+        if (buffer.size() - at < block_bytes) {
+            error = "inline-bitpacked dictionary block is truncated";
+            return false;
+        }
+        packed.resize(packed_words != 0U ? packed_words : 1U);
+        if (packed_words != 0U) {
+            std::memcpy(packed.data(), buffer.data() + at, block_bytes);
+        }
+        at += block_bytes;
+        nano_lance::fastlanes::unpack_1024<T>(width, packed.data(), values);
+        // A block always holds 1024 values; the last one is only partly used.
+        const std::size_t take = std::min<std::size_t>(1024U, count - done);
+        const auto* p = reinterpret_cast<const std::uint8_t*>(values);
+        out.insert(out.end(), p, p + take * sizeof(T));
+        done += take;
+    }
+    return true;
+}
+
+/// Unpack an OUT-OF-LINE bitpacked buffer: `count` values of `T` packed at `width` bits, with the
+/// width taken from the DESCRIPTOR (`Bitpacked{uncompressed_bits, Flat(width)}`) rather than from a
+/// word at the head of each block. Writes exactly `count` values to `dest`.
+///
+/// The buffer is a run of whole FastLanes blocks followed by a tail, and the tail has two legal
+/// spellings: packed-and-padded, or raw `T` words. Lance's `unpack_out_of_line`
+/// (`rust/lance-encoding/src/encodings/physical/bitpacking.rs`) tells them apart by the buffer's
+/// total LENGTH -- the encoder pads only when padding costs fewer bits than packing saves -- and this
+/// mirrors that arithmetic exactly rather than approximating it:
+///
+///     whole_blocks = count / 1024              tail = count % 1024
+///     raw  <=>  words == whole_blocks * packed_words + tail
+///
+/// `what` names the buffer in any error, since both definition levels and dictionaries come here.
+template <class T>
+[[nodiscard]] bool unpack_out_of_line_bitpacked(const std::vector<std::uint8_t>& buffer, std::size_t count,
+                                                unsigned width, T* dest, const char* what, std::string& error) {
+    // Width 0 is legal, not a malformed descriptor: it is how an all-zero buffer packs, and Lance
+    // has no guard against producing it. `unpack_1024` emits zeros for it and the size arithmetic
+    // below stays well defined (`packed_words` is 0), so refusing it would reject a file Lance can
+    // write. Only a width wider than the element itself is nonsense.
+    if (width > sizeof(T) * 8U) {
+        error = std::string(what) + " declares an unsupported width of " + std::to_string(width) + " bits";
+        return false;
+    }
+    if (buffer.size() % sizeof(T) != 0U) {
+        error = std::string(what) + " is not a whole number of " + std::to_string(sizeof(T) * 8U) + "-bit words";
+        return false;
+    }
+    const auto packed_words = nano_lance::fastlanes::packed_words_1024<T>(width);
+    const auto words = buffer.size() / sizeof(T);
+    const std::size_t whole_blocks = count / 1024U;
+    const std::size_t tail = count % 1024U;
+    const std::size_t full_words = whole_blocks * packed_words;
+    const bool tail_is_raw = tail != 0U && words == full_words + tail;
+    const std::size_t expected_words =
+        tail_is_raw ? full_words + tail : full_words + (tail != 0U ? packed_words : 0U);
+    if (words != expected_words) {
+        error = std::string(what) + " is " + std::to_string(buffer.size()) + " bytes, expected " +
+                std::to_string(expected_words * sizeof(T)) + " for " + std::to_string(count) +
+                " values at " + std::to_string(width) + " bits";
+        return false;
+    }
+
+    thread_local std::vector<T> packed;
+    packed.resize(packed_words != 0U ? packed_words : 1U);
+    T block[1024];
+    std::size_t word_at = 0;
+    for (std::size_t b = 0; b < whole_blocks; ++b) {
+        std::memcpy(packed.data(), buffer.data() + word_at * sizeof(T), packed_words * sizeof(T));
+        nano_lance::fastlanes::unpack_1024<T>(width, packed.data(), block);
+        std::memcpy(dest + b * 1024U, block, 1024U * sizeof(T));
+        word_at += packed_words;
+    }
+    if (tail != 0U) {
+        if (tail_is_raw) {
+            std::memcpy(dest + whole_blocks * 1024U, buffer.data() + word_at * sizeof(T), tail * sizeof(T));
+        } else {
+            std::memcpy(packed.data(), buffer.data() + word_at * sizeof(T), packed_words * sizeof(T));
+            nano_lance::fastlanes::unpack_1024<T>(width, packed.data(), block);
+            std::memcpy(dest + whole_blocks * 1024U, block, tail * sizeof(T));
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool unpack_out_of_line_bitpacked_dispatch(const std::vector<std::uint8_t>& buffer,
+                                                         std::size_t count, unsigned width,
+                                                         std::size_t bytes_per_value, std::uint8_t* dest,
+                                                         const char* what, std::string& error) {
+    switch (bytes_per_value) {
+        case 1U:
+            return unpack_out_of_line_bitpacked<std::uint8_t>(buffer, count, width, dest, what, error);
+        case 2U:
+            return unpack_out_of_line_bitpacked<std::uint16_t>(buffer, count, width,
+                                                               reinterpret_cast<std::uint16_t*>(dest), what, error);
+        case 4U:
+            return unpack_out_of_line_bitpacked<std::uint32_t>(buffer, count, width,
+                                                               reinterpret_cast<std::uint32_t*>(dest), what, error);
+        case 8U:
+            return unpack_out_of_line_bitpacked<std::uint64_t>(buffer, count, width,
+                                                               reinterpret_cast<std::uint64_t*>(dest), what, error);
+        default:
+            error = std::string(what) + " has " + std::to_string(bytes_per_value) +
+                    "-byte values, which has no FastLanes kernel";
+            return false;
+    }
+}
+
+[[nodiscard]] bool unpack_inline_bitpacked_series_dispatch(const std::vector<std::uint8_t>& buffer,
+                                                           std::size_t count, std::size_t bytes_per_value,
+                                                           std::vector<std::uint8_t>& out, std::string& error) {
+    switch (bytes_per_value) {
+        case 1U:
+            return unpack_inline_bitpacked_series<std::uint8_t>(buffer, count, out, error);
+        case 2U:
+            return unpack_inline_bitpacked_series<std::uint16_t>(buffer, count, out, error);
+        case 4U:
+            return unpack_inline_bitpacked_series<std::uint32_t>(buffer, count, out, error);
+        case 8U:
+            return unpack_inline_bitpacked_series<std::uint64_t>(buffer, count, out, error);
+        default:
+            // FastLanes kernels exist for 8/16/32/64-bit lanes only. A 16-byte decimal is never
+            // inline-bitpacked by Lance for exactly that reason; refuse by width rather than guess.
+            error = "inline-bitpacked dictionary entries are " + std::to_string(bytes_per_value) +
+                    " bytes, which has no FastLanes kernel";
+            return false;
+    }
+}
+
 /// Inverse of the writer's encode_scalar_variable_value: a Lance scalar value buffer holding a
 /// length-1 string/binary array, laid out as [u32 num_buffers][u32 buffer_len ...][buffers]. For
 /// utf8/binary that is two buffers -- offsets [0, len] and the data -- and the value we want is the
@@ -731,63 +891,16 @@ bool append_levels_to_validity(const std::uint16_t* levels, std::uint32_t count,
         error = "unsupported definition-level encoding: " + page_layout::describe_encoding(encoding);
         return false;
     }
+    // `unpack_out_of_line_bitpacked` rejects a width of 0 or one wider than the element, so there is
+    // no second bound to keep in step here.
     const auto width = encoding.values->bits_per_value;
-    if (width == 0U || width > 16U) {
-        error = "definition levels declare an unsupported width of " + std::to_string(width) + " bits";
+    // Shared with the dictionary path, which meets the same encoding. Two cases this has to keep
+    // getting right: a 20000-row nullable binary column from pylance ends in a 32-value chunk whose
+    // 64-byte level buffer is raw, and a 1025-row bool column is one whole packed block (128 bytes)
+    // plus a single raw u16.
+    if (!unpack_out_of_line_bitpacked<std::uint16_t>(repdef, count, width, levels, "definition-level buffer",
+                                                     error)) {
         return false;
-    }
-    // The buffer is a run of whole FastLanes blocks followed by a tail, and the tail has two legal
-    // spellings: packed-and-padded, or raw u16 words. Lance's `unpack_out_of_line`
-    // (`rust/lance-encoding/src/encodings/physical/bitpacking.rs`) tells them apart by the buffer's
-    // total LENGTH -- the encoder pads only when padding costs fewer bits than packing saves -- and
-    // this mirrors that arithmetic exactly rather than approximating it:
-    //
-    //     whole_blocks = count / 1024              tail = count % 1024
-    //     raw  <=>  words == whole_blocks * packed_words + tail
-    //
-    // Two cases this has to keep getting right: a 20000-row nullable binary column from pylance ends
-    // in a 32-value chunk whose 64-byte level buffer is raw, and a 1025-row bool column is one whole
-    // packed block (128 bytes) plus a single raw u16.
-    const auto packed_words = nano_lance::fastlanes::packed_words_1024<std::uint16_t>(width);
-    if (repdef.size() % sizeof(std::uint16_t) != 0U) {
-        error = "definition-level buffer is not a whole number of 16-bit words";
-        return false;
-    }
-    const auto words = repdef.size() / sizeof(std::uint16_t);
-    const std::size_t whole_blocks = count / 1024U;
-    const std::size_t tail = count % 1024U;
-    const std::size_t full_words = whole_blocks * packed_words;
-    const bool tail_is_raw = tail != 0U && words == full_words + tail;
-    const std::size_t expected_words = tail_is_raw ? full_words + tail
-                                                   : full_words + (tail != 0U ? packed_words : 0U);
-    if (words != expected_words) {
-        error = "definition-level buffer is " + std::to_string(repdef.size()) + " bytes, expected " +
-                std::to_string(expected_words * sizeof(std::uint16_t)) + " for " +
-                std::to_string(count) + " levels at " + std::to_string(width) + " bits";
-        return false;
-    }
-
-    thread_local std::vector<std::uint16_t> packed;
-    packed.resize(packed_words != 0U ? packed_words : 1U);
-    std::uint16_t block[1024];
-    std::size_t word_at = 0;
-    for (std::size_t b = 0; b < whole_blocks; ++b) {
-        std::memcpy(packed.data(), repdef.data() + word_at * sizeof(std::uint16_t),
-                    packed_words * sizeof(std::uint16_t));
-        nano_lance::fastlanes::unpack_1024<std::uint16_t>(width, packed.data(), block);
-        std::memcpy(levels + b * 1024U, block, 1024U * sizeof(std::uint16_t));
-        word_at += packed_words;
-    }
-    if (tail != 0U) {
-        if (tail_is_raw) {
-            std::memcpy(levels + whole_blocks * 1024U, repdef.data() + word_at * sizeof(std::uint16_t),
-                        tail * sizeof(std::uint16_t));
-        } else {
-            std::memcpy(packed.data(), repdef.data() + word_at * sizeof(std::uint16_t),
-                        packed_words * sizeof(std::uint16_t));
-            nano_lance::fastlanes::unpack_1024<std::uint16_t>(width, packed.data(), block);
-            std::memcpy(levels + whole_blocks * 1024U, block, tail * sizeof(std::uint16_t));
-        }
     }
 
     return append_levels_to_validity(levels, count, rows_already_appended, out_validity, out_null_count);
@@ -854,6 +967,14 @@ struct ColumnEncodingPlan {
     /// kDict: `num_dictionary_items` from the descriptor. Authoritative for a fixed-width dictionary,
     /// whose block carries no count of its own.
     std::uint64_t dict_items = 0;
+    /// kDict / kDictRle: the fixed-width dictionary's entries are themselves FastLanes bit-packed
+    /// rather than stored flat. Lance picks this once the entries are narrow enough for packing to
+    /// pay -- an int64 column with runs gets it. It comes in two spellings, and they differ only in
+    /// where the bit width is written: `InlineBitpacking(N)` puts it at the head of each block,
+    /// `Bitpacked{N, Flat(width)}` puts it in the descriptor. Zero means the entries are flat.
+    std::uint32_t dict_packed_width = 0;  // set only for the out-of-line spelling
+    bool dict_inline_bitpacked = false;
+    bool dict_out_of_line_bitpacked = false;
     /// kVariable: the offset width the descriptor declares for the value block, in bits. Only the
     /// FSST path consults it -- there the block being decoded is the COMPRESSED one, whose offsets
     /// index compressed bytes and need not share the column's own offset width.
@@ -883,6 +1004,121 @@ struct ColumnEncodingPlan {
             error = "unsupported dictionary buffer compression";
             return false;
     }
+}
+
+/// A page's dictionary, in whichever of its two shapes the descriptor declared.
+///
+/// `Variable` is a block with an offset header: [u32][u32 bytes_start][u32 offsets...][bytes]. That
+/// is what a low-cardinality string column gets. `Flat(N)` is N-bit entries end to end with NO
+/// header, which is what Lance builds for a temporal, decimal or integer column once a dictionary
+/// pays for itself. Only the descriptor distinguishes them, and reading a flat block as a
+/// variable-width one takes its first entry for an offset header.
+///
+/// Both dictionary branches -- plain indices and RLE'd indices -- parse the same block, so they
+/// share this rather than keeping two copies that can drift apart.
+struct DictionaryBlock {
+    std::vector<std::uint8_t> bytes;
+    /// Variable-width: (start, length) per entry. Empty for a fixed-width dictionary.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+    /// Fixed-width: bytes per entry. Zero when the dictionary is variable-width.
+    std::size_t value_bytes = 0;
+    std::size_t count = 0;
+
+    bool is_fixed_width() const { return value_bytes != 0U; }
+    const std::uint8_t* entry(std::size_t index) const {
+        return bytes.data() + (is_fixed_width() ? index * value_bytes : ranges[index].first);
+    }
+    std::size_t entry_size(std::size_t index) const {
+        return is_fixed_width() ? value_bytes : ranges[index].second;
+    }
+};
+
+[[nodiscard]] bool decode_dictionary_block(const ColumnEncodingPlan& plan, const std::string& logical_type,
+                                           const std::vector<std::uint8_t>& stored, DictionaryBlock& out,
+                                           std::string& error) {
+    if (!decompress_dictionary_block(plan.dict_scheme, stored, out.bytes, error)) {
+        return false;
+    }
+    out.ranges.clear();
+    if (plan.dict_value_bits != 0U) {
+        out.value_bytes = plan.dict_value_bits / 8U;
+        // The descriptor and the schema have to agree about how wide a value is. They always do in a
+        // file Lance wrote; where they disagree, trusting either one alone would silently shift every
+        // value, so refuse instead.
+        const auto schema_bytes = lance_logical_type_value_bytes(logical_type);
+        if (out.value_bytes != schema_bytes) {
+            error = "dictionary declares " + std::to_string(out.value_bytes) +
+                    "-byte values but the column's type is " + std::to_string(schema_bytes) + " bytes wide";
+            return false;
+        }
+        // A headerless block states neither its entry width nor its count, so `num_dictionary_items`
+        // is the only statement of how many there are. Lance pads the block, so it may be longer than
+        // the entries need -- it must never be shorter.
+        out.count = static_cast<std::size_t>(plan.dict_items);
+        std::uint64_t needed = 0;
+        if (out.count == 0U ||
+            !checked_mul(plan.dict_items, static_cast<std::uint64_t>(out.value_bytes), needed) ||
+            !fits_size_t(needed) || needed > default_read_limits().max_uncompressed_bytes) {
+            error = "dictionary declares an implausible " + std::to_string(plan.dict_items) + " entries of " +
+                    std::to_string(out.value_bytes) + " bytes";
+            return false;
+        }
+        if (plan.dict_out_of_line_bitpacked) {
+            std::vector<std::uint8_t> unpacked(static_cast<std::size_t>(needed));
+            if (!unpack_out_of_line_bitpacked_dispatch(out.bytes, out.count, plan.dict_packed_width,
+                                                       out.value_bytes, unpacked.data(), "dictionary block",
+                                                       error)) {
+                return false;
+            }
+            out.bytes = std::move(unpacked);
+            return true;
+        }
+        if (plan.dict_inline_bitpacked) {
+            // The count is what bounds the walk, and the buffer is what bounds the count: a series of
+            // packed blocks is far smaller than the values it yields, so the size check below cannot
+            // be applied to the stored bytes. `unpack_inline_bitpacked_series` refuses a count the
+            // buffer cannot actually supply, which is the same guarantee from the other direction.
+            std::vector<std::uint8_t> unpacked;
+            if (!unpack_inline_bitpacked_series_dispatch(out.bytes, out.count, out.value_bytes, unpacked, error)) {
+                return false;
+            }
+            out.bytes = std::move(unpacked);
+            return true;
+        }
+        if (static_cast<std::size_t>(needed) > out.bytes.size()) {
+            error = "dictionary declares " + std::to_string(plan.dict_items) + " entries of " +
+                    std::to_string(out.value_bytes) + " bytes but the block holds " +
+                    std::to_string(out.bytes.size());
+            return false;
+        }
+        return true;
+    }
+
+    out.value_bytes = 0;
+    if (out.bytes.size() < 8U) {
+        error = "dict block too short";
+        return false;
+    }
+    std::uint32_t bytes_start = 0;
+    std::memcpy(&bytes_start, out.bytes.data() + 4U, 4U);
+    if (bytes_start < 12U || bytes_start > out.bytes.size() || (bytes_start - 8U) % 4U != 0U) {
+        error = "dict block header invalid";
+        return false;
+    }
+    out.count = (bytes_start - 8U) / 4U - 1U;
+    out.ranges.resize(out.count);
+    for (std::size_t d = 0; d < out.count; ++d) {
+        std::uint32_t a = 0;
+        std::uint32_t b = 0;
+        std::memcpy(&a, out.bytes.data() + 8U + d * 4U, 4U);
+        std::memcpy(&b, out.bytes.data() + 8U + (d + 1U) * 4U, 4U);
+        if (bytes_start + b > out.bytes.size() || b < a) {
+            error = "dict offsets out of range";
+            return false;
+        }
+        out.ranges[d] = {bytes_start + a, b - a};
+    }
+    return true;
 }
 
 /// Classify from the page descriptor alone. Returns false when the column carries no descriptor (an
@@ -965,17 +1201,22 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             }
             dict = dict->values.get();
         }
-        if (dict == nullptr || (dict->kind != page_layout::CompressiveKind::kVariable &&
-                                dict->kind != page_layout::CompressiveKind::kFlat)) {
+        const bool dict_is_fixed_width = dict != nullptr &&
+                                         (dict->kind == page_layout::CompressiveKind::kFlat ||
+                                          dict->kind == page_layout::CompressiveKind::kInlineBitpacking ||
+                                          dict->kind == page_layout::CompressiveKind::kBitpacked);
+        if (dict == nullptr || (dict->kind != page_layout::CompressiveKind::kVariable && !dict_is_fixed_width)) {
             out.kind = ColumnEncodingKind::kUnsupported;
             out.unsupported_reason = "unsupported dictionary encoding in " + page_layout::describe(layout);
             return true;
         }
-        if (dict->kind == page_layout::CompressiveKind::kFlat) {
-            // A dictionary of fixed-width values. Lance builds these once a temporal or decimal
-            // column's cardinality justifies it -- `Flat(64)` for time64 past 1024 rows,
-            // `Flat(128)` for decimal128 past 20000 -- and the block is then just the values, with
-            // none of the offset header the variable-width path reads.
+        if (dict_is_fixed_width) {
+            // A dictionary of fixed-width entries, in one of its two spellings. `Flat(N)` is the
+            // entries end to end -- `Flat(64)` for time64 past 1024 rows, `Flat(128)` for decimal128
+            // past 20000. `InlineBitpacking(N)` is the same entries FastLanes-packed, which Lance
+            // picks once they are narrow enough for packing to pay: an int64 column with runs and a
+            // couple of hundred distinct values gets it. Neither has the offset header the
+            // variable-width path reads.
             if (dict->bits_per_value == 0U || dict->bits_per_value % 8U != 0U) {
                 out.kind = ColumnEncodingKind::kUnsupported;
                 out.unsupported_reason =
@@ -985,6 +1226,22 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             }
             out.dict_value_bits = dict->bits_per_value;
             out.dict_items = layout.mini_block.num_dictionary_items;
+            out.dict_inline_bitpacked = dict->kind == page_layout::CompressiveKind::kInlineBitpacking;
+            if (dict->kind == page_layout::CompressiveKind::kBitpacked) {
+                // `Bitpacked{uncompressed_bits, Flat(width)}`: the packed width lives in the
+                // descriptor, so there is no width word to read at the head of each block. Lance
+                // switches to this spelling from the inline one as the dictionary grows -- an int64
+                // column with runs gets InlineBitpacking at a few hundred entries and this past a
+                // couple of thousand.
+                if (dict->values == nullptr || dict->values->kind != page_layout::CompressiveKind::kFlat) {
+                    out.kind = ColumnEncodingKind::kUnsupported;
+                    out.unsupported_reason =
+                        "unsupported dictionary encoding in " + page_layout::describe(layout);
+                    return true;
+                }
+                out.dict_out_of_line_bitpacked = true;
+                out.dict_packed_width = dict->values->bits_per_value;
+            }
         }
     }
 
@@ -1399,81 +1656,97 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         return true;
     }
 
-    // Dictionary + RLE variable-width column: buffer[1] = RLE'd u32 indices, buffer[2] = dictionary.
+    // Dictionary with RLE'd indices: buffer[1] = the miniblock payload, buffer[2] = the dictionary.
+    //
+    // This branch used to parse the payload itself as [u16 num_levels][u32 size0][u32 size1] and take
+    // the whole page to be one chunk. That is nanolance's own dict-rle page and nothing else. Lance
+    // writes the ordinary miniblock grammar -- a chunk header whose shape the descriptor declares,
+    // as many chunks as the page needs -- so a pylance column with runs decoded only its first 1024
+    // values per chunk read and then failed downstream with a buffer-size mismatch rather than
+    // anything naming the cause. A repetitive string column past ~5000 rows is exactly that shape,
+    // and so is any integer column with runs, whose dictionary is fixed-width rather than variable.
     if (encoding_plan.kind == ColumnEncodingKind::kDictRle) {
-        out.kind = ColumnValues::Kind::VariableWidth;
+        const bool fixed_dict = encoding_plan.dict_value_bits != 0U;
+        out.kind = fixed_dict ? ColumnValues::Kind::FixedWidth : ColumnValues::Kind::VariableWidth;
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-        std::vector<std::uint8_t> data;       // buffer[1]: RLE chunk of indices
-        std::vector<std::uint8_t> dict_frame;  // buffer[2]: dictionary
-        std::vector<std::uint8_t> dict_block;
+        std::vector<std::uint8_t> payload;
+        std::vector<std::uint8_t> dict_stored;
+        DictionaryBlock dict;
+        std::vector<MiniBlockChunkView> chunks;
+        std::vector<std::pair<std::uint32_t, std::uint8_t>> runs;  // (dictionary index, run length)
+        std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
             if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
                 error = "dict-rle page missing buffers";
                 return false;
             }
-            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[1], page.buffer_sizes[1], data, error) ||
-                !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_frame,
+            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[1], page.buffer_sizes[1], payload,
+                                            error) ||
+                !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_stored,
                                             error)) {
                 return false;
             }
-            // Decode the dictionary: unwrap -> [u32 32][u32 bytes_start][u32 offsets][data].
-            if (!decompress_dictionary_block(encoding_plan.dict_scheme, dict_frame, dict_block, error)) {
+            if (!decode_dictionary_block(encoding_plan, on_disk_field.logical_type, dict_stored, dict, error)) {
                 return false;
             }
-            if (dict_block.size() < 8U) {
-                error = "dict block too short";
+            // Same splitter as every other miniblock path, so a nullable column's definition levels
+            // are read here rather than being mistaken for run data.
+            if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows, out,
+                                                error)) {
                 return false;
             }
-            std::uint32_t bytes_start = 0;
-            std::memcpy(&bytes_start, dict_block.data() + 4U, 4U);
-            if (bytes_start < 12U || bytes_start > dict_block.size() || (bytes_start - 8U) % 4U != 0U) {
-                error = "dict block header invalid";
-                return false;
-            }
-            const std::size_t num_dict = (bytes_start - 8U) / 4U - 1U;
-            std::vector<std::pair<std::uint32_t, std::uint32_t>> dict_ranges(num_dict);
-            for (std::size_t d = 0; d < num_dict; ++d) {
-                std::uint32_t a = 0;
-                std::uint32_t b = 0;
-                std::memcpy(&a, dict_block.data() + 8U + d * 4U, 4U);
-                std::memcpy(&b, dict_block.data() + 8U + (d + 1U) * 4U, 4U);
-                if (bytes_start + b > dict_block.size() || b < a) {
-                    error = "dict offsets out of range";
+            runs.clear();
+            for (const auto& chunk : chunks) {
+                if (chunk.extra_buffers.empty()) {
+                    error = "dict-rle chunk is missing its run-lengths buffer";
                     return false;
                 }
-                dict_ranges[d] = {bytes_start + a, b - a};
+                const auto& values = chunk.values;    // one u32 dictionary index per run
+                const auto& lengths = chunk.extra_buffers[0];  // one u8 run length per run
+                if (values.size() % 4U != 0U || values.size() / 4U != lengths.size()) {
+                    error = "dict-rle run count mismatch between indices and lengths";
+                    return false;
+                }
+                const std::size_t num_runs = lengths.size();
+                runs.reserve(runs.size() + num_runs);
+                for (std::size_t r = 0; r < num_runs; ++r) {
+                    std::uint32_t index = 0;
+                    std::memcpy(&index, values.data() + r * 4U, 4U);
+                    if (index >= dict.count) {
+                        error = "dict-rle index out of range";
+                        return false;
+                    }
+                    runs.emplace_back(index, lengths[r]);
+                }
             }
-            // Decode the RLE chunk of u32 indices (same framing as the fixed-width RLE path).
-            if (data.size() < 10U) {
-                error = "dict-rle data chunk too short";
-                return false;
-            }
-            std::uint32_t size0 = 0;
-            std::uint32_t size1 = 0;
-            std::memcpy(&size0, data.data() + 2U, 4U);
-            std::memcpy(&size1, data.data() + 6U, 4U);
-            std::size_t voff = 10U;
-            voff += (8U - (voff % 8U)) % 8U;
-            std::size_t loff = voff + size0;
-            loff += (8U - (loff % 8U)) % 8U;
-            if (loff + size1 > data.size() || size0 % 4U != 0U || size0 / 4U != size1) {
-                error = "dict-rle chunk sizes invalid";
-                return false;
-            }
-            const std::size_t num_runs = size1;
-            // Pre-pass: validate indices and size the output.
+
+            // Pre-pass over the whole page: how many rows, and how many bytes they expand to.
             std::size_t total_rows = 0;
             std::size_t total_data = 0;
-            for (std::size_t r = 0; r < num_runs; ++r) {
-                std::uint32_t index = 0;
-                std::memcpy(&index, data.data() + voff + r * 4U, 4U);
-                if (index >= num_dict) {
-                    error = "dict-rle index out of range";
-                    return false;
-                }
-                total_rows += data[loff + r];
-                total_data += static_cast<std::size_t>(data[loff + r]) * dict_ranges[index].second;
+            for (const auto& [index, run] : runs) {
+                total_rows += run;
+                total_data += static_cast<std::size_t>(run) * dict.entry_size(index);
             }
+            if (total_rows != page.length) {
+                error = "dict-rle runs cover " + std::to_string(total_rows) + " rows but the page declares " +
+                        std::to_string(page.length);
+                return false;
+            }
+
+            if (fixed_dict) {
+                const std::size_t base = out.fixed.size();
+                out.fixed.resize(base + total_data);
+                std::uint8_t* dest = out.fixed.data() + base;
+                for (const auto& [index, run] : runs) {
+                    const std::uint8_t* src = dict.entry(index);
+                    for (std::uint8_t c = 0; c < run; ++c) {
+                        std::memcpy(dest, src, dict.value_bytes);
+                        dest += dict.value_bytes;
+                    }
+                }
+                continue;
+            }
+
             out.variable.data.reserve(out.variable.data.size() + total_data);
             const bool first_page = out.variable.offsets.empty();
             std::uint64_t cumulative = out.variable.data.size();  // byte offset (continues across pages)
@@ -1485,12 +1758,9 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 if (first_page) {
                     offs.push_back(static_cast<OT>(cumulative));
                 }
-                for (std::size_t r = 0; r < num_runs; ++r) {
-                    std::uint32_t index = 0;
-                    std::memcpy(&index, data.data() + voff + r * 4U, 4U);
-                    const std::uint8_t run = data[loff + r];
-                    const auto [start, len] = dict_ranges[index];
-                    if (!append_repeated_value(out.variable.data, dict_block.data() + start, len, run)) {
+                for (const auto& [index, run] : runs) {
+                    const std::size_t len = dict.entry_size(index);
+                    if (!append_repeated_value(out.variable.data, dict.entry(index), len, run)) {
                         return false;
                     }
                     for (std::uint8_t c = 0; c < run; ++c) {
@@ -1528,25 +1798,11 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     // one read the first value as an offset header and refused with "dict block header invalid".
     if (encoding_plan.kind == ColumnEncodingKind::kDict) {
         const bool fixed_dict = encoding_plan.dict_value_bits != 0U;
-        const std::size_t dict_value_bytes = encoding_plan.dict_value_bits / 8U;
-        if (fixed_dict) {
-            // The descriptor and the schema have to agree about how wide a value is. They always do
-            // in a file Lance wrote; a file where they disagree is the one case where trusting
-            // either would silently produce shifted values, so refuse instead.
-            const auto schema_bytes = lance_logical_type_value_bytes(on_disk_field.logical_type);
-            if (dict_value_bytes != schema_bytes) {
-                error = "dictionary declares " + std::to_string(dict_value_bytes) +
-                        "-byte values but the column's type is " + std::to_string(schema_bytes) + " bytes wide";
-                return false;
-            }
-            out.kind = ColumnValues::Kind::FixedWidth;
-        } else {
-            out.kind = ColumnValues::Kind::VariableWidth;
-        }
+        out.kind = fixed_dict ? ColumnValues::Kind::FixedWidth : ColumnValues::Kind::VariableWidth;
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> dict_stored;
-        std::vector<std::uint8_t> dict_block;
+        DictionaryBlock dict;
         std::vector<std::uint8_t> indices_bytes;
         std::vector<MiniBlockChunkView> index_chunks;
         std::uint64_t validity_rows = 0;
@@ -1561,50 +1817,10 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                                             error)) {
                 return false;
             }
-            if (!decompress_dictionary_block(encoding_plan.dict_scheme, dict_stored, dict_block, error)) {
+            if (!decode_dictionary_block(encoding_plan, on_disk_field.logical_type, dict_stored, dict, error)) {
                 return false;
             }
-            std::size_t num_dict = 0;
-            std::vector<std::pair<std::uint32_t, std::uint32_t>> dict_ranges;
-            if (fixed_dict) {
-                // No header: the block is entries of `dict_value_bytes`, and the descriptor's
-                // `num_dictionary_items` is the only statement of how many. Lance pads the block, so
-                // it may be longer than the entries need -- it must never be shorter.
-                num_dict = static_cast<std::size_t>(encoding_plan.dict_items);
-                std::uint64_t needed = 0;
-                if (num_dict == 0U ||
-                    !checked_mul(encoding_plan.dict_items, static_cast<std::uint64_t>(dict_value_bytes), needed) ||
-                    !fits_size_t(needed) || static_cast<std::size_t>(needed) > dict_block.size()) {
-                    error = "dictionary declares " + std::to_string(encoding_plan.dict_items) + " entries of " +
-                            std::to_string(dict_value_bytes) + " bytes but the block holds " +
-                            std::to_string(dict_block.size());
-                    return false;
-                }
-            } else {
-                if (dict_block.size() < 8U) {
-                    error = "dict block too short";
-                    return false;
-                }
-                std::uint32_t bytes_start = 0;
-                std::memcpy(&bytes_start, dict_block.data() + 4U, 4U);
-                if (bytes_start < 12U || bytes_start > dict_block.size() || (bytes_start - 8U) % 4U != 0U) {
-                    error = "dict block header invalid";
-                    return false;
-                }
-                num_dict = (bytes_start - 8U) / 4U - 1U;
-                dict_ranges.resize(num_dict);
-                for (std::size_t d = 0; d < num_dict; ++d) {
-                    std::uint32_t a = 0;
-                    std::uint32_t b = 0;
-                    std::memcpy(&a, dict_block.data() + 8U + d * 4U, 4U);
-                    std::memcpy(&b, dict_block.data() + 8U + (d + 1U) * 4U, 4U);
-                    if (bytes_start + b > dict_block.size() || b < a) {
-                        error = "dict offsets out of range";
-                        return false;
-                    }
-                    dict_ranges[d] = {bytes_start + a, b - a};
-                }
-            }
+            const std::size_t num_dict = dict.count;
             // The index chunks go through the same splitter every other miniblock path uses, so a
             // nullable dictionary column (a categorical column with missing values -- the shape this
             // encoding exists for) carries its definition levels here like anywhere else. The
@@ -1642,7 +1858,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 // Every row is the same width, so the destination is sized once and written through
                 // a pointer -- no per-row growth, and no offsets to maintain.
                 const std::size_t base = out.fixed.size();
-                out.fixed.resize(base + static_cast<std::size_t>(page.length) * dict_value_bytes);
+                out.fixed.resize(base + static_cast<std::size_t>(page.length) * dict.value_bytes);
                 std::uint8_t* dest = out.fixed.data() + base;
                 for (std::uint64_t r = 0; r < page.length; ++r) {
                     std::uint32_t index = 0;
@@ -1651,9 +1867,8 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                         error = "dict index out of range";
                         return false;
                     }
-                    std::memcpy(dest, dict_block.data() + static_cast<std::size_t>(index) * dict_value_bytes,
-                                dict_value_bytes);
-                    dest += dict_value_bytes;
+                    std::memcpy(dest, dict.entry(index), dict.value_bytes);
+                    dest += dict.value_bytes;
                 }
                 continue;
             }
@@ -1673,9 +1888,9 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                     error = "dict index out of range";
                     return false;
                 }
-                const auto [start, len] = dict_ranges[index];
-                out.variable.data.insert(out.variable.data.end(), dict_block.begin() + static_cast<std::ptrdiff_t>(start),
-                                         dict_block.begin() + static_cast<std::ptrdiff_t>(start + len));
+                const std::size_t len = dict.entry_size(index);
+                const std::uint8_t* src = dict.entry(index);
+                out.variable.data.insert(out.variable.data.end(), src, src + len);
                 cumulative += len;
                 append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
             }
