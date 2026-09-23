@@ -151,8 +151,14 @@ Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](https:
   With those allocations bounded, the same target reached far deeper and found a real crash:
   `std::length_error` escaping the parser because the record batch's int64 row count was checked with
   `values.size() < rows * 4`, which overflows uint64 past 2^62. An uncaught exception from a
-  malformed file is a crash, not a refusal; it uses `checked_mul` now. Its reproducer is checked in
-  beside the others.
+  malformed file is a crash, not a refusal; it uses `checked_mul` now.
+
+  And behind that, the one that actually reads memory it does not own: an **ASan heap-buffer-overflow
+  READ**, because `flatbuffer_field` treated an offset equal to `bytes.size()` as a present field and
+  the caller indexed it. A present flatbuffer scalar is at least one byte, so the contract is now
+  strictly-inside, and single-byte reads go through a bounds-checked `flatbuffer_byte`. Each of these
+  was only reachable once the previous one was fixed — the memory-safety bug was six rounds deep.
+  Every reproducer is checked in beside the others.
 
 - **Negative-corpus tests** ([`tests/test_read_safety.cpp`](https://github.com/yoavbendor/nanolance/blob/main/tests/test_read_safety.cpp)) — hand-built
   malformed footers (oversized column count, overflowing descriptor bounds) and garbage protobuf must

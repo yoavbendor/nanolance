@@ -1388,12 +1388,30 @@ This is the overflow-naive spelling the nanom audit noticed a few paragraphs abo
 given their input ranges, but by argument rather than by construction". That judgement was right
 about the roaring parser and wrong here — which is the whole reason the distinction matters.
 
+### ...and, once that was gone too, an out-of-bounds read
+
+The next run's tail carried an **AddressSanitizer heap-buffer-overflow: a one-byte READ past the end
+of the input buffer**, in the same function. This is the most serious of the set — the others were
+denial of service, this one reads memory the file does not own.
+
+`flatbuffer_field` ended with `return out_absolute <= b.size()`, so an offset *equal to* the buffer
+size counted as a **present** field, and the caller indexed it. Every flatbuffer scalar is at least
+one byte, so "present" has to mean strictly inside. Two fixes, deliberately overlapping: the contract
+is now `<`, and the two single-byte reads go through a bounds-checked `flatbuffer_byte` instead of
+indexing — because a caller that trusts a proof made somewhere else inherits every future weakening
+of it.
+
 ### What the exercise says
 
-Five rounds, and the fuzzer found something in each: a missing budget, a budget that rejected honest
-files, a 4 GiB reserve the *fix itself* introduced, the same allocation bug in the other parser, and
-then a genuine crash that the allocation bugs had been masking. None would have been found by a test
-someone thought to write.
+Six rounds, and the fuzzer found something in each: a missing budget, a budget that rejected honest
+files, a 4 GiB reserve the *fix itself* introduced, the same allocation bug in the other parser, a
+crash the allocation bugs had been masking, and finally — once the crash was gone — an out-of-bounds
+read that had been sitting behind all of them. None would have been found by a test someone thought
+to write.
+
+The order matters and is worth stating: **each bug was only reachable once the one in front of it was
+fixed.** A single fuzz run would have found the first and stopped. The memory-safety bug was six
+deep.
 
 That is the argument for the harness, more than any individual finding — and it reframes the question
 that started this. "Should the core use nanom?" matters much less than "does every parser have a

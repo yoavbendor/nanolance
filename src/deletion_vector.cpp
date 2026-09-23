@@ -70,6 +70,24 @@ bool read_i64(const std::vector<std::uint8_t>& b, std::size_t at, std::int64_t& 
 // default". Field ids are positional and stable, which is what makes this safe to hand-roll.
 
 /// Absolute offset of `field_id` within the table at `table`, or 0 when the field is absent.
+/// One byte of a flatbuffer scalar field, or `fallback` when the field is absent (offset 0).
+///
+/// Reading through this instead of indexing `b[at]` is the whole point: `flatbuffer_field` proves an
+/// offset is inside the buffer, and a caller that trusts that proof and indexes anyway inherits every
+/// future weakening of it. The bounds check belongs next to the read.
+bool flatbuffer_byte(const std::vector<std::uint8_t>& b, std::size_t at, std::uint8_t fallback,
+                     std::uint8_t& out) {
+    if (at == 0U) {
+        out = fallback;
+        return true;
+    }
+    if (at >= b.size()) {
+        return false;
+    }
+    out = b[at];
+    return true;
+}
+
 bool flatbuffer_field(const std::vector<std::uint8_t>& b, std::size_t table, std::size_t field_id,
                       std::size_t& out_absolute) {
     out_absolute = 0;
@@ -100,7 +118,11 @@ bool flatbuffer_field(const std::vector<std::uint8_t>& b, std::size_t table, std
         return true;  // explicitly absent
     }
     out_absolute = table + field_offset;
-    return out_absolute <= b.size();
+    // Strictly inside, not "at most the end": every flatbuffer scalar is at least one byte, so an
+    // offset equal to size() is not a position a present field can occupy. Returning it as present
+    // is what let a caller index one past the buffer -- an ASan heap-buffer-overflow read that
+    // fuzz_deletion_vector found once the allocation bugs above stopped masking it.
+    return out_absolute < b.size();
 }
 
 /// Follow a uoffset stored at `at` (vectors and sub-tables are referenced indirectly).
@@ -252,7 +274,11 @@ bool parse_arrow_ipc_uint32_column(const std::vector<std::uint8_t>& bytes,
             error = "malformed Arrow IPC message header";
             return false;
         }
-        const std::uint8_t header_type = header_type_at == 0U ? 0U : bytes[header_type_at];
+        std::uint8_t header_type = 0;
+        if (!flatbuffer_byte(bytes, header_type_at, 0U, header_type)) {
+            error = "malformed Arrow IPC message header";
+            return false;
+        }
 
         std::size_t body_length_at = 0;
         std::int64_t body_length = 0;
@@ -314,7 +340,12 @@ bool parse_arrow_ipc_uint32_column(const std::vector<std::uint8_t>& bytes,
                     error = "malformed Arrow IPC compression codec";
                     return false;
                 }
-                const auto codec = codec_at == 0U ? 0 : static_cast<std::int8_t>(bytes[codec_at]);
+                std::uint8_t codec_byte = 0;
+                if (!flatbuffer_byte(bytes, codec_at, 0U, codec_byte)) {
+                    error = "malformed Arrow IPC compression codec";
+                    return false;
+                }
+                const auto codec = static_cast<std::int8_t>(codec_byte);
                 if (codec != kCompressionZstd) {
                     error = "deletion file uses an Arrow IPC compression codec nanolance does not read";
                     return false;
