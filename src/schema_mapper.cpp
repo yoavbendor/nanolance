@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace nano_lance {
@@ -769,6 +770,27 @@ bool dematerialize_blob_v2_for_arrow_append(LanceSchemaMapping& mapping, std::st
     return true;
 }
 
+/// Promote to the root any field whose `parent_id` names a field that is not in the schema.
+///
+/// The read side has to infer an absent `parent_id` as 0 (proto3 omits the zero), which is right for
+/// every schema Lance writes -- it numbers fields from 0 up and marks roots with an explicit -1. It
+/// would be wrong for a schema with NO field 0, which `drop_columns` can produce: there the inferred
+/// parent names nothing, and the field would be neither a root nor anybody's child, so it would drop
+/// out of the output silently. A column that cannot be placed in the tree belongs at the top, where
+/// it is at least visible.
+void reroot_orphaned_fields(LanceSchemaMapping& mapping) {
+    std::unordered_set<std::int32_t> ids;
+    ids.reserve(mapping.fields.size());
+    for (const auto& f : mapping.fields) {
+        ids.insert(f.id);
+    }
+    for (auto& f : mapping.fields) {
+        if (f.parent_id >= 0 && ids.count(f.parent_id) == 0U) {
+            f.parent_id = -1;
+        }
+    }
+}
+
 }  // namespace
 
 bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchemaMapping& out, std::string& error) {
@@ -804,6 +826,7 @@ bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchem
         lf.column_index = col_it != id_to_column.end() ? col_it->second : -1;
         out.fields.push_back(std::move(lf));
     }
+    reroot_orphaned_fields(out);
     if (!dematerialize_blob_v2_for_arrow_append(out, error)) {
         return false;
     }

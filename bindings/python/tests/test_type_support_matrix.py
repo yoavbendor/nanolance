@@ -121,7 +121,6 @@ UNREADABLE_FROM_PYLANCE = {
     "fixed_size_list": "unsupported on-disk logical type",
     "map": "unsupported on-disk logical type",
     "dictionary": "unsupported on-disk logical type",
-    "struct": "struct field has no children in mapping",
 }
 
 
@@ -159,6 +158,28 @@ def test_read_only_types_read_back_from_stock_lance(tmp_path, name):
     """Refused on write, correct on read. Pinning this stops the asymmetry being 'tidied up'."""
     lance_mod = require_pylance()
     table = REFUSED_ON_WRITE[name][0]
+    path = str(tmp_path / f"{name}.lance")
+    lance_mod.write_dataset(table, path)
+    expected = lance_mod.dataset(path).to_table()
+    assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
+
+
+@pytest.mark.parametrize("name", sorted(ROUNDTRIPS))
+def test_stock_lance_written_type_reads_back(tmp_path, name):
+    """The third direction: pylance writes it, nanolance reads it.
+
+    The two tests above cover files nanolance WROTE, and they agree with each other because they
+    share a writer. This one starts from Lance's own encoder, which picks layouts ours never emits.
+
+    Its absence hid a real bug for as long as this file existed. `struct` round-tripped here and read
+    back from nanolance's own files, yet a pylance struct in the FIRST column position was
+    unreadable: Lance leaves a zero `parent_id` off the wire (proto3), our decoder read the absence
+    as "root", and every child of field id 0 detached from its parent. Only a file Lance wrote could
+    show it, and only when the struct was field 0 -- put any column ahead of it and the ids shift,
+    the parent link is non-zero, and it is serialized again.
+    """
+    lance_mod = require_pylance()
+    table = ROUNDTRIPS[name]
     path = str(tmp_path / f"{name}.lance")
     lance_mod.write_dataset(table, path)
     expected = lance_mod.dataset(path).to_table()

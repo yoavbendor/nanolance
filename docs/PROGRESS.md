@@ -1488,25 +1488,74 @@ written**, in four classes, none of which any existing test touched:
 | `decimal128` ≥20000 | `dict=General{LZ4,Flat(128)}` | `dict block header invalid` |
 | `str_runs` ≥5000 | `Rle{Flat(32),Flat(8)}` over `General{LZ4,Variable}` | buffer sized 16388, needed 20004 |
 
-Three distinct missing decoders behind them:
+Three distinct causes behind them:
 
-1. **Structs written by pylance.** It stores a struct as its flattened leaves with no physical column
-   for the parent; nanolance's schema mapper expects the parent to carry children. nanolance can
-   write a struct and read its own back — the reverse direction was never tested.
+1. **Structs written by pylance** — **fixed**, and not for the reason the descriptor suggested. See
+   the section below: it was a protobuf defaulting bug, not a missing decoder.
 2. **Dictionaries whose values are fixed-width.** nanolance's dictionary path assumes a
    variable-width block and reads the header of a block that has none. Lance builds these for
    temporal and decimal columns once the cardinality justifies it.
 3. **Dictionary + RLE'd indices over an LZ4 dictionary.** nanolance writes dict+RLE with a *zstd*
    dictionary and reads that shape; this combination lands in the wrong branch.
 
-All four are pinned in the matrix by their **specific** message, so each fails loudly the moment it
-is fixed. `test_the_gap_list_is_not_stale` additionally asserts every entry still matches a cell the
+All four were pinned in the matrix by their **specific** message, so each fails loudly the moment it
+is fixed — which is exactly what happened to the struct entry. `test_the_gap_list_is_not_stale` additionally asserts every entry still matches a cell the
 matrix generates — otherwise trimming a size would orphan an entry and leave the suite advertising a
 gap nobody reproduces.
 
 The general point, which is the answer to "what needs more tests": **a format reader's coverage axis
 is the writer's choices, not the reader's types.** Enumerating types found none of this; enumerating
 types x sizes found all of it in one run.
+
+---
+
+## The struct gap was a protobuf defaulting bug
+
+The first of the three read gaps looked like a missing decoder and was not. The symptom pointed
+straight at the schema mapper -- `struct field has no children in mapping` -- and the page dump
+agreed: a pylance struct has no physical column for the parent, only its flattened leaves. The
+obvious reading was that nanolance expected a parent column that Lance does not write.
+
+That reading was wrong, and one experiment showed it. Put **any** column ahead of the struct and the
+same file reads perfectly:
+
+```
+lance.write_dataset(pa.table({"s": struct_col}), ...)               -> FAILS
+lance.write_dataset(pa.table({"lead": ints, "s": struct_col}), ...) -> reads fine
+```
+
+A missing decoder does not care what position a column is in. Field **ids** do.
+
+Lance's `Field.parent_id` is a proto3 `int32`, and **proto3 does not put a zero on the wire**. A
+struct in the first column gets id 0, so its children carry `parent_id = 0` -- which is never
+serialized. Our decoder initialized `parent_id` to `-1` and therefore read the absence as *"I am a
+root"* rather than *"my parent is field 0"*. Both children detached, the struct was left childless,
+and the whole dataset failed to open. Roots are unaffected because Lance writes `-1` for them, and
+`-1` is non-zero, so it is always on the wire. The bug was reachable only through the single value
+protobuf refuses to transmit.
+
+The fix is three rules, each independently defensible:
+
+* absent `parent_id` means **0**, per proto3;
+* a field cannot be its own parent, so field 0 with no `parent_id` on the wire is a root;
+* a `parent_id` naming a field that is not in the schema re-roots instead of orphaning -- `drop_columns`
+  can remove field 0, and a column that cannot be placed in the tree should be visible at the top
+  rather than vanish from the output.
+
+**Why no test caught it.** `test_type_support_matrix.py` had `struct` in `ROUNDTRIPS` and it passed,
+because both of its directions start from a file *nanolance wrote* -- and our encoder always emits
+field 4 explicitly, zero or not. The matrix was missing a third direction: **pylance writes it,
+nanolance reads it**. That test now exists over every round-trippable type, and it is the one that
+fails when the fix is reverted. The C++ side pins the rule directly, on hand-built wire bytes, since
+no round-trip through our own encoder can produce a message with field 4 absent.
+
+The generalizable lesson is narrower than "test both directions" and worth stating exactly: **a
+round-trip test through your own encoder cannot see a decoder's defaulting bugs**, because your
+encoder never produces the omission that triggers them. Any field whose proto3 default differs from
+the value your struct initializes it to is a live bug waiting for a foreign writer. `Field.type`
+(our default 2, proto3's 0) and `Field.encoding` (our default 1, proto3's 0) are the same shape;
+neither is currently load-bearing on the read path, but both are noted here rather than left to be
+rediscovered.
 
 ---
 
@@ -1558,11 +1607,11 @@ is most likely to hit.
 
 ### Correctness / reach — worth doing next
 
-1. **Three read gaps for pylance-written columns**, all found by `test_lance_read_matrix.py` and all
-   pinned there: structs (schema mapping), fixed-width dictionaries (`General{LZ4,Flat(64|128)}`,
-   hit by `time64` and `decimal128`), and dict+RLE over an LZ4 dictionary (hit by a repetitive string
-   column at 5000+ rows). These are the most user-visible items on this list: each makes an ordinary
-   pylance dataset unreadable.
+1. **Two read gaps for pylance-written columns**, both found by `test_lance_read_matrix.py` and both
+   pinned there: fixed-width dictionaries (`General{LZ4,Flat(64|128)}`, hit by `time64` and
+   `decimal128`) and dict+RLE over an LZ4 dictionary (hit by a repetitive string column at 5000+
+   rows). These are the most user-visible items on this list: each makes an ordinary pylance dataset
+   unreadable. The third, structs, is **fixed** — see the post-mortem above.
 
 2. **No FSST on write.** The direct answer to the one bench shape nanolance still loses
    (`high_card`: 7.67 ms vs rust-lance 5.12 ms). zstd is ~48% of that read; rust-lance avoids it by

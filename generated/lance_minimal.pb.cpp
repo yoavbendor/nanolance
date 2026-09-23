@@ -368,6 +368,15 @@ bool decode_map_metadata_entry(const std::vector<std::uint8_t>& nested, std::str
 
 bool decode_field_message(const std::vector<std::uint8_t>& bytes, Field& field) {
     field = Field{};
+    // proto3 does not put a zero on the wire, so an ABSENT `parent_id` means 0 -- "my parent is the
+    // field whose id is 0" -- not "I have no parent". Lance writes -1 for a root field, and -1 is
+    // non-zero, so it is always serialized; only the 0 is ever implied.
+    //
+    // The struct default is -1 because the writer side wants it, so the read side has to say 0 here
+    // explicitly. Getting this backwards made every child of field 0 decode as a root: a pylance
+    // dataset whose FIRST column was a struct lost that struct's children and failed with "struct
+    // field has no children in mapping", while the same struct in second position read fine.
+    field.parent_id = 0;
     std::size_t pos = 0;
     bool nullable_wire_seen = false;
     while (pos < bytes.size()) {
@@ -415,6 +424,11 @@ bool decode_field_message(const std::vector<std::uint8_t>& bytes, Field& field) 
     // encode_field_message omits wire field 6 when nullable is false; default struct value is true.
     if (!nullable_wire_seen) {
         field.nullable = false;
+    }
+    // A field cannot be its own parent. This is field 0 with an absent `parent_id`, i.e. the root
+    // struct of a schema whose writer left the zero off the wire; it is a root.
+    if (field.parent_id == field.id) {
+        field.parent_id = -1;
     }
     return true;
 }

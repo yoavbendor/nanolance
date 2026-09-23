@@ -73,9 +73,6 @@ SIZES = (1, 100, 1024, 1025, 5000, 20_000)
 # Known read gaps, each reproduced by this matrix and each a distinct missing decoder. Recorded as
 # (predicate, message fragment); see docs/PROGRESS.md for the page descriptors behind them.
 KNOWN_GAPS = (
-    # pylance stores a struct as its flattened leaf columns with no physical column for the parent;
-    # nanolance's schema mapper expects the parent to carry children. Affects every size.
-    (lambda n, k: k == "struct", "struct field has no children in mapping"),
     # A dictionary whose VALUES are fixed-width -- `General{LZ4, Flat(64)}` for time64,
     # `Flat(128)` for decimal128. nanolance's dictionary path assumes a variable-width block, so it
     # reads the header of a block that has none.
