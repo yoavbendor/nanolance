@@ -336,16 +336,21 @@ bool map_field(const ArrowSchema& field,
         }
     }
     const bool under_blob_v2 = mapped_parent != nullptr && mapped_parent->extension_name == "lance.blob.v2";
-    // The Arrow null type is an all-null column by definition, so it runs into the same wall as any
-    // other null: nanolance writes no validity information and has nothing to store. Say so here
-    // rather than letting ingest fail later with "fixed-width array is missing values buffer".
+    // Arrow's null type carries no values buffer at all -- not "a buffer of nulls", nothing. Every
+    // encoder here starts from value bytes, so there is nothing to start from, and ingest would
+    // otherwise fail later with "fixed-width array is missing values buffer".
+    //
+    // This is NOT the old "nanolance cannot store nulls" limitation, which the message used to claim
+    // and which stopped being true when definition levels landed: a null *value* in a typed column is
+    // written and read back. What is missing is the writer side of Lance's all-null spelling
+    // (ConstantLayout with definition-level layers and no value), which the reader already decodes.
     if (parsed.logical_type == "null") {
         error = "column '";
         error += field.name == nullptr ? "<unnamed>" : field.name;
         error +=
-            "' has Arrow's null type, which is all-null by definition; nanolance cannot store nulls "
-            "yet (it writes no validity information). Drop the column, or give it a concrete type "
-            "and a fill value.";
+            "' has Arrow's null type, which carries no values buffer for nanolance to encode. Nulls "
+            "inside a typed column are supported; it is the null TYPE that is not. Drop the column, "
+            "or give it a concrete type (pyarrow: col.cast(pa.int64()) etc.).";
         return false;
     }
 

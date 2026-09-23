@@ -1298,31 +1298,61 @@ piece of work (an FSST encoder), not a tweak — so it is listed below rather th
 
 ## Deviations from the plan, and open items
 
-- **The nullable opt-out was not needed** (see above) — simpler than planned.
-- **`large_utf8` was refused rather than fixed.** The plan said "prefer fixing; reject as the
-  stopgap". Fixing it means touching five variable-width page paths' hand-assembled protobuf, for a
-  type central to neither target audience. The exact fix is recorded where the rejection is.
+Kept honest: everything here was found and reproduced during this work. Ordered by what a new user
+is most likely to hit.
+
+### Correctness / reach — worth doing next
+
+1. **No FSST on write.** The direct answer to the one bench shape nanolance still loses
+   (`high_card`: 7.67 ms vs rust-lance 5.12 ms). zstd is ~48% of that read; rust-lance avoids it by
+   writing FSST, a symbol-table substitution that decodes near memcpy speed. nanolance already
+   *reads* FSST, so this is an encoder, not a format change — the largest single remaining read win,
+   and a real piece of work.
+2. **Pages are much smaller than Lance's.** nanolance emits ~1024 rows per page for bitpacked
+   columns; pylance put 200,000 items in **one** page for the same data. 306 pages vs 2 on the
+   `high_card` dataset means hundreds of extra page-buffer reads, each a seek plus a read. The
+   `DataFileReadScope` win came from the same place, which suggests the remaining per-page overhead
+   is worth measuring before anything more exotic.
+3. **`large_utf8` / `large_binary` are refused on write.** Lance keeps u32 offsets *inside* the
+   chunk for large types and signals the 64-bit Arrow width only in the page descriptor, so
+   supporting these means decoupling the chunk offset width from the declared Arrow width across
+   every variable-width page path. The exact fix is recorded where the rejection is raised.
+4. **Arrow `null`-typed columns are refused, and the message is now wrong.** It says nanolance
+   "cannot store nulls yet", which stopped being true at 1.1. The reader already understands Lance's
+   all-null spelling (`ConstantLayout` + definition-level layers); the writer just has no path to
+   emit it. Small, and the stale wording should go either way.
+5. **Arrow dictionary columns are refused.** Deliberate and explained in the error (nanolance would
+   keep the indices and drop the values), with a working remedy — cast to the value type and let
+   nanolance's own on-disk dictionary do it. Worth revisiting only if a user hits it.
+6. **`list` types are unsupported end to end.** Lance's repetition layer is parsed only far enough to
+   know it is there (`has_repetition`), which is what the chunk header needs; nothing decodes it.
+
+### Ergonomics
+
+7. **No way to split fragments within one `nanolance import` run.** It commits exactly one fragment
+   however many Arrow IPC batches it reads, so a large input becomes one large fragment — which
+   `nanolance info` then warns about. Splitting means re-running per chunk with `--append`. Found
+   while correcting a hint that advertised a `--rows-per-fragment` flag no tool has ever had.
+8. **Plan item 2.2, CMake install/export, is still not done.** There is no `install()` rule in the
+   tree at all, so `find_package(nanolance)` cannot work and the only way to consume the library is
+   to vendor it or point at a build tree. Deferred during Phase 2 and never picked back up; it is the
+   oldest genuinely-open item here.
+
+### Verification gaps
+
+9. **The wheel build has never completed on this branch.** Actions itself is healthy now — the
+   earlier note that it was dead is obsolete, and `ci-platforms` (macOS 14 + Windows 2022) passes —
+   but every `wheels` run is queued or cancelled, because the workflow cancels in-progress runs and
+   this branch has been pushed to faster than cibuildwheel's matrix takes. So manylinux/macOS wheels
+   across CPython 3.9–3.13 remain **unverified**. The Linux wheel itself was built and installed into
+   a clean virtualenv locally.
+
+### Deliberate deviations (not defects)
+
+- **The nullable opt-out was not needed** — simpler than planned.
 - **`tests/test_framed.pcapng` (15.4 MB) stays.** Replacing a real capture with a synthetic fixture
   would change what the pcapng2lance tests cover, and those tests cannot be built without the
   nanotins submodule. Tracked size is ~18 MB, down from 22.8 MB.
-- **GitHub Actions is not running on this repository right now.** Every workflow run on this branch
-  — including long-standing ones untouched by this work (`linux-bench` #229, `Memory safety` #77,
-  `Python bindings` #125) — completes as a failure within 3–7 seconds and produces no downloadable
-  logs at all (the log endpoint 404s). That is what an account- or repository-level Actions problem
-  looks like (spending limit, Actions disabled, no runner minutes), not a workflow defect: it
-  predates the workflows added here and hits jobs whose files have not changed in weeks. Nothing in
-  this document that says "verified" rests on CI — the ctest, pytest and fuzzer numbers were all
-  produced locally — but the **macOS job and the wheel builds specifically cannot be confirmed until
-  Actions runs again**, because there is no local macOS or manylinux to run them on. The Linux wheel
-  itself WAS built and installed into a clean virtualenv locally; what is unverified is cibuildwheel
-  driving that across CPython 3.9–3.13 and macOS.
-
-- **No way to split fragments within one `nanolance import` run.** The run commits exactly one
-  fragment regardless of how many Arrow IPC batches it reads, so a large input becomes one large
-  fragment — which `nanolance info` then warns about, since fuselance loads a fragment as one batch.
-  Splitting means re-running per chunk with `--append`. Found while correcting an `nlance_info` hint
-  that advertised a `--rows-per-fragment` flag no tool has ever had.
-
-- **Not yet verified on this branch:** macOS and Windows (CI is Linux-only), and the ASan/UBSan
-  workflow, which runs in CI rather than here. The libFuzzer workflow's targets were built and run
-  locally (see above).
+- **Two Phase 4 items were closed by measuring rather than implementing** (4.3 default-init buffers,
+  4.4 mmap), and one unplanned refactor was rejected the same way (making `MiniBlockChunkView` an
+  actual view, 3.8% for a span type threaded through six signatures). The numbers are above.
