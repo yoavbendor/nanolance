@@ -1413,6 +1413,25 @@ The order matters and is worth stating: **each bug was only reachable once the o
 fixed.** A single fuzz run would have found the first and stopped. The memory-safety bug was six
 deep.
 
+Final state, one completed 10-minute run against the checked-in corpus:
+
+| | first run | final run |
+|---|---|---|
+| executions | 25,023 in 241 s | **8,784,055 in 601 s** |
+| throughput | ~104/s | **~14,600/s** (140x) |
+| peak RSS | 614 MiB | **383 MiB** |
+| coverage | 520 edges | **1,016 edges** |
+| result | unbounded expansion | **clean** |
+
+The throughput and coverage numbers are the interesting ones: the parser now refuses malformed input
+immediately instead of allocating into it, so the fuzzer reaches twice as much code per unit of time.
+A harness that spends its budget in the allocator is not fuzzing, it is benchmarking `malloc`.
+
+**A caveat that belongs with these numbers:** CI runs each target for 120 seconds. The out-of-bounds
+read surfaced roughly nine minutes into a local run, so CI would not have found it. What CI gives is
+replay of the checked-in reproducers at startup — a regression guard, not a discovery engine. Real
+discovery wants a nightly job with a persisted corpus, which does not exist yet.
+
 That is the argument for the harness, more than any individual finding — and it reframes the question
 that started this. "Should the core use nanom?" matters much less than "does every parser have a
 fuzzer?", which until today was **no**.
@@ -1488,7 +1507,12 @@ is most likely to hit.
 
 ### Verification gaps
 
-10. **The wheel build has never completed on this branch.** Actions itself is healthy now — the
+10. **No nightly fuzz job.** CI runs each target for 120 s, which is a regression guard (it replays
+    the checked-in reproducers) rather than a discovery engine — the out-of-bounds read above took
+    ~9 minutes of local fuzzing to surface. A scheduled job with a persisted corpus would find the
+    next one; nothing does today.
+
+11. **The wheel build has never completed on this branch.** Actions itself is healthy now — the
    earlier note that it was dead is obsolete, and `ci-platforms` (macOS 14 + Windows 2022) passes —
    but every `wheels` run is queued or cancelled, because the workflow cancels in-progress runs and
    this branch has been pushed to faster than cibuildwheel's matrix takes. So manylinux/macOS wheels
