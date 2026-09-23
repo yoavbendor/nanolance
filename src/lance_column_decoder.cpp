@@ -69,9 +69,23 @@ const std::vector<std::uint8_t>* field_metadata_bytes(const pb::Field& field, co
     const std::size_t base = out.size();
     out.resize(static_cast<std::size_t>(new_size));
     std::uint8_t* dst = out.data() + base;
-    for (std::size_t i = 0; i < count; ++i) {
-        std::memcpy(dst, val, vlen);
-        dst += vlen;
+
+    // Doubling fill: write the value once, then repeatedly copy everything written so far. That is
+    // log2(count) memcpys of geometrically growing size instead of `count` memcpys of `vlen` bytes.
+    //
+    // Measured on a 4M-row constant column: int64 12.3 ms -> 4.9 ms. A constant STRING barely moves
+    // (69 ms -> 66 ms) and that is not a shortcoming of this loop -- the cost there is the bytes
+    // themselves. Read time scales linearly with the materialized volume (3.8 MiB 4.0 ms, 91.6 MiB
+    // 50.8 ms, 381.5 MiB 224.8 ms: ~1.7 GB/s, i.e. memory bandwidth), so the only way to beat it is
+    // to not materialize at all -- Arrow REE or a dictionary, which changes the type the caller
+    // gets. See docs/OPTIMIZATION_PLAN.md 4.2.
+    std::memcpy(dst, val, vlen);
+    std::size_t filled = vlen;
+    const std::size_t total = static_cast<std::size_t>(added);
+    while (filled < total) {
+        const std::size_t chunk = std::min(filled, total - filled);
+        std::memcpy(dst + filled, dst, chunk);
+        filled += chunk;
     }
     return true;
 }
@@ -316,9 +330,33 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
 
     // First page for this column: also emit the leading offset 0 (i=0); later pages continue an
     // already-started offsets buffer, so only the per-row terminal offsets (i=1..num_values) are new.
-    for (std::uint64_t i = (out_offsets.empty() ? 0U : 1U); i <= num_values; ++i) {
-        const auto off = read_list_offset(chunk_bytes, i, large) - data_base_in_chunk;
-        append_list_offset(out_offsets, cumulative_base + off, large);
+    //
+    // Grown in ONE resize and then written through a typed pointer, rather than one
+    // append_list_offset() per row. The per-row shape was 32% of a whole read's instruction count in
+    // callgrind -- not the four bytes it copies, but the size/capacity round trip and value-init that
+    // vector::resize() does per call. Shifting a run of offsets by a constant is the same work either
+    // way; only the bookkeeping around it differs, and here it happens once per page.
+    const auto first_index = out_offsets.empty() ? 0U : 1U;
+    const auto emit = static_cast<std::size_t>(num_values + 1U - first_index);
+    const auto write_at = out_offsets.size();
+    out_offsets.resize(write_at + emit * offset_width);
+    const auto shift = cumulative_base - data_base_in_chunk;
+    const auto* src = chunk_bytes.data() + static_cast<std::size_t>(first_index) * offset_width;
+    auto* dst = out_offsets.data() + write_at;
+    if (large) {
+        for (std::size_t i = 0; i < emit; ++i) {
+            std::int64_t v = 0;
+            std::memcpy(&v, src + i * 8U, sizeof(v));
+            v += shift;
+            std::memcpy(dst + i * 8U, &v, sizeof(v));
+        }
+    } else {
+        for (std::size_t i = 0; i < emit; ++i) {
+            std::int32_t v = 0;
+            std::memcpy(&v, src + i * 4U, sizeof(v));
+            const auto out_v = static_cast<std::int32_t>(static_cast<std::int64_t>(v) + shift);
+            std::memcpy(dst + i * 4U, &out_v, sizeof(out_v));
+        }
     }
     return true;
 }
@@ -342,6 +380,10 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
     if (out_offsets.empty()) {
         append_list_offset(out_offsets, 0, out_large);
     }
+    // Each value's decoded length is only known after decompressing it, so unlike the plain
+    // variable-width path this cannot be one bulk write -- but the growth can still be one
+    // reservation instead of a reallocation every few rows.
+    out_offsets.reserve(out_offsets.size() + static_cast<std::size_t>(num_values) * (out_large ? 8U : 4U));
     const auto base = read_list_offset(offsets, 0, offsets_large);
     for (std::uint64_t i = 0; i < num_values; ++i) {
         // decode_variable_width_page already proved this table is non-decreasing and inside `data`.
@@ -1401,6 +1443,10 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             }
             const bool first_page = out.variable.offsets.empty();
             std::uint64_t cumulative = out.variable.data.size();
+            // Same reasoning as expand_fsst_values(): a row's length comes from the dictionary entry
+            // its index selects, so the offsets are built per row -- but only grown once per page.
+            out.variable.offsets.reserve(out.variable.offsets.size() +
+                                         static_cast<std::size_t>(page.length) * (out.variable.large ? 8U : 4U));
             if (first_page) {
                 append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
             }
