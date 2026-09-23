@@ -1363,12 +1363,18 @@ Arrow IPC reader trusts each buffer's int64 uncompressed-length prefix, checked 
 reader's generic 8 GiB ceiling — so **a 328-byte file declaring 4 GiB got a 4 GiB zeroed
 allocation**.
 
-The fix was already written, in another file: `zstd_unframe_buffer` in `lance_column_decoder.cpp` has
-always cross-checked the declared size against `ZSTD_getFrameContentSize` before allocating. This
-parser simply did not, which is a better argument for one shared decompression helper than any
-amount of style discussion. `materialize_ipc_buffer` now asks the frame header what it really holds,
-refuses a disagreement by name, and refuses a frame with no declared content size at all (Arrow
-compresses each buffer in one shot, so every writer nanolance targets emits one).
+My first fix for it was wrong, and **CI's fuzzer rejected it in twelve seconds.**
+
+I cross-checked the Arrow prefix against `ZSTD_getFrameContentSize`, reasoning that the frame header
+is "the authority". It is not: a zstd frame header's content-size field is written by whoever wrote
+the frame, so it comes out of the same untrusted bytes as the Arrow prefix. Making the two agree
+proves only that the file is self-consistent about its lie — set both to 4 GiB and the check passes.
+That is a consistency check, not a bound, and I shipped it as a bound.
+
+The real bound is the one number the file does not choose: **the manifest's `num_deleted_rows`**,
+times four bytes per `uint32` offset. `parse_arrow_ipc_uint32_column` now takes the same `max_values`
+cap `parse_roaring_bitmap` does, and `read_deletion_vector` passes it. The frame cross-check stays,
+correctly labelled as a consistency check.
 
 Both reproducers are checked in at `tests/fuzz/corpus/deletion_vector/` and CI passes that directory
 to the fuzzer, so they are replayed on every push rather than waiting to be rediscovered.

@@ -145,7 +145,8 @@ constexpr std::int8_t kCompressionZstd = 1;  // Arrow CompressionType: 0 = LZ4_F
 /// -1 means "this one did not compress, the rest is raw". Lance always asks for ZSTD, but small
 /// buffers routinely come back as -1, so both spellings occur in practice.
 bool materialize_ipc_buffer(const std::vector<std::uint8_t>& body, std::size_t offset, std::size_t length,
-                            bool compressed, std::vector<std::uint8_t>& out, std::string& error) {
+                            bool compressed, std::uint64_t max_bytes, std::vector<std::uint8_t>& out,
+                            std::string& error) {
     if (offset > body.size() || length > body.size() - offset) {
         error = "deletion file buffer runs past the message body";
         return false;
@@ -171,18 +172,18 @@ bool materialize_ipc_buffer(const std::vector<std::uint8_t>& body, std::size_t o
                    body.begin() + static_cast<std::ptrdiff_t>(payload + payload_len));
         return true;
     }
-    const auto& limits = default_read_limits();
-    if (static_cast<std::uint64_t>(uncompressed) > limits.max_uncompressed_bytes) {
+    // `max_bytes` is what the CALLER knows this buffer can legitimately hold -- for a deletion file,
+    // the manifest's deleted-row count times four. That is the only bound here that the file does not
+    // get to choose, which is the whole point: both the Arrow length prefix and the zstd frame header
+    // declare the uncompressed size, and both come out of the same untrusted bytes.
+    if (static_cast<std::uint64_t>(uncompressed) > max_bytes) {
         error = "deletion file declares an implausible uncompressed size";
         return false;
     }
-    // Ask the zstd frame how big it really is before allocating what the Arrow prefix CLAIMS. The
-    // prefix is attacker-controlled and the limit above is the reader's generic 8 GiB ceiling, so a
-    // 300-byte file could declare 4 GiB and get it -- which is exactly what fuzz_deletion_vector
-    // found. The frame header is the authority and it costs nothing to read.
-    //
-    // zstd_unframe_buffer in lance_column_decoder.cpp has done this since it was written; this parser
-    // simply did not, which is the argument for one decompression helper rather than two.
+    // Cross-check the Arrow prefix against the zstd frame header. This catches an inconsistent file,
+    // and it is NOT a bound: an earlier version of this code treated it as one, and CI's fuzzer
+    // rejected that within twelve seconds. Both numbers are declared by the same untrusted input, so
+    // an attacker simply sets both to 4 GiB and they agree. The bound is `max_bytes` above.
     const auto content = ZSTD_getFrameContentSize(body.data() + payload, payload_len);
     if (content == ZSTD_CONTENTSIZE_ERROR) {
         error = "deletion file buffer is not a valid zstd frame";
@@ -212,7 +213,8 @@ bool materialize_ipc_buffer(const std::vector<std::uint8_t>& body, std::size_t o
 }  // namespace
 
 bool parse_arrow_ipc_uint32_column(const std::vector<std::uint8_t>& bytes,
-                                   std::vector<std::uint32_t>& out_values, std::string& error) {
+                                   std::vector<std::uint32_t>& out_values, std::string& error,
+                                   std::uint64_t max_values) {
     out_values.clear();
     error.clear();
 
@@ -385,8 +387,18 @@ bool parse_arrow_ipc_uint32_column(const std::vector<std::uint8_t>& bytes,
                 bytes.begin() + static_cast<std::ptrdiff_t>(padded_metadata),
                 bytes.begin() + static_cast<std::ptrdiff_t>(padded_metadata + static_cast<std::size_t>(body_length)));
             std::vector<std::uint8_t> values;
+            // Four bytes per uint32 offset: the cap on values IS the cap on this buffer.
+            const std::uint64_t value_budget =
+                max_values != 0U ? max_values
+                                 : default_read_limits().max_uncompressed_bytes / sizeof(std::uint32_t);
+            std::uint64_t budget_bytes = 0;
+            if (!checked_mul(value_budget, sizeof(std::uint32_t), budget_bytes)) {
+                error = "deletion file value budget overflows";
+                return false;
+            }
             if (!materialize_ipc_buffer(body, static_cast<std::size_t>(values_offset),
-                                        static_cast<std::size_t>(values_length), compressed, values, error)) {
+                                        static_cast<std::size_t>(values_length), compressed,
+                                        budget_bytes, values, error)) {
                 return false;
             }
             // `rows` is an int64 straight off the wire. It is already known non-negative, but
@@ -664,7 +676,8 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
             return false;
         }
     } else {
-        if (!parse_arrow_ipc_uint32_column(bytes, out_sorted_offsets, error)) {
+        if (!parse_arrow_ipc_uint32_column(bytes, out_sorted_offsets, error,
+                                           deletion_file.num_deleted_rows)) {
             return false;
         }
         std::sort(out_sorted_offsets.begin(), out_sorted_offsets.end());

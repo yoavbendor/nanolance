@@ -142,9 +142,12 @@ Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](https:
   a 41 KB input that asks for a gigabyte.
 
   The same target then found the Arrow IPC side: a buffer's int64 uncompressed-length prefix was
-  trusted up to the generic 8 GiB ceiling, so a 328-byte file could ask for 4 GiB.
-  `materialize_ipc_buffer` now cross-checks it against `ZSTD_getFrameContentSize` before allocating,
-  the way `zstd_unframe_buffer` always has. Both reproducers are checked in at
+  trusted up to the generic 8 GiB ceiling, so a 328-byte file could ask for 4 GiB. Cross-checking it
+  against `ZSTD_getFrameContentSize` was **not** a fix — a frame header's content size is written by
+  whoever wrote the frame, so both numbers come from the same untrusted bytes and an attacker simply
+  makes them agree. CI's fuzzer rejected that version in twelve seconds. The bound is the manifest's
+  `num_deleted_rows`, which the file does not choose, passed down as a byte ceiling; the frame
+  cross-check remains as a consistency check. Both reproducers are checked in at
   [`tests/fuzz/corpus/deletion_vector/`](https://github.com/yoavbendor/nanolance/tree/main/tests/fuzz/corpus/deletion_vector)
   and replayed by CI on every push.
 

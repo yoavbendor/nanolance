@@ -44,7 +44,14 @@ bool parse_roaring_bitmap(const std::vector<std::uint8_t>& bytes,
                           std::uint64_t max_values = 0);
 
 /// Parse an Arrow IPC file holding a single non-null `uint32` column. Exposed for testing.
+///
+/// `max_values` bounds the parse the same way it does for `parse_roaring_bitmap`, and for the same
+/// reason: a compressed buffer's uncompressed size is declared, not derived. Both the Arrow
+/// length prefix and the zstd frame header state it, and both come from the file -- making them
+/// agree proves only that the file is self-consistent about its lie. 0 means "use
+/// `default_read_limits()`"; the real caller passes the manifest's `num_deleted_rows`.
 bool parse_arrow_ipc_uint32_column(const std::vector<std::uint8_t>& bytes,
-                                   std::vector<std::uint32_t>& out_values, std::string& error);
+                                   std::vector<std::uint32_t>& out_values, std::string& error,
+                                   std::uint64_t max_values = 0);
 
 }  // namespace nano_lance

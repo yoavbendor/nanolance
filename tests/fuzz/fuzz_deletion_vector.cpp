@@ -62,14 +62,16 @@ void check_arrow_ipc(const std::vector<std::uint8_t>& bytes) {
     static const std::vector<std::uint32_t> kPrefix{5U};
     std::vector<std::uint32_t> out = kPrefix;
     std::string error;
-    if (!nano_lance::parse_arrow_ipc_uint32_column(bytes, out, error)) {
+    // Same reasoning as check_roaring: production always passes the manifest's deleted-row count.
+    constexpr std::uint64_t kMaxValues = 1U << 16U;
+    if (!nano_lance::parse_arrow_ipc_uint32_column(bytes, out, error, kMaxValues)) {
         assert(!error.empty() && "a refused IPC file must say why");
         return;
     }
 
     std::vector<std::uint32_t> again{3U, 3U};
     std::string again_error;
-    const bool ok_again = nano_lance::parse_arrow_ipc_uint32_column(bytes, again, again_error);
+    const bool ok_again = nano_lance::parse_arrow_ipc_uint32_column(bytes, again, again_error, kMaxValues);
     assert(ok_again && again == out && "parsing must be deterministic and replace the output");
     (void)ok_again;
 }
