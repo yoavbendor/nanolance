@@ -1466,6 +1466,50 @@ roaring containers map cleanly onto `length_data` / `length_count` / `take` / `v
 
 ---
 
+## The read matrix, and the four gaps it found immediately
+
+Asked where coverage was thin, the honest way to answer was to look at where the bugs had actually
+been, not at which files lacked a test named after them. Every stock-Lance defect in this project has
+been on the **read** side, and the reason is structural: when nanolance writes, it chooses the
+encoding; when it reads a pylance file, Lance chose, **and Lance chooses by row count**. The same
+column is flat at 100 rows, dictionary-encoded at 1024 and run-length encoded at 5000.
+
+The write direction was well covered — `test_write_encoding_matrix.py`, 21 shapes x 3 modes, both
+readers agreeing. The read direction had spot tests and the nullable matrix, nothing systematic.
+
+`test_lance_read_matrix.py` is the counterpart: 19 column shapes x 6 row counts, each written by
+pylance and compared against pylance's own read. **It failed 14 of 114 cells the day it was
+written**, in four classes, none of which any existing test touched:
+
+| shape | descriptor Lance produced | symptom |
+|---|---|---|
+| `struct`, every size | leaf columns only, no physical column for the parent | `struct field has no children in mapping` |
+| `time64` ≥1024 | `dict=General{LZ4,Flat(64)}` | `dict block header invalid` |
+| `decimal128` ≥20000 | `dict=General{LZ4,Flat(128)}` | `dict block header invalid` |
+| `str_runs` ≥5000 | `Rle{Flat(32),Flat(8)}` over `General{LZ4,Variable}` | buffer sized 16388, needed 20004 |
+
+Three distinct missing decoders behind them:
+
+1. **Structs written by pylance.** It stores a struct as its flattened leaves with no physical column
+   for the parent; nanolance's schema mapper expects the parent to carry children. nanolance can
+   write a struct and read its own back — the reverse direction was never tested.
+2. **Dictionaries whose values are fixed-width.** nanolance's dictionary path assumes a
+   variable-width block and reads the header of a block that has none. Lance builds these for
+   temporal and decimal columns once the cardinality justifies it.
+3. **Dictionary + RLE'd indices over an LZ4 dictionary.** nanolance writes dict+RLE with a *zstd*
+   dictionary and reads that shape; this combination lands in the wrong branch.
+
+All four are pinned in the matrix by their **specific** message, so each fails loudly the moment it
+is fixed. `test_the_gap_list_is_not_stale` additionally asserts every entry still matches a cell the
+matrix generates — otherwise trimming a size would orphan an entry and leave the suite advertising a
+gap nobody reproduces.
+
+The general point, which is the answer to "what needs more tests": **a format reader's coverage axis
+is the writer's choices, not the reader's types.** Enumerating types found none of this; enumerating
+types x sizes found all of it in one run.
+
+---
+
 ## Deviations from the plan, and open items
 
 Kept honest: everything here was found and reproduced during this work. Ordered by what a new user
@@ -1473,52 +1517,58 @@ is most likely to hit.
 
 ### Correctness / reach — worth doing next
 
-1. **No FSST on write.** The direct answer to the one bench shape nanolance still loses
+1. **Three read gaps for pylance-written columns**, all found by `test_lance_read_matrix.py` and all
+   pinned there: structs (schema mapping), fixed-width dictionaries (`General{LZ4,Flat(64|128)}`,
+   hit by `time64` and `decimal128`), and dict+RLE over an LZ4 dictionary (hit by a repetitive string
+   column at 5000+ rows). These are the most user-visible items on this list: each makes an ordinary
+   pylance dataset unreadable.
+
+2. **No FSST on write.** The direct answer to the one bench shape nanolance still loses
    (`high_card`: 7.67 ms vs rust-lance 5.12 ms). zstd is ~48% of that read; rust-lance avoids it by
    writing FSST, a symbol-table substitution that decodes near memcpy speed. nanolance already
    *reads* FSST, so this is an encoder, not a format change — the largest single remaining read win,
    and a real piece of work.
-2. **Pages are much smaller than Lance's.** nanolance emits ~1024 rows per page for bitpacked
+3. **Pages are much smaller than Lance's.** nanolance emits ~1024 rows per page for bitpacked
    columns; pylance put 200,000 items in **one** page for the same data. 306 pages vs 2 on the
    `high_card` dataset means hundreds of extra page-buffer reads, each a seek plus a read. The
    `DataFileReadScope` win came from the same place, which suggests the remaining per-page overhead
    is worth measuring before anything more exotic.
-3. **`large_utf8` / `large_binary` are refused on write.** Lance keeps u32 offsets *inside* the
+4. **`large_utf8` / `large_binary` are refused on write.** Lance keeps u32 offsets *inside* the
    chunk for large types and signals the 64-bit Arrow width only in the page descriptor, so
    supporting these means decoupling the chunk offset width from the declared Arrow width across
    every variable-width page path. The exact fix is recorded where the rejection is raised.
-4. **Arrow `null`-typed columns are refused, and the message is now wrong.** It says nanolance
+5. **Arrow `null`-typed columns are refused, and the message is now wrong.** It says nanolance
    "cannot store nulls yet", which stopped being true at 1.1. The reader already understands Lance's
    all-null spelling (`ConstantLayout` + definition-level layers); the writer just has no path to
    emit it. Small, and the stale wording should go either way.
-5. **Arrow dictionary columns are refused.** Deliberate and explained in the error (nanolance would
+6. **Arrow dictionary columns are refused.** Deliberate and explained in the error (nanolance would
    keep the indices and drop the values), with a working remedy — cast to the value type and let
    nanolance's own on-disk dictionary do it. Worth revisiting only if a user hits it.
-6. **`list` types are unsupported end to end.** Lance's repetition layer is parsed only far enough to
+7. **`list` types are unsupported end to end.** Lance's repetition layer is parsed only far enough to
    know it is there (`has_repetition`), which is what the chunk header needs; nothing decodes it.
 
 ### Ergonomics
 
-7. **`nanom` is not used by the core library, deliberately** — see the section above. Revisit only
+8. **`nanom` is not used by the core library, deliberately** — see the section above. Revisit only
    if nanolance moves to C++23 for other reasons; `deletion_vector.cpp` would be the first candidate,
    and the protobuf paths the last (nanom has no varint combinator).
-8. **No way to split fragments within one `nanolance import` run.** It commits exactly one fragment
+9. **No way to split fragments within one `nanolance import` run.** It commits exactly one fragment
    however many Arrow IPC batches it reads, so a large input becomes one large fragment — which
    `nanolance info` then warns about. Splitting means re-running per chunk with `--append`. Found
    while correcting a hint that advertised a `--rows-per-fragment` flag no tool has ever had.
-9. **Plan item 2.2, CMake install/export, is still not done.** There is no `install()` rule in the
+10. **Plan item 2.2, CMake install/export, is still not done.** There is no `install()` rule in the
    tree at all, so `find_package(nanolance)` cannot work and the only way to consume the library is
    to vendor it or point at a build tree. Deferred during Phase 2 and never picked back up; it is the
    oldest genuinely-open item here.
 
 ### Verification gaps
 
-10. **No nightly fuzz job.** CI runs each target for 120 s, which is a regression guard (it replays
+11. **No nightly fuzz job.** CI runs each target for 120 s, which is a regression guard (it replays
     the checked-in reproducers) rather than a discovery engine — the out-of-bounds read above took
     ~9 minutes of local fuzzing to surface. A scheduled job with a persisted corpus would find the
     next one; nothing does today.
 
-11. **The wheel build has never completed on this branch.** Actions itself is healthy now — the
+12. **The wheel build has never completed on this branch.** Actions itself is healthy now — the
    earlier note that it was dead is obsolete, and `ci-platforms` (macOS 14 + Windows 2022) passes —
    but every `wheels` run is queued or cancelled, because the workflow cancels in-progress runs and
    this branch has been pushed to faster than cibuildwheel's matrix takes. So manylinux/macOS wheels
