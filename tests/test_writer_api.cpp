@@ -174,6 +174,42 @@ void test_zeroed_options_are_the_defaults() {
     }
 }
 
+/// A one-column batch whose values are all identical, so structural encoding has something
+/// unambiguous to do with it (ConstantLayout: the value lives in the page descriptor and the page
+/// has no data buffers at all).
+///
+/// The two-column sample above deliberately is NOT used for this: at six rows, bitpacking correctly
+/// loses to a flat page -- a FastLanes chunk pads to 1024 values whatever the row count -- so
+/// structural encoding on and off produce the same bytes and the test would prove nothing. That is
+/// the writer being right, not the option being ignored, and it is exactly the confusion a constant
+/// column avoids.
+void write_constant_sample(NanoLanceWriter* writer) {
+    ArrowSchema child{};
+    child.format = "l";
+    child.name = "k";
+    ArrowSchema* child_ptrs[1] = {&child};
+    ArrowSchema schema{};
+    schema.format = "+s";
+    schema.n_children = 1;
+    schema.children = child_ptrs;
+
+    static const std::int64_t kSame[8] = {11, 11, 11, 11, 11, 11, 11, 11};
+    const void* buffers[2] = {nullptr, kSame};
+    ArrowArray column{};
+    column.length = 8;
+    column.n_buffers = 2;
+    column.buffers = buffers;
+
+    ArrowArray* array_children[1] = {&column};
+    ArrowArray batch{};
+    batch.length = 8;
+    batch.n_children = 1;
+    batch.children = array_children;
+
+    require(nano_lance_write_batch(writer, &batch, &schema) == NANO_LANCE_OK,
+            std::string("write_batch: ") + nano_lance_writer_last_error(writer));
+}
+
 /// `disable_structural_encoding` is negated so a zeroed struct keeps the default; check the negation
 /// actually reaches the writer rather than being ignored in either direction.
 void test_disable_structural_encoding_is_wired_the_right_way_round() {
@@ -182,7 +218,7 @@ void test_disable_structural_encoding_is_wired_the_right_way_round() {
         NanoLanceWriter w{};
         require(nano_lance_writer_init(&w, with_setter.string().c_str(), 0) == NANO_LANCE_OK, "init");
         require(nano_lance_writer_set_structural_encoding(&w, false) == NANO_LANCE_OK, "set_structural");
-        write_sample(&w);
+        write_constant_sample(&w);
         require(nano_lance_writer_commit(&w, false) == NANO_LANCE_OK, "commit");
         require(nano_lance_writer_close(&w) == NANO_LANCE_OK, "close");
     }
@@ -193,7 +229,7 @@ void test_disable_structural_encoding_is_wired_the_right_way_round() {
         options.disable_structural_encoding = true;
         NanoLanceWriter w{};
         require(nano_lance_writer_open(&w, with_option.string().c_str(), &options) == NANO_LANCE_OK, "open");
-        write_sample(&w);
+        write_constant_sample(&w);
         require(nano_lance_writer_commit(&w, false) == NANO_LANCE_OK, "commit");
         require(nano_lance_writer_close(&w) == NANO_LANCE_OK, "close");
     }
@@ -202,7 +238,7 @@ void test_disable_structural_encoding_is_wired_the_right_way_round() {
     {
         NanoLanceWriter w{};
         require(nano_lance_writer_open(&w, defaults.string().c_str(), nullptr) == NANO_LANCE_OK, "open");
-        write_sample(&w);
+        write_constant_sample(&w);
         require(nano_lance_writer_commit(&w, false) == NANO_LANCE_OK, "commit");
         require(nano_lance_writer_close(&w) == NANO_LANCE_OK, "close");
     }

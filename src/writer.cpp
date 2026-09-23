@@ -121,6 +121,57 @@ bool dispatch_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t bpv,
     }
 }
 
+template <class T>
+std::size_t bitpack_words_for_column(const std::uint8_t* data, std::size_t n) {
+    // One FastLanes chunk per 1024 values; each chunk stores its own width, so each is costed on its
+    // own maximum.
+    constexpr std::size_t kBits = sizeof(T) * 8U;
+    std::size_t total_words = 0;
+    for (std::size_t base = 0; base < n; base += 1024U) {
+        const std::size_t count = std::min<std::size_t>(1024U, n - base);
+        T bits_or = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            T v = 0;
+            std::memcpy(&v, data + (base + i) * sizeof(T), sizeof(T));
+            bits_or = static_cast<T>(bits_or | v);
+        }
+        std::size_t width = 0;
+        while (bits_or != 0U) {
+            ++width;
+            bits_or = static_cast<T>(bits_or >> 1U);
+        }
+        total_words += 1U + (1024U * width) / kBits;  // one inline width word + the packed words
+    }
+    return total_words;
+}
+
+/// Is bitpacking actually smaller than storing the values flat?
+///
+/// This mirrors Lance's own rule (`rust/lance-encoding/src/compression.rs`: a bitpacked block is
+/// only offered when its estimated size is strictly below `raw_bytes`) rather than inventing a
+/// threshold. Costing it per 1024-value chunk is what makes the answer right: each chunk carries its
+/// own width word, so a column that needs the full width is strictly LARGER bitpacked than flat, and
+/// pays a FastLanes transpose on every read for it.
+///
+/// nanolance used to bitpack every integer column unconditionally. On a column of random `uint64`
+/// ids -- the `high_card` bench shape, and any hash/uuid column -- that made the file 2.4% bigger and
+/// the read 0.85 ms instead of 0.50 ms. Stock Lance writes `Flat(64)` for the same data.
+bool bitpack_beats_flat(const nano_lance::ColumnValues& cv, std::size_t bpv) {
+    if (bpv == 0U || cv.fixed_size() == 0U || cv.fixed_size() % bpv != 0U) {
+        return true;  // not our call to make; leave the column as it was tagged
+    }
+    const std::size_t n = cv.fixed_size() / bpv;
+    const auto* data = cv.fixed_data();
+    std::size_t words = 0;
+    switch (bpv) {
+        case 1U: words = bitpack_words_for_column<std::uint8_t>(data, n); break;
+        case 2U: words = bitpack_words_for_column<std::uint16_t>(data, n); break;
+        case 4U: words = bitpack_words_for_column<std::uint32_t>(data, n); break;
+        default: words = bitpack_words_for_column<std::uint64_t>(data, n); break;
+    }
+    return words * bpv < cv.fixed_size();
+}
+
 // Decide whether RLE beats bitpacking for a fixed-width column. Lance requires 8-bit run lengths, so
 // runs longer than 255 are split into <=255 sub-runs; we count those split runs. Two passes (same
 // structure as variable_column_dict_rle_beneficial): pass 1 counts only, with the reject-early exit
@@ -951,6 +1002,15 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
                     for (auto& field : disk_schema.fields) {
                         if (field.id == pf->id) {
                             field.metadata["nanolance:packing"] = "rle";
+                            break;
+                        }
+                    }
+                } else if (!bitpack_beats_flat(cv, bpv)) {
+                    // Incompressible integers (hashes, ids, random keys): drop the bitpack tag so the
+                    // column writes flat pages, which is both smaller and cheaper to read.
+                    for (auto& field : disk_schema.fields) {
+                        if (field.id == pf->id) {
+                            field.metadata.erase("nanolance:packing");
                             break;
                         }
                     }

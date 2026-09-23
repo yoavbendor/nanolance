@@ -1243,6 +1243,59 @@ untrusted read path, `fuzz_decode` was re-run over them: 3,346,817 runs, clean.
 
 ---
 
+## Choosing an encoding by whether it pays, not by type
+
+Asked where high-cardinality reads still lag rust-lance, I wrote the same dataset with both and
+compared the page descriptors. The answer was not in the decoder:
+
+| column | rust-lance picks | nanolance picked |
+|---|---|---|
+| `id` — random `uint64` | `Flat(64)` | `InlineBitpacking(64)` |
+| `label` — random 16-char string | `Fsst{...}` | `General(ZSTD)+Variable` |
+
+nanolance bitpacked **every** integer column, unconditionally, because integers are bitpackable.
+That is a claim about the type, not the data, and it is wrong in two ways:
+
+- **Values that need the full width** pack to exactly their own size, plus a width word per chunk. A
+  column of ids, hashes or uuids therefore comes out *larger* bitpacked, and pays a FastLanes
+  transpose on every read to get back what it started with. Measured on 200k random `uint64`:
+  **0.85 ms → 0.50 ms per read (−41%)**, file 2.4% smaller.
+- **A FastLanes chunk always covers 1024 values, padded.** Any integer column shorter than that was
+  inflated to a whole block. An 8-row `int64` column's page payload was **528 bytes for 64 bytes of
+  data**; the dataset as a whole went 1041 → 499 bytes. For the "simple parquet user" this project
+  is courting, whose first file is small, that was a 2× penalty on the very first thing they write.
+
+The rule is now Lance's own (`rust/lance-encoding/src/compression.rs`): cost the packed form per
+1024-value chunk — one width word plus `1024 * width / bits` words — and bitpack only when that is
+strictly smaller than raw. Mirroring the reference implementation rather than inventing a threshold
+is deliberate; "how much saving is enough" is exactly the kind of number that gets picked once and
+never re-examined.
+
+It was the writer's own test that caught the second case: `test_writer_api.cpp` asserted that
+disabling structural encoding *changes* the bytes, and after this change its six-row sample encodes
+identically either way — because at six rows bitpacking correctly loses. That test now uses a
+constant column, where structural encoding has something unambiguous to do.
+
+`bindings/python/tests/test_write_encoding_choice.py` pins both directions, including the one that
+matters most: **a narrow column must still be bitpacked.** Without it, "only bitpack when it pays"
+could quietly become "never bitpack" and every other assertion would still hold. Verified by
+reverting the check: the small-column and incompressible-column tests fail, the narrow-column one
+does not.
+
+### What is left on high_card, and it is not the decoder
+
+After this, `high_card` reads 7.67 ms against rust-lance's 5.12 ms. Callgrind says where the rest
+goes: **zstd decompression is ~48% of the read** (`ZSTD_decompressSequences` alone is 37%). That is
+not waste — zstd earns its size on that column (~2.6× on the string data; nanolance's file is
+*smaller* than lance's, 18.0 vs 18.9 B/row). It is a deliberate trade that rust-lance declines by
+using **FSST**, which decompresses at roughly memcpy speed because it is a symbol-table
+substitution rather than an entropy coder.
+
+nanolance already *reads* FSST. Writing it is the real answer to this shape, and it is a genuine
+piece of work (an FSST encoder), not a tweak — so it is listed below rather than guessed at here.
+
+---
+
 ## Deviations from the plan, and open items
 
 - **The nullable opt-out was not needed** (see above) — simpler than planned.
