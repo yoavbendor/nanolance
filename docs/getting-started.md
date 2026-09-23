@@ -97,8 +97,10 @@ or `nano_lance_table_read_dataset` / `nano_lance_table_read_dataset_ex` (C ABI,
 - **nanolance** (namespace `nano_lance`, include prefix `nanolance/`): the Lance writer/reader. CMake
   targets: `nanolance_proto`, `nanolance_reader`, `nanolance` (writing); link `nanolance_reader` alone
   if you only fetch external blobs.
-- **Tool:** `arrowipc2lance` — Arrow IPC stream → Lance dataset; `nlance2table` — Lance dataset →
-  CSV/NDJSON text (for validation).
+- **CLI:** one `nanolance` binary with subcommands: `import` (Arrow IPC stream → Lance dataset),
+  `info` (fragments, rows, file sizes), `cat` (dataset → CSV/NDJSON, for validation) and `stitch`.
+  `nanolance --help` lists them. The original names (`arrowipc2lance`, `nlance_info`,
+  `nlance2table`, `nlance_stitch`) are still built and behave identically.
 
 For the full integration guide — API lifecycle, the measured per-column compression table, the
 data-model recipe for small files, and interop verification — see

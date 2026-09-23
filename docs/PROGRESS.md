@@ -1087,6 +1087,60 @@ find candidates. Never to size them.
 
 ---
 
+## Phase 5 — the writer's front door, and one CLI instead of four
+
+**One options struct (5.1).** The writer's options were eight `set_*` calls that all had to precede
+the first `write_batch` — a rule enforced at runtime with `INVALID_STATE` and nowhere else.
+`NanoLanceWriteOptions` + `nano_lance_writer_open` take them together, so there is no "after" for
+them to be in. Both `init` forms and every setter stay and now delegate, so nothing that compiled
+before stops compiling.
+
+One decision is worth recording because it looks like a wart and is not: **a zeroed struct means the
+defaults**, which forced the one option that is ON by default to be spelled as a negation,
+`disable_structural_encoding`. A positive `structural_encoding` field would make
+`NanoLanceWriteOptions options = {0}` silently turn structural encodings off — precisely the class of
+trap this item exists to remove, reintroduced in the fix for it. The C++ `WriteOptions` has member
+initializers and spells it positively.
+
+**An RAII writer (5.2).** `nano_lance::Writer` (`nanolance/writer.hpp`) owns the handle, so an early
+return closes it. Errors stay in the house style (`bool` + `error()`, not exceptions); only the
+lifetime changes. `commit()` defaults `is_append` to whatever `open()` was given and flips to `true`
+after the first successful commit, so the argument that was easiest to get wrong has a right answer
+by default.
+
+`tests/test_writer_api.cpp` is about **equivalence**, not coverage: the options struct against the
+equivalent setters, a zeroed struct and a `NULL` pointer against plain `init`,
+`disable_structural_encoding` against `set_structural_encoding(false)`, and the RAII writer against
+the hand-rolled C sequence — each compared as **byte-identical data files**. A second way to write
+files would be worse than none.
+
+**One CLI (5.3).** `nanolance import` / `info` / `cat` / `stitch`, replacing `arrowipc2lance`,
+`nlance_info`, `nlance2table` and `nlance_stitch` as the surface a user is meant to find. The old
+names stay, and deliberately: each tool's source is compiled **twice** — once into its standalone
+binary, once into `nanolance` with `NANOLANCE_CLI_SUBCOMMAND` defined, which drops its `main()` and
+leaves the subcommand entry point. One implementation, two front doors. Deleting the four names would
+have broken every script that calls them while buying nothing visible; duplicating the argument
+parsing to keep them would have created exactly the drift this was meant to remove.
+
+`tests/smoke_nanolance_cli.sh` pins the join: the same Arrow IPC input through both front doors must
+produce byte-identical data files, `cat` and `info` must produce identical text, and a value-taking
+flag (`--compress -l 9`) must survive the forwarding **and** be shown to have changed the output —
+otherwise the comparison proves nothing. It fails against a dispatcher that drops one forwarded
+argument, which is how it was checked. Subcommands print `argv[0]`, so `nanolance info` says
+`Usage: nanolance info`.
+
+Two stale claims surfaced while wiring this up, and were corrected rather than carried across:
+
+- `arrowipc2lance --help` still said **"nanolance cannot store nulls yet"**. It has since 1.1.
+- `nlance_info`'s hint suggested re-ingesting with `--rows-per-fragment`, **a flag no tool has ever
+  had**. One `import` run commits exactly one fragment however many IPC batches it reads, so the hint
+  now says to split the input and re-run with `--append`. The real gap — no way to split fragments
+  within a single run — is listed below rather than papered over.
+
+**5.4** turned out to be already done: `append_fixed_values` went with 4.1's rewrite.
+
+---
+
 ## Deviations from the plan, and open items
 
 - **The nullable opt-out was not needed** (see above) — simpler than planned.
@@ -1107,6 +1161,12 @@ find candidates. Never to size them.
   Actions runs again**, because there is no local macOS or manylinux to run them on. The Linux wheel
   itself WAS built and installed into a clean virtualenv locally; what is unverified is cibuildwheel
   driving that across CPython 3.9–3.13 and macOS.
+
+- **No way to split fragments within one `nanolance import` run.** The run commits exactly one
+  fragment regardless of how many Arrow IPC batches it reads, so a large input becomes one large
+  fragment — which `nanolance info` then warns about, since fuselance loads a fragment as one batch.
+  Splitting means re-running per chunk with `--append`. Found while correcting an `nlance_info` hint
+  that advertised a `--rows-per-fragment` flag no tool has ever had.
 
 - **Not yet verified on this branch:** macOS and Windows (CI is Linux-only), and the ASan/UBSan
   workflow, which runs in CI rather than here. The libFuzzer workflow's targets were built and run

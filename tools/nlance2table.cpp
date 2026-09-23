@@ -9,6 +9,8 @@
 // semantic-free: it does not know a column is a MAC or an IP). Nested struct columns flatten to dotted
 // names in CSV and nested objects in NDJSON. Nulls are an empty CSV field / JSON null.
 
+#include "cli_subcommands.hpp"
+
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/version.hpp"
 
@@ -230,7 +232,7 @@ void json_value(const ArrowArrayView* col, int64_t row, const ArrowSchema* schem
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int nanolance_cli_cat(int argc, char** argv) {
     CLI::App app{"Dump a nanolance-written Lance dataset to CSV or NDJSON"};
     std::string dataset_path;
     std::string output_path;
@@ -250,7 +252,7 @@ int main(int argc, char** argv) {
     } else if (format_str == "ndjson" || format_str == "jsonl") {
         format = Format::Ndjson;
     } else {
-        std::fprintf(stderr, "nlance2table: unknown --format '%s' (expected csv | ndjson)\n", format_str.c_str());
+        std::fprintf(stderr, "%s: unknown --format '%s' (expected csv | ndjson)\n", argv[0], format_str.c_str());
         return 2;
     }
 
@@ -258,7 +260,7 @@ int main(int argc, char** argv) {
     std::vector<ArrowArray> batches;
     std::string err;
     if (!nano_lance::lance_table_read_dataset(dataset_path, schema, batches, err)) {
-        std::fprintf(stderr, "nlance2table: read failed: %s\n", err.c_str());
+        std::fprintf(stderr, "%s: read failed: %s\n", argv[0], err.c_str());
         return 1;
     }
 
@@ -267,7 +269,7 @@ int main(int argc, char** argv) {
     if (!output_path.empty()) {
         file.open(output_path, std::ios::binary);
         if (!file) {
-            std::fprintf(stderr, "nlance2table: cannot open output '%s'\n", output_path.c_str());
+            std::fprintf(stderr, "%s: cannot open output '%s'\n", argv[0], output_path.c_str());
             return 1;
         }
         os = &file;
@@ -298,7 +300,7 @@ int main(int argc, char** argv) {
         ArrowError ae{};
         if (ArrowArrayViewInitFromSchema(&view, &schema, &ae) != NANOARROW_OK ||
             ArrowArrayViewSetArray(&view, &batch, &ae) != NANOARROW_OK) {
-            std::fprintf(stderr, "nlance2table: array view init failed: %s\n", ArrowErrorMessage(&ae));
+            std::fprintf(stderr, "%s: array view init failed: %s\n", argv[0], ArrowErrorMessage(&ae));
             ArrowArrayViewReset(&view);
             rc = 1;
             break;
@@ -350,3 +352,9 @@ int main(int argc, char** argv) {
     }
     return rc;
 }
+
+#ifndef NANOLANCE_CLI_SUBCOMMAND
+// Standalone build of this tool. The `nanolance` binary compiles the same file with
+// NANOLANCE_CLI_SUBCOMMAND defined and calls nanolance_cli_cat from its dispatcher instead.
+int main(int argc, char** argv) { return nanolance_cli_cat(argc, argv); }
+#endif

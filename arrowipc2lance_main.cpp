@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "cli_subcommands.hpp"
+
 #include "nanolance/nano_lance_reader.h"
 #include "nanolance/nano_lance_writer.h"
 #include "nanolance/version.hpp"
@@ -49,9 +51,9 @@ void set_stdin_binary() {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int nanolance_cli_import(int argc, char** argv) {
     CLI::App app{"Convert Arrow IPC streams (from a file or stdin) to Lance v2.2 datasets"};
-    app.set_version_flag("--version", std::string("arrowipc2lance (nanolance ") + nanolance::library_version() + ")");
+    app.set_version_flag("--version", std::string(argv[0]) + " (nanolance " + nanolance::library_version() + ")");
 
     std::string output_path;
     std::string input_path;
@@ -71,8 +73,8 @@ int main(int argc, char** argv) {
     app.add_flag("-a,--append", append, "Append to an existing dataset");
     app.add_flag("--ignore-nullability",
                  ignore_nullability,
-                 "No-op, accepted for compatibility: nullable-flagged fields are accepted by default now. "
-                 "Batches that actually contain a null are refused either way -- nanolance cannot store nulls yet.");
+                 "No-op, accepted for compatibility: nullable-flagged fields are accepted by default now, "
+                 "and nulls are written through Lance's definition levels. A null struct is still refused.");
     app.add_flag("--compress", compress,
                  "zstd-compress variable-width (string/binary) columns (Lance-compatible)");
     app.add_flag("--no-structural", no_structural,
@@ -304,7 +306,13 @@ int main(int argc, char** argv) {
         std::cerr << nano_lance_writer_last_error(&writer) << '\n';
         return close_status;
     }
-    std::cerr << "arrowipc2lance: committed " << batches << " complete IPC batches to " << output_path << '\n';
+    std::cerr << argv[0] << ": committed " << batches << " complete IPC batches to " << output_path << '\n';
     std::cerr << "nl_write_ms=" << core_write_ms << '\n';  // core ingest+encode+commit only (machine-readable)
     return 0;
 }
+
+#ifndef NANOLANCE_CLI_SUBCOMMAND
+// Standalone build of this tool. The `nanolance` binary compiles the same file with
+// NANOLANCE_CLI_SUBCOMMAND defined and calls nanolance_cli_import from its dispatcher instead.
+int main(int argc, char** argv) { return nanolance_cli_import(argc, argv); }
+#endif

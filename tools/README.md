@@ -1,6 +1,26 @@
 # nanolance tools
 
-## `nlance2table` — dump a Lance dataset to CSV / NDJSON
+## `nanolance` — one CLI over the four main tools
+
+```
+nanolance import [...]    # was arrowipc2lance: Arrow IPC stream -> Lance dataset
+nanolance info <ds>       # was nlance_info:    fragments, rows per fragment, file sizes
+nanolance cat [...] <ds>  # was nlance2table:   dataset -> CSV / NDJSON
+nanolance stitch [...]    # was nlance_stitch:  several datasets -> one
+```
+
+Four binaries with four naming conventions meant nothing told you the other three existed.
+`nanolance --help` now teaches the whole surface. Each subcommand is the *same source file* compiled
+into both the dispatcher and its original standalone binary, so the old names keep working and there
+is no second argument grammar to drift: every flag documented below applies to both spellings.
+`tests/smoke_nanolance_cli.sh` pins that by running the same input through both front doors and
+comparing the bytes.
+
+The remaining tools (`nlance-pagelayout`, `nlance_blobgen`, `nlance_blobfetch`, `nlbench`,
+`nlbench_gendata`) stay standalone: they are development and benchmarking instruments rather than
+part of the surface a user is meant to discover.
+
+## `nlance2table` — dump a Lance dataset to CSV / NDJSON (`nanolance cat`)
 
 A small reader-side companion that prints the rows of a **nanolance-written** Lance dataset as text. It is
 deliberately scoped to what nanolance itself writes (not arbitrary Lance encodings/compressions), reusing

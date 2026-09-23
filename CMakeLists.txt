@@ -344,6 +344,7 @@ endif()
 
 if(NANOLANCE_BUILD_TOOLS)
     add_executable(arrowipc2lance arrowipc2lance_main.cpp)
+    target_include_directories(arrowipc2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     target_compile_features(arrowipc2lance PRIVATE cxx_std_20)
     target_link_libraries(arrowipc2lance PRIVATE CLI11::CLI11 nanolance)
 
@@ -356,12 +357,14 @@ if(NANOLANCE_BUILD_TOOLS)
     target_link_libraries(nlbench_gendata PRIVATE nanolance)
 
     add_executable(nlance2table tools/nlance2table.cpp)
+    target_include_directories(nlance2table PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     target_compile_features(nlance2table PRIVATE cxx_std_20)
     target_link_libraries(nlance2table PRIVATE CLI11::CLI11 nanolance)
 
     # nlance-stitch: gather/merge many free-standing worker .lance folders into one self-contained dataset
     # (Option A: relocate fragments into one data/ + write one master manifest; no column data re-encode).
     add_executable(nlance_stitch tools/nlance_stitch.cpp)
+    target_include_directories(nlance_stitch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     target_compile_features(nlance_stitch PRIVATE cxx_std_20)
     target_link_libraries(nlance_stitch PRIVATE CLI11::CLI11 nanolance)
 
@@ -380,8 +383,26 @@ if(NANOLANCE_BUILD_TOOLS)
     set_target_properties(nlance_pagelayout PROPERTIES OUTPUT_NAME nlance-pagelayout)
 
     add_executable(nlance_info tools/nlance_info.cpp)
+    target_include_directories(nlance_info PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     target_compile_features(nlance_info PRIVATE cxx_std_20)
     target_link_libraries(nlance_info PRIVATE nanolance)
+
+    # One CLI over the same four sources. Each is compiled a second time with
+    # NANOLANCE_CLI_SUBCOMMAND, which drops its standalone main() and leaves the subcommand entry
+    # point the dispatcher calls -- so `nanolance import` and `arrowipc2lance` are the same code
+    # parsing the same arguments, not two grammars that can drift.
+    add_executable(nanolance_cli
+        tools/nanolance_main.cpp
+        arrowipc2lance_main.cpp
+        tools/nlance_info.cpp
+        tools/nlance2table.cpp
+        tools/nlance_stitch.cpp
+    )
+    set_target_properties(nanolance_cli PROPERTIES OUTPUT_NAME nanolance)
+    target_compile_features(nanolance_cli PRIVATE cxx_std_20)
+    target_compile_definitions(nanolance_cli PRIVATE NANOLANCE_CLI_SUBCOMMAND)
+    target_include_directories(nanolance_cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
+    target_link_libraries(nanolance_cli PRIVATE CLI11::CLI11 nanolance)
 endif()
 
 if(NANOLANCE_STANDALONE)
@@ -595,6 +616,11 @@ endif()
 if(NANOLANCE_BUILD_TOOLS)
     add_test(NAME app_arrowipc2lance_help COMMAND $<TARGET_FILE:arrowipc2lance> -h)
     set_tests_properties(app_arrowipc2lance_help PROPERTIES LABELS "smoke")
+
+    add_test(NAME app_nanolance_cli COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_nanolance_cli.sh"
+             $<TARGET_FILE:nanolance_cli> $<TARGET_FILE:arrowipc2lance> $<TARGET_FILE:nlance2table>
+             $<TARGET_FILE:nlance_info>)
+    set_tests_properties(app_nanolance_cli PROPERTIES LABELS "smoke")
     add_test(NAME app_arrowipc2lance_version COMMAND $<TARGET_FILE:arrowipc2lance> --version)
     set_tests_properties(app_arrowipc2lance_version PROPERTIES LABELS "smoke")
 endif()

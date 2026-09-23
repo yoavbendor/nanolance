@@ -505,9 +505,35 @@ write files would be worse than none; the test is there to keep it the same way.
 CLI** with subcommands. Four binaries with four naming conventions is a discoverability tax; one
 `nanolance --help` teaches the whole surface.
 
+**DONE**, as `nanolance import` / `info` / `cat` / `stitch`.
+
+The old names stay, and that is deliberate rather than timid: each tool's source file is compiled
+**twice** — once into its standalone binary, once into `nanolance` with `NANOLANCE_CLI_SUBCOMMAND`
+defined, which drops its `main()` and leaves the subcommand entry point. One implementation, two front
+doors. Deleting the four names would have bought nothing a user can see while breaking every script
+and smoke test that already calls them, and duplicating the argument parsing to avoid that would have
+created exactly the drift this item is about.
+
+`tests/smoke_nanolance_cli.sh` holds it together: the same Arrow IPC input through both front doors
+must produce byte-identical data files, `cat` and `info` must produce identical text, and a
+value-taking flag (`--compress -l 9`) must survive the forwarding *and* be shown to have changed the
+output — otherwise the comparison proves nothing. It fails against a dispatcher that drops one
+forwarded argument. The subcommands print `argv[0]` in their usage and diagnostics now, so
+`nanolance info` says `Usage: nanolance info`, not `nlance_info`.
+
+Two stale claims surfaced while wiring this up and were corrected rather than carried over:
+`arrowipc2lance --help` still said "nanolance cannot store nulls yet" (it has since 1.1), and
+`nlance_info` suggested re-ingesting with `--rows-per-fragment`, a flag no tool has ever had — one
+`import` run commits exactly one fragment however many IPC batches it reads, so the hint now says to
+split the input and re-run with `--append`. **Still open:** there is no way to split fragments within
+a single run, which is what that hint originally wanted to offer.
+
 **5.4 Retire dead read paths.** `append_fixed_values` in `lance_table_reader.cpp` compares
 `arrow_format` as a `std::string` **per value** — it survives only on a fallback path, but it is a
 trap for the next person optimizing this file.
+
+**DONE**, incidentally: the function went with 4.1's rewrite of how columns reach their Arrow
+buffers, and `lance_table_reader.cpp` no longer mentions it.
 
 ---
 

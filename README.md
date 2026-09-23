@@ -268,7 +268,11 @@ nano_lance_writer_close(&w);
 - **soatins** (namespace `soatins`, include prefix `soatins/`): reflection nucleus — `be<>`/`le<>` endian-aware fields, bitfield `bits<>`, `soa<T>` columnar store, Arrow `arrow_schema<T>()` / `to_arrow()`. Header-only, depends only on nanoarrow + boost. CMake target: `soatins::core`.
 - **nanotins** (namespace `nanotins`, include prefix `nanotins/`): pcap/pcapng scanner + L2/L3/L4 wire structs and decode, built on the **wire_spec** declarative spec system (one explicit-offset spec → host read + device-callable read + SoA + Arrow; see `protocol_specs.hpp`) + **spec_dag** DAG/FSM dispatcher. Also has scheduler-agnostic `bulk_for_each` (over stdexec). Header-only, depends on soatins + header-only stdexec. CMake targets: `nanotins::pcap`, `nanotins::protocols`, `nanotins` (umbrella). (A GPU/CUDA executor layer is developed separately and not vendored here for now.)
 - **nanolance** (namespace `nano_lance`, include prefix `nanolance/`): the Lance writer/reader. CMake targets: `nanolance_proto`, `nanolance_reader`, `nanolance` (writing); link `nanolance_reader` alone if you only fetch external blobs.
-- **Tool:** `arrowipc2lance` — Arrow IPC stream → Lance dataset (`--version` prints nanolance version); `nlance2table` — Lance dataset → CSV/NDJSON text (for validation).
+- **CLI:** one `nanolance` binary with subcommands — `import` (Arrow IPC stream → Lance dataset),
+  `info` (fragments, rows, file sizes), `cat` (dataset → CSV/NDJSON, for validation), `stitch`
+  (several datasets → one). `nanolance --help` lists them; `--version` prints the library version.
+  Each is also still built under its original name (`arrowipc2lance`, `nlance_info`, `nlance2table`,
+  `nlance_stitch`) — same binary contents, same flags, since it is the same code compiled twice.
 
 ## Standalone build
 
