@@ -171,7 +171,7 @@ this fix**, and the bigger win is in causes (2) and (3), which delete the work r
 cheaper. I am flagging this explicitly because it is easy to read the callgrind output and promise a
 3× that will not materialize.
 
-Current gap to close, from CI: `pcap_ref` read 11.01 ms vs rust-lance 6.24 ms.
+Current gap to close, from CI: `pcap_ref` read 11.01 ms vs rust-lance 6.24 ms. **Closed — see 4.5.**
 
 ### 2.5 The documented quick start does not work
 
@@ -458,6 +458,33 @@ trade at that price; revisit only with the coalescing above.
 **4.5 Re-profile.** Publish the new callgrind breakdown alongside the bench, the way CI already
 does. State the ratio honestly — parity with rust-lance on read is the goal, and if 4.1–4.4 land it
 looks reachable.
+
+**DONE.** CI already publishes the callgrind breakdown next to the bench
+(`linux-bench.yml`, "Native-read profile"), so what 4.5 actually owed was the honest ratio. Here it
+is, `bench/run-local-bench.sh` on this branch, best of 7 reads, each engine reading its own file:
+
+| 200k rows | parquet (zstd) | rust lance | nanolance | vs rust lance |
+|---|---|---|---|---|
+| `pcap_ref` | 6.34 ms | 5.64 ms | **1.51 ms** | 3.7× faster |
+| `wide_int` | 3.48 ms | 3.25 ms | **1.55 ms** | 2.1× faster |
+| `high_card` | 7.47 ms | **5.53 ms** | 8.04 ms | **1.45× slower** |
+| `float_smooth` | 3.50 ms | 9.29 ms | **1.73 ms** | 5.4× faster |
+| `bool_flags` | 2.00 ms | 1.79 ms | **1.10 ms** | 1.6× faster |
+
+Parity on read was the goal; four of the five shapes are past it. Three caveats, because the table
+is easy to over-read:
+
+- **This is a shared container, not the CI runner.** Only comparisons *within* one run are
+  meaningful — the 11.01 ms in §2.4 was measured on a different machine and must not be subtracted
+  from the 1.51 ms here. `bench/linux-ci-results.md` stays the authoritative file, and it is
+  auto-committed from `main`.
+- **`high_card` is the remaining gap, and it is the one this work predicted.** It is the
+  high-cardinality-string shape — the variable-width path, which every profile in this phase ended
+  up pointing at, and which §4.2 already established is memory-bandwidth bound once the per-row
+  bookkeeping is gone. nanolance is also slower to *write* it (28.42 ms vs 17.96 ms).
+- **`read(lance)` — rust-lance reading nanolance's file — is 10.90 ms on `pcap_ref` against 5.64 ms
+  for its own.** Interop works, but nanolance's encoding choices are not free for the other reader,
+  and that number belongs next to the wins rather than under them.
 
 **Where Phase 4 landed.** Three reads of a 1M-row `int64 + double + string` dataset: **87 ms → 68 ms
 (−22%)**, on top of 4.1's 201 ms → 160 ms and its 2.01× → 1.01× peak RSS.

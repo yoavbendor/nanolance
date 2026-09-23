@@ -1066,6 +1066,30 @@ named "View" but copies each chunk out of the page payload, and callgrind blamed
 refactor would thread a span type through six decoder helper signatures and give up the
 `std::swap(chunk.values, raw)` the zstd and LZ4 paths rely on. Not at that price.
 
+### 4.5 — the ratio, stated honestly
+
+CI already publishes the callgrind breakdown beside the bench, so what 4.5 owed was the number.
+`bench/run-local-bench.sh` on this branch, best of 7 reads, each engine reading its own file:
+
+| 200k rows | parquet (zstd) | rust lance | nanolance | vs rust lance |
+|---|---|---|---|---|
+| `pcap_ref` | 6.34 ms | 5.64 ms | **1.51 ms** | 3.7x faster |
+| `wide_int` | 3.48 ms | 3.25 ms | **1.55 ms** | 2.1x faster |
+| `high_card` | 7.47 ms | **5.53 ms** | 8.04 ms | **1.45x slower** |
+| `float_smooth` | 3.50 ms | 9.29 ms | **1.73 ms** | 5.4x faster |
+| `bool_flags` | 2.00 ms | 1.79 ms | **1.10 ms** | 1.6x faster |
+
+Parity was the goal and four of five shapes are past it, so the caveats matter more than the wins:
+
+- This ran in a **shared container, not the CI runner**. Only comparisons within one run mean
+  anything — the 11.01 ms this plan quoted as the gap was measured on a different machine, and
+  subtracting the two would be arithmetic on noise. `bench/linux-ci-results.md` stays authoritative.
+- **`high_card` is the shape that is still slower**, and it is the one every profile in this phase
+  pointed at: high-cardinality strings, the variable-width path, memory-bandwidth bound once the
+  per-row bookkeeping is gone (4.2). nanolance writes it more slowly too (28.42 ms vs 17.96 ms).
+- **rust-lance reading a nanolance file takes 10.90 ms on `pcap_ref`, against 5.64 ms for its own.**
+  Interop works; it is not free for the other reader.
+
 ### What Phase 4 actually taught
 
 Three reads of a 1M-row `int64 + double + string` dataset: **87 ms → 68 ms (−22%)**, on top of 4.1's
