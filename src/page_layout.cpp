@@ -358,7 +358,17 @@ bool parse_mini_block(Cursor c, MiniBlock& out, std::string& error) {
         }
         const auto field = static_cast<std::uint32_t>(key >> 3U);
         const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (wire == kWireBytes && (field == 2U || field == 3U || field == 4U)) {
+        if (wire == kWireBytes && field == 1U) {
+            // rep_compression. Not modelled beyond its presence -- but the chunk header reserves a
+            // slot for the repetition buffer's size when this field exists, so the flag is
+            // load-bearing for parsing every chunk in the page.
+            Cursor sub;
+            if (!read_submessage(c, sub)) {
+                error = "page layout: truncated MiniBlockLayout rep_compression";
+                return false;
+            }
+            out.has_repetition = true;
+        } else if (wire == kWireBytes && (field == 2U || field == 3U || field == 4U)) {
             Cursor sub;
             if (!read_submessage(c, sub)) {
                 error = "page layout: truncated MiniBlockLayout encoding";

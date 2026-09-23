@@ -1165,14 +1165,14 @@ Two stale claims surfaced while wiring this up, and were corrected rather than c
 
 ---
 
-## Reading pylance's nullable columns: one gap closed, two found
+## Reading pylance's nullable columns: three gaps, all closed
 
 The stock-Lance suite had been testing nulls at one or two sizes. Nulls are the wrong axis to spot
 check: Lance does not have *a* definition-level encoding, it has several, and which one a column gets
 depends on the row count and the null pattern rather than on anything the writer was asked for.
-Walking the cross-product of five types x five null patterns x five sizes, each cell compared against
+Walking the cross-product of five types x five null patterns x ten sizes, each cell compared against
 **pylance's own read**, found three distinct failures — one of which made ordinary datasets
-unreadable.
+unreadable. All three are fixed, and all 250 cells now match.
 
 ### Closed: `InlineBitpacking(16)` definition levels
 
@@ -1196,9 +1196,9 @@ anything else is still refused by name rather than guessed at.
 
 All 13 sizes from 100 to 20000 now match pylance exactly.
 
-### Still open, and now precisely characterised
+### Closed: the chunk header is not a fixed shape
 
-The other two failures are both the **chunk header**, and reading `decode_miniblock_chunk` in
+The other two failures both came back to the chunk header, and reading `decode_miniblock_chunk` in
 `rust/lance-encoding/src/encodings/logical/primitive.rs` settled what the real grammar is:
 
 ```
@@ -1210,26 +1210,36 @@ pad to 8
 [rep] pad8  [def] pad8  [buffer_0] pad8  [buffer_1] pad8 ...
 ```
 
-nanolance reads a **fixed** `[u16 num_levels][u16][u16][u16]`. That is the right 8 bytes exactly when
-there is no repetition layer, two value buffers and `has_large_chunk` is false — which covers
-everything it has been tested on, and silently misreads the rest.
+nanolance read a **fixed** `[u16 num_levels][u16][u16][u16]`. That is the right 8 bytes for exactly
+one shape — no repetition layer, two value buffers, `has_large_chunk` false — which covers everything
+it had been tested on, and silently misreads the rest. The header now comes from the page's
+descriptor: `has_repetition` (a new flag, since f1 `rep_compression` was being skipped and its `u16`
+slot shifts every later field), `def_compression`'s presence, `num_buffers` and `has_large_chunk`.
 
-1. **A `float64` column with a run-shaped null pattern** (`rle chunk buffer sizes invalid`, at 200
-   and 400 rows). Lance RLEs both values and levels, so the page declares `has_large_chunk=1` and the
-   buffer sizes are `u32`: the real header is `[u16 200][u16 def_size=14][u32 1208][u32 151]` plus
-   `fe fe fe fe` padding to 16. Read as four `u16`s, the definition block is located 8 bytes early.
+1. **A `float64` column with a run-shaped null pattern** (`rle chunk buffer sizes invalid`). Lance
+   RLEs both values and levels, so the page sets `has_large_chunk` and its buffer sizes are `u32`:
+   the real header is `[u16 200][u16 def_size=14][u32 1208][u32 151]` plus `fe fe fe fe` padding to
+   16 bytes. Read as four `u16`s, the definition block was located 8 bytes early.
+
+   The RLE branch also had a **second, hand-rolled copy** of the chunk parse, assuming
+   `[u16 num_levels][u32 size0][u32 size1]` — correct only for a *non-nullable* RLE column. It now
+   uses the shared split like every other branch, which is the point: the duplicate parser is how the
+   two drifted apart in the first place.
+
 2. **A `bool` column over 1024 rows** (`definition-level chunk covers more than one FastLanes
-   block`). Bools pack densely enough that one chunk holds 1025 values, so the level buffer is a full
-   FastLanes block followed by a raw `u16` tail — 128 + 2 = 130 bytes, which is what the 1025-row page
-   actually contains. The decoder handles exactly one block.
+   block`). Bools pack a bit per value, so a byte-sized chunk holds far more of them than of anything
+   else — 1025 at the first size that overflows. The level buffer is then a whole packed block
+   followed by a raw `u16` tail (128 + 2 = 130 bytes, exactly what that page contains). The decoder
+   now walks blocks, using Lance's own rule from `unpack_out_of_line` for whether the tail is packed
+   or raw: `raw ⟺ words == whole_blocks * packed_words + tail`, rather than approximating it.
 
-Both are fixable and neither is guesswork any more, but they are a change to the chunk header parse
-on the untrusted read path, which needs its own fuzz pass rather than a quick patch.
+**All 250 cells of the sweep now match pylance** — 5 types x 5 null patterns x 10 sizes from 100 to
+20000. `bindings/python/tests/test_lance_nullable_matrix.py` is that cross-product, plus a named test
+per failure so a future break says which shape regressed instead of only which parameter tuple.
 
-`bindings/python/tests/test_lance_nullable_matrix.py` holds the whole cross-product, and the two open
-cells are asserted to fail **with their specific message** rather than skipped. A skip rots quietly;
-an assertion that a gap still exists fails the moment someone fixes it, which is exactly when it
-should be revisited.
+Both fixes were checked in the other direction too: forcing `large_buffer_sizes` false fails the
+float64 tests, and restoring the one-block cap fails the bool tests. Being decode changes on the
+untrusted read path, `fuzz_decode` was re-run over them: 3,346,817 runs, clean.
 
 ---
 
@@ -1253,12 +1263,6 @@ should be revisited.
   Actions runs again**, because there is no local macOS or manylinux to run them on. The Linux wheel
   itself WAS built and installed into a clean virtualenv locally; what is unverified is cibuildwheel
   driving that across CPython 3.9–3.13 and macOS.
-
-- **Two pylance nullable-column shapes still unreadable**, both the miniblock chunk header: a
-  `float64` column whose nulls come in runs (`has_large_chunk` makes the buffer sizes `u32`, and the
-  header is parsed as fixed `u16`s), and a `bool` column over 1024 rows (one chunk carries more than
-  one FastLanes block of levels). The on-disk grammar for both is decoded above; what is missing is
-  the header parse and a fuzz pass over it.
 
 - **No way to split fragments within one `nanolance import` run.** The run commits exactly one
   fragment regardless of how many Arrow IPC batches it reads, so a large input becomes one large

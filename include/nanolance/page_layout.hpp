@@ -99,6 +99,10 @@ struct MiniBlock {
     std::uint64_t num_items = 0;
     std::uint32_t num_buffers = 0;
     bool has_large_chunk = false;
+    /// f1 `rep_compression` was present. Only the flag is kept, not the node: nothing here decodes a
+    /// repetition layer yet, but a chunk header carries a `u16 rep_size` slot when one exists, so
+    /// missing it would shift every later field by two bytes.
+    bool has_repetition = false;
     /// f6 `layers`: [1] for a column with no nulls, [3] when a definition-level layer is present.
     /// Stored raw because it is a length-delimited field rather than a plain varint.
     std::vector<std::uint8_t> layers;

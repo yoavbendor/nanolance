@@ -8,9 +8,10 @@ pattern will pass while common datasets fail.
 This walks the cross-product directly. Every cell is compared against **pylance's own read** of the
 same dataset, so the oracle is Lance, not our expectations.
 
-The two cells that do not work yet are asserted to fail *with their specific message*, not skipped.
-A skip rots silently; an assertion that a gap still exists fails the moment it is fixed, which is
-exactly when someone should come back and delete it.
+Every cell passes. It did not when this file was written: the sweep found three separate failures --
+`InlineBitpacking(16)` levels, a chunk header whose shape depends on the page descriptor, and
+definition levels spanning more than one FastLanes block. All three are fixed; see docs/PROGRESS.md
+for the on-disk grammar behind each.
 """
 
 from __future__ import annotations
@@ -45,9 +46,10 @@ PATTERNS = {
     "none": lambda i: False,
 }
 
-# 1025 is deliberate: one more than a FastLanes block, which is where a bool page first puts more
-# than 1024 values in a single chunk.
-SIZES = (200, 400, 999, 1025, 3000)
+# 1024 and 1025 are deliberate: exactly one FastLanes block, and one more than one, which is where a
+# bool page first puts more than 1024 values into a single chunk. 20000 reaches a chunk whose tail is
+# stored raw rather than packed.
+SIZES = (100, 200, 400, 999, 1024, 1025, 3000, 20_000)
 
 
 def _dataset(lance_mod, tmp_path, n, type_name, pattern_name):
@@ -62,45 +64,12 @@ def _dataset(lance_mod, tmp_path, n, type_name, pattern_name):
     return path
 
 
-# Known, reproducible read gaps. Each entry is (predicate, expected message fragment); see
-# docs/PROGRESS.md for the decoded on-disk grammar behind both.
-KNOWN_GAPS = (
-    # A bool page packs more than 1024 values into one chunk, so its definition levels span several
-    # FastLanes blocks; the decoder handles exactly one.
-    (lambda n, t, p: t == "bool" and n > 1024 and p not in ("all_null", "none"),
-     "definition-level chunk covers more than one FastLanes block"),
-    # A run-shaped null pattern on a float column makes Lance RLE both the values and the levels,
-    # which gives the chunk two value buffers and a chunk header longer than the 8 bytes the decoder
-    # assumes.
-    (lambda n, t, p: t == "float64" and p == "first_half" and n in (200, 400),
-     "rle chunk buffer sizes invalid"),
-)
-
-
-def _expected_gap(n, type_name, pattern_name):
-    for predicate, message in KNOWN_GAPS:
-        if predicate(n, type_name, pattern_name):
-            return message
-    return None
-
-
 @pytest.mark.parametrize("n", SIZES)
 @pytest.mark.parametrize("type_name", sorted(VALUES))
 @pytest.mark.parametrize("pattern_name", sorted(PATTERNS))
 def test_nullable_column_matches_pylance(lance_mod, tmp_path, n, type_name, pattern_name):
     path = _dataset(lance_mod, tmp_path, n, type_name, pattern_name)
     expected = lance_mod.dataset(path).to_table()
-    gap = _expected_gap(n, type_name, pattern_name)
-
-    if gap is not None:
-        with pytest.raises(Exception) as excinfo:
-            pa.table(nanolance.read_table(path))
-        assert gap in str(excinfo.value), (
-            f"the known gap for n={n} {type_name}/{pattern_name} now fails differently: "
-            f"{excinfo.value}. If it was fixed, delete its entry from KNOWN_GAPS."
-        )
-        return
-
     assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
 
 
@@ -118,3 +87,29 @@ def test_inline_bitpacked_definition_levels(lance_mod, tmp_path):
         expected = lance_mod.dataset(path).to_table()
         got = pa.table(nanolance.read_table(path))
         assert got.to_pydict() == expected.to_pydict(), f"n={n}"
+
+
+def test_definition_levels_spanning_several_fastlanes_blocks(lance_mod, tmp_path):
+    """A bool column puts more than 1024 values in one chunk, so its levels are several blocks.
+
+    Bools pack a bit per value, so a chunk sized by bytes holds far more of them than of anything
+    else -- 1025 at the first size that overflows. The level buffer is then a whole packed FastLanes
+    block followed by a raw u16 tail (128 + 2 bytes), and the decoder handled exactly one block.
+    """
+    for n in (1024, 1025, 1026, 2048, 3000, 20_000):
+        path = _dataset(lance_mod, tmp_path, n, "bool", "every7")
+        expected = lance_mod.dataset(path).to_table()
+        assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict(), f"n={n}"
+
+
+def test_run_shaped_nulls_on_a_float_column(lance_mod, tmp_path):
+    """Runs of nulls make Lance RLE both the values and the levels.
+
+    That gives the page two value buffers AND a definition-level slot, and sets has_large_chunk so the
+    buffer sizes are u32 -- a chunk header three fields longer than the fixed eight bytes the decoder
+    assumed. It read the definition block 8 bytes early and failed on the sizes it found there.
+    """
+    for n in (200, 400, 999, 3000):
+        path = _dataset(lance_mod, tmp_path, n, "float64", "first_half")
+        expected = lance_mod.dataset(path).to_table()
+        assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict(), f"n={n}"

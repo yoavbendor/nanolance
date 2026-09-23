@@ -135,22 +135,12 @@ bool read_le16(const std::uint8_t* p, std::uint16_t& v) {
     return true;
 }
 
-// A miniblock chunk's 8-byte header is four little-endian u16 slots:
-//
-//   [0] number of values the repetition/definition layer covers -- 0 when the chunk has no repdef
-//   [1] size in bytes of the first buffer
-//   [2] size in bytes of the second buffer
-//   [3] size in bytes of the third buffer
-//
-// with 0xFEFE marking a slot that is not in use. When slot 0 is zero the chunk holds values only and
-// slot 1 is their size; when it is non-zero the chunk carries a definition-level buffer FIRST
-// (slot 1) and the values after it (slot 2). Buffers are laid out back to back straight after the
-// header, and the next chunk begins at the next 8-byte boundary.
-//
-// This was established by walking real pylance 12.0.0 output: the arithmetic below reproduces every
-// chunk boundary of a 5000-row column exactly, across the plain, scattered-null and single-null
-// cases. The previous reader hardcoded the no-repdef shape (slots 0 and 2 zero, slot 3 == 0xFEFE),
-// which is why every nullable stock-Lance column failed with "unexpected miniblock payload prefix".
+bool read_le32(const std::uint8_t* p, std::uint32_t& v) {
+    v = static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8U) |
+        (static_cast<std::uint32_t>(p[2]) << 16U) | (static_cast<std::uint32_t>(p[3]) << 24U);
+    return true;
+}
+
 /// Every buffer inside a miniblock chunk is padded up to 8 bytes AFTER it is written, and the header
 /// records the unpadded length. The padding was invisible while the only level buffer nanolance
 /// produced or met was a full 128-byte packed block; a short chunk's raw level buffer (see
@@ -162,53 +152,116 @@ constexpr std::size_t align_to_miniblock(std::size_t bytes) {
     return (bytes + kMiniblockAlignment - 1U) & ~(kMiniblockAlignment - 1U);
 }
 
-struct MiniBlockChunkHeader {
-    std::uint16_t repdef_values = 0;
-    std::uint16_t slots[3] = {0, 0, 0};
+/// How to read a chunk header, which is not a fixed shape: the slots that exist depend on the page's
+/// MiniBlockLayout descriptor.
+///
+/// Lance's own `decode_miniblock_chunk` (`rust/lance-encoding/src/encodings/logical/primitive.rs`)
+/// spells it out:
+///
+///     [u16 num_levels]
+///     [u16 rep_size]                       only when rep_compression is present
+///     [u16 def_size]                       only when def_compression is present
+///     [num_buffers x (u32 if has_large_chunk else u16)]
+///     pad to 8
+///     [rep] pad8  [def] pad8  [buffer_0] pad8  [buffer_1] pad8 ...
+///
+/// This used to be read as a fixed `[u16 num_levels][u16][u16][u16]`, which is the right 8 bytes for
+/// exactly one shape: no repetition layer, two value buffers, small chunks. That covers nanolance's
+/// own output and most of stock Lance's, and silently misreads the rest -- a `float64` column whose
+/// nulls come in runs sets `has_large_chunk`, so its buffer sizes are `u32` and the definition block
+/// starts 8 bytes later than the fixed parse expects.
+/// The defaults are the shape of a page with no descriptor at all, which is only ever an old
+/// nanolance file: no repetition, no definition levels (nullability postdates the writer emitting
+/// descriptors, so no such file has any), two u16 buffer sizes. That is exactly what the old fixed
+/// 8-byte parse assumed, so those files decode byte-for-byte as they did before.
+struct MiniBlockChunkShape {
+    bool has_repetition = false;
+    bool has_definition = false;
+    std::uint32_t num_buffers = 2;
+    bool large_buffer_sizes = false;
 
-    bool has_repdef() const { return repdef_values != 0U; }
-    /// Byte offset of the values buffer relative to the end of the header.
-    std::size_t values_offset() const { return has_repdef() ? align_to_miniblock(slots[0]) : 0U; }
-    std::size_t values_size() const { return has_repdef() ? slots[1] : slots[0]; }
-    std::size_t repdef_size() const { return has_repdef() ? slots[0] : 0U; }
-    /// Total payload bytes the chunk occupies after its header, padding included.
-    std::size_t data_size() const {
-        std::size_t total = 0;
-        for (const auto slot : slots) {
-            if (slot != 0xFEFEU) {
-                total += align_to_miniblock(slot);
-            }
-        }
-        return total;
+    std::size_t buffer_size_bytes() const { return large_buffer_sizes ? 4U : 2U; }
+    /// Bytes before the padding, i.e. everything the header declares.
+    std::size_t declared_bytes() const {
+        return 2U + (has_repetition ? 2U : 0U) + (has_definition ? 2U : 0U) +
+               static_cast<std::size_t>(num_buffers) * buffer_size_bytes();
     }
 };
 
+struct MiniBlockChunkHeader {
+    std::uint16_t num_levels = 0;
+    std::uint32_t rep_size = 0;
+    std::uint32_t def_size = 0;
+    std::vector<std::uint32_t> buffer_sizes;
+    /// Bytes the whole chunk occupies, padding included -- i.e. where the next chunk starts.
+    std::size_t chunk_bytes = 0;
+};
+
 bool read_miniblock_chunk_header(const std::vector<std::uint8_t>& payload, std::size_t offset,
-                                 MiniBlockChunkHeader& out, std::string& error) {
-    if (offset + 8U > payload.size()) {
+                                 const MiniBlockChunkShape& shape, MiniBlockChunkHeader& out,
+                                 std::string& error) {
+    out.buffer_sizes.clear();
+    // num_buffers comes from the untrusted descriptor; cap it so a hostile value cannot make the
+    // header arithmetic below run away before any of it is bounds-checked.
+    if (shape.num_buffers > 64U) {
+        error = "miniblock layout declares " + std::to_string(shape.num_buffers) + " buffers per chunk";
+        return false;
+    }
+    const auto declared = shape.declared_bytes();
+    if (offset > payload.size() || payload.size() - offset < declared) {
         error = "truncated miniblock payload header";
         return false;
     }
-    if (!read_le16(payload.data() + offset, out.repdef_values)) {
-        error = "failed to read miniblock repdef value count";
-        return false;
+
+    std::size_t at = offset;
+    const auto take_u16 = [&payload, &at]() {
+        std::uint16_t v = 0;
+        read_le16(payload.data() + at, v);
+        at += 2U;
+        return static_cast<std::uint32_t>(v);
+    };
+    const auto take_u32 = [&payload, &at]() {
+        std::uint32_t v = 0;
+        read_le32(payload.data() + at, v);
+        at += 4U;
+        return v;
+    };
+
+    out.num_levels = static_cast<std::uint16_t>(take_u16());
+    out.rep_size = shape.has_repetition ? take_u16() : 0U;
+    out.def_size = shape.has_definition ? take_u16() : 0U;
+    out.buffer_sizes.reserve(shape.num_buffers);
+    for (std::uint32_t i = 0; i < shape.num_buffers; ++i) {
+        out.buffer_sizes.push_back(shape.large_buffer_sizes ? take_u32() : take_u16());
     }
-    for (std::size_t i = 0; i < 3U; ++i) {
-        if (!read_le16(payload.data() + offset + 2U + i * 2U, out.slots[i])) {
-            error = "failed to read miniblock chunk size";
-            return false;
-        }
+
+    // Every section is padded to the miniblock alignment, so walk them in order and let each one's
+    // end define the next one's start. Sizes are untrusted: accumulate in 64 bits and compare against
+    // what is left of the payload at every step rather than summing first and checking once.
+    std::uint64_t cursor = align_to_miniblock(declared);
+    const auto advance = [&cursor](std::uint64_t size) {
+        cursor = (cursor + size + kMiniblockAlignment - 1U) & ~static_cast<std::uint64_t>(kMiniblockAlignment - 1U);
+    };
+    advance(out.rep_size);
+    advance(out.def_size);
+    for (const auto size : out.buffer_sizes) {
+        advance(size);
     }
-    if (offset + 8U + out.data_size() > payload.size()) {
+    if (cursor > payload.size() - offset) {
         error = "miniblock chunk exceeds payload";
         return false;
     }
+    out.chunk_bytes = static_cast<std::size_t>(cursor);
     return true;
 }
 
-/// One decoded chunk: its values buffer, and its definition levels when it carries any.
+/// One decoded chunk: its value buffers, and its definition levels when it carries any.
+///
+/// `values` is the FIRST value buffer, which is the only one most encodings have; `extra_buffers`
+/// holds the rest (an RLE value block, for instance, is a values buffer plus a run-lengths buffer).
 struct MiniBlockChunkView {
     std::vector<std::uint8_t> values;
+    std::vector<std::vector<std::uint8_t>> extra_buffers;
     std::vector<std::uint8_t> repdef;
     std::uint32_t repdef_values = 0;
 };
@@ -219,27 +272,41 @@ struct MiniBlockChunkView {
 /// is why treating the payload as a single chunk worked on its own files; stock Lance packs many
 /// (a 5000-row int64 page arrives as five 1024-value chunks), so the concatenated buffer failed the
 /// per-chunk size check with "bitpacked chunk size does not match bit width".
-bool split_miniblock_payload(const std::vector<std::uint8_t>& payload, std::vector<MiniBlockChunkView>& out,
-                             std::string& error) {
+bool split_miniblock_payload(const std::vector<std::uint8_t>& payload, const MiniBlockChunkShape& shape,
+                             std::vector<MiniBlockChunkView>& out, std::string& error) {
     out.clear();
     std::size_t offset = 0;
     while (offset < payload.size()) {
         MiniBlockChunkHeader header;
-        if (!read_miniblock_chunk_header(payload, offset, header, error)) {
+        if (!read_miniblock_chunk_header(payload, offset, shape, header, error)) {
             return false;
         }
-        const auto data_start = offset + 8U;
-        MiniBlockChunkView chunk;
-        if (header.has_repdef()) {
-            chunk.repdef_values = header.repdef_values;
-            chunk.repdef.assign(payload.begin() + static_cast<std::ptrdiff_t>(data_start),
-                                payload.begin() + static_cast<std::ptrdiff_t>(data_start + header.repdef_size()));
+        if (header.chunk_bytes == 0U) {
+            error = "miniblock chunk declares no bytes";
+            return false;
         }
-        const auto values_start = data_start + header.values_offset();
-        chunk.values.assign(payload.begin() + static_cast<std::ptrdiff_t>(values_start),
-                            payload.begin() + static_cast<std::ptrdiff_t>(values_start + header.values_size()));
+        MiniBlockChunkView chunk;
+        std::size_t at = offset + align_to_miniblock(shape.declared_bytes());
+        at += align_to_miniblock(header.rep_size);  // repetition levels are not decoded yet
+        if (shape.has_definition && header.def_size != 0U) {
+            chunk.repdef_values = header.num_levels;
+            chunk.repdef.assign(payload.begin() + static_cast<std::ptrdiff_t>(at),
+                                payload.begin() + static_cast<std::ptrdiff_t>(at + header.def_size));
+        }
+        at += align_to_miniblock(header.def_size);
+        for (std::size_t i = 0; i < header.buffer_sizes.size(); ++i) {
+            const auto size = static_cast<std::size_t>(header.buffer_sizes[i]);
+            std::vector<std::uint8_t> buffer(payload.begin() + static_cast<std::ptrdiff_t>(at),
+                                             payload.begin() + static_cast<std::ptrdiff_t>(at + size));
+            if (i == 0U) {
+                chunk.values = std::move(buffer);
+            } else {
+                chunk.extra_buffers.push_back(std::move(buffer));
+            }
+            at += align_to_miniblock(size);
+        }
         out.push_back(std::move(chunk));
-        offset = (data_start + header.data_size() + 7U) & ~static_cast<std::size_t>(7U);
+        offset += header.chunk_bytes;
     }
     return true;
 }
@@ -623,11 +690,12 @@ bool append_levels_to_validity(const std::uint16_t* levels, std::uint32_t count,
                                             std::uint64_t rows_already_appended,
                                             std::vector<std::uint8_t>& out_validity,
                                             std::uint64_t& out_null_count, std::string& error) {
-    if (count > 1024U) {
-        error = "definition-level chunk covers more than one FastLanes block";
-        return false;
-    }
-    std::uint16_t levels[1024];
+    // Levels are u16 and `count` comes from the chunk header, so it is bounded by 65535 -- but a
+    // chunk can legitimately carry more than one FastLanes block of them. A `bool` column packs
+    // densely enough that pylance puts 1025 values in one chunk, which this used to refuse outright.
+    thread_local std::vector<std::uint16_t> level_storage;
+    level_storage.resize(std::max<std::size_t>(count, 1U));
+    std::uint16_t* levels = level_storage.data();
     if (encoding.kind == page_layout::CompressiveKind::kRle) {
         if (!decode_rle_definition_levels(repdef, encoding, count, levels, error)) {
             return false;
@@ -668,29 +736,58 @@ bool append_levels_to_validity(const std::uint16_t* levels, std::uint32_t count,
         error = "definition levels declare an unsupported width of " + std::to_string(width) + " bits";
         return false;
     }
-    // A chunk shorter than one FastLanes block has two legal spellings, and Lance's own decoder
-    // tells them apart by the buffer's LENGTH: if it holds exactly `count` u16 words the levels are
-    // raw, otherwise it is a padded, packed block. (The encoder pads only when padding costs fewer
-    // bits than packing saves, so at width 1 a tail of 64 or fewer values is always raw.) A 20000-row
-    // nullable binary column from pylance ends in a 32-value chunk, whose 64-byte level buffer this
-    // used to reject outright as "expected 128".
+    // The buffer is a run of whole FastLanes blocks followed by a tail, and the tail has two legal
+    // spellings: packed-and-padded, or raw u16 words. Lance's `unpack_out_of_line`
+    // (`rust/lance-encoding/src/encodings/physical/bitpacking.rs`) tells them apart by the buffer's
+    // total LENGTH -- the encoder pads only when padding costs fewer bits than packing saves -- and
+    // this mirrors that arithmetic exactly rather than approximating it:
+    //
+    //     whole_blocks = count / 1024              tail = count % 1024
+    //     raw  <=>  words == whole_blocks * packed_words + tail
+    //
+    // Two cases this has to keep getting right: a 20000-row nullable binary column from pylance ends
+    // in a 32-value chunk whose 64-byte level buffer is raw, and a 1025-row bool column is one whole
+    // packed block (128 bytes) plus a single raw u16.
     const auto packed_words = nano_lance::fastlanes::packed_words_1024<std::uint16_t>(width);
     if (repdef.size() % sizeof(std::uint16_t) != 0U) {
         error = "definition-level buffer is not a whole number of 16-bit words";
         return false;
     }
     const auto words = repdef.size() / sizeof(std::uint16_t);
-    if (count < 1024U && words == count) {
-        std::memcpy(levels, repdef.data(), repdef.size());
-    } else if (words == packed_words) {
-        std::vector<std::uint16_t> packed(packed_words);
-        std::memcpy(packed.data(), repdef.data(), repdef.size());
-        nano_lance::fastlanes::unpack_1024<std::uint16_t>(width, packed.data(), levels);
-    } else {
+    const std::size_t whole_blocks = count / 1024U;
+    const std::size_t tail = count % 1024U;
+    const std::size_t full_words = whole_blocks * packed_words;
+    const bool tail_is_raw = tail != 0U && words == full_words + tail;
+    const std::size_t expected_words = tail_is_raw ? full_words + tail
+                                                   : full_words + (tail != 0U ? packed_words : 0U);
+    if (words != expected_words) {
         error = "definition-level buffer is " + std::to_string(repdef.size()) + " bytes, expected " +
-                std::to_string(packed_words * sizeof(std::uint16_t)) + " packed or " +
-                std::to_string(count * sizeof(std::uint16_t)) + " raw";
+                std::to_string(expected_words * sizeof(std::uint16_t)) + " for " +
+                std::to_string(count) + " levels at " + std::to_string(width) + " bits";
         return false;
+    }
+
+    thread_local std::vector<std::uint16_t> packed;
+    packed.resize(packed_words != 0U ? packed_words : 1U);
+    std::uint16_t block[1024];
+    std::size_t word_at = 0;
+    for (std::size_t b = 0; b < whole_blocks; ++b) {
+        std::memcpy(packed.data(), repdef.data() + word_at * sizeof(std::uint16_t),
+                    packed_words * sizeof(std::uint16_t));
+        nano_lance::fastlanes::unpack_1024<std::uint16_t>(width, packed.data(), block);
+        std::memcpy(levels + b * 1024U, block, 1024U * sizeof(std::uint16_t));
+        word_at += packed_words;
+    }
+    if (tail != 0U) {
+        if (tail_is_raw) {
+            std::memcpy(levels + whole_blocks * 1024U, repdef.data() + word_at * sizeof(std::uint16_t),
+                        tail * sizeof(std::uint16_t));
+        } else {
+            std::memcpy(packed.data(), repdef.data() + word_at * sizeof(std::uint16_t),
+                        packed_words * sizeof(std::uint16_t));
+            nano_lance::fastlanes::unpack_1024<std::uint16_t>(width, packed.data(), block);
+            std::memcpy(levels + whole_blocks * 1024U, block, tail * sizeof(std::uint16_t));
+        }
     }
 
     return append_levels_to_validity(levels, count, rows_already_appended, out_validity, out_null_count);
@@ -754,6 +851,8 @@ struct ColumnEncodingPlan {
     std::uint32_t variable_offset_bits = 0;
     /// Set when the descriptor named something this build does not model, so the error can say what.
     std::string unsupported_reason;
+    /// kMiniBlock: how to read each chunk's header. Not a constant -- see MiniBlockChunkShape.
+    MiniBlockChunkShape chunk_shape;
 };
 
 /// A dictionary block is stored raw, zstd-framed or LZ4-framed depending on who wrote the file:
@@ -805,6 +904,19 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
         out.unsupported_reason = "unsupported page layout: " + page_layout::describe(layout);
         return true;
     }
+
+    // The chunk header's shape, taken from the same three descriptor fields Lance's decoder reads it
+    // from. `has_definition` keys off the presence of `def_compression` (f2) rather than off `layers`,
+    // because that is what decides whether the header carries a `def_size` slot -- read it from the
+    // wrong field and every byte after it is misplaced.
+    out.chunk_shape.has_repetition = layout.mini_block.has_repetition;
+    out.chunk_shape.has_definition = layout.mini_block.repdef_compression != nullptr;
+    out.chunk_shape.large_buffer_sizes = layout.mini_block.has_large_chunk;
+    // A descriptor that omits `num_buffers` (f7) leaves it 0. Two is what this reader assumed for
+    // years and what every page it has been able to read actually has, so keep that rather than
+    // deciding a page has no buffers at all.
+    out.chunk_shape.num_buffers =
+        layout.mini_block.num_buffers != 0U ? layout.mini_block.num_buffers : 2U;
 
     if (page_layout::layers_have_definition_levels(layout.mini_block.layers)) {
         if (layout.mini_block.repdef_compression == nullptr) {
@@ -1002,7 +1114,7 @@ bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& 
                                                   std::vector<MiniBlockChunkView>& chunks,
                                                   std::uint64_t& validity_rows, ColumnValues& out,
                                                   std::string& error) {
-    if (!split_miniblock_payload(payload, chunks, error)) {
+    if (!split_miniblock_payload(payload, plan.chunk_shape, chunks, error)) {
         return false;
     }
     if (plan.repdef == nullptr) {
@@ -1218,46 +1330,45 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         }
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> data;
+        std::vector<MiniBlockChunkView> chunks;
+        std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
             if (!read_page_buffers(data_file_path, page, false, control, data, error)) {
                 return false;
             }
-            if (data.size() < 10U) {
-                error = "rle chunk too short";
+            // Shared chunk split, not a second hand-rolled one. This branch used to parse the chunk
+            // itself as [u16 num_levels][u32 size0][u32 size1], which is the right header only for a
+            // NON-nullable RLE column: a nullable one carries a `u16 def_size` slot between the level
+            // count and the buffer sizes, so every offset after it was two bytes out and the read died
+            // with "rle chunk buffer sizes invalid". A pylance float64 column whose nulls come in runs
+            // is exactly that shape.
+            if (!read_page_chunks_with_validity(data, encoding_plan, page.length, chunks, validity_rows,
+                                                out, error)) {
                 return false;
             }
-            std::uint32_t size0 = 0;
-            std::uint32_t size1 = 0;
-            std::memcpy(&size0, data.data() + 2U, 4U);
-            std::memcpy(&size1, data.data() + 6U, 4U);
-            std::size_t off = 10U;
-            off += (8U - (off % 8U)) % 8U;  // pad to 8 after the [num_levels][size0][size1] header
-            const std::size_t values_off = off;
-            std::size_t lengths_off = values_off + size0;
-            lengths_off += (8U - (lengths_off % 8U)) % 8U;
-            if (lengths_off + size1 > data.size() || size0 % bpv != 0U || length_bytes == 0U ||
-                size1 % length_bytes != 0U) {
-                error = "rle chunk buffer sizes invalid";
-                return false;
-            }
-            const std::size_t num_runs = size0 / bpv;
-            if (num_runs != size1 / length_bytes) {
-                error = "rle run count mismatch between values and lengths";
-                return false;
-            }
-            auto run_length_at = [&](std::size_t r) -> std::uint64_t {
-                std::uint64_t run = 0;
-                for (std::size_t k = 0; k < length_bytes; ++k) {
-                    run |= static_cast<std::uint64_t>(data[lengths_off + r * length_bytes + k]) << (8U * k);
-                }
-                return run;
-            };
-            for (std::size_t r = 0; r < num_runs; ++r) {
-                const std::uint64_t run = run_length_at(r);
-                const auto* vptr = data.data() + values_off + r * bpv;
-                if (!append_repeated_value(out.fixed, vptr, bpv, static_cast<std::size_t>(run))) {
-                    error = "rle run expansion overflows";
+            for (const auto& chunk : chunks) {
+                if (chunk.extra_buffers.empty()) {
+                    error = "rle chunk is missing its run-lengths buffer";
                     return false;
+                }
+                const auto& values = chunk.values;
+                const auto& lengths = chunk.extra_buffers[0];
+                if (bpv == 0U || values.size() % bpv != 0U) {
+                    error = "rle chunk buffer sizes invalid";
+                    return false;
+                }
+                const std::size_t num_runs = values.size() / bpv;
+                if (num_runs != lengths.size() / length_bytes) {
+                    error = "rle run count mismatch between values and lengths";
+                    return false;
+                }
+                for (std::size_t r = 0; r < num_runs; ++r) {
+                    const std::uint64_t run = lengths[r];
+                    if (!append_repeated_value(out.fixed, values.data() + r * bpv, bpv,
+                                               static_cast<std::size_t>(run))) {
+                        error = "rle run expansion overflows";
+                        return false;
+                    }
                 }
             }
         }
@@ -1709,7 +1820,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
             return false;
         }
-        if (!split_miniblock_payload(payload, chunks, error)) {
+        if (!split_miniblock_payload(payload, encoding_plan.chunk_shape, chunks, error)) {
             return false;
         }
         // How many values a chunk holds depends on how it is encoded, and the header only states it

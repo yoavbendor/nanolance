@@ -564,6 +564,30 @@ buffers, and `lance_table_reader.cpp` no longer mentions it.
 
 ---
 
+## 3b. Reading pylance's nullable columns (found and fixed after the plan was written)
+
+Not a plan item — a hole the plan's own "valid pylance alternative" claim rested on. Nulls had been
+tested at one or two sizes, which is the wrong shape of test here: Lance does not have *a*
+definition-level encoding, it has several, and which one a column gets depends on the row count and
+the null pattern rather than on anything the writer is asked for.
+
+Sweeping 5 types x 5 null patterns x 10 sizes against pylance's own read found three separate
+failures, the largest of which made a 200-to-1000-row nullable string column unreadable outright:
+
+| | symptom | cause |
+|---|---|---|
+| `InlineBitpacking(16)` levels | refused by name | the bit width is the buffer's first `u16`, not a number in the descriptor |
+| chunk header | `rle chunk buffer sizes invalid` | the header's shape depends on the descriptor; it was parsed as a fixed 8 bytes |
+| multi-block levels | `covers more than one FastLanes block` | a `bool` chunk holds 1025 values, so its levels span two blocks |
+
+All 250 cells now match pylance. The details, including the on-disk grammar for each, are in
+`docs/PROGRESS.md`; `bindings/python/tests/test_lance_nullable_matrix.py` is the sweep.
+
+The general lesson is the one worth keeping: **a format reader cannot be spot-checked.** Each of
+these was a shape stock Lance picks on its own, for ordinary data, that no test happened to land on.
+
+---
+
 ## 4. Suggested sequencing
 
 Phase 0 first and immediately — it is days of work and it is the difference between "silently wrong"
