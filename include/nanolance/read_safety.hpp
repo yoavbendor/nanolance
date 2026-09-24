@@ -21,6 +21,7 @@
 #include <cstring>
 #include <limits>
 #include <type_traits>
+#include <vector>
 
 namespace nano_lance {
 
@@ -32,6 +33,19 @@ namespace nano_lance {
 /// decompressed size above `compressed * kZstdMaxExpansion` cannot be true, and unlike any size field
 /// it is derived from bytes that are actually present -- which is what makes it a bound.
 inline constexpr std::uint64_t kZstdMaxExpansion = 32768U;
+
+/// Make room for `extra` more elements, growing geometrically. Use this, not
+/// `v.reserve(v.size() + extra)`, anywhere it runs once per value, chunk, page or batch: `reserve`
+/// grows to EXACTLY the size asked for, so calling it in a loop reallocates and copies everything
+/// accumulated so far on almost every call -- quadratic in the column. That is how a 20,000-row
+/// pylance string page came to take 2 s to read.
+template <class T>
+void reserve_more(std::vector<T>& v, std::size_t extra) {
+    const auto needed = v.size() + extra;
+    if (needed > v.capacity()) {
+        v.reserve(needed > v.capacity() * 2U ? needed : v.capacity() * 2U);
+    }
+}
 
 #ifndef NANOLANCE_MAX_UNCOMPRESSED_BYTES
 #define NANOLANCE_MAX_UNCOMPRESSED_BYTES (std::uint64_t{8} << 30)  // 8 GiB per decoded buffer

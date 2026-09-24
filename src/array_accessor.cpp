@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/array_accessor.hpp"
+#include "nanolance/read_safety.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -305,7 +306,7 @@ bool append_fixed_width(const ArrowArray& array,
     if (field.logical_type == "bool") {
         const auto* bits = static_cast<const std::uint8_t*>(array.buffers[1]);
         const auto base = static_cast<std::size_t>(array.offset);
-        out.fixed.reserve(out.fixed.size() + static_cast<std::size_t>(array.length));
+        reserve_more(out.fixed, static_cast<std::size_t>(array.length));
         for (std::int64_t i = 0; i < array.length; ++i) {
             const auto bit_index = base + static_cast<std::size_t>(i);
             const auto byte = bits[bit_index >> 3U];

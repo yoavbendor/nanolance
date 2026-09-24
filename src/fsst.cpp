@@ -64,9 +64,9 @@ bool decompress_value(const SymbolTable& table, const std::uint8_t* data, std::s
         out.insert(out.end(), data, data + size);
         return true;
     }
-    // Reserve the worst case once rather than growing inside the loop: every code expands to at most
-    // kMaxSymbolLength bytes, and this runs once per value.
-    out.reserve(out.size() + size * kMaxSymbolLength);
+    // Room for the worst case: every code expands to at most kMaxSymbolLength bytes. Geometric,
+    // because this runs once per value -- see reserve_more.
+    reserve_more(out, size * kMaxSymbolLength);
     for (std::size_t i = 0; i < size;) {
         const auto code = data[i];
         if (code == kEscape) {

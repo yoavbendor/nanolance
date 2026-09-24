@@ -25,12 +25,12 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
 | Roadmap E — small type gaps | **E1–E3 done** (float16, duration, Arrow null type); E4 `large_*` write open |
 
-Test suite: **52 ctest** (was 42) and **1106 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **52 ctest** (was 42) and **1107 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
 all clean at their last run; the longest campaign run here was 95,896,936 executions. The newest,
-`column_decode`, found two bugs in its first hour — see the roadmap section below.
+`column_decode`, found two memory-safety bugs and one quadratic read — see the roadmap section below.
 
 ---
 
@@ -1904,6 +1904,15 @@ Bugs found on the way, each now pinned by a test:
 footer and never decodes a page, so the new decoders were not reached at all. The rise came from
 other parsing. `fuzz_column_decode` exists because of that mistake, and README's "fuzzer over the
 full decode chain" — true only of the chain up to the footer — now says what is actually covered.
+
+4. **Reading a pylance string column was quadratic.** Found because CI's new page-decoding fuzz
+   step ran at 15 inputs a second, two seeds taking 13–16 s each. The FSST decoder called
+   `reserve(size() + worst_case)` once per value, and `reserve` grows to exactly what it is asked
+   for, so nearly every value reallocated and copied the whole column so far. A 20,000-row page
+   took **2,099 ms; now 3.9 ms**, same output. Four more places had the same exact-size reserve once
+   per chunk, page or batch; all now use one geometric `reserve_more` helper. Fuzz throughput on
+   CI's seeds went from 15 to 1,458 inputs a second. `test_a_large_fsst_page_reads_in_linear_time`
+   pins it: 100,000 strings took 21 s before the fix and must now read in under 3.
 
 Still open from these phases: B5 (writing FullZip — nanolance writes long strings as MiniBlock,
 which stock Lance reads, pinned by `str_long` in the write matrix), element nulls on write, and

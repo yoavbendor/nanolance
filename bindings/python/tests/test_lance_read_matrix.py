@@ -340,3 +340,31 @@ def test_value_size_shapes_under_ranges_and_deletions(lance_mod, tmp_path, name)
     assert got.to_pydict() == expected.to_pydict()
     got = pa.table(nanolance.read_table(path, offset=11, length=40))
     assert got.to_pydict() == expected.slice(11, 40).to_pydict()
+
+
+def test_a_large_fsst_page_reads_in_linear_time(lance_mod, tmp_path):
+    """A page of FSST strings must not cost time quadratic in its row count.
+
+    The FSST decoder reserved `size() + worst_case` bytes once per VALUE. `reserve` grows to exactly
+    what it is asked for, so nearly every value reallocated and copied the whole column decoded so
+    far: 20,000 pylance strings took 2.1 s, and this test's 100,000 took 21 s. It was found because
+    the page-decoding fuzzer ran at 15 inputs a second in CI, two of its seeds taking 13-16 s each.
+
+    The bound is deliberately loose -- about 100x the fixed read, 7x under the broken one -- so a
+    slow runner cannot fail it and the quadratic version cannot pass it.
+    """
+    import random
+    import time
+
+    rng = random.Random(5)
+    words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+    n = 100_000
+    text = [" ".join(rng.choice(words) for _ in range(rng.randint(3, 12))) + f" {i}" for i in range(n)]
+    path = str(tmp_path / "fsst.lance")
+    lance_mod.write_dataset(pa.table({"c": pa.array(text)}), path)
+
+    started = time.perf_counter()
+    got = pa.table(nanolance.read_table(path))
+    elapsed = time.perf_counter() - started
+    assert got.column("c").to_pylist() == text
+    assert elapsed < 3.0, f"reading {n} FSST strings took {elapsed:.2f} s"

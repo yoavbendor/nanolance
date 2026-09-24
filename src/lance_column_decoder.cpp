@@ -459,7 +459,7 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
     // Each value's decoded length is only known after decompressing it, so unlike the plain
     // variable-width path this cannot be one bulk write -- but the growth can still be one
     // reservation instead of a reallocation every few rows.
-    out_offsets.reserve(out_offsets.size() + static_cast<std::size_t>(num_values) * (out_large ? 8U : 4U));
+    reserve_more(out_offsets, static_cast<std::size_t>(num_values) * (out_large ? 8U : 4U));
     const auto base = read_list_offset(offsets, 0, offsets_large);
     for (std::uint64_t i = 0; i < num_values; ++i) {
         // decode_variable_width_page already proved this table is non-decreasing and inside `data`.
@@ -2024,7 +2024,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                     return false;
                 }
                 const std::size_t num_runs = lengths.size();
-                runs.reserve(runs.size() + num_runs);
+                reserve_more(runs, num_runs);
                 for (std::size_t r = 0; r < num_runs; ++r) {
                     std::uint32_t index = 0;
                     std::memcpy(&index, values.data() + r * 4U, 4U);
@@ -2063,7 +2063,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 continue;
             }
 
-            out.variable.data.reserve(out.variable.data.size() + total_data);
+            reserve_more(out.variable.data, total_data);
             const bool first_page = out.variable.offsets.empty();
             std::uint64_t cumulative = out.variable.data.size();  // byte offset (continues across pages)
 
@@ -2192,8 +2192,8 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
             std::uint64_t cumulative = out.variable.data.size();
             // Same reasoning as expand_fsst_values(): a row's length comes from the dictionary entry
             // its index selects, so the offsets are built per row -- but only grown once per page.
-            out.variable.offsets.reserve(out.variable.offsets.size() +
-                                         static_cast<std::size_t>(page.length) * (out.variable.large ? 8U : 4U));
+            reserve_more(out.variable.offsets,
+                         static_cast<std::size_t>(page.length) * (out.variable.large ? 8U : 4U));
             if (first_page) {
                 append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
             }
@@ -2276,7 +2276,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                             " bytes, expected " + std::to_string(page_bytes);
                     return false;
                 }
-                out.fixed.reserve(out.fixed.size() + rows * (params.value_bytes - params.item_validity_bytes));
+                reserve_more(out.fixed, rows * (params.value_bytes - params.item_validity_bytes));
                 if (params.items != 0U) {
                     out.items_per_row = params.items;
                 }
