@@ -24,7 +24,7 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | [Roadmap](ROADMAP.md) A — pin and instrument | **done** |
 | Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
 | Roadmap E — small type gaps | **E1–E3 done** (float16, duration, Arrow null type); E4 `large_*` write open |
-| Roadmap C — lists, read side | **C0–C7 done**; FullZip list pages (C8) open |
+| Roadmap C — lists, read side | **C0–C8 done**; only a list of `fixed_size_list` is still refused |
 | Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip; pages compressed to within ~0.2% of pylance (FSST aside) |
 
 Test suite: **53 ctest** (was 42) and **1288 pytest** (was 22), all passing -- and nothing skipped: the one
@@ -2058,6 +2058,27 @@ list shapes within 10% of pylance (`test_list_pages_are_about_as_small_as_stock_
 and under ASan/UBSan; the page-decoding fuzzer seeded with nanolance-written list pages (chunk-
 spanning rows, dictionary items, constant pages) ran 732,113 executions clean, and CI now seeds it
 with the same dataset.
+
+## Roadmap C8: FullZip list pages
+
+A list whose items include one of 256 bytes or more -- a long string, a document body -- is stored by
+pylance as a FullZip page, which nanolance refused. It now reads them: one control word per level
+(`rep << bits_def | def`), a value only behind the levels that own one, and the levels handed to the
+same unraveler MiniBlock list pages use. The layout was taken from `serialize_full_zip_*` and
+`ControlWordIterator` in Lance's source, not guessed.
+
+Verified against pylance on six FullZip shapes (each confirmed FullZip with `nlance-pagelayout`):
+`list<utf8>` with null lists, empty lists and null items (FSST values); `large_list<large_binary>`
+(64-bit lengths); `list<list<utf8>>` with nulls at both levels; a list of nullable structs with a
+long-string field; a nullable struct holding a list; and a map with long-string values -- each read
+whole, by row range and after deletions, and each also written by nanolance and read back by both
+readers. A 25 MB column that Lance cuts into two FullZip pages reads across the boundary.
+Two mutations -- a level's visibility off by one, the repetition level not shifted out of the word
+-- each fail the tests. The page-decoding fuzzer, seeded with these pages, ran 692,338 executions
+clean; CI seeds it with FullZip list pages too.
+
+Still refused by name: a list of `fixed_size_list` (pylance stores wide ones as FullZip too, but the
+refusal is in the schema, before any page is read).
 
 ### Deliberate deviations (not defects)
 

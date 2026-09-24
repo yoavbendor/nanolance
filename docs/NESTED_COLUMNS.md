@@ -93,7 +93,19 @@ read is refused by name. They are written together, so disagreement means a corr
 
 ## What this does not cover yet
 
-FullZip with `bits_rep > 0` (C8), and `fixed_size_list` inside or around a list.
+`fixed_size_list` inside or around a list.
+
+## FullZip list pages (C8)
+
+A page whose longest item is 256 bytes or more is a FullZip, lists or not. With lists it holds one
+control word per **level**, `rep << bits_def | def`, 1/2/4 bytes as `bits_rep + bits_def` needs. A
+level whose definition is above `max_visible_def` -- the definition levels of the item and any
+structs below the innermost list; above that, an empty or null list -- is the control word alone.
+Every other level is laid out as a non-list FullZip row: a fixed-width slot, or for variable width a
+length and the bytes when the item is valid. `num_items` in the descriptor counts levels,
+`num_visible_items` values. The value pass hands the levels to the nested path, which unravels them
+like a MiniBlock page's. Buffer 1, the per-row byte-offset repetition index, is for random access;
+a full-page read does not need it.
 
 ## The write side (Phase D)
 

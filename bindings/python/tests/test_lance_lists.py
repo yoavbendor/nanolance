@@ -44,6 +44,11 @@ def _ints_lists(n, *, null_lists=False, empty_lists=False, null_items=False, see
     return out
 
 
+def _text(i, j):
+    """Mostly short, but every 50th row's items are over 256 bytes: enough to make pages FullZip."""
+    return ("L" * 300 if i % 50 == 1 else "") + f"t{i}-{j}"
+
+
 SHAPES = {
     "int64": lambda: pa.array(_ints_lists(N), pa.list_(pa.int64())),
     "int64_null_lists": lambda: pa.array(_ints_lists(N, null_lists=True), pa.list_(pa.int64())),
@@ -107,6 +112,39 @@ SHAPES = {
     ),
     # Long lists: one row's items span several miniblock chunks.
     "long_lists": lambda: pa.array([list(range(i % 3000)) for i in range(40)], pa.list_(pa.int64())),
+    # FullZip list pages (C8): one item of 256+ bytes turns the whole page into a FullZip, with one
+    # control word per LEVEL -- `rep << bits_def | def` -- and a value only behind the visible ones.
+    # Empty and null lists, null items, nesting, structs and maps each put different levels there.
+    "long_strings": lambda: pa.array(
+        [
+            None if i % 7 == 0 else [] if i % 5 == 0 else [None if (i + j) % 4 == 0 else _text(i, j) for j in range(i % 4)]
+            for i in range(N)
+        ],
+        pa.list_(pa.utf8()),
+    ),
+    "long_large_binary": lambda: pa.array(
+        [[_text(i, j).encode() for j in range(i % 3)] for i in range(N)], pa.large_list(pa.large_binary())
+    ),
+    "long_list_of_lists": lambda: pa.array(
+        [
+            None if i % 11 == 0 else [None if j == 2 else [_text(i, k) for k in range(j % 3)] for j in range(i % 4)]
+            for i in range(N)
+        ],
+        pa.list_(pa.list_(pa.utf8())),
+    ),
+    "long_list_of_struct": lambda: pa.array(
+        [
+            None if i % 7 == 0 else [None if j == 1 else {"a": i, "t": None if i % 5 == 0 else _text(i, j)} for j in range(i % 3)]
+            for i in range(N)
+        ]
+    ),
+    "long_struct_of_list": lambda: pa.array(
+        [None if i % 4 == 0 else {"t": [_text(i, j) for j in range(i % 3)], "b": i} for i in range(N)]
+    ),
+    "long_map_values": lambda: pa.array(
+        [None if i % 9 == 0 else [(f"k{j}", _text(i, j)) for j in range(i % 3)] for i in range(N)],
+        pa.map_(pa.utf8(), pa.utf8()),
+    ),
 }
 
 
@@ -166,6 +204,31 @@ def test_lists_across_fragments_and_pages(lance_mod, tmp_path):
     assert got.to_pydict() == expected.to_pydict()
     got = pa.table(nanolance.read_table(path, offset=24_990, length=30))
     assert got.to_pydict() == expected.slice(24_990, 30).to_pydict()
+
+
+def test_full_zip_lists_across_pages(lance_mod, tmp_path):
+    """FullZip list pages cut at Lance's 32 MiB page limit: ~25 MB of incompressible 700-byte items
+    lands in two pages (26,814 + 3,186 rows with this seed). Each page's control words start at a
+    row, so the levels unravel page by page; a range and a deletion cross the page boundary."""
+    rng = _rng(5)
+    n = 30_000
+    column = pa.array(
+        [
+            None if i % 13 == 0 else [] if i % 11 == 0 else [rng.randbytes(700 + i % 50) if (i + j) % 6 else None for j in range(i % 4)]
+            for i in range(n)
+        ],
+        pa.list_(pa.binary()),
+    )
+    table = pa.table({"id": pa.array(range(n), pa.int64()), "c": column})
+    path = _write(lance_mod, tmp_path, "pages", table)
+    expected = lance_mod.dataset(path).to_table()
+    got = pa.table(nanolance.read_table(path))
+    got.validate(full=True)
+    assert got.to_pydict() == expected.to_pydict()
+    assert pa.table(nanolance.read_table(path, offset=26_800, length=30)).to_pydict() == expected.slice(26_800, 30).to_pydict()
+    lance_mod.dataset(path).delete("id % 3 == 1")
+    expected = lance_mod.dataset(path).to_table()
+    assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
 
 
 def test_list_projection_and_neighbours(lance_mod, tmp_path):

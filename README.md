@@ -185,7 +185,7 @@ Lance's string compressor switches on):
 | a low-cardinality (categorical) string column, with or without nulls | yes — including its LZ4-compressed dictionary |
 | `struct`, including null structs | yes |
 | `fixed_size_list` vectors — nullable rows, null elements, any dimension | yes |
-| `list`, `large_list`, `list<list<…>>` of any type above — null lists, empty lists, null items | yes |
+| `list`, `large_list`, `list<list<…>>` of any type above, long values (FullZip) included — null lists, empty lists, null items | yes |
 | a list of structs, a struct holding lists — with nulls at any level | yes |
 | `map` | yes |
 | a list of `fixed_size_list` | no — refused by name |

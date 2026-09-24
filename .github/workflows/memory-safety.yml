@@ -196,6 +196,12 @@ jobs:
               "strs": pa.array([[f"s{i}-{j}" for j in range(i % 3)] for i in range(m)], pa.list_(pa.utf8())),
               "nested": pa.array([[[i] * (j % 2 + 1) for j in range(i % 3)] for i in range(m)],
                                  pa.list_(pa.list_(pa.int64()))),
+              # FullZip list pages: one control word per level, values only behind visible ones.
+              "long_lists": pa.array([None if i % 7 == 0 else [] if i % 5 == 0 else
+                                      [None if (i + j) % 4 == 0 else "w" * 300 + str(i) for j in range(i % 4)]
+                                      for i in range(m)], pa.list_(pa.utf8())),
+              "long_nested": pa.array([[["w" * 280 + str(i)] * (j % 3) for j in range(i % 3)] for i in range(m)],
+                                      pa.list_(pa.list_(pa.utf8()))),
           }), "seed-datasets/wide.lance")
           PY
           mkdir -p corpus-page-layout

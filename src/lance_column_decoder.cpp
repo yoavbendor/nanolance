@@ -1045,9 +1045,11 @@ enum class ColumnEncodingKind {
 struct ItemView {
     std::vector<std::vector<std::uint64_t>> page_chunk_items;
     std::size_t next_page = 0;
-    /// FullZip pages: the definition levels read from each row's control word, handed back so the
-    /// nested path can unravel struct nulls from them.
+    /// FullZip pages: the definition levels read from each control word -- one per row, or with lists
+    /// one per level -- handed back so the nested path can unravel them; and with lists, the
+    /// repetition levels beside them.
     std::vector<std::uint16_t> full_zip_levels;
+    std::vector<std::uint16_t> full_zip_rep;
 };
 
 struct ColumnEncodingPlan {
@@ -1296,9 +1298,21 @@ void append_item_validity(ColumnValues& out, const std::uint8_t* src, std::uint6
 /// Byte layout (verified against page buffer sizes; see docs/ROADMAP.md, B1): each row is a control
 /// word of 0/1/2/4 bytes holding its definition level, then either a fixed-width value slot -- present
 /// even for a null row -- or, for a valid variable-width row only, a length prefix and the bytes.
+///
+/// A list page (`bits_rep > 0`, C8) has one control word per LEVEL, not per row: the word is
+/// `rep << bits_def | def` (`ControlWordIterator` in Lance's `repdef.rs`). A level whose definition is
+/// above `max_visible_def` -- an empty or null list -- is the control word alone; every other level
+/// is laid out exactly like a non-list row.
 struct FullZipPageParams {
     std::size_t control_bytes = 0;
+    std::uint32_t bits_rep = 0;
     std::uint32_t bits_def = 0;
+    /// Levels (control words) and value-carrying levels in the page; both the row count without lists.
+    std::uint64_t levels = 0;
+    std::uint64_t visible = 0;
+    /// Highest definition level that still owns a value slot: the item's and any structs' below the
+    /// innermost list. Everything above it is an empty or null list.
+    std::uint32_t max_visible_def = 0xFFFFU;
     std::size_t value_bytes = 0;   // fixed width; 0 for variable width
     std::size_t length_bytes = 0;  // variable width: the length prefix, 4 or 8; 0 for fixed width
     std::optional<fsst::SymbolTable> fsst;
@@ -1317,30 +1331,52 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
         return false;
     }
     const auto& fz = layout.full_zip;
-    if (fz.bits_rep != 0U) {
-        why = "repeated values (lists) in a FullZip page are not read yet";
-        return false;
-    }
-    if (fz.num_items != page_rows || fz.num_visible_items != page_rows) {
-        why = "FullZip page declares " + std::to_string(fz.num_items) + " items (" +
-              std::to_string(fz.num_visible_items) + " visible) for " + std::to_string(page_rows) + " rows";
-        return false;
-    }
-    // Item and struct layers only: the value itself, and any structs around it (whose nulls are the
-    // higher definition levels -- decode_nested_column reads those). A list layer would need
-    // repetition, refused above.
-    bool any_nullable = false;
+    // The layers decide what the levels can mean: which carry definition levels, and whether there is
+    // a list (so repetition). decode_nested_column unravels them; here they only have to agree with
+    // the control word's widths.
+    bool any_def_layer = false;
+    bool any_list = false;
+    std::uint32_t max_visible_def = 0;
     for (const auto layer : fz.layers) {
-        if (layer != 1U && layer != 3U) {
+        if (layer < repdef::kAllValidItem || layer > repdef::kNullAndEmptyList) {
             why = "unsupported FullZip layer set";
             return false;
         }
-        any_nullable = any_nullable || layer == 3U;
+        const std::uint32_t def_levels = layer == repdef::kAllValidItem || layer == repdef::kAllValidList ? 0U
+                                         : layer == repdef::kNullAndEmptyList                             ? 2U
+                                                                                                          : 1U;
+        any_def_layer = any_def_layer || def_levels != 0U;
+        if (!any_list && repdef::is_list_layer(layer)) {
+            any_list = true;
+            out.max_visible_def = max_visible_def;
+        }
+        max_visible_def += def_levels;
     }
-    if (fz.layers.empty() || fz.bits_def > 16U || (fz.bits_def != 0U) != any_nullable) {
+    // A layer that can be null may still see only valid levels on this page (Lance then writes no
+    // definition bits), but definition bits with no layer to give them meaning are corrupt.
+    if (fz.layers.empty() || fz.bits_def > 16U || fz.bits_rep > 16U || (fz.bits_def != 0U && !any_def_layer)) {
         why = "FullZip definition bits do not match its layers";
         return false;
     }
+    if ((fz.bits_rep != 0U) != any_list) {
+        why = "FullZip repetition bits do not match its layers";
+        return false;
+    }
+    if (fz.bits_rep == 0U) {
+        if (fz.num_items != page_rows || fz.num_visible_items != page_rows) {
+            why = "FullZip page declares " + std::to_string(fz.num_items) + " items (" +
+                  std::to_string(fz.num_visible_items) + " visible) for " + std::to_string(page_rows) + " rows";
+            return false;
+        }
+    } else if (fz.num_visible_items > fz.num_items || fz.num_items < page_rows) {
+        // Every row starts with a level, and only some levels carry values.
+        why = "FullZip page declares " + std::to_string(fz.num_items) + " levels (" +
+              std::to_string(fz.num_visible_items) + " with values) for " + std::to_string(page_rows) + " rows";
+        return false;
+    }
+    out.levels = fz.num_items;
+    out.visible = fz.num_visible_items;
+    out.bits_rep = fz.bits_rep;
     out.bits_def = fz.bits_def;
     const auto total_bits = fz.bits_rep + fz.bits_def;
     out.control_bytes = total_bits == 0U ? 0U : total_bits <= 8U ? 1U : total_bits <= 16U ? 2U : 4U;
@@ -2378,8 +2414,8 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     // longest value is 256 bytes or more -- a long string, or a float32 fixed_size_list of 64+ dims.
     if (encoding_plan.kind == ColumnEncodingKind::kFullZip) {
         std::vector<std::uint8_t> data;
-        std::vector<std::uint16_t> levels;
-        std::uint64_t rows_so_far = 0;
+        std::vector<std::uint16_t> levels;  // definition level of each value-carrying level (item)
+        std::uint64_t rows_so_far = 0;      // items so far: rows, unless the page has lists
         bool variable = false;
         for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
             const auto& page = column_metadata.pages[page_index];
@@ -2418,22 +2454,43 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
             if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[0], page.buffer_sizes[0], data, error)) {
                 return false;
             }
-            if (page.length > std::numeric_limits<std::uint32_t>::max()) {
+            if (params.levels > std::numeric_limits<std::uint32_t>::max()) {
                 error = "FullZip page row count exceeds 2^32";
                 return false;
             }
-            const auto rows = static_cast<std::size_t>(page.length);
+            // Without lists: one level per row, each with a value. With lists: `levels` control words,
+            // `visible` of them followed by a value (rows = items there, for everything below).
+            const auto num_levels = static_cast<std::size_t>(params.levels);
+            const auto rows = static_cast<std::size_t>(params.visible);
+            // Every control word is at least a byte when there are lists, so a page cannot declare
+            // more levels than it has bytes -- checked before anything is sized from the count.
+            if (params.control_bytes != 0U && num_levels > data.size() / params.control_bytes) {
+                error = "column '" + on_disk_field.name + "': FullZip page declares " + std::to_string(num_levels) +
+                        " levels in " + std::to_string(data.size()) + " bytes";
+                return false;
+            }
             levels.assign(rows, 0U);
+            std::vector<std::uint16_t> page_rep;
+            std::vector<std::uint16_t> page_def;
+            if (params.bits_rep != 0U) {
+                page_rep.resize(num_levels);
+                page_def.resize(num_levels);
+            }
             const std::uint32_t def_mask = params.bits_def == 0U ? 0U : ((1U << params.bits_def) - 1U);
+            const std::uint32_t rep_mask = params.bits_rep == 0U ? 0U : ((1U << params.bits_rep) - 1U);
             bool page_has_nulls = false;
             std::size_t at = 0;
             if (!variable) {
                 std::uint64_t page_bytes = 0;
-                if (!checked_mul(static_cast<std::uint64_t>(rows),
-                                 static_cast<std::uint64_t>(params.value_bytes + params.control_bytes), page_bytes) ||
-                    page_bytes != data.size()) {
+                std::uint64_t value_total = 0;
+                if (!checked_mul(static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(params.value_bytes),
+                                 value_total) ||
+                    !checked_mul(static_cast<std::uint64_t>(num_levels),
+                                 static_cast<std::uint64_t>(params.control_bytes), page_bytes) ||
+                    page_bytes > std::numeric_limits<std::uint64_t>::max() - value_total ||
+                    page_bytes + value_total != data.size()) {
                     error = "column '" + on_disk_field.name + "': FullZip page is " + std::to_string(data.size()) +
-                            " bytes, expected " + std::to_string(page_bytes);
+                            " bytes, expected " + std::to_string(page_bytes + value_total);
                     return false;
                 }
                 reserve_more(out.fixed, rows * (params.value_bytes - params.item_validity_bytes));
@@ -2441,7 +2498,8 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     out.items_per_row = params.items;
                 }
             }
-            for (std::size_t r = 0; r < rows; ++r) {
+            std::size_t r = 0;  // the next item
+            for (std::size_t level = 0; level < num_levels; ++level) {
                 std::uint32_t def = 0;
                 if (params.control_bytes != 0U) {
                     if (data.size() - at < params.control_bytes) {
@@ -2452,6 +2510,18 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     std::memcpy(&word, data.data() + at, params.control_bytes);  // little-endian
                     at += params.control_bytes;
                     def = word & def_mask;
+                    if (params.bits_rep != 0U) {
+                        page_rep[level] = static_cast<std::uint16_t>((word >> params.bits_def) & rep_mask);
+                        page_def[level] = static_cast<std::uint16_t>(def);
+                        if (def > params.max_visible_def) {
+                            continue;  // an empty or null list: the control word is all there is
+                        }
+                    }
+                    if (r == rows) {
+                        error = "column '" + on_disk_field.name + "': FullZip page has more values than the " +
+                                std::to_string(rows) + " it declares";
+                        return false;
+                    }
                     levels[r] = static_cast<std::uint16_t>(def);
                     page_has_nulls = page_has_nulls || def != 0U;
                 }
@@ -2467,6 +2537,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     out.fixed.insert(out.fixed.end(), data.begin() + static_cast<std::ptrdiff_t>(at),
                                      data.begin() + static_cast<std::ptrdiff_t>(at + item_bytes));
                     at += item_bytes;
+                    ++r;
                     continue;
                 }
                 if (def == 0U) {
@@ -2500,6 +2571,12 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 }
                 append_list_offset(out.variable.offsets, static_cast<std::int64_t>(out.variable.data.size()),
                                    out.variable.large);
+                ++r;
+            }
+            if (r != rows) {
+                error = "column '" + on_disk_field.name + "': FullZip page has " + std::to_string(r) +
+                        " values, it declares " + std::to_string(rows);
+                return false;
             }
             if (at != data.size()) {
                 error = "column '" + on_disk_field.name + "': FullZip page has " + std::to_string(data.size() - at) +
@@ -2507,7 +2584,12 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 return false;
             }
             if (item_view) {
-                item_view->full_zip_levels.insert(item_view->full_zip_levels.end(), levels.begin(), levels.end());
+                if (params.bits_rep != 0U) {
+                    item_view->full_zip_levels.insert(item_view->full_zip_levels.end(), page_def.begin(), page_def.end());
+                    item_view->full_zip_rep.insert(item_view->full_zip_rep.end(), page_rep.begin(), page_rep.end());
+                } else {
+                    item_view->full_zip_levels.insert(item_view->full_zip_levels.end(), levels.begin(), levels.end());
+                }
             }
             // The validity bitmap stays empty until the first null, then covers every row so far.
             if (page_has_nulls && out.validity.empty() && rows_so_far != 0U) {
@@ -2519,7 +2601,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 append_levels_to_validity(levels.data(), static_cast<std::uint32_t>(rows), rows_so_far, out.validity,
                                           out.null_count);
             }
-            rows_so_far += page.length;
+            rows_so_far += rows;
         }
         return true;
     }
@@ -3092,11 +3174,12 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             has_rep = !rep.empty();
             has_def = true;
             layer_kinds = &c.layers;
-        } else if (layout.kind == page_layout::LayoutKind::kFullZip && layout.full_zip.bits_rep == 0U) {
-            // Struct nulls over long values: the definition levels are in each row's control word,
+        } else if (layout.kind == page_layout::LayoutKind::kFullZip) {
+            // Long values under lists or null structs: the levels are in each value's control word,
             // which the FullZip value pass reads anyway and hands back.
+            has_rep = layout.full_zip.bits_rep != 0U;
             has_def = layout.full_zip.bits_def != 0U;
-            num_items = page.length;
+            num_items = has_rep ? layout.full_zip.num_visible_items : page.length;
             layer_kinds = &layout.full_zip.layers;
         } else {
             error = where + "unsupported page layout in a nested column: " + page_layout::describe(layout);
@@ -3114,6 +3197,9 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             }
             if (has_def) {
                 def = std::move(view->full_zip_levels);
+            }
+            if (has_rep) {
+                rep = std::move(view->full_zip_rep);
             }
         }
 
