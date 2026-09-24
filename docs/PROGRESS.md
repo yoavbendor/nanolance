@@ -1789,12 +1789,22 @@ is most likely to hit.
     ~9 minutes of local fuzzing to surface. A scheduled job with a persisted corpus would find the
     next one; nothing does today.
 
-12. **The wheel build has never completed on this branch.** Actions itself is healthy now — the
-   earlier note that it was dead is obsolete, and `ci-platforms` (macOS 14 + Windows 2022) passes —
-   but every `wheels` run is queued or cancelled, because the workflow cancels in-progress runs and
-   this branch has been pushed to faster than cibuildwheel's matrix takes. So manylinux/macOS wheels
-   across CPython 3.9–3.13 remain **unverified**. The Linux wheel itself was built and installed into
-   a clean virtualenv locally.
+12. **The wheel build had never completed on this branch**, and when a run finally got far enough to
+   finish, it showed why it would never have passed: `test-command` used the wrong cibuildwheel
+   placeholder. `{project}` is the working directory cibuildwheel was called in — the repository
+   root — while `{package}` is the package directory, `bindings/python`. The smoke test lives under
+   the package, so every wheel job built and repaired its wheel successfully and then died at the
+   last step:
+
+       can't open file '/Users/runner/work/nanolance/nanolance/tests/wheel_smoke.py'
+
+   Fixed to `{package}`. The lasting part is `test_packaging_config.py`, which resolves the
+   placeholders exactly as cibuildwheel does and asserts the referenced file exists — it reproduces
+   this failure locally in milliseconds instead of at the end of the longest CI job. A config path
+   that only runs inside a wheel job is otherwise unverifiable until it is too late.
+
+   Wheels across CPython 3.9–3.13 on manylinux/macOS stay **unverified until a full run goes green**;
+   that is the next thing to watch on this branch, not something already proven.
 
 ### Deliberate deviations (not defects)
 

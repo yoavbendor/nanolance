@@ -63,7 +63,15 @@ build-frontend = "build"
 test-requires = ["pyarrow"]
 # Deliberately not the pytest suite: that needs pylance, polars and pandas, which would be testing
 # THEIR wheels. See tests/wheel_smoke.py for what this checks instead.
-test-command = "python {project}/tests/wheel_smoke.py"
+#
+# `{package}`, NOT `{project}`. cibuildwheel is invoked from the repository root with
+# `package-dir: bindings/python`, and the two placeholders are different directories: `{project}` is
+# the working directory cibuildwheel was called in (the repo root), `{package}` is the package
+# directory. With `{project}` every wheel job failed at the very last step, after building and
+# repairing the wheel successfully:
+#
+#     can't open file '/Users/runner/work/nanolance/nanolance/tests/wheel_smoke.py'
+test-command = "python {package}/tests/wheel_smoke.py"
 
 [tool.cibuildwheel.linux]
 # manylinux_2_28 for a C++20 toolchain (GCC 12); the older manylinux2014 image's GCC 10 cannot build
