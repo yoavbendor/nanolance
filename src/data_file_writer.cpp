@@ -8,6 +8,7 @@
 #include "nanolance/bool_bitpack.hpp"
 #include "nanolance/byte_stream_split.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
+#include "nanolance/repdef.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <zstd.h>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -958,6 +960,269 @@ bool build_variable_chunks_for_column(const VariableWidthColumnValues& column,
 
 }  // namespace
 
+// ── Nested columns (lists, maps) ────────────────────────────────────────────────────────────────
+//
+// One leaf column under list layers: its levels come from repdef::serialize, its values are the
+// leaf items those levels point at. Every page is ONE mini-block chunk -- the page's final chunk --
+// so its value count is free (non-final chunks must hold 2^k values, which would split rows across
+// chunks) and the page holds whole rows. Levels are raw u16, `Flat(16)`, a spelling pylance itself
+// writes for small pages; compressing them is a size optimization for later.
+
+std::vector<std::uint8_t> flat16_encoding() {
+    std::vector<std::uint8_t> flat{0x08, 0x10};  // Flat{ bits_per_value = 16 }
+    std::vector<std::uint8_t> out;
+    write_length_delimited(out, 1, flat);        // CompressiveEncoding{ f1 Flat }
+    return out;
+}
+
+void append_u16_levels(std::vector<std::uint8_t>& out, const std::vector<std::uint16_t>& levels) {
+    for (const auto level : levels) {
+        append_le16(out, level);
+    }
+}
+
+void pad8(std::vector<std::uint8_t>& out) {
+    while (out.size() % 8U != 0U) {
+        out.push_back(0U);
+    }
+}
+
+std::uint64_t write_buffer(std::ofstream& out, const std::vector<std::uint8_t>& bytes) {
+    align64(out);
+    const auto at = pos(out);
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return at;
+}
+
+std::vector<std::uint8_t> page_encoding(std::uint32_t layout_field, const std::vector<std::uint8_t>& layout) {
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, layout_field, layout);
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
+/// The page's item values, gathered from the column by leaf index, as one chunk value buffer.
+bool gather_items(const LanceField& field, const ColumnValues& values, const std::vector<std::uint64_t>& items,
+                  std::vector<std::uint8_t>& out, std::vector<std::uint8_t>& value_encoding, std::string& error) {
+    out.clear();
+    if (values.kind == ColumnValues::Kind::VariableWidth) {
+        const bool large = values.variable.large;
+        const auto width = static_cast<std::size_t>(large ? 8U : 4U);
+        const auto offset = [&](std::uint64_t i) {
+            std::int64_t v = 0;
+            if (large) {
+                std::memcpy(&v, values.variable.offsets.data() + i * 8U, 8U);
+            } else {
+                std::int32_t n = 0;
+                std::memcpy(&n, values.variable.offsets.data() + i * 4U, 4U);
+                v = n;
+            }
+            return v;
+        };
+        const auto count = values.variable.offsets.size() / width;
+        const auto header = (items.size() + 1U) * 4U;
+        std::uint64_t total = header;
+        for (const auto i : items) {
+            if (i + 1U >= count) {
+                error = "list items run past the column's values";
+                return false;
+            }
+            total += static_cast<std::uint64_t>(offset(i + 1U) - offset(i));
+        }
+        if (total > std::numeric_limits<std::uint32_t>::max()) {
+            error = "a list page's strings exceed 4 GiB";
+            return false;
+        }
+        out.resize(static_cast<std::size_t>(header));
+        auto at = static_cast<std::uint32_t>(header);
+        std::memcpy(out.data(), &at, 4U);
+        std::size_t slot = 1;
+        for (const auto i : items) {
+            const auto begin = offset(i);
+            const auto end = offset(i + 1U);
+            out.insert(out.end(), values.variable.data.begin() + begin, values.variable.data.begin() + end);
+            at += static_cast<std::uint32_t>(end - begin);
+            std::memcpy(out.data() + slot * 4U, &at, 4U);
+            ++slot;
+        }
+        // Lance's binary decompressor requires the chunk to be a whole number of offset words; the
+        // flat string path pads to 8 for the same reason (see build_variable_chunk_bytes).
+        pad8(out);
+        // CompressiveEncoding{ f2 Variable{ f1 offsets = CompressiveEncoding{ Flat(32) } } }
+        value_encoding = {0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20};
+        return true;
+    }
+    const auto width = lance_logical_type_value_bytes(field.logical_type);
+    const auto* data = values.fixed_borrowed != nullptr ? values.fixed_borrowed : values.fixed.data();
+    const auto size = values.fixed_borrowed != nullptr ? values.fixed_borrowed_size : values.fixed.size();
+    if (width == 0U) {
+        error = "column '" + field.name + "': unsupported list item type " + field.logical_type;
+        return false;
+    }
+    for (const auto i : items) {
+        if ((i + 1U) * width > size) {
+            error = "list items run past the column's values";
+            return false;
+        }
+    }
+    std::vector<std::uint8_t> flat{0x08};
+    if (field.logical_type == "bool") {
+        // Flat(1): the items' bits, LSB first -- the same packing a flat bool page uses.
+        out.assign((items.size() + 7U) / 8U, 0U);
+        for (std::size_t k = 0; k < items.size(); ++k) {
+            if (data[items[k]] != 0U) {
+                out[k >> 3U] |= static_cast<std::uint8_t>(1U << (k & 7U));
+            }
+        }
+        append_varint(flat, 1U);
+    } else {
+        out.reserve(items.size() * width);
+        for (const auto i : items) {
+            out.insert(out.end(), data + i * width, data + (i + 1U) * width);
+        }
+        append_varint(flat, width * 8U);
+    }
+    value_encoding.clear();
+    write_length_delimited(value_encoding, 1, flat);
+    return true;
+}
+
+bool write_nested_column(std::ofstream& out, const LanceField& field, const ColumnValues& values, std::uint64_t rows,
+                         pb::ColumnMetadata& column, std::string& error) {
+    std::vector<repdef::SerializeLayer> layers;
+    for (const auto& layer : values.layers) {
+        layers.push_back({layer.is_list, &layer.offsets, &layer.validity});
+    }
+    if (values.layers.front().length != rows) {
+        error = "column '" + field.name + "' holds " + std::to_string(values.layers.front().length) +
+                " rows, the fragment " + std::to_string(rows);
+        return false;
+    }
+    // A page is one chunk: its level buffers carry u16 byte sizes (so at most 32767 raw u16 levels),
+    // and its values are kept to a few MiB so a reader never holds much more than a page.
+    constexpr std::size_t kMaxLevels = 32000U;
+    constexpr std::size_t kMaxValueBytes = std::size_t{4} << 20U;
+    constexpr std::uint64_t kMaxRowsPerPage = 4096U;
+    column.encoding = column_encoding_bytes();
+    std::uint64_t row = 0;
+    std::uint64_t try_rows = kMaxRowsPerPage;
+    repdef::Serialized ser;
+    std::vector<std::uint8_t> value_bytes;
+    std::vector<std::uint8_t> value_encoding;
+    while (row < rows) {
+        const auto n = std::min(try_rows, rows - row);
+        if (!repdef::serialize(layers, values.validity, row, n, ser, error) ||
+            !gather_items(field, values, ser.items, value_bytes, value_encoding, error)) {
+            error = "column '" + field.name + "': " + error;
+            return false;
+        }
+        const auto levels = std::max(ser.rep.size(), ser.def.size());
+        if (levels > kMaxLevels || value_bytes.size() > kMaxValueBytes) {
+            if (n == 1U) {
+                if (levels > kMaxLevels) {
+                    error = "column '" + field.name + "': row " + std::to_string(row) + " holds " +
+                            std::to_string(levels) + " list entries; one row can hold at most " +
+                            std::to_string(kMaxLevels) + " until large-row pages are written";
+                    return false;
+                }
+            } else {
+                try_rows = std::max<std::uint64_t>(1U, n / 2U);
+                continue;
+            }
+        }
+
+        std::vector<std::uint8_t> rep_bytes;
+        std::vector<std::uint8_t> def_bytes;
+        append_u16_levels(rep_bytes, ser.rep);
+        append_u16_levels(def_bytes, ser.def);
+        std::vector<std::uint8_t> layer_bytes(ser.layers.begin(), ser.layers.end());
+        pb::ColumnPage page;
+        page.length = n;
+        page.priority = 0;
+
+        if (ser.items.empty()) {
+            // No values at all -- every list empty or null. Lance writes a ConstantLayout with no
+            // value and the levels as raw u16 buffers [rep, def]; so does this.
+            std::vector<std::uint8_t> constant;
+            write_length_delimited(constant, 5, layer_bytes);
+            constant.push_back(0x48U);  // f9 num_rep_values
+            append_varint(constant, ser.rep.size());
+            constant.push_back(0x50U);  // f10 num_def_values
+            append_varint(constant, ser.def.size());
+            page.buffer_offsets.push_back(write_buffer(out, rep_bytes));
+            page.buffer_sizes.push_back(rep_bytes.size());
+            page.buffer_offsets.push_back(write_buffer(out, def_bytes));
+            page.buffer_sizes.push_back(def_bytes.size());
+            page.encoding = page_encoding(2, constant);
+        } else {
+            // Chunk: [u16 levels][u16 rep bytes][u16 def bytes][u32 value bytes] padded to 8, then
+            // each buffer padded to 8.
+            std::vector<std::uint8_t> chunk;
+            append_le16(chunk, static_cast<std::uint16_t>(levels));
+            if (ser.has_rep) {
+                append_le16(chunk, static_cast<std::uint16_t>(rep_bytes.size()));
+            }
+            if (ser.has_def) {
+                append_le16(chunk, static_cast<std::uint16_t>(def_bytes.size()));
+            }
+            append_le32(chunk, static_cast<std::uint32_t>(value_bytes.size()));
+            pad8(chunk);
+            if (ser.has_rep) {
+                chunk.insert(chunk.end(), rep_bytes.begin(), rep_bytes.end());
+                pad8(chunk);
+            }
+            if (ser.has_def) {
+                chunk.insert(chunk.end(), def_bytes.begin(), def_bytes.end());
+                pad8(chunk);
+            }
+            chunk.insert(chunk.end(), value_bytes.begin(), value_bytes.end());
+            pad8(chunk);
+            std::vector<std::uint8_t> control;  // one u32 word: (footprint / 8 - 1) << 4, final chunk
+            append_le32(control, static_cast<std::uint32_t>((chunk.size() / 8U - 1U) << 4U));
+            std::vector<std::uint8_t> rep_index;  // depth 1: [rows finishing in the chunk, leftovers]
+            for (const std::uint64_t v : {n, std::uint64_t{0}}) {
+                for (int b = 0; b < 8; ++b) {
+                    rep_index.push_back(static_cast<std::uint8_t>((v >> (8 * b)) & 0xFFU));
+                }
+            }
+            std::vector<std::uint8_t> mini;
+            if (ser.has_rep) {
+                write_length_delimited(mini, 1, flat16_encoding());
+            }
+            if (ser.has_def) {
+                write_length_delimited(mini, 2, flat16_encoding());
+            }
+            write_length_delimited(mini, 3, value_encoding);
+            write_length_delimited(mini, 6, layer_bytes);
+            mini.push_back(0x38U);  // f7 num_buffers
+            mini.push_back(0x01U);
+            if (ser.has_rep) {
+                mini.push_back(0x40U);  // f8 repetition_index_depth
+                mini.push_back(0x01U);
+            }
+            mini.push_back(0x48U);  // f9 num_items
+            append_varint(mini, ser.items.size());
+            mini.push_back(0x50U);  // f10 has_large_chunk
+            mini.push_back(0x01U);
+            page.buffer_offsets.push_back(write_buffer(out, control));
+            page.buffer_sizes.push_back(control.size());
+            page.buffer_offsets.push_back(write_buffer(out, chunk));
+            page.buffer_sizes.push_back(chunk.size());
+            if (ser.has_rep) {
+                page.buffer_offsets.push_back(write_buffer(out, rep_index));
+                page.buffer_sizes.push_back(rep_index.size());
+            }
+            page.encoding = page_encoding(1, mini);
+        }
+        column.pages.push_back(std::move(page));
+        row += n;
+        try_rows = std::min<std::uint64_t>(kMaxRowsPerPage, try_rows * 2U);
+    }
+    return true;
+}
+
 bool write_lance_data_file(const std::filesystem::path& dataset_path,
                            const std::string& file_name,
                            const LanceSchemaMapping& mapping,
@@ -1053,6 +1318,15 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.priority = 0;
             page.encoding = blob_v2_column_page_encoding();
             column.pages.push_back(std::move(page));
+            columns.push_back(std::move(column));
+            continue;
+        }
+
+        if (values.needs_nested_pages()) {
+            pb::ColumnMetadata column;
+            if (!write_nested_column(out, field, values, rows, column, error)) {
+                return false;
+            }
             columns.push_back(std::move(column));
             continue;
         }

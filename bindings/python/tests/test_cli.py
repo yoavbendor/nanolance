@@ -53,6 +53,29 @@ def test_converted_output_is_readable_by_stock_lance(source_parquet, tmp_path):
     assert lance.dataset(str(dest)).to_table().to_pydict() == table.to_pydict()
 
 
+def test_convert_parquet_with_lists_and_maps(tmp_path):
+    """A parquet file with nested columns -- the common case for event data -- converts, and stock
+    Lance reads the result. Parquet names a list's child `element`, not `item`; the name is carried
+    through as given."""
+    lance = require_pylance()
+    n = 5_000
+    table = pa.table(
+        {
+            "id": pa.array(range(n), type=pa.int64()),
+            "tags": pa.array([None if i % 13 == 0 else [f"t{j}" for j in range(i % 4)] for i in range(n)]),
+            "attrs": pa.array([[("k", i), ("j", None)][: i % 3] for i in range(n)], pa.map_(pa.utf8(), pa.int64())),
+            "hits": pa.array([{"n": i, "at": [i, i + 1][: i % 3]} for i in range(n)]),
+        }
+    )
+    path = tmp_path / "nested.parquet"
+    pq.write_table(table, path)
+    expected = pq.read_table(path)
+    dest = tmp_path / "nested.lance"
+    assert main(["convert", str(path), str(dest), "--compress"]) == 0
+    assert pa.table(nanolance.read_table(dest)).to_pydict() == expected.to_pydict()
+    assert lance.dataset(str(dest)).to_table().to_pydict() == expected.to_pydict()
+
+
 def test_convert_projects_and_bounds_fragments(source_parquet, tmp_path):
     path, table = source_parquet
     dest = tmp_path / "subset.lance"

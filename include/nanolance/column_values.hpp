@@ -95,6 +95,17 @@ struct ColumnValues {
         std::uint64_t length = 0;
     };
     std::vector<NestedLayer> layers;
+    /// Does this column need nested pages (repetition/definition levels per layer)? Only a list, or a
+    /// struct with an actual null. A leaf under structs that are never null keeps the flat encodings
+    /// -- its `layers` are then ignored by the writer.
+    bool needs_nested_pages() const {
+        for (const auto& layer : layers) {
+            if (layer.is_list || layer.null_count != 0U) {
+                return true;
+            }
+        }
+        return false;
+    }
     /// Rows accumulated so far. Needed on the write side because validity arrives one batch at a
     /// time and each batch's bits must land at the right absolute row offset -- the value buffers
     /// cannot supply that for a variable-width column, and for a borrowed fixed-width column there

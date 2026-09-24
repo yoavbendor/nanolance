@@ -11,9 +11,9 @@ Three things this pins that prose cannot:
    its reason is recorded where it is raised; pinning it stops someone "tidying up" one side.
    (`decimal256`, `float16`, `duration` and Arrow's `null` type used to be on the refused side too;
    all four now round-trip.)
-3. **Lists read and are refused on write.** `list` and `large_list` of any flat type read back
-   from pylance (roadmap Phase C), including lists of structs, structs of lists and maps; writing
-   them is Phase D.
+3. **Lists and maps round-trip.** `list`, `large_list`, lists of structs, structs of lists and maps
+   are written as leaf columns with repetition and definition levels (roadmap Phase D) and read
+   back by both readers, as are pylance's own (Phase C).
 
 Types are exercised at 200 rows: enough for Lance to make real encoding choices, small enough that
 the whole matrix runs in a couple of seconds. Row-count sensitivity is `test_lance_read_matrix.py`'s
@@ -86,6 +86,15 @@ ROUNDTRIPS = {
         {"c": pa.FixedSizeListArray.from_arrays(pa.array([float(i % 97) for i in range(N * 768)], pa.float32()), 768)}
     ),
     "fixed_size_list_nullable": _t(pa.list_(pa.float32(), 4), [None if i % 7 == 0 else [i, i, i, i] for i in range(N)]),
+    # Lists and maps (roadmap phases C and D): written as leaf columns with repetition and definition
+    # levels, read back by both readers.
+    "list": _t(pa.list_(pa.int64()), [None if i % 9 == 0 else [i, i + 1][: i % 3] for i in range(N)]),
+    "large_list": _t(pa.large_list(pa.int64()), [[i, i + 1] for i in range(N)]),
+    "list_of_struct": _t(pa.list_(pa.struct([("a", pa.int64())])), [[{"a": i}] for i in range(N)]),
+    "struct_of_list": _t(pa.struct([("a", pa.list_(pa.int64()))]), [{"a": [i]} for i in range(N)]),
+    "map": _t(pa.map_(pa.utf8(), pa.int64()), [[("k%d" % i, i)] for i in range(N)]),
+    "list_of_strings": _t(pa.list_(pa.utf8()), [[f"s{i}", None][: i % 3] for i in range(N)]),
+    "null_struct": _t(pa.struct([("a", pa.int64()), ("s", pa.utf8())]), [None if i % 4 == 0 else {"a": i, "s": f"s{i}"} for i in range(N)]),
 }
 
 # Refused at write_batch, each with a message naming the column. The fragment is what the refusal has
@@ -97,23 +106,6 @@ REFUSED_ON_WRITE = {
         pa.table({"c": pa.array([f"d{i % 5}" for i in range(N)]).dictionary_encode()}),
         "dictionary-encoded column",
     ),
-    "list": (_t(pa.list_(pa.int64()), [[i, i + 1] for i in range(N)]), "unsupported Arrow C format"),
-    "large_list": (
-        _t(pa.large_list(pa.int64()), [[i, i + 1] for i in range(N)]),
-        "unsupported Arrow C format",
-    ),
-    "list_of_struct": (
-        _t(pa.list_(pa.struct([("a", pa.int64())])), [[{"a": i}] for i in range(N)]),
-        "unsupported Arrow C format",
-    ),
-    "struct_of_list": (
-        _t(pa.struct([("a", pa.list_(pa.int64()))]), [{"a": [i]} for i in range(N)]),
-        "unsupported Arrow C format",
-    ),
-    "map": (
-        _t(pa.map_(pa.utf8(), pa.int64()), [[("k%d" % i, i)] for i in range(N)]),
-        "unsupported Arrow C format",
-    ),
     # A null element inside a VALID vector needs FixedSizeList.has_validity on write, which this
     # writer does not emit yet. It reads correctly (pylance writes it; see test_lance_read_matrix).
     "fixed_size_list_item_nulls": (
@@ -124,7 +116,7 @@ REFUSED_ON_WRITE = {
 
 # Written by pylance, read correctly by nanolance, but refused on OUR write side. Each asymmetry is
 # deliberate; see the refusal sites for why.
-READ_ONLY = ("large_string", "large_binary", "list", "large_list", "list_of_struct", "struct_of_list", "map")
+READ_ONLY = ("large_string", "large_binary")
 
 # Written by pylance and NOT readable. Pinned by message so each fails loudly when implemented.
 UNREADABLE_FROM_PYLANCE = {
@@ -206,22 +198,3 @@ def test_unreadable_types_fail_by_name(tmp_path, name):
         f"{name} now fails differently: {excinfo.value}. If it was implemented, move it out of "
         f"UNREADABLE_FROM_PYLANCE."
     )
-
-
-def test_lists_read_but_are_refused_on_write(tmp_path):
-    """Where lists stand, stated once in one place.
-
-    Read: a pylance list column unravels its repetition and definition levels into Arrow offsets and
-    validity (src/repdef.cpp; tests/test_lance_lists.py has the full matrix). Write: the schema mapper
-    refuses the Arrow format string before an encoder is reached -- roadmap Phase D.
-    """
-    lance_mod = require_pylance()
-    table = _t(pa.list_(pa.int64()), [[i, i + 1] for i in range(N)])
-
-    with pytest.raises(Exception) as write_err:
-        nanolance.write_table(table, tmp_path / "w.lance")
-    assert "unsupported Arrow C format" in str(write_err.value)
-
-    path = str(tmp_path / "r.lance")
-    lance_mod.write_dataset(table, path)
-    assert pa.table(nanolance.read_table(path)).to_pydict() == table.to_pydict()

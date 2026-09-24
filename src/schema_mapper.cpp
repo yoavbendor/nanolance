@@ -126,6 +126,14 @@ ParsedFormat parse_format(const char* format) {
         out.supported = true;
         return out;
     }
+    // Lists and maps: logical-only fields like a struct, whose data lives in the leaf columns under
+    // them with repetition levels (see docs/NESTED_COLUMNS.md). A map is a list of (key, value)
+    // entry structs, and Lance names it so.
+    if (std::strcmp(format, "+l") == 0 || std::strcmp(format, "+L") == 0 || std::strcmp(format, "+m") == 0) {
+        out.logical_type = format[1] == 'm' ? "map" : format[1] == 'L' ? "large_list" : "list";
+        out.supported = true;
+        return out;
+    }
     // ── Temporal and decimal types ───────────────────────────────────────────────────────────────
     //
     // All of these are plain fixed-width integers on the wire, so no encoder work is involved: the
@@ -367,7 +375,18 @@ bool map_field(const ArrowSchema& field,
     std::string extension_name;
     read_metadata_key(field, kArrowExtensionNameKey, extension_name);
 
-    const bool is_struct = parsed.logical_type == "struct";
+    const bool is_list = lance_logical_type_is_list(parsed.logical_type);
+    if (is_list && (field.n_children != 1 || field.children == nullptr || field.children[0] == nullptr)) {
+        error = "column '" + std::string(field.name == nullptr ? "<unnamed>" : field.name) +
+                "': a list or map needs exactly one child";
+        return false;
+    }
+    // Lance spells a list of structs "list.struct".
+    if (is_list && parsed.logical_type != "map" && field.children[0]->format != nullptr &&
+        std::strcmp(field.children[0]->format, "+s") == 0) {
+        parsed.logical_type += ".struct";
+    }
+    const bool is_struct = parsed.logical_type == "struct" || is_list;
     const bool is_dictionary = field.dictionary != nullptr;
 
     // large_utf8 / large_binary produce a file stock Lance rejects as corrupt. nanolance writes the

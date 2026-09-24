@@ -970,6 +970,11 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
                     continue;
                 }
             }
+            // A leaf under a list writes its own pages (repetition levels, items): no structural
+            // encoding applies to it, and its values count items, not rows.
+            if (i < commit_columns.size() && commit_columns[i].needs_nested_pages()) {
+                continue;
+            }
             // Declared columns (set_column_encoding) skip ALL detection scans -- the encoding was
             // decided by the caller; these scans are exactly the work the declaration saves.
             if (state->column_encodings.find(pf->name) != state->column_encodings.end()) {

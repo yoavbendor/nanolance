@@ -64,14 +64,14 @@ def _sample_value(arrow_type, i):
     return i * 10
 
 
-def test_null_struct_is_refused(tmp_path):
+def test_null_struct_round_trips(tmp_path):
     """A null STRUCT is not the same as a struct whose fields are all null.
 
-    Lance distinguishes them with a deeper definition level; nanolance writes only one. Folding the
-    parent's nulls into its children would silently turn "no struct here" into "a struct with
-    nothing in it", so this is refused rather than approximated. A null on a struct's FIELD is fine
-    and is covered above.
+    Lance distinguishes them with a definition level of their own, above the field's. This used to be
+    refused, because the flat writer had only one level; a struct column with nulls is now written
+    as a nested column (docs/NESTED_COLUMNS.md), and both readers must see `None`, not `{"x": ...}`.
     """
+    lance = require_pylance()
     table = pa.table(
         {
             "st": pa.array(
@@ -80,11 +80,10 @@ def test_null_struct_is_refused(tmp_path):
             )
         }
     )
-    with pytest.raises(RuntimeError) as excinfo:
-        nanolance.write_table(table, tmp_path / "struct_nulls.lance")
-    message = str(excinfo.value)
-    assert "struct with a null at row 1" in message
-    assert "second definition level" in message
+    path = tmp_path / "struct_nulls.lance"
+    nanolance.write_table(table, path)
+    assert pa.table(nanolance.read_table(path)).to_pydict() == table.to_pydict()
+    assert lance.dataset(str(path)).to_table().to_pydict() == table.to_pydict()
 
 
 def test_lance_pylance_reader(pylance_interop_table, tmp_path):

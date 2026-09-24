@@ -6,6 +6,7 @@
 
 #include <nanoarrow/nanoarrow.h>
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -452,6 +453,160 @@ bool append_variable_width(const ArrowArray& array,
     return true;
 }
 
+/// Append `count` validity bits of `array` from physical index `at` to a lazily materialized bitmap
+/// that already holds `have` entries (empty = all valid so far).
+void append_bits(std::vector<std::uint8_t>& bits, std::uint64_t& nulls, std::uint64_t have, const ArrowArray& array,
+                 std::int64_t at, std::int64_t count) {
+    const auto* src = array.n_buffers >= 1 && array.buffers != nullptr && array.null_count != 0
+                          ? static_cast<const std::uint8_t*>(array.buffers[0])
+                          : nullptr;
+    for (std::int64_t i = 0; i < count; ++i) {
+        const auto b = static_cast<std::uint64_t>(at + i);
+        const bool valid = src == nullptr || ((src[b >> 3U] >> (b & 7U)) & 1U) != 0U;
+        const auto dst = have + static_cast<std::uint64_t>(i);
+        if (!valid && bits.empty()) {
+            bits.assign(static_cast<std::size_t>((dst + 8U) / 8U), 0U);
+            for (std::uint64_t j = 0; j < dst; ++j) {
+                bits[static_cast<std::size_t>(j >> 3U)] |= static_cast<std::uint8_t>(1U << (j & 7U));
+            }
+        }
+        if (bits.empty()) {
+            continue;
+        }
+        bits.resize(static_cast<std::size_t>((dst + 8U) / 8U), 0U);
+        if (valid) {
+            bits[static_cast<std::size_t>(dst >> 3U)] |= static_cast<std::uint8_t>(1U << (dst & 7U));
+        } else {
+            ++nulls;
+        }
+    }
+}
+
+/// A leaf under one or more lists (or a map). Walks its path from the top-level column down, one
+/// layer per list or struct, recording each layer's offsets and validity for this batch's rows and
+/// narrowing to the children those rows cover; then appends the leaf values those children span.
+/// Physical indices compose the Arrow way: a list's offsets are logical indices into its child (plus
+/// the child's own offset), and a struct's children are NOT sliced with it (child physical = child
+/// offset + the struct's physical index).
+bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, const LanceField& field,
+                   ColumnValues& out, std::string& error) {
+    std::vector<const LanceField*> path;
+    for (const LanceField* f = &field; f != nullptr;
+         f = f->parent_id < 0 ? nullptr : find_field_by_id(mapping, f->parent_id)) {
+        path.push_back(f);
+    }
+    std::reverse(path.begin(), path.end());
+    ArrowArray top{};
+    if (!resolve_field_array_impl(batch, mapping, *path.front(), top)) {
+        error = "missing ArrowArray for mapped field " + path.front()->name;
+        return false;
+    }
+    if (out.layers.empty()) {
+        out.layers.resize(path.size() - 1U);
+        for (std::size_t k = 0; k + 1U < path.size(); ++k) {
+            out.layers[k].is_list = lance_logical_type_is_list(path[k]->logical_type);
+            if (out.layers[k].is_list) {
+                out.layers[k].offsets.push_back(0);
+            }
+        }
+    }
+    if (out.layers.size() + 1U != path.size()) {
+        error = "column '" + field.name + "' changed nesting between batches";
+        return false;
+    }
+    const ArrowArray* node = &top;
+    std::int64_t at = top.offset;
+    std::int64_t count = top.length;
+    for (std::size_t k = 0; k + 1U < path.size(); ++k) {
+        auto& layer = out.layers[k];
+        append_bits(layer.validity, layer.null_count, layer.length, *node, at, count);
+        layer.length += static_cast<std::uint64_t>(count);
+        if (layer.is_list) {
+            if (node->n_buffers < 2 || node->buffers == nullptr || node->buffers[1] == nullptr ||
+                node->n_children != 1 || node->children == nullptr || node->children[0] == nullptr) {
+                error = "list array for '" + path[k]->name + "' is missing its offsets or child";
+                return false;
+            }
+            const bool large = lance_logical_type_is_large_list(path[k]->logical_type);
+            const auto offset_at = [&](std::int64_t i) -> std::int64_t {
+                if (large) {
+                    return static_cast<const std::int64_t*>(node->buffers[1])[i];
+                }
+                return static_cast<const std::int32_t*>(node->buffers[1])[i];
+            };
+            const auto first = offset_at(at);
+            const auto last = offset_at(at + count);
+            if (last < first) {
+                error = "list array for '" + path[k]->name + "' has decreasing offsets";
+                return false;
+            }
+            const auto base = layer.offsets.back();
+            for (std::int64_t i = 1; i <= count; ++i) {
+                layer.offsets.push_back(base + offset_at(at + i) - first);
+            }
+            node = node->children[0];
+            at = node->offset + first;
+            count = last - first;
+        } else {
+            const auto* child = child_by_mapped_name(*node, mapping, path[k]->id, path[k + 1U]->name);
+            if (child == nullptr) {
+                error = "struct array for '" + path[k]->name + "' is missing child " + path[k + 1U]->name;
+                return false;
+            }
+            at = child->offset + at;
+            node = child;
+        }
+        if (at < 0 || count < 0 || at + count > node->offset + node->length) {
+            error = "column '" + field.name + "': a list points past the end of its child array";
+            return false;
+        }
+    }
+
+    std::string element;
+    std::uint64_t items = 0;
+    if (field.logical_type == "null" || !field.extension_name.empty() ||
+        lance_fixed_size_list_parts(field.logical_type, element, items)) {
+        error = "column '" + field.name + "': a list of " + field.logical_type + " cannot be written yet";
+        return false;
+    }
+    ArrowArray leaf = *node;
+    leaf.offset = at;
+    leaf.length = count;
+    if (leaf.null_count != 0) {
+        leaf.null_count = -1;
+    }
+    leaf.release = nullptr;
+    // Items already held, for the validity bitmap's position. Taken before the values are appended.
+    std::uint64_t items_before = 0;
+    if (out.kind == ColumnValues::Kind::VariableWidth && !out.variable.offsets.empty()) {
+        items_before = out.variable.offsets.size() / (out.variable.large ? 8U : 4U) - 1U;
+    } else if (out.kind == ColumnValues::Kind::FixedWidth) {
+        const auto width = lance_logical_type_value_bytes(field.logical_type);
+        items_before = width == 0U ? 0U : out.fixed.size() / width;
+    }
+    append_bits(out.validity, out.null_count, items_before, leaf, at, count);
+    if (lance_field_is_variable_width(field.logical_type)) {
+        return append_variable_width(leaf, field, out, error);
+    }
+    return append_fixed_width(leaf, field, out, error);
+}
+
+/// A leaf under a list, or under plain structs: both are walked as nested columns, so every struct's
+/// nulls and every list's offsets are recorded per layer. (Whether the pages are written nested is
+/// decided later, per fragment: see ColumnValues::needs_nested_pages.) A leaf under an extension type
+/// -- lance.blob.v2 -- keeps its own path.
+bool is_nested_leaf(const LanceSchemaMapping& mapping, const LanceField& field) {
+    bool any = false;
+    for (const LanceField* f = field.parent_id < 0 ? nullptr : find_field_by_id(mapping, field.parent_id); f != nullptr;
+         f = f->parent_id < 0 ? nullptr : find_field_by_id(mapping, f->parent_id)) {
+        if (!f->extension_name.empty()) {
+            return false;
+        }
+        any = true;
+    }
+    return any;
+}
+
 }  // namespace
 
 bool resolve_field_array(const ArrowArray& batch, const LanceSchemaMapping& mapping,
@@ -491,6 +646,24 @@ bool append_batch_column_values(const ArrowArray& batch,
     }
     for (std::size_t i = 0; i < selected.size(); ++i) {
         const auto& field = *selected[i];
+        // A leaf under a list is not row-aligned with the batch (a list's child has as many entries
+        // as its lists have items), so it is reached by walking down from its top-level column.
+        if (is_nested_leaf(mapping, field)) {
+            const LanceField* top = &field;
+            while (top->parent_id >= 0) {
+                top = find_field_by_id(mapping, top->parent_id);
+            }
+            ArrowArray top_view{};
+            if (!resolve_field_array(batch, mapping, *top, top_view)) {
+                error = "missing ArrowArray for mapped field " + top->name;
+                return false;
+            }
+            if (!append_nested(batch, mapping, field, columns[i], error)) {
+                return false;
+            }
+            columns[i].rows += static_cast<std::uint64_t>(top_view.length);
+            continue;
+        }
         ArrowArray view{};
         if (!resolve_field_array(batch, mapping, field, view)) {
             error = "missing ArrowArray for mapped field ";

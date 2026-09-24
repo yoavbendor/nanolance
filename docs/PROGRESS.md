@@ -25,8 +25,9 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
 | Roadmap E — small type gaps | **E1–E3 done** (float16, duration, Arrow null type); E4 `large_*` write open |
 | Roadmap C — lists, read side | **C0–C7 done**; FullZip list pages (C8) open |
+| Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip |
 
-Test suite: **53 ctest** (was 42) and **1203 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **53 ctest** (was 42) and **1284 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
@@ -1999,6 +2000,29 @@ Three changes: speculative reservations are capped at 256 MiB (growth past that 
 constant expansion is bounded by the decoded-size limit; and every C entry point, plus the stream's
 `get_next`, now turns an exception into an error status and message. `test_read_safety` decodes the
 2^33-row page and requires a refusal, not an exception; with the limit removed it fails.
+
+## Roadmap phase D: writing lists, maps and null structs
+
+nanolance now writes every nested shape it reads: `list`, `large_list`, `map`, lists of structs,
+structs of lists — and null structs, which were refused on write until now. A parquet file with
+nested columns converts with `nanolance convert` and stock Lance reads the result.
+
+- **D1, the serializer** (`repdef::serialize`), inverse of the unraveler, property-tested against it
+  over 20,000 random nested columns.
+- **D2, ingest and pages.** Each leaf's path is walked from its top-level Arrow column; pages are one
+  mini-block chunk each, cut at row boundaries, with raw `u16` levels and the repetition index Lance
+  expects; a page with no values is a `ConstantLayout`, as pylance writes it. Leaves under structs
+  that are never null keep the existing flat encodings.
+
+Verified: `tests/test_lance_list_writes.py` writes every read-matrix shape and every null-struct
+shape, reads each back with nanolance **and pylance**, through sliced batches and several fragments
+and a range across a fragment boundary; the type and parity matrices move lists, maps and null
+structs from "refused on write" to "round-trips". Two ingest offset rules (a list's child offset, a
+struct's physical index) each fail tests when broken — the first needed a new test, because
+`to_batches()` never produces a list whose child has its own offset.
+
+Open: a list of `fixed_size_list` (refused by name), and level compression (levels are raw `u16`,
+2 bytes each — pylance bit-packs them).
 
 ### Deliberate deviations (not defects)
 

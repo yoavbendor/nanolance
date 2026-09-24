@@ -171,7 +171,11 @@ The read side has to come first: it is the oracle for the write side, alongside 
 **Status:** D1 done — `repdef::serialize` in `src/repdef.cpp`. Property test: 20,000 random nested
 columns (lists and structs at depths 1–4, nulls and empties at every layer, garbage children under
 null lists) serialized over a random row range and unravelled back, compared row by row; two
-deliberate mutations fail it thousands of times.
+deliberate mutations fail it thousands of times. **D2 done:** lists, large lists, maps, lists of
+structs, structs of lists and null structs are written and read by both readers
+(`tests/test_lance_list_writes.py`, plus the type and parity matrices), including sliced batches,
+several fragments, long rows split across pages, and `nanolance convert` from parquet. Levels are
+written raw (`Flat(16)`); compressing them is the obvious next size win.
 
 ### Phase E — small type gaps (any time; good first tasks)
 

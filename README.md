@@ -53,10 +53,10 @@ speedup). Full details, the threat model, and a reviewer checklist: **[docs/SAFE
 - **Type coverage:** the Arrow C scalar types (int/uint 8–64, `float`, `double`, `bool`) +
   `utf8`/`binary`/`fixed_size_binary`, the temporal types (`timestamp` with or without a timezone,
   `date32/64`, `time32/64`), `decimal128/256`, `float16`, `duration`, `fixed_size_list` vectors,
-  and nested structs. Everything it writes, it reads back; every type it cannot round-trip is
-  **refused at `write_batch`** rather than written. `list` columns **read** (from pylance) but do not
-  write yet. See [Type coverage](#type-coverage) for the exact list. **Nulls are stored**, in fixed-
-  and variable-width columns alike.
+  nested structs, `list`/`large_list` and `map` — including lists of structs, structs of lists and
+  null structs. Everything it writes, it reads back; every type it cannot round-trip is **refused at
+  `write_batch`** rather than written. See [Type coverage](#type-coverage) for the exact list.
+  **Nulls are stored**, in fixed- and variable-width columns alike.
 - **Links:** `nanolance` to write; `nanolance_reader` alone if you only fetch external blobs.
 - **Python:** fast zero-copy bindings — `pip install -e bindings/python` then `import nanolance` (see
   [bindings/python/README.md](bindings/python/README.md)). Uses the Arrow PyCapsule interface; no hard
@@ -156,7 +156,7 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 | `lance.blob.v2` external references | round-trips (the headline feature) |
 | nulls in a fixed-width column (int, float, bool, temporal, decimal, `fixed_size_binary`) | round-trips |
 | nulls in a `utf8`/`binary` column | round-trips |
-| a null **struct** (as opposed to a null field inside one) | **refused** — needs a second definition level |
+| a null **struct** (as opposed to a null field inside one) | round-trips (written with its own definition level, as Lance does) |
 | `null` type | round-trips (Lance's all-null constant page) |
 | `float16`, `duration` | round-trips |
 | `fixed_size_list<T, N>` of a fixed-width `T` (embedding vectors) | round-trips, including null rows; a null *element* inside a valid row is refused |
@@ -164,7 +164,7 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 | `date32`, `date64`, `time32` (s/ms), `time64` (us/ns) | round-trips |
 | `decimal128`, `decimal256` | round-trips |
 | `timestamp` with a **UTC-offset** timezone (`+05:30`) | **refused** — Lance supports IANA zone names only and panics on offsets, so pylance cannot write one either; use a named zone |
-| `list`, `large_list`, `map` | **refused** on write (roadmap Phase D); all three **read** |
+| `list`, `large_list`, `map`, lists of structs, structs of lists | round-trips — null and empty lists, null items, any nesting depth; a list of `fixed_size_list` is refused |
 | `large_utf8`, `large_binary` | **refused** — would need 64-bit offsets in a page whose chunk grammar is u32 |
 | Arrow `dictionary<...>` columns | **refused** — cast to the value type; nanolance dictionary-encodes low-cardinality strings on disk by itself, so the file stays the same size |
 
@@ -259,8 +259,8 @@ nano_lance_writer_close(&w);
 - For S3, export credentials to the environment if your profile uses SSO/assume-role.
 
 **Don't**
-- Don't pass `list`/`large_utf8`/dictionary columns or a null struct to the writer — all are
-  refused at `write_batch` (see [Type coverage](#type-coverage)). Timestamps are supported,
+- Don't pass `large_utf8`/dictionary columns to the writer — both are refused at `write_batch`
+  (see [Type coverage](#type-coverage)). Timestamps are supported,
   but their timezone must be an IANA name, not a UTC offset.
 - Don't change the schema between batches in one session.
 - Don't enable `nano_lance_writer_set_blob_uri_dictionary` if stock Lance must read that column

@@ -93,6 +93,25 @@ read is refused by name. They are written together, so disagreement means a corr
 
 ## What this does not cover yet
 
-FullZip with `bits_rep > 0` (C8), `fixed_size_list` of lists (Lance itself does not support it:
-`decimate` is `todo!()` there), maps (C6: `list<struct<key, value>>` with Arrow `+m`), and the write
-side (Phase D).
+FullZip with `bits_rep > 0` (C8), and `fixed_size_list` inside or around a list.
+
+## The write side (Phase D)
+
+The inverse, piece by piece:
+
+- **Ingest** walks each leaf's path from its top-level Arrow column, recording one layer per list
+  or struct: validity bits, and for a list its offsets rebased to this column's running child count.
+  Physical indices compose as Arrow defines them: a list's offsets are logical indices into its
+  child (plus the child's own `offset`); a struct's children are not sliced with it (child physical
+  index = child offset + the struct's physical index). The leaf values are appended for the
+  children the batch's rows span, garbage under null lists included.
+- **`repdef::serialize`** turns a run of rows into levels, choosing each layer's kind from what
+  those rows contain, and lists the leaf entries that get a value slot. A null or empty list gets a
+  level and no slot, and its children are never visited.
+- **Pages** are one mini-block chunk each — the final chunk, so its value count is free and rows
+  never span chunks — cut at row boundaries to at most 32,000 levels (raw `u16` levels, `Flat(16)`)
+  and ~4 MiB of values. The page carries the depth-1 repetition index Lance expects
+  (`[rows, 0]`). A page with no values at all is a `ConstantLayout` with `[rep, def]` buffers,
+  exactly as pylance writes one.
+- A leaf under structs that are never null keeps the flat encodings: nested pages are written only
+  for a list or an actual struct null (`ColumnValues::needs_nested_pages`).
