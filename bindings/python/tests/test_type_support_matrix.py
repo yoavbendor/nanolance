@@ -12,8 +12,8 @@ Three things this pins that prose cannot:
    (`decimal256`, `float16`, `duration` and Arrow's `null` type used to be on the refused side too;
    all four now round-trip.)
 3. **Lists read and are refused on write.** `list` and `large_list` of any flat type read back
-   from pylance (roadmap Phase C); writing them is Phase D. Structs mixed with lists and maps are
-   still refused on read, each by name.
+   from pylance (roadmap Phase C), including lists of structs and structs of lists; writing them is
+   Phase D. Maps are still refused on read, by name.
 
 Types are exercised at 200 rows: enough for Lance to make real encoding choices, small enough that
 the whole matrix runs in a couple of seconds. Row-count sensitivity is `test_lance_read_matrix.py`'s
@@ -124,12 +124,10 @@ REFUSED_ON_WRITE = {
 
 # Written by pylance, read correctly by nanolance, but refused on OUR write side. Each asymmetry is
 # deliberate; see the refusal sites for why.
-READ_ONLY = ("large_string", "large_binary", "list", "large_list")
+READ_ONLY = ("large_string", "large_binary", "list", "large_list", "list_of_struct", "struct_of_list")
 
 # Written by pylance and NOT readable. Pinned by message so each fails loudly when implemented.
 UNREADABLE_FROM_PYLANCE = {
-    "list_of_struct": "a struct inside a list is not read yet",
-    "struct_of_list": "a list inside a struct is not read yet",
     "map": "unsupported on-disk logical type",
     "dictionary": "unsupported on-disk logical type",
 }

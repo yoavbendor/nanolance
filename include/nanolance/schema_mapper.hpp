@@ -168,7 +168,21 @@ inline std::size_t lance_logical_type_value_bytes(const std::string& logical_typ
         return 16U;
     }
     if (logical_type.rfind("fixed_size_binary:", 0) == 0) {
-        return static_cast<std::size_t>(std::stoul(logical_type.substr(18)));  // strlen("fixed_size_binary:")
+        // The logical type comes from the file. std::stoul threw on "fixed_size_binary:x" and the
+        // exception escaped the reader (found by fuzz_column_decode); 0 means "no usable width",
+        // which every caller already refuses.
+        std::size_t width = 0;
+        const auto digits = logical_type.substr(18);  // strlen("fixed_size_binary:")
+        if (digits.empty()) {
+            return 0U;
+        }
+        for (const char c : digits) {
+            if (c < '0' || c > '9' || width > (std::size_t{1} << 31U)) {
+                return 0U;
+            }
+            width = width * 10U + static_cast<std::size_t>(c - '0');
+        }
+        return width;
     }
     return 8U;
 }

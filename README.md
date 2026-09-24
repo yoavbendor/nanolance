@@ -183,10 +183,11 @@ Lance's string compressor switches on):
 | `utf8`, `large_utf8`, `binary` — including FSST-compressed and nullable | yes |
 | strings or binaries with values of 256 bytes or more (Lance's FullZip layout) | yes |
 | a low-cardinality (categorical) string column, with or without nulls | yes — including its LZ4-compressed dictionary |
-| `struct` | yes |
+| `struct`, including null structs | yes |
 | `fixed_size_list` vectors — nullable rows, null elements, any dimension | yes |
 | `list`, `large_list`, `list<list<…>>` of any type above — null lists, empty lists, null items | yes |
-| a struct inside a list, a list inside a struct, `map` | no — refused by name |
+| a list of structs, a struct holding lists — with nulls at any level | yes |
+| `map`, a list of `fixed_size_list` | no — refused by name |
 
 nanolance also reads Lance datasets pylance has **modified**: multiple versions, `append`,
 `overwrite`, `update`, `delete` (both the Arrow-IPC and roaring-bitmap deletion formats) and

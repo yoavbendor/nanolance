@@ -46,13 +46,17 @@ table-driven tests use Lance's own `repdef.rs` vectors, and it gets a fuzz targe
 
 ```cpp
 struct NestedLayer {                   // one per list/struct layer, OUTERMOST first
-    enum class Kind { List, LargeList, Struct } kind;
-    std::vector<std::int64_t> offsets; // List only: parent_count + 1 entries, starting at 0
+    bool is_list;                      // false: a struct -- validity only, one child per entry
+    std::vector<std::int64_t> offsets; // lists only: length + 1 entries, starting at 0
     std::vector<std::uint8_t> validity; // empty = all valid
     std::uint64_t null_count = 0;
 };
 std::vector<NestedLayer> layers;       // empty for a non-nested column: no behaviour change
 ```
+
+A column takes this path when any page has repetition levels **or a nullable layer above the item**
+— a struct that can be null. Everything else, by far the common case, keeps the flat decoder.
+Whether a list is `large_list` is the schema's business, decided when the Arrow array is built.
 
 Offsets are held as `int64` in memory and narrowed to Arrow's `int32` only when the array is
 built, with a checked failure past `INT32_MAX`. Row count = `layers[0]`'s entry count for a list,

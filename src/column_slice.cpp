@@ -381,8 +381,19 @@ bool check_layers(const std::vector<ColumnValues::NestedLayer>& layers, std::uin
     }
     for (std::size_t k = 0; k < layers.size(); ++k) {
         const auto& layer = layers[k];
-        if (layer.offsets.size() != layer.length + 1U || layer.offsets.front() != 0 ||
-            (!layer.validity.empty() && layer.validity.size() < bitmap_bytes(layer.length))) {
+        if (!layer.validity.empty() && layer.validity.size() < bitmap_bytes(layer.length)) {
+            error = "nested layer " + std::to_string(k) + " is malformed";
+            return false;
+        }
+        if (!layer.is_list) {
+            // A struct: one child per entry.
+            if (!layer.offsets.empty() || (k + 1U < layers.size() && layers[k + 1U].length != layer.length)) {
+                error = "struct layer " + std::to_string(k) + " is malformed";
+                return false;
+            }
+            continue;
+        }
+        if (layer.offsets.size() != layer.length + 1U || layer.offsets.front() != 0) {
             error = "list layer " + std::to_string(k) + " is malformed";
             return false;
         }
@@ -398,7 +409,7 @@ bool check_layers(const std::vector<ColumnValues::NestedLayer>& layers, std::uin
             return false;
         }
     }
-    items = static_cast<std::uint64_t>(layers.back().offsets.back());
+    items = layers.back().is_list ? static_cast<std::uint64_t>(layers.back().offsets.back()) : layers.back().length;
     return true;
 }
 
@@ -425,12 +436,23 @@ bool slice_column_values(ColumnValues& values, std::uint64_t first, std::uint64_
     for (std::size_t k = 0; k < values.layers.size(); ++k) {
         const auto& layer = values.layers[k];
         auto& out = cut[k];
+        out.is_list = layer.is_list;
+        out.length = n;
+        if (!layer.is_list) {
+            // A struct passes the same range straight to its children.
+            if (!layer.validity.empty()) {
+                out.validity = slice_bitmap(layer.validity, at, n, out.null_count);
+                if (out.null_count == 0U) {
+                    out.validity.clear();
+                }
+            }
+            continue;
+        }
         const auto base = layer.offsets[static_cast<std::size_t>(at)];
         out.offsets.reserve(static_cast<std::size_t>(n + 1U));
         for (std::uint64_t i = 0; i <= n; ++i) {
             out.offsets.push_back(layer.offsets[static_cast<std::size_t>(at + i)] - base);
         }
-        out.length = n;
         if (!layer.validity.empty()) {
             out.validity = slice_bitmap(layer.validity, at, n, out.null_count);
             if (out.null_count == 0U) {
@@ -467,18 +489,25 @@ bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>
     for (std::size_t k = 0; k < values.layers.size(); ++k) {
         const auto& layer = values.layers[k];
         auto& out = cut[k];
-        std::vector<std::uint8_t> keep_children(static_cast<std::size_t>(layer.offsets.back()), 0U);
-        out.offsets.push_back(0);
+        out.is_list = layer.is_list;
+        // A struct keeps exactly the entries it is told to, and so do its children.
+        std::vector<std::uint8_t> keep_children =
+            layer.is_list ? std::vector<std::uint8_t>(static_cast<std::size_t>(layer.offsets.back()), 0U) : keep_here;
+        if (layer.is_list) {
+            out.offsets.push_back(0);
+        }
         for (std::uint64_t i = 0; i < layer.length; ++i) {
             if (keep_here[static_cast<std::size_t>(i)] == 0U) {
                 continue;
             }
-            const auto begin = layer.offsets[static_cast<std::size_t>(i)];
-            const auto end = layer.offsets[static_cast<std::size_t>(i + 1U)];
-            for (auto c = begin; c < end; ++c) {
-                keep_children[static_cast<std::size_t>(c)] = 1U;
+            if (layer.is_list) {
+                const auto begin = layer.offsets[static_cast<std::size_t>(i)];
+                const auto end = layer.offsets[static_cast<std::size_t>(i + 1U)];
+                for (auto c = begin; c < end; ++c) {
+                    keep_children[static_cast<std::size_t>(c)] = 1U;
+                }
+                out.offsets.push_back(out.offsets.back() + (end - begin));
             }
-            out.offsets.push_back(out.offsets.back() + (end - begin));
             const bool valid = layer.validity.empty() || bit_set(layer.validity, i);
             if (!valid && out.validity.empty()) {
                 out.validity.assign(bitmap_bytes(out.length + 1U), 0U);

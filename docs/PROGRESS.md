@@ -24,9 +24,9 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | [Roadmap](ROADMAP.md) A — pin and instrument | **done** |
 | Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
 | Roadmap E — small type gaps | **E1–E3 done** (float16, duration, Arrow null type); E4 `large_*` write open |
-| Roadmap C — lists, read side | **C0–C4 and C7 done**, `list<list>` of C5; structs mixed with lists, `map`, FullZip lists open |
+| Roadmap C — lists, read side | **C0–C5 and C7 done**; `map` (C6) and FullZip list pages (C8) open |
 
-Test suite: **53 ctest** (was 42) and **1175 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **53 ctest** (was 42) and **1194 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
@@ -1958,6 +1958,28 @@ Two more, older, in code the wider seed set now reaches:
   A frame declaring more than 64 MiB is now decompressed as a stream, its buffer growing only as real
   output arrives; `test_a_zstd_frame_over_64_mib_streams_back` covers the legitimate side (a 100 MB
   value in a ~10 KB frame).
+
+### A null struct read back as a struct of nulls
+
+Found while building C5, in code that predates it, and silent: a pylance struct column with null
+rows read back with those rows present and every field null — `{"b": None}` where pylance returns
+`None` — and no error. A struct field's definition levels give "null struct" a level of its own,
+above "null field"; the flat decoder treated every non-zero level as "null field", and the batch
+builder never gave a struct array a validity bitmap at all.
+
+Any column with a nullable layer above its item now takes the nested path, which already unravels
+struct layers, and the batch builder fills each struct array's validity from them — once, with
+every other field of the same struct checked to agree. Long strings (FullZip) and constant fields
+under a null struct are covered too. `test_null_structs_read_as_null` pins six shapes, with ranges
+and deletions; routing those columns back to the flat path fails all six.
+
+The same change delivered C5: a list of structs has one leaf per field, sharing one list array and
+one struct array; a struct holding a list is a struct layer above the list layers.
+
+The page-decoding fuzzer, seeded with these struct pages, found one more old bug: the
+`fixed_size_binary:N` width was parsed with `std::stoul`, which throws on a malformed type string,
+and the exception escaped the reader — a crash, not a refusal. It is a bounded digit loop now; the
+reproducer is checked in. A 10-minute rerun after the fix: 1.23M inputs, clean.
 
 ### Deliberate deviations (not defects)
 

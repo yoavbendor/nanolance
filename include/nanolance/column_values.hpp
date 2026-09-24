@@ -82,12 +82,14 @@ struct ColumnValues {
     std::uint64_t item_null_count = 0;
     std::uint64_t items_per_row = 0;
 
-    /// List columns only: the list layers above the leaf, OUTERMOST first (docs/NESTED_COLUMNS.md).
-    /// When present, everything else in this struct describes the leaf ITEMS -- `fixed`/`variable`
-    /// hold one value per item and `validity` is item validity -- and the row count is
-    /// `layers.front().length`. Empty for every non-list column, which is then unchanged.
+    /// Nested columns only: the list and struct layers above the leaf, OUTERMOST first
+    /// (docs/NESTED_COLUMNS.md). When present, everything else in this struct describes the leaf
+    /// ITEMS -- `fixed`/`variable` hold one value per item and `validity` is item validity -- and the
+    /// row count is `layers.front().length`. Empty for a column with no list above it and no struct
+    /// that can be null, which is then unchanged.
     struct NestedLayer {
-        std::vector<std::int64_t> offsets;   // length + 1 entries, starting at 0
+        bool is_list = true;                 // false: a struct, one entry per child, validity only
+        std::vector<std::int64_t> offsets;   // lists only: length + 1 entries, starting at 0
         std::vector<std::uint8_t> validity;  // LSB-first; empty when no entry is null
         std::uint64_t null_count = 0;
         std::uint64_t length = 0;

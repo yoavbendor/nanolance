@@ -1031,6 +1031,9 @@ enum class ColumnEncodingKind {
 struct ItemView {
     std::vector<std::vector<std::uint64_t>> page_chunk_items;
     std::size_t next_page = 0;
+    /// FullZip pages: the definition levels read from each row's control word, handed back so the
+    /// nested path can unravel struct nulls from them.
+    std::vector<std::uint16_t> full_zip_levels;
 };
 
 struct ColumnEncodingPlan {
@@ -1309,12 +1312,18 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
               std::to_string(fz.num_visible_items) + " visible) for " + std::to_string(page_rows) + " rows";
         return false;
     }
-    // One layer, describing the value itself: a list would have more.
-    if (fz.layers.size() != 1U || (fz.layers[0] != 1U && fz.layers[0] != 3U)) {
-        why = "unsupported FullZip layer set";
-        return false;
+    // Item and struct layers only: the value itself, and any structs around it (whose nulls are the
+    // higher definition levels -- decode_nested_column reads those). A list layer would need
+    // repetition, refused above.
+    bool any_nullable = false;
+    for (const auto layer : fz.layers) {
+        if (layer != 1U && layer != 3U) {
+            why = "unsupported FullZip layer set";
+            return false;
+        }
+        any_nullable = any_nullable || layer == 3U;
     }
-    if (fz.bits_def > 16U || (fz.bits_def != 0U) != (fz.layers[0] == 3U)) {
+    if (fz.layers.empty() || fz.bits_def > 16U || (fz.bits_def != 0U) != any_nullable) {
         why = "FullZip definition bits do not match its layers";
         return false;
     }
@@ -1906,13 +1915,12 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     auto encoding_plan = classify_column_encoding(on_disk_field, column_metadata);
     if (item_view) {
         // Item validity comes from the unravelled levels, not from each chunk's definition levels,
-        // which here count list layers too. Only MiniBlock value encodings are read inside a list.
+        // which here count list and struct layers too. Constant pages are expanded by the nested
+        // path itself, so never reach here.
         encoding_plan.repdef = nullptr;
         encoding_plan.item_view = item_view;
-        if (encoding_plan.kind == ColumnEncodingKind::kConstant || encoding_plan.kind == ColumnEncodingKind::kFullZip) {
-            error = "column '" + on_disk_field.name + "': list items in a " +
-                    (encoding_plan.kind == ColumnEncodingKind::kConstant ? "constant" : "FullZip") +
-                    " page are not read yet";
+        if (encoding_plan.kind == ColumnEncodingKind::kConstant) {
+            error = "column '" + on_disk_field.name + "': a constant page reached the nested item pass";
             return false;
         }
     }
@@ -2484,6 +2492,9 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                         " bytes left over after its " + std::to_string(rows) + " rows";
                 return false;
             }
+            if (item_view) {
+                item_view->full_zip_levels.insert(item_view->full_zip_levels.end(), levels.begin(), levels.end());
+            }
             // The validity bitmap stays empty until the first null, then covers every row so far.
             if (page_has_nulls && out.validity.empty() && rows_so_far != 0U) {
                 std::vector<std::uint16_t> earlier(static_cast<std::size_t>(rows_so_far), 0U);
@@ -2883,6 +2894,11 @@ void append_validity_bits(std::vector<std::uint8_t>& dst, std::uint64_t& dst_nul
 /// Append one page's decoded leaf values to the column's. Validity is not touched: for a list it
 /// comes from the unravelled levels.
 bool append_leaf_values(ColumnValues& dst, ColumnValues& src, std::string& error) {
+    if (!src.item_validity.empty()) {
+        // A second bitmap, per vector element, that nothing here would carry: refuse, never drop it.
+        error = "null elements in a fixed_size_list under a list or nullable struct are not read yet";
+        return false;
+    }
     if (dst.kind == ColumnValues::Kind::FixedWidth) {
         if (src.kind != ColumnValues::Kind::FixedWidth) {
             error = "list pages decoded to different value kinds";
@@ -2934,7 +2950,8 @@ bool decode_level_buffer(const std::vector<std::uint8_t>& bytes, const page_layo
     return decode_levels(bytes, *encoding, static_cast<std::uint32_t>(count), out.data(), error);
 }
 
-/// A list column: one leaf's values under one or more list layers (docs/NESTED_COLUMNS.md).
+/// A nested column: one leaf's values under list layers, nullable struct layers, or both
+/// (docs/NESTED_COLUMNS.md).
 ///
 /// Page by page, two steps. First the page's repetition and definition levels are unravelled into
 /// per-layer offsets and validity (src/repdef.cpp). Then its values are read through the ordinary
@@ -2942,7 +2959,7 @@ bool decode_level_buffer(const std::vector<std::uint8_t>& bytes, const page_layo
 /// count, with each chunk's value count taken from the page's metadata words -- so every value
 /// encoding (bit-packing, dictionaries, FSST, RLE) works inside a list without a second copy. A
 /// constant page (all lists empty or null, or one repeated item) carries its levels as buffers.
-bool decode_list_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool decode_nested_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
                         const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
     const auto& logical_type = on_disk_field.logical_type;
     const bool variable = lance_field_is_variable_width(logical_type);
@@ -2986,11 +3003,16 @@ bool decode_list_column(const std::filesystem::path& data_file_path, const pb::F
         const std::vector<std::uint8_t>* layer_kinds = nullptr;
         std::vector<std::uint64_t> items;
 
-        if (layout.kind == page_layout::LayoutKind::kMiniBlock && layout.mini_block.has_repetition &&
-            layout.mini_block.rep_compression != nullptr) {
+        bool has_rep = false;
+        if (layout.kind == page_layout::LayoutKind::kMiniBlock) {
             const auto& mb = layout.mini_block;
+            has_rep = mb.has_repetition;
+            if (has_rep && mb.rep_compression == nullptr) {
+                error = where + "a page declares repetition levels but no encoding for them";
+                return false;
+            }
             MiniBlockChunkShape chunk_shape;
-            chunk_shape.has_repetition = true;
+            chunk_shape.has_repetition = has_rep;
             chunk_shape.has_definition = mb.repdef_compression != nullptr;
             chunk_shape.large_buffer_sizes = mb.has_large_chunk;
             chunk_shape.num_buffers = mb.num_buffers != 0U ? mb.num_buffers : 2U;
@@ -3010,14 +3032,16 @@ bool decode_list_column(const std::filesystem::path& data_file_path, const pb::F
                 if (n == 0U) {
                     continue;
                 }
-                if (chunk.rep.empty() || (chunk_shape.has_definition && chunk.repdef.empty())) {
+                if ((has_rep && chunk.rep.empty()) || (chunk_shape.has_definition && chunk.repdef.empty())) {
                     error = where + "a chunk declares levels but carries no level buffer";
                     return false;
                 }
-                rep.resize(rep.size() + n);
-                if (!decode_levels(chunk.rep, *mb.rep_compression, n, rep.data() + rep.size() - n, error)) {
-                    error = where + "repetition levels: " + error;
-                    return false;
+                if (has_rep) {
+                    rep.resize(rep.size() + n);
+                    if (!decode_levels(chunk.rep, *mb.rep_compression, n, rep.data() + rep.size() - n, error)) {
+                        error = where + "repetition levels: " + error;
+                        return false;
+                    }
                 }
                 if (chunk_shape.has_definition) {
                     def.resize(def.size() + n);
@@ -3050,16 +3074,37 @@ bool decode_list_column(const std::filesystem::path& data_file_path, const pb::F
                 error = where + error;
                 return false;
             }
+            // A constant under a nullable struct but in no list stores an empty repetition buffer.
+            has_rep = !rep.empty();
             has_def = true;
             layer_kinds = &c.layers;
+        } else if (layout.kind == page_layout::LayoutKind::kFullZip && layout.full_zip.bits_rep == 0U) {
+            // Struct nulls over long values: the definition levels are in each row's control word,
+            // which the FullZip value pass reads anyway and hands back.
+            has_def = layout.full_zip.bits_def != 0U;
+            num_items = page.length;
+            layer_kinds = &layout.full_zip.layers;
         } else {
-            error = where + "a list column page must be MiniBlock or Constant with repetition levels, not " +
-                    page_layout::describe(layout);
+            error = where + "unsupported page layout in a nested column: " + page_layout::describe(layout);
             return false;
         }
 
+        // FullZip: the values come first, because they are what yields the levels.
+        ColumnValues full_zip_values;
+        if (layout.kind == page_layout::LayoutKind::kFullZip) {
+            pb::ColumnMetadata one_page;
+            one_page.pages.push_back(page);
+            auto view = std::make_shared<ItemView>();
+            if (!decode_column_impl(data_file_path, on_disk_field, one_page, full_zip_values, error, view)) {
+                return false;
+            }
+            if (has_def) {
+                def = std::move(view->full_zip_levels);
+            }
+        }
+
         std::vector<repdef::UnraveledLayer> unraveled;
-        if (!repdef::unravel(rep, true, def, has_def, *layer_kinds, num_items, unraveled, error)) {
+        if (!repdef::unravel(rep, has_rep, def, has_def, *layer_kinds, num_items, unraveled, error)) {
             error = where + error;
             return false;
         }
@@ -3075,18 +3120,13 @@ bool decode_list_column(const std::filesystem::path& data_file_path, const pb::F
         }
         if (page_index == 0U) {
             shape = page_shape;
-            for (std::size_t k = 1; k < shape.size(); ++k) {
-                if (!shape[k]) {
-                    const bool above_every_list =
-                        std::find(shape.begin() + static_cast<std::ptrdiff_t>(k), shape.end(), true) == shape.end();
-                    error = where + (above_every_list ? "a list inside a struct is not read yet"
-                                                      : "a struct inside a list is not read yet");
-                    return false;
-                }
-            }
             layers.resize(shape.size() - 1U);
-            for (auto& layer : layers) {
-                layer.offsets.push_back(0);
+            for (std::size_t k = 1; k < shape.size(); ++k) {
+                auto& layer = layers[layers.size() - k];
+                layer.is_list = shape[k];
+                if (layer.is_list) {
+                    layer.offsets.push_back(0);
+                }
             }
         } else if (page_shape != shape) {
             error = where + "its list layers differ from the column's first page";
@@ -3095,7 +3135,9 @@ bool decode_list_column(const std::filesystem::path& data_file_path, const pb::F
 
         // The page's items.
         ColumnValues page_values;
-        if (layout.kind == page_layout::LayoutKind::kMiniBlock) {
+        if (layout.kind == page_layout::LayoutKind::kFullZip) {
+            page_values = std::move(full_zip_values);
+        } else if (layout.kind == page_layout::LayoutKind::kMiniBlock) {
             pb::ColumnMetadata one_page;
             one_page.pages.push_back(page);
             one_page.pages.back().length = page_items;
@@ -3108,7 +3150,7 @@ bool decode_list_column(const std::filesystem::path& data_file_path, const pb::F
             // One value repeated for every item -- or, with no value stored, every item null.
             const auto& c = layout.constant;
             std::vector<std::uint8_t> value;
-            if (page.buffer_offsets.size() == 3U) {
+            if (page.buffer_offsets.size() == 3U) {  // [value, rep, def]
                 if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[0], page.buffer_sizes[0], control,
                                                 error)) {
                     return false;
@@ -3170,9 +3212,11 @@ bool decode_list_column(const std::filesystem::path& data_file_path, const pb::F
         for (std::size_t k = 1; k < unraveled.size(); ++k) {
             auto& dst = layers[layers.size() - k];
             const auto& src = unraveled[k];
-            const auto base = dst.offsets.back();
-            for (std::size_t i = 1; i < src.offsets.size(); ++i) {
-                dst.offsets.push_back(base + src.offsets[i]);
+            if (dst.is_list) {
+                const auto base = dst.offsets.back();
+                for (std::size_t i = 1; i < src.offsets.size(); ++i) {
+                    dst.offsets.push_back(base + src.offsets[i]);
+                }
             }
             append_validity_bits(dst.validity, dst.null_count, dst.length, src.validity, src.null_count, src.length);
             dst.length += src.length;
@@ -3193,32 +3237,58 @@ bool decode_list_column(const std::filesystem::path& data_file_path, const pb::F
     return true;
 }
 
-/// Does this column hold list items? Read off the first page's descriptor: repetition levels.
-bool column_has_repetition(const pb::ColumnMetadata& column_metadata) {
-    if (column_metadata.pages.empty() || column_metadata.pages.front().encoding.empty()) {
+/// Does this column need the nested path? Any page with repetition levels (a list), or with a
+/// nullable layer above the item (a struct that can be null). A column whose only nullable layer is
+/// the item itself -- by far the common case -- keeps the flat path.
+bool column_is_nested(const pb::ColumnMetadata& column_metadata) {
+    const auto has_nullable_outer = [](const std::vector<std::uint8_t>& layers) {
+        for (std::size_t k = 1; k < layers.size(); ++k) {
+            if (layers[k] != repdef::kAllValidItem) {
+                return true;
+            }
+        }
         return false;
+    };
+    for (const auto& page : column_metadata.pages) {
+        if (page.encoding.empty()) {
+            continue;
+        }
+        page_layout::PageLayout layout;
+        std::string ignored;
+        if (!page_layout::decode_page_layout(page.encoding, layout, ignored)) {
+            return false;  // the ordinary path refuses it by name
+        }
+        switch (layout.kind) {
+            case page_layout::LayoutKind::kMiniBlock:
+                if (layout.mini_block.has_repetition || has_nullable_outer(layout.mini_block.layers)) {
+                    return true;
+                }
+                break;
+            case page_layout::LayoutKind::kConstant:
+                if (has_nullable_outer(layout.constant.layers)) {
+                    return true;
+                }
+                break;
+            case page_layout::LayoutKind::kFullZip:
+                if (layout.full_zip.bits_rep != 0U || has_nullable_outer(layout.full_zip.layers)) {
+                    return true;
+                }
+                break;
+            default:
+                break;
+        }
     }
-    page_layout::PageLayout layout;
-    std::string ignored;
-    if (!page_layout::decode_page_layout(column_metadata.pages.front().encoding, layout, ignored)) {
-        return false;  // the ordinary path refuses it by name
-    }
-    if (layout.kind == page_layout::LayoutKind::kConstant) {
-        return std::any_of(layout.constant.layers.begin(), layout.constant.layers.end(),
-                           [](std::uint8_t kind) { return repdef::is_list_layer(kind); });
-    }
-    return (layout.kind == page_layout::LayoutKind::kMiniBlock && layout.mini_block.has_repetition) ||
-           (layout.kind == page_layout::LayoutKind::kFullZip && layout.full_zip.bits_rep != 0U);
+    return false;
 }
 
 }  // namespace
 
 bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
                                   const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
-    if (column_has_repetition(column_metadata)) {
+    if (column_is_nested(column_metadata)) {
         error.clear();
         out = ColumnValues{};
-        return decode_list_column(data_file_path, on_disk_field, column_metadata, out, error);
+        return decode_nested_column(data_file_path, on_disk_field, column_metadata, out, error);
     }
     return decode_column_impl(data_file_path, on_disk_field, column_metadata, out, error, nullptr);
 }

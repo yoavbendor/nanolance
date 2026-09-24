@@ -85,6 +85,17 @@ SHAPES = {
     # A constant page: every item the same, so the value is inline and only the levels vary.
     "constant_items": lambda: pa.array([[5] * (i % 3) for i in range(N)], pa.list_(pa.int64())),
     "constant_string_items": lambda: pa.array([["same"] * (i % 3) for i in range(N)], pa.list_(pa.utf8())),
+    # Structs mixed with lists (C5). A list of structs has one leaf column per field, each carrying
+    # the list and struct layers; they must agree, and they fill ONE list array and ONE struct array.
+    "list_of_struct": lambda: pa.array([[{"a": i, "b": f"s{j}"} for j in range(i % 3)] for i in range(N)]),
+    "list_of_struct_nulls": lambda: pa.array(
+        [
+            None if i % 7 == 0 else [None if j == 1 else {"a": None if i % 5 == 0 else i, "b": f"s{i}-{j}"} for j in range(i % 3)]
+            for i in range(N)
+        ]
+    ),
+    "struct_of_list": lambda: pa.array([{"a": [i] * (i % 3), "b": i} for i in range(N)]),
+    "struct_of_list_nulls": lambda: pa.array([None if i % 4 == 0 else {"a": [i] * (i % 3), "b": i} for i in range(N)]),
     # Long lists: one row's items span several miniblock chunks.
     "long_lists": lambda: pa.array([list(range(i % 3000)) for i in range(40)], pa.list_(pa.int64())),
 }
@@ -165,9 +176,9 @@ def test_list_projection_and_neighbours(lance_mod, tmp_path):
 
 # Pinned: shapes that still fail, by message. Each fails loudly once it reads.
 LIST_GAPS = {
-    "list_of_struct": (
-        lambda: pa.array([[{"a": i, "b": j} for j in range(i % 3)] for i in range(N)]),
-        "a struct inside a list is not read yet",
+    "list_of_vectors": (
+        lambda: pa.array([[[1.0, 2.0]] * (i % 3) for i in range(N)], pa.list_(pa.list_(pa.float32(), 2))),
+        "a list of fixed_size_list",
     ),
 }
 
@@ -183,3 +194,42 @@ def test_list_gaps_are_pinned(lance_mod, tmp_path, name):
     with pytest.raises(Exception) as excinfo:
         pa.table(nanolance.read_table(path))
     assert gap in str(excinfo.value), f"{name} now fails differently: {excinfo.value}"
+
+
+# A NULL STRUCT, not in any list. Before the nested path this read back as a struct whose fields were
+# all null -- {"b": None} where pylance says None -- with no error: the leaf's definition levels say
+# "null struct" with a level of their own, and the flat decoder folded every non-zero level into
+# "null item". Each shape below takes a different page layout under the struct.
+NULL_STRUCTS = {
+    "fields": lambda: pa.array([None if i % 4 == 0 else {"b": i, "s": f"x{i}"} for i in range(N)]),
+    "null_fields_too": lambda: pa.array([None if i % 4 == 0 else {"b": None if i % 3 == 0 else i} for i in range(N)]),
+    "constant_fields": lambda: pa.array(
+        [None if i % 4 == 0 else {"k": 7, "s": "same", "z": None} for i in range(N)],
+        pa.struct([("k", pa.int64()), ("s", pa.utf8()), ("z", pa.int64())]),
+    ),
+    "long_strings": lambda: pa.array([None if i % 4 == 0 else {"t": "q" * 300 + str(i)} for i in range(N)]),
+    "vectors": lambda: pa.array(
+        [None if i % 4 == 0 else {"v": [float(i)] * 4} for i in range(N)], pa.struct([("v", pa.list_(pa.float32(), 4))])
+    ),
+    "nested_struct": lambda: pa.array(
+        [None if i % 5 == 0 else {"inner": None if i % 3 == 0 else {"x": i}} for i in range(N)]
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(NULL_STRUCTS))
+def test_null_structs_read_as_null(lance_mod, tmp_path, name):
+    column = NULL_STRUCTS[name]()
+    table = pa.table({"id": pa.array(range(len(column)), pa.int64()), "c": column})
+    path = _write(lance_mod, tmp_path, name, table)
+    expected = lance_mod.dataset(path).to_table()
+    got = pa.table(nanolance.read_table(path))
+    got.validate(full=True)
+    assert got.column("c").null_count == expected.column("c").null_count
+    assert got.to_pydict() == expected.to_pydict()
+    got = pa.table(nanolance.read_table(path, offset=5, length=40))
+    assert got.to_pydict() == expected.slice(5, 40).to_pydict()
+    lance_mod.dataset(path).delete("id % 3 == 0")
+    expected = lance_mod.dataset(path).to_table()
+    assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
+
