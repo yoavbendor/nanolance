@@ -11,8 +11,9 @@ Three things this pins that prose cannot:
    its reason is recorded where it is raised; pinning it stops someone "tidying up" one side.
    (`decimal256`, `float16`, `duration` and Arrow's `null` type used to be on the refused side too;
    all four now round-trip.)
-3. **Lists are unsupported in both directions**, and fail at the earliest possible point -- the
-   manifest's schema, before any page is touched. That is the single largest type gap.
+3. **Lists read and are refused on write.** `list` and `large_list` of any flat type read back
+   from pylance (roadmap Phase C); writing them is Phase D. Structs mixed with lists and maps are
+   still refused on read, each by name.
 
 Types are exercised at 200 rows: enough for Lance to make real encoding choices, small enough that
 the whole matrix runs in a couple of seconds. Row-count sensitivity is `test_lance_read_matrix.py`'s
@@ -123,12 +124,12 @@ REFUSED_ON_WRITE = {
 
 # Written by pylance, read correctly by nanolance, but refused on OUR write side. Each asymmetry is
 # deliberate; see the refusal sites for why.
-READ_ONLY = ("large_string", "large_binary")
+READ_ONLY = ("large_string", "large_binary", "list", "large_list")
 
 # Written by pylance and NOT readable. Pinned by message so each fails loudly when implemented.
 UNREADABLE_FROM_PYLANCE = {
-    "list": "unsupported on-disk logical type",
-    "large_list": "unsupported on-disk logical type",
+    "list_of_struct": "a struct inside a list is not read yet",
+    "struct_of_list": "a list inside a struct is not read yet",
     "map": "unsupported on-disk logical type",
     "dictionary": "unsupported on-disk logical type",
 }
@@ -210,13 +211,12 @@ def test_unreadable_types_fail_by_name(tmp_path, name):
     )
 
 
-def test_lists_are_unsupported_in_both_directions(tmp_path):
-    """The single largest type gap, stated once in one place.
+def test_lists_read_but_are_refused_on_write(tmp_path):
+    """Where lists stand, stated once in one place.
 
-    Lance's repetition layer is parsed only far enough to know it exists (`has_repetition`, which the
-    chunk header needs); nothing decodes it. On the write side a list never reaches an encoder -- the
-    schema mapper refuses the Arrow format string. On the read side it fails even earlier, at the
-    manifest's schema, before a page is touched.
+    Read: a pylance list column unravels its repetition and definition levels into Arrow offsets and
+    validity (src/repdef.cpp; tests/test_lance_lists.py has the full matrix). Write: the schema mapper
+    refuses the Arrow format string before an encoder is reached -- roadmap Phase D.
     """
     lance_mod = require_pylance()
     table = _t(pa.list_(pa.int64()), [[i, i + 1] for i in range(N)])
@@ -227,6 +227,4 @@ def test_lists_are_unsupported_in_both_directions(tmp_path):
 
     path = str(tmp_path / "r.lance")
     lance_mod.write_dataset(table, path)
-    with pytest.raises(Exception) as read_err:
-        pa.table(nanolance.read_table(path))
-    assert "unsupported on-disk logical type" in str(read_err.value)
+    assert pa.table(nanolance.read_table(path)).to_pydict() == table.to_pydict()

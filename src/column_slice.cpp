@@ -65,8 +65,10 @@ void write_offset(std::uint8_t* dst, std::uint64_t value, bool large) {
 
 }  // namespace
 
-bool slice_column_values(ColumnValues& values, std::uint64_t first, std::uint64_t count,
-                         std::uint64_t total, std::size_t value_bytes, std::string& error) {
+namespace {
+
+bool slice_leaf(ColumnValues& values, std::uint64_t first, std::uint64_t count, std::uint64_t total,
+                std::size_t value_bytes, std::string& error) {
     if (first > total || count > total - first) {
         error = "row range is outside the column";
         return false;
@@ -209,8 +211,8 @@ bool slice_column_values(ColumnValues& values, std::uint64_t first, std::uint64_
     return true;
 }
 
-bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>& keep,
-                           std::uint64_t total, std::size_t value_bytes, std::string& error) {
+bool compact_leaf(ColumnValues& values, const std::vector<std::uint8_t>& keep, std::uint64_t total,
+                  std::size_t value_bytes, std::string& error) {
     if (keep.size() != total) {
         error = "keep mask does not cover the column's rows";
         return false;
@@ -364,6 +366,143 @@ bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>
     values.structural_dict_plan = StructuralDictPlan{};
     values.structural_dict_rle_plan = StructuralDictRlePlan{};
     values.fixed_rle_plan = FixedRlePlan{};
+    return true;
+}
+
+
+/// Check a list column's layers describe a consistent tree before cutting it: each layer's offsets
+/// have one more entry than it has lists, start at 0, never decrease, and end at the next layer's
+/// length (the leaf's item count, for the innermost). Returns that item count.
+bool check_layers(const std::vector<ColumnValues::NestedLayer>& layers, std::uint64_t rows, std::uint64_t& items,
+                  std::string& error) {
+    if (layers.front().length != rows) {
+        error = "list column holds " + std::to_string(layers.front().length) + " rows, not " + std::to_string(rows);
+        return false;
+    }
+    for (std::size_t k = 0; k < layers.size(); ++k) {
+        const auto& layer = layers[k];
+        if (layer.offsets.size() != layer.length + 1U || layer.offsets.front() != 0 ||
+            (!layer.validity.empty() && layer.validity.size() < bitmap_bytes(layer.length))) {
+            error = "list layer " + std::to_string(k) + " is malformed";
+            return false;
+        }
+        for (std::size_t i = 1; i < layer.offsets.size(); ++i) {
+            if (layer.offsets[i] < layer.offsets[i - 1U]) {
+                error = "list layer " + std::to_string(k) + " has decreasing offsets";
+                return false;
+            }
+        }
+        const auto end = static_cast<std::uint64_t>(layer.offsets.back());
+        if (k + 1U < layers.size() && end != layers[k + 1U].length) {
+            error = "list layer " + std::to_string(k) + " ends past its children";
+            return false;
+        }
+    }
+    items = static_cast<std::uint64_t>(layers.back().offsets.back());
+    return true;
+}
+
+}  // namespace
+
+bool slice_column_values(ColumnValues& values, std::uint64_t first, std::uint64_t count,
+                         std::uint64_t total, std::size_t value_bytes, std::string& error) {
+    if (values.layers.empty()) {
+        return slice_leaf(values, first, count, total, value_bytes, error);
+    }
+    // A list column: the row range selects entries of the outermost layer, whose offsets select a
+    // contiguous range of the next layer's entries, and so on down to the items.
+    if (first > total || count > total - first) {
+        error = "row range is outside the column";
+        return false;
+    }
+    std::uint64_t items = 0;
+    if (!check_layers(values.layers, total, items, error)) {
+        return false;
+    }
+    std::vector<ColumnValues::NestedLayer> cut(values.layers.size());
+    std::uint64_t at = first;
+    std::uint64_t n = count;
+    for (std::size_t k = 0; k < values.layers.size(); ++k) {
+        const auto& layer = values.layers[k];
+        auto& out = cut[k];
+        const auto base = layer.offsets[static_cast<std::size_t>(at)];
+        out.offsets.reserve(static_cast<std::size_t>(n + 1U));
+        for (std::uint64_t i = 0; i <= n; ++i) {
+            out.offsets.push_back(layer.offsets[static_cast<std::size_t>(at + i)] - base);
+        }
+        out.length = n;
+        if (!layer.validity.empty()) {
+            out.validity = slice_bitmap(layer.validity, at, n, out.null_count);
+            if (out.null_count == 0U) {
+                out.validity.clear();
+            }
+        }
+        at = static_cast<std::uint64_t>(base);
+        n = static_cast<std::uint64_t>(out.offsets.back());
+    }
+    if (!slice_leaf(values, at, n, items, value_bytes, error)) {
+        return false;
+    }
+    values.layers = std::move(cut);
+    return true;
+}
+
+bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>& keep,
+                           std::uint64_t total, std::size_t value_bytes, std::string& error) {
+    if (values.layers.empty()) {
+        return compact_leaf(values, keep, total, value_bytes, error);
+    }
+    if (keep.size() != total) {
+        error = "keep mask does not cover the column's rows";
+        return false;
+    }
+    std::uint64_t items = 0;
+    if (!check_layers(values.layers, total, items, error)) {
+        return false;
+    }
+    // Each layer turns "which of my entries survive" into "which of my children survive": a deleted
+    // row drops every list and item under it, however deep.
+    std::vector<ColumnValues::NestedLayer> cut(values.layers.size());
+    std::vector<std::uint8_t> keep_here = keep;
+    for (std::size_t k = 0; k < values.layers.size(); ++k) {
+        const auto& layer = values.layers[k];
+        auto& out = cut[k];
+        std::vector<std::uint8_t> keep_children(static_cast<std::size_t>(layer.offsets.back()), 0U);
+        out.offsets.push_back(0);
+        for (std::uint64_t i = 0; i < layer.length; ++i) {
+            if (keep_here[static_cast<std::size_t>(i)] == 0U) {
+                continue;
+            }
+            const auto begin = layer.offsets[static_cast<std::size_t>(i)];
+            const auto end = layer.offsets[static_cast<std::size_t>(i + 1U)];
+            for (auto c = begin; c < end; ++c) {
+                keep_children[static_cast<std::size_t>(c)] = 1U;
+            }
+            out.offsets.push_back(out.offsets.back() + (end - begin));
+            const bool valid = layer.validity.empty() || bit_set(layer.validity, i);
+            if (!valid && out.validity.empty()) {
+                out.validity.assign(bitmap_bytes(out.length + 1U), 0U);
+                for (std::uint64_t b = 0; b < out.length; ++b) {
+                    out.validity[static_cast<std::size_t>(b >> 3U)] |= static_cast<std::uint8_t>(1U << (b & 7U));
+                }
+            }
+            if (!out.validity.empty()) {
+                out.validity.resize(bitmap_bytes(out.length + 1U), 0U);
+                if (valid) {
+                    out.validity[static_cast<std::size_t>(out.length >> 3U)] |=
+                        static_cast<std::uint8_t>(1U << (out.length & 7U));
+                } else {
+                    ++out.null_count;
+                }
+            }
+            ++out.length;
+        }
+        keep_here = std::move(keep_children);
+    }
+    if (!compact_leaf(values, keep_here, items, value_bytes, error)) {
+        return false;
+    }
+    values.layers = std::move(cut);
     return true;
 }
 

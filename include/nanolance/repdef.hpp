@@ -39,6 +39,10 @@ struct UnraveledLayer {
     std::uint64_t null_count = 0;
 };
 
+/// Pass as `num_items` when the page does not declare its item count (a constant page): the count
+/// is then whatever the levels say, and nothing is checked against it.
+inline constexpr std::uint64_t kInferItems = ~std::uint64_t{0};
+
 /// Unravel one page.
 ///
 /// `rep` / `def` are the page's levels, one entry per item plus one per empty or null list; an empty

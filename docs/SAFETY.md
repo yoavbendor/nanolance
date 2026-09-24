@@ -138,8 +138,11 @@ Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](https:
   harness "over the full decode chain" that stopped at the footer. It found two bugs in its first
   hour: a zstd buffer's declared uncompressed size was trusted up to the generic 8 GiB ceiling, so an
   899-byte page asked for 8.4 GB (now bounded by zstd's own maximum expansion, 32,768:1, of the
-  compressed size); and a variable-width chunk shorter than one offset was read as if it held one —
-  an out-of-bounds read, caught by UBSan as a null `memcpy` source on the empty case. Both
+  compressed size, and a frame over 64 MiB is streamed so memory follows real output); and a
+  variable-width chunk shorter than one offset was read as if it held one — an out-of-bounds read,
+  caught by UBSan as a null `memcpy` source on the empty case. Seeded with list pages it then found a
+  heap over-read in the dictionary-block parser (a `u32` bounds sum that wrapped) and two `memcpy`s
+  from null on empty level buffers. Both
   reproducers are in [`tests/fuzz/corpus/column_decode/`](https://github.com/yoavbendor/nanolance/tree/main/tests/fuzz/corpus/column_decode).
 
   The deletion-file target earned its place three times over. The roaring

@@ -24,8 +24,9 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | [Roadmap](ROADMAP.md) A — pin and instrument | **done** |
 | Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
 | Roadmap E — small type gaps | **E1–E3 done** (float16, duration, Arrow null type); E4 `large_*` write open |
+| Roadmap C — lists, read side | **C0–C4 and C7 done**, `list<list>` of C5; structs mixed with lists, `map`, FullZip lists open |
 
-Test suite: **52 ctest** (was 42) and **1107 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **53 ctest** (was 42) and **1175 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
@@ -1917,6 +1918,46 @@ full decode chain" — true only of the chain up to the footer — now says what
 Still open from these phases: B5 (writing FullZip — nanolance writes long strings as MiniBlock,
 which stock Lance reads, pinned by `str_long` in the write matrix), element nulls on write, and
 page size: nanolance writes ~10 rows per page for a 768-dim float32 vector (roadmap F1).
+
+## Roadmap phase C: reading list columns
+
+`list` and `large_list` columns written by pylance now read — the largest type gap this project had.
+Design first ([NESTED_COLUMNS.md](NESTED_COLUMNS.md)), then three pieces:
+
+- **The unraveler** (`src/repdef.cpp`), a port of Lance's `RepDefUnraveler`: repetition and
+  definition levels in, per-layer offsets and validity out. Pure computation, tested case by case
+  against the vectors in Lance's own `repdef.rs`, and fuzzed on its own with Arrow's list invariants
+  asserted on every accepted input (6.8M inputs, clean).
+- **Decoding, page by page, in two steps.** Levels are unravelled; then the page's values are read
+  by the *existing* decoders as a flat page of items, with each chunk's value count taken from the
+  page's metadata words (a list chunk has more levels than values, so the old inference does not
+  apply). Bit-packing, FSST, dictionaries and RLE therefore work inside lists with no second copy.
+  A constant page — every list empty or null, or one repeated item — carries its levels as buffers.
+- **Slicing and compaction per layer.** A row range selects one contiguous range at each layer down
+  to the items; a deletion turns kept rows into kept items through every level. Reverting either to
+  the flat code fails 43 and 21 of the new tests respectively.
+
+Verified: 66 cases in `tests/test_lance_lists.py` — every flat leaf type, `large_list`,
+`list<list<int64>>` with nulls at every level, null/empty lists, null items, dictionary and constant
+pages, 60,000 rows across fragments and pages, row ranges and deletions — each against pylance's own
+read. Still refused by name: a struct inside a list, a list inside a struct, `map`, FullZip list
+pages, a list of `fixed_size_list`.
+
+The page-decoding fuzzer, now reaching list pages, found two `memcpy`-from-null bugs (undefined
+behaviour even for zero bytes): one in the new raw-level path, and one older one it could now reach
+— width-0 bit-packing, which is legal (an all-zero level buffer packs to nothing), over an empty
+buffer. Both fixed; both reproducers are in `tests/fuzz/corpus/column_decode`.
+
+Two more, older, in code the wider seed set now reaches:
+
+- **A heap-buffer over-read in the dictionary-block parser.** Its bounds check added two `u32`s, so
+  an entry offset near 2^32 wrapped the sum back under the buffer size, passed, and handed the copy a
+  ~4 GiB length. Now checked in 64 bits.
+- **A 2.8 GB allocation from an 85 KiB page.** The earlier zstd fix bounded a frame's declared size
+  by zstd's true maximum expansion (32768:1) — but that maximum is large enough to still allow this.
+  A frame declaring more than 64 MiB is now decompressed as a stream, its buffer growing only as real
+  output arrives; `test_a_zstd_frame_over_64_mib_streams_back` covers the legitimate side (a 100 MB
+  value in a ~10 KB frame).
 
 ### Deliberate deviations (not defects)
 

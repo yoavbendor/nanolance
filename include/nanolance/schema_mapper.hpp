@@ -39,6 +39,16 @@ inline bool lance_field_is_physical(const LanceField& field) {
     return field.column_index >= 0;
 }
 
+/// A list field, as Lance's schema spells it. A list of structs is `list.struct`.
+inline bool lance_logical_type_is_list(const std::string& logical_type) {
+    return logical_type == "list" || logical_type == "large_list" || logical_type == "list.struct" ||
+           logical_type == "large_list.struct";
+}
+
+inline bool lance_logical_type_is_large_list(const std::string& logical_type) {
+    return logical_type.rfind("large_list", 0) == 0;
+}
+
 inline bool lance_field_is_variable_width(const std::string& logical_type) {
     return logical_type == "utf8" || logical_type == "large_utf8" || logical_type == "string" ||
            logical_type == "large_string" || logical_type == "binary" || logical_type == "large_binary";

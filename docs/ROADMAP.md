@@ -148,7 +148,11 @@ Order matters: each step's tests are the next step's regression suite.
 | C8 | FullZip with `bits_rep > 0` (lists of long strings / wide FSLs). | M | Sonnet, after B2 and C3 |
 
 **Status:** C0 done — [NESTED_COLUMNS.md](NESTED_COLUMNS.md). C1 done — `src/repdef.cpp`, tested
-against Lance's own `repdef.rs` vectors and fuzzed (`fuzz_repdef`).
+against Lance's own `repdef.rs` vectors and fuzzed (`fuzz_repdef`). **C2, C3, C4 and C7 done**, and
+the `list<list<…>>` part of C5: every flat leaf type, null/empty lists and null items, dictionary and
+constant pages inside lists, row ranges and deletions (`tests/test_lance_lists.py`, 66 cases against
+pylance). Open: a struct inside a list or a list inside a struct (rest of C5), `map` (C6), FullZip
+list pages (C8), and a list of `fixed_size_list`.
 
 Done when the list shapes in A2 pass, `test_type_support_matrix.py` moves `list`, `large_list`,
 `map` from `UNREADABLE_FROM_PYLANCE` to read-only, and the fuzz harness covers the unraveler.

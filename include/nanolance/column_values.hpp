@@ -81,6 +81,18 @@ struct ColumnValues {
     std::vector<std::uint8_t> item_validity;
     std::uint64_t item_null_count = 0;
     std::uint64_t items_per_row = 0;
+
+    /// List columns only: the list layers above the leaf, OUTERMOST first (docs/NESTED_COLUMNS.md).
+    /// When present, everything else in this struct describes the leaf ITEMS -- `fixed`/`variable`
+    /// hold one value per item and `validity` is item validity -- and the row count is
+    /// `layers.front().length`. Empty for every non-list column, which is then unchanged.
+    struct NestedLayer {
+        std::vector<std::int64_t> offsets;   // length + 1 entries, starting at 0
+        std::vector<std::uint8_t> validity;  // LSB-first; empty when no entry is null
+        std::uint64_t null_count = 0;
+        std::uint64_t length = 0;
+    };
+    std::vector<NestedLayer> layers;
     /// Rows accumulated so far. Needed on the write side because validity arrives one batch at a
     /// time and each batch's bits must land at the right absolute row offset -- the value buffers
     /// cannot supply that for a variable-width column, and for a borrowed fixed-width column there

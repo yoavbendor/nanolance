@@ -368,3 +368,18 @@ def test_a_large_fsst_page_reads_in_linear_time(lance_mod, tmp_path):
     elapsed = time.perf_counter() - started
     assert got.column("c").to_pylist() == text
     assert elapsed < 3.0, f"reading {n} FSST strings took {elapsed:.2f} s"
+
+
+def test_a_zstd_frame_over_64_mib_streams_back(tmp_path):
+    """A zstd frame declaring more than 64 MiB is decompressed as a stream, not pre-allocated.
+
+    The declared size is written by the file. zstd can genuinely expand 32768:1, so a size bound alone
+    still let an 85 KiB page ask for 2.8 GB before any of it was shown to exist (found by
+    fuzz_column_decode). Large frames now grow their buffer only as real output arrives. This is the
+    legitimate side of that path: one 100 MB value, a ~10 KB frame, read back byte for byte.
+    """
+    value = "abc" * ((100 << 20) // 3)
+    table = pa.table({"c": pa.array([value, "x", value[:1000]])})
+    path = tmp_path / "big.lance"
+    nanolance.write_table(table, path, compression=True)
+    assert pa.table(nanolance.read_table(path)).column("c").to_pylist() == table.column("c").to_pylist()

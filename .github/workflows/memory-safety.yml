@@ -171,6 +171,13 @@ jobs:
                                pa.list_(pa.float32(), 4)),
               "vec96": pa.FixedSizeListArray.from_arrays(
                   pa.array([None if i % 13 == 0 else float(i) for i in range(m * 96)], pa.float32()), 96),
+              # List pages: repetition levels, null/empty lists, null items, nesting.
+              "ints": pa.array([None if i % 7 == 0 else [] if i % 5 == 0 else
+                                [None if (i + j) % 4 == 0 else i for j in range(i % 4)] for i in range(m)],
+                               pa.list_(pa.int64())),
+              "strs": pa.array([[f"s{i}-{j}" for j in range(i % 3)] for i in range(m)], pa.list_(pa.utf8())),
+              "nested": pa.array([[[i] * (j % 2 + 1) for j in range(i % 3)] for i in range(m)],
+                                 pa.list_(pa.list_(pa.int64()))),
           }), "seed-datasets/wide.lance")
           PY
           mkdir -p corpus-page-layout
@@ -205,7 +212,7 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
         run: |
           mkdir -p corpus-column-decode-found
-          ./build-fuzz/nanolance_fuzz_column_decode -max_total_time=180 -rss_limit_mb=4096 \
+          ./build-fuzz/nanolance_fuzz_column_decode -max_total_time=180 -rss_limit_mb=2048 \
             -print_final_stats=1 corpus-column-decode-found corpus-column-decode tests/fuzz/corpus/column_decode
 
       # Repetition/definition unravelling for list columns. Asserts the Arrow list invariants

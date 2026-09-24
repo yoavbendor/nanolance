@@ -87,7 +87,7 @@ bool unravel(const std::vector<std::uint16_t>& rep_in, bool has_rep, const std::
                 std::to_string(def_in.size()) + ")";
         return false;
     }
-    if (!has_rep && has_def && def_in.size() != num_items) {
+    if (!has_rep && has_def && num_items != kInferItems && def_in.size() != num_items) {
         error = "definition levels cover " + std::to_string(def_in.size()) + " items, the page holds " +
                 std::to_string(num_items);
         return false;
@@ -121,6 +121,10 @@ bool unravel(const std::vector<std::uint16_t>& rep_in, bool has_rep, const std::
 
         if (is_item_layer(kind)) {
             if (!has_def) {
+                if (!has_rep && num_items == kInferItems) {
+                    error = "an item count is needed when there are no levels to infer it from";
+                    return false;
+                }
                 layer.length = has_rep ? rep.size() : num_items;
             } else {
                 const bool nullable = kind == kNullableItem;
@@ -133,7 +137,7 @@ bool unravel(const std::vector<std::uint16_t>& rep_in, bool has_rep, const std::
             if (kind == kNullableItem) {
                 ++def_cmp;
             }
-            if (li == 0 && layer.length != num_items) {
+            if (li == 0 && num_items != kInferItems && layer.length != num_items) {
                 error = "levels describe " + std::to_string(layer.length) + " items, the page holds " +
                         std::to_string(num_items);
                 return false;
