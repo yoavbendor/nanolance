@@ -96,6 +96,15 @@ SHAPES = {
     ),
     "struct_of_list": lambda: pa.array([{"a": [i] * (i % 3), "b": i} for i in range(N)]),
     "struct_of_list_nulls": lambda: pa.array([None if i % 4 == 0 else {"a": [i] * (i % 3), "b": i} for i in range(N)]),
+    # Maps (C6): stored as a list of (key, value) entry structs, read into Arrow's map type.
+    "map": lambda: pa.array([[(f"k{j}", i + j) for j in range(i % 3)] for i in range(N)], pa.map_(pa.utf8(), pa.int64())),
+    "map_nulls": lambda: pa.array(
+        [None if i % 7 == 0 else [(f"k{j}", None if j == 1 else i + j) for j in range(i % 3)] for i in range(N)],
+        pa.map_(pa.utf8(), pa.int64()),
+    ),
+    "map_of_lists": lambda: pa.array(
+        [[(i + j, [f"v{j}"] * j) for j in range(i % 3)] for i in range(N)], pa.map_(pa.int32(), pa.list_(pa.utf8()))
+    ),
     # Long lists: one row's items span several miniblock chunks.
     "long_lists": lambda: pa.array([list(range(i % 3000)) for i in range(40)], pa.list_(pa.int64())),
 }

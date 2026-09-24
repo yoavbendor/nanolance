@@ -152,8 +152,9 @@ against Lance's own `repdef.rs` vectors and fuzzed (`fuzz_repdef`). **C2, C3, C4
 the `list<list<…>>` part of C5: every flat leaf type, null/empty lists and null items, dictionary and
 constant pages inside lists, row ranges and deletions (`tests/test_lance_lists.py`, 66 cases against
 pylance). **C5 done** too: lists of structs and structs of lists, with nulls at every level — which
-also fixed null structs outside any list, read until then as structs of nulls. Open: `map` (C6),
-FullZip list pages (C8), and a list of `fixed_size_list`.
+also fixed null structs outside any list, read until then as structs of nulls. Open: FullZip list
+pages (C8), and a list of `fixed_size_list`. **C6 done** since: `map` reads as Arrow's
+map type — it is stored as a list of (key, value) structs, so it needed only the schema mapping.
 
 Done when the list shapes in A2 pass, `test_type_support_matrix.py` moves `list`, `large_list`,
 `map` from `UNREADABLE_FROM_PYLANCE` to read-only, and the fuzz harness covers the unraveler.

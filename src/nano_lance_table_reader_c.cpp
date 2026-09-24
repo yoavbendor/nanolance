@@ -7,6 +7,8 @@
 #include <cerrno>
 #include <cstring>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -68,7 +70,26 @@ nano_lance::LanceRowRange make_range(uint64_t offset, int64_t length) {
     return range;
 }
 
-int read_dataset_impl(const char* dataset_path, bool trusted_input, const std::vector<std::string>* columns,
+/// Nothing may unwind through a C entry point: an exception crossing `extern "C"` terminates the
+/// caller's process. The read path is written to refuse bad input by return value, but allocation can
+/// still throw -- a file may declare more data than the machine has -- so every entry point runs
+/// inside this and turns an exception into an error status with a message.
+template <class Body>
+int guarded(char* error_message, size_t error_message_capacity, Body&& body) noexcept {
+    try {
+        return body();
+    } catch (const std::bad_alloc&) {
+        set_error(error_message, error_message_capacity,
+                  "out of memory: the dataset declares more data than could be allocated");
+    } catch (const std::exception& e) {
+        set_error(error_message, error_message_capacity, std::string("internal error: ") + e.what());
+    } catch (...) {
+        set_error(error_message, error_message_capacity, "internal error");
+    }
+    return NANO_LANCE_READER_IO_ERROR;
+}
+
+int read_dataset_impl_unguarded(const char* dataset_path, bool trusted_input, const std::vector<std::string>* columns,
                       const nano_lance::LanceRowRange& range, struct ArrowSchema* out_schema,
                       struct ArrowArray** out_batches, size_t* out_batch_count, char* error_message,
                       size_t error_message_capacity) {
@@ -120,6 +141,27 @@ int read_dataset_impl(const char* dataset_path, bool trusted_input, const std::v
     *out_batches = heap_batches;
     *out_batch_count = batches.size();
     return NANO_LANCE_READER_OK;
+}
+
+int read_dataset_impl(const char* dataset_path, bool trusted_input, const std::vector<std::string>* columns,
+                      const nano_lance::LanceRowRange& range, struct ArrowSchema* out_schema,
+                      struct ArrowArray** out_batches, size_t* out_batch_count, char* error_message,
+                      size_t error_message_capacity) {
+    bool returned = false;
+    const int rc = guarded(error_message, error_message_capacity, [&] {
+        const int inner = read_dataset_impl_unguarded(dataset_path, trusted_input, columns, range, out_schema,
+                                                      out_batches, out_batch_count, error_message,
+                                                      error_message_capacity);
+        returned = true;
+        return inner;
+    });
+    if (!returned && out_schema != nullptr && out_schema->release != nullptr) {
+        // An exception can leave the schema built and the batches not: release it, as any other
+        // failure does, so the caller's contract (nothing to free on error) holds.
+        out_schema->release(out_schema);
+        std::memset(out_schema, 0, sizeof(*out_schema));
+    }
+    return rc;
 }
 
 }  // namespace
@@ -218,9 +260,17 @@ int stream_get_schema(struct ArrowArrayStream* stream, struct ArrowSchema* out) 
 
 int stream_get_next(struct ArrowArrayStream* stream, struct ArrowArray* out) {
     auto* self = stream_private(stream);
-    std::string error;
-    if (!self->stream.next(*out, error)) {
-        self->last_error = error;
+    try {
+        std::string error;
+        if (!self->stream.next(*out, error)) {
+            self->last_error = error;
+            return EIO;
+        }
+    } catch (const std::bad_alloc&) {
+        self->last_error = "out of memory: the dataset declares more data than could be allocated";
+        return ENOMEM;
+    } catch (const std::exception& e) {
+        self->last_error = std::string("internal error: ") + e.what();
         return EIO;
     }
     return 0;  // end of stream leaves out->release null, which is what the interface expects
@@ -264,14 +314,20 @@ int open_stream_impl(const char* dataset_path, const char* const* column_names, 
 
     auto self = std::make_unique<StreamPrivate>();
     std::string error;
-    if (!nano_lance::LanceTableStream::open_range(std::filesystem::path(dataset_path),
-                                                  columns.empty() ? nullptr : &columns, range,
-                                                  self->schema, self->stream, error,
-                                                  trusted_input != 0)) {
-        // open() already released the schema on failure (see its declaration), and ~StreamPrivate
-        // checks `release` before touching it, so unwinding here is safe.
-        set_error(error_message, error_message_capacity, error);
-        return map_status(error);
+    const int rc = guarded(error_message, error_message_capacity, [&] {
+        if (!nano_lance::LanceTableStream::open_range(std::filesystem::path(dataset_path),
+                                                      columns.empty() ? nullptr : &columns, range,
+                                                      self->schema, self->stream, error,
+                                                      trusted_input != 0)) {
+            // open() already released the schema on failure (see its declaration), and
+            // ~StreamPrivate checks `release` before touching it, so unwinding here is safe.
+            set_error(error_message, error_message_capacity, error);
+            return map_status(error);
+        }
+        return static_cast<int>(NANO_LANCE_READER_OK);
+    });
+    if (rc != NANO_LANCE_READER_OK) {
+        return rc;
     }
 
     out_stream->get_schema = &stream_get_schema;
@@ -312,16 +368,18 @@ extern "C" int nano_lance_table_read_schema(const char* dataset_path, struct Arr
         set_error(error_message, error_message_capacity, "dataset_path is required");
         return NANO_LANCE_READER_INVALID_ARGUMENT;
     }
-    std::string error;
-    if (!nano_lance::lance_table_read_schema(std::filesystem::path(dataset_path), *out_schema, error)) {
-        // The C++ side leaves out_schema released on failure; zero it so the caller cannot be tempted
-        // to release it a second time. Double-releasing a schema is what used to segfault every failed
-        // read through this shim.
-        std::memset(out_schema, 0, sizeof(*out_schema));
-        set_error(error_message, error_message_capacity, error);
-        return map_status(error);
-    }
-    return NANO_LANCE_READER_OK;
+    return guarded(error_message, error_message_capacity, [&] {
+        std::string error;
+        if (!nano_lance::lance_table_read_schema(std::filesystem::path(dataset_path), *out_schema, error)) {
+            // The C++ side leaves out_schema released on failure; zero it so the caller cannot be
+            // tempted to release it a second time. Double-releasing a schema is what used to segfault
+            // every failed read through this shim.
+            std::memset(out_schema, 0, sizeof(*out_schema));
+            set_error(error_message, error_message_capacity, error);
+            return map_status(error);
+        }
+        return static_cast<int>(NANO_LANCE_READER_OK);
+    });
 }
 
 extern "C" int nano_lance_table_count_rows(const char* dataset_path, uint64_t* out_rows,
@@ -335,12 +393,14 @@ extern "C" int nano_lance_table_count_rows(const char* dataset_path, uint64_t* o
         set_error(error_message, error_message_capacity, "dataset_path is required");
         return NANO_LANCE_READER_INVALID_ARGUMENT;
     }
-    std::string error;
-    if (!nano_lance::lance_table_count_rows(std::filesystem::path(dataset_path), *out_rows, error)) {
-        set_error(error_message, error_message_capacity, error);
-        return map_status(error);
-    }
-    return NANO_LANCE_READER_OK;
+    return guarded(error_message, error_message_capacity, [&] {
+        std::string error;
+        if (!nano_lance::lance_table_count_rows(std::filesystem::path(dataset_path), *out_rows, error)) {
+            set_error(error_message, error_message_capacity, error);
+            return map_status(error);
+        }
+        return static_cast<int>(NANO_LANCE_READER_OK);
+    });
 }
 
 extern "C" void nano_lance_table_read_result_free(struct ArrowSchema* schema, struct ArrowArray* batches,

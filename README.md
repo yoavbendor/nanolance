@@ -164,7 +164,7 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 | `date32`, `date64`, `time32` (s/ms), `time64` (us/ns) | round-trips |
 | `decimal128`, `decimal256` | round-trips |
 | `timestamp` with a **UTC-offset** timezone (`+05:30`) | **refused** — Lance supports IANA zone names only and panics on offsets, so pylance cannot write one either; use a named zone |
-| `list`, `large_list`, `map` | **refused** on write (roadmap Phase D); `list` and `large_list` **read** |
+| `list`, `large_list`, `map` | **refused** on write (roadmap Phase D); all three **read** |
 | `large_utf8`, `large_binary` | **refused** — would need 64-bit offsets in a page whose chunk grammar is u32 |
 | Arrow `dictionary<...>` columns | **refused** — cast to the value type; nanolance dictionary-encodes low-cardinality strings on disk by itself, so the file stays the same size |
 
@@ -187,7 +187,8 @@ Lance's string compressor switches on):
 | `fixed_size_list` vectors — nullable rows, null elements, any dimension | yes |
 | `list`, `large_list`, `list<list<…>>` of any type above — null lists, empty lists, null items | yes |
 | a list of structs, a struct holding lists — with nulls at any level | yes |
-| `map`, a list of `fixed_size_list` | no — refused by name |
+| `map` | yes |
+| a list of `fixed_size_list` | no — refused by name |
 
 nanolance also reads Lance datasets pylance has **modified**: multiple versions, `append`,
 `overwrite`, `update`, `delete` (both the Arrow-IPC and roaring-bitmap deletion formats) and

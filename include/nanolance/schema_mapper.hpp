@@ -39,10 +39,11 @@ inline bool lance_field_is_physical(const LanceField& field) {
     return field.column_index >= 0;
 }
 
-/// A list field, as Lance's schema spells it. A list of structs is `list.struct`.
+/// A list field, as Lance's schema spells it. A list of structs is `list.struct`; a map is a list of
+/// `entries` structs (key, value) and is stored exactly like one.
 inline bool lance_logical_type_is_list(const std::string& logical_type) {
     return logical_type == "list" || logical_type == "large_list" || logical_type == "list.struct" ||
-           logical_type == "large_list.struct";
+           logical_type == "large_list.struct" || logical_type == "map";
 }
 
 inline bool lance_logical_type_is_large_list(const std::string& logical_type) {

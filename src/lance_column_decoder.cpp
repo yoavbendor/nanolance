@@ -56,6 +56,15 @@ const std::vector<std::uint8_t>* field_metadata_bytes(const pb::Field& field, co
 // count separate std::vector::insert calls (whose per-call machinery dominated the read profile).
 // Returns false (without touching `out`) if the resulting size would overflow — `count` can derive
 // from untrusted on-disk run/row counts, so the multiply must not wrap into a small allocation.
+/// Reserve for a column the page table says is `bytes` long -- but never more than 256 MiB up
+/// front. The row counts behind `bytes` are the file's own claim: a small file declaring 16 billion
+/// int64 rows asked for 128 GiB here before one value was read. Past the cap the vector grows
+/// geometrically as real values arrive, which costs one or two copies, not a quadratic.
+void reserve_capped(std::vector<std::uint8_t>& out, std::uint64_t bytes) {
+    constexpr std::uint64_t kReserveCap = std::uint64_t{256} << 20U;
+    out.reserve(static_cast<std::size_t>(std::min(bytes, kReserveCap)));
+}
+
 [[nodiscard]] bool append_repeated_value(std::vector<std::uint8_t>& out, const std::uint8_t* val,
                                          std::size_t vlen, std::size_t count) {
     if (count == 0U || vlen == 0U) {
@@ -64,10 +73,11 @@ const std::vector<std::uint8_t>* field_metadata_bytes(const pb::Field& field, co
     std::uint64_t added = 0;
     std::uint64_t new_size = 0;
     if (!checked_mul(vlen, count, added) || !checked_add(out.size(), added, new_size) ||
-        !fits_size_t(new_size)) {
+        !fits_size_t(new_size) || new_size > default_read_limits().max_uncompressed_bytes) {
         return false;
     }
     const std::size_t base = out.size();
+    reserve_more(out, static_cast<std::size_t>(added));  // called once per run: grow geometrically
     out.resize(static_cast<std::size_t>(new_size));
     std::uint8_t* dst = out.data() + base;
 
@@ -617,7 +627,11 @@ template <class T>
 [[nodiscard]] bool unpack_inline_bitpacked_series(const std::vector<std::uint8_t>& buffer, std::size_t count,
                                                   std::vector<std::uint8_t>& out, std::string& error) {
     out.clear();
-    out.reserve(count * sizeof(T));
+    // `count` is the descriptor's; the buffer is what exists. Every block costs at least its width
+    // word and yields at most 1024 values, so reserve no more than the buffer could produce -- a
+    // reserve of the declared count alone asked for 4 GiB from a small page (fuzz_column_decode).
+    const std::size_t producible = (buffer.size() / sizeof(T)) * 1024U;
+    out.reserve(std::min(count, producible) * sizeof(T));
     thread_local std::vector<T> packed;
     T values[1024];
     std::size_t at = 0;
@@ -2068,7 +2082,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         // with many runs. declared_rows is already validated against the safety limit above.
         std::uint64_t reserve_bytes = 0;
         if (checked_mul(declared_rows, static_cast<std::uint64_t>(bpv), reserve_bytes) && fits_size_t(reserve_bytes)) {
-            out.fixed.reserve(static_cast<std::size_t>(reserve_bytes));
+            reserve_capped(out.fixed, reserve_bytes);
         }
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> data;
@@ -2519,7 +2533,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
             std::uint64_t reserve_bytes = 0;
             if (checked_mul(declared_rows, static_cast<std::uint64_t>(bytes_per_value), reserve_bytes) &&
                 fits_size_t(reserve_bytes)) {
-                out.fixed.reserve(static_cast<std::size_t>(reserve_bytes));
+                reserve_capped(out.fixed, reserve_bytes);
             }
         }
         std::vector<std::uint8_t> control;
@@ -2567,7 +2581,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     // data_file_writer.cpp's bool_pack). nanolance's internal representation stays one byte per value.
     if (encoding_plan.kind == ColumnEncodingKind::kBoolPacked) {
         out.kind = ColumnValues::Kind::FixedWidth;
-        out.fixed.reserve(static_cast<std::size_t>(declared_rows));
+        reserve_capped(out.fixed, declared_rows);
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
         std::vector<MiniBlockChunkView> chunks;
@@ -2725,7 +2739,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     std::uint64_t reserve_bytes = 0;
     if (checked_mul(declared_rows, static_cast<std::uint64_t>(bytes_per_value), reserve_bytes) &&
         fits_size_t(reserve_bytes)) {
-        out.fixed.reserve(static_cast<std::size_t>(reserve_bytes));
+        reserve_capped(out.fixed, reserve_bytes);
     }
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;

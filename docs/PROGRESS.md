@@ -24,9 +24,9 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | [Roadmap](ROADMAP.md) A — pin and instrument | **done** |
 | Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
 | Roadmap E — small type gaps | **E1–E3 done** (float16, duration, Arrow null type); E4 `large_*` write open |
-| Roadmap C — lists, read side | **C0–C5 and C7 done**; `map` (C6) and FullZip list pages (C8) open |
+| Roadmap C — lists, read side | **C0–C7 done**; FullZip list pages (C8) open |
 
-Test suite: **53 ctest** (was 42) and **1194 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **53 ctest** (was 42) and **1203 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
@@ -1980,6 +1980,25 @@ The page-decoding fuzzer, seeded with these struct pages, found one more old bug
 `fixed_size_binary:N` width was parsed with `std::stoul`, which throws on a malformed type string,
 and the exception escaped the reader — a crash, not a refusal. It is a bounded digit loop now; the
 reproducer is checked in. A 10-minute rerun after the fix: 1.23M inputs, clean.
+
+**Maps (C6)** read as Arrow's `map<K, V>`: Lance stores one as a list of `entries` structs, so the
+nested path already handled it and only the schema mapping (`+m`, non-nullable entries and keys, as
+Arrow requires) was new.
+
+### Declared sizes cannot force an allocation, and nothing escapes the C API
+
+Seeded with map pages, the fuzzer found one more: the inline-bit-packed dictionary reserved
+`count x width` bytes from the descriptor's count before reading a block, 4 GiB from a small page.
+It now reserves no more than the buffer could produce. Looking for the same pattern by hand turned
+up the bigger one the harness cannot reach (it caps rows at 32,768): several paths reserved
+`declared_rows x width` up front, and a constant page expanded to `rows x width` with no limit, so a
+small file declaring 2^33 int64 rows asked for 64 GiB — and nothing on the read path caught
+`std::bad_alloc`, so it would have escaped through the C API and terminated the calling process.
+
+Three changes: speculative reservations are capped at 256 MiB (growth past that is geometric);
+constant expansion is bounded by the decoded-size limit; and every C entry point, plus the stream's
+`get_next`, now turns an exception into an error status and message. `test_read_safety` decodes the
+2^33-row page and requires a refusal, not an exception; with the limit removed it fails.
 
 ### Deliberate deviations (not defects)
 

@@ -118,14 +118,27 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
             error = "list field " + field.name + " has no element field";
             return false;
         }
-        if (ArrowSchemaSetFormat(&schema, lance_logical_type_is_large_list(field.logical_type) ? "+L" : "+l") !=
-                NANOARROW_OK ||
+        const char* list_format = field.logical_type == "map"                          ? "+m"
+                                  : lance_logical_type_is_large_list(field.logical_type) ? "+L"
+                                                                                         : "+l";
+        if (ArrowSchemaSetFormat(&schema, list_format) != NANOARROW_OK ||
             ArrowSchemaAllocateChildren(&schema, 1) != NANOARROW_OK) {
             error = "failed to build the list schema for " + field.name;
             return false;
         }
         if (!init_schema_from_field(*child, mapping, *schema.children[0], error)) {
             return false;
+        }
+        if (field.logical_type == "map") {
+            // Arrow's map is a list of non-nullable (key, value) structs with non-nullable keys;
+            // nanoarrow refuses the schema otherwise. The data agrees: an entry is never null.
+            ArrowSchema* entries = schema.children[0];
+            if (entries->n_children != 2) {
+                error = "map field " + field.name + " does not hold (key, value) entries";
+                return false;
+            }
+            entries->flags &= ~ARROW_FLAG_NULLABLE;
+            entries->children[0]->flags &= ~ARROW_FLAG_NULLABLE;
         }
     } else if (std::string element; lance_fixed_size_list_parts(field.logical_type, element, fsl_items)) {
         // Lance's schema has no child field for a fixed_size_list -- the element type lives in the

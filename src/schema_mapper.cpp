@@ -670,6 +670,10 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
         return true;
     }
     // A list's element type is its child field's; Lance's schema has one, unlike fixed_size_list.
+    if (logical_type == "map") {
+        arrow_format = "+m";
+        return true;
+    }
     if (lance_logical_type_is_list(logical_type)) {
         arrow_format = lance_logical_type_is_large_list(logical_type) ? "+L" : "+l";
         return true;

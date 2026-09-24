@@ -6,7 +6,9 @@
 // ASan+UBSan in CI, they turn "the reader is safe against malformed files" into an enforced property.
 
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/column_values.hpp"
 #include "nanolance/deletion_vector.hpp"
+#include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/path_safety.hpp"
 #include "nanolance/read_safety.hpp"
 
@@ -289,6 +291,40 @@ void test_roaring_bitmap_expansion_is_budgeted() {
     check(ok_out.size() == 3U, "and returns its three values");
 }
 
+// A page's row count is the file's claim. A constant int64 page declaring 2^33 rows expands to 64 GiB:
+// the decoder used to resize() straight to that, and the std::bad_alloc escaped every C entry point
+// and terminated the process. It must be refused by the decoded-size limit instead -- by return
+// value, without throwing. The descriptor is a real one, from a nanolance constant column (value 42).
+void test_declared_rows_cannot_force_an_allocation() {
+    const char* hex =
+        "0a1d2f6c616e63652e656e636f64696e677332312e506167654c61796f7574120f120d2a010132082a00000000000000";
+    std::vector<std::uint8_t> descriptor;
+    for (std::size_t i = 0; hex[i] != '\0' && hex[i + 1] != '\0'; i += 2) {
+        descriptor.push_back(static_cast<std::uint8_t>(std::stoul(std::string(hex + i, 2), nullptr, 16)));
+    }
+    nano_lance::pb::ColumnPage page;
+    page.length = std::uint64_t{1} << 33U;
+    page.encoding = descriptor;
+    nano_lance::pb::ColumnMetadata column;
+    column.pages.push_back(page);
+    nano_lance::pb::Field field;
+    field.name = "c";
+    field.logical_type = "int64";
+    const auto path = write_temp({}, "declared_rows");
+    nano_lance::ColumnValues out;
+    std::string error;
+    bool ok = true;
+    bool threw = false;
+    try {
+        ok = nano_lance::decode_lance_physical_column(path, field, column, out, error);
+    } catch (...) {
+        threw = true;
+    }
+    check(!threw, "a page declaring 2^33 constant rows threw instead of being refused");
+    check(!ok && !error.empty(), "a page declaring 2^33 constant rows was not refused with a reason");
+    std::filesystem::remove(path);
+}
+
 }  // namespace
 
 int main() {
@@ -301,6 +337,7 @@ int main() {
     test_scoped_read_limits_restores_previous();
     test_path_jail();
     test_roaring_bitmap_expansion_is_budgeted();
+    test_declared_rows_cannot_force_an_allocation();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d read-safety checks failed\n", g_failures);
         return 1;
