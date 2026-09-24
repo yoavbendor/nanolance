@@ -77,6 +77,10 @@ SHAPES = [
     ("null_int_constant", _table([None if _null(i) else 7 for i in range(N)], pa.int64()), "constant + def levels"),
     ("null_str_constant", _table([None if _null(i) else "same" for i in range(N)], pa.utf8()), "constant + def levels"),
     ("null_float_constant", _table([None if _null(i) else 1.5 for i in range(N)], pa.float64()), "constant + def levels"),
+    # Arrow's null TYPE, not nulls in a typed column: no buffers at all, written as an all-null
+    # ConstantLayout. Here mainly for the combined-table tests below, where a column with zero data
+    # buffers sits beside every other encoding in the same file.
+    ("null_type", pa.table({"c": pa.nulls(N)}), "all-null ConstantLayout"),
 ]
 
 MODES = [

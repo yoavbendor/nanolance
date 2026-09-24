@@ -6,10 +6,11 @@ Three things this pins that prose cannot:
    type it could not represent and producing a file that read back wrong (see the nullability work).
    Every entry in ``REFUSED_ON_WRITE`` asserts a clean, named refusal -- so a future change that makes
    one of them "work" fails here instead of silently shipping bad files.
-2. **The read and write surfaces are not the same, on purpose.** `large_string`, `large_binary`,
-   `decimal256` and Arrow's `null` type all READ correctly from a pylance dataset and are REFUSED on
-   write. Those asymmetries are deliberate and each has a reason recorded where it is raised; pinning
-   them stops someone "tidying up" one side.
+2. **The read and write surfaces are not the same, on purpose.** `large_string` and `large_binary`
+   READ correctly from a pylance dataset and are REFUSED on write. That asymmetry is deliberate and
+   its reason is recorded where it is raised; pinning it stops someone "tidying up" one side.
+   (`decimal256`, `float16`, `duration` and Arrow's `null` type used to be on the refused side too;
+   all four now round-trip.)
 3. **Lists are unsupported in both directions**, and fail at the earliest possible point -- the
    manifest's schema, before any page is touched. That is the single largest type gap.
 
@@ -74,6 +75,9 @@ ROUNDTRIPS = {
     "float16_nullable": _t(pa.float16(), [None if i % 7 == 0 else float(i % 10) for i in range(N)]),
     "duration_us": _t(pa.duration("us"), [datetime.timedelta(seconds=i) for i in range(N)]),
     "duration_s_nullable": _t(pa.duration("s"), [None if i % 5 == 0 else datetime.timedelta(seconds=i) for i in range(N)]),
+    # Arrow's null type: no buffers at all. Written as Lance's all-null spelling -- a ConstantLayout
+    # with a NULLABLE_ITEM layer and no value -- byte-identical to pylance's.
+    "null": _t(pa.null(), [None] * N),
 }
 
 # Refused at write_batch, each with a message naming the column. The fragment is what the refusal has
@@ -85,7 +89,6 @@ REFUSED_ON_WRITE = {
         pa.table({"c": pa.array([f"d{i % 5}" for i in range(N)]).dictionary_encode()}),
         "dictionary-encoded column",
     ),
-    "null": (_t(pa.null(), [None] * N), "null type"),
     "list": (_t(pa.list_(pa.int64()), [[i, i + 1] for i in range(N)]), "unsupported Arrow C format"),
     "large_list": (
         _t(pa.large_list(pa.int64()), [[i, i + 1] for i in range(N)]),
@@ -111,7 +114,7 @@ REFUSED_ON_WRITE = {
 
 # Written by pylance, read correctly by nanolance, but refused on OUR write side. Each asymmetry is
 # deliberate; see the refusal sites for why.
-READ_ONLY = ("large_string", "large_binary", "null")
+READ_ONLY = ("large_string", "large_binary")
 
 # Written by pylance and NOT readable. Pinned by message so each fails loudly when implemented.
 UNREADABLE_FROM_PYLANCE = {

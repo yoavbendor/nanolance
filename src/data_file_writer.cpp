@@ -724,6 +724,18 @@ std::vector<std::uint8_t> constant_layout_message(const std::vector<std::uint8_t
     return encoding;
 }
 
+// PageLayout = ConstantLayout with a NULLABLE_ITEM layer and no value: Lance's spelling of a column
+// whose every row is null. Zero data buffers. Byte-identical to what pylance writes for pa.nulls(n).
+std::vector<std::uint8_t> all_null_constant_layout_message() {
+    const std::vector<std::uint8_t> constant_layout{0x2a, 0x01, 0x03};  // f5 layers = [NULLABLE_ITEM]
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, 2, constant_layout);
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
 // MiniBlockLayout PageLayout advertising InlineBitpacking{uncompressed_bits_per_value}. Matches lance
 // output (CompressiveEncoding f5 = inline_bitpacking). See memory: lance-inline-bitpacking-format.
 std::vector<std::uint8_t> page_layout_bytes_inline_bitpacking(std::uint8_t uncompressed_bits, std::uint64_t rows,
@@ -1028,6 +1040,19 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.length = rows;
             page.priority = 0;
             page.encoding = blob_v2_column_page_encoding();
+            column.pages.push_back(std::move(page));
+            columns.push_back(std::move(column));
+            continue;
+        }
+
+        // Arrow's null type: every row is null and there is no value to store at all.
+        if (field.logical_type == "null") {
+            pb::ColumnMetadata column;
+            column.encoding = column_encoding_bytes();
+            pb::ColumnPage page;
+            page.length = rows;
+            page.priority = 0;
+            page.encoding = all_null_constant_layout_message();
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
             continue;

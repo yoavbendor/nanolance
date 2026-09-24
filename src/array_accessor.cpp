@@ -457,6 +457,25 @@ bool append_batch_column_values(const ArrowArray& batch,
             return false;
         }
         const ArrowArray* array = &view;
+        // Arrow's null type has NO buffers -- not even a validity bitmap; every row is null by
+        // definition. Neither path below can take it (both start from a buffer that is not there), and
+        // there is nothing to encode beyond the row count: the writer emits Lance's all-null spelling.
+        if (field.logical_type == "null") {
+            auto& column = columns[i];
+            const auto base = column.rows;
+            const auto rows = base + static_cast<std::uint64_t>(array->length);
+            if (column.validity.empty() && base != 0U) {
+                error = "column '";
+                error += field.name;
+                error += "' is null-typed but earlier rows were recorded as valid";
+                return false;
+            }
+            column.kind = ColumnValues::Kind::FixedWidth;
+            column.validity.resize(static_cast<std::size_t>((rows + 7U) / 8U), 0U);  // every bit clear
+            column.null_count += static_cast<std::uint64_t>(array->length);
+            column.rows = rows;
+            continue;
+        }
         // Validity first: it is recorded against the rows already appended, so it has to be taken
         // before the value append advances them.
         if (!append_validity(batch, mapping, field, array->length, columns[i], error)) {

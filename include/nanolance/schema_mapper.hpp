@@ -77,8 +77,12 @@ inline bool lance_logical_type_is_bitpackable_integer(const std::string& logical
            lance_logical_type_is_temporal(logical_type);
 }
 
-/// Lance `file.Field.encoding`: 1 = fixed-width, 2 = variable-width.
+/// Lance `file.Field.encoding`: 1 = fixed-width, 2 = variable-width, 0 = none -- which is what
+/// pylance writes for a null-typed field, since it has no values to encode.
 inline std::int32_t lance_on_disk_field_encoding(const std::string& logical_type) {
+    if (logical_type == "null") {
+        return 0;
+    }
     return lance_field_is_variable_width(logical_type) ? 2 : 1;
 }
 
