@@ -1834,6 +1834,29 @@ is most likely to hit.
    neither one is red. The workflow now says so where it will be read: if a job is queued far longer
    than its siblings take to finish, check the label still exists before assuming capacity.
 
+   **The wheels workflow has now completed, for the first time in 35 runs.** `macos-15-intel`
+   started one second after the run began — against `macos-13`, which never started in 47 minutes —
+   and the full matrix is green:
+
+   | job | wheels |
+   |---|---|
+   | `ubuntu-24.04 x86_64` | 10 (manylinux_2_28 + musllinux_1_2, CPython 3.9–3.13) |
+   | `macos-14 arm64` | 5 |
+   | `macos-15-intel x86_64` | 5 |
+   | `sdist` | source distribution |
+
+   20 wheels and an sdist, each installed into a clean virtualenv and smoke-tested against the
+   *installed* package. Both bugs show in a single log line — the path resolving under
+   `bindings/python`, on a runner that exists:
+
+       + /bin/sh -c 'python .../bindings/python/tests/wheel_smoke.py'
+       nanolance 0.2.0 from .../venv-test-x86_64/lib/python3.13/site-packages/nanolance/__init__.py
+       wheel smoke passed
+
+   `pip install nanolance` is therefore a verified on-ramp on Linux (glibc and musl), Apple silicon
+   and Intel macOS. Windows is still out of the matrix; `ci-platforms.yml`'s `windows` job is the
+   thing that has to go green first.
+
 ### Deliberate deviations (not defects)
 
 - **The nullable opt-out was not needed** — simpler than planned.
