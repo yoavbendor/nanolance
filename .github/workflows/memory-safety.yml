@@ -99,7 +99,7 @@ jobs:
             -DNANOLANCE_BUILD_EXAMPLES=OFF -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
 
       - name: Build fuzzers
-        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst nanolance_fuzz_lz4 nanolance_fuzz_deletion_vector -j
+        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst nanolance_fuzz_lz4 nanolance_fuzz_deletion_vector nanolance_fuzz_column_decode -j
 
       # 2 minutes per push per target is enough to catch regressions; extend for a nightly run.
       - name: Fuzz the decode chain
@@ -162,6 +162,16 @@ jobs:
               "dict": pa.array([("h\u00e9llo w\u00f6rld " * (i % 5 + 1)) for i in range(n)]),
               "ints": pa.array([None if i % 13 == 0 else i for i in range(n)], type=pa.int64()),
           }), "seed-datasets/stock.lance")
+          # FullZip pages (values of 256+ bytes) and fixed_size_list vectors, with and without
+          # element validity -- the layouts page decoding added last.
+          m = 600
+          lance.write_dataset(pa.table({
+              "long_str": pa.array([None if i % 7 == 0 else "z" * 300 + str(i) for i in range(m)]),
+              "vec4": pa.array([None if i % 9 == 0 else [float(i)] * 4 for i in range(m)],
+                               pa.list_(pa.float32(), 4)),
+              "vec96": pa.FixedSizeListArray.from_arrays(
+                  pa.array([None if i % 13 == 0 else float(i) for i in range(m * 96)], pa.float32()), 96),
+          }), "seed-datasets/wide.lance")
           PY
           mkdir -p corpus-page-layout
           ./build-seed/nlance-pagelayout --dump-corpus corpus-page-layout \
@@ -170,6 +180,11 @@ jobs:
             ./build-seed/nlance-pagelayout --dump-corpus corpus-page-layout \
               seed-datasets/stock.lance || true
           fi
+          # Whole pages -- descriptor plus buffers -- for the page-decoding target.
+          mkdir -p corpus-column-decode
+          for ds in seed-datasets/*.lance; do
+            ./build-seed/nlance-pagelayout --dump-fuzz-pages corpus-column-decode "$ds" || true
+          done
 
       - name: Fuzz the PageLayout descriptor parser
         env:
@@ -179,6 +194,19 @@ jobs:
           mkdir -p corpus-page-layout-found
           ./build-fuzz/nanolance_fuzz_page_layout -max_total_time=120 -print_final_stats=1 \
             corpus-page-layout-found corpus-page-layout
+
+      # Page decoding itself: descriptor + buffers -> values. fuzz_decode stops at the footer and
+      # column metadata, so this is the only target that reaches dictionaries, bit-unpacking, RLE,
+      # definition levels, FullZip and fixed_size_list. tests/fuzz/corpus/column_decode holds the
+      # reproducers it has caught (a zstd size header that asked for 8 GB).
+      - name: Fuzz page decoding
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-column-decode-found
+          ./build-fuzz/nanolance_fuzz_column_decode -max_total_time=180 -rss_limit_mb=4096 \
+            -print_final_stats=1 corpus-column-decode-found corpus-column-decode tests/fuzz/corpus/column_decode
 
       - name: Fuzz the FSST decompressor
         env:

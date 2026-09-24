@@ -158,13 +158,25 @@ std::vector<std::uint8_t> mini_block_tail(std::uint64_t num_items, std::uint8_t 
 }
 
 std::vector<std::uint8_t> build_mini_block_layout(std::uint32_t bits_per_value_token, std::uint64_t num_items,
-                                                  bool nullable = false) {
+                                                  bool nullable = false, std::uint64_t fsl_items = 0) {
+    // A fixed_size_list row is `fsl_items` flat values back to back. Lance describes that as
+    // CompressiveEncoding{ f11 FixedSizeList{ f1 items_per_value, f2 CompressiveEncoding{ f1 Flat } } },
+    // with the ELEMENT's width in the Flat -- the wrapper is what tells a reader it is a list at all.
+    const std::uint64_t flat_bits = fsl_items != 0U ? bits_per_value_token / fsl_items : bits_per_value_token;
     std::vector<std::uint8_t> flat;                  // Flat{ f1 bits_per_value }
     flat.push_back(0x08U);
-    append_varint(flat, bits_per_value_token);
+    append_varint(flat, flat_bits);
 
     std::vector<std::uint8_t> compressive;           // CompressiveEncoding{ f1 Flat }
     write_length_delimited(compressive, 1, flat);
+    if (fsl_items != 0U) {
+        std::vector<std::uint8_t> fixed_size_list;   // FixedSizeList{ f1 items, f2 values }
+        fixed_size_list.push_back(0x08U);
+        append_varint(fixed_size_list, fsl_items);
+        write_length_delimited(fixed_size_list, 2, compressive);
+        compressive.clear();
+        write_length_delimited(compressive, 11, fixed_size_list);
+    }
 
     std::vector<std::uint8_t> mini;
     if (nullable) {
@@ -177,10 +189,12 @@ std::vector<std::uint8_t> build_mini_block_layout(std::uint32_t bits_per_value_t
     return mini;
 }
 
-/// page_layout_bytes for a flat page, with the nullable flag threaded through.
-std::vector<std::uint8_t> page_layout_bytes_flat(std::uint32_t bits_token, std::uint64_t rows, bool nullable) {
+/// page_layout_bytes for a flat page, with the nullable flag threaded through. `fsl_items` non-zero
+/// wraps the values as a fixed_size_list of that many elements per row.
+std::vector<std::uint8_t> page_layout_bytes_flat(std::uint32_t bits_token, std::uint64_t rows, bool nullable,
+                                                 std::uint64_t fsl_items = 0) {
     std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, build_mini_block_layout(bits_token, rows, nullable));
+    write_length_delimited(page_layout, 1, build_mini_block_layout(bits_token, rows, nullable, fsl_items));
     std::vector<std::uint8_t> encoding;
     write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
     write_length_delimited(encoding, 2, page_layout);
@@ -712,9 +726,7 @@ std::vector<std::uint8_t> encode_scalar_variable_value(const std::vector<std::ui
 std::vector<std::uint8_t> constant_layout_message(const std::vector<std::uint8_t>* inline_value) {
     std::vector<std::uint8_t> constant_layout{0x2a, 0x01, 0x01};  // f5 layers = single non-null layer
     if (inline_value != nullptr) {
-        constant_layout.push_back(0x32);  // f6 inline_value
-        constant_layout.push_back(static_cast<std::uint8_t>(inline_value->size()));
-        constant_layout.insert(constant_layout.end(), inline_value->begin(), inline_value->end());
+        write_length_delimited(constant_layout, 6, *inline_value);  // f6 inline_value, varint length
     }
     std::vector<std::uint8_t> page_layout;
     write_length_delimited(page_layout, 2, constant_layout);  // PageLayout f2 = constant_layout
@@ -1067,7 +1079,15 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         // positional -- one level per value, in row order. Pairing them needs the levels to be encoded
         // against the rewritten sequence, which is not done yet, so a nullable column takes the flat or
         // bit-packed path instead. It costs size, never correctness.
-        if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "constant") {
+        // A fixed-width constant is inlined in the descriptor, which Lance caps at 32 bytes. Wider
+        // ones fall through to the flat path -- this used to write the inline value's length as ONE
+        // byte, so any value of 128 bytes or more produced a descriptor neither nanolance nor pylance
+        // could parse: a corrupt file, from a constant fixed_size_binary(200) column.
+        const bool constant_fits =
+            lance_field_is_variable_width(field.logical_type) ||
+            lance_logical_type_value_bytes(field.logical_type) <= kMaxInlineConstantBytes;
+        if (!column_has_nulls && constant_fits && packing_it != field.metadata.end() &&
+            packing_it->second == "constant") {
             const auto value_it = field.metadata.find("nanolance:const-value");
             if (value_it == field.metadata.end()) {
                 error = "constant column missing nanolance:const-value for ";
@@ -1394,6 +1414,11 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
             const auto total = values.fixed_size() / fixed_bytes_per_value;
+            std::uint64_t fsl_items = 0;
+            {
+                std::string element;
+                (void)lance_fixed_size_list_parts(field.logical_type, element, fsl_items);
+            }
             // A chunk that carries definition levels is limited to one FastLanes block (1024
             // values); without nulls the chunk is sized purely by its byte budget, which for a
             // narrow type runs to several thousand values.
@@ -1438,11 +1463,12 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 if (count == max_chunk_values) {
                     if (full_chunk_encoding.empty()) {
                         full_chunk_encoding = page_layout_bytes_flat(flat_bits_per_value(field), count,
-                                                                     column_has_nulls);
+                                                                     column_has_nulls, fsl_items);
                     }
                     page.encoding = full_chunk_encoding;
                 } else {
-                    page.encoding = page_layout_bytes_flat(flat_bits_per_value(field), count, column_has_nulls);
+                    page.encoding =
+                        page_layout_bytes_flat(flat_bits_per_value(field), count, column_has_nulls, fsl_items);
                 }
                 column.pages.push_back(std::move(page));
                 off += count;

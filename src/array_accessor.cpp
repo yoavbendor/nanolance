@@ -331,6 +331,46 @@ bool append_fixed_width(const ArrowArray& array,
     return true;
 }
 
+/// A fixed_size_list's rows are its child's elements, N per row: row r of a list at offset `o` is
+/// child elements [(o + r) * N, (o + r + 1) * N), further shifted by the child's own offset. Copied as
+/// one run -- that byte layout is exactly what Lance stores. Row-level nulls were taken by
+/// append_validity from the list's own bitmap; a null ELEMENT inside a row is refused, because
+/// writing it needs FixedSizeList.has_validity, which this writer does not emit.
+bool append_fixed_size_list(const ArrowArray& array, const LanceField& field, const std::string& element,
+                            std::uint64_t items, ColumnValues& out, std::string& error) {
+    const ArrowArray* child = array.n_children == 1 && array.children != nullptr ? array.children[0] : nullptr;
+    if (child == nullptr || child->n_buffers < 2 || child->buffers == nullptr || child->buffers[1] == nullptr) {
+        error = "fixed_size_list column '" + field.name + "' has no values buffer";
+        return false;
+    }
+    const std::size_t element_bytes = lance_logical_type_value_bytes(element);
+    const auto first = static_cast<std::uint64_t>(child->offset) + static_cast<std::uint64_t>(array.offset) * items;
+    const auto count = static_cast<std::uint64_t>(array.length) * items;
+    if (child->null_count != 0 && child->buffers[0] != nullptr) {
+        // Only elements of VALID rows count. pyarrow marks every element of a null row null as well
+        // (pa.array([None, [1, 2]], pa.list_(t, 2)) does), and those are masked by the row anyway --
+        // refusing them refused every ordinary nullable vector column.
+        const auto* bits = static_cast<const std::uint8_t*>(child->buffers[0]);
+        const auto* rows = static_cast<const std::uint8_t*>(array.buffers != nullptr ? array.buffers[0] : nullptr);
+        for (std::uint64_t k = first; k < first + count; ++k) {
+            const auto row = static_cast<std::uint64_t>(array.offset) + (k - first) / items;
+            if (rows != nullptr && ((rows[row >> 3U] >> (row & 7U)) & 1U) == 0U) {
+                continue;
+            }
+            if (((bits[k >> 3U] >> (k & 7U)) & 1U) == 0U) {
+                error = "fixed_size_list column '" + field.name +
+                        "' has a null element inside a row; whole-row nulls are supported, null elements "
+                        "are not yet";
+                return false;
+            }
+        }
+    }
+    out.kind = ColumnValues::Kind::FixedWidth;
+    const auto* bytes = static_cast<const std::uint8_t*>(child->buffers[1]) + first * element_bytes;
+    out.fixed.insert(out.fixed.end(), bytes, bytes + count * element_bytes);
+    return true;
+}
+
 bool append_variable_width(const ArrowArray& array,
                            const LanceField& field,
                            ColumnValues& out,
@@ -481,7 +521,13 @@ bool append_batch_column_values(const ArrowArray& batch,
         if (!append_validity(batch, mapping, field, array->length, columns[i], error)) {
             return false;
         }
-        if (lance_field_is_variable_width(field.logical_type)) {
+        std::string fsl_element;
+        std::uint64_t fsl_items = 0;
+        if (lance_fixed_size_list_parts(field.logical_type, fsl_element, fsl_items)) {
+            if (!append_fixed_size_list(*array, field, fsl_element, fsl_items, columns[i], error)) {
+                return false;
+            }
+        } else if (lance_field_is_variable_width(field.logical_type)) {
             if (!append_variable_width(*array, field, columns[i], error)) {
                 return false;
             }

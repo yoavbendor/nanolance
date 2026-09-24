@@ -76,6 +76,7 @@ bool set_schema_metadata(ArrowSchema& schema, const std::string& key, const std:
 bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& mapping, ArrowSchema& schema,
                             std::string& error) {
     ArrowSchemaInit(&schema);
+    std::uint64_t fsl_items = 0;
     if (field.logical_type == "struct") {
         std::vector<const LanceField*> children;
         for (const auto& candidate : mapping.fields) {
@@ -99,6 +100,21 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
             if (!init_schema_from_field(*children[i], mapping, *schema.children[i], error)) {
                 return false;
             }
+        }
+    } else if (std::string element; lance_fixed_size_list_parts(field.logical_type, element, fsl_items)) {
+        // Lance's schema has no child field for a fixed_size_list -- the element type lives in the
+        // logical type string -- so the Arrow child is made up here, named "item" as Arrow and
+        // pylance name it.
+        std::string element_format;
+        if (fsl_items > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) ||
+            !lance_arrow_format_for_logical_type(element, element_format, error) ||
+            ArrowSchemaSetTypeFixedSize(&schema, NANOARROW_TYPE_FIXED_SIZE_LIST, static_cast<std::int32_t>(fsl_items)) !=
+                NANOARROW_OK ||
+            ArrowSchemaSetFormat(schema.children[0], element_format.c_str()) != NANOARROW_OK) {
+            if (error.empty()) {
+                error = "failed to build the fixed_size_list schema for " + field.name;
+            }
+            return false;
         }
     } else {
         if (ArrowSchemaSetFormat(&schema, field.arrow_format.c_str()) != NANOARROW_OK) {
@@ -432,7 +448,7 @@ bool append_fixed_fast(ArrowArray& array, const std::uint8_t* data, FixedFmt fmt
 
 // One column's decode plan, resolved once before the row loop (no per-row metadata/string work).
 struct ColumnPlan {
-    enum class Kind { Skip, Blob, Variable, Fixed } kind = Kind::Skip;
+    enum class Kind { Skip, Blob, Variable, Fixed, FixedSizeList } kind = Kind::Skip;
     ArrowArray* array = nullptr;
     const LanceField* field = nullptr;      // Blob path needs the full field
     ColumnValues* values = nullptr;
@@ -603,7 +619,11 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             return false;
         }
         const bool is_blob = field->extension_name == "lance.blob.v2";
-        const bool is_struct = !is_blob && node_schema->format != nullptr && node_schema->format[0] == '+';
+        std::string fsl_element;
+        std::uint64_t fsl_items = 0;
+        const bool is_fsl = lance_fixed_size_list_parts(field->logical_type, fsl_element, fsl_items);
+        const bool is_struct =
+            !is_blob && !is_fsl && node_schema->format != nullptr && node_schema->format[0] == '+';
 
         if (is_struct) {
             struct_nodes.push_back(node_array);
@@ -638,6 +658,14 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         if (is_blob) {
             plan.kind = ColumnPlan::Kind::Blob;
             plan.dict = dict_for(field->id);
+        } else if (is_fsl) {
+            // One physical column of N-element rows. The decoded bytes ARE the child's values buffer:
+            // N elements per row, back to back.
+            plan.kind = ColumnPlan::Kind::FixedSizeList;
+            plan.width = static_cast<std::size_t>(fsl_items);
+            plan.fmt = fixed_fmt_code(node_schema->children != nullptr && node_schema->n_children == 1
+                                          ? node_schema->children[0]->format
+                                          : "");
         } else if (lance_field_is_variable_width(field->logical_type)) {
             plan.kind = ColumnPlan::Kind::Variable;
         } else {
@@ -662,7 +690,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     // per-row append/FinishElement entirely.
     bool bulk_ok = true;
     for (const auto& plan : plans) {
-        if (plan.kind != ColumnPlan::Kind::Fixed && plan.kind != ColumnPlan::Kind::Variable) {
+        if (plan.kind != ColumnPlan::Kind::Fixed && plan.kind != ColumnPlan::Kind::Variable &&
+            plan.kind != ColumnPlan::Kind::FixedSizeList) {
             bulk_ok = false;
             break;
         }
@@ -671,11 +700,41 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         for (auto& plan : plans) {
             // Validity first: nanoarrow expects buffer 0 filled before the data buffers it sizes
             // against, and both fill_* helpers set child->length/null_count at the end.
-            const bool ok = fill_validity(plan.array, *plan.values, length, error) &&
-                            (plan.kind == ColumnPlan::Kind::Fixed
-                                 ? fill_fixed_child(plan.array, std::move(plan.values->fixed), length,
-                                                    plan.fmt, error)
-                                 : fill_variable_child(plan.array, plan.values->variable, length, error));
+            bool ok = fill_validity(plan.array, *plan.values, length, error);
+            if (ok && plan.kind == ColumnPlan::Kind::FixedSizeList) {
+                // Row-level validity sits on the list; the child carries every row's N elements,
+                // including a null row's, which is what Arrow's fixed_size_list layout requires.
+                ArrowArray* child = plan.array->n_children == 1 ? plan.array->children[0] : nullptr;
+                std::uint64_t child_length = 0;
+                if (child == nullptr ||
+                    !checked_mul(static_cast<std::uint64_t>(length), static_cast<std::uint64_t>(plan.width),
+                                 child_length) ||
+                    child_length > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                    error = "fixed_size_list column has no child array or too many elements";
+                    ok = false;
+                } else {
+                    child->null_count = 0;
+                    if (!plan.values->item_validity.empty()) {
+                        auto& bits = plan.values->item_validity;
+                        const auto expected = static_cast<std::size_t>((child_length + 7U) / 8U);
+                        if (bits.size() < expected) {
+                            error = "fixed_size_list element validity covers fewer elements than the column has";
+                            ok = false;
+                        } else {
+                            bits.resize(expected);
+                            ok = adopt_into_buffer(std::move(bits), ArrowArrayBuffer(child, 0), error);
+                            child->null_count = static_cast<std::int64_t>(plan.values->item_null_count);
+                        }
+                    }
+                    ok = ok && fill_fixed_child(child, std::move(plan.values->fixed),
+                                                static_cast<std::int64_t>(child_length), plan.fmt, error);
+                    plan.array->length = length;
+                }
+            } else if (ok) {
+                ok = plan.kind == ColumnPlan::Kind::Fixed
+                         ? fill_fixed_child(plan.array, std::move(plan.values->fixed), length, plan.fmt, error)
+                         : fill_variable_child(plan.array, plan.values->variable, length, error);
+            }
             if (!ok) {
                 ArrowArrayRelease(&batch);
                 return false;
@@ -705,6 +764,16 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     // into such a batch would therefore have its own FinishElement skipped, so refuse that
     // combination explicitly rather than emit a subtly malformed array. Struct-only batches take the
     // bulk path above and are fine.
+    const bool has_fsl = std::any_of(plans.begin(), plans.end(), [](const ColumnPlan& plan) {
+        return plan.kind == ColumnPlan::Kind::FixedSizeList;
+    });
+    if (has_fsl) {
+        error =
+            "a fixed_size_list column cannot be read back in the same batch as a lance.blob.v2 column "
+            "or a skipped logical field (the per-row append path does not build nested arrays)";
+        ArrowArrayRelease(&batch);
+        return false;
+    }
     if (!struct_nodes.empty()) {
         error =
             "a plain struct column cannot be read back in the same batch as a lance.blob.v2 column "
@@ -721,6 +790,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         for (auto& plan : plans) {
             switch (plan.kind) {
                 case ColumnPlan::Kind::Skip:
+                case ColumnPlan::Kind::FixedSizeList:  // refused above: this path builds no nested arrays
                     break;
                 case ColumnPlan::Kind::Variable:
                     if (!append_string_at_row(*plan.array, plan.values->variable, static_cast<std::size_t>(row),

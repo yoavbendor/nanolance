@@ -842,8 +842,12 @@ std::string describe(const PageLayout& layout) {
         }
         case LayoutKind::kConstant:
             out = "Constant{";
+            // With no inline value and a definition layer, the descriptor alone cannot say whether
+            // the page is all-null or a nullable constant whose value sits in a buffer: that is
+            // decided by the page's buffer count (0/2 vs 1/3). Saying "all-null" here was the same
+            // mistake the decoder used to make, and it mislabelled a 2999-null + 1-value column.
             out += layout.constant.inline_value ? "inline " + std::to_string(layout.constant.inline_value->size()) + "B"
-                   : layers_have_definition_levels(layout.constant.layers) ? "all-null"
+                   : layers_have_definition_levels(layout.constant.layers) ? "no-inline,nullable (all-null unless buffered; see -v)"
                                                                           : "buffered";
             // A constant page with definition levels is the nullable case -- the same value in every
             // non-null row. Worth naming in the dump: it reads identically to the non-null case

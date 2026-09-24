@@ -27,6 +27,12 @@ namespace nano_lance {
 // ── Read limits (compile-time-tunable budget on untrusted on-disk sizes) ──────────────────────────
 // Override any of these at build time with -DNANOLANCE_MAX_*=... , or per-read via ReadLimits.
 // They bound what a *hostile* file can make the reader allocate; legitimate files are far below them.
+/// The most a zstd frame can expand: its best block is an RLE block, 4 bytes (3-byte header plus the
+/// byte) for at most 128 KiB of output. 512 MiB of zeros at level 22 measures 32,732:1. A declared
+/// decompressed size above `compressed * kZstdMaxExpansion` cannot be true, and unlike any size field
+/// it is derived from bytes that are actually present -- which is what makes it a bound.
+inline constexpr std::uint64_t kZstdMaxExpansion = 32768U;
+
 #ifndef NANOLANCE_MAX_UNCOMPRESSED_BYTES
 #define NANOLANCE_MAX_UNCOMPRESSED_BYTES (std::uint64_t{8} << 30)  // 8 GiB per decoded buffer
 #endif

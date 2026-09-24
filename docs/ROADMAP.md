@@ -106,6 +106,27 @@ Sizes: **XS** < 1 h, **S** half a day, **M** 1–2 days, **L** most of a week �
 | B4 | **FSL writer.** Emit field 11 around Flat. Verify stock Lance reads nanolance's MiniBlock FSL at dim 768 — legal, but unproven; if it does not, emit FullZip for wide rows. | M | Sonnet, then Opus if B4's verification fails |
 | B5 | **FullZip writer for long strings** — only if measurement shows MiniBlock with 256 B+ values costs something real on read. Not needed for correctness: MiniBlock with long values is a legal page. | S–M | Opus decides; Sonnet builds |
 
+**B1 result — the FullZip byte layout (non-list), confirmed against page buffer sizes.**
+
+- Page buffer 0 is the zipped data. A variable-width page has a second buffer, the repetition index
+  (`(rows + 1)` offsets), used for random access and ignored by a full scan.
+- Every row starts with a control word of `0 / 1 / 2 / 4` bytes as `bits_rep + bits_def` is
+  `0 / ≤8 / ≤16 / more` (`ControlWordParser::new` in `repdef.rs`). With no repetition the whole
+  little-endian word is the definition level; with both, `rep = word >> bits_def` and
+  `def = word & mask(bits_def)`. Level 0 is a valid item.
+- **Fixed width:** every row is `control word + bits_per_value/8` bytes, the value slot present even
+  for a null row. Checked: FSL-768 nullable, 2000 rows = `2000 × (1 + 3072)` = 6,146,000 bytes.
+- **Variable width:** a valid row is `control word + length (bits_per_offset/8 bytes) + bytes`; a null
+  row is the control word alone. Checked: one 300-byte string among 2000, `2000 × 4 + 19,180`
+  = 27,180 bytes. Per-value compression is what `value_compression` says: `Variable` = raw bytes,
+  `Fsst{…}` = each value FSST-compressed on its own.
+- **fixed_size_list element validity** (`FixedSizeList.has_validity`): on FullZip, each slot starts
+  with `ceil(N/8)` bytes of element bits (LSB-first, 1 = valid), then the N items, and
+  `bits_per_value` counts both — 768 × float32 is 25,344 bits. On MiniBlock the chunk carries two
+  buffers: element bits for all the chunk's rows back to back, then the values.
+
+**Status:** B1–B4 done — see PROGRESS, "Roadmap phases A, B and E". B5 not started.
+
 Done when: A2's value-size and FSL cells pass with their `KNOWN_GAPS` entries deleted, the
 write-matrix gains FSL and long-string shapes read by both readers, and a 768-dim embedding column
 round-trips pylance → nanolance → pylance.
@@ -159,7 +180,7 @@ The read side has to come first: it is the oracle for the write side, alongside 
 | # | Task | Size | Model |
 |---|---|---|---|
 | G1 | **CMake `install()` + `export()`** so `find_package(nanolance)` works (plan item 2.2, the oldest open item). Test by consuming the installed package from a separate CMake project in CI. | S–M | Sonnet |
-| G2 | **Nightly fuzz** with a persisted corpus (`actions/cache`), all five targets, longer runs. CI's 120 s is a regression guard; the OOB read took ~9 min locally. | S | Sonnet |
+| G2 | **Nightly fuzz** with a persisted corpus (`actions/cache`), all six targets, longer runs. CI's 120 s is a regression guard; the OOB read took ~9 min locally. | S | Sonnet |
 | G3 | `nanolance import --rows-per-fragment`. | S | Sonnet |
 | G4 | **Windows** bring-up in `ci-platforms.yml`, then add `windows-2022` to the wheels matrix. Mostly waiting on CI and fixing what it reports. | M | Sonnet |
 

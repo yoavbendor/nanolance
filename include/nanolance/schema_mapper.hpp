@@ -77,6 +77,11 @@ inline bool lance_logical_type_is_bitpackable_integer(const std::string& logical
            lance_logical_type_is_temporal(logical_type);
 }
 
+/// The widest value Lance lets a ConstantLayout carry inline in its descriptor
+/// ("MUST be <= 32 bytes if present", encodings_v2_1.proto). A wider fixed-width constant is not
+/// written as a ConstantLayout at all.
+inline constexpr std::size_t kMaxInlineConstantBytes = 32U;
+
 /// Lance `file.Field.encoding`: 1 = fixed-width, 2 = variable-width, 0 = none -- which is what
 /// pylance writes for a null-typed field, since it has no values to encode.
 inline std::int32_t lance_on_disk_field_encoding(const std::string& logical_type) {
@@ -86,8 +91,48 @@ inline std::int32_t lance_on_disk_field_encoding(const std::string& logical_type
     return lance_field_is_variable_width(logical_type) ? 2 : 1;
 }
 
+/// Split Lance's `fixed_size_list:<element type>:<N>` into its parts. The element type can itself
+/// contain colons (`timestamp:us:-`), so N is taken from the LAST colon. Returns false for anything
+/// else, including N = 0.
+inline bool lance_fixed_size_list_parts(const std::string& logical_type, std::string& element,
+                                        std::uint64_t& items) {
+    static const std::string prefix = "fixed_size_list:";
+    if (logical_type.rfind(prefix, 0) != 0) {
+        return false;
+    }
+    const auto last = logical_type.rfind(':');
+    if (last == std::string::npos || last <= prefix.size() || last + 1U >= logical_type.size()) {
+        return false;
+    }
+    std::uint64_t n = 0;
+    for (std::size_t i = last + 1U; i < logical_type.size(); ++i) {
+        const char c = logical_type[i];
+        if (c < '0' || c > '9' || n > (1ULL << 32U)) {
+            return false;
+        }
+        n = n * 10U + static_cast<std::uint64_t>(c - '0');
+    }
+    if (n == 0U) {
+        return false;
+    }
+    element = logical_type.substr(prefix.size(), last - prefix.size());
+    items = n;
+    return true;
+}
+
+inline std::size_t lance_logical_type_value_bytes(const std::string& logical_type);
+
 /// Fixed-width byte size for Lance on-disk logical types (writer/reader parity).
 inline std::size_t lance_logical_type_value_bytes(const std::string& logical_type) {
+    // A fixed_size_list row is N elements back to back -- which is also exactly how Lance stores it,
+    // so the whole row decodes as one fixed-width value.
+    {
+        std::string element;
+        std::uint64_t items = 0;
+        if (lance_fixed_size_list_parts(logical_type, element, items)) {
+            return static_cast<std::size_t>(items) * lance_logical_type_value_bytes(element);
+        }
+    }
     if (logical_type == "bool") {
         return 1U;
     }
@@ -153,5 +198,11 @@ std::string describe_schema_mapping_mismatch(const LanceSchemaMapping& expected,
 
 /// Rebuild `LanceSchemaMapping` from an on-disk manifest (inverse of manifest_writer field mapping).
 bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchemaMapping& out, std::string& error);
+
+/// The Arrow C format string for a Lance logical type, as read back from a manifest. Exposed for the
+/// one place that needs it outside manifest recovery: building a fixed_size_list's child, whose
+/// element type Lance keeps only inside the list's logical type string.
+bool lance_arrow_format_for_logical_type(const std::string& logical_type, std::string& arrow_format,
+                                         std::string& error);
 
 }  // namespace nano_lance

@@ -81,6 +81,21 @@ SHAPES = [
     # ConstantLayout. Here mainly for the combined-table tests below, where a column with zero data
     # buffers sits beside every other encoding in the same file.
     ("null_type", pa.table({"c": pa.nulls(N)}), "all-null ConstantLayout"),
+    # A constant fixed-width column is stored INLINE in the page descriptor, which Lance caps at 32
+    # bytes. The writer used to inline anything, and wrote the value's length as a single byte -- so
+    # a constant value of 128+ bytes produced a descriptor NEITHER reader could parse: a corrupt file.
+    # 32 is the last width that may inline; 33 and 200 must take the flat path.
+    ("fsb_constant_32", _table([b"k" * 32] * N, pa.binary(32)), "ConstantLayout, inline"),
+    ("fsb_constant_33", _table([b"k" * 33] * N, pa.binary(33)), "flat: too wide to inline"),
+    ("fsb_constant_200", _table([b"k" * 200] * N, pa.binary(200)), "flat: too wide to inline"),
+    # Vectors. fixed_size_list is one physical column with a FixedSizeList wrapper around Flat; the
+    # null-row variant is built the way pyarrow builds it, with every element of a null row null too.
+    ("fsl_f32_8", _table([[float(i + j) for j in range(8)] for i in range(N)], pa.list_(pa.float32(), 8)), "FixedSizeList{8xFlat}"),
+    ("null_fsl_f32_4", _table([None if _null(i) else [float(i)] * 4 for i in range(N)], pa.list_(pa.float32(), 4)), "FixedSizeList + def levels"),
+    ("fsl_i64_2", _table([[i, -i] for i in range(N)], pa.list_(pa.int64(), 2)), "FixedSizeList{2xFlat}"),
+    # Long strings: stock Lance switches to FullZip at 256 bytes; nanolance keeps MiniBlock, which is
+    # legal at any value size. This pins that stock Lance reads it.
+    ("str_long", _table([("q" * 300) + str(i) for i in range(N)], pa.utf8()), "variable, 300-byte values"),
 ]
 
 MODES = [

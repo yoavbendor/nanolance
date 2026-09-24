@@ -176,6 +176,12 @@ bool materialize_ipc_buffer(const std::vector<std::uint8_t>& body, std::size_t o
     // the manifest's deleted-row count times four. That is the only bound here that the file does not
     // get to choose, which is the whole point: both the Arrow length prefix and the zstd frame header
     // declare the uncompressed size, and both come out of the same untrusted bytes.
+    // Defence in depth beside the manifest-derived ceiling: no zstd frame can decode to more than
+    // kZstdMaxExpansion times its compressed size (see read_safety.hpp).
+    if (static_cast<std::uint64_t>(uncompressed) > static_cast<std::uint64_t>(length - 8U) * kZstdMaxExpansion) {
+        error = "deletion file declares more uncompressed bytes than its zstd frame can produce";
+        return false;
+    }
     if (static_cast<std::uint64_t>(uncompressed) > max_bytes) {
         error = "deletion file declares an implausible uncompressed size";
         return false;

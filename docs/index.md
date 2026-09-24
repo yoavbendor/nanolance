@@ -38,8 +38,8 @@ asserted:
   external `file://` blob fetch rejects `..` traversal — a hostile `../../etc/passwd` path can't escape.
 - **Mid-read failures release everything already built** — no leaked `ArrowArray`/`ArrowSchema` on a
   partial read.
-- **Continuous ASan + UBSan + LSan CI** and a **libFuzzer harness** over the full decode chain
-  (manifest → footer → column decode), seeded and run on every push.
+- **Continuous ASan + UBSan + LSan CI** and **libFuzzer targets** covering manifest, footer,
+  page descriptors, page decoding, FSST, LZ4 and deletion files, run on every push.
 
 All of this validates **once per page/header, not once per value** — a declared size or offset table
 is checked against the real buffer in a prologue, then the tight per-value `memcpy`/materialization

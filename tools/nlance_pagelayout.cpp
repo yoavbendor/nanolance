@@ -34,6 +34,8 @@ namespace {
 
 /// When set, descriptors are written here instead of (as well as) being printed.
 std::filesystem::path g_corpus_dir;
+std::filesystem::path g_pages_dir;  // --dump-fuzz-pages: seed inputs for fuzz_column_decode
+bool g_verbose = false;  // -v: also print every page's row count and buffer sizes
 std::set<std::vector<std::uint8_t>> g_seen;
 
 void maybe_dump(const std::vector<std::uint8_t>& encoding) {
@@ -135,6 +137,68 @@ int report(const std::filesystem::path& dataset) {
             continue;
         }
         std::cout << label << "  " << name << ": " << pl::describe(parsed) << '\n';
+        if (!g_pages_dir.empty()) {
+            // One file per page, in the input format tests/fuzz/fuzz_column_decode.cpp documents:
+            // [u8 n][logical type][u32 rows][u32 n][descriptor][u8 count]{[u32 n][buffer]}.
+            std::string logical_type;
+            for (std::size_t i = 0; i < file_entry.column_indices.size() && i < file_entry.fields.size(); ++i) {
+                if (file_entry.column_indices[i] == static_cast<std::int32_t>(c)) {
+                    for (const auto& f : manifest.fields) {
+                        if (f.id == file_entry.fields[i]) {
+                            logical_type = f.logical_type;
+                        }
+                    }
+                }
+            }
+            for (std::size_t pg = 0; pg < columns[c].pages.size(); ++pg) {
+                const auto& page = columns[c].pages[pg];
+                std::vector<std::uint8_t> blob;
+                const auto put_u32 = [&blob](std::uint64_t v) {
+                    for (int k = 0; k < 4; ++k) {
+                        blob.push_back(static_cast<std::uint8_t>((v >> (8 * k)) & 0xFFU));
+                    }
+                };
+                blob.push_back(static_cast<std::uint8_t>(logical_type.size()));
+                blob.insert(blob.end(), logical_type.begin(), logical_type.end());
+                put_u32(page.length);
+                put_u32(page.encoding.size());
+                blob.insert(blob.end(), page.encoding.begin(), page.encoding.end());
+                blob.push_back(static_cast<std::uint8_t>(page.buffer_sizes.size()));
+                bool ok = true;
+                for (std::size_t b = 0; b < page.buffer_sizes.size() && ok; ++b) {
+                    std::vector<std::uint8_t> bytes;
+                    std::string read_error;
+                    // Seeds are for exploring structure, not volume: a page larger than this is
+                    // skipped rather than written as a multi-megabyte corpus entry.
+                    if (page.buffer_sizes[b] > (1U << 20U) ||
+                        !nano_lance::read_lance_data_file_bytes(data_file, page.buffer_offsets[b], page.buffer_sizes[b],
+                                                                bytes, read_error)) {
+                        ok = false;
+                        break;
+                    }
+                    put_u32(bytes.size());
+                    blob.insert(blob.end(), bytes.begin(), bytes.end());
+                }
+                if (!ok) {
+                    continue;
+                }
+                const auto path = g_pages_dir / (label + "_c" + std::to_string(c) + "_p" + std::to_string(pg) + ".page");
+                std::ofstream out(path, std::ios::binary);
+                out.write(reinterpret_cast<const char*>(blob.data()), static_cast<std::streamsize>(blob.size()));
+            }
+        }
+        if (g_verbose) {
+            // Per page: row count and every buffer's size. The descriptor says how a page is
+            // encoded; the buffer sizes are what settle questions about its byte layout.
+            for (std::size_t pg = 0; pg < columns[c].pages.size(); ++pg) {
+                const auto& page = columns[c].pages[pg];
+                std::cout << "    page " << pg << ": rows=" << page.length << " buffers=[";
+                for (std::size_t b = 0; b < page.buffer_sizes.size(); ++b) {
+                    std::cout << (b != 0U ? "," : "") << page.buffer_sizes[b];
+                }
+                std::cout << "]\n";
+            }
+        }
     }
     return failures;
 }
@@ -143,18 +207,28 @@ int report(const std::filesystem::path& dataset) {
 
 int main(int argc, char** argv) {
     int first = 1;
-    if (argc >= 3 && std::string(argv[1]) == "--dump-corpus") {
-        g_corpus_dir = argv[2];
+    if (argc >= 2 && std::string(argv[1]) == "-v") {
+        g_verbose = true;
+        ++first;
+    }
+    if (argc >= first + 2 && std::string(argv[first]) == "--dump-fuzz-pages") {
+        g_pages_dir = argv[first + 1];
+        std::error_code ec;
+        std::filesystem::create_directories(g_pages_dir, ec);
+        first += 2;
+    }
+    if (argc >= first + 2 && std::string(argv[first]) == "--dump-corpus") {
+        g_corpus_dir = argv[first + 1];
         std::error_code ec;
         std::filesystem::create_directories(g_corpus_dir, ec);
         if (ec) {
             std::cerr << "cannot create corpus dir " << g_corpus_dir << ": " << ec.message() << '\n';
             return 2;
         }
-        first = 3;
+        first += 2;
     }
     if (argc <= first) {
-        std::cerr << "usage: nlance-pagelayout [--dump-corpus <dir>] <dataset.lance> [more.lance ...]\n";
+        std::cerr << "usage: nlance-pagelayout [-v] [--dump-fuzz-pages <dir>] [--dump-corpus <dir>] <dataset.lance> [more.lance ...]\n";
         return 2;
     }
     int failures = 0;

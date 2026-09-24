@@ -279,6 +279,38 @@ void copy_metadata(const ArrowSchema& schema, std::map<std::string, std::string>
     }
 }
 
+/// Arrow fixed_size_list ("+w:N") -> Lance "fixed_size_list:<element>:<N>". Lance stores it as ONE
+/// physical column of N-element rows and keeps no child field in its schema, so the element type
+/// travels inside the logical type string. Only a fixed-width numeric/temporal element is accepted:
+/// a variable-width, boolean, nested or null element would each need a different page shape.
+ParsedFormat parse_fixed_size_list(const ArrowSchema& field) {
+    ParsedFormat out;
+    const char* format = field.format == nullptr ? "" : field.format;
+    std::uint64_t items = 0;
+    for (const char* c = format + 3; *c != '\0'; ++c) {
+        if (*c < '0' || *c > '9' || items > (1ULL << 31U)) {
+            out.rejection = "malformed fixed_size_list format";
+            return out;
+        }
+        items = items * 10U + static_cast<std::uint64_t>(*c - '0');
+    }
+    if (items == 0U || field.n_children != 1 || field.children == nullptr || field.children[0] == nullptr) {
+        out.rejection = "a fixed_size_list needs one child and a non-zero size";
+        return out;
+    }
+    const auto element = parse_format(field.children[0]->format);
+    if (!element.supported || element.logical_type == "struct" || element.logical_type == "bool" ||
+        element.logical_type == "null" || lance_field_is_variable_width(element.logical_type)) {
+        out.rejection = std::string("fixed_size_list of '") +
+                        (field.children[0]->format == nullptr ? "?" : field.children[0]->format) +
+                        "' is not supported; the element must be a fixed-width number, decimal or temporal type";
+        return out;
+    }
+    out.logical_type = "fixed_size_list:" + element.logical_type + ":" + std::to_string(items);
+    out.supported = true;
+    return out;
+}
+
 bool map_field(const ArrowSchema& field,
                std::int32_t parent_id,
                std::int32_t& next_id,
@@ -316,7 +348,10 @@ bool map_field(const ArrowSchema& field,
                LanceSchemaMapping& mapping,
                std::string& error) {
     const char* format = field.format == nullptr ? "" : field.format;
-    const auto parsed = parse_format(format);
+    auto parsed = parse_format(format);
+    if (starts_with(format, "+w:")) {
+        parsed = parse_fixed_size_list(field);
+    }
     if (!parsed.supported) {
         error = "column '";
         error += field.name == nullptr ? "<unnamed>" : field.name;
@@ -594,6 +629,22 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
         arrow_format = "e";
         return true;
     }
+    // fixed_size_list:<element>:<N> -> "+w:N". The element's own format is attached as the child
+    // when the Arrow schema is built; here it only has to be one this reader can produce.
+    {
+        std::string element;
+        std::uint64_t items = 0;
+        if (lance_fixed_size_list_parts(logical_type, element, items)) {
+            std::string element_format;
+            if (lance_field_is_variable_width(element) || element == "bool" ||
+                !infer_arrow_format_from_internal(element, element_format, error)) {
+                error = "unsupported fixed_size_list element type in logical type: " + logical_type;
+                return false;
+            }
+            arrow_format = "+w:" + std::to_string(items);
+            return true;
+        }
+    }
     if (logical_type == "bool") {
         arrow_format = "b";
         return true;
@@ -808,6 +859,11 @@ void reroot_orphaned_fields(LanceSchemaMapping& mapping) {
 }
 
 }  // namespace
+
+bool lance_arrow_format_for_logical_type(const std::string& logical_type, std::string& arrow_format,
+                                         std::string& error) {
+    return infer_arrow_format_from_internal(disk_logical_type_to_internal(logical_type), arrow_format, error);
+}
 
 bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchemaMapping& out, std::string& error) {
     out.fields.clear();

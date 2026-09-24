@@ -74,6 +74,13 @@ struct ColumnValues {
     std::vector<std::uint8_t> validity;
     /// Number of rows whose validity bit is clear. Zero whenever `validity` is empty.
     std::uint64_t null_count = 0;
+    /// fixed_size_list only: validity per ELEMENT -- `items_per_row` bits per row, Arrow convention --
+    /// for the list's child array. Distinct from `validity`, which is per row. pyarrow marks every
+    /// element of a null row null too, so an ordinary nullable vector column carries this even when no
+    /// valid row has a null element. Empty when no element is null.
+    std::vector<std::uint8_t> item_validity;
+    std::uint64_t item_null_count = 0;
+    std::uint64_t items_per_row = 0;
     /// Rows accumulated so far. Needed on the write side because validity arrives one batch at a
     /// time and each batch's bits must land at the right absolute row offset -- the value buffers
     /// cannot supply that for a variable-width column, and for a borrowed fixed-width column there

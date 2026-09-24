@@ -35,7 +35,7 @@ Rust parser would be, and it's proven, not asserted:
 - A path jail confines every manifest-derived data-file path under the dataset directory; the external
   `file://` blob fetch rejects `..` traversal.
 - Mid-read failures release everything already built — no leaked `ArrowArray`/`ArrowSchema`.
-- Continuous **ASan + UBSan + LSan CI** and a **libFuzzer** harness over the full decode chain.
+- Continuous **ASan + UBSan + LSan CI** and **libFuzzer** targets for every untrusted format, page decoding included.
 
 All of it validates once per page/header, not once per value, so the safety cost doesn't show up in a
 profile — proven by a read-throughput parity benchmark (`trusted_input=true`, which skips only the

@@ -97,11 +97,20 @@ bool zstd_unframe_buffer(const std::vector<std::uint8_t>& framed, std::vector<st
         return false;
     }
     const std::uint64_t uncompressed = load_le<std::uint64_t>(framed.data());
-    // The declared uncompressed size is attacker-controlled: cap it (DoS/OOM) and never allocate more
-    // than the platform can index. Also cross-check it against the zstd frame's own content size when
-    // the frame records one, so a lie in the header can't drive a giant allocation.
-    if (uncompressed > default_read_limits().max_uncompressed_bytes || !fits_size_t(uncompressed)) {
-        error = "zstd uncompressed size exceeds safety limit";
+    // The declared size decides the allocation, and it is written by the file -- as is the zstd frame's
+    // own content size, so the cross-check below proves only that the two agree, not that either is
+    // true. An 899-byte page declaring 8.4 GB passed both and was allocated; found by
+    // tests/fuzz/fuzz_column_decode.cpp within 10,000 executions.
+    //
+    // The bound has to come from bytes that are actually present. zstd cannot expand more than its
+    // best block allows: an RLE block is 4 bytes (3-byte header + the byte) for at most 128 KiB of
+    // output, so no frame exceeds 32768x its compressed size. Measured: 512 MiB of zeros at level 22
+    // compresses 32,732:1. LZ4 has the same kind of bound (255x) in lz4_block.cpp, for the same reason.
+    const std::uint64_t compressed = static_cast<std::uint64_t>(framed.size() - 8U);
+    if (uncompressed > default_read_limits().max_uncompressed_bytes || !fits_size_t(uncompressed) ||
+        uncompressed > compressed * kZstdMaxExpansion) {
+        error = "zstd frame declares " + std::to_string(uncompressed) + " uncompressed bytes from " +
+                std::to_string(compressed) + " compressed, more than zstd can produce";
         return false;
     }
     const unsigned long long content =
@@ -929,6 +938,7 @@ enum class ColumnEncodingKind {
     kVariable,
     kBitpack,
     kFlat,
+    kFullZip,
     kUnsupported,
 };
 
@@ -970,6 +980,10 @@ struct ColumnEncodingPlan {
     /// kDict: `num_dictionary_items` from the descriptor. Authoritative for a fixed-width dictionary,
     /// whose block carries no count of its own.
     std::uint64_t dict_items = 0;
+    /// kFlat over FixedSizeList{N, Flat, has_validity}: each chunk's first buffer is N validity bits
+    /// per row (one per element, LSB-first, contiguous across rows) and its second the values.
+    std::uint64_t fsl_items = 0;
+    bool fsl_item_validity = false;
     /// kDict / kDictRle: the fixed-width dictionary's entries are themselves FastLanes bit-packed
     /// rather than stored flat. Lance picks this once the entries are narrow enough for packing to
     /// pay -- an int64 column with runs gets it. It comes in two spellings, and they differ only in
@@ -1124,6 +1138,155 @@ struct DictionaryBlock {
     return true;
 }
 
+/// Appends `count` fixed_size_list ELEMENT validity bits, read LSB-first from `src` starting at bit
+/// `src_bit`, at element `at` of `out.item_validity`. `src == nullptr` appends valid elements. The
+/// bitmap is materialized lazily: nothing is stored until the first null element, at which point
+/// every element before it is filled in as valid.
+void append_item_validity(ColumnValues& out, const std::uint8_t* src, std::uint64_t src_bit, std::uint64_t count,
+                          std::uint64_t at) {
+    const auto set_valid_upto = [&out](std::uint64_t from, std::uint64_t to) {
+        out.item_validity.resize(static_cast<std::size_t>((to + 7U) / 8U), 0U);
+        for (std::uint64_t i = from; i < to; ++i) {
+            out.item_validity[static_cast<std::size_t>(i >> 3U)] |= static_cast<std::uint8_t>(1U << (i & 7U));
+        }
+    };
+    if (src == nullptr) {
+        if (!out.item_validity.empty()) {
+            set_valid_upto(at, at + count);
+        }
+        return;
+    }
+    for (std::uint64_t i = 0; i < count; ++i) {
+        const auto b = src_bit + i;
+        const bool valid = ((src[static_cast<std::size_t>(b >> 3U)] >> (b & 7U)) & 1U) != 0U;
+        const auto dst = at + i;
+        if (out.item_validity.empty()) {
+            if (valid) {
+                continue;  // still all valid
+            }
+            set_valid_upto(0, dst);  // materialize: every element before this one was valid
+        }
+        if (out.item_validity.size() < static_cast<std::size_t>((dst + 8U) / 8U)) {
+            out.item_validity.resize(static_cast<std::size_t>((dst + 8U) / 8U), 0U);
+        }
+        if (valid) {
+            out.item_validity[static_cast<std::size_t>(dst >> 3U)] |= static_cast<std::uint8_t>(1U << (dst & 7U));
+        } else {
+            ++out.item_null_count;
+        }
+    }
+}
+
+/// What decoding one FullZip page needs, derived from THAT page's descriptor. Not hoisted to the
+/// column: every page carries its own descriptor, and with it its own FSST symbol table and its own
+/// nullability, so the first page's values are not the second page's.
+///
+/// Byte layout (verified against page buffer sizes; see docs/ROADMAP.md, B1): each row is a control
+/// word of 0/1/2/4 bytes holding its definition level, then either a fixed-width value slot -- present
+/// even for a null row -- or, for a valid variable-width row only, a length prefix and the bytes.
+struct FullZipPageParams {
+    std::size_t control_bytes = 0;
+    std::uint32_t bits_def = 0;
+    std::size_t value_bytes = 0;   // fixed width; 0 for variable width
+    std::size_t length_bytes = 0;  // variable width: the length prefix, 4 or 8; 0 for fixed width
+    std::optional<fsst::SymbolTable> fsst;
+    /// fixed_size_list with element validity: each slot starts with ceil(items/8) bytes of per-element
+    /// validity bits, then the items. `value_bytes` counts both.
+    std::uint64_t items = 0;
+    std::size_t item_validity_bytes = 0;
+};
+
+/// Fills `out` from a FullZip layout, or explains why it cannot be read.
+bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t page_rows,
+                          FullZipPageParams& out, std::string& why) {
+    out = FullZipPageParams{};
+    if (layout.kind != page_layout::LayoutKind::kFullZip) {
+        why = "a FullZip column has a page with a different layout";
+        return false;
+    }
+    const auto& fz = layout.full_zip;
+    if (fz.bits_rep != 0U) {
+        why = "repeated values (lists) in a FullZip page are not read yet";
+        return false;
+    }
+    if (fz.num_items != page_rows || fz.num_visible_items != page_rows) {
+        why = "FullZip page declares " + std::to_string(fz.num_items) + " items (" +
+              std::to_string(fz.num_visible_items) + " visible) for " + std::to_string(page_rows) + " rows";
+        return false;
+    }
+    // One layer, describing the value itself: a list would have more.
+    if (fz.layers.size() != 1U || (fz.layers[0] != 1U && fz.layers[0] != 3U)) {
+        why = "unsupported FullZip layer set";
+        return false;
+    }
+    if (fz.bits_def > 16U || (fz.bits_def != 0U) != (fz.layers[0] == 3U)) {
+        why = "FullZip definition bits do not match its layers";
+        return false;
+    }
+    out.bits_def = fz.bits_def;
+    const auto total_bits = fz.bits_rep + fz.bits_def;
+    out.control_bytes = total_bits == 0U ? 0U : total_bits <= 8U ? 1U : total_bits <= 16U ? 2U : 4U;
+
+    const auto* values = fz.value_compression.get();
+    if (values == nullptr) {
+        why = "FullZip page has no value compression";
+        return false;
+    }
+    if (fz.bits_per_offset != 0U) {
+        if (fz.bits_per_offset != 32U && fz.bits_per_offset != 64U) {
+            why = "unsupported FullZip length width of " + std::to_string(fz.bits_per_offset) + " bits";
+            return false;
+        }
+        out.length_bytes = fz.bits_per_offset / 8U;
+        // Per-value compression: Variable is the bytes as they are; Fsst compresses each value on
+        // its own, against this page's symbol table.
+        if (values->kind == page_layout::CompressiveKind::kFsst) {
+            fsst::SymbolTable table;
+            if (!fsst::parse_symbol_table(values->symbol_table, table, why)) {
+                return false;
+            }
+            out.fsst = table;
+            values = values->values.get();
+        }
+        if (values == nullptr || values->kind != page_layout::CompressiveKind::kVariable) {
+            why = "unsupported FullZip value compression";
+            return false;
+        }
+        return true;
+    }
+    if (fz.bits_per_value == 0U || fz.bits_per_value % 8U != 0U) {
+        why = "FullZip value width of " + std::to_string(fz.bits_per_value) + " bits is not whole bytes";
+        return false;
+    }
+    out.value_bytes = fz.bits_per_value / 8U;
+    // The slot is either one flat value, or a fixed_size_list's N flat items back to back. Either way
+    // the declared width has to be exactly what the value encoding says, or the stride is wrong.
+    std::uint64_t described_bits = 0;
+    if (values->kind == page_layout::CompressiveKind::kFlat) {
+        described_bits = values->bits_per_value;
+    } else if (values->kind == page_layout::CompressiveKind::kFixedSizeList && values->values != nullptr &&
+               values->values->kind == page_layout::CompressiveKind::kFlat && values->items_per_value != 0U &&
+               values->values->bits_per_value % 8U == 0U) {
+        // With element validity the slot is [ceil(N/8) bytes of bits][N items]; Lance's
+        // bits_per_value counts both (a nullable 768 x float32 vector is 25344 bits).
+        const std::uint64_t validity_bytes = values->has_validity ? (values->items_per_value + 7U) / 8U : 0U;
+        if (!checked_mul(values->items_per_value, static_cast<std::uint64_t>(values->values->bits_per_value),
+                         described_bits) ||
+            described_bits > std::numeric_limits<std::uint64_t>::max() - validity_bytes * 8U) {
+            described_bits = 0;
+        } else {
+            described_bits += validity_bytes * 8U;
+            out.items = values->items_per_value;
+            out.item_validity_bytes = static_cast<std::size_t>(validity_bytes);
+        }
+    }
+    if (described_bits != fz.bits_per_value) {
+        why = "unsupported FullZip value compression";
+        return false;
+    }
+    return true;
+}
+
 /// Classify from the page descriptor alone. Returns false when the column carries no descriptor (an
 /// older nanolance file), leaving the caller to fall back to the field metadata.
 bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnEncodingPlan& out) {
@@ -1144,6 +1307,19 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
         // column whose every row is null -- there is no repeated value to store, only the fact that
         // there is none.
         out.constant_declares_levels = page_layout::layers_have_definition_levels(layout.constant.layers);
+        return true;
+    }
+    if (layout.kind == page_layout::LayoutKind::kFullZip) {
+        // Validate against the first page so an unreadable column is refused before anything is
+        // read, with the reason. Decode re-derives the parameters page by page.
+        FullZipPageParams params;
+        std::string why;
+        if (!full_zip_page_params(layout, column_metadata.pages.front().length, params, why)) {
+            out.kind = ColumnEncodingKind::kUnsupported;
+            out.unsupported_reason = "unsupported page layout: " + page_layout::describe(layout) + " (" + why + ")";
+            return true;
+        }
+        out.kind = ColumnEncodingKind::kFullZip;
         return true;
     }
     if (layout.kind != page_layout::LayoutKind::kMiniBlock) {
@@ -1328,6 +1504,25 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             // bool is Flat{bits_per_value: 1}; that IS how stock Lance represents it, so the
             // descriptor distinguishes it from a byte-wide flat column with no help from metadata.
             out.kind = inner->bits_per_value == 1U ? ColumnEncodingKind::kBoolPacked : ColumnEncodingKind::kFlat;
+            return true;
+        case page_layout::CompressiveKind::kFixedSizeList:
+            // FixedSizeList{N, Flat(b)}: each row is N flat values back to back, which the flat path
+            // reads as one N*b-bit value once the column's width is N elements (see
+            // lance_logical_type_value_bytes). Item-level validity and packed items are refused by
+            // name rather than read as flat bytes.
+            // With has_validity the chunk carries two buffers, element bits then values.
+            if (!has_dictionary && out.value_scheme == page_layout::BufferScheme::kNone && !out.fsst &&
+                inner->values != nullptr && inner->values->kind == page_layout::CompressiveKind::kFlat &&
+                inner->values->bits_per_value % 8U == 0U && inner->values->bits_per_value != 0U &&
+                inner->items_per_value != 0U &&
+                (!inner->has_validity || out.chunk_shape.num_buffers == 2U)) {
+                out.kind = ColumnEncodingKind::kFlat;
+                out.fsl_items = inner->items_per_value;
+                out.fsl_item_validity = inner->has_validity;
+                return true;
+            }
+            out.kind = ColumnEncodingKind::kUnsupported;
+            out.unsupported_reason = "unsupported fixed_size_list encoding " + page_layout::describe(layout);
             return true;
         default:
             out.kind = ColumnEncodingKind::kUnsupported;
@@ -2019,6 +2214,153 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         return true;
     }
 
+    // FullZip: values stored row by row, each behind a control word. What Lance writes when a page's
+    // longest value is 256 bytes or more -- a long string, or a float32 fixed_size_list of 64+ dims.
+    if (encoding_plan.kind == ColumnEncodingKind::kFullZip) {
+        std::vector<std::uint8_t> data;
+        std::vector<std::uint16_t> levels;
+        std::uint64_t rows_so_far = 0;
+        bool variable = false;
+        for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
+            const auto& page = column_metadata.pages[page_index];
+            page_layout::PageLayout layout;
+            FullZipPageParams params;
+            std::string why;
+            if (!page_layout::decode_page_layout(page.encoding, layout, why) ||
+                !full_zip_page_params(layout, page.length, params, why)) {
+                error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) + ": " + why;
+                return false;
+            }
+            if (page_index == 0U) {
+                variable = params.length_bytes != 0U;
+                if (variable) {
+                    out.kind = ColumnValues::Kind::VariableWidth;
+                    out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+                    append_list_offset(out.variable.offsets, 0, out.variable.large);
+                } else {
+                    out.kind = ColumnValues::Kind::FixedWidth;
+                    const auto schema_bytes = lance_logical_type_value_bytes(on_disk_field.logical_type);
+                    if (schema_bytes != params.value_bytes - params.item_validity_bytes) {
+                        error = "column '" + on_disk_field.name + "': FullZip values are " +
+                                std::to_string(params.value_bytes) + " bytes but the type is " +
+                                std::to_string(schema_bytes);
+                        return false;
+                    }
+                }
+            } else if (variable != (params.length_bytes != 0U)) {
+                error = "column '" + on_disk_field.name + "' mixes fixed- and variable-width FullZip pages";
+                return false;
+            }
+            if (page.buffer_offsets.empty() || page.buffer_sizes.empty()) {
+                error = "column '" + on_disk_field.name + "': FullZip page has no data buffer";
+                return false;
+            }
+            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[0], page.buffer_sizes[0], data, error)) {
+                return false;
+            }
+            if (page.length > std::numeric_limits<std::uint32_t>::max()) {
+                error = "FullZip page row count exceeds 2^32";
+                return false;
+            }
+            const auto rows = static_cast<std::size_t>(page.length);
+            levels.assign(rows, 0U);
+            const std::uint32_t def_mask = params.bits_def == 0U ? 0U : ((1U << params.bits_def) - 1U);
+            bool page_has_nulls = false;
+            std::size_t at = 0;
+            if (!variable) {
+                std::uint64_t page_bytes = 0;
+                if (!checked_mul(static_cast<std::uint64_t>(rows),
+                                 static_cast<std::uint64_t>(params.value_bytes + params.control_bytes), page_bytes) ||
+                    page_bytes != data.size()) {
+                    error = "column '" + on_disk_field.name + "': FullZip page is " + std::to_string(data.size()) +
+                            " bytes, expected " + std::to_string(page_bytes);
+                    return false;
+                }
+                out.fixed.reserve(out.fixed.size() + rows * (params.value_bytes - params.item_validity_bytes));
+                if (params.items != 0U) {
+                    out.items_per_row = params.items;
+                }
+            }
+            for (std::size_t r = 0; r < rows; ++r) {
+                std::uint32_t def = 0;
+                if (params.control_bytes != 0U) {
+                    if (data.size() - at < params.control_bytes) {
+                        error = "column '" + on_disk_field.name + "': FullZip page truncated in a control word";
+                        return false;
+                    }
+                    std::uint32_t word = 0;
+                    std::memcpy(&word, data.data() + at, params.control_bytes);  // little-endian
+                    at += params.control_bytes;
+                    def = word & def_mask;
+                    levels[r] = static_cast<std::uint16_t>(def);
+                    page_has_nulls = page_has_nulls || def != 0U;
+                }
+                if (!variable) {
+                    const auto first_item = (rows_so_far + r) * params.items;
+                    if (params.item_validity_bytes != 0U) {
+                        append_item_validity(out, data.data() + at, 0U, params.items, first_item);
+                    } else if (params.items != 0U) {
+                        append_item_validity(out, nullptr, 0U, params.items, first_item);
+                    }
+                    at += params.item_validity_bytes;
+                    const auto item_bytes = params.value_bytes - params.item_validity_bytes;
+                    out.fixed.insert(out.fixed.end(), data.begin() + static_cast<std::ptrdiff_t>(at),
+                                     data.begin() + static_cast<std::ptrdiff_t>(at + item_bytes));
+                    at += item_bytes;
+                    continue;
+                }
+                if (def == 0U) {
+                    if (data.size() - at < params.length_bytes) {
+                        error = "column '" + on_disk_field.name + "': FullZip page truncated in a length";
+                        return false;
+                    }
+                    std::uint64_t length = 0;
+                    std::memcpy(&length, data.data() + at, params.length_bytes);
+                    at += params.length_bytes;
+                    if (length > data.size() - at) {
+                        error = "column '" + on_disk_field.name + "': FullZip value runs past the page";
+                        return false;
+                    }
+                    if (params.fsst) {
+                        if (!fsst::decompress_value(*params.fsst, data.data() + at, static_cast<std::size_t>(length),
+                                                    out.variable.data, error)) {
+                            return false;
+                        }
+                    } else {
+                        out.variable.data.insert(out.variable.data.end(), data.begin() + static_cast<std::ptrdiff_t>(at),
+                                                 data.begin() + static_cast<std::ptrdiff_t>(at + length));
+                    }
+                    at += static_cast<std::size_t>(length);
+                    if (out.variable.data.size() > default_read_limits().max_uncompressed_bytes ||
+                        (!out.variable.large &&
+                         out.variable.data.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
+                        error = "column '" + on_disk_field.name + "' exceeds the decoded-size limit";
+                        return false;
+                    }
+                }
+                append_list_offset(out.variable.offsets, static_cast<std::int64_t>(out.variable.data.size()),
+                                   out.variable.large);
+            }
+            if (at != data.size()) {
+                error = "column '" + on_disk_field.name + "': FullZip page has " + std::to_string(data.size() - at) +
+                        " bytes left over after its " + std::to_string(rows) + " rows";
+                return false;
+            }
+            // The validity bitmap stays empty until the first null, then covers every row so far.
+            if (page_has_nulls && out.validity.empty() && rows_so_far != 0U) {
+                std::vector<std::uint16_t> earlier(static_cast<std::size_t>(rows_so_far), 0U);
+                append_levels_to_validity(earlier.data(), static_cast<std::uint32_t>(rows_so_far), 0U, out.validity,
+                                          out.null_count);
+            }
+            if (page_has_nulls || !out.validity.empty()) {
+                append_levels_to_validity(levels.data(), static_cast<std::uint32_t>(rows), rows_so_far, out.validity,
+                                          out.null_count);
+            }
+            rows_so_far += page.length;
+        }
+        return true;
+    }
+
     // Byte-stream-split + zstd fixed-width column (float/double): each page's payload is a zstd frame
     // of vlen contiguous byte-planes; un-zstd then inverse-transpose to reconstruct the original bytes.
     if (encoding_plan.kind == ColumnEncodingKind::kBssZstd) {
@@ -2173,6 +2515,10 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 if (nullable) {
                     chunk_values = chunk.repdef_values;
                 } else {
+                    if (chunk.values.size() < offset_width) {
+                        error = "variable-width chunk is too short to hold an offset table";
+                        return false;
+                    }
                     const auto data_base = read_list_offset(chunk.values, 0, stored_offsets_large);
                     if (data_base < static_cast<std::int64_t>(offset_width) ||
                         static_cast<std::uint64_t>(data_base) % offset_width != 0U) {
@@ -2234,6 +2580,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     std::vector<MiniBlockChunkView> chunks;
     const bool nullable = encoding_plan.repdef != nullptr;
     std::uint64_t validity_rows = 0;
+    std::uint64_t page_rows_before = 0;
     for (const auto& page : column_metadata.pages) {
         if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
             return false;
@@ -2248,7 +2595,15 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         //   * flat chunks are sized by bytes -- the writer fills them to a byte budget, not to a
         //     value count, so a flat int64 chunk holds whatever fits.
         std::uint64_t remaining = page.length;
-        for (const auto& chunk : chunks) {
+        for (auto& chunk : chunks) {
+            if (encoding_plan.fsl_item_validity) {
+                // [element validity bits][values]: move the values into place and keep the bits.
+                if (chunk.extra_buffers.size() != 1U) {
+                    error = "fixed_size_list chunk with element validity does not carry two buffers";
+                    return false;
+                }
+                std::swap(chunk.values, chunk.extra_buffers[0]);
+            }
             std::uint32_t chunk_values = 0;
             if (nullable) {
                 chunk_values = chunk.repdef_values;
@@ -2289,6 +2644,22 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                 }
                 out.fixed.insert(out.fixed.end(), chunk.values.begin(), chunk.values.end());
             }
+            if (encoding_plan.fsl_items != 0U) {
+                out.items_per_row = encoding_plan.fsl_items;
+                const auto first_item = (page_rows_before + page.length - remaining) * encoding_plan.fsl_items;
+                const auto items = static_cast<std::uint64_t>(chunk_values) * encoding_plan.fsl_items;
+                if (encoding_plan.fsl_item_validity) {
+                    const auto& bits = chunk.extra_buffers[0];
+                    if (bits.size() != static_cast<std::size_t>((items + 7U) / 8U)) {
+                        error = "fixed_size_list element validity is " + std::to_string(bits.size()) +
+                                " bytes for " + std::to_string(items) + " elements";
+                        return false;
+                    }
+                    append_item_validity(out, bits.data(), 0U, items, first_item);
+                } else {
+                    append_item_validity(out, nullptr, 0U, items, first_item);
+                }
+            }
             remaining -= chunk_values;
         }
         if (remaining != 0U) {
@@ -2296,6 +2667,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
                     " of " + std::to_string(page.length) + " rows";
             return false;
         }
+        page_rows_before += page.length;
     }
     if (nullable && validity_rows != declared_rows) {
         error = "definition levels cover " + std::to_string(validity_rows) + " rows but the column has " +

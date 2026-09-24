@@ -252,28 +252,47 @@ def _fsl(dim, nullable=False):
     return pa.FixedSizeListArray.from_arrays(flat, dim, mask=mask)
 
 
-FULLZIP = "unsupported page layout: FullZip"
-FSL_SCHEMA = "unsupported on-disk logical type for manifest recovery: fixed_size_list"
+def _fsl_item_nulls(dim):
+    flat = pa.array([None if i % 13 == 0 else float(i % 1000) for i in range(N_WIDE * dim)], pa.float32())
+    return pa.FixedSizeListArray.from_arrays(flat, dim)
+
+
+def _fsl_null_rows_pyarrow(dim):
+    return pa.array(
+        [None if i % 7 == 0 else [float((i + j) % 100) for j in range(dim)] for i in range(N_WIDE)],
+        pa.list_(pa.float32(), dim),
+    )
+
 
 VALUE_SIZE_SHAPES = {
     # (column builder, the failure it produces today or None)
     "str_255": (lambda: pa.array([("x" * 250) + f"{i:05d}" for i in range(N_WIDE)]), None),
-    "str_256": (lambda: pa.array([("x" * 251) + f"{i:05d}" for i in range(N_WIDE)]), FULLZIP),
-    "str_one_long": (lambda: _one_long(N_WIDE), FULLZIP),
-    "str_1024": (lambda: pa.array([("w" * 1019) + f"{i:05d}" for i in range(N_WIDE)]), FULLZIP),
+    "str_256": (lambda: pa.array([("x" * 251) + f"{i:05d}" for i in range(N_WIDE)]), None),
+    "str_one_long": (lambda: _one_long(N_WIDE), None),
+    "str_1024": (lambda: pa.array([("w" * 1019) + f"{i:05d}" for i in range(N_WIDE)]), None),
     "str_long_nullable": (
         lambda: pa.array([None if i % 7 == 0 else ("z" * 400) + str(i) for i in range(N_WIDE)]),
-        FULLZIP,
+        None,
     ),
     # Distinct values on purpose: a LOW-cardinality long binary column is dictionary-encoded first
     # (251 distinct 1 KiB values came back as a MiniBlock dictionary page), so the size rule only
     # decides the layout of what the dictionary step leaves alone.
-    "binary_1024": (lambda: pa.array([i.to_bytes(4, "little") * 256 for i in range(N_WIDE)], pa.binary()), FULLZIP),
-    "fsl_8": (lambda: _fsl(8), FSL_SCHEMA),
-    "fsl_32": (lambda: _fsl(32), FSL_SCHEMA),
-    "fsl_64": (lambda: _fsl(64), FSL_SCHEMA),
-    "fsl_768": (lambda: _fsl(768), FSL_SCHEMA),
-    "fsl_768_nullable": (lambda: _fsl(768, nullable=True), FSL_SCHEMA),
+    "binary_1024": (lambda: pa.array([i.to_bytes(4, "little") * 256 for i in range(N_WIDE)], pa.binary()), None),
+    "fsl_8": (lambda: _fsl(8), None),
+    "fsl_32": (lambda: _fsl(32), None),
+    "fsl_64": (lambda: _fsl(64), None),
+    "fsl_768": (lambda: _fsl(768), None),
+    "fsl_768_nullable": (lambda: _fsl(768, nullable=True), None),
+    # Nulls INSIDE the vectors (not whole null rows): Lance sets FixedSizeList.has_validity. On a
+    # MiniBlock page that is a second chunk buffer of element bits; on a FullZip page, ceil(N/8) bytes
+    # of bits at the head of every row's slot. Element 0 is null on purpose -- the first bit is the
+    # one a lazily-built bitmap is most likely to drop.
+    "fsl_item_nulls": (lambda: _fsl_item_nulls(4), None),
+    "fsl_768_item_nulls": (lambda: _fsl_item_nulls(768), None),
+    # What `pa.array([None, [..]], pa.list_(t, N))` builds: pyarrow marks every element of a null row
+    # null too, so an ORDINARY nullable vector column is written with element validity.
+    "fsl_4_null_rows_pyarrow": (lambda: _fsl_null_rows_pyarrow(4), None),
+    "fsl_768_null_rows_pyarrow": (lambda: _fsl_null_rows_pyarrow(768), None),
 }
 
 
@@ -292,3 +311,32 @@ def test_value_size_axis(lance_mod, tmp_path, name):
         )
         return
     assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
+
+
+# Row ranges and deletions over the same shapes. Both re-cut the decoded column row by row, and a
+# fixed_size_list carries a SECOND bitmap -- N element bits per row -- that has to be cut with it.
+# A range whose start is not a multiple of 8 rows puts the element bits at a non-byte offset.
+RANGE_SHAPES = ("str_long_nullable", "fsl_768_nullable", "fsl_item_nulls", "fsl_768_item_nulls",
+                "fsl_4_null_rows_pyarrow")
+
+
+@pytest.mark.parametrize("name", RANGE_SHAPES)
+def test_value_size_shapes_under_ranges_and_deletions(lance_mod, tmp_path, name):
+    build, _ = VALUE_SIZE_SHAPES[name]
+    column = build()
+    table = pa.table({"id": pa.array(range(len(column)), pa.int64()), "c": column})
+    path = str(tmp_path / f"{name}.lance")
+    lance_mod.write_dataset(table, path)
+    expected = lance_mod.dataset(path).to_table()
+    for offset, length in ((0, 1), (3, 17), (N_WIDE // 3, N_WIDE // 3), (N_WIDE - 5, 5)):
+        got = pa.table(nanolance.read_table(path, offset=offset, length=length))
+        got.validate(full=True)
+        assert got.to_pydict() == expected.slice(offset, length).to_pydict(), (offset, length)
+
+    lance_mod.dataset(path).delete("id % 5 == 1 OR id < 3")
+    expected = lance_mod.dataset(path).to_table()
+    got = pa.table(nanolance.read_table(path))
+    got.validate(full=True)
+    assert got.to_pydict() == expected.to_pydict()
+    got = pa.table(nanolance.read_table(path, offset=11, length=40))
+    assert got.to_pydict() == expected.slice(11, 40).to_pydict()

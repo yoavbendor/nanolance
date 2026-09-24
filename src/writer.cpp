@@ -959,6 +959,17 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
             if (!pf->extension_name.empty()) {
                 continue;
             }
+            // A fixed_size_list stays flat. Every structural encoding here would describe a row as one
+            // wide scalar -- Constant, RLE, a dictionary -- with no FixedSizeList wrapper, and Lance
+            // reads the list type from exactly that wrapper. (A constant one is doubly out: Lance's
+            // inline constant value is for types with no child data.)
+            {
+                std::string element;
+                std::uint64_t items = 0;
+                if (nano_lance::lance_fixed_size_list_parts(pf->logical_type, element, items)) {
+                    continue;
+                }
+            }
             // Declared columns (set_column_encoding) skip ALL detection scans -- the encoding was
             // decided by the caller; these scans are exactly the work the declaration saves.
             if (state->column_encodings.find(pf->name) != state->column_encodings.end()) {
@@ -969,7 +980,11 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
             bool constant = false;
             if (cv.kind == nano_lance::ColumnValues::Kind::FixedWidth) {
                 const auto bpv = nano_lance::lance_logical_type_value_bytes(pf->logical_type);
-                if (bpv != 0U && cv.fixed_size() >= bpv && cv.fixed_size() % bpv == 0U) {
+                // A fixed-width constant is stored INLINE in the page descriptor, and Lance allows at
+                // most 32 bytes there (ConstantLayout.inline_value). Wider values -- a 200-byte
+                // fixed_size_binary, a vector -- stay on the flat path.
+                if (bpv != 0U && bpv <= nano_lance::kMaxInlineConstantBytes && cv.fixed_size() >= bpv &&
+                    cv.fixed_size() % bpv == 0U) {
                     // A buffer is all-one-value iff it equals itself shifted by one element, so ONE
                     // overlapped memcmp over the whole column replaces the previous
                     // one-libc-call-per-row loop (memcmp only reads, so overlap is fine; a 1-row

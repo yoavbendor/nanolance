@@ -118,6 +118,21 @@ bool slice_column_values(ColumnValues& values, std::uint64_t first, std::uint64_
             break;
     }
 
+    if (!values.item_validity.empty()) {
+        // items_per_row bits per row; the row range selects a contiguous run of them.
+        const auto per_row = values.items_per_row;
+        if (per_row == 0U || values.item_validity.size() < bitmap_bytes(total * per_row)) {
+            error = "element validity bitmap covers fewer elements than the column claims";
+            return false;
+        }
+        std::uint64_t item_nulls = 0;
+        values.item_validity = slice_bitmap(values.item_validity, first * per_row, count * per_row, item_nulls);
+        values.item_null_count = item_nulls;
+        if (item_nulls == 0U) {
+            values.item_validity.clear();
+        }
+    }
+
     if (!values.validity.empty()) {
         std::uint64_t nulls = 0;
         values.validity = slice_bitmap(values.validity, first, count, nulls);
@@ -243,6 +258,29 @@ bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>
                 return false;
             }
             break;
+    }
+
+    if (!values.item_validity.empty()) {
+        const auto per_row = values.items_per_row;
+        if (per_row == 0U || values.item_validity.size() < bitmap_bytes(total * per_row)) {
+            error = "element validity bitmap covers fewer elements than the column claims";
+            return false;
+        }
+        std::vector<std::uint8_t> bitmap(bitmap_bytes(count * per_row), 0U);
+        std::uint64_t item_nulls = 0;
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const auto src_row = kept[static_cast<std::size_t>(i)];
+            for (std::uint64_t j = 0; j < per_row; ++j) {
+                const auto dst = i * per_row + j;
+                if (bit_set(values.item_validity, src_row * per_row + j)) {
+                    bitmap[static_cast<std::size_t>(dst >> 3U)] |= static_cast<std::uint8_t>(1U << (dst & 7U));
+                } else {
+                    ++item_nulls;
+                }
+            }
+        }
+        values.item_null_count = item_nulls;
+        values.item_validity = item_nulls == 0U ? std::vector<std::uint8_t>{} : std::move(bitmap);
     }
 
     if (!values.validity.empty()) {

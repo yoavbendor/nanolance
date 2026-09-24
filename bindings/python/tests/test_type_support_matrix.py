@@ -78,6 +78,13 @@ ROUNDTRIPS = {
     # Arrow's null type: no buffers at all. Written as Lance's all-null spelling -- a ConstantLayout
     # with a NULLABLE_ITEM layer and no value -- byte-identical to pylance's.
     "null": _t(pa.null(), [None] * N),
+    # fixed_size_list is NOT a repetition-level list in Lance: one physical column of N-element rows,
+    # with a FixedSizeList wrapper in the page descriptor and no child field in the schema. Vectors.
+    "fixed_size_list": _t(pa.list_(pa.int64(), 2), [[i, i + 1] for i in range(N)]),
+    "fixed_size_list_f32_768": pa.table(
+        {"c": pa.FixedSizeListArray.from_arrays(pa.array([float(i % 97) for i in range(N * 768)], pa.float32()), 768)}
+    ),
+    "fixed_size_list_nullable": _t(pa.list_(pa.float32(), 4), [None if i % 7 == 0 else [i, i, i, i] for i in range(N)]),
 }
 
 # Refused at write_batch, each with a message naming the column. The fragment is what the refusal has
@@ -94,10 +101,6 @@ REFUSED_ON_WRITE = {
         _t(pa.large_list(pa.int64()), [[i, i + 1] for i in range(N)]),
         "unsupported Arrow C format",
     ),
-    "fixed_size_list": (
-        _t(pa.list_(pa.int64(), 2), [[i, i + 1] for i in range(N)]),
-        "unsupported Arrow C format",
-    ),
     "list_of_struct": (
         _t(pa.list_(pa.struct([("a", pa.int64())])), [[{"a": i}] for i in range(N)]),
         "unsupported Arrow C format",
@@ -110,6 +113,12 @@ REFUSED_ON_WRITE = {
         _t(pa.map_(pa.utf8(), pa.int64()), [[("k%d" % i, i)] for i in range(N)]),
         "unsupported Arrow C format",
     ),
+    # A null element inside a VALID vector needs FixedSizeList.has_validity on write, which this
+    # writer does not emit yet. It reads correctly (pylance writes it; see test_lance_read_matrix).
+    "fixed_size_list_item_nulls": (
+        _t(pa.list_(pa.float32(), 2), [[None, 1.0] if i % 5 == 0 else [1.0, 2.0] for i in range(N)]),
+        "null element inside a row",
+    ),
 }
 
 # Written by pylance, read correctly by nanolance, but refused on OUR write side. Each asymmetry is
@@ -120,7 +129,6 @@ READ_ONLY = ("large_string", "large_binary")
 UNREADABLE_FROM_PYLANCE = {
     "list": "unsupported on-disk logical type",
     "large_list": "unsupported on-disk logical type",
-    "fixed_size_list": "unsupported on-disk logical type",
     "map": "unsupported on-disk logical type",
     "dictionary": "unsupported on-disk logical type",
 }

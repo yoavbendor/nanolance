@@ -341,6 +341,13 @@ if(NANOLANCE_BUILD_FUZZERS)
     target_link_libraries(nanolance_fuzz_lz4 PRIVATE nanolance)
     target_link_options(nanolance_fuzz_lz4 PRIVATE -fsanitize=fuzzer)
 
+    # Page decoding itself: one real descriptor plus its buffers into decode_lance_physical_column.
+    # Nothing else reaches the value decoders -- fuzz_decode stops at the column metadata.
+    add_executable(nanolance_fuzz_column_decode tests/fuzz/fuzz_column_decode.cpp)
+    target_compile_features(nanolance_fuzz_column_decode PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_column_decode PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_column_decode PRIVATE -fsanitize=fuzzer)
+
     add_executable(nanolance_fuzz_deletion_vector tests/fuzz/fuzz_deletion_vector.cpp)
     target_compile_features(nanolance_fuzz_deletion_vector PRIVATE cxx_std_20)
     target_link_libraries(nanolance_fuzz_deletion_vector PRIVATE nanolance)

@@ -21,13 +21,16 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Phase 2 — wheels, CMake install | **2.1 wheels and 2.3 CI done**; 2.2 install/export deliberately not |
 | Phase 3 — the Python API a parquet user expects | **complete** — streaming, projection, row ranges, `count_rows`/`read_schema`, `nanolance convert` |
 | Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
+| [Roadmap](ROADMAP.md) A — pin and instrument | **done** |
+| Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
+| Roadmap E — small type gaps | **E1–E3 done** (float16, duration, Arrow null type); E4 `large_*` write open |
 
-Test suite: **50 ctest** (was 42) and **399 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **52 ctest** (was 42) and **1106 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
-Fuzzers: `nanolance_fuzz_decode`, `nanolance_fuzz_page_layout`, `nanolance_fuzz_fsst` and
-`nanolance_fuzz_lz4`, all clean; the longest campaign run here was 95,896,936 executions. Between
-them they have found three real bugs on this branch.
+Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
+all clean at their last run; the longest campaign run here was 95,896,936 executions. The newest,
+`column_decode`, found two bugs in its first hour — see the roadmap section below.
 
 ---
 
@@ -1862,6 +1865,49 @@ compressive wrapper rather than with repetition levels.
    `pip install nanolance` is therefore a verified on-ramp on Linux (glibc and musl), Apple silicon
    and Intel macOS. Windows is still out of the matrix; `ci-platforms.yml`'s `windows` job is the
    thing that has to go green first.
+
+## Roadmap phases A, B and E: vectors, long strings, and small types
+
+What a pylance user writes and nanolance could not read, until this round: **any string or binary
+column with a value of 256 bytes or more** (Lance switches that page to the FullZip layout), and
+**any `fixed_size_list` column** — which is how every embedding is stored. Both now read, and
+fixed-size lists write.
+
+- **FullZip reader** (non-list). Byte layout settled empirically and written up in the roadmap (B1):
+  a 0/1/2/4-byte control word per row, then a fixed slot (present even for a null row) or a length
+  prefix plus bytes (absent for a null row), per-value FSST or raw.
+- **fixed_size_list, read and write.** Lance keeps no child field for it; the element type lives in
+  the logical type `fixed_size_list:<elem>:<N>`, and the page wraps Flat in `FixedSizeList{N}`. Read
+  from both layouts, including **element validity**: pyarrow marks every element of a null row null,
+  so pylance writes element bits for an *ordinary* nullable vector column — refusing them refused
+  every nullable embedding column. Element bits are carried to Arrow's child array and re-cut by
+  row ranges and deletion vectors (tests fail if that slicing is reverted). On write, whole-row nulls
+  work; a null element inside a valid row is refused by name, pinned in the type matrix.
+- **float16, duration, Arrow's null type** round-trip in all three directions.
+
+Bugs found on the way, each now pinned by a test:
+
+1. **A constant fixed-width column of 128+ bytes wrote a corrupt file.** The value was inlined in
+   the page descriptor with a one-byte length, so 128+ bytes produced a descriptor neither reader
+   could parse. Lance caps inline constants at 32 bytes; nanolance now does too, and wider constants
+   take the flat path (`fsb_constant_32/33/200` in the write matrix).
+2. **proto3 defaults.** `Field.type` and `Field.encoding` had the `parent_id` bug's shape: an absent
+   field decoded as nanolance's own default rather than proto3's 0. Neither was load-bearing yet.
+3. **The page decoder was never fuzzed.** A new target, `fuzz_column_decode`, feeds a real
+   descriptor and buffers — dumped from pylance datasets by `nlance-pagelayout --dump-fuzz-pages` —
+   straight to the decoder. It found an **8.4 GB allocation from an 899-byte page** (a zstd size
+   header was trusted; now bounded by zstd's 32,768:1 maximum expansion, in the deletion-file path
+   too), and an **out-of-bounds read** on a variable-width chunk shorter than one offset.
+
+**Correction.** An earlier commit message on this branch said `fuzz_decode`'s coverage rose from
+1008 to 1193 features "so the new paths are reached". That was wrong: `fuzz_decode` stops at the
+footer and never decodes a page, so the new decoders were not reached at all. The rise came from
+other parsing. `fuzz_column_decode` exists because of that mistake, and README's "fuzzer over the
+full decode chain" — true only of the chain up to the footer — now says what is actually covered.
+
+Still open from these phases: B5 (writing FullZip — nanolance writes long strings as MiniBlock,
+which stock Lance reads, pinned by `str_long` in the write matrix), element nulls on write, and
+page size: nanolance writes ~10 rows per page for a 768-dim float32 vector (roadmap F1).
 
 ### Deliberate deviations (not defects)
 
