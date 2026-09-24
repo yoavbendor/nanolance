@@ -168,6 +168,11 @@ Done when the list shapes in A2 pass, `test_type_support_matrix.py` moves `list`
 
 The read side has to come first: it is the oracle for the write side, alongside pylance.
 
+**Status:** D1 done — `repdef::serialize` in `src/repdef.cpp`. Property test: 20,000 random nested
+columns (lists and structs at depths 1–4, nulls and empties at every layer, garbage children under
+null lists) serialized over a random row range and unravelled back, compared row by row; two
+deliberate mutations fail it thousands of times.
+
 ### Phase E — small type gaps (any time; good first tasks)
 
 | # | Task | Size | Model |

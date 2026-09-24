@@ -237,4 +237,204 @@ bool unravel(const std::vector<std::uint16_t>& rep_in, bool has_rep, const std::
     return true;
 }
 
+namespace {
+
+bool valid_at(const std::vector<std::uint8_t>* bits, std::uint64_t i) {
+    return bits == nullptr || bits->empty() ||
+           ((static_cast<std::size_t>(i >> 3U) < bits->size()) && (((*bits)[static_cast<std::size_t>(i >> 3U)] >> (i & 7U)) & 1U) != 0U);
+}
+
+/// Per layer (outermost first, then the item layer): what occurs among the entries serialized.
+struct LayerFlags {
+    bool has_null = false;
+    bool has_empty = false;
+};
+
+class Serializer {
+public:
+    Serializer(const std::vector<SerializeLayer>& layers, const std::vector<std::uint8_t>& item_validity)
+        : layers_(layers), item_validity_(item_validity), flags_(layers.size() + 1U) {
+        // list_depth_[k]: how many list layers there are from k inward, k included -- the repetition
+        // level that starts a new list at layer k. lists_below_[k]: whether any list sits strictly
+        // inside layer k, which decides whether a null there still owns a value slot.
+        list_depth_.assign(layers.size() + 1U, 0U);
+        lists_below_.assign(layers.size() + 1U, false);
+        std::uint16_t depth = 0;
+        for (std::size_t k = layers.size(); k-- > 0;) {
+            lists_below_[k] = depth != 0U;
+            if (layers[k].is_list) {
+                ++depth;
+            }
+            list_depth_[k] = depth;
+        }
+    }
+
+    bool check(std::uint64_t first_row, std::uint64_t num_rows, std::string& error) const {
+        for (std::size_t k = 0; k < layers_.size(); ++k) {
+            if (layers_[k].is_list && (layers_[k].offsets == nullptr || layers_[k].offsets->empty())) {
+                error = "list layer " + std::to_string(k) + " has no offsets";
+                return false;
+            }
+        }
+        if (!layers_.empty() && layers_[0].is_list && first_row + num_rows + 1U > layers_[0].offsets->size()) {
+            error = "rows past the end of the outermost list";
+            return false;
+        }
+        return true;
+    }
+
+    /// Pass 1: which kinds each layer needs. Pass 2 (emit = true): the levels themselves.
+    bool visit(std::size_t k, std::uint64_t idx, std::uint16_t rep, bool emit, std::string& error) {
+        if (k == layers_.size()) {
+            const bool valid = valid_at(&item_validity_, idx);
+            if (!emit) {
+                flags_[k].has_null = flags_[k].has_null || !valid;
+                return true;
+            }
+            push(rep, valid ? 0U : null_level_[k], idx);
+            return true;
+        }
+        const auto& layer = layers_[k];
+        const bool valid = valid_at(layer.validity, idx);
+        if (!layer.is_list) {
+            if (!valid) {
+                if (!emit) {
+                    flags_[k].has_null = true;
+                    return true;
+                }
+                push(rep, null_level_[k], lists_below_[k] ? kNoSlot : idx);
+                return true;
+            }
+            return visit(k + 1U, idx, rep, emit, error);
+        }
+        const auto& offsets = *layer.offsets;
+        if (idx + 1U >= offsets.size()) {
+            error = "list layer " + std::to_string(k) + " has too few offsets";
+            return false;
+        }
+        const auto begin = offsets[static_cast<std::size_t>(idx)];
+        const auto end = offsets[static_cast<std::size_t>(idx + 1U)];
+        if (!valid) {
+            if (!emit) {
+                flags_[k].has_null = true;
+                return true;
+            }
+            push(rep, null_level_[k], kNoSlot);
+            return true;
+        }
+        if (end < begin) {
+            error = "list layer " + std::to_string(k) + " has decreasing offsets";
+            return false;
+        }
+        if (end == begin) {
+            if (!emit) {
+                flags_[k].has_empty = true;
+                return true;
+            }
+            push(rep, empty_level_[k], kNoSlot);
+            return true;
+        }
+        // The first child inherits the level that starts this list (and any around it); each later
+        // child starts a new entry one list level in.
+        const auto continuation = static_cast<std::uint16_t>(list_depth_[k] - 1U);
+        for (auto c = begin; c < end; ++c) {
+            if (!visit(k + 1U, static_cast<std::uint64_t>(c), c == begin ? rep : continuation, emit, error)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Between the passes: fix every layer's kind, and number the definition levels from the items
+    /// outward, exactly as `unravel` reads them.
+    void assign_levels(Serialized& out) {
+        null_level_.assign(layers_.size() + 1U, 0U);
+        empty_level_.assign(layers_.size() + 1U, 0U);
+        std::uint16_t next = 1;
+        out.layers.clear();
+        // Items first (innermost), then layers from the inside out.
+        const auto& item = flags_[layers_.size()];
+        out.layers.push_back(item.has_null ? kNullableItem : kAllValidItem);
+        if (item.has_null) {
+            null_level_[layers_.size()] = next++;
+        }
+        for (std::size_t k = layers_.size(); k-- > 0;) {
+            const auto& f = flags_[k];
+            if (!layers_[k].is_list) {
+                out.layers.push_back(f.has_null ? kNullableItem : kAllValidItem);
+                if (f.has_null) {
+                    null_level_[k] = next++;
+                }
+                continue;
+            }
+            if (f.has_null && f.has_empty) {
+                out.layers.push_back(kNullAndEmptyList);
+                null_level_[k] = next++;
+                empty_level_[k] = next++;
+            } else if (f.has_null) {
+                out.layers.push_back(kNullableList);
+                null_level_[k] = next++;
+            } else if (f.has_empty) {
+                out.layers.push_back(kEmptyableList);
+                empty_level_[k] = next++;
+            } else {
+                out.layers.push_back(kAllValidList);
+            }
+        }
+        out.has_def = next > 1U;
+        out.has_rep = list_depth_[0] != 0U;
+        out_ = &out;
+    }
+
+    std::uint16_t row_rep() const { return list_depth_.empty() ? 0U : list_depth_[0]; }
+
+private:
+    static constexpr std::uint64_t kNoSlot = ~std::uint64_t{0};
+
+    void push(std::uint16_t rep, std::uint16_t def, std::uint64_t slot) {
+        if (out_->has_rep) {
+            out_->rep.push_back(rep);
+        }
+        if (out_->has_def) {
+            out_->def.push_back(def);
+        }
+        if (slot != kNoSlot) {
+            out_->items.push_back(slot);
+        }
+    }
+
+    const std::vector<SerializeLayer>& layers_;
+    const std::vector<std::uint8_t>& item_validity_;
+    std::vector<LayerFlags> flags_;
+    std::vector<std::uint16_t> list_depth_;
+    std::vector<bool> lists_below_;
+    std::vector<std::uint16_t> null_level_;
+    std::vector<std::uint16_t> empty_level_;
+    Serialized* out_ = nullptr;
+};
+
+}  // namespace
+
+bool serialize(const std::vector<SerializeLayer>& layers, const std::vector<std::uint8_t>& item_validity,
+               std::uint64_t first_row, std::uint64_t num_rows, Serialized& out, std::string& error) {
+    out = Serialized{};
+    Serializer s(layers, item_validity);
+    if (!s.check(first_row, num_rows, error)) {
+        return false;
+    }
+    for (std::uint64_t r = first_row; r < first_row + num_rows; ++r) {
+        if (!s.visit(0, r, 0, false, error)) {
+            return false;
+        }
+    }
+    s.assign_levels(out);
+    const auto rep = s.row_rep();
+    for (std::uint64_t r = first_row; r < first_row + num_rows; ++r) {
+        if (!s.visit(0, r, rep, true, error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace nano_lance::repdef

@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -79,7 +80,137 @@ void refuse(const std::string& name, const std::vector<std::uint16_t>& rep, bool
 
 }  // namespace
 
+// ── Serializer: property test against the unraveler ─────────────────────────────────────────────
+//
+// Random nested columns -- lists and structs at random depths, nulls and empties at every layer, and
+// null lists that still point at "garbage" children as Arrow allows -- are serialized over a random
+// row range, unravelled back, and both sides rendered row by row as values. Equal renderings mean the
+// round trip preserved everything a reader can observe.
+
+struct RandomColumn {
+    std::vector<bool> is_list;                               // outermost first
+    std::vector<std::vector<std::int64_t>> offsets;          // lists only
+    std::vector<std::vector<std::uint8_t>> validity;
+    std::vector<std::uint8_t> item_validity;
+    std::uint64_t rows = 0;
+};
+
+std::vector<std::uint8_t> random_bits(std::mt19937& rng, std::uint64_t n, int null_percent) {
+    std::vector<std::uint8_t> bits((n + 7U) / 8U, 0U);
+    for (std::uint64_t i = 0; i < n; ++i) {
+        if (static_cast<int>(rng() % 100U) >= null_percent) {
+            bits[i >> 3U] |= static_cast<std::uint8_t>(1U << (i & 7U));
+        }
+    }
+    return bits;
+}
+
+RandomColumn random_column(std::mt19937& rng) {
+    RandomColumn c;
+    const auto depth = 1U + rng() % 4U;
+    bool any_list = false;
+    for (unsigned k = 0; k < depth; ++k) {
+        const bool list = (rng() % 3U) != 0U || (k + 1U == depth && !any_list);
+        c.is_list.push_back(list);
+        any_list = any_list || list;
+    }
+    c.rows = 1U + rng() % 40U;
+    std::uint64_t n = c.rows;
+    const int null_percent = static_cast<int>(rng() % 40U);
+    for (unsigned k = 0; k < depth; ++k) {
+        c.validity.push_back((rng() % 4U) == 0U ? std::vector<std::uint8_t>{} : random_bits(rng, n, null_percent));
+        if (!c.is_list[k]) {
+            c.offsets.emplace_back();
+            continue;  // a struct: one child per entry
+        }
+        std::vector<std::int64_t> off{0};
+        for (std::uint64_t i = 0; i < n; ++i) {
+            off.push_back(off.back() + static_cast<std::int64_t>(rng() % 4U));  // null lists keep garbage
+        }
+        n = static_cast<std::uint64_t>(off.back());
+        c.offsets.push_back(std::move(off));
+    }
+    c.item_validity = (rng() % 3U) == 0U ? std::vector<std::uint8_t>{} : random_bits(rng, n, null_percent);
+    return c;
+}
+
+bool bit(const std::vector<std::uint8_t>& v, std::uint64_t i) {
+    return v.empty() || ((v[i >> 3U] >> (i & 7U)) & 1U) != 0U;
+}
+
+std::string render_input(const RandomColumn& c, std::size_t k, std::uint64_t idx) {
+    if (k == c.is_list.size()) {
+        return bit(c.item_validity, idx) ? "v" + std::to_string(idx) : "null";
+    }
+    if (!bit(c.validity[k], idx)) {
+        return "null";
+    }
+    if (!c.is_list[k]) {
+        return "{" + render_input(c, k + 1U, idx) + "}";
+    }
+    std::string s = "[";
+    for (auto i = c.offsets[k][idx]; i < c.offsets[k][idx + 1U]; ++i) {
+        s += (i == c.offsets[k][idx] ? "" : ",") + render_input(c, k + 1U, static_cast<std::uint64_t>(i));
+    }
+    return s + "]";
+}
+
+std::string render_output(const std::vector<rd::UnraveledLayer>& u, const std::vector<std::uint64_t>& items,
+                          std::size_t depth, std::size_t k, std::uint64_t idx) {
+    if (k == depth) {
+        return bit(u[0].validity, idx) ? "v" + std::to_string(items[idx]) : "null";
+    }
+    const auto& layer = u[depth - k];
+    if (!bit(layer.validity, idx)) {
+        return "null";
+    }
+    if (!rd::is_list_layer(layer.kind)) {
+        return "{" + render_output(u, items, depth, k + 1U, idx) + "}";
+    }
+    std::string s = "[";
+    for (auto i = layer.offsets[idx]; i < layer.offsets[idx + 1U]; ++i) {
+        s += (i == layer.offsets[idx] ? "" : ",") + render_output(u, items, depth, k + 1U, static_cast<std::uint64_t>(i));
+    }
+    return s + "]";
+}
+
+void serializer_round_trips(int seeds) {
+    for (int seed = 0; seed < seeds; ++seed) {
+        std::mt19937 rng(static_cast<unsigned>(seed));
+        const auto c = random_column(rng);
+        std::vector<rd::SerializeLayer> layers;
+        for (std::size_t k = 0; k < c.is_list.size(); ++k) {
+            layers.push_back({c.is_list[k], &c.offsets[k], &c.validity[k]});
+        }
+        const std::uint64_t first = rng() % c.rows;
+        const std::uint64_t count = 1U + rng() % (c.rows - first);
+        rd::Serialized ser;
+        std::string error;
+        const auto where = "seed " + std::to_string(seed);
+        if (!rd::serialize(layers, c.item_validity, first, count, ser, error)) {
+            check(false, where + ": serialize refused: " + error);
+            continue;
+        }
+        std::vector<rd::UnraveledLayer> u;
+        if (!rd::unravel(ser.rep, ser.has_rep, ser.def, ser.has_def, ser.layers, ser.items.size(), u, error)) {
+            check(false, where + ": unravel refused its output: " + error);
+            continue;
+        }
+        check(u.back().length == count, where + ": row count");
+        for (std::uint64_t r = 0; r < count && r < u.back().length; ++r) {
+            const auto want = render_input(c, 0, first + r);
+            const auto got = render_output(u, ser.items, c.is_list.size(), 0, r);
+            if (want != got) {
+                check(false, where + " row " + std::to_string(r) + ": wrote " + want + ", read " + got);
+                break;
+            }
+        }
+    }
+}
+
 int main() {
+    serializer_round_trips(20000);
+
     using V = std::vector<bool>;
     constexpr bool T = true;
     constexpr bool F = false;

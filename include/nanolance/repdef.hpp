@@ -58,4 +58,33 @@ bool unravel(const std::vector<std::uint16_t>& rep, bool has_rep, const std::vec
              bool has_def, const std::vector<std::uint8_t>& layers, std::uint64_t num_items,
              std::vector<UnraveledLayer>& out, std::string& error);
 
+/// One layer of a nested column as the writer holds it, OUTERMOST first: a list (offsets into the
+/// next layer) or a struct (one child per entry). Pointers, not copies: the column owns the data.
+struct SerializeLayer {
+    bool is_list = true;
+    const std::vector<std::int64_t>* offsets = nullptr;  // lists: one more entry than the layer has
+    const std::vector<std::uint8_t>* validity = nullptr; // LSB-first; null or empty = all valid
+};
+
+/// Levels for a run of rows, the inverse of `unravel`.
+struct Serialized {
+    std::vector<std::uint16_t> rep;       // empty when the column has no list layer
+    std::vector<std::uint16_t> def;       // empty when nothing in the rows is null or empty
+    std::vector<std::uint8_t> layers;     // the descriptor's layer list, innermost first
+    std::vector<std::uint64_t> items;     // leaf index of every value slot, in order
+    bool has_rep = false;
+    bool has_def = false;
+};
+
+/// Serialize rows `[first_row, first_row + num_rows)` of a nested column to repetition and
+/// definition levels -- what Lance's `RepDefBuilder` produces from Arrow arrays.
+///
+/// Every layer's kind is chosen from the rows serialized: a list is `NullableList` only if one of
+/// them is null, `EmptyableList` only if one is empty, and so on, as Lance does. A null or empty
+/// list takes one level and no value slot, and its children (Arrow allows garbage there) are never
+/// visited; a null struct with no list below it keeps its value slot, as in Lance. `items` lists the
+/// leaf entries that get a slot, so the caller can gather exactly those values.
+bool serialize(const std::vector<SerializeLayer>& layers, const std::vector<std::uint8_t>& item_validity,
+               std::uint64_t first_row, std::uint64_t num_rows, Serialized& out, std::string& error);
+
 }  // namespace nano_lance::repdef
