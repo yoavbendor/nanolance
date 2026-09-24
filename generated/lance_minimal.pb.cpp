@@ -141,7 +141,11 @@ std::vector<std::uint8_t> encode_data_storage_format(const DataStorageFormat& fo
 
 std::vector<std::uint8_t> encode_field_message(const Field& field) {
     std::vector<std::uint8_t> out;
-    if (field.type != 2) {
+    // proto3: a field is omitted only when it equals ZERO. This used to omit `type` when it was 2
+    // (LEAF) -- the struct's default -- so any proto3 reader decoded every nanolance leaf as PARENT.
+    // Harmless in practice (Lance neither writes nor reads Field.type), but the same shape of bug as
+    // `parent_id`, which was not harmless.
+    if (field.type != 0) {
         write_int32(out, 1, field.type);
     }
     write_string(out, 2, field.name);
@@ -377,6 +381,12 @@ bool decode_field_message(const std::vector<std::uint8_t>& bytes, Field& field) 
     // dataset whose FIRST column was a struct lost that struct's children and failed with "struct
     // field has no children in mapping", while the same struct in second position read fine.
     field.parent_id = 0;
+    // Same rule for the two other fields whose struct default is not zero: absent means 0. For
+    // `type` that is PARENT, for `encoding` it is NONE -- which is what Lance writes for a struct
+    // parent. Nothing on the read path consults either for correctness today; this keeps the next
+    // reader of them from inheriting the parent_id mistake.
+    field.type = 0;
+    field.encoding = 0;
     std::size_t pos = 0;
     bool nullable_wire_seen = false;
     while (pos < bytes.size()) {

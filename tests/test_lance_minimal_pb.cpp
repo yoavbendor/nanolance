@@ -238,5 +238,29 @@ int main() {
         require(nano_lance::pb::decode_field(nested, decoded), "field decode failed");
         require(decoded.parent_id == 1, "an explicit parent_id must be kept");
     }
+    {
+        // `type` and `encoding` follow the same proto3 rule: absent means 0, not the struct default.
+        // A Lance struct parent carries neither (PARENT = 0, encoding NONE = 0).
+        std::vector<std::uint8_t> parent;
+        put_varint(parent, 3, 5);
+        nano_lance::pb::Field decoded;
+        require(nano_lance::pb::decode_field(parent, decoded), "field decode failed");
+        require(decoded.type == 0, "an absent type must decode as 0 (PARENT)");
+        require(decoded.encoding == 0, "an absent encoding must decode as 0 (NONE)");
+
+        // And our own LEAF (2) must survive a round trip, which needs the encoder to write it.
+        nano_lance::pb::Field leaf;
+        leaf.name = "x";
+        leaf.type = 2;
+        leaf.encoding = 1;
+        nano_lance::pb::FileDescriptor descriptor;
+        descriptor.fields.push_back(leaf);
+        nano_lance::pb::FileDescriptor back;
+        require(nano_lance::pb::decode_file_descriptor(nano_lance::pb::encode_file_descriptor(descriptor), back) &&
+                    back.fields.size() == 1U,
+                "file descriptor round trip failed");
+        require(back.fields[0].type == 2, "a LEAF type must round-trip");
+        require(back.fields[0].encoding == 1, "a PLAIN encoding must round-trip");
+    }
     return 0;
 }

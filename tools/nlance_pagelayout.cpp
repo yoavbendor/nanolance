@@ -72,16 +72,40 @@ int report(const std::filesystem::path& dataset) {
         return 1;
     }
 
+    // Name each physical column from the manifest's own field-id -> column-index table, and print the
+    // field's full path. Guessing from schema order (skip structs, count the rest) mislabelled every
+    // list and map: their parent fields hold no column, so a list's leaf was named after the list,
+    // and a map's `value` column after its `key`.
+    const auto& file_entry = manifest.fragments[0].files[0];
+    const auto field_path = [&manifest](std::int32_t id) {
+        std::string path;
+        std::string type;
+        for (int guard = 0; guard < 64 && id >= 0; ++guard) {
+            const nano_lance::pb::Field* found = nullptr;
+            for (const auto& f : manifest.fields) {
+                if (f.id == id) {
+                    found = &f;
+                    break;
+                }
+            }
+            if (found == nullptr) {
+                break;
+            }
+            if (type.empty()) {
+                type = found->logical_type;
+            }
+            path = path.empty() ? found->name : found->name + "." + path;
+            id = found->parent_id;
+        }
+        return path + " (" + type + ")";
+    };
+
     int failures = 0;
     for (std::size_t c = 0; c < columns.size(); ++c) {
         std::string name = "column " + std::to_string(c);
-        std::size_t seen = 0;
-        for (const auto& f : descriptor.fields) {
-            if (f.logical_type == "struct") {
-                continue;
-            }
-            if (seen++ == c) {
-                name = f.name + " (" + f.logical_type + ")";
+        for (std::size_t i = 0; i < file_entry.column_indices.size() && i < file_entry.fields.size(); ++i) {
+            if (file_entry.column_indices[i] == static_cast<std::int32_t>(c)) {
+                name = field_path(file_entry.fields[i]);
                 break;
             }
         }

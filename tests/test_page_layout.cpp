@@ -418,16 +418,17 @@ void check_malformed_inputs() {
     check(!pl::decode_page_layout(wrong_url, parsed, err), "unexpected type url should be refused");
 
     // An unmodeled layout variant parses but is reported, so decode refuses by name instead of
-    // misreading the page's buffers. PageLayout field 3 with an empty body.
+    // misreading the page's buffers. PageLayout field 4 (BlobLayout) with an empty body -- field 3,
+    // FullZip, used to serve here until it became a modelled layout.
     const std::vector<std::uint8_t> unknown_layout{
         0x0a, 0x1d, '/', 'l', 'a', 'n', 'c', 'e', '.', 'e', 'n', 'c', 'o', 'd', 'i', 'n',
         'g',  's',  '2', '1', '.', 'P', 'a', 'g', 'e', 'L', 'a', 'y', 'o', 'u', 't',
-        0x12, 0x02, 0x1a, 0x00};
+        0x12, 0x02, 0x22, 0x00};
     pl::PageLayout unknown;
     std::string unknown_err;
     check(pl::decode_page_layout(unknown_layout, unknown, unknown_err),
           "unmodeled layout should parse: " + unknown_err);
-    check(unknown.unknown_layout_field == 3U,
+    check(unknown.unknown_layout_field == 4U,
           "unmodeled layout should record its field number, got " +
               std::to_string(unknown.unknown_layout_field));
 }

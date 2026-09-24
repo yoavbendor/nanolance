@@ -48,10 +48,9 @@ jobs:
         include:
           - os: ubuntu-24.04
             archs: x86_64
-          # macos-14 is Apple silicon. GitHub has marked it DEPRECATED (not yet retired); when it
-          # goes, `macos-15` is the arm64 replacement. See the note below for why that matters more
-          # than a deprecation warning usually does.
-          - os: macos-14
+          # Apple silicon. Moved off `macos-14` while it was merely DEPRECATED, before it could be
+          # retired -- see the note below for why a retired label is worse than it sounds.
+          - os: macos-15
             archs: arm64
           # Intel macOS. This was `macos-13` until that image was RETIRED, and the way it failed is
           # worth recording, because it does not look like a failure:

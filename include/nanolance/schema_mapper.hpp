@@ -58,10 +58,11 @@ inline bool lance_logical_type_is_32bit_temporal(const std::string& logical_type
 }
 
 /// Is this a temporal type? They are integers on the wire, so every fixed-width encoding applies.
+/// `duration` is always 64-bit, like a timestamp, and stock Lance bitpacks it the same way.
 inline bool lance_logical_type_is_temporal(const std::string& logical_type) {
     return logical_type.rfind("timestamp:", 0) == 0 || logical_type.rfind("date32:", 0) == 0 ||
            logical_type.rfind("date64:", 0) == 0 || logical_type.rfind("time32:", 0) == 0 ||
-           logical_type.rfind("time64:", 0) == 0;
+           logical_type.rfind("time64:", 0) == 0 || logical_type.rfind("duration:", 0) == 0;
 }
 
 /// Integer logical types (8/16/32/64-bit) eligible for Lance InlineBitpacking. Excludes bool/float.
@@ -89,7 +90,9 @@ inline std::size_t lance_logical_type_value_bytes(const std::string& logical_typ
     if (logical_type == "int8" || logical_type == "uint8") {
         return 1U;
     }
-    if (logical_type == "int16" || logical_type == "uint16") {
+    // halffloat is 2 bytes. Without this line it fell through to the 8-byte default below, which
+    // would have read four rows as one.
+    if (logical_type == "int16" || logical_type == "uint16" || logical_type == "halffloat") {
         return 2U;
     }
     if (logical_type == "int32" || logical_type == "uint32" || logical_type == "float") {

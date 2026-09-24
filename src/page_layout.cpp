@@ -215,6 +215,46 @@ bool parse_fsst(Cursor c, Compressive& out, int depth, std::string& error) {
     return true;
 }
 
+/// FixedSizeList{ f1 items_per_value, f2 values (CompressiveEncoding), f3 has_validity }.
+bool parse_fixed_size_list(Cursor c, Compressive& out, int depth, std::string& error) {
+    while (!c.done()) {
+        std::uint64_t key = 0;
+        if (!read_varint(c, key)) {
+            error = "page layout: malformed tag in FixedSizeList";
+            return false;
+        }
+        const auto field = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
+        if ((field == 1U || field == 3U) && wire == kWireVarint) {
+            std::uint64_t value = 0;
+            if (!read_varint(c, value)) {
+                error = "page layout: malformed FixedSizeList scalar";
+                return false;
+            }
+            if (field == 1U) {
+                out.items_per_value = value;
+            } else {
+                out.has_validity = value != 0U;
+            }
+        } else if (field == 2U && wire == kWireBytes) {
+            Cursor sub;
+            if (!read_submessage(c, sub)) {
+                error = "page layout: truncated FixedSizeList values";
+                return false;
+            }
+            auto node = std::make_unique<Compressive>();
+            if (!parse_compressive(sub, *node, depth + 1, error)) {
+                return false;
+            }
+            out.values = std::move(node);
+        } else if (!skip_field(c, wire)) {
+            error = "page layout: malformed FixedSizeList";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool parse_general(Cursor c, Compressive& out, int depth, std::string& error) {
     while (!c.done()) {
         std::uint64_t key = 0;
@@ -338,6 +378,12 @@ bool parse_compressive(Cursor c, Compressive& out, int depth, std::string& error
                     return false;
                 }
                 break;
+            case 11U:
+                out.kind = CompressiveKind::kFixedSizeList;
+                if (!parse_fixed_size_list(sub, out, depth, error)) {
+                    return false;
+                }
+                break;
             default:
                 // Parsed successfully, just not modeled. Recording the wire field lets the caller
                 // refuse by name instead of misreading the page's buffers.
@@ -359,14 +405,18 @@ bool parse_mini_block(Cursor c, MiniBlock& out, std::string& error) {
         const auto field = static_cast<std::uint32_t>(key >> 3U);
         const auto wire = static_cast<std::uint8_t>(key & 0x07U);
         if (wire == kWireBytes && field == 1U) {
-            // rep_compression. Not modelled beyond its presence -- but the chunk header reserves a
-            // slot for the repetition buffer's size when this field exists, so the flag is
-            // load-bearing for parsing every chunk in the page.
+            // rep_compression. Its mere presence is load-bearing: the chunk header reserves a slot
+            // for the repetition buffer's size when this field exists.
             Cursor sub;
             if (!read_submessage(c, sub)) {
                 error = "page layout: truncated MiniBlockLayout rep_compression";
                 return false;
             }
+            auto node = std::make_unique<Compressive>();
+            if (!parse_compressive(sub, *node, 0, error)) {
+                return false;
+            }
+            out.rep_compression = std::move(node);
             out.has_repetition = true;
         } else if (wire == kWireBytes && (field == 2U || field == 3U || field == 4U)) {
             Cursor sub;
@@ -386,7 +436,8 @@ bool parse_mini_block(Cursor c, MiniBlock& out, std::string& error) {
                 error = "page layout: truncated MiniBlockLayout layers";
                 return false;
             }
-        } else if (wire == kWireVarint && (field == 5U || field == 7U || field == 9U || field == 10U)) {
+        } else if (wire == kWireVarint &&
+                   (field == 5U || field == 7U || field == 8U || field == 9U || field == 10U)) {
             std::uint64_t value = 0;
             if (!read_varint(c, value)) {
                 error = "page layout: malformed MiniBlockLayout scalar";
@@ -399,6 +450,9 @@ bool parse_mini_block(Cursor c, MiniBlock& out, std::string& error) {
                 case 7U:
                     out.num_buffers = static_cast<std::uint32_t>(value);
                     break;
+                case 8U:
+                    out.repetition_index_depth = static_cast<std::uint32_t>(value);
+                    break;
                 case 9U:
                     out.num_items = value;
                     break;
@@ -408,6 +462,67 @@ bool parse_mini_block(Cursor c, MiniBlock& out, std::string& error) {
             }
         } else if (!skip_field(c, wire)) {
             error = "page layout: malformed MiniBlockLayout";
+            return false;
+        }
+    }
+    return true;
+}
+
+/// FullZipLayout{ f1 bits_rep, f2 bits_def, f3 bits_per_value | f4 bits_per_offset, f5 num_items,
+/// f6 num_visible_items, f7 value_compression, f8 layers }.
+bool parse_full_zip(Cursor c, FullZip& out, std::string& error) {
+    while (!c.done()) {
+        std::uint64_t key = 0;
+        if (!read_varint(c, key)) {
+            error = "page layout: malformed tag in FullZipLayout";
+            return false;
+        }
+        const auto field = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
+        if (wire == kWireVarint && field >= 1U && field <= 6U) {
+            std::uint64_t value = 0;
+            if (!read_varint(c, value)) {
+                error = "page layout: malformed FullZipLayout scalar";
+                return false;
+            }
+            switch (field) {
+                case 1U:
+                    out.bits_rep = static_cast<std::uint32_t>(value);
+                    break;
+                case 2U:
+                    out.bits_def = static_cast<std::uint32_t>(value);
+                    break;
+                case 3U:
+                    out.bits_per_value = static_cast<std::uint32_t>(value);
+                    break;
+                case 4U:
+                    out.bits_per_offset = static_cast<std::uint32_t>(value);
+                    break;
+                case 5U:
+                    out.num_items = value;
+                    break;
+                default:
+                    out.num_visible_items = value;
+                    break;
+            }
+        } else if (wire == kWireBytes && field == 7U) {
+            Cursor sub;
+            if (!read_submessage(c, sub)) {
+                error = "page layout: truncated FullZipLayout value_compression";
+                return false;
+            }
+            auto node = std::make_unique<Compressive>();
+            if (!parse_compressive(sub, *node, 0, error)) {
+                return false;
+            }
+            out.value_compression = std::move(node);
+        } else if (wire == kWireBytes && field == 8U) {
+            if (!read_bytes(c, out.layers)) {
+                error = "page layout: truncated FullZipLayout layers";
+                return false;
+            }
+        } else if (!skip_field(c, wire)) {
+            error = "page layout: malformed FullZipLayout";
             return false;
         }
     }
@@ -539,10 +654,15 @@ bool decode_page_layout_into(const std::vector<std::uint8_t>& encoding, PageLayo
             out.kind = LayoutKind::kConstant;
             return parse_constant(sub, out.constant, error);
         }
-        // Field 3 is FullZipLayout -- that is what a lance.blob.v2 packed column's pages use, and
-        // what nanolance's own blob writer emits. Field 4 and beyond (AllNull, and whatever Lance
-        // adds later) are likewise parsed but not modeled: record the field so a caller refuses by
-        // name rather than misreading the page's buffers.
+        if (field == 3U) {
+            // Also what a lance.blob.v2 packed column's pages use; the decoder routes those by the
+            // column's `lance-encoding:blob` metadata before it ever looks at the layout.
+            out.kind = LayoutKind::kFullZip;
+            return parse_full_zip(sub, out.full_zip, error);
+        }
+        // Field 4 (BlobLayout), 5 (SparseLayout, file version 2.3+) and whatever Lance adds later are
+        // parsed but not modeled: record the field so a caller refuses by name rather than misreading
+        // the page's buffers.
         out.kind = LayoutKind::kNone;
         out.unknown_layout_field = field;
         return true;
@@ -626,11 +746,36 @@ void describe_compressive(const Compressive* node, std::string& out) {
             describe_compressive(node->values.get(), out);
             out += "}";
             return;
+        case CompressiveKind::kFixedSizeList:
+            out += "FixedSizeList{" + std::to_string(node->items_per_value) + "x";
+            describe_compressive(node->values.get(), out);
+            out += node->has_validity ? ",validity}" : "}";
+            return;
         case CompressiveKind::kUnknown:
         default:
             out += "Unknown(field " + std::to_string(node->wire_field) + ")";
             return;
     }
+}
+
+/// `RepDefLayer` names, outermost layer last, as Lance stores them.
+void describe_layers(const std::vector<std::uint8_t>& layers, std::string& out) {
+    out += "[";
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        if (i != 0U) {
+            out += ",";
+        }
+        switch (layers[i]) {
+            case 1U: out += "valid-item"; break;
+            case 2U: out += "valid-list"; break;
+            case 3U: out += "nullable-item"; break;
+            case 4U: out += "nullable-list"; break;
+            case 5U: out += "emptyable-list"; break;
+            case 6U: out += "null+empty-list"; break;
+            default: out += "layer" + std::to_string(layers[i]); break;
+        }
+    }
+    out += "]";
 }
 
 }  // namespace
@@ -647,6 +792,10 @@ std::string describe(const PageLayout& layout) {
         case LayoutKind::kMiniBlock: {
             out = "MiniBlock{values=";
             describe_compressive(layout.mini_block.value_compression.get(), out);
+            if (layout.mini_block.rep_compression) {
+                out += ",rep=";
+                describe_compressive(layout.mini_block.rep_compression.get(), out);
+            }
             if (layout.mini_block.repdef_compression) {
                 out += ",repdef=";
                 describe_compressive(layout.mini_block.repdef_compression.get(), out);
@@ -659,8 +808,35 @@ std::string describe(const PageLayout& layout) {
                 describe_compressive(layout.mini_block.dictionary.get(), out);
                 out += "x" + std::to_string(layout.mini_block.num_dictionary_items);
             }
+            if (layout.mini_block.has_repetition) {
+                out += ",layers=";
+                describe_layers(layout.mini_block.layers, out);
+            }
             out += ",rows=" + std::to_string(layout.mini_block.num_items);
             out += ",buffers=" + std::to_string(layout.mini_block.num_buffers);
+            out += "}";
+            return out;
+        }
+        case LayoutKind::kFullZip: {
+            const auto& fz = layout.full_zip;
+            out = "FullZip{values=";
+            describe_compressive(fz.value_compression.get(), out);
+            out += fz.bits_per_offset != 0U ? ",offset_bits=" + std::to_string(fz.bits_per_offset)
+                                            : ",value_bits=" + std::to_string(fz.bits_per_value);
+            if (fz.bits_rep != 0U) {
+                out += ",rep_bits=" + std::to_string(fz.bits_rep);
+            }
+            if (fz.bits_def != 0U) {
+                out += ",def_bits=" + std::to_string(fz.bits_def);
+            }
+            if (!fz.layers.empty()) {
+                out += ",layers=";
+                describe_layers(fz.layers, out);
+            }
+            out += ",rows=" + std::to_string(fz.num_items);
+            if (fz.num_visible_items != fz.num_items) {
+                out += ",visible=" + std::to_string(fz.num_visible_items);
+            }
             out += "}";
             return out;
         }

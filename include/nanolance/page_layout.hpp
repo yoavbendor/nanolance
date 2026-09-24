@@ -47,6 +47,10 @@ enum class CompressiveKind {
     kRle = 8,                ///< f8  Rle{ f1 values, f2 lengths }
     kByteStreamSplit = 9,    ///< f9  ByteStreamSplit{ f1 values }
     kGeneral = 10,           ///< f10 General{ f1 BufferCompression{ f1 scheme }, f3 values }
+    /// f11 FixedSizeList{ f1 items_per_value, f2 values, f3 has_validity }. How Lance stores an Arrow
+    /// fixed_size_list: NOT with repetition levels, but as a wrapper saying "every N consecutive
+    /// values are one row". The schema has no child field for it either.
+    kFixedSizeList = 11,
 };
 
 /// Buffer-compression schemes inside `General`, numbered as Lance's `CompressionScheme` enum does.
@@ -80,7 +84,12 @@ struct Compressive {
     /// the descriptor rather than the page, because one table covers the whole page.
     std::vector<std::uint8_t> symbol_table;
 
-    /// Variable::offsets, ByteStreamSplit::values, General::values, Rle::values, Fsst::values.
+    /// FixedSizeList: values per row, and whether the list itself carries a validity buffer.
+    std::uint64_t items_per_value = 0;
+    bool has_validity = false;
+
+    /// Variable::offsets, ByteStreamSplit::values, General::values, Rle::values, Fsst::values,
+    /// FixedSizeList::values.
     std::unique_ptr<Compressive> values;
     /// Rle::lengths.
     std::unique_ptr<Compressive> lengths;
@@ -99,10 +108,13 @@ struct MiniBlock {
     std::uint64_t num_items = 0;
     std::uint32_t num_buffers = 0;
     bool has_large_chunk = false;
-    /// f1 `rep_compression` was present. Only the flag is kept, not the node: nothing here decodes a
-    /// repetition layer yet, but a chunk header carries a `u16 rep_size` slot when one exists, so
-    /// missing it would shift every later field by two bytes.
+    /// f1 `rep_compression` was present. A chunk header carries a `u16 rep_size` slot when it
+    /// exists, so missing it would shift every later field by two bytes.
     bool has_repetition = false;
+    /// f1 itself: how the repetition levels are stored (`Bitpacked{16, Flat(bits)}` for a list).
+    std::unique_ptr<Compressive> rep_compression;
+    /// f8 `repetition_index_depth`: how many list levels the page's repetition index covers.
+    std::uint32_t repetition_index_depth = 0;
     /// f6 `layers`: [1] for a column with no nulls, [3] when a definition-level layer is present.
     /// Stored raw because it is a length-delimited field rather than a plain varint.
     std::vector<std::uint8_t> layers;
@@ -147,13 +159,31 @@ struct Constant {
     std::uint64_t num_def_values = 0;
 };
 
-enum class LayoutKind { kNone, kMiniBlock, kConstant };
+/// PageLayout f3. The layout Lance uses when a page's values are large: any value of 256 bytes or
+/// more (`MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE`), which is one long string in a column, or a float32
+/// fixed_size_list of 64+ dimensions. Values are stored row by row, each preceded by a control word
+/// holding its repetition/definition levels, instead of being packed into mini-blocks.
+struct FullZip {
+    std::uint32_t bits_rep = 0;
+    std::uint32_t bits_def = 0;
+    /// Exactly one of these is set: a fixed-width page stores `bits_per_value`, a variable-width one
+    /// stores the width of each value's length prefix in `bits_per_offset`.
+    std::uint32_t bits_per_value = 0;
+    std::uint32_t bits_per_offset = 0;
+    std::uint64_t num_items = 0;
+    std::uint64_t num_visible_items = 0;
+    std::unique_ptr<Compressive> value_compression;
+    std::vector<std::uint8_t> layers;
+};
+
+enum class LayoutKind { kNone, kMiniBlock, kConstant, kFullZip };
 
 struct PageLayout {
     LayoutKind kind = LayoutKind::kNone;
     MiniBlock mini_block;
     Constant constant;
-    /// Set when the descriptor named a layout this build does not model (FullZip, AllNull, ...), so
+    FullZip full_zip;
+    /// Set when the descriptor named a layout this build does not model (Blob, Sparse, ...), so
     /// the caller can refuse by name rather than misinterpret the page's buffers.
     std::uint32_t unknown_layout_field = 0;
 };

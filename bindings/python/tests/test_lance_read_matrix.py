@@ -222,3 +222,73 @@ def test_bitpacked_dictionary_reads_back(lance_mod, tmp_path, name, nullable, n,
     lance_mod.write_dataset(pa.table({"c": pa.array(values, arrow_type)}), path)
     expected = lance_mod.dataset(path).to_table()
     assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
+
+
+# ── The value-size axis ──────────────────────────────────────────────────────────────────────────
+#
+# Row count and cardinality are not the only things Lance decides on. It picks a page's LAYOUT from
+# the page's LONGEST value: below 256 bytes (`MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE` in lance-encoding)
+# the page is a MiniBlock; at or above it, a FullZip. So one long string among thousands of short
+# ones changes how the whole column is stored, and a float32 fixed_size_list crosses the line at 64
+# dimensions -- which is every real embedding.
+#
+# Each shape maps to the message it fails with today, or None once it reads correctly. A shape that
+# starts reading must be flipped to None here -- the assertion below fails loudly until it is.
+N_WIDE = 2_000
+
+
+def _one_long(n):
+    values = [f"short-{i}" for i in range(n)]
+    values[n // 2] = "y" * 300
+    return pa.array(values)
+
+
+def _fsl(dim, nullable=False):
+    import random
+
+    rng = random.Random(dim)
+    flat = pa.array([rng.random() for _ in range(N_WIDE * dim)], pa.float32())
+    mask = pa.array([i % 9 == 0 for i in range(N_WIDE)]) if nullable else None
+    return pa.FixedSizeListArray.from_arrays(flat, dim, mask=mask)
+
+
+FULLZIP = "unsupported page layout: FullZip"
+FSL_SCHEMA = "unsupported on-disk logical type for manifest recovery: fixed_size_list"
+
+VALUE_SIZE_SHAPES = {
+    # (column builder, the failure it produces today or None)
+    "str_255": (lambda: pa.array([("x" * 250) + f"{i:05d}" for i in range(N_WIDE)]), None),
+    "str_256": (lambda: pa.array([("x" * 251) + f"{i:05d}" for i in range(N_WIDE)]), FULLZIP),
+    "str_one_long": (lambda: _one_long(N_WIDE), FULLZIP),
+    "str_1024": (lambda: pa.array([("w" * 1019) + f"{i:05d}" for i in range(N_WIDE)]), FULLZIP),
+    "str_long_nullable": (
+        lambda: pa.array([None if i % 7 == 0 else ("z" * 400) + str(i) for i in range(N_WIDE)]),
+        FULLZIP,
+    ),
+    # Distinct values on purpose: a LOW-cardinality long binary column is dictionary-encoded first
+    # (251 distinct 1 KiB values came back as a MiniBlock dictionary page), so the size rule only
+    # decides the layout of what the dictionary step leaves alone.
+    "binary_1024": (lambda: pa.array([i.to_bytes(4, "little") * 256 for i in range(N_WIDE)], pa.binary()), FULLZIP),
+    "fsl_8": (lambda: _fsl(8), FSL_SCHEMA),
+    "fsl_32": (lambda: _fsl(32), FSL_SCHEMA),
+    "fsl_64": (lambda: _fsl(64), FSL_SCHEMA),
+    "fsl_768": (lambda: _fsl(768), FSL_SCHEMA),
+    "fsl_768_nullable": (lambda: _fsl(768, nullable=True), FSL_SCHEMA),
+}
+
+
+@pytest.mark.parametrize("name", sorted(VALUE_SIZE_SHAPES))
+def test_value_size_axis(lance_mod, tmp_path, name):
+    build, gap = VALUE_SIZE_SHAPES[name]
+    path = str(tmp_path / f"{name}.lance")
+    lance_mod.write_dataset(pa.table({"c": build()}), path)
+    expected = lance_mod.dataset(path).to_table()
+
+    if gap is not None:
+        with pytest.raises(Exception) as excinfo:
+            pa.table(nanolance.read_table(path))
+        assert gap in str(excinfo.value), (
+            f"{name} now fails differently: {excinfo.value}. If it reads now, set its gap to None."
+        )
+        return
+    assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()

@@ -68,16 +68,17 @@ ROUNDTRIPS = {
     "decimal256": _t(pa.decimal256(40, 2), [decimal.Decimal(f"{i}.{i % 100:02d}") for i in range(N)]),
     "struct": pa.table({"c": pa.array([{"a": i, "b": f"s{i}"} for i in range(N)])}),
     "struct_nested": pa.table({"c": pa.array([{"a": {"x": i}} for i in range(N)])}),
+    # Lance names these "halffloat" and "duration:<unit>" on disk. Both are existing fixed-width
+    # paths; they were refused only because nothing mapped the names.
+    "float16": _t(pa.float16(), [float(i % 10) for i in range(N)]),
+    "float16_nullable": _t(pa.float16(), [None if i % 7 == 0 else float(i % 10) for i in range(N)]),
+    "duration_us": _t(pa.duration("us"), [datetime.timedelta(seconds=i) for i in range(N)]),
+    "duration_s_nullable": _t(pa.duration("s"), [None if i % 5 == 0 else datetime.timedelta(seconds=i) for i in range(N)]),
 }
 
 # Refused at write_batch, each with a message naming the column. The fragment is what the refusal has
 # to keep saying; a change that makes any of these WRITE must come here and justify itself.
 REFUSED_ON_WRITE = {
-    "float16": (_t(pa.float16(), [float(i % 10) for i in range(N)]), "unsupported Arrow C format"),
-    "duration_us": (
-        _t(pa.duration("us"), [datetime.timedelta(seconds=i) for i in range(N)]),
-        "unsupported Arrow C format",
-    ),
     "large_string": (_t(pa.large_utf8(), [f"s{i}" for i in range(N)]), "large_utf8"),
     "large_binary": (_t(pa.large_binary(), [b"b%d" % i for i in range(N)]), "large_binary"),
     "dictionary": (
@@ -114,8 +115,6 @@ READ_ONLY = ("large_string", "large_binary", "null")
 
 # Written by pylance and NOT readable. Pinned by message so each fails loudly when implemented.
 UNREADABLE_FROM_PYLANCE = {
-    "float16": "unsupported on-disk logical type",
-    "duration_us": "unsupported on-disk logical type",
     "list": "unsupported on-disk logical type",
     "large_list": "unsupported on-disk logical type",
     "fixed_size_list": "unsupported on-disk logical type",

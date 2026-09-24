@@ -90,6 +90,12 @@ ParsedFormat parse_format(const char* format) {
         out.supported = true;
         return out;
     }
+    // Lance's own name for a 16-bit float, read back out of a pylance manifest -- not "float16".
+    if (std::strcmp(format, "e") == 0) {
+        out.logical_type = "halffloat";
+        out.supported = true;
+        return out;
+    }
     if (std::strcmp(format, "b") == 0) {
         out.logical_type = "bool";
         out.supported = true;
@@ -156,6 +162,19 @@ ParsedFormat parse_format(const char* format) {
             }
             // Lance spells "no timezone" as "-", never as an empty field.
             out.logical_type = std::string("timestamp:") + unit + ":" + (tz.empty() ? "-" : tz);
+            out.supported = true;
+            return out;
+        }
+    }
+    // duration: "tD{s,m,u,n}", an int64 on the wire. Lance spells it "duration:<unit>".
+    if (starts_with(format, "tD") && std::strlen(format) == 3U) {
+        const char* unit = format[2] == 's'   ? "s"
+                           : format[2] == 'm' ? "ms"
+                           : format[2] == 'u' ? "us"
+                           : format[2] == 'n' ? "ns"
+                                              : nullptr;
+        if (unit != nullptr) {
+            out.logical_type = std::string("duration:") + unit;
             out.supported = true;
             return out;
         }
@@ -588,6 +607,10 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
         arrow_format = "g";
         return true;
     }
+    if (logical_type == "halffloat") {
+        arrow_format = "e";
+        return true;
+    }
     if (logical_type == "bool") {
         arrow_format = "b";
         return true;
@@ -631,6 +654,16 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
         }
         // Lance's "-" means no timezone; Arrow spells that as an empty field after the colon.
         arrow_format = std::string("ts") + code + ":" + (tz == "-" ? "" : tz);
+        return true;
+    }
+    if (logical_type.rfind("duration:", 0) == 0) {
+        const auto unit = logical_type.substr(std::strlen("duration:"));
+        const char* code = unit == "s" ? "s" : unit == "ms" ? "m" : unit == "us" ? "u" : unit == "ns" ? "n" : nullptr;
+        if (code == nullptr) {
+            error = "unsupported duration unit in logical type: " + logical_type;
+            return false;
+        }
+        arrow_format = std::string("tD") + code;
         return true;
     }
     if (logical_type == "date32:day") {
