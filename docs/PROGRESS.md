@@ -1729,6 +1729,12 @@ message. It is the project's capability statement, executable.
 Kept honest: everything here was found and reproduced during this work. Ordered by what a new user
 is most likely to hit.
 
+**The forward plan is [`docs/ROADMAP.md`](ROADMAP.md)**, which supersedes the ordering below. Writing
+it against freshly measured pylance files found two gaps missing from this list, and both outrank
+lists: the **FullZip** page layout (any string column with one value of 256 bytes or more, and every
+embedding of 64+ float32 dimensions, is unreadable) and **`fixed_size_list`**, which Lance encodes as a
+compressive wrapper rather than with repetition levels.
+
 ### Correctness / reach — worth doing next
 
 1. **No known read gaps for pylance-written columns.** All three are fixed, and `KNOWN_GAPS` in
@@ -1803,7 +1809,7 @@ is most likely to hit.
    this failure locally in milliseconds instead of at the end of the longest CI job. A config path
    that only runs inside a wheel job is otherwise unverifiable until it is too late.
 
-   **Now verified, with one job still pending.** The first run after the fix produced **10 Linux
+   **Now verified.** The first run after the fix produced **10 Linux
    wheels** (manylinux_2_28 + musllinux_1_2, x86_64, CPython 3.9–3.13) and the macOS 14 arm64 set,
    every one of them installed into a clean virtualenv and smoke-tested. The log shows the
    placeholder resolving and the test importing the *installed* package rather than the repo, which

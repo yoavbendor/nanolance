@@ -18,7 +18,9 @@ comparing the bytes.
 
 The remaining tools (`nlance-pagelayout`, `nlance_blobgen`, `nlance_blobfetch`, `nlbench`,
 `nlbench_gendata`) stay standalone: they are development and benchmarking instruments rather than
-part of the surface a user is meant to discover.
+part of the surface a user is meant to discover. `pb_raw.py` belongs with them: it prints the wire
+structure of a raw descriptor from `nlance-pagelayout --dump-corpus`, for fields the tool does not
+summarise yet.
 
 ## `nlance2table` — dump a Lance dataset to CSV / NDJSON (`nanolance cat`)
 
