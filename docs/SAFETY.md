@@ -122,11 +122,12 @@ Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](https:
   ```
 - **A fuzzer per parser, not just per entry point.** `fuzz_decode` stops at the data file's footer
   and column metadata, so each format reached only *after* that point needs its own target, and CI
-  runs all six on every push ([`.github/workflows/memory-safety.yml`](https://github.com/yoavbendor/nanolance/blob/main/.github/workflows/memory-safety.yml)):
+  runs all seven on every push ([`.github/workflows/memory-safety.yml`](https://github.com/yoavbendor/nanolance/blob/main/.github/workflows/memory-safety.yml)):
 
   | target | covers | why `fuzz_decode` does not reach it |
   |---|---|---|
   | `nanolance_fuzz_column_decode` | page decoding: descriptor + buffers → values (dictionaries, bit-unpacking, RLE, definition levels, constant pages, FSST/LZ4/zstd values, FullZip, fixed_size_list) | `fuzz_decode` never decodes a page. Seeded with whole pages dumped from real datasets by `nlance-pagelayout --dump-fuzz-pages` |
+  | `nanolance_fuzz_repdef` | repetition/definition unravelling for list columns; asserts Arrow's list invariants on every accepted input | pure computation, fuzzed on its own at ~50,000 inputs a second instead of through a page |
   | `nanolance_fuzz_page_layout` | the `/lance.encodings21.PageLayout` descriptor | seeded from real pylance descriptors — FSST, LZ4 dictionaries, RLE levels — which nanolance's own writer never emits |
   | `nanolance_fuzz_fsst` | the FSST symbol-table decompressor | only runs once a value buffer is being decompressed |
   | `nanolance_fuzz_lz4` | the LZ4 block decompressor | same |

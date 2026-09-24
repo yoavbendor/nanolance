@@ -99,7 +99,7 @@ jobs:
             -DNANOLANCE_BUILD_EXAMPLES=OFF -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
 
       - name: Build fuzzers
-        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst nanolance_fuzz_lz4 nanolance_fuzz_deletion_vector nanolance_fuzz_column_decode -j
+        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst nanolance_fuzz_lz4 nanolance_fuzz_deletion_vector nanolance_fuzz_column_decode nanolance_fuzz_repdef -j
 
       # 2 minutes per push per target is enough to catch regressions; extend for a nightly run.
       - name: Fuzz the decode chain
@@ -207,6 +207,16 @@ jobs:
           mkdir -p corpus-column-decode-found
           ./build-fuzz/nanolance_fuzz_column_decode -max_total_time=180 -rss_limit_mb=4096 \
             -print_final_stats=1 corpus-column-decode-found corpus-column-decode tests/fuzz/corpus/column_decode
+
+      # Repetition/definition unravelling for list columns. Asserts the Arrow list invariants
+      # (offsets from 0, non-decreasing, ending at the child length) on every input it accepts.
+      - name: Fuzz the rep/def unraveler
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-repdef
+          ./build-fuzz/nanolance_fuzz_repdef -max_total_time=60 -print_final_stats=1 corpus-repdef
 
       - name: Fuzz the FSST decompressor
         env:

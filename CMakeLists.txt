@@ -278,6 +278,7 @@ add_library(nanolance STATIC
     src/lance_column_decoder.cpp
     src/lance_table_reader.cpp
     src/page_layout.cpp
+    src/repdef.cpp
     src/nano_lance_table_reader_c.cpp
     src/manifest_writer.cpp
     src/dataset_stitcher.cpp
@@ -323,6 +324,13 @@ if(NANOLANCE_BUILD_FUZZERS)
     target_compile_features(nanolance_fuzz_decode PRIVATE cxx_std_20)
     target_link_libraries(nanolance_fuzz_decode PRIVATE nanolance)
     target_link_options(nanolance_fuzz_decode PRIVATE -fsanitize=fuzzer)
+
+    # Repetition/definition unravelling: level streams in, list offsets out. Pure computation, so
+    # it fuzzes far faster on its own than through a page.
+    add_executable(nanolance_fuzz_repdef tests/fuzz/fuzz_repdef.cpp)
+    target_compile_features(nanolance_fuzz_repdef PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_repdef PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_repdef PRIVATE -fsanitize=fuzzer)
 
     # The PageLayout descriptor gets its own target: libFuzzer's coverage feedback works best aimed
     # at one grammar, and descriptor bytes look nothing like a data file.
@@ -554,6 +562,10 @@ add_executable(nano_lance_page_layout_test tests/test_page_layout.cpp)
 target_link_libraries(nano_lance_page_layout_test PRIVATE nanolance)
 target_compile_features(nano_lance_page_layout_test PRIVATE cxx_std_20)
 
+add_executable(nano_lance_repdef_test tests/test_repdef.cpp)
+target_link_libraries(nano_lance_repdef_test PRIVATE nanolance)
+target_compile_features(nano_lance_repdef_test PRIVATE cxx_std_20)
+
 add_executable(nano_lance_fsst_test tests/test_fsst.cpp)
 target_link_libraries(nano_lance_fsst_test PRIVATE nanolance)
 target_compile_features(nano_lance_fsst_test PRIVATE cxx_std_20)
@@ -705,6 +717,9 @@ endif()
 add_test(NAME nano_lance_page_layout
          COMMAND $<TARGET_FILE:nano_lance_page_layout_test> "${CMAKE_CURRENT_BINARY_DIR}/page_layout_probe")
 set_tests_properties(nano_lance_page_layout PROPERTIES LABELS smoke)
+
+add_test(NAME nano_lance_repdef COMMAND $<TARGET_FILE:nano_lance_repdef_test>)
+set_tests_properties(nano_lance_repdef PROPERTIES LABELS smoke)
 
 add_test(NAME nano_lance_fsst COMMAND $<TARGET_FILE:nano_lance_fsst_test>)
 set_tests_properties(nano_lance_fsst PROPERTIES LABELS smoke)

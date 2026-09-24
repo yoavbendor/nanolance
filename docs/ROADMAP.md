@@ -147,6 +147,9 @@ Order matters: each step's tests are the next step's regression suite.
 | C7 | Row ranges and deletion vectors on nested columns, per C0. | M | **Opus** |
 | C8 | FullZip with `bits_rep > 0` (lists of long strings / wide FSLs). | M | Sonnet, after B2 and C3 |
 
+**Status:** C0 done — [NESTED_COLUMNS.md](NESTED_COLUMNS.md). C1 done — `src/repdef.cpp`, tested
+against Lance's own `repdef.rs` vectors and fuzzed (`fuzz_repdef`).
+
 Done when the list shapes in A2 pass, `test_type_support_matrix.py` moves `list`, `large_list`,
 `map` from `UNREADABLE_FROM_PYLANCE` to read-only, and the fuzz harness covers the unraveler.
 
