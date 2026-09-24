@@ -1813,9 +1813,26 @@ is most likely to hit.
        nanolance 0.2.0 from /tmp/.../venv/lib/python3.13/site-packages/nanolance/__init__.py
        wheel smoke passed
 
-   `macos-13 x86_64` has been **queued** rather than failing — GitHub's macOS 13 x86 runners are
-   scarce, which is a capacity matter, not a defect in this tree. Intel macOS wheels stay unproven
-   until that job actually runs.
+   `macos-13 x86_64` was the remaining job, and it was **not** slow runners, which is what it looked
+   like and what I first wrote here. **GitHub retired the macOS 13 image.** The label no longer
+   exists, so the job is never scheduled at all — and a retired label does not error:
+
+       a job whose runner label no longer exists sits `queued` forever.
+
+   That is why this hid so well. The wheels workflow had **34 runs and not one ever completed**.
+   Every one of them showed as `cancelled`, because `cancel-in-progress` kills the run when the next
+   push lands, and a job still queued at that moment is reported as cancelled rather than as stuck.
+   The backlog note blamed the cancellations on pushing faster than cibuildwheel takes. That was
+   true, and it was the wrong conclusion: the cancellations were *masking* a job that could never
+   have started, not causing one.
+
+   Fixed by moving Intel macOS to `macos-15-intel`, the current x86_64 label. `macos-14` (arm64) is
+   marked deprecated but not retired, so it stays, with a comment naming `macos-15` as its
+   replacement — the same silent-hang failure is waiting behind that label whenever it goes.
+
+   The lesson is about the failure's *shape*: a stuck job and a busy queue look identical, and
+   neither one is red. The workflow now says so where it will be read: if a job is queued far longer
+   than its siblings take to finish, check the label still exists before assuming capacity.
 
 ### Deliberate deviations (not defects)
 
