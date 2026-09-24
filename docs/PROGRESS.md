@@ -1803,8 +1803,19 @@ is most likely to hit.
    this failure locally in milliseconds instead of at the end of the longest CI job. A config path
    that only runs inside a wheel job is otherwise unverifiable until it is too late.
 
-   Wheels across CPython 3.9–3.13 on manylinux/macOS stay **unverified until a full run goes green**;
-   that is the next thing to watch on this branch, not something already proven.
+   **Now verified, with one job still pending.** The first run after the fix produced **10 Linux
+   wheels** (manylinux_2_28 + musllinux_1_2, x86_64, CPython 3.9–3.13) and the macOS 14 arm64 set,
+   every one of them installed into a clean virtualenv and smoke-tested. The log shows the
+   placeholder resolving and the test importing the *installed* package rather than the repo, which
+   is the property the smoke test exists to prove:
+
+       + sh -c 'python /project/bindings/python/tests/wheel_smoke.py'
+       nanolance 0.2.0 from /tmp/.../venv/lib/python3.13/site-packages/nanolance/__init__.py
+       wheel smoke passed
+
+   `macos-13 x86_64` has been **queued** rather than failing — GitHub's macOS 13 x86 runners are
+   scarce, which is a capacity matter, not a defect in this tree. Intel macOS wheels stay unproven
+   until that job actually runs.
 
 ### Deliberate deviations (not defects)
 
