@@ -27,7 +27,7 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Roadmap C — lists, read side | **C0–C8 done**; only a list of `fixed_size_list` is still refused |
 | Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip; pages compressed to within ~0.2% of pylance (FSST aside) |
 
-Test suite: **53 ctest** (was 42) and **1288 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **53 ctest** (was 42) and **1317 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
