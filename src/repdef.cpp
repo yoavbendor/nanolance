@@ -398,6 +398,9 @@ private:
         if (out_->has_def) {
             out_->def.push_back(def);
         }
+        if (out_->has_rep || out_->has_def) {
+            out_->is_slot.push_back(slot != kNoSlot);
+        }
         if (slot != kNoSlot) {
             out_->items.push_back(slot);
         }

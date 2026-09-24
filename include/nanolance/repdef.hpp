@@ -72,6 +72,7 @@ struct Serialized {
     std::vector<std::uint16_t> def;       // empty when nothing in the rows is null or empty
     std::vector<std::uint8_t> layers;     // the descriptor's layer list, innermost first
     std::vector<std::uint64_t> items;     // leaf index of every value slot, in order
+    std::vector<bool> is_slot;            // per level: does it own a value slot? (sizes a chunk's levels)
     bool has_rep = false;
     bool has_def = false;
 };

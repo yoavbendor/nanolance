@@ -141,7 +141,25 @@ jobs:
           with open("seed-datasets/input.arrow", "wb") as sink:
               with ipc.new_stream(sink, table.schema) as w:
                   w.write_table(table)
+          # List pages as nanolance writes them: bit-packed levels, rows spanning 1,024-value
+          # chunks, bit-packed integer items, dictionary string items, constant pages.
+          lists = pa.table({
+              "ints": pa.array([None if i % 7 == 0 else [] if i % 5 == 0 else
+                                [None if (i + j) % 4 == 0 else j for j in range(i % 9)] for i in range(n)],
+                               pa.list_(pa.int64())),
+              "long": pa.array([list(range(3000)) if i % 500 == 0 else [i] for i in range(n)],
+                               pa.list_(pa.int32())),
+              "tags": pa.array([[f"t{(i + j) % 30}" for j in range(i % 4)] for i in range(n)],
+                               pa.list_(pa.utf8())),
+              "nested": pa.array([[[i] * (j % 2 + 1) for j in range(i % 3)] for i in range(n)],
+                                 pa.list_(pa.list_(pa.int64()))),
+              "empty": pa.array([[] if i % 2 else None for i in range(n)], pa.list_(pa.int64())),
+          })
+          with open("seed-datasets/lists.arrow", "wb") as sink:
+              with ipc.new_stream(sink, lists.schema) as w:
+                  w.write_table(lists)
           PY
+          ./build-seed/arrowipc2lance -c -o seed-datasets/lists.lance < seed-datasets/lists.arrow
           ./build-seed/arrowipc2lance -c -o seed-datasets/plain.lance < seed-datasets/input.arrow
           ./build-seed/arrowipc2lance -c --compress -o seed-datasets/zstd.lance < seed-datasets/input.arrow
           # Also seed from datasets STOCK Lance wrote. Their descriptors are the ones nanolance's own

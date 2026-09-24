@@ -174,8 +174,10 @@ null lists) serialized over a random row range and unravelled back, compared row
 deliberate mutations fail it thousands of times. **D2 done:** lists, large lists, maps, lists of
 structs, structs of lists and null structs are written and read by both readers
 (`tests/test_lance_list_writes.py`, plus the type and parity matrices), including sliced batches,
-several fragments, long rows split across pages, and `nanolance convert` from parquet. Levels are
-written raw (`Flat(16)`); compressing them is the obvious next size win.
+several fragments, long rows split across pages, and `nanolance convert` from parquet. **Pages
+compressed:** bit-packed levels, 1,024-value chunks (rows may span them), bit-packed integer items and
+per-page string dictionaries -- within ~0.2% of pylance's size except high-cardinality strings, which
+wait on an FSST encoder (F2).
 
 ### Phase E — small type gaps (any time; good first tasks)
 

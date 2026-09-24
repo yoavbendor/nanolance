@@ -108,10 +108,21 @@ The inverse, piece by piece:
 - **`repdef::serialize`** turns a run of rows into levels, choosing each layer's kind from what
   those rows contain, and lists the leaf entries that get a value slot. A null or empty list gets a
   level and no slot, and its children are never visited.
-- **Pages** are one mini-block chunk each — the final chunk, so its value count is free and rows
-  never span chunks — cut at row boundaries to at most 32,000 levels (raw `u16` levels, `Flat(16)`)
-  and ~4 MiB of values. The page carries the depth-1 repetition index Lance expects
-  (`[rows, 0]`). A page with no values at all is a `ConstantLayout` with `[rep, def]` buffers,
-  exactly as pylance writes one.
+- **Pages** are cut at row boundaries (up to 32,768 rows, ~8 MiB of values) and split into
+  mini-block chunks of 1,024 values (`log_num_values = 10`; the last chunk holds the rest). Levels go
+  to chunks by Lance's slicer rule: a chunk takes levels until it has covered its values, and any
+  trailing levels with no value slot (empty or null lists) go to the next. So a row can span
+  chunks; the depth-1 repetition index records, per chunk, the rows that finish in it and the
+  levels left over from the row still open at its end.
+- **Levels** are `Bitpacked{16, Flat(w)}` at the page's widest level, per chunk: whole 1,024-level
+  blocks plus a tail kept raw (`u16`) when that is cheaper than padding it to a block. A chunk
+  holds at most 65,535 levels (a `u16` count); a single row that needs more in one chunk is refused
+  by name.
+- **Items** reuse the flat encodings: `InlineBitpacking` for integers, bits for booleans, `Flat` for
+  other fixed widths, and for strings either `Variable` chunks (`u32` offsets, padded to 8) or a
+  per-page dictionary (`InlineBitpacking(32)` indices, the dictionary as one `Variable` block) when
+  it is at most half the items and under 80% of the plain size.
+- A page with no values at all is a `ConstantLayout` with raw `[rep, def]` buffers, exactly as
+  pylance writes one.
 - A leaf under structs that are never null keeps the flat encodings: nested pages are written only
   for a list or an actual struct null (`ColumnValues::needs_nested_pages`).

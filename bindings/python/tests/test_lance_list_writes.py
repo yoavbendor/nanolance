@@ -8,7 +8,7 @@ also goes through the paths that re-cut a nested column on the way in:
     every level -- a list's child is not row-aligned with the batch, a struct's children are not
     sliced with it);
   * several fragments (`max_rows_per_fragment`), so layers are rebased across batches;
-  * long rows, so a page is cut into several at row boundaries.
+  * long rows, so a row spans mini-block chunks and a column spans pages.
 """
 
 from __future__ import annotations
@@ -63,21 +63,53 @@ def test_nested_column_survives_sliced_batches_and_fragments(lance_mod, tmp_path
     assert lance_mod.dataset(str(path)).to_table(offset=1_090, limit=25).to_pydict() == expected
 
 
-def test_long_rows_split_across_pages(lance_mod, tmp_path):
-    """Rows whose items overflow one page's level budget are cut into several pages, at row
-    boundaries -- 40,000-item rows exceed the 32,000 levels a raw-u16 page can hold."""
+def test_long_rows_span_chunks_and_pages(lance_mod, tmp_path):
+    """A page is cut into 1,024-value mini-block chunks, and a row may span many of them: the
+    repetition index then counts it in the chunk where it ends. 40,000-item rows span ~40 chunks;
+    many medium rows fill several pages. Both are read back in full and by range."""
     lengths = [40_000 if i % 5 == 0 else i % 7 for i in range(60)]
     column = pa.array([list(range(n)) for n in lengths], pa.list_(pa.int32()))
     table = pa.table({"c": column})
     path = tmp_path / "long.lance"
-    with pytest.raises(Exception) as excinfo:
-        nanolance.write_table(table, path)
-    assert "one row can hold at most" in str(excinfo.value)
-    # Rows under the limit, but many of them: several pages.
-    column = pa.array([list(range(i % 3000)) for i in range(200)], pa.list_(pa.int32()))
-    table = pa.table({"c": column})
     nanolance.write_table(table, path)
     _both_readers_agree(lance_mod, path, table)
+    expected = table.slice(9, 7).to_pydict()
+    assert pa.table(nanolance.read_table(path, offset=9, length=7)).to_pydict() == expected
+    assert lance_mod.dataset(str(path)).to_table(offset=9, limit=7).to_pydict() == expected
+
+    column = pa.array([list(range(i % 3000)) for i in range(200)], pa.list_(pa.int32()))
+    table = pa.table({"c": column})
+    path = tmp_path / "many.lance"
+    nanolance.write_table(table, path)
+    _both_readers_agree(lance_mod, path, table)
+
+
+def _data_bytes(path):
+    return sum(f.stat().st_size for f in (path / "data").iterdir())
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        # Small integers: levels and items both bit-pack.
+        lambda n: pa.array([[j % 100 for j in range(i % 9)] if i % 11 else None for i in range(n)], pa.list_(pa.int64())),
+        # Repeating strings: a per-page dictionary.
+        lambda n: pa.array([[f"tag{(i + j) % 40}" for j in range(i % 5)] for i in range(n)], pa.list_(pa.string())),
+        # Two list layers.
+        lambda n: pa.array([[[j] * (j % 3) for j in range(i % 4)] for i in range(n)], pa.list_(pa.list_(pa.int32()))),
+    ],
+    ids=["ints", "tags", "nested"],
+)
+def test_list_pages_are_about_as_small_as_stock_lance(lance_mod, tmp_path, shape):
+    """Size regression guard: nanolance's list pages (bit-packed levels, bit-packed or dictionary
+    items) stay within 10% of what pylance writes for the same column. Before compression they
+    were 5-16x larger."""
+    table = pa.table({"c": shape(20_000)})
+    ours, theirs = tmp_path / "ours.lance", tmp_path / "theirs.lance"
+    nanolance.write_table(table, ours)
+    lance_mod.write_dataset(table, str(theirs))
+    _both_readers_agree(lance_mod, ours, table)
+    assert _data_bytes(ours) <= 1.1 * _data_bytes(theirs), (_data_bytes(ours), _data_bytes(theirs))
 
 
 def test_nested_columns_beside_flat_ones_with_compression(lance_mod, tmp_path):
@@ -120,3 +152,12 @@ def test_list_children_with_their_own_offset(lance_mod, tmp_path):
     path = tmp_path / "offsets.lance"
     nanolance.write_table(table, path)
     _both_readers_agree(lance_mod, path, table)
+
+
+def test_a_row_too_dense_for_one_chunk_is_refused_by_name(tmp_path):
+    """A chunk's level count is a u16. 70,000 empty inner lists before one item put 70,001 levels in
+    a single 1,024-value chunk -- refused by name rather than written with a wrapped count."""
+    table = pa.table({"c": pa.array([[[]] * 70_000 + [[1]], [[2]]], pa.list_(pa.list_(pa.int64())))})
+    with pytest.raises(Exception) as excinfo:
+        nanolance.write_table(table, tmp_path / "x.lance")
+    assert "more list entries than one page chunk can describe" in str(excinfo.value)

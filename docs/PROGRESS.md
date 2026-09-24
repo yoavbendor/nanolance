@@ -25,9 +25,9 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
 | Roadmap E — small type gaps | **E1–E3 done** (float16, duration, Arrow null type); E4 `large_*` write open |
 | Roadmap C — lists, read side | **C0–C7 done**; FullZip list pages (C8) open |
-| Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip |
+| Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip; pages compressed to within ~0.2% of pylance (FSST aside) |
 
-Test suite: **53 ctest** (was 42) and **1284 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **53 ctest** (was 42) and **1288 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
@@ -2021,8 +2021,43 @@ structs from "refused on write" to "round-trips". Two ingest offset rules (a lis
 struct's physical index) each fail tests when broken — the first needed a new test, because
 `to_batches()` never produces a list whose child has its own offset.
 
-Open: a list of `fixed_size_list` (refused by name), and level compression (levels are raw `u16`,
-2 bytes each — pylance bit-packs them).
+Open: a list of `fixed_size_list` (refused by name).
+
+### List pages compressed
+
+The first list pages were correct but 4-16x larger than pylance's: raw `u16` levels, plain items,
+one chunk per page. They are now written the way pylance writes them:
+
+- **Levels bit-packed**, `Bitpacked{16, Flat(w)}` at the page's widest level (1-3 bits, typically):
+  whole 1,024-level blocks plus a raw tail when that is smaller than padding a last block — the
+  choice Lance's own decoder tells apart by buffer length.
+- **Pages cut into 1,024-value mini-block chunks**, levels split between chunks by Lance's slicer
+  rule (a chunk takes levels until it has covered its values; trailing empty/null lists go to the
+  next). A row can now span chunks, so the per-chunk repetition index counts it where it ends. The
+  old 32,000-level page budget -- and the refusal of any row longer than that -- is gone: a
+  40,000-item row writes and is read back in full and by range by both readers.
+- **Integer items bit-packed** (`InlineBitpacking`, as flat columns already were).
+- **String items dictionary-encoded** per page when the page repeats itself (distinct values at most
+  half the items, and dictionary + indices under 80% of plain), else plain `Variable`.
+
+Data bytes for 20,000-row columns (nanolance before -> after, pylance):
+
+| Column | before | after | pylance |
+|---|---:|---:|---:|
+| `list<int64>` small ints, nulls | 287,368 | 53,512 | 53,395 |
+| `list<string>` repeating tags | 228,232 | 13,896 | 13,865 |
+| `list<list<int64>>` | 348,296 | 68,680 | 68,586 |
+| `map<string, int64>` | — | 60,312 | 60,221 |
+| `list<string>` all distinct | — | 303,112 | 173,744 |
+
+The last row is the remaining gap: pylance FSST-compresses high-cardinality strings, and nanolance has
+no FSST *encoder* yet (roadmap F2) -- it applies to flat string columns just the same.
+
+Verified: both readers on every shape of the write matrix, plus a size-regression test holding three
+list shapes within 10% of pylance (`test_list_pages_are_about_as_small_as_stock_lance`); ctest plain
+and under ASan/UBSan; the page-decoding fuzzer seeded with nanolance-written list pages (chunk-
+spanning rows, dictionary items, constant pages) ran 732,113 executions clean, and CI now seeds it
+with the same dataset.
 
 ### Deliberate deviations (not defects)
 
