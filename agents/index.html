@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -675,6 +675,60 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
     
     
     
@@ -689,10 +743,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
         
           
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="">
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
             
   
   
@@ -710,8 +764,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -981,7 +1035,7 @@ path and CMake targets changed.</p>
 <p>nanolance is the "nanoarrow of Lance": a small C++ library that <strong>writes Lance v2.2 datasets</strong> (and
 reads back what it wrote) with no Rust <code>lance</code> core. Its headline feature is pointing rows at raw
 bytes that live elsewhere (local file or S3) instead of copying them in. Everything it writes is
-readable by stock <code>lance</code> (verified against <code>lance</code> 7.0.0), unless a feature is explicitly marked
+readable by stock <code>lance</code> (verified against <code>pylance</code> 12.0.0), unless a feature is explicitly marked
 "nanolance-only" below.</p>
 <h2 id="1-what-changed-breaking">1. What changed (breaking)<a class="headerlink" href="#1-what-changed-breaking" title="Permanent link">&para;</a></h2>
 <ul>
@@ -998,20 +1052,44 @@ readable by stock <code>lance</code> (verified against <code>lance</code> 7.0.0)
 <div class="language-c highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;nanolance/nano_lance_writer.h&quot;</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;nanoarrow/nanoarrow.h&gt;</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">NanoLanceWriter</span><span class="w"> </span><span class="n">w</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">nano_lance_writer_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;out.lance&quot;</span><span class="p">,</span><span class="w"> </span><span class="cm">/*compression_level=*/</span><span class="mi">3</span><span class="p">);</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">nano_lance_writer_set_ignore_nullability</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="nb">true</span><span class="p">);</span><span class="w">  </span><span class="c1">// if your Arrow fields are nullable</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="n">nano_lance_writer_set_compression</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="nb">true</span><span class="p">);</span><span class="w">         </span><span class="c1">// enable Lance-compatible compression (see §3)</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="n">nano_lance_write_batch</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">arrow_array</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">arrow_schema</span><span class="p">);</span><span class="w">  </span><span class="c1">// call repeatedly; schema is fixed after #1</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="n">nano_lance_writer_commit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="cm">/*is_append=*/</span><span class="nb">false</span><span class="p">);</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="n">nano_lance_writer_close</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">);</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="c1">// On any non-zero return, read nano_lance_writer_last_error(&amp;w).</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">NanoLanceWriteOptions</span><span class="w"> </span><span class="n">options</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span><span class="w">                 </span><span class="c1">// zeroed == the defaults</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">NanoLanceWriter</span><span class="w"> </span><span class="n">w</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">options</span><span class="p">.</span><span class="n">compression_level</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="n">options</span><span class="p">.</span><span class="n">compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">true</span><span class="p">;</span><span class="w">                          </span><span class="c1">// Lance-compatible compression (see §3)</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="n">nano_lance_writer_open</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;out.lance&quot;</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">options</span><span class="p">);</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="n">nano_lance_write_batch</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">arrow_array</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">arrow_schema</span><span class="p">);</span><span class="w">  </span><span class="c1">// call repeatedly; schema is fixed after #1</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="n">nano_lance_writer_commit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="cm">/*is_append=*/</span><span class="nb">false</span><span class="p">);</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="n">nano_lance_writer_close</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">);</span>
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="c1">// On any non-zero return, read nano_lance_writer_last_error(&amp;w).</span>
 </code></pre></div>
+<p>From C++, <code>nano_lance::Writer</code> (<code>nanolance/writer.hpp</code>) is the same thing with the handle owned:
+<code>open(path, {.compression_level = 3, .compression = true})</code>, then <code>write_batch</code> / <code>commit</code>, and the
+destructor closes it.</p>
 <p>Lifecycle rules:
 - Schema is locked after the first batch; all batches in a writer session share it.
-- All <code>set_*</code> options must be called <strong>before the first <code>write_batch</code></strong>.
+- Options go to <code>nano_lance_writer_open</code>. The older <code>nano_lance_writer_init</code> / <code>init_append</code> plus
+  <code>set_*</code> calls still work and produce byte-identical files, but each <code>set_*</code> must precede the first
+  <code>write_batch</code> and only says so at runtime (<code>INVALID_STATE</code>).
+- <strong>Nulls are stored</strong> via Lance's definition-level layer, and stock Lance reads them back: in
+  fixed-width columns (int, float, bool, timestamp/date/time, decimal, <code>fixed_size_binary</code>) and in
+  variable-width ones (<code>utf8</code>, <code>binary</code>). Still refused, by name: a null <strong>struct</strong> (as opposed to a
+  null field inside one), and a null in a <code>lance.blob.v2</code> external-reference column.
+  <code>nano_lance_writer_set_ignore_nullability</code> is a no-op kept for compatibility; the manifest's
+  nullable flag now mirrors the Arrow schema, as pylance's does.
+- Types nanolance cannot round-trip are refused at <code>write_batch</code> rather than written: <code>list</code>,
+  <code>large_utf8</code>/<code>large_binary</code>, Arrow <code>dictionary</code> columns, Arrow's <code>null</code> type, and a <code>timestamp</code>
+  whose timezone is a UTC offset rather than an IANA name (Lance panics on those). Supported:
+  int/uint 8–64, <code>float</code>, <code>double</code>, <code>bool</code>, <code>utf8</code>, <code>binary</code>, <code>fixed_size_binary(N)</code>, <code>timestamp</code>
+  (s/ms/us/ns, optionally with an IANA timezone), <code>date32/64</code>, <code>time32/64</code>, <code>decimal128/256</code>,
+  nested <code>struct</code>, and <code>lance.blob.v2</code> external references.
+- nanolance reads back everything it writes, and now every non-nested column type the Rust <code>lance</code>
+  crate writes: fixed-width and temporal types, nullable columns (bit-packed <em>and</em> run-length-encoded
+  definition levels), <code>utf8</code>/<code>large_utf8</code>/<code>binary</code> including FSST-compressed ones, and categorical
+  columns with their LZ4-compressed dictionary. <code>list</code> and <code>struct</code> are still refused <strong>by name</strong>,
+  not misread (see README "What nanolance can read").
 - <code>commit(is_append=false)</code> creates; <code>commit(is_append=true)</code> (or <code>nano_lance_writer_init_append</code>)
   adds a fragment to an existing dataset.</p>
+<p><code>arrowipc2lance</code> reads its Arrow IPC stream from <code>-i/--input FILE</code> or, with neither given, stdin.</p>
 <p>Read back with <code>nano_lance::lance_table_read_dataset(path, schema, batches, error)</code> (C++,
 <code>nanolance/lance_table_reader.hpp</code>) or fetch external bytes with
 <code>nano_lance_fetch_external_blob(uri, position, size, ...)</code>.</p>
@@ -1025,9 +1103,31 @@ polars, etc. The module is <code>import nanolance</code> (not <code>lance</code>
 <a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="n">table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">&quot;uri&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;s3://b/f.pcapng&quot;</span><span class="p">]</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">,</span> <span class="s2">&quot;position&quot;</span><span class="p">:</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1000</span><span class="p">),</span> <span class="s2">&quot;size&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mi">1500</span><span class="p">]</span> <span class="o">*</span> <span class="mi">1000</span><span class="p">})</span>
 <a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="n">nanolance</span><span class="o">.</span><span class="n">write_table</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">&quot;out.lance&quot;</span><span class="p">,</span> <span class="n">compression</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="n">roundtrip</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">read_table</span><span class="p">(</span><span class="s2">&quot;out.lance&quot;</span><span class="p">))</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="c1"># Projection, and a fragment-at-a-time stream for datasets larger than memory:</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="n">subset</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">read_table</span><span class="p">(</span><span class="s2">&quot;out.lance&quot;</span><span class="p">,</span> <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;uri&quot;</span><span class="p">,</span> <span class="s2">&quot;size&quot;</span><span class="p">]))</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">pa</span><span class="o">.</span><span class="n">RecordBatchReader</span><span class="o">.</span><span class="n">from_stream</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">open_stream</span><span class="p">(</span><span class="s2">&quot;out.lance&quot;</span><span class="p">)):</span>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>    <span class="o">...</span>
 </code></pre></div>
 <p>Key options mirror the C writer: <code>compression=True</code>, <code>WriteOptions(append=True)</code>, etc. See
 <code>bindings/python/README.md</code> for install, tests (<code>pytest</code>), and pylance interop checks.</p>
+<p><code>read_table</code> and <code>open_stream</code> both take <code>offset=</code>/<code>length=</code> for a row range. Fragments outside the
+range are never opened (measured 29x faster for a 1k-row range of a 4M-row, 16-fragment dataset), so
+the saving is proportional to fragments skipped, not rows dropped -- write with
+<code>max_rows_per_fragment</code> if range reads matter to you.</p>
+<p><code>nanolance.count_rows(path)</code> and <code>nanolance.read_schema(path)</code> answer from the manifest without
+opening a data file -- use them instead of reading a table to find out how big it is or what is in it.</p>
+<p><code>read_table</code> decodes up front and raises at call time; <code>open_stream</code> decodes one fragment per pull,
+so errors surface from the first pull instead (as <code>OSError</code>) and the handle is single-shot. Prefer
+<code>open_stream</code> for bounded peak memory (measured 0.09x the dataset against 1.01x) and a fast first
+batch; prefer <code>read_table</code> when you want the whole thing and up-front errors.</p>
+<p>The package also installs a CLI, <code>nanolance</code> (equivalently <code>python -m nanolance</code>):</p>
+<div class="language-bash highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>nanolance<span class="w"> </span>convert<span class="w"> </span><span class="k">in</span>.parquet<span class="w"> </span>out.lance<span class="w"> </span>--compress<span class="w">   </span><span class="c1"># batch at a time; prints both sizes</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>nanolance<span class="w"> </span>inspect<span class="w"> </span>out.lance<span class="w">                         </span><span class="c1"># rows, on-disk bytes, schema</span>
+</code></pre></div>
+<p><code>convert</code> takes <code>--columns</code>, <code>--rows-per-fragment</code>, <code>--batch-size</code>, <code>--no-structural</code>,
+<code>-l/--compression-level</code> and <code>--overwrite</code>. It refuses a non-parquet extension and an existing output
+by name rather than guessing.</p>
 <p>Parquet Python bindings are a separate package in
 <a href="https://github.com/yoavbendor/nanoarrow2parquet">nanoarrow2parquet</a> (<code>nanoarrow_io.parquet</code>).</p>
 <h2 id="3-enabling-the-compression-that-was-measured">3. Enabling the compression that was measured<a class="headerlink" href="#3-enabling-the-compression-that-was-measured" title="Permanent link">&para;</a></h2>
@@ -1181,12 +1281,12 @@ fixed width) now chunks at the same 32 KB miniblock max as the variable-width pa
 cap turned a large float column into thousands of tiny one-chunk pages and made float/struct writes
 allocation-bound (fixed — float/struct writes are now at Lance parity or faster).</p>
 <h2 id="5-verifying-lance-interop-do-this-after-changes">5. Verifying Lance interop (do this after changes)<a class="headerlink" href="#5-verifying-lance-interop-do-this-after-changes" title="Permanent link">&para;</a></h2>
-<p><div class="language-bash highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># build (see §6), then:</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>python<span class="w"> </span>-<span class="w"> </span><span class="s">&lt;&lt;&#39;PY&#39;</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="s">import lance</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="s">ds = lance.dataset(&quot;out.lance&quot;); t = ds.to_table()</span>
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="s">print(t.num_rows, t.schema)   # values must match what you wrote</span>
-<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="s">PY</span>
+<p><div class="language-bash highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># build (see §6), then:</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>python<span class="w"> </span>-<span class="w"> </span><span class="s">&lt;&lt;&#39;PY&#39;</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="s">import lance</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="s">ds = lance.dataset(&quot;out.lance&quot;); t = ds.to_table()</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="s">print(t.num_rows, t.schema)   # values must match what you wrote</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="s">PY</span>
 </code></pre></div>
 The repo's C++ smoke tests cover writer→reader round-trips without Python. Run:
 <code>ctest --test-dir build -L smoke</code>. Keep new encodings behind a round-trip test that also checks the
@@ -1221,7 +1321,21 @@ on-disk size shrank.</p>
    <code>encoding</code> and <code>nanolance:*</code> metadata tags set by the writer (Lance ignores those tags and reads the
    real <code>PageLayout</code>).</li>
 <li>Validate both directions: nanolance write → nanolance read, <strong>and</strong> nanolance write → <code>lance</code> read.</li>
+<li><strong>Add the shape to <code>bindings/python/tests/test_write_encoding_matrix.py</code>.</strong> That file writes one
+   table of every shape the writer's heuristics can pick, under all three write modes, and asserts
+   both readers agree -- whole table and every column on its own. A dictionary-page bug once made
+   every <em>other</em> column in the same file unreadable by Lance and survived for months because no test
+   wrote that shape; the matrix is what closes that gap.</li>
 </ol>
+<p>Two repo rules that came out of the same incident:</p>
+<ul>
+<li><strong>A test may skip for a missing optional dependency and for nothing else.</strong> Four tests here once
+  reported success for a genuine failure (<code>exit 0</code>, or <code>except Exception: sys.exit(77)</code> which ctest
+  reports as SKIP). Do not add a handler that turns a red result green.</li>
+<li><strong>CI builds with <code>-DNANOLANCE_WERROR=ON</code></strong> (<code>-Wall -Wextra -Werror</code> on nanolance's own three
+  library targets), in <code>linux-bench.yml</code> under clang and <code>memory-safety.yml</code> under gcc. The option
+  defaults OFF so a downstream build on an unknown compiler cannot be broken by a new warning.</li>
+</ul>
 
 
 
@@ -1340,7 +1454,7 @@ on-disk size shrank.</p>
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

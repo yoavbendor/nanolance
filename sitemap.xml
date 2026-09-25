@@ -2,42 +2,58 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://yoavbendor.github.io/nanolance/</loc>
-         <lastmod>2026-07-10</lastmod>
+         <lastmod>2026-09-25</lastmod>
+    </url>
+    <url>
+         <loc>https://yoavbendor.github.io/nanolance/NESTED_COLUMNS/</loc>
+         <lastmod>2026-09-25</lastmod>
+    </url>
+    <url>
+         <loc>https://yoavbendor.github.io/nanolance/OPTIMIZATION_PLAN/</loc>
+         <lastmod>2026-09-25</lastmod>
+    </url>
+    <url>
+         <loc>https://yoavbendor.github.io/nanolance/PROGRESS/</loc>
+         <lastmod>2026-09-25</lastmod>
+    </url>
+    <url>
+         <loc>https://yoavbendor.github.io/nanolance/ROADMAP/</loc>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/SAFETY/</loc>
-         <lastmod>2026-07-10</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/agents/</loc>
-         <lastmod>2026-07-10</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/bench-trusted-parity/</loc>
-         <lastmod>2026-07-10</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/bench-write-read/</loc>
-         <lastmod>2026-07-10</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/bench/</loc>
-         <lastmod>2026-07-10</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/disk-lru-block-cache/</loc>
-         <lastmod>2026-07-10</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/getting-started/</loc>
-         <lastmod>2026-07-10</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/lance_table_reader_plan/</loc>
-         <lastmod>2026-07-10</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
     <url>
          <loc>https://yoavbendor.github.io/nanolance/s3_reader_notes/</loc>
-         <lastmod>2026-07-10</lastmod>
+         <lastmod>2026-09-25</lastmod>
     </url>
 </urlset>

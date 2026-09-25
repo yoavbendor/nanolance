@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -670,6 +670,60 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
     
     
     
@@ -684,10 +738,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
         
           
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="">
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
             
   
   
@@ -705,8 +759,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -1068,6 +1122,91 @@ bitpack/RLE/dict-RLE/constant/plain per column):</p>
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>cmake --build build-fuzz --target nanolance_fuzz_decode
 <a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>./build-fuzz/nanolance_fuzz_decode -max_total_time=60 corpus/
 </code></pre></div></li>
+<li><strong>A fuzzer per parser, not just per entry point.</strong> <code>fuzz_decode</code> stops at the data file's footer
+  and column metadata, so each format reached only <em>after</em> that point needs its own target, and CI
+  runs all seven on every push (<a href="https://github.com/yoavbendor/nanolance/blob/main/.github/workflows/memory-safety.yml"><code>.github/workflows/memory-safety.yml</code></a>):</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>target</th>
+<th>covers</th>
+<th>why <code>fuzz_decode</code> does not reach it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nanolance_fuzz_column_decode</code></td>
+<td>page decoding: descriptor + buffers → values (dictionaries, bit-unpacking, RLE, definition levels, constant pages, FSST/LZ4/zstd values, FullZip, fixed_size_list)</td>
+<td><code>fuzz_decode</code> never decodes a page. Seeded with whole pages dumped from real datasets by <code>nlance-pagelayout --dump-fuzz-pages</code></td>
+</tr>
+<tr>
+<td><code>nanolance_fuzz_repdef</code></td>
+<td>repetition/definition unravelling for list columns; asserts Arrow's list invariants on every accepted input</td>
+<td>pure computation, fuzzed on its own at ~50,000 inputs a second instead of through a page</td>
+</tr>
+<tr>
+<td><code>nanolance_fuzz_page_layout</code></td>
+<td>the <code>/lance.encodings21.PageLayout</code> descriptor</td>
+<td>seeded from real pylance descriptors — FSST, LZ4 dictionaries, RLE levels — which nanolance's own writer never emits</td>
+</tr>
+<tr>
+<td><code>nanolance_fuzz_fsst</code></td>
+<td>the FSST symbol-table decompressor</td>
+<td>only runs once a value buffer is being decompressed</td>
+</tr>
+<tr>
+<td><code>nanolance_fuzz_lz4</code></td>
+<td>the LZ4 block decompressor</td>
+<td>same</td>
+</tr>
+<tr>
+<td><code>nanolance_fuzz_deletion_vector</code></td>
+<td><code>_deletions/*.arrow</code> (Arrow IPC framing + flatbuffer vtable walk) and <code>_deletions/*.bin</code> (roaring bitmap)</td>
+<td>a deletion file is never opened by the data-file path</td>
+</tr>
+</tbody>
+</table>
+<p>The page-decoding target is the newest. Before it, every page decoder written against pylance
+  files had been bounds-checked by construction and never by a fuzzer, and this page claimed a
+  harness "over the full decode chain" that stopped at the footer. It found two bugs in its first
+  hour: a zstd buffer's declared uncompressed size was trusted up to the generic 8 GiB ceiling, so an
+  899-byte page asked for 8.4 GB (now bounded by zstd's own maximum expansion, 32,768:1, of the
+  compressed size, and a frame over 64 MiB is streamed so memory follows real output); and a
+  variable-width chunk shorter than one offset was read as if it held one — an out-of-bounds read,
+  caught by UBSan as a null <code>memcpy</code> source on the empty case. Seeded with list pages it then found a
+  heap over-read in the dictionary-block parser (a <code>u32</code> bounds sum that wrapped) and two <code>memcpy</code>s
+  from null on empty level buffers. Both
+  reproducers are in <a href="https://github.com/yoavbendor/nanolance/tree/main/tests/fuzz/corpus/column_decode"><code>tests/fuzz/corpus/column_decode/</code></a>.</p>
+<p>The deletion-file target earned its place three times over. The roaring
+  format amplifies up to ~65,000x — a four-byte run container can emit 65,536 values — and nothing
+  budgeted it, so roughly 640 KiB of crafted input bought 16 GiB of allocation. The parser now sums
+  the containers' declared cardinalities and checks that total <strong>before materializing anything</strong>,
+  capped by the manifest's own <code>num_deleted_rows</code>; a bitmap container whose popcount, or a run
+  container whose expansion, disagrees with its declared cardinality is refused outright; and the
+  output reserve is capped rather than trusting the declared total, because the fuzzer turned that
+  trust into a 4 GiB <code>malloc</code> from a few kilobytes. <code>tests/test_read_safety.cpp</code> pins the budget with
+  a 41 KB input that asks for a gigabyte.</p>
+<p>The same target then found the Arrow IPC side: a buffer's int64 uncompressed-length prefix was
+  trusted up to the generic 8 GiB ceiling, so a 328-byte file could ask for 4 GiB. Cross-checking it
+  against <code>ZSTD_getFrameContentSize</code> was <strong>not</strong> a fix — a frame header's content size is written by
+  whoever wrote the frame, so both numbers come from the same untrusted bytes and an attacker simply
+  makes them agree. CI's fuzzer rejected that version in twelve seconds. The bound is the manifest's
+  <code>num_deleted_rows</code>, which the file does not choose, passed down as a byte ceiling; the frame
+  cross-check remains as a consistency check. Both reproducers are checked in at
+  <a href="https://github.com/yoavbendor/nanolance/tree/main/tests/fuzz/corpus/deletion_vector"><code>tests/fuzz/corpus/deletion_vector/</code></a>
+  and replayed by CI on every push.</p>
+<p>With those allocations bounded, the same target reached far deeper and found a real crash:
+  <code>std::length_error</code> escaping the parser because the record batch's int64 row count was checked with
+  <code>values.size() &lt; rows * 4</code>, which overflows uint64 past 2^62. An uncaught exception from a
+  malformed file is a crash, not a refusal; it uses <code>checked_mul</code> now.</p>
+<p>And behind that, the one that actually reads memory it does not own: an <strong>ASan heap-buffer-overflow
+  READ</strong>, because <code>flatbuffer_field</code> treated an offset equal to <code>bytes.size()</code> as a present field and
+  the caller indexed it. A present flatbuffer scalar is at least one byte, so the contract is now
+  strictly-inside, and single-byte reads go through a bounds-checked <code>flatbuffer_byte</code>. Each of these
+  was only reachable once the previous one was fixed — the memory-safety bug was six rounds deep.
+  Every reproducer is checked in beside the others.</p>
+<ul>
 <li><strong>Negative-corpus tests</strong> (<a href="https://github.com/yoavbendor/nanolance/blob/main/tests/test_read_safety.cpp"><code>tests/test_read_safety.cpp</code></a>) — hand-built
   malformed footers (oversized column count, overflowing descriptor bounds) and garbage protobuf must
   be <em>rejected cleanly</em>, and the checked-math/<code>load_le</code> helpers are unit-tested.</li>
@@ -1213,7 +1352,7 @@ bitpack/RLE/dict-RLE/constant/plain per column):</p>
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

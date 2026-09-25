@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -29,7 +29,7 @@
       
     
     
-      <link rel="stylesheet" href="assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="assets/stylesheets/palette.ab4e12ef.min.css">
@@ -607,6 +607,60 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
     
     
     
@@ -621,10 +675,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
         
           
-          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="">
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
             
   
   
@@ -642,8 +696,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_6">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -872,8 +926,8 @@ asserted:</p>
   external <code>file://</code> blob fetch rejects <code>..</code> traversal — a hostile <code>../../etc/passwd</code> path can't escape.</li>
 <li><strong>Mid-read failures release everything already built</strong> — no leaked <code>ArrowArray</code>/<code>ArrowSchema</code> on a
   partial read.</li>
-<li><strong>Continuous ASan + UBSan + LSan CI</strong> and a <strong>libFuzzer harness</strong> over the full decode chain
-  (manifest → footer → column decode), seeded and run on every push.</li>
+<li><strong>Continuous ASan + UBSan + LSan CI</strong> and <strong>libFuzzer targets</strong> covering manifest, footer,
+  page descriptors, page decoding, FSST, LZ4 and deletion files, run on every push.</li>
 </ul>
 <p>All of this validates <strong>once per page/header, not once per value</strong> — a declared size or offset table
 is checked against the real buffer in a prologue, then the tight per-value <code>memcpy</code>/materialization
@@ -912,14 +966,15 @@ comparison against Parquet and Rust <code>lance</code>.</p>
 <div class="language-c highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;nanolance/nano_lance_writer.h&quot;</span>
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;nanoarrow/nanoarrow.h&gt;</span>
 <a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="n">NanoLanceWriter</span><span class="w"> </span><span class="n">w</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="n">nano_lance_writer_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;out.lance&quot;</span><span class="p">,</span><span class="w"> </span><span class="cm">/*compression_level=*/</span><span class="mi">3</span><span class="p">);</span>
-<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="n">nano_lance_writer_set_ignore_nullability</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="nb">true</span><span class="p">);</span><span class="w">  </span><span class="c1">// BEFORE the first write_batch</span>
-<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="n">nano_lance_writer_set_compression</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="nb">true</span><span class="p">);</span><span class="w">         </span><span class="c1">// BEFORE the first write_batch</span>
-<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="n">nano_lance_write_batch</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">arrow_array</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">arrow_schema</span><span class="p">);</span><span class="w">  </span><span class="c1">// schema locks after batch #1</span>
-<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="n">nano_lance_writer_commit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="cm">/*is_append=*/</span><span class="nb">false</span><span class="p">);</span><span class="w">   </span><span class="c1">// false = create, true = append a fragment</span>
-<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="n">nano_lance_writer_close</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">);</span>
-<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="c1">// non-zero return -&gt; nano_lance_writer_last_error(&amp;w)</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="n">NanoLanceWriteOptions</span><span class="w"> </span><span class="n">options</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span><span class="w">                 </span><span class="c1">// zeroed == the defaults</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="n">NanoLanceWriter</span><span class="w"> </span><span class="n">w</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="n">options</span><span class="p">.</span><span class="n">compression_level</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="n">options</span><span class="p">.</span><span class="n">compression</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">true</span><span class="p">;</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="n">nano_lance_writer_open</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;out.lance&quot;</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">options</span><span class="p">);</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="n">nano_lance_write_batch</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">arrow_array</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">arrow_schema</span><span class="p">);</span><span class="w">  </span><span class="c1">// schema locks after batch #1</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="n">nano_lance_writer_commit</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="cm">/*is_append=*/</span><span class="nb">false</span><span class="p">);</span><span class="w">   </span><span class="c1">// false = create, true = append a fragment</span>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="n">nano_lance_writer_close</span><span class="p">(</span><span class="o">&amp;</span><span class="n">w</span><span class="p">);</span>
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="c1">// non-zero return -&gt; nano_lance_writer_last_error(&amp;w)</span>
 </code></pre></div>
 <p>Reading back — default (fully-checked) or <code>trusted_input=true</code> for a known-good, self-produced file:</p>
 <div class="language-cpp highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;nanolance/lance_table_reader.hpp&quot;</span>
@@ -935,6 +990,11 @@ comparison against Parquet and Rust <code>lance</code>.</p>
 <a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="n">table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">&quot;id&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span> <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;alpha&quot;</span><span class="p">,</span> <span class="s2">&quot;beta&quot;</span><span class="p">,</span> <span class="s2">&quot;gamma&quot;</span><span class="p">]})</span>
 <a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="n">nanolance</span><span class="o">.</span><span class="n">write_table</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">&quot;out.lance&quot;</span><span class="p">,</span> <span class="n">compression</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="k">assert</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">read_table</span><span class="p">(</span><span class="s2">&quot;out.lance&quot;</span><span class="p">))</span><span class="o">.</span><span class="n">equals</span><span class="p">(</span><span class="n">table</span><span class="p">)</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="c1"># Column projection, and a fragment-at-a-time stream for datasets bigger than memory:</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="n">nanolance</span><span class="o">.</span><span class="n">read_table</span><span class="p">(</span><span class="s2">&quot;out.lance&quot;</span><span class="p">,</span> <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">])</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">pa</span><span class="o">.</span><span class="n">RecordBatchReader</span><span class="o">.</span><span class="n">from_stream</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">open_stream</span><span class="p">(</span><span class="s2">&quot;out.lance&quot;</span><span class="p">)):</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a>    <span class="o">...</span>
 </code></pre></div>
 <p>Read on: <strong><a href="getting-started/">Getting started</a></strong> · <strong><a href="SAFETY/">Memory safety</a></strong> ·
 <strong><a href="agents/">AI agent integration</a></strong> · <strong><a href="bench/">Benchmarks</a></strong>.</p>
@@ -1043,7 +1103,7 @@ comparison against Parquet and Rust <code>lance</code>.</p>
       <script id="__config" type="application/json">{"annotate": null, "base": ".", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

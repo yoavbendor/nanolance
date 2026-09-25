@@ -10,13 +10,9 @@
       
       
       
-        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/bench/">
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/NESTED_COLUMNS/">
       
       
-        <link rel="prev" href="../agents/">
-      
-      
-        <link rel="next" href="../bench-write-read/">
       
       
         
@@ -27,7 +23,7 @@
     
     
       
-        <title>Overview - nanolance</title>
+        <title>Nested columns: how list data flows from page to Arrow - nanolance</title>
       
     
     
@@ -78,7 +74,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#benchmarks" class="md-skip">
+        <a href="#nested-columns-how-list-data-flows-from-page-to-arrow" class="md-skip">
           Skip to content
         </a>
       
@@ -114,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Overview
+              Nested columns: how list data flows from page to Arrow
             
           </span>
         </div>
@@ -367,8 +363,6 @@
       
   
   
-    
-  
   
   
     
@@ -381,11 +375,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
         
           
           <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
@@ -406,7 +400,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_5">
             <span class="md-nav__icon md-icon"></span>
             
@@ -421,19 +415,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../bench/" class="md-nav__link">
         
   
   
@@ -449,7 +434,6 @@
   
 
       </a>
-      
     </li>
   
 
@@ -735,6 +719,102 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#what-a-list-page-holds" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What a list page holds
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#unravelling-c1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Unravelling (C1)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#data-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Data model
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#slicing-and-compaction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Slicing and compaction
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#assembling-arrow" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Assembling Arrow
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-this-does-not-cover-yet" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What this does not cover yet
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#fullzip-list-pages-c8" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        FullZip list pages (C8)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-write-side-phase-d" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The write side (Phase D)
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -753,23 +833,126 @@
   
 
 
-<h1 id="benchmarks">Benchmarks<a class="headerlink" href="#benchmarks" title="Permanent link">&para;</a></h1>
-<p>Two independent claims, each reproducible and each with its own results page:</p>
+<h1 id="nested-columns-how-list-data-flows-from-page-to-arrow">Nested columns: how list data flows from page to Arrow<a class="headerlink" href="#nested-columns-how-list-data-flows-from-page-to-arrow" title="Permanent link">&para;</a></h1>
+<p><em>Design note for roadmap Phase C (C0). It fixes the data model before any list code lands, because
+the part most likely to go wrong — slicing and compacting nested columns for row ranges and
+deletions — goes wrong silently.</em></p>
+<h2 id="what-a-list-page-holds">What a list page holds<a class="headerlink" href="#what-a-list-page-holds" title="Permanent link">&para;</a></h2>
+<p>Verified against pylance 2.x pages (<code>nlance-pagelayout -v</code>) and <code>rust/lance-encoding/src/repdef.rs</code>:</p>
+<ul>
+<li><strong>One physical column per leaf.</strong> <code>list&lt;int64&gt;</code> is one column (<code>c.item</code>); <code>list&lt;struct&lt;a, b&gt;&gt;</code> is two,
+  each carrying the full repetition and definition levels of every layer above it.</li>
+<li><strong>Levels, not offsets.</strong> Each MiniBlock chunk stores a repetition-level buffer (<code>rep_compression</code>,
+  e.g. <code>Bitpacked{16, Flat(1)}</code>) and, when any layer can be null or empty, a definition-level buffer.
+  Both have <code>num_levels</code> entries — one per item <strong>plus one per empty or null list</strong>.</li>
+<li><strong>Values only for item slots.</strong> An empty or null list has a level but no value; a null <em>item</em> has
+  both (a garbage value slot, as in a flat nullable column). Checked: <code>[[1,2],[],None,[None,4]]</code> is
+  4 values, 6 levels.</li>
+<li><strong>A chunk's value count comes from its metadata word</strong>, <code>log_num_values</code> (non-final chunks hold
+  <code>2^log</code> values, the last one the remainder of <code>num_items</code>), not from its level count. The current
+  splitter derives counts from levels, which is only right when there is no repetition.</li>
+<li><strong><code>layers</code> is innermost first</strong> (<code>DefinitionInterpretation</code>): item layer, then one entry per list
+  or struct above it. Level numbering is per page: a page with no nulls may use a different layer
+  set from its neighbour.</li>
+<li><strong>Rows never span pages</strong>, so each page unravels on its own.</li>
+<li>Page buffer 2 is the repetition index (random access); a full scan ignores it.</li>
+</ul>
+<h2 id="unravelling-c1">Unravelling (C1)<a class="headerlink" href="#unravelling-c1" title="Permanent link">&para;</a></h2>
+<p>A port of <code>RepDefUnraveler</code>, innermost layer first:</p>
 <ol>
-<li><strong><a href="../bench-write-read/">Write/read vs Parquet &amp; Rust lance</a></strong> — nanolance's write and read
-   throughput against <code>parquet</code> (zstd) and Rust <code>lance</code>, on three synthetic schemas (a pcap-reference
-   shape, a wide-int shape, and a high-cardinality-string shape). Auto-generated on every push to
-   <code>main</code> by <a href="https://github.com/yoavbendor/nanolance/blob/main/.github/workflows/linux-bench.yml"><code>.github/workflows/linux-bench.yml</code></a>
-   — this page always reflects the latest <code>main</code>.</li>
-<li><strong><a href="../bench-trusted-parity/">Safety-parity: trusted vs default read</a></strong> — proves the memory-safety
-   posture costs nothing: <code>trusted_input=true</code> (which skips only the untrusted-input DoS/OOM budget
-   checks — every bounds check keeps running regardless, see <a href="../SAFETY/">Memory safety</a>) measures as
-   no faster than the default, fully-checked read. Reproduce locally with
-   <code>bench/read_parity_bench.sh [build_dir] [rows]</code>.</li>
+<li><strong>Item validity</strong> — levels visible at repetition 0 (<code>levels_to_rep[def] == 0</code>) are item slots;
+   <code>def == 0</code> is a valid item.</li>
+<li><strong>Each list layer</strong> — walk the levels: <code>rep != 0</code> starts a list (valid, null, empty, or invisible
+   at this depth, by <code>def</code>); <code>rep == 0</code> continues one. Emit that layer's offsets and validity, then
+   compact the stream to list starts only, with <code>rep - 1</code>: that is the next layer's input.</li>
+<li><strong>Struct layers</strong> (<code>NullableItem</code> above a list) unravel as validity at their own depth.</li>
 </ol>
-<p>Reproduce the write/read comparison locally with <code>bench/run-local-bench.sh</code> (writes
-<code>bench/linux-local-results.md</code>, kept separate from the CI-owned file so local runs and the CI
-auto-commit never collide on the same path).</p>
+<p>It takes <code>(rep, def, layers, num_items)</code> and returns offsets and validity per layer, with no I/O —
+table-driven tests use Lance's own <code>repdef.rs</code> vectors, and it gets a fuzz target.</p>
+<h2 id="data-model">Data model<a class="headerlink" href="#data-model" title="Permanent link">&para;</a></h2>
+<p><code>ColumnValues</code> keeps describing the <strong>leaf items</strong>: <code>fixed</code> / <code>variable</code> hold the values and
+<code>validity</code> holds item validity, exactly as today. A list column adds:</p>
+<div class="language-cpp highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">struct</span><span class="w"> </span><span class="nc">NestedLayer</span><span class="w"> </span><span class="p">{</span><span class="w">                   </span><span class="c1">// one per list/struct layer, OUTERMOST first</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">    </span><span class="kt">bool</span><span class="w"> </span><span class="n">is_list</span><span class="p">;</span><span class="w">                      </span><span class="c1">// false: a struct -- validity only, one child per entry</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="kt">int64_t</span><span class="o">&gt;</span><span class="w"> </span><span class="n">offsets</span><span class="p">;</span><span class="w"> </span><span class="c1">// lists only: length + 1 entries, starting at 0</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="kt">uint8_t</span><span class="o">&gt;</span><span class="w"> </span><span class="n">validity</span><span class="p">;</span><span class="w"> </span><span class="c1">// empty = all valid</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">null_count</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="p">};</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">NestedLayer</span><span class="o">&gt;</span><span class="w"> </span><span class="n">layers</span><span class="p">;</span><span class="w">       </span><span class="c1">// empty for a non-nested column: no behaviour change</span>
+</code></pre></div>
+<p>A column takes this path when any page has repetition levels <strong>or a nullable layer above the item</strong>
+— a struct that can be null. Everything else, by far the common case, keeps the flat decoder.
+Whether a list is <code>large_list</code> is the schema's business, decided when the Arrow array is built.</p>
+<p>Offsets are held as <code>int64</code> in memory and narrowed to Arrow's <code>int32</code> only when the array is
+built, with a checked failure past <code>INT32_MAX</code>. Row count = <code>layers[0]</code>'s entry count for a list,
+as it is today for a flat column.</p>
+<p><strong>Pages concatenate layer by layer.</strong> Page N's offsets are rebased by the current item (or
+child-list) count and appended without their leading 0; validity bits append at the running count.</p>
+<h2 id="slicing-and-compaction">Slicing and compaction<a class="headerlink" href="#slicing-and-compaction" title="Permanent link">&para;</a></h2>
+<p>The existing row-range and deletion paths operate on one leaf's <code>ColumnValues</code>. For nested columns
+they walk the layers from the outside in:</p>
+<ul>
+<li><strong>Row range <code>[first, first + count)</code></strong>: layer 0 selects offsets <code>first .. first + count</code>; the
+  children it covers are <code>[off[first], off[first + count])</code>. Rebase to start at 0 and carry that
+  child range into the next layer. The last range selects leaf items; slice values and item
+  validity as today.</li>
+<li><strong>Deletions (kept-row list)</strong>: layer 0 turns kept rows into <strong>kept child ranges</strong> (runs, not
+  per-item indices — a deletion vector can drop one row of a 10,000-item list), builds new offsets
+  by concatenating range lengths, and passes the ranges down. The leaf compacts by ranges.</li>
+<li>Validity at each layer is sliced or compacted with the same selection as that layer's offsets.</li>
+</ul>
+<p>Both are pure functions of <code>(layers, selection)</code> and get property tests: for random nested Arrow
+arrays, <code>slice(read(file))</code> must equal <code>read(file).slice(...)</code> from pyarrow, and a deletion must equal
+pylance's <code>delete</code> then <code>to_table()</code>. The FSL element-bitmap bug class (a second bitmap not cut with
+the first) is exactly what this guards against.</p>
+<h2 id="assembling-arrow">Assembling Arrow<a class="headerlink" href="#assembling-arrow" title="Permanent link">&para;</a></h2>
+<p>The table reader builds a list array per <code>List</code> layer (<code>+l</code>, or <code>+L</code> for <code>large_list</code>) around the
+next layer, and a struct array per <code>Struct</code> layer. For <code>list&lt;struct&lt;a, b&gt;&gt;</code> the offsets and validity
+of the shared layers come from the first leaf; every other leaf's copy must match exactly, or the
+read is refused by name. They are written together, so disagreement means a corrupt file.</p>
+<h2 id="what-this-does-not-cover-yet">What this does not cover yet<a class="headerlink" href="#what-this-does-not-cover-yet" title="Permanent link">&para;</a></h2>
+<p><code>fixed_size_list</code> inside or around a list.</p>
+<h2 id="fullzip-list-pages-c8">FullZip list pages (C8)<a class="headerlink" href="#fullzip-list-pages-c8" title="Permanent link">&para;</a></h2>
+<p>A page whose longest item is 256 bytes or more is a FullZip, lists or not. With lists it holds one
+control word per <strong>level</strong>, <code>rep &lt;&lt; bits_def | def</code>, 1/2/4 bytes as <code>bits_rep + bits_def</code> needs. A
+level whose definition is above <code>max_visible_def</code> -- the definition levels of the item and any
+structs below the innermost list; above that, an empty or null list -- is the control word alone.
+Every other level is laid out as a non-list FullZip row: a fixed-width slot, or for variable width a
+length and the bytes when the item is valid. <code>num_items</code> in the descriptor counts levels,
+<code>num_visible_items</code> values. The value pass hands the levels to the nested path, which unravels them
+like a MiniBlock page's. Buffer 1, the per-row byte-offset repetition index, is for random access;
+a full-page read does not need it.</p>
+<h2 id="the-write-side-phase-d">The write side (Phase D)<a class="headerlink" href="#the-write-side-phase-d" title="Permanent link">&para;</a></h2>
+<p>The inverse, piece by piece:</p>
+<ul>
+<li><strong>Ingest</strong> walks each leaf's path from its top-level Arrow column, recording one layer per list
+  or struct: validity bits, and for a list its offsets rebased to this column's running child count.
+  Physical indices compose as Arrow defines them: a list's offsets are logical indices into its
+  child (plus the child's own <code>offset</code>); a struct's children are not sliced with it (child physical
+  index = child offset + the struct's physical index). The leaf values are appended for the
+  children the batch's rows span, garbage under null lists included.</li>
+<li><strong><code>repdef::serialize</code></strong> turns a run of rows into levels, choosing each layer's kind from what
+  those rows contain, and lists the leaf entries that get a value slot. A null or empty list gets a
+  level and no slot, and its children are never visited.</li>
+<li><strong>Pages</strong> are cut at row boundaries (up to 32,768 rows, ~8 MiB of values) and split into
+  mini-block chunks of 1,024 values (<code>log_num_values = 10</code>; the last chunk holds the rest). Levels go
+  to chunks by Lance's slicer rule: a chunk takes levels until it has covered its values, and any
+  trailing levels with no value slot (empty or null lists) go to the next. So a row can span
+  chunks; the depth-1 repetition index records, per chunk, the rows that finish in it and the
+  levels left over from the row still open at its end.</li>
+<li><strong>Levels</strong> are <code>Bitpacked{16, Flat(w)}</code> at the page's widest level, per chunk: whole 1,024-level
+  blocks plus a tail kept raw (<code>u16</code>) when that is cheaper than padding it to a block. A chunk
+  holds at most 65,535 levels (a <code>u16</code> count); a single row that needs more in one chunk is refused
+  by name.</li>
+<li><strong>Items</strong> reuse the flat encodings: <code>InlineBitpacking</code> for integers, bits for booleans, <code>Flat</code> for
+  other fixed widths, and for strings either <code>Variable</code> chunks (<code>u32</code> offsets, padded to 8) or a
+  per-page dictionary (<code>InlineBitpacking(32)</code> indices, the dictionary as one <code>Variable</code> block) when
+  it is at most half the items and under 80% of the plain size.</li>
+<li>A page with no values at all is a <code>ConstantLayout</code> with raw <code>[rep, def]</code> buffers, exactly as
+  pylance writes one.</li>
+<li>A leaf under structs that are never null keeps the flat encodings: nested pages are written only
+  for a list or an actual struct null (<code>ColumnValues::needs_nested_pages</code>).</li>
+</ul>
 
 
 
@@ -800,44 +983,6 @@ auto-commit never collide on the same path).</p>
       
         <footer class="md-footer">
   
-    
-      
-      <nav class="md-footer__inner md-grid" aria-label="Footer" >
-        
-          
-          <a href="../agents/" class="md-footer__link md-footer__link--prev" aria-label="Previous: AI agent integration">
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
-            </div>
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Previous
-              </span>
-              <div class="md-ellipsis">
-                AI agent integration
-              </div>
-            </div>
-          </a>
-        
-        
-          
-          <a href="../bench-write-read/" class="md-footer__link md-footer__link--next" aria-label="Next: Write/read vs Parquet &amp; Rust lance">
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Next
-              </span>
-              <div class="md-ellipsis">
-                Write/read vs Parquet & Rust lance
-              </div>
-            </div>
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
-            </div>
-          </a>
-        
-      </nav>
     
   
   <div class="md-footer-meta md-typeset">

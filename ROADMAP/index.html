@@ -1,0 +1,1553 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/ROADMAP/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Roadmap: lists, maps and every other open gap - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#roadmap-lists-maps-and-every-other-open-gap" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Roadmap: lists, maps and every other open gap
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#what-the-survey-found" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What the survey found
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="What the survey found">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#two-gaps-nobody-had-listed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Two gaps nobody had listed
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#two-things-smaller-than-the-backlog-said" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Two things smaller than the backlog said
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#lists-measured" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lists, measured
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-plan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The plan
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="The plan">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#phase-a-pin-and-instrument-do-first-unblocks-every-diagnosis-below" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase A — pin and instrument (do first; unblocks every diagnosis below)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-b-fullzip-and-fixed-size-lists-highest-user-impact" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase B — FullZip and fixed-size lists (highest user impact)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-c-lists-read-side" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase C — lists, read side
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-d-lists-write-side" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase D — lists, write side
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-e-small-type-gaps-any-time-good-first-tasks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase E — small type gaps (any time; good first tasks)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-f-performance-measure-before-building" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase F — performance (measure before building)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-g-packaging-and-infrastructure-independent-run-in-parallel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase G — packaging and infrastructure (independent; run in parallel)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#which-work-suits-sonnet" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Which work suits Sonnet
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Which work suits Sonnet">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#how-to-run-it-in-claude-code" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How to run it in Claude Code
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#recommended-order" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recommended order
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#appendix-a-decoding-a-descriptor-without-protoc" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Appendix A — decoding a descriptor without protoc
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="roadmap-lists-maps-and-every-other-open-gap">Roadmap: lists, maps and every other open gap<a class="headerlink" href="#roadmap-lists-maps-and-every-other-open-gap" title="Permanent link">&para;</a></h1>
+<p>Written 2026-09-24, after the read-gap work in <code>docs/PROGRESS.md</code>. This supersedes the ordering of the
+open-items list there. Each task is written to be picked up by a session that has not seen this one:
+it names the evidence, the files, the oracle that proves it done, and which model should do it.</p>
+<p>Everything below was <strong>measured against pylance 2.2 files written for this plan</strong>, not taken from the
+backlog. That changed the picture substantially. Two gaps nobody had listed are bigger than lists, and
+two items the backlog called large are small.</p>
+<hr />
+<h2 id="what-the-survey-found">What the survey found<a class="headerlink" href="#what-the-survey-found" title="Permanent link">&para;</a></h2>
+<h3 id="two-gaps-nobody-had-listed">Two gaps nobody had listed<a class="headerlink" href="#two-gaps-nobody-had-listed" title="Permanent link">&para;</a></h3>
+<p><strong>1. FullZip layout: any string over 255 bytes, and every real embedding.</strong> Lance picks its page layout
+from the page's <em>longest</em> value (<code>MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE = 256</code> in
+<code>rust/lance-encoding/src/encodings/logical/primitive.rs</code>). At or above it, the page is <code>FullZipLayout</code>
+(<code>PageLayout</code> field 3), which nanolance cannot read at all:</p>
+<table>
+<thead>
+<tr>
+<th>column written by pylance</th>
+<th>layout</th>
+<th>nanolance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>strings, every value &lt; 256 B</td>
+<td>MiniBlock</td>
+<td>reads</td>
+</tr>
+<tr>
+<td>strings, <strong>one</strong> value of 300 B among 2000</td>
+<td>FullZip</td>
+<td><code>unsupported page layout</code></td>
+</tr>
+<tr>
+<td><code>fixed_size_list&lt;float32, 16/32&gt;</code></td>
+<td>MiniBlock</td>
+<td>fails (see 2)</td>
+</tr>
+<tr>
+<td><code>fixed_size_list&lt;float32, 64/128/768/1536&gt;</code></td>
+<td>FullZip</td>
+<td><code>unsupported page layout</code></td>
+</tr>
+</tbody>
+</table>
+<p>One long value flips the whole column. Text columns and embedding columns are the two most common
+things people put in a Lance dataset, so this is the most user-visible gap in the project. It fails
+loudly and projecting other columns still works, which is why it hurt nobody's tests.</p>
+<p>What FullZip actually is, from the descriptors (decoded raw; no <code>protoc</code> needed, see Appendix A):</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>FullZipLayout { bits_rep=0, bits_def=0|1, bits_per_offset=32 | bits_per_value=N,
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>                num_items, num_visible_items, value_compression, layers }
+</code></pre></div>
+<p>Per row: a control word holding the rep/def bits, then either the fixed-width value or a <code>u32</code>
+length plus bytes. The per-value compression pylance chose was <strong>FSST</strong> for strings — which
+nanolance already decodes (<code>fsst::decompress_value</code>) — and <code>FixedSizeList{dim, Flat(32)}</code> for
+vectors. Buffer 0 is the zipped data; buffer 1 is a repetition index used for random access, which a
+full scan does not need. For the non-list case this is a few hundred lines, not a subsystem.</p>
+<p><strong>2. <code>fixed_size_list</code> is a compressive encoding, not a list.</strong> Lance does not model FSL with
+repetition levels. The schema has <strong>no child field</strong> (logical type <code>fixed_size_list:float:3</code>) and the
+descriptor wraps the values: <code>CompressiveEncoding</code> field 11 = <code>FixedSizeList{ items_per_value,
+values, has_validity }</code>. Reading it is a reshape of a flat buffer into an Arrow <code>+w:N</code> array. It
+does not depend on the list work at all — it was only ever grouped with lists because Arrow calls it
+a list.</p>
+<h3 id="two-things-smaller-than-the-backlog-said">Two things smaller than the backlog said<a class="headerlink" href="#two-things-smaller-than-the-backlog-said" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong><code>float16</code></strong> is <code>halffloat</code> on disk, <code>InlineBitpacking(16)</code>. <strong><code>duration</code></strong> is <code>duration:us</code>,
+  <code>InlineBitpacking(64)</code>. Both are existing integer paths plus a schema mapping.</li>
+<li><strong>Rep levels reuse code that already exists.</strong> A <code>list&lt;int64&gt;</code> page carries its repetition levels as
+  <code>Bitpacked{16, Flat(1)}</code> — exactly the out-of-line encoding <code>unpack_out_of_line_bitpacked</code> was
+  generalised for in the dictionary work. Decoding the levels is solved. What is missing is
+  <em>interpreting</em> them.</li>
+</ul>
+<h3 id="lists-measured">Lists, measured<a class="headerlink" href="#lists-measured" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>shape</th>
+<th>rep</th>
+<th>def</th>
+<th>layers</th>
+<th>notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list&lt;int64&gt;</code>, no nulls</td>
+<td><code>Bitpacked(16,Flat(1))</code></td>
+<td>—</td>
+<td>all-valid</td>
+<td><code>num_items</code> = leaf values (10000 for 5000 rows of 2)</td>
+</tr>
+<tr>
+<td><code>list&lt;int64&gt;</code> with null lists, empty lists, null items</td>
+<td>1-bit</td>
+<td><code>Bitpacked(16,Flat(2))</code></td>
+<td><code>[NULLABLE_ITEM, NULL_AND_EMPTY_LIST]</code></td>
+<td>2 def bits: valid / null item / empty / null list</td>
+</tr>
+<tr>
+<td><code>list&lt;list&lt;int64&gt;&gt;</code></td>
+<td><code>Flat(2)</code></td>
+<td>—</td>
+<td>—</td>
+<td>2 rep bits</td>
+</tr>
+<tr>
+<td><code>list&lt;string&gt;</code></td>
+<td>1-bit</td>
+<td>—</td>
+<td>—</td>
+<td>values go through the existing FSST path</td>
+</tr>
+<tr>
+<td><code>list&lt;struct&lt;a&gt;&gt;</code></td>
+<td></td>
+<td></td>
+<td></td>
+<td>logical type <code>list.struct</code></td>
+</tr>
+<tr>
+<td><code>map&lt;string,int64&gt;</code></td>
+<td></td>
+<td></td>
+<td></td>
+<td><code>map</code> → <code>entries</code> struct → <code>key</code>, <code>value</code>: two physical columns</td>
+</tr>
+</tbody>
+</table>
+<p>All MiniBlock at these sizes, with <code>has_large_chunk = 1</code> (already handled by <code>MiniBlockChunkShape</code>).
+<code>SparseLayout</code> (field 5) needs file version 2.3; pylance writes 2.2 by default, so it is a watch item,
+not a gap.</p>
+<p>The hard part is not decoding. It is (a) Lance's <strong>rep/def unraveler</strong> — turning level streams back
+into per-layer offsets and validity, including the rule for which definition levels are visible at
+which repetition depth — and (b) <strong>nanolance's own data model</strong>, which is flat all the way down:
+<code>ColumnValues</code>, the Arrow batch builder, and above all <code>column_slice.cpp</code> (row ranges, deletion
+vectors) are byte-addressed and would need offset rebasing per layer. (b) is the larger of the two.</p>
+<hr />
+<h2 id="the-plan">The plan<a class="headerlink" href="#the-plan" title="Permanent link">&para;</a></h2>
+<p>Sizes: <strong>XS</strong> &lt; 1 h, <strong>S</strong> half a day, <strong>M</strong> 1–2 days, <strong>L</strong> most of a week — for one focused session.
+<strong>Model</strong>: who should do it and why (see the section after the plan).</p>
+<h3 id="phase-a-pin-and-instrument-do-first-unblocks-every-diagnosis-below">Phase A — pin and instrument (do first; unblocks every diagnosis below)<a class="headerlink" href="#phase-a-pin-and-instrument-do-first-unblocks-every-diagnosis-below" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Task</th>
+<th>Size</th>
+<th>Model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A1</td>
+<td><strong>Fix <code>nlance-pagelayout</code> labelling.</strong> It names physical columns after the first N schema fields, skipping structs but not lists or maps, so a list column is labelled with the list's name and a map's <code>value</code> column is labelled <code>key</code>. Map physical columns to <em>leaf</em> fields. Also print <code>rep=</code> (only a flag is stored today), <code>layers=</code>, FullZip details, and decode CompressiveEncoding field 11 instead of <code>Unknown(field 11)</code>.</td>
+<td>S</td>
+<td>Sonnet</td>
+</tr>
+<tr>
+<td>A2</td>
+<td><strong>Pin every gap as a failing test by its message.</strong> Add to <code>test_lance_read_matrix.py</code>: a <em>value-size</em> axis (strings of 64/255/256/1024 B, one-long-value-among-short), FSL at dims 8/64/768, the list shapes above, <code>halffloat</code>, <code>duration</code>. Use <code>KNOWN_GAPS</code> with the specific message, exactly as the four previous gaps were pinned, so each fails loudly when fixed.</td>
+<td>S</td>
+<td>Sonnet</td>
+</tr>
+<tr>
+<td>A3</td>
+<td><strong>proto3 defaulting hardening.</strong> <code>Field.type</code> (ours 2, proto3's 0) and <code>Field.encoding</code> (ours 1, proto3's 0) are the same shape as the <code>parent_id</code> bug. Neither is load-bearing on the read path today; make the decoder honour proto3 and add hand-built wire-byte tests like the <code>parent_id</code> ones in <code>tests/test_lance_minimal_pb.cpp</code>.</td>
+<td>XS</td>
+<td>Sonnet</td>
+</tr>
+<tr>
+<td>A4</td>
+<td><strong><code>macos-14</code> → <code>macos-15</code></strong> in <code>wheels.yml</code> and <code>ci-platforms.yml</code> (deprecated; a retired label queues forever — see PROGRESS item 12).</td>
+<td>XS</td>
+<td>Sonnet</td>
+</tr>
+</tbody>
+</table>
+<h3 id="phase-b-fullzip-and-fixed-size-lists-highest-user-impact">Phase B — FullZip and fixed-size lists (highest user impact)<a class="headerlink" href="#phase-b-fullzip-and-fixed-size-lists-highest-user-impact" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Task</th>
+<th>Size</th>
+<th>Model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>B1</td>
+<td><strong>Spike: settle FullZip's byte layout empirically.</strong> Open questions, each answered by writing a file and reading bytes, not by inference: control-word width and bit order for <code>bits_def</code> 1 and 2; whether a null row carries a value slot (fixed-width) or a zero length (variable); when <code>num_items ≠ num_visible_items</code> without lists; what buffer 1 holds. Output: a short spec in this file plus hand-checked fixtures.</td>
+<td>S</td>
+<td><strong>Opus</strong></td>
+</tr>
+<tr>
+<td>B2</td>
+<td><strong>FullZip reader, non-list</strong> (<code>bits_rep = 0</code>): variable-width with FSST/plain per-value compression, fixed-width, nullable. New <code>ColumnEncodingKind</code>, parsing in <code>page_layout.cpp</code>, decode in <code>lance_column_decoder.cpp</code>, fuzz seeds.</td>
+<td>M</td>
+<td>Sonnet, against B1's spec and A2's tests; Opus review</td>
+</tr>
+<tr>
+<td>B3</td>
+<td><strong>FSL reader</strong> (field 11, <code>has_validity</code>), MiniBlock and FullZip; schema <code>fixed_size_list:&lt;type&gt;:&lt;n&gt;</code> → Arrow <code>+w:n</code>; nested child array in the batch builder. Row slicing is trivial (fixed stride).</td>
+<td>M</td>
+<td>Sonnet; Opus review</td>
+</tr>
+<tr>
+<td>B4</td>
+<td><strong>FSL writer.</strong> Emit field 11 around Flat. Verify stock Lance reads nanolance's MiniBlock FSL at dim 768 — legal, but unproven; if it does not, emit FullZip for wide rows.</td>
+<td>M</td>
+<td>Sonnet, then Opus if B4's verification fails</td>
+</tr>
+<tr>
+<td>B5</td>
+<td><strong>FullZip writer for long strings</strong> — only if measurement shows MiniBlock with 256 B+ values costs something real on read. Not needed for correctness: MiniBlock with long values is a legal page.</td>
+<td>S–M</td>
+<td>Opus decides; Sonnet builds</td>
+</tr>
+</tbody>
+</table>
+<p><strong>B1 result — the FullZip byte layout (non-list), confirmed against page buffer sizes.</strong></p>
+<ul>
+<li>Page buffer 0 is the zipped data. A variable-width page has a second buffer, the repetition index
+  (<code>(rows + 1)</code> offsets), used for random access and ignored by a full scan.</li>
+<li>Every row starts with a control word of <code>0 / 1 / 2 / 4</code> bytes as <code>bits_rep + bits_def</code> is
+  <code>0 / ≤8 / ≤16 / more</code> (<code>ControlWordParser::new</code> in <code>repdef.rs</code>). With no repetition the whole
+  little-endian word is the definition level; with both, <code>rep = word &gt;&gt; bits_def</code> and
+  <code>def = word &amp; mask(bits_def)</code>. Level 0 is a valid item.</li>
+<li><strong>Fixed width:</strong> every row is <code>control word + bits_per_value/8</code> bytes, the value slot present even
+  for a null row. Checked: FSL-768 nullable, 2000 rows = <code>2000 × (1 + 3072)</code> = 6,146,000 bytes.</li>
+<li><strong>Variable width:</strong> a valid row is <code>control word + length (bits_per_offset/8 bytes) + bytes</code>; a null
+  row is the control word alone. Checked: one 300-byte string among 2000, <code>2000 × 4 + 19,180</code>
+  = 27,180 bytes. Per-value compression is what <code>value_compression</code> says: <code>Variable</code> = raw bytes,
+  <code>Fsst{…}</code> = each value FSST-compressed on its own.</li>
+<li><strong>fixed_size_list element validity</strong> (<code>FixedSizeList.has_validity</code>): on FullZip, each slot starts
+  with <code>ceil(N/8)</code> bytes of element bits (LSB-first, 1 = valid), then the N items, and
+  <code>bits_per_value</code> counts both — 768 × float32 is 25,344 bits. On MiniBlock the chunk carries two
+  buffers: element bits for all the chunk's rows back to back, then the values.</li>
+</ul>
+<p><strong>Status:</strong> B1–B4 done — see PROGRESS, "Roadmap phases A, B and E". B5 not started.</p>
+<p>Done when: A2's value-size and FSL cells pass with their <code>KNOWN_GAPS</code> entries deleted, the
+write-matrix gains FSL and long-string shapes read by both readers, and a 768-dim embedding column
+round-trips pylance → nanolance → pylance.</p>
+<h3 id="phase-c-lists-read-side">Phase C — lists, read side<a class="headerlink" href="#phase-c-lists-read-side" title="Permanent link">&para;</a></h3>
+<p>Order matters: each step's tests are the next step's regression suite.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Task</th>
+<th>Size</th>
+<th>Model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>C0</td>
+<td><strong>Design note: nested <code>ColumnValues</code> and slicing.</strong> How per-layer offsets and validity are carried from decoder to Arrow, and how <code>column_slice.cpp</code> slices and compacts them (row ranges and deletion vectors both have to rebase offsets per layer). This is the piece most likely to be got subtly wrong, and wrong here is silent.</td>
+<td>S</td>
+<td><strong>Opus</strong></td>
+</tr>
+<tr>
+<td>C1</td>
+<td><strong>Port the rep/def unraveler</strong> (<code>RepDefUnraveler</code> in <code>rust/lance-encoding/src/repdef.rs</code>: <code>levels_to_rep</code>, <code>unravel_offsets</code>, <code>unravel_validity</code>) as a standalone, fuzzable unit with table-driven tests built from pylance-written level streams.</td>
+<td>M</td>
+<td><strong>Opus</strong></td>
+</tr>
+<tr>
+<td>C2</td>
+<td><code>list&lt;primitive&gt;</code>, no nulls, full scan. Schema <code>list</code>/<code>large_list</code> → <code>+l</code>/<code>+L</code>.</td>
+<td>M</td>
+<td>Opus (establishes the pattern)</td>
+</tr>
+<tr>
+<td>C3</td>
+<td>Null lists, empty lists, null items — all four <code>DefinitionInterpretation</code>s.</td>
+<td>S</td>
+<td>Sonnet, against C1's tests</td>
+</tr>
+<tr>
+<td>C4</td>
+<td><code>list&lt;string&gt;</code> / <code>list&lt;binary&gt;</code> — composes C2 with the existing variable-width path.</td>
+<td>S</td>
+<td>Sonnet</td>
+</tr>
+<tr>
+<td>C5</td>
+<td><code>list&lt;list&lt;…&gt;&gt;</code>, <code>list&lt;struct&gt;</code>, <code>struct&lt;list&gt;</code>. Multi-leaf structs under a list: every leaf carries the full rep/def and they must agree — check it, refuse on mismatch.</td>
+<td>M</td>
+<td>Opus</td>
+</tr>
+<tr>
+<td>C6</td>
+<td><code>map</code> = <code>list&lt;struct&lt;key, value&gt;&gt;</code> with logical type <code>map</code>, Arrow <code>+m</code>, keys non-null.</td>
+<td>S</td>
+<td>Sonnet, once C5 lands</td>
+</tr>
+<tr>
+<td>C7</td>
+<td>Row ranges and deletion vectors on nested columns, per C0.</td>
+<td>M</td>
+<td><strong>Opus</strong></td>
+</tr>
+<tr>
+<td>C8</td>
+<td>FullZip with <code>bits_rep &gt; 0</code> (lists of long strings / wide FSLs).</td>
+<td>M</td>
+<td>Sonnet, after B2 and C3</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Status:</strong> C0 done — <a href="../NESTED_COLUMNS/">NESTED_COLUMNS.md</a>. C1 done — <code>src/repdef.cpp</code>, tested
+against Lance's own <code>repdef.rs</code> vectors and fuzzed (<code>fuzz_repdef</code>). <strong>C2, C3, C4 and C7 done</strong>, and
+the <code>list&lt;list&lt;…&gt;&gt;</code> part of C5: every flat leaf type, null/empty lists and null items, dictionary and
+constant pages inside lists, row ranges and deletions (<code>tests/test_lance_lists.py</code>, 66 cases against
+pylance). <strong>C5 done</strong> too: lists of structs and structs of lists, with nulls at every level — which
+also fixed null structs outside any list, read until then as structs of nulls. <strong>C8 done</strong>: FullZip
+list pages -- lists of long strings or binaries, at any depth, under structs and as map values. Open:
+a list of <code>fixed_size_list</code>. <strong>C6 done</strong> since: <code>map</code> reads as Arrow's
+map type — it is stored as a list of (key, value) structs, so it needed only the schema mapping.</p>
+<p>Done when the list shapes in A2 pass, <code>test_type_support_matrix.py</code> moves <code>list</code>, <code>large_list</code>,
+<code>map</code> from <code>UNREADABLE_FROM_PYLANCE</code> to read-only, and the fuzz harness covers the unraveler.</p>
+<h3 id="phase-d-lists-write-side">Phase D — lists, write side<a class="headerlink" href="#phase-d-lists-write-side" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Task</th>
+<th>Size</th>
+<th>Model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D1</td>
+<td>Rep/def <strong>serializer</strong> (<code>RepDefBuilder</code>/<code>SerializerContext</code> in <code>repdef.rs</code>, the inverse of C1). Property test: serialize → C1's unravel = identity, over random nested Arrow arrays.</td>
+<td>M</td>
+<td><strong>Opus</strong></td>
+</tr>
+<tr>
+<td>D2</td>
+<td>List, nested and map writers; <code>schema_mapper</code> accepts <code>+l</code>/<code>+L</code>/<code>+m</code>. Every shape joins the write matrix, read back by both readers.</td>
+<td>M</td>
+<td>Sonnet, against D1 and the matrix</td>
+</tr>
+</tbody>
+</table>
+<p>The read side has to come first: it is the oracle for the write side, alongside pylance.</p>
+<p><strong>Status:</strong> D1 done — <code>repdef::serialize</code> in <code>src/repdef.cpp</code>. Property test: 20,000 random nested
+columns (lists and structs at depths 1–4, nulls and empties at every layer, garbage children under
+null lists) serialized over a random row range and unravelled back, compared row by row; two
+deliberate mutations fail it thousands of times. <strong>D2 done:</strong> lists, large lists, maps, lists of
+structs, structs of lists and null structs are written and read by both readers
+(<code>tests/test_lance_list_writes.py</code>, plus the type and parity matrices), including sliced batches,
+several fragments, long rows split across pages, and <code>nanolance convert</code> from parquet. <strong>Pages
+compressed:</strong> bit-packed levels, 1,024-value chunks (rows may span them), bit-packed integer items and
+per-page string dictionaries -- within ~0.2% of pylance's size except high-cardinality strings, which
+wait on an FSST encoder (F2).</p>
+<h3 id="phase-e-small-type-gaps-any-time-good-first-tasks">Phase E — small type gaps (any time; good first tasks)<a class="headerlink" href="#phase-e-small-type-gaps-any-time-good-first-tasks" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Task</th>
+<th>Size</th>
+<th>Model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>E1</td>
+<td><code>float16</code> read + write (<code>halffloat</code>, Arrow <code>e</code>).</td>
+<td>XS</td>
+<td>Sonnet</td>
+</tr>
+<tr>
+<td>E2</td>
+<td><code>duration</code> read + write (<code>duration:&lt;unit&gt;</code>, Arrow <code>tDs/tDm/tDu/tDn</code>).</td>
+<td>XS</td>
+<td>Sonnet</td>
+</tr>
+<tr>
+<td>E3</td>
+<td>Arrow <code>null</code> type on write → <code>ConstantLayout</code> all-null (the reader already understands it). Delete the stale refusal message "cannot store nulls yet", which stopped being true at 1.1.</td>
+<td>S</td>
+<td>Sonnet</td>
+</tr>
+<tr>
+<td>E4</td>
+<td><code>large_utf8</code> / <code>large_binary</code> on write: decouple the chunk's u32 offsets from the declared 64-bit Arrow width across the variable-width paths. The exact fix is recorded at the refusal site.</td>
+<td>M</td>
+<td>Sonnet; Opus review</td>
+</tr>
+</tbody>
+</table>
+<h3 id="phase-f-performance-measure-before-building">Phase F — performance (measure before building)<a class="headerlink" href="#phase-f-performance-measure-before-building" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Task</th>
+<th>Size</th>
+<th>Model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>F1</td>
+<td><strong>Page size.</strong> nanolance writes ~1024 rows per bitpacked page; pylance put 200,000 in one. Measure read time vs page size on the bench datasets <em>first</em> — this project's instruction profiles misled four times; only wall clock is trusted.</td>
+<td>S (measure) + M</td>
+<td><strong>Opus</strong></td>
+</tr>
+<tr>
+<td>F2</td>
+<td><strong>FSST on write</strong> — the answer to the one bench shape nanolance still loses (<code>high_card</code>, 7.67 ms vs 5.12 ms). Encoder only; the reader exists. Correctness oracle: pylance reads it; speed oracle: the bench.</td>
+<td>M–L</td>
+<td><strong>Opus</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="phase-g-packaging-and-infrastructure-independent-run-in-parallel">Phase G — packaging and infrastructure (independent; run in parallel)<a class="headerlink" href="#phase-g-packaging-and-infrastructure-independent-run-in-parallel" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Task</th>
+<th>Size</th>
+<th>Model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>G1</td>
+<td><strong>CMake <code>install()</code> + <code>export()</code></strong> so <code>find_package(nanolance)</code> works (plan item 2.2, the oldest open item). Test by consuming the installed package from a separate CMake project in CI.</td>
+<td>S–M</td>
+<td>Sonnet</td>
+</tr>
+<tr>
+<td>G2</td>
+<td><strong>Nightly fuzz</strong> with a persisted corpus (<code>actions/cache</code>), all six targets, longer runs. CI's 120 s is a regression guard; the OOB read took ~9 min locally.</td>
+<td>S</td>
+<td>Sonnet</td>
+</tr>
+<tr>
+<td>G3</td>
+<td><code>nanolance import --rows-per-fragment</code>.</td>
+<td>S</td>
+<td>Sonnet</td>
+</tr>
+<tr>
+<td>G4</td>
+<td><strong>Windows</strong> bring-up in <code>ci-platforms.yml</code>, then add <code>windows-2022</code> to the wheels matrix. Mostly waiting on CI and fixing what it reports.</td>
+<td>M</td>
+<td>Sonnet</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="which-work-suits-sonnet">Which work suits Sonnet<a class="headerlink" href="#which-work-suits-sonnet" title="Permanent link">&para;</a></h2>
+<p><strong>The price gap is 2×, not 5×.</strong> Opus 5.5 is $4 / $20 per million input / output tokens; Sonnet 5 is
+$2 / $10. So the best case for moving a task to Sonnet is half its cost — and that saving is gone
+the moment the cheaper session needs a second round trip to reach the same result. Cost per
+<em>finished task</em> is what counts, not cost per request.</p>
+<p>What actually cost time in this project was <strong>wrong conclusions, not typing.</strong> Of the seven bugs
+fixed in the last session, the expensive moments were the struct gap diagnosed as a missing
+decoder (it was protobuf defaulting), a consistency check shipped as a bound, a mid-run fuzz
+reading reported as a result, and a retired runner label read as scarce capacity. Each was a
+plausible reading of the evidence, and each was caught by an oracle or by re-examining the
+evidence — not by writing code faster.</p>
+<p>So the split is not "easy vs hard". A task goes to Sonnet when <strong>both</strong> hold:</p>
+<ol>
+<li><strong>It has a mechanical oracle.</strong> A pylance differential test that fails today and must pass. A
+   wrong implementation cannot survive it, whichever model wrote it.</li>
+<li><strong>It needs no format archaeology.</strong> The behaviour is already specified — in this file, in a
+   spike's output, or in an existing nanolance path it composes with. Reading Lance's Rust source to
+   infer undocumented behaviour stays with Opus.</li>
+</ol>
+<p>That gives three patterns, used in the tables above:</p>
+<ul>
+<li><strong>Sonnet end to end</strong> — A1–A4, E1–E3, G1–G4, C3, C4, C6. Specified, oracle-checked, mostly
+  composition of existing paths.</li>
+<li><strong>Opus specifies, Sonnet builds, Opus reviews</strong> — B2–B4, C8, D2, E4. Opus does the short spike or
+  design note (B1, C0, D1) and writes the failing tests; Sonnet implements against them; Opus reviews
+  the diff. Reviewing is much cheaper than authoring, and it is where a subtle defect gets caught.</li>
+<li><strong>Opus</strong> — B1, C0, C1, C2, C5, C7, D1, F1, F2. Format archaeology, a new algorithm, a data-model
+  change whose failure would be silent, or performance work where the measurement discipline matters
+  more than the code.</li>
+</ul>
+<p><strong>Rough effect.</strong> By task count, about two-thirds of this plan can run on Sonnet. By effort it is
+closer to half, because the large items (the unraveler, nested slicing, FSST) stay with Opus. At half
+the price, that is on the order of <strong>a quarter off the whole plan</strong> — worth having, not transformative.
+That figure is an estimate from task sizes, not a measurement.</p>
+<p>Two cheaper levers are worth trying before a task moves models at all:</p>
+<ul>
+<li><strong>Opus 5.5 at lower effort.</strong> Its default is already <code>medium</code>. For the XS/S Sonnet-bucket tasks,
+  <code>low</code> may land within the same margin with no change of model, and keeps one cache namespace.</li>
+<li><strong>Give every session the oracle up front.</strong> A task that starts from a failing test finishes in
+  fewer turns on any model. Phase A exists partly for this.</li>
+</ul>
+<h3 id="how-to-run-it-in-claude-code">How to run it in Claude Code<a class="headerlink" href="#how-to-run-it-in-claude-code" title="Permanent link">&para;</a></h3>
+<ul>
+<li>One task per session. Start it with <code>/model sonnet</code> (or <code>/model opus</code>), point it at the task's row
+  here, and say which tests must pass.</li>
+<li>Or, from an Opus session driving the plan, delegate a Sonnet-bucket task to a sub-agent with
+  <code>model: "sonnet"</code> and review what it returns before it is committed.</li>
+<li>Every task ends the way the last session's did: full pytest and ctest, the ASan/UBSan build with
+  <code>-Werror</code>, a revert check that the new test actually fails without the fix, and for decoder changes
+  a fuzz run that has printed its completion line.</li>
+</ul>
+<hr />
+<h2 id="recommended-order">Recommended order<a class="headerlink" href="#recommended-order" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Phase A</strong> (a day, mostly Sonnet) — every later task starts from a pinned failing test and a
+   dump tool that labels columns correctly.</li>
+<li><strong>Phase E1–E3</strong> alongside it — three small, visible wins.</li>
+<li><strong>Phase B</strong> — FullZip and FSL. The largest user-visible gain available: it makes text and
+   embedding datasets readable, which are the two things most Lance users store.</li>
+<li><strong>Phase C</strong>, then <strong>D</strong> — lists and maps, read before write.</li>
+<li><strong>Phase F</strong> once correctness work has settled; <strong>Phase G</strong> in parallel throughout.</li>
+</ol>
+<hr />
+<h2 id="appendix-a-decoding-a-descriptor-without-protoc">Appendix A — decoding a descriptor without protoc<a class="headerlink" href="#appendix-a-decoding-a-descriptor-without-protoc" title="Permanent link">&para;</a></h2>
+<p><code>nlance-pagelayout --dump-corpus DIR DATASET</code> writes each page's raw <code>PageLayout</code> descriptor, and
+<code>python3 tools/pb_raw.py DIR/descriptor_1.bin</code> prints its wire structure with no schema — that is how
+every descriptor in this file was read. Field numbers are in <code>protos/encodings_v2_1.proto</code> in the
+Lance repository (<code>MiniBlockLayout</code>, <code>FullZipLayout</code>, <code>ConstantLayout</code>, <code>FixedSizeList</code>, <code>RepDefLayer</code>).
+Task A1 makes the tool print all of this itself.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

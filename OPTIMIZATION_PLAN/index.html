@@ -1,0 +1,2256 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/OPTIMIZATION_PLAN/">
+      
+      
+        <link rel="prev" href="../bench-trusted-parity/">
+      
+      
+        <link rel="next" href="../PROGRESS/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Roadmap & review - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#nanolance-review-improvement-plan" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Roadmap & review
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-verdict" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Verdict
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-what-was-measured" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. What was measured
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. What was measured">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-nulls-are-silently-corrupted-p0" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.1 Nulls are silently corrupted (P0)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-nanolance-cannot-read-stock-lance-data-p0-for-the-rust-lance-audience" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.2 nanolance cannot read stock-Lance data (P0 for the rust-lance audience)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-arrow-type-coverage-is-narrower-than-advertised" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.3 Arrow type coverage is narrower than advertised
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#24-read-path-where-the-time-actually-goes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.4 Read path: where the time actually goes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#25-the-documented-quick-start-does-not-work" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.5 The documented quick start does not work
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#26-distribution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.6 Distribution
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#27-python-api-gaps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.7 Python API gaps
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#28-repo-hygiene" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.8 Repo hygiene
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-plan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Plan
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Plan">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#phase-0-stop-the-bleeding-days" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 0 — Stop the bleeding (days)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-1-be-a-lance-reader-and-a-dataframe-shaped-one-weeks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 1 — Be a Lance reader, and a dataframe-shaped one (weeks)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-2-distribution-parallel-with-phase-1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 2 — Distribution (parallel with Phase 1)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-3-the-python-api-a-parquet-user-expects-weeks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 3 — The Python API a parquet user expects (weeks)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-4-close-the-read-gap-weeks-after-phase-1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 4 — Close the read gap (weeks, after Phase 1)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-5-simplicity-opportunistic" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 5 — Simplicity (opportunistic)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3b-reading-pylances-nullable-columns-found-and-fixed-after-the-plan-was-written" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3b. Reading pylance's nullable columns (found and fixed after the plan was written)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-suggested-sequencing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Suggested sequencing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-explicit-non-goals" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Explicit non-goals
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-generalizing-the-reader-without-touching-the-writer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Generalizing the reader without touching the writer
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Generalizing the reader without touching the writer">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#61-the-actual-root-cause" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.1 The actual root cause
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#62-how-close-the-two-writers-actually-are" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2 How close the two writers actually are
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#63-the-change" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.3 The change
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#64-the-verification-promise-survives-and-gets-stronger" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.4 The verification promise survives — and gets stronger
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#65-what-this-does-not-do" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.5 What this does not do
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#66-positioning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.6 Positioning
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-verdict" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Verdict
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-what-was-measured" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. What was measured
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. What was measured">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-nulls-are-silently-corrupted-p0" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.1 Nulls are silently corrupted (P0)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-nanolance-cannot-read-stock-lance-data-p0-for-the-rust-lance-audience" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.2 nanolance cannot read stock-Lance data (P0 for the rust-lance audience)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-arrow-type-coverage-is-narrower-than-advertised" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.3 Arrow type coverage is narrower than advertised
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#24-read-path-where-the-time-actually-goes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.4 Read path: where the time actually goes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#25-the-documented-quick-start-does-not-work" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.5 The documented quick start does not work
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#26-distribution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.6 Distribution
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#27-python-api-gaps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.7 Python API gaps
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#28-repo-hygiene" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.8 Repo hygiene
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-plan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Plan
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Plan">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#phase-0-stop-the-bleeding-days" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 0 — Stop the bleeding (days)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-1-be-a-lance-reader-and-a-dataframe-shaped-one-weeks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 1 — Be a Lance reader, and a dataframe-shaped one (weeks)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-2-distribution-parallel-with-phase-1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 2 — Distribution (parallel with Phase 1)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-3-the-python-api-a-parquet-user-expects-weeks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 3 — The Python API a parquet user expects (weeks)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-4-close-the-read-gap-weeks-after-phase-1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 4 — Close the read gap (weeks, after Phase 1)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-5-simplicity-opportunistic" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 5 — Simplicity (opportunistic)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3b-reading-pylances-nullable-columns-found-and-fixed-after-the-plan-was-written" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3b. Reading pylance's nullable columns (found and fixed after the plan was written)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-suggested-sequencing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Suggested sequencing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-explicit-non-goals" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Explicit non-goals
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-generalizing-the-reader-without-touching-the-writer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Generalizing the reader without touching the writer
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Generalizing the reader without touching the writer">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#61-the-actual-root-cause" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.1 The actual root cause
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#62-how-close-the-two-writers-actually-are" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2 How close the two writers actually are
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#63-the-change" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.3 The change
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#64-the-verification-promise-survives-and-gets-stronger" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.4 The verification promise survives — and gets stronger
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#65-what-this-does-not-do" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.5 What this does not do
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#66-positioning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.6 Positioning
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="nanolance-review-improvement-plan">nanolance — review &amp; improvement plan<a class="headerlink" href="#nanolance-review-improvement-plan" title="Permanent link">&para;</a></h1>
+<p><em>Reviewed at <code>b914735</code>. Every claim below was reproduced on this tree (Ubuntu 24.04, gcc 13.3,
+Release), not read off the docs. Commands to re-run each check are inline.</em></p>
+<h2 id="1-verdict">1. Verdict<a class="headerlink" href="#1-verdict" title="Permanent link">&para;</a></h2>
+<p>nanolance is a genuinely good <strong>writer</strong>. The encoder work is done and it shows: on the CI bench it
+beats rust-lance on <code>float_smooth</code> (5.95 ms vs 6.50) and <code>bool_flags</code> (0.78 vs 1.26), reaches parity
+on <code>pcap_ref</code>, and lands at Lance file sizes — which are smaller than Parquet's. The external-blob
+data model is a real differentiator with no equivalent in either ecosystem. The read path is
+hardened to a standard most C++ projects do not reach, and it is <em>proven</em> hardened (ASan/UBSan CI,
+libFuzzer, a parity benchmark showing the checks are free).</p>
+<p>The problem is that almost none of that is reachable by either audience we want.</p>
+<p>For a <strong>rust-lance user</strong>, the deciding question is "can it read my data?" Today: no. A plain
+5000-row <code>int64</code> column written by <code>lance</code> 12.0.0 fails to decode. So does a string column, a
+nullable column, a timestamp, a list, a dictionary, a struct. The reader is explicitly scoped
+"writer parity only" (<code>docs/lance_table_reader_plan.md</code>). That is a defensible engineering choice
+and a fatal adoption choice: it means nanolance is not a Lance reader, it is a reader of nanolance's
+own output. There is nothing to switch <em>to</em>.</p>
+<p>For a <strong>"simple parquet" Python user</strong>, the deciding question is "does my dataframe survive the
+round trip?" Today: no, and it fails <em>silently</em>. <code>nanolance.write_table</code> turns nulls into <code>0</code> and
+<code>""</code> with no error and no warning. Timestamps — in practically every parquet file in the world —
+are rejected outright. And they cannot <code>pip install nanolance</code> at all; there are no wheels.</p>
+<p>So the headline is not "make it faster." It is: <strong>the writer is ahead of everything around it.</strong>
+Correctness gaps, type coverage, and distribution are what is actually blocking adoption, and the
+read-throughput gap is fourth on that list, not first.</p>
+<p>One structural note that shapes the whole plan: several items below are not "add a feature," they
+are "the docs claim this already works." Nullable columns, nested structs, and <code>large_utf8</code> are all
+advertised in <code>README.md</code> and all broken. Fixing the claims is as urgent as fixing the code, because
+a user who hits one of these silently stops trusting the rest of the numbers — including the
+benchmark table, which is honest and hard-won.</p>
+<hr />
+<h2 id="2-what-was-measured">2. What was measured<a class="headerlink" href="#2-what-was-measured" title="Permanent link">&para;</a></h2>
+<h3 id="21-nulls-are-silently-corrupted-p0">2.1 Nulls are silently corrupted (P0)<a class="headerlink" href="#21-nulls-are-silently-corrupted-p0" title="Permanent link">&para;</a></h3>
+<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span> <span class="nn">pyarrow</span> <span class="k">as</span> <span class="nn">pa</span><span class="o">,</span> <span class="nn">nanolance</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">t</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">&quot;a&quot;</span><span class="p">:</span> <span class="n">pa</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="mi">10</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="mi">30</span><span class="p">],</span> <span class="nb">type</span><span class="o">=</span><span class="n">pa</span><span class="o">.</span><span class="n">int64</span><span class="p">()),</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>              <span class="s2">&quot;s&quot;</span><span class="p">:</span> <span class="n">pa</span><span class="o">.</span><span class="n">array</span><span class="p">([</span><span class="s2">&quot;x&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;zz&quot;</span><span class="p">])})</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">nanolance</span><span class="o">.</span><span class="n">write_table</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="s2">&quot;py_nulls.lance&quot;</span><span class="p">)</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">nanolance</span><span class="o">.</span><span class="n">read_table</span><span class="p">(</span><span class="s2">&quot;py_nulls.lance&quot;</span><span class="p">))</span><span class="o">.</span><span class="n">to_pydict</span><span class="p">()</span>
+</code></pre></div>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>INPUT : {&#39;a&#39;: [10, None, 30], &#39;s&#39;: [&#39;x&#39;, None, &#39;zz&#39;]}
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>OUTPUT: {&#39;a&#39;: [10,   0,  30], &#39;s&#39;: [&#39;x&#39;,   &#39;&#39;, &#39;zz&#39;]}
+</code></pre></div>
+<p>No exception. No warning. The data is just wrong.</p>
+<p>The mechanism: <code>schema_mapper.cpp:225</code> rejects any nullable field unless <code>ignore_nullability</code> is
+set, and when it <em>is</em> set, <code>map_field</code> writes <code>out.nullable = false</code> (line 244) and the validity
+bitmap is never read. <code>arrowipc2lance --help</code> is honest about it ("copy null slot bytes as-is"); the
+Python binding is not — <code>WriteOptions.ignore_nullability</code> defaults to <strong><code>True</code></strong>
+(<code>bindings/python/nanolance/__init__.py:22</code>).</p>
+<p>That default is there because pyarrow marks every field nullable by default, so without it the
+common case is a hard error:</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>$ arrowipc2lance -c -o big.lance &lt; big.arrow
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>nullable fields are not supported without --ignore-nullability: pos
+</code></pre></div>
+<p>Which leaves a user with two doors: a confusing error, or silent corruption. The project's own test
+knows — <code>bindings/python/tests/test_lance_parity.py::test_lance_nullable_roundtrip</code> writes a table
+with nulls and then asserts only on the <code>ctrl</code> column (which has none) plus the row count. It is
+shaped precisely around the bug.</p>
+<p>This also quietly undermines the interop claim. Stock Lance reads these files fine; it just reads
+wrong values out of them. "Verified against lance" is true at the format level and false at the data
+level, which is the worse of the two failure modes.</p>
+<h3 id="22-nanolance-cannot-read-stock-lance-data-p0-for-the-rust-lance-audience">2.2 nanolance cannot read stock-Lance data (P0 for the rust-lance audience)<a class="headerlink" href="#22-nanolance-cannot-read-stock-lance-data-p0-for-the-rust-lance-audience" title="Permanent link">&para;</a></h3>
+<p>5000 rows per case, written by <code>pylance</code> 12.0.0, read with <code>nlance2table</code>:</p>
+<table>
+<thead>
+<tr>
+<th>stock-lance dataset</th>
+<th>nanolance read</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>int64</code> plain</td>
+<td><strong>FAIL</strong> — <code>fixed-width page byte count mismatch</code></td>
+</tr>
+<tr>
+<td><code>utf8</code></td>
+<td><strong>FAIL</strong> — <code>variable-width chunk terminal offset out of range</code></td>
+</tr>
+<tr>
+<td><code>int64</code> with nulls</td>
+<td><strong>FAIL</strong> — <code>unexpected miniblock payload prefix</code></td>
+</tr>
+<tr>
+<td><code>timestamp[ms]</code></td>
+<td><strong>FAIL</strong> — <code>unsupported on-disk logical type ... timestamp:ms:-</code></td>
+</tr>
+<tr>
+<td><code>list&lt;int32&gt;</code></td>
+<td><strong>FAIL</strong> — <code>unsupported on-disk logical type: list</code></td>
+</tr>
+<tr>
+<td><code>dictionary&lt;string&gt;</code></td>
+<td><strong>FAIL</strong> — <code>unsupported on-disk logical type: dict:string:int32:false</code></td>
+</tr>
+<tr>
+<td><code>struct</code></td>
+<td><strong>FAIL</strong> — <code>struct field has no children in mapping</code></td>
+</tr>
+<tr>
+<td><code>float64</code></td>
+<td>OK</td>
+</tr>
+<tr>
+<td><code>bool</code></td>
+<td>OK</td>
+</tr>
+</tbody>
+</table>
+<p>Note the first row. It is not an exotic encoding — it is <code>pa.array(range(5000))</code>. A 3-row version of
+the same table <em>does</em> read, which is worse than a clean failure: it means the smoke test a curious
+user writes first will pass, and their real data will not.</p>
+<p>Also: the docs pin interop claims to <code>lance</code> 7.0.0. Current pylance is 12.0.0. Whatever we assert
+about compatibility needs a version floor and a CI job that actually re-checks it.</p>
+<h3 id="23-arrow-type-coverage-is-narrower-than-advertised">2.3 Arrow type coverage is narrower than advertised<a class="headerlink" href="#23-arrow-type-coverage-is-narrower-than-advertised" title="Permanent link">&para;</a></h3>
+<p>Round-trip via <code>arrowipc2lance</code> → <code>nlance2table</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Arrow type</th>
+<th>write</th>
+<th>read back</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>int8..64</code>, <code>uint8..64</code>, <code>float</code>, <code>double</code>, <code>bool</code></td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td><code>utf8</code>, <code>binary</code>, <code>fixed_size_binary</code></td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td><code>large_utf8</code> / <code>large_binary</code></td>
+<td>ok</td>
+<td><strong>FAIL</strong> — <code>variable-width chunk terminal offset out of range</code></td>
+</tr>
+<tr>
+<td><code>dictionary&lt;utf8&gt;</code></td>
+<td>ok</td>
+<td><strong>WRONG</strong> — reads back the index (<code>0</code>), not the value (<code>"a"</code>)</td>
+</tr>
+<tr>
+<td><code>struct</code></td>
+<td>ok</td>
+<td><strong>FAIL</strong> — <code>nested struct children are not supported in this reader build</code></td>
+</tr>
+<tr>
+<td><code>timestamp</code> / <code>date32</code> / <code>time64</code></td>
+<td><strong>reject</strong> — <code>unsupported Arrow C format: tsu:</code> / <code>tdD</code> / <code>ttu</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>decimal128</code></td>
+<td><strong>reject</strong> — <code>d:10,2</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>list</code></td>
+<td><strong>reject</strong> — <code>+l</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>null</code></td>
+<td><strong>reject</strong> — <code>fixed-width array is missing values buffer</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>Three of these — <code>large_utf8</code>, <code>dictionary</code>, <code>struct</code> — are <strong>write/read asymmetries</strong>: the writer
+accepts them and produces a file that the library's own reader cannot load. That is strictly worse
+than rejecting them, and <code>README.md</code> advertises nested structs as supported.</p>
+<p><code>timestamp</code> is the one that matters most for the parquet audience. There is no such thing as a
+representative parquet file without a timestamp column, and <code>pa.Table.from_pandas</code> produces one from
+any <code>DatetimeIndex</code>. The good news is that it is cheap: <code>timestamp</code> is <code>int64</code> on the wire, so this
+is a <code>schema_mapper</code> mapping plus a logical-type string, not an encoder change.</p>
+<h3 id="24-read-path-where-the-time-actually-goes">2.4 Read path: where the time actually goes<a class="headerlink" href="#24-read-path-where-the-time-actually-goes" title="Permanent link">&para;</a></h3>
+<p>Local callgrind, 1M rows × 4 columns (constant uri, constant size, bitpacked position, bitpacked
+int64) — the library's own flagship shape:</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>132,601,959 (100.0%)  PROGRAM TOTALS
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a> 43,155,475 ( 32.6%)  __memset_avx2_unaligned_erms
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a> 32,900,253 ( 24.8%)  __memcpy_avx_unaligned_erms
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a> 16,000,194 ( 12.1%)  append_repeated_value(...)
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>  9,430,981 (  7.1%)  fastlanes::unpack_1024_w&lt;uint64_t, 20u&gt;
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>  4,984,624 (  3.8%)  decode_lance_physical_column(...)
+</code></pre></div>
+<p>This matches the CI profile on <code>pcap_ref</code> (39.8% memset / 27.0% memcpy). <strong>Roughly 70% of read
+instructions are zeroing and copying buffers, not decoding.</strong> Three separate causes:</p>
+<ol>
+<li><strong>Zero-then-overwrite.</strong> <code>std::vector&lt;uint8_t&gt;::resize()</code> value-initializes. Every
+   <code>read_lance_data_file_bytes</code> page read, every <code>append_repeated_value</code>, every
+   <code>out.fixed.resize(base + page.length)</code> memsets bytes that the very next line memcpys over.</li>
+<li><strong>A whole redundant materialization.</strong> Decode writes into <code>ColumnValues</code>, then
+   <code>fill_fixed_child</code> / <code>fill_variable_child</code> copy <code>ColumnValues</code> into the <code>ArrowBuffer</code>. For this
+   dataset that is ~59 MB written, then ~59 MB copied again. The decoder could write straight into
+   the destination <code>ArrowBuffer</code>.</li>
+<li><strong>Constant columns are expanded N times.</strong> <code>size</code> (all <code>1500</code>) and <code>uri</code> (one 27-byte string)
+   are stored in ~0 bytes on disk and then blown up to 8 MB and 35 MB in memory — twice, per (2).
+   That is the exact workload the external-blob design optimizes for on disk, undone on read.</li>
+</ol>
+<p><strong>I ran the experiment for cause (1).</strong> Swapping the <code>ColumnValues</code> byte buffers and the page-read
+buffers to a default-initializing allocator (so <code>resize</code> skips the memset) — output byte-identical,
+verified with <code>cmp</code> on the data files:</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>baseline      best_ms: 80.31 / 78.89 / 78.58
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>no-zero-fill  best_ms: 75.15 / 74.32 / 73.48
+</code></pre></div>
+<p>~6.5% wall clock. Real, but far less than 32.6% of instructions suggests — memset is
+bandwidth-bound and cheap per instruction. <strong>The lesson is that the instruction profile overstates
+this fix</strong>, and the bigger win is in causes (2) and (3), which delete the work rather than making it
+cheaper. I am flagging this explicitly because it is easy to read the callgrind output and promise a
+3× that will not materialize.</p>
+<p>Current gap to close, from CI: <code>pcap_ref</code> read 11.01 ms vs rust-lance 6.24 ms. <strong>Closed — see 4.5.</strong></p>
+<h3 id="25-the-documented-quick-start-does-not-work">2.5 The documented quick start does not work<a class="headerlink" href="#25-the-documented-quick-start-does-not-work" title="Permanent link">&para;</a></h3>
+<p><code>README.md</code> and <code>docs/getting-started.md</code> both say building the library needs no submodule, and give:</p>
+<div class="language-bash highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>cmake<span class="w"> </span>-S<span class="w"> </span>.<span class="w"> </span>-B<span class="w"> </span>build<span class="w"> </span>-DCMAKE_BUILD_TYPE<span class="o">=</span>Release
+</code></pre></div>
+<p>On a non-recursive clone this fails:</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>CMake Error at examples/pcapng2lance/CMakeLists.txt:14 (message):
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>  examples/pcapng2lance/extern/nanotins is empty — run: git submodule update --init --recursive
+</code></pre></div>
+<p><code>NANOLANCE_BUILD_EXAMPLES</code> defaults <code>ON</code> for standalone builds (<code>CMakeLists.txt:337</code>) and the
+example hard-<code>FATAL_ERROR</code>s. This is the first command a new user runs, and the fix is four lines.</p>
+<h3 id="26-distribution">2.6 Distribution<a class="headerlink" href="#26-distribution" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>No wheels.</strong> No <code>cibuildwheel</code>, no PyPI publish job. Installing means CMake + a C++20
+  toolchain + network for FetchContent. A pandas user will not do this. This is the single biggest
+  lever for the "simple parquet user" audience and it is pure packaging work.</li>
+<li><strong>No <code>install()</code> rules at all</strong> in <code>CMakeLists.txt</code>. No exported targets, no
+  <code>nanolanceConfig.cmake</code>. C++ consumers cannot <code>find_package(nanolance)</code> — only
+  <code>add_subdirectory</code>/FetchContent.</li>
+<li><strong>CI is Linux-only.</strong> No macOS, no Windows, no ARM.</li>
+<li><strong>Version skew.</strong> <code>bindings/python/pyproject.toml</code> says <code>0.1.0</code>; the library says <code>0.2.0</code>.</li>
+</ul>
+<h3 id="27-python-api-gaps">2.7 Python API gaps<a class="headerlink" href="#27-python-api-gaps" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>read_table</code> calls <code>nano_lance_table_read_dataset</code>, which materializes <strong>every</strong> batch before
+  handing back a handle (<code>bindings/python/src/nanolance_bindings.cpp:253</code>). The docstring's promise
+  that a reader "can consume it chunk by chunk" is true of the handle and false of the memory
+  profile.</li>
+</ul>
+<p><strong>Measured peak is 2.01× the dataset — but not for the reason stated here originally.</strong> On a
+  61 MiB, 4M-row table: one fragment → <strong>2.01×</strong>; the same data across 16 fragments → <strong>1.10×</strong>. So
+  the 2× is <em>not</em> batches accumulating, and <code>ExportedTable::from_read_result</code> is not a copy (it is
+  <code>ArrowArrayMove</code>). It is <strong>within one fragment's decode</strong>: the decoder fills <code>ColumnValues</code>
+  buffers and then copies them into the ArrowArray, so both exist at once. Split across 16 fragments
+  the transient is 1/16 of the data and the peak collapses.</p>
+<p>This changes what fixes it. Streaming (3.1) removes the <em>accumulation</em>, which only bites on
+  many-fragment datasets; the 2× on an ordinary single-fragment dataset is removed by <strong>4.1,
+  decoding straight into <code>ArrowBuffer</code></strong>.
+- <code>lance_table_read_dataset_projected</code> exists in C++ and is <strong>not exposed to Python</strong>. Column
+  projection is the first thing a parquet user reaches for.
+- No row-range / slice / <code>take</code>, no filter, no <code>count_rows</code>, no schema-only peek.</p>
+<h3 id="28-repo-hygiene">2.8 Repo hygiene<a class="headerlink" href="#28-repo-hygiene" title="Permanent link">&para;</a></h3>
+<p>22.8 MB tracked, of which ~21 MB is binaries: <code>tests/test_framed.pcapng</code> (15.4 MB),
+<code>st_nl.srctrldb</code> (4.9 MB, a committed Sourcetrail IDE index), plus a checked-in <code>__pycache__/*.pyc</code>.
+<code>README.md</code> has a section explaining that the repo is small and <code>build/</code> is what makes zips huge —
+while shipping 21 MB of fixtures and an IDE database. Regenerate the big pcapng from a script at
+test time and drop the index.</p>
+<hr />
+<h2 id="3-plan">3. Plan<a class="headerlink" href="#3-plan" title="Permanent link">&para;</a></h2>
+<p>Ordered by what unblocks adoption, not by what is most interesting to build. Each phase is
+independently shippable.</p>
+<h3 id="phase-0-stop-the-bleeding-days">Phase 0 — Stop the bleeding (days)<a class="headerlink" href="#phase-0-stop-the-bleeding-days" title="Permanent link">&para;</a></h3>
+<p>The cheap items whose absence is currently costing trust.</p>
+<p><strong>0.1 Make nulls loud instead of wrong.</strong> Until real null support lands (1.1), <code>ignore_nullability</code>
+must refuse a batch whose validity bitmap has any null set, rather than copying slot bytes. Keep a
+separate explicit opt-out (<code>allow_null_slot_garbage</code>, or similar) for the pcap pipelines that
+knowingly pass nullable-flagged-but-never-null Arrow. Flip the Python default to <code>False</code>. This turns
+a silent-corruption bug into an error message, in one function, today.</p>
+<p><strong>0.2 Reject what we cannot round-trip.</strong> <code>large_utf8</code>, <code>dictionary</code>, and <code>struct</code> must either read
+back correctly or be rejected at <code>write_batch</code>. A file our own reader cannot open is not a valid
+output. (Prefer fixing; reject as the stopgap.)</p>
+<p><strong>0.3 Fix the quick start.</strong> Make <code>examples/pcapng2lance/CMakeLists.txt</code> skip with a
+<code>message(STATUS)</code> when the submodule is absent, or default <code>NANOLANCE_BUILD_EXAMPLES=OFF</code> for
+standalone builds. Add a CI job that configures and builds from a <strong>non-recursive</strong> clone, so this
+cannot regress.</p>
+<p><strong>0.4 Correct the docs.</strong> Remove or qualify the nullable-column and nested-struct claims in
+<code>README.md</code> and <code>AGENTS.md</code>. Add an explicit, honest "what nanolance cannot read" table (§2.2) near
+the top. Reconcile the two version numbers. Re-pin interop claims to a pylance version we actually
+test against, not 7.0.0.</p>
+<p><strong>0.5 Repo slim-down.</strong> Drop <code>st_nl.srctrl*</code> and the <code>.pyc</code>; generate <code>test_framed.pcapng</code> from a
+fixture script. Target &lt;2 MB tracked.</p>
+<p><em>Done when:</em> a null-bearing write either works or raises; <code>cmake -S . -B build</code> succeeds on a fresh
+shallow clone in CI; no advertised feature fails its own round trip.</p>
+<h3 id="phase-1-be-a-lance-reader-and-a-dataframe-shaped-one-weeks">Phase 1 — Be a Lance reader, and a dataframe-shaped one (weeks)<a class="headerlink" href="#phase-1-be-a-lance-reader-and-a-dataframe-shaped-one-weeks" title="Permanent link">&para;</a></h3>
+<p>This is the phase that creates a reason to switch.</p>
+<p><strong>1.1 Real nullability, end to end.</strong> Emit Lance validity/definition information on write; decode it
+into Arrow validity bitmaps on read. This is the prerequisite for every other item in this phase and
+for any dataframe interop at all. Round-trip tests against pyarrow <strong>and</strong> pylance for every
+supported type, at 5k+ rows so the encoders actually engage.</p>
+<p><strong>1.2 Timestamp, date, time, decimal.</strong> All of these are fixed-width integers on the wire; the work
+is <code>schema_mapper</code> format parsing plus logical-type strings plus reader mapping, not new encoders.
+<code>timestamp</code> alone unlocks the majority of real parquet files.</p>
+<p><strong>1.3 Decode stock-Lance files by parsing the descriptor the writer already emits.</strong> See §6 —
+this turned out to be far smaller and far safer than "implement a general Lance reader," and it
+needs no writer change at all.</p>
+<p><strong>1.4 CI that proves it.</strong> A matrix job that, for each supported Arrow type: writes with pylance →
+reads with nanolance → compares; and writes with nanolance → reads with pylance → compares. Pin the
+pylance version, bump it deliberately. This is the artifact that makes the interop claim credible to
+a rust-lance user, and right now nothing like it exists.</p>
+<p><em>Done when:</em> the §2.2 table is all-OK for the types in §2.3, and a nulls-and-timestamps pandas
+dataframe round-trips byte-exactly through both readers.</p>
+<h3 id="phase-2-distribution-parallel-with-phase-1">Phase 2 — Distribution (parallel with Phase 1)<a class="headerlink" href="#phase-2-distribution-parallel-with-phase-1" title="Permanent link">&para;</a></h3>
+<p><strong>2.1 Ship wheels.</strong> <code>cibuildwheel</code> for manylinux/macOS/Windows × cp39–cp313, publish to PyPI on
+tag. Vendor or statically link zstd so the wheel is self-contained. <code>pip install nanolance</code> is the
+entire on-ramp for the parquet audience, and nothing else in this plan reaches them without it.</p>
+<p><strong>2.2 CMake install/export.</strong> <code>install(TARGETS ... EXPORT)</code>, a generated <code>nanolanceConfig.cmake</code>, a
+<code>nanolance::nanolance</code> namespaced target, <code>find_package(nanolance)</code> working from an install tree.
+Add a consumer smoke test that builds a tiny program against an installed nanolance.</p>
+<p><strong>2.3 Widen CI.</strong> macOS and Windows at minimum for the library and the wheels.</p>
+<h3 id="phase-3-the-python-api-a-parquet-user-expects-weeks">Phase 3 — The Python API a parquet user expects (weeks)<a class="headerlink" href="#phase-3-the-python-api-a-parquet-user-expects-weeks" title="Permanent link">&para;</a></h3>
+<p><strong>3.1 Streaming read.</strong> Add a real <code>ArrowArrayStream</code> that decodes fragment by fragment, next to
+the materialize-everything <code>read_table</code>. This is also a C++-side improvement
+(<code>lance_table_read_dataset</code> has the same shape).</p>
+<p>What it buys, corrected by measurement (see 2.7): <strong>larger-than-memory datasets and time-to-first-
+batch</strong>, not the 2× peak. A single-fragment dataset still peaks at 2× after this change, because
+that 2× lives inside one fragment's decode. Pair it with 4.1 to get ~1× for any dataset — and note
+that 4.1 is the one with the headline number, despite being sequenced later.</p>
+<p><strong>DONE</strong>, as a <em>separate</em> entry point rather than a replacement. Making <code>read_table</code> stream would
+have been a silent contract change: streaming moves error reporting from open to consumption, and
+a corrupt file that used to raise <code>RuntimeError</code> from <code>read_table(...)</code> instead raises <code>OSError</code>
+from whoever pulls the first batch. Two existing tests caught it. So <code>open_stream()</code> is its own
+function and <code>read_table</code> keeps its eager contract.</p>
+<p>Measured on a 61 MiB / 16-fragment dataset: peak <strong>5.6 MiB (0.09×)</strong> against 61.4 MiB (1.01×)
+eager, and <strong>3.2 ms</strong> to the first batch against 66.5 ms. Exactly what the correction above
+predicted — a throughput-neutral win in peak memory and latency, on top of 4.1's 1.01×.</p>
+<p><strong>3.2 Expose projection</strong>, then add row-range/slice and <code>count_rows</code>/schema-peek. Projection already
+exists in C++ (<code>lance_table_read_dataset_projected</code>) and just needs binding.</p>
+<p><strong>DONE</strong> for projection: <code>read_table(path, columns=[...])</code> and <code>open_stream(path, columns=[...])</code>,
+pushed down to the decoder so unprojected columns are never touched. <strong><code>count_rows(path)</code> and
+<code>read_schema(path)</code> are done too</strong>, both answered from the manifest without opening a data file
+(0.18 ms against 16 ms for a full read of the same 200k-row dataset).</p>
+<p><strong>Row-range/slice is DONE too</strong>, built the honest way described here: the <code>ReadPlan</code> now knows each
+data file's row span, fragments outside the range are never opened, and only the one or two files a
+range partially covers are trimmed. Measured on a 61 MiB / 16-fragment dataset: a 1,000-row range
+reads in 2.5 ms against 72.1 ms for the whole table (<strong>29x</strong>), at 0.03x the peak memory.</p>
+<p><strong>3.3 Shape the API like the thing it is replacing.</strong> <code>nanolance.read_table(path, columns=[...])</code>,
+<code>nanolance.write_table(table, path, compression=...)</code> — deliberately <code>pyarrow.parquet</code>-shaped, so
+the migration from <code>pq.write_table</code> is a one-line diff. Document it that way: a side-by-side
+"coming from pyarrow.parquet" table beats any benchmark for this audience.</p>
+<p><strong>DONE</strong> for the API shape (it already was) and for the documentation: bindings/python/README.md now
+carries a "Coming from <code>pyarrow.parquet</code>" side-by-side table, the four differences worth knowing
+before switching, and the <code>nanolance convert</code> one-liner.</p>
+<p><strong>3.4 A <code>parquet2lance</code> entry point.</strong> The single most persuasive demo for the target user is
+<code>python -m nanolance convert in.parquet out.lance</code> followed by a size comparison. Also add a
+non-stdin mode to <code>arrowipc2lance</code> (it currently only reads stdin, which surprised me).</p>
+<p><strong>DONE.</strong> <code>nanolance convert in.parquet out.lance</code> (and <code>python -m nanolance convert ...</code>), plus
+<code>nanolance inspect</code>. It converts a batch at a time, so a file larger than memory converts fine, and
+it prints both sizes. <code>arrowipc2lance -i/--input FILE</code> now exists; stdin stays the default.</p>
+<p>The demo immediately found something the plan did not anticipate: the converted dataset was
+unreadable by stock Lance. See "The dictionary encoding that made whole FILES unreadable" in
+PROGRESS -- an item that only surfaced because 3.4 exercised a realistic table.</p>
+<h3 id="phase-4-close-the-read-gap-weeks-after-phase-1">Phase 4 — Close the read gap (weeks, after Phase 1)<a class="headerlink" href="#phase-4-close-the-read-gap-weeks-after-phase-1" title="Permanent link">&para;</a></h3>
+<p>Sequenced last deliberately: correctness and reach move adoption, and optimizing decode paths that
+are about to be rewritten for nullability (1.1) and stock-Lance layouts (1.3) is wasted work.</p>
+<p><strong>That rewrite has now happened</strong> (1.1 and 1.3 are done), so the reason to defer 4.1 is spent. And
+the measurement in §2.7 moved 4.1 up in value: it, not 3.1, is what removes the 2× read peak.</p>
+<p><strong>4.1 Decode straight into <code>ArrowBuffer</code>.</strong> Delete the <code>ColumnValues</code> → <code>ArrowBuffer</code> copy (§2.4
+cause 2). Largest single win; ~59 MB of redundant traffic on the 1M-row bench.</p>
+<p><strong>DONE</strong>, and taken out of order — see §2.7: this, not 3.1, is what removes the 2× peak. Implemented
+by <em>adopting</em> the decoded vector's storage into the <code>ArrowBuffer</code> (<code>ArrowBufferDeallocator</code>) rather
+than rewriting the decoder to emit <code>ArrowBuffer</code>s, which gets the same zero-copy result for a fraction
+of the change. Measured: peak 2.01× → 1.01× (one fragment), read 201 ms → 160 ms.</p>
+<p><strong>4.2 Do not materialize constant columns row-by-row.</strong> Fill the destination buffer once (§2.4
+cause 3), or expose Arrow REE/dictionary where the consumer accepts it. Targets exactly the
+external-blob workload the project is built around.</p>
+<p><strong>DONE</strong>, and widened. The constant path now writes the value once and doubles it forward
+(<code>log2(N)</code> memcpys instead of <code>N</code>): constant int64 over 4M rows 12.3 ms → 4.5 ms. Constant <em>strings</em>
+barely move (69 ms → 66 ms) and that is the honest result — 4M copies of a 26-byte value is ~100 MiB
+of stores and the fill already runs at ~1.7 GB/s, so that case is memory-bandwidth bound. Only an
+encoding that never materializes the bytes (Arrow REE or dictionary) would help, and that changes
+the output type, so it is deferred rather than smuggled in.</p>
+<p>Profiling the result turned up a bigger, unlisted target: <code>decode_variable_width_page</code> appended each
+row's offset through its own <code>vector::resize()</code>, which callgrind put at <strong>32% of a whole read's
+instruction count</strong>. A page's offsets are now grown in one resize and written through a typed
+pointer. On a 1M-row int64 + double + string dataset read three times: 373.0M → 235.6M instructions
+(−37%), 87 ms → 77 ms wall clock (best of 20, interleaved). memcpy is now 53% of the profile, which
+is the floor for a reader that materializes Arrow buffers.</p>
+<p><strong>4.3 Default-init byte buffers. CLOSED — not worth doing.</strong> §2.4 measured ~6.5% for this <em>before</em>
+4.1 and 4.2. It does not survive them. After 4.2 the remaining zero-fill is the one in
+<code>decode_variable_width_page</code>'s offset resize, and callgrind still bills it at 5.1% of instructions —
+but that number is an artifact: callgrind counts <code>rep stosb</code> once <strong>per byte</strong>, so it reports ~12 MB
+of zeroing as ~12M instructions. Timed rather than counted, it is free.</p>
+<p>The experiment: the same function rewritten to <code>insert()</code> the page's offsets (copy, no zero-init)
+and shift them in place, which gets the default-init saving with no allocator and no public type
+change. Best of 20, interleaved against the resize version on the same dataset:</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>resize + write   80 ms
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>insert + shift   81 ms
+</code></pre></div>
+<p>Indistinguishable. So the version in the tree is the simpler one, and the allocator-parameterised
+<code>ColumnValues</code> this item asked for — a custom allocator leaking into a public type, in a library
+whose pitch is that it does not do that — buys nothing. This is the second time in this document
+that an instruction profile promised a win that wall clock did not pay; §2.4 already warned about
+exactly this fix, and the warning was if anything too mild.</p>
+<p><strong>4.4 mmap the data file. CLOSED — the win was in syscalls, and it was not the ones mmap removes.</strong>
+The item assumed the cost of <code>ifstream</code> page reads was the zero-fill and the kernel→heap copy.
+<code>strace -c</code> said otherwise. Three reads of the 1M-row dataset issued <strong>38,315 syscalls</strong>, and the
+single largest line was not read at all:</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a> 48.17%   19,065   newfstatat
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a> 26.68%    9,544   read
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a> 23.00%    9,546   lseek
+</code></pre></div>
+<p>The 19,065 stats were the open-file LRU re-validating size and mtime on <em>every page-buffer read</em> —
+two syscalls per page, to re-answer a question ("is this still the same file?") that cannot change
+partway through one read. <code>DataFileReadScope</code> marks a batch read as one operation so each file is
+validated on first touch; outside a scope every lookup still validates, so the guarantee is opt-in
+rather than something a caller loses by forgetting. The reader also remembers where the stream is and
+skips the seek when the next page starts there.</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>newfstatat   19,065 -&gt; 15
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>lseek         9,546 -&gt; 8,793
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>wall clock    78 ms -&gt; 68 ms      (best of 15, interleaved)
+</code></pre></div>
+<p>With those gone, the <em>entire</em> remaining file-read path — seek, read, and the copy into the page
+buffer — prices at <strong>~5% of a read</strong>, measured by doing every page read twice and taking the
+difference (74 ms -&gt; 78 ms over three reads). That is mmap's whole ceiling, against a <code>docs/SAFETY.md</code>
+rewrite, its own fuzz pass, and SIGBUS on a truncated file. Not worth it.</p>
+<p>The lseeks that remain are real: Lance pads each page buffer to 8 bytes, so the next buffer usually
+starts a few bytes past where the last read stopped. Coalescing a page's two buffers into one read
+would remove them, and is worth doing only if that ~5% ever becomes the top of the profile.</p>
+<p><strong>Also measured and rejected: making <code>MiniBlockChunkView</code> an actual view.</strong> It is named "View" but
+copies each chunk out of the page payload, and callgrind blamed those copies for <strong>25.6%</strong> of a
+read's instructions. Priced by running the split twice: 78 ms -&gt; 81 ms over three reads, so removing
+it entirely is worth ~3.8%. The refactor would thread a span type through six decoder helper
+signatures and give up the <code>std::swap(chunk.values, raw)</code> that the zstd and LZ4 paths use. Not a good
+trade at that price; revisit only with the coalescing above.</p>
+<p><strong>4.5 Re-profile.</strong> Publish the new callgrind breakdown alongside the bench, the way CI already
+does. State the ratio honestly — parity with rust-lance on read is the goal, and if 4.1–4.4 land it
+looks reachable.</p>
+<p><strong>DONE.</strong> CI already publishes the callgrind breakdown next to the bench
+(<code>linux-bench.yml</code>, "Native-read profile"), so what 4.5 actually owed was the honest ratio. Here it
+is, <code>bench/run-local-bench.sh</code> on this branch, best of 7 reads, each engine reading its own file:</p>
+<table>
+<thead>
+<tr>
+<th>200k rows</th>
+<th>parquet (zstd)</th>
+<th>rust lance</th>
+<th>nanolance</th>
+<th>vs rust lance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pcap_ref</code></td>
+<td>6.34 ms</td>
+<td>5.64 ms</td>
+<td><strong>1.51 ms</strong></td>
+<td>3.7× faster</td>
+</tr>
+<tr>
+<td><code>wide_int</code></td>
+<td>3.48 ms</td>
+<td>3.25 ms</td>
+<td><strong>1.55 ms</strong></td>
+<td>2.1× faster</td>
+</tr>
+<tr>
+<td><code>high_card</code></td>
+<td>7.47 ms</td>
+<td><strong>5.53 ms</strong></td>
+<td>8.04 ms</td>
+<td><strong>1.45× slower</strong></td>
+</tr>
+<tr>
+<td><code>float_smooth</code></td>
+<td>3.50 ms</td>
+<td>9.29 ms</td>
+<td><strong>1.73 ms</strong></td>
+<td>5.4× faster</td>
+</tr>
+<tr>
+<td><code>bool_flags</code></td>
+<td>2.00 ms</td>
+<td>1.79 ms</td>
+<td><strong>1.10 ms</strong></td>
+<td>1.6× faster</td>
+</tr>
+</tbody>
+</table>
+<p>Parity on read was the goal; four of the five shapes are past it. Three caveats, because the table
+is easy to over-read:</p>
+<ul>
+<li><strong>This is a shared container, not the CI runner.</strong> Only comparisons <em>within</em> one run are
+  meaningful — the 11.01 ms in §2.4 was measured on a different machine and must not be subtracted
+  from the 1.51 ms here. <code>bench/linux-ci-results.md</code> stays the authoritative file, and it is
+  auto-committed from <code>main</code>.</li>
+<li><strong><code>high_card</code> is the remaining gap, and it is the one this work predicted.</strong> It is the
+  high-cardinality-string shape — the variable-width path, which every profile in this phase ended
+  up pointing at, and which §4.2 already established is memory-bandwidth bound once the per-row
+  bookkeeping is gone. nanolance is also slower to <em>write</em> it (28.42 ms vs 17.96 ms).</li>
+<li><strong><code>read(lance)</code> — rust-lance reading nanolance's file — is 10.90 ms on <code>pcap_ref</code> against 5.64 ms
+  for its own.</strong> Interop works, but nanolance's encoding choices are not free for the other reader,
+  and that number belongs next to the wins rather than under them.</li>
+</ul>
+<p><strong>Where Phase 4 landed.</strong> Three reads of a 1M-row <code>int64 + double + string</code> dataset: <strong>87 ms → 68 ms
+(−22%)</strong>, on top of 4.1's 201 ms → 160 ms and its 2.01× → 1.01× peak RSS.</p>
+<p>The method mattered more than any single change here, so it is worth stating plainly: <strong>every item
+in this phase was decided by wall clock, and the instruction profile was wrong about all four of
+them.</strong> It over-sold 4.3 (5.1% of instructions, 0% of time — callgrind counts <code>rep stosb</code> once per
+byte). It over-sold the chunk-view refactor (25.6% of instructions, 3.8% of time). It under-sold the
+file-read path badly enough to hide the largest remaining win entirely (3.9% of instructions, ~24% of
+time — syscalls are cheap to count and expensive to make). It was right only about the per-row offset
+append, and even there the 32% of instructions paid out as 11% of time. Read <code>callgrind_annotate</code> to
+find <em>candidates</em>; never to size them.</p>
+<h3 id="phase-5-simplicity-opportunistic">Phase 5 — Simplicity (opportunistic)<a class="headerlink" href="#phase-5-simplicity-opportunistic" title="Permanent link">&para;</a></h3>
+<p><strong>5.1 One <code>WriteOptions</code> struct, one entry point.</strong> The current C API is eight <code>set_*</code> calls that
+must all precede <code>write_batch</code>, enforced at runtime with <code>INVALID_STATE</code>. An options struct passed
+to <code>writer_init</code> makes the ordering constraint unrepresentable instead of documented. Keep the C ABI
+stable; add the struct form alongside and let the setters delegate.</p>
+<p><strong>DONE.</strong> <code>NanoLanceWriteOptions</code> + <code>nano_lance_writer_open</code>. The setters and both <code>init</code> forms stay,
+and now delegate, so nothing that compiled before stops compiling.</p>
+<p>One decision worth recording: <strong>a zeroed struct means the defaults</strong>, and stays meaning them as
+fields are added. That forced <code>disable_structural_encoding</code> to be spelled as a negation, because
+structural encoding is the one option that is ON by default. A positive <code>structural_encoding</code> field
+would have made <code>NanoLanceWriteOptions options = {0}</code> silently disable it — the exact class of trap
+this item exists to remove. The C++ <code>WriteOptions</code> has member initializers and so spells it
+positively.</p>
+<p><strong>5.2 A <code>nano_lance::Writer</code> RAII type</strong> wrapping init/commit/close, since every C++ example in the
+repo hand-rolls the same lifecycle and <code>close()</code>-on-exception is currently the caller's problem.</p>
+<p><strong>DONE.</strong> <code>nanolance/writer.hpp</code>. Errors stay in the house style (<code>bool</code> + <code>error()</code>, not exceptions);
+only the lifetime changes. <code>commit()</code> defaults <code>is_append</code> to whatever <code>open()</code> was given, and flips
+to <code>true</code> after the first successful commit, so the one argument that was easy to get wrong now has a
+right answer by default.</p>
+<p>Both are guarded by <code>tests/test_writer_api.cpp</code>, which asserts <strong>byte-identical data files</strong> between
+the old spelling and the new one — for the options struct, for a zeroed struct against plain <code>init</code>,
+for a NULL options pointer, and for the RAII type against the hand-rolled C sequence. A second way to
+write files would be worse than none; the test is there to keep it the same way.</p>
+<p><strong>5.3 Fold <code>nlance_info</code>/<code>nlance2table</code>/<code>nlance_stitch</code>/<code>arrowipc2lance</code> into one <code>nanolance</code>
+CLI</strong> with subcommands. Four binaries with four naming conventions is a discoverability tax; one
+<code>nanolance --help</code> teaches the whole surface.</p>
+<p><strong>DONE</strong>, as <code>nanolance import</code> / <code>info</code> / <code>cat</code> / <code>stitch</code>.</p>
+<p>The old names stay, and that is deliberate rather than timid: each tool's source file is compiled
+<strong>twice</strong> — once into its standalone binary, once into <code>nanolance</code> with <code>NANOLANCE_CLI_SUBCOMMAND</code>
+defined, which drops its <code>main()</code> and leaves the subcommand entry point. One implementation, two front
+doors. Deleting the four names would have bought nothing a user can see while breaking every script
+and smoke test that already calls them, and duplicating the argument parsing to avoid that would have
+created exactly the drift this item is about.</p>
+<p><code>tests/smoke_nanolance_cli.sh</code> holds it together: the same Arrow IPC input through both front doors
+must produce byte-identical data files, <code>cat</code> and <code>info</code> must produce identical text, and a
+value-taking flag (<code>--compress -l 9</code>) must survive the forwarding <em>and</em> be shown to have changed the
+output — otherwise the comparison proves nothing. It fails against a dispatcher that drops one
+forwarded argument. The subcommands print <code>argv[0]</code> in their usage and diagnostics now, so
+<code>nanolance info</code> says <code>Usage: nanolance info</code>, not <code>nlance_info</code>.</p>
+<p>Two stale claims surfaced while wiring this up and were corrected rather than carried over:
+<code>arrowipc2lance --help</code> still said "nanolance cannot store nulls yet" (it has since 1.1), and
+<code>nlance_info</code> suggested re-ingesting with <code>--rows-per-fragment</code>, a flag no tool has ever had — one
+<code>import</code> run commits exactly one fragment however many IPC batches it reads, so the hint now says to
+split the input and re-run with <code>--append</code>. <strong>Still open:</strong> there is no way to split fragments within
+a single run, which is what that hint originally wanted to offer.</p>
+<p><strong>5.4 Retire dead read paths.</strong> <code>append_fixed_values</code> in <code>lance_table_reader.cpp</code> compares
+<code>arrow_format</code> as a <code>std::string</code> <strong>per value</strong> — it survives only on a fallback path, but it is a
+trap for the next person optimizing this file.</p>
+<p><strong>DONE</strong>, incidentally: the function went with 4.1's rewrite of how columns reach their Arrow
+buffers, and <code>lance_table_reader.cpp</code> no longer mentions it.</p>
+<hr />
+<h2 id="3b-reading-pylances-nullable-columns-found-and-fixed-after-the-plan-was-written">3b. Reading pylance's nullable columns (found and fixed after the plan was written)<a class="headerlink" href="#3b-reading-pylances-nullable-columns-found-and-fixed-after-the-plan-was-written" title="Permanent link">&para;</a></h2>
+<p>Not a plan item — a hole the plan's own "valid pylance alternative" claim rested on. Nulls had been
+tested at one or two sizes, which is the wrong shape of test here: Lance does not have <em>a</em>
+definition-level encoding, it has several, and which one a column gets depends on the row count and
+the null pattern rather than on anything the writer is asked for.</p>
+<p>Sweeping 5 types x 5 null patterns x 10 sizes against pylance's own read found three separate
+failures, the largest of which made a 200-to-1000-row nullable string column unreadable outright:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>symptom</th>
+<th>cause</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>InlineBitpacking(16)</code> levels</td>
+<td>refused by name</td>
+<td>the bit width is the buffer's first <code>u16</code>, not a number in the descriptor</td>
+</tr>
+<tr>
+<td>chunk header</td>
+<td><code>rle chunk buffer sizes invalid</code></td>
+<td>the header's shape depends on the descriptor; it was parsed as a fixed 8 bytes</td>
+</tr>
+<tr>
+<td>multi-block levels</td>
+<td><code>covers more than one FastLanes block</code></td>
+<td>a <code>bool</code> chunk holds 1025 values, so its levels span two blocks</td>
+</tr>
+</tbody>
+</table>
+<p>All 250 cells now match pylance. The details, including the on-disk grammar for each, are in
+<code>docs/PROGRESS.md</code>; <code>bindings/python/tests/test_lance_nullable_matrix.py</code> is the sweep.</p>
+<p>The general lesson is the one worth keeping: <strong>a format reader cannot be spot-checked.</strong> Each of
+these was a shape stock Lance picks on its own, for ordinary data, that no test happened to land on.</p>
+<hr />
+<h2 id="4-suggested-sequencing">4. Suggested sequencing<a class="headerlink" href="#4-suggested-sequencing" title="Permanent link">&para;</a></h2>
+<p>Phase 0 first and immediately — it is days of work and it is the difference between "silently wrong"
+and "trustworthy." Then Phase 2 (wheels) and Phase 1 (nullability + types) in parallel, since they
+are independent and together they are what make the project installable <em>and</em> useful. Phase 1.3
+(stock-Lance decode) is detailed in §6 and can start immediately — it is additive and needs no
+writer change. Phase 3 follows Phase 1.
+Phase 4 last, for the reason stated there.</p>
+<h2 id="5-explicit-non-goals">5. Explicit non-goals<a class="headerlink" href="#5-explicit-non-goals" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Becoming a query engine. No SQL, no predicate pushdown, no indexes. "Fast, small, honest Lance
+  I/O" is the differentiator; scan-and-filter is not.</li>
+<li>Write-side parity with every rust-lance encoding. The current encoder set already hits Lance file
+  sizes; adding encodings for their own sake trades simplicity for nothing.</li>
+<li>Dropping the safety posture to win the read benchmark. <code>bench/read_parity_results.md</code> shows the
+  checks cost ~1.0×; that result is worth protecting, and any mmap work (4.4) must preserve it.</li>
+</ul>
+<hr />
+<h2 id="6-generalizing-the-reader-without-touching-the-writer">6. Generalizing the reader without touching the writer<a class="headerlink" href="#6-generalizing-the-reader-without-touching-the-writer" title="Permanent link">&para;</a></h2>
+<p><em>Added after the initial review, in answer to: can the reader be made general while the writer stays
+as-is and the verification-reader promise is preserved? <strong>Yes — and it is mostly a dispatch change,
+not new decoders.</strong></em></p>
+<h3 id="61-the-actual-root-cause">6.1 The actual root cause<a class="headerlink" href="#61-the-actual-root-cause" title="Permanent link">&para;</a></h3>
+<p>The writer and the reader speak different languages about the same file.</p>
+<p><strong>The writer already speaks Lance properly.</strong> For every encoding it emits, it writes a real
+<code>/lance.encodings21.PageLayout</code> message into <code>ColumnPage</code> field 4 — <code>MiniBlockLayout</code> wrapping a
+<code>CompressiveEncoding</code> tree (Flat, Variable, Constant, RLE, Dictionary, InlineBitpacking,
+ByteStreamSplit, General{ZSTD}). That is exactly why stock Lance reads nanolance output.</p>
+<p><strong>The reader ignores all of it.</strong> <code>pb::decode_column_page</code> parses fields 1, 2, 3 and 5 and <em>skips
+field 4</em> — the encoding descriptor is written and never read back. <code>decode_lance_physical_column</code>
+instead branches on a nanolance-private side channel in the field metadata:</p>
+<div class="language-cpp highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="n">field_metadata_equals</span><span class="p">(</span><span class="n">on_disk_field</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;nanolance:packing&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;constant&quot;</span><span class="p">)</span><span class="w">   </span><span class="c1">// :415</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="n">field_metadata_equals</span><span class="p">(</span><span class="n">on_disk_field</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;nanolance:packing&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;rle&quot;</span><span class="p">)</span><span class="w">        </span><span class="c1">// :459</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="n">field_metadata_equals</span><span class="p">(</span><span class="n">on_disk_field</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;nanolance:packing&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;dict-rle&quot;</span><span class="p">)</span><span class="w">   </span><span class="c1">// :524</span>
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="n">field_metadata_equals</span><span class="p">(</span><span class="n">on_disk_field</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;nanolance:packing&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;dict&quot;</span><span class="p">)</span><span class="w">       </span><span class="c1">// :644</span>
+<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="n">field_metadata_equals</span><span class="p">(</span><span class="n">on_disk_field</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;nanolance:packing&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;bss-zstd&quot;</span><span class="p">)</span><span class="w">   </span><span class="c1">// :729</span>
+<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="n">field_metadata_equals</span><span class="p">(</span><span class="n">on_disk_field</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;nanolance:packing&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;bitpack&quot;</span><span class="p">)</span><span class="w">    </span><span class="c1">// :834</span>
+</code></pre></div>
+<p>A file from stock Lance carries none of those keys, so it falls through to a flat-page assumption
+that does not match, and dies on a size check.</p>
+<h3 id="62-how-close-the-two-writers-actually-are">6.2 How close the two writers actually are<a class="headerlink" href="#62-how-close-the-two-writers-actually-are" title="Permanent link">&para;</a></h3>
+<p>Both writers emit the <em>same</em> descriptor namespaces — verified by <code>strings</code> on the data files:</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>pylance 12.0.0 :  /lance.encodings.ColumnEncoding   /lance.encodings21.PageLayout
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>nanolance      :  /lance.encodings.ColumnEncoding   /lance.encodings21.PageLayout
+</code></pre></div>
+<p>And for the case that failed hardest in §2.2 — a plain 5000-row <code>int64</code> — the PageLayout bodies are
+<strong>byte-identical apart from the chunk row count</strong>:</p>
+<div class="language-text highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>pylance   int64 : 12 12 0a 10 1a 04 2a 02 08 40 32 01 01 38 01 48 88 27 50 01   (0x2788 = 5000 rows)
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>nanolance int64 : 12 12 0a 10 1a 04 2a 02 08 40 32 01 01 38 01 48 80 08 50 01   (0x0880 = 1024 rows)
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>                                    ^^^^^^^^^^^
+<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>                     CompressiveEncoding{ f5 InlineBitpacking{ bits = 64 } }
+</code></pre></div>
+<p>That node is <code>InlineBitpacking</code> — which nanolance <strong>already writes</strong>
+(<code>data_file_writer.cpp:571</code>, <code>ce = {0x2a, 0x02, 0x08, bits}</code>) and <strong>already decodes</strong>
+(<code>unpack_bitpacked_page</code>, the FastLanes port, fuzzed and ASan-clean).</p>
+<p>So the failure on stock-Lance <code>int64</code> is not a missing decoder. It is a working decoder that never
+gets called, because dispatch asks the field metadata instead of reading the descriptor sitting in
+the page. Several of the §2.2 FAILs are this same shape.</p>
+<h3 id="63-the-change">6.3 The change<a class="headerlink" href="#63-the-change" title="Permanent link">&para;</a></h3>
+<p>Three steps, strictly additive, writer untouched:</p>
+<ol>
+<li><strong>Parse <code>ColumnPage</code> field 4.</strong> Add a real <code>PageLayout</code> / <code>CompressiveEncoding</code> decoder to
+   <code>lance_minimal.pb</code>, generated from the pinned Lance <code>encodings_v2_1.proto</code>. This is the mirror of
+   serializers the writer already has, and it is what <code>proto/README.md</code> has said to do since the
+   scaffold went in ("replace or extend that scaffold with nanopb output generated from the pinned
+   Lance <code>v7.0.0-rc.1</code> files ... <code>encodings_v2_1.proto</code>"). The proto dirs are still README-only.</li>
+<li><strong>Re-root dispatch on the parsed tree.</strong> Walk <code>MiniBlockLayout → CompressiveEncoding</code> and call
+   the existing leaf kernels. No kernel is rewritten: FastLanes unpack, RLE expansion, dictionary
+   expansion, byte-stream-split and zstd-unframe all stay exactly as they are and as they are
+   fuzzed. This is a routing change.</li>
+<li><strong>Then</strong> add only what nanolance genuinely never writes: <code>FullZipLayout</code>, <code>AllNullLayout</code>,
+   validity/definition levels (which is the same work as the null support in 1.1), and the logical
+   types in 1.2. This is the one genuinely new decoding work, and it is an enumerable list rather
+   than an open-ended "support all of Lance."</li>
+</ol>
+<p>Steps 1–2 alone should clear the <code>int64</code> and <code>utf8</code> rows of §2.2 — the two that matter most, since
+they are what a rust-lance user's first smoke test contains.</p>
+<h3 id="64-the-verification-promise-survives-and-gets-stronger">6.4 The verification promise survives — and gets stronger<a class="headerlink" href="#64-the-verification-promise-survives-and-gets-stronger" title="Permanent link">&para;</a></h3>
+<p>The promise worth keeping is: <em>everything nanolance writes, nanolance reads back exactly; anything
+it cannot handle is a clear error, never silent wrong data.</em> That is a <strong>test property</strong>. The
+current policy enforces it with a <strong>scope restriction</strong> ("only decode what we write"), and the scope
+restriction is the part that blocks generality. Swap the mechanism, keep the property:</p>
+<p><strong>A differential oracle, free of charge.</strong> During the transition, keep both decoders. For every file
+the writer produces, decode it via the legacy <code>nanolance:packing</code> path <em>and</em> via the new PageLayout
+path and assert the resulting <code>ColumnValues</code> are byte-identical. Run it over the whole existing test
+corpus, the golden files, and the fuzz corpus. That is an exhaustive proof that the general path
+agrees with the verified path on 100% of writer output — a much stronger guarantee than "we only
+wrote code for our own files," and something very few parsers get to have when they generalize. When
+it is green everywhere, delete the legacy path. The writer can keep emitting the <code>nanolance:*</code>
+metadata indefinitely; it costs a few bytes and keeps old files readable.</p>
+<p><strong>"Clear error, never best-effort" gets sharper, not weaker.</strong> Today's behaviour is worse than the
+policy advertises. <code>fixed-width page byte count mismatch</code> on a stock-Lance <code>int64</code> is not the reader
+recognising a foreign format and declining it — it is the reader <em>misparsing</em> foreign bytes under
+nanolance layout assumptions and getting caught by a downstream size check. That is why a 3-row
+table reads "fine" and a 5000-row one fails: the luck runs out, not the validation. Dispatching on a
+typed descriptor replaces that with an honest, named refusal — "unsupported CompressiveEncoding
+variant 7" — decided before a single byte is interpreted.</p>
+<p><strong>The safety posture is unchanged and the budget applies as-is.</strong> Every new node goes through the
+same <code>read_safety</code> overflow-checked bounds and allocation budget; the descriptor is itself untrusted
+input and gets validated like any other. Seed <code>tests/fuzz/fuzz_decode.cpp</code> with pylance-written
+files and coverage goes up, not down. <code>bench/read_parity_results.md</code> (~1.0× trusted vs default)
+should be re-run after the change and is expected to hold — these checks are per-page, not per-value.</p>
+<h3 id="65-what-this-does-not-do">6.5 What this does <em>not</em> do<a class="headerlink" href="#65-what-this-does-not-do" title="Permanent link">&para;</a></h3>
+<p>It does not make nanolance a general Lance <em>writer</em>, and it should not. The writer's encoder set
+already hits Lance file sizes; leave it alone. It also does not, by itself, fix nulls (1.1) or the
+missing logical types (1.2) — those are genuine feature work that happens to share the
+validity-decoding step with 6.3's step 3.</p>
+<h3 id="66-positioning">6.6 Positioning<a class="headerlink" href="#66-positioning" title="Permanent link">&para;</a></h3>
+<p>With this, the honest claim becomes: <strong>"writes a deliberately small, fast subset of Lance; reads
+Lance."</strong> That is a coherent and attractive place to stand — the same shape as the writer/reader
+asymmetry argument nanoarrow2parquet's README already makes, inverted. It gives a rust-lance user
+something to actually switch <em>to</em>, without asking the writer to grow.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../bench-trusted-parity/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Safety-parity (trusted vs default)">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Safety-parity (trusted vs default)
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../PROGRESS/" class="md-footer__link md-footer__link--next" aria-label="Next: Implementation progress">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Implementation progress
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
