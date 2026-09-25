@@ -1564,8 +1564,8 @@ bool fsst_pays_on_first_page(const fsst::Encoder& encoder, const ColumnValues& v
 }
 
 bool build_nested_page(const LanceField& field, const ColumnValues& values, const repdef::Serialized& ser,
-                       std::uint64_t rows, const fsst::Encoder* fsst_encoder, NestedPageBuffers& page, bool& too_big,
-                       std::string& error) {
+                       std::uint64_t rows, const fsst::Encoder* fsst_encoder, bool plain, NestedPageBuffers& page,
+                       bool& too_big, std::string& error) {
     constexpr std::size_t kValuesPerChunk = 1024U;  // 2^10: the log in every non-final chunk's word
     constexpr std::size_t kMaxChunkLevelBytes = 65535U;
     too_big = false;
@@ -1573,7 +1573,10 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
     const auto encoding = item_encoding_for(field, values);
     std::vector<std::string_view> distinct;
     std::vector<std::uint32_t> indices;
-    const bool dictionary = encoding == ItemEncoding::kVariable && plan_item_dictionary(values, ser.items, distinct, indices);
+    // `plain`: the caller asked for no structural encoding (set_structural_encoding(false)), so the
+    // values are written as they are -- no page dictionary here, and no FSST (it passes none).
+    const bool dictionary =
+        !plain && encoding == ItemEncoding::kVariable && plan_item_dictionary(values, ser.items, distinct, indices);
     // Not repetitive enough for a dictionary: FSST, when it pays. Its chunks are ordinary Variable
     // chunks of the COMPRESSED values, gathered from `fsst_values` in page order.
     ColumnValues fsst_values;
@@ -1746,10 +1749,13 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
 }
 
 bool write_nested_column(std::ofstream& out, const LanceField& field, const ColumnValues& values, std::uint64_t rows,
-                         pb::ColumnMetadata& column, std::string& error, const fsst::Encoder* fsst_encoder = nullptr) {
+                         pb::ColumnMetadata& column, std::string& error, const fsst::Encoder* fsst_encoder = nullptr,
+                         bool plain = false) {
     // One FSST table for the whole column, used by every page it pays on.
     fsst::Encoder trained;
-    if (fsst_encoder == nullptr && train_column_fsst(field, values, trained)) {
+    if (plain) {
+        fsst_encoder = nullptr;
+    } else if (fsst_encoder == nullptr && train_column_fsst(field, values, trained)) {
         fsst_encoder = &trained;
     }
     std::vector<repdef::SerializeLayer> layers;
@@ -1824,7 +1830,7 @@ bool write_nested_column(std::ofstream& out, const LanceField& field, const Colu
             page.encoding = page_encoding(2, constant);
         } else {
             bool too_big = false;
-            const bool built_ok = build_nested_page(field, values, ser, n, fsst_encoder, built, too_big, error);
+            const bool built_ok = build_nested_page(field, values, ser, n, fsst_encoder, plain, built, too_big, error);
             if (!built_ok && !too_big) {
                 error = "column '" + field.name + "': " + error;
                 return false;
@@ -2478,9 +2484,34 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             continue;
         }
 
-        // Variable-width columns keep the two-phase build (chunks are unequal-sized, driven by the
-        // offsets math in build_variable_chunks_for_column). A nullable column additionally caps each
-        // chunk at one FastLanes block, since that is what a definition-level buffer covers.
+        // Every other string or binary column goes to the multi-chunk page writer too, in its plain
+        // mode (Variable chunks, no dictionary, no FSST). The single-chunk pages below describe a
+        // chunk's value bytes in a u16, so one value over ~32 KB -- a JPEG, an audio clip -- wrote a
+        // file Rust Lance could not read, and over 64 KB one nanolance could not read either; they
+        // also cost Rust a page set-up per 32 KB. The multi-chunk writer's chunks carry u32 sizes.
+        // What stays below is zstd (compress), which only these pages carry, and only while every
+        // value fits a chunk.
+        bool value_too_big_for_a_chunk = false;
+        {
+            const auto width = values.variable.large ? 8U : 4U;
+            const auto entries = values.variable.offsets.size() / width;
+            for (std::size_t i = 0; i + 1U < entries && !value_too_big_for_a_chunk; ++i) {
+                value_too_big_for_a_chunk =
+                    variable_offset(values, i + 1U) - variable_offset(values, i) > kMaxVariableMiniblockBytes / 2U;
+            }
+        }
+        if (!compress || value_too_big_for_a_chunk) {
+            pb::ColumnMetadata column;
+            if (!write_nested_column(out, field, values, rows, column, error, nullptr, /*plain=*/true)) {
+                return false;
+            }
+            columns.push_back(std::move(column));
+            continue;
+        }
+
+        // zstd variable-width columns keep the two-phase build (chunks are unequal-sized, driven by
+        // the offsets math in build_variable_chunks_for_column). A nullable column additionally caps
+        // each chunk at one FastLanes block, since that is what a definition-level buffer covers.
         if (!build_variable_chunks_for_column(values.variable, chunks, error,
                                               column_has_nulls ? 1024U : 0U)) {
             return false;

@@ -1866,8 +1866,26 @@ bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& 
         !apply_item_view(plan, chunks, error)) {
         return false;
     }
+    // `validity_rows` counts every row read so far, with or without levels. Lance (and nanolance)
+    // leave definition levels out of a page with no null in it even when other pages of the column
+    // have some, so a page without them is all valid: its bits are appended when the bitmap already
+    // exists, and the first page with levels back-fills the rows before it.
+    const auto set_valid = [&out](std::uint64_t first, std::uint64_t count) {
+        const auto end = first + count;
+        out.validity.resize(static_cast<std::size_t>((end + 7U) / 8U), 0U);
+        for (auto row = first; row < end; ++row) {
+            out.validity[static_cast<std::size_t>(row >> 3U)] |= static_cast<std::uint8_t>(1U << (row & 7U));
+        }
+    };
     if (plan.repdef == nullptr) {
+        if (!out.validity.empty()) {
+            set_valid(validity_rows, page_rows);
+        }
+        validity_rows += page_rows;
         return true;
+    }
+    if (out.validity.empty() && validity_rows != 0U) {
+        set_valid(0U, validity_rows);
     }
     std::uint64_t covered = 0;
     for (const auto& chunk : chunks) {
