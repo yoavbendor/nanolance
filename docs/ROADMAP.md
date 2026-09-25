@@ -177,8 +177,8 @@ structs, structs of lists and null structs are written and read by both readers
 (`tests/test_lance_list_writes.py`, plus the type and parity matrices), including sliced batches,
 several fragments, long rows split across pages, and `nanolance convert` from parquet. **Pages
 compressed:** bit-packed levels, 1,024-value chunks (rows may span them), bit-packed integer items and
-per-page string dictionaries -- within ~0.2% of pylance's size except high-cardinality strings, which
-wait on an FSST encoder (F2).
+per-page string dictionaries -- within ~0.2% of pylance's size; high-cardinality string items are
+FSST-compressed since F2.
 
 ### Phase E — small type gaps (any time; good first tasks)
 
@@ -189,12 +189,22 @@ wait on an FSST encoder (F2).
 | E3 | Arrow `null` type on write → `ConstantLayout` all-null (the reader already understands it). Delete the stale refusal message "cannot store nulls yet", which stopped being true at 1.1. | S | Sonnet |
 | E4 | `large_utf8` / `large_binary` on write: decouple the chunk's u32 offsets from the declared 64-bit Arrow width across the variable-width paths. The exact fix is recorded at the refusal site. | M | Sonnet; Opus review |
 
+**Status:** E1–E4 done. E4 turned out to need the opposite of what the refusal site said: Lance
+wants **u64** offsets inside a large type's chunk, dictionary block and list-item chunk, with
+`Variable{Flat(64)}` — it decodes each page straight into the Arrow type and refuses 32-bit offsets
+for a large one. See PROGRESS, "Roadmap E4".
+
 ### Phase F — performance (measure before building)
 
 | # | Task | Size | Model |
 |---|---|---|---|
 | F1 | **Page size.** nanolance writes ~1024 rows per bitpacked page; pylance put 200,000 in one. Measure read time vs page size on the bench datasets *first* — this project's instruction profiles misled four times; only wall clock is trusted. | S (measure) + M | **Opus** |
 | F2 | **FSST on write** — the answer to the one bench shape nanolance still loses (`high_card`, 7.67 ms vs 5.12 ms). Encoder only; the reader exists. Correctness oracle: pylance reads it; speed oracle: the bench. | M–L | **Opus** |
+
+**Status:** F2 done — see PROGRESS, "Roadmap F2". String files are now as small as pylance's or
+smaller. On `high_card`, rust lance reads nanolance's file in ~7 ms (10.8–18.7 ms before, when it was
+zstd); nanolance's own read is about where it was (7.6–8.0 ms against 7.7–10.6 ms) and still trails
+rust lance reading its own file (6.1–6.7 ms on the same runs). F1 is still open.
 
 ### Phase G — packaging and infrastructure (independent; run in parallel)
 

@@ -166,9 +166,105 @@ void values_accumulate_onto_one_buffer() {
     require(std::string(out.begin(), out.end()) == "-abcd", "values append");
 }
 
+// ── The encoder (roadmap F2) ─────────────────────────────────────────────────────────────────
+
+using Values = std::vector<std::pair<const std::uint8_t*, std::size_t>>;
+
+Values views(const std::vector<std::string>& strings) {
+    Values out;
+    for (const auto& s : strings) {
+        out.emplace_back(reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
+    }
+    return out;
+}
+
+/// Train on `strings`, compress each, and decode through the SERIALIZED table with the reader's
+/// own parser: the round trip every written page takes. Returns compressed bytes (table excluded).
+std::size_t round_trip(const std::vector<std::string>& strings, const std::string& what) {
+    fsst::Encoder encoder;
+    require(fsst::train(views(strings), encoder), what + ": training found no symbols");
+    require(encoder.symbol_count >= 1U && encoder.symbol_count <= 255U, what + ": 1..255 symbols");
+    fsst::SymbolTable table;
+    std::string error;
+    require(fsst::parse_symbol_table(fsst::serialize(encoder), table, error), what + ": " + error);
+    require(!table.passthrough, what + ": a trained table has the encoder switch on");
+    std::size_t compressed_bytes = 0;
+    for (const auto& s : strings) {
+        std::vector<std::uint8_t> compressed;
+        fsst::compress_value(encoder, reinterpret_cast<const std::uint8_t*>(s.data()), s.size(), compressed);
+        compressed_bytes += compressed.size();
+        std::vector<std::uint8_t> back;
+        require(fsst::decompress_value(table, compressed.data(), compressed.size(), back, error), what + ": " + error);
+        require(std::string(back.begin(), back.end()) == s, what + ": value did not round-trip: " + s);
+    }
+    return compressed_bytes;
+}
+
+void encoder_round_trips_and_compresses() {
+    std::vector<std::string> urls;
+    std::size_t raw = 0;
+    for (int i = 0; i < 20000; ++i) {
+        urls.push_back("https://example.com/users/" + std::to_string(i * 7919 % 100003) + "/profile?tab=" +
+                       std::to_string(i % 13));
+        raw += urls.back().size();
+    }
+    const auto packed = round_trip(urls, "urls");
+    // Repetitive text: pylance's FSST gets these to well under half; so must this one.
+    require(packed * 2U < raw, "urls compress to less than half (" + std::to_string(packed) + " of " +
+                                   std::to_string(raw) + " bytes)");
+
+    // Every byte value, empty values, one-byte values, values shorter than any symbol, a value of
+    // 0xFF bytes (the escape code as DATA), and bytes that only appear once.
+    std::vector<std::string> edge{"", "a", "ab", std::string(1, '\0'), std::string(40, '\xFF'), "xyz"};
+    std::string all_bytes;
+    for (int b = 0; b < 256; ++b) {
+        all_bytes.push_back(static_cast<char>(b));
+    }
+    for (int i = 0; i < 300; ++i) {
+        edge.push_back(all_bytes.substr(static_cast<std::size_t>(i % 256)) + all_bytes.substr(0, static_cast<std::size_t>(i % 256)));
+        edge.push_back("repeated repeated repeated " + std::to_string(i));
+    }
+    round_trip(edge, "edge cases");
+
+    // Random bytes: nothing to gain, but it must still round-trip (mostly escapes).
+    std::vector<std::string> noise;
+    std::uint64_t x = 88172645463325252ULL;
+    for (int i = 0; i < 2000; ++i) {
+        std::string v;
+        for (int j = 0; j < 1 + i % 37; ++j) {
+            x ^= x << 13U;
+            x ^= x >> 7U;
+            x ^= x << 17U;
+            v.push_back(static_cast<char>(x & 0xFFU));
+        }
+        noise.push_back(v);
+    }
+    round_trip(noise, "noise");
+}
+
+void encoder_is_deterministic() {
+    std::vector<std::string> strings;
+    for (int i = 0; i < 50000; ++i) {
+        strings.push_back("customer-" + std::to_string(i * 31 % 9973) + "@mail.example.org");
+    }
+    fsst::Encoder a;
+    fsst::Encoder b;
+    require(fsst::train(views(strings), a) && fsst::train(views(strings), b), "training succeeds");
+    require(fsst::serialize(a) == fsst::serialize(b), "the same input trains the same table (fixed-seed sample)");
+}
+
+void nothing_to_train_on_is_declined() {
+    fsst::Encoder encoder;
+    require(!fsst::train({}, encoder), "no values: no table");
+    require(!fsst::train(views({"", "", ""}), encoder), "only empty values: no table");
+}
+
 }  // namespace
 
 int main() {
+    encoder_round_trips_and_compresses();
+    encoder_is_deterministic();
+    nothing_to_train_on_is_declined();
     table_shape_is_validated();
     a_parsed_table_reports_what_it_holds();
     codes_expand_to_their_symbols();

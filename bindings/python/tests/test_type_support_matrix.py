@@ -6,11 +6,9 @@ Three things this pins that prose cannot:
    type it could not represent and producing a file that read back wrong (see the nullability work).
    Every entry in ``REFUSED_ON_WRITE`` asserts a clean, named refusal -- so a future change that makes
    one of them "work" fails here instead of silently shipping bad files.
-2. **The read and write surfaces are not the same, on purpose.** `large_string` and `large_binary`
-   READ correctly from a pylance dataset and are REFUSED on write. That asymmetry is deliberate and
-   its reason is recorded where it is raised; pinning it stops someone "tidying up" one side.
-   (`decimal256`, `float16`, `duration` and Arrow's `null` type used to be on the refused side too;
-   all four now round-trip.)
+2. **What is still refused is pinned by message.** `large_string` and `large_binary` used to be
+   read-only (roadmap E4); like `decimal256`, `float16`, `duration` and Arrow's `null` type before
+   them, they now round-trip.
 3. **Lists and maps round-trip.** `list`, `large_list`, lists of structs, structs of lists and maps
    are written as leaf columns with repetition and definition levels (roadmap Phase D) and read
    back by both readers, as are pylance's own (Phase C).
@@ -95,13 +93,16 @@ ROUNDTRIPS = {
     "map": _t(pa.map_(pa.utf8(), pa.int64()), [[("k%d" % i, i)] for i in range(N)]),
     "list_of_strings": _t(pa.list_(pa.utf8()), [[f"s{i}", None][: i % 3] for i in range(N)]),
     "null_struct": _t(pa.struct([("a", pa.int64()), ("s", pa.utf8())]), [None if i % 4 == 0 else {"a": i, "s": f"s{i}"} for i in range(N)]),
+    # 64-bit offsets (roadmap E4): written with u64 offsets inside the chunk and Variable{Flat(64)},
+    # as pylance writes them -- Lance refuses 32-bit offsets for a large type.
+    "large_string": _t(pa.large_utf8(), [None if i % 7 == 0 else f"s{i}" for i in range(N)]),
+    "large_binary": _t(pa.large_binary(), [b"b%d" % i for i in range(N)]),
+    "list_of_large_strings": _t(pa.large_list(pa.large_utf8()), [[f"s{i}", None][: i % 3] for i in range(N)]),
 }
 
 # Refused at write_batch, each with a message naming the column. The fragment is what the refusal has
 # to keep saying; a change that makes any of these WRITE must come here and justify itself.
 REFUSED_ON_WRITE = {
-    "large_string": (_t(pa.large_utf8(), [f"s{i}" for i in range(N)]), "large_utf8"),
-    "large_binary": (_t(pa.large_binary(), [b"b%d" % i for i in range(N)]), "large_binary"),
     "dictionary": (
         pa.table({"c": pa.array([f"d{i % 5}" for i in range(N)]).dictionary_encode()}),
         "dictionary-encoded column",
@@ -113,10 +114,6 @@ REFUSED_ON_WRITE = {
         "null element inside a row",
     ),
 }
-
-# Written by pylance, read correctly by nanolance, but refused on OUR write side. Each asymmetry is
-# deliberate; see the refusal sites for why.
-READ_ONLY = ("large_string", "large_binary")
 
 # Written by pylance and NOT readable. Pinned by message so each fails loudly when implemented.
 UNREADABLE_FROM_PYLANCE = {
@@ -151,17 +148,6 @@ def test_unsupported_type_is_refused_not_corrupted(tmp_path, name):
     message = str(excinfo.value)
     assert fragment in message, f"{name} refused with an unexpected message: {message}"
     assert "'c'" in message or "column" in message, f"{name}'s refusal does not name the column: {message}"
-
-
-@pytest.mark.parametrize("name", READ_ONLY)
-def test_read_only_types_read_back_from_stock_lance(tmp_path, name):
-    """Refused on write, correct on read. Pinning this stops the asymmetry being 'tidied up'."""
-    lance_mod = require_pylance()
-    table = REFUSED_ON_WRITE[name][0]
-    path = str(tmp_path / f"{name}.lance")
-    lance_mod.write_dataset(table, path)
-    expected = lance_mod.dataset(path).to_table()
-    assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
 
 
 @pytest.mark.parametrize("name", sorted(ROUNDTRIPS))

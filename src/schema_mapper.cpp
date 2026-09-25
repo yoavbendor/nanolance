@@ -389,39 +389,6 @@ bool map_field(const ArrowSchema& field,
     const bool is_struct = parsed.logical_type == "struct" || is_list;
     const bool is_dictionary = field.dictionary != nullptr;
 
-    // large_utf8 / large_binary produce a file stock Lance rejects as corrupt. nanolance writes the
-    // 64-bit Arrow offsets straight into the miniblock chunk, but Lance v2.2 miniblock pages require
-    // the u32 chunk grammar ("expected 32-bit offsets but got 64-bit offsets"). Lance keeps u32
-    // offsets INSIDE the chunk for large types too and signals the 64-bit Arrow width only in the
-    // page layout's Variable{offsets = Flat{bits}} node -- pylance's string and large_string page
-    // descriptors are byte-identical apart from that one token (0x20 vs 0x40). Supporting these
-    // properly therefore means decoupling the chunk offset width from the declared Arrow width
-    // across every variable-width page path (plain, zstd, dict, dict+RLE, constant); until that
-    // lands, refuse rather than emit a file no reader accepts.
-    //
-    // Scoped to columns that go through the generic variable-width page path. A lance.blob.v2
-    // struct's `data` child is declared large_binary but is encoded by the blob-v2 packed writer,
-    // which never builds a miniblock chunk, so it is unaffected and must keep working.
-    const LanceField* mapped_parent = nullptr;
-    for (const auto& candidate : mapping.fields) {
-        if (parent_id >= 0 && candidate.id == parent_id) {
-            mapped_parent = &candidate;
-            break;
-        }
-    }
-    const bool under_blob_v2 = mapped_parent != nullptr && mapped_parent->extension_name == "lance.blob.v2";
-
-    if (!under_blob_v2 && (parsed.logical_type == "large_utf8" || parsed.logical_type == "large_binary")) {
-        error = "column '";
-        error += field.name == nullptr ? "<unnamed>" : field.name;
-        error += "' has type " + parsed.logical_type +
-                 ", which nanolance cannot write yet (it would emit 64-bit offsets inside a Lance "
-                 "v2.2 miniblock page, which requires the u32 chunk grammar, and stock Lance "
-                 "rejects the result as corrupt). Use utf8 / binary instead (pyarrow: "
-                 "col.cast(pa.string()) / col.cast(pa.binary())).";
-        return false;
-    }
-
     LanceField out;
     out.name = field.name == nullptr ? "" : field.name;
     out.logical_type = parsed.logical_type;

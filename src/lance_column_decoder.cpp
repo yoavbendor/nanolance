@@ -524,33 +524,56 @@ bool decode_variable_width_page(const std::vector<std::uint8_t>& chunk_bytes, co
     if (out_offsets.empty()) {
         append_list_offset(out_offsets, 0, out_large);
     }
-    // Each value's decoded length is only known after decompressing it, so unlike the plain
-    // variable-width path this cannot be one bulk write -- but the growth can still be one
-    // reservation instead of a reallocation every few rows.
-    reserve_more(out_offsets, static_cast<std::size_t>(num_values) * (out_large ? 8U : 4U));
+    // One pass over the chunk into a scratch buffer sized for the worst case (every code a full
+    // 8-byte symbol), recording each value's end; then one copy onto the column. Per value,
+    // grow-and-shrink of the column's own buffer was over half the read time of a high-cardinality
+    // string column.
     const auto base = read_list_offset(offsets, 0, offsets_large);
+    const auto chunk_bytes = read_list_offset(offsets, num_values, offsets_large) - base;
+    if (chunk_bytes < 0 || static_cast<std::size_t>(chunk_bytes) > data.size()) {
+        error = "FSST value bounds out of range";
+        return false;
+    }
+    thread_local std::vector<std::uint8_t> scratch;
+    const auto worst = static_cast<std::size_t>(chunk_bytes) * fsst::kMaxSymbolLength + fsst::kMaxSymbolLength;
+    if (scratch.size() < worst) {
+        scratch.resize(worst);
+    }
+    const std::size_t width = out_large ? 8U : 4U;
+    const auto offsets_at = out_offsets.size();
+    out_offsets.resize(offsets_at + static_cast<std::size_t>(num_values) * width);
+    const auto data_start = out_data.size();
+    auto* dst = scratch.data();
     for (std::uint64_t i = 0; i < num_values; ++i) {
         // decode_variable_width_page already proved this table is non-decreasing and inside `data`.
         const auto start = read_list_offset(offsets, i, offsets_large) - base;
         const auto end = read_list_offset(offsets, i + 1U, offsets_large) - base;
-        if (start < 0 || end < start || static_cast<std::size_t>(end) > data.size()) {
+        if (start < 0 || end < start || end > chunk_bytes) {
             error = "FSST value bounds out of range";
             return false;
         }
-        if (!fsst::decompress_value(table, data.data() + start, static_cast<std::size_t>(end - start),
-                                    out_data, error)) {
+        if (!fsst::decode_checked(table, data.data() + start, static_cast<std::size_t>(end - start), dst, error)) {
             return false;
         }
+        const auto total = data_start + static_cast<std::size_t>(dst - scratch.data());
         // A 32-bit offsets column cannot address more than 2 GiB of decoded bytes. FSST expands, so
         // this is reachable from a file that was itself well under the limit -- check it per value
         // rather than discovering it as a wrapped negative offset later.
-        if (out_data.size() > default_read_limits().max_uncompressed_bytes ||
-            (!out_large && out_data.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
+        if (total > default_read_limits().max_uncompressed_bytes ||
+            (!out_large && total > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))) {
             error = "FSST-decoded column exceeds the decoded-size limit";
             return false;
         }
-        append_list_offset(out_offsets, static_cast<std::int64_t>(out_data.size()), out_large);
+        auto* slot = out_offsets.data() + offsets_at + static_cast<std::size_t>(i) * width;
+        if (out_large) {
+            const auto v = static_cast<std::int64_t>(total);
+            std::memcpy(slot, &v, 8U);
+        } else {
+            const auto v = static_cast<std::int32_t>(total);
+            std::memcpy(slot, &v, 4U);
+        }
     }
+    out_data.insert(out_data.end(), scratch.data(), dst);
     return true;
 }
 
@@ -1148,7 +1171,7 @@ struct ColumnEncodingPlan {
 struct DictionaryBlock {
     std::vector<std::uint8_t> bytes;
     /// Variable-width: (start, length) per entry. Empty for a fixed-width dictionary.
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
     /// Fixed-width: bytes per entry. Zero when the dictionary is variable-width.
     std::size_t value_bytes = 0;
     std::size_t count = 0;
@@ -1224,30 +1247,42 @@ struct DictionaryBlock {
     }
 
     out.value_bytes = 0;
+    // [bits_per_offset][bytes_start][offsets (count + 1)][data], every word as wide as bits_per_offset
+    // says: 32, or 64 for a large_utf8 / large_binary dictionary.
     if (out.bytes.size() < 8U) {
         error = "dict block too short";
         return false;
     }
-    std::uint32_t bytes_start = 0;
-    std::memcpy(&bytes_start, out.bytes.data() + 4U, 4U);
-    if (bytes_start < 12U || bytes_start > out.bytes.size() || (bytes_start - 8U) % 4U != 0U) {
+    std::uint32_t bits_per_offset = 0;
+    std::memcpy(&bits_per_offset, out.bytes.data(), 4U);
+    const std::size_t word = bits_per_offset == 64U ? 8U : 4U;
+    const auto read_word = [&](std::size_t at) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, out.bytes.data() + at, word);  // little-endian; the upper bytes stay 0 for u32
+        return v;
+    };
+    if (out.bytes.size() < 2U * word) {
+        error = "dict block too short";
+        return false;
+    }
+    const std::uint64_t bytes_start = read_word(word);
+    if (bytes_start < 3U * word || bytes_start > out.bytes.size() || (bytes_start - 2U * word) % word != 0U) {
         error = "dict block header invalid";
         return false;
     }
-    out.count = (bytes_start - 8U) / 4U - 1U;
+    out.count = static_cast<std::size_t>((bytes_start - 2U * word) / word - 1U);
     out.ranges.resize(out.count);
     for (std::size_t d = 0; d < out.count; ++d) {
-        std::uint32_t a = 0;
-        std::uint32_t b = 0;
-        std::memcpy(&a, out.bytes.data() + 8U + d * 4U, 4U);
-        std::memcpy(&b, out.bytes.data() + 8U + (d + 1U) * 4U, 4U);
-        // In 64 bits: `bytes_start + b` in u32 wraps for an offset near 2^32, which passed this check
-        // and handed the copy below a ~4 GiB entry length (found by fuzz_column_decode).
-        if (static_cast<std::uint64_t>(bytes_start) + b > out.bytes.size() || b < a) {
+        const std::uint64_t a = read_word(2U * word + d * word);
+        const std::uint64_t b = read_word(2U * word + (d + 1U) * word);
+        // Compared without adding: `bytes_start + b` in u32 once wrapped for an offset near 2^32 and
+        // handed the copy below a ~4 GiB entry length (found by fuzz_column_decode); with u64 words
+        // the sum can wrap too.
+        if (b < a || b > out.bytes.size() - bytes_start) {
             error = "dict offsets out of range";
             return false;
         }
-        out.ranges[d] = {bytes_start + a, b - a};
+        out.ranges[d] = {static_cast<std::size_t>(bytes_start + a), static_cast<std::size_t>(b - a)};
     }
     return true;
 }
@@ -2707,16 +2742,6 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     if (encoding_plan.kind == ColumnEncodingKind::kVariable) {
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-        const auto value_scheme = encoding_plan.value_scheme;
-        const bool nullable = encoding_plan.repdef != nullptr;
-        // The offset width of the block actually stored in the chunk. Without FSST that is the
-        // column's own (utf8 -> 32-bit, large_utf8 -> 64-bit). With FSST the stored block is the
-        // COMPRESSED one, whose offsets index compressed bytes and whose width the descriptor
-        // declares independently (Fsst.values = Variable{Flat(bits)}).
-        const bool stored_offsets_large = encoding_plan.fsst && encoding_plan.variable_offset_bits != 0U
-                                              ? encoding_plan.variable_offset_bits == 64U
-                                              : out.variable.large;
-        const auto offset_width = static_cast<std::uint64_t>(stored_offsets_large ? 8U : 4U);
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
         std::vector<MiniBlockChunkView> chunks;
@@ -2725,12 +2750,43 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         std::vector<std::uint8_t> fsst_offsets;
         std::vector<std::uint8_t> fsst_data;
         std::uint64_t validity_rows = 0;
-        for (const auto& page : column_metadata.pages) {
+        ColumnEncodingPlan later_page;
+        for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
+            const auto& page = column_metadata.pages[page_index];
+            // Every page carries its own descriptor, and the column's plan was taken from the first.
+            // A string page's FSST symbol table, offset width and buffer compression are per page:
+            // Lance trains a table per page, and a page too small for FSST is written plain. Using
+            // page 0's for all of them decoded later pages against the wrong table.
+            const ColumnEncodingPlan* plan = &encoding_plan;
+            if (page_index != 0U && !page.encoding.empty()) {
+                pb::ColumnMetadata one_page;
+                one_page.pages.push_back(page);
+                later_page = ColumnEncodingPlan{};
+                if (classify_from_descriptor(one_page, later_page)) {
+                    if (later_page.kind != ColumnEncodingKind::kVariable) {
+                        error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) +
+                                " is not a variable-width page like the column's first" +
+                                (later_page.unsupported_reason.empty() ? "" : ": " + later_page.unsupported_reason);
+                        return false;
+                    }
+                    later_page.item_view = encoding_plan.item_view;
+                    plan = &later_page;
+                }
+            }
+            const auto value_scheme = plan->value_scheme;
+            const bool nullable = plan->repdef != nullptr;
+            // The offset width of the block actually stored in the chunk. Without FSST that is the
+            // column's own (utf8 -> 32-bit, large_utf8 -> 64-bit). With FSST the stored block is the
+            // COMPRESSED one, whose offsets index compressed bytes and whose width the descriptor
+            // declares independently (Fsst.values = Variable{Flat(bits)}).
+            const bool stored_offsets_large = plan->fsst && plan->variable_offset_bits != 0U
+                                                  ? plan->variable_offset_bits == 64U
+                                                  : out.variable.large;
+            const auto offset_width = static_cast<std::uint64_t>(stored_offsets_large ? 8U : 4U);
             if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
                 return false;
             }
-            if (!read_page_chunks_with_validity(payload, encoding_plan, page.length, chunks, validity_rows,
-                                                out, error)) {
+            if (!read_page_chunks_with_validity(payload, *plan, page.length, chunks, validity_rows, out, error)) {
                 return false;
             }
             std::uint64_t remaining = page.length;
@@ -2780,7 +2836,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                             " values with " + std::to_string(remaining) + " left in the page";
                     return false;
                 }
-                if (encoding_plan.fsst) {
+                if (plan->fsst) {
                     // The FSST-compressed bytes are themselves a variable-width block, so decode
                     // that into scratch buffers first and then expand each value onto the column's.
                     fsst_offsets.clear();
@@ -2789,7 +2845,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                                                     fsst_offsets, fsst_data, error)) {
                         return false;
                     }
-                    if (!expand_fsst_values(*encoding_plan.fsst, fsst_offsets, stored_offsets_large,
+                    if (!expand_fsst_values(*plan->fsst, fsst_offsets, stored_offsets_large,
                                             fsst_data, chunk_values, out.variable.large,
                                             out.variable.offsets, out.variable.data, error)) {
                         return false;

@@ -78,6 +78,8 @@ std::string shape_of(const pl::Compressive* node) {
             return "InlineBitpacking";
         case pl::CompressiveKind::kVariable:
             return "Variable";
+        case pl::CompressiveKind::kFsst:
+            return "Fsst(" + shape_of(node->values.get()) + ")";
         case pl::CompressiveKind::kRle:
             return "Rle";
         case pl::CompressiveKind::kByteStreamSplit:
@@ -323,8 +325,12 @@ void check_dataset(const std::filesystem::path& dataset, const std::string& labe
             const std::string got = parsed.kind == pl::LayoutKind::kConstant
                                         ? "CONSTANT"
                                         : shape_of(parsed.mini_block.value_compression.get());
-            check(got == want, where + ": descriptor says " + got + " but nanolance:packing='" +
-                                   packing + "' implies " + want + " (" + pl::describe(parsed) + ")");
+            // An FSST-tagged column (roadmap F2) is FSST wherever that pays and otherwise keeps the
+            // untagged shape -- plain Variable, or zstd when the column asked for it.
+            const bool fsst_ok = packing == "fsst" && (got == "Fsst(Variable)" || got == "Variable" ||
+                                                       got == expected_shape("", true, compress));
+            check(got == want || fsst_ok, where + ": descriptor says " + got + " but nanolance:packing='" +
+                                              packing + "' implies " + want + " (" + pl::describe(parsed) + ")");
 
             // (4) Dictionary pages must carry their dictionary in the descriptor too.
             if (packing == "dict" || packing == "dict-rle") {
