@@ -64,6 +64,7 @@ int nanolance_cli_import(int argc, char** argv) {
     bool compress = false;
     bool no_structural = false;
     int compression_level = 3;
+    std::uint64_t max_pending_bytes = 0;
 
     app.add_option("-o,--output", output_path, "Output Lance dataset path");
     app.add_option("-i,--input", input_path,
@@ -80,6 +81,11 @@ int nanolance_cli_import(int argc, char** argv) {
     app.add_flag("--no-structural", no_structural,
                  "Disable structural encodings (bitpacking/constant/RLE/dictionary); emit plain pages");
     app.add_option("-l,--compression-level", compression_level, "Zstd compression level")->default_val(3);
+    app.add_option("--max-pending-bytes", max_pending_bytes,
+                   "Flush a fragment whenever the writer holds this many bytes of unwritten rows, bounding "
+                   "memory (0 = off: one fragment for the whole stream). A batch is never split, so peak "
+                   "memory is about this plus one IPC batch.")
+        ->default_val(0);
 
     try {
         app.parse(argc, argv);
@@ -213,6 +219,13 @@ int nanolance_cli_import(int argc, char** argv) {
         nano_lance_writer_close(&writer);
         close_input_if_owned();
         return structural_status;
+    }
+    const int budget_status = nano_lance_writer_set_max_pending_bytes(&writer, max_pending_bytes);
+    if (budget_status != NANO_LANCE_OK) {
+        std::cerr << nano_lance_writer_last_error(&writer) << '\n';
+        nano_lance_writer_close(&writer);
+        close_input_if_owned();
+        return budget_status;
     }
 
     ArrowIpcInputStream ipc_input{};

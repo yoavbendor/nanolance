@@ -101,6 +101,12 @@ class LanceWriter:
     ``max_rows_per_fragment`` > 0 to flush a fragment (and free the writer's
     internal buffer) once that many rows accumulate, bounding memory for very
     large writes. The resulting multi-fragment dataset reads back as one table.
+
+    ``max_pending_bytes`` > 0 bounds the same buffer in BYTES instead, which is
+    what a memory-constrained device actually has to budget: the writer flushes
+    a fragment whenever the data it holds reaches that size. Plan for a peak of
+    about 3-4x the budget plus one batch (buffer growth and encoding need room of
+    their own). Either limit, or both, may be set.
     """
 
     def __init__(
@@ -115,6 +121,7 @@ class LanceWriter:
         blob_uri_dictionary: bool | None = None,
         append: bool | None = None,
         max_rows_per_fragment: int = 0,
+        max_pending_bytes: int = 0,
     ) -> None:
         opts = options or WriteOptions()
         if compression is not None:
@@ -137,7 +144,11 @@ class LanceWriter:
         native.blob_uri_dictionary = opts.blob_uri_dictionary
         native.ignore_nullability = opts.ignore_nullability
         native.append = opts.append
-        self._writer = _nanolance.LanceWriter(Path(path), native, int(max_rows_per_fragment))
+        if max_rows_per_fragment < 0 or max_pending_bytes < 0:
+            raise ValueError("max_rows_per_fragment and max_pending_bytes must be >= 0")
+        self._writer = _nanolance.LanceWriter(
+            Path(path), native, int(max_rows_per_fragment), int(max_pending_bytes)
+        )
 
     def write_batch(self, batch) -> None:
         """Append one Arrow-exportable ``RecordBatch`` (pyarrow, polars, nanom, ...)."""

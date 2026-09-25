@@ -138,6 +138,12 @@ if (!writer.commit()) { return writer.error(); }     // is_append follows what o
   table.
 - **To get small files, model external refs as plain `uri`/`position`/`size` columns**, *not* the packed
   `lance.blob.v2` descriptor (~41 B/row vs ~3.4 B/row). See [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
+- **Memory while saving is bounded only if you bound it.** The writer holds every row until a commit,
+  so by default a whole session is resident. On a memory-constrained device set
+  `max_pending_bytes` (C options struct / `set_max_pending_bytes`, C++ `WriteOptions` and typed
+  `writer::options`, Python `LanceWriter(max_pending_bytes=...)`, CLI `--max-pending-bytes`):
+  `write_batch` then commits a fragment itself whenever the buffered data reaches the budget. Plan
+  for a peak of about 3-4x the budget plus one batch; a smaller budget means more, smaller fragments.
 - **The reader is hardened against untrusted files** — bounds/overflow-checked decode, allocation
   budgets, ASan+UBSan CI, and continuous fuzzing. See [docs/SAFETY.md](docs/SAFETY.md) for the threat
   model and reviewer checklist.

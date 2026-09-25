@@ -49,6 +49,7 @@ bool Writer::open(const std::filesystem::path& path, const WriteOptions& options
     c_options.borrow_buffers = options.borrow_buffers;
     c_options.column_encodings = encodings.empty() ? nullptr : encodings.data();
     c_options.num_column_encodings = encodings.size();
+    c_options.max_pending_bytes = options.max_pending_bytes;
 
     append_ = options.append;
     status_ = nano_lance_writer_open(&handle_, path.string().c_str(), &c_options);
@@ -80,5 +81,7 @@ bool Writer::close() {
 }
 
 std::uint64_t Writer::pending_batches() const { return nano_lance_writer_pending_batches(&handle_); }
+
+std::uint64_t Writer::pending_bytes() const { return nano_lance_writer_pending_bytes(&handle_); }
 
 }  // namespace nano_lance

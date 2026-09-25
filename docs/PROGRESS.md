@@ -28,7 +28,7 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Roadmap C — lists, read side | **C0–C8 done**; only a list of `fixed_size_list` is still refused |
 | Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip; pages compressed to within ~0.2% of pylance (FSST aside) |
 
-Test suite: **53 ctest** (was 42) and **1388 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **54 ctest** (was 42) and **1395 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
@@ -2181,6 +2181,50 @@ table and the reader's own parser, and check training is deterministic. A new fu
 `fuzz_fsst_encode`, asserts every value round-trips and never more than doubles (51,995 runs clean,
 now in CI); `fuzz_fsst` ran 22 million decodes and the page-decoding fuzzer, seeded with
 nanolance-written FSST pages, 704,805, all clean.
+
+## A memory budget for writing (edge devices)
+
+nanolance's writer buffers every batch until a commit and only then encodes and writes the fragment,
+so the resident set while saving is the whole pending fragment plus the encoder's working space. The
+only control was `max_rows_per_fragment`, Python-only and in rows -- not what a memory-constrained
+device (the C++ user this library is most likely to have) has to budget.
+
+`max_pending_bytes` -- in the C options struct and `nano_lance_writer_set_max_pending_bytes`, the C++
+`WriteOptions` and typed `writer::options`, Python's `LanceWriter`, and both CLIs -- makes
+`write_batch` commit a fragment itself whenever the writer's buffered data reaches the budget. The
+count is the capacity of every buffer the writer owns plus borrowed caller buffers, which stay pinned
+until the flush. The caller's code does not change: the final `commit(false)` appends whatever is
+still pending, and is a no-op when a flush already took everything. It cannot be combined with blob
+URI dictionary mode, which cannot append (refused by name either way).
+
+Measured (fresh batches of 64 Ki rows, uint64 + uint32 + string, 60 MiB in total; RSS sampled per
+batch through the Python writer):
+
+| budget | peak writer RSS | fragments |
+|---:|---:|---:|
+| none | 73.4 MiB | 1 |
+| 32 MiB | 46.9 MiB | 2 |
+| 8 MiB | 15.4 MiB | 7 |
+| 2 MiB | 7.6 MiB | 16 |
+
+and in C++ (`tests/test_writer_memory.cpp`, kernel high-water mark): 52 MiB of rows peak at 138-145
+MiB unbounded and 15-17 MiB under a 4 MiB budget. So plan for about 3-4x the budget plus one batch:
+buffers grow by doubling, and encoding a fragment needs room of its own (FSST's worst-case scratch,
+page buffers). Encoding at about twice the pending data is the next thing to shrink if it matters.
+
+A false lead worth recording: measuring against input READ FROM A FILE with pyarrow showed the writer
+"leaking" ~2 MiB per batch at any budget. The input's buffers were memory-mapped, and each page the
+writer read for the first time joined the process's RSS. Writing the same batch 30 times, or fresh
+in-memory batches, shows no growth at all -- which is how the numbers above were taken.
+
+Verified: the C++ test checks the accounting after every batch (pending bytes stay under the budget
+plus a batch), row order across flushes through nanolance's reader, the final commit after automatic
+flushes (and as a no-op with nothing left), the typed writer with borrowed spans, the dictionary-mode
+refusal through both the setter and the options struct, and the RSS effect itself (skipped only under
+sanitizers, whose quarantine holds freed memory by design). `tests/test_writer_memory_budget.py`
+covers every page layout that commits a fragment -- flat, dictionary, FSST, lists -- through both
+readers, ranges across flush boundaries, the budget together with the row limit, a later append and
+a deletion, explicit flushes between automatic ones, and the `convert --max-pending-bytes` flag.
 
 ### Deliberate deviations (not defects)
 

@@ -50,7 +50,39 @@ struct WriterState {
     /// After the first successful manifest write, further commits must pass `is_append=true`.
     bool append_only_commits = false;
     bool closed = false;
+    /// Memory budget for rows buffered between commits (set_max_pending_bytes); 0 = unlimited. When
+    /// a write_batch takes the buffered data to this size, the writer commits a fragment itself.
+    std::uint64_t max_pending_bytes = 0;
+    /// write_batch has committed at least once on its own: the caller's final commit is then an
+    /// append whatever it says, and a no-op when nothing is left pending.
+    bool flushed_by_budget = false;
 };
+
+/// Commit what is pending as one fragment (defined with nano_lance_writer_commit).
+int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append);
+
+/// Bytes the writer is holding for rows not yet committed: the capacity of every buffer it owns,
+/// plus borrowed caller buffers, which stay pinned until the commit.
+std::uint64_t pending_bytes(const WriterState& state) {
+    const auto column_bytes = [](const nano_lance::ColumnValues& cv) {
+        std::uint64_t n = cv.fixed.capacity() + cv.fixed_borrowed_size + cv.variable.offsets.capacity() +
+                          cv.variable.data.capacity() + cv.validity.capacity() + cv.item_validity.capacity() +
+                          cv.blob_v2.packed_payload.capacity() +
+                          cv.blob_v2.row_packed_sizes.capacity() * sizeof(std::uint32_t);
+        for (const auto& layer : cv.layers) {
+            n += layer.offsets.capacity() * sizeof(std::int64_t) + layer.validity.capacity();
+        }
+        for (const auto& uri : cv.blob_v2.uri_dictionary) {
+            n += uri.capacity();
+        }
+        return n;
+    };
+    std::uint64_t total = column_bytes(state.blob_column_values);
+    for (const auto& cv : state.column_values) {
+        total += column_bytes(cv);
+    }
+    return total;
+}
 
 void clear_error(NanoLanceWriter* writer) {
     if (writer != nullptr) {
@@ -569,6 +601,11 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
         return set_error(writer, NANO_LANCE_UNSUPPORTED,
                          "blob URI dictionary mode is not supported for append datasets");
     }
+    if (opts.max_pending_bytes != 0U && opts.blob_uri_dictionary) {
+        // Every flush after the first is an append, which dictionary mode cannot do.
+        return set_error(writer, NANO_LANCE_UNSUPPORTED,
+                         "blob URI dictionary mode cannot be combined with max_pending_bytes");
+    }
 
     auto state = std::make_unique<WriterState>();
     state->dataset_path = path;
@@ -578,6 +615,7 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
     state->blob_uri_dictionary = opts.blob_uri_dictionary;
     state->borrow_buffers = opts.borrow_buffers;
     state->append_only_commits = opts.append;
+    state->max_pending_bytes = opts.max_pending_bytes;
 
     for (std::size_t i = 0; i < opts.num_column_encodings; ++i) {
         const auto& entry = opts.column_encodings[i];
@@ -668,6 +706,10 @@ int nano_lance_writer_set_blob_uri_dictionary(NanoLanceWriter* writer, bool enab
     if (enable && state->append_only_commits) {
         return set_error(writer, NANO_LANCE_UNSUPPORTED, "blob URI dictionary mode is not supported for append datasets");
     }
+    if (enable && state->max_pending_bytes != 0U) {
+        return set_error(writer, NANO_LANCE_UNSUPPORTED,
+                         "blob URI dictionary mode cannot be combined with max_pending_bytes");
+    }
     state->blob_uri_dictionary = enable;
     clear_error(writer);
     return NANO_LANCE_OK;
@@ -722,6 +764,20 @@ int nano_lance_writer_set_column_encoding(NanoLanceWriter* writer, const char* f
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT,
                          "unknown column encoding (expected auto/plain/bitpack/bss-zstd/zstd): " + enc);
     }
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_max_pending_bytes(NanoLanceWriter* writer, uint64_t max_pending_bytes) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (max_pending_bytes != 0U && state->blob_uri_dictionary) {
+        return set_error(writer, NANO_LANCE_UNSUPPORTED,
+                         "blob URI dictionary mode cannot be combined with max_pending_bytes");
+    }
+    state->max_pending_bytes = max_pending_bytes;
     clear_error(writer);
     return NANO_LANCE_OK;
 }
@@ -803,6 +859,16 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
 
     ++state->pending_batches;
     state->pending_rows += static_cast<std::uint64_t>(batch->length);
+    if (state->max_pending_bytes != 0U && state->pending_rows != 0U &&
+        pending_bytes(*state) >= state->max_pending_bytes) {
+        // Over budget: write what is buffered as a fragment now and free it. The first flush of a
+        // create-mode writer creates the dataset; every later one appends.
+        const int rc = commit_pending(writer, state, state->append_only_commits);
+        if (rc != NANO_LANCE_OK) {
+            return rc;
+        }
+        state->flushed_by_budget = true;
+    }
     clear_error(writer);
     return NANO_LANCE_OK;
 }
@@ -815,6 +881,22 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
     if (state->closed) {
         return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is already closed");
     }
+    if (state->flushed_by_budget) {
+        // write_batch already committed on its own (max_pending_bytes): the dataset exists, so this
+        // commit appends -- the caller wrote the same code it would without a budget -- and with
+        // nothing left pending there is nothing to do.
+        if (state->pending_rows == 0) {
+            clear_error(writer);
+            return NANO_LANCE_OK;
+        }
+        is_append = true;
+    }
+    return commit_pending(writer, state, is_append);
+}
+
+extern "C++" {  // an internal helper, inside the extern "C" block
+namespace {
+int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) {
     if (state->pending_rows == 0) {
         return set_error(writer, NANO_LANCE_INVALID_STATE, "no pending rows to commit");
     }
@@ -1108,6 +1190,8 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
     clear_error(writer);
     return NANO_LANCE_OK;
 }
+}  // namespace
+}  // extern "C++"
 
 int nano_lance_writer_close(NanoLanceWriter* writer) {
     if (writer == nullptr) {
@@ -1138,6 +1222,16 @@ uint64_t nano_lance_writer_pending_batches(const NanoLanceWriter* writer) {
         return 0;
     }
     return state->pending_batches;
+}
+
+uint64_t nano_lance_writer_pending_rows(const NanoLanceWriter* writer) {
+    const auto* state = state_from(writer);
+    return state == nullptr ? 0U : state->pending_rows;
+}
+
+uint64_t nano_lance_writer_pending_bytes(const NanoLanceWriter* writer) {
+    const auto* state = state_from(writer);
+    return state == nullptr ? 0U : pending_bytes(*state);
 }
 
 }  // extern "C"

@@ -199,6 +199,7 @@ for a large one. See PROGRESS, "Roadmap E4".
 | # | Task | Size | Model |
 |---|---|---|---|
 | F1 | **Page size.** nanolance writes ~1024 rows per bitpacked page; pylance put 200,000 in one. Measure read time vs page size on the bench datasets *first* — this project's instruction profiles misled four times; only wall clock is trusted. | S (measure) + M | **Opus** |
+| F3 | **Memory budget for writing** — `max_pending_bytes`: write_batch flushes a fragment when the buffered data reaches it (edge devices). | S | **Done** — see PROGRESS |
 | F2 | **FSST on write** — the answer to the one bench shape nanolance still loses (`high_card`, 7.67 ms vs 5.12 ms). Encoder only; the reader exists. Correctness oracle: pylance reads it; speed oracle: the bench. | M–L | **Opus** |
 
 **Status:** F2 done — see PROGRESS, "Roadmap F2". String files are now as small as pylance's or

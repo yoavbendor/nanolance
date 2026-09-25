@@ -132,7 +132,7 @@ void write_table(nb::handle table, const std::filesystem::path& path, const Lanc
 class LanceWriter {
 public:
     LanceWriter(const std::filesystem::path& path, const LanceWriterOptions& opts,
-                std::int64_t max_rows_per_fragment)
+                std::int64_t max_rows_per_fragment, std::uint64_t max_pending_bytes)
         : max_rows_per_fragment_(max_rows_per_fragment), append_mode_(opts.append) {
         int rc = opts.append
                      ? nano_lance_writer_init_append(&writer_, path.string().c_str(), opts.compression_level)
@@ -165,6 +165,12 @@ public:
                 throw_lance_writer("nano_lance_writer_set_ignore_nullability", rc, &writer_);
             }
         }
+        if (max_pending_bytes != 0U) {
+            rc = nano_lance_writer_set_max_pending_bytes(&writer_, max_pending_bytes);
+            if (rc != NANO_LANCE_OK) {
+                throw_lance_writer("nano_lance_writer_set_max_pending_bytes", rc, &writer_);
+            }
+        }
         // In append mode the dataset already exists, so every commit is an append.
         committed_ = opts.append;
     }
@@ -188,7 +194,12 @@ public:
         if (rc != NANO_LANCE_OK) {
             throw_lance_writer("nano_lance_write_batch", rc, &writer_);
         }
-        pending_rows_ += rows;
+        // The C writer may have flushed a fragment itself (max_pending_bytes): take its count.
+        const auto pending = static_cast<std::int64_t>(nano_lance_writer_pending_rows(&writer_));
+        if (pending < pending_rows_ + rows) {
+            committed_ = true;
+        }
+        pending_rows_ = pending;
         if (max_rows_per_fragment_ > 0 && pending_rows_ >= max_rows_per_fragment_) {
             flush();
         }
@@ -353,12 +364,13 @@ NB_MODULE(_nanolance, m) {
         "Write an Arrow table to a Lance dataset directory.");
 
     nb::class_<LanceWriter>(m, "LanceWriter")
-        .def(nb::init<const std::filesystem::path&, const LanceWriterOptions&, std::int64_t>(),
+        .def(nb::init<const std::filesystem::path&, const LanceWriterOptions&, std::int64_t, std::uint64_t>(),
              nb::arg("path"), nb::arg("options") = LanceWriterOptions{},
-             nb::arg("max_rows_per_fragment") = 0,
+             nb::arg("max_rows_per_fragment") = 0, nb::arg("max_pending_bytes") = 0,
              "Streaming Lance writer. Feed record batches with write_batch(); close() commits and "
              "finalizes. Use as a context manager. max_rows_per_fragment>0 flushes a fragment once that "
-             "many rows are buffered, bounding memory for very large writes.")
+             "many rows are buffered; max_pending_bytes>0 once the buffered data reaches that many "
+             "bytes -- either bounds memory for very large writes.")
         .def("write_batch", &LanceWriter::write_batch, nb::arg("batch"),
              "Append one Arrow RecordBatch (imported via the Arrow C array PyCapsule).")
         .def("flush", &LanceWriter::flush, "Commit buffered rows as a fragment (forces a boundary).")

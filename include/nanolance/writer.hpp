@@ -36,6 +36,9 @@ struct WriteOptions {
     bool borrow_buffers = false;
     /// Per-column encodings: "auto" / "plain" / "bitpack" / "bss-zstd" / "zstd".
     std::vector<std::pair<std::string, std::string>> column_encodings;
+    /// Memory budget for uncommitted rows, in bytes; 0 = unlimited. write_batch commits a fragment
+    /// itself whenever the buffered data reaches it (see nano_lance_writer_set_max_pending_bytes).
+    std::uint64_t max_pending_bytes = 0;
 };
 
 /// A `NanoLanceWriter` that closes itself.
@@ -79,6 +82,8 @@ class Writer {
 
     [[nodiscard]] bool is_open() const { return handle_.private_data != nullptr; }
     [[nodiscard]] std::uint64_t pending_batches() const;
+    /// Bytes held for uncommitted rows, as max_pending_bytes counts them.
+    [[nodiscard]] std::uint64_t pending_bytes() const;
 
     /// Why the last call returned false.
     [[nodiscard]] const char* error() const { return handle_.last_error; }
