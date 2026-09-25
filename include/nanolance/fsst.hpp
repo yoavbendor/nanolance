@@ -110,6 +110,9 @@ struct Encoder {
     std::array<std::uint16_t, 256> byte_codes{};
     std::vector<std::uint16_t> short_codes;
     std::array<Slot, 1024> long_codes{};
+    /// For compression, by the next two bytes: (length << 8) | code of the best symbol of at most two
+    /// bytes -- the two-byte one, else the one-byte one, else the escape (length 1). Built by train().
+    std::vector<std::uint16_t> short_or_byte;
 };
 
 /// Train a table on `values` (a sample of them, if they are large). Returns false when no symbol is

@@ -26,6 +26,10 @@
 #include <memory>
 #include <utility>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 namespace nano_lance {
 namespace {
 
@@ -60,9 +64,62 @@ const std::vector<std::uint8_t>* field_metadata_bytes(const pb::Field& field, co
 /// front. The row counts behind `bytes` are the file's own claim: a small file declaring 16 billion
 /// int64 rows asked for 128 GiB here before one value was read. Past the cap the vector grows
 /// geometrically as real values arrive, which costs one or two copies, not a quadratic.
+/// Ask for transparent huge pages behind the untouched part of a large output buffer (Linux).
+///
+/// A column's output is usually a fresh allocation, which glibc serves from newly mapped memory, so
+/// every 4 KiB page of it is faulted in as it is first written -- on a warm, repeated read that was
+/// about half the time of a large string or vector column. Backed by 2 MiB pages it takes 512x fewer
+/// faults. This is what glibc's own glibc.malloc.hugetlb=1 tunable does for every large allocation,
+/// here only for the buffers a read returns, from 8 MiB up. It is advice: where THP is off
+/// (/sys/kernel/mm/transparent_hugepage/enabled = never) or on other systems nothing changes. The
+/// cost is at most one partly used 2 MiB page at the end of each such buffer.
+void advise_huge_pages(std::vector<std::uint8_t>& out) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    constexpr std::size_t kMinBytes = std::size_t{8} << 20U;
+    constexpr std::uintptr_t kHuge = std::uintptr_t{2} << 20U;
+    if (out.capacity() < kMinBytes) {
+        return;
+    }
+    const auto base = reinterpret_cast<std::uintptr_t>(out.data());
+    const auto begin = (base + out.size() + kHuge - 1U) & ~(kHuge - 1U);
+    const auto end = (base + out.capacity()) & ~(kHuge - 1U);
+    if (end > begin) {
+        (void)madvise(reinterpret_cast<void*>(begin), end - begin, MADV_HUGEPAGE);
+    }
+#else
+    (void)out;
+#endif
+}
+
 void reserve_capped(std::vector<std::uint8_t>& out, std::uint64_t bytes) {
     constexpr std::uint64_t kReserveCap = std::uint64_t{256} << 20U;
     out.reserve(static_cast<std::size_t>(std::min(bytes, kReserveCap)));
+    advise_huge_pages(out);
+}
+
+/// After a page of a column whose final size the page table does not give (strings, list items):
+/// when `out` would outgrow its capacity at the rate seen so far, reserve for the whole column --
+/// the projection plus an eighth -- instead of letting it double its way there. Each doubling copies
+/// everything so far into fresh memory, and with glibc's allocator fresh memory for a large buffer is
+/// new pages the kernel has to fault in: a 45 MB string column touched ~105 MB per read. Capped like
+/// reserve_capped (the row count is the file's claim); a projection that falls short grows by at
+/// least half again, so a bad guess still costs a geometric number of copies.
+void reserve_projected(std::vector<std::uint8_t>& out, std::uint64_t rows_done, std::uint64_t rows_total) {
+    constexpr std::uint64_t kReserveCap = std::uint64_t{256} << 20U;
+    if (rows_done == 0U || rows_done >= rows_total || out.empty()) {
+        return;
+    }
+    const auto per_row = static_cast<double>(out.size()) / static_cast<double>(rows_done);
+    const auto projected = per_row * static_cast<double>(rows_total) * 1.125 + 64.0;
+    if (projected <= static_cast<double>(out.capacity())) {
+        return;
+    }
+    const auto want = std::max<std::uint64_t>(static_cast<std::uint64_t>(std::min(projected, static_cast<double>(kReserveCap))),
+                                              static_cast<std::uint64_t>(out.capacity()) + out.capacity() / 2U);
+    if (want > out.capacity() && fits_size_t(want)) {
+        out.reserve(static_cast<std::size_t>(want));
+        advise_huge_pages(out);
+    }
 }
 
 [[nodiscard]] bool append_repeated_value(std::vector<std::uint8_t>& out, const std::uint8_t* val,
@@ -2419,15 +2476,13 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 }
                 continue;
             }
-            const bool first_page = out.variable.offsets.empty();
-            std::uint64_t cumulative = out.variable.data.size();
-            // Same reasoning as expand_fsst_values(): a row's length comes from the dictionary entry
-            // its index selects, so the offsets are built per row -- but only grown once per page.
-            reserve_more(out.variable.offsets,
-                         static_cast<std::size_t>(page.length) * (out.variable.large ? 8U : 4U));
-            if (first_page) {
-                append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
+            if (out.variable.offsets.empty()) {
+                append_list_offset(out.variable.offsets, 0, out.variable.large);
             }
+            // Two passes over the indices: the page's expanded size first (checking every index),
+            // then the values copied into a buffer grown once. Growing it value by value doubled a
+            // large column into place, faulting in about twice its size of fresh memory per read.
+            std::uint64_t page_bytes = 0;
             for (std::uint64_t r = 0; r < page.length; ++r) {
                 std::uint32_t index = 0;
                 std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
@@ -2435,11 +2490,42 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     error = "dict index out of range";
                     return false;
                 }
+                page_bytes += dict.entry_size(index);
+            }
+            const std::size_t data_base = out.variable.data.size();
+            std::uint64_t data_end = 0;
+            if (!checked_add(static_cast<std::uint64_t>(data_base), page_bytes, data_end) || !fits_size_t(data_end) ||
+                data_end > default_read_limits().max_uncompressed_bytes ||
+                (!out.variable.large && data_end > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()))) {
+                error = "dictionary column expands past the decoded-size limit";
+                return false;
+            }
+            const auto width = static_cast<std::size_t>(out.variable.large ? 8U : 4U);
+            const std::size_t offsets_base = out.variable.offsets.size();
+            if (data_end > out.variable.data.capacity()) {
+                out.variable.data.reserve(static_cast<std::size_t>(data_end));
+                advise_huge_pages(out.variable.data);
+            }
+            out.variable.data.resize(static_cast<std::size_t>(data_end));
+            out.variable.offsets.resize(offsets_base + static_cast<std::size_t>(page.length) * width);
+            std::uint8_t* dest = out.variable.data.data() + data_base;
+            std::uint8_t* offsets = out.variable.offsets.data() + offsets_base;
+            auto cumulative = static_cast<std::uint64_t>(data_base);
+            for (std::uint64_t r = 0; r < page.length; ++r) {
+                std::uint32_t index = 0;
+                std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
                 const std::size_t len = dict.entry_size(index);
-                const std::uint8_t* src = dict.entry(index);
-                out.variable.data.insert(out.variable.data.end(), src, src + len);
+                if (len != 0U) {
+                    std::memcpy(dest, dict.entry(index), len);
+                }
+                dest += len;
                 cumulative += len;
-                append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
+                if (out.variable.large) {
+                    std::memcpy(offsets + r * 8U, &cumulative, 8U);
+                } else {
+                    const auto narrow = static_cast<std::int32_t>(cumulative);
+                    std::memcpy(offsets + r * 4U, &narrow, 4U);
+                }
             }
         }
         return true;
@@ -2750,6 +2836,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         std::vector<std::uint8_t> fsst_offsets;
         std::vector<std::uint8_t> fsst_data;
         std::uint64_t validity_rows = 0;
+        std::uint64_t rows_done = 0;
         ColumnEncodingPlan later_page;
         for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
             const auto& page = column_metadata.pages[page_index];
@@ -2855,11 +2942,18 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     return false;
                 }
                 remaining -= chunk_values;
+                // Per chunk, not only per page: a column of one or two big pages would otherwise
+                // double its way through the first of them.
+                reserve_projected(out.variable.data, rows_done + page.length - remaining, declared_rows);
+                reserve_projected(out.variable.offsets, rows_done + page.length - remaining, declared_rows);
             }
             if (remaining != 0U) {
                 error = "variable-width page chunks cover fewer rows than the page declares";
                 return false;
             }
+            rows_done += page.length;
+            reserve_projected(out.variable.data, rows_done, declared_rows);
+            reserve_projected(out.variable.offsets, rows_done, declared_rows);
         }
         return true;
     }
@@ -3056,7 +3150,11 @@ bool append_leaf_values(ColumnValues& dst, ColumnValues& src, std::string& error
             error = "list pages decoded to different value kinds";
             return false;
         }
-        dst.fixed.insert(dst.fixed.end(), src.fixed.begin(), src.fixed.end());
+        if (dst.fixed.empty()) {
+            std::swap(dst.fixed, src.fixed);  // the first page: take its buffer rather than copy it
+        } else {
+            dst.fixed.insert(dst.fixed.end(), src.fixed.begin(), src.fixed.end());
+        }
         return true;
     }
     if (src.kind != ColumnValues::Kind::VariableWidth || src.variable.large != dst.variable.large) {
@@ -3139,6 +3237,11 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
     std::vector<MiniBlockChunkView> chunks;
     std::vector<std::uint16_t> rep;
     std::vector<std::uint16_t> def;
+    std::uint64_t rows_total = 0;
+    for (const auto& page : column_metadata.pages) {
+        rows_total += page.length;  // only guides reserve_projected; overflow would just skip it
+    }
+    std::uint64_t rows_done = 0;
     for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
         const auto& page = column_metadata.pages[page_index];
         const auto where = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) + ": ";
@@ -3360,6 +3463,10 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             error = where + error;
             return false;
         }
+        rows_done += page.length;
+        reserve_projected(out.fixed, rows_done, rows_total);
+        reserve_projected(out.variable.data, rows_done, rows_total);
+        reserve_projected(out.variable.offsets, rows_done, rows_total);
 
         // The page's layers: layer k (innermost first, k >= 1) lands in layers[size - k].
         append_validity_bits(item_validity, item_nulls, items_total, unraveled[0].validity, unraveled[0].null_count,

@@ -8,6 +8,7 @@
 
 #include "nanolance/fsst.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -253,6 +254,39 @@ void encoder_is_deterministic() {
     require(fsst::serialize(a) == fsst::serialize(b), "the same input trains the same table (fixed-seed sample)");
 }
 
+/// compress_into has a fast path (8-byte loads, one merged two-byte/one-byte/escape table, a padded
+/// tail) next to the plain longest-match loop. Both must emit exactly the same codes: compress with a
+/// trained encoder, then with a copy whose merged table is removed (which takes the plain loop).
+void the_fast_compressor_matches_the_plain_one() {
+    std::vector<std::string> strings;
+    std::uint64_t x = 0x9E3779B97F4A7C15ULL;
+    for (int i = 0; i < 20000; ++i) {
+        x ^= x << 13U;
+        x ^= x >> 7U;
+        x ^= x << 17U;
+        std::string v = "user-" + std::to_string(x % 1000003) + "@mail" + std::to_string(i % 97) + ".example.org";
+        v.resize(static_cast<std::size_t>(i % 53));  // every length 0..52: every tail, every 8-byte step
+        if (i % 11 == 0) {
+            v.push_back(static_cast<char>(x & 0xFFU));  // bytes no symbol covers: escapes, in the tail too
+        }
+        strings.push_back(v);
+    }
+    fsst::Encoder fast;
+    require(fsst::train(views(strings), fast), "training succeeds");
+    require(!fast.short_or_byte.empty(), "a trained encoder carries the merged lookup table");
+    fsst::Encoder plain = fast;
+    plain.short_or_byte.clear();
+    std::vector<std::uint8_t> a(128);
+    std::vector<std::uint8_t> b(128);
+    for (const auto& s : strings) {
+        const auto* p = reinterpret_cast<const std::uint8_t*>(s.data());
+        const auto na = fsst::compress_into(fast, p, s.size(), a.data());
+        const auto nb = fsst::compress_into(plain, p, s.size(), b.data());
+        require(na == nb && std::equal(a.begin(), a.begin() + static_cast<std::ptrdiff_t>(na), b.begin()),
+                "fast and plain compression agree on '" + s + "'");
+    }
+}
+
 void nothing_to_train_on_is_declined() {
     fsst::Encoder encoder;
     require(!fsst::train({}, encoder), "no values: no table");
@@ -264,6 +298,7 @@ void nothing_to_train_on_is_declined() {
 int main() {
     encoder_round_trips_and_compresses();
     encoder_is_deterministic();
+    the_fast_compressor_matches_the_plain_one();
     nothing_to_train_on_is_declined();
     table_shape_is_validated();
     a_parsed_table_reports_what_it_holds();

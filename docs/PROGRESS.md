@@ -2247,6 +2247,116 @@ was a cold first read in a noisy run: the first `to_table()` in a process took 1
 Larger pages remain possible, but they cost write-side memory, which the memory budget (above) now
 bounds -- so no page-size change, and no knob until someone needs one.
 
+
+## Performance from the benchmark matrix
+
+The first full run of the new benchmark matrix (`tools/bench_matrix.py`, 27 datasets, every reader on
+every writer's file; report in `docs/BENCHMARKS.md`) found three things worth fixing before
+publishing numbers: one real interop problem, write paths doing avoidable work, and reads paying
+the allocator for memory they did not need. It also found two faults in the harness itself.
+
+### The harness
+
+- **Unequal input.** The C++ writer got 64K-row batches from an IPC file; the Python and Rust writers
+  got the table as one chunk. Batching alone costs nanolance ~40% on a narrow column (a batch is
+  copied into the writer's buffer), so every writer now gets the same 64K-row batches.
+- **A cold process per C++ write.** `arrowipc2lance` was run once per timing, so every write paid a
+  fresh heap's page faults (int64 ids: 40 ms cold, 23 ms warm). `nlbench --write` now loads the batches
+  once and times repeated writes in one process, like the reads; `nlbench` reports `warm_median_ms`,
+  the median without the warm-up run.
+- **`binary_blobs` was not random.** It reseeded one of seven generators per row, so the column held
+  343 distinct values and both writers dictionary-encoded it. It now draws from one stream.
+
+### Pages of many chunks (F1, reopened)
+
+nanolance wrote flat, bit-packed, bool and byte-stream-split columns one chunk per page. A 2M-row
+int64 column was 1,954 pages of ~2.5 KB, and Rust Lance, which pays a set-up cost per page, read it in
+104 ms against 18 ms for its own one-page file (int32: 97 vs 13; timestamps: 90 vs 22). F1 had been
+closed on a 200,000-row measurement that claimed bit-packed columns were already multi-chunk -- they
+were not, on this path. `MiniblockPageWriter` now gathers chunks into pages of ~512 KiB (every
+non-final chunk a power of two, the final one's log2 nibble 0, as Lance requires), and Rust reads
+nanolance's numeric files at its own speed. The page size was swept from 64 KiB to 8 MiB: Rust levels
+off from ~512 KiB, nanolance's reader is best at 64-256 KiB and slows past that (each page is read into
+one buffer before its chunks are copied out; 8 MiB pages made float64 reads 4x slower). A side effect:
+byte-stream-split chunks are now capped at 16 KiB raw, leaving room for a zstd frame that does not
+shrink under the 32 KiB chunk limit.
+
+### Writes
+
+Profiled with callgrind (instruction counts, then confirmed on wall clock):
+
+- **The dictionary check sampled first.** Each string page hashed values until half the page was
+  distinct before giving up -- a third of a string column's write. A page of 8,192+ items is now
+  sampled (1,024 values across it) and its cardinality estimated with Chao1 (`d + f1^2/(2 f2)`), which
+  a frequent value such as the empty string of null rows does not fool (a plain distinct ratio did:
+  `string_nulls` kept the full pass). Only a page estimated at over twice the rule's limit skips it.
+- **`try_emplace` instead of `emplace`** in the dictionary maps: `emplace` builds the node before it
+  looks, so every repeated value allocated and freed one.
+- **FSST.** Compression into a reused scratch buffer instead of a zero-filled 2x output per page; a
+  fast path (one 8-byte load per step, a merged 64K-entry table that settles the two-byte, one-byte and
+  escape cases at once, a zero-padded tail) checked against the plain loop by a new test.
+- **Gathering chunk values** by one copy when the chunk's items are consecutive (nearly always), by
+  `memcpy` into a pre-sized buffer otherwise, instead of an `insert` per value.
+- **The rep/def serializer** counts levels in its first pass so the second allocates once, visits the
+  innermost list's items in a loop rather than a call each, and stores `is_slot` as bytes, not
+  `vector<bool>`.
+- **The column-level run check** stops as soon as the runs cannot fit the one-chunk page it plans.
+
+### Reads
+
+A warm read of a 45 MB string column faulted in ~105 MB of fresh memory per read: glibc returns large
+buffers to the OS on free, so the next read maps and faults them again, and a vector doubling its way
+to size copies into fresh pages each time. Rust and pyarrow use allocators that keep memory.
+
+- **Projected reservations.** After each chunk of a string column and each page of a nested one, the
+  output is reserved for the whole column at the rate seen so far (plus an eighth, capped like the
+  existing reservation) instead of doubling into place.
+- **Dictionary pages sized exactly**: one pass sums the selected entries' lengths, then the values are
+  copied into a buffer grown once.
+- **Transparent huge pages for large outputs** (Linux, `madvise(MADV_HUGEPAGE)` on the untouched part of
+  buffers of 8 MiB or more): 512x fewer faults where the system allows THP (`enabled` = `madvise` or
+  `always`, the common defaults). This is what glibc's `glibc.malloc.hugetlb=1` tunable does for every
+  allocation; here only for the buffers a read returns. At most one partly used 2 MiB page per buffer.
+- **The unraveler** appends validity bits without a size check per bit.
+
+### Before and after
+
+The last commit against this one, the same inputs, both timed with this `nlbench` (in-process,
+median of 7 warm runs, pinned to one core, glibc's default allocator), in ms:
+
+| dataset | write before | write after | read before | read after |
+|---|---:|---:|---:|---:|
+| `int64_ids` | 27.1 | 21.2 | 17.1 | 7.1 |
+| `int32_small` | 15.3 | 10.1 | 8.7 | 2.5 |
+| `date32` | 17.3 | 12.0 | 9.0 | 4.8 |
+| `timestamp_us` | 31.3 | 25.7 | 15.6 | 10.7 |
+| `int64_nulls` | 37.0 | 32.4 | 17.3 | 11.5 |
+| `string_ids` | 218.5 | 113.7 | 48.7 | 24.7 |
+| `string_text` | 189.3 | 80.3 | 67.0 | 24.6 |
+| `string_urls` | 184.8 | 104.2 | 57.2 | 24.1 |
+| `string_long` | 229.9 | 146.3 | 112.4 | 35.9 |
+| `string_nulls` | 191.7 | 110.3 | 54.6 | 25.5 |
+| `string_lowcard` | 81.6 | 49.3 | 31.2 | 15.9 |
+| `binary_blobs` | 76.0 | 74.0 | 51.7 | 13.9 |
+| `vector_f32x128` | 121.8 | 118.5 | 55.3 | 32.0 |
+| `struct_mixed` | 123.8 | 75.5 | 25.6 | 24.7 |
+| `list_int64` | 133.7 | 86.2 | 81.3 | 45.1 |
+| `list_string` | 103.3 | 72.1 | 51.0 | 37.1 |
+| `list_struct` | 59.2 | 53.8 | 28.8 | 25.9 |
+| `map_string_int64` | 110.9 | 100.7 | 58.1 | 53.6 |
+| `float64_smooth` | 20.5 | 21.5 | 8.9 | 9.2 |
+| `uint8_codes` | 3.5 | 3.5 | 0.6 | 0.6 |
+
+Everything else moved within noise (±1 ms). Nested reads remain the widest gap to Rust (see
+`docs/BENCHMARKS.md`): the unraveler and per-page assembly are instruction-bound rather than
+allocation-bound, and are the next place to look.
+
+Verified: 54 C++ tests (also under AddressSanitizer and UBSan), the Python suite, and the new
+`tests/test_multichunk_pages.py` -- every fixed-width path (flat, bit-packed, bool, byte-stream-split,
+nullable, decimal, fixed-size binary and lists) written as multi-chunk pages with both structural
+settings and with compression, read back by both readers, row ranges and `take` across page
+boundaries, deletions, and columns of 1 to 4,097 rows.
+
 ### Deliberate deviations (not defects)
 
 - **The nullable opt-out was not needed** — simpler than planned.

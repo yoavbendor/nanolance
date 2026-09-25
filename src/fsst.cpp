@@ -6,6 +6,7 @@
 #include "nanolance/read_safety.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -350,6 +351,14 @@ bool train(const Values& values, Encoder& out) {
     if (best.symbol_count == 0U) {
         return false;
     }
+    best.short_or_byte.resize(65536U);
+    for (std::uint32_t w = 0; w < 65536U; ++w) {
+        const auto two = best.short_codes[w];
+        const auto one = best.byte_codes[w & 0xFFU];
+        best.short_or_byte[w] = two != Encoder::kNone   ? static_cast<std::uint16_t>((2U << 8U) | two)
+                                : one != Encoder::kNone ? static_cast<std::uint16_t>((1U << 8U) | one)
+                                                        : static_cast<std::uint16_t>((1U << 8U) | kEscape);
+    }
     out = std::move(best);
     return true;
 }
@@ -357,6 +366,61 @@ bool train(const Values& values, Encoder& out) {
 std::size_t compress_into(const Encoder& encoder, const std::uint8_t* data, std::size_t size, std::uint8_t* dst) {
     auto* out = dst;
     std::size_t pos = 0;
+    if (!encoder.short_or_byte.empty()) {
+        // While 8 bytes remain: one unaligned load, the long-symbol slot, then one lookup that
+        // settles the two-byte / one-byte / escape cases. The code and the literal byte are both
+        // stored and `out` advances past the literal only for an escape (it stays within 2 * size).
+        while (pos + 8U <= size) {
+            std::uint64_t word = 0;
+            std::memcpy(&word, data + pos, 8U);
+            const auto& slot = encoder.long_codes[hash3(word)];
+            if (slot.length != 0U && ((word ^ slot.value) << (64U - 8U * slot.length)) == 0U) {
+                *out++ = slot.code;
+                pos += slot.length;
+                continue;
+            }
+            const auto entry = encoder.short_or_byte[word & 0xFFFFU];
+            const auto code = static_cast<std::uint8_t>(entry & 0xFFU);
+            out[0] = code;
+            out[1] = static_cast<std::uint8_t>(word & 0xFFU);
+            out += code == kEscape ? 2 : 1;
+            pos += entry >> 8U;
+        }
+        // The last < 8 bytes, the same way from a zero-padded copy (so the loads stay in bounds), with
+        // no match allowed to run past the value.
+        if (pos < size) {
+            std::array<std::uint8_t, 16> tail{};
+            const auto rest = size - pos;
+            std::memcpy(tail.data(), data + pos, rest);
+            std::size_t at = 0;
+            while (at < rest) {
+                std::uint64_t word = 0;
+                std::memcpy(&word, tail.data() + at, 8U);
+                const auto remaining = rest - at;
+                const auto& slot = encoder.long_codes[hash3(word)];
+                if (slot.length != 0U && slot.length <= remaining &&
+                    ((word ^ slot.value) << (64U - 8U * slot.length)) == 0U) {
+                    *out++ = slot.code;
+                    at += slot.length;
+                    continue;
+                }
+                std::uint16_t entry = 0;
+                if (remaining >= 2U) {
+                    entry = encoder.short_or_byte[word & 0xFFFFU];
+                } else {
+                    const auto one = encoder.byte_codes[word & 0xFFU];
+                    entry = static_cast<std::uint16_t>((1U << 8U) | (one != Encoder::kNone ? one : kEscape));
+                }
+                const auto code = static_cast<std::uint8_t>(entry & 0xFFU);
+                out[0] = code;
+                out[1] = static_cast<std::uint8_t>(word & 0xFFU);
+                out += code == kEscape ? 2 : 1;
+                at += entry >> 8U;
+            }
+            return static_cast<std::size_t>(out - dst);
+        }
+        return static_cast<std::size_t>(out - dst);
+    }
     while (pos < size) {
         unsigned length = 0;
         const auto code = find(encoder, data + pos, size - pos, length);

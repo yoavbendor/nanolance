@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -359,7 +360,7 @@ std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& c
     return out;
 }
 
-// Single-chunk fast paths: nanolance emits one chunk per page on most paths, so the vector-based
+// Single-chunk fast paths: the variable-width paths emit one chunk per page, so the vector-based
 // miniblock_payload() above would otherwise force callers to wrap each chunk in a temporary
 // one-element vector (an extra heap allocation and copy of the whole chunk on every page). These
 // avoid that entirely. The chunk they describe is always the page's final one, which is why the
@@ -394,8 +395,8 @@ std::vector<std::uint8_t> miniblock_payload(const MiniblockChunk& chunk) {
 ///
 /// It encodes the chunk's FULL footprint -- its 8-byte header plus every buffer, padded to 8 -- as
 /// ((footprint / 8) - 1) << 4, with the low nibble holding log2(value count) for a non-final chunk
-/// and 0 for the last one. nanolance writes one chunk per page, so that chunk is always final and
-/// the nibble is always 0.
+/// and 0 for the last one. The pages built with it hold one chunk, so that chunk is always final and
+/// the nibble is always 0 (multi-chunk pages go through MiniblockPageWriter).
 ///
 /// The previous form derived the word from the VALUE bytes alone, which agreed with this only
 /// because the 8-byte header and the -1 cancel when the values are a multiple of 8. Adding a
@@ -449,6 +450,94 @@ std::uint64_t stream_flat_miniblock_payload(std::ostream& out, const std::uint8_
     }
     return written + pad;
 }
+
+/// Pages of a flat fixed-width column hold this much chunk payload before a new page starts.
+///
+/// These columns used to be written one chunk per page, so a 2M-row int64 column became ~2000
+/// pages of ~2.5 KB, and Rust Lance, which pays a scheduling and decode set-up cost per page, read
+/// those files ~5x slower than its own. Measured over 64 KiB - 8 MiB on the tools/bench_matrix.py
+/// data: Rust's reads level off from ~512 KiB; nanolance's own reader is fastest at 64 - 256 KiB
+/// and slows past that, because a page is read into one buffer before its chunks are copied out
+/// (1 MiB pages cost it 10-30% on flat columns, 8 MiB pages 4x). 512 KiB is within noise of the
+/// best for Rust and within ~10% of the best for nanolance.
+constexpr std::uint64_t kTargetMiniblockPageBytes = 512U << 10U;
+
+/// The most values a non-final chunk of a multi-chunk page may hold: its control word keeps
+/// log2(values) in four bits.
+constexpr std::size_t kMaxValuesPerMultiChunk = std::size_t{1} << 15U;
+
+/// The largest power of two <= `n` that a non-final chunk can carry (0 when n < 2: a chunk of one
+/// value has log2 = 0, which only the final chunk of a page may have).
+std::size_t multichunk_values(std::size_t n) {
+    n = std::min(n, kMaxValuesPerMultiChunk);
+    if (n < 2U) {
+        return 0U;
+    }
+    std::size_t p = 1U;
+    while (p * 2U <= n) {
+        p *= 2U;
+    }
+    return p;
+}
+
+/// A MiniBlock page of one or more chunks, streamed as the chunks are built.
+///
+/// The caller streams each chunk (stream_flat_miniblock_payload / stream_miniblock_payload_with_repdef,
+/// which pad it to 8 bytes, so consecutive chunks are contiguous) and reports its footprint and value
+/// count here. finish() then writes the control buffer: one u32 word per chunk,
+/// (footprint/8 - 1) << 4 | log2(values), with the final chunk's nibble 0 -- Lance derives the last
+/// chunk's count from the page's item count, and every other chunk must hold a power of two.
+class MiniblockPageWriter {
+public:
+    explicit MiniblockPageWriter(std::ostream& out) : out_(out) {}
+
+    [[nodiscard]] bool empty() const { return chunks_ == 0U; }
+    [[nodiscard]] std::uint64_t rows() const { return rows_; }
+    [[nodiscard]] std::uint64_t payload_bytes() const { return payload_size_; }
+
+    /// Call before streaming a chunk.
+    void begin_chunk() {
+        if (chunks_ == 0U) {
+            align64(out_);
+            payload_offset_ = pos(out_);
+        }
+    }
+
+    void end_chunk(std::uint64_t footprint, std::size_t values) {
+        std::uint32_t log_values = 0U;
+        for (std::size_t v = values; v > 1U; v >>= 1U) {
+            ++log_values;
+        }
+        append_le32(control_, static_cast<std::uint32_t>((footprint / 8U - 1U) << 4U) | (log_values & 0x0FU));
+        payload_size_ += footprint;
+        rows_ += values;
+        ++chunks_;
+    }
+
+    /// Write the control buffer and fill `page`'s buffers and length; resets for the next page.
+    void finish(pb::ColumnPage& page) {
+        control_[control_.size() - 4U] &= 0xF0U;  // the final chunk: log2 nibble 0
+        align64(out_);
+        const auto control_offset = pos(out_);
+        out_.write(reinterpret_cast<const char*>(control_.data()), static_cast<std::streamsize>(control_.size()));
+        page.buffer_offsets = {control_offset, payload_offset_};
+        page.buffer_sizes = {control_.size(), payload_size_};
+        page.length = rows_;
+        page.priority = 0;
+        control_.clear();
+        payload_size_ = 0;
+        rows_ = 0;
+        chunks_ = 0;
+    }
+
+private:
+    std::ostream& out_;
+    std::vector<std::uint8_t> control_;
+    std::uint64_t payload_offset_ = 0;
+    std::uint64_t payload_size_ = 0;
+    std::uint64_t rows_ = 0;
+    std::size_t chunks_ = 0;
+};
 
 std::vector<std::uint8_t> bytes_from_hex(std::string_view hex) {
     std::vector<std::uint8_t> bytes;
@@ -1170,7 +1259,7 @@ bool gather_chunk_values(const LanceField& field, const ColumnValues& values, It
             error = "a list chunk's strings exceed 4 GiB";
             return false;
         }
-        out.resize(static_cast<std::size_t>(header));
+        out.resize(static_cast<std::size_t>(total));
         std::uint64_t at = header;
         const auto put = [&](std::size_t slot) {
             if (large) {
@@ -1184,7 +1273,9 @@ bool gather_chunk_values(const LanceField& field, const ColumnValues& values, It
         for (std::size_t k = 0; k < count; ++k) {
             const auto begin = offset(items[first + k]);
             const auto end = offset(items[first + k] + 1U);
-            out.insert(out.end(), values.variable.data.begin() + begin, values.variable.data.begin() + end);
+            if (end > begin) {
+                std::memcpy(out.data() + at, values.variable.data.data() + begin, static_cast<std::size_t>(end - begin));
+            }
             at += static_cast<std::uint64_t>(end - begin);
             put(k + 1U);
         }
@@ -1216,16 +1307,26 @@ bool gather_chunk_values(const LanceField& field, const ColumnValues& values, It
         }
         return true;
     }
+    // A chunk's items are nearly always consecutive values (a list's children, a flat column's rows):
+    // then they are one slice of the value buffer, used in place.
+    bool consecutive = true;
+    for (std::size_t k = first + 1U; k < first + count && consecutive; ++k) {
+        consecutive = items[k] == items[k - 1U] + 1U;
+    }
+    const std::uint8_t* chunk = count == 0U ? data : data + items[first] * width;
     std::vector<std::uint8_t> gathered;
-    gathered.reserve(count * width);
-    for (std::size_t k = first; k < first + count; ++k) {
-        gathered.insert(gathered.end(), data + items[k] * width, data + (items[k] + 1U) * width);
+    if (!consecutive) {
+        gathered.resize(count * width);
+        for (std::size_t k = 0; k < count; ++k) {
+            std::memcpy(gathered.data() + k * width, data + items[first + k] * width, width);
+        }
+        chunk = gathered.data();
     }
     if (encoding == ItemEncoding::kBitpacked) {
-        build_bitpacked_chunk(gathered.data(), count, width, out);
+        build_bitpacked_chunk(chunk, count, width, out);
         return true;
     }
-    out = std::move(gathered);
+    out.assign(chunk, chunk + count * width);
     return true;
 }
 
@@ -1268,15 +1369,55 @@ bool plan_item_dictionary(const ColumnValues& values, const std::vector<std::uin
         return v;
     };
     const auto* base = reinterpret_cast<const char*>(values.variable.data.data());
+    const auto value_at = [&](std::uint64_t i) {
+        const auto begin = offset(i);
+        return std::string_view(base + begin, static_cast<std::size_t>(offset(i + 1U) - begin));
+    };
+    // Most string pages that are not dictionary material (ids, text, URLs) are nearly all distinct,
+    // and finding that out by hashing every value until half the page is distinct used to be a third
+    // of a string column's write time. So a big page is sampled first -- kSample values spread
+    // across it -- and its number of distinct values estimated with Chao1: D ~ d + f1^2 / (2 f2),
+    // from the sample's distinct count d and the values seen once (f1) and twice (f2). Unlike the
+    // sample's distinct ratio alone it is not fooled by one frequent value (the empty strings of null
+    // rows next to unique text) and keeps a column drawing on a few thousand values (~5,000 of them:
+    // ~90% distinct in the sample, estimated within a few percent). Only a page estimated at over
+    // twice the rule's limit is declined without the full pass.
+    constexpr std::size_t kSample = 1024U;
+    if (items.size() >= 8U * kSample) {
+        std::vector<std::string_view> sample(kSample);
+        const auto stride = items.size() / kSample;
+        for (std::size_t k = 0; k < kSample; ++k) {
+            sample[k] = value_at(items[k * stride]);
+        }
+        std::sort(sample.begin(), sample.end());
+        double d = 0.0;
+        double f1 = 0.0;
+        double f2 = 0.0;
+        for (std::size_t k = 0; k < kSample;) {
+            std::size_t run = 1;
+            while (k + run < kSample && sample[k + run] == sample[k]) {
+                ++run;
+            }
+            d += 1.0;
+            f1 += run == 1U ? 1.0 : 0.0;
+            f2 += run == 2U ? 1.0 : 0.0;
+            k += run;
+        }
+        const auto estimate = d + f1 * (f1 - 1.0) / (2.0 * (f2 + 1.0));  // bias-corrected Chao1
+        const auto limit = static_cast<double>(std::min<std::size_t>(kMaxDistinct, items.size() / 2U));
+        if (estimate > 2.0 * limit) {
+            return false;
+        }
+    }
     std::unordered_map<std::string_view, std::uint32_t> ids;
+    ids.reserve(std::min<std::size_t>(items.size(), 4096U));
     std::uint64_t plain_bytes = 0;
     std::uint64_t dict_bytes = 0;
     indices.reserve(items.size());
     for (const auto i : items) {
-        const auto begin = offset(i);
-        const std::string_view value(base + begin, static_cast<std::size_t>(offset(i + 1U) - begin));
+        const auto value = value_at(i);
         plain_bytes += value.size() + 4U;
-        const auto [it, inserted] = ids.emplace(value, static_cast<std::uint32_t>(distinct.size()));
+        const auto [it, inserted] = ids.try_emplace(value, static_cast<std::uint32_t>(distinct.size()));
         if (inserted) {
             distinct.push_back(value);
             dict_bytes += value.size() + 4U;
@@ -1380,17 +1521,34 @@ bool plan_item_fsst(const fsst::Encoder& encoder, const ColumnValues& values, co
     packed = ColumnValues{};
     packed.kind = ColumnValues::Kind::VariableWidth;
     packed.variable.large = large;
-    packed.variable.data.resize(static_cast<std::size_t>(2U * raw));  // the worst case: all escapes
-    packed.variable.offsets.reserve((items.size() + 1U) * (large ? 8U : 4U));
-    append_offset(packed.variable.offsets, 0, large);
+    // Compressed into a reused scratch buffer sized for the worst case (every byte escaped: 2x), then
+    // copied out at its real size: sizing the output itself for the worst case zero-filled twice the
+    // page's bytes on every page.
+    thread_local std::vector<std::uint8_t> scratch;
+    if (scratch.size() < 2U * raw) {
+        scratch.resize(static_cast<std::size_t>(2U * raw));
+    }
+    const auto width = large ? 8U : 4U;
+    packed.variable.offsets.resize((items.size() + 1U) * width);
+    auto* offsets = packed.variable.offsets.data();
+    const auto put = [&](std::size_t slot, std::uint64_t value) {
+        if (large) {
+            std::memcpy(offsets + slot * 8U, &value, 8U);
+        } else {
+            const auto narrow = static_cast<std::int32_t>(value);
+            std::memcpy(offsets + slot * 4U, &narrow, 4U);
+        }
+    };
+    put(0U, 0U);
     std::size_t at = 0;
+    std::size_t slot = 0;
     for (const auto i : items) {
         const auto begin = variable_offset(values, i);
         const auto size = static_cast<std::size_t>(variable_offset(values, i + 1U) - begin);
-        at += fsst::compress_into(encoder, values.variable.data.data() + begin, size, packed.variable.data.data() + at);
-        append_offset(packed.variable.offsets, static_cast<std::int64_t>(at), large);
+        at += fsst::compress_into(encoder, values.variable.data.data() + begin, size, scratch.data() + at);
+        put(++slot, at);
     }
-    packed.variable.data.resize(at);
+    packed.variable.data.assign(scratch.data(), scratch.data() + at);
     return (at + fsst::kSymbolTableBytes) * 10U < raw * 9U;
 }
 
@@ -1985,7 +2143,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                     const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
                                                static_cast<std::size_t>(e - s));
                     const auto id = static_cast<std::uint32_t>(distinct.size());
-                    const auto [it, inserted] = dict.emplace(val, id);
+                    const auto [it, inserted] = dict.try_emplace(val, id);
                     if (inserted) {
                         distinct.push_back(val);
                     }
@@ -2081,7 +2239,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                     const std::string_view val(reinterpret_cast<const char*>(values.variable.data.data() + s),
                                                static_cast<std::size_t>(e - s));
                     const auto id = static_cast<std::uint32_t>(local_distinct.size());
-                    const auto [it, inserted] = dict.emplace(val, id);
+                    const auto [it, inserted] = dict.try_emplace(val, id);
                     if (inserted) {
                         local_distinct.push_back(val);
                     }
@@ -2161,10 +2319,9 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         }
 
         // Flat (uncompressed) fixed-width column: stream each miniblock chunk directly from the value
-        // buffer. The generic path below would copy the values into a MiniblockChunk and then again
-        // into a payload vector; for a plain fixed-width column the chunk bytes are just a slice of
-        // values.fixed, so both copies are pure overhead (memcpy dominates this path after the chunk
-        // count was reduced). One chunk per page, byte-identical to the generic flat encoding.
+        // buffer -- the chunk bytes are just a slice of values.fixed, so building a MiniblockChunk
+        // first would only copy them. Chunks are gathered into pages of ~kTargetMiniblockPageBytes
+        // (MiniblockPageWriter); a value too wide for two to share a chunk gets a page per chunk.
         if (!is_variable && !bitpack && !bss_zstd && !bool_pack) {
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
@@ -2175,87 +2332,70 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 (void)lance_fixed_size_list_parts(field.logical_type, element, fsl_items);
             }
             // A chunk that carries definition levels is limited to one FastLanes block (1024
-            // values); without nulls the chunk is sized purely by its byte budget, which for a
-            // narrow type runs to several thousand values.
-            const auto max_chunk_values =
-                column_has_nulls ? std::min<std::size_t>(1024U,
-                                                         max_values_per_uncompressed_chunk(fixed_bytes_per_value))
-                                 : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
-            // Every full chunk of a column produces IDENTICAL page-encoding bytes (only the row-count
-            // varint differs, and full chunks all carry max_chunk_values rows) -- build them once and
-            // copy per page instead of re-encoding the whole protobuf tree per page.
-            std::vector<std::uint8_t> full_chunk_encoding;
+            // values); without nulls the chunk is sized by its byte budget, rounded down to the
+            // power of two a non-final chunk needs.
+            const auto by_bytes = max_values_per_uncompressed_chunk(fixed_bytes_per_value);
+            const auto multi = multichunk_values(column_has_nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
+            const auto max_chunk_values = multi != 0U ? multi : std::size_t{1};
+            // Every full page produces IDENTICAL page-encoding bytes: build them once per row count.
+            std::uint64_t cached_rows = 0;
+            std::vector<std::uint8_t> cached_encoding;
+            MiniblockPageWriter page_writer(out);
             for (std::size_t off = 0; off < total;) {
                 const auto count = std::min(max_chunk_values, total - off);
                 const auto chunk_bytes = count * fixed_bytes_per_value;
                 const auto chunk_repdef =
                     column_has_nulls ? pack_definition_levels(values.validity, off, count)
                                      : std::vector<std::uint8_t>{};
-                const auto word = miniblock_control_word(chunk_repdef.size(), chunk_bytes);
-                const std::array<char, 4> control{static_cast<char>(word & 0xFFU),
-                                                  static_cast<char>((word >> 8U) & 0xFFU), 0, 0};
-
-                align64(out);
-                const auto control_offset = pos(out);
-                out.write(control.data(), static_cast<std::streamsize>(control.size()));
-                align64(out);
-                const auto payload_offset = pos(out);
-                const auto payload_size =
+                page_writer.begin_chunk();
+                const auto footprint =
                     column_has_nulls
                         ? stream_miniblock_payload_with_repdef(
                               out, chunk_repdef, count,
                               values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes)
                         : stream_flat_miniblock_payload(
                               out, values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes);
-
-                pb::ColumnPage page;
-                page.buffer_offsets.push_back(control_offset);
-                page.buffer_offsets.push_back(payload_offset);
-                page.buffer_sizes.push_back(control.size());
-                page.buffer_sizes.push_back(payload_size);
-                page.length = count;
-                page.priority = 0;
-                if (count == max_chunk_values) {
-                    if (full_chunk_encoding.empty()) {
-                        full_chunk_encoding = page_layout_bytes_flat(flat_bits_per_value(field), count,
-                                                                     column_has_nulls, fsl_items);
-                    }
-                    page.encoding = full_chunk_encoding;
-                } else {
-                    page.encoding =
-                        page_layout_bytes_flat(flat_bits_per_value(field), count, column_has_nulls, fsl_items);
-                }
-                column.pages.push_back(std::move(page));
+                page_writer.end_chunk(footprint, count);
                 off += count;
+                if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
+                    continue;
+                }
+                pb::ColumnPage page;
+                const auto page_rows = page_writer.rows();
+                page_writer.finish(page);
+                if (page_rows != cached_rows || cached_encoding.empty()) {
+                    cached_rows = page_rows;
+                    cached_encoding =
+                        page_layout_bytes_flat(flat_bits_per_value(field), page_rows, column_has_nulls, fsl_items);
+                }
+                page.encoding = cached_encoding;
+                column.pages.push_back(std::move(page));
             }
             columns.push_back(std::move(column));
             continue;
         }
 
         // Bitpack / bool / byte-stream-split+zstd fixed-width columns: STREAM one chunk at a time
-        // through hoisted, loop-reused scratch buffers (build chunk -> write control+payload -> reuse),
-        // mirroring the flat path above. The previous two-phase shape (materialize every chunk into a
-        // std::vector<MiniblockChunk>, then write) paid a fresh zero-initialized allocation per chunk
-        // whose fill was immediately overwritten; with reuse, resize() touches nothing after the first
-        // chunk since chunks are equal-sized. Output is byte-identical to the two-phase code:
-        // stream_flat_miniblock_payload == miniblock_payload over a single chunk, and the 4-byte
-        // control word below is the same single-chunk encoding control_buffer_for(chunk) produced.
+        // through hoisted, loop-reused scratch buffers (build chunk -> write it -> reuse); after the
+        // first chunk resize() touches nothing, since chunks are equal-sized. Pages gather chunks as
+        // the flat path above does.
         if (bitpack || bool_pack || bss_zstd) {
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
             const auto total = bool_pack ? values.fixed_size() : values.fixed_size() / fixed_bytes_per_value;
-            std::size_t step = bitpack      ? 1024U  // one FastLanes block per page
+            std::size_t step = bitpack      ? 1024U  // one FastLanes block per chunk
                                : bool_pack ? kMaxBoolValuesPerChunk
                                            : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
             if (column_has_nulls) {
                 step = std::min<std::size_t>(step, 1024U);  // see pack_definition_levels
             }
+            // A power of two for every non-final chunk. For byte-stream-split it also keeps the raw
+            // chunk at half the 32 KiB cap, leaving room for a zstd frame that does not shrink.
+            const auto multi = multichunk_values(step);
+            step = multi != 0U ? multi : std::size_t{1};
             std::vector<std::uint8_t> scratch;  // built chunk bytes, reused across chunks
             std::vector<std::uint8_t> framed;   // zstd frame (bss-zstd only), reused across chunks
-            // Every full chunk of a column produces IDENTICAL page-encoding bytes (only the row-count
-            // varint differs, and full chunks all carry `step` rows) -- build once, copy per page.
-            std::vector<std::uint8_t> full_chunk_encoding;
-            auto build_page_encoding = [&](std::size_t count) {
+            auto build_page_encoding = [&](std::uint64_t count) {
                 if (bitpack) {
                     return page_layout_bytes_inline_bitpacking(
                         static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), count, column_has_nulls);
@@ -2268,6 +2408,9 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 return page_layout_bytes_bss_zstd(static_cast<std::uint8_t>(flat_bits_per_value(field)), count,
                                                   column_has_nulls);
             };
+            std::uint64_t cached_rows = 0;
+            std::vector<std::uint8_t> cached_encoding;
+            MiniblockPageWriter page_writer(out);
             for (std::size_t off = 0; off < total;) {
                 const auto count = std::min(step, total - off);
                 if (bitpack) {
@@ -2291,39 +2434,27 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 const auto chunk_repdef =
                     column_has_nulls ? pack_definition_levels(values.validity, off, count)
                                      : std::vector<std::uint8_t>{};
-                const auto word = miniblock_control_word(chunk_repdef.size(), chunk_bytes.size());
-                const std::array<char, 4> control{static_cast<char>(word & 0xFFU),
-                                                  static_cast<char>((word >> 8U) & 0xFFU), 0, 0};
-
-                align64(out);
-                const auto control_offset = pos(out);
-                out.write(control.data(), static_cast<std::streamsize>(control.size()));
-                align64(out);
-                const auto payload_offset = pos(out);
-                const auto payload_size =
+                page_writer.begin_chunk();
+                const auto footprint =
                     column_has_nulls ? stream_miniblock_payload_with_repdef(out, chunk_repdef, count,
                                                                             chunk_bytes.data(),
                                                                             chunk_bytes.size())
                                      : stream_flat_miniblock_payload(out, chunk_bytes.data(),
                                                                      chunk_bytes.size());
-
-                pb::ColumnPage page;
-                page.buffer_offsets.push_back(control_offset);
-                page.buffer_offsets.push_back(payload_offset);
-                page.buffer_sizes.push_back(control.size());
-                page.buffer_sizes.push_back(payload_size);
-                page.length = count;
-                page.priority = 0;
-                if (count == step) {
-                    if (full_chunk_encoding.empty()) {
-                        full_chunk_encoding = build_page_encoding(count);
-                    }
-                    page.encoding = full_chunk_encoding;
-                } else {
-                    page.encoding = build_page_encoding(count);
-                }
-                column.pages.push_back(std::move(page));
+                page_writer.end_chunk(footprint, count);
                 off += count;
+                if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
+                    continue;
+                }
+                pb::ColumnPage page;
+                const auto page_rows = page_writer.rows();
+                page_writer.finish(page);
+                if (page_rows != cached_rows || cached_encoding.empty()) {
+                    cached_rows = page_rows;
+                    cached_encoding = build_page_encoding(page_rows);
+                }
+                page.encoding = cached_encoding;
+                column.pages.push_back(std::move(page));
             }
             columns.push_back(std::move(column));
             continue;

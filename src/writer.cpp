@@ -350,6 +350,9 @@ bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
         if (split_runs * 2U >= rows) {
             return false;  // not run-friendly (and therefore not low-cardinality)
         }
+        if (split_runs * 5U + 32U > 32760U) {
+            return false;  // already too many runs for the one-chunk page below: stop scanning
+        }
         row_runs.emplace_back(i, run);
         i += run;
     }
@@ -368,7 +371,7 @@ bool variable_column_dict_rle_beneficial(nano_lance::ColumnValues& cv) {
         const auto e0 = read_offset(row + 1);
         const std::string_view val(base + s0, static_cast<std::size_t>(e0 - s0));
         const auto id = static_cast<std::uint32_t>(distinct.size());
-        const auto [it, inserted] = dict.emplace(val, id);
+        const auto [it, inserted] = dict.try_emplace(val, id);  // no node allocated for a repeat
         if (inserted) {
             distinct.push_back(val);
         }
@@ -464,7 +467,7 @@ bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv) {
         raw_bytes += len;
         const std::string_view val(base + s, len);
         const auto id = static_cast<std::uint32_t>(distinct.size());
-        const auto [it, inserted] = dict.emplace(val, id);
+        const auto [it, inserted] = dict.try_emplace(val, id);  // no node allocated for a repeat
         if (inserted) {
             if (distinct.size() >= kMaxCardinality) {
                 return false;
