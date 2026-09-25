@@ -1512,7 +1512,29 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Roadmap C8: FullZip list pages">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#roadmap-e4-writing-large_utf8-and-large_binary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Roadmap E4: writing large_utf8 and large_binary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#roadmap-f2-fsst-on-write" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Roadmap F2: FSST on write
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Roadmap F2: FSST on write">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -2621,7 +2643,29 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Roadmap C8: FullZip list pages">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#roadmap-e4-writing-large_utf8-and-large_binary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Roadmap E4: writing large_utf8 and large_binary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#roadmap-f2-fsst-on-write" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Roadmap F2: FSST on write
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Roadmap F2: FSST on write">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -2734,8 +2778,12 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 <td><strong>B1–B4 done</strong>; B5 (FullZip <em>writer</em>) not started, not needed for correctness</td>
 </tr>
 <tr>
+<td>Roadmap F — performance</td>
+<td><strong>F2 done</strong> (FSST on write); F1 (page size) open</td>
+</tr>
+<tr>
 <td>Roadmap E — small type gaps</td>
-<td><strong>E1–E3 done</strong> (float16, duration, Arrow null type); E4 <code>large_*</code> write open</td>
+<td><strong>E1–E4 done</strong> (float16, duration, Arrow null type, <code>large_utf8</code>/<code>large_binary</code> write)</td>
 </tr>
 <tr>
 <td>Roadmap C — lists, read side</td>
@@ -2747,7 +2795,7 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 </tr>
 </tbody>
 </table>
-<p>Test suite: <strong>53 ctest</strong> (was 42) and <strong>1317 pytest</strong> (was 22), all passing -- and nothing skipped: the one
+<p>Test suite: <strong>53 ctest</strong> (was 42) and <strong>1388 pytest</strong> (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.</p>
 <p>Fuzzers: six targets (<code>decode</code>, <code>page_layout</code>, <code>fsst</code>, <code>lz4</code>, <code>deletion_vector</code>, <code>column_decode</code>),
 all clean at their last run; the longest campaign run here was 95,896,936 executions. The newest,
@@ -4922,8 +4970,8 @@ one chunk per page. They are now written the way pylance writes them:</p>
 </tr>
 </tbody>
 </table>
-<p>The last row is the remaining gap: pylance FSST-compresses high-cardinality strings, and nanolance has
-no FSST <em>encoder</em> yet (roadmap F2) -- it applies to flat string columns just the same.</p>
+<p>The last row was the remaining gap: pylance FSST-compresses high-cardinality strings, and nanolance
+had no FSST <em>encoder</em> -- closed by roadmap F2 (below).</p>
 <p>Verified: both readers on every shape of the write matrix, plus a size-regression test holding three
 list shapes within 10% of pylance (<code>test_list_pages_are_about_as_small_as_stock_lance</code>); ctest plain
 and under ASan/UBSan; the page-decoding fuzzer seeded with nanolance-written list pages (chunk-
@@ -4946,6 +4994,135 @@ Two mutations -- a level's visibility off by one, the repetition level not shift
 clean; CI seeds it with FullZip list pages too.</p>
 <p>Still refused by name: a list of <code>fixed_size_list</code> (pylance stores wide ones as FullZip too, but the
 refusal is in the schema, before any page is read).</p>
+<h2 id="roadmap-e4-writing-large_utf8-and-large_binary">Roadmap E4: writing <code>large_utf8</code> and <code>large_binary</code><a class="headerlink" href="#roadmap-e4-writing-large_utf8-and-large_binary" title="Permanent link">&para;</a></h2>
+<p>These were refused on write, with a reason that turned out to be wrong: the refusal said Lance keeps
+u32 offsets inside a large type's miniblock chunk. Measured against pylance 12, it does the
+opposite -- a <code>large_string</code> chunk holds u64 offsets (20 short strings: 232 bytes against 144 for
+<code>string</code>), its descriptor says <code>Variable{Flat(64)}</code>, and Lance's decoder refuses 32-bit offsets for
+a large type ("expected 64-bit offsets but got 32-bit offsets").</p>
+<p>Lifting the refusal and running every string page nanolance writes through both readers showed
+which paths were already right and which were not. Plain, nullable, constant, all-null, long and
+binary columns were fine: the flat chunk writer already used the column's own offset width. Three
+paths were not, and pylance refused each: the flat dictionary (both the bit-packed and the RLE
+variant), whose dictionary block and descriptor were hard-coded to 32 bits; list, struct and map
+items, whose chunks were built with u32 offsets; and the per-page dictionary for list items. All
+three now write u64 words and <code>Flat(64)</code> for a large column.</p>
+<p>That also exposed a <strong>read</strong> gap: nanolance's dictionary-block parser only knew the 32-bit layout,
+so a low-cardinality <code>large_string</code> column written by pylance -- a 64-bit block,
+<code>[u64 64][u64 start][u64 offsets][data]</code> -- failed with "dict block header invalid". The parser now
+reads the width from the block's first word.</p>
+<p>Verified: 15 shapes (plain, nullable, three dictionary variants, constant, all-null, empty, long,
+binary, list items, list dictionary items, <code>large_list&lt;large_binary&gt;</code>, a null struct's field, map
+values), each written by nanolance with and without zstd and read back by both readers with the
+large type intact, and each written by pylance and read by nanolance
+(<code>test_lance_parity.py::test_large_offset_types_*</code>); the type matrix moves both types from
+"refused" to "round-trips". Before the fix, the same shapes failed in exactly the three paths above,
+so the tests are known to catch each one. The page-decoding fuzzer, seeded with 64-bit dictionary
+pages (pylance's and nanolance's), ran 662,109 executions clean; CI seeds it with one too.</p>
+<h2 id="roadmap-f2-fsst-on-write">Roadmap F2: FSST on write<a class="headerlink" href="#roadmap-f2-fsst-on-write" title="Permanent link">&para;</a></h2>
+<p>pylance compresses high-cardinality strings -- ids, URLs, free text -- with FSST, and nanolance only
+read FSST, so on exactly that shape its files were 1.5-4x larger. nanolance now writes FSST too.</p>
+<ul>
+<li><strong>The encoder</strong> (<code>fsst::train</code>, <code>fsst::compress_value</code> in <code>src/fsst.cpp</code>) builds the symbol table
+  the way Lance does (<code>build_symbol_table</code> in <code>rust/compression/fsst</code>): six rounds over a ~16 KiB
+  sample, counting symbols and adjacent pairs, keeping the 255 with the highest count x length
+  (single bytes x8), and returning the table from the round that compressed the sample best. Three
+  deliberate differences, none visible to a decoder: the sample is drawn with a fixed seed (the same
+  input always writes the same file); a candidate is keyed by its bytes alone, so the same string
+  reached two ways is one candidate; and matching never reads past a value's end, where Lance loads
+  whole words and relies on a sentinel.</li>
+<li><strong>When:</strong> Lance's own rule -- <code>utf8</code>/<code>large_utf8</code>, not binary, at least 32 KiB, longest value at
+  least 5 bytes -- plus one more: a page is written FSST only if the compressed values plus the
+  2,312-byte table are at least 10% smaller than plain, otherwise plain. With zstd requested, strings
+  go FSST only if it pays on the column's first 32,768 rows; otherwise they keep zstd.</li>
+<li><strong>Where:</strong> one table per column, trained on a sample of the whole column, stored in every page's
+  descriptor. Training per page, as Lance does, doubled the write time of <code>high_card</code> for no
+  measurable size gain. FSST pages use the multi-chunk page layout from the list work (1,024 values
+  per chunk), so a flat string column that FSST takes goes through the same writer as list items --
+  the single-chunk pages would have paid the table every 32 KiB.</li>
+<li><strong>Reading got faster too.</strong> The decoder appended one symbol at a time and grew the output per value;
+  it now decodes a whole chunk in one pass into scratch space sized for the worst case (every code a
+  full 8-byte symbol), copying symbols as whole words. On the same <code>high_card</code> file: 10.0-11.2 ms -&gt;
+  7.35 ms, 78M -&gt; 52M instructions.</li>
+</ul>
+<p>Data bytes, 20,000 rows (before -&gt; after, pylance):</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th style="text-align: right;">before</th>
+<th style="text-align: right;">after</th>
+<th style="text-align: right;">pylance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>unique short ids</td>
+<td style="text-align: right;">308,552</td>
+<td style="text-align: right;">186,504</td>
+<td style="text-align: right;">200,188</td>
+</tr>
+<tr>
+<td>URLs</td>
+<td style="text-align: right;">988,744</td>
+<td style="text-align: right;">250,952</td>
+<td style="text-align: right;">285,500</td>
+</tr>
+<tr>
+<td>sentences</td>
+<td style="text-align: right;">1,081,352</td>
+<td style="text-align: right;">286,152</td>
+<td style="text-align: right;">284,156</td>
+</tr>
+<tr>
+<td>sentences with nulls</td>
+<td style="text-align: right;">--</td>
+<td style="text-align: right;">235,720</td>
+<td style="text-align: right;">255,688</td>
+</tr>
+<tr>
+<td><code>list&lt;string&gt;</code>, distinct items</td>
+<td style="text-align: right;">303,112</td>
+<td style="text-align: right;">285,448</td>
+<td style="text-align: right;">329,392</td>
+</tr>
+<tr>
+<td>random hex</td>
+<td style="text-align: right;">--</td>
+<td style="text-align: right;">418,184</td>
+<td style="text-align: right;">421,820</td>
+</tr>
+</tbody>
+</table>
+<p><code>tools/bench.py</code>, <code>high_card</code> (200,000 rows, best of 5 writes / 7 reads; this machine is noisy):
+size 18.45 B/row (zstd was 18.02); rust lance reading nanolance's file ~7 ms (was 10.8-18.7 ms);
+nanolance's native read 7.6-8.0 ms (was 7.7-10.6 ms), still behind rust lance reading its own file
+(6.1-6.7 ms); write 38 ms (was ~35 ms).</p>
+<p><strong>It follows the structural-encoding switch.</strong> The writer's column scan tags a string column that
+neither dictionary encoding takes as <code>nanolance:packing = fsst</code>, and only a tagged column gets FSST,
+so <code>set_structural_encoding(false)</code> still writes plain pages -- which is what four C++ tests use as
+their uncompressed baseline, and which they caught.</p>
+<p><strong>Two pre-existing bugs found on the way.</strong> First, the reader planned a string column from its FIRST
+page's descriptor and applied it to every page -- including page 0's FSST symbol table. Every page
+carries its own descriptor: Lance trains a table per page, and a page too small for FSST is written
+plain, which is exactly what nanolance now does with the last 100 rows of a 32,868-row column. The
+plain page was decoded as FSST ("FSST code 120 is not in the symbol table") -- found by the 100 MB
+single-value test, whose column is split across two pages. String pages are now planned one by one;
+<code>test_a_column_mixing_fsst_and_plain_pages</code> fails without it. Second, a nullable plain string chunk could fill all 32,760 value
+bytes its control word describes and ALSO carry up to 128 bytes of definition levels; the footprint
+overflowed the word and stock Lance read past the page ("the offset + length of the sliced Buffer
+cannot exceed the existing length"). 1,024 nullable ~33-byte strings were enough. Chunks carrying
+levels now leave room for them. <code>test_nullable_chunks_leave_room_for_their_levels</code> fails without
+the fix.</p>
+<p>Verified: <code>tests/test_fsst_writes.py</code> -- eight shapes (ids, URLs, sentences with and without nulls,
+<code>large_utf8</code>, list items, a null struct's field, map values), with and without zstd, read by both
+readers whole and by range, and held within 5% of pylance's size; several fragments fed by sliced
+batches, then a deletion; binary, small and incompressible columns still round-trip. C++ unit tests
+round-trip every byte value, empty values, 0xFF as data and random noise through the serialized
+table and the reader's own parser, and check training is deterministic. A new fuzz target,
+<code>fuzz_fsst_encode</code>, asserts every value round-trips and never more than doubles (51,995 runs clean,
+now in CI); <code>fuzz_fsst</code> ran 22 million decodes and the page-decoding fuzzer, seeded with
+nanolance-written FSST pages, 704,805, all clean.</p>
 <h3 id="deliberate-deviations-not-defects">Deliberate deviations (not defects)<a class="headerlink" href="#deliberate-deviations-not-defects" title="Permanent link">&para;</a></h3>
 <ul>
 <li><strong>The nullable opt-out was not needed</strong> — simpler than planned.</li>
