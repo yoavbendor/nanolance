@@ -2226,6 +2226,27 @@ covers every page layout that commits a fragment -- flat, dictionary, FSST, list
 readers, ranges across flush boundaries, the budget together with the row limit, a later append and
 a deletion, explicit flushes between automatic ones, and the `convert --max-pending-bytes` flag.
 
+## Roadmap F1: page size -- measured, no change
+
+The item assumed nanolance's pages were ~1024 rows and that stock Lance paid for it. Neither holds
+any longer. Bitpacked integer columns are written as 32,768-row pages of 32 chunks; flat columns
+(random ids, say) keep 4,095-row single-chunk pages. Rust lance reading nanolance's files against
+its own, warmed-up medians of 21 reads at 200,000 rows:
+
+| dataset | rust reads rust | rust reads nanolance | pages (rust / nanolance) |
+|---|---:|---:|---:|
+| pcap_ref | 10.38 ms | 11.81 ms | 3 / 9 |
+| wide_int | 3.83 ms | 5.09 ms | 4 / 22 |
+| high_card | 7.75 ms | 7.93 ms | 2 / 56 |
+| float_smooth | 11.45 ms | 8.87 ms | 2 / 74 |
+| bool_flags | 2.40 ms | 2.86 ms | 1 / 7 |
+
+A throwaway experiment routing every plain fixed-width column through the multi-chunk page writer
+(the one lists and FSST use) left `wide_int` unchanged. The "6x slower" figure that motivated this
+was a cold first read in a noisy run: the first `to_table()` in a process took 12 ms, the rest ~5.
+Larger pages remain possible, but they cost write-side memory, which the memory budget (above) now
+bounds -- so no page-size change, and no knob until someone needs one.
+
 ### Deliberate deviations (not defects)
 
 - **The nullable opt-out was not needed** — simpler than planned.
