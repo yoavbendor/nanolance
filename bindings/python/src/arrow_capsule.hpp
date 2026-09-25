@@ -284,6 +284,125 @@ struct ExportState {
     ExportState& operator=(const ExportState&) = delete;
 };
 
+/// A handle over a LIVE ArrowArrayStream, exported to Python once.
+///
+/// The difference from ExportedTable is when the decode happens. ExportedTable holds batches that
+/// have already been decoded; this holds an open dataset and decodes a batch each time the consumer
+/// asks for one, which is what makes a larger-than-memory dataset readable and what gets a first
+/// batch out without waiting for the last.
+///
+/// Export is single-shot, as it has to be: a stream is consumed, not copied. The second
+/// `__arrow_c_stream__` raises rather than handing out a stream someone else is already draining.
+/// A bare Arrow schema handed out through the PyCapsule interface, for the schema-only peek.
+///
+/// Unlike ExportedStream this is NOT single-shot: a schema is copyable, so every export hands out a
+/// fresh deep copy and the handle stays usable. `pa.schema(nanolance.read_schema(p))` twice is fine.
+class ExportedSchema {
+public:
+    ExportedSchema() = default;
+
+    /// Takes ownership of `schema` (which must be a valid, initialized ArrowSchema).
+    static ExportedSchema adopt(ArrowSchema&& schema) {
+        ExportedSchema out;
+        std::memcpy(&out.schema_, &schema, sizeof(ArrowSchema));
+        std::memset(&schema, 0, sizeof(ArrowSchema));
+        return out;
+    }
+
+    nb::capsule arrow_c_schema() {
+        if (schema_.release == nullptr) {
+            throw std::runtime_error("this nanolance schema handle is empty");
+        }
+        auto* copy = static_cast<ArrowSchema*>(std::malloc(sizeof(ArrowSchema)));
+        if (copy == nullptr) {
+            throw std::bad_alloc();
+        }
+        std::memset(copy, 0, sizeof(ArrowSchema));
+        if (ArrowSchemaDeepCopy(&schema_, copy) != NANOARROW_OK) {
+            std::free(copy);
+            throw std::runtime_error("failed to copy the dataset schema for export");
+        }
+        return detail::make_schema_capsule(copy);
+    }
+
+    ~ExportedSchema() {
+        if (schema_.release != nullptr) {
+            ArrowSchemaRelease(&schema_);
+        }
+    }
+
+    ExportedSchema(ExportedSchema&& other) noexcept {
+        std::memcpy(&schema_, &other.schema_, sizeof(ArrowSchema));
+        std::memset(&other.schema_, 0, sizeof(ArrowSchema));
+    }
+    ExportedSchema& operator=(ExportedSchema&& other) noexcept {
+        if (this != &other) {
+            if (schema_.release != nullptr) {
+                ArrowSchemaRelease(&schema_);
+            }
+            std::memcpy(&schema_, &other.schema_, sizeof(ArrowSchema));
+            std::memset(&other.schema_, 0, sizeof(ArrowSchema));
+        }
+        return *this;
+    }
+    ExportedSchema(const ExportedSchema&) = delete;
+    ExportedSchema& operator=(const ExportedSchema&) = delete;
+
+private:
+    ArrowSchema schema_{};
+};
+
+class ExportedStream {
+public:
+    ExportedStream() = default;
+
+    /// Takes ownership of `stream` (which must be a valid, open ArrowArrayStream).
+    static ExportedStream adopt(ArrowArrayStream&& stream) {
+        ExportedStream out;
+        out.stream_ = static_cast<ArrowArrayStream*>(std::malloc(sizeof(ArrowArrayStream)));
+        if (out.stream_ == nullptr) {
+            throw std::bad_alloc();
+        }
+        std::memcpy(out.stream_, &stream, sizeof(ArrowArrayStream));
+        std::memset(&stream, 0, sizeof(ArrowArrayStream));
+        return out;
+    }
+
+    nb::capsule arrow_c_stream(nb::object /*requested_schema*/) {
+        if (stream_ == nullptr) {
+            throw std::runtime_error(
+                "this nanolance reader has already been consumed; call read_table() again for a "
+                "second pass (a stream is consumed, not copied)");
+        }
+        auto* stream = stream_;
+        stream_ = nullptr;  // the capsule owns it now, and releases it when Python drops it
+        return detail::make_stream_capsule(stream);
+    }
+
+    ~ExportedStream() {
+        // Only runs when the handle was never exported; after export the capsule owns the stream.
+        if (stream_ != nullptr) {
+            if (stream_->release != nullptr) {
+                stream_->release(stream_);
+            }
+            std::free(stream_);
+        }
+    }
+
+    ExportedStream(ExportedStream&& other) noexcept : stream_(other.stream_) { other.stream_ = nullptr; }
+    ExportedStream& operator=(ExportedStream&& other) noexcept {
+        if (this != &other) {
+            std::swap(stream_, other.stream_);
+        }
+        return *this;
+    }
+    ExportedStream(const ExportedStream&) = delete;
+    ExportedStream& operator=(const ExportedStream&) = delete;
+
+private:
+    ArrowArrayStream* stream_ = nullptr;
+};
+
 class ExportedTable {
 public:
     ExportedTable() = default;

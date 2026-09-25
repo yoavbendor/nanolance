@@ -4,7 +4,9 @@
 #include "nanolance/lance_table_reader.hpp"
 
 #include "nanolance/blob_v2_external.hpp"
+#include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/deletion_vector.hpp"
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/path_safety.hpp"
@@ -12,7 +14,9 @@
 #include "nanolance/schema_mapper.hpp"
 
 #include <algorithm>
+#include <map>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -20,12 +24,24 @@
 namespace nano_lance {
 namespace {
 
-const LanceField* find_mapping_field_by_name(const LanceSchemaMapping& mapping, const char* name) {
+/// Same lookup scoped to one parent, so a struct child named `id` does not resolve to a top-level
+/// `id`. `parent_id` is -1 for top-level fields, matching LanceField::parent_id.
+const LanceField* find_mapping_field_by_name_under(const LanceSchemaMapping& mapping, const char* name,
+                                                   std::int32_t parent_id) {
     if (name == nullptr) {
         return nullptr;
     }
     for (const auto& field : mapping.fields) {
-        if (field.name == name) {
+        if (field.parent_id == parent_id && field.name == name) {
+            return &field;
+        }
+    }
+    return nullptr;
+}
+
+const LanceField* find_mapping_field(const LanceSchemaMapping& mapping, std::int32_t id) {
+    for (const auto& field : mapping.fields) {
+        if (field.id == id) {
             return &field;
         }
     }
@@ -61,6 +77,7 @@ bool set_schema_metadata(ArrowSchema& schema, const std::string& key, const std:
 bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& mapping, ArrowSchema& schema,
                             std::string& error) {
     ArrowSchemaInit(&schema);
+    std::uint64_t fsl_items = 0;
     if (field.logical_type == "struct") {
         std::vector<const LanceField*> children;
         for (const auto& candidate : mapping.fields) {
@@ -84,6 +101,59 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
             if (!init_schema_from_field(*children[i], mapping, *schema.children[i], error)) {
                 return false;
             }
+        }
+    } else if (lance_logical_type_is_list(field.logical_type)) {
+        // One child, the element field Lance's schema names "item".
+        const LanceField* child = nullptr;
+        for (const auto& candidate : mapping.fields) {
+            if (candidate.parent_id == field.id) {
+                if (child != nullptr) {
+                    error = "list field " + field.name + " has more than one child";
+                    return false;
+                }
+                child = &candidate;
+            }
+        }
+        if (child == nullptr) {
+            error = "list field " + field.name + " has no element field";
+            return false;
+        }
+        const char* list_format = field.logical_type == "map"                          ? "+m"
+                                  : lance_logical_type_is_large_list(field.logical_type) ? "+L"
+                                                                                         : "+l";
+        if (ArrowSchemaSetFormat(&schema, list_format) != NANOARROW_OK ||
+            ArrowSchemaAllocateChildren(&schema, 1) != NANOARROW_OK) {
+            error = "failed to build the list schema for " + field.name;
+            return false;
+        }
+        if (!init_schema_from_field(*child, mapping, *schema.children[0], error)) {
+            return false;
+        }
+        if (field.logical_type == "map") {
+            // Arrow's map is a list of non-nullable (key, value) structs with non-nullable keys;
+            // nanoarrow refuses the schema otherwise. The data agrees: an entry is never null.
+            ArrowSchema* entries = schema.children[0];
+            if (entries->n_children != 2) {
+                error = "map field " + field.name + " does not hold (key, value) entries";
+                return false;
+            }
+            entries->flags &= ~ARROW_FLAG_NULLABLE;
+            entries->children[0]->flags &= ~ARROW_FLAG_NULLABLE;
+        }
+    } else if (std::string element; lance_fixed_size_list_parts(field.logical_type, element, fsl_items)) {
+        // Lance's schema has no child field for a fixed_size_list -- the element type lives in the
+        // logical type string -- so the Arrow child is made up here, named "item" as Arrow and
+        // pylance name it.
+        std::string element_format;
+        if (fsl_items > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) ||
+            !lance_arrow_format_for_logical_type(element, element_format, error) ||
+            ArrowSchemaSetTypeFixedSize(&schema, NANOARROW_TYPE_FIXED_SIZE_LIST, static_cast<std::int32_t>(fsl_items)) !=
+                NANOARROW_OK ||
+            ArrowSchemaSetFormat(schema.children[0], element_format.c_str()) != NANOARROW_OK) {
+            if (error.empty()) {
+                error = "failed to build the fixed_size_list schema for " + field.name;
+            }
+            return false;
         }
     } else {
         if (ArrowSchemaSetFormat(&schema, field.arrow_format.c_str()) != NANOARROW_OK) {
@@ -205,62 +275,10 @@ bool append_fixed_raw(ArrowArray& array, const std::uint8_t* data, const std::si
     return true;
 }
 
-bool append_fixed_values(ArrowArray& array, const std::vector<std::uint8_t>& bytes, const std::size_t bytes_per_value,
-                         const std::string& arrow_format, std::string& error) {
-    if (bytes.size() % bytes_per_value != 0U) {
-        error = "fixed column bytes not aligned";
-        return false;
-    }
-    const auto num_values = bytes.size() / bytes_per_value;
-    for (std::size_t i = 0; i < num_values; ++i) {
-        if (!append_fixed_raw(array, bytes.data() + i * bytes_per_value, bytes_per_value, arrow_format, error)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool append_one_string(ArrowArray& array, std::string_view value, std::string& error) {
     if (ArrowArrayAppendString(&array, {value.data(), static_cast<int64_t>(value.size())}) != NANOARROW_OK) {
         error = "failed to append string value";
         return false;
-    }
-    return true;
-}
-
-bool append_string_values(ArrowArray& array, const VariableWidthColumnValues& column, std::string& error) {
-    const bool large = column.large;
-    const auto offset_width = large ? 8U : 4U;
-    if (column.offsets.size() % offset_width != 0U) {
-        error = "string offsets not aligned";
-        return false;
-    }
-    const auto num_values = column.offsets.size() / offset_width - 1U;
-    for (std::size_t i = 0; i < num_values; ++i) {
-        std::int64_t start = 0;
-        std::int64_t end = 0;
-        const auto* off = column.offsets.data() + i * offset_width;
-        if (large) {
-            std::memcpy(&start, off, sizeof(start));
-            std::memcpy(&end, off + 8U, sizeof(end));
-        } else {
-            std::int32_t s = 0;
-            std::int32_t e = 0;
-            std::memcpy(&s, off, sizeof(s));
-            std::memcpy(&e, off + 4U, sizeof(e));
-            start = s;
-            end = e;
-        }
-        if (start < 0 || end < start || static_cast<std::size_t>(end) > column.data.size()) {
-            error = "string bounds invalid";
-            return false;
-        }
-        if (!append_one_string(array,
-                               {reinterpret_cast<const char*>(column.data.data() + static_cast<std::size_t>(start)),
-                                static_cast<std::size_t>(end - start)},
-                               error)) {
-            return false;
-        }
     }
     return true;
 }
@@ -340,152 +358,6 @@ bool append_blob_v2_row(ArrowArray& struct_array, const std::vector<std::uint8_t
         error = "failed to finish blob struct element";
         return false;
     }
-    return true;
-}
-
-bool build_array_from_field(const LanceField& field, const LanceSchemaMapping& mapping,
-                            const std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id,
-                            const std::int64_t length, ArrowArray& array, std::string& error) {
-    ArrowSchema schema;
-    if (!init_schema_from_field(field, mapping, schema, error)) {
-        return false;
-    }
-    if (ArrowArrayInitFromSchema(&array, &schema, nullptr) != NANOARROW_OK) {
-        error = "failed to init array from schema";
-        ArrowSchemaRelease(&schema);
-        return false;
-    }
-    ArrowSchemaRelease(&schema);
-    if (ArrowArrayStartAppending(&array) != NANOARROW_OK) {
-        error = "failed to start appending array";
-        ArrowArrayRelease(&array);
-        return false;
-    }
-
-    if (field.logical_type == "struct") {
-        std::vector<const LanceField*> children;
-        for (const auto& candidate : mapping.fields) {
-            if (candidate.parent_id == field.id) {
-                children.push_back(&candidate);
-            }
-        }
-        std::unordered_map<std::string, std::size_t> child_index_by_name;
-        for (std::int64_t c = 0; c < schema.n_children; ++c) {
-            if (schema.children[c]->name != nullptr) {
-                child_index_by_name.emplace(schema.children[c]->name, static_cast<std::size_t>(c));
-            }
-        }
-
-        const ColumnValues* blob_packed = nullptr;
-        const auto blob_col_it = decoded_by_field_id.find(field.id);
-        if (blob_col_it != decoded_by_field_id.end() &&
-            blob_col_it->second.kind == ColumnValues::Kind::BlobV2External) {
-            blob_packed = &blob_col_it->second;
-        }
-
-        std::size_t blob_payload_offset = 0;
-        for (std::int64_t row = 0; row < length; ++row) {
-            for (const auto* child : children) {
-                const auto idx_it = child_index_by_name.find(child->name);
-                if (idx_it == child_index_by_name.end()) {
-                    error = "struct child missing from schema: " + child->name;
-                    ArrowArrayRelease(&array);
-                    return false;
-                }
-                auto* child_array = array.children[static_cast<int64_t>(idx_it->second)];
-                if (child->extension_name == "lance.blob.v2") {
-                    if (blob_packed == nullptr) {
-                        error = "missing packed blob values for " + child->name;
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                    if (row >= static_cast<std::int64_t>(blob_packed->blob_v2.row_packed_sizes.size())) {
-                        error = "blob row index out of range";
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                    const auto row_size = blob_packed->blob_v2.row_packed_sizes[static_cast<std::size_t>(row)];
-                    if (blob_payload_offset + row_size > blob_packed->blob_v2.packed_payload.size()) {
-                        error = "blob packed row out of range";
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                    const std::vector<std::uint8_t> row_bytes(
-                        blob_packed->blob_v2.packed_payload.begin() +
-                            static_cast<std::ptrdiff_t>(blob_payload_offset),
-                        blob_packed->blob_v2.packed_payload.begin() +
-                            static_cast<std::ptrdiff_t>(blob_payload_offset + row_size));
-                    if (!append_blob_v2_row(*child_array, row_bytes, nullptr, error)) {
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                    blob_payload_offset += row_size;
-                    continue;
-                }
-                if (child->column_index < 0) {
-                    continue;
-                }
-                const auto col_it = decoded_by_field_id.find(child->id);
-                if (col_it == decoded_by_field_id.end()) {
-                    error = "missing decoded column for child " + child->name;
-                    ArrowArrayRelease(&array);
-                    return false;
-                }
-                if (lance_field_is_variable_width(child->logical_type)) {
-                    if (!append_string_at_row(*child_array, col_it->second.variable, static_cast<std::size_t>(row),
-                                              error)) {
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                } else {
-                    const auto width = lance_logical_type_value_bytes(child->logical_type);
-                    const auto& bytes = col_it->second.fixed;
-                    if (bytes.size() < (static_cast<std::size_t>(row) + 1U) * width) {
-                        error = "fixed column too short for row";
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                    if (!append_fixed_raw(*child_array,
-                                          bytes.data() + static_cast<std::size_t>(row) * width, width,
-                                          child->arrow_format, error)) {
-                        ArrowArrayRelease(&array);
-                        return false;
-                    }
-                }
-            }
-            if (ArrowArrayFinishElement(&array) != NANOARROW_OK) {
-                error = "failed to finish struct element";
-                ArrowArrayRelease(&array);
-                return false;
-            }
-        }
-    } else {
-        const auto col_it = decoded_by_field_id.find(field.id);
-        if (col_it == decoded_by_field_id.end()) {
-            error = "missing decoded values for " + field.name;
-            ArrowArrayRelease(&array);
-            return false;
-        }
-        if (lance_field_is_variable_width(field.logical_type)) {
-            if (!append_string_values(array, col_it->second.variable, error)) {
-                ArrowArrayRelease(&array);
-                return false;
-            }
-        } else {
-            if (!append_fixed_values(array, col_it->second.fixed,
-                                    lance_logical_type_value_bytes(field.logical_type), field.arrow_format, error)) {
-                ArrowArrayRelease(&array);
-                return false;
-            }
-        }
-    }
-
-    if (ArrowArrayFinishBuildingDefault(&array, nullptr) != NANOARROW_OK) {
-        error = "failed to finish building array";
-        ArrowArrayRelease(&array);
-        return false;
-    }
-    array.length = length;
     return true;
 }
 
@@ -615,27 +487,183 @@ bool append_fixed_fast(ArrowArray& array, const std::uint8_t* data, FixedFmt fmt
 
 // One column's decode plan, resolved once before the row loop (no per-row metadata/string work).
 struct ColumnPlan {
-    enum class Kind { Skip, Blob, Variable, Fixed } kind = Kind::Skip;
+    enum class Kind { Skip, Blob, Variable, Fixed, FixedSizeList } kind = Kind::Skip;
     ArrowArray* array = nullptr;
     const LanceField* field = nullptr;      // Blob path needs the full field
-    const ColumnValues* values = nullptr;
+    ColumnValues* values = nullptr;
     const std::vector<std::string>* dict = nullptr;
     std::size_t width = 0;                   // Fixed
     FixedFmt fmt = FixedFmt::kUnsupported;   // Fixed
+    /// The struct and list arrays from the top-level field down to the leaf `array`, outermost
+    /// first. When the decoded column carries `layers` (a list above it, or a struct that can be
+    /// null), those fill these nodes one to one.
+    struct Node {
+        enum class Kind { Struct, List, LargeList } kind;
+        ArrowArray* array;
+    };
+    std::vector<Node> nodes;
+    bool under_list() const {
+        return std::any_of(nodes.begin(), nodes.end(), [](const Node& n) { return n.kind != Node::Kind::Struct; });
+    }
 };
 
 // Bulk-fill a fixed-width child array's data buffer from the already-decoded column bytes.
-bool fill_fixed_child(ArrowArray* child, const std::vector<std::uint8_t>& bytes, std::int64_t rows,
-                      FixedFmt fmt, std::string& error) {
-    ArrowBuffer* data = ArrowArrayBuffer(child, 1);
-    // bool is one byte per value on disk but bit-packed (1 bit/value, LSB-first) in the Arrow buffer,
-    // so it cannot be bulk-copied like the wider fixed types; pack the bits here.
-    if (fmt == FixedFmt::kBool) {
-        const auto packed_bytes = static_cast<std::size_t>((rows + 7) / 8);
-        if (ArrowBufferReserve(data, static_cast<std::int64_t>(packed_bytes)) != NANOARROW_OK) {
-            error = "failed to reserve bool data buffer";
+/// Attach a decoded validity bitmap to `child`. Arrow buffer 0 is the validity bitmap in exactly the
+/// layout the decoder produces (LSB-first, bit set == valid), so this is a straight copy.
+/// Deallocator for a buffer whose memory is owned by a heap `std::vector<uint8_t>`.
+/// nanoarrow hands `allocator->private_data` straight back to us; it is the vector itself.
+void release_adopted_vector(struct ArrowBufferAllocator* allocator, std::uint8_t* /*ptr*/,
+                            std::int64_t /*size*/) {
+    delete static_cast<std::vector<std::uint8_t>*>(allocator->private_data);
+}
+
+/// Hand a decoded vector's memory to `out` WITHOUT copying it.
+///
+/// This is the whole of plan item 4.1. The decoder produces each column into a std::vector, and every
+/// fill_* helper below used to ArrowBufferAppend it into the Arrow buffer -- so the decoded column and
+/// its Arrow copy were both live, and a single-fragment read peaked at 2.01x the dataset (measured; see
+/// docs/PROGRESS.md). Adopting the vector's storage instead makes that a move.
+///
+/// nanoarrow documents ArrowBufferDeallocator for exactly this ("avoid copying an existing buffer that
+/// was not allocated using the infrastructure provided here"). The vector moves to the heap and the
+/// ArrowBuffer owns it from here on.
+///
+/// An EMPTY vector is deliberately not adopted: ArrowBufferReset only calls the deallocator when
+/// `data != NULL`, so a zero-length vector would leak the heap object it was moved into. An empty
+/// Arrow buffer is already the correct representation, so there is nothing to do.
+bool adopt_into_buffer(std::vector<std::uint8_t>&& bytes, ArrowBuffer* out, std::string& error) {
+    if (bytes.empty()) {
+        return true;
+    }
+    auto* owned = new std::vector<std::uint8_t>(std::move(bytes));
+    if (ArrowBufferSetAllocator(out, ArrowBufferDeallocator(&release_adopted_vector, owned)) !=
+        NANOARROW_OK) {
+        // Only possible if the buffer already holds data, which would mean this column was filled
+        // twice. Refuse rather than leak or double-own.
+        delete owned;
+        error = "cannot adopt a decoded buffer into an Arrow buffer that already holds data";
+        return false;
+    }
+    out->data = owned->data();
+    out->size_bytes = static_cast<std::int64_t>(owned->size());
+    out->capacity_bytes = static_cast<std::int64_t>(owned->capacity());
+    return true;
+}
+
+bool fill_validity(ArrowArray* child, ColumnValues& values, std::int64_t rows, std::string& error) {
+    if (values.validity.empty()) {
+        child->null_count = 0;
+        return true;
+    }
+    const auto expected = static_cast<std::size_t>((rows + 7) / 8);
+    if (values.validity.size() < expected) {
+        error = "validity bitmap covers fewer rows than the column has";
+        return false;
+    }
+    // The decoder sizes the bitmap to whole bytes over the rows it appended, which can exceed
+    // `expected` only by trailing padding bits Arrow ignores. Trim before adopting so the buffer's
+    // length is exactly what Arrow expects.
+    values.validity.resize(expected);
+    if (!adopt_into_buffer(std::move(values.validity), ArrowArrayBuffer(child, 0), error)) {
+        return false;
+    }
+    child->null_count = static_cast<std::int64_t>(values.null_count);
+    return true;
+}
+
+/// What a nested node was filled with, kept so every other leaf under it can be checked against it.
+struct FilledNode {
+    std::vector<std::int64_t> offsets;
+    std::vector<std::uint8_t> validity;
+    std::uint64_t length = 0;
+};
+
+bool same_validity(const std::vector<std::uint8_t>& a, const std::vector<std::uint8_t>& b, std::uint64_t length) {
+    for (std::uint64_t i = 0; i < length; ++i) {
+        const bool va = a.empty() || ((a[static_cast<std::size_t>(i >> 3U)] >> (i & 7U)) & 1U) != 0U;
+        const bool vb = b.empty() || ((b[static_cast<std::size_t>(i >> 3U)] >> (i & 7U)) & 1U) != 0U;
+        if (va != vb) {
             return false;
         }
+    }
+    return true;
+}
+
+/// Give each struct and list array above a leaf its validity (and a list its offsets) from the
+/// decoded column's layers. A node shared by several leaves -- a list of structs has one leaf per
+/// field -- is filled by the first and must be described identically by every other: they were
+/// written together, so a disagreement means a corrupt file, never a choice.
+bool fill_nested_nodes(ColumnPlan& plan, std::int64_t rows, std::map<ArrowArray*, FilledNode>& filled,
+                       std::string& error) {
+    auto& layers = plan.values->layers;
+    const auto& name = plan.field->name;
+    if (layers.size() != plan.nodes.size() || layers.empty() ||
+        layers.front().length != static_cast<std::uint64_t>(rows)) {
+        error = "nested column '" + name + "' decoded to a different shape than its schema (" +
+                std::to_string(layers.size()) + " layers for " + std::to_string(plan.nodes.size()) + " levels)";
+        return false;
+    }
+    for (std::size_t k = 0; k < layers.size(); ++k) {
+        auto& layer = layers[k];
+        const auto& node = plan.nodes[k];
+        const bool is_list = node.kind != ColumnPlan::Node::Kind::Struct;
+        if (layer.is_list != is_list || (is_list && layer.offsets.size() != layer.length + 1U)) {
+            error = "nested column '" + name + "': layer " + std::to_string(k) + " does not match its schema";
+            return false;
+        }
+        if (const auto seen = filled.find(node.array); seen != filled.end()) {
+            if (seen->second.length != layer.length || seen->second.offsets != layer.offsets ||
+                !same_validity(seen->second.validity, layer.validity, layer.length)) {
+                error = "nested column '" + name + "' disagrees with its sibling fields about a shared list or "
+                        "struct; the file is inconsistent";
+                return false;
+            }
+            continue;
+        }
+        filled[node.array] = FilledNode{layer.offsets, layer.validity, layer.length};
+        ArrowArray* array = node.array;
+        array->null_count = 0;
+        if (!layer.validity.empty()) {
+            layer.validity.resize(static_cast<std::size_t>((layer.length + 7U) / 8U));
+            if (!adopt_into_buffer(std::move(layer.validity), ArrowArrayBuffer(array, 0), error)) {
+                return false;
+            }
+            array->null_count = static_cast<std::int64_t>(layer.null_count);
+        }
+        if (is_list) {
+            const bool large = node.kind == ColumnPlan::Node::Kind::LargeList;
+            std::vector<std::uint8_t> offsets(layer.offsets.size() * (large ? 8U : 4U));
+            for (std::size_t i = 0; i < layer.offsets.size(); ++i) {
+                const auto value = layer.offsets[i];
+                if (large) {
+                    std::memcpy(offsets.data() + i * 8U, &value, 8U);
+                } else {
+                    if (value > std::numeric_limits<std::int32_t>::max()) {
+                        error = "list column '" + name + "' has more than 2^31 elements in one batch; "
+                                "read it as large_list";
+                        return false;
+                    }
+                    const auto narrow = static_cast<std::int32_t>(value);
+                    std::memcpy(offsets.data() + i * 4U, &narrow, 4U);
+                }
+            }
+            if (!adopt_into_buffer(std::move(offsets), ArrowArrayBuffer(array, 1), error)) {
+                return false;
+            }
+        }
+        array->length = static_cast<std::int64_t>(layer.length);
+    }
+    return true;
+}
+
+bool fill_fixed_child(ArrowArray* child, std::vector<std::uint8_t>&& bytes, std::int64_t rows,
+                      FixedFmt fmt, std::string& error) {
+    ArrowBuffer* data = ArrowArrayBuffer(child, 1);
+    // bool is the one fixed type that cannot be adopted: it is a byte per value on disk and a BIT per
+    // value in the Arrow buffer, so the bits have to be packed somewhere. They are packed into a fresh
+    // vector, which is then adopted -- so this path still copies once (unavoidably) rather than twice.
+    if (fmt == FixedFmt::kBool) {
+        const auto packed_bytes = static_cast<std::size_t>((rows + 7) / 8);
         std::vector<std::uint8_t> packed(packed_bytes, 0U);
         for (std::int64_t i = 0; i < rows; ++i) {
             if (bytes[static_cast<std::size_t>(i)] != 0U) {
@@ -643,40 +671,32 @@ bool fill_fixed_child(ArrowArray* child, const std::vector<std::uint8_t>& bytes,
                     static_cast<std::uint8_t>(1U << (static_cast<std::size_t>(i) & 7U));
             }
         }
-        ArrowBufferAppendUnsafe(data, packed.data(), static_cast<std::int64_t>(packed.size()));
+        if (!adopt_into_buffer(std::move(packed), data, error)) {
+            return false;
+        }
         child->length = rows;
-        child->null_count = 0;
         return true;
     }
-    if (ArrowBufferReserve(data, static_cast<std::int64_t>(bytes.size())) != NANOARROW_OK) {
-        error = "failed to reserve fixed data buffer";
+    if (!adopt_into_buffer(std::move(bytes), data, error)) {
         return false;
     }
-    ArrowBufferAppendUnsafe(data, bytes.data(), static_cast<std::int64_t>(bytes.size()));
     child->length = rows;
-    child->null_count = 0;
     return true;
 }
 
 // Bulk-fill a variable-width child array's offsets+data buffers from the decoded column.
-bool fill_variable_child(ArrowArray* child, const VariableWidthColumnValues& v, std::int64_t rows,
+bool fill_variable_child(ArrowArray* child, VariableWidthColumnValues& v, std::int64_t rows,
                          std::string& error) {
-    ArrowBuffer* offsets = ArrowArrayBuffer(child, 1);
-    ArrowBuffer* data = ArrowArrayBuffer(child, 2);
-    if (ArrowBufferReserve(offsets, static_cast<std::int64_t>(v.offsets.size())) != NANOARROW_OK ||
-        ArrowBufferReserve(data, static_cast<std::int64_t>(v.data.size())) != NANOARROW_OK) {
-        error = "failed to reserve variable buffers";
+    if (!adopt_into_buffer(std::move(v.offsets), ArrowArrayBuffer(child, 1), error) ||
+        !adopt_into_buffer(std::move(v.data), ArrowArrayBuffer(child, 2), error)) {
         return false;
     }
-    ArrowBufferAppendUnsafe(offsets, v.offsets.data(), static_cast<std::int64_t>(v.offsets.size()));
-    ArrowBufferAppendUnsafe(data, v.data.data(), static_cast<std::int64_t>(v.data.size()));
     child->length = rows;
-    child->null_count = 0;
     return true;
 }
 
 bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaMapping& mapping,
-                             const std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id,
+                             std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id,
                              const std::int64_t length, ArrowArray& batch, std::string& error) {
     if (ArrowArrayInitFromSchema(&batch, &batch_schema, nullptr) != NANOARROW_OK) {
         error = "failed to init batch array from schema";
@@ -707,52 +727,121 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
 
     // Resolve every column's decode plan ONCE (field lookup, kind, width, format, dict) so the row
     // loop does zero per-row metadata/string work — this was ~27% of read instructions (callgrind).
-    std::vector<ColumnPlan> plans(static_cast<std::size_t>(batch_schema.n_children));
-    for (int64_t c = 0; c < batch_schema.n_children; ++c) {
-        const auto* child_schema = batch_schema.children[c];
-        auto* child_array = batch.children[c];
-        if (child_schema == nullptr || child_schema->name == nullptr || child_array == nullptr) {
-            error = "batch schema child is missing";
-            ArrowArrayRelease(&batch);
+    //
+    // `plans` is flat over LEAF columns wherever they sit in the schema. A plain struct column
+    // (anything but the lance.blob.v2 extension, which has its own packed representation) is not a
+    // leaf: its data lives in its children's columns, exactly as the writer laid it out, so it
+    // contributes its descendants here and is recorded in `struct_nodes` for its length to be set
+    // once the leaves are filled. The writer already produces a correct, stock-Lance-readable file
+    // for these -- pylance reads a nanolance struct column fine -- so refusing them here (the old
+    // "nested struct children are not supported in this reader build") made nanolance unable to read
+    // back a file it had just written correctly, for a feature README.md advertises.
+    std::vector<ColumnPlan> plans;
+    std::vector<ArrowArray*> struct_nodes;
+    plans.reserve(static_cast<std::size_t>(batch_schema.n_children));
+
+    std::string collect_error;
+    const auto collect = [&](auto&& self, const ArrowSchema* node_schema, ArrowArray* node_array,
+                             std::int32_t parent_id, std::vector<ColumnPlan::Node> path) -> bool {
+        if (node_schema == nullptr || node_schema->name == nullptr || node_array == nullptr) {
+            collect_error = "batch schema child is missing";
             return false;
         }
-        const auto* field = find_mapping_field_by_name(mapping, child_schema->name);
+        const auto* field = find_mapping_field_by_name_under(mapping, node_schema->name, parent_id);
         if (field == nullptr) {
-            error = "mapping field not found for schema child ";
-            error += child_schema->name;
-            ArrowArrayRelease(&batch);
+            collect_error = "mapping field not found for schema child ";
+            collect_error += node_schema->name;
             return false;
         }
-        auto& plan = plans[static_cast<std::size_t>(c)];
-        plan.array = child_array;
-        plan.field = field;
         const bool is_blob = field->extension_name == "lance.blob.v2";
-        if (!is_blob && child_schema->format != nullptr && child_schema->format[0] == '+') {
-            error = "nested struct children are not supported in this reader build";
-            ArrowArrayRelease(&batch);
+        std::string fsl_element;
+        std::uint64_t fsl_items = 0;
+        const bool is_fsl = lance_fixed_size_list_parts(field->logical_type, fsl_element, fsl_items);
+        const bool is_struct =
+            !is_blob && !is_fsl && node_schema->format != nullptr && node_schema->format[0] == '+';
+
+        if (lance_logical_type_is_list(field->logical_type)) {
+            // A list array is not a leaf: its data lives in the element's column, which carries every
+            // list layer above it.
+            if (node_schema->n_children != 1 || node_array->n_children != 1 || node_schema->children[0] == nullptr) {
+                collect_error = "list array has no element child for " + field->name;
+                return false;
+            }
+            path.push_back({lance_logical_type_is_large_list(field->logical_type) ? ColumnPlan::Node::Kind::LargeList
+                                                                                  : ColumnPlan::Node::Kind::List,
+                            node_array});
+            return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path));
+        }
+
+        if (is_struct) {
+            const bool under_list = std::any_of(path.begin(), path.end(), [](const ColumnPlan::Node& n) {
+                return n.kind != ColumnPlan::Node::Kind::Struct;
+            });
+            if (!under_list) {
+                struct_nodes.push_back(node_array);  // one entry per row; a struct in a list is sized by its layer
+            }
+            path.push_back({ColumnPlan::Node::Kind::Struct, node_array});
+            for (std::int64_t i = 0; i < node_schema->n_children; ++i) {
+                if (node_array->children == nullptr || i >= node_array->n_children) {
+                    collect_error = "struct array is missing children for ";
+                    collect_error += field->name;
+                    return false;
+                }
+                if (!self(self, node_schema->children[i], node_array->children[i], field->id, path)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        ColumnPlan plan;
+        plan.array = node_array;
+        plan.field = field;
+        plan.nodes = std::move(path);
+        if (plan.under_list() && (is_blob || is_fsl || field->column_index < 0)) {
+            collect_error = "column '" + field->name + "': a list of " +
+                            (is_blob ? std::string("blobs") : field->logical_type) + " is not read yet";
             return false;
         }
         if (!is_blob && field->column_index < 0) {
             plan.kind = ColumnPlan::Kind::Skip;
-            continue;
+            plans.push_back(plan);
+            return true;
         }
         const auto col_it = decoded_by_field_id.find(field->id);
         if (col_it == decoded_by_field_id.end()) {
-            error = "missing decoded column for ";
-            error += field->name;
-            ArrowArrayRelease(&batch);
+            collect_error = "missing decoded column for ";
+            collect_error += field->name;
             return false;
         }
         plan.values = &col_it->second;
         if (is_blob) {
             plan.kind = ColumnPlan::Kind::Blob;
             plan.dict = dict_for(field->id);
+        } else if (is_fsl) {
+            // One physical column of N-element rows. The decoded bytes ARE the child's values buffer:
+            // N elements per row, back to back.
+            plan.kind = ColumnPlan::Kind::FixedSizeList;
+            plan.width = static_cast<std::size_t>(fsl_items);
+            plan.fmt = fixed_fmt_code(node_schema->children != nullptr && node_schema->n_children == 1
+                                          ? node_schema->children[0]->format
+                                          : "");
         } else if (lance_field_is_variable_width(field->logical_type)) {
             plan.kind = ColumnPlan::Kind::Variable;
         } else {
             plan.kind = ColumnPlan::Kind::Fixed;
             plan.width = lance_logical_type_value_bytes(field->logical_type);
             plan.fmt = fixed_fmt_code(field->arrow_format);
+        }
+        plans.push_back(plan);
+        return true;
+    };
+
+    for (int64_t c = 0; c < batch_schema.n_children; ++c) {
+        if (!collect(collect, batch_schema.children[c], batch.children[c], -1, {})) {
+            error = collect_error;
+            ArrowArrayRelease(&batch);
+            return false;
         }
     }
 
@@ -761,19 +850,79 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     // per-row append/FinishElement entirely.
     bool bulk_ok = true;
     for (const auto& plan : plans) {
-        if (plan.kind != ColumnPlan::Kind::Fixed && plan.kind != ColumnPlan::Kind::Variable) {
+        if (plan.kind != ColumnPlan::Kind::Fixed && plan.kind != ColumnPlan::Kind::Variable &&
+            plan.kind != ColumnPlan::Kind::FixedSizeList) {
             bulk_ok = false;
             break;
         }
     }
     if (bulk_ok) {
+        std::map<ArrowArray*, FilledNode> filled;
         for (auto& plan : plans) {
-            const bool ok = plan.kind == ColumnPlan::Kind::Fixed
-                                ? fill_fixed_child(plan.array, plan.values->fixed, length, plan.fmt, error)
-                                : fill_variable_child(plan.array, plan.values->variable, length, error);
+            // A nested column's leaf holds ITEMS: as many as its innermost layer has children.
+            std::int64_t leaf_length = length;
+            if (!plan.values->layers.empty()) {
+                const auto& inner = plan.values->layers.back();
+                leaf_length = static_cast<std::int64_t>(inner.is_list ? static_cast<std::uint64_t>(inner.offsets.back())
+                                                                      : inner.length);
+                if (!fill_nested_nodes(plan, length, filled, error)) {
+                    ArrowArrayRelease(&batch);
+                    return false;
+                }
+            } else if (plan.under_list()) {
+                error = "column '" + plan.field->name + "' sits under a list but decoded with no list layers";
+                ArrowArrayRelease(&batch);
+                return false;
+            }
+            // Validity first: nanoarrow expects buffer 0 filled before the data buffers it sizes
+            // against, and both fill_* helpers set child->length/null_count at the end.
+            bool ok = fill_validity(plan.array, *plan.values, leaf_length, error);
+            if (ok && plan.kind == ColumnPlan::Kind::FixedSizeList) {
+                // Row-level validity sits on the list; the child carries every row's N elements,
+                // including a null row's, which is what Arrow's fixed_size_list layout requires.
+                ArrowArray* child = plan.array->n_children == 1 ? plan.array->children[0] : nullptr;
+                std::uint64_t child_length = 0;
+                if (child == nullptr ||
+                    !checked_mul(static_cast<std::uint64_t>(leaf_length), static_cast<std::uint64_t>(plan.width),
+                                 child_length) ||
+                    child_length > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                    error = "fixed_size_list column has no child array or too many elements";
+                    ok = false;
+                } else {
+                    child->null_count = 0;
+                    if (!plan.values->item_validity.empty()) {
+                        auto& bits = plan.values->item_validity;
+                        const auto expected = static_cast<std::size_t>((child_length + 7U) / 8U);
+                        if (bits.size() < expected) {
+                            error = "fixed_size_list element validity covers fewer elements than the column has";
+                            ok = false;
+                        } else {
+                            bits.resize(expected);
+                            ok = adopt_into_buffer(std::move(bits), ArrowArrayBuffer(child, 0), error);
+                            child->null_count = static_cast<std::int64_t>(plan.values->item_null_count);
+                        }
+                    }
+                    ok = ok && fill_fixed_child(child, std::move(plan.values->fixed),
+                                                static_cast<std::int64_t>(child_length), plan.fmt, error);
+                    plan.array->length = leaf_length;
+                }
+            } else if (ok) {
+                ok = plan.kind == ColumnPlan::Kind::Fixed
+                         ? fill_fixed_child(plan.array, std::move(plan.values->fixed), leaf_length, plan.fmt, error)
+                         : fill_variable_child(plan.array, plan.values->variable, leaf_length, error);
+            }
             if (!ok) {
                 ArrowArrayRelease(&batch);
                 return false;
+            }
+            plan.array->null_count = static_cast<std::int64_t>(plan.values->null_count);
+        }
+        // A struct node owns no buffers of its own -- its leaves were just filled above -- but Arrow
+        // still needs its length, and validation checks it against every child's.
+        for (auto* node : struct_nodes) {
+            node->length = length;
+            if (filled.find(node) == filled.end()) {
+                node->null_count = 0;  // no leaf said it could be null
             }
         }
         batch.length = length;
@@ -788,7 +937,28 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         return true;
     }
 
-    // Per-row fallback (blob struct columns or skipped logical fields): needs the append machinery.
+    // Per-row fallback (blob columns or skipped logical fields): needs the append machinery, which
+    // drives nesting through ArrowArrayFinishElement on the ROOT only. A plain struct column mixed
+    // into such a batch would therefore have its own FinishElement skipped, so refuse that
+    // combination explicitly rather than emit a subtly malformed array. Struct-only batches take the
+    // bulk path above and are fine.
+    const bool has_fsl = std::any_of(plans.begin(), plans.end(), [](const ColumnPlan& plan) {
+        return plan.kind == ColumnPlan::Kind::FixedSizeList || (plan.values != nullptr && !plan.values->layers.empty());
+    });
+    if (has_fsl) {
+        error =
+            "a fixed_size_list or list column cannot be read back in the same batch as a lance.blob.v2 column "
+            "or a skipped logical field (the per-row append path does not build nested arrays)";
+        ArrowArrayRelease(&batch);
+        return false;
+    }
+    if (!struct_nodes.empty()) {
+        error =
+            "a plain struct column cannot be read back in the same batch as a lance.blob.v2 column "
+            "or a skipped logical field (the per-row append path drives nesting from the root only)";
+        ArrowArrayRelease(&batch);
+        return false;
+    }
     if (ArrowArrayStartAppending(&batch) != NANOARROW_OK) {
         error = "failed to start batch append";
         ArrowArrayRelease(&batch);
@@ -798,6 +968,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         for (auto& plan : plans) {
             switch (plan.kind) {
                 case ColumnPlan::Kind::Skip:
+                case ColumnPlan::Kind::FixedSizeList:  // refused above: this path builds no nested arrays
                     break;
                 case ColumnPlan::Kind::Variable:
                     if (!append_string_at_row(*plan.array, plan.values->variable, static_cast<std::size_t>(row),
@@ -839,67 +1010,175 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     return true;
 }
 
-bool read_data_file_batch(const std::filesystem::path& dataset_path, const pb::DataFile& data_file,
+/// One fragment, and which of its rows this read wants.
+///
+/// `skip`/`take` are how a row range reaches the decoder. A fragment the range does not touch at all
+/// is never put in the plan, so it is never opened -- that, not the trimming, is where the saving is.
+///
+/// A fragment can hold SEVERAL data files, and they are not more rows: they are more COLUMNS of the
+/// same rows. `add_columns` produces exactly that -- the computed column lands in a second file
+/// beside the original. Treating each file as its own batch (which this used to do) silently dropped
+/// every column after the first file's.
+struct PlannedFile {
+    std::vector<pb::DataFile> files;
+    std::uint64_t fragment_id = 0;
+    pb::DeletionFile deletion_file;    // `present` false when the fragment has no deletions
+    std::uint64_t physical_rows = 0;   // rows on disk, before deletions
+    std::uint64_t rows = 0;            // LOGICAL rows: physical minus deleted. What a read returns.
+    std::uint64_t skip = 0;            // logical rows to drop from the front
+    std::uint64_t take = 0;            // logical rows to keep
+
+    bool partial() const { return skip != 0U || take != rows; }
+};
+
+bool read_data_file_batch(const std::filesystem::path& dataset_path, const PlannedFile& planned,
                           const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema, ArrowArray& batch,
                           std::string& error,
                           const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr) {
-    // data_file.path is attacker-controlled (it comes out of the untrusted manifest). Confine it under
-    // <dataset>/data/ so a hostile ".."/absolute path can't make the reader open a file outside the
-    // dataset. The writer only ever stores a bare filename here, so legitimate datasets are unaffected.
-    const auto jailed = safe_join_under(dataset_path / "data", data_file.path);
-    if (!jailed) {
-        error = "data file path escapes the dataset directory";
-        return false;
-    }
-    const auto& path = *jailed;
-    pb::FileDescriptor descriptor{};
-    LanceDataFileFooterLayout layout{};
-    if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
-        return false;
-    }
-    std::vector<pb::ColumnMetadata> column_metadatas;
-    if (!read_lance_data_file_column_metadatas(path, layout, column_metadatas, error)) {
-        return false;
-    }
-    if (data_file.fields.size() != data_file.column_indices.size()) {
-        error = "data file field/column index mismatch";
+    if (planned.files.empty()) {
+        error = "fragment has no data files";
         return false;
     }
 
+    // One batch is one read operation, so each data file it touches is validated once here rather
+    // than once per page buffer (see DataFileReadScope).
+    const DataFileReadScope read_scope;
+
+    // One fragment, one batch -- however many files its columns are split across.
     std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
-    for (std::size_t i = 0; i < data_file.fields.size(); ++i) {
-        const auto field_id = data_file.fields[i];
-        // Skip columns not in the projection (if one is set).
-        if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
+    std::int64_t length = -1;
+    for (const auto& data_file : planned.files) {
+        // data_file.path is attacker-controlled (it comes out of the untrusted manifest). Confine it
+        // under <dataset>/data/ so a hostile ".."/absolute path can't make the reader open a file
+        // outside the dataset. The writer only ever stores a bare filename here, so legitimate
+        // datasets are unaffected.
+        const auto jailed = safe_join_under(dataset_path / "data", data_file.path);
+        if (!jailed) {
+            error = "data file path escapes the dataset directory";
+            return false;
+        }
+        const auto& path = *jailed;
+        pb::FileDescriptor descriptor{};
+        LanceDataFileFooterLayout layout{};
+        if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
+            return false;
+        }
+        std::vector<pb::ColumnMetadata> column_metadatas;
+        if (!read_lance_data_file_column_metadatas(path, layout, column_metadatas, error)) {
+            return false;
+        }
+        if (data_file.fields.size() != data_file.column_indices.size()) {
+            error = "data file field/column index mismatch";
+            return false;
+        }
+        // Every file of a fragment describes the SAME rows. A disagreement means the manifest and the
+        // files are out of step, and merging them would silently pad or truncate a column.
+        if (length < 0) {
+            length = static_cast<std::int64_t>(descriptor.length);
+        } else if (static_cast<std::uint64_t>(length) != descriptor.length) {
+            error = "data files within one fragment disagree on their row count";
+            return false;
+        }
 
-        const auto column_index = data_file.column_indices[i];
-        if (column_index < 0 ||
-            static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
-            error = "data file column index out of range";
-            return false;
+        for (std::size_t i = 0; i < data_file.fields.size(); ++i) {
+            const auto field_id = data_file.fields[i];
+            // Skip columns not in the projection (if one is set).
+            if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
+
+            const auto column_index = data_file.column_indices[i];
+            if (column_index < 0 ||
+                static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
+                error = "data file column index out of range";
+                return false;
+            }
+            const auto* on_disk = find_descriptor_field(descriptor, field_id);
+            if (on_disk == nullptr) {
+                error = "data file references unknown field id";
+                return false;
+            }
+            ColumnValues values;
+            if (!decode_lance_physical_column(path, *on_disk,
+                                              column_metadatas[static_cast<std::size_t>(column_index)],
+                                              values, error)) {
+                return false;
+            }
+            decoded_by_field_id.emplace(field_id, std::move(values));
         }
-        const auto* on_disk = find_descriptor_field(descriptor, field_id);
-        if (on_disk == nullptr) {
-            error = "data file references unknown field id";
-            return false;
-        }
-        ColumnValues values;
-        if (!decode_lance_physical_column(path, *on_disk, column_metadatas[static_cast<std::size_t>(column_index)],
-                                          values, error)) {
-            return false;
-        }
-        decoded_by_field_id.emplace(field_id, std::move(values));
     }
 
-    const auto length = static_cast<std::int64_t>(descriptor.length);
+    // Deletions first, then the row range: a range is expressed in LOGICAL row numbers, which only
+    // exist once the deleted rows are gone.
+    if (planned.deletion_file.present) {
+        if (static_cast<std::uint64_t>(length) != planned.physical_rows) {
+            error = "data file holds " + std::to_string(length) +
+                    " rows but the manifest claims " + std::to_string(planned.physical_rows) +
+                    "; refusing to apply a deletion vector against rows that do not line up";
+            return false;
+        }
+        std::vector<std::uint32_t> deleted;
+        if (!read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
+            return false;
+        }
+        std::vector<std::uint8_t> keep(static_cast<std::size_t>(length), 1U);
+        for (const auto row : deleted) {
+            if (row >= static_cast<std::uint64_t>(length)) {
+                error = "deletion file names row " + std::to_string(row) + " but the fragment holds " +
+                        std::to_string(length);
+                return false;
+            }
+            keep[row] = 0U;
+        }
+        for (auto& [field_id, values] : decoded_by_field_id) {
+            const auto* field = find_mapping_field(mapping, field_id);
+            const std::size_t value_bytes =
+                field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            if (!compact_column_values(values, keep, static_cast<std::uint64_t>(length), value_bytes,
+                                       error)) {
+                return false;
+            }
+        }
+        length = static_cast<std::int64_t>(planned.rows);
+    }
+
+    if (planned.partial()) {
+        // The plan's skip/take came from the MANIFEST's per-fragment row count, while the rows are
+        // here in the data file. If the two disagree, the arithmetic that decided which files to skip
+        // was wrong, and a silently misaligned row range is exactly the failure this must not have.
+        if (static_cast<std::uint64_t>(length) != planned.rows) {
+            error = "data file holds " + std::to_string(length) +
+                    " rows but the manifest claims " + std::to_string(planned.rows) +
+                    "; refusing to guess which rows a range covers";
+            return false;
+        }
+        for (auto& [field_id, values] : decoded_by_field_id) {
+            const auto* field = find_mapping_field(mapping, field_id);
+            const std::size_t value_bytes =
+                field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            if (!slice_column_values(values, planned.skip, planned.take,
+                                     static_cast<std::uint64_t>(length), value_bytes, error)) {
+                return false;
+            }
+        }
+        length = static_cast<std::int64_t>(planned.take);
+    }
+
     return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id, length, batch, error);
+}
+
+/// ArrowSchemaRelease dereferences `release` unconditionally, and releasing sets it to null, so
+/// calling it twice on the same schema jumps through a null pointer. Every failure path below leaves
+/// the schema released exactly once by going through here.
+void release_schema_if_held(ArrowSchema& schema) {
+    if (schema.release != nullptr) {
+        ArrowSchemaRelease(&schema);
+    }
 }
 
 // Release out_schema and every ArrowArray already pushed into out_batches, then clear out_batches. Used
 // on every failure path after the loop has started building batches, so a mid-read error (a later
 // fragment/data-file fails to decode) can't leak the batches successfully built before it.
 void release_partial_read(ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches) {
-    ArrowSchemaRelease(&out_schema);
+    release_schema_if_held(out_schema);
     for (auto& batch : out_batches) {
         ArrowArrayRelease(&batch);
     }
@@ -908,102 +1187,83 @@ void release_partial_read(ArrowSchema& out_schema, std::vector<ArrowArray>& out_
 
 }  // namespace
 
-bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
-                              std::vector<ArrowArray>& out_batches, std::string& error,
-                              bool trusted_input) {
-    error.clear();
-    out_batches.clear();
-    ArrowSchemaInit(&out_schema);
+namespace {
 
-    std::optional<ScopedReadLimits> trusted_scope;
-    if (trusted_input) {
-        trusted_scope.emplace(trusted_read_limits());
-    }
-
-    pb::Manifest manifest{};
-    std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
-        return false;
-    }
+/// Everything a read needs after the manifest has been parsed: where the data files are, how the
+/// on-disk fields map to Arrow, and (for a projected read) which field ids survive.
+///
+/// This exists because the eager read, the projected eager read and the stream below are all the same
+/// two steps -- open, then walk the data files -- and were three copies of the first step. The stream
+/// needs to keep that state alive between `next()` calls, which is what made the duplication worth
+/// removing rather than adding a fourth copy.
+struct ReadPlan {
+    std::filesystem::path dataset_path;
     LanceSchemaMapping mapping;
-    if (!lance_schema_mapping_from_manifest(manifest, mapping, error)) {
-        return false;
-    }
-    if (!build_schema_from_mapping(mapping, out_schema, error)) {
-        return false;
-    }
+    std::vector<PlannedFile> files;  // flattened in fragment-id order, range-filtered
+    std::unordered_set<std::int32_t> allowed_ids;
+    bool projected = false;
 
-    std::vector<pb::DataFragment> fragments = manifest.fragments;
-    std::sort(fragments.begin(), fragments.end(),
-              [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
+    const std::unordered_set<std::int32_t>* allowed() const { return projected ? &allowed_ids : nullptr; }
+};
 
-    for (const auto& fragment : fragments) {
-        for (const auto& data_file : fragment.files) {
-            ArrowArray batch{};
-            if (!read_data_file_batch(dataset_path, data_file, mapping, out_schema, batch, error)) {
-                release_partial_read(out_schema, out_batches);
-                return false;
-            }
-            out_batches.push_back(batch);
-        }
-    }
-    return true;
-}
-
-bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_path,
-                                        const std::vector<std::string>& column_names,
-                                        ArrowSchema& out_schema,
-                                        std::vector<ArrowArray>& out_batches,
-                                        std::string& error, bool trusted_input) {
-    error.clear();
-    out_batches.clear();
-    ArrowSchemaInit(&out_schema);
-
-    std::optional<ScopedReadLimits> trusted_scope;
-    if (trusted_input) {
-        trusted_scope.emplace(trusted_read_limits());
-    }
+/// Parse the manifest and build the Arrow schema. `column_names` null means every column.
+bool open_read_plan(const std::filesystem::path& dataset_path,
+                    const std::vector<std::string>* column_names, const LanceRowRange& range,
+                    ReadPlan& plan, ArrowSchema& out_schema, std::string& error) {
+    plan.dataset_path = dataset_path;
 
     pb::Manifest manifest{};
     std::uint64_t version = 0;
     if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+        release_schema_if_held(out_schema);
         return false;
     }
     LanceSchemaMapping full_mapping;
     if (!lance_schema_mapping_from_manifest(manifest, full_mapping, error)) {
+        release_schema_if_held(out_schema);
         return false;
     }
 
-    // Collect IDs of requested top-level columns and ALL their descendants.
-    std::unordered_set<std::int32_t> allowed_ids;
-    for (const auto& col_name : column_names) {
-        // Find root field by name.
-        const LanceField* root = nullptr;
-        for (const auto& f : full_mapping.fields) {
-            if (f.parent_id == -1 && f.name == col_name) { root = &f; break; }
-        }
-        if (root == nullptr) {
-            error = "projected column '" + col_name + "' not found in schema";
-            return false;
-        }
-        // BFS to collect root + all descendants.
-        std::vector<std::int32_t> queue = {root->id};
-        while (!queue.empty()) {
-            auto id = queue.back(); queue.pop_back();
-            allowed_ids.insert(id);
+    if (column_names == nullptr) {
+        plan.mapping = std::move(full_mapping);
+    } else {
+        // Collect the requested top-level columns and ALL their descendants: a projected struct
+        // column is only meaningful together with the children that hold its data.
+        for (const auto& col_name : *column_names) {
+            const LanceField* root = nullptr;
             for (const auto& f : full_mapping.fields) {
-                if (f.parent_id == id) queue.push_back(f.id);
+                if (f.parent_id == -1 && f.name == col_name) {
+                    root = &f;
+                    break;
+                }
+            }
+            if (root == nullptr) {
+                release_schema_if_held(out_schema);
+                error = "projected column '" + col_name + "' not found in schema";
+                return false;
+            }
+            std::vector<std::int32_t> queue = {root->id};
+            while (!queue.empty()) {
+                const auto id = queue.back();
+                queue.pop_back();
+                plan.allowed_ids.insert(id);
+                for (const auto& f : full_mapping.fields) {
+                    if (f.parent_id == id) {
+                        queue.push_back(f.id);
+                    }
+                }
+            }
+        }
+        plan.projected = true;
+        for (const auto& f : full_mapping.fields) {
+            if (plan.allowed_ids.count(f.id) != 0U) {
+                plan.mapping.fields.push_back(f);
             }
         }
     }
 
-    // Build a projected LanceSchemaMapping (only allowed fields).
-    LanceSchemaMapping proj_mapping;
-    for (const auto& f : full_mapping.fields) {
-        if (allowed_ids.count(f.id)) proj_mapping.fields.push_back(f);
-    }
-
-    if (!build_schema_from_mapping(proj_mapping, out_schema, error)) {
+    if (!build_schema_from_mapping(plan.mapping, out_schema, error)) {
+        release_schema_if_held(out_schema);
         return false;
     }
 
@@ -1011,16 +1271,264 @@ bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_pat
     std::sort(fragments.begin(), fragments.end(),
               [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
 
-    for (const auto& fragment : fragments) {
-        for (const auto& data_file : fragment.files) {
-            ArrowArray batch{};
-            if (!read_data_file_batch(dataset_path, data_file, proj_mapping, out_schema, batch, error,
-                                      &allowed_ids)) {
-                release_partial_read(out_schema, out_batches);
-                return false;
-            }
-            out_batches.push_back(batch);
+    const bool ranged = !range.is_whole_dataset();
+    std::uint64_t cursor = 0;  // absolute row index of the next fragment's first row
+    for (auto& fragment : fragments) {
+        if (fragment.files.empty()) {
+            continue;
         }
+        // Deleted rows are not rows any more: a range, a count and a full read all have to agree,
+        // and a full read does not return them. So the plan counts in LOGICAL rows throughout and
+        // the deletion filter runs before the range is applied.
+        if (fragment.deletion_file.present &&
+            fragment.deletion_file.num_deleted_rows > fragment.physical_rows) {
+            release_schema_if_held(out_schema);
+            error = "fragment claims more deleted rows than it holds";
+            return false;
+        }
+        const auto rows = fragment.physical_rows - (fragment.deletion_file.present
+                                                        ? fragment.deletion_file.num_deleted_rows
+                                                        : 0U);
+        const auto first_row = cursor;
+        if (rows > std::numeric_limits<std::uint64_t>::max() - cursor) {
+            release_schema_if_held(out_schema);
+            error = "dataset row count overflows a 64-bit integer";
+            return false;
+        }
+        cursor += rows;
+
+        PlannedFile planned;
+        planned.fragment_id = fragment.id;
+        planned.deletion_file = fragment.deletion_file;
+        planned.physical_rows = fragment.physical_rows;
+        planned.rows = rows;
+
+        if (!ranged) {
+            planned.files = std::move(fragment.files);
+            planned.skip = 0U;
+            planned.take = rows;
+            plan.files.push_back(std::move(planned));
+            continue;
+        }
+
+        // Half-open intersection of [first_row, first_row + rows) with the requested range. An empty
+        // intersection means the file is dropped from the plan entirely and never opened.
+        const auto want_begin = range.offset;
+        const auto want_end = range.length == LanceRowRange::kAllRows
+                                  ? std::numeric_limits<std::uint64_t>::max()
+                                  : (range.offset > std::numeric_limits<std::uint64_t>::max() - range.length
+                                         ? std::numeric_limits<std::uint64_t>::max()
+                                         : range.offset + range.length);
+        const auto file_end = first_row + rows;
+        const auto begin = std::max(want_begin, first_row);
+        const auto end = std::min(want_end, file_end);
+        if (begin >= end) {
+            continue;
+        }
+        planned.files = std::move(fragment.files);
+        planned.skip = begin - first_row;
+        planned.take = end - begin;
+        plan.files.push_back(std::move(planned));
+    }
+
+    if (ranged && range.offset > cursor) {
+        release_schema_if_held(out_schema);
+        error = "row range starts past the end of the dataset (" + std::to_string(cursor) + " rows)";
+        return false;
+    }
+    return true;
+}
+
+/// Decode every data file up front. The eager reads' second half.
+bool read_all_batches(const ReadPlan& plan, ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
+                      std::string& error) {
+    for (const auto& planned : plan.files) {
+        ArrowArray batch{};
+        if (!read_data_file_batch(plan.dataset_path, planned, plan.mapping, out_schema, batch, error,
+                                  plan.allowed())) {
+            release_partial_read(out_schema, out_batches);
+            return false;
+        }
+        out_batches.push_back(batch);
+    }
+    return true;
+}
+
+bool read_dataset_eager(const std::filesystem::path& dataset_path,
+                        const std::vector<std::string>* column_names, const LanceRowRange& range,
+                        ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
+                        std::string& error, bool trusted_input) {
+    error.clear();
+    out_batches.clear();
+    ArrowSchemaInit(&out_schema);
+
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
+    ReadPlan plan;
+    if (!open_read_plan(dataset_path, column_names, range, plan, out_schema, error)) {
+        return false;
+    }
+    return read_all_batches(plan, out_schema, out_batches, error);
+}
+
+}  // namespace
+
+bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
+                              std::vector<ArrowArray>& out_batches, std::string& error,
+                              bool trusted_input) {
+    return read_dataset_eager(dataset_path, /*column_names=*/nullptr, LanceRowRange{}, out_schema,
+                              out_batches, error, trusted_input);
+}
+
+bool lance_table_read_dataset_projected(const std::filesystem::path& dataset_path,
+                                        const std::vector<std::string>& column_names,
+                                        ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
+                                        std::string& error, bool trusted_input) {
+    return read_dataset_eager(dataset_path, &column_names, LanceRowRange{}, out_schema, out_batches,
+                              error, trusted_input);
+}
+
+bool lance_table_read_dataset_range(const std::filesystem::path& dataset_path,
+                                    const std::vector<std::string>* column_names,
+                                    const LanceRowRange& range, ArrowSchema& out_schema,
+                                    std::vector<ArrowArray>& out_batches, std::string& error,
+                                    bool trusted_input) {
+    return read_dataset_eager(dataset_path, column_names, range, out_schema, out_batches, error,
+                              trusted_input);
+}
+
+/// The stream's state. Held by pointer so the public header stays free of the manifest and schema
+/// mapping types.
+struct LanceTableStream::Impl {
+    ReadPlan plan;
+    ArrowSchema schema{};   // the stream's own copy; the caller got a deep copy at open()
+    std::size_t cursor = 0;
+    bool trusted_input = false;
+
+    ~Impl() { release_schema_if_held(schema); }
+};
+
+LanceTableStream::LanceTableStream() = default;
+LanceTableStream::~LanceTableStream() = default;
+LanceTableStream::LanceTableStream(LanceTableStream&&) noexcept = default;
+LanceTableStream& LanceTableStream::operator=(LanceTableStream&&) noexcept = default;
+
+bool LanceTableStream::open(const std::filesystem::path& dataset_path,
+                            const std::vector<std::string>* column_names, ArrowSchema& out_schema,
+                            LanceTableStream& out, std::string& error, bool trusted_input) {
+    return open_range(dataset_path, column_names, LanceRowRange{}, out_schema, out, error, trusted_input);
+}
+
+bool LanceTableStream::open_range(const std::filesystem::path& dataset_path,
+                                  const std::vector<std::string>* column_names,
+                                  const LanceRowRange& range, ArrowSchema& out_schema,
+                                  LanceTableStream& out, std::string& error, bool trusted_input) {
+    error.clear();
+    ArrowSchemaInit(&out_schema);
+
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
+
+    auto impl = std::make_unique<Impl>();
+    impl->trusted_input = trusted_input;
+    if (!open_read_plan(dataset_path, column_names, range, impl->plan, out_schema, error)) {
+        return false;
+    }
+    // The stream keeps its own schema: read_data_file_batch builds each batch against one, and the
+    // caller owns (and may release) the schema it was handed the moment open() returns.
+    if (ArrowSchemaDeepCopy(&out_schema, &impl->schema) != NANOARROW_OK) {
+        release_schema_if_held(out_schema);
+        error = "failed to copy the dataset schema for the stream";
+        return false;
+    }
+    out.impl_ = std::move(impl);
+    return true;
+}
+
+bool LanceTableStream::next(ArrowArray& out_batch, std::string& error) {
+    error.clear();
+    out_batch = ArrowArray{};
+    if (impl_ == nullptr) {
+        error = "stream is not open";
+        return false;
+    }
+    if (impl_->cursor >= impl_->plan.files.size()) {
+        return true;  // end of stream: out_batch.release stays null
+    }
+
+    // The limits are per-thread and scoped, so a trusted stream has to re-establish them on every
+    // next() -- open()'s scope ended when open() returned.
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (impl_->trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
+    const auto& planned = impl_->plan.files[impl_->cursor];
+    if (!read_data_file_batch(impl_->plan.dataset_path, planned, impl_->plan.mapping, impl_->schema,
+                              out_batch, error, impl_->plan.allowed())) {
+        out_batch = ArrowArray{};
+        return false;
+    }
+    ++impl_->cursor;
+    return true;
+}
+
+
+bool lance_table_read_schema(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
+                             std::string& error) {
+    error.clear();
+    ArrowSchemaInit(&out_schema);
+
+    pb::Manifest manifest{};
+    std::uint64_t version = 0;
+    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    LanceSchemaMapping mapping;
+    if (!lance_schema_mapping_from_manifest(manifest, mapping, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    if (!build_schema_from_mapping(mapping, out_schema, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    return true;
+}
+
+bool lance_table_count_rows(const std::filesystem::path& dataset_path, std::uint64_t& out_rows,
+                            std::string& error) {
+    error.clear();
+    out_rows = 0;
+
+    pb::Manifest manifest{};
+    std::uint64_t version = 0;
+    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+        return false;
+    }
+    // Summed from the fragments rather than taken from a total field: the count has to agree with
+    // what a read actually returns, and a read walks these same fragments. That is also why deleted
+    // rows are subtracted -- a read does not return them, so counting them would make count_rows
+    // disagree with len(read_table(...)), which is the one thing it must never do.
+    for (const auto& fragment : manifest.fragments) {
+        const auto deleted =
+            fragment.deletion_file.present ? fragment.deletion_file.num_deleted_rows : 0U;
+        if (deleted > fragment.physical_rows) {
+            error = "fragment claims more deleted rows than it holds";
+            out_rows = 0;
+            return false;
+        }
+        const auto live = fragment.physical_rows - deleted;
+        if (live > UINT64_MAX - out_rows) {
+            error = "dataset row count overflows a 64-bit integer";
+            out_rows = 0;
+            return false;
+        }
+        out_rows += live;
     }
     return true;
 }

@@ -45,14 +45,6 @@ void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
 }
 
-void append_varint(std::vector<std::uint8_t>& out, std::uint64_t value) {
-    while (value >= 0x80U) {
-        out.push_back(static_cast<std::uint8_t>((value & 0x7FU) | 0x80U));
-        value >>= 7U;
-    }
-    out.push_back(static_cast<std::uint8_t>(value));
-}
-
 bool arrow_row_is_null(const ArrowArray& array, std::int64_t row_index) {
     if (array.buffers == nullptr || array.buffers[0] == nullptr) {
         return false;
@@ -546,8 +538,8 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
                                         ColumnValues& out,
                                         std::string& error) {
     error.clear();
-    const auto* struct_array = resolve_field_array(batch, mapping, blob_field);
-    if (struct_array == nullptr) {
+    ArrowArray struct_array{};
+    if (!resolve_field_array(batch, mapping, blob_field, struct_array)) {
         error = "missing Arrow struct array for blob field ";
         error += blob_field.name;
         return false;
@@ -562,11 +554,14 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
         return false;
     }
 
-    const auto* data_a = resolve_field_array(batch, mapping, *data_f);
-    const auto* uri_a = resolve_field_array(batch, mapping, *uri_f);
-    const auto* pos_a = resolve_field_array(batch, mapping, *pos_f);
-    const auto* size_a = resolve_field_array(batch, mapping, *size_f);
-    if (data_a == nullptr || uri_a == nullptr || pos_a == nullptr || size_a == nullptr) {
+    ArrowArray data_a{};
+    ArrowArray uri_a{};
+    ArrowArray pos_a{};
+    ArrowArray size_a{};
+    if (!resolve_field_array(batch, mapping, *data_f, data_a) ||
+        !resolve_field_array(batch, mapping, *uri_f, uri_a) ||
+        !resolve_field_array(batch, mapping, *pos_f, pos_a) ||
+        !resolve_field_array(batch, mapping, *size_f, size_a)) {
         error = "missing Arrow arrays for blob children";
         return false;
     }
@@ -579,13 +574,13 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
         return false;
     } else {
         out.blob_v2.row_packed_sizes.reserve(out.blob_v2.row_packed_sizes.size() +
-                                            static_cast<std::size_t>(struct_array->length));
+                                            static_cast<std::size_t>(struct_array.length));
     }
 
-    const auto rows = struct_array->length;
+    const auto rows = struct_array.length;
     for (std::int64_t row = 0; row < rows; ++row) {
         BlobV2ExternalDescriptor descriptor;
-        if (!preprocess_blob_v2_external_row(*data_a, *uri_a, *pos_a, *size_a, row, descriptor, error)) {
+        if (!preprocess_blob_v2_external_row(data_a, uri_a, pos_a, size_a, row, descriptor, error)) {
             return false;
         }
         if (dictionary_mode) {

@@ -9,6 +9,8 @@
 // emptied source folders are deleted. The result is an ordinary multi-fragment Lance dataset that stock
 // tools open out of the box; row order follows <item>. See nanolance/dataset_stitcher.hpp.
 
+#include "cli_subcommands.hpp"
+
 #include "nanolance/dataset_stitcher.hpp"
 #include "nanolance/version.hpp"
 
@@ -48,7 +50,7 @@ std::optional<std::uint64_t> item_number(const std::string& name, const std::str
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int nanolance_cli_stitch(int argc, char** argv) {
     CLI::App app{"Stitch many free-standing Lance worker outputs into one self-contained dataset"};
     std::string input_dir;
     std::string master_out;
@@ -102,3 +104,9 @@ int main(int argc, char** argv) {
                  static_cast<unsigned long long>(summary.total_rows), master_out.c_str());
     return 0;
 }
+
+#ifndef NANOLANCE_CLI_SUBCOMMAND
+// Standalone build of this tool. The `nanolance` binary compiles the same file with
+// NANOLANCE_CLI_SUBCOMMAND defined and calls nanolance_cli_stitch from its dispatcher instead.
+int main(int argc, char** argv) { return nanolance_cli_stitch(argc, argv); }
+#endif

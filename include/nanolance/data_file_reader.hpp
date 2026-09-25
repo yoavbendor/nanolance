@@ -29,6 +29,34 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
 bool read_lance_data_file_column_metadatas(const std::filesystem::path& path, const LanceDataFileFooterLayout& layout,
                                            std::vector<pb::ColumnMetadata>& columns, std::string& error);
 
+/// One read operation's boundary for the reader's cache of open data files.
+///
+/// That cache re-stats a file's size and mtime to notice that the same path now names a *different*
+/// file -- fragment names are assigned from the lowest unused suffix, so wiping a dataset directory
+/// and rewriting it reproduces "fragment-0.lance" with different bytes (nanolance's own tests do
+/// exactly this). Correct, but it was doing it on every page-buffer read: two `stat` syscalls per
+/// page, 48% of a read's syscall time, to re-answer a question that cannot change inside one read.
+///
+/// Constructing this says "from here until scope exit is one read operation": the first lookup of a
+/// given file still validates, and the rest of the operation's reads of that file skip the stats.
+/// Outside any scope nothing is cached across calls -- every lookup validates, as before -- so the
+/// guarantee is opt-in rather than something a caller can lose by forgetting.
+///
+/// Scopes nest, and a nested one is its own operation: leaving it restores the enclosing scope,
+/// whose next lookup validates again.
+class DataFileReadScope {
+  public:
+    DataFileReadScope();
+    ~DataFileReadScope();
+    DataFileReadScope(const DataFileReadScope&) = delete;
+    DataFileReadScope& operator=(const DataFileReadScope&) = delete;
+    DataFileReadScope(DataFileReadScope&&) = delete;
+    DataFileReadScope& operator=(DataFileReadScope&&) = delete;
+
+  private:
+    std::uint64_t saved_ = 0;
+};
+
 /// Read a byte range from a Lance data file.
 bool read_lance_data_file_bytes(const std::filesystem::path& path, std::uint64_t offset, std::uint64_t size,
                                 std::vector<std::uint8_t>& out, std::string& error);

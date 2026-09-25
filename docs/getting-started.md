@@ -33,7 +33,24 @@ import nanolance
 table = pa.table({"id": [1, 2, 3], "name": ["alpha", "beta", "gamma"]})
 nanolance.write_table(table, "out.lance", compression=True)
 assert pa.table(nanolance.read_table("out.lance")).equals(table)
+
+# Column projection, and a fragment-at-a-time stream for datasets bigger than memory:
+nanolance.read_table("out.lance", columns=["name"])
+for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")):
+    ...
 ```
+
+Already have parquet? Convert it and compare, without writing any code:
+
+```console
+$ nanolance convert events.parquet events.lance --compress   # or: python -m nanolance convert ...
+200,000 rows  events.parquet -> events.lance
+  parquet :    2.0 MiB
+  lance   :  530.3 KiB   (3.92x smaller)
+```
+
+It converts a batch at a time, so a file larger than memory is fine, and `nanolance inspect
+events.lance` prints rows, size and schema.
 
 Install for development: `pip install -e "bindings/python[test]"` then `pytest` in that directory. No
 hard `pyarrow` runtime dependency (uses the Arrow PyCapsule interface); does not shadow `import lance`
@@ -46,9 +63,10 @@ hard `pyarrow` runtime dependency (uses the Arrow PyCapsule interface); does not
 #include <nanoarrow/nanoarrow.h>
 
 NanoLanceWriter w = {0};
-nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
-nano_lance_writer_set_ignore_nullability(&w, true);  // if your Arrow fields are nullable
-nano_lance_writer_set_compression(&w, true);         // Lance-compatible compression (off by default)
+NanoLanceWriteOptions options = {0};                 // zeroed == the defaults
+options.compression_level = 3;
+options.compression = true;                          // Lance-compatible compression (off by default)
+nano_lance_writer_open(&w, "out.lance", &options);
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // repeatable; schema locks after batch #1
 nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append a fragment
 nano_lance_writer_close(&w);
@@ -79,8 +97,10 @@ or `nano_lance_table_read_dataset` / `nano_lance_table_read_dataset_ex` (C ABI,
 - **nanolance** (namespace `nano_lance`, include prefix `nanolance/`): the Lance writer/reader. CMake
   targets: `nanolance_proto`, `nanolance_reader`, `nanolance` (writing); link `nanolance_reader` alone
   if you only fetch external blobs.
-- **Tool:** `arrowipc2lance` — Arrow IPC stream → Lance dataset; `nlance2table` — Lance dataset →
-  CSV/NDJSON text (for validation).
+- **CLI:** one `nanolance` binary with subcommands: `import` (Arrow IPC stream → Lance dataset),
+  `info` (fragments, rows, file sizes), `cat` (dataset → CSV/NDJSON, for validation) and `stitch`.
+  `nanolance --help` lists them. The original names (`arrowipc2lance`, `nlance_info`,
+  `nlance2table`, `nlance_stitch`) are still built and behave identically.
 
 For the full integration guide — API lifecycle, the measured per-column compression table, the
 data-model recipe for small files, and interop verification — see

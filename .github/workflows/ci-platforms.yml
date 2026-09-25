@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The library and its test suite on macOS and Windows.
+#
+# Every other workflow here runs on Linux, so "builds on macOS/Windows" has been an untested claim.
+# This job is what makes it a tested one -- and, for Windows, what decides whether wheels can be
+# published for it at all (see wheels.yml).
+#
+# It is deliberately the plain documented build: `cmake -S . -B build && cmake --build build` and
+# ctest, with no flags a new user would not use.
+#
+# macOS runs on every push. Windows runs on workflow_dispatch ONLY, on purpose: the tree has never
+# been built there and a job that is red on every push teaches people to ignore red. Run it by hand
+# (Actions -> ci-platforms -> Run workflow), fix what it finds, then move it under `push` here and
+# add Windows to wheels.yml.
+name: ci-platforms
+
+on:
+  push:
+    branches: [main, "claude/**", "cursor/**"]
+    paths:
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "include/**"
+      - "src/**"
+      - "tests/**"
+      - "tools/**"
+      - "generated/**"
+      - ".github/workflows/ci-platforms.yml"
+  pull_request:
+    paths:
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "include/**"
+      - "src/**"
+      - "tests/**"
+      - "tools/**"
+      - "generated/**"
+      - ".github/workflows/ci-platforms.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-platforms-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    # macos-14 is deprecated; a retired runner label queues forever instead of failing.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pyarrow
+        # Several ctest cases are pylance/pyarrow interop smoke tests; without pyarrow they skip
+        # rather than fail, which would quietly hollow out this job.
+        run: python -m pip install --upgrade pip pyarrow pylance
+
+      - name: Cache fetched deps
+        uses: actions/cache@v4
+        with:
+          path: .deps-Unix_Makefiles
+          key: deps-macos-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j3
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j3
+
+  windows:
+    # Manual only -- see the note at the top of this file. Several ctest cases invoke bash scripts,
+    # so a first failure there is about the test harness rather than the library; the build step
+    # above it is the signal that matters.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pyarrow
+        run: python -m pip install --upgrade pip pyarrow
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure -j2

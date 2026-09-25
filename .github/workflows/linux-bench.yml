@@ -57,7 +57,13 @@ jobs:
           # NANOLANCE_BUILD_EXAMPLES=OFF: dpar/lldp2lance_main.cpp trigger clang ICEs on both
           # clang-18 and clang-19; pcapng2lance also requires the nanotins submodule which CI
           # does not need for core library tests.
+          # NANOLANCE_WERROR=ON: -Wall -Wextra -Werror on nanolance's own three library targets
+          # (not on FetchContent'd deps, the tools or the tests -- see CMakeLists). The option
+          # defaults OFF so a downstream build on an unknown compiler cannot be broken by a new
+          # warning; CI is where the ratchet belongs. This job is the clang side of it;
+          # memory-safety.yml is the gcc side.
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DNANOLANCE_WERROR=ON \
             -DNANOLANCE_BUILD_EXAMPLES=OFF \
             -DNANOLANCE_BUILD_FUSE_EXAMPLE=ON
           cmake --build build -j

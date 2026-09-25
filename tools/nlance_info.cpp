@@ -14,6 +14,8 @@
 // a single giant fragment means the whole table is read as one batch before
 // any FUSE operation can be served.
 
+#include "cli_subcommands.hpp"
+
 #include "nanolance/nano_lance_reader.h"
 
 #include <algorithm>
@@ -35,20 +37,21 @@ static const char* human_size(uint64_t bytes, char* buf, size_t n) {
     return buf;
 }
 
-int main(int argc, char** argv) {
+int nanolance_cli_info(int argc, char** argv) {
     if (argc < 2 || std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0) {
         std::fprintf(stderr,
-            "Usage: nlance_info <dataset.lance>\n\n"
+            "Usage: %s <dataset.lance>\n\n"
             "Print fragment/chunk statistics: rows per fragment, data file sizes.\n"
             "Useful for diagnosing why fuselance startup is slow (one huge fragment\n"
-            "= one giant batch that must be read before any file is accessible).\n");
+            "= one giant batch that must be read before any file is accessible).\n",
+            argv[0]);
         return argc < 2 ? 1 : 0;
     }
 
     NanoLanceDatasetMetadata meta{};
     char err[512];
     if (nano_lance_dataset_read_latest(argv[1], &meta, err, sizeof(err)) != NANO_LANCE_READER_OK) {
-        std::fprintf(stderr, "nlance_info: %s\n", err);
+        std::fprintf(stderr, "%s: %s\n", argv[0], err);
         return 1;
     }
 
@@ -127,10 +130,17 @@ int main(int argc, char** argv) {
         if (maxr > 100000)
             std::fprintf(stdout,
                 "\nHint: max fragment has %" PRIu64 " rows — fuselance loads each fragment as one\n"
-                "      batch; large fragments cause slow startup. Re-ingest with smaller batches\n"
-                "      (e.g. arrowipc2lance --rows-per-fragment 10000) to fix this.\n", maxr);
+                "      batch; large fragments cause slow startup. One `nanolance import` run commits\n"
+                "      one fragment however many IPC batches it reads, so split the input and re-run\n"
+                "      with --append per chunk.\n", maxr);
     }
 
     nano_lance_dataset_metadata_free(&meta);
     return 0;
 }
+
+#ifndef NANOLANCE_CLI_SUBCOMMAND
+// Standalone build of this tool. The `nanolance` binary compiles the same file with
+// NANOLANCE_CLI_SUBCOMMAND defined and calls nanolance_cli_info from its dispatcher instead.
+int main(int argc, char** argv) { return nanolance_cli_info(argc, argv); }
+#endif

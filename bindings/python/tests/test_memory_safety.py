@@ -28,6 +28,49 @@ def test_lance_repeated_roundtrip_bounded(sample_table, tmp_path):
     assert growth < 250, f"RSS grew by {growth:.1f} MB after 20 lance cycles"
 
 
+def test_read_peak_is_about_one_copy_of_the_dataset(tmp_path):
+    """The decoded column must be ADOPTED by the Arrow buffer, not copied into it.
+
+    This is the regression guard for plan item 4.1. Before it, the decoder filled a std::vector per
+    column and then ArrowBufferAppend'd it into the Arrow buffer, so both were live and a
+    single-fragment read peaked at 2.01x the dataset (measured). Adopting the vector's storage makes
+    that a move, and the peak drops to ~1.01x.
+
+    A single fragment is the point: the old 2x lived INSIDE one fragment's decode, so splitting the
+    data across fragments used to hide it (16 fragments measured 1.10x). Whatever else changes here,
+    one fragment must not cost two copies again.
+
+    The threshold is 1.5x -- comfortably above the ~1.0x this should now cost and comfortably below
+    the 2.0x it used to, so it fails on a real regression without tripping on allocator noise.
+    """
+    # 4M rows / ~61 MiB, not smaller: at ~30 MiB the old copying build measured only 1.50x, close
+    # enough to the threshold to pass by luck on another machine. At this size the two behaviours are
+    # 2.01x vs 1.01x, so the guard has margin on both sides.
+    n = 4_000_000
+    table = pa.table(
+        {
+            "a": pa.array(range(n), type=pa.int64()),
+            "b": pa.array([i * 0.5 for i in range(n)], type=pa.float64()),
+        }
+    )
+    dataset_mb = table.nbytes / (1024 * 1024)
+    path = tmp_path / "peak.lance"
+    nanolance.write_table(table, path)
+    del table
+    gc.collect()
+
+    baseline = _rss_mb()
+    back = pa.table(nanolance.read_table(path))
+    peak = _rss_mb()
+    assert back.num_rows == n
+
+    ratio = (peak - baseline) / dataset_mb
+    assert ratio < 1.5, (
+        f"read peaked at {ratio:.2f}x the dataset ({peak - baseline:.1f} MB for {dataset_mb:.1f} MB); "
+        "the decoded column is being copied into the Arrow buffer again rather than adopted"
+    )
+
+
 def test_large_single_batch_write(tmp_path):
     n = 1_000_000
     table = pa.table({"x": pa.array(range(n), type=pa.int64())})
@@ -37,3 +80,37 @@ def test_large_single_batch_write(tmp_path):
     gc.collect()
     after = _rss_mb()
     assert after - before < 300
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(lambda p: (p / "_versions").rename(p / "_gone"), id="manifest_missing"),
+        pytest.param(
+            lambda p: next((p / "data").glob("*.lance")).write_bytes(b"not a lance file"),
+            id="data_file_garbage",
+        ),
+        pytest.param(
+            lambda p: next((p / "data").glob("*.lance")).write_bytes(b""),
+            id="data_file_empty",
+        ),
+    ],
+)
+def test_failed_read_raises_instead_of_crashing(corrupt, tmp_path):
+    """A read that fails must raise, not take the interpreter down with it.
+
+    lance_table_read_dataset releases out_schema on its mid-read failure path; the C shim released it
+    a second time. ArrowSchemaRelease dereferences `release` unconditionally and releasing nulls it,
+    so the second call jumped through a null pointer -- EVERY failed read through the C API or these
+    bindings segfaulted rather than reporting its error. A library that crashes the process on a bad
+    file is worse than one that rejects it, and it undercut the whole hardened-reader posture.
+    """
+    path = tmp_path / "victim.lance"
+    nanolance.write_table(pa.table({"a": pa.array([1, 2, 3], type=pa.int64())}), path)
+    corrupt(path)
+    with pytest.raises(RuntimeError):
+        nanolance.read_table(path)
+    # Still here, and the process is still healthy enough to do real work.
+    ok = tmp_path / "after.lance"
+    nanolance.write_table(pa.table({"a": pa.array([4, 5], type=pa.int64())}), ok)
+    assert pa.table(nanolance.read_table(ok)).column(0).to_pylist() == [4, 5]

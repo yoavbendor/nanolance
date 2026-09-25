@@ -10,6 +10,18 @@
 CMakeLists.txt.user
 compile_commands.json
 
+# Python bytecode + packaging/test scratch. A stale .pyc was tracked in
+# examples/pcapng2lance/tests/ for a Python version nobody here runs.
+__pycache__/
+*.py[cod]
+*.egg-info/
+/.pytest_cache/
+
+# Sourcetrail IDE index (st_nl.srctrldb was ~4.9MB of the repo's 22.8MB). Regenerate locally from
+# st_nl.srctrlprj; there is no reason for a consumer's clone to carry one developer's index.
+*.srctrldb
+*.srctrlbm
+
 # Local-only GPU (gputins) work-in-progress: removed from the public nanotins repo and the
 # pcapng2lance example for now; kept here to develop on a CUDA box. Re-introduce when ready.
 /local-gputins/

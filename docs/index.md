@@ -38,8 +38,8 @@ asserted:
   external `file://` blob fetch rejects `..` traversal — a hostile `../../etc/passwd` path can't escape.
 - **Mid-read failures release everything already built** — no leaked `ArrowArray`/`ArrowSchema` on a
   partial read.
-- **Continuous ASan + UBSan + LSan CI** and a **libFuzzer harness** over the full decode chain
-  (manifest → footer → column decode), seeded and run on every push.
+- **Continuous ASan + UBSan + LSan CI** and **libFuzzer targets** covering manifest, footer,
+  page descriptors, page decoding, FSST, LZ4 and deletion files, run on every push.
 
 All of this validates **once per page/header, not once per value** — a declared size or offset table
 is checked against the real buffer in a prologue, then the tight per-value `memcpy`/materialization
@@ -87,10 +87,11 @@ comparison against Parquet and Rust `lance`.
 #include "nanolance/nano_lance_writer.h"
 #include <nanoarrow/nanoarrow.h>
 
+NanoLanceWriteOptions options = {0};                 // zeroed == the defaults
 NanoLanceWriter w = {0};
-nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
-nano_lance_writer_set_ignore_nullability(&w, true);  // BEFORE the first write_batch
-nano_lance_writer_set_compression(&w, true);         // BEFORE the first write_batch
+options.compression_level = 3;
+options.compression = true;
+nano_lance_writer_open(&w, "out.lance", &options);
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // schema locks after batch #1
 nano_lance_writer_commit(&w, /*is_append=*/false);   // false = create, true = append a fragment
 nano_lance_writer_close(&w);
@@ -115,6 +116,11 @@ import nanolance
 table = pa.table({"id": [1, 2, 3], "name": ["alpha", "beta", "gamma"]})
 nanolance.write_table(table, "out.lance", compression=True)
 assert pa.table(nanolance.read_table("out.lance")).equals(table)
+
+# Column projection, and a fragment-at-a-time stream for datasets bigger than memory:
+nanolance.read_table("out.lance", columns=["name"])
+for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")):
+    ...
 ```
 
 Read on: **[Getting started](getting-started.md)** · **[Memory safety](SAFETY.md)** ·

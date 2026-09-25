@@ -27,6 +27,14 @@ void require(bool ok, const char* msg) {
     }
 }
 
+// NB: `require(f(error), error)` is a trap. The two arguments are evaluated in unspecified
+// order, so c_str() can capture a pointer into the EMPTY string before f() runs; when f() then fails
+// and assigns a long message, the string reallocates and that pointer dangles. Real failures printed
+// a stray letter instead of their message. Pass the string itself.
+void require(bool ok, const std::string& msg) {
+    require(ok, msg.c_str());
+}
+
 std::filesystem::path temp_dataset(const char* suffix) {
     auto p = std::filesystem::temp_directory_path() / ("nano_lance_blob_dict_" + std::string(suffix));
     std::error_code ec;
@@ -70,7 +78,7 @@ void write_dataset(const std::filesystem::path& ds, bool dictionary_mode,
                    const std::vector<std::string>& uris) {
     ArrowSchema schema{};
     std::string error;
-    require(nano_lance::build_epb_table_schema(schema, error), error.c_str());
+    require(nano_lance::build_epb_table_schema(schema, error), error);
 
     std::vector<std::uint64_t> packet_ids;
     std::vector<nano_lance::BlobV2Row> rows;
@@ -79,7 +87,7 @@ void write_dataset(const std::filesystem::path& ds, bool dictionary_mode,
         rows.push_back({std::nullopt, uris[i], i * 1500, 1500});
     }
     ArrowArray batch{};
-    require(nano_lance::build_epb_table_array(packet_ids, rows, batch, error), error.c_str());
+    require(nano_lance::build_epb_table_array(packet_ids, rows, batch, error), error);
 
     NanoLanceWriter writer{};
     require(nano_lance_writer_init(&writer, ds.string().c_str(), 0) == NANO_LANCE_OK, "init");
@@ -100,7 +108,7 @@ std::vector<std::string> read_uris(const std::filesystem::path& ds) {
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
     std::string error;
-    require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error.c_str());
+    require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error);
     require(batches.size() == 1U, "expected one batch");
 
     // Root struct -> payload_ref struct -> uri utf8 child.

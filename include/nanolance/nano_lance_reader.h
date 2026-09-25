@@ -119,6 +119,71 @@ int nano_lance_table_read_dataset_ex(const char* dataset_path, int trusted_input
                                      struct ArrowArray** out_batches, size_t* out_batch_count, char* error_message,
                                      size_t error_message_capacity);
 
+/// Same as nano_lance_table_read_dataset_ex, but decodes only the named top-level columns (and their
+/// children); every other column is skipped rather than decoded and thrown away. For a wide table
+/// read for a few columns, the skipped decode IS the cost -- column materialization dominates the
+/// read profile.
+///
+/// \p column_names holds \p column_count NUL-terminated names, none of them null, and must name at
+/// least one column. An unknown name is an error rather than a silent empty column.
+///
+/// Ownership and the failure contract are exactly nano_lance_table_read_dataset's: release with
+/// `nano_lance_table_read_result_free`, and on failure \p out_schema is left RELEASED.
+int nano_lance_table_read_dataset_projected(const char* dataset_path, const char* const* column_names,
+                                            size_t column_count, int trusted_input,
+                                            struct ArrowSchema* out_schema, struct ArrowArray** out_batches,
+                                            size_t* out_batch_count, char* error_message,
+                                            size_t error_message_capacity);
+
+/// Open a dataset as a streaming Arrow reader: one batch per data file, decoded on demand, instead
+/// of every batch materialized before the caller sees any of them.
+///
+/// This is what makes a larger-than-memory dataset readable, and it is what gets you a first batch
+/// without waiting for the last. It is NOT a way to halve peak memory on an ordinary single-fragment
+/// dataset -- there is only one batch there either way.
+///
+/// \p column_names / \p column_count project, exactly as
+/// nano_lance_table_read_dataset_projected does; pass NULL / 0 to read every column.
+///
+/// On success \p out_stream is a valid ArrowArrayStream that the CALLER releases
+/// (`out_stream->release(out_stream)`), which also closes the dataset. On failure it is left zeroed,
+/// so releasing it is unnecessary and calling through it is not possible.
+int nano_lance_table_open_stream(const char* dataset_path, const char* const* column_names,
+                                 size_t column_count, int trusted_input,
+                                 struct ArrowArrayStream* out_stream, char* error_message,
+                                 size_t error_message_capacity);
+
+/// Read rows [offset, offset + length) -- a negative \p length means "to the end of the dataset".
+///
+/// \p column_names / \p column_count project; NULL/0 reads every column. (That differs from
+/// nano_lance_table_read_dataset_projected, which refuses a zero-column projection: there an empty
+/// list is a caller mistake, here it is the ordinary "no projection" case.)
+///
+/// Fragments the range does not touch are never opened, so the I/O saved is proportional to the
+/// fragments skipped rather than to the rows dropped. The row semantics are exact either way.
+int nano_lance_table_read_dataset_range(const char* dataset_path, const char* const* column_names,
+                                        size_t column_count, uint64_t offset, int64_t length,
+                                        int trusted_input, struct ArrowSchema* out_schema,
+                                        struct ArrowArray** out_batches, size_t* out_batch_count,
+                                        char* error_message, size_t error_message_capacity);
+
+/// nano_lance_table_open_stream restricted to a row range; see
+/// nano_lance_table_read_dataset_range for what a range costs.
+int nano_lance_table_open_stream_range(const char* dataset_path, const char* const* column_names,
+                                       size_t column_count, uint64_t offset, int64_t length,
+                                       int trusted_input, struct ArrowArrayStream* out_stream,
+                                       char* error_message, size_t error_message_capacity);
+
+/// The dataset's Arrow schema, from the manifest alone -- no data file is opened, so this is the
+/// cheap way to ask what columns a dataset has. The CALLER releases \p out_schema on success; on
+/// failure it is left zeroed and must not be released.
+int nano_lance_table_read_schema(const char* dataset_path, struct ArrowSchema* out_schema,
+                                 char* error_message, size_t error_message_capacity);
+
+/// The dataset's row count, summed from the manifest's fragments. O(fragments), not O(rows).
+int nano_lance_table_count_rows(const char* dataset_path, uint64_t* out_rows, char* error_message,
+                                size_t error_message_capacity);
+
 void nano_lance_table_read_result_free(struct ArrowSchema* schema, struct ArrowArray* batches, size_t batch_count);
 
 #ifdef __cplusplus

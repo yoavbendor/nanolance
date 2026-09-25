@@ -9,6 +9,8 @@
 // semantic-free: it does not know a column is a MAC or an IP). Nested struct columns flatten to dotted
 // names in CSV and nested objects in NDJSON. Nulls are an empty CSV field / JSON null.
 
+#include "cli_subcommands.hpp"
+
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/version.hpp"
 
@@ -40,8 +42,35 @@ std::string to_hex(ArrowBufferView b) {
     return out;
 }
 
+/// Render a decimal cell. The value's precision and scale live only in the SCHEMA -- an
+/// ArrowArrayView carries neither -- so this is the one cell type that needs it. Without it the
+/// switch below fell through to its default and printed an empty cell, which for a decimal column
+/// meant a CSV of blanks with no error: exactly the silent loss this tool exists to avoid.
+std::string decimal_text(const ArrowArrayView* col, int64_t row, const ArrowSchema* schema) {
+    ArrowSchemaView view;
+    if (schema == nullptr || ArrowSchemaViewInit(&view, schema, nullptr) != NANOARROW_OK) {
+        return {};
+    }
+    ArrowDecimal decimal;
+    ArrowDecimalInit(&decimal, view.decimal_bitwidth, view.decimal_precision, view.decimal_scale);
+    ArrowArrayViewGetDecimalUnsafe(col, row, &decimal);
+    ArrowBuffer buffer;
+    ArrowBufferInit(&buffer);
+    std::string out;
+    if (ArrowDecimalAppendStringToBuffer(&decimal, &buffer) == NANOARROW_OK) {
+        out.assign(reinterpret_cast<const char*>(buffer.data), static_cast<std::size_t>(buffer.size_bytes));
+    }
+    ArrowBufferReset(&buffer);
+    return out;
+}
+
 // Render one scalar cell to its raw text (no CSV/JSON quoting applied here).
-std::string scalar_text(const ArrowArrayView* col, int64_t row) {
+//
+// `schema` may be null; only decimal cells need it, and every caller that can supply it does.
+// Temporal columns (timestamp / date / time) print as their raw integer in the column's own unit:
+// that is lossless, which matters more here than being pretty, and the unit is in the dataset's
+// schema (`nlance-info`).
+std::string scalar_text(const ArrowArrayView* col, int64_t row, const ArrowSchema* schema = nullptr) {
     switch (col->storage_type) {
         case NANOARROW_TYPE_BOOL:
             return ArrowArrayViewGetIntUnsafe(col, row) ? "true" : "false";
@@ -71,6 +100,9 @@ std::string scalar_text(const ArrowArrayView* col, int64_t row) {
         case NANOARROW_TYPE_LARGE_BINARY:
         case NANOARROW_TYPE_FIXED_SIZE_BINARY:
             return to_hex(ArrowArrayViewGetBytesUnsafe(col, row));
+        case NANOARROW_TYPE_DECIMAL128:
+        case NANOARROW_TYPE_DECIMAL256:
+            return decimal_text(col, row, schema);
         default:
             return "";  // unsupported storage type -> empty
     }
@@ -110,18 +142,19 @@ void csv_header_names(const ArrowSchema* schema, const std::string& prefix, std:
 }
 
 // Append one row's leaf cells (depth-first, matching csv_header_names order).
-void csv_row_cells(const ArrowArrayView* col, int64_t row, std::vector<std::string>& cells) {
+void csv_row_cells(const ArrowArrayView* col, int64_t row, const ArrowSchema* schema,
+                   std::vector<std::string>& cells) {
     if (is_struct(col)) {
         const bool null = ArrowArrayViewIsNull(col, row);
         for (int64_t i = 0; i < col->n_children; ++i) {
             if (null) {
                 cells.emplace_back();  // whole struct null -> empty leaves
             } else {
-                csv_row_cells(col->children[i], row, cells);
+                csv_row_cells(col->children[i], row, schema->children[i], cells);
             }
         }
     } else {
-        cells.push_back(ArrowArrayViewIsNull(col, row) ? std::string() : scalar_text(col, row));
+        cells.push_back(ArrowArrayViewIsNull(col, row) ? std::string() : scalar_text(col, row, schema));
     }
 }
 
@@ -187,7 +220,7 @@ void json_value(const ArrowArrayView* col, int64_t row, const ArrowSchema* schem
         out.push_back('}');
         return;
     }
-    const std::string text = scalar_text(col, row);
+    const std::string text = scalar_text(col, row, schema);
     if (col->storage_type == NANOARROW_TYPE_BOOL) {
         out += text;  // true/false literal
     } else if (json_is_numeric(col->storage_type)) {
@@ -199,7 +232,7 @@ void json_value(const ArrowArrayView* col, int64_t row, const ArrowSchema* schem
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int nanolance_cli_cat(int argc, char** argv) {
     CLI::App app{"Dump a nanolance-written Lance dataset to CSV or NDJSON"};
     std::string dataset_path;
     std::string output_path;
@@ -219,7 +252,7 @@ int main(int argc, char** argv) {
     } else if (format_str == "ndjson" || format_str == "jsonl") {
         format = Format::Ndjson;
     } else {
-        std::fprintf(stderr, "nlance2table: unknown --format '%s' (expected csv | ndjson)\n", format_str.c_str());
+        std::fprintf(stderr, "%s: unknown --format '%s' (expected csv | ndjson)\n", argv[0], format_str.c_str());
         return 2;
     }
 
@@ -227,7 +260,7 @@ int main(int argc, char** argv) {
     std::vector<ArrowArray> batches;
     std::string err;
     if (!nano_lance::lance_table_read_dataset(dataset_path, schema, batches, err)) {
-        std::fprintf(stderr, "nlance2table: read failed: %s\n", err.c_str());
+        std::fprintf(stderr, "%s: read failed: %s\n", argv[0], err.c_str());
         return 1;
     }
 
@@ -236,7 +269,7 @@ int main(int argc, char** argv) {
     if (!output_path.empty()) {
         file.open(output_path, std::ios::binary);
         if (!file) {
-            std::fprintf(stderr, "nlance2table: cannot open output '%s'\n", output_path.c_str());
+            std::fprintf(stderr, "%s: cannot open output '%s'\n", argv[0], output_path.c_str());
             return 1;
         }
         os = &file;
@@ -267,7 +300,7 @@ int main(int argc, char** argv) {
         ArrowError ae{};
         if (ArrowArrayViewInitFromSchema(&view, &schema, &ae) != NANOARROW_OK ||
             ArrowArrayViewSetArray(&view, &batch, &ae) != NANOARROW_OK) {
-            std::fprintf(stderr, "nlance2table: array view init failed: %s\n", ArrowErrorMessage(&ae));
+            std::fprintf(stderr, "%s: array view init failed: %s\n", argv[0], ArrowErrorMessage(&ae));
             ArrowArrayViewReset(&view);
             rc = 1;
             break;
@@ -282,7 +315,7 @@ int main(int argc, char** argv) {
                 std::vector<std::string> cells;
                 cells.reserve(header.size());
                 for (int64_t c = 0; c < view.n_children; ++c) {
-                    csv_row_cells(view.children[c], row, cells);
+                    csv_row_cells(view.children[c], row, schema.children[c], cells);
                 }
                 for (std::size_t i = 0; i < cells.size(); ++i) {
                     if (i) {
@@ -319,3 +352,9 @@ int main(int argc, char** argv) {
     }
     return rc;
 }
+
+#ifndef NANOLANCE_CLI_SUBCOMMAND
+// Standalone build of this tool. The `nanolance` binary compiles the same file with
+// NANOLANCE_CLI_SUBCOMMAND defined and calls nanolance_cli_cat from its dispatcher instead.
+int main(int argc, char** argv) { return nanolance_cli_cat(argc, argv); }
+#endif

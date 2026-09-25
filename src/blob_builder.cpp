@@ -62,7 +62,10 @@ bool append_string_child(ArrowArray& array, const std::string& value) {
 }
 
 bool append_large_bytes_child(ArrowArray& array, const std::vector<std::uint8_t>& value) {
-    ArrowBufferView view{value.data(), static_cast<int64_t>(value.size())};
+    // The braces around value.data() are not optional style: ArrowBufferView::data is a UNION, so
+    // the flat form initializes its first member by accident rather than by intent (clang
+    // -Wmissing-braces).
+    ArrowBufferView view{{value.data()}, static_cast<int64_t>(value.size())};
     return ArrowArrayAppendBytes(&array, view) == NANOARROW_OK;
 }
 
@@ -111,6 +114,22 @@ bool build_blob_v2_payload_schema(ArrowSchema& schema, std::string& error) {
     return true;
 }
 
+/// Clear ARROW_FLAG_NULLABLE on a schema and every descendant.
+///
+/// nanoarrow sets the flag by default, and the manifest's nullable flag now mirrors it (it used to
+/// be hardcoded false). Neither of the columns this builder produces can carry a null -- a
+/// lance.blob.v2 external reference is refused outright if it does -- so declaring them non-nullable
+/// is both honest and what keeps this builder's output identical to the typed facade's, which builds
+/// its own schema structs zero-initialized.
+void clear_nullable_recursive(ArrowSchema& schema) {
+    schema.flags &= ~static_cast<std::int64_t>(ARROW_FLAG_NULLABLE);
+    for (std::int64_t i = 0; i < schema.n_children; ++i) {
+        if (schema.children != nullptr && schema.children[i] != nullptr) {
+            clear_nullable_recursive(*schema.children[i]);
+        }
+    }
+}
+
 bool build_epb_table_schema(ArrowSchema& schema, std::string& error) {
     error.clear();
     ArrowSchemaInit(&schema);
@@ -133,7 +152,7 @@ bool build_epb_table_schema(ArrowSchema& schema, std::string& error) {
         ArrowSchemaRelease(&schema);
         return false;
     }
-    schema.flags = 0;
+    clear_nullable_recursive(schema);
     return true;
 }
 

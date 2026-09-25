@@ -18,6 +18,20 @@ void require(bool condition, const char* message) {
     }
 }
 
+/// Append a protobuf varint key/value pair by hand, so a test can write wire bytes our own encoder
+/// would never produce -- specifically, one that LEAVES OUT a field.
+void put_varint(std::vector<std::uint8_t>& out, std::uint32_t field_number, std::int64_t value) {
+    auto put = [&out](std::uint64_t v) {
+        while (v >= 0x80U) {
+            out.push_back(static_cast<std::uint8_t>((v & 0x7FU) | 0x80U));
+            v >>= 7U;
+        }
+        out.push_back(static_cast<std::uint8_t>(v));
+    };
+    put((static_cast<std::uint64_t>(field_number) << 3U) | 0U);
+    put(static_cast<std::uint64_t>(value));
+}
+
 bool contains_bytes(const std::vector<std::uint8_t>& haystack, const std::string& needle) {
     const auto needle_begin = reinterpret_cast<const std::uint8_t*>(needle.data());
     const std::vector<std::uint8_t> bytes(needle_begin, needle_begin + needle.size());
@@ -185,6 +199,68 @@ int main() {
         require(decoded.pages[0].buffer_offsets[0] == 64, "column page offset mismatch");
         require(decoded.pages[0].buffer_sizes[0] == 16, "column page size mismatch");
         require(decoded.pages[0].length == 4, "column page length mismatch");
+    }
+    {
+        // Lance's `Field.parent_id` is a proto3 int32, and proto3 puts no zero on the wire. So an
+        // ABSENT field 4 means parent_id 0 -- "my parent is field id 0" -- and NOT "I am a root".
+        // Roots carry an explicit -1, which is non-zero and therefore always serialized.
+        //
+        // Reading the absence as -1 detached every child of field id 0 from its parent. The visible
+        // damage was a pylance dataset whose first column was a struct: its children became roots,
+        // the struct was left childless, and the whole dataset failed to open. The same struct in
+        // second position was fine, because then the ids shift and the parent link is non-zero.
+        //
+        // Our own encoder always writes field 4, so a round-trip test cannot reach this. The bytes
+        // have to be built by hand.
+        std::vector<std::uint8_t> child;
+        put_varint(child, 3, 1);  // id = 1; no field 4
+        nano_lance::pb::Field decoded;
+        require(nano_lance::pb::decode_field(child, decoded), "field decode failed");
+        require(decoded.id == 1, "field id mismatch");
+        require(decoded.parent_id == 0, "an absent parent_id must mean field 0, not root");
+
+        // ...except for field 0 itself, which cannot be its own parent. That is a root.
+        std::vector<std::uint8_t> root_zero;
+        put_varint(root_zero, 3, 0);  // id = 0; no field 4
+        require(nano_lance::pb::decode_field(root_zero, decoded), "field decode failed");
+        require(decoded.parent_id == -1, "field 0 with no parent_id on the wire is a root");
+
+        // An explicit -1 is a root at any id, and an explicit parent is honoured as written.
+        std::vector<std::uint8_t> root;
+        put_varint(root, 3, 0);
+        put_varint(root, 4, -1);
+        require(nano_lance::pb::decode_field(root, decoded), "field decode failed");
+        require(decoded.parent_id == -1, "an explicit -1 parent_id is a root");
+
+        std::vector<std::uint8_t> nested;
+        put_varint(nested, 3, 2);
+        put_varint(nested, 4, 1);
+        require(nano_lance::pb::decode_field(nested, decoded), "field decode failed");
+        require(decoded.parent_id == 1, "an explicit parent_id must be kept");
+    }
+    {
+        // `type` and `encoding` follow the same proto3 rule: absent means 0, not the struct default.
+        // A Lance struct parent carries neither (PARENT = 0, encoding NONE = 0).
+        std::vector<std::uint8_t> parent;
+        put_varint(parent, 3, 5);
+        nano_lance::pb::Field decoded;
+        require(nano_lance::pb::decode_field(parent, decoded), "field decode failed");
+        require(decoded.type == 0, "an absent type must decode as 0 (PARENT)");
+        require(decoded.encoding == 0, "an absent encoding must decode as 0 (NONE)");
+
+        // And our own LEAF (2) must survive a round trip, which needs the encoder to write it.
+        nano_lance::pb::Field leaf;
+        leaf.name = "x";
+        leaf.type = 2;
+        leaf.encoding = 1;
+        nano_lance::pb::FileDescriptor descriptor;
+        descriptor.fields.push_back(leaf);
+        nano_lance::pb::FileDescriptor back;
+        require(nano_lance::pb::decode_file_descriptor(nano_lance::pb::encode_file_descriptor(descriptor), back) &&
+                    back.fields.size() == 1U,
+                "file descriptor round trip failed");
+        require(back.fields[0].type == 2, "a LEAF type must round-trip");
+        require(back.fields[0].encoding == 1, "a PLAIN encoding must round-trip");
     }
     return 0;
 }

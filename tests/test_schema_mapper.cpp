@@ -22,6 +22,15 @@ void require(bool condition, const char* message) {
     }
 }
 
+// `require(f(error), error)` is a trap: the two arguments are evaluated in unspecified
+// order, so c_str() can capture a pointer into the EMPTY string before f() runs. When f() then fails
+// and assigns a long message, the string reallocates and the captured pointer dangles -- a real
+// failure printed a stray "N" instead of its message. Taking the string by reference and calling
+// c_str() only after the condition is known fixes it.
+void require(bool condition, const std::string& message) {
+    require(condition, message.c_str());
+}
+
 void release_schema(ArrowSchema& schema) {
     if (schema.release != nullptr) {
         schema.release(&schema);
@@ -74,7 +83,7 @@ void test_flat_schema() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(root, mapping, error), error.c_str());
+    require(nano_lance::map_arrow_schema(root, mapping, error), error);
     require(mapping.fields.size() == 2, "expected two fields");
     require(mapping.fields[0].name == "id", "id field name mismatch");
     require(mapping.fields[0].logical_type == "int64", "id logical type mismatch");
@@ -87,7 +96,11 @@ void test_flat_schema() {
     require(nano_lance::lance_physical_fields(mapping).size() == 2, "flat physical field count mismatch");
 }
 
-void test_nullability_ignore() {
+// Mapping a nullable-FLAGGED field always succeeds, with or without the legacy ignore_nullability
+// argument. It used to be rejected unless the flag was passed, which rejected essentially every
+// pyarrow table (pyarrow marks all fields nullable) while protecting nothing -- what needs guarding
+// is a null VALUE, and ingest refuses those unconditionally (tests/test_null_rejection.cpp).
+void test_nullable_flag_is_accepted() {
     ArrowSchema nullable{};
     nullable.format = "l";
     nullable.name = "nullable";
@@ -95,10 +108,19 @@ void test_nullability_ignore() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(!nano_lance::map_arrow_schema(nullable, mapping, error), "nullable type should fail");
-    require(nano_lance::map_arrow_schema(nullable, mapping, error, true), "nullable type should pass with ignore flag");
-    require(mapping.fields.size() == 1, "nullable ignore field count mismatch");
-    require(!mapping.fields[0].nullable, "nullable ignore should produce non-null Lance field");
+    require(nano_lance::map_arrow_schema(nullable, mapping, error), "nullable flag should map by default");
+    require(mapping.fields.size() == 1, "nullable field count mismatch");
+    // The Lance field mirrors the Arrow flag, as pylance's does. It was hardcoded false while nulls
+    // were refused outright; now that they are stored, a column with nulls under a field declared
+    // non-nullable makes stock Lance reject the file.
+    require(mapping.fields[0].nullable, "nullable Arrow flag should produce a nullable Lance field");
+
+    // The legacy argument is accepted and ignored, so old call sites keep compiling and behave the same.
+    nano_lance::LanceSchemaMapping legacy;
+    require(nano_lance::map_arrow_schema(nullable, legacy, error, true),
+            "nullable flag should still map with the legacy ignore argument");
+    require(legacy.fields.size() == mapping.fields.size(), "legacy argument changed the mapping");
+    require(legacy.fields[0].nullable == mapping.fields[0].nullable, "legacy argument changed nullability");
 }
 
 void test_fixed_size_binary() {
@@ -109,7 +131,7 @@ void test_fixed_size_binary() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(mac, mapping, error), error.c_str());
+    require(nano_lance::map_arrow_schema(mac, mapping, error), error);
     // The width is carried in the logical type (Lance's own form is "fixed_size_binary:<N>") so it can
     // be recovered from the manifest on read.
     require(mapping.fields[0].logical_type == "fixed_size_binary:6", "fixed size binary logical type mismatch");
@@ -128,13 +150,19 @@ void test_dictionary_schema() {
     dictionary_values.flags = 0;
     uri_index.dictionary = &dictionary_values;
 
+    // An Arrow dictionary column is refused. It used to map to a bare index column: LanceField
+    // recorded is_dictionary_index / dictionary_value_logical_type, but those are read ONLY by the
+    // schema-equality comparison -- no writer path ever stored the dictionary VALUES, so
+    // pa.array(["a","b","a"]).dictionary_encode() became an int32 column reading back [0, 1, 0] with
+    // no record of what the indices meant.
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(uri_index, mapping, error), error.c_str());
-    require(mapping.fields.size() == 1, "dictionary field count mismatch");
-    require(mapping.fields[0].is_dictionary_index, "dictionary index flag mismatch");
-    require(mapping.fields[0].dictionary_value_logical_type == "utf8", "dictionary value type mismatch");
-    require(mapping.fields[0].column_index == 0, "dictionary column index mismatch");
+    require(!nano_lance::map_arrow_schema(uri_index, mapping, error),
+            "dictionary-encoded column should be refused");
+    require(error.find("dictionary") != std::string::npos,
+            "dictionary rejection should say what was refused, got: " + error);
+    require(error.find("cast") != std::string::npos,
+            "dictionary rejection should suggest casting, got: " + error);
 }
 
 void test_extension_struct() {
@@ -177,7 +205,7 @@ void test_extension_struct() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(root, mapping, error), error.c_str());
+    require(nano_lance::map_arrow_schema(root, mapping, error), error);
     require(mapping.fields.size() == 5, "extension struct field count mismatch");
 
     const auto* parent = find_field(mapping, "payload_ref");
@@ -220,7 +248,7 @@ void test_top_level_named_struct_maps_as_field() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(payload, mapping, error), error.c_str());
+    require(nano_lance::map_arrow_schema(payload, mapping, error), error);
     require(mapping.fields.size() == 2, "named top-level struct should map parent and child");
     require(mapping.fields[0].name == "payload_ref", "named top-level struct parent missing");
     require(mapping.fields[0].column_index == -1, "named top-level struct should be logical-only");
@@ -252,7 +280,7 @@ void test_golden_blob_ipc_schema() {
 
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(nano_lance::map_arrow_schema(schema, mapping, error, true), error.c_str());
+    require(nano_lance::map_arrow_schema(schema, mapping, error, true), error);
 
     const auto* packet_id = find_field(mapping, "packet_id");
     const auto* payload_ref = find_field(mapping, "payload_ref");
@@ -278,7 +306,7 @@ void test_golden_blob_ipc_schema() {
 
 int main() {
     test_flat_schema();
-    test_nullability_ignore();
+    test_nullable_flag_is_accepted();
     test_fixed_size_binary();
     test_dictionary_schema();
     test_extension_struct();

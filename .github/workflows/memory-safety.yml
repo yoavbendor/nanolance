@@ -52,9 +52,12 @@ jobs:
 
       - name: Configure (address,undefined)
         run: |
+          # NANOLANCE_WERROR=ON: the gcc side of the warning ratchet (linux-bench.yml is the clang
+          # side). Only nanolance's own three library targets are covered; see CMakeLists.
           cmake -S . -B build-asan -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13 \
+            -DNANOLANCE_WERROR=ON \
             -DNANOLANCE_SANITIZER=address,undefined \
             -DNANOLANCE_BUILD_EXAMPLES=OFF -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
 
@@ -70,7 +73,7 @@ jobs:
         run: ctest --test-dir build-asan -L smoke --output-on-failure
 
   fuzz:
-    name: libFuzzer (decode chain)
+    name: libFuzzer (decode chain + PageLayout)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -95,10 +98,10 @@ jobs:
             -DNANOLANCE_BUILD_TESTS=OFF -DNANOLANCE_BUILD_TOOLS=OFF \
             -DNANOLANCE_BUILD_EXAMPLES=OFF -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
 
-      - name: Build fuzzer
-        run: cmake --build build-fuzz --target nanolance_fuzz_decode -j
+      - name: Build fuzzers
+        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst nanolance_fuzz_lz4 nanolance_fuzz_deletion_vector nanolance_fuzz_column_decode nanolance_fuzz_repdef -j
 
-      # 2 minutes per push is enough to catch regressions; extend for a scheduled nightly run.
+      # 2 minutes per push per target is enough to catch regressions; extend for a nightly run.
       - name: Fuzz the decode chain
         env:
           UBSAN_OPTIONS: halt_on_error=1
@@ -106,6 +109,176 @@ jobs:
         run: |
           mkdir -p corpus
           ./build-fuzz/nanolance_fuzz_decode -max_total_time=120 -print_final_stats=1 corpus
+
+      # Seed the PageLayout corpus with REAL descriptors before fuzzing. Starting from valid grammar
+      # is worth far more than the two minutes of budget it saves: from random bytes the fuzzer
+      # spends most of its time rediscovering the type-url wrapper instead of mutating encoding
+      # trees. The tools build is a separate, non-instrumented tree -- nlance-pagelayout only needs
+      # to WRITE the corpus, and building it with sanitizers would just slow it down.
+      - name: Seed the PageLayout corpus
+        run: |
+          cmake -S . -B build-seed -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DNANOLANCE_BUILD_TESTS=OFF -DNANOLANCE_BUILD_EXAMPLES=OFF \
+            -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
+          cmake --build build-seed --target nlance_pagelayout arrowipc2lance -j
+          python3 -m pip install --quiet pyarrow
+          mkdir -p seed-datasets
+          python3 - <<'PY'
+          import pyarrow as pa, pyarrow.ipc as ipc, random
+          random.seed(3)
+          n = 4000
+          cols = {
+              "wide": pa.array([i * 7919 for i in range(n)], type=pa.int64()),
+              "constant": pa.array([42] * n, type=pa.int64()),
+              "runs": pa.array([i // 500 for i in range(n)], type=pa.int64()),
+              "smooth": pa.array([i * 0.25 for i in range(n)], type=pa.float64()),
+              "flags": pa.array([i % 2 == 0 for i in range(n)]),
+              "high_card": pa.array(["v%d" % random.randrange(10**6) for _ in range(n)]),
+              "low_card": pa.array(["alpha", "beta", "gamma"] * (n // 3) + ["alpha"] * (n % 3)),
+              "const_str": pa.array(["file:///capture.pcapng"] * n),
+          }
+          table = pa.table(cols)
+          with open("seed-datasets/input.arrow", "wb") as sink:
+              with ipc.new_stream(sink, table.schema) as w:
+                  w.write_table(table)
+          # List pages as nanolance writes them: bit-packed levels, rows spanning 1,024-value
+          # chunks, bit-packed integer items, dictionary string items, constant pages.
+          lists = pa.table({
+              "ints": pa.array([None if i % 7 == 0 else [] if i % 5 == 0 else
+                                [None if (i + j) % 4 == 0 else j for j in range(i % 9)] for i in range(n)],
+                               pa.list_(pa.int64())),
+              "long": pa.array([list(range(3000)) if i % 500 == 0 else [i] for i in range(n)],
+                               pa.list_(pa.int32())),
+              "tags": pa.array([[f"t{(i + j) % 30}" for j in range(i % 4)] for i in range(n)],
+                               pa.list_(pa.utf8())),
+              "nested": pa.array([[[i] * (j % 2 + 1) for j in range(i % 3)] for i in range(n)],
+                                 pa.list_(pa.list_(pa.int64()))),
+              "empty": pa.array([[] if i % 2 else None for i in range(n)], pa.list_(pa.int64())),
+          })
+          with open("seed-datasets/lists.arrow", "wb") as sink:
+              with ipc.new_stream(sink, lists.schema) as w:
+                  w.write_table(lists)
+          PY
+          ./build-seed/arrowipc2lance -c -o seed-datasets/lists.lance < seed-datasets/lists.arrow
+          ./build-seed/arrowipc2lance -c -o seed-datasets/plain.lance < seed-datasets/input.arrow
+          ./build-seed/arrowipc2lance -c --compress -o seed-datasets/zstd.lance < seed-datasets/input.arrow
+          # Also seed from datasets STOCK Lance wrote. Their descriptors are the ones nanolance's own
+          # writer never produces -- FSST-wrapped strings, LZ4-compressed dictionaries, run-length
+          # definition levels -- which is exactly the grammar the parser has to survive. Best-effort:
+          # a pylance that will not install must not fail the safety job.
+          python3 -m pip install --quiet pylance || true
+          python3 - <<'PY' || true
+          import random, lance, pyarrow as pa
+          random.seed(5)
+          words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+          n = 20000
+          text = [" ".join(random.choice(words) for _ in range(random.randint(3, 12))) + " %d" % i
+                  for i in range(n)]
+          lance.write_dataset(pa.table({
+              "fsst": pa.array(text),
+              "fsst_null": pa.array([None if i % 11 == 0 else text[i] for i in range(n)]),
+              "dict": pa.array([("h\u00e9llo w\u00f6rld " * (i % 5 + 1)) for i in range(n)]),
+              "ints": pa.array([None if i % 13 == 0 else i for i in range(n)], type=pa.int64()),
+          }), "seed-datasets/stock.lance")
+          # FullZip pages (values of 256+ bytes) and fixed_size_list vectors, with and without
+          # element validity -- the layouts page decoding added last.
+          m = 600
+          lance.write_dataset(pa.table({
+              "long_str": pa.array([None if i % 7 == 0 else "z" * 300 + str(i) for i in range(m)]),
+              "vec4": pa.array([None if i % 9 == 0 else [float(i)] * 4 for i in range(m)],
+                               pa.list_(pa.float32(), 4)),
+              "vec96": pa.FixedSizeListArray.from_arrays(
+                  pa.array([None if i % 13 == 0 else float(i) for i in range(m * 96)], pa.float32()), 96),
+              # List pages: repetition levels, null/empty lists, null items, nesting.
+              "ints": pa.array([None if i % 7 == 0 else [] if i % 5 == 0 else
+                                [None if (i + j) % 4 == 0 else i for j in range(i % 4)] for i in range(m)],
+                               pa.list_(pa.int64())),
+              "strs": pa.array([[f"s{i}-{j}" for j in range(i % 3)] for i in range(m)], pa.list_(pa.utf8())),
+              "nested": pa.array([[[i] * (j % 2 + 1) for j in range(i % 3)] for i in range(m)],
+                                 pa.list_(pa.list_(pa.int64()))),
+              # FullZip list pages: one control word per level, values only behind visible ones.
+              "long_lists": pa.array([None if i % 7 == 0 else [] if i % 5 == 0 else
+                                      [None if (i + j) % 4 == 0 else "w" * 300 + str(i) for j in range(i % 4)]
+                                      for i in range(m)], pa.list_(pa.utf8())),
+              "long_nested": pa.array([[["w" * 280 + str(i)] * (j % 3) for j in range(i % 3)] for i in range(m)],
+                                      pa.list_(pa.list_(pa.utf8()))),
+          }), "seed-datasets/wide.lance")
+          PY
+          mkdir -p corpus-page-layout
+          ./build-seed/nlance-pagelayout --dump-corpus corpus-page-layout \
+            seed-datasets/plain.lance seed-datasets/zstd.lance || true
+          if [ -d seed-datasets/stock.lance ]; then
+            ./build-seed/nlance-pagelayout --dump-corpus corpus-page-layout \
+              seed-datasets/stock.lance || true
+          fi
+          # Whole pages -- descriptor plus buffers -- for the page-decoding target.
+          mkdir -p corpus-column-decode
+          for ds in seed-datasets/*.lance; do
+            ./build-seed/nlance-pagelayout --dump-fuzz-pages corpus-column-decode "$ds" || true
+          done
+
+      - name: Fuzz the PageLayout descriptor parser
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-page-layout-found
+          ./build-fuzz/nanolance_fuzz_page_layout -max_total_time=120 -print_final_stats=1 \
+            corpus-page-layout-found corpus-page-layout
+
+      # Page decoding itself: descriptor + buffers -> values. fuzz_decode stops at the footer and
+      # column metadata, so this is the only target that reaches dictionaries, bit-unpacking, RLE,
+      # definition levels, FullZip and fixed_size_list. tests/fuzz/corpus/column_decode holds the
+      # reproducers it has caught (a zstd size header that asked for 8 GB).
+      - name: Fuzz page decoding
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-column-decode-found
+          ./build-fuzz/nanolance_fuzz_column_decode -max_total_time=180 -rss_limit_mb=2048 \
+            -print_final_stats=1 corpus-column-decode-found corpus-column-decode tests/fuzz/corpus/column_decode
+
+      # Repetition/definition unravelling for list columns. Asserts the Arrow list invariants
+      # (offsets from 0, non-decreasing, ending at the child length) on every input it accepts.
+      - name: Fuzz the rep/def unraveler
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-repdef
+          ./build-fuzz/nanolance_fuzz_repdef -max_total_time=60 -print_final_stats=1 corpus-repdef
+
+      - name: Fuzz the FSST decompressor
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-fsst
+          ./build-fuzz/nanolance_fuzz_fsst -max_total_time=120 -print_final_stats=1 corpus-fsst
+
+      - name: Fuzz the LZ4 block decompressor
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-lz4
+          ./build-fuzz/nanolance_fuzz_lz4 -max_total_time=120 -print_final_stats=1 corpus-lz4
+
+      # The deletion-file parsers: an Arrow IPC file (framing + flatbuffer vtable walk + zstd body)
+      # and a roaring bitmap. Not reachable from fuzz_decode, which stops at the data file and never
+      # opens a deletion file.
+      - name: Fuzz the deletion-file parsers
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          # Seeded from tests/fuzz/corpus/deletion_vector, which holds the minimized reproducers for
+          # everything this target has already caught. libFuzzer replays a seed directory before it
+          # mutates, so those bugs fail the job immediately if they come back.
+          mkdir -p corpus-deletion-vector
+          ./build-fuzz/nanolance_fuzz_deletion_vector -max_total_time=120 -print_final_stats=1 \
+            corpus-deletion-vector tests/fuzz/corpus/deletion_vector
 
       - name: Upload crash reproducers
         if: failure()

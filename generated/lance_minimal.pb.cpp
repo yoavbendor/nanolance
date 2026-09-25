@@ -84,6 +84,10 @@ std::vector<std::uint8_t> encode_direct_encoding(const std::vector<std::uint8_t>
     return out;
 }
 
+/// Inverse of encode_direct_encoding: unwrap Encoding{ f2 direct = DirectEncoding{ f1 encoding } }
+/// back to the raw descriptor bytes, so ColumnPage::encoding round-trips exactly what was written.
+bool decode_direct_encoding(const std::vector<std::uint8_t>& bytes, std::vector<std::uint8_t>& out);
+
 bool read_bytes(const std::vector<std::uint8_t>& data, std::size_t& pos, std::vector<std::uint8_t>& value) {
     std::uint64_t length = 0;
     if (!read_varint(data, pos, length) || length > data.size() - pos) {
@@ -137,7 +141,11 @@ std::vector<std::uint8_t> encode_data_storage_format(const DataStorageFormat& fo
 
 std::vector<std::uint8_t> encode_field_message(const Field& field) {
     std::vector<std::uint8_t> out;
-    if (field.type != 2) {
+    // proto3: a field is omitted only when it equals ZERO. This used to omit `type` when it was 2
+    // (LEAF) -- the struct's default -- so any proto3 reader decoded every nanolance leaf as PARENT.
+    // Harmless in practice (Lance neither writes nor reads Field.type), but the same shape of bug as
+    // `parent_id`, which was not harmless.
+    if (field.type != 0) {
         write_int32(out, 1, field.type);
     }
     write_string(out, 2, field.name);
@@ -220,6 +228,49 @@ bool decode_data_storage_format(const std::vector<std::uint8_t>& bytes, DataStor
     return true;
 }
 
+bool decode_direct_encoding(const std::vector<std::uint8_t>& bytes, std::vector<std::uint8_t>& out) {
+    // Two nested single-field messages: Encoding f2 -> DirectEncoding f1 -> the descriptor bytes.
+    std::size_t pos = 0;
+    std::vector<std::uint8_t> direct;
+    bool have_direct = false;
+    while (pos < bytes.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(bytes, pos, key)) {
+            return false;
+        }
+        const auto field_number = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        if (field_number == 2 && wire_type == kWireBytes) {
+            if (!read_bytes(bytes, pos, direct)) {
+                return false;
+            }
+            have_direct = true;
+        } else if (!skip_field(bytes, pos, wire_type)) {
+            return false;
+        }
+    }
+    if (!have_direct) {
+        return true;  // no direct encoding present; leave `out` empty
+    }
+    pos = 0;
+    while (pos < direct.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(direct, pos, key)) {
+            return false;
+        }
+        const auto field_number = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        if (field_number == 1 && wire_type == kWireBytes) {
+            if (!read_bytes(direct, pos, out)) {
+                return false;
+            }
+        } else if (!skip_field(direct, pos, wire_type)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::vector<std::uint8_t> encode_column_page(const ColumnPage& page) {
     std::vector<std::uint8_t> out;
     write_packed_uint64(out, 1, page.buffer_offsets);
@@ -254,6 +305,16 @@ bool decode_column_page(const std::vector<std::uint8_t>& bytes, ColumnPage& page
             } else if (field_number == 5) {
                 page.priority = value;
             }
+        } else if (wire_type == kWireBytes && field_number == 4) {
+            // The /lance.encodings21.PageLayout descriptor. This was written and then skipped on
+            // read for as long as the reader existed, which is why decode dispatched on nanolance's
+            // private `nanolance:packing` field metadata instead -- and why a file from the Rust
+            // lance crate, carrying no such metadata, could not be decoded. Keep the bytes;
+            // nanolance/page_layout.hpp parses them.
+            std::vector<std::uint8_t> wrapped;
+            if (!read_bytes(bytes, pos, wrapped) || !decode_direct_encoding(wrapped, page.encoding)) {
+                return false;
+            }
         } else if (wire_type == kWireBytes && (field_number == 1 || field_number == 2)) {
             std::vector<std::uint8_t> packed;
             if (!read_bytes(bytes, pos, packed)) {
@@ -280,8 +341,9 @@ bool decode_column_page(const std::vector<std::uint8_t>& bytes, ColumnPage& page
 bool decode_map_metadata_entry(const std::vector<std::uint8_t>& nested, std::string& map_key, std::vector<std::uint8_t>& map_value) {
     map_key.clear();
     map_value.clear();
+    // Only the key is tracked: the comment at the return explains why a missing value is legal, and
+    // nothing reads a have_value flag.
     bool have_key = false;
-    bool have_value = false;
     std::size_t pos = 0;
     while (pos < nested.size()) {
         std::uint64_t key = 0;
@@ -299,7 +361,6 @@ bool decode_map_metadata_entry(const std::vector<std::uint8_t>& nested, std::str
             if (!read_bytes(nested, pos, map_value)) {
                 return false;
             }
-            have_value = true;
         } else if (!skip_field(nested, pos, wire_type)) {
             return false;
         }
@@ -311,6 +372,21 @@ bool decode_map_metadata_entry(const std::vector<std::uint8_t>& nested, std::str
 
 bool decode_field_message(const std::vector<std::uint8_t>& bytes, Field& field) {
     field = Field{};
+    // proto3 does not put a zero on the wire, so an ABSENT `parent_id` means 0 -- "my parent is the
+    // field whose id is 0" -- not "I have no parent". Lance writes -1 for a root field, and -1 is
+    // non-zero, so it is always serialized; only the 0 is ever implied.
+    //
+    // The struct default is -1 because the writer side wants it, so the read side has to say 0 here
+    // explicitly. Getting this backwards made every child of field 0 decode as a root: a pylance
+    // dataset whose FIRST column was a struct lost that struct's children and failed with "struct
+    // field has no children in mapping", while the same struct in second position read fine.
+    field.parent_id = 0;
+    // Same rule for the two other fields whose struct default is not zero: absent means 0. For
+    // `type` that is PARENT, for `encoding` it is NONE -- which is what Lance writes for a struct
+    // parent. Nothing on the read path consults either for correctness today; this keeps the next
+    // reader of them from inheriting the parent_id mistake.
+    field.type = 0;
+    field.encoding = 0;
     std::size_t pos = 0;
     bool nullable_wire_seen = false;
     while (pos < bytes.size()) {
@@ -358,6 +434,11 @@ bool decode_field_message(const std::vector<std::uint8_t>& bytes, Field& field) 
     // encode_field_message omits wire field 6 when nullable is false; default struct value is true.
     if (!nullable_wire_seen) {
         field.nullable = false;
+    }
+    // A field cannot be its own parent. This is field 0 with an absent `parent_id`, i.e. the root
+    // struct of a schema whose writer left the zero off the wire; it is a root.
+    if (field.parent_id == field.id) {
+        field.parent_id = -1;
     }
     return true;
 }
@@ -426,6 +507,33 @@ bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& 
     return true;
 }
 
+bool decode_deletion_file_message(const std::vector<std::uint8_t>& bytes, DeletionFile& out) {
+    out = DeletionFile{};
+    out.present = true;
+    std::size_t pos = 0;
+    while (pos < bytes.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(bytes, pos, key)) {
+            return false;
+        }
+        const auto field_number = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        std::uint64_t value = 0;
+        if (field_number == 1 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
+            out.file_type = static_cast<std::uint32_t>(value);
+        } else if (field_number == 2 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
+            out.read_version = value;
+        } else if (field_number == 3 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
+            out.id = value;
+        } else if (field_number == 4 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
+            out.num_deleted_rows = value;
+        } else if (!skip_field(bytes, pos, wire_type)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool decode_data_fragment_message(const std::vector<std::uint8_t>& bytes, DataFragment& fragment) {
     fragment = DataFragment{};
     std::size_t pos = 0;
@@ -449,6 +557,14 @@ bool decode_data_fragment_message(const std::vector<std::uint8_t>& bytes, DataFr
                 return false;
             }
             fragment.files.push_back(std::move(df));
+        } else if (field_number == 3 && wire_type == kWireBytes) {
+            std::vector<std::uint8_t> nested;
+            if (!read_bytes(bytes, pos, nested)) {
+                return false;
+            }
+            if (!decode_deletion_file_message(nested, fragment.deletion_file)) {
+                return false;
+            }
         } else if (field_number == 4 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
             fragment.physical_rows = value;
         } else if (!skip_field(bytes, pos, wire_type)) {

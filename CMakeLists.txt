@@ -14,17 +14,31 @@ set(NANOLANCE_VERSION_STRING
     "${NANOLANCE_VERSION_MAJOR}.${NANOLANCE_VERSION_MINOR}.${NANOLANCE_VERSION_PATCH}")
 
 if(NANOLANCE_STANDALONE)
-    project(nanolance VERSION ${NANOLANCE_VERSION_MAJOR}.${NANOLANCE_VERSION_MINOR}.${NANOLANCE_VERSION_PATCH} LANGUAGES CXX)
+    # C is enabled so tests/test_readme_quickstart.c can compile the documented C snippet as real
+    # C -- nano_lance_writer.h is an extern "C" header whose only other consumers are C++, so
+    # nothing else in the tree would notice it drifting into C++-only syntax.
+    project(nanolance VERSION ${NANOLANCE_VERSION_MAJOR}.${NANOLANCE_VERSION_MINOR}.${NANOLANCE_VERSION_PATCH} LANGUAGES C CXX)
     enable_testing()
 
     # Developer ergonomics for a standalone build (skipped when embedded):
     #   * compile_commands.json so clangd / IDEs index our sources AND the FetchContent'd deps
     #     (nanoarrow/zstd/CLI11/nanos3reader) we compile against. (Already gitignored.)
-    #   * park FetchContent's downloads in a stable, IDE-indexable ./.deps that survives `rm -rf build`
-    #     (gitignored). Honour a caller-provided FETCHCONTENT_BASE_DIR (e.g. a CI cache) if already set.
+    #   * park FetchContent's downloads in a stable, IDE-indexable ./.deps-<generator> that survives
+    #     `rm -rf build` (gitignored). Honour a caller-provided FETCHCONTENT_BASE_DIR (e.g. a CI
+    #     cache) if already set.
+    #
+    # The directory is keyed by generator on purpose. FetchContent's sub-build trees bake in the
+    # generator that created them, so a single shared ./.deps is poisoned the moment two generators
+    # are used against the same source tree -- which is the DEFAULT path for a new user:
+    # `pip install -e bindings/python` runs scikit-build-core (Ninja), and the documented
+    # `cmake -S . -B build` then uses Makefiles and dies with "Does not match the generator used
+    # previously: Ninja". Keying by generator lets both coexist.
     set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
     if(NOT DEFINED FETCHCONTENT_BASE_DIR)
-        set(FETCHCONTENT_BASE_DIR "${CMAKE_SOURCE_DIR}/.deps" CACHE PATH "Fetched dependency sources")
+        string(REGEX REPLACE "[^A-Za-z0-9_.-]+" "_" _nanolance_generator_slug "${CMAKE_GENERATOR}")
+        set(FETCHCONTENT_BASE_DIR "${CMAKE_SOURCE_DIR}/.deps-${_nanolance_generator_slug}"
+            CACHE PATH "Fetched dependency sources")
+        unset(_nanolance_generator_slug)
     endif()
 endif()
 
@@ -110,7 +124,16 @@ if(NOT TARGET nanoarrow_static OR NOT DEFINED nanoarrow_SOURCE_DIR)
         GIT_SHALLOW FALSE
     )
     FetchContent_Populate(nanoarrow)
-    add_subdirectory(${nanoarrow_SOURCE_DIR} ${nanoarrow_BINARY_DIR} EXCLUDE_FROM_ALL)
+    # Build into THIS build tree, not ${nanoarrow_BINARY_DIR} -- that lives under the shared
+    # FETCHCONTENT_BASE_DIR, so two build trees would compile nanoarrow into the same object
+    # directory. Keying that directory by generator is not enough: a sanitizer/fuzzer build
+    # (-DNANOLANCE_BUILD_FUZZERS=ON adds -fsanitize=... globally) and a plain build share a generator
+    # but must not share objects. Left shared, the fuzzer build's instrumented nanoarrow leaked into
+    # the plain build, which then failed to link on __sanitizer_cov_* / __asan_* symbols. Sharing the
+    # SOURCE checkout is the point of .deps and stays; sharing compiled output never was.
+    # (_nanolance_zstd below already builds into CMAKE_CURRENT_BINARY_DIR for the same reason.)
+    add_subdirectory(${nanoarrow_SOURCE_DIR} "${CMAKE_CURRENT_BINARY_DIR}/_nanolance_nanoarrow_build"
+                     EXCLUDE_FROM_ALL)
     set(nanoarrow_SOURCE_DIR "${nanoarrow_SOURCE_DIR}" CACHE PATH "Nanoarrow source for nanolance" FORCE)
 endif()
 
@@ -246,15 +269,22 @@ add_library(nanolance STATIC
     src/array_accessor.cpp
     src/blob_builder.cpp
     src/blob_v2_external.cpp
+    src/column_slice.cpp
     src/data_file_reader.cpp
+    src/deletion_vector.cpp
     src/data_file_writer.cpp
+    src/fsst.cpp
+    src/lz4_block.cpp
     src/lance_column_decoder.cpp
     src/lance_table_reader.cpp
+    src/page_layout.cpp
+    src/repdef.cpp
     src/nano_lance_table_reader_c.cpp
     src/manifest_writer.cpp
     src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp
+    src/writer_cxx.cpp
 )
 target_compile_features(nanolance PUBLIC cxx_std_20)
 target_include_directories(nanolance PUBLIC
@@ -294,10 +324,47 @@ if(NANOLANCE_BUILD_FUZZERS)
     target_compile_features(nanolance_fuzz_decode PRIVATE cxx_std_20)
     target_link_libraries(nanolance_fuzz_decode PRIVATE nanolance)
     target_link_options(nanolance_fuzz_decode PRIVATE -fsanitize=fuzzer)
+
+    # Repetition/definition unravelling: level streams in, list offsets out. Pure computation, so
+    # it fuzzes far faster on its own than through a page.
+    add_executable(nanolance_fuzz_repdef tests/fuzz/fuzz_repdef.cpp)
+    target_compile_features(nanolance_fuzz_repdef PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_repdef PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_repdef PRIVATE -fsanitize=fuzzer)
+
+    # The PageLayout descriptor gets its own target: libFuzzer's coverage feedback works best aimed
+    # at one grammar, and descriptor bytes look nothing like a data file.
+    add_executable(nanolance_fuzz_page_layout tests/fuzz/fuzz_page_layout.cpp)
+    target_compile_features(nanolance_fuzz_page_layout PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_page_layout PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_page_layout PRIVATE -fsanitize=fuzzer)
+
+    add_executable(nanolance_fuzz_fsst tests/fuzz/fuzz_fsst.cpp)
+    target_compile_features(nanolance_fuzz_fsst PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_fsst PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_fsst PRIVATE -fsanitize=fuzzer)
+
+    add_executable(nanolance_fuzz_lz4 tests/fuzz/fuzz_lz4.cpp)
+    target_compile_features(nanolance_fuzz_lz4 PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_lz4 PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_lz4 PRIVATE -fsanitize=fuzzer)
+
+    # Page decoding itself: one real descriptor plus its buffers into decode_lance_physical_column.
+    # Nothing else reaches the value decoders -- fuzz_decode stops at the column metadata.
+    add_executable(nanolance_fuzz_column_decode tests/fuzz/fuzz_column_decode.cpp)
+    target_compile_features(nanolance_fuzz_column_decode PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_column_decode PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_column_decode PRIVATE -fsanitize=fuzzer)
+
+    add_executable(nanolance_fuzz_deletion_vector tests/fuzz/fuzz_deletion_vector.cpp)
+    target_compile_features(nanolance_fuzz_deletion_vector PRIVATE cxx_std_20)
+    target_link_libraries(nanolance_fuzz_deletion_vector PRIVATE nanolance)
+    target_link_options(nanolance_fuzz_deletion_vector PRIVATE -fsanitize=fuzzer)
 endif()
 
 if(NANOLANCE_BUILD_TOOLS)
     add_executable(arrowipc2lance arrowipc2lance_main.cpp)
+    target_include_directories(arrowipc2lance PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     target_compile_features(arrowipc2lance PRIVATE cxx_std_20)
     target_link_libraries(arrowipc2lance PRIVATE CLI11::CLI11 nanolance)
 
@@ -310,12 +377,14 @@ if(NANOLANCE_BUILD_TOOLS)
     target_link_libraries(nlbench_gendata PRIVATE nanolance)
 
     add_executable(nlance2table tools/nlance2table.cpp)
+    target_include_directories(nlance2table PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     target_compile_features(nlance2table PRIVATE cxx_std_20)
     target_link_libraries(nlance2table PRIVATE CLI11::CLI11 nanolance)
 
     # nlance-stitch: gather/merge many free-standing worker .lance folders into one self-contained dataset
     # (Option A: relocate fragments into one data/ + write one master manifest; no column data re-encode).
     add_executable(nlance_stitch tools/nlance_stitch.cpp)
+    target_include_directories(nlance_stitch PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     target_compile_features(nlance_stitch PRIVATE cxx_std_20)
     target_link_libraries(nlance_stitch PRIVATE CLI11::CLI11 nanolance)
 
@@ -328,9 +397,32 @@ if(NANOLANCE_BUILD_TOOLS)
     target_compile_features(nlance_blobfetch PRIVATE cxx_std_20)
     target_link_libraries(nlance_blobfetch PRIVATE CLI11::CLI11 nanolance)
 
+    add_executable(nlance_pagelayout tools/nlance_pagelayout.cpp)
+    target_compile_features(nlance_pagelayout PRIVATE cxx_std_20)
+    target_link_libraries(nlance_pagelayout PRIVATE nanolance)
+    set_target_properties(nlance_pagelayout PROPERTIES OUTPUT_NAME nlance-pagelayout)
+
     add_executable(nlance_info tools/nlance_info.cpp)
+    target_include_directories(nlance_info PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
     target_compile_features(nlance_info PRIVATE cxx_std_20)
     target_link_libraries(nlance_info PRIVATE nanolance)
+
+    # One CLI over the same four sources. Each is compiled a second time with
+    # NANOLANCE_CLI_SUBCOMMAND, which drops its standalone main() and leaves the subcommand entry
+    # point the dispatcher calls -- so `nanolance import` and `arrowipc2lance` are the same code
+    # parsing the same arguments, not two grammars that can drift.
+    add_executable(nanolance_cli
+        tools/nanolance_main.cpp
+        arrowipc2lance_main.cpp
+        tools/nlance_info.cpp
+        tools/nlance2table.cpp
+        tools/nlance_stitch.cpp
+    )
+    set_target_properties(nanolance_cli PROPERTIES OUTPUT_NAME nanolance)
+    target_compile_features(nanolance_cli PRIVATE cxx_std_20)
+    target_compile_definitions(nanolance_cli PRIVATE NANOLANCE_CLI_SUBCOMMAND)
+    target_include_directories(nanolance_cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
+    target_link_libraries(nanolance_cli PRIVATE CLI11::CLI11 nanolance)
 endif()
 
 if(NANOLANCE_STANDALONE)
@@ -342,8 +434,19 @@ endif()
 # reads/writes Lance using only nanoarrow + zstd + local code. It is a consumer-side dependency of the
 # pcapng2lance example, which vendors it as a git submodule and adds it itself (see
 # examples/pcapng2lance/CMakeLists.txt). A plain nanolance build (library, tools, tests) needs no submodule.
+# Skip (don't fail) when the submodule is absent: a plain `git clone` without --recursive is the
+# documented way to build the library, and EXAMPLES defaults ON for standalone builds, so a hard
+# error here would break the quick start in README.md / docs/getting-started.md. Same graceful-skip
+# posture fuselance already takes when libfuse3 is missing.
 if(NANOLANCE_BUILD_EXAMPLES)
-    add_subdirectory(examples/pcapng2lance)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2lance/extern/nanotins/CMakeLists.txt")
+        add_subdirectory(examples/pcapng2lance)
+    else()
+        message(STATUS
+            "nanolance: skipping the pcapng2lance example -- its nanotins submodule is not checked "
+            "out. The library, tools and tests build fine without it. To build the example, run: "
+            "git submodule update --init --recursive")
+    endif()
 endif()
 
 # pcapng2lance_nanom — the same L1 converter built on nanom instead of nanotins, for a head-to-head
@@ -415,6 +518,10 @@ add_executable(nano_lance_writer_options_test tests/test_writer_options.cpp)
 target_compile_features(nano_lance_writer_options_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_writer_options_test PRIVATE nanolance)
 
+add_executable(nano_lance_writer_api_test tests/test_writer_api.cpp)
+target_compile_features(nano_lance_writer_api_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_writer_api_test PRIVATE nanolance nanolance_reader)
+
 add_executable(nano_lance_typed_writer_test tests/test_typed_writer.cpp)
 target_compile_features(nano_lance_typed_writer_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_typed_writer_test PRIVATE nanolance)
@@ -451,6 +558,30 @@ add_executable(nano_lance_dict_roundtrip_test tests/test_dict_roundtrip.cpp)
 target_compile_features(nano_lance_dict_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_dict_roundtrip_test PRIVATE nanolance)
 
+add_executable(nano_lance_page_layout_test tests/test_page_layout.cpp)
+target_link_libraries(nano_lance_page_layout_test PRIVATE nanolance)
+target_compile_features(nano_lance_page_layout_test PRIVATE cxx_std_20)
+
+add_executable(nano_lance_repdef_test tests/test_repdef.cpp)
+target_link_libraries(nano_lance_repdef_test PRIVATE nanolance)
+target_compile_features(nano_lance_repdef_test PRIVATE cxx_std_20)
+
+add_executable(nano_lance_fsst_test tests/test_fsst.cpp)
+target_link_libraries(nano_lance_fsst_test PRIVATE nanolance)
+target_compile_features(nano_lance_fsst_test PRIVATE cxx_std_20)
+
+add_executable(nano_lance_lz4_block_test tests/test_lz4_block.cpp)
+target_link_libraries(nano_lance_lz4_block_test PRIVATE nanolance)
+target_compile_features(nano_lance_lz4_block_test PRIVATE cxx_std_20)
+
+add_executable(nano_lance_readme_quickstart_test tests/test_readme_quickstart.c)
+target_link_libraries(nano_lance_readme_quickstart_test PRIVATE nanolance)
+set_property(TARGET nano_lance_readme_quickstart_test PROPERTY C_STANDARD 99)
+
+add_executable(nano_lance_null_rejection_test tests/test_null_rejection.cpp)
+target_link_libraries(nano_lance_null_rejection_test PRIVATE nanolance)
+target_compile_features(nano_lance_null_rejection_test PRIVATE cxx_std_20)
+
 add_executable(nano_lance_array_accessor_test tests/test_array_accessor.cpp)
 target_compile_features(nano_lance_array_accessor_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_array_accessor_test PRIVATE nanolance)
@@ -485,6 +616,14 @@ add_executable(nano_lance_table_roundtrip_test tests/test_nano_lance_table_round
 target_compile_features(nano_lance_table_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_table_roundtrip_test PRIVATE nanolance)
 
+add_executable(nano_lance_table_stream_test tests/test_table_stream.cpp)
+target_compile_features(nano_lance_table_stream_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_table_stream_test PRIVATE nanolance)
+
+add_executable(nano_lance_column_slice_test tests/test_column_slice.cpp)
+target_compile_features(nano_lance_column_slice_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_column_slice_test PRIVATE nanolance)
+
 add_executable(nano_lance_external_blob_test tests/test_nano_lance_external_blob.cpp)
 target_compile_features(nano_lance_external_blob_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_external_blob_test PRIVATE nanolance_reader)
@@ -501,6 +640,11 @@ endif()
 if(NANOLANCE_BUILD_TOOLS)
     add_test(NAME app_arrowipc2lance_help COMMAND $<TARGET_FILE:arrowipc2lance> -h)
     set_tests_properties(app_arrowipc2lance_help PROPERTIES LABELS "smoke")
+
+    add_test(NAME app_nanolance_cli COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_nanolance_cli.sh"
+             $<TARGET_FILE:nanolance_cli> $<TARGET_FILE:arrowipc2lance> $<TARGET_FILE:nlance2table>
+             $<TARGET_FILE:nlance_info>)
+    set_tests_properties(app_nanolance_cli PROPERTIES LABELS "smoke")
     add_test(NAME app_arrowipc2lance_version COMMAND $<TARGET_FILE:arrowipc2lance> --version)
     set_tests_properties(app_arrowipc2lance_version PROPERTIES LABELS "smoke")
 endif()
@@ -529,6 +673,9 @@ set_tests_properties(nano_lance_bool_roundtrip PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_writer_options COMMAND $<TARGET_FILE:nano_lance_writer_options_test>)
 set_tests_properties(nano_lance_writer_options PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_writer_api COMMAND $<TARGET_FILE:nano_lance_writer_api_test>)
+set_tests_properties(nano_lance_writer_api PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_typed_writer COMMAND $<TARGET_FILE:nano_lance_typed_writer_test>)
 set_tests_properties(nano_lance_typed_writer PROPERTIES LABELS "smoke")
@@ -560,6 +707,34 @@ set_tests_properties(nano_lance_read_safety PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_dict_roundtrip COMMAND $<TARGET_FILE:nano_lance_dict_roundtrip_test>)
 set_tests_properties(nano_lance_dict_roundtrip PROPERTIES LABELS "smoke")
 
+if(TARGET nlance_pagelayout AND NANOLANCE_PYTHON)
+    add_test(NAME app_pagelayout_pylance_interop_smoke
+             COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_pagelayout_pylance_interop.sh"
+                     "$<TARGET_FILE:nlance_pagelayout>" "${NANOLANCE_PYTHON}")
+    set_tests_properties(app_pagelayout_pylance_interop_smoke PROPERTIES LABELS smoke SKIP_RETURN_CODE 77)
+endif()
+
+add_test(NAME nano_lance_page_layout
+         COMMAND $<TARGET_FILE:nano_lance_page_layout_test> "${CMAKE_CURRENT_BINARY_DIR}/page_layout_probe")
+set_tests_properties(nano_lance_page_layout PROPERTIES LABELS smoke)
+
+add_test(NAME nano_lance_repdef COMMAND $<TARGET_FILE:nano_lance_repdef_test>)
+set_tests_properties(nano_lance_repdef PROPERTIES LABELS smoke)
+
+add_test(NAME nano_lance_fsst COMMAND $<TARGET_FILE:nano_lance_fsst_test>)
+set_tests_properties(nano_lance_fsst PROPERTIES LABELS smoke)
+
+add_test(NAME nano_lance_lz4_block COMMAND $<TARGET_FILE:nano_lance_lz4_block_test>)
+set_tests_properties(nano_lance_lz4_block PROPERTIES LABELS smoke)
+
+add_test(NAME nano_lance_readme_quickstart
+         COMMAND $<TARGET_FILE:nano_lance_readme_quickstart_test>
+                 "${CMAKE_CURRENT_BINARY_DIR}/readme_quickstart.lance")
+set_tests_properties(nano_lance_readme_quickstart PROPERTIES LABELS smoke)
+
+add_test(NAME nano_lance_null_rejection COMMAND $<TARGET_FILE:nano_lance_null_rejection_test>)
+set_tests_properties(nano_lance_null_rejection PROPERTIES LABELS smoke)
+
 add_test(NAME nano_lance_array_accessor COMMAND $<TARGET_FILE:nano_lance_array_accessor_test>)
 set_tests_properties(nano_lance_array_accessor PROPERTIES LABELS "smoke")
 
@@ -585,6 +760,12 @@ set_tests_properties(nano_lance_data_file_reader PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_table_roundtrip COMMAND $<TARGET_FILE:nano_lance_table_roundtrip_test>)
 set_tests_properties(nano_lance_table_roundtrip PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_table_stream COMMAND $<TARGET_FILE:nano_lance_table_stream_test>)
+set_tests_properties(nano_lance_table_stream PROPERTIES LABELS "smoke")
+
+add_test(NAME nano_lance_column_slice COMMAND $<TARGET_FILE:nano_lance_column_slice_test>)
+set_tests_properties(nano_lance_column_slice PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_external_blob COMMAND $<TARGET_FILE:nano_lance_external_blob_test>)
 set_tests_properties(nano_lance_external_blob PROPERTIES LABELS "smoke")
@@ -634,7 +815,7 @@ if(NANOLANCE_BUILD_TOOLS)
                 "${NANO_LANCE_WRITER_PYTHON}"
                 "${NANO_LANCE_BLOB_V2_GOLDEN_DIR}"
     )
-    set_tests_properties(app_arrowipc2lance_blob_v2_smoke PROPERTIES LABELS "smoke" DEPENDS nano_lance_blob_v2_golden_generate)
+    set_tests_properties(app_arrowipc2lance_blob_v2_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77 DEPENDS nano_lance_blob_v2_golden_generate)
 
     add_test(
         NAME app_arrowipc2lance_nonnull_smoke
@@ -642,7 +823,7 @@ if(NANOLANCE_BUILD_TOOLS)
                 "$<TARGET_FILE:arrowipc2lance>"
                 "${NANO_LANCE_WRITER_PYTHON}"
     )
-    set_tests_properties(app_arrowipc2lance_nonnull_smoke PROPERTIES LABELS "smoke")
+    set_tests_properties(app_arrowipc2lance_nonnull_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
 
     add_test(
         NAME app_arrowipc2lance_ignore_nullability_smoke
@@ -650,7 +831,7 @@ if(NANOLANCE_BUILD_TOOLS)
                 "$<TARGET_FILE:arrowipc2lance>"
                 "${NANO_LANCE_WRITER_PYTHON}"
     )
-    set_tests_properties(app_arrowipc2lance_ignore_nullability_smoke PROPERTIES LABELS "smoke")
+    set_tests_properties(app_arrowipc2lance_ignore_nullability_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
 
     add_test(
         NAME app_arrowipc2lance_inspect_smoke
@@ -658,7 +839,7 @@ if(NANOLANCE_BUILD_TOOLS)
                 "$<TARGET_FILE:arrowipc2lance>"
                 "${NANO_LANCE_WRITER_PYTHON}"
     )
-    set_tests_properties(app_arrowipc2lance_inspect_smoke PROPERTIES LABELS "smoke")
+    set_tests_properties(app_arrowipc2lance_inspect_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
 
     add_test(
         NAME app_arrowipc2lance_append_smoke
@@ -666,7 +847,7 @@ if(NANOLANCE_BUILD_TOOLS)
                 "$<TARGET_FILE:arrowipc2lance>"
                 "${NANO_LANCE_WRITER_PYTHON}"
     )
-    set_tests_properties(app_arrowipc2lance_append_smoke PROPERTIES LABELS "smoke")
+    set_tests_properties(app_arrowipc2lance_append_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
 
     add_test(
         NAME app_dict_pylance_interop_smoke

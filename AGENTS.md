@@ -7,7 +7,7 @@ path and CMake targets changed.
 nanolance is the "nanoarrow of Lance": a small C++ library that **writes Lance v2.2 datasets** (and
 reads back what it wrote) with no Rust `lance` core. Its headline feature is pointing rows at raw
 bytes that live elsewhere (local file or S3) instead of copying them in. Everything it writes is
-readable by stock `lance` (verified against `lance` 7.0.0), unless a feature is explicitly marked
+readable by stock `lance` (verified against `pylance` 12.0.0), unless a feature is explicitly marked
 "nanolance-only" below.
 
 ## 1. What changed (breaking)
@@ -27,21 +27,47 @@ readable by stock `lance` (verified against `lance` 7.0.0), unless a feature is 
 #include "nanolance/nano_lance_writer.h"
 #include <nanoarrow/nanoarrow.h>
 
+NanoLanceWriteOptions options = {0};                 // zeroed == the defaults
 NanoLanceWriter w = {0};
-nano_lance_writer_init(&w, "out.lance", /*compression_level=*/3);
-nano_lance_writer_set_ignore_nullability(&w, true);  // if your Arrow fields are nullable
-nano_lance_writer_set_compression(&w, true);         // enable Lance-compatible compression (see §3)
+options.compression_level = 3;
+options.compression = true;                          // Lance-compatible compression (see §3)
+nano_lance_writer_open(&w, "out.lance", &options);
 nano_lance_write_batch(&w, &arrow_array, &arrow_schema);  // call repeatedly; schema is fixed after #1
 nano_lance_writer_commit(&w, /*is_append=*/false);
 nano_lance_writer_close(&w);
 // On any non-zero return, read nano_lance_writer_last_error(&w).
 ```
 
+From C++, `nano_lance::Writer` (`nanolance/writer.hpp`) is the same thing with the handle owned:
+`open(path, {.compression_level = 3, .compression = true})`, then `write_batch` / `commit`, and the
+destructor closes it.
+
 Lifecycle rules:
 - Schema is locked after the first batch; all batches in a writer session share it.
-- All `set_*` options must be called **before the first `write_batch`**.
+- Options go to `nano_lance_writer_open`. The older `nano_lance_writer_init` / `init_append` plus
+  `set_*` calls still work and produce byte-identical files, but each `set_*` must precede the first
+  `write_batch` and only says so at runtime (`INVALID_STATE`).
+- **Nulls are stored** via Lance's definition-level layer, and stock Lance reads them back: in
+  fixed-width columns (int, float, bool, timestamp/date/time, decimal, `fixed_size_binary`) and in
+  variable-width ones (`utf8`, `binary`). Still refused, by name: a null **struct** (as opposed to a
+  null field inside one), and a null in a `lance.blob.v2` external-reference column.
+  `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility; the manifest's
+  nullable flag now mirrors the Arrow schema, as pylance's does.
+- Types nanolance cannot round-trip are refused at `write_batch` rather than written: `list`,
+  `large_utf8`/`large_binary`, Arrow `dictionary` columns, Arrow's `null` type, and a `timestamp`
+  whose timezone is a UTC offset rather than an IANA name (Lance panics on those). Supported:
+  int/uint 8–64, `float`, `double`, `bool`, `utf8`, `binary`, `fixed_size_binary(N)`, `timestamp`
+  (s/ms/us/ns, optionally with an IANA timezone), `date32/64`, `time32/64`, `decimal128/256`,
+  nested `struct`, and `lance.blob.v2` external references.
+- nanolance reads back everything it writes, and now every non-nested column type the Rust `lance`
+  crate writes: fixed-width and temporal types, nullable columns (bit-packed *and* run-length-encoded
+  definition levels), `utf8`/`large_utf8`/`binary` including FSST-compressed ones, and categorical
+  columns with their LZ4-compressed dictionary. `list` and `struct` are still refused **by name**,
+  not misread (see README "What nanolance can read").
 - `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
   adds a fragment to an existing dataset.
+
+`arrowipc2lance` reads its Arrow IPC stream from `-i/--input FILE` or, with neither given, stdin.
 
 Read back with `nano_lance::lance_table_read_dataset(path, schema, batches, error)` (C++,
 `nanolance/lance_table_reader.hpp`) or fetch external bytes with
@@ -60,10 +86,39 @@ import nanolance
 table = pa.table({"uri": ["s3://b/f.pcapng"] * 1000, "position": range(1000), "size": [1500] * 1000})
 nanolance.write_table(table, "out.lance", compression=True)
 roundtrip = pa.table(nanolance.read_table("out.lance"))
+
+# Projection, and a fragment-at-a-time stream for datasets larger than memory:
+subset = pa.table(nanolance.read_table("out.lance", columns=["uri", "size"]))
+for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")):
+    ...
 ```
 
 Key options mirror the C writer: `compression=True`, `WriteOptions(append=True)`, etc. See
 `bindings/python/README.md` for install, tests (`pytest`), and pylance interop checks.
+
+`read_table` and `open_stream` both take `offset=`/`length=` for a row range. Fragments outside the
+range are never opened (measured 29x faster for a 1k-row range of a 4M-row, 16-fragment dataset), so
+the saving is proportional to fragments skipped, not rows dropped -- write with
+`max_rows_per_fragment` if range reads matter to you.
+
+`nanolance.count_rows(path)` and `nanolance.read_schema(path)` answer from the manifest without
+opening a data file -- use them instead of reading a table to find out how big it is or what is in it.
+
+`read_table` decodes up front and raises at call time; `open_stream` decodes one fragment per pull,
+so errors surface from the first pull instead (as `OSError`) and the handle is single-shot. Prefer
+`open_stream` for bounded peak memory (measured 0.09x the dataset against 1.01x) and a fast first
+batch; prefer `read_table` when you want the whole thing and up-front errors.
+
+The package also installs a CLI, `nanolance` (equivalently `python -m nanolance`):
+
+```bash
+nanolance convert in.parquet out.lance --compress   # batch at a time; prints both sizes
+nanolance inspect out.lance                         # rows, on-disk bytes, schema
+```
+
+`convert` takes `--columns`, `--rows-per-fragment`, `--batch-size`, `--no-structural`,
+`-l/--compression-level` and `--overwrite`. It refuses a non-parquet extension and an existing output
+by name rather than guessing.
 
 Parquet Python bindings are a separate package in
 [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) (`nanoarrow_io.parquet`).
@@ -213,3 +268,17 @@ on-disk size shrank.
    `encoding` and `nanolance:*` metadata tags set by the writer (Lance ignores those tags and reads the
    real `PageLayout`).
 4. Validate both directions: nanolance write → nanolance read, **and** nanolance write → `lance` read.
+5. **Add the shape to `bindings/python/tests/test_write_encoding_matrix.py`.** That file writes one
+   table of every shape the writer's heuristics can pick, under all three write modes, and asserts
+   both readers agree -- whole table and every column on its own. A dictionary-page bug once made
+   every *other* column in the same file unreadable by Lance and survived for months because no test
+   wrote that shape; the matrix is what closes that gap.
+
+Two repo rules that came out of the same incident:
+
+- **A test may skip for a missing optional dependency and for nothing else.** Four tests here once
+  reported success for a genuine failure (`exit 0`, or `except Exception: sys.exit(77)` which ctest
+  reports as SKIP). Do not add a handler that turns a red result green.
+- **CI builds with `-DNANOLANCE_WERROR=ON`** (`-Wall -Wextra -Werror` on nanolance's own three
+  library targets), in `linux-bench.yml` under clang and `memory-safety.yml` under gcc. The option
+  defaults OFF so a downstream build on an unknown compiler cannot be broken by a new warning.

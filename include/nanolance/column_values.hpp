@@ -67,6 +67,50 @@ struct FixedRlePlan {
 
 struct ColumnValues {
     enum class Kind { FixedWidth, VariableWidth, BlobV2External } kind = Kind::FixedWidth;
+
+    /// Arrow-convention validity bitmap (LSB-first, bit SET means the row is VALID), or empty when
+    /// every row is valid. Note the inversion against the wire format: Lance stores a definition
+    /// level per value where level 1 means NULL, so both encoding and decoding flip it.
+    std::vector<std::uint8_t> validity;
+    /// Number of rows whose validity bit is clear. Zero whenever `validity` is empty.
+    std::uint64_t null_count = 0;
+    /// fixed_size_list only: validity per ELEMENT -- `items_per_row` bits per row, Arrow convention --
+    /// for the list's child array. Distinct from `validity`, which is per row. pyarrow marks every
+    /// element of a null row null too, so an ordinary nullable vector column carries this even when no
+    /// valid row has a null element. Empty when no element is null.
+    std::vector<std::uint8_t> item_validity;
+    std::uint64_t item_null_count = 0;
+    std::uint64_t items_per_row = 0;
+
+    /// Nested columns only: the list and struct layers above the leaf, OUTERMOST first
+    /// (docs/NESTED_COLUMNS.md). When present, everything else in this struct describes the leaf
+    /// ITEMS -- `fixed`/`variable` hold one value per item and `validity` is item validity -- and the
+    /// row count is `layers.front().length`. Empty for a column with no list above it and no struct
+    /// that can be null, which is then unchanged.
+    struct NestedLayer {
+        bool is_list = true;                 // false: a struct, one entry per child, validity only
+        std::vector<std::int64_t> offsets;   // lists only: length + 1 entries, starting at 0
+        std::vector<std::uint8_t> validity;  // LSB-first; empty when no entry is null
+        std::uint64_t null_count = 0;
+        std::uint64_t length = 0;
+    };
+    std::vector<NestedLayer> layers;
+    /// Does this column need nested pages (repetition/definition levels per layer)? Only a list, or a
+    /// struct with an actual null. A leaf under structs that are never null keeps the flat encodings
+    /// -- its `layers` are then ignored by the writer.
+    bool needs_nested_pages() const {
+        for (const auto& layer : layers) {
+            if (layer.is_list || layer.null_count != 0U) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /// Rows accumulated so far. Needed on the write side because validity arrives one batch at a
+    /// time and each batch's bits must land at the right absolute row offset -- the value buffers
+    /// cannot supply that for a variable-width column, and for a borrowed fixed-width column there
+    /// is no owned buffer to measure at all.
+    std::uint64_t rows = 0;
     std::vector<std::uint8_t> fixed;
     VariableWidthColumnValues variable;
     BlobV2ExternalColumnValues blob_v2;

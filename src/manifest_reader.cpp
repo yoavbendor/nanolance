@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <string_view>
+#include <sstream>
+#include <limits>
+#include <iomanip>
 
 namespace nano_lance {
 namespace {
@@ -29,7 +33,33 @@ std::uint64_t read_le64(const unsigned char* p) {
     return v;
 }
 
+constexpr std::size_t kManifestV2Digits = 20U;
+
 }  // namespace
+
+bool parse_manifest_version(const std::string& name, std::uint64_t& version_out) {
+    constexpr std::string_view kSuffix = ".manifest";
+    if (name.size() <= kSuffix.size() ||
+        name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+        return false;
+    }
+    const auto digits = name.substr(0, name.size() - kSuffix.size());
+    if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
+        return false;  // detached (`d123.manifest`) or simply not a manifest of ours
+    }
+    std::uint64_t parsed = 0;
+    try {
+        parsed = std::stoull(digits);
+    } catch (...) {
+        return false;
+    }
+    // V2 is identified by the numeric part being exactly 20 characters, which is what Lance keys on.
+    version_out = digits.size() == kManifestV2Digits
+                      ? std::numeric_limits<std::uint64_t>::max() - parsed
+                      : parsed;
+    return true;
+}
+
 
 std::uint64_t highest_manifest_version(const std::filesystem::path& dataset_path, std::string& error) {
     error.clear();
@@ -51,14 +81,9 @@ std::uint64_t highest_manifest_version(const std::filesystem::path& dataset_path
         if (!entry.is_regular_file()) {
             continue;
         }
-        const auto name = entry.path().filename().string();
-        if (name.size() <= 9 || name.substr(name.size() - 9) != ".manifest") {
-            continue;
-        }
-        try {
-            max_version =
-                std::max(max_version, static_cast<std::uint64_t>(std::stoull(name.substr(0, name.size() - 9))));
-        } catch (...) {
+        std::uint64_t version = 0;
+        if (parse_manifest_version(entry.path().filename().string(), version)) {
+            max_version = std::max(max_version, version);
         }
     }
     return max_version;
@@ -132,7 +157,16 @@ bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifes
         error = "no manifest found under _versions";
         return false;
     }
-    const auto manifest_path = dataset_path / "_versions" / (std::to_string(v) + ".manifest");
+    // The version is scheme-independent, so try both spellings rather than assuming one. A dataset
+    // nanolance appended to after pylance created it can legitimately hold a mix.
+    std::error_code path_ec;
+    auto manifest_path = dataset_path / "_versions" / (std::to_string(v) + ".manifest");
+    if (!std::filesystem::exists(manifest_path, path_ec)) {
+        std::ostringstream inverted;
+        inverted << std::setfill('0') << std::setw(static_cast<int>(kManifestV2Digits))
+                 << (std::numeric_limits<std::uint64_t>::max() - v);
+        manifest_path = dataset_path / "_versions" / (inverted.str() + ".manifest");
+    }
     std::vector<std::uint8_t> body;
     if (!read_manifest_file(manifest_path, body, error)) {
         return false;

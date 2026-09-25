@@ -121,6 +121,57 @@ bool dispatch_rle_scan(const std::uint8_t* data, std::size_t n, std::size_t bpv,
     }
 }
 
+template <class T>
+std::size_t bitpack_words_for_column(const std::uint8_t* data, std::size_t n) {
+    // One FastLanes chunk per 1024 values; each chunk stores its own width, so each is costed on its
+    // own maximum.
+    constexpr std::size_t kBits = sizeof(T) * 8U;
+    std::size_t total_words = 0;
+    for (std::size_t base = 0; base < n; base += 1024U) {
+        const std::size_t count = std::min<std::size_t>(1024U, n - base);
+        T bits_or = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            T v = 0;
+            std::memcpy(&v, data + (base + i) * sizeof(T), sizeof(T));
+            bits_or = static_cast<T>(bits_or | v);
+        }
+        std::size_t width = 0;
+        while (bits_or != 0U) {
+            ++width;
+            bits_or = static_cast<T>(bits_or >> 1U);
+        }
+        total_words += 1U + (1024U * width) / kBits;  // one inline width word + the packed words
+    }
+    return total_words;
+}
+
+/// Is bitpacking actually smaller than storing the values flat?
+///
+/// This mirrors Lance's own rule (`rust/lance-encoding/src/compression.rs`: a bitpacked block is
+/// only offered when its estimated size is strictly below `raw_bytes`) rather than inventing a
+/// threshold. Costing it per 1024-value chunk is what makes the answer right: each chunk carries its
+/// own width word, so a column that needs the full width is strictly LARGER bitpacked than flat, and
+/// pays a FastLanes transpose on every read for it.
+///
+/// nanolance used to bitpack every integer column unconditionally. On a column of random `uint64`
+/// ids -- the `high_card` bench shape, and any hash/uuid column -- that made the file 2.4% bigger and
+/// the read 0.85 ms instead of 0.50 ms. Stock Lance writes `Flat(64)` for the same data.
+bool bitpack_beats_flat(const nano_lance::ColumnValues& cv, std::size_t bpv) {
+    if (bpv == 0U || cv.fixed_size() == 0U || cv.fixed_size() % bpv != 0U) {
+        return true;  // not our call to make; leave the column as it was tagged
+    }
+    const std::size_t n = cv.fixed_size() / bpv;
+    const auto* data = cv.fixed_data();
+    std::size_t words = 0;
+    switch (bpv) {
+        case 1U: words = bitpack_words_for_column<std::uint8_t>(data, n); break;
+        case 2U: words = bitpack_words_for_column<std::uint16_t>(data, n); break;
+        case 4U: words = bitpack_words_for_column<std::uint32_t>(data, n); break;
+        default: words = bitpack_words_for_column<std::uint64_t>(data, n); break;
+    }
+    return words * bpv < cv.fixed_size();
+}
+
 // Decide whether RLE beats bitpacking for a fixed-width column. Lance requires 8-bit run lengths, so
 // runs longer than 255 are split into <=255 sub-runs; we count those split runs. Two passes (same
 // structure as variable_column_dict_rle_beneficial): pass 1 counts only, with the reject-early exit
@@ -484,72 +535,113 @@ std::uint64_t next_fragment_numeric_suffix(const std::filesystem::path& dataset_
 
 extern "C" {
 
-int nano_lance_writer_init(NanoLanceWriter* writer, const char* path, int compression_level) {
-    if (writer == nullptr) {
-        return NANO_LANCE_INVALID_ARGUMENT;
+void nano_lance_write_options_init(NanoLanceWriteOptions* options) {
+    if (options != nullptr) {
+        *options = NanoLanceWriteOptions{};
     }
-    writer->private_data = nullptr;
-    clear_error(writer);
-
-    if (path == nullptr || path[0] == '\0') {
-        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "dataset path must not be empty");
-    }
-    if (compression_level < 0 || compression_level > 22) {
-        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "zstd compression level must be in range 0..22");
-    }
-
-    auto state = std::make_unique<WriterState>();
-    state->dataset_path = path;
-    state->compression_level = compression_level;
-    state->append_only_commits = false;
-    writer->private_data = state.release();
-    return NANO_LANCE_OK;
 }
 
-int nano_lance_writer_init_append(NanoLanceWriter* writer, const char* path, int compression_level) {
+int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const NanoLanceWriteOptions* options) {
     if (writer == nullptr) {
         return NANO_LANCE_INVALID_ARGUMENT;
     }
     if (writer->private_data != nullptr) {
-        return set_error(writer, NANO_LANCE_INVALID_STATE, "close writer before init_append");
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "close writer before opening another dataset");
     }
-    writer->private_data = nullptr;
     clear_error(writer);
+
+    // A NULL options pointer and a zeroed struct mean the same thing, and both mean the defaults.
+    const NanoLanceWriteOptions defaults{};
+    const NanoLanceWriteOptions& opts = options != nullptr ? *options : defaults;
 
     if (path == nullptr || path[0] == '\0') {
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "dataset path must not be empty");
     }
-    if (compression_level < 0 || compression_level > 22) {
+    if (opts.compression_level < 0 || opts.compression_level > 22) {
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "zstd compression level must be in range 0..22");
+    }
+    if (opts.num_column_encodings != 0U && opts.column_encodings == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT,
+                         "column_encodings is NULL but num_column_encodings is not zero");
+    }
+    if (opts.append && opts.blob_uri_dictionary) {
+        // Same refusal, same code, as set_blob_uri_dictionary on an append writer.
+        return set_error(writer, NANO_LANCE_UNSUPPORTED,
+                         "blob URI dictionary mode is not supported for append datasets");
     }
 
     auto state = std::make_unique<WriterState>();
     state->dataset_path = path;
-    state->compression_level = compression_level;
-    state->append_only_commits = true;
+    state->compression_level = opts.compression_level;
+    state->compression = opts.compression;
+    state->structural = !opts.disable_structural_encoding;
+    state->blob_uri_dictionary = opts.blob_uri_dictionary;
+    state->borrow_buffers = opts.borrow_buffers;
+    state->append_only_commits = opts.append;
 
-    std::error_code ec;
-    if (!std::filesystem::exists(state->dataset_path / "_versions", ec)) {
-        return set_error(writer, NANO_LANCE_IO_ERROR, "init_append requires an existing dataset with _versions");
+    for (std::size_t i = 0; i < opts.num_column_encodings; ++i) {
+        const auto& entry = opts.column_encodings[i];
+        if (entry.field_name == nullptr || entry.field_name[0] == '\0') {
+            return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "field name must not be empty");
+        }
+        const std::string enc = entry.encoding != nullptr ? entry.encoding : "";
+        if (enc == "auto") {
+            state->column_encodings.erase(entry.field_name);
+        } else if (enc == "plain" || enc == "bitpack" || enc == "bss-zstd" || enc == "zstd") {
+            state->column_encodings[entry.field_name] = enc;
+        } else {
+            return set_error(writer, NANO_LANCE_INVALID_ARGUMENT,
+                             "unknown column encoding (expected auto/plain/bitpack/bss-zstd/zstd): " + enc);
+        }
     }
 
-    nano_lance::pb::Manifest manifest{};
-    std::uint64_t manifest_version = 0;
-    std::string load_error;
-    if (!nano_lance::load_latest_manifest(state->dataset_path, manifest, manifest_version, load_error)) {
-        return set_error(writer, NANO_LANCE_IO_ERROR, load_error);
-    }
-    if (!nano_lance::lance_schema_mapping_from_manifest(manifest, state->schema_mapping, load_error)) {
-        return set_error(writer, NANO_LANCE_UNSUPPORTED, load_error);
-    }
+    if (opts.append) {
+        std::error_code ec;
+        if (!std::filesystem::exists(state->dataset_path / "_versions", ec)) {
+            return set_error(writer, NANO_LANCE_IO_ERROR, "init_append requires an existing dataset with _versions");
+        }
 
-    state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
-    const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
-    state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
-    state->has_schema = true;
+        nano_lance::pb::Manifest manifest{};
+        std::uint64_t manifest_version = 0;
+        std::string load_error;
+        if (!nano_lance::load_latest_manifest(state->dataset_path, manifest, manifest_version, load_error)) {
+            return set_error(writer, NANO_LANCE_IO_ERROR, load_error);
+        }
+        if (!nano_lance::lance_schema_mapping_from_manifest(manifest, state->schema_mapping, load_error)) {
+            return set_error(writer, NANO_LANCE_UNSUPPORTED, load_error);
+        }
+
+        state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
+        const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
+        state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
+        state->has_schema = true;
+    }
 
     writer->private_data = state.release();
     return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_init(NanoLanceWriter* writer, const char* path, int compression_level) {
+    if (writer == nullptr) {
+        return NANO_LANCE_INVALID_ARGUMENT;
+    }
+    // Historically this reset private_data without looking at it, so a caller that re-inits without
+    // closing leaks rather than being told. Kept, because changing it would break those callers.
+    writer->private_data = nullptr;
+    NanoLanceWriteOptions options{};
+    options.compression_level = compression_level;
+    return nano_lance_writer_open(writer, path, &options);
+}
+
+int nano_lance_writer_init_append(NanoLanceWriter* writer, const char* path, int compression_level) {
+    NanoLanceWriteOptions options{};
+    options.compression_level = compression_level;
+    options.append = true;
+    const auto rc = nano_lance_writer_open(writer, path, &options);
+    if (rc == NANO_LANCE_INVALID_STATE && writer != nullptr && writer->private_data != nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "close writer before init_append");
+    }
+    return rc;
 }
 
 int nano_lance_writer_set_ignore_nullability(NanoLanceWriter* writer, bool ignore_nullability) {
@@ -867,6 +959,22 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
             if (!pf->extension_name.empty()) {
                 continue;
             }
+            // A fixed_size_list stays flat. Every structural encoding here would describe a row as one
+            // wide scalar -- Constant, RLE, a dictionary -- with no FixedSizeList wrapper, and Lance
+            // reads the list type from exactly that wrapper. (A constant one is doubly out: Lance's
+            // inline constant value is for types with no child data.)
+            {
+                std::string element;
+                std::uint64_t items = 0;
+                if (nano_lance::lance_fixed_size_list_parts(pf->logical_type, element, items)) {
+                    continue;
+                }
+            }
+            // A leaf under a list writes its own pages (repetition levels, items): no structural
+            // encoding applies to it, and its values count items, not rows.
+            if (i < commit_columns.size() && commit_columns[i].needs_nested_pages()) {
+                continue;
+            }
             // Declared columns (set_column_encoding) skip ALL detection scans -- the encoding was
             // decided by the caller; these scans are exactly the work the declaration saves.
             if (state->column_encodings.find(pf->name) != state->column_encodings.end()) {
@@ -877,7 +985,11 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
             bool constant = false;
             if (cv.kind == nano_lance::ColumnValues::Kind::FixedWidth) {
                 const auto bpv = nano_lance::lance_logical_type_value_bytes(pf->logical_type);
-                if (bpv != 0U && cv.fixed_size() >= bpv && cv.fixed_size() % bpv == 0U) {
+                // A fixed-width constant is stored INLINE in the page descriptor, and Lance allows at
+                // most 32 bytes there (ConstantLayout.inline_value). Wider values -- a 200-byte
+                // fixed_size_binary, a vector -- stay on the flat path.
+                if (bpv != 0U && bpv <= nano_lance::kMaxInlineConstantBytes && cv.fixed_size() >= bpv &&
+                    cv.fixed_size() % bpv == 0U) {
                     // A buffer is all-one-value iff it equals itself shifted by one element, so ONE
                     // overlapped memcmp over the whole column replaces the previous
                     // one-libc-call-per-row loop (memcmp only reads, so overlap is fine; a 1-row
@@ -910,6 +1022,15 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
                     for (auto& field : disk_schema.fields) {
                         if (field.id == pf->id) {
                             field.metadata["nanolance:packing"] = "rle";
+                            break;
+                        }
+                    }
+                } else if (!bitpack_beats_flat(cv, bpv)) {
+                    // Incompressible integers (hashes, ids, random keys): drop the bitpack tag so the
+                    // column writes flat pages, which is both smaller and cheaper to read.
+                    for (auto& field : disk_schema.fields) {
+                        if (field.id == pf->id) {
+                            field.metadata.erase("nanolance:packing");
                             break;
                         }
                     }

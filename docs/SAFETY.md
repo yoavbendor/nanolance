@@ -120,6 +120,63 @@ Not asserted — exercised in CI ([`.github/workflows/memory-safety.yml`](https:
   cmake --build build-fuzz --target nanolance_fuzz_decode
   ./build-fuzz/nanolance_fuzz_decode -max_total_time=60 corpus/
   ```
+- **A fuzzer per parser, not just per entry point.** `fuzz_decode` stops at the data file's footer
+  and column metadata, so each format reached only *after* that point needs its own target, and CI
+  runs all seven on every push ([`.github/workflows/memory-safety.yml`](https://github.com/yoavbendor/nanolance/blob/main/.github/workflows/memory-safety.yml)):
+
+  | target | covers | why `fuzz_decode` does not reach it |
+  |---|---|---|
+  | `nanolance_fuzz_column_decode` | page decoding: descriptor + buffers → values (dictionaries, bit-unpacking, RLE, definition levels, constant pages, FSST/LZ4/zstd values, FullZip, fixed_size_list) | `fuzz_decode` never decodes a page. Seeded with whole pages dumped from real datasets by `nlance-pagelayout --dump-fuzz-pages` |
+  | `nanolance_fuzz_repdef` | repetition/definition unravelling for list columns; asserts Arrow's list invariants on every accepted input | pure computation, fuzzed on its own at ~50,000 inputs a second instead of through a page |
+  | `nanolance_fuzz_page_layout` | the `/lance.encodings21.PageLayout` descriptor | seeded from real pylance descriptors — FSST, LZ4 dictionaries, RLE levels — which nanolance's own writer never emits |
+  | `nanolance_fuzz_fsst` | the FSST symbol-table decompressor | only runs once a value buffer is being decompressed |
+  | `nanolance_fuzz_lz4` | the LZ4 block decompressor | same |
+  | `nanolance_fuzz_deletion_vector` | `_deletions/*.arrow` (Arrow IPC framing + flatbuffer vtable walk) and `_deletions/*.bin` (roaring bitmap) | a deletion file is never opened by the data-file path |
+
+  The page-decoding target is the newest. Before it, every page decoder written against pylance
+  files had been bounds-checked by construction and never by a fuzzer, and this page claimed a
+  harness "over the full decode chain" that stopped at the footer. It found two bugs in its first
+  hour: a zstd buffer's declared uncompressed size was trusted up to the generic 8 GiB ceiling, so an
+  899-byte page asked for 8.4 GB (now bounded by zstd's own maximum expansion, 32,768:1, of the
+  compressed size, and a frame over 64 MiB is streamed so memory follows real output); and a
+  variable-width chunk shorter than one offset was read as if it held one — an out-of-bounds read,
+  caught by UBSan as a null `memcpy` source on the empty case. Seeded with list pages it then found a
+  heap over-read in the dictionary-block parser (a `u32` bounds sum that wrapped) and two `memcpy`s
+  from null on empty level buffers. Both
+  reproducers are in [`tests/fuzz/corpus/column_decode/`](https://github.com/yoavbendor/nanolance/tree/main/tests/fuzz/corpus/column_decode).
+
+  The deletion-file target earned its place three times over. The roaring
+  format amplifies up to ~65,000x — a four-byte run container can emit 65,536 values — and nothing
+  budgeted it, so roughly 640 KiB of crafted input bought 16 GiB of allocation. The parser now sums
+  the containers' declared cardinalities and checks that total **before materializing anything**,
+  capped by the manifest's own `num_deleted_rows`; a bitmap container whose popcount, or a run
+  container whose expansion, disagrees with its declared cardinality is refused outright; and the
+  output reserve is capped rather than trusting the declared total, because the fuzzer turned that
+  trust into a 4 GiB `malloc` from a few kilobytes. `tests/test_read_safety.cpp` pins the budget with
+  a 41 KB input that asks for a gigabyte.
+
+  The same target then found the Arrow IPC side: a buffer's int64 uncompressed-length prefix was
+  trusted up to the generic 8 GiB ceiling, so a 328-byte file could ask for 4 GiB. Cross-checking it
+  against `ZSTD_getFrameContentSize` was **not** a fix — a frame header's content size is written by
+  whoever wrote the frame, so both numbers come from the same untrusted bytes and an attacker simply
+  makes them agree. CI's fuzzer rejected that version in twelve seconds. The bound is the manifest's
+  `num_deleted_rows`, which the file does not choose, passed down as a byte ceiling; the frame
+  cross-check remains as a consistency check. Both reproducers are checked in at
+  [`tests/fuzz/corpus/deletion_vector/`](https://github.com/yoavbendor/nanolance/tree/main/tests/fuzz/corpus/deletion_vector)
+  and replayed by CI on every push.
+
+  With those allocations bounded, the same target reached far deeper and found a real crash:
+  `std::length_error` escaping the parser because the record batch's int64 row count was checked with
+  `values.size() < rows * 4`, which overflows uint64 past 2^62. An uncaught exception from a
+  malformed file is a crash, not a refusal; it uses `checked_mul` now.
+
+  And behind that, the one that actually reads memory it does not own: an **ASan heap-buffer-overflow
+  READ**, because `flatbuffer_field` treated an offset equal to `bytes.size()` as a present field and
+  the caller indexed it. A present flatbuffer scalar is at least one byte, so the contract is now
+  strictly-inside, and single-byte reads go through a bounds-checked `flatbuffer_byte`. Each of these
+  was only reachable once the previous one was fixed — the memory-safety bug was six rounds deep.
+  Every reproducer is checked in beside the others.
+
 - **Negative-corpus tests** ([`tests/test_read_safety.cpp`](https://github.com/yoavbendor/nanolance/blob/main/tests/test_read_safety.cpp)) — hand-built
   malformed footers (oversized column count, overflowing descriptor bounds) and garbage protobuf must
   be *rejected cleanly*, and the checked-math/`load_le` helpers are unit-tested.

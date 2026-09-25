@@ -10,9 +10,18 @@ struct ArrowArray;
 
 namespace nano_lance {
 
-const ArrowArray* resolve_field_array(const ArrowArray& batch,
-                                      const LanceSchemaMapping& mapping,
-                                      const LanceField& field);
+/// Resolve `field`'s Arrow array within `batch` as a REBASED, BORROWED view.
+///
+/// `out` is a shallow copy whose `offset`/`length` already account for every enclosing array's own
+/// slice, so it can be read with the ordinary `array.offset + row` arithmetic. Arrow does not slice
+/// a struct's children when the struct is sliced -- the parent carries the offset and the children
+/// keep their full extent -- so using a child pointer directly returns the wrong rows and the wrong
+/// count for any sliced batch, which `Table.to_batches()` produces by default.
+///
+/// The view borrows the batch's buffers and children and must NOT be released; its `release` is
+/// blanked so an accidental release fails loudly. Returns false when the field has no array.
+bool resolve_field_array(const ArrowArray& batch, const LanceSchemaMapping& mapping,
+                         const LanceField& field, ArrowArray& out);
 
 bool append_batch_column_values(const ArrowArray& batch,
                                 const LanceSchemaMapping& mapping,

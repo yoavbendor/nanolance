@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace nano_lance {
@@ -20,6 +21,9 @@ constexpr const char* kArrowExtensionNameKey = "ARROW:extension:name";
 struct ParsedFormat {
     std::string logical_type;
     bool supported = false;
+    /// Set when the format is understood but deliberately refused, so the caller can report WHY
+    /// instead of the generic "unsupported Arrow C format".
+    std::string rejection;
 };
 
 bool starts_with(std::string_view value, std::string_view prefix) {
@@ -86,6 +90,12 @@ ParsedFormat parse_format(const char* format) {
         out.supported = true;
         return out;
     }
+    // Lance's own name for a 16-bit float, read back out of a pylance manifest -- not "float16".
+    if (std::strcmp(format, "e") == 0) {
+        out.logical_type = "halffloat";
+        out.supported = true;
+        return out;
+    }
     if (std::strcmp(format, "b") == 0) {
         out.logical_type = "bool";
         out.supported = true;
@@ -116,6 +126,109 @@ ParsedFormat parse_format(const char* format) {
         out.supported = true;
         return out;
     }
+    // Lists and maps: logical-only fields like a struct, whose data lives in the leaf columns under
+    // them with repetition levels (see docs/NESTED_COLUMNS.md). A map is a list of (key, value)
+    // entry structs, and Lance names it so.
+    if (std::strcmp(format, "+l") == 0 || std::strcmp(format, "+L") == 0 || std::strcmp(format, "+m") == 0) {
+        out.logical_type = format[1] == 'm' ? "map" : format[1] == 'L' ? "large_list" : "list";
+        out.supported = true;
+        return out;
+    }
+    // ── Temporal and decimal types ───────────────────────────────────────────────────────────────
+    //
+    // All of these are plain fixed-width integers on the wire, so no encoder work is involved: the
+    // only reason they were rejected is that nothing mapped their Arrow format strings. The Lance
+    // logical-type names below are not invented -- each was read back out of a manifest written by
+    // pylance 12.0.0, so a column nanolance writes is described exactly as stock Lance describes its
+    // own. They carry every parameter (unit, timezone, precision, scale), which is why they are used
+    // verbatim as the internal logical type too: no lossy translation table to keep in step.
+    //
+    // Arrow C format reference: timestamp "ts{s,m,u,n}:<tz>", date "tdD"/"tdm",
+    // time "tts"/"ttm"/"ttu"/"ttn", decimal "d:<precision>,<scale>[,<bits>]".
+    if (starts_with(format, "ts") && std::strlen(format) >= 4U && format[3] == ':') {
+        const char* unit = nullptr;
+        switch (format[2]) {
+            case 's': unit = "s"; break;
+            case 'm': unit = "ms"; break;
+            case 'u': unit = "us"; break;
+            case 'n': unit = "ns"; break;
+            default: break;
+        }
+        if (unit != nullptr) {
+            const std::string tz(format + 4);
+            // Lance only understands IANA zone NAMES ("UTC", "Europe/Berlin"). Given an offset form
+            // like "+05:30" its schema layer raises "Unsupported timestamp type" -- and pylance
+            // surfaces that as a Rust panic, on read AND on write, so it cannot produce such a file
+            // either. Refuse here rather than emit one no reference reader will open.
+            if (!tz.empty() && (tz[0] == '+' || tz[0] == '-')) {
+                out.rejection =
+                    "timestamp timezone '" + tz +
+                    "' is a UTC offset; Lance supports only IANA zone names (e.g. \"UTC\", "
+                    "\"Europe/Berlin\") and panics on offsets. Convert the column to a named zone "
+                    "or to a naive timestamp first.";
+                return out;
+            }
+            // Lance spells "no timezone" as "-", never as an empty field.
+            out.logical_type = std::string("timestamp:") + unit + ":" + (tz.empty() ? "-" : tz);
+            out.supported = true;
+            return out;
+        }
+    }
+    // duration: "tD{s,m,u,n}", an int64 on the wire. Lance spells it "duration:<unit>".
+    if (starts_with(format, "tD") && std::strlen(format) == 3U) {
+        const char* unit = format[2] == 's'   ? "s"
+                           : format[2] == 'm' ? "ms"
+                           : format[2] == 'u' ? "us"
+                           : format[2] == 'n' ? "ns"
+                                              : nullptr;
+        if (unit != nullptr) {
+            out.logical_type = std::string("duration:") + unit;
+            out.supported = true;
+            return out;
+        }
+    }
+    if (std::strcmp(format, "tdD") == 0) {
+        out.logical_type = "date32:day";
+        out.supported = true;
+        return out;
+    }
+    if (std::strcmp(format, "tdm") == 0) {
+        out.logical_type = "date64:ms";
+        out.supported = true;
+        return out;
+    }
+    if (std::strcmp(format, "tts") == 0 || std::strcmp(format, "ttm") == 0) {
+        out.logical_type = std::string("time32:") + (format[2] == 's' ? "s" : "ms");
+        out.supported = true;
+        return out;
+    }
+    if (std::strcmp(format, "ttu") == 0 || std::strcmp(format, "ttn") == 0) {
+        out.logical_type = std::string("time64:") + (format[2] == 'u' ? "us" : "ns");
+        out.supported = true;
+        return out;
+    }
+    if (starts_with(format, "d:")) {
+        // "d:precision,scale" is 128-bit; "d:precision,scale,bits" names the width explicitly.
+        const std::string spec(format + 2);
+        const auto comma = spec.find(',');
+        if (comma != std::string::npos) {
+            const auto precision = spec.substr(0, comma);
+            auto rest = spec.substr(comma + 1U);
+            std::string bits = "128";
+            const auto second = rest.find(',');
+            if (second != std::string::npos) {
+                bits = rest.substr(second + 1U);
+                rest = rest.substr(0, second);
+            }
+            if (!precision.empty() && !rest.empty() && (bits == "128" || bits == "256")) {
+                out.logical_type = "decimal:" + bits + ":" + precision + ":" + rest;
+                out.supported = true;
+                return out;
+            }
+        }
+        return out;  // unsupported decimal width, or a malformed spec: refuse rather than guess
+    }
+
     if (starts_with(format, "w:")) {
         // Carry the byte width through (Lance's own logical type is "fixed_size_binary:<N>"), so it can
         // be recovered from the manifest on read.
@@ -174,11 +287,42 @@ void copy_metadata(const ArrowSchema& schema, std::map<std::string, std::string>
     }
 }
 
+/// Arrow fixed_size_list ("+w:N") -> Lance "fixed_size_list:<element>:<N>". Lance stores it as ONE
+/// physical column of N-element rows and keeps no child field in its schema, so the element type
+/// travels inside the logical type string. Only a fixed-width numeric/temporal element is accepted:
+/// a variable-width, boolean, nested or null element would each need a different page shape.
+ParsedFormat parse_fixed_size_list(const ArrowSchema& field) {
+    ParsedFormat out;
+    const char* format = field.format == nullptr ? "" : field.format;
+    std::uint64_t items = 0;
+    for (const char* c = format + 3; *c != '\0'; ++c) {
+        if (*c < '0' || *c > '9' || items > (1ULL << 31U)) {
+            out.rejection = "malformed fixed_size_list format";
+            return out;
+        }
+        items = items * 10U + static_cast<std::uint64_t>(*c - '0');
+    }
+    if (items == 0U || field.n_children != 1 || field.children == nullptr || field.children[0] == nullptr) {
+        out.rejection = "a fixed_size_list needs one child and a non-zero size";
+        return out;
+    }
+    const auto element = parse_format(field.children[0]->format);
+    if (!element.supported || element.logical_type == "struct" || element.logical_type == "bool" ||
+        element.logical_type == "null" || lance_field_is_variable_width(element.logical_type)) {
+        out.rejection = std::string("fixed_size_list of '") +
+                        (field.children[0]->format == nullptr ? "?" : field.children[0]->format) +
+                        "' is not supported; the element must be a fixed-width number, decimal or temporal type";
+        return out;
+    }
+    out.logical_type = "fixed_size_list:" + element.logical_type + ":" + std::to_string(items);
+    out.supported = true;
+    return out;
+}
+
 bool map_field(const ArrowSchema& field,
                std::int32_t parent_id,
                std::int32_t& next_id,
                std::int32_t& next_column,
-               bool ignore_nullability,
                LanceSchemaMapping& mapping,
                std::string& error);
 
@@ -186,8 +330,7 @@ bool map_struct_children(const ArrowSchema& field,
                          std::int32_t parent_id,
                          std::int32_t& next_id,
                          std::int32_t& next_column,
-                         bool ignore_nullability,
-                         LanceSchemaMapping& mapping,
+                                   LanceSchemaMapping& mapping,
                          std::string& error) {
     if (field.n_children <= 0 || field.children == nullptr) {
         error = "struct field has no children: ";
@@ -199,7 +342,7 @@ bool map_struct_children(const ArrowSchema& field,
             error = "struct field has null child";
             return false;
         }
-        if (!map_field(*field.children[i], parent_id, next_id, next_column, ignore_nullability, mapping, error)) {
+        if (!map_field(*field.children[i], parent_id, next_id, next_column, mapping, error)) {
             return false;
         }
     }
@@ -210,29 +353,74 @@ bool map_field(const ArrowSchema& field,
                std::int32_t parent_id,
                std::int32_t& next_id,
                std::int32_t& next_column,
-               bool ignore_nullability,
                LanceSchemaMapping& mapping,
                std::string& error) {
     const char* format = field.format == nullptr ? "" : field.format;
-    const auto parsed = parse_format(format);
+    auto parsed = parse_format(format);
+    if (starts_with(format, "+w:")) {
+        parsed = parse_fixed_size_list(field);
+    }
     if (!parsed.supported) {
-        error = "unsupported Arrow C format for field ";
+        error = "column '";
         error += field.name == nullptr ? "<unnamed>" : field.name;
-        error += ": ";
-        error += format;
+        error += "': ";
+        if (!parsed.rejection.empty()) {
+            error += parsed.rejection;
+        } else {
+            error += "unsupported Arrow C format: ";
+            error += format;
+        }
         return false;
     }
-    if (is_nullable(field) && !ignore_nullability) {
-        error = "nullable fields are not supported without --ignore-nullability: ";
-        error += field.name == nullptr ? "<unnamed>" : field.name;
-        return false;
-    }
-
     std::string extension_name;
     read_metadata_key(field, kArrowExtensionNameKey, extension_name);
 
-    const bool is_struct = parsed.logical_type == "struct";
+    const bool is_list = lance_logical_type_is_list(parsed.logical_type);
+    if (is_list && (field.n_children != 1 || field.children == nullptr || field.children[0] == nullptr)) {
+        error = "column '" + std::string(field.name == nullptr ? "<unnamed>" : field.name) +
+                "': a list or map needs exactly one child";
+        return false;
+    }
+    // Lance spells a list of structs "list.struct".
+    if (is_list && parsed.logical_type != "map" && field.children[0]->format != nullptr &&
+        std::strcmp(field.children[0]->format, "+s") == 0) {
+        parsed.logical_type += ".struct";
+    }
+    const bool is_struct = parsed.logical_type == "struct" || is_list;
     const bool is_dictionary = field.dictionary != nullptr;
+
+    // large_utf8 / large_binary produce a file stock Lance rejects as corrupt. nanolance writes the
+    // 64-bit Arrow offsets straight into the miniblock chunk, but Lance v2.2 miniblock pages require
+    // the u32 chunk grammar ("expected 32-bit offsets but got 64-bit offsets"). Lance keeps u32
+    // offsets INSIDE the chunk for large types too and signals the 64-bit Arrow width only in the
+    // page layout's Variable{offsets = Flat{bits}} node -- pylance's string and large_string page
+    // descriptors are byte-identical apart from that one token (0x20 vs 0x40). Supporting these
+    // properly therefore means decoupling the chunk offset width from the declared Arrow width
+    // across every variable-width page path (plain, zstd, dict, dict+RLE, constant); until that
+    // lands, refuse rather than emit a file no reader accepts.
+    //
+    // Scoped to columns that go through the generic variable-width page path. A lance.blob.v2
+    // struct's `data` child is declared large_binary but is encoded by the blob-v2 packed writer,
+    // which never builds a miniblock chunk, so it is unaffected and must keep working.
+    const LanceField* mapped_parent = nullptr;
+    for (const auto& candidate : mapping.fields) {
+        if (parent_id >= 0 && candidate.id == parent_id) {
+            mapped_parent = &candidate;
+            break;
+        }
+    }
+    const bool under_blob_v2 = mapped_parent != nullptr && mapped_parent->extension_name == "lance.blob.v2";
+
+    if (!under_blob_v2 && (parsed.logical_type == "large_utf8" || parsed.logical_type == "large_binary")) {
+        error = "column '";
+        error += field.name == nullptr ? "<unnamed>" : field.name;
+        error += "' has type " + parsed.logical_type +
+                 ", which nanolance cannot write yet (it would emit 64-bit offsets inside a Lance "
+                 "v2.2 miniblock page, which requires the u32 chunk grammar, and stock Lance "
+                 "rejects the result as corrupt). Use utf8 / binary instead (pyarrow: "
+                 "col.cast(pa.string()) / col.cast(pa.binary())).";
+        return false;
+    }
 
     LanceField out;
     out.name = field.name == nullptr ? "" : field.name;
@@ -240,19 +428,32 @@ bool map_field(const ArrowSchema& field,
     out.arrow_format = format;
     out.id = next_id++;
     out.parent_id = parent_id;
-    out.nullable = false;
+    // Mirrors the Arrow schema's flag, which is what pylance writes too (it marks a field nullable
+    // even when the column happens to contain no nulls). Writing false unconditionally used to be
+    // harmless only because nulls were refused outright; now that they are stored, a column with
+    // nulls under a field declared non-nullable makes stock Lance reject the file with "Found
+    // unmasked nulls for non-nullable StructArray".
+    out.nullable = is_nullable(field);
     out.extension_name = extension_name;
     copy_metadata(field, out.metadata);
 
+    // An Arrow dictionary column used to be written as a bare index column with the dictionary
+    // VALUES stored nowhere at all: pa.array(["a","b","a"]).dictionary_encode() became an int32
+    // column reading back [0, 1, 0], with no record of what 0 and 1 meant. Nothing downstream could
+    // detect the loss -- the file is a perfectly valid int32 column to every reader. Refuse it.
+    //
+    // The remedy costs nothing on disk: nanolance already dictionary-encodes low-cardinality string
+    // columns on its own (structural dict / dict+RLE, on by default), so casting to plain utf8 gives
+    // the same file size without the Arrow-level dictionary.
     if (is_dictionary) {
-        const auto value_parsed = parse_format(field.dictionary->format);
-        if (!value_parsed.supported) {
-            error = "unsupported dictionary value format for field ";
-            error += out.name;
-            return false;
-        }
-        out.is_dictionary_index = true;
-        out.dictionary_value_logical_type = value_parsed.logical_type;
+        error = "dictionary-encoded column '";
+        error += out.name;
+        error +=
+            "' is not supported: nanolance would store only the integer indices and discard the "
+            "dictionary values. Cast it to its value type first (pyarrow: "
+            "col.cast(pa.string()), or table.cast(...)); nanolance dictionary-encodes "
+            "low-cardinality string columns on disk by itself, so the file stays the same size.";
+        return false;
     }
 
     if (is_struct || !extension_name.empty()) {
@@ -264,7 +465,7 @@ bool map_field(const ArrowSchema& field,
     mapping.fields.push_back(out);
 
     if (is_struct) {
-        return map_struct_children(field, out.id, next_id, next_column, ignore_nullability, mapping, error);
+        return map_struct_children(field, out.id, next_id, next_column, mapping, error);
     }
     return true;
 }
@@ -313,7 +514,8 @@ std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& m
     return out;
 }
 
-bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error, bool ignore_nullability) {
+bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
+                      bool /*ignore_nullability*/) {
     mapping.fields.clear();
     error.clear();
 
@@ -326,14 +528,14 @@ bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, st
                 error = "schema has null child";
                 return false;
             }
-            if (!map_field(*schema.children[i], -1, next_id, next_column, ignore_nullability, mapping, error)) {
+            if (!map_field(*schema.children[i], -1, next_id, next_column, mapping, error)) {
                 return false;
             }
         }
         return true;
     }
 
-    return map_field(schema, -1, next_id, next_column, ignore_nullability, mapping, error);
+    return map_field(schema, -1, next_id, next_column, mapping, error);
 }
 
 bool schema_mappings_equal(const LanceSchemaMapping& left, const LanceSchemaMapping& right) {
@@ -391,6 +593,9 @@ std::string disk_logical_type_to_internal(const std::string& disk) {
     if (disk == "string") {
         return "utf8";
     }
+    if (disk == "large_string") {
+        return "large_utf8";
+    }
     return disk;
 }
 
@@ -439,6 +644,26 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
         arrow_format = "g";
         return true;
     }
+    if (logical_type == "halffloat") {
+        arrow_format = "e";
+        return true;
+    }
+    // fixed_size_list:<element>:<N> -> "+w:N". The element's own format is attached as the child
+    // when the Arrow schema is built; here it only has to be one this reader can produce.
+    {
+        std::string element;
+        std::uint64_t items = 0;
+        if (lance_fixed_size_list_parts(logical_type, element, items)) {
+            std::string element_format;
+            if (lance_field_is_variable_width(element) || element == "bool" ||
+                !infer_arrow_format_from_internal(element, element_format, error)) {
+                error = "unsupported fixed_size_list element type in logical type: " + logical_type;
+                return false;
+            }
+            arrow_format = "+w:" + std::to_string(items);
+            return true;
+        }
+    }
     if (logical_type == "bool") {
         arrow_format = "b";
         return true;
@@ -463,6 +688,82 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
         arrow_format = "+s";
         return true;
     }
+    // A list's element type is its child field's; Lance's schema has one, unlike fixed_size_list.
+    if (logical_type == "map") {
+        arrow_format = "+m";
+        return true;
+    }
+    if (lance_logical_type_is_list(logical_type)) {
+        arrow_format = lance_logical_type_is_large_list(logical_type) ? "+L" : "+l";
+        return true;
+    }
+    // Inverse of the temporal/decimal mapping in parse_format. Reconstructed from the Lance logical
+    // type alone, which carries every parameter, so a column read back from a manifest gets its unit,
+    // timezone, precision and scale -- not just its storage width.
+    if (logical_type.rfind("timestamp:", 0) == 0) {
+        const std::string rest = logical_type.substr(std::strlen("timestamp:"));
+        const auto colon = rest.find(':');
+        if (colon == std::string::npos) {
+            error = "malformed timestamp logical type: " + logical_type;
+            return false;
+        }
+        const auto unit = rest.substr(0, colon);
+        const auto tz = rest.substr(colon + 1U);
+        const char* code = unit == "s" ? "s" : unit == "ms" ? "m" : unit == "us" ? "u" : unit == "ns" ? "n" : nullptr;
+        if (code == nullptr) {
+            error = "unsupported timestamp unit in logical type: " + logical_type;
+            return false;
+        }
+        // Lance's "-" means no timezone; Arrow spells that as an empty field after the colon.
+        arrow_format = std::string("ts") + code + ":" + (tz == "-" ? "" : tz);
+        return true;
+    }
+    if (logical_type.rfind("duration:", 0) == 0) {
+        const auto unit = logical_type.substr(std::strlen("duration:"));
+        const char* code = unit == "s" ? "s" : unit == "ms" ? "m" : unit == "us" ? "u" : unit == "ns" ? "n" : nullptr;
+        if (code == nullptr) {
+            error = "unsupported duration unit in logical type: " + logical_type;
+            return false;
+        }
+        arrow_format = std::string("tD") + code;
+        return true;
+    }
+    if (logical_type == "date32:day") {
+        arrow_format = "tdD";
+        return true;
+    }
+    if (logical_type == "date64:ms") {
+        arrow_format = "tdm";
+        return true;
+    }
+    if (logical_type == "time32:s" || logical_type == "time32:ms") {
+        arrow_format = logical_type == "time32:s" ? "tts" : "ttm";
+        return true;
+    }
+    if (logical_type == "time64:us" || logical_type == "time64:ns") {
+        arrow_format = logical_type == "time64:us" ? "ttu" : "ttn";
+        return true;
+    }
+    if (logical_type.rfind("decimal:", 0) == 0) {
+        // decimal:<bits>:<precision>:<scale> -> Arrow "d:<precision>,<scale>[,256]"
+        const std::string rest = logical_type.substr(std::strlen("decimal:"));
+        const auto first = rest.find(':');
+        const auto second = first == std::string::npos ? std::string::npos : rest.find(':', first + 1U);
+        if (second == std::string::npos) {
+            error = "malformed decimal logical type: " + logical_type;
+            return false;
+        }
+        const auto bits = rest.substr(0, first);
+        const auto precision = rest.substr(first + 1U, second - first - 1U);
+        const auto scale = rest.substr(second + 1U);
+        if (bits != "128" && bits != "256") {
+            error = "unsupported decimal width in logical type: " + logical_type;
+            return false;
+        }
+        arrow_format = "d:" + precision + "," + scale + (bits == "256" ? ",256" : "");
+        return true;
+    }
+
     if (logical_type.rfind("fixed_size_binary:", 0) == 0) {
         arrow_format = "w:" + logical_type.substr(std::strlen("fixed_size_binary:"));
         return true;
@@ -475,13 +776,36 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
     return false;
 }
 
-const pb::DataFile* pick_latest_data_file(const pb::Manifest& manifest) {
+/// Which fields the newest fragment materializes, and at what column index within its own file.
+///
+/// A fragment's columns can be split across SEVERAL data files -- `add_columns` puts the computed
+/// column in a file of its own beside the original -- so every file of that fragment has to be
+/// consulted. Reading only `files[0]` marked every later file's fields as unmaterialized
+/// (column_index -1), and the reader then quietly dropped them from the batch.
+///
+/// The index recorded here is only used as "is this field materialized at all?". Which column of
+/// which file actually holds it is resolved per file when the fragment is read.
+bool latest_fragment_column_indices(const pb::Manifest& manifest,
+                                    std::unordered_map<std::int32_t, std::int32_t>& out,
+                                    std::string& error) {
+    out.clear();
     for (auto it = manifest.fragments.rbegin(); it != manifest.fragments.rend(); ++it) {
-        if (!it->files.empty()) {
-            return &it->files[0];
+        if (it->files.empty()) {
+            continue;
         }
+        for (const auto& file : it->files) {
+            if (file.fields.size() != file.column_indices.size()) {
+                error = "manifest data file field id / column index length mismatch";
+                return false;
+            }
+            for (std::size_t i = 0; i < file.fields.size(); ++i) {
+                out.emplace(file.fields[i], file.column_indices[i]);
+            }
+        }
+        return true;
     }
-    return nullptr;
+    error = "manifest has no data files";
+    return false;
 }
 
 bool dematerialize_blob_v2_for_arrow_append(LanceSchemaMapping& mapping, std::string& error) {
@@ -541,24 +865,40 @@ bool dematerialize_blob_v2_for_arrow_append(LanceSchemaMapping& mapping, std::st
     return true;
 }
 
+/// Promote to the root any field whose `parent_id` names a field that is not in the schema.
+///
+/// The read side has to infer an absent `parent_id` as 0 (proto3 omits the zero), which is right for
+/// every schema Lance writes -- it numbers fields from 0 up and marks roots with an explicit -1. It
+/// would be wrong for a schema with NO field 0, which `drop_columns` can produce: there the inferred
+/// parent names nothing, and the field would be neither a root nor anybody's child, so it would drop
+/// out of the output silently. A column that cannot be placed in the tree belongs at the top, where
+/// it is at least visible.
+void reroot_orphaned_fields(LanceSchemaMapping& mapping) {
+    std::unordered_set<std::int32_t> ids;
+    ids.reserve(mapping.fields.size());
+    for (const auto& f : mapping.fields) {
+        ids.insert(f.id);
+    }
+    for (auto& f : mapping.fields) {
+        if (f.parent_id >= 0 && ids.count(f.parent_id) == 0U) {
+            f.parent_id = -1;
+        }
+    }
+}
+
 }  // namespace
+
+bool lance_arrow_format_for_logical_type(const std::string& logical_type, std::string& arrow_format,
+                                         std::string& error) {
+    return infer_arrow_format_from_internal(disk_logical_type_to_internal(logical_type), arrow_format, error);
+}
 
 bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchemaMapping& out, std::string& error) {
     out.fields.clear();
     error.clear();
-    const auto* data_file = pick_latest_data_file(manifest);
-    if (data_file == nullptr) {
-        error = "manifest has no data files";
-        return false;
-    }
-    if (data_file->fields.size() != data_file->column_indices.size()) {
-        error = "manifest data file field id / column index length mismatch";
-        return false;
-    }
     std::unordered_map<std::int32_t, std::int32_t> id_to_column;
-    id_to_column.reserve(data_file->fields.size());
-    for (std::size_t i = 0; i < data_file->fields.size(); ++i) {
-        id_to_column.emplace(data_file->fields[i], data_file->column_indices[i]);
+    if (!latest_fragment_column_indices(manifest, id_to_column, error)) {
+        return false;
     }
 
     for (const auto& pf : manifest.fields) {
@@ -586,6 +926,7 @@ bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchem
         lf.column_index = col_it != id_to_column.end() ? col_it->second : -1;
         out.fields.push_back(std::move(lf));
     }
+    reroot_orphaned_fields(out);
     if (!dematerialize_blob_v2_for_arrow_append(out, error)) {
         return false;
     }

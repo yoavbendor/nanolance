@@ -70,6 +70,8 @@ nav:
       - Overview: bench.md
       - Write/read vs Parquet & Rust lance: bench-write-read.md
       - Safety-parity (trusted vs default): bench-trusted-parity.md
+  - Roadmap & review: OPTIMIZATION_PLAN.md
+  - Implementation progress: PROGRESS.md
   - Internals:
       - S3 reader notes: s3_reader_notes.md
       - Disk LRU block cache: disk-lru-block-cache.md

@@ -10,9 +10,21 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Union
+from typing import Optional, Sequence, Union
 
 from nanolance import _nanolance
+
+# The installed distribution's version, so `nanolance.__version__` answers the first question anyone
+# asks a wheel. Read from the package metadata rather than duplicated here: pyproject.toml already
+# has to stay in step with NANOLANCE_VERSION_* in the top-level CMakeLists.txt, and a third copy
+# would be a third thing to forget. "0+unknown" is what you get running from a source tree that was
+# never installed.
+try:  # pragma: no cover - trivial, and the fallback only fires outside an install
+    from importlib.metadata import PackageNotFoundError, version as _dist_version
+
+    __version__ = _dist_version("nanolance")
+except (ImportError, PackageNotFoundError):  # pragma: no cover
+    __version__ = "0+unknown"
 
 
 @dataclass
@@ -23,6 +35,10 @@ class WriteOptions:
     # dictionary+RLE). On by default and independent of ``compression`` (which controls only zstd).
     structural_encoding: bool = True
     blob_uri_dictionary: bool = False
+    # Deprecated no-op, kept so existing keyword arguments still work. Nullable-flagged fields are
+    # accepted unconditionally now, and a null VALUE is stored rather than refused -- nanolance writes
+    # Lance's definition-level layer. The few nulls that are still refused (a null struct, a null in a
+    # lance.blob.v2 column) are refused either way, naming the column and row.
     ignore_nullability: bool = True
     append: bool = False
 
@@ -143,15 +159,164 @@ class LanceWriter:
         return self._writer.__exit__(exc_type, exc, tb)
 
 
-def read_table(path: Union[str, os.PathLike]):
-    """Read a nanolance-written Lance dataset.
+def _normalize_columns(columns: Optional[Sequence[str]]) -> Optional[list]:
+    """Validate a `columns=` argument once, for every entry point that takes one."""
+    if columns is None:
+        return None
+    # A bare string is the trap: `str` IS a Sequence[str] -- of its own characters -- so "abc" would
+    # quietly become ["a", "b", "c"] and then fail as three unknown columns.
+    if isinstance(columns, str):
+        raise TypeError("columns must be a sequence of column names, not a single string")
+    names = [str(name) for name in columns]
+    if not names:
+        raise ValueError("columns must name at least one column; pass columns=None to read them all")
+    return names
+
+
+def _normalize_range(offset: int, length: Optional[int]) -> tuple:
+    """Validate a row range once, for every entry point that takes one.
+
+    ``length=None`` means "to the end", which the native layer spells as a negative length. A
+    negative ``offset`` or ``length`` is refused rather than reinterpreted: ``[-10:]`` semantics
+    would need the row count, and silently reading the wrong rows is the failure this whole feature
+    has to avoid.
+    """
+    offset = int(offset)
+    if offset < 0:
+        raise ValueError("offset must not be negative")
+    if length is None:
+        return offset, -1
+    length = int(length)
+    if length < 0:
+        raise ValueError("length must not be negative; pass length=None to read to the end")
+    return offset, length
+
+
+def read_table(
+    path: Union[str, os.PathLike],
+    columns: Optional[Sequence[str]] = None,
+    *,
+    offset: int = 0,
+    length: Optional[int] = None,
+):
+    """Read a Lance dataset.
 
     Returns an Arrow-exportable handle. Pass to ``pyarrow.table()`` or
     ``polars.from_arrow()`` for a zero-copy view. The handle exports an Arrow C
     stream that yields one batch per fragment, so a reader can consume it chunk
     by chunk (e.g. ``for batch in pa.RecordBatchReader.from_stream(handle): ...``).
+
+    ``columns`` names the top-level columns to read, the same way
+    ``pyarrow.parquet.read_table(..., columns=[...])`` does::
+
+        nanolance.read_table("events.lance", columns=["ts", "level"])
+
+    This is a real projection, not a post-filter: the columns you do not ask for
+    are skipped during decode rather than decoded and thrown away. Column
+    materialization is where a read spends its time, so on a wide table read for
+    a few columns that skipped work IS the cost. Naming a column that does not
+    exist is an error, not a silently empty result, and so is an empty list --
+    pass ``columns=None`` to read everything.
+
+    One difference from ``pyarrow.parquet``: the result is in the dataset's own
+    column order, not the order you listed. ``columns=["c", "a"]`` gives back
+    ``["a", "c"]``. Reorder afterwards (``table.select([...])``) if it matters.
+
+    ``offset``/``length`` read a row range, spelled like :meth:`pyarrow.Table.slice`::
+
+        nanolance.read_table("events.lance", offset=1_000_000, length=1_000)
+
+    The rows you get back are exactly the rows you asked for. What it *saves* is
+    more specific: fragments the range does not touch are never opened, so the
+    I/O avoided is proportional to the fragments skipped, not to the rows
+    dropped. A range inside one fragment still decodes that whole fragment, and
+    a single-fragment dataset saves nothing -- write with
+    ``max_rows_per_fragment`` if you intend to read ranges.
+
+    ``length=None`` reads to the end. A range running past the end is clamped;
+    an ``offset`` past the end is an error, since it nearly always means the
+    caller's arithmetic is wrong.
     """
-    return _nanolance.read_table(Path(path))
+    start, count = _normalize_range(offset, length)
+    return _nanolance.read_table(Path(path), _normalize_columns(columns), start, count)
 
 
-__all__ = ["write_table", "read_table", "WriteOptions", "LanceWriter"]
+def open_stream(
+    path: Union[str, os.PathLike],
+    columns: Optional[Sequence[str]] = None,
+    *,
+    offset: int = 0,
+    length: Optional[int] = None,
+):
+    """Open a Lance dataset as a *streaming* Arrow handle.
+
+    Same decode as :func:`read_table`, but one batch per fragment decoded when the
+    consumer asks for it, instead of every batch before you get anything::
+
+        import pyarrow as pa
+
+        reader = pa.RecordBatchReader.from_stream(nanolance.open_stream("big.lance"))
+        for batch in reader:
+            ...  # peak memory tracks ONE fragment, not the dataset
+
+    Measured on a 61 MiB dataset in 16 fragments: peak 5.6 MiB streamed vs
+    61.4 MiB materialized, and 3.2 ms to the first batch vs 66.5 ms. That is
+    what makes a larger-than-memory dataset readable.
+
+    Two differences from :func:`read_table`, both inherent to streaming rather
+    than incidental:
+
+    * **Errors surface late.** Opening validates the manifest and the schema;
+      a corrupt *data file* is only discovered when the batch containing it is
+      pulled. ``read_table`` reports it at call time because it decodes
+      everything there. The exception also comes from the consumer (pyarrow
+      raises ``OSError``) rather than from nanolance.
+    * **The handle is single-shot.** A stream is consumed, not copied, so
+      exporting it twice raises. Call ``open_stream`` again for a second pass.
+
+    ``columns``, ``offset`` and ``length`` behave exactly as they do for
+    :func:`read_table` -- including that a row range skips whole fragments
+    rather than saving work inside one.
+    """
+    start, count = _normalize_range(offset, length)
+    return _nanolance.open_stream(Path(path), _normalize_columns(columns), start, count)
+
+
+def read_schema(path: Union[str, os.PathLike]):
+    """The dataset's Arrow schema, without reading a single row.
+
+    Only the manifest is opened, so this stays cheap however large the dataset
+    is -- it is the "what is in here?" call that should not cost a decode::
+
+        import pyarrow as pa
+
+        schema = pa.schema(nanolance.read_schema("events.lance"))
+        print(schema.names)
+
+    The returned handle exports ``__arrow_c_schema__``, and unlike
+    :func:`open_stream` it is *not* single-shot: a schema is copyable, so it can
+    be exported as many times as you like.
+    """
+    return _nanolance.read_schema(Path(path))
+
+
+def count_rows(path: Union[str, os.PathLike]) -> int:
+    """The dataset's row count, without reading a single row.
+
+    Summed from the manifest's fragment records, so the cost is O(fragments)
+    rather than O(rows) -- ``pq.ParquetFile(p).metadata.num_rows`` is the
+    equivalent you are probably replacing.
+    """
+    return int(_nanolance.count_rows(Path(path)))
+
+
+__all__ = [
+    "write_table",
+    "read_table",
+    "open_stream",
+    "read_schema",
+    "count_rows",
+    "WriteOptions",
+    "LanceWriter",
+    "__version__",
+]

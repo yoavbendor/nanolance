@@ -8,13 +8,17 @@
 #include "nanolance/bool_bitpack.hpp"
 #include "nanolance/byte_stream_split.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
+#include "nanolance/repdef.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <zstd.h>
 
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -59,22 +63,15 @@ void align64(std::ostream& out) {
 }
 
 std::uint32_t bits_per_value(const LanceField& field) {
+    // bool is the one type whose on-disk width is not a whole number of bytes: 1 bit per value,
+    // LSB-first, matching stock Lance. Everything else derives from the single shared width table --
+    // this used to be a second copy of it that fell through to 64 bits for anything it did not
+    // recognize, which silently gave every temporal type 8 bytes and every decimal 8 instead of
+    // 16/32, and surfaced as "column value buffer size is not aligned to field width".
     if (field.logical_type == "bool") {
         return 1;
     }
-    if (field.logical_type == "int8" || field.logical_type == "uint8") {
-        return 8;
-    }
-    if (field.logical_type == "int16" || field.logical_type == "uint16") {
-        return 16;
-    }
-    if (field.logical_type == "int32" || field.logical_type == "uint32" || field.logical_type == "float") {
-        return 32;
-    }
-    if (field.logical_type.rfind("fixed_size_binary:", 0) == 0) {
-        return static_cast<std::uint32_t>(lance_logical_type_value_bytes(field.logical_type) * 8U);
-    }
-    return 64;
+    return static_cast<std::uint32_t>(lance_logical_type_value_bytes(field.logical_type) * 8U);
 }
 
 std::size_t value_width_bytes(const LanceField& field) {
@@ -101,6 +98,8 @@ constexpr std::size_t kMaxBoolValuesPerChunk = static_cast<std::size_t>(kMaxUnco
 struct MiniblockChunk {
     std::vector<std::uint8_t> bytes;
     std::size_t value_count = 0;
+    /// FastLanes-packed definition levels for this chunk, when the column has nulls. Empty otherwise.
+    std::vector<std::uint8_t> repdef;
 };
 
 void append_varint(std::vector<std::uint8_t>& out, std::uint64_t value) {
@@ -121,39 +120,90 @@ void write_string_field(std::vector<std::uint8_t>& out, std::uint32_t field_numb
     write_length_delimited(out, field_number, std::vector<std::uint8_t>(value.begin(), value.end()));
 }
 
-std::uint8_t flat_bits_per_value_token(const LanceField& field) {
-    const auto bits = bits_per_value(field);
-    if (bits == 64U) {
-        return 0x40U;
-    }
-    if (bits == 8U) {
-        return 0x08U;
-    }
-    if (bits == 1U) {
-        return 0x01U;
-    }
-    return 0x20U;
+/// Declared bits per value for a flat page. This is what tells every reader how wide each value is,
+/// so it must be the REAL width, not a nearby one.
+///
+/// It used to snap anything it did not recognize to 32, which silently mis-declared two types the
+/// library already claimed to support: a 16-bit column was written as 32 bits (stock Lance panicked
+/// with "range end index 12 out of range for slice of length 6"), and fixed_size_binary(N) for any N
+/// but 4 likewise -- including the 6-byte MAC address README.md recommends the type for. With the
+/// default structural encodings an integer column escapes through InlineBitpacking, which declares
+/// its own width, so int16 happened to survive; fixed_size_binary is not bitpackable and did not.
+std::uint32_t flat_bits_per_value(const LanceField& field) {
+    return bits_per_value(field);
 }
 
-std::vector<std::uint8_t> build_mini_block_layout(std::uint8_t bits_token, std::uint64_t num_items) {
+/// MiniBlockLayout for a flat page:
+///   f3 value_compression = CompressiveEncoding{ f1 Flat{ f1 bits_per_value } }
+///   f6 layers = 1, f7 num_buffers = 1, f9 num_items, f10 has_large_chunk = 1
+///
+/// Lengths are computed rather than hardcoded: `bits_per_value` is a varint, so a width of 128 or
+/// 256 (decimal128 / decimal256) is two bytes, and the nested message lengths in front of it shift
+/// accordingly. The previous hand-written byte string baked in a one-byte width.
+std::vector<std::uint8_t> repdef_encoding_bytes();
+
+/// The MiniBlockLayout tail shared by every shape: f6 layers, f7 num_buffers, f9 num_items,
+/// f10 has_large_chunk. `nullable` switches layers from [1] to [3], which is how Lance announces a
+/// definition-level layer.
+std::vector<std::uint8_t> mini_block_tail(std::uint64_t num_items, std::uint8_t num_buffers, bool nullable) {
+    std::vector<std::uint8_t> tail;
+    tail.push_back(0x32U);                           // f6 layers
+    tail.push_back(0x01U);
+    tail.push_back(nullable ? 0x03U : 0x01U);
+    tail.push_back(0x38U);                           // f7 num_buffers
+    tail.push_back(num_buffers);
+    tail.push_back(0x48U);                           // f9 num_items
+    append_varint(tail, num_items);
+    tail.push_back(0x50U);                           // f10 has_large_chunk
+    tail.push_back(0x01U);
+    return tail;
+}
+
+std::vector<std::uint8_t> build_mini_block_layout(std::uint32_t bits_per_value_token, std::uint64_t num_items,
+                                                  bool nullable = false, std::uint64_t fsl_items = 0) {
+    // A fixed_size_list row is `fsl_items` flat values back to back. Lance describes that as
+    // CompressiveEncoding{ f11 FixedSizeList{ f1 items_per_value, f2 CompressiveEncoding{ f1 Flat } } },
+    // with the ELEMENT's width in the Flat -- the wrapper is what tells a reader it is a list at all.
+    const std::uint64_t flat_bits = fsl_items != 0U ? bits_per_value_token / fsl_items : bits_per_value_token;
+    std::vector<std::uint8_t> flat;                  // Flat{ f1 bits_per_value }
+    flat.push_back(0x08U);
+    append_varint(flat, flat_bits);
+
+    std::vector<std::uint8_t> compressive;           // CompressiveEncoding{ f1 Flat }
+    write_length_delimited(compressive, 1, flat);
+    if (fsl_items != 0U) {
+        std::vector<std::uint8_t> fixed_size_list;   // FixedSizeList{ f1 items, f2 values }
+        fixed_size_list.push_back(0x08U);
+        append_varint(fixed_size_list, fsl_items);
+        write_length_delimited(fixed_size_list, 2, compressive);
+        compressive.clear();
+        write_length_delimited(compressive, 11, fixed_size_list);
+    }
+
     std::vector<std::uint8_t> mini;
-    mini.push_back(0x1aU);
-    mini.push_back(0x04U);
-    mini.push_back(0x0aU);
-    mini.push_back(0x02U);
-    mini.push_back(0x08U);
-    mini.push_back(bits_token);
-    mini.push_back(0x32U);
-    mini.push_back(0x01U);
-    mini.push_back(0x01U);
-    mini.push_back(0x38U);
-    mini.push_back(0x01U);
-    mini.push_back(0x48U);
-    append_varint(mini, num_items);
-    mini.push_back(0x50U);
-    mini.push_back(0x01U);
+    if (nullable) {
+        // f2 (how the definition levels are stored) precedes f3, matching what pylance emits.
+        write_length_delimited(mini, 2, repdef_encoding_bytes());
+    }
+    write_length_delimited(mini, 3, compressive);    // f3 value_compression
+    const auto tail = mini_block_tail(num_items, 1U, nullable);
+    mini.insert(mini.end(), tail.begin(), tail.end());
     return mini;
 }
+
+/// page_layout_bytes for a flat page, with the nullable flag threaded through. `fsl_items` non-zero
+/// wraps the values as a fixed_size_list of that many elements per row.
+std::vector<std::uint8_t> page_layout_bytes_flat(std::uint32_t bits_token, std::uint64_t rows, bool nullable,
+                                                 std::uint64_t fsl_items = 0) {
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, 1, build_mini_block_layout(bits_token, rows, nullable, fsl_items));
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
+void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value);  // defined with the other buffer writers
 
 void append_le16(std::vector<std::uint8_t>& out, std::uint16_t value) {
     out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
@@ -174,63 +224,127 @@ std::size_t max_values_per_uncompressed_chunk(std::size_t bytes_per_value) {
     return std::max<std::size_t>(1U, std::min(by_bytes, by_metadata));
 }
 
-std::vector<std::uint8_t> control_buffer_for(const std::vector<MiniblockChunk>& chunks) {
-    std::vector<std::uint8_t> out;
-    out.reserve(chunks.size() * 2U);
-    for (std::size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
-        const auto& chunk = chunks[chunk_index];
-        const auto words = static_cast<std::uint16_t>((chunk.bytes.size() + 7U) / 8U);
-        std::uint16_t entry = static_cast<std::uint16_t>(words << 4U);
-        const bool is_last = chunk_index + 1U == chunks.size();
-        (void)chunk.value_count;
-        entry |= 0U;
-        append_le16(out, entry);
-    }
-    if (out.size() < 4U) {
-        out.push_back(0U);
-        out.push_back(0U);
-    }
-    return out;
-}
-
-// Chunk-meta (control) buffer for a multi-chunk miniblock page with has_large_chunk=false and one
-// value buffer per chunk (the structural-dictionary index chunks). Each u16 word is
+// Chunk-meta (control) buffer for a multi-chunk miniblock page with one value buffer per chunk (the
+// structural-dictionary index chunks). Each word is
 // (wrapped_bytes/8 - 1) << 4 | log2(num_values), where wrapped_bytes is the chunk's full footprint in
 // the value buffer as written by miniblock_payload (8-byte chunk header + buffer, padded to 8). Lance
 // requires every non-final chunk to carry a nonzero log2 (num_values = 1 << log2, so full chunks must
-// be a power of two) and derives the final chunk's value count from the page's total item count. The
-// shared control_buffer_for() writes log2=0 for every chunk and sizes the raw buffer, which only works
-// for single-chunk pages; multi-chunk pages (a >1024-row dictionary column) need this exact layout to
-// be readable by stock Lance.
+// be a power of two) and derives the final chunk's value count from the page's total item count.
+// The single-chunk control_buffer_for() below cannot serve here: it always writes log2=0, which is
+// correct only because the one chunk it describes is by definition the final one. A multi-chunk page
+// (a >1024-row dictionary column) needs this exact layout to be readable by stock Lance.
+//
+// The words are u32, matching has_large_chunk=1 in the page layout. They used to be u16 with
+// has_large_chunk=0, and stock Lance rejects that outright: v2_2's validate_page_layout refuses ANY
+// miniblock page without the u32 chunk grammar, before it looks at a single byte. Because that check
+// runs over the whole file's page table, one dictionary-encoded column made every OTHER column in the
+// same dataset unreadable by Lance too. The word's own layout is identical either way -- only the
+// width changes -- so nothing else about the page moved.
 std::vector<std::uint8_t> control_buffer_for_index_chunks(const std::vector<MiniblockChunk>& chunks) {
     std::vector<std::uint8_t> out;
-    out.reserve(chunks.size() * 2U);
+    out.reserve(chunks.size() * 4U);
     for (std::size_t i = 0; i < chunks.size(); ++i) {
         const std::size_t wrapped = ((8U + chunks[i].bytes.size()) + 7U) / 8U * 8U;
-        const auto divided_minus_one = static_cast<std::uint16_t>(wrapped / 8U - 1U);
-        std::uint16_t log_num_values = 0U;
+        const auto divided_minus_one = static_cast<std::uint32_t>(wrapped / 8U - 1U);
+        std::uint32_t log_num_values = 0U;
         if (i + 1U < chunks.size()) {
             for (std::size_t v = chunks[i].value_count; v > 1U; v >>= 1U) {
                 ++log_num_values;
             }
         }
-        append_le16(out, static_cast<std::uint16_t>((divided_minus_one << 4U) | (log_num_values & 0x0FU)));
+        append_le32(out, (divided_minus_one << 4U) | (log_num_values & 0x0FU));
     }
     return out;
 }
 
+// A chunk's 8-byte header is four little-endian u16 slots: the number of values the
+// repetition/definition layer covers (0 when there is none), then up to three buffer sizes, with
+// 0xFEFE marking an unused slot. Without levels the chunk holds values only; with them the level
+// buffer comes FIRST and the values follow it.
 void append_miniblock_chunk(std::vector<std::uint8_t>& out, const MiniblockChunk& chunk) {
-    out.push_back(0U);
-    out.push_back(0U);
-    append_le16(out, static_cast<std::uint16_t>(chunk.bytes.size()));
-    out.push_back(0U);
-    out.push_back(0U);
-    out.push_back(0xFEU);
-    out.push_back(0xFEU);
-    out.insert(out.end(), chunk.bytes.begin(), chunk.bytes.end());
+    if (chunk.repdef.empty()) {
+        append_le16(out, 0U);                                                  // no repdef layer
+        append_le16(out, static_cast<std::uint16_t>(chunk.bytes.size()));      // values
+        append_le16(out, 0U);
+        append_le16(out, 0xFEFEU);                                             // unused
+        out.insert(out.end(), chunk.bytes.begin(), chunk.bytes.end());
+    } else {
+        append_le16(out, static_cast<std::uint16_t>(chunk.value_count));       // values the levels cover
+        append_le16(out, static_cast<std::uint16_t>(chunk.repdef.size()));     // definition levels
+        append_le16(out, static_cast<std::uint16_t>(chunk.bytes.size()));      // values
+        append_le16(out, 0U);
+        out.insert(out.end(), chunk.repdef.begin(), chunk.repdef.end());
+        // Every buffer is padded to 8 bytes after it is written, the header recording the UNPADDED
+        // length. Invisible while a level buffer was always a 128-byte packed block; a short chunk's
+        // raw levels can be any even size, and stock Lance then read the values from the wrong offset
+        // ("Inline bitpacking width 67108864 exceeds 64-bit values").
+        while (out.size() % 8U != 0U) {
+            out.push_back(0U);
+        }
+        out.insert(out.end(), chunk.bytes.begin(), chunk.bytes.end());
+    }
     while (out.size() % 8U != 0U) {
         out.push_back(0U);
     }
+}
+
+/// Pack `count` definition levels for the rows starting at `first_row` of `validity` into one
+/// FastLanes block at 1 bit per level.
+///
+/// Lance stores a level per value where **1 means NULL** -- the inverse of Arrow's validity bit --
+/// and packs them with the same FastLanes kernel integer columns use. Rows past `count` in the block
+/// are padded with 0 (valid); the chunk header states the real count, so they are never read back.
+std::vector<std::uint8_t> pack_definition_levels(const std::vector<std::uint8_t>& validity,
+                                                 std::uint64_t first_row, std::size_t count) {
+    // One FastLanes block is exactly 1024 values, so a chunk carrying levels must not exceed it.
+    // Callers cap their chunk size (see kMaxValuesPerNullableChunk); this is the backstop, because
+    // getting it wrong overruns `levels` below -- which it did, as a stack smash, when the flat
+    // path's 4095-value chunks were first given definition levels.
+    if (count > 1024U) {
+        std::abort();
+    }
+    std::uint16_t levels[1024] = {0};
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto row = first_row + i;
+        const bool valid = (validity[static_cast<std::size_t>(row >> 3U)] >> (row & 7U)) & 1U;
+        levels[i] = valid ? 0U : 1U;
+    }
+    // A short final chunk has two legal spellings, and the choice is not ours: Lance's decoder infers
+    // which one it is FROM THE BUFFER LENGTH, so writing the wrong one is silently misread rather
+    // than rejected. Its rule is to pad up to a full block only when padding costs fewer bits than
+    // packing saves; otherwise the levels go in raw, as plain u16 words. At width 1 that means a tail
+    // of 64 or fewer values is raw -- and 64 is exactly the packed size, so a padded 64-value chunk
+    // is indistinguishable from a raw one and would come back as 64 arbitrary levels.
+    const auto packed_words = nano_lance::fastlanes::packed_words_1024<std::uint16_t>(1);
+    const std::size_t padding_cost = 1U * (1024U - count);
+    const std::size_t pack_savings = (16U - 1U) * count;
+    if (count < 1024U && padding_cost >= pack_savings) {
+        std::vector<std::uint8_t> out(count * sizeof(std::uint16_t));
+        std::memcpy(out.data(), levels, out.size());
+        return out;
+    }
+    std::vector<std::uint16_t> packed(packed_words);
+    nano_lance::fastlanes::pack_1024<std::uint16_t>(1, levels, packed.data());
+    std::vector<std::uint8_t> out(packed_words * sizeof(std::uint16_t));
+    std::memcpy(out.data(), packed.data(), out.size());
+    return out;
+}
+
+/// PageLayout for a chunk that carries definition levels: the same MiniBlockLayout as the
+/// no-nulls case, plus f2 (how the levels are encoded) and f6 layers = [3] instead of [1].
+///
+/// f2's shape is CompressiveEncoding field 4 -- a bit-width wrapper whose f1 is the level's
+/// uncompressed width (16) and whose f3 says how the levels are actually stored (Flat(1), since the
+/// only levels here are 0 and 1). Matches pylance 12.0.0 byte for byte.
+std::vector<std::uint8_t> repdef_encoding_bytes() {
+    std::vector<std::uint8_t> flat{0x08, 0x01};                 // Flat{ f1 bits_per_value = 1 }
+    std::vector<std::uint8_t> flat_ce;
+    write_length_delimited(flat_ce, 1, flat);                   // CompressiveEncoding{ f1 Flat }
+    std::vector<std::uint8_t> wrapper{0x08, 0x10};              // f1 uncompressed_bits_per_value = 16
+    write_length_delimited(wrapper, 3, flat_ce);                // f3 values
+    std::vector<std::uint8_t> out;
+    write_length_delimited(out, 4, wrapper);                    // CompressiveEncoding{ f4 }
+    return out;
 }
 
 std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& chunks) {
@@ -241,13 +355,16 @@ std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& c
     return out;
 }
 
-// Single-chunk fast paths: nanolance emits one chunk per page, so the general vector-based helpers
-// above would otherwise force callers to wrap each chunk in a temporary one-element vector (an extra
-// heap allocation and copy of the whole chunk on every page). These avoid that entirely.
+// Single-chunk fast paths: nanolance emits one chunk per page on most paths, so the vector-based
+// miniblock_payload() above would otherwise force callers to wrap each chunk in a temporary
+// one-element vector (an extra heap allocation and copy of the whole chunk on every page). These
+// avoid that entirely. The chunk they describe is always the page's final one, which is why the
+// control word's log2 nibble is unconditionally 0 -- see miniblock_control_word.
+std::uint16_t miniblock_control_word(std::size_t repdef_bytes, std::size_t value_bytes);
+
 std::vector<std::uint8_t> control_buffer_for(const MiniblockChunk& chunk) {
     std::vector<std::uint8_t> out;
-    const auto words = static_cast<std::uint16_t>((chunk.bytes.size() + 7U) / 8U);
-    append_le16(out, static_cast<std::uint16_t>(words << 4U));
+    append_le16(out, miniblock_control_word(chunk.repdef.size(), chunk.bytes.size()));
     out.push_back(0U);
     out.push_back(0U);
     return out;
@@ -265,6 +382,54 @@ std::vector<std::uint8_t> miniblock_payload(const MiniblockChunk& chunk) {
 // This is byte-identical to miniblock_payload() over a MiniblockChunk holding the same slice, but it
 // avoids materializing the slice into a MiniblockChunk and then again into a payload vector — for a
 // plain fixed-width column the chunk bytes are just a view into values.fixed. Returns bytes written.
+/// Same as stream_flat_miniblock_payload but for a chunk that carries definition levels: the header's
+/// four slots become [values covered][level bytes][value bytes][0], and the level buffer precedes the
+/// values.
+
+/// The per-chunk control word for a single-chunk page.
+///
+/// It encodes the chunk's FULL footprint -- its 8-byte header plus every buffer, padded to 8 -- as
+/// ((footprint / 8) - 1) << 4, with the low nibble holding log2(value count) for a non-final chunk
+/// and 0 for the last one. nanolance writes one chunk per page, so that chunk is always final and
+/// the nibble is always 0.
+///
+/// The previous form derived the word from the VALUE bytes alone, which agreed with this only
+/// because the 8-byte header and the -1 cancel when the values are a multiple of 8. Adding a
+/// definition-level buffer broke that coincidence and stock Lance panicked with "the offset + length
+/// of the sliced Buffer cannot exceed the existing length".
+std::uint16_t miniblock_control_word(std::size_t repdef_bytes, std::size_t value_bytes) {
+    // Each buffer is padded to 8 bytes in the chunk, so the level buffer's padding counts toward the
+    // footprint too -- see append_miniblock_chunk.
+    const auto padded_repdef = (repdef_bytes + 7U) & ~static_cast<std::size_t>(7U);
+    const auto footprint = ((8U + padded_repdef + value_bytes) + 7U) / 8U;
+    return static_cast<std::uint16_t>((footprint - 1U) << 4U);
+}
+
+std::uint64_t stream_miniblock_payload_with_repdef(std::ostream& out, const std::vector<std::uint8_t>& repdef,
+                                                   std::size_t value_count, const std::uint8_t* data,
+                                                   std::size_t chunk_bytes) {
+    std::vector<std::uint8_t> header;
+    append_le16(header, static_cast<std::uint16_t>(value_count));
+    append_le16(header, static_cast<std::uint16_t>(repdef.size()));
+    append_le16(header, static_cast<std::uint16_t>(chunk_bytes));
+    append_le16(header, 0U);
+    static constexpr std::array<char, 8> zeros{};
+    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    out.write(reinterpret_cast<const char*>(repdef.data()), static_cast<std::streamsize>(repdef.size()));
+    // The level buffer is padded to 8 bytes before the values start (see append_miniblock_chunk).
+    const auto repdef_pad = (8U - (repdef.size() % 8U)) % 8U;
+    if (repdef_pad != 0U) {
+        out.write(zeros.data(), static_cast<std::streamsize>(repdef_pad));
+    }
+    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(chunk_bytes));
+    std::uint64_t written = 8U + repdef.size() + repdef_pad + chunk_bytes;
+    const auto pad = (8U - (written % 8U)) % 8U;
+    if (pad != 0U) {
+        out.write(zeros.data(), static_cast<std::streamsize>(pad));
+    }
+    return written + pad;
+}
+
 std::uint64_t stream_flat_miniblock_payload(std::ostream& out, const std::uint8_t* data,
                                             std::size_t chunk_bytes) {
     const std::array<char, 8> header{0, 0, static_cast<char>(chunk_bytes & 0xFFU),
@@ -295,33 +460,33 @@ std::vector<std::uint8_t> column_encoding_bytes() {
     return bytes_from_hex("0a1f2f6c616e63652e656e636f64696e67732e436f6c756d6e456e636f64696e6712020a00");
 }
 
-std::vector<std::uint8_t> variable_width_structural_payload(std::uint8_t bits_token, std::uint64_t rows) {
-    const auto mini_block = build_mini_block_layout(bits_token, rows);
-    if (mini_block.size() < 6U) {
-        return mini_block;
+/// MiniBlockLayout for a variable-width (utf8/binary) column: the value buffer holds the offsets
+/// followed by the bytes, so value_compression is CompressiveEncoding{ f2 Variable{ f1 offsets } }
+/// rather than the Flat encoding a fixed-width column uses. Matches IPC2Lance / the Lance reference
+/// PageLayout. `nullable` adds the f2 repdef_compression and the layers=[3] marker in the tail, in
+/// the same places variable_width_structural_payload_zstd puts them.
+std::vector<std::uint8_t> variable_width_structural_payload(std::uint32_t bits_token, std::uint64_t rows,
+                                                            bool nullable) {
+    // CompressiveEncoding{ f2 Variable{ f1 offsets = Flat{ f1 bits } } }.
+    const std::vector<std::uint8_t> value_comp{
+        0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, static_cast<std::uint8_t>(bits_token)};
+    std::vector<std::uint8_t> out;
+    if (nullable) {
+        write_length_delimited(out, 2, repdef_encoding_bytes());
     }
-    // Matches IPC2Lance / Lance reference PageLayout for utf8/binary columns.
-    std::vector<std::uint8_t> wrapped;
-    wrapped.push_back(0x1aU);
-    wrapped.push_back(0x08U);
-    wrapped.push_back(0x12U);
-    wrapped.push_back(0x06U);
-    wrapped.push_back(0x0aU);
-    wrapped.push_back(0x04U);
-    wrapped.push_back(0x0aU);
-    wrapped.push_back(0x02U);
-    wrapped.push_back(0x08U);
-    wrapped.push_back(bits_token);
-    wrapped.insert(wrapped.end(), mini_block.begin() + 6, mini_block.end());
-    return wrapped;
+    write_length_delimited(out, 3, value_comp);
+    const auto tail = mini_block_tail(rows, 1U, nullable);
+    out.insert(out.end(), tail.begin(), tail.end());
+    return out;
 }
 
-std::vector<std::uint8_t> page_layout_bytes(std::uint8_t bits_token, std::uint64_t rows, bool variable_width) {
+std::vector<std::uint8_t> page_layout_bytes(std::uint32_t bits_token, std::uint64_t rows, bool variable_width,
+                                            bool nullable = false) {
     std::vector<std::uint8_t> page_layout;
     if (variable_width) {
-        write_length_delimited(page_layout, 1, variable_width_structural_payload(bits_token, rows));
+        write_length_delimited(page_layout, 1, variable_width_structural_payload(bits_token, rows, nullable));
     } else {
-        write_length_delimited(page_layout, 1, build_mini_block_layout(bits_token, rows));
+        write_length_delimited(page_layout, 1, build_mini_block_layout(bits_token, rows, nullable));
     }
 
     std::vector<std::uint8_t> encoding;
@@ -330,14 +495,11 @@ std::vector<std::uint8_t> page_layout_bytes(std::uint8_t bits_token, std::uint64
     return encoding;
 }
 
-std::vector<std::uint8_t> page_layout_bytes(const LanceField& field, std::uint64_t rows) {
-    return page_layout_bytes(flat_bits_per_value_token(field), rows, false);
-}
-
 // Variable-width structural payload whose value_compression is wrapped in General(ZSTD), so the
 // chunk's value buffer is interpreted as [u64 LE uncompressed size][zstd frame]. Byte layout mirrors
 // what lance 7.0 emits for a zstd variable-width column (see memory: lance-zstd-variable-encoding).
-std::vector<std::uint8_t> variable_width_structural_payload_zstd(std::uint8_t bits_token, std::uint64_t rows) {
+std::vector<std::uint8_t> variable_width_structural_payload_zstd(std::uint8_t bits_token, std::uint64_t rows,
+                                                                 bool nullable) {
     // Uncompressed variable CompressiveEncoding body: f2 Variable{ f1 offsets = Flat{ f1 bits } }.
     const std::vector<std::uint8_t> inner_ce{0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, bits_token};
     // General{ f1 BufferCompression{ f1 scheme = ZSTD(2) }, f3 values = inner_ce }.
@@ -346,17 +508,23 @@ std::vector<std::uint8_t> variable_width_structural_payload_zstd(std::uint8_t bi
     // value_compression CompressiveEncoding{ f10 General }.
     std::vector<std::uint8_t> value_comp{0x52, static_cast<std::uint8_t>(general.size())};
     value_comp.insert(value_comp.end(), general.begin(), general.end());
-    // MiniBlockLayout f3 = value_compression, followed by the unchanged f6/f7/f9/f10 tail.
-    std::vector<std::uint8_t> out{0x1a, static_cast<std::uint8_t>(value_comp.size())};
+    // MiniBlockLayout [f2 repdef,] f3 = value_compression, then the tail.
+    std::vector<std::uint8_t> out;
+    if (nullable) {
+        write_length_delimited(out, 2, repdef_encoding_bytes());
+    }
+    out.push_back(0x1aU);
+    out.push_back(static_cast<std::uint8_t>(value_comp.size()));
     out.insert(out.end(), value_comp.begin(), value_comp.end());
-    const auto mini = build_mini_block_layout(bits_token, rows);
-    out.insert(out.end(), mini.begin() + 6, mini.end());
+    const auto tail = mini_block_tail(rows, 1U, nullable);
+    out.insert(out.end(), tail.begin(), tail.end());
     return out;
 }
 
-std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_token, std::uint64_t rows) {
+std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_token, std::uint64_t rows,
+                                                          bool nullable = false) {
     std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, variable_width_structural_payload_zstd(bits_token, rows));
+    write_length_delimited(page_layout, 1, variable_width_structural_payload_zstd(bits_token, rows, nullable));
     std::vector<std::uint8_t> encoding;
     write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
     write_length_delimited(encoding, 2, page_layout);
@@ -374,7 +542,8 @@ std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_toke
 //   -> ByteStreamSplit{ f1 values = above }                          -- f9 of CompressiveEncoding
 //   -> General{ f1 BufferCompression{f1 scheme=ZSTD(2)}, f3 values = above }   -- f10 of CompressiveEncoding
 //   -> MiniBlockLayout.value_compression (f3) = CompressiveEncoding{ f10 General = above }
-std::vector<std::uint8_t> fixed_width_structural_payload_bss_zstd(std::uint8_t bits_token, std::uint64_t rows) {
+std::vector<std::uint8_t> fixed_width_structural_payload_bss_zstd(std::uint8_t bits_token, std::uint64_t rows,
+                                                                  bool nullable) {
     const std::vector<std::uint8_t> flat_ce{0x0a, 0x02, 0x08, bits_token};
     std::vector<std::uint8_t> bss{0x0a, static_cast<std::uint8_t>(flat_ce.size())};
     bss.insert(bss.end(), flat_ce.begin(), flat_ce.end());
@@ -384,16 +553,22 @@ std::vector<std::uint8_t> fixed_width_structural_payload_bss_zstd(std::uint8_t b
     general.insert(general.end(), bss_ce.begin(), bss_ce.end());
     std::vector<std::uint8_t> value_comp{0x52, static_cast<std::uint8_t>(general.size())};
     value_comp.insert(value_comp.end(), general.begin(), general.end());
-    std::vector<std::uint8_t> out{0x1a, static_cast<std::uint8_t>(value_comp.size())};
+    std::vector<std::uint8_t> out;
+    if (nullable) {
+        write_length_delimited(out, 2, repdef_encoding_bytes());
+    }
+    out.push_back(0x1aU);                                         // f3 value_compression
+    out.push_back(static_cast<std::uint8_t>(value_comp.size()));
     out.insert(out.end(), value_comp.begin(), value_comp.end());
-    const auto mini = build_mini_block_layout(bits_token, rows);
-    out.insert(out.end(), mini.begin() + 6, mini.end());
+    const auto tail = mini_block_tail(rows, 1U, nullable);
+    out.insert(out.end(), tail.begin(), tail.end());
     return out;
 }
 
-std::vector<std::uint8_t> page_layout_bytes_bss_zstd(std::uint8_t bits_token, std::uint64_t rows) {
+std::vector<std::uint8_t> page_layout_bytes_bss_zstd(std::uint8_t bits_token, std::uint64_t rows,
+                                                     bool nullable = false) {
     std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, fixed_width_structural_payload_bss_zstd(bits_token, rows));
+    write_length_delimited(page_layout, 1, fixed_width_structural_payload_bss_zstd(bits_token, rows, nullable));
     std::vector<std::uint8_t> encoding;
     write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
     write_length_delimited(encoding, 2, page_layout);
@@ -475,7 +650,8 @@ std::vector<std::uint8_t> build_dict_variable_block(const std::vector<std::strin
 
 // PageLayout for structural dictionary with flat bitpacked u32 indices (matches stock Lance for
 // scattered low-cardinality strings): value_compression = InlineBitpacking(32), dictionary =
-// Variable+Flat(32) without general compression, num_buffers=1, has_large_chunk=false.
+// Variable+Flat(32) without general compression, num_buffers=1, has_large_chunk=true (the chunk-meta
+// words are u32 to match -- see control_buffer_for_index_chunks).
 std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items) {
     static const std::uint8_t kF3Bitpack[] = {0x1a, 0x04, 0x2a, 0x02, 0x08, 0x20};
     static const std::uint8_t kF4Dict[] = {0x22, 0x08, 0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20};
@@ -483,7 +659,7 @@ std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std
     structural.insert(structural.end(), kF4Dict, kF4Dict + sizeof(kF4Dict));
     structural.push_back(0x28);  // f5 num_dictionary_items
     append_varint(structural, num_distinct);
-    const auto tail = miniblock_tail(num_items, 1U, false);
+    const auto tail = miniblock_tail(num_items, 1U);
     structural.insert(structural.end(), tail.begin(), tail.end());
 
     std::vector<std::uint8_t> page_layout;
@@ -552,9 +728,7 @@ std::vector<std::uint8_t> encode_scalar_variable_value(const std::vector<std::ui
 std::vector<std::uint8_t> constant_layout_message(const std::vector<std::uint8_t>* inline_value) {
     std::vector<std::uint8_t> constant_layout{0x2a, 0x01, 0x01};  // f5 layers = single non-null layer
     if (inline_value != nullptr) {
-        constant_layout.push_back(0x32);  // f6 inline_value
-        constant_layout.push_back(static_cast<std::uint8_t>(inline_value->size()));
-        constant_layout.insert(constant_layout.end(), inline_value->begin(), inline_value->end());
+        write_length_delimited(constant_layout, 6, *inline_value);  // f6 inline_value, varint length
     }
     std::vector<std::uint8_t> page_layout;
     write_length_delimited(page_layout, 2, constant_layout);  // PageLayout f2 = constant_layout
@@ -564,15 +738,31 @@ std::vector<std::uint8_t> constant_layout_message(const std::vector<std::uint8_t
     return encoding;
 }
 
+// PageLayout = ConstantLayout with a NULLABLE_ITEM layer and no value: Lance's spelling of a column
+// whose every row is null. Zero data buffers. Byte-identical to what pylance writes for pa.nulls(n).
+std::vector<std::uint8_t> all_null_constant_layout_message() {
+    const std::vector<std::uint8_t> constant_layout{0x2a, 0x01, 0x03};  // f5 layers = [NULLABLE_ITEM]
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, 2, constant_layout);
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
 // MiniBlockLayout PageLayout advertising InlineBitpacking{uncompressed_bits_per_value}. Matches lance
 // output (CompressiveEncoding f5 = inline_bitpacking). See memory: lance-inline-bitpacking-format.
-std::vector<std::uint8_t> page_layout_bytes_inline_bitpacking(std::uint8_t uncompressed_bits, std::uint64_t rows) {
+std::vector<std::uint8_t> page_layout_bytes_inline_bitpacking(std::uint8_t uncompressed_bits, std::uint64_t rows,
+                                                              bool nullable = false) {
     // value_compression CompressiveEncoding{ f5 InlineBitpacking{ f1 uncompressed_bits_per_value } }.
     const std::vector<std::uint8_t> ce{0x2a, 0x02, 0x08, uncompressed_bits};
-    std::vector<std::uint8_t> structural{0x1a, static_cast<std::uint8_t>(ce.size())};  // MiniBlockLayout f3
-    structural.insert(structural.end(), ce.begin(), ce.end());
-    const auto mini = build_mini_block_layout(0x40U, rows);  // token irrelevant; reuse the f6/f7/f9/f10 tail
-    structural.insert(structural.end(), mini.begin() + 6, mini.end());
+    std::vector<std::uint8_t> structural;
+    if (nullable) {
+        write_length_delimited(structural, 2, repdef_encoding_bytes());
+    }
+    write_length_delimited(structural, 3, ce);  // MiniBlockLayout f3
+    const auto tail = mini_block_tail(rows, 1U, nullable);
+    structural.insert(structural.end(), tail.begin(), tail.end());
 
     std::vector<std::uint8_t> page_layout;
     write_length_delimited(page_layout, 1, structural);
@@ -710,7 +900,8 @@ bool build_variable_chunk_bytes(const std::vector<OffsetType>& offsets,
 template <typename OffsetType>
 bool build_variable_chunks(const VariableWidthColumnValues& column,
                            std::vector<MiniblockChunk>& chunks,
-                           std::string& error) {
+                           std::string& error,
+                           std::size_t max_values_per_chunk = 0U) {
     std::vector<OffsetType> offsets;
     if (!read_offsets(column.offsets, offsets, error)) {
         return false;
@@ -732,6 +923,11 @@ bool build_variable_chunks(const VariableWidthColumnValues& column,
         // variable-width writes. The full buffer is now materialized exactly once per finalized chunk.
         std::size_t last_value = first_value + 1U;  // at least one value per chunk (a lone oversized value gets its own)
         while (last_value < total_values) {
+            // A chunk carrying definition levels is limited to one FastLanes block; callers pass
+            // that cap in. Without nulls the chunk is bounded only by its byte budget.
+            if (max_values_per_chunk != 0U && (last_value - first_value) >= max_values_per_chunk) {
+                break;
+            }
             const auto num_values = (last_value + 1U) - first_value;
             const auto data_bytes = static_cast<std::size_t>(offsets[last_value + 1U] - offsets[first_value]);
             const auto packed = padded_size((num_values + 1U) * offset_width + data_bytes, 8U);
@@ -754,14 +950,554 @@ bool build_variable_chunks(const VariableWidthColumnValues& column,
 
 bool build_variable_chunks_for_column(const VariableWidthColumnValues& column,
                                       std::vector<MiniblockChunk>& chunks,
-                                      std::string& error) {
+                                      std::string& error,
+                                      std::size_t max_values_per_chunk = 0U) {
     if (column.large) {
-        return build_variable_chunks<std::int64_t>(column, chunks, error);
+        return build_variable_chunks<std::int64_t>(column, chunks, error, max_values_per_chunk);
     }
-    return build_variable_chunks<std::int32_t>(column, chunks, error);
+    return build_variable_chunks<std::int32_t>(column, chunks, error, max_values_per_chunk);
 }
 
 }  // namespace
+
+// ── Nested columns (lists, maps) ────────────────────────────────────────────────────────────────
+//
+// One leaf column under list layers: its levels come from repdef::serialize, its values are the
+// leaf items those levels point at. Every page is ONE mini-block chunk -- the page's final chunk --
+// so its value count is free (non-final chunks must hold 2^k values, which would split rows across
+// chunks) and the page holds whole rows. Levels are bit-packed at the narrowest width that holds
+// them, as pylance writes its own.
+
+/// The narrowest bit width holding every level (at least 1). One width per page: the page descriptor
+/// declares a single level encoding for all of its chunks.
+unsigned level_width(const std::vector<std::uint16_t>& levels) {
+    std::uint16_t max_level = 0;
+    for (const auto level : levels) {
+        max_level = std::max(max_level, level);
+    }
+    unsigned width = 1;
+    while (width < 16U && (max_level >> width) != 0U) {
+        ++width;
+    }
+    return width;
+}
+
+/// CompressiveEncoding{ f4 Bitpacked{ uncompressed 16, values Flat(width) } } -- the spelling pylance
+/// writes for its own levels.
+std::vector<std::uint8_t> levels_encoding(unsigned width) {
+    std::vector<std::uint8_t> flat{0x08};
+    append_varint(flat, width);
+    std::vector<std::uint8_t> flat_ce;
+    write_length_delimited(flat_ce, 1, flat);
+    std::vector<std::uint8_t> bitpacked{0x08, 0x10};  // f1 uncompressed_bits_per_value = 16
+    write_length_delimited(bitpacked, 3, flat_ce);    // f3 values
+    std::vector<std::uint8_t> encoding;
+    write_length_delimited(encoding, 4, bitpacked);
+    return encoding;
+}
+
+/// Bit-pack `n` levels at `width`: whole 1024-level FastLanes blocks, then the tail either raw (u16
+/// words) or padded to a full block -- whichever Lance's encoder would pick, because its decoder tells
+/// the two apart by the buffer's length alone (the rule pack_definition_levels follows at width 1).
+void pack_levels(const std::uint16_t* levels, std::size_t n, unsigned width, std::vector<std::uint8_t>& out) {
+    const auto packed_words = nano_lance::fastlanes::packed_words_1024<std::uint16_t>(width);
+    std::vector<std::uint16_t> packed(packed_words);
+    std::uint16_t block[1024];
+    out.clear();
+    const auto append_words = [&out](const std::uint16_t* words, std::size_t count) {
+        const auto at = out.size();
+        out.resize(at + count * sizeof(std::uint16_t));
+        std::memcpy(out.data() + at, words, count * sizeof(std::uint16_t));
+    };
+    std::size_t at = 0;
+    for (; at + 1024U <= n; at += 1024U) {
+        nano_lance::fastlanes::pack_1024<std::uint16_t>(width, levels + at, packed.data());
+        append_words(packed.data(), packed_words);
+    }
+    const auto tail = n - at;
+    if (tail != 0U) {
+        const std::size_t padding_cost = width * (1024U - tail);
+        const std::size_t pack_savings = (16U - width) * tail;
+        if (padding_cost >= pack_savings) {
+            append_words(levels + at, tail);
+        } else {
+            std::fill(std::begin(block), std::end(block), std::uint16_t{0});
+            std::memcpy(block, levels + at, tail * sizeof(std::uint16_t));
+            nano_lance::fastlanes::pack_1024<std::uint16_t>(width, block, packed.data());
+            append_words(packed.data(), packed_words);
+        }
+    }
+}
+
+void append_u16_levels(std::vector<std::uint8_t>& out, const std::vector<std::uint16_t>& levels) {
+    for (const auto level : levels) {
+        append_le16(out, level);
+    }
+}
+
+void pad8(std::vector<std::uint8_t>& out) {
+    while (out.size() % 8U != 0U) {
+        out.push_back(0U);
+    }
+}
+
+std::uint64_t write_buffer(std::ofstream& out, const std::vector<std::uint8_t>& bytes) {
+    align64(out);
+    const auto at = pos(out);
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return at;
+}
+
+std::vector<std::uint8_t> page_encoding(std::uint32_t layout_field, const std::vector<std::uint8_t>& layout) {
+    std::vector<std::uint8_t> page_layout;
+    write_length_delimited(page_layout, layout_field, layout);
+    std::vector<std::uint8_t> encoding;
+    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
+    write_length_delimited(encoding, 2, page_layout);
+    return encoding;
+}
+
+/// How a nested page's item values are encoded -- chosen once per page, since the descriptor declares
+/// one value encoding for all of its chunks.
+enum class ItemEncoding { kFlat, kBool, kBitpacked, kVariable };
+
+ItemEncoding item_encoding_for(const LanceField& field, const ColumnValues& values) {
+    if (values.kind == ColumnValues::Kind::VariableWidth) {
+        return ItemEncoding::kVariable;
+    }
+    if (field.logical_type == "bool") {
+        return ItemEncoding::kBool;
+    }
+    const auto width = lance_logical_type_value_bytes(field.logical_type);
+    if (lance_logical_type_is_bitpackable_integer(field.logical_type) &&
+        (width == 1U || width == 2U || width == 4U || width == 8U)) {
+        return ItemEncoding::kBitpacked;
+    }
+    return ItemEncoding::kFlat;
+}
+
+/// The value_compression node for `encoding`.
+std::vector<std::uint8_t> item_value_encoding(ItemEncoding encoding, const LanceField& field) {
+    switch (encoding) {
+        case ItemEncoding::kVariable:
+            // CompressiveEncoding{ f2 Variable{ f1 offsets = CompressiveEncoding{ Flat(32) } } }
+            return {0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20};
+        case ItemEncoding::kBitpacked:
+            // CompressiveEncoding{ f5 InlineBitpacking{ f1 uncompressed_bits_per_value } }
+            return {0x2a, 0x02, 0x08,
+                    static_cast<std::uint8_t>(lance_logical_type_value_bytes(field.logical_type) * 8U)};
+        case ItemEncoding::kBool:
+        case ItemEncoding::kFlat: {
+            std::vector<std::uint8_t> flat{0x08};
+            append_varint(flat, encoding == ItemEncoding::kBool ? 1U
+                                                                : lance_logical_type_value_bytes(field.logical_type) * 8U);
+            std::vector<std::uint8_t> out;
+            write_length_delimited(out, 1, flat);
+            return out;
+        }
+    }
+    return {};
+}
+
+/// One chunk's value buffer: the items `items[first, first + count)`, gathered from the column by
+/// leaf index. Bit-packed chunks hold at most 1024 values (one FastLanes block, width in its header),
+/// which is why nested pages are cut into 1024-value chunks.
+bool gather_chunk_values(const LanceField& field, const ColumnValues& values, ItemEncoding encoding,
+                         const std::vector<std::uint64_t>& items, std::size_t first, std::size_t count,
+                         std::vector<std::uint8_t>& out, std::string& error) {
+    out.clear();
+    if (encoding == ItemEncoding::kVariable) {
+        const bool large = values.variable.large;
+        const auto width = static_cast<std::size_t>(large ? 8U : 4U);
+        const auto offset = [&](std::uint64_t i) {
+            std::int64_t v = 0;
+            if (large) {
+                std::memcpy(&v, values.variable.offsets.data() + i * 8U, 8U);
+            } else {
+                std::int32_t n = 0;
+                std::memcpy(&n, values.variable.offsets.data() + i * 4U, 4U);
+                v = n;
+            }
+            return v;
+        };
+        const auto entries = values.variable.offsets.size() / width;
+        const auto header = (count + 1U) * 4U;
+        std::uint64_t total = header;
+        for (std::size_t k = first; k < first + count; ++k) {
+            if (items[k] + 1U >= entries) {
+                error = "list items run past the column's values";
+                return false;
+            }
+            total += static_cast<std::uint64_t>(offset(items[k] + 1U) - offset(items[k]));
+        }
+        if (total > std::numeric_limits<std::uint32_t>::max()) {
+            error = "a list chunk's strings exceed 4 GiB";
+            return false;
+        }
+        out.resize(static_cast<std::size_t>(header));
+        auto at = static_cast<std::uint32_t>(header);
+        std::memcpy(out.data(), &at, 4U);
+        for (std::size_t k = 0; k < count; ++k) {
+            const auto begin = offset(items[first + k]);
+            const auto end = offset(items[first + k] + 1U);
+            out.insert(out.end(), values.variable.data.begin() + begin, values.variable.data.begin() + end);
+            at += static_cast<std::uint32_t>(end - begin);
+            std::memcpy(out.data() + (k + 1U) * 4U, &at, 4U);
+        }
+        // Lance's binary decompressor requires the chunk to be a whole number of offset words; the
+        // flat string path pads to 8 for the same reason (see build_variable_chunk_bytes).
+        pad8(out);
+        return true;
+    }
+    const auto width = lance_logical_type_value_bytes(field.logical_type);
+    const auto* data = values.fixed_borrowed != nullptr ? values.fixed_borrowed : values.fixed.data();
+    const auto size = values.fixed_borrowed != nullptr ? values.fixed_borrowed_size : values.fixed.size();
+    if (width == 0U) {
+        error = "column '" + field.name + "': unsupported list item type " + field.logical_type;
+        return false;
+    }
+    for (std::size_t k = first; k < first + count; ++k) {
+        if ((items[k] + 1U) * width > size) {
+            error = "list items run past the column's values";
+            return false;
+        }
+    }
+    if (encoding == ItemEncoding::kBool) {
+        // Flat(1): the items' bits, LSB first -- the same packing a flat bool page uses.
+        out.assign((count + 7U) / 8U, 0U);
+        for (std::size_t k = 0; k < count; ++k) {
+            if (data[items[first + k]] != 0U) {
+                out[k >> 3U] |= static_cast<std::uint8_t>(1U << (k & 7U));
+            }
+        }
+        return true;
+    }
+    std::vector<std::uint8_t> gathered;
+    gathered.reserve(count * width);
+    for (std::size_t k = first; k < first + count; ++k) {
+        gathered.insert(gathered.end(), data + items[k] * width, data + (items[k] + 1U) * width);
+    }
+    if (encoding == ItemEncoding::kBitpacked) {
+        build_bitpacked_chunk(gathered.data(), count, width, out);
+        return true;
+    }
+    out = std::move(gathered);
+    return true;
+}
+
+/// One page of a nested column, built from its serialized levels: 1024 values per chunk (the last one
+/// takes the rest), each chunk carrying the levels that lead up to its last value -- Lance's
+/// RepDefSlicer rule: levels with no value slot after a chunk's last value belong to the next chunk.
+/// Returns false with `too_big` set when a chunk's levels would not fit its u16 header fields, so the
+/// caller can retry with fewer rows.
+struct NestedPageBuffers {
+    std::vector<std::uint8_t> control;
+    std::vector<std::uint8_t> payload;
+    std::vector<std::uint8_t> dictionary;  // a dictionary-encoded string page only
+    std::vector<std::uint8_t> rep_index;
+    std::vector<std::uint8_t> descriptor;
+};
+
+/// A page's string items as a dictionary, when that pays: repeated tags, categories, keys -- the
+/// usual content of a list of strings. `indices` has one entry per item. Chosen per page, like
+/// pylance, and only when the dictionary plus 32-bit indices (bit-packed on disk, so smaller still)
+/// come in under 80% of the plain strings.
+bool plan_item_dictionary(const ColumnValues& values, const std::vector<std::uint64_t>& items,
+                          std::vector<std::string_view>& distinct, std::vector<std::uint32_t>& indices) {
+    constexpr std::size_t kMinItems = 64U;
+    constexpr std::size_t kMaxDistinct = 65536U;
+    distinct.clear();
+    indices.clear();
+    if (items.size() < kMinItems || values.kind != ColumnValues::Kind::VariableWidth) {
+        return false;
+    }
+    const bool large = values.variable.large;
+    const auto offset = [&](std::uint64_t i) {
+        std::int64_t v = 0;
+        if (large) {
+            std::memcpy(&v, values.variable.offsets.data() + i * 8U, 8U);
+        } else {
+            std::int32_t n = 0;
+            std::memcpy(&n, values.variable.offsets.data() + i * 4U, 4U);
+            v = n;
+        }
+        return v;
+    };
+    const auto* base = reinterpret_cast<const char*>(values.variable.data.data());
+    std::unordered_map<std::string_view, std::uint32_t> ids;
+    std::uint64_t plain_bytes = 0;
+    std::uint64_t dict_bytes = 0;
+    indices.reserve(items.size());
+    for (const auto i : items) {
+        const auto begin = offset(i);
+        const std::string_view value(base + begin, static_cast<std::size_t>(offset(i + 1U) - begin));
+        plain_bytes += value.size() + 4U;
+        const auto [it, inserted] = ids.emplace(value, static_cast<std::uint32_t>(distinct.size()));
+        if (inserted) {
+            distinct.push_back(value);
+            dict_bytes += value.size() + 4U;
+            if (distinct.size() > kMaxDistinct || distinct.size() * 2U > items.size()) {
+                distinct.clear();
+                indices.clear();
+                return false;
+            }
+        }
+        indices.push_back(it->second);
+    }
+    std::uint32_t index_bits = 1;
+    while (index_bits < 32U && (std::uint64_t{1} << index_bits) < distinct.size()) {
+        ++index_bits;
+    }
+    const auto index_bytes = (items.size() * index_bits + 7U) / 8U;
+    if (static_cast<double>(dict_bytes + index_bytes) >= 0.8 * static_cast<double>(plain_bytes)) {
+        distinct.clear();
+        indices.clear();
+        return false;
+    }
+    return true;
+}
+
+bool build_nested_page(const LanceField& field, const ColumnValues& values, const repdef::Serialized& ser,
+                       std::uint64_t rows, NestedPageBuffers& page, bool& too_big, std::string& error) {
+    constexpr std::size_t kValuesPerChunk = 1024U;  // 2^10: the log in every non-final chunk's word
+    constexpr std::size_t kMaxChunkLevelBytes = 65535U;
+    too_big = false;
+    page = NestedPageBuffers{};
+    const auto encoding = item_encoding_for(field, values);
+    std::vector<std::string_view> distinct;
+    std::vector<std::uint32_t> indices;
+    const bool dictionary = encoding == ItemEncoding::kVariable && plan_item_dictionary(values, ser.items, distinct, indices);
+    const auto rep_width = ser.has_rep ? level_width(ser.rep) : 0U;
+    const auto def_width = ser.has_def ? level_width(ser.def) : 0U;
+    const std::uint16_t max_rep = ser.has_rep ? *std::max_element(ser.rep.begin(), ser.rep.end()) : 0U;
+    const auto num_levels = ser.has_rep ? ser.rep.size() : ser.has_def ? ser.def.size() : ser.items.size();
+
+    std::size_t level_at = 0;
+    std::size_t item_at = 0;
+    std::vector<std::uint8_t> rep_bytes;
+    std::vector<std::uint8_t> def_bytes;
+    std::vector<std::uint8_t> value_bytes;
+    std::vector<std::uint64_t> rep_index;
+    const auto num_chunks = std::max<std::size_t>(1U, (ser.items.size() + kValuesPerChunk - 1U) / kValuesPerChunk);
+    for (std::size_t c = 0; c < num_chunks; ++c) {
+        const bool last = c + 1U == num_chunks;
+        const auto values_here = last ? ser.items.size() - item_at : kValuesPerChunk;
+        // This chunk's levels: up to and including its last value slot (all the rest, if final).
+        std::size_t level_end = level_at;
+        if (last) {
+            level_end = num_levels;
+        } else if (ser.is_slot.empty()) {
+            level_end = level_at + values_here;
+        } else {
+            std::size_t taken = 0;
+            while (taken < values_here) {
+                taken += ser.is_slot[level_end] ? 1U : 0U;
+                ++level_end;
+            }
+        }
+        const auto chunk_levels = level_end - level_at;
+        if (ser.has_rep) {
+            pack_levels(ser.rep.data() + level_at, chunk_levels, rep_width, rep_bytes);
+        }
+        if (ser.has_def) {
+            pack_levels(ser.def.data() + level_at, chunk_levels, def_width, def_bytes);
+        }
+        if (chunk_levels > 0xFFFFU || rep_bytes.size() > kMaxChunkLevelBytes || def_bytes.size() > kMaxChunkLevelBytes) {
+            too_big = true;
+            return false;
+        }
+        if (dictionary) {
+            // The chunk holds its items' dictionary indices, bit-packed like any u32 column.
+            build_bitpacked_chunk(reinterpret_cast<const std::uint8_t*>(indices.data() + item_at), values_here, 4U,
+                                  value_bytes);
+        } else if (!gather_chunk_values(field, values, encoding, ser.items, item_at, values_here, value_bytes,
+                                        error)) {
+            return false;
+        }
+        // Chunk: [u16 levels][u16 rep bytes][u16 def bytes][u32 value bytes] padded to 8, then each
+        // buffer padded to 8.
+        const auto chunk_start = page.payload.size();
+        auto& chunk = page.payload;
+        append_le16(chunk, static_cast<std::uint16_t>(ser.has_rep || ser.has_def ? chunk_levels : 0U));
+        if (ser.has_rep) {
+            append_le16(chunk, static_cast<std::uint16_t>(rep_bytes.size()));
+        }
+        if (ser.has_def) {
+            append_le16(chunk, static_cast<std::uint16_t>(def_bytes.size()));
+        }
+        append_le32(chunk, static_cast<std::uint32_t>(value_bytes.size()));
+        pad8(chunk);
+        if (ser.has_rep) {
+            chunk.insert(chunk.end(), rep_bytes.begin(), rep_bytes.end());
+            pad8(chunk);
+        }
+        if (ser.has_def) {
+            chunk.insert(chunk.end(), def_bytes.begin(), def_bytes.end());
+            pad8(chunk);
+        }
+        chunk.insert(chunk.end(), value_bytes.begin(), value_bytes.end());
+        pad8(chunk);
+        const auto footprint = chunk.size() - chunk_start;
+        const std::uint32_t log_values = last ? 0U : 10U;
+        append_le32(page.control, static_cast<std::uint32_t>(((footprint / 8U - 1U) << 4U) | log_values));
+
+        // Repetition index, depth 1, as Lance's encoder computes it: rows that FINISH in this chunk,
+        // and the levels left over after the last row start (0 in the final chunk). A chunk that
+        // begins a row turns the previous chunk's leftovers into one more finished row.
+        if (ser.has_rep) {
+            const auto* r = ser.rep.data() + level_at;
+            std::uint64_t finished = 0;
+            for (std::size_t i = 1; i < chunk_levels; ++i) {
+                finished += r[i] == max_rep ? 1U : 0U;
+            }
+            std::uint64_t leftovers = 0;
+            if (!last) {
+                leftovers = chunk_levels;
+                for (std::size_t i = chunk_levels; i-- > 0;) {
+                    if (r[i] == max_rep) {
+                        leftovers = chunk_levels - i;
+                        break;
+                    }
+                }
+            }
+            if (c != 0U && chunk_levels != 0U && r[0] == max_rep && rep_index.back() != 0U) {
+                rep_index[rep_index.size() - 2U] += 1U;
+                rep_index.back() = 0U;
+            }
+            if (last) {
+                finished += 1U;
+            }
+            rep_index.push_back(finished);
+            rep_index.push_back(leftovers);
+        }
+        level_at = level_end;
+        item_at += values_here;
+    }
+    for (const auto v : rep_index) {
+        for (int b = 0; b < 8; ++b) {
+            page.rep_index.push_back(static_cast<std::uint8_t>((v >> (8 * b)) & 0xFFU));
+        }
+    }
+    (void)rows;
+
+    std::vector<std::uint8_t> mini;
+    if (ser.has_rep) {
+        write_length_delimited(mini, 1, levels_encoding(rep_width));
+    }
+    if (ser.has_def) {
+        write_length_delimited(mini, 2, levels_encoding(def_width));
+    }
+    if (dictionary) {
+        // Indices: InlineBitpacking(32). Dictionary: Variable{Flat(32)}, stored raw -- the same block
+        // the flat string path writes (build_dict_variable_block).
+        write_length_delimited(mini, 3, std::vector<std::uint8_t>{0x2a, 0x02, 0x08, 0x20});
+        write_length_delimited(mini, 4, std::vector<std::uint8_t>{0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20});
+        mini.push_back(0x28U);  // f5 num_dictionary_items
+        append_varint(mini, distinct.size());
+        page.dictionary = build_dict_variable_block(distinct);
+    } else {
+        write_length_delimited(mini, 3, item_value_encoding(encoding, field));
+    }
+    std::vector<std::uint8_t> layer_bytes(ser.layers.begin(), ser.layers.end());
+    write_length_delimited(mini, 6, layer_bytes);
+    mini.push_back(0x38U);  // f7 num_buffers
+    mini.push_back(0x01U);
+    if (ser.has_rep) {
+        mini.push_back(0x40U);  // f8 repetition_index_depth
+        mini.push_back(0x01U);
+    }
+    mini.push_back(0x48U);  // f9 num_items
+    append_varint(mini, ser.items.size());
+    mini.push_back(0x50U);  // f10 has_large_chunk
+    mini.push_back(0x01U);
+    page.descriptor = page_encoding(1, mini);
+    return true;
+}
+
+bool write_nested_column(std::ofstream& out, const LanceField& field, const ColumnValues& values, std::uint64_t rows,
+                         pb::ColumnMetadata& column, std::string& error) {
+    std::vector<repdef::SerializeLayer> layers;
+    for (const auto& layer : values.layers) {
+        layers.push_back({layer.is_list, &layer.offsets, &layer.validity});
+    }
+    if (values.layers.front().length != rows) {
+        error = "column '" + field.name + "' holds " + std::to_string(values.layers.front().length) +
+                " rows, the fragment " + std::to_string(rows);
+        return false;
+    }
+    // Pages are cut at row boundaries. A page may hold many chunks; what bounds it is the reader's
+    // working set, so keep a page to a few MiB of values and a bounded number of rows.
+    constexpr std::size_t kMaxValueBytes = std::size_t{8} << 20U;
+    constexpr std::uint64_t kMaxRowsPerPage = 32768U;
+    column.encoding = column_encoding_bytes();
+    std::uint64_t row = 0;
+    std::uint64_t try_rows = kMaxRowsPerPage;
+    repdef::Serialized ser;
+    NestedPageBuffers built;
+    while (row < rows) {
+        const auto n = std::min(try_rows, rows - row);
+        if (!repdef::serialize(layers, values.validity, row, n, ser, error)) {
+            error = "column '" + field.name + "': " + error;
+            return false;
+        }
+        pb::ColumnPage page;
+        page.length = n;
+        page.priority = 0;
+        if (ser.items.empty()) {
+            // No values at all -- every list empty or null. Lance writes a ConstantLayout with no
+            // value and the levels as raw u16 buffers [rep, def]; so does this.
+            std::vector<std::uint8_t> layer_bytes(ser.layers.begin(), ser.layers.end());
+            std::vector<std::uint8_t> constant;
+            write_length_delimited(constant, 5, layer_bytes);
+            constant.push_back(0x48U);  // f9 num_rep_values
+            append_varint(constant, ser.rep.size());
+            constant.push_back(0x50U);  // f10 num_def_values
+            append_varint(constant, ser.def.size());
+            std::vector<std::uint8_t> raw_rep;
+            std::vector<std::uint8_t> raw_def;
+            append_u16_levels(raw_rep, ser.rep);
+            append_u16_levels(raw_def, ser.def);
+            page.buffer_offsets.push_back(write_buffer(out, raw_rep));
+            page.buffer_sizes.push_back(raw_rep.size());
+            page.buffer_offsets.push_back(write_buffer(out, raw_def));
+            page.buffer_sizes.push_back(raw_def.size());
+            page.encoding = page_encoding(2, constant);
+        } else {
+            bool too_big = false;
+            const bool built_ok = build_nested_page(field, values, ser, n, built, too_big, error);
+            if (!built_ok && !too_big) {
+                error = "column '" + field.name + "': " + error;
+                return false;
+            }
+            if (too_big || (built.payload.size() > kMaxValueBytes && n > 1U)) {
+                if (n == 1U) {
+                    error = "column '" + field.name + "': row " + std::to_string(row) +
+                            " holds more list entries than one page chunk can describe";
+                    return false;
+                }
+                try_rows = std::max<std::uint64_t>(1U, n / 2U);
+                continue;
+            }
+            page.buffer_offsets.push_back(write_buffer(out, built.control));
+            page.buffer_sizes.push_back(built.control.size());
+            page.buffer_offsets.push_back(write_buffer(out, built.payload));
+            page.buffer_sizes.push_back(built.payload.size());
+            if (!built.dictionary.empty()) {
+                page.buffer_offsets.push_back(write_buffer(out, built.dictionary));
+                page.buffer_sizes.push_back(built.dictionary.size());
+            }
+            if (ser.has_rep) {
+                page.buffer_offsets.push_back(write_buffer(out, built.rep_index));
+                page.buffer_sizes.push_back(built.rep_index.size());
+            }
+            page.encoding = built.descriptor;
+        }
+        column.pages.push_back(std::move(page));
+        row += n;
+        try_rows = std::min<std::uint64_t>(kMaxRowsPerPage, try_rows * 2U);
+    }
+    return true;
+}
 
 bool write_lance_data_file(const std::filesystem::path& dataset_path,
                            const std::string& file_name,
@@ -803,6 +1539,26 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
     for (std::size_t field_index = 0; field_index < physical_fields.size(); ++field_index) {
         const auto& field = *physical_fields[field_index];
         const auto& values = column_values[field_index];
+
+        // Nulls are encodable only on the paths that have been taught the definition-level layer.
+        // Everything else must refuse rather than drop them: ingest no longer rejects a null batch,
+        // so this is the backstop that keeps a column with nulls from being written as if it had
+        // none -- which is exactly the silent [10, null, 30] -> [10, 0, 30] corruption this whole
+        // area is here to prevent.
+        const bool column_has_nulls = values.null_count != 0U;
+        if (column_has_nulls) {
+            if (values.kind == ColumnValues::Kind::BlobV2External) {
+                error = "column '" + field.name +
+                        "' is a lance.blob.v2 external reference and cannot carry nulls yet";
+                return false;
+            }
+            if (values.validity.empty()) {
+                error = "column '" + field.name + "' reports " + std::to_string(values.null_count) +
+                        " nulls but carries no validity bitmap";
+                return false;
+            }
+        }
+
         if (values.kind == ColumnValues::Kind::BlobV2External) {
             const auto& blob = values.blob_v2;
             if (blob.row_packed_sizes.size() != static_cast<std::size_t>(rows)) {
@@ -842,11 +1598,46 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             continue;
         }
 
+        if (values.needs_nested_pages()) {
+            pb::ColumnMetadata column;
+            if (!write_nested_column(out, field, values, rows, column, error)) {
+                return false;
+            }
+            columns.push_back(std::move(column));
+            continue;
+        }
+
+        // Arrow's null type: every row is null and there is no value to store at all.
+        if (field.logical_type == "null") {
+            pb::ColumnMetadata column;
+            column.encoding = column_encoding_bytes();
+            pb::ColumnPage page;
+            page.length = rows;
+            page.priority = 0;
+            page.encoding = all_null_constant_layout_message();
+            column.pages.push_back(std::move(page));
+            columns.push_back(std::move(column));
+            continue;
+        }
+
         // Constant column (tagged by the writer): ConstantLayout. The single value comes from the
         // field metadata. Fixed-width stores it inline (zero data buffers); variable-width stores it
         // in one data buffer.
         const auto packing_it = field.metadata.find("nanolance:packing");
-        if (packing_it != field.metadata.end() && packing_it->second == "constant") {
+// Skipped for a column with nulls: these encodings rewrite the value sequence (a constant column
+        // stores one value, RLE stores runs, a dictionary stores indices) and the definition-level layer is
+        // positional -- one level per value, in row order. Pairing them needs the levels to be encoded
+        // against the rewritten sequence, which is not done yet, so a nullable column takes the flat or
+        // bit-packed path instead. It costs size, never correctness.
+        // A fixed-width constant is inlined in the descriptor, which Lance caps at 32 bytes. Wider
+        // ones fall through to the flat path -- this used to write the inline value's length as ONE
+        // byte, so any value of 128 bytes or more produced a descriptor neither nanolance nor pylance
+        // could parse: a corrupt file, from a constant fixed_size_binary(200) column.
+        const bool constant_fits =
+            lance_field_is_variable_width(field.logical_type) ||
+            lance_logical_type_value_bytes(field.logical_type) <= kMaxInlineConstantBytes;
+        if (!column_has_nulls && constant_fits && packing_it != field.metadata.end() &&
+            packing_it->second == "constant") {
             const auto value_it = field.metadata.find("nanolance:const-value");
             if (value_it == field.metadata.end()) {
                 error = "constant column missing nanolance:const-value for ";
@@ -861,7 +1652,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.priority = 0;
             if (lance_field_is_variable_width(field.logical_type)) {
                 const bool large =
-                    field.logical_type == "large_utf8" || field.logical_type == "large_binary";
+                    lance_logical_type_has_large_offsets(field.logical_type);
                 const auto scalar_buffer = encode_scalar_variable_value(value, large);
                 align64(out);
                 const auto value_offset = pos(out);
@@ -880,7 +1671,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
 
         // Run-length encoded fixed-width column (tagged by the writer): one chunk with two buffers
         // (run values + run lengths) -> Rle PageLayout.
-        if (packing_it != field.metadata.end() && packing_it->second == "rle" &&
+        if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "rle" &&
             values.kind == ColumnValues::Kind::FixedWidth) {
             const auto bpv = value_width_bytes(field);
             const std::size_t n = values.fixed_size() / bpv;
@@ -945,10 +1736,10 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
 
         // Dictionary + RLE for a low-cardinality variable-width column: distinct values in buffer[2],
         // per-row u32 indices RLE'd in buffer[1].
-        if (packing_it != field.metadata.end() && packing_it->second == "dict-rle" &&
+        if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "dict-rle" &&
             values.kind == ColumnValues::Kind::VariableWidth) {
             const bool large =
-                field.logical_type == "large_utf8" || field.logical_type == "large_binary";
+                lance_logical_type_has_large_offsets(field.logical_type);
             const std::size_t ow = large ? 8U : 4U;
             const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
             auto read_offset = [&](std::size_t idx) -> std::int64_t {
@@ -1051,10 +1842,10 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
 
         // Structural dictionary for scattered low-cardinality strings: flat bitpacked u32 indices in
         // buffer[1], uncompressed dictionary variable block in buffer[2].
-        if (packing_it != field.metadata.end() && packing_it->second == "dict" &&
+        if (!column_has_nulls && packing_it != field.metadata.end() && packing_it->second == "dict" &&
             values.kind == ColumnValues::Kind::VariableWidth) {
             const bool large =
-                field.logical_type == "large_utf8" || field.logical_type == "large_binary";
+                lance_logical_type_has_large_offsets(field.logical_type);
             const std::size_t ow = large ? 8U : 4U;
             const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
             auto read_offset = [&](std::size_t idx) -> std::int64_t {
@@ -1173,7 +1964,18 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
             const auto total = values.fixed_size() / fixed_bytes_per_value;
-            const auto max_chunk_values = max_values_per_uncompressed_chunk(fixed_bytes_per_value);
+            std::uint64_t fsl_items = 0;
+            {
+                std::string element;
+                (void)lance_fixed_size_list_parts(field.logical_type, element, fsl_items);
+            }
+            // A chunk that carries definition levels is limited to one FastLanes block (1024
+            // values); without nulls the chunk is sized purely by its byte budget, which for a
+            // narrow type runs to several thousand values.
+            const auto max_chunk_values =
+                column_has_nulls ? std::min<std::size_t>(1024U,
+                                                         max_values_per_uncompressed_chunk(fixed_bytes_per_value))
+                                 : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
             // Every full chunk of a column produces IDENTICAL page-encoding bytes (only the row-count
             // varint differs, and full chunks all carry max_chunk_values rows) -- build them once and
             // copy per page instead of re-encoding the whole protobuf tree per page.
@@ -1181,17 +1983,25 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             for (std::size_t off = 0; off < total;) {
                 const auto count = std::min(max_chunk_values, total - off);
                 const auto chunk_bytes = count * fixed_bytes_per_value;
-                const auto words = static_cast<std::uint16_t>((chunk_bytes + 7U) / 8U);
-                const std::array<char, 4> control{static_cast<char>((words << 4U) & 0xFFU),
-                                                  static_cast<char>(((words << 4U) >> 8U) & 0xFFU), 0, 0};
+                const auto chunk_repdef =
+                    column_has_nulls ? pack_definition_levels(values.validity, off, count)
+                                     : std::vector<std::uint8_t>{};
+                const auto word = miniblock_control_word(chunk_repdef.size(), chunk_bytes);
+                const std::array<char, 4> control{static_cast<char>(word & 0xFFU),
+                                                  static_cast<char>((word >> 8U) & 0xFFU), 0, 0};
 
                 align64(out);
                 const auto control_offset = pos(out);
                 out.write(control.data(), static_cast<std::streamsize>(control.size()));
                 align64(out);
                 const auto payload_offset = pos(out);
-                const auto payload_size = stream_flat_miniblock_payload(
-                    out, values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes);
+                const auto payload_size =
+                    column_has_nulls
+                        ? stream_miniblock_payload_with_repdef(
+                              out, chunk_repdef, count,
+                              values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes)
+                        : stream_flat_miniblock_payload(
+                              out, values.fixed_data() + off * fixed_bytes_per_value, chunk_bytes);
 
                 pb::ColumnPage page;
                 page.buffer_offsets.push_back(control_offset);
@@ -1202,11 +2012,13 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 page.priority = 0;
                 if (count == max_chunk_values) {
                     if (full_chunk_encoding.empty()) {
-                        full_chunk_encoding = page_layout_bytes(field, count);
+                        full_chunk_encoding = page_layout_bytes_flat(flat_bits_per_value(field), count,
+                                                                     column_has_nulls, fsl_items);
                     }
                     page.encoding = full_chunk_encoding;
                 } else {
-                    page.encoding = page_layout_bytes(field, count);
+                    page.encoding =
+                        page_layout_bytes_flat(flat_bits_per_value(field), count, column_has_nulls, fsl_items);
                 }
                 column.pages.push_back(std::move(page));
                 off += count;
@@ -1227,9 +2039,12 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
             const auto total = bool_pack ? values.fixed_size() : values.fixed_size() / fixed_bytes_per_value;
-            const std::size_t step = bitpack      ? 1024U  // one FastLanes block per page
-                                     : bool_pack ? kMaxBoolValuesPerChunk
-                                                 : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
+            std::size_t step = bitpack      ? 1024U  // one FastLanes block per page
+                               : bool_pack ? kMaxBoolValuesPerChunk
+                                           : max_values_per_uncompressed_chunk(fixed_bytes_per_value);
+            if (column_has_nulls) {
+                step = std::min<std::size_t>(step, 1024U);  // see pack_definition_levels
+            }
             std::vector<std::uint8_t> scratch;  // built chunk bytes, reused across chunks
             std::vector<std::uint8_t> framed;   // zstd frame (bss-zstd only), reused across chunks
             // Every full chunk of a column produces IDENTICAL page-encoding bytes (only the row-count
@@ -1238,13 +2053,15 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             auto build_page_encoding = [&](std::size_t count) {
                 if (bitpack) {
                     return page_layout_bytes_inline_bitpacking(
-                        static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), count);
+                        static_cast<std::uint8_t>(fixed_bytes_per_value * 8U), count, column_has_nulls);
                 }
                 if (bool_pack) {
                     // Plain Flat{bits_per_value:1} -- no CompressiveEncoding wrapper, matching stock Lance.
-                    return page_layout_bytes(flat_bits_per_value_token(field), count, false);
+                    return page_layout_bytes_flat(flat_bits_per_value(field), count, column_has_nulls);
                 }
-                return page_layout_bytes_bss_zstd(flat_bits_per_value_token(field), count);
+                // byte-stream-split is restricted to 32/64-bit values, so the cast is safe.
+                return page_layout_bytes_bss_zstd(static_cast<std::uint8_t>(flat_bits_per_value(field)), count,
+                                                  column_has_nulls);
             };
             for (std::size_t off = 0; off < total;) {
                 const auto count = std::min(step, total - off);
@@ -1266,9 +2083,12 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                     }
                 }
                 const auto& chunk_bytes = bss_zstd ? framed : scratch;
-                const auto words = static_cast<std::uint16_t>((chunk_bytes.size() + 7U) / 8U);
-                const std::array<char, 4> control{static_cast<char>((words << 4U) & 0xFFU),
-                                                  static_cast<char>(((words << 4U) >> 8U) & 0xFFU), 0, 0};
+                const auto chunk_repdef =
+                    column_has_nulls ? pack_definition_levels(values.validity, off, count)
+                                     : std::vector<std::uint8_t>{};
+                const auto word = miniblock_control_word(chunk_repdef.size(), chunk_bytes.size());
+                const std::array<char, 4> control{static_cast<char>(word & 0xFFU),
+                                                  static_cast<char>((word >> 8U) & 0xFFU), 0, 0};
 
                 align64(out);
                 const auto control_offset = pos(out);
@@ -1276,7 +2096,11 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 align64(out);
                 const auto payload_offset = pos(out);
                 const auto payload_size =
-                    stream_flat_miniblock_payload(out, chunk_bytes.data(), chunk_bytes.size());
+                    column_has_nulls ? stream_miniblock_payload_with_repdef(out, chunk_repdef, count,
+                                                                            chunk_bytes.data(),
+                                                                            chunk_bytes.size())
+                                     : stream_flat_miniblock_payload(out, chunk_bytes.data(),
+                                                                     chunk_bytes.size());
 
                 pb::ColumnPage page;
                 page.buffer_offsets.push_back(control_offset);
@@ -1301,9 +2125,18 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         }
 
         // Variable-width columns keep the two-phase build (chunks are unequal-sized, driven by the
-        // offsets math in build_variable_chunks_for_column).
-        if (!build_variable_chunks_for_column(values.variable, chunks, error)) {
+        // offsets math in build_variable_chunks_for_column). A nullable column additionally caps each
+        // chunk at one FastLanes block, since that is what a definition-level buffer covers.
+        if (!build_variable_chunks_for_column(values.variable, chunks, error,
+                                              column_has_nulls ? 1024U : 0U)) {
             return false;
+        }
+        if (column_has_nulls) {
+            std::uint64_t row = 0;
+            for (auto& chunk : chunks) {
+                chunk.repdef = pack_definition_levels(values.validity, row, chunk.value_count);
+                row += chunk.value_count;
+            }
         }
 
         const bool zstd_variable = compress;
@@ -1340,8 +2173,10 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.priority = 0;
             const auto bits_token =
                 values.variable.large ? static_cast<std::uint8_t>(0x40U) : static_cast<std::uint8_t>(0x20U);
-            page.encoding = zstd_variable ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count)
-                                          : page_layout_bytes(bits_token, chunk.value_count, true);
+            page.encoding = zstd_variable
+                                ? page_layout_bytes_variable_zstd(bits_token, chunk.value_count,
+                                                                  column_has_nulls)
+                                : page_layout_bytes(bits_token, chunk.value_count, true, column_has_nulls);
             column.pages.push_back(std::move(page));
         }
         columns.push_back(std::move(column));

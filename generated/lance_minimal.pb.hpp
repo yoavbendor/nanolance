@@ -38,10 +38,24 @@ struct DataFile {
     std::uint64_t file_size_bytes = 0;
 };
 
+/// A fragment's deletion file: which of its rows Lance considers deleted.
+///
+/// Lives at `_deletions/{fragment_id}-{read_version}-{id}.{arrow|bin}` and comes in two shapes --
+/// an Arrow IPC file of u32 row offsets when deletions are sparse, a roaring bitmap when they are
+/// dense (Lance switches above 5000). `present` is false when the fragment has none.
+struct DeletionFile {
+    bool present = false;
+    std::uint32_t file_type = 0;  // 0 = ARROW_ARRAY (.arrow), 1 = BITMAP (.bin)
+    std::uint64_t read_version = 0;
+    std::uint64_t id = 0;
+    std::uint64_t num_deleted_rows = 0;
+};
+
 struct DataFragment {
     std::uint64_t id = 0;
     std::vector<DataFile> files;
     std::uint64_t physical_rows = 0;
+    DeletionFile deletion_file;
 };
 
 struct Manifest {
