@@ -170,7 +170,7 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 | `date32`, `date64`, `time32` (s/ms), `time64` (us/ns) | round-trips |
 | `decimal128`, `decimal256` | round-trips |
 | `timestamp` with a **UTC-offset** timezone (`+05:30`) | **refused** — Lance supports IANA zone names only and panics on offsets, so pylance cannot write one either; use a named zone |
-| `list`, `large_list`, `map`, lists of structs, structs of lists | round-trips — null and empty lists, null items, any nesting depth; a list of `fixed_size_list` is refused |
+| `list`, `large_list`, `map`, lists of structs, structs of lists | round-trips — null and empty lists, null items, any nesting depth, `fixed_size_list` items (bounding boxes, embeddings); a null element inside a valid `fixed_size_list` item is refused |
 | `large_utf8`, `large_binary` | round-trips — plain, nullable, dictionary-encoded, constant, and as list, struct or map items |
 | Arrow `dictionary<...>` columns | **refused** — cast to the value type; nanolance dictionary-encodes low-cardinality strings on disk by itself, so the file stays the same size |
 
@@ -194,7 +194,7 @@ Lance's string compressor switches on):
 | `list`, `large_list`, `list<list<…>>` of any type above, long values (FullZip) included — null lists, empty lists, null items | yes |
 | a list of structs, a struct holding lists — with nulls at any level | yes |
 | `map` | yes |
-| a list of `fixed_size_list` | no — refused by name |
+| a list of `fixed_size_list` | yes (a null element inside a valid item is refused by name) |
 
 nanolance also reads Lance datasets pylance has **modified**: multiple versions, `append`,
 `overwrite`, `update`, `delete` (both the Arrow-IPC and roaring-bitmap deletion formats) and

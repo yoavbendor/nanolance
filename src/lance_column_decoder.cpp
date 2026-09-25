@@ -3614,6 +3614,27 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             page_values.kind = out.kind;
             page_values.variable.large = out.variable.large;
         }
+        // fixed_size_list items (bounding boxes, embeddings): Lance marks every element of a null item
+        // null as well. Those element bits say nothing the item's own validity does not, so they are
+        // dropped; a null element inside a VALID item is not something this reader can carry.
+        if (!page_values.item_validity.empty()) {
+            const auto per_item = page_values.items_per_row;
+            const auto& item_bits = unraveled[0].validity;
+            for (std::uint64_t k = 0; k < page_items && per_item != 0U; ++k) {
+                if (!item_bits.empty() && ((item_bits[static_cast<std::size_t>(k >> 3U)] >> (k & 7U)) & 1U) == 0U) {
+                    continue;
+                }
+                for (std::uint64_t e = k * per_item; e < (k + 1U) * per_item; ++e) {
+                    if (static_cast<std::size_t>(e >> 3U) < page_values.item_validity.size() &&
+                        ((page_values.item_validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) == 0U) {
+                        error = where + "a null element inside a fixed_size_list item is not read yet";
+                        return false;
+                    }
+                }
+            }
+            page_values.item_validity.clear();
+            page_values.item_null_count = 0;
+        }
         if (!append_leaf_values(out, page_values, error)) {
             error = where + error;
             return false;

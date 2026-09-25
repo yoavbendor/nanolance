@@ -1211,6 +1211,22 @@ std::vector<std::uint8_t> item_value_encoding(ItemEncoding encoding, const Lance
                     static_cast<std::uint8_t>(lance_logical_type_value_bytes(field.logical_type) * 8U)};
         case ItemEncoding::kBool:
         case ItemEncoding::kFlat: {
+            // A fixed_size_list item, as Lance describes it: CompressiveEncoding{ f11 FixedSizeList{
+            // f1 items_per_value, f2 values = Flat(element bits) } } -- not one wide Flat value.
+            std::string element;
+            std::uint64_t items = 0;
+            if (encoding == ItemEncoding::kFlat && lance_fixed_size_list_parts(field.logical_type, element, items)) {
+                std::vector<std::uint8_t> element_flat{0x08};
+                append_varint(element_flat, lance_logical_type_value_bytes(element) * 8U);
+                std::vector<std::uint8_t> element_encoding;
+                write_length_delimited(element_encoding, 1, element_flat);
+                std::vector<std::uint8_t> fsl{0x08};
+                append_varint(fsl, items);
+                write_length_delimited(fsl, 2, element_encoding);
+                std::vector<std::uint8_t> out;
+                write_length_delimited(out, 11, fsl);
+                return out;
+            }
             std::vector<std::uint8_t> flat{0x08};
             append_varint(flat, encoding == ItemEncoding::kBool ? 1U
                                                                 : lance_logical_type_value_bytes(field.logical_type) * 8U);

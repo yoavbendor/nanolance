@@ -795,7 +795,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         plan.array = node_array;
         plan.field = field;
         plan.nodes = std::move(path);
-        if (plan.under_list() && (is_blob || is_fsl || field->column_index < 0)) {
+        if (plan.under_list() && (is_blob || field->column_index < 0)) {
             collect_error = "column '" + field->name + "': a list of " +
                             (is_blob ? std::string("blobs") : field->logical_type) + " is not read yet";
             return false;

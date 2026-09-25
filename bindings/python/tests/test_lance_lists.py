@@ -250,7 +250,7 @@ def test_list_projection_and_neighbours(lance_mod, tmp_path):
 LIST_GAPS = {
     "list_of_vectors": (
         lambda: pa.array([[[1.0, 2.0]] * (i % 3) for i in range(N)], pa.list_(pa.list_(pa.float32(), 2))),
-        "a list of fixed_size_list",
+        None,  # reads since the COCO benchmark needed it (tests/test_fsl_in_lists.py)
     ),
 }
 

@@ -564,8 +564,7 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
 
     std::string element;
     std::uint64_t items = 0;
-    if (field.logical_type == "null" || !field.extension_name.empty() ||
-        lance_fixed_size_list_parts(field.logical_type, element, items)) {
+    if (field.logical_type == "null" || !field.extension_name.empty()) {
         error = "column '" + field.name + "': a list of " + field.logical_type + " cannot be written yet";
         return false;
     }
@@ -587,6 +586,11 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
     append_bits(out.validity, out.null_count, items_before, leaf, at, count);
     if (lance_field_is_variable_width(field.logical_type)) {
         return append_variable_width(leaf, field, out, error);
+    }
+    // A fixed_size_list item (a bounding box, an embedding) is one fixed-width value of N elements,
+    // taken from the child array; a null item is fine, a null element inside a valid one is refused.
+    if (lance_fixed_size_list_parts(field.logical_type, element, items)) {
+        return append_fixed_size_list(leaf, field, element, items, out, error);
     }
     return append_fixed_width(leaf, field, out, error);
 }
