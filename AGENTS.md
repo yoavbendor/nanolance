@@ -188,12 +188,15 @@ Tips that help the encoders:
 ## 4a. Measured performance vs Parquet and Rust Lance
 
 `docs/BENCHMARKS.md` (from `tools/bench_matrix.py`) is the current, complete comparison: 27 data
-types, nanolance C++ and Python against Rust Lance on one core and on all cores, with Parquet as a
-yardstick, every read verified. Geometric means, nanolance on one thread: reads 2.00x faster than
-Rust Lance on one core and 1.43x faster than Rust on four; writes 1.35x / 1.41x; files 99% of Rust's
-size. Numeric and temporal columns are the strongest (2.5-3.5x); lists and maps the weakest (reads
-0.61x four-core Rust). Where Parquet's files are smaller: sorted or low-range numbers (delta and
-dictionary encodings), where both Lance writers produce the same larger files.
+types, nanolance C++ and Python against Rust Lance (pylance, and the `lance` crate with no Python via
+`tools/lance_rs_bench`) on one core and on all cores, with Parquet as a yardstick, every read
+verified, plus peak memory and program size. Geometric means, nanolance on one thread: reads 2.02x
+faster than Rust Lance on one core and 1.44x faster than Rust on four; writes 1.34x / 1.37x; files
+99% of Rust's size; peak read memory 3.2x less than the lance crate, and write memory 3.2x less with
+a 4 MiB `max_pending_bytes`; a stripped reader+writer program is 2.5 MB against 165 MB. Numeric and
+temporal columns are the strongest (2.8-3.4x); lists and maps the weakest (reads 0.61x four-core
+Rust). Where Parquet's files are smaller: sorted or low-range numbers (delta and dictionary
+encodings), where both Lance writers produce the same larger files.
 
 Allocator note: with glibc's default allocator a large read pays page faults for fresh memory;
 nanolance asks for transparent huge pages on outputs of 8 MiB or more, and a retaining allocator

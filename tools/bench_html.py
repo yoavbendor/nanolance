@@ -240,8 +240,9 @@ python tools/bench_html.py          # this page</pre>
   if (FP && FP.nanolance.bench_binary_bytes && FP.rust.bench_binary_bytes)
     tiles.push(["Program size", (FP.nanolance.bench_binary_bytes / 1e6).toFixed(1) + " MB",
                 `reader + writer, stripped; the lance crate: ${(FP.rust.bench_binary_bytes / 1e6).toFixed(0)} MB`]);
+  const memB = geo(names.map(n => ratio(P(n, "rust-native write"), P(n, "nanolance-cpp-budget write"))));
   if (memW && memR)
-    tiles.push(["Memory", fmtX(Math.sqrt(memW * memR)) + " less", `peak, vs the lance crate: writes ${fmtX(memW)}, reads ${fmtX(memR)}`]);
+    tiles.push(["Less memory to read", fmtX(memR), `peak vs the lance crate; writes ${fmtX(memW)}, ${fmtX(memB)} with a 4 MiB budget`]);
   const tilesEl = document.getElementById("tiles");
   tiles.forEach(([l, v, n]) => { const t = el("div", {class: "tile"}); t.append(el("div", {class: "label"}, l), el("div", {class: "value"}, v), el("div", {class: "note"}, n)); tilesEl.append(t); });
   document.getElementById("tiles-note").textContent = "Speed ratios are Rust Lance's time divided by nanolance's: above 1× means nanolance is faster. Averages are geometric means across all data types.";

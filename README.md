@@ -446,22 +446,28 @@ Standalone configures use **`GIT_SHALLOW TRUE`** on FetchContent to keep *future
 
 ## Benchmarking
 
-**[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** has the full comparison against Rust Lance (pylance 12)
-and Parquet: 27 Arrow data types -- numbers, dates, strings, nulls, vectors, structs, lists, maps and a
-mixed table -- each written and read by nanolance C++, nanolance Python, Rust Lance on one core and on
-all cores, every read checked against the source before it is timed, and every file read by the other
-side. In short (geometric means; nanolance on one thread, Rust on 4 cores / 1 core):
+**[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** has the full comparison against Rust Lance -- through
+pylance 12 and through the `lance` crate itself with no Python (`tools/lance_rs_bench`) -- and
+Parquet: 27 Arrow data types (numbers, dates, strings, nulls, vectors, structs, lists, maps and a
+mixed table), each written and read by nanolance C++, nanolance Python and Rust on one core and on all
+cores, every read checked against the source before it is timed, every file read by the other side,
+with peak memory and program size. In short (geometric means; nanolance on one thread):
 
 | | vs Rust Lance, 4 cores | vs Rust Lance, 1 core |
 |---|---:|---:|
-| Read | 1.43x faster | 2.00x faster |
-| Write | 1.41x faster | 1.35x faster |
+| Read | 1.44x faster | 2.02x faster |
+| Write | 1.37x faster | 1.34x faster |
+| Peak memory, read | 3.2x less | |
+| Peak memory, write with a 4 MiB budget | 3.2x less | |
 | File size | 99% of Rust's | |
+| Reader + writer program, stripped | 2.5 MB against 165 MB | |
 
-Numbers, dates and strings are where nanolance leads (reads 2.5-3.5x faster than four-core Rust on
-numeric types); lists and maps are where Rust leads (nanolance reads them at 0.61x four-core Rust).
+Numbers, dates and strings are where nanolance leads (reads 2.8-3.4x faster than four-core Rust on
+numeric and temporal types); lists and maps are where Rust leads (nanolance reads them at 0.61x
+four-core Rust). Python costs Rust Lance nothing measurable, so pylance is a fair stand-in for Rust.
 Reproduce with `python tools/bench_matrix.py && python tools/bench_report.py && python tools/bench_html.py`
-(the last renders `bench/results/report.html`, with charts).
+(the last renders `bench/results/report.html`, with charts; the Rust-native columns need
+`cargo build --release` in `tools/lance_rs_bench`).
 
 Older, narrower benchmarks: pcap-style columns and native-reader profiles in
 [bench/linux-ci-results.md](bench/linux-ci-results.md) (CI-owned; local runs go to

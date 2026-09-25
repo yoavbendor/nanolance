@@ -1,45 +1,63 @@
 {
  "findings": [
   [
-   "Numbers, dates and times: 2.5–3.5× faster",
-   "On integer, float, boolean, timestamp, date and decimal columns nanolance's single-threaded reader beats Rust Lance on all four cores by 3.5× (numbers) and 2.5× (temporal), geometric mean; a 2M-row int64 id column reads in 6.0 ms against 17.6 ms. Writes are 2.2–2.8× faster. Files are the same size as Rust Lance's, within 2%."
+   "Numbers, dates and times: 2.8–3.4× faster",
+   "On integer, float, boolean, timestamp, date and decimal columns nanolance's single-threaded reader beats Rust Lance on all four cores by 3.4× (numbers) and 2.8× (temporal), geometric mean; a 2M-row int64 id column reads in 5.9 ms against 14.9 ms. Writes are 2.3–2.8× faster. Files are the same size as Rust Lance's, within 2%."
   ],
   [
-   "Strings: 2× faster per core, level on all cores",
-   "Against Rust Lance on one core, nanolance reads strings 2.1× faster; against Rust on all four cores it is 1.14× faster, from one thread. Writes are at parity (1.07–1.11×). FSST makes the files up to 11% smaller than Rust's (URLs: 7.8 vs 8.8 MB). Binary writes are the exception: 68 ms against Rust's 46 ms."
+   "Strings: 2.4× faster per core, faster on all cores too",
+   "Against Rust Lance on one core nanolance reads strings 2.4× faster; against Rust on all four cores 1.2× faster, from one thread. Writes are at parity (0.97–0.99×). FSST makes the files up to 11% smaller than Rust's (URLs: 7.8 vs 8.8 MB)."
   ],
   [
    "Nested data is where Rust leads",
-   "Lists, maps and lists of structs: nanolance reads at 0.96× Rust on one core and 0.61× Rust on four (a map<string, int64> column: 50 ms against 23 ms), and writes at 0.92× and 0.76×. Vectors read faster than Rust on all cores (35 vs 47 ms) and plain structs faster than Rust on one core. The time goes to reassembling repetition and definition levels page by page, the next thing to optimize."
+   "Lists, maps and lists of structs: nanolance reads at 0.91× Rust on one core and 0.61× Rust on four (a map<string, int64> column: 49 ms against 21 ms), and writes at 0.93× and 0.74×. Vectors read faster than Rust on all cores (29 vs 41 ms). The time goes to reassembling repetition and definition levels page by page, the next thing to optimize."
+  ],
+  [
+   "Without Python, the same picture",
+   "A Rust program using the lance crate directly (tools/lance_rs_bench, the crate pylance 12.0.0 is built from) is no faster than pylance: pylance takes 1.12× and 0.92× the crate's read time (one core, all cores) and 0.96× and 0.98× of its write time. Against the crate itself nanolance reads 1.8× faster on one core and 1.6× faster on four, and writes 1.4× faster."
+  ],
+  [
+   "A read needs the table and little else",
+   "nanolance's peak memory for a read is the table it returns plus 1–11 MB. The lance crate's is the table plus 34–65 MB, and it needs 35 MB to read even a 1,000-row dataset: 3.2× more on average (geometric mean)."
+  ],
+  [
+   "A write in a fixed amount of memory",
+   "Without a limit, nanolance holds a write until commit, about twice the input. Its 4 MiB writer budget, the edge-device setting, commits a fragment whenever it holds 4 MiB: peak memory then drops to 3.2× less than the lance crate's (int64 ids: 6.9 against 32.9 MB), and writes get 13% faster on average, since the working set stays in cache. The budget acts between batches: string_long arrives as one 45 MB batch and still peaks at 117 MB."
+  ],
+  [
+   "2.5 MB against 165 MB",
+   "A stripped program that reads and writes Lance is 2.5 MB with nanolance and 165 MB with the lance crate, built for local files only (pylance's native library, with the cloud object stores, is 213 MB; nanolance's Python extension is 2.7 MB). nanolance links two third-party libraries, nanoarrow and zstd; the lance crate brings 371 crates."
   ],
   [
    "One thread, on purpose",
-   "nanolance never starts a thread, which is what embedded and edge deployments want: predictable CPU, no pool to size, memory bounded by the writer's byte budget. That is why both Rust columns are shown: one core is the per-core comparison, all cores is out of the box. Across the 27 data types nanolance is faster than one-core Rust on 22 reads and 17 writes, and faster than four-core Rust on 18 reads and 18 writes."
+   "nanolance never starts a thread, which is what embedded and edge deployments want: predictable CPU, no pool to size, memory bounded by the writer's budget. Both Rust columns are shown for that reason: one core is the per-core comparison, all cores is out of the box. Across the 27 data types nanolance is faster than one-core Rust on 22 reads and 17 writes, and faster than four-core Rust on 18 reads and 17 writes."
   ],
   [
    "Every file read by the other side, 81 of 81",
-   "Rust Lance read every file nanolance wrote, and nanolance read every file Rust Lance wrote, from C++ and Python, each checked value by value before it was timed. Rust reads nanolance's files at 1.07× the time of its own (geometric mean). Building this benchmark found and fixed two problems: Rust read nanolance's integer columns 5.7× slower than its own (pages were too small), and nanolance refused Rust files whose pages switch encoding midway."
+   "Rust Lance read every file nanolance wrote, and nanolance read every file Rust Lance wrote, from C++ and Python, each checked value by value before it was timed; Rust reads nanolance's files as fast as its own (1.00×, geometric mean). Building this benchmark found and fixed two problems: Rust read nanolance's integer columns 5.7× slower than its own (pages were too small), and nanolance refused Rust files whose pages switch encoding midway."
   ],
   [
    "Python costs nothing",
-   "The Python bindings hand Arrow buffers across without copying (the PyCapsule interface), so nanolance from Python reads and writes within noise of the C++ API (0.97× and 0.95× of its time, geometric mean), including conversion to a pyarrow.Table."
+   "The Python bindings hand Arrow buffers across without copying (the PyCapsule interface), so nanolance from Python reads and writes within noise of the C++ API (0.95× and 0.97× of its time, geometric mean), including conversion to and from a pyarrow.Table."
   ],
   [
    "Parquet: 2× slower, sometimes smaller",
-   "pyarrow's Parquet reader and writer, using all four cores, take 2.2× and 2.3× nanolance's time (geometric mean). Parquet's files are smaller for sorted or low-range numbers, where its delta and dictionary encodings apply (monotonic ids 0.46×, timestamps 0.37×, decimals 0.30× of Lance's size); both Lance writers produce the same, larger files there."
+   "pyarrow's Parquet reader and writer, on all four cores, take 2.1× and 2.4× nanolance's time (geometric mean). Parquet's files are smaller for sorted or low-range numbers, where its delta and dictionary encodings apply (monotonic ids 0.46×, timestamps 0.37×, decimals 0.30× of Lance's size); both Lance writers produce the same, larger files there."
   ],
   [
    "Known gaps, stated plainly",
-   "Rust on one core reads booleans 1.8× faster (5.5 vs 10.0 ms) and writes them 2.6× faster. nanolance reads Rust's FullZip pages (128-dim vectors, long strings) about 3× slower than its own layout of the same data. With glibc's default allocator a large read pays for page faults; a retaining allocator (jemalloc, mimalloc, or two glibc environment variables) gives nanolance another 1.15× on average, which the full table shows."
+   "Rust on one core reads booleans 1.8–2.4× faster (4.9 and 3.7 ms against 9.0) and writes them 2.6× faster. nanolance reads Rust's FullZip pages (128-dim vectors, long strings) 2.4–3.6× slower than its own layout of the same data. Rust reads nanolance's plain binary column 1.8× slower than its own (34 vs 19 ms). With glibc's default allocator a large read pays for page faults; a retaining allocator (jemalloc, mimalloc, or two glibc environment variables) gives nanolance another 1.17× on average."
   ]
  ],
  "method": [
-  "Machine: Intel Xeon @ 2.80 GHz, 4 cores, 16 GB, Linux 6.18. Rust Lance is pylance 12.0.0 writing and reading Lance file format 2.2; pyarrow 25.0.1; nanolance built Release at the commit shown above.",
+  "Machine: Intel Xeon @ 2.80 GHz, 4 cores, 16 GB, Linux 6.18. Rust Lance is pylance 12.0.0 and the lance crate 12.0.0 it is built from, both writing and reading Lance file format 2.2; pyarrow 25.0.1; nanolance built Release at the commit shown above.",
   "27 data types, 50,000 to 2,000,000 rows each (tens of MB in memory), one column per data type except the 10-column event table. Every writer receives the same input: the table as 64K-row Arrow batches.",
   "Every time is the median of 7 runs after one warm-up, with the files in the page cache: the warm, repeated read a query service sees.",
   "nanolance C++ runs pinned to one core, timed inside one process by tools/nlbench: a read is lance_table_read_dataset into Arrow arrays; a write is writer open, write_batch per batch, commit. glibc's default allocator unless a column says otherwise.",
-  "Rust Lance runs twice: lance.dataset(path).to_table() and lance.write_dataset(...) with its default thread pools on all 4 cores, and in a separate process pinned to one core with LANCE_CPU_THREADS=1 and LANCE_IO_THREADS=1.",
+  "Rust Lance through pylance: lance.dataset(path).to_table() and lance.write_dataset(...) on all 4 cores, and in a separate process pinned to one core with LANCE_CPU_THREADS=1 and LANCE_IO_THREADS=1. Without Python: tools/lance_rs_bench (Dataset::open + scan into record batches; Dataset::write), the same two ways, one tokio worker on one core; built with the crate's default features off (local files only) and thin LTO.",
+  "Peak memory: nlbench and lance_rs_bench reset the kernel's high-water mark (/proc/self/clear_refs) before each run and report the most any run added over what the process already held: the input batches of a write; nothing for a read, whose peak includes the table it returns. The budgeted write sets nanolance's max_pending_bytes to 4 MiB.",
+  "Program sizes are the benchmark programs themselves (reader, writer and Arrow IPC input), stripped; the Python sizes are each package's installed native library.",
   "Python times (nanolance.read_table / write_table) include conversion to and from pyarrow.Table. Parquet is pyarrow.parquet with zstd on all cores, as a familiar yardstick.",
-  "Before any read was timed, its result was compared with the source table (values and types). A reader that returned anything else would be listed as a failure, not a time; this run had none."
+  "Before any read was timed, its result was compared with the source table (values and types), Rust-native reads included (dumped to Arrow IPC and compared). A reader that returned anything else would be listed as a failure, not a time; this run had none."
  ]
 }
