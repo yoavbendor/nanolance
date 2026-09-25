@@ -7,6 +7,9 @@
 //      added over what the process held before it, the returned table included. --trusted reads with trusted_input=true
 //      (skips the untrusted-input DoS/OOM budget checks; bounds checks are unconditional and always run)
 //      -- used to produce the safety-vs-trusted parity table in docs/SAFETY.md (bench/read_parity_bench.sh).
+// Usage: nlbench --take <dataset.lance> [iters] [batch] [col,col,...]
+//   -> one shuffled epoch per iteration: every row once, in seeded random mini-batches of `batch`
+//      (default 64) read with lance_table_take, optionally projected; prints the same JSON.
 // Usage: nlbench --write <in.arrow> <out.lance> [iters] [--budget BYTES]
 //   -> loads the IPC stream's batches into memory once, then writes them to a fresh dataset `iters`
 //      times in this process (write_batch per batch + commit), and prints the same JSON. Timing the
@@ -153,6 +156,53 @@ int bench_write(const std::string& in_path, const std::string& out_path, int ite
     return status;
 }
 
+int bench_take(const std::string& path, int iters, std::size_t batch, const std::vector<std::string>& columns) {
+    std::uint64_t rows = 0;
+    std::string error;
+    if (!nano_lance::lance_table_count_rows(path, rows, error)) {
+        std::cerr << "count failed: " << error << '\n';
+        return 1;
+    }
+    std::vector<std::uint64_t> order(rows);
+    for (std::uint64_t i = 0; i < rows; ++i) {
+        order[i] = i;
+    }
+    std::uint64_t state = 0x9E3779B97F4A7C15ULL;  // splitmix64: a fixed shuffle, the same every run
+    for (std::uint64_t i = rows; i > 1U; --i) {
+        state += 0x9E3779B97F4A7C15ULL;
+        auto z = state;
+        z = (z ^ (z >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27U)) * 0x94D049BB133111EBULL;
+        z ^= z >> 31U;
+        std::swap(order[i - 1U], order[z % i]);
+    }
+    std::vector<double> all_ms;
+    for (int it = 0; it < iters; ++it) {
+        const auto baseline = reset_peak();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::uint64_t at = 0; at < rows; at += batch) {
+            const std::vector<std::uint64_t> indices(order.begin() + static_cast<std::ptrdiff_t>(at),
+                                                     order.begin() + static_cast<std::ptrdiff_t>(std::min<std::uint64_t>(rows, at + batch)));
+            ArrowSchema schema{};
+            std::vector<ArrowArray> batches;
+            if (!nano_lance::lance_table_take(path, columns.empty() ? nullptr : &columns, indices, schema, batches,
+                                              error)) {
+                std::cerr << "take failed: " << error << '\n';
+                return 1;
+            }
+            ArrowSchemaRelease(&schema);
+            for (auto& b : batches) {
+                ArrowArrayRelease(&b);
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        all_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        g_peak_kb = std::max(g_peak_kb, peak_added_kb(baseline));
+    }
+    print_times(static_cast<std::int64_t>(rows), false, all_ms);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -160,6 +210,26 @@ int main(int argc, char** argv) {
         std::cerr << "usage: nlbench <dataset.lance> [iters] [--trusted]\n"
                      "       nlbench --write <in.arrow> <out.lance> [iters] [--budget BYTES]\n";
         return 2;
+    }
+    if (std::strcmp(argv[1], "--take") == 0) {
+        if (argc < 3) {
+            std::cerr << "usage: nlbench --take <dataset.lance> [iters] [batch] [col,col,...]\n";
+            return 2;
+        }
+        std::vector<std::string> columns;
+        if (argc > 5) {
+            std::string list = argv[5];
+            for (std::size_t at = 0; at <= list.size();) {
+                const auto comma = list.find(',', at);
+                const auto end = comma == std::string::npos ? list.size() : comma;
+                if (end > at) {
+                    columns.push_back(list.substr(at, end - at));
+                }
+                at = end + 1U;
+            }
+        }
+        return bench_take(argv[2], argc > 3 ? std::atoi(argv[3]) : 5,
+                          argc > 4 ? static_cast<std::size_t>(std::atoi(argv[4])) : 64U, columns);
     }
     if (std::strcmp(argv[1], "--write") == 0) {
         if (argc < 4) {

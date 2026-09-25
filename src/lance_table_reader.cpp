@@ -19,6 +19,8 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1160,6 +1162,55 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
     return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id, length, batch, error);
 }
 
+/// A data file's parsed footer, descriptor and column metadata, kept for take(): a shuffled epoch calls
+/// take once per mini-batch, and re-reading and re-parsing a file's page table every time (4,890 pages
+/// for the Speech Commands waveforms) cost more than decoding the rows. Keyed by path, file size and
+/// modification time -- Lance never rewrites a data file in place, a new version writes new files --
+/// and bounded, so a long-running loader over many datasets does not grow without limit.
+struct CachedFileMetadata {
+    pb::FileDescriptor descriptor;
+    LanceDataFileFooterLayout layout{};
+    std::vector<pb::ColumnMetadata> columns;
+};
+
+bool cached_file_metadata(const std::filesystem::path& path, std::shared_ptr<const CachedFileMetadata>& out,
+                          std::string& error) {
+    struct Entry {
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type mtime{};
+        std::shared_ptr<const CachedFileMetadata> metadata;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::string, Entry> cache;
+    constexpr std::size_t kMaxFiles = 256U;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
+    const auto key = path.string();
+    if (!ec) {
+        const std::lock_guard<std::mutex> lock(mutex);
+        const auto it = cache.find(key);
+        if (it != cache.end() && it->second.size == size && it->second.mtime == mtime) {
+            out = it->second.metadata;
+            return true;
+        }
+    }
+    auto fresh = std::make_shared<CachedFileMetadata>();
+    if (!read_lance_data_file_footer_and_descriptor(path, fresh->descriptor, fresh->layout, error) ||
+        !read_lance_data_file_column_metadatas(path, fresh->layout, fresh->columns, error)) {
+        return false;
+    }
+    out = fresh;
+    if (!ec) {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (cache.size() >= kMaxFiles) {
+            cache.clear();
+        }
+        cache[key] = Entry{size, mtime, fresh};
+    }
+    return true;
+}
+
 /// One fragment's share of a take: `logical` are its requested rows, ascending, fragment-local and
 /// counted without the deleted ones. Deleted rows are mapped out first, then every projected column
 /// decodes just those physical rows (decode_lance_physical_column_rows).
@@ -1212,18 +1263,15 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
             return false;
         }
         const auto& path = *jailed;
-        pb::FileDescriptor descriptor{};
-        LanceDataFileFooterLayout layout{};
-        if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
+        std::shared_ptr<const CachedFileMetadata> file;
+        if (!cached_file_metadata(path, file, error)) {
             return false;
         }
+        const auto& descriptor = file->descriptor;
+        const auto& column_metadatas = file->columns;
         if (descriptor.length != planned.physical_rows) {
             error = "data file holds " + std::to_string(descriptor.length) + " rows but the manifest claims " +
                     std::to_string(planned.physical_rows);
-            return false;
-        }
-        std::vector<pb::ColumnMetadata> column_metadatas;
-        if (!read_lance_data_file_column_metadatas(path, layout, column_metadatas, error)) {
             return false;
         }
         if (data_file.fields.size() != data_file.column_indices.size()) {

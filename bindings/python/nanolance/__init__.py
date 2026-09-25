@@ -270,7 +270,9 @@ def take(
     images.
 
     Returns a ``pyarrow.Table`` when the rows need reordering (``indices`` not strictly ascending),
-    which needs pyarrow; otherwise the same Arrow-exportable handle as :func:`read_table`.
+    which needs pyarrow; otherwise the same Arrow-exportable handle as :func:`read_table`. The
+    reordered table is assembled from zero-copy slices of the rows read -- one per run of rows that
+    stay adjacent -- so no value is copied; call ``combine_chunks()`` if you need one chunk.
     """
     wanted = [int(i) for i in indices]
     if any(i < 0 for i in wanted):
@@ -282,11 +284,20 @@ def take(
     handle = _nanolance.take(Path(path), distinct, _normalize_columns(columns))
     if wanted == distinct:
         return handle
-    import pyarrow as pa  # reordering needs a take kernel; pyarrow's is the one Arrow users have
+    import pyarrow as pa  # reordering needs Arrow's slicing; pyarrow is what Arrow users have
 
     table = pa.table(handle)
     position = {row: k for k, row in enumerate(distinct)}
-    return table.take(pa.array([position[i] for i in wanted], pa.int64()))
+    pieces = []
+    start = prev = position[wanted[0]]
+    for i in wanted[1:]:
+        k = position[i]
+        if k != prev + 1:
+            pieces.append(table.slice(start, prev - start + 1))
+            start = k
+        prev = k
+    pieces.append(table.slice(start, prev - start + 1))
+    return pa.concat_tables(pieces)
 
 
 def open_stream(

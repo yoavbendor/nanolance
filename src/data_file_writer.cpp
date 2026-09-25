@@ -1792,12 +1792,20 @@ bool write_nested_column(std::ofstream& out, const LanceField& field, const Colu
         return false;
     }
     // Pages are cut at row boundaries. A page may hold many chunks; what bounds it is the reader's
-    // working set, so keep a page to a few MiB of values and a bounded number of rows.
+    // working set, so keep a page to a few MiB of values and a bounded number of rows -- and, when
+    // rows are large (a waveform, a long token list), to about one row: a random-access read
+    // (take) decodes whole pages, so a page of one 32 KiB row costs a mini-batch that row, where
+    // an 8 MiB page cost it 250 rows. Each page's row count is sized from the bytes per row the
+    // previous page measured, instead of trying 32,768 rows and halving: with 32 KiB rows that
+    // built ~1 GB before the first page fit, and doubled back past the limit after every page.
     constexpr std::size_t kMaxValueBytes = std::size_t{8} << 20U;
+    constexpr std::size_t kLargeRowPageBytes = std::size_t{32} << 10U;
+    constexpr std::size_t kLargeRowBytes = std::size_t{4} << 10U;
     constexpr std::uint64_t kMaxRowsPerPage = 32768U;
     column.encoding = column_encoding_bytes();
     std::uint64_t row = 0;
-    std::uint64_t try_rows = kMaxRowsPerPage;
+    std::uint64_t try_rows = 1024U;
+    std::size_t page_bytes = kMaxValueBytes;
     repdef::Serialized ser;
     NestedPageBuffers built;
     while (row < rows) {
@@ -1835,13 +1843,18 @@ bool write_nested_column(std::ofstream& out, const LanceField& field, const Colu
                 error = "column '" + field.name + "': " + error;
                 return false;
             }
-            if (too_big || (built.payload.size() > kMaxValueBytes && n > 1U)) {
+            const auto bytes_per_row = std::max<std::size_t>(1U, built.payload.size() / static_cast<std::size_t>(n));
+            if (bytes_per_row >= kLargeRowBytes) {
+                page_bytes = kLargeRowPageBytes;
+            }
+            if (too_big || (built.payload.size() > page_bytes && n > 1U)) {
                 if (n == 1U) {
                     error = "column '" + field.name + "': row " + std::to_string(row) +
                             " holds more list entries than one page chunk can describe";
                     return false;
                 }
-                try_rows = std::max<std::uint64_t>(1U, n / 2U);
+                try_rows = too_big ? std::max<std::uint64_t>(1U, n / 2U)
+                                   : std::clamp<std::uint64_t>(page_bytes / bytes_per_row, 1U, n - 1U);
                 continue;
             }
             page.buffer_offsets.push_back(write_buffer(out, built.control));
@@ -1860,7 +1873,12 @@ bool write_nested_column(std::ofstream& out, const LanceField& field, const Colu
         }
         column.pages.push_back(std::move(page));
         row += n;
-        try_rows = std::min<std::uint64_t>(kMaxRowsPerPage, try_rows * 2U);
+        // The next page: as many rows as the one just built says fit, a little under the limit. (A
+        // page of only empty or null lists has no payload to measure: keep the row count.)
+        if (!ser.items.empty()) {
+            const auto per_row = std::max<std::size_t>(1U, built.payload.size() / static_cast<std::size_t>(n));
+            try_rows = std::clamp<std::uint64_t>(page_bytes * 7U / 8U / per_row, 1U, kMaxRowsPerPage);
+        }
     }
     return true;
 }
