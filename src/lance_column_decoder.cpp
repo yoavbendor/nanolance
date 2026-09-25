@@ -19,6 +19,7 @@
 
 #include <zstd.h>
 
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <algorithm>
@@ -29,6 +30,9 @@
 
 #if defined(__linux__)
 #include <sys/mman.h>
+#endif
+#if defined(__SSE2__)
+#include <emmintrin.h>
 #endif
 
 namespace nano_lance {
@@ -937,12 +941,40 @@ template <class T>
 /// Turn `count` decoded levels into validity bits. Rows accumulate across chunks into one contiguous
 /// bitmap, so a chunk whose row count is not a multiple of 8 leaves the next chunk starting mid-byte;
 /// each bit therefore goes at its ABSOLUTE row index rather than at a per-chunk offset.
+/// Eight definition levels as one validity byte: bit k set when level k is 0 (valid). SSE2 compares
+/// all eight at once where it is available (every x86-64 CPU); elsewhere the loop is branch-free.
+inline std::uint8_t valid_bits8(const std::uint16_t* levels) {
+#if defined(__SSE2__)
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(levels));
+    const __m128i zero = _mm_cmpeq_epi16(v, _mm_setzero_si128());  // 0xFFFF per valid level
+    return static_cast<std::uint8_t>(_mm_movemask_epi8(_mm_packs_epi16(zero, zero)) & 0xFF);
+#else
+    std::uint8_t b = 0;
+    for (unsigned k = 0; k < 8U; ++k) {
+        b = static_cast<std::uint8_t>(b | ((levels[k] == 0U ? 1U : 0U) << k));
+    }
+    return b;
+#endif
+}
+
 bool append_levels_to_validity(const std::uint16_t* levels, std::uint32_t count,
                                std::uint64_t rows_already_appended, std::vector<std::uint8_t>& out_validity,
                                std::uint64_t& out_null_count) {
     const auto total_rows = rows_already_appended + count;
     out_validity.resize(static_cast<std::size_t>((total_rows + 7U) / 8U), 0U);
-    for (std::uint32_t i = 0; i < count; ++i) {
+    std::uint32_t i = 0;
+    // Byte-aligned, as nearly every chunk is (1024 levels at a time): eight levels per byte written.
+    if ((rows_already_appended & 7U) == 0U) {
+        auto* dst = out_validity.data() + static_cast<std::size_t>(rows_already_appended >> 3U);
+        std::uint64_t valid = 0;
+        for (; i + 8U <= count; i += 8U) {
+            const auto b = valid_bits8(levels + i);
+            *dst++ = b;
+            valid += static_cast<std::uint64_t>(std::popcount(b));
+        }
+        out_null_count += i - valid;
+    }
+    for (; i < count; ++i) {
         if (levels[i] != 0U) {
             ++out_null_count;  // level 1 == null; the bit stays clear
             continue;

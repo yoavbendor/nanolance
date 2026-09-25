@@ -9,35 +9,58 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace nano_lance::boolpack {
 
-// Pack `count` byte-per-value bools into ceil(count/8) LSB-first bytes, into `out`. Each output byte
-// is composed in a register and written exactly once, so no pre-zeroing of `out` is needed -- a caller
-// reusing `out` across chunks pays no per-chunk zero-fill (unlike the previous set-bits-via-|= shape,
-// which required a zeroed buffer).
-inline void pack_lsb_first(const std::uint8_t* values, std::size_t count, std::vector<std::uint8_t>& out) {
-    const std::size_t out_bytes = (count + 7U) / 8U;
-    out.resize(out_bytes);
+namespace detail {
+
+/// Eight byte-per-value bools (each 0 or 1) as one LSB-first byte: the multiply moves byte i's low bit
+/// to bit 56 + i with no carries between the partial products, so one multiply and a shift replace
+/// eight shifts and ors.
+inline std::uint8_t pack8(const std::uint8_t* v) {
+    std::uint64_t x = 0;
+    std::memcpy(&x, v, 8U);
+    return static_cast<std::uint8_t>(((x & 0x0101010101010101ULL) * 0x0102040810204080ULL) >> 56U);
+}
+
+/// byte -> the eight 0/1 bytes it holds, LSB first, as one little-endian u64.
+struct UnpackTable {
+    std::uint64_t entry[256];
+    constexpr UnpackTable() : entry{} {
+        for (unsigned b = 0; b < 256U; ++b) {
+            std::uint64_t e = 0;
+            for (unsigned k = 0; k < 8U; ++k) {
+                e |= static_cast<std::uint64_t>((b >> k) & 1U) << (8U * k);
+            }
+            entry[b] = e;
+        }
+    }
+};
+inline constexpr UnpackTable kUnpack{};
+
+}  // namespace detail
+
+// Pack `count` byte-per-value bools (0 or 1, as nanolance holds them) into ceil(count/8) LSB-first
+// bytes, into `out`. Each output byte is written exactly once, so `out` needs no pre-zeroing.
+inline void pack_lsb_first(const std::uint8_t* values, std::size_t count, std::uint8_t* out) {
     const std::size_t full_bytes = count / 8U;
     for (std::size_t j = 0; j < full_bytes; ++j) {
-        const std::uint8_t* v = values + j * 8U;
-        std::uint8_t b = 0;
-        for (unsigned k = 0; k < 8U; ++k) {
-            b = static_cast<std::uint8_t>(b | static_cast<std::uint8_t>((v[k] != 0U ? 1U : 0U) << k));
-        }
-        out[j] = b;
+        out[j] = detail::pack8(values + j * 8U);
     }
-    if (full_bytes < out_bytes) {
+    if (full_bytes * 8U < count) {
         std::uint8_t b = 0;
         for (std::size_t i = full_bytes * 8U; i < count; ++i) {
-            if (values[i] != 0U) {
-                b = static_cast<std::uint8_t>(b | static_cast<std::uint8_t>(1U << (i % 8U)));
-            }
+            b = static_cast<std::uint8_t>(b | ((values[i] & 1U) << (i % 8U)));
         }
         out[full_bytes] = b;
     }
+}
+
+inline void pack_lsb_first(const std::uint8_t* values, std::size_t count, std::vector<std::uint8_t>& out) {
+    out.resize((count + 7U) / 8U);
+    pack_lsb_first(values, count, out.data());
 }
 
 // Convenience overload returning a fresh buffer (one-shot callers / tests).
@@ -47,10 +70,27 @@ inline std::vector<std::uint8_t> pack_lsb_first(const std::uint8_t* values, std:
     return out;
 }
 
-inline void unpack_lsb_first(const std::uint8_t* packed, std::size_t count, std::uint8_t* out) {
-    for (std::size_t i = 0; i < count; ++i) {
-        out[i] = static_cast<std::uint8_t>((packed[i / 8U] >> (i % 8U)) & 1U);
+// Expand bits `[bit_offset, bit_offset + count)` of LSB-first `packed` to one 0/1 byte each at `out`.
+// Byte-aligned runs go eight values per table lookup.
+inline void unpack_lsb_first(const std::uint8_t* packed, std::size_t bit_offset, std::size_t count,
+                             std::uint8_t* out) {
+    std::size_t i = 0;
+    for (; i < count && ((bit_offset + i) & 7U) != 0U; ++i) {
+        const auto bit = bit_offset + i;
+        out[i] = static_cast<std::uint8_t>((packed[bit >> 3U] >> (bit & 7U)) & 1U);
     }
+    const std::uint8_t* src = packed + ((bit_offset + i) >> 3U);
+    for (; i + 8U <= count; i += 8U) {
+        std::memcpy(out + i, &detail::kUnpack.entry[*src++], 8U);
+    }
+    for (; i < count; ++i) {
+        const auto bit = bit_offset + i;
+        out[i] = static_cast<std::uint8_t>((packed[bit >> 3U] >> (bit & 7U)) & 1U);
+    }
+}
+
+inline void unpack_lsb_first(const std::uint8_t* packed, std::size_t count, std::uint8_t* out) {
+    unpack_lsb_first(packed, 0U, count, out);
 }
 
 }  // namespace nano_lance::boolpack

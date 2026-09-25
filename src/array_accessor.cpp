@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/array_accessor.hpp"
+
+#include "nanolance/bool_bitpack.hpp"
 #include "nanolance/read_safety.hpp"
 
 #include <nanoarrow/nanoarrow.h>
@@ -306,13 +308,11 @@ bool append_fixed_width(const ArrowArray& array,
     // length bytes out of a length/8-byte buffer (which read far past the buffer and crashed).
     if (field.logical_type == "bool") {
         const auto* bits = static_cast<const std::uint8_t*>(array.buffers[1]);
-        const auto base = static_cast<std::size_t>(array.offset);
+        const auto at = out.fixed.size();
         reserve_more(out.fixed, static_cast<std::size_t>(array.length));
-        for (std::int64_t i = 0; i < array.length; ++i) {
-            const auto bit_index = base + static_cast<std::size_t>(i);
-            const auto byte = bits[bit_index >> 3U];
-            out.fixed.push_back(static_cast<std::uint8_t>((byte >> (bit_index & 7U)) & 1U));
-        }
+        out.fixed.resize(at + static_cast<std::size_t>(array.length));
+        boolpack::unpack_lsb_first(bits, static_cast<std::size_t>(array.offset),
+                                   static_cast<std::size_t>(array.length), out.fixed.data() + at);
         return true;
     }
     // Use the shared width table so every fixed-width logical type (incl. fixed_size_binary:N) agrees

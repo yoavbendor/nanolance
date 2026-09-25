@@ -7,6 +7,7 @@
 #include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/deletion_vector.hpp"
+#include "nanolance/bool_bitpack.hpp"
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/path_safety.hpp"
@@ -663,14 +664,8 @@ bool fill_fixed_child(ArrowArray* child, std::vector<std::uint8_t>&& bytes, std:
     // value in the Arrow buffer, so the bits have to be packed somewhere. They are packed into a fresh
     // vector, which is then adopted -- so this path still copies once (unavoidably) rather than twice.
     if (fmt == FixedFmt::kBool) {
-        const auto packed_bytes = static_cast<std::size_t>((rows + 7) / 8);
-        std::vector<std::uint8_t> packed(packed_bytes, 0U);
-        for (std::int64_t i = 0; i < rows; ++i) {
-            if (bytes[static_cast<std::size_t>(i)] != 0U) {
-                packed[static_cast<std::size_t>(i) >> 3U] |=
-                    static_cast<std::uint8_t>(1U << (static_cast<std::size_t>(i) & 7U));
-            }
-        }
+        std::vector<std::uint8_t> packed;
+        boolpack::pack_lsb_first(bytes.data(), static_cast<std::size_t>(rows), packed);
         if (!adopt_into_buffer(std::move(packed), data, error)) {
             return false;
         }
