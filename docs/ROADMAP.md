@@ -177,8 +177,8 @@ structs, structs of lists and null structs are written and read by both readers
 (`tests/test_lance_list_writes.py`, plus the type and parity matrices), including sliced batches,
 several fragments, long rows split across pages, and `nanolance convert` from parquet. **Pages
 compressed:** bit-packed levels, 1,024-value chunks (rows may span them), bit-packed integer items and
-per-page string dictionaries -- within ~0.2% of pylance's size except high-cardinality strings, which
-wait on an FSST encoder (F2).
+per-page string dictionaries -- within ~0.2% of pylance's size; high-cardinality string items are
+FSST-compressed since F2.
 
 ### Phase E — small type gaps (any time; good first tasks)
 
@@ -200,6 +200,11 @@ for a large one. See PROGRESS, "Roadmap E4".
 |---|---|---|---|
 | F1 | **Page size.** nanolance writes ~1024 rows per bitpacked page; pylance put 200,000 in one. Measure read time vs page size on the bench datasets *first* — this project's instruction profiles misled four times; only wall clock is trusted. | S (measure) + M | **Opus** |
 | F2 | **FSST on write** — the answer to the one bench shape nanolance still loses (`high_card`, 7.67 ms vs 5.12 ms). Encoder only; the reader exists. Correctness oracle: pylance reads it; speed oracle: the bench. | M–L | **Opus** |
+
+**Status:** F2 done — see PROGRESS, "Roadmap F2". String files are now as small as pylance's or
+smaller. On `high_card`, rust lance reads nanolance's file in ~7 ms (10.8–18.7 ms before, when it was
+zstd); nanolance's own read is about where it was (7.6–8.0 ms against 7.7–10.6 ms) and still trails
+rust lance reading its own file (6.1–6.7 ms on the same runs). F1 is still open.
 
 ### Phase G — packaging and infrastructure (independent; run in parallel)
 

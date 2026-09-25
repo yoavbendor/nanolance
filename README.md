@@ -151,7 +151,7 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 |---|---|
 | `int8..64`, `uint8..64`, `float`, `double` | round-trips |
 | `bool` | round-trips (bit-packed on disk, 1 bit/value, same as stock Lance) |
-| `utf8`, `binary`, `fixed_size_binary(N)` | round-trips |
+| `utf8`, `binary`, `fixed_size_binary(N)` | round-trips (high-cardinality strings FSST-compressed, as stock Lance does) |
 | `struct` (nested, arbitrarily deep) | round-trips |
 | `lance.blob.v2` external references | round-trips (the headline feature) |
 | nulls in a fixed-width column (int, float, bool, temporal, decimal, `fixed_size_binary`) | round-trips |

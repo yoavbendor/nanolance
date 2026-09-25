@@ -99,7 +99,7 @@ jobs:
             -DNANOLANCE_BUILD_EXAMPLES=OFF -DNANOLANCE_BUILD_FUSE_EXAMPLE=OFF
 
       - name: Build fuzzers
-        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst nanolance_fuzz_lz4 nanolance_fuzz_deletion_vector nanolance_fuzz_column_decode nanolance_fuzz_repdef -j
+        run: cmake --build build-fuzz --target nanolance_fuzz_decode nanolance_fuzz_page_layout nanolance_fuzz_fsst nanolance_fuzz_fsst_encode nanolance_fuzz_lz4 nanolance_fuzz_deletion_vector nanolance_fuzz_column_decode nanolance_fuzz_repdef -j
 
       # 2 minutes per push per target is enough to catch regressions; extend for a nightly run.
       - name: Fuzz the decode chain
@@ -142,7 +142,7 @@ jobs:
               with ipc.new_stream(sink, table.schema) as w:
                   w.write_table(table)
           # List pages as nanolance writes them: bit-packed levels, rows spanning 1,024-value
-          # chunks, bit-packed integer items, dictionary string items, constant pages.
+          # chunks, bit-packed integer items, dictionary string items, constant pages -- and FSST.
           lists = pa.table({
               "ints": pa.array([None if i % 7 == 0 else [] if i % 5 == 0 else
                                 [None if (i + j) % 4 == 0 else j for j in range(i % 9)] for i in range(n)],
@@ -154,6 +154,9 @@ jobs:
               "nested": pa.array([[[i] * (j % 2 + 1) for j in range(i % 3)] for i in range(n)],
                                  pa.list_(pa.list_(pa.int64()))),
               "empty": pa.array([[] if i % 2 else None for i in range(n)], pa.list_(pa.int64())),
+              # High-cardinality strings: FSST pages (roadmap F2), one symbol table per page.
+              "text": pa.array([None if i % 9 == 0 else f"row {i} value {i * 7919 % 100003} text"
+                                for i in range(n)]),
           })
           with open("seed-datasets/lists.arrow", "wb") as sink:
               with ipc.new_stream(sink, lists.schema) as w:
@@ -258,6 +261,16 @@ jobs:
         run: |
           mkdir -p corpus-fsst
           ./build-fuzz/nanolance_fuzz_fsst -max_total_time=120 -print_final_stats=1 corpus-fsst
+
+      # The FSST encoder (roadmap F2): train, compress, and decode through the serialized table --
+      # every value must come back exactly, at most twice its size compressed.
+      - name: Fuzz the FSST encoder
+        env:
+          UBSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          mkdir -p corpus-fsst-encode
+          ./build-fuzz/nanolance_fuzz_fsst_encode -max_total_time=90 -print_final_stats=1 corpus-fsst-encode
 
       - name: Fuzz the LZ4 block decompressor
         env:

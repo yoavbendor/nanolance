@@ -1055,6 +1055,16 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
                         break;
                     }
                 }
+            } else if (cv.kind == nano_lance::ColumnValues::Kind::VariableWidth &&
+                       (pf->logical_type == "utf8" || pf->logical_type == "large_utf8")) {
+                // Everything else a string column can be: FSST candidate (roadmap F2). The data file
+                // writer trains the table and still writes plain pages where it does not pay.
+                for (auto& field : disk_schema.fields) {
+                    if (field.id == pf->id) {
+                        field.metadata["nanolance:packing"] = "fsst";
+                        break;
+                    }
+                }
             }
         }
     }

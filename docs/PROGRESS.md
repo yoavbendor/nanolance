@@ -23,11 +23,12 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
 | [Roadmap](ROADMAP.md) A — pin and instrument | **done** |
 | Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
+| Roadmap F — performance | **F2 done** (FSST on write); F1 (page size) open |
 | Roadmap E — small type gaps | **E1–E4 done** (float16, duration, Arrow null type, `large_utf8`/`large_binary` write) |
 | Roadmap C — lists, read side | **C0–C8 done**; only a list of `fixed_size_list` is still refused |
 | Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip; pages compressed to within ~0.2% of pylance (FSST aside) |
 
-Test suite: **53 ctest** (was 42) and **1367 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **53 ctest** (was 42) and **1388 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
@@ -2050,8 +2051,8 @@ Data bytes for 20,000-row columns (nanolance before -> after, pylance):
 | `map<string, int64>` | — | 60,312 | 60,221 |
 | `list<string>` all distinct | — | 303,112 | 173,744 |
 
-The last row is the remaining gap: pylance FSST-compresses high-cardinality strings, and nanolance has
-no FSST *encoder* yet (roadmap F2) -- it applies to flat string columns just the same.
+The last row was the remaining gap: pylance FSST-compresses high-cardinality strings, and nanolance
+had no FSST *encoder* -- closed by roadmap F2 (below).
 
 Verified: both readers on every shape of the write matrix, plus a size-regression test holding three
 list shapes within 10% of pylance (`test_list_pages_are_about_as_small_as_stock_lance`); ctest plain
@@ -2109,6 +2110,77 @@ large type intact, and each written by pylance and read by nanolance
 "refused" to "round-trips". Before the fix, the same shapes failed in exactly the three paths above,
 so the tests are known to catch each one. The page-decoding fuzzer, seeded with 64-bit dictionary
 pages (pylance's and nanolance's), ran 662,109 executions clean; CI seeds it with one too.
+
+## Roadmap F2: FSST on write
+
+pylance compresses high-cardinality strings -- ids, URLs, free text -- with FSST, and nanolance only
+read FSST, so on exactly that shape its files were 1.5-4x larger. nanolance now writes FSST too.
+
+- **The encoder** (`fsst::train`, `fsst::compress_value` in `src/fsst.cpp`) builds the symbol table
+  the way Lance does (`build_symbol_table` in `rust/compression/fsst`): six rounds over a ~16 KiB
+  sample, counting symbols and adjacent pairs, keeping the 255 with the highest count x length
+  (single bytes x8), and returning the table from the round that compressed the sample best. Three
+  deliberate differences, none visible to a decoder: the sample is drawn with a fixed seed (the same
+  input always writes the same file); a candidate is keyed by its bytes alone, so the same string
+  reached two ways is one candidate; and matching never reads past a value's end, where Lance loads
+  whole words and relies on a sentinel.
+- **When:** Lance's own rule -- `utf8`/`large_utf8`, not binary, at least 32 KiB, longest value at
+  least 5 bytes -- plus one more: a page is written FSST only if the compressed values plus the
+  2,312-byte table are at least 10% smaller than plain, otherwise plain. With zstd requested, strings
+  go FSST only if it pays on the column's first 32,768 rows; otherwise they keep zstd.
+- **Where:** one table per column, trained on a sample of the whole column, stored in every page's
+  descriptor. Training per page, as Lance does, doubled the write time of `high_card` for no
+  measurable size gain. FSST pages use the multi-chunk page layout from the list work (1,024 values
+  per chunk), so a flat string column that FSST takes goes through the same writer as list items --
+  the single-chunk pages would have paid the table every 32 KiB.
+- **Reading got faster too.** The decoder appended one symbol at a time and grew the output per value;
+  it now decodes a whole chunk in one pass into scratch space sized for the worst case (every code a
+  full 8-byte symbol), copying symbols as whole words. On the same `high_card` file: 10.0-11.2 ms ->
+  7.35 ms, 78M -> 52M instructions.
+
+Data bytes, 20,000 rows (before -> after, pylance):
+
+| Column | before | after | pylance |
+|---|---:|---:|---:|
+| unique short ids | 308,552 | 186,504 | 200,188 |
+| URLs | 988,744 | 250,952 | 285,500 |
+| sentences | 1,081,352 | 286,152 | 284,156 |
+| sentences with nulls | -- | 235,720 | 255,688 |
+| `list<string>`, distinct items | 303,112 | 285,448 | 329,392 |
+| random hex | -- | 418,184 | 421,820 |
+
+`tools/bench.py`, `high_card` (200,000 rows, best of 5 writes / 7 reads; this machine is noisy):
+size 18.45 B/row (zstd was 18.02); rust lance reading nanolance's file ~7 ms (was 10.8-18.7 ms);
+nanolance's native read 7.6-8.0 ms (was 7.7-10.6 ms), still behind rust lance reading its own file
+(6.1-6.7 ms); write 38 ms (was ~35 ms).
+
+**It follows the structural-encoding switch.** The writer's column scan tags a string column that
+neither dictionary encoding takes as `nanolance:packing = fsst`, and only a tagged column gets FSST,
+so `set_structural_encoding(false)` still writes plain pages -- which is what four C++ tests use as
+their uncompressed baseline, and which they caught.
+
+**Two pre-existing bugs found on the way.** First, the reader planned a string column from its FIRST
+page's descriptor and applied it to every page -- including page 0's FSST symbol table. Every page
+carries its own descriptor: Lance trains a table per page, and a page too small for FSST is written
+plain, which is exactly what nanolance now does with the last 100 rows of a 32,868-row column. The
+plain page was decoded as FSST ("FSST code 120 is not in the symbol table") -- found by the 100 MB
+single-value test, whose column is split across two pages. String pages are now planned one by one;
+`test_a_column_mixing_fsst_and_plain_pages` fails without it. Second, a nullable plain string chunk could fill all 32,760 value
+bytes its control word describes and ALSO carry up to 128 bytes of definition levels; the footprint
+overflowed the word and stock Lance read past the page ("the offset + length of the sliced Buffer
+cannot exceed the existing length"). 1,024 nullable ~33-byte strings were enough. Chunks carrying
+levels now leave room for them. `test_nullable_chunks_leave_room_for_their_levels` fails without
+the fix.
+
+Verified: `tests/test_fsst_writes.py` -- eight shapes (ids, URLs, sentences with and without nulls,
+`large_utf8`, list items, a null struct's field, map values), with and without zstd, read by both
+readers whole and by range, and held within 5% of pylance's size; several fragments fed by sliced
+batches, then a deletion; binary, small and incompressible columns still round-trip. C++ unit tests
+round-trip every byte value, empty values, 0xFF as data and random noise through the serialized
+table and the reader's own parser, and check training is deterministic. A new fuzz target,
+`fuzz_fsst_encode`, asserts every value round-trips and never more than doubles (51,995 runs clean,
+now in CI); `fuzz_fsst` ran 22 million decodes and the page-decoding fuzzer, seeded with
+nanolance-written FSST pages, 704,805, all clean.
 
 ### Deliberate deviations (not defects)
 
