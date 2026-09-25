@@ -23,11 +23,11 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Phase 4 — read-path optimization | **4.1 done** — 2.01x -> 1.01x peak, ~20% faster reads |
 | [Roadmap](ROADMAP.md) A — pin and instrument | **done** |
 | Roadmap B — FullZip and fixed-size lists | **B1–B4 done**; B5 (FullZip *writer*) not started, not needed for correctness |
-| Roadmap E — small type gaps | **E1–E3 done** (float16, duration, Arrow null type); E4 `large_*` write open |
+| Roadmap E — small type gaps | **E1–E4 done** (float16, duration, Arrow null type, `large_utf8`/`large_binary` write) |
 | Roadmap C — lists, read side | **C0–C8 done**; only a list of `fixed_size_list` is still refused |
 | Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip; pages compressed to within ~0.2% of pylance (FSST aside) |
 
-Test suite: **53 ctest** (was 42) and **1317 pytest** (was 22), all passing -- and nothing skipped: the one
+Test suite: **53 ctest** (was 42) and **1367 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.
 
 Fuzzers: six targets (`decode`, `page_layout`, `fsst`, `lz4`, `deletion_vector`, `column_decode`),
@@ -2079,6 +2079,36 @@ clean; CI seeds it with FullZip list pages too.
 
 Still refused by name: a list of `fixed_size_list` (pylance stores wide ones as FullZip too, but the
 refusal is in the schema, before any page is read).
+
+## Roadmap E4: writing `large_utf8` and `large_binary`
+
+These were refused on write, with a reason that turned out to be wrong: the refusal said Lance keeps
+u32 offsets inside a large type's miniblock chunk. Measured against pylance 12, it does the
+opposite -- a `large_string` chunk holds u64 offsets (20 short strings: 232 bytes against 144 for
+`string`), its descriptor says `Variable{Flat(64)}`, and Lance's decoder refuses 32-bit offsets for
+a large type ("expected 64-bit offsets but got 32-bit offsets").
+
+Lifting the refusal and running every string page nanolance writes through both readers showed
+which paths were already right and which were not. Plain, nullable, constant, all-null, long and
+binary columns were fine: the flat chunk writer already used the column's own offset width. Three
+paths were not, and pylance refused each: the flat dictionary (both the bit-packed and the RLE
+variant), whose dictionary block and descriptor were hard-coded to 32 bits; list, struct and map
+items, whose chunks were built with u32 offsets; and the per-page dictionary for list items. All
+three now write u64 words and `Flat(64)` for a large column.
+
+That also exposed a **read** gap: nanolance's dictionary-block parser only knew the 32-bit layout,
+so a low-cardinality `large_string` column written by pylance -- a 64-bit block,
+`[u64 64][u64 start][u64 offsets][data]` -- failed with "dict block header invalid". The parser now
+reads the width from the block's first word.
+
+Verified: 15 shapes (plain, nullable, three dictionary variants, constant, all-null, empty, long,
+binary, list items, list dictionary items, `large_list<large_binary>`, a null struct's field, map
+values), each written by nanolance with and without zstd and read back by both readers with the
+large type intact, and each written by pylance and read by nanolance
+(`test_lance_parity.py::test_large_offset_types_*`); the type matrix moves both types from
+"refused" to "round-trips". Before the fix, the same shapes failed in exactly the three paths above,
+so the tests are known to catch each one. The page-decoding fuzzer, seeded with 64-bit dictionary
+pages (pylance's and nanolance's), ran 662,109 executions clean; CI seeds it with one too.
 
 ### Deliberate deviations (not defects)
 

@@ -179,6 +179,8 @@ jobs:
               "fsst_null": pa.array([None if i % 11 == 0 else text[i] for i in range(n)]),
               "dict": pa.array([("h\u00e9llo w\u00f6rld " * (i % 5 + 1)) for i in range(n)]),
               "ints": pa.array([None if i % 13 == 0 else i for i in range(n)], type=pa.int64()),
+              # A 64-bit dictionary block: [u64 64][u64 start][u64 offsets][data].
+              "large_dict": pa.array([f"c{i % 5}" for i in range(n)], type=pa.large_utf8()),
           }), "seed-datasets/stock.lance")
           # FullZip pages (values of 256+ bytes) and fixed_size_list vectors, with and without
           # element validity -- the layouts page decoding added last.

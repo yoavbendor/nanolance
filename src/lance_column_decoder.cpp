@@ -1148,7 +1148,7 @@ struct ColumnEncodingPlan {
 struct DictionaryBlock {
     std::vector<std::uint8_t> bytes;
     /// Variable-width: (start, length) per entry. Empty for a fixed-width dictionary.
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
     /// Fixed-width: bytes per entry. Zero when the dictionary is variable-width.
     std::size_t value_bytes = 0;
     std::size_t count = 0;
@@ -1224,30 +1224,42 @@ struct DictionaryBlock {
     }
 
     out.value_bytes = 0;
+    // [bits_per_offset][bytes_start][offsets (count + 1)][data], every word as wide as bits_per_offset
+    // says: 32, or 64 for a large_utf8 / large_binary dictionary.
     if (out.bytes.size() < 8U) {
         error = "dict block too short";
         return false;
     }
-    std::uint32_t bytes_start = 0;
-    std::memcpy(&bytes_start, out.bytes.data() + 4U, 4U);
-    if (bytes_start < 12U || bytes_start > out.bytes.size() || (bytes_start - 8U) % 4U != 0U) {
+    std::uint32_t bits_per_offset = 0;
+    std::memcpy(&bits_per_offset, out.bytes.data(), 4U);
+    const std::size_t word = bits_per_offset == 64U ? 8U : 4U;
+    const auto read_word = [&](std::size_t at) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, out.bytes.data() + at, word);  // little-endian; the upper bytes stay 0 for u32
+        return v;
+    };
+    if (out.bytes.size() < 2U * word) {
+        error = "dict block too short";
+        return false;
+    }
+    const std::uint64_t bytes_start = read_word(word);
+    if (bytes_start < 3U * word || bytes_start > out.bytes.size() || (bytes_start - 2U * word) % word != 0U) {
         error = "dict block header invalid";
         return false;
     }
-    out.count = (bytes_start - 8U) / 4U - 1U;
+    out.count = static_cast<std::size_t>((bytes_start - 2U * word) / word - 1U);
     out.ranges.resize(out.count);
     for (std::size_t d = 0; d < out.count; ++d) {
-        std::uint32_t a = 0;
-        std::uint32_t b = 0;
-        std::memcpy(&a, out.bytes.data() + 8U + d * 4U, 4U);
-        std::memcpy(&b, out.bytes.data() + 8U + (d + 1U) * 4U, 4U);
-        // In 64 bits: `bytes_start + b` in u32 wraps for an offset near 2^32, which passed this check
-        // and handed the copy below a ~4 GiB entry length (found by fuzz_column_decode).
-        if (static_cast<std::uint64_t>(bytes_start) + b > out.bytes.size() || b < a) {
+        const std::uint64_t a = read_word(2U * word + d * word);
+        const std::uint64_t b = read_word(2U * word + (d + 1U) * word);
+        // Compared without adding: `bytes_start + b` in u32 once wrapped for an offset near 2^32 and
+        // handed the copy below a ~4 GiB entry length (found by fuzz_column_decode); with u64 words
+        // the sum can wrap too.
+        if (b < a || b > out.bytes.size() - bytes_start) {
             error = "dict offsets out of range";
             return false;
         }
-        out.ranges[d] = {bytes_start + a, b - a};
+        out.ranges[d] = {static_cast<std::size_t>(bytes_start + a), static_cast<std::size_t>(b - a)};
     }
     return true;
 }

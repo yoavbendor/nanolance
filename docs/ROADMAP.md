@@ -189,6 +189,11 @@ wait on an FSST encoder (F2).
 | E3 | Arrow `null` type on write → `ConstantLayout` all-null (the reader already understands it). Delete the stale refusal message "cannot store nulls yet", which stopped being true at 1.1. | S | Sonnet |
 | E4 | `large_utf8` / `large_binary` on write: decouple the chunk's u32 offsets from the declared 64-bit Arrow width across the variable-width paths. The exact fix is recorded at the refusal site. | M | Sonnet; Opus review |
 
+**Status:** E1–E4 done. E4 turned out to need the opposite of what the refusal site said: Lance
+wants **u64** offsets inside a large type's chunk, dictionary block and list-item chunk, with
+`Variable{Flat(64)}` — it decodes each page straight into the Arrow type and refuses 32-bit offsets
+for a large one. See PROGRESS, "Roadmap E4".
+
 ### Phase F — performance (measure before building)
 
 | # | Task | Size | Model |

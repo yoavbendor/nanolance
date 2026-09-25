@@ -165,7 +165,7 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 | `decimal128`, `decimal256` | round-trips |
 | `timestamp` with a **UTC-offset** timezone (`+05:30`) | **refused** — Lance supports IANA zone names only and panics on offsets, so pylance cannot write one either; use a named zone |
 | `list`, `large_list`, `map`, lists of structs, structs of lists | round-trips — null and empty lists, null items, any nesting depth; a list of `fixed_size_list` is refused |
-| `large_utf8`, `large_binary` | **refused** — would need 64-bit offsets in a page whose chunk grammar is u32 |
+| `large_utf8`, `large_binary` | round-trips — plain, nullable, dictionary-encoded, constant, and as list, struct or map items |
 | Arrow `dictionary<...>` columns | **refused** — cast to the value type; nanolance dictionary-encodes low-cardinality strings on disk by itself, so the file stays the same size |
 
 ### What nanolance can read
@@ -259,8 +259,8 @@ nano_lance_writer_close(&w);
 - For S3, export credentials to the environment if your profile uses SSO/assume-role.
 
 **Don't**
-- Don't pass `large_utf8`/dictionary columns to the writer — both are refused at `write_batch`
-  (see [Type coverage](#type-coverage)). Timestamps are supported,
+- Don't pass Arrow dictionary columns to the writer — they are refused at `write_batch`
+  (see [Type coverage](#type-coverage)); cast to the value type. Timestamps are supported,
   but their timezone must be an IANA name, not a UTC offset.
 - Don't change the schema between batches in one session.
 - Don't enable `nano_lance_writer_set_blob_uri_dictionary` if stock Lance must read that column

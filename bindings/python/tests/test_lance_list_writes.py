@@ -27,9 +27,8 @@ def lance_mod():
 
 
 ALL = {**SHAPES, **{f"null_struct_{k}": v for k, v in NULL_STRUCTS.items()}}
-# Not writable yet, and refused by name: a list of vectors (a FixedSizeList under a list layer), and
-# large_binary items (64-bit value offsets are not written anywhere yet -- roadmap E4).
-NOT_WRITABLE = {"null_struct_vectors", "long_large_binary"}
+# Not writable yet, and refused by name: a list of vectors (a FixedSizeList under a list layer).
+NOT_WRITABLE = {"null_struct_vectors"}
 
 
 def _both_readers_agree(lance_mod, path, table):

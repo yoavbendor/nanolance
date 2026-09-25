@@ -163,14 +163,65 @@ def test_dictionary_column_is_refused(tmp_path):
     assert pa.table(nanolance.read_table(path)).to_pydict() == plain.to_pydict()
 
 
-@pytest.mark.parametrize("arrow_type", [pa.large_string(), pa.large_binary()])
-def test_large_offset_types_are_refused(arrow_type, tmp_path):
-    """These produced a file stock Lance rejects as corrupt (64-bit offsets in a u32 chunk)."""
-    values = ["a", "bb", "ccc"] if arrow_type == pa.large_string() else [b"a", b"bb", b"ccc"]
-    table = pa.table({"v": pa.array(values, type=arrow_type)})
-    with pytest.raises(RuntimeError) as excinfo:
-        nanolance.write_table(table, tmp_path / "large.lance")
-    assert "cannot write yet" in str(excinfo.value)
+# large_utf8 / large_binary through every page nanolance can write for a string column (roadmap E4).
+# Lance decodes each page straight into the column's Arrow type and refuses 32-bit offsets for a
+# large one -- in the chunk, in a dictionary block, or in list items -- so every path has to carry
+# u64 offsets and say Flat(64). These were refused on write until each path did.
+_LARGE_N = 3_000
+_LU, _LB = pa.large_utf8(), pa.large_binary()
+LARGE_OFFSET_SHAPES = {
+    "plain": lambda: pa.array([f"v{i}" for i in range(_LARGE_N)], _LU),
+    "nullable": lambda: pa.array([None if i % 7 == 0 else f"v{i}" for i in range(_LARGE_N)], _LU),
+    "dictionary": lambda: pa.array([f"c{i % 5}" for i in range(_LARGE_N)], _LU),
+    "dictionary_nulls": lambda: pa.array([None if i % 7 == 0 else f"c{i % 5}" for i in range(_LARGE_N)], _LU),
+    "dictionary_runs": lambda: pa.array([f"r{i // 500}" for i in range(_LARGE_N)], _LU),
+    "constant": lambda: pa.array(["same"] * _LARGE_N, _LU),
+    "all_null": lambda: pa.array([None] * _LARGE_N, _LU),
+    "empty_values": lambda: pa.array([""] * _LARGE_N, _LU),
+    "long_values": lambda: pa.array([("x" * 300 if i % 10 == 0 else "") + str(i) for i in range(_LARGE_N)], _LU),
+    "binary": lambda: pa.array([bytes([i % 251]) * (i % 9) for i in range(_LARGE_N)], _LB),
+    "list_items": lambda: pa.array([[f"s{i}-{j}" for j in range(i % 3)] for i in range(_LARGE_N)], pa.list_(_LU)),
+    "list_dictionary_items": lambda: pa.array(
+        [[f"t{(i + j) % 4}" for j in range(i % 3)] for i in range(_LARGE_N)], pa.list_(_LU)
+    ),
+    "large_list_binary_items": lambda: pa.array(
+        [[f"s{i}-{j}".encode() for j in range(i % 3)] for i in range(_LARGE_N)], pa.large_list(_LB)
+    ),
+    "null_struct_field": lambda: pa.array(
+        [None if i % 5 == 0 else {"a": f"s{i}"} for i in range(_LARGE_N)], pa.struct([("a", _LU)])
+    ),
+    "map_values": lambda: pa.array(
+        [[(f"k{j}", f"v{i}") for j in range(i % 3)] for i in range(_LARGE_N)], pa.map_(pa.utf8(), _LU)
+    ),
+}
+
+
+@pytest.mark.parametrize("compression", [False, True], ids=["plain", "zstd"])
+@pytest.mark.parametrize("shape", sorted(LARGE_OFFSET_SHAPES))
+def test_large_offset_types_round_trip(shape, compression, tmp_path):
+    lance = require_pylance()
+    column = LARGE_OFFSET_SHAPES[shape]()
+    table = pa.table({"id": pa.array(range(len(column)), pa.int64()), "c": column})
+    path = tmp_path / "large.lance"
+    nanolance.write_table(table, path, compression=compression)
+    got = pa.table(nanolance.read_table(path))
+    assert got.schema == table.schema
+    assert got.to_pydict() == table.to_pydict()
+    theirs = lance.dataset(str(path)).to_table()
+    assert theirs.schema.field("c").type == column.type
+    assert theirs.to_pydict() == table.to_pydict()
+
+
+@pytest.mark.parametrize("shape", sorted(LARGE_OFFSET_SHAPES))
+def test_large_offset_types_written_by_stock_lance(shape, tmp_path):
+    """And the other direction. pylance dictionary-encodes low-cardinality large strings with a
+    64-bit dictionary block ([u64 64][u64 start][u64 offsets][data]), which nanolance used to reject
+    as "dict block header invalid" -- a read gap the write work exposed."""
+    lance = require_pylance()
+    table = pa.table({"c": LARGE_OFFSET_SHAPES[shape]()})
+    path = str(tmp_path / "large.lance")
+    lance.write_dataset(table, path)
+    assert pa.table(nanolance.read_table(path)).to_pydict() == lance.dataset(path).to_table().to_pydict()
 
 
 # ── Temporal and decimal types ───────────────────────────────────────────────────────────────────
