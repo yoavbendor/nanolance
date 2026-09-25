@@ -14,6 +14,9 @@ WHAT IS MEASURED, per dataset (one column of one type, so a number can be attrib
           rust-lance      lance.write_dataset (pylance 12, Lance format 2.2), all cores
           rust-lance-1c   the same, pinned to one core with one CPU and one I/O thread -- the
                           per-core comparison, since nanolance is single-threaded by design
+          nanolance-cpp-budget  the same with max_pending_bytes = 4 MiB, the edge-device setting
+          rust-native     the lance crate itself (tools/lance_rs_bench, no Python), all cores
+          rust-native-1c  the same pinned to one core, one tokio worker, one CPU and one I/O thread
           parquet         pyarrow.parquet.write_table, zstd -- the yardstick, not a competitor
   read    each Lance reader reads BOTH Lance files (the one nanolance wrote and the one Rust Lance
           wrote), so the matrix answers "can I mix them" as well as "how fast":
@@ -26,7 +29,12 @@ WHAT IS MEASURED, per dataset (one column of one type, so a number can be attrib
           nanolance-py    nanolance.read_table -> pyarrow.Table
           rust-lance      lance.dataset(path).to_table(), all cores
           rust-lance-1c   the same, pinned to one core
+          rust-native(-1c)  lance_rs_bench: Dataset::open + scan into record batches, as above
           parquet         pyarrow.parquet.read_table of the Parquet file
+  memory  peak_mb: for every native process (nlbench, lance_rs_bench), the most memory one run added
+          over what the process held before it -- the input batches of a write, nothing for a read,
+          whose peak includes the table it returns
+  footprint  stripped binary sizes, the Python packages' native libraries, third-party code
   size    bytes on disk of each file
 
 HOW: every timing is one warm-up run, then the MEDIAN of --runs runs (default 7), files in the page
@@ -65,6 +73,9 @@ import nanolance
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = Path(os.environ.get("NL_BUILD", ROOT / "build"))
 NLBENCH = BUILD / "nlbench"
+# The pure-Rust counterpart (tools/lance_rs_bench, `cargo build --release` there). Optional: without
+# it the rust-native columns are left out.
+RUST_BENCH = Path(os.environ.get("LANCE_RS_BENCH", ROOT / "tools" / "lance_rs_bench" / "target" / "release" / "lance_rs_bench"))
 
 
 # ── Datasets ─────────────────────────────────────────────────────────────────────────────────────
@@ -240,6 +251,17 @@ def same(got: pa.Table, want: pa.Table) -> bool:
 
 RETAINING_MALLOC = {"MALLOC_MMAP_THRESHOLD_": str(1 << 30), "MALLOC_TRIM_THRESHOLD_": str(1 << 30)}
 ONE_CORE_ENV = {"LANCE_CPU_THREADS": "1", "LANCE_IO_THREADS": "1", "OMP_NUM_THREADS": "1"}
+RUST_NATIVE_1C_ENV = {**ONE_CORE_ENV, "TOKIO_WORKER_THREADS": "1"}
+BUDGET_BYTES = 4 << 20  # nanolance-cpp-budget: the writer's max_pending_bytes
+
+
+def native(cmd, one_core=False, env=None):
+    """Run a native bench tool (nlbench or lance_rs_bench) and return its JSON line."""
+    full_env = {**os.environ, **(RUST_NATIVE_1C_ENV if one_core else {}), **(env or {})}
+    r = subprocess.run(pinned(cmd) if one_core else cmd, capture_output=True, text=True, env=full_env)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()[-300:])
+    return json.loads(r.stdout.strip().splitlines()[-1])
 
 
 def pinned(cmd):
@@ -271,7 +293,8 @@ def worker(action, path, runs, ipc_path):
 
 
 def run_one(name, table, runs, work: Path, verbose):
-    rec = {"rows": table.num_rows, "arrow_bytes": table.nbytes, "write_ms": {}, "read_ms": {}, "size": {}, "errors": {}}
+    rec = {"rows": table.num_rows, "arrow_bytes": table.nbytes, "write_ms": {}, "read_ms": {}, "size": {},
+           "peak_mb": {}, "errors": {}}
     ipc_path = work / f"{name}.arrow"
     with ipc.new_stream(ipc_path, table.schema) as w:
         for batch in table.to_batches(max_chunksize=65536):
@@ -283,17 +306,45 @@ def run_one(name, table, runs, work: Path, verbose):
     # arrives (and what the IPC file the C++ and one-core runs read holds).
     table = pa.Table.from_batches(table.to_batches(max_chunksize=65536))
 
-    def w_nl_cpp():
-        r = subprocess.run(pinned([str(NLBENCH), "--write", str(ipc_path), str(nl_path), str(runs + 1)]),
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip()[-300:])
-        return json.loads(r.stdout)["warm_median_ms"]  # the first of the runs + 1 is the warm-up
-
-    try:
-        rec["write_ms"]["nanolance-cpp"] = w_nl_cpp()
+    try:  # the first of the runs + 1 is the warm-up; warm_median_ms leaves it out
+        out = native([str(NLBENCH), "--write", str(ipc_path), str(nl_path), str(runs + 1)], one_core=True)
+        rec["write_ms"]["nanolance-cpp"] = out["warm_median_ms"]
+        rec["peak_mb"]["nanolance-cpp write"] = out["peak_rss_mb"]
     except Exception as e:  # noqa: BLE001 -- recorded, not hidden
         rec["errors"]["write nanolance-cpp"] = str(e)[:300]
+
+    # The same with the writer's memory budget (max_pending_bytes): it commits a fragment whenever
+    # it holds 4 MiB -- what an edge device would set to bound its resident memory while saving.
+    budget_path = work / f"{name}_nlbudget.lance"
+    try:
+        out = native([str(NLBENCH), "--write", str(ipc_path), str(budget_path), str(runs + 1),
+                      "--budget", str(BUDGET_BYTES)], one_core=True)
+        rec["write_ms"]["nanolance-cpp-budget"] = out["warm_median_ms"]
+        rec["peak_mb"]["nanolance-cpp-budget write"] = out["peak_rss_mb"]
+        if not same(pa.table(nanolance.read_table(budget_path)), table):
+            rec["errors"]["write nanolance-cpp-budget"] = "wrote different data"
+    except Exception as e:  # noqa: BLE001
+        rec["errors"]["write nanolance-cpp-budget"] = str(e)[:300]
+    shutil.rmtree(budget_path, ignore_errors=True)
+
+    # The lance crate itself, no Python: all cores, and pinned to one core with one thread per pool.
+    rsn_path = work / f"{name}_rsn.lance"
+    if RUST_BENCH.exists():
+        for label, one_core in (("rust-native", False), ("rust-native-1c", True)):
+            try:
+                out = native([str(RUST_BENCH), "write", str(ipc_path), str(rsn_path), str(runs + 1)], one_core=one_core)
+                rec["write_ms"][label] = out["warm_median_ms"]
+                rec["peak_mb"][f"{label} write"] = out["peak_rss_mb"]
+            except Exception as e:  # noqa: BLE001
+                rec["errors"][f"write {label}"] = str(e)[:300]
+        try:  # what it wrote is checked like any read: through pylance, against the source
+            if not same(lance.dataset(str(rsn_path)).to_table(), table):
+                rec["errors"]["write rust-native"] = "wrote different data"
+            else:
+                rec["size"]["rust-native"] = dir_bytes(rsn_path)
+        except Exception as e:  # noqa: BLE001
+            rec["errors"]["write rust-native"] = str(e)[:300]
+        shutil.rmtree(rsn_path, ignore_errors=True)
 
     def w_nl_py():
         shutil.rmtree(py_path, ignore_errors=True)
@@ -341,18 +392,33 @@ def run_one(name, table, runs, work: Path, verbose):
         key = f"nanolance-cpp <- {file_label}"
         try:
             # Correctness of the C++ read is the Python read's: both are lance_table_read_dataset.
-            r = subprocess.run(pinned([str(NLBENCH), str(path), str(runs + 1)]), capture_output=True, text=True)
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr.strip()[-300:])
-            out = json.loads(r.stdout)
+            out = native([str(NLBENCH), str(path), str(runs + 1)], one_core=True)
             if out["rows"] != table.num_rows:
                 raise RuntimeError(f"read {out['rows']} rows, expected {table.num_rows}")
             rec["read_ms"][key] = out["warm_median_ms"]
+            rec["peak_mb"][f"nanolance-cpp read <- {file_label}"] = out["peak_rss_mb"]
             r = subprocess.run(pinned([str(NLBENCH), str(path), str(runs + 1)]), capture_output=True, text=True,
                                env={**os.environ, **RETAINING_MALLOC})
             rec["read_ms"][f"nanolance-cpp-retain <- {file_label}"] = json.loads(r.stdout)["warm_median_ms"]
         except Exception as e:  # noqa: BLE001
             rec["errors"][f"read {key}"] = str(e)[:300]
+        if RUST_BENCH.exists():
+            for label, one_core in (("rust-native", False), ("rust-native-1c", True)):
+                key = f"{label} <- {file_label}"
+                dump = work / f"{name}_rsn_dump.arrow"
+                try:
+                    out = native([str(RUST_BENCH), "read", str(path), str(runs + 1), "--dump", str(dump)],
+                                 one_core=one_core)
+                    got = ipc.open_stream(dump).read_all()
+                    if not same(got, table):
+                        rec["errors"][f"read {key}"] = "returned different data"
+                        continue
+                    rec["read_ms"][key] = out["warm_median_ms"]
+                    rec["peak_mb"][f"{label} read <- {file_label}"] = out["peak_rss_mb"]
+                except Exception as e:  # noqa: BLE001
+                    rec["errors"][f"read {key}"] = str(e)[:300]
+                finally:
+                    dump.unlink(missing_ok=True)
         key = f"rust-lance-1c <- {file_label}"
         if f"read rust-lance <- {file_label}" not in rec["errors"]:
             try:
@@ -379,9 +445,56 @@ def run_one(name, table, runs, work: Path, verbose):
               f" | read nl-cpp<-nl {r.get('nanolance-cpp <- nanolance', float('nan')):7.1f}"
               f" rust<-rust {r.get('rust-lance <- rust-lance', float('nan')):7.1f}"
               f" rust1c<-rust {r.get('rust-lance-1c <- rust-lance', float('nan')):7.1f}"
+              f" rsn<-rust {r.get('rust-native <- rust-lance', float('nan')):7.1f}"
+              f" rsn1c<-rust {r.get('rust-native-1c <- rust-lance', float('nan')):7.1f}"
               f" | size nl {rec['size'].get('nanolance', 0) / 1e6:6.1f}MB rust {rec['size'].get('rust-lance', 0) / 1e6:6.1f}MB"
               + (f" | ERR {list(rec['errors'])}" if rec["errors"] else ""), flush=True)
     return rec
+
+
+def footprint():
+    """What each side costs to ship: stripped binary sizes, the Python packages' native libraries,
+    and the third-party code linked in."""
+
+    def stripped_size(path):
+        path = Path(path)
+        if not path.exists():
+            return None
+        if not shutil.which("strip"):
+            return path.stat().st_size
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / path.name
+            shutil.copy(path, copy)
+            subprocess.run(["strip", str(copy)], capture_output=True)
+            return copy.stat().st_size
+
+    def native_lib(module):
+        """The largest native library the package has loaded (its extension module)."""
+        files = {Path(m.__file__) for name, m in list(sys.modules.items())
+                 if (name == module.__name__ or name.startswith(module.__name__ + "."))
+                 and getattr(m, "__file__", None) and str(m.__file__).endswith(".so")}
+        return max((f.stat().st_size for f in files), default=None)
+
+    crates = None
+    if RUST_BENCH.exists() and shutil.which("cargo"):
+        r = subprocess.run(["cargo", "tree", "-e", "normal", "--prefix", "none"], cwd=RUST_BENCH.parents[2],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            crates = len({line.replace(" (*)", "").strip() for line in r.stdout.splitlines() if line.strip()}) - 1
+    return {
+        "nanolance": {
+            "bench_binary_bytes": stripped_size(NLBENCH),
+            "python_native_lib_bytes": native_lib(nanolance),
+            "third_party": ["nanoarrow (its IPC reader bundles flatcc)", "zstd"],
+            "binary": "tools/nlbench: reader + writer + Arrow IPC input, static, stripped",
+        },
+        "rust": {
+            "bench_binary_bytes": stripped_size(RUST_BENCH),
+            "python_native_lib_bytes": native_lib(lance),
+            "crates": crates,
+            "binary": "tools/lance_rs_bench: lance 12.0.0, default features off (local files only), thin LTO, stripped",
+        },
+    }
 
 
 def environment():
@@ -430,7 +543,8 @@ def main(argv=None):
 
     datasets = build_datasets(scale)
     names = args.only or list(datasets) + ["mixed_events"]
-    results = {"environment": environment(), "runs": args.runs, "scale": scale, "datasets": {}}
+    results = {"environment": environment(), "footprint": footprint(), "runs": args.runs, "scale": scale,
+               "datasets": {}}
     work = Path(tempfile.mkdtemp(prefix="nlmatrix-"))
     print(f"environment: {results['environment']}", flush=True)
     try:

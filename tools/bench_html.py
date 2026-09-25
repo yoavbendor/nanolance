@@ -24,6 +24,7 @@ TEMPLATE = r"""<!doctype html>
   --bg: #f6f7f9; --surface: #ffffff; --ink: #14171c; --ink-2: #4b5361; --ink-3: #6b7482;
   --rule: #e2e6ec; --grid: #eceff3; --tint: #eef3fa;
   --nl: #2a78d6; --rust: #eb6834; --rust1: #1baf7a; --parity: #9aa3b1;
+  --op-write: #4a3aa7; --op-budget: #eda100; --op-read: #e87ba4;
   --good: #0ca30c; --bad: #d03b3b;
   --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
   --body: "Public Sans", "Segoe UI", system-ui, sans-serif;
@@ -35,6 +36,7 @@ TEMPLATE = r"""<!doctype html>
     --bg: #111418; --surface: #171b21; --ink: #eef1f5; --ink-2: #b4bcc8; --ink-3: #8b94a2;
     --rule: #2a313b; --grid: #232932; --tint: #1c2530;
     --nl: #3987e5; --rust: #d95926; --rust1: #199e70; --parity: #6b7482;
+    --op-write: #9085e9; --op-budget: #c98500; --op-read: #d55181;
   }
 }
 :root[data-theme="dark"] {
@@ -42,6 +44,7 @@ TEMPLATE = r"""<!doctype html>
   --bg: #111418; --surface: #171b21; --ink: #eef1f5; --ink-2: #b4bcc8; --ink-3: #8b94a2;
   --rule: #2a313b; --grid: #232932; --tint: #1c2530;
   --nl: #3987e5; --rust: #d95926; --rust1: #199e70; --parity: #6b7482;
+  --op-write: #9085e9; --op-budget: #c98500; --op-read: #d55181;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 var(--body); }
@@ -138,6 +141,23 @@ pre { font: 12.5px/1.5 var(--mono); background: var(--surface); border: 1px soli
     <div class="card chart-scroll"><div id="chart-size"></div></div>
   </section>
 
+  <section aria-labelledby="h-memory">
+    <h2 id="h-memory">Memory</h2>
+    <p class="muted">How many times more memory the Rust <code>lance</code> crate (no Python, all cores) needed than nanolance for the same write or read: the peak each process added over what it already held, the returned table included for a read. Right of the line, nanolance needs less. The budgeted write is nanolance with a 4 MiB writer budget, the edge-device setting. The number at the end of each row is the write ratio.</p>
+    <div class="legend" id="legend-memory"></div>
+    <div class="card chart-scroll"><div id="chart-memory"></div></div>
+  </section>
+
+  <section aria-labelledby="h-footprint">
+    <h2 id="h-footprint">What it takes to ship</h2>
+    <p class="muted">Size of a program that reads and writes Lance, and of the native library each Python package installs; and how much third-party code comes with it.</p>
+    <div class="table-scroll"><table id="footprint"></table></div>
+    <p class="small" id="footprint-note"></p>
+    <h3 style="margin-top:10px">Does Python slow Rust Lance down?</h3>
+    <p class="muted">pylance against a Rust program using the same <code>lance</code> crate with no Python in the process (<code>tools/lance_rs_bench</code>). Above 1×, the Rust program is faster. The Rust comparisons elsewhere on this page use pylance.</p>
+    <div class="table-scroll"><table id="pycost"></table></div>
+  </section>
+
   <section aria-labelledby="h-interop">
     <h2 id="h-interop">They read each other's files</h2>
     <p class="muted">Every file nanolance wrote was read by Rust Lance, and every file Rust Lance wrote was read by nanolance, from C++ and from Python. Each read was checked value by value against the source table before it was timed.</p>
@@ -146,7 +166,7 @@ pre { font: 12.5px/1.5 var(--mono); background: var(--surface); border: 1px soli
 
   <section aria-labelledby="h-tables">
     <h2 id="h-tables">Every number</h2>
-    <p class="muted">Medians in milliseconds; sizes in MB. The faster of nanolance C++ and Rust Lance (1 core) is marked.</p>
+    <p class="muted">Medians in milliseconds; peak memory and sizes in MB. The faster of nanolance C++ and Rust Lance (1 core) is marked.</p>
     <div class="tabs" id="tabs" role="group" aria-label="Data type group"></div>
     <div class="table-scroll"><table id="full"></table></div>
   </section>
@@ -176,7 +196,7 @@ python tools/bench_html.py          # this page</pre>
   const DATA = JSON.parse(document.getElementById("data").textContent);
   const NOTES = JSON.parse(document.getElementById("notes-data").textContent);
   const D = DATA.datasets, env = DATA.environment;
-  const CATS = [["numeric","Numbers"],["temporal","Dates, times, decimals"],["string","Strings and binary"],
+  const CATS = [["numeric","Integers, floats, booleans"],["temporal","Dates, times, decimals"],["string","Strings and binary"],
                 ["nullable","Nulls"],["nested","Vectors, structs, lists, maps"],["mixed","A realistic table"]];
   const names = CATS.flatMap(([c]) => Object.keys(D).filter(n => D[n].category === c));
   const el = (tag, attrs = {}, text) => { const e = document.createElement(tag);
@@ -206,13 +226,22 @@ python tools/bench_html.py          # this page</pre>
   const CROSS = ["nanolance-cpp <- rust-lance", "nanolance-py <- rust-lance", "rust-lance <- nanolance"];
   const interopReads = names.length * CROSS.length;
   const crossOk = names.reduce((s, n) => s + CROSS.filter(k => R(n, k) != null).length, 0);
-  const tiles = [
+  let tiles = [
     ["Read, per core", fmtX(read1), "nanolance C++ vs Rust Lance on one core (geometric mean)"],
     ["Read, out of the box", fmtX(read4), "nanolance on one core vs Rust Lance on all " + env.cores],
     ["Write", fmtX(write4), `vs Rust Lance on all cores; ${fmtX(write1)} vs one core`],
     ["File size", (size * 100).toFixed(1) + "%", "of Rust Lance's, same data"],
     ["Cross-reads verified", `${crossOk} / ${interopReads}`, "each reading the other's file, value by value"],
   ];
+  const P = (n, k) => (D[n].peak_mb || {})[k];
+  const memW = geo(names.map(n => ratio(P(n, "rust-native write"), P(n, "nanolance-cpp write"))));
+  const memR = geo(names.map(n => ratio(P(n, "rust-native read <- rust-lance"), P(n, "nanolance-cpp read <- nanolance"))));
+  const FP = DATA.footprint;
+  if (FP && FP.nanolance.bench_binary_bytes && FP.rust.bench_binary_bytes)
+    tiles.push(["Program size", (FP.nanolance.bench_binary_bytes / 1e6).toFixed(1) + " MB",
+                `reader + writer, stripped; the lance crate: ${(FP.rust.bench_binary_bytes / 1e6).toFixed(0)} MB`]);
+  if (memW && memR)
+    tiles.push(["Memory", fmtX(Math.sqrt(memW * memR)) + " less", `peak, vs the lance crate: writes ${fmtX(memW)}, reads ${fmtX(memR)}`]);
   const tilesEl = document.getElementById("tiles");
   tiles.forEach(([l, v, n]) => { const t = el("div", {class: "tile"}); t.append(el("div", {class: "label"}, l), el("div", {class: "value"}, v), el("div", {class: "note"}, n)); tilesEl.append(t); });
   document.getElementById("tiles-note").textContent = "Speed ratios are Rust Lance's time divided by nanolance's: above 1× means nanolance is faster. Averages are geometric means across all data types.";
@@ -308,6 +337,44 @@ python tools/bench_html.py          # this page</pre>
                ["var(--rust)", (D[n].size["rust-lance"] / 1e6).toFixed(2) + " MB", "Rust Lance"],
                ["var(--rust1)", ((D[n].size["parquet"] || 0) / 1e6).toFixed(2) + " MB", "Parquet (zstd)"]]});
 
+  // Memory.
+  const MEM_SERIES = [
+    {label: "write", color: "--op-write", value: n => ratio(P(n, "rust-native write"), P(n, "nanolance-cpp write"))},
+    {label: "write, 4 MiB budget", color: "--op-budget", value: n => ratio(P(n, "rust-native write"), P(n, "nanolance-cpp-budget write"))},
+    {label: "read", color: "--op-read", value: n => ratio(P(n, "rust-native read <- rust-lance"), P(n, "nanolance-cpp read <- nanolance"))},
+  ];
+  const fmtMB = v => v == null ? "—" : (v < 10 ? v.toFixed(1) : Math.round(v)) + " MB";
+  if (names.some(n => D[n].peak_mb)) {
+    legend("legend-memory", MEM_SERIES);
+    dotPlot("chart-memory", MEM_SERIES, {min: 0.5, max: 4, ticks: [0.5, 1, 2, 4, 8, 16, 32, 64], tickLabel: t => t + "×", valueLabel: fmtX,
+      leftLabel: "← nanolance needs more", rightLabel: "nanolance needs less →", aria: "Peak memory ratio per data type",
+      tip: n => [["var(--op-write)", fmtMB(P(n, "nanolance-cpp write")) + " / " + fmtMB(P(n, "rust-native write")), "write: nanolance / Rust"],
+                 ["var(--op-budget)", fmtMB(P(n, "nanolance-cpp-budget write")), "nanolance write, 4 MiB budget"],
+                 ["var(--op-read)", fmtMB(P(n, "nanolance-cpp read <- nanolance")) + " / " + fmtMB(P(n, "rust-native read <- rust-lance")), "read: nanolance / Rust"]]});
+  } else { document.getElementById("h-memory").parentElement.hidden = true; }
+
+  // Footprint and the cost of Python.
+  if (FP) {
+    const f = document.getElementById("footprint");
+    const mb = v => v == null ? "—" : (v / 1e6).toFixed(1) + " MB";
+    const h = el("tr"); ["", "nanolance", "Rust Lance"].forEach(t => h.append(el("th", {}, t))); f.append(h);
+    [["Reader + writer program, stripped", mb(FP.nanolance.bench_binary_bytes), mb(FP.rust.bench_binary_bytes)],
+     ["Python package's native library", mb(FP.nanolance.python_native_lib_bytes), mb(FP.rust.python_native_lib_bytes)],
+     ["Third-party code linked in", `${FP.nanolance.third_party.length} libraries`, FP.rust.crates != null ? `${FP.rust.crates} crates` : "—"]]
+      .forEach(row => { const tr = el("tr"); row.forEach(v => tr.append(el("td", {}, v))); f.append(tr); });
+    document.getElementById("footprint-note").textContent =
+      `nanolance's third-party code: ${FP.nanolance.third_party.join(", ")}. Programs: ${FP.nanolance.binary}; ${FP.rust.binary}. pylance's library also carries the cloud object stores the Rust program leaves out.`;
+  }
+  const pc = document.getElementById("pycost");
+  const pcRows = [["Read, 1 core", n => ratio(R(n, "rust-lance-1c <- rust-lance"), R(n, "rust-native-1c <- rust-lance"))],
+                  ["Read, all cores", n => ratio(R(n, "rust-lance <- rust-lance"), R(n, "rust-native <- rust-lance"))],
+                  ["Write, 1 core", n => ratio(W(n, "rust-lance-1c"), W(n, "rust-native-1c"))],
+                  ["Write, all cores", n => ratio(W(n, "rust-lance"), W(n, "rust-native"))]];
+  if (names.some(n => W(n, "rust-native"))) {
+    const h = el("tr"); ["", "pylance time ÷ Rust program time (geometric mean)"].forEach(t => h.append(el("th", {}, t))); pc.append(h);
+    pcRows.forEach(([label, f]) => { const tr = el("tr"); tr.append(el("td", {}, label), el("td", {}, fmtX(geo(names.map(f))))); pc.append(tr); });
+  }
+
   // Interop table.
   const inter = document.getElementById("interop");
   const pairs = [["nanolance-cpp <- rust-lance", "nanolance C++ reads Rust's"], ["nanolance-py <- rust-lance", "nanolance Python reads Rust's"],
@@ -327,12 +394,22 @@ python tools/bench_html.py          # this page</pre>
     ["read · nanolance Python", n => fmtMs(R(n, "nanolance-py <- nanolance"))],
     ["read · Rust 1 core", n => fmtMs(R(n, "rust-lance-1c <- rust-lance")), "rr"],
     ["read · Rust all cores", n => fmtMs(R(n, "rust-lance <- rust-lance"))],
+    ["read · Rust native 1 core", n => fmtMs(R(n, "rust-native-1c <- rust-lance"))],
+    ["read · Rust native all cores", n => fmtMs(R(n, "rust-native <- rust-lance"))],
     ["read · Parquet", n => fmtMs(R(n, "parquet <- parquet"))],
     ["write · nanolance C++", n => fmtMs(W(n, "nanolance-cpp")), "wc"],
+    ["write · + 4 MiB budget", n => fmtMs(W(n, "nanolance-cpp-budget"))],
     ["write · nanolance Python", n => fmtMs(W(n, "nanolance-py"))],
     ["write · Rust 1 core", n => fmtMs(W(n, "rust-lance-1c")), "wr"],
     ["write · Rust all cores", n => fmtMs(W(n, "rust-lance"))],
+    ["write · Rust native 1 core", n => fmtMs(W(n, "rust-native-1c"))],
+    ["write · Rust native all cores", n => fmtMs(W(n, "rust-native"))],
     ["write · Parquet", n => fmtMs(W(n, "parquet"))],
+    ["peak MB · nanolance write", n => fmtMs(P(n, "nanolance-cpp write"))],
+    ["peak MB · + budget", n => fmtMs(P(n, "nanolance-cpp-budget write"))],
+    ["peak MB · Rust write", n => fmtMs(P(n, "rust-native write"))],
+    ["peak MB · nanolance read", n => fmtMs(P(n, "nanolance-cpp read <- nanolance"))],
+    ["peak MB · Rust read", n => fmtMs(P(n, "rust-native read <- rust-lance"))],
     ["MB · nanolance", n => (D[n].size["nanolance"] / 1e6).toFixed(2)],
     ["MB · Rust Lance", n => (D[n].size["rust-lance"] / 1e6).toFixed(2)],
     ["MB · Parquet", n => ((D[n].size["parquet"] || 0) / 1e6).toFixed(2)],

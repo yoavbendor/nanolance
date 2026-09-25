@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CATEGORIES = [
-    ("numeric", "Numbers"),
+    ("numeric", "Integers, floats, booleans"),
     ("temporal", "Dates, times, decimals"),
     ("string", "Strings and binary"),
     ("nullable", "Nulls"),
@@ -104,6 +104,82 @@ def render(data) -> str:
       f"Reads that returned wrong data or failed: **{failures}**.")
     w("")
 
+    has_native = any("rust-native" in r["write_ms"] for r in D.values())
+    if has_native:
+        py_read = geomean(collect(lambda r: ratio(r["read_ms"].get("rust-lance <- rust-lance"),
+                                                  r["read_ms"].get("rust-native <- rust-lance"))))
+        py_read1 = geomean(collect(lambda r: ratio(r["read_ms"].get("rust-lance-1c <- rust-lance"),
+                                                   r["read_ms"].get("rust-native-1c <- rust-lance"))))
+        py_write = geomean(collect(lambda r: ratio(r["write_ms"].get("rust-lance"), r["write_ms"].get("rust-native"))))
+        py_write1 = geomean(collect(lambda r: ratio(r["write_ms"].get("rust-lance-1c"),
+                                                    r["write_ms"].get("rust-native-1c"))))
+        nat_read = geomean(collect(lambda r: ratio(r["read_ms"].get("rust-native <- rust-lance"),
+                                                   r["read_ms"].get("nanolance-cpp <- nanolance"))))
+        nat_read1 = geomean(collect(lambda r: ratio(r["read_ms"].get("rust-native-1c <- rust-lance"),
+                                                    r["read_ms"].get("nanolance-cpp <- nanolance"))))
+        nat_write = geomean(collect(lambda r: ratio(r["write_ms"].get("rust-native"), r["write_ms"].get("nanolance-cpp"))))
+        nat_write1 = geomean(collect(lambda r: ratio(r["write_ms"].get("rust-native-1c"),
+                                                     r["write_ms"].get("nanolance-cpp"))))
+        w("### Without Python: the lance crate itself")
+        w("")
+        w("The same comparison against `tools/lance_rs_bench`, a Rust program using the `lance` crate (12.0.0, "
+          "the version pylance 12.0.0 is built from) with no Python in the process:")
+        w("")
+        w("| | vs Rust native on 1 core | vs Rust native on all cores |")
+        w("|---|---:|---:|")
+        w(f"| Read | {fx(nat_read1)} | {fx(nat_read)} |")
+        w(f"| Write | {fx(nat_write1)} | {fx(nat_write)} |")
+        w("")
+        w(f"Does Python slow Rust Lance down? pylance's time over the crate's own: reads {fx(py_read1)} (1 core) "
+          f"and {fx(py_read)} (all cores), writes {fx(py_write1)} and {fx(py_write)} -- 1.00x would mean no cost.")
+        w("")
+
+    mem_keys = [("nanolance-cpp write", "nanolance write"), ("nanolance-cpp-budget write", "nanolance write, 4 MiB budget"),
+                ("rust-native write", "Rust write"), ("nanolance-cpp read <- nanolance", "nanolance read"),
+                ("rust-native read <- rust-lance", "Rust read")]
+    if any(r.get("peak_mb") for r in D.values()):
+        wm = geomean(collect(lambda r: ratio(r.get("peak_mb", {}).get("rust-native write"),
+                                             r.get("peak_mb", {}).get("nanolance-cpp write"))))
+        wb = geomean(collect(lambda r: ratio(r.get("peak_mb", {}).get("rust-native write"),
+                                             r.get("peak_mb", {}).get("nanolance-cpp-budget write"))))
+        rm = geomean(collect(lambda r: ratio(r.get("peak_mb", {}).get("rust-native read <- rust-lance"),
+                                             r.get("peak_mb", {}).get("nanolance-cpp read <- nanolance"))))
+        w("## Memory")
+        w("")
+        w("Peak memory each native process added for one write or read (MB): for a write, over the input "
+          "batches it already held; for a read, including the table it returns. nanolance with a 4 MiB "
+          "budget commits a fragment whenever it holds 4 MiB, the setting for a device that must bound "
+          "its resident memory while saving. Rust is the `lance` crate on all cores.")
+        w("")
+        w(f"Geometric mean, Rust's peak over nanolance's: writes {fx(wm)} ({fx(wb)} against the 4 MiB budget), "
+          f"reads {fx(rm)}.")
+        w("")
+        w("| dataset | in-memory MB | " + " | ".join(t for _, t in mem_keys) + " |")
+        w("|---|---:|" + "---:|" * len(mem_keys))
+        for n, r in D.items():
+            pk = r.get("peak_mb", {})
+            w(f"| `{n}` | {r['arrow_bytes'] / 1e6:,.1f} | " + " | ".join(ms(pk.get(k)) for k, _ in mem_keys) + " |")
+        w("")
+
+    fp = data.get("footprint")
+    if fp:
+        def mbytes(v):
+            return "—" if v is None else f"{v / 1e6:,.1f} MB"
+        nl, rs = fp["nanolance"], fp["rust"]
+        w("## Footprint")
+        w("")
+        w("| | nanolance | Rust Lance |")
+        w("|---|---:|---:|")
+        w(f"| Reader + writer program, stripped | {mbytes(nl['bench_binary_bytes'])} | {mbytes(rs['bench_binary_bytes'])} |")
+        w(f"| Python package's native library | {mbytes(nl['python_native_lib_bytes'])} | "
+          f"{mbytes(rs['python_native_lib_bytes'])} |")
+        w(f"| Third-party code linked in | {len(nl['third_party'])} libraries ({', '.join(nl['third_party'])}) | "
+          f"{rs['crates'] if rs['crates'] is not None else '—'} crates |")
+        w("")
+        w(f"The programs: {nl['binary']}; {rs['binary']}. pylance's library also carries the cloud object "
+          "stores, which the Rust program leaves out.")
+        w("")
+
     notes = data.get("_notes") or {}
     if notes.get("findings"):
         w("## What the numbers say")
@@ -127,27 +203,30 @@ def render(data) -> str:
         w("**Read**, ms (each reader on the file its own writer made, then the cross reads):")
         w("")
         w("| dataset | rows | nanolance C++ | + retaining malloc | nanolance Python | Rust Lance 1 core | "
-          "Rust Lance all cores | Parquet | Rust reads nanolance's | nanolance reads Rust's |")
-        w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+          "Rust Lance all cores | Rust native 1 core | Rust native all cores | Parquet | Rust reads nanolance's | "
+          "nanolance reads Rust's |")
+        w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for n in names:
             r = D[n]
             R = r["read_ms"]
             w(f"| `{n}` — {r['description']} | {r['rows']:,} | {ms(R.get('nanolance-cpp <- nanolance'))} | "
               f"{ms(R.get('nanolance-cpp-retain <- nanolance'))} | {ms(R.get('nanolance-py <- nanolance'))} | "
               f"{ms(R.get('rust-lance-1c <- rust-lance'))} | {ms(R.get('rust-lance <- rust-lance'))} | "
+              f"{ms(R.get('rust-native-1c <- rust-lance'))} | {ms(R.get('rust-native <- rust-lance'))} | "
               f"{ms(R.get('parquet <- parquet'))} | {ms(R.get('rust-lance <- nanolance'))} | "
               f"{ms(R.get('nanolance-cpp <- rust-lance'))} |")
         w("")
         w("**Write** (ms) and **size** (MB):")
         w("")
-        w("| dataset | nanolance C++ | nanolance Python | Rust Lance 1 core | Rust Lance all cores | Parquet | "
-          "size nanolance | size Rust Lance | size Parquet |")
-        w("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        w("| dataset | nanolance C++ | + 4 MiB budget | nanolance Python | Rust Lance 1 core | Rust Lance all cores | "
+          "Rust native 1 core | Rust native all cores | Parquet | size nanolance | size Rust Lance | size Parquet |")
+        w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for n in names:
             r = D[n]
             W, S = r["write_ms"], r["size"]
-            w(f"| `{n}` | {ms(W.get('nanolance-cpp'))} | {ms(W.get('nanolance-py'))} | {ms(W.get('rust-lance-1c'))} | "
-              f"{ms(W.get('rust-lance'))} | {ms(W.get('parquet'))} | {mb(S.get('nanolance'))} | "
+            w(f"| `{n}` | {ms(W.get('nanolance-cpp'))} | {ms(W.get('nanolance-cpp-budget'))} | {ms(W.get('nanolance-py'))} | "
+              f"{ms(W.get('rust-lance-1c'))} | {ms(W.get('rust-lance'))} | {ms(W.get('rust-native-1c'))} | "
+              f"{ms(W.get('rust-native'))} | {ms(W.get('parquet'))} | {mb(S.get('nanolance'))} | "
               f"{mb(S.get('rust-lance'))} | {mb(S.get('parquet'))} |")
         w("")
         errs = [(n, k, v) for n in names for k, v in D[n]["errors"].items()]
