@@ -446,7 +446,28 @@ Standalone configures use **`GIT_SHALLOW TRUE`** on FetchContent to keep *future
 
 ## Benchmarking
 
-Performance benchmarks (pcap-style columns: run-length URI + monotonic position + constant size) and native-reader profiles are in [bench/linux-ci-results.md](bench/linux-ci-results.md) (CI-owned; local runs go to [bench/linux-local-results.md](bench/linux-local-results.md) via `bench/run-local-bench.sh`). External blob fetching (nanolance vs. Rust Lance) is in [bench/README_blob_fetch.md](bench/README_blob_fetch.md). The per-column compression ratios and method selection are documented in [AGENTS.md](AGENTS.md#3-enabling-the-compression-that-was-measured).
+**[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** has the full comparison against Rust Lance (pylance 12)
+and Parquet: 27 Arrow data types -- numbers, dates, strings, nulls, vectors, structs, lists, maps and a
+mixed table -- each written and read by nanolance C++, nanolance Python, Rust Lance on one core and on
+all cores, every read checked against the source before it is timed, and every file read by the other
+side. In short (geometric means; nanolance on one thread, Rust on 4 cores / 1 core):
+
+| | vs Rust Lance, 4 cores | vs Rust Lance, 1 core |
+|---|---:|---:|
+| Read | 1.43x faster | 2.00x faster |
+| Write | 1.41x faster | 1.35x faster |
+| File size | 99% of Rust's | |
+
+Numbers, dates and strings are where nanolance leads (reads 2.5-3.5x faster than four-core Rust on
+numeric types); lists and maps are where Rust leads (nanolance reads them at 0.61x four-core Rust).
+Reproduce with `python tools/bench_matrix.py && python tools/bench_report.py && python tools/bench_html.py`
+(the last renders `bench/results/report.html`, with charts).
+
+Older, narrower benchmarks: pcap-style columns and native-reader profiles in
+[bench/linux-ci-results.md](bench/linux-ci-results.md) (CI-owned; local runs go to
+[bench/linux-local-results.md](bench/linux-local-results.md) via `bench/run-local-bench.sh`), external
+blob fetching in [bench/README_blob_fetch.md](bench/README_blob_fetch.md), per-column compression in
+[AGENTS.md](AGENTS.md#3-enabling-the-compression-that-was-measured).
 
 ## Version
 

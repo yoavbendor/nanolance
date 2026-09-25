@@ -12,7 +12,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-TEMPLATE = r"""<title>nanolance Benchmarks</title>
+TEMPLATE = r"""<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanolance Benchmarks</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800&family=IBM+Plex+Mono:wght@400;500&family=Public+Sans:wght@400;500;600&display=swap">
@@ -41,8 +44,9 @@ TEMPLATE = r"""<title>nanolance Benchmarks</title>
   --nl: #3987e5; --rust: #d95926; --rust1: #199e70; --parity: #6b7482;
 }
 * { box-sizing: border-box; }
-body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--body); }
-.wrap { max-width: 1120px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 64px; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 var(--body); }
+.wrap { max-width: 1120px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 64px; }
+header > *, section > *, .tiles > *, .grid2 > * { min-width: 0; }  /* let wide charts scroll inside their card */
 h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; letter-spacing: -0.01em; }
 h1 { font-size: clamp(30px, 5vw, 46px); font-weight: 800; line-height: 1.05; }
 h2 { font-size: 24px; font-weight: 700; margin-bottom: 6px; }
@@ -52,11 +56,11 @@ p { margin: 0; max-width: 68ch; }
 .small { font-size: 13px; color: var(--ink-3); }
 .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 header { display: grid; gap: 14px; padding-bottom: 22px; border-bottom: 1px solid var(--rule); }
-.eyebrow { font: 500 12px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
+.eyebrow { font: 500 12px/1.4 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
 .env { display: flex; flex-wrap: wrap; gap: 6px 14px; font: 12.5px/1.4 var(--mono); color: var(--ink-2); }
 .env span b { color: var(--ink); font-weight: 500; }
 section { padding-block: 34px 6px; display: grid; gap: 14px; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: 12px; }
 .tile { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px 18px; display: grid; gap: 4px; }
 .tile .label { font-size: 13px; color: var(--ink-2); }
 .tile .value { font: 600 34px/1.1 var(--body); font-variant-numeric: proportional-nums; }
@@ -90,7 +94,7 @@ td:first-child { font-family: var(--body); }
 td .desc { display: block; color: var(--ink-3); font-size: 12px; }
 td.win { color: var(--good); font-weight: 500; }
 tr:last-child td { border-bottom: 0; }
-.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 14px; }
 ul { margin: 0; padding-left: 20px; max-width: 72ch; }
 li + li { margin-top: 6px; }
 code { font-family: var(--mono); font-size: .92em; background: var(--tint); padding: 1px 5px; border-radius: 4px; }
@@ -116,14 +120,14 @@ pre { font: 12.5px/1.5 var(--mono); background: var(--surface); border: 1px soli
 
   <section aria-labelledby="h-read">
     <h2 id="h-read">Read speed, by data type</h2>
-    <p class="muted">How many times faster nanolance's C++ reader is than Rust Lance, each reading the file its own writer made. Right of the line, nanolance is faster. Hover a dot for the milliseconds.</p>
+    <p class="muted">How many times faster nanolance's C++ reader is than Rust Lance, each reading the file its own writer made. Right of the line, nanolance is faster. The number at the end of each row is the one-core ratio; hover a row for the milliseconds.</p>
     <div class="legend" id="legend-read"></div>
     <div class="card chart-scroll"><div id="chart-read"></div></div>
   </section>
 
   <section aria-labelledby="h-write">
     <h2 id="h-write">Write speed, by data type</h2>
-    <p class="muted">The same comparison for writing: nanolance's C API (write_batch + commit) against <code>lance.write_dataset</code>.</p>
+    <p class="muted">The same comparison for writing: nanolance's C API (open, write_batch per 64K-row batch, commit) against <code>lance.write_dataset</code> given the same batches. The number at the end of each row is the one-core ratio.</p>
     <div class="legend" id="legend-write"></div>
     <div class="card chart-scroll"><div id="chart-write"></div></div>
   </section>

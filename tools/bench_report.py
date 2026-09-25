@@ -104,6 +104,20 @@ def render(data) -> str:
       f"Reads that returned wrong data or failed: **{failures}**.")
     w("")
 
+    notes = data.get("_notes") or {}
+    if notes.get("findings"):
+        w("## What the numbers say")
+        w("")
+        for title, body in notes["findings"]:
+            w(f"- **{title}.** {body}")
+        w("")
+    if notes.get("method"):
+        w("## Method")
+        w("")
+        for line in notes["method"]:
+            w(f"- {line}")
+        w("")
+
     for cat, title in CATEGORIES:
         names = [n for n, r in D.items() if r.get("category") == cat]
         if not names:
@@ -149,7 +163,11 @@ def render(data) -> str:
 def main(argv):
     src = Path(argv[1]) if len(argv) > 1 else ROOT / "bench" / "results" / "matrix.json"
     dst = Path(argv[2]) if len(argv) > 2 else ROOT / "docs" / "BENCHMARKS.md"
-    dst.write_text(render(json.loads(src.read_text())))
+    data = json.loads(src.read_text())
+    notes = src.with_name("notes.json")  # the findings and method, shared with bench_html.py
+    if notes.exists():
+        data["_notes"] = json.loads(notes.read_text())
+    dst.write_text(render(data))
     print(f"wrote {dst}")
 
 
