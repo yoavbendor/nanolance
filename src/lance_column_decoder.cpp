@@ -2964,7 +2964,6 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         internal_type = "utf8";
     }
     const auto bytes_per_value = lance_logical_type_value_bytes(internal_type);
-    const bool bitpacked = encoding_plan.kind == ColumnEncodingKind::kBitpack;
     // Reserve the whole column upfront: unpack_bitpacked_page() (and the plain-copy branch below) grow
     // out.fixed one FastLanes chunk (<=1024 values) at a time via insert(), so without this a column of
     // many chunks reallocates and re-copies everything already written on almost every chunk.
@@ -2976,15 +2975,60 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;
     std::vector<MiniBlockChunkView> chunks;
-    const bool nullable = encoding_plan.repdef != nullptr;
+    // Every page carries its own descriptor, and Rust Lance chooses per page: a float64 column
+    // bit-packs its full pages and writes the short last one Flat, and a page with no nulls in it
+    // carries no definition levels even when other pages do. Decoding every page with the first
+    // page's plan read Flat bytes as bit-packed ones ("invalid bit width") and refused level-less
+    // pages. So each later page is planned from its own descriptor (it must still be Flat or
+    // bit-packed), and a page without levels counts as all valid -- backfilled, if an earlier
+    // level-less page came before the first null.
+    const auto plan_page = [&](std::size_t page_index, ColumnEncodingPlan& later) -> const ColumnEncodingPlan* {
+        const auto& page = column_metadata.pages[page_index];
+        if (page_index == 0U || page.encoding.empty()) {
+            return &encoding_plan;
+        }
+        pb::ColumnMetadata one_page;
+        one_page.pages.push_back(page);
+        later = ColumnEncodingPlan{};
+        if (!classify_from_descriptor(one_page, later)) {
+            return &encoding_plan;
+        }
+        if (later.kind != ColumnEncodingKind::kFlat && later.kind != ColumnEncodingKind::kBitpack) {
+            error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) +
+                    " is neither flat nor bit-packed like the column's first page" +
+                    (later.unsupported_reason.empty() ? "" : ": " + later.unsupported_reason);
+            return nullptr;
+        }
+        later.item_view = encoding_plan.item_view;
+        return &later;
+    };
+    bool any_levels = false;
+    {
+        ColumnEncodingPlan scratch;
+        for (std::size_t i = 0; i < column_metadata.pages.size() && !any_levels; ++i) {
+            const auto* plan = plan_page(i, scratch);
+            if (plan == nullptr) {
+                return false;
+            }
+            any_levels = plan->repdef != nullptr;
+        }
+    }
     std::uint64_t validity_rows = 0;
     std::uint64_t page_rows_before = 0;
-    for (const auto& page : column_metadata.pages) {
+    ColumnEncodingPlan later_page;
+    for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
+        const auto& page = column_metadata.pages[page_index];
+        const auto* plan = plan_page(page_index, later_page);
+        if (plan == nullptr) {
+            return false;
+        }
+        const bool bitpacked = plan->kind == ColumnEncodingKind::kBitpack;
+        const bool nullable = plan->repdef != nullptr;
         if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
             return false;
         }
-        if (!split_miniblock_payload(payload, encoding_plan.chunk_shape, chunks, error) ||
-            !apply_item_view(encoding_plan, chunks, error)) {
+        if (!split_miniblock_payload(payload, plan->chunk_shape, chunks, error) ||
+            !apply_item_view(*plan, chunks, error)) {
             return false;
         }
         // How many values a chunk holds depends on how it is encoded, and the header only states it
@@ -3027,11 +3071,19 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     error = "column declares definition levels but a chunk carries none";
                     return false;
                 }
-                if (!append_definition_levels(chunk.repdef, *encoding_plan.repdef, chunk.repdef_values,
+                if (!append_definition_levels(chunk.repdef, *plan->repdef, chunk.repdef_values,
                                               validity_rows, out.validity, out.null_count, error)) {
                     return false;
                 }
                 validity_rows += chunk.repdef_values;
+            } else if (any_levels) {
+                // A page with no nulls in a column that has some: its rows are all valid.
+                const auto end = validity_rows + chunk_values;
+                out.validity.resize(static_cast<std::size_t>((end + 7U) / 8U), 0U);
+                for (auto row = validity_rows; row < end; ++row) {
+                    out.validity[static_cast<std::size_t>(row >> 3U)] |= static_cast<std::uint8_t>(1U << (row & 7U));
+                }
+                validity_rows = end;
             }
             if (bitpacked) {
                 if (!unpack_bitpacked_page_dispatch(chunk.values, chunk_values, bytes_per_value, out.fixed,
@@ -3070,7 +3122,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         }
         page_rows_before += page.length;
     }
-    if (nullable && validity_rows != declared_rows) {
+    if (any_levels && validity_rows != declared_rows) {
         error = "definition levels cover " + std::to_string(validity_rows) + " rows but the column has " +
                 std::to_string(declared_rows);
         return false;

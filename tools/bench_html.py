@@ -199,14 +199,15 @@ python tools/bench_html.py          # this page</pre>
   const write4 = geo(names.map(n => ratio(W(n, "rust-lance"), W(n, "nanolance-cpp"))));
   const write1 = geo(names.map(n => ratio(W(n, "rust-lance-1c"), W(n, "nanolance-cpp"))));
   const size = geo(names.map(n => ratio(D[n].size["nanolance"], D[n].size["rust-lance"])));
-  const failures = names.reduce((s, n) => s + Object.keys(D[n].errors).length, 0);
-  const interopReads = names.length * 6;
+  const CROSS = ["nanolance-cpp <- rust-lance", "nanolance-py <- rust-lance", "rust-lance <- nanolance"];
+  const interopReads = names.length * CROSS.length;
+  const crossOk = names.reduce((s, n) => s + CROSS.filter(k => R(n, k) != null).length, 0);
   const tiles = [
     ["Read, per core", fmtX(read1), "nanolance C++ vs Rust Lance on one core (geometric mean)"],
     ["Read, out of the box", fmtX(read4), "nanolance on one core vs Rust Lance on all " + env.cores],
     ["Write", fmtX(write4), `vs Rust Lance on all cores; ${fmtX(write1)} vs one core`],
     ["File size", (size * 100).toFixed(1) + "%", "of Rust Lance's, same data"],
-    ["Cross-reads verified", `${interopReads - failures} / ${interopReads}`, "Rust ⇄ nanolance, C++ and Python"],
+    ["Cross-reads verified", `${crossOk} / ${interopReads}`, "each reading the other's file, value by value"],
   ];
   const tilesEl = document.getElementById("tiles");
   tiles.forEach(([l, v, n]) => { const t = el("div", {class: "tile"}); t.append(el("div", {class: "label"}, l), el("div", {class: "value"}, v), el("div", {class: "note"}, n)); tilesEl.append(t); });
