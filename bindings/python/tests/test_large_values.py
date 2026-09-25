@@ -90,3 +90,34 @@ def test_an_image_table(lance_mod, tmp_path):
     path = tmp_path / "images.lance"
     nanolance.write_table(table, path)
     _check(lance_mod, path, table, offset=100, length=77)
+
+
+@pytest.mark.parametrize("compressible", [False, True])
+@pytest.mark.parametrize("nulls", [False, True])
+@pytest.mark.parametrize("kind", [pa.binary(), pa.large_binary(), pa.utf8()])
+def test_reading_rusts_per_value_compressed_pages(lance_mod, tmp_path, compressible, nulls, kind):
+    """pylance writes large values as FullZip pages with each value zstd-compressed on its own
+    (General{zstd, Variable}); nanolance refused them as "unsupported page layout"."""
+    rng = np.random.default_rng(4)
+    n = 60
+    if compressible:
+        raw = [(f"row {i} " * (2_000 + i * 50)).encode() for i in range(n)]
+    else:
+        raw = [rng.bytes(int(s)) for s in rng.integers(300, 90_000, n)]
+    vals = [r.hex() if kind == pa.utf8() else r for r in raw]
+    if nulls:
+        vals[5] = None
+        vals[40] = None
+    table = pa.table({"v": pa.array(vals, kind)})
+    path = tmp_path / "rust.lance"
+    lance_mod.write_dataset(table, str(path), data_storage_version="2.2")
+    from lance.file import LanceFileReader
+    import glob
+    (data_file,) = glob.glob(f"{path}/data/*.lance")
+    encoding = str(LanceFileReader(data_file).metadata().columns[0].pages[0].encoding)
+    assert "FullZip" in encoding, "pylance no longer writes these as FullZip pages"
+    got = pa.table(nanolance.read_table(path))
+    got.validate(full=True)
+    assert got.to_pydict() == table.to_pydict()
+    part = pa.table(nanolance.read_table(path, offset=7, length=40))
+    assert part.to_pydict() == table.slice(7, 40).to_pydict()

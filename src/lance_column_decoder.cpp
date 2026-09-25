@@ -253,6 +253,37 @@ bool zstd_unframe_buffer(const std::vector<std::uint8_t>& framed, std::vector<st
     return true;
 }
 
+/// One per-value-compressed FullZip value (General{zstd | lz4} around Variable), appended to `out`.
+/// zstd values are [u64 raw size][frame] -- or, in files from older Lance, a bare frame -- and lz4 values
+/// [u32 raw size][block]; both go through the same bounded decoders the MiniBlock paths use.
+bool decompress_full_zip_value(page_layout::BufferScheme scheme, const std::uint8_t* data, std::size_t size,
+                               std::vector<std::uint8_t>& out, std::string& error) {
+    thread_local std::vector<std::uint8_t> framed;
+    thread_local std::vector<std::uint8_t> raw;
+    framed.assign(data, data + size);
+    if (scheme == page_layout::BufferScheme::kZstd) {
+        static constexpr std::uint8_t kZstdMagic[4] = {0x28U, 0xB5U, 0x2FU, 0xFDU};
+        if (size >= 4U && std::memcmp(data, kZstdMagic, 4U) == 0) {
+            const unsigned long long content = ZSTD_getFrameContentSize(data, size);
+            if (content == ZSTD_CONTENTSIZE_UNKNOWN || content == ZSTD_CONTENTSIZE_ERROR) {
+                error = "zstd value without a declared content size";
+                return false;
+            }
+            framed.resize(size + 8U);
+            std::memmove(framed.data() + 8U, data, size);
+            const std::uint64_t declared = content;
+            std::memcpy(framed.data(), &declared, 8U);
+        }
+        if (!zstd_unframe_buffer(framed, raw, error)) {
+            return false;
+        }
+    } else if (!lz4_block::decompress_sized(framed, raw, error)) {
+        return false;
+    }
+    out.insert(out.end(), raw.begin(), raw.end());
+    return true;
+}
+
 bool read_le16(const std::uint8_t* p, std::uint16_t& v) {
     v = static_cast<std::uint16_t>(static_cast<unsigned>(p[0]) | (static_cast<unsigned>(p[1]) << 8U));
     return true;
@@ -1408,6 +1439,9 @@ struct FullZipPageParams {
     std::size_t value_bytes = 0;   // fixed width; 0 for variable width
     std::size_t length_bytes = 0;  // variable width: the length prefix, 4 or 8; 0 for fixed width
     std::optional<fsst::SymbolTable> fsst;
+    /// Variable width: General{zstd | lz4} around the values -- each value compressed on its own, as
+    /// Lance writes large binary (images, audio): zstd as [u64 raw size][frame], lz4 as [u32][block].
+    page_layout::BufferScheme value_scheme = page_layout::BufferScheme::kNone;
     /// fixed_size_list with element validity: each slot starts with ceil(items/8) bytes of per-element
     /// validity bits, then the items. `value_bytes` counts both.
     std::uint64_t items = 0;
@@ -1492,6 +1526,13 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
                 return false;
             }
             out.fsst = table;
+            values = values->values.get();
+        } else if (values->kind == page_layout::CompressiveKind::kGeneral) {
+            if (values->scheme != page_layout::BufferScheme::kZstd && values->scheme != page_layout::BufferScheme::kLz4) {
+                why = "unsupported FullZip value compression scheme " + std::to_string(values->wire_scheme);
+                return false;
+            }
+            out.value_scheme = values->scheme;
             values = values->values.get();
         }
         if (values == nullptr || values->kind != page_layout::CompressiveKind::kVariable) {
@@ -2696,6 +2737,14 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                                                     out.variable.data, error)) {
                             return false;
                         }
+                    } else if (params.value_scheme != page_layout::BufferScheme::kNone && length != 0U) {
+                        if (!decompress_full_zip_value(params.value_scheme, data.data() + at,
+                                                       static_cast<std::size_t>(length), out.variable.data, error)) {
+                            error = "column '" + on_disk_field.name + "': " + error;
+                            return false;
+                        }
+                    } else if (params.value_scheme != page_layout::BufferScheme::kNone) {
+                        // An empty compressed value is an empty value (Lance's decompressor skips it).
                     } else {
                         out.variable.data.insert(out.variable.data.end(), data.begin() + static_cast<std::ptrdiff_t>(at),
                                                  data.begin() + static_cast<std::ptrdiff_t>(at + length));
