@@ -69,6 +69,18 @@ bool lance_table_read_dataset_range(const std::filesystem::path& dataset_path,
                                     std::vector<ArrowArray>& out_batches, std::string& error,
                                     bool trusted_input = false);
 
+/// Read the rows at `indices` (logical row numbers, as a full read numbers them: deleted rows are not
+/// counted), optionally projected -- random access, e.g. a shuffled training mini-batch.
+///
+/// The rows come back in ascending order, each once, one batch per fragment touched: sort and dedupe
+/// happen here, so reorder afterwards if your indices were not ascending (the Python `take` does).
+/// Fragments without a requested row are never opened, and within a fragment only the pages holding a
+/// requested row are read -- for large values (images, audio: FullZip pages) only the rows themselves.
+/// An index past the end is an error.
+bool lance_table_take(const std::filesystem::path& dataset_path, const std::vector<std::string>* column_names,
+                      const std::vector<std::uint64_t>& indices, ArrowSchema& out_schema,
+                      std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input = false);
+
 /// The dataset's Arrow schema, read from the manifest alone -- no data file is opened.
 ///
 /// This is the cheap "what is in here?" call: opening a dataset to look at its columns should not

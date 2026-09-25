@@ -167,6 +167,19 @@ int nano_lance_table_read_dataset_range(const char* dataset_path, const char* co
                                         struct ArrowArray** out_batches, size_t* out_batch_count,
                                         char* error_message, size_t error_message_capacity);
 
+/// Read the rows at \p indices (\p index_count of them): logical row numbers, deleted rows not
+/// counted -- random access, e.g. a shuffled training mini-batch. \p column_names / \p column_count
+/// project as in nano_lance_table_read_dataset_range.
+///
+/// Rows come back in ascending order, each once, one batch per fragment touched. Only fragments and
+/// pages holding a requested row are read, and for large values (FullZip pages) only the rows
+/// themselves. An index past the end is an error. Free the
+/// result with nano_lance_table_read_result_free.
+int nano_lance_table_take(const char* dataset_path, const char* const* column_names, size_t column_count,
+                          const uint64_t* indices, size_t index_count, int trusted_input,
+                          struct ArrowSchema* out_schema, struct ArrowArray** out_batches,
+                          size_t* out_batch_count, char* error_message, size_t error_message_capacity);
+
 /// nano_lance_table_open_stream restricted to a row range; see
 /// nano_lance_table_read_dataset_range for what a range costs.
 int nano_lance_table_open_stream_range(const char* dataset_path, const char* const* column_names,

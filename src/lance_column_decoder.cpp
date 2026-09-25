@@ -8,6 +8,7 @@
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/bool_bitpack.hpp"
 #include "nanolance/byte_stream_split.hpp"
+#include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
 #include "nanolance/fsst.hpp"
@@ -3448,9 +3449,12 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
                 error = where + error;
                 return false;
             }
-            // A constant under a nullable struct but in no list stores an empty repetition buffer.
+            // A constant under a nullable struct but in no list stores an empty repetition buffer; one
+            // under lists whose every layer is all-valid (a map's constant key, say) stores an empty
+            // definition buffer -- there is nothing to define. With both empty the page has no levels
+            // to infer its items from, and the definition path reports that.
             has_rep = !rep.empty();
-            has_def = true;
+            has_def = !def.empty() || rep.empty();
             layer_kinds = &c.layers;
         } else if (layout.kind == page_layout::LayoutKind::kFullZip) {
             // Long values under lists or null structs: the levels are in each value's control word,
@@ -3664,6 +3668,218 @@ bool column_is_nested(const pb::ColumnMetadata& column_metadata) {
 }
 
 }  // namespace
+
+namespace {
+
+/// The rows of a single-layer, variable-width FullZip page that `take_full_zip_rows` can read straight
+/// through the repetition index, or false for any page it cannot (lists, nullable structs, fixed width,
+/// no index): those take the decode-the-page path.
+bool full_zip_row_addressable(const pb::ColumnPage& page, page_layout::PageLayout& layout, FullZipPageParams& params) {
+    std::string why;
+    if (page.encoding.empty() || page.buffer_offsets.size() < 2U || page.buffer_sizes.size() < 2U ||
+        !page_layout::decode_page_layout(page.encoding, layout, why) ||
+        layout.kind != page_layout::LayoutKind::kFullZip || layout.full_zip.layers.size() != 1U ||
+        !full_zip_page_params(layout, page.length, params, why)) {
+        return false;
+    }
+    return params.bits_rep == 0U && params.length_bytes != 0U && params.control_bytes <= 1U &&
+           params.bits_def <= 1U;
+}
+
+/// Append rows `[begin, end)` of `rows` -- all inside `page`, as page-local row numbers relative to
+/// `page_first` -- reading each row's bytes through the page's repetition index.
+bool take_full_zip_rows(const std::filesystem::path& path, const std::string& column, const pb::ColumnPage& page,
+                        const FullZipPageParams& params, const std::vector<std::uint64_t>& rows, std::size_t begin,
+                        std::size_t end, std::uint64_t page_first, ColumnValues& out, std::uint64_t& out_row,
+                        std::string& error) {
+    const auto index_size = page.buffer_sizes[1];
+    const auto entries = page.length + 1U;
+    if (index_size == 0U || index_size % entries != 0U) {
+        error = "column '" + column + "': FullZip repetition index does not have one entry per row";
+        return false;
+    }
+    const auto width = index_size / entries;
+    if (width != 1U && width != 2U && width != 4U && width != 8U) {
+        error = "column '" + column + "': FullZip repetition index entries are " + std::to_string(width) + " bytes";
+        return false;
+    }
+    thread_local std::vector<std::uint8_t> index;
+    thread_local std::vector<std::uint8_t> bytes;
+    if (!read_lance_data_file_bytes(path, page.buffer_offsets[1], index_size, index, error)) {
+        return false;
+    }
+    const auto entry = [&](std::uint64_t k) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, index.data() + k * width, static_cast<std::size_t>(width));
+        return v;
+    };
+    const auto data_size = page.buffer_sizes[0];
+    for (std::size_t i = begin; i < end;) {
+        // Rows that sit next to each other in the page are one read.
+        std::size_t j = i + 1U;
+        while (j < end && rows[j] == rows[j - 1U] + 1U) {
+            ++j;
+        }
+        const auto first_local = rows[i] - page_first;
+        const auto last_local = rows[j - 1U] - page_first;
+        const auto start = entry(first_local);
+        const auto stop = entry(last_local + 1U);
+        if (stop < start || stop > data_size) {
+            error = "column '" + column + "': FullZip repetition index points past the page";
+            return false;
+        }
+        if (!read_lance_data_file_bytes(path, page.buffer_offsets[0] + start, stop - start, bytes, error)) {
+            return false;
+        }
+        for (auto local = first_local; local <= last_local; ++local) {
+            const auto row_begin = entry(local) - start;
+            const auto row_end = entry(local + 1U) - start;
+            if (row_end < row_begin || row_end > bytes.size()) {
+                error = "column '" + column + "': FullZip repetition index is not increasing";
+                return false;
+            }
+            std::size_t at = static_cast<std::size_t>(row_begin);
+            std::uint32_t def = 0;
+            if (params.control_bytes == 1U) {
+                if (at >= row_end) {
+                    error = "column '" + column + "': FullZip row has no control word";
+                    return false;
+                }
+                def = bytes[at++] & ((1U << params.bits_def) - 1U);
+            }
+            if (def == 0U) {
+                if (row_end - at < params.length_bytes) {
+                    error = "column '" + column + "': FullZip row truncated in its length";
+                    return false;
+                }
+                std::uint64_t length = 0;
+                std::memcpy(&length, bytes.data() + at, params.length_bytes);
+                at += params.length_bytes;
+                if (length != row_end - at) {
+                    error = "column '" + column + "': FullZip row length disagrees with its index entries";
+                    return false;
+                }
+                if (params.fsst) {
+                    if (!fsst::decompress_value(*params.fsst, bytes.data() + at, static_cast<std::size_t>(length),
+                                                out.variable.data, error)) {
+                        return false;
+                    }
+                } else if (params.value_scheme != page_layout::BufferScheme::kNone) {
+                    if (length != 0U && !decompress_full_zip_value(params.value_scheme, bytes.data() + at,
+                                                                   static_cast<std::size_t>(length), out.variable.data,
+                                                                   error)) {
+                        return false;
+                    }
+                } else {
+                    out.variable.data.insert(out.variable.data.end(), bytes.begin() + static_cast<std::ptrdiff_t>(at),
+                                             bytes.begin() + static_cast<std::ptrdiff_t>(at + length));
+                }
+                if (out.variable.data.size() > default_read_limits().max_uncompressed_bytes) {
+                    error = "column '" + column + "' exceeds the decoded-size limit";
+                    return false;
+                }
+                out.validity.resize(static_cast<std::size_t>((out_row + 8U) / 8U), 0U);
+                out.validity[static_cast<std::size_t>(out_row >> 3U)] |= static_cast<std::uint8_t>(1U << (out_row & 7U));
+            } else {
+                out.validity.resize(static_cast<std::size_t>((out_row + 8U) / 8U), 0U);
+                ++out.null_count;
+            }
+            append_list_offset(out.variable.offsets, static_cast<std::int64_t>(out.variable.data.size()),
+                               out.variable.large);
+            ++out_row;
+        }
+        i = j;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                                       const pb::ColumnMetadata& column_metadata,
+                                       const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
+                                       ColumnValues& out, std::string& error) {
+    error.clear();
+    out = ColumnValues{};
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        if (rows[i] <= rows[i - 1U]) {
+            error = "rows to take must be strictly ascending";
+            return false;
+        }
+    }
+    // Which pages hold a requested row, and where each page starts.
+    std::vector<std::uint64_t> page_first(column_metadata.pages.size() + 1U, 0U);
+    for (std::size_t p = 0; p < column_metadata.pages.size(); ++p) {
+        page_first[p + 1U] = page_first[p] + column_metadata.pages[p].length;
+    }
+    if (!rows.empty() && rows.back() >= page_first.back()) {
+        error = "row " + std::to_string(rows.back()) + " is past the column's " + std::to_string(page_first.back()) +
+                " rows";
+        return false;
+    }
+    std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>> touched;  // page, [begin, end) of rows
+    for (std::size_t i = 0; i < rows.size();) {
+        const auto p = static_cast<std::size_t>(
+            std::upper_bound(page_first.begin(), page_first.end(), rows[i]) - page_first.begin() - 1);
+        std::size_t j = i;
+        while (j < rows.size() && rows[j] < page_first[p + 1U]) {
+            ++j;
+        }
+        touched.push_back({p, {i, j}});
+        i = j;
+    }
+
+    // Every touched page row-addressable: read just the rows.
+    bool addressable = !touched.empty() && !column_is_nested(column_metadata);
+    std::vector<FullZipPageParams> params(touched.size());
+    for (std::size_t t = 0; t < touched.size() && addressable; ++t) {
+        page_layout::PageLayout layout;
+        addressable = full_zip_row_addressable(column_metadata.pages[touched[t].first], layout, params[t]);
+    }
+    if (addressable) {
+        out.kind = ColumnValues::Kind::VariableWidth;
+        out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+        append_list_offset(out.variable.offsets, 0, out.variable.large);
+        std::uint64_t out_row = 0;
+        for (std::size_t t = 0; t < touched.size(); ++t) {
+            const auto& [p, span] = touched[t];
+            if (!take_full_zip_rows(data_file_path, on_disk_field.name, column_metadata.pages[p], params[t], rows,
+                                    span.first, span.second, page_first[p], out, out_row, error)) {
+                return false;
+            }
+        }
+        if (out.null_count == 0U) {
+            out.validity.clear();
+        } else {
+            out.validity.resize(static_cast<std::size_t>((out_row + 7U) / 8U), 0U);
+        }
+        return true;
+    }
+
+    // Otherwise decode the touched pages -- only those -- and pick the rows out.
+    pb::ColumnMetadata subset = column_metadata;
+    subset.pages.clear();
+    std::uint64_t subset_rows = 0;
+    std::vector<std::uint8_t> keep;
+    for (const auto& [p, span] : touched) {
+        subset.pages.push_back(column_metadata.pages[p]);
+        keep.resize(static_cast<std::size_t>(subset_rows + column_metadata.pages[p].length), 0U);
+        for (auto i = span.first; i < span.second; ++i) {
+            keep[static_cast<std::size_t>(subset_rows + rows[i] - page_first[p])] = 1U;
+        }
+        subset_rows += column_metadata.pages[p].length;
+    }
+    if (subset.pages.empty()) {
+        // No rows asked for: decode nothing, but return the column's shape (kind, offset width).
+        subset.pages.push_back(column_metadata.pages.front());
+        keep.assign(static_cast<std::size_t>(column_metadata.pages.front().length), 0U);
+        subset_rows = column_metadata.pages.front().length;
+    }
+    if (!decode_lance_physical_column(data_file_path, on_disk_field, subset, out, error)) {
+        return false;
+    }
+    return compact_column_values(out, keep, subset_rows, value_bytes, error);
+}
 
 bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
                                   const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {

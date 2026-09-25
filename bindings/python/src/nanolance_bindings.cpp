@@ -341,6 +341,30 @@ ExportedTable read_table_eager(const std::filesystem::path& path,
     return out;
 }
 
+ExportedTable take_rows(const std::filesystem::path& path, const std::vector<std::uint64_t>& indices,
+                        std::optional<std::vector<std::string>> columns) {
+    ArrowSchema schema{};
+    ArrowArray* batches = nullptr;
+    std::size_t batch_count = 0;
+    char err[512] = {};
+    std::vector<const char*> names;
+    if (columns) {
+        names.reserve(columns->size());
+        for (const auto& name : *columns) {
+            names.push_back(name.c_str());
+        }
+    }
+    const int rc = nano_lance_table_take(path.string().c_str(), names.empty() ? nullptr : names.data(), names.size(),
+                                         indices.data(), indices.size(), /*trusted_input=*/0, &schema, &batches,
+                                         &batch_count, err, sizeof(err));
+    if (rc != NANO_LANCE_READER_OK) {
+        throw_lance_reader("nano_lance_table_take", rc, err);
+    }
+    ExportedTable out = ExportedTable::from_read_result(&schema, batches, batch_count);
+    nano_lance_table_read_result_free(&schema, batches, batch_count);
+    return out;
+}
+
 }  // namespace
 
 NB_MODULE(_nanolance, m) {
@@ -405,6 +429,9 @@ NB_MODULE(_nanolance, m) {
           nb::arg("offset") = 0, nb::arg("length") = -1,
           "Read a Lance dataset, decoding every batch up front. `columns` names the top-level columns "
           "to read; the rest are skipped during decode rather than decoded and discarded.");
+    m.def("take", &take_rows, nb::arg("path"), nb::arg("indices"), nb::arg("columns") = nb::none(),
+          "Read the rows at `indices` (ascending, distinct), reading only the fragments and pages -- for "
+          "large values only the rows -- that hold them.");
     m.def("open_stream", &read_table_stream, nb::arg("path"), nb::arg("columns") = nb::none(),
           nb::arg("offset") = 0, nb::arg("length") = -1,
           "Open a Lance dataset as a streaming Arrow handle: one batch decoded per pull, so peak "

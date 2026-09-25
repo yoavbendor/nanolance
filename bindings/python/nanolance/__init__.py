@@ -252,6 +252,43 @@ def read_table(
     return _nanolance.read_table(Path(path), _normalize_columns(columns), start, count)
 
 
+def take(
+    path: Union[str, os.PathLike],
+    indices: Sequence[int],
+    columns: Optional[Sequence[str]] = None,
+):
+    """Read the rows at ``indices`` -- random access, e.g. a shuffled training mini-batch::
+
+        batch = nanolance.take("coco.lance", [4031, 17, 2980, 511], columns=["image", "caption"])
+
+    Rows come back in the order of ``indices``, repeats included, as :meth:`lance.LanceDataset.take`
+    returns them; indices count rows the way a full read does (deleted rows are not counted).
+
+    Only the fragments and pages holding a requested row are read. For large values -- images, audio,
+    documents, which nanolance and Lance store as FullZip pages -- only the requested rows themselves
+    are read, through each page's per-row index, so a batch of 64 images out of 100,000 reads 64
+    images.
+
+    Returns a ``pyarrow.Table`` when the rows need reordering (``indices`` not strictly ascending),
+    which needs pyarrow; otherwise the same Arrow-exportable handle as :func:`read_table`.
+    """
+    wanted = [int(i) for i in indices]
+    if any(i < 0 for i in wanted):
+        raise IndexError("indices must not be negative")
+    total = count_rows(path)
+    if wanted and max(wanted) >= total:
+        raise IndexError(f"index {max(wanted)} is past the end of the dataset ({total} rows)")
+    distinct = sorted(set(wanted))
+    handle = _nanolance.take(Path(path), distinct, _normalize_columns(columns))
+    if wanted == distinct:
+        return handle
+    import pyarrow as pa  # reordering needs a take kernel; pyarrow's is the one Arrow users have
+
+    table = pa.table(handle)
+    position = {row: k for k, row in enumerate(distinct)}
+    return table.take(pa.array([position[i] for i in wanted], pa.int64()))
+
+
 def open_stream(
     path: Union[str, os.PathLike],
     columns: Optional[Sequence[str]] = None,
@@ -324,6 +361,7 @@ def count_rows(path: Union[str, os.PathLike]) -> int:
 __all__ = [
     "write_table",
     "read_table",
+    "take",
     "open_stream",
     "read_schema",
     "count_rows",

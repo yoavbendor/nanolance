@@ -1865,6 +1865,114 @@ bool write_nested_column(std::ofstream& out, const LanceField& field, const Colu
     return true;
 }
 
+/// Values at least this big on average are written as FullZip pages (see write_full_zip_variable_column).
+constexpr std::uint64_t kFullZipMinAverageValueBytes = 4096U;
+
+/// A column of large values -- images, audio clips, documents -- as FullZip pages, the layout Lance
+/// itself writes for them: each row's bytes stored whole, one after the other, behind a per-row index.
+///
+/// A row is [definition byte, when the page has nulls][length, 4 or 8 bytes][the value]; a null is
+/// the definition byte alone. The page's second buffer is the repetition index -- rows + 1 byte
+/// offsets where each row starts (Lance requires one for variable-width FullZip pages) -- which is what
+/// lets a reader fetch one row without reading the page: a shuffled mini-batch of 64 images out of
+/// thousands reads 64 images, not the column. Pages are cut at ~8 MiB of values, at least one row.
+bool write_full_zip_variable_column(std::ofstream& out, const ColumnValues& values, std::uint64_t rows,
+                                    pb::ColumnMetadata& column, std::string& error) {
+    constexpr std::size_t kPageBytes = std::size_t{8} << 20U;
+    const bool large = values.variable.large;
+    const std::size_t length_bytes = large ? 8U : 4U;
+    column.encoding = column_encoding_bytes();
+    std::vector<std::uint8_t> data;
+    std::vector<std::uint64_t> starts;
+    std::uint64_t row = 0;
+    while (row < rows) {
+        const auto first = row;
+        std::uint64_t end = row;
+        std::size_t bytes = 0;
+        bool nulls = false;
+        while (end < rows && (end == first || bytes < kPageBytes)) {
+            if (validity_bit(values.validity, end)) {
+                bytes += static_cast<std::size_t>(variable_offset(values, end + 1U) - variable_offset(values, end)) +
+                         length_bytes;
+            } else {
+                nulls = true;
+            }
+            ++end;
+        }
+        data.clear();
+        data.reserve(bytes + static_cast<std::size_t>(end - first));
+        starts.clear();
+        for (auto r = first; r < end; ++r) {
+            starts.push_back(data.size());
+            const bool valid = validity_bit(values.validity, r);
+            if (nulls) {
+                data.push_back(valid ? 0U : 1U);  // the definition level: 1 = null item
+            }
+            if (!valid) {
+                continue;
+            }
+            const auto begin = variable_offset(values, r);
+            const auto len = static_cast<std::uint64_t>(variable_offset(values, r + 1U) - begin);
+            if (!large && len > std::numeric_limits<std::uint32_t>::max()) {
+                error = "a utf8/binary value over 4 GiB";
+                return false;
+            }
+            const auto at = data.size();
+            data.resize(at + length_bytes + static_cast<std::size_t>(len));
+            std::memcpy(data.data() + at, &len, length_bytes);  // little-endian, low bytes first
+            if (len != 0U) {
+                std::memcpy(data.data() + at + length_bytes, values.variable.data.data() + begin,
+                            static_cast<std::size_t>(len));
+            }
+        }
+        starts.push_back(data.size());
+        const std::size_t index_width = data.size() <= std::numeric_limits<std::uint32_t>::max() ? 4U : 8U;
+        std::vector<std::uint8_t> rep_index(starts.size() * index_width);
+        for (std::size_t k = 0; k < starts.size(); ++k) {
+            std::memcpy(rep_index.data() + k * index_width, &starts[k], index_width);
+        }
+
+        // FullZipLayout{ f2 bits_def, f4 bits_per_offset, f5 num_items, f6 num_visible_items,
+        //                f7 value_compression = Variable{ offsets = Flat(32|64) }, f8 layers }
+        std::vector<std::uint8_t> flat;
+        flat.push_back(0x08U);  // Flat.f1 bits_per_value
+        append_varint(flat, length_bytes * 8U);
+        std::vector<std::uint8_t> offsets_encoding;
+        write_length_delimited(offsets_encoding, 1, flat);
+        std::vector<std::uint8_t> variable;
+        write_length_delimited(variable, 1, offsets_encoding);
+        std::vector<std::uint8_t> value_compression;
+        write_length_delimited(value_compression, 2, variable);
+        std::vector<std::uint8_t> layout;
+        if (nulls) {
+            layout.push_back(0x10U);  // f2 bits_def
+            append_varint(layout, 1U);
+        }
+        layout.push_back(0x20U);  // f4 bits_per_offset
+        append_varint(layout, length_bytes * 8U);
+        layout.push_back(0x28U);  // f5 num_items
+        append_varint(layout, end - first);
+        layout.push_back(0x30U);  // f6 num_visible_items
+        append_varint(layout, end - first);
+        write_length_delimited(layout, 7, value_compression);
+        write_length_delimited(layout, 8,
+                               std::vector<std::uint8_t>{nulls ? static_cast<std::uint8_t>(repdef::kNullableItem)
+                                                               : static_cast<std::uint8_t>(repdef::kAllValidItem)});
+
+        pb::ColumnPage page;
+        page.buffer_offsets.push_back(write_buffer(out, data));
+        page.buffer_sizes.push_back(data.size());
+        page.buffer_offsets.push_back(write_buffer(out, rep_index));
+        page.buffer_sizes.push_back(rep_index.size());
+        page.length = end - first;
+        page.priority = 0;
+        page.encoding = page_encoding(3, layout);
+        column.pages.push_back(std::move(page));
+        row = end;
+    }
+    return true;
+}
+
 bool write_lance_data_file(const std::filesystem::path& dataset_path,
                            const std::string& file_name,
                            const LanceSchemaMapping& mapping,
@@ -2502,7 +2610,16 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         }
         if (!compress || value_too_big_for_a_chunk) {
             pb::ColumnMetadata column;
-            if (!write_nested_column(out, field, values, rows, column, error, nullptr, /*plain=*/true)) {
+            // Large values get FullZip pages (row-addressable, as Lance writes them); the rest
+            // MiniBlock chunks.
+            std::uint64_t valid_rows = 0;
+            for (std::uint64_t r = 0; r < rows; ++r) {
+                valid_rows += validity_bit(values.validity, r) ? 1U : 0U;
+            }
+            const auto total_bytes = static_cast<std::uint64_t>(variable_offset(values, rows) - variable_offset(values, 0));
+            const bool full_zip = valid_rows != 0U && total_bytes / valid_rows >= kFullZipMinAverageValueBytes;
+            if (full_zip ? !write_full_zip_variable_column(out, values, rows, column, error)
+                         : !write_nested_column(out, field, values, rows, column, error, nullptr, /*plain=*/true)) {
                 return false;
             }
             columns.push_back(std::move(column));

@@ -1165,6 +1165,104 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
     return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id, length, batch, error);
 }
 
+/// One fragment's share of a take: `logical` are its requested rows, ascending, fragment-local and
+/// counted without the deleted ones. Deleted rows are mapped out first, then every projected column
+/// decodes just those physical rows (decode_lance_physical_column_rows).
+bool take_from_data_file(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                         const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
+                         const std::vector<std::uint64_t>& logical, ArrowArray& batch, std::string& error,
+                         const std::unordered_set<std::int32_t>* allowed_field_ids) {
+    if (planned.files.empty()) {
+        error = "fragment has no data files";
+        return false;
+    }
+    const DataFileReadScope read_scope;
+    std::vector<std::uint64_t> physical;
+    physical.reserve(logical.size());
+    if (planned.deletion_file.present) {
+        std::vector<std::uint32_t> deleted;
+        if (!read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
+            return false;
+        }
+        std::sort(deleted.begin(), deleted.end());
+        std::size_t d = 0;
+        std::uint64_t next_logical = 0;
+        std::size_t want = 0;
+        for (std::uint64_t row = 0; row < planned.physical_rows && want < logical.size(); ++row) {
+            while (d < deleted.size() && deleted[d] < row) {
+                ++d;
+            }
+            if (d < deleted.size() && deleted[d] == row) {
+                continue;
+            }
+            if (next_logical == logical[want]) {
+                physical.push_back(row);
+                ++want;
+            }
+            ++next_logical;
+        }
+        if (physical.size() != logical.size()) {
+            error = "fragment " + std::to_string(planned.fragment_id) + " has fewer rows than the take asks for";
+            return false;
+        }
+    } else {
+        physical = logical;
+    }
+
+    std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
+    for (const auto& data_file : planned.files) {
+        const auto jailed = safe_join_under(dataset_path / "data", data_file.path);
+        if (!jailed) {
+            error = "data file path escapes the dataset directory";
+            return false;
+        }
+        const auto& path = *jailed;
+        pb::FileDescriptor descriptor{};
+        LanceDataFileFooterLayout layout{};
+        if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
+            return false;
+        }
+        if (descriptor.length != planned.physical_rows) {
+            error = "data file holds " + std::to_string(descriptor.length) + " rows but the manifest claims " +
+                    std::to_string(planned.physical_rows);
+            return false;
+        }
+        std::vector<pb::ColumnMetadata> column_metadatas;
+        if (!read_lance_data_file_column_metadatas(path, layout, column_metadatas, error)) {
+            return false;
+        }
+        if (data_file.fields.size() != data_file.column_indices.size()) {
+            error = "data file field/column index mismatch";
+            return false;
+        }
+        for (std::size_t i = 0; i < data_file.fields.size(); ++i) {
+            const auto field_id = data_file.fields[i];
+            if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
+            const auto column_index = data_file.column_indices[i];
+            if (column_index < 0 || static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
+                error = "data file column index out of range";
+                return false;
+            }
+            const auto* on_disk = find_descriptor_field(descriptor, field_id);
+            if (on_disk == nullptr) {
+                error = "data file references unknown field id";
+                return false;
+            }
+            const auto* field = find_mapping_field(mapping, field_id);
+            const std::size_t value_bytes = field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            ColumnValues values;
+            if (!decode_lance_physical_column_rows(path, *on_disk,
+                                                   column_metadatas[static_cast<std::size_t>(column_index)],
+                                                   physical, value_bytes, values, error)) {
+                return false;
+            }
+            decoded_by_field_id.emplace(field_id, std::move(values));
+        }
+    }
+    return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id,
+                                   static_cast<std::int64_t>(logical.size()), batch, error);
+}
+
 /// ArrowSchemaRelease dereferences `release` unconditionally, and releasing sets it to null, so
 /// calling it twice on the same schema jumps through a null pointer. Every failure path below leaves
 /// the schema released exactly once by going through here.
@@ -1374,6 +1472,56 @@ bool read_dataset_eager(const std::filesystem::path& dataset_path,
 }
 
 }  // namespace
+
+bool lance_table_take(const std::filesystem::path& dataset_path, const std::vector<std::string>* column_names,
+                      const std::vector<std::uint64_t>& indices, ArrowSchema& out_schema,
+                      std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+    error.clear();
+    out_batches.clear();
+    ArrowSchemaInit(&out_schema);
+    std::optional<ScopedReadLimits> trusted_scope;
+    if (trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
+    ReadPlan plan;
+    if (!open_read_plan(dataset_path, column_names, LanceRowRange{}, plan, out_schema, error)) {
+        return false;
+    }
+    std::vector<std::uint64_t> wanted(indices);
+    std::sort(wanted.begin(), wanted.end());
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    std::uint64_t total = 0;
+    for (const auto& planned : plan.files) {
+        total += planned.rows;
+    }
+    if (!wanted.empty() && wanted.back() >= total) {
+        release_schema_if_held(out_schema);
+        error = "row " + std::to_string(wanted.back()) + " is past the end of the dataset (" + std::to_string(total) +
+                " rows)";
+        return false;
+    }
+    std::uint64_t cursor = 0;
+    std::size_t w = 0;
+    for (const auto& planned : plan.files) {
+        const auto first = cursor;
+        cursor += planned.rows;
+        std::vector<std::uint64_t> logical;
+        while (w < wanted.size() && wanted[w] < cursor) {
+            logical.push_back(wanted[w++] - first);
+        }
+        if (logical.empty()) {
+            continue;
+        }
+        ArrowArray batch{};
+        if (!take_from_data_file(plan.dataset_path, planned, plan.mapping, out_schema, logical, batch, error,
+                                 plan.allowed())) {
+            release_partial_read(out_schema, out_batches);
+            return false;
+        }
+        out_batches.push_back(batch);
+    }
+    return true;
+}
 
 bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
                               std::vector<ArrowArray>& out_batches, std::string& error,
