@@ -50,6 +50,12 @@ struct LanceScanRequest {
     /// stable row ids -- all nanolance writes -- the row id is the address.
     bool with_row_id = false;
     bool with_row_address = false;
+    /// An SQL filter (nanolance/expr.hpp): only rows for which it is TRUE are read. Its columns are
+    /// decoded whether or not they are returned. With a filter, `range` counts the rows that pass.
+    const std::string* filter = nullptr;
+    /// Read the rows of the fragments' deletion files too (every physical row, in file order): what an
+    /// operation that writes a new column for existing fragments needs.
+    bool include_deleted_rows = false;
 };
 
 /// A read as `request` describes it. See lance_table_read_dataset for the ownership rules.

@@ -284,6 +284,9 @@ add_library(nanolance STATIC
     src/nano_lance_table_reader_c.cpp
     src/manifest_writer.cpp
     src/dataset.cpp
+    src/expr.cpp
+    src/arrow_slice.cpp
+    src/dataset_ops.cpp
     src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp
@@ -664,6 +667,10 @@ add_executable(nano_lance_table_stream_test tests/test_table_stream.cpp)
 target_compile_features(nano_lance_table_stream_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_table_stream_test PRIVATE nanolance)
 
+add_executable(nano_lance_expr_test tests/test_expr.cpp)
+target_compile_features(nano_lance_expr_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_expr_test PRIVATE nanolance)
+
 add_executable(nano_lance_column_slice_test tests/test_column_slice.cpp)
 target_compile_features(nano_lance_column_slice_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_column_slice_test PRIVATE nanolance)
@@ -811,6 +818,7 @@ add_test(NAME nano_lance_table_stream COMMAND $<TARGET_FILE:nano_lance_table_str
 set_tests_properties(nano_lance_table_stream PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_column_slice COMMAND $<TARGET_FILE:nano_lance_column_slice_test>)
+add_test(NAME nano_lance_expr COMMAND $<TARGET_FILE:nano_lance_expr_test>)
 set_tests_properties(nano_lance_column_slice PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_external_blob COMMAND $<TARGET_FILE:nano_lance_external_blob_test>)

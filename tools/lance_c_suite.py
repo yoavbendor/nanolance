@@ -75,7 +75,7 @@ def driver(test_file: str, calls: list, cpp: bool) -> str:
         "    int status = 0;",
         "    waitpid(pid, &status, 0);",
         '    const char* verdict = WIFEXITED(status) && WEXITSTATUS(status) == 0 ? "PASS" : "FAIL";',
-        '    printf("RESULT %s %s\\n", name, verdict);',
+        '    printf("\\nRESULT %s %s\\n", name, verdict);',
         "    fflush(stdout);",
         "}",
         "int main(int argc, char** argv) {",
@@ -131,10 +131,14 @@ def main(argv=None) -> int:
                                      capture_output=True, text=True)
                 if args.verbose:
                     print(run.stdout, run.stderr)
-                for line in run.stdout.splitlines():
-                    if line.startswith("RESULT "):
-                        _, test, verdict = line.split()
-                        results[f"{kind}/{writer}::{test}"] = verdict == "PASS"
+                # A test that fails mid-line leaves the RESULT after its own output on the same line.
+                for test, verdict in re.findall(r"RESULT (\w+) (PASS|FAIL)", run.stdout):
+                    results[f"{kind}/{writer}::{test}"] = verdict == "PASS"
+                expected_count = len(calls_of_main((tests / ("test_cpp_api.cpp" if kind == "cpp" else "test_c_api.c")).read_text()))
+                reported = sum(1 for k in results if k.startswith(f"{kind}/{writer}::"))
+                if reported != expected_count:
+                    print(f"{kind}/{writer}: {reported} results for {expected_count} tests -- the driver crashed?")
+                    return 2
                 failures = [l for l in run.stderr.splitlines() if l.startswith("FAIL")]
                 if failures and args.verbose:
                     print("\n".join(failures))

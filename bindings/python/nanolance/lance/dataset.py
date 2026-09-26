@@ -394,7 +394,7 @@ class LanceDataset:
 
     def count_rows(self, filter=None, **kwargs) -> int:
         if filter is not None:
-            return self.scanner(filter=filter, columns=[], with_row_id=True).count_rows()
+            return self.scanner(filter=filter).count_rows()
         return sum(int(f["physical_rows"]) - int(f["deleted_rows"]) for f in self._info["fragments"])
 
     def take(self, indices, columns=None) -> pa.Table:
@@ -415,11 +415,21 @@ class LanceDataset:
         return self._take_rows(row_ids, columns, **kwargs)
 
     def _take(self, wanted: List[int], names, addresses: bool, with_row_id=False, with_row_address=False):
+        order = None
+        if names is not None and any(n in ("_rowid", "_rowaddr") for n in names):
+            order = list(names)
+            with_row_id = with_row_id or "_rowid" in names
+            with_row_address = with_row_address or "_rowaddr" in names
+            names = [n for n in names if n not in ("_rowid", "_rowaddr")]
+            if not names and not (with_row_id or with_row_address):
+                names = None
         distinct = sorted(set(wanted))
         with native():
             table = pa.table(_nanolance._ds_take(self._uri, self._version, distinct, names, with_row_id,
                                                  with_row_address, addresses))
-        if names is not None:
+        if order is not None:
+            table = table.select(order)
+        elif names is not None:
             table = table.select(names + [c for c in ("_rowid", "_rowaddr") if c in table.column_names])
         if wanted == distinct:
             return table
@@ -441,13 +451,86 @@ class LanceDataset:
         new = write_dataset(data, self._uri, mode=mode, **kwargs)
         self._set_info(new._info)
 
+    # ── changes ───────────────────────────────────────────────────────────────────────────────────
+
+    def delete(self, predicate, *, conflict_retries: int = 10, retry_timeout=None) -> Dict[str, int]:
+        """Delete the rows where `predicate` (SQL or a pyarrow expression) is true. One new version."""
+        sql = _filter_sql(predicate)
+        if sql is None:
+            raise ValueError("delete needs a predicate")
+        with native():
+            deleted, _ = _nanolance._ds_delete(self._uri, sql)
+        self._refresh_latest()
+        return {"num_deleted_rows": int(deleted)}
+
+    def update(self, updates: Dict[str, str], where: Optional[str] = None, conflict_retries: int = 10,
+               retry_timeout=None) -> Dict[str, int]:
+        """Set columns to SQL values on the rows `where` selects (every row when None)."""
+        if not updates:
+            raise ValueError("update needs at least one column to set")
+        assignments = [(str(k), str(v)) for k, v in updates.items()]
+        with native():
+            updated, _ = _nanolance._ds_update(self._uri, _filter_sql(where), assignments)
+        self._refresh_latest()
+        return {"num_rows_updated": int(updated)}
+
+    def merge_insert(self, on=None) -> "MergeInsertBuilder":
+        return MergeInsertBuilder(self, on)
+
+    def add_columns(self, transforms, read_columns=None, reader_schema=None, batch_size=None) -> None:
+        """New columns: {name: SQL expression}, all-null fields (a pyarrow Field, list of Fields or
+        Schema), or data (a table / reader with one row per row of the dataset)."""
+        if isinstance(transforms, dict):
+            columns = [(str(k), str(v)) for k, v in transforms.items()]
+            with native():
+                _nanolance._ds_add_columns_sql(self._uri, columns)
+        elif isinstance(transforms, (pa.Field, pa.Schema)) or (
+            isinstance(transforms, list) and transforms and all(isinstance(f, pa.Field) for f in transforms)
+        ):
+            fields = [transforms] if isinstance(transforms, pa.Field) else list(transforms)
+            with native():
+                _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields))
+        elif callable(transforms):
+            raise unsupported("add_columns with a UDF")
+        else:
+            reader = _coerce_reader(transforms, reader_schema)
+            with native():
+                _nanolance._ds_add_columns_stream(self._uri, reader)
+        self._refresh_latest()
+
+    def drop_columns(self, columns: List[str]) -> None:
+        if isinstance(columns, str):
+            columns = [columns]
+        with native():
+            _nanolance._ds_drop_columns(self._uri, [str(c) for c in columns])
+        self._refresh_latest()
+
+    def alter_columns(self, *alterations) -> None:
+        items = []
+        for a in alterations:
+            if not isinstance(a, dict) or "path" not in a:
+                raise ValueError("each alteration must be a dict with a 'path'")
+            unknown = set(a) - {"path", "name", "nullable", "data_type"}
+            if unknown:
+                raise ValueError(f"unknown alteration keys: {sorted(unknown)}")
+            item = dict(a)
+            if item.get("data_type") is not None:
+                item["data_type"] = pa.field("x", item["data_type"])
+            items.append(item)
+        with native():
+            _nanolance._ds_alter_columns(self._uri, items)
+        self._refresh_latest()
+
+    @property
+    def optimize(self) -> "DatasetOptimizer":
+        return DatasetOptimizer(self)
+
     # ── not supported ─────────────────────────────────────────────────────────────────────────────
 
     def __getattr__(self, name: str):
         known = {
             "create_index", "create_scalar_index", "drop_index", "list_indices", "describe_indices",
-            "index_statistics", "optimize", "cleanup_old_versions", "merge_insert", "merge", "add_columns",
-            "alter_columns", "drop_columns", "update", "delete", "tags", "branches", "create_branch", "sql",
+            "index_statistics", "cleanup_old_versions", "merge", "tags", "branches", "create_branch", "sql",
             "shallow_clone", "deep_clone", "commit", "commit_batch", "session", "stats", "join", "delta",
             "take_blobs", "read_blobs", "has_index", "prewarm_index", "lance_schema", "validate",
         }
@@ -488,6 +571,115 @@ def _index_list(indices) -> List[int]:
 _SYSTEM_COLUMNS = ("_rowid", "_rowaddr", "_rowoffset")
 
 
+def _filter_sql(filter) -> Optional[str]:
+    """A filter as SQL: a string as given, a pyarrow compute expression translated."""
+    if filter is None:
+        return None
+    if isinstance(filter, str):
+        return filter if filter.strip() else None
+    try:
+        import pyarrow.compute as pc
+
+        if isinstance(filter, pc.Expression):
+            return _expression_sql(filter)
+    except ImportError:  # pragma: no cover
+        pass
+    raise unsupported(f"filters of type {type(filter).__name__} (use SQL or a pyarrow.compute.Expression)")
+
+
+def _expression_sql(expr) -> str:
+    """pyarrow.compute.Expression -> SQL, from its string form: (a > 1), ((a == "x") and is_null(b)),
+    is_in(a, {value_set=int64:[1, 2], ...}), invert(...)."""
+    import re
+
+    text = str(expr)
+
+    def value_set(m):
+        body = m.group(2)
+        items = body.split(":", 1)[1] if ":" in body.split("[", 1)[0] else body
+        items = items.strip().lstrip("[").rstrip("]")
+        return f"({m.group(1)} IN ({items}))"
+
+    text = re.sub(r'is_in\(([^,]+), \{value_set=([^}]*?\])[^}]*\}\)', value_set, text)
+    text = re.sub(r", \{[^}]*\}\)", ")", text)  # function options: is_null(a, {nan_is_null=false})
+    # pyarrow quotes strings with double quotes; SQL uses single.
+    text = re.sub(r'"((?:[^"\\]|\\.)*)"', lambda m: "'" + m.group(1).replace("'", "''") + "'", text)
+    return text
+
+
+class MergeInsertBuilder:
+    """Mirrors ``lance.dataset.MergeInsertBuilder``."""
+
+    def __init__(self, dataset: LanceDataset, on):
+        if on is None:
+            raise unsupported("merge_insert without key columns (by the schema's primary key)")
+        self._ds = dataset
+        self._on = [on] if isinstance(on, str) else list(on)
+        self._update_all = False
+        self._insert_all = False
+        self._delete_by_source = False
+        self._delete_condition = ""
+
+    def when_matched_update_all(self, condition: Optional[str] = None) -> "MergeInsertBuilder":
+        if condition is not None:
+            raise unsupported("when_matched_update_all(condition=...)")
+        self._update_all = True
+        return self
+
+    def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
+        self._insert_all = True
+        return self
+
+    def when_not_matched_by_source_delete(self, expr: Optional[str] = None) -> "MergeInsertBuilder":
+        self._delete_by_source = True
+        self._delete_condition = "" if expr is None else _filter_sql(expr) or ""
+        return self
+
+    def conflict_retries(self, max_retries: int) -> "MergeInsertBuilder":
+        return self
+
+    def retry_timeout(self, timeout) -> "MergeInsertBuilder":
+        return self
+
+    def use_index(self, use_index: bool) -> "MergeInsertBuilder":
+        return self
+
+    def execute(self, data_obj, *, schema: Optional[pa.Schema] = None) -> Dict[str, int]:
+        reader = _coerce_reader(data_obj, schema)
+        target = self._ds.schema
+        _check_append_schema(target, reader.schema)
+        conformed = pa.RecordBatchReader.from_batches(target, (_conform(b, target) for b in reader))
+        with native():
+            stats, _ = _nanolance._ds_merge_insert(self._ds.uri, self._on, self._update_all, self._insert_all,
+                                                   self._delete_by_source, self._delete_condition, conformed)
+        self._ds._refresh_latest()
+        return {k: int(v) for k, v in stats.items()}
+
+
+class DatasetOptimizer:
+    """Mirrors ``lance.dataset.DatasetOptimizer``: compaction."""
+
+    def __init__(self, dataset: LanceDataset):
+        self._ds = dataset
+
+    def compact_files(self, *, target_rows_per_fragment: Optional[int] = None, max_rows_per_group=None,
+                      max_bytes_per_file=None, materialize_deletions: Optional[bool] = None,
+                      materialize_deletions_threshold: Optional[float] = None, num_threads=None, batch_size=None,
+                      **kwargs):
+        from nanolance.lance.optimize import CompactionMetrics
+
+        with native():
+            metrics, _ = _nanolance._ds_compact_files(
+                self._ds.uri, int(target_rows_per_fragment or 1024 * 1024),
+                True if materialize_deletions is None else bool(materialize_deletions),
+                0.1 if materialize_deletions_threshold is None else float(materialize_deletions_threshold))
+        self._ds._refresh_latest()
+        return CompactionMetrics(**{k: int(v) for k, v in metrics.items()})
+
+    def optimize_indices(self, **kwargs):
+        raise unsupported("indexes")
+
+
 class LanceScanner:
     """A configured read. Mirrors ``lance.LanceScanner``."""
 
@@ -505,8 +697,7 @@ class LanceScanner:
             raise unsupported("include_deleted_rows")
         if order_by:
             raise unsupported("order_by")
-        if filter is not None:
-            raise unsupported("filters")
+        self._filter = _filter_sql(filter)
         if limit is not None and int(limit) < 0:
             raise ValueError("limit must be non-negative")
         if offset is not None and int(offset) < 0:
@@ -533,18 +724,29 @@ class LanceScanner:
         self._with_row_address = bool(with_row_address)
 
     def _read(self, stream: bool):
-        n = self._ds.count_rows() if self._fragment_ids is None else sum(
-            self._ds.get_fragment(i).count_rows() for i in self._fragment_ids
-        )
-        offset = min(self._offset, n)
+        if self._filter is None:
+            n = self._ds.count_rows() if self._fragment_ids is None else sum(
+                self._ds.get_fragment(i).count_rows() for i in self._fragment_ids
+            )
+            offset = min(self._offset, n)
+        else:
+            offset = self._offset
         length = -1 if self._limit is None else self._limit
         if self._names is not None and not self._names and not (self._with_row_id or self._with_row_address):
-            raise ValueError("a scan must select at least one column (or with_row_id)")
+            self._drop_rowaddr = True
+            with native():
+                return _nanolance._ds_scan(self._ds.uri, self._ds.version, [], self._fragment_ids, offset, length,
+                                           False, True, stream, self._filter)
         with native():
             return _nanolance._ds_scan(self._ds.uri, self._ds.version, self._names, self._fragment_ids, offset,
-                                       length, self._with_row_id, self._with_row_address, stream)
+                                       length, self._with_row_id, self._with_row_address, stream, self._filter)
+
+    _drop_rowaddr = False
 
     def _shape(self, table: pa.Table) -> pa.Table:
+        if self._drop_rowaddr:
+            # No columns asked for: the rows, without any column.
+            return pa.table({"_": pa.nulls(table.num_rows)}).drop_columns(["_"])
         if self._row_offset:
             first = self._offset
             if self._fragment_ids is not None:
@@ -580,6 +782,11 @@ class LanceScanner:
         return self._rebatch(self.to_table())
 
     def count_rows(self) -> int:
+        if self._names is None and not (self._with_row_id or self._with_row_address):
+            # Count by reading only what the filter needs (a row address column when it needs nothing).
+            counter = LanceScanner(self._ds, columns=[], filter=self._filter, limit=self._limit, offset=self._offset,
+                                   fragments=self._fragment_ids, with_row_address=True)
+            return counter.to_table().num_rows
         return self.to_table().num_rows
 
     @property
@@ -758,6 +965,13 @@ def write_dataset(
     path = _path_of(uri)
     reader = _coerce_reader(data_obj, schema)
     exists = _exists(path)
+    in_memory = not isinstance(uri, LanceDataset) and os.fspath(uri).startswith("memory://")
+    if mode == "create" and exists and in_memory:
+        # Every memory:// write is its own store in Lance: creating one never finds an earlier one.
+        import shutil
+
+        shutil.rmtree(path, ignore_errors=True)
+        exists = False
     if mode == "create" and exists:
         raise OSError(f"Dataset already exists: {path}")
     append = mode == "append" and exists

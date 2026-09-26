@@ -2,9 +2,9 @@
  "pylance_version": "12.0.0",
  "target": "nanolance.lance",
  "totals": {
-  "failed": 984,
+  "failed": 924,
   "skipped": 347,
-  "passed": 129
+  "passed": 189
  },
  "files": {
   ".py": {
@@ -37,8 +37,8 @@
    "failed": 10
   },
   "tests/test_column_names.py": {
-   "passed": 5,
-   "failed": 22
+   "passed": 16,
+   "failed": 11
   },
   "tests/test_commit_index.py": {
    "failed": 6
@@ -56,8 +56,8 @@
    "failed": 6
   },
   "tests/test_dataset.py": {
-   "passed": 50,
-   "failed": 200,
+   "passed": 79,
+   "failed": 171,
    "skipped": 5
   },
   "tests/test_debug.py": {
@@ -71,15 +71,16 @@
    "failed": 13
   },
   "tests/test_filter.py": {
-   "failed": 26,
+   "failed": 17,
+   "passed": 9,
    "skipped": 1
   },
   "tests/test_fork.py": {
    "passed": 1
   },
   "tests/test_fragment.py": {
-   "failed": 84,
-   "passed": 1
+   "failed": 80,
+   "passed": 5
   },
   "tests/test_fragment_typing.py": {
    "failed": 3
@@ -102,8 +103,8 @@
    "failed": 1
   },
   "tests/test_json.py": {
-   "failed": 13,
-   "passed": 5
+   "passed": 5,
+   "failed": 13
   },
   "tests/test_kmeans.py": {
    "failed": 3
@@ -116,8 +117,8 @@
    "failed": 18
   },
   "tests/test_map_type.py": {
-   "passed": 12,
-   "failed": 7
+   "passed": 17,
+   "failed": 2
   },
   "tests/test_mem_wal.py": {
    "failed": 20
@@ -151,8 +152,8 @@
    "failed": 1
   },
   "tests/test_pydantic.py": {
-   "failed": 8,
-   "passed": 4
+   "passed": 4,
+   "failed": 8
   },
   "tests/test_row_addr_prefilter.py": {
    "failed": 12,
@@ -173,7 +174,8 @@
    "failed": 4
   },
   "tests/test_schema_evolution.py": {
-   "failed": 23
+   "failed": 21,
+   "passed": 2
   },
   "tests/test_session.py": {
    "failed": 9

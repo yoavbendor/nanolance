@@ -11,10 +11,12 @@
 #include "nanolance/schema_mapper.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <algorithm>
 #include <fstream>
 #include <limits>
+#include <random>
 #include <utility>
 
 namespace nano_lance {
@@ -58,7 +60,7 @@ std::string manifest_filename(std::uint64_t version, bool v2) {
 /// The scheme matters as much as the number: stock Lance REFUSES to open a `_versions` directory
 /// holding both schemes ("Found multiple manifest naming schemes in the same directory"). So an
 /// append onto a pylance dataset has to keep writing pylance's names, or nanolance would make the
-/// dataset unreadable by the tool that created it. A fresh dataset keeps nanolance's own V1 naming.
+/// dataset unreadable by the tool that created it. A fresh dataset gets V2 names, as Lance's default.
 std::uint64_t next_version(const std::filesystem::path& versions_dir, bool& v2_out) {
     std::uint64_t max_version = 0;
     v2_out = false;
@@ -101,9 +103,15 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
 
     const auto manifest_bytes = pb::encode_manifest(manifest);
     bool existing_is_v2 = false;
-    (void)next_version(versions_dir, existing_is_v2);
-    const auto name = manifest_filename(manifest.version, existing_is_v2);
-    const auto temp_path = versions_dir / (name + ".tmp");
+    const bool first = next_version(versions_dir, existing_is_v2) == 1U;
+    // A new dataset gets V2 names, Lance's default (enable_v2_manifest_paths); an existing one keeps its
+    // scheme, since Lance refuses a _versions directory that mixes the two.
+    const auto name = manifest_filename(manifest.version, first || existing_is_v2);
+    // The temp name is the writer's own: two writers racing for one version must not share it, or
+    // one's link could publish the other's manifest (and report success for a change it lost).
+    static std::atomic<std::uint64_t> counter{0};
+    const auto unique = std::to_string(std::random_device{}()) + "-" + std::to_string(counter.fetch_add(1U));
+    const auto temp_path = versions_dir / (name + "." + unique + ".tmp");
     const auto final_path = versions_dir / name;
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -125,6 +133,20 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
         return false;
     }
 
+    // Publish without replacing: a hard link fails if the name exists, so a version another writer
+    // committed meanwhile is never overwritten (rename would silently replace it). File systems
+    // without hard links fall back to rename.
+    std::filesystem::create_hard_link(temp_path, final_path, ec);
+    if (!ec) {
+        std::filesystem::remove(temp_path, ec);
+        return true;
+    }
+    if (std::filesystem::exists(final_path)) {
+        std::filesystem::remove(temp_path, ec);
+        error = "commit conflict: version " + std::to_string(manifest.version) + " was committed concurrently";
+        return false;
+    }
+    ec.clear();
     std::filesystem::rename(temp_path, final_path, ec);
     if (ec) {
         error = "failed to atomically publish manifest: " + ec.message();
@@ -132,6 +154,8 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     }
     return true;
 }
+
+
 
 namespace {
 
@@ -167,6 +191,18 @@ pb::DataFile manifest_data_file(const LanceSchemaMapping& mapping, const DataFil
 }
 
 }  // namespace
+
+pb::Field make_manifest_field(const LanceField& field) {
+    return manifest_field(field);
+}
+
+pb::DataFragment make_data_fragment(const LanceSchemaMapping& mapping, const NewFragment& fragment, std::uint64_t id) {
+    pb::DataFragment out;
+    out.id = id;
+    out.physical_rows = fragment.rows;
+    out.files.push_back(manifest_data_file(mapping, fragment.data_file));
+    return out;
+}
 
 const char* nanolance_writer_version() {
     return nanolance::library_version();

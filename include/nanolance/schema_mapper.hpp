@@ -221,6 +221,16 @@ std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& m
 /// (see append_batch_column_values), where the data is.
 bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
                       bool ignore_nullability = false);
+/// The same schema, field for field -- names, types, nullability, nesting -- whatever the field ids
+/// and column positions. What an append checks a batch against: a dataset's field ids need not run
+/// 0..n (a dropped or re-typed column leaves a gap), a new batch's always do.
+bool schema_mappings_equivalent(const LanceSchemaMapping& left, const LanceSchemaMapping& right);
+
+/// Number the physical fields' columns 0..n in field order: the layout of one new data file holding
+/// every column. A mapping read from a manifest carries each field's position in whichever file of
+/// the latest fragment holds it, and those collide once a fragment has several files.
+void renumber_columns_for_one_file(LanceSchemaMapping& mapping);
+
 bool schema_mappings_equal(const LanceSchemaMapping& left, const LanceSchemaMapping& right);
 /// Human-readable description of the first way `actual` differs from `expected` (column count, or the
 /// first field whose name/order, type, nullability, or extension differs). Returns a generic string if

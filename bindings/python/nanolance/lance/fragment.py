@@ -117,7 +117,7 @@ class LanceFragment:
 
     def count_rows(self, filter=None) -> int:
         if filter is not None:
-            return self.scanner(filter=filter, columns=[], with_row_id=True).count_rows()
+            return self.scanner(filter=filter).count_rows()
         return self.physical_rows - self.num_deletions
 
     @property

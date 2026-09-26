@@ -15,8 +15,11 @@
 
 #include "lance/lance.h"
 
+#include "nanolance/arrow_slice.hpp"
 #include "nanolance/dataset.hpp"
+#include "nanolance/dataset_ops.hpp"
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/expr.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/nano_lance_writer.h"
@@ -66,6 +69,7 @@ struct LanceScanner {
     uint64_t version = 0;
     bool has_columns = false;
     std::vector<std::string> columns;
+    std::string filter;  // SQL; empty: none
     int64_t limit = -1;
     int64_t offset = 0;
     int64_t batch_size = 0;
@@ -116,8 +120,16 @@ void set_error(LanceErrorCode code, std::string message) {
 /// The lance-c code for a nanolance error message.
 LanceErrorCode code_for(const std::string& error) {
     auto has = [&](const char* s) { return error.find(s) != std::string::npos; };
+    if (has("commit conflict")) {
+        return LANCE_ERR_COMMIT_CONFLICT;
+    }
     if (has("already exists")) {
         return LANCE_ERR_DATASET_ALREADY_EXISTS;
+    }
+    // A bad expression, or a column it (or an operation) names that is not there.
+    if (has("invalid filter") || has("filter column") || has("column '") || has("cannot compare") ||
+        has("cannot drop every column") || has("merge insert")) {
+        return LANCE_ERR_INVALID_ARGUMENT;
     }
     if (has("not found") || has("No such file") || has("no manifest")) {
         return LANCE_ERR_NOT_FOUND;
@@ -235,72 +247,11 @@ std::vector<std::string> column_list(const char* const* columns) {
     return out;
 }
 
-// ── batches that share one decoded batch ────────────────────────────────────────────────────────
-//
-// A slice of a batch (for batch_size, and for take's input order) is a new struct array whose
-// children are views of the decoded batch's children at an offset. Every view holds a reference to
-// the decoded batch, so any of them can be released in any order, children included.
+using nano_lance::SharedBatch;
 
-struct SharedBatch {
-    ArrowArray array{};
-    ~SharedBatch() {
-        if (array.release != nullptr) {
-            array.release(&array);
-        }
-    }
-};
-
-struct ViewPrivate {
-    std::shared_ptr<SharedBatch> base;
-    std::vector<ArrowArray*> children;
-    std::vector<const void*> buffers;
-};
-
-void release_child_view(ArrowArray* array) {
-    delete static_cast<ViewPrivate*>(array->private_data);
-    array->release = nullptr;
-}
-
-void release_view(ArrowArray* array) {
-    auto* priv = static_cast<ViewPrivate*>(array->private_data);
-    for (auto* child : priv->children) {
-        if (child->release != nullptr) {
-            child->release(child);
-        }
-        delete child;
-    }
-    delete priv;
-    array->release = nullptr;
-}
-
-/// A view of rows [offset, offset + length) of the struct batch `base`, children in `order`.
 ArrowArray view_of(const std::shared_ptr<SharedBatch>& base, int64_t offset, int64_t length,
                    const std::vector<int64_t>& order) {
-    const ArrowArray& b = base->array;
-    auto* priv = new ViewPrivate{base, {}, {}};
-    ArrowArray out{};
-    out.length = length;
-    out.null_count = 0;
-    out.offset = 0;
-    out.n_buffers = 1;
-    priv->buffers.assign(1, nullptr);  // no top-level validity: a record batch has no null rows
-    out.buffers = priv->buffers.data();
-    for (const auto index : order) {
-        const ArrowArray* src = b.children[index];
-        auto* child = new ArrowArray(*src);  // shares the buffers and grandchildren
-        child->offset = src->offset + b.offset + offset;
-        child->length = length;
-        child->null_count = src->null_count == 0 ? 0 : -1;
-        child->private_data = new ViewPrivate{base, {}, {}};
-        child->release = &release_child_view;
-        priv->children.push_back(child);
-    }
-    out.n_children = static_cast<int64_t>(priv->children.size());
-    out.children = priv->children.data();
-    out.dictionary = nullptr;
-    out.private_data = priv;
-    out.release = &release_view;
-    return out;
+    return nano_lance::slice_batch(base, offset, length, order);
 }
 
 /// `schema` with its top-level children in `order` (a deep copy).
@@ -485,11 +436,13 @@ bool open_scan(const LanceScanner& scanner, ArrowArrayStream& out) {
                                              : static_cast<uint64_t>(scanner.limit);
     request.with_row_id = row_id;
     request.with_row_address = row_address;
+    request.filter = scanner.filter.empty() ? nullptr : &scanner.filter;
     auto& c = nano_lance::work_stats::counters();
     self->bytes_at_open = c.data_bytes_read.load(std::memory_order_relaxed);
     self->reads_at_open = c.data_reads.load(std::memory_order_relaxed);
     std::string error;
-    // An offset past the end reads nothing, as in Lance (nanolance's reader calls it an error).
+    // An offset past the end reads nothing, as in Lance (nanolance's reader calls it an error). With
+    // a filter the range counts the rows that pass, and the reader handles it.
     nano_lance::DatasetInfo info;
     if (!load_info(scanner.path, scanner.version, info)) {
         return false;
@@ -501,7 +454,9 @@ bool open_scan(const LanceScanner& scanner, ArrowArrayStream& out) {
             rows += f.rows();
         }
     }
-    request.range.offset = std::min<uint64_t>(request.range.offset, rows);
+    if (scanner.filter.empty()) {
+        request.range.offset = std::min<uint64_t>(request.range.offset, rows);
+    }
     if (!nano_lance::LanceTableStream::open_request(scanner.path, request, self->decoded_schema, self->stream, error)) {
         fail(error);
         return false;
@@ -577,10 +532,7 @@ bool take_stream(ArrowSchema& decoded_schema, std::vector<ArrowArray>& batches, 
     std::string error;
     std::vector<std::shared_ptr<SharedBatch>> shared;
     for (auto& b : batches) {
-        auto s = std::make_shared<SharedBatch>();
-        s->array = b;
-        b.release = nullptr;
-        shared.push_back(std::move(s));
+        shared.push_back(std::make_shared<SharedBatch>(std::move(b)));
     }
     const bool ok = column_order(decoded_schema, names, order, error) &&
                     reordered_schema(decoded_schema, order, self->schema);
@@ -1274,11 +1226,16 @@ LanceScanner* lance_scanner_new(const LanceDataset* dataset, const char* const* 
         invalid("dataset must not be NULL");
         return nullptr;
     }
-    if (filter != nullptr && filter[0] != '\0') {
-        not_supported("filters (yet)");
-        return nullptr;
-    }
     auto scanner = std::make_unique<LanceScanner>();
+    if (filter != nullptr && filter[0] != '\0') {
+        nano_lance::expr::Expression parsed;
+        std::string error;
+        if (!nano_lance::expr::Expression::parse(filter, parsed, error)) {
+            set_error(LANCE_ERR_INVALID_ARGUMENT, error);
+            return nullptr;
+        }
+        scanner->filter = filter;
+    }
     scanner->path = dataset->path;
     scanner->version = dataset->version;
     scanner->has_columns = columns != nullptr;
@@ -1407,8 +1364,17 @@ int32_t lance_scanner_additional_sql_filter(LanceScanner* scanner, const char* f
         invalid("filter must not be NULL or empty");
         return -1;
     }
-    not_supported("filters (yet)");
-    return -1;
+    return before_scan(scanner, [&] {
+        nano_lance::expr::Expression parsed;
+        std::string error;
+        if (!nano_lance::expr::Expression::parse(filter, parsed, error)) {
+            set_error(LANCE_ERR_INVALID_ARGUMENT, error);
+            return false;
+        }
+        scanner->filter = scanner->filter.empty() ? std::string(filter)
+                                                  : "(" + scanner->filter + ") AND (" + filter + ")";
+        return true;
+    });
 }
 
 int32_t lance_scanner_set_statistics_callback(LanceScanner* scanner, LanceScanStatisticsCallback callback,
@@ -1466,6 +1432,7 @@ void lance_scanner_scan_async(const LanceScanner* scanner, LanceCallback callbac
     copy->version = scanner->version;
     copy->has_columns = scanner->has_columns;
     copy->columns = scanner->columns;
+    copy->filter = scanner->filter;
     copy->limit = scanner->limit;
     copy->offset = scanner->offset;
     copy->batch_size = scanner->batch_size;
@@ -1582,37 +1549,280 @@ int32_t lance_write_fragments(const char* uri, const struct ArrowSchema* schema,
     not_supported(what);         \
     return -1
 
-int32_t lance_dataset_delete(LanceDataset*, const char*, uint64_t*) { NL_UNSUPPORTED_INT("lance_dataset_delete (yet)"); }
-int32_t lance_dataset_update(LanceDataset*, const char*, const char* const*, const char* const*, size_t, uint64_t*) {
-    NL_UNSUPPORTED_INT("lance_dataset_update (yet)");
-}
-int32_t lance_dataset_merge_insert(LanceDataset*, const char* const*, size_t, struct ArrowArrayStream* source,
-                                   const LanceMergeInsertParams*, LanceMergeInsertResult*) {
-    if (source != nullptr && source->release != nullptr) {
-        source->release(source);
+}  // extern "C"
+
+namespace {
+
+/// After a change: the handle sees the new version, as lance-c's mutate-in-place contract says.
+bool refresh(LanceDataset* ds, uint64_t version) {
+    nano_lance::DatasetInfo info;
+    if (!load_info(ds->path, version, info)) {
+        return false;
     }
-    NL_UNSUPPORTED_INT("lance_dataset_merge_insert (yet)");
+    ds->info = std::move(info);
+    ds->version = version;
+    return true;
 }
-int32_t lance_dataset_compact_files(LanceDataset*, const LanceCompactionOptions*, LanceCompactionMetrics*) {
-    NL_UNSUPPORTED_INT("lance_dataset_compact_files (yet)");
+
+template <typename F>
+int32_t mutate(LanceDataset* dataset, F&& op) {
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        uint64_t version = 0;
+        std::string error;
+        if (!op(version, error)) {
+            fail(error);
+            return -1;
+        }
+        if (!refresh(dataset, version)) {
+            return -1;
+        }
+        clear_error();
+        return 0;
+    });
 }
-int32_t lance_dataset_drop_columns(LanceDataset*, const char* const*, size_t) {
-    NL_UNSUPPORTED_INT("lance_dataset_drop_columns (yet)");
-}
-int32_t lance_dataset_alter_columns(LanceDataset*, const LanceColumnAlteration*, size_t) {
-    NL_UNSUPPORTED_INT("lance_dataset_alter_columns (yet)");
-}
-int32_t lance_dataset_add_columns_sql(LanceDataset*, const LanceSqlColumn*, size_t, uint64_t) {
-    NL_UNSUPPORTED_INT("lance_dataset_add_columns_sql (yet)");
-}
-int32_t lance_dataset_add_columns_nulls(LanceDataset*, const struct ArrowSchema*) {
-    NL_UNSUPPORTED_INT("lance_dataset_add_columns_nulls (yet)");
-}
-int32_t lance_dataset_add_columns_stream(LanceDataset*, struct ArrowArrayStream* stream, uint64_t) {
-    if (stream != nullptr && stream->release != nullptr) {
-        stream->release(stream);
+
+}  // namespace
+
+extern "C" {
+
+int32_t lance_dataset_delete(LanceDataset* dataset, const char* predicate, uint64_t* out_num_deleted) {
+    if (dataset == nullptr || predicate == nullptr || predicate[0] == '\0') {
+        invalid("dataset and predicate must not be NULL or empty");
+        return -1;
     }
-    NL_UNSUPPORTED_INT("lance_dataset_add_columns_stream (yet)");
+    uint64_t deleted = 0;
+    const int32_t rc = mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_delete(dataset->path, predicate, deleted, v, e);
+    });
+    if (rc == 0 && out_num_deleted != nullptr) {
+        *out_num_deleted = deleted;
+    }
+    return rc;
+}
+
+int32_t lance_dataset_update(LanceDataset* dataset, const char* predicate, const char* const* columns,
+                             const char* const* values, size_t num_updates, uint64_t* out_num_updated) {
+    if (dataset == nullptr || columns == nullptr || values == nullptr || num_updates == 0U) {
+        invalid("dataset, columns and values must not be NULL, and num_updates must be > 0");
+        return -1;
+    }
+    std::vector<std::pair<std::string, std::string>> assignments;
+    for (size_t i = 0; i < num_updates; ++i) {
+        if (columns[i] == nullptr || values[i] == nullptr || columns[i][0] == '\0') {
+            invalid("an update column or value is NULL or empty");
+            return -1;
+        }
+        assignments.emplace_back(columns[i], values[i]);
+    }
+    const std::string where = predicate != nullptr ? predicate : "";
+    uint64_t updated = 0;
+    const int32_t rc = mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_update(dataset->path, where.empty() ? nullptr : &where, assignments, updated, v, e);
+    });
+    if (rc == 0 && out_num_updated != nullptr) {
+        *out_num_updated = updated;
+    }
+    return rc;
+}
+
+int32_t lance_dataset_merge_insert(LanceDataset* dataset, const char* const* on_columns, size_t num_on_columns,
+                                   struct ArrowArrayStream* source, const LanceMergeInsertParams* params,
+                                   LanceMergeInsertResult* out_result) {
+    if (dataset == nullptr || on_columns == nullptr || num_on_columns == 0U || source == nullptr) {
+        if (source != nullptr && source->release != nullptr) {
+            source->release(source);
+        }
+        invalid("dataset, on_columns and source must not be NULL, and num_on_columns must be > 0");
+        return -1;
+    }
+    nano_lance::MergeInsertSpec spec;
+    for (size_t i = 0; i < num_on_columns; ++i) {
+        spec.on.emplace_back(on_columns[i] != nullptr ? on_columns[i] : "");
+    }
+    if (params != nullptr) {
+        using WM = nano_lance::MergeInsertSpec::WhenMatched;
+        switch (params->when_matched) {
+            case LANCE_MERGE_WHEN_MATCHED_DO_NOTHING: spec.when_matched = WM::DoNothing; break;
+            case LANCE_MERGE_WHEN_MATCHED_UPDATE_ALL: spec.when_matched = WM::UpdateAll; break;
+            case LANCE_MERGE_WHEN_MATCHED_FAIL: spec.when_matched = WM::Fail; break;
+            case LANCE_MERGE_WHEN_MATCHED_DELETE: spec.when_matched = WM::Delete; break;
+            case LANCE_MERGE_WHEN_MATCHED_UPDATE_IF:
+                if (source->release != nullptr) {
+                    source->release(source);
+                }
+                not_supported("merge insert WHEN MATCHED UPDATE IF (yet)");
+                return -1;
+            default:
+                if (source->release != nullptr) {
+                    source->release(source);
+                }
+                invalid("unknown when_matched");
+                return -1;
+        }
+        if (params->when_not_matched != LANCE_MERGE_WHEN_NOT_MATCHED_INSERT_ALL &&
+            params->when_not_matched != LANCE_MERGE_WHEN_NOT_MATCHED_DO_NOTHING) {
+            if (source->release != nullptr) {
+                source->release(source);
+            }
+            invalid("unknown when_not_matched");
+            return -1;
+        }
+        spec.when_not_matched_insert_all = params->when_not_matched == LANCE_MERGE_WHEN_NOT_MATCHED_INSERT_ALL;
+        switch (params->when_not_matched_by_source) {
+            case LANCE_MERGE_WHEN_NOT_MATCHED_BY_SOURCE_KEEP: break;
+            case LANCE_MERGE_WHEN_NOT_MATCHED_BY_SOURCE_DELETE: spec.when_not_matched_by_source_delete = true; break;
+            case LANCE_MERGE_WHEN_NOT_MATCHED_BY_SOURCE_DELETE_IF:
+                if (params->when_not_matched_by_source_expr == nullptr ||
+                    params->when_not_matched_by_source_expr[0] == '\0') {
+                    if (source->release != nullptr) {
+                        source->release(source);
+                    }
+                    invalid("DELETE_IF needs when_not_matched_by_source_expr");
+                    return -1;
+                }
+                spec.when_not_matched_by_source_delete = true;
+                spec.when_not_matched_by_source_condition = params->when_not_matched_by_source_expr;
+                break;
+            default:
+                if (source->release != nullptr) {
+                    source->release(source);
+                }
+                invalid("unknown when_not_matched_by_source");
+                return -1;
+        }
+    }
+    nano_lance::MergeInsertStats stats;
+    const int32_t rc = mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_merge_insert(dataset->path, spec, *source, stats, v, e);
+    });
+    if (rc == 0 && out_result != nullptr) {
+        out_result->num_inserted_rows = stats.inserted;
+        out_result->num_updated_rows = stats.updated;
+        out_result->num_deleted_rows = stats.deleted;
+    }
+    return rc;
+}
+
+int32_t lance_dataset_compact_files(LanceDataset* dataset, const LanceCompactionOptions* options,
+                                    LanceCompactionMetrics* out_metrics) {
+    if (dataset == nullptr) {
+        invalid("dataset must not be NULL");
+        return -1;
+    }
+    nano_lance::CompactionOptions opts;
+    if (options != nullptr && options->target_rows_per_fragment != 0U) {
+        opts.target_rows_per_fragment = options->target_rows_per_fragment;
+    }
+    nano_lance::CompactionMetrics metrics;
+    const int32_t rc = mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_compact_files(dataset->path, opts, metrics, v, e);
+    });
+    if (rc == 0 && out_metrics != nullptr) {
+        out_metrics->fragments_removed = metrics.fragments_removed;
+        out_metrics->fragments_added = metrics.fragments_added;
+        out_metrics->files_removed = metrics.files_removed;
+        out_metrics->files_added = metrics.files_added;
+    }
+    return rc;
+}
+
+int32_t lance_dataset_drop_columns(LanceDataset* dataset, const char* const* columns, size_t num_columns) {
+    if (dataset == nullptr || columns == nullptr || num_columns == 0U) {
+        invalid("dataset and columns must not be NULL, and num_columns must be > 0");
+        return -1;
+    }
+    std::vector<std::string> names;
+    for (size_t i = 0; i < num_columns; ++i) {
+        if (columns[i] == nullptr || columns[i][0] == '\0') {
+            invalid("a column name is NULL or empty");
+            return -1;
+        }
+        names.emplace_back(columns[i]);
+    }
+    return mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_drop_columns(dataset->path, names, v, e);
+    });
+}
+
+int32_t lance_dataset_alter_columns(LanceDataset* dataset, const LanceColumnAlteration* alterations,
+                                    size_t num_alterations) {
+    if (dataset == nullptr || alterations == nullptr || num_alterations == 0U) {
+        invalid("dataset and alterations must not be NULL, and num_alterations must be > 0");
+        return -1;
+    }
+    std::vector<nano_lance::ColumnAlteration> alts;
+    for (size_t i = 0; i < num_alterations; ++i) {
+        const auto& a = alterations[i];
+        if (a.path == nullptr || a.path[0] == '\0') {
+            invalid("an alteration's path is NULL or empty");
+            return -1;
+        }
+        if (a.nullable_mode < LANCE_COLUMN_NULLABLE_UNCHANGED || a.nullable_mode > LANCE_COLUMN_NULLABLE_FALSE) {
+            invalid("unknown nullable_mode");
+            return -1;
+        }
+        if (a.rename == nullptr && a.nullable_mode == LANCE_COLUMN_NULLABLE_UNCHANGED && a.data_type == nullptr) {
+            invalid("an alteration must change something");
+            return -1;
+        }
+        nano_lance::ColumnAlteration alt;
+        alt.path = a.path;
+        if (a.rename != nullptr) {
+            alt.rename = std::string(a.rename);
+        }
+        if (a.nullable_mode != LANCE_COLUMN_NULLABLE_UNCHANGED) {
+            alt.nullable = a.nullable_mode == LANCE_COLUMN_NULLABLE_TRUE;
+        }
+        alt.data_type = a.data_type;
+        alts.push_back(std::move(alt));
+    }
+    return mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_alter_columns(dataset->path, alts, v, e);
+    });
+}
+
+int32_t lance_dataset_add_columns_sql(LanceDataset* dataset, const LanceSqlColumn* columns, size_t num_columns,
+                                      uint64_t /*batch_size*/) {
+    if (dataset == nullptr || columns == nullptr || num_columns == 0U) {
+        invalid("dataset and columns must not be NULL, and num_columns must be > 0");
+        return -1;
+    }
+    std::vector<std::pair<std::string, std::string>> cols;
+    for (size_t i = 0; i < num_columns; ++i) {
+        if (columns[i].name == nullptr || columns[i].name[0] == '\0' || columns[i].expression == nullptr ||
+            columns[i].expression[0] == '\0') {
+            invalid("a column's name or expression is NULL or empty");
+            return -1;
+        }
+        cols.emplace_back(columns[i].name, columns[i].expression);
+    }
+    return mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_add_columns_sql(dataset->path, cols, v, e);
+    });
+}
+
+int32_t lance_dataset_add_columns_nulls(LanceDataset* dataset, const struct ArrowSchema* schema) {
+    if (dataset == nullptr || schema == nullptr || schema->n_children <= 0) {
+        invalid("dataset and a schema of at least one field are required");
+        return -1;
+    }
+    return mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_add_columns_nulls(dataset->path, *schema, v, e);
+    });
+}
+
+int32_t lance_dataset_add_columns_stream(LanceDataset* dataset, struct ArrowArrayStream* stream,
+                                         uint64_t /*batch_size*/) {
+    if (dataset == nullptr || stream == nullptr) {
+        if (stream != nullptr && stream->release != nullptr) {
+            stream->release(stream);
+        }
+        invalid("dataset and stream must not be NULL");
+        return -1;
+    }
+    return mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_add_columns_stream(dataset->path, *stream, v, e);
+    });
 }
 
 int32_t lance_dataset_take_blobs(const LanceDataset*, const uint64_t*, size_t, const char*, LanceBlobFile**) {

@@ -78,14 +78,16 @@ for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")
     ...
 ```
 
-Already using pylance? `nanolance.lance` speaks its API: the reads, writes, versions, fragments,
-row ids and file API that pylance 12's own test suite exercises, run against nanolance in CI:
+Already using pylance? `nanolance.lance` speaks its API: the reads, writes, filters, versions,
+fragments, row ids, dataset changes (delete, update, merge insert, schema evolution, compaction) and
+file API that pylance 12's own test suite exercises, run against nanolance in CI:
 
 ```python
 import nanolance.lance as lance          # or nanolance.lance.install_as_lance(), then `import lance`
 
 ds = lance.write_dataset(table, "out.lance", mode="append")
-ds.to_table(columns=["name"], limit=10, with_row_id=True)
+ds.to_table(columns=["name"], filter="id > 10 AND name LIKE 'a%'", limit=10, with_row_id=True)
+ds.delete("id < 3")
 lance.dataset("out.lance", version=1).take([2, 0])
 ```
 

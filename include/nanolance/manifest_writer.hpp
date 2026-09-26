@@ -44,6 +44,12 @@ bool commit_dataset_version(const std::filesystem::path& dataset_path, const Lan
                             const std::vector<NewFragment>& fragments, CommitMode mode, std::uint64_t& version,
                             std::string& error, const CommitExtras& extras = {});
 
+/// A schema field as the manifest records it.
+pb::Field make_manifest_field(const LanceField& field);
+
+/// The manifest record of a new fragment `fragment` (one data file, written with `mapping`), as `id`.
+pb::DataFragment make_data_fragment(const LanceSchemaMapping& mapping, const NewFragment& fragment, std::uint64_t id);
+
 /// The version nanolance records in the manifests it writes.
 const char* nanolance_writer_version();
 

@@ -7,6 +7,7 @@
 
 #include <nanoarrow/nanoarrow.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
@@ -511,6 +512,42 @@ bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, st
     return map_field(schema, -1, next_id, next_column, mapping, error);
 }
 
+bool schema_mappings_equivalent(const LanceSchemaMapping& left, const LanceSchemaMapping& right) {
+    if (left.fields.size() != right.fields.size()) {
+        return false;
+    }
+    auto position = [](const LanceSchemaMapping& m, std::int32_t id) -> std::int64_t {
+        for (std::size_t i = 0; i < m.fields.size(); ++i) {
+            if (m.fields[i].id == id) {
+                return static_cast<std::int64_t>(i);
+            }
+        }
+        return -1;
+    };
+    for (std::size_t i = 0; i < left.fields.size(); ++i) {
+        const auto& l = left.fields[i];
+        const auto& r = right.fields[i];
+        if (l.name != r.name || l.logical_type != r.logical_type || l.arrow_format != r.arrow_format ||
+            l.nullable != r.nullable || l.extension_name != r.extension_name ||
+            !metadata_equal_ignoring_encoding(l.metadata, r.metadata) || l.is_dictionary_index != r.is_dictionary_index ||
+            l.dictionary_value_logical_type != r.dictionary_value_logical_type ||
+            (l.column_index >= 0) != (r.column_index >= 0) ||
+            position(left, l.parent_id) != position(right, r.parent_id)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void renumber_columns_for_one_file(LanceSchemaMapping& mapping) {
+    std::int32_t next = 0;
+    for (auto& f : mapping.fields) {
+        if (f.column_index >= 0) {
+            f.column_index = next++;
+        }
+    }
+}
+
 bool schema_mappings_equal(const LanceSchemaMapping& left, const LanceSchemaMapping& right) {
     if (left.fields.size() != right.fields.size()) {
         return false;
@@ -777,8 +814,20 @@ bool latest_fragment_column_indices(const pb::Manifest& manifest,
         }
         return true;
     }
-    error = "manifest has no data files";
-    return false;
+    // No data file yet (a dataset of a schema alone): every leaf field is a column, in field order.
+    std::unordered_set<std::int32_t> parents;
+    for (const auto& f : manifest.fields) {
+        if (f.parent_id >= 0) {
+            parents.insert(f.parent_id);
+        }
+    }
+    std::int32_t column = 0;
+    for (const auto& f : manifest.fields) {
+        if (parents.count(f.id) == 0U) {
+            out.emplace(f.id, column++);
+        }
+    }
+    return true;
 }
 
 bool dematerialize_blob_v2_for_arrow_append(LanceSchemaMapping& mapping, std::string& error) {
@@ -898,6 +947,38 @@ bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchem
         const auto col_it = id_to_column.find(pf.id);
         lf.column_index = col_it != id_to_column.end() ? col_it->second : -1;
         out.fields.push_back(std::move(lf));
+    }
+    // A leaf field no data file of the latest fragment holds -- a column pylance added to the schema
+    // alone (add_columns with a pa.field) -- is still a column: it reads as nulls, and an append
+    // writes it. Give it an index past every real one. Fields inside a Lance-owned extension (a blob
+    // struct) keep theirs: those are not columns of their own.
+    {
+        std::unordered_set<std::int32_t> parents;
+        std::unordered_map<std::int32_t, const LanceField*> by_id;
+        std::int32_t next = 0;
+        for (const auto& f : out.fields) {
+            by_id.emplace(f.id, &f);
+            if (f.parent_id >= 0) {
+                parents.insert(f.parent_id);
+            }
+            next = std::max(next, f.column_index + 1);
+        }
+        auto inside_lance_extension = [&](const LanceField& f) {
+            for (const LanceField* p = &f; p != nullptr;) {
+                if (lance_extension_is_lance_owned(p->extension_name)) {
+                    return true;
+                }
+                const auto it = by_id.find(p->parent_id);
+                p = it == by_id.end() ? nullptr : it->second;
+            }
+            return false;
+        };
+        for (auto& f : out.fields) {
+            if (f.column_index < 0 && parents.count(f.id) == 0U && f.logical_type != "struct" &&
+                !inside_lance_extension(f)) {
+                f.column_index = next++;
+            }
+        }
     }
     reroot_orphaned_fields(out);
     if (!dematerialize_blob_v2_for_arrow_append(out, error)) {

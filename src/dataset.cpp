@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/dataset.hpp"
+#include "nanolance/dataset_commit.hpp"
 
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/manifest_writer.hpp"
@@ -35,14 +36,19 @@ bool load(const std::filesystem::path& dataset_path, bool has_version, std::uint
     return load_latest_manifest(dataset_path, manifest, latest, error);
 }
 
-/// Publish `manifest` as the next version, stamped now and by nanolance.
-bool publish_next(const std::filesystem::path& dataset_path, pb::Manifest manifest, std::uint64_t& new_version,
-                  std::string& error) {
-    std::uint64_t latest = 0;
-    if (!dataset_latest_version(dataset_path, latest, error)) {
+}  // namespace
+
+/// Publish `manifest` as the version after the one it was read at, stamped now and by nanolance.
+/// Committing as the version after the one it was READ at -- not after whatever is latest by now -- is
+/// what keeps a concurrent change from being lost: if another writer took that version meanwhile, the
+/// publish refuses (commit conflict) instead of stacking a stale manifest on top of it.
+bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest manifest, std::uint64_t& new_version,
+                         std::string& error) {
+    std::uint64_t read_version = manifest.version;
+    if (read_version == 0U && !dataset_latest_version(dataset_path, read_version, error)) {
         return false;
     }
-    manifest.version = latest + 1U;
+    manifest.version = read_version + 1U;
     manifest.has_timestamp = true;
     const auto nanos =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
@@ -56,8 +62,6 @@ bool publish_next(const std::filesystem::path& dataset_path, pb::Manifest manife
     new_version = manifest.version;
     return publish_manifest(dataset_path, manifest, error);
 }
-
-}  // namespace
 
 bool dataset_latest_version(const std::filesystem::path& dataset_path, std::uint64_t& out, std::string& error) {
     out = highest_manifest_version(dataset_path, error);
@@ -164,7 +168,8 @@ bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t ve
         manifest.has_max_fragment_id = true;
         manifest.max_fragment_id = std::max(manifest.max_fragment_id, latest.max_fragment_id);
     }
-    return publish_next(dataset_path, std::move(manifest), new_version, error);
+    manifest.version = latest_version;  // committed on top of the latest, which it replaces
+    return commit_next_version(dataset_path, std::move(manifest), new_version, error);
 }
 
 bool dataset_update_config(const std::filesystem::path& dataset_path,
@@ -181,7 +186,7 @@ bool dataset_update_config(const std::filesystem::path& dataset_path,
     for (const auto& key : remove) {
         manifest.config.erase(key);
     }
-    return publish_next(dataset_path, std::move(manifest), new_version, error);
+    return commit_next_version(dataset_path, std::move(manifest), new_version, error);
 }
 
 bool dataset_update_table_metadata(const std::filesystem::path& dataset_path,
@@ -198,7 +203,7 @@ bool dataset_update_table_metadata(const std::filesystem::path& dataset_path,
     for (const auto& kv : values) {
         manifest.table_metadata[kv.first] = kv.second;
     }
-    return publish_next(dataset_path, std::move(manifest), new_version, error);
+    return commit_next_version(dataset_path, std::move(manifest), new_version, error);
 }
 
 bool dataset_update_schema_metadata(const std::filesystem::path& dataset_path,
@@ -215,7 +220,7 @@ bool dataset_update_schema_metadata(const std::filesystem::path& dataset_path,
     for (const auto& kv : values) {
         manifest.schema_metadata[kv.first] = std::vector<std::uint8_t>(kv.second.begin(), kv.second.end());
     }
-    return publish_next(dataset_path, std::move(manifest), new_version, error);
+    return commit_next_version(dataset_path, std::move(manifest), new_version, error);
 }
 
 }  // namespace nano_lance

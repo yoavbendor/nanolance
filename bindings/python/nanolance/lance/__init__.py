@@ -67,6 +67,15 @@ def __getattr__(name: str):
 
     if name.startswith("__"):
         raise AttributeError(name)
+    # A submodule nanolance implements (lance.file, lance.fragment, ...) is the module itself.
+    try:
+        module = importlib.import_module(f"{__name__}.{name}")
+    except ModuleNotFoundError as exc:
+        if exc.name != f"{__name__}.{name}":
+            raise
+    else:
+        globals()[name] = module
+        return module
     value = placeholder(f"lance.{name}")
     globals()[name] = value
     return value

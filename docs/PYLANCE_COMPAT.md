@@ -40,6 +40,8 @@ compared, results are checked against pylance on the same files, in both directi
 | Versions | `version`, `latest_version`, `versions()` (with pylance's summary metadata), `checkout_version`, `checkout_latest`, `restore` |
 | Metadata | `schema` (with its schema metadata), `data_storage_version`, `config` / `update_config` / `delete_config_keys`, `metadata` / `update_metadata`, `schema_metadata` / `update_schema_metadata` / `replace_schema_metadata` |
 | Fragments | `get_fragments`, `get_fragment`; `LanceFragment`: `fragment_id`, `metadata` (`FragmentMetadata`, `DataFile`, `DeletionFile`), `count_rows`, `physical_rows`, `num_deletions`, `to_table`, `to_batches`, `scanner`, `head`, `take` |
+| Filters | `filter=` on `to_table`, `to_batches`, `scanner`, `count_rows` and fragments: an SQL string or a pyarrow compute expression. Comparisons, `AND` / `OR` / `NOT` with SQL's three-valued logic, `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE` / `ILIKE`, arithmetic, `CAST`, `DATE` / `TIMESTAMP` literals, struct fields (`s.a`), and the functions `lower`, `upper`, `length`, `abs`, `coalesce`, `starts_with`, `ends_with`, `contains`. With a filter, `offset` and `limit` count the rows that pass, as in pylance. |
+| Changes | `delete`, `update` (SQL values), `merge_insert` (`when_matched_update_all` with a condition, `when_not_matched_insert_all`, `when_not_matched_by_source_delete`, `execute`), `add_columns` (SQL expressions, a `pa.field` / schema of null columns, or a reader), `drop_columns`, `alter_columns` (rename, nullability, data type), `optimize.compact_files`. Each is one version, and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column. |
 | Files | `lance.file`: `LanceFileReader` (`read_all`, `read_range`, `take_rows`, `num_rows`, `metadata`, `file_statistics`, `read_global_buffer`), `LanceFileWriter`, `LanceFileSession` (local), `stable_version` |
 
 Datasets and files are written in format 2.2, which is pylance 12's default. A request for another
@@ -50,11 +52,11 @@ version (`data_storage_version="2.0"`, `LanceFileWriter(version="2.1")`) raises.
 These raise `NotImplementedError` (`nanolance.lance.NotSupportedError`) naming the feature. None of
 them is silently ignored:
 
-- Filters (`filter=`), SQL, `order_by`. These are planned for step 3, the shared C++ predicate
-  evaluator.
-- Dataset changes other than appends: `delete`, `update`, `merge_insert`, `add_columns` /
-  `alter_columns` / `drop_columns`, compaction, the transaction API (`LanceOperation`, `commit`),
-  `write_fragments`. Also planned for step 3.
+- `order_by`, Substrait filters, and SQL functions beyond the list above (regular expressions,
+  JSON, array functions). A function the filter dialect lacks is refused by name.
+- The transaction API (`LanceOperation`, `commit`, `write_fragments`), `LanceFragment.merge_columns`
+  / `update_columns`, `cleanup_old_versions`. Conflicting writers are refused rather than retried:
+  a change built on a version another writer has since replaced fails with "commit conflict".
 - Indexes of every kind, vector search (`nearest`), full-text search.
 - Tags and branches, stable row ids, multiple base paths, shallow and deep clones.
 - Object stores and namespaces (`s3://`, `gs://`, REST and directory namespaces).
@@ -87,33 +89,37 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **129**, every one of which pylance also passes |
+| nanolance.lance | **189**, every one of which pylance also passes (129 before filters and changes) |
 
 By test file, where nanolance passes any:
 
 | file | pylance | nanolance |
 |---|---|---|
-| test_dataset.py | 250 | 49 |
+| test_dataset.py | 250 | 79 |
 | test_file.py | 40 | 27 |
-| test_map_type.py | 19 | 12 |
+| test_map_type.py | 19 | 17 |
+| test_column_names.py | 27 | 16 |
 | test_scalar_index.py | 189 | 10 |
+| test_filter.py | 26 | 9 |
 | test_lance.py | 23 | 9 |
-| test_column_names.py | 27 | 5 |
+| test_fragment.py | 85 | 5 |
 | test_json.py | 18 | 5 |
 | test_pydantic.py | 12 | 4 |
-| others | | 7 |
+| test_schema_evolution.py | 23 | 2 |
+| others | | 6 |
 
 The main reasons tests fail today:
 
-- About 400 need indexes, vector or full-text search, namespaces, object stores or the `mem_wal`.
-  These are out of scope.
-- About 300 need filters or dataset changes. These are step 3.
+- Most need indexes (175 fail on `create_scalar_index` alone), vector or full-text search,
+  namespaces (about 130), object stores or the `mem_wal`. These are out of scope.
+- About 90 need the transaction API, fragment-level writes, stable row ids or multiple base paths.
+- About 25 need filter functions nanolance lacks, or a data storage version other than 2.2.
 - A tail of writer gaps in nanolance itself: Arrow dictionary arrays, empty structs, a nullable
   fixed-size list of nullable values, bfloat16. Each is a real gap, listed by the run.
 
 ## Bugs the suite found in nanolance itself
 
-The first runs found three bugs in nanolance's core. All three are fixed and pinned in
+The runs found these bugs in nanolance's core. All are fixed and pinned in
 `test_pylance_compat.py`:
 
 - **Any schema-level metadata broke writes.** pandas adds such metadata to every table. nanoarrow's
@@ -125,6 +131,22 @@ The first runs found three bugs in nanolance's core. All three are fixed and pin
   having no storage: the file held nothing for it, and nanolance read it back with **zero rows**.
 - **Appending dropped deletion files.** The manifest encoder did not write a fragment's deletion
   file, so appending to a dataset with deleted rows brought those rows back.
+
+- **Appends to a dataset with several files per fragment failed.** The column indices of the
+  latest fragment's files collide (each file counts from 0), and a dataset whose field ids had gaps
+  (a dropped column) never matched a fresh batch's schema.
+- **Reading after pylance dropped a column failed.** The dropped column's data stays in its files;
+  a full scan decoded it with no schema entry to size it by ("fixed-width column has no value
+  width"). Such columns are now skipped.
+- **A column pylance added without data could not be read.** `add_columns(pa.field(...))` writes
+  only the schema, and every existing fragment reads the column as nulls. nanolance refused the
+  scan; it now synthesizes the nulls, and appending writes the column.
+- **Racing writers could lose a change.** A change committed as "the version after the latest",
+  re-read at commit time, so a change built on version N could land on top of another writer's
+  N+1 and silently discard it. And two writers racing for one version shared a temp file name, so
+  one could publish the other's manifest and still report success. A change now commits as the
+  version after the one it read, the publish refuses to replace an existing version, and the temp
+  name is each writer's own (`test_concurrent_commits_lose_nothing`).
 
 The same work made the manifest codec keep everything pylance writes, so nanolance no longer drops
 it: timestamps, writer version, table config and metadata, schema metadata, feature flags, and

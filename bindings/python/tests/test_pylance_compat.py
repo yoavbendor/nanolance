@@ -239,3 +239,147 @@ def test_encoding_hints_stay_out_of_the_schema(tmp_path):
     uri = str(tmp_path / "ds")
     nl.write_dataset(pa.table({"z": [1.5] * 10}), uri)
     assert nl.dataset(uri).schema.field("z").metadata in (None, {})
+
+
+# ── filters and changes (the shared C++ core: nanolance/expr.hpp, dataset_ops.hpp) ────────────────
+
+
+def _rich(n=40):
+    import datetime
+
+    return pa.table({
+        "id": pa.array(range(n), pa.int64()),
+        "name": pa.array([f"n{i}" if i % 3 else None for i in range(n)]),
+        "x": pa.array([i * 0.5 for i in range(n)]),
+        "d": pa.array([datetime.date(2024, 1, 1) + datetime.timedelta(days=i) for i in range(n)]),
+        "s": pa.array([{"a": i, "b": str(i)} for i in range(n)]),
+    })
+
+
+FILTERS = [
+    "id > 30", "name IS NULL", "name LIKE 'n1%'", "id IN (1, 2, 3) OR x >= 18", "id BETWEEN 3 AND 9 AND NOT (name = 'n4')",
+    "d = date '2024-01-05'", "s.a < 3", "lower(name) = 'n2'", "id % 2 = 0", "name != 'n1'", "x * 2 > 15",
+    "NOT id IN (1, 2)", "id NOT BETWEEN 2 AND 37", "id > 1000",
+]
+
+
+@pytest.mark.parametrize("sql", FILTERS)
+def test_filters_agree(lance, tmp_path, sql):
+    uri = str(tmp_path / "ds")
+    nl.write_dataset(_rich(), uri, max_rows_per_file=13)
+    ours, theirs = nl.dataset(uri), lance.dataset(uri)
+    assert ours.to_table(filter=sql) == theirs.to_table(filter=sql)
+    assert ours.count_rows(filter=sql) == theirs.count_rows(filter=sql)
+    kw = dict(filter=sql, limit=5, offset=2, columns=["name", "id"], with_row_id=True)
+    assert ours.to_table(**kw) == theirs.to_table(**kw)
+
+
+def test_pyarrow_expression_filters(lance, tmp_path):
+    import pyarrow.compute as pc
+
+    uri = str(tmp_path / "ds")
+    nl.write_dataset(_rich(), uri)
+    ours, theirs = nl.dataset(uri), lance.dataset(uri)
+    for expr in [pc.field("id") > 35, (pc.field("id") > 1) & (pc.field("name") == "n2"),
+                 pc.field("id").isin([4, 5]), ~pc.field("name").is_null()]:
+        assert ours.to_table(filter=expr) == theirs.to_table(filter=expr), str(expr)
+
+
+CHANGES = {
+    "delete": lambda ds: ds.delete("id < 3 or id = 17"),
+    "update": lambda ds: ds.update({"name": "'x'", "x": "x + 100"}, where="id >= 30"),
+    "update_all": lambda ds: ds.update({"id": "id * 2"}),
+    "merge_upsert": lambda ds: ds.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute(
+        pa.table({"id": [5, 500], "name": ["m", "n"], "x": [1.0, 2.0], "d": _rich().column("d").take([0, 1]),
+                  "s": pa.array([{"a": 1, "b": "1"}, {"a": 2, "b": "2"}])})),
+    "merge_delete_by_source": lambda ds: ds.merge_insert("id").when_not_matched_by_source_delete("id > 30").execute(
+        _rich().slice(0, 5)),
+    "add_sql": lambda ds: ds.add_columns({"y": "id * 2", "z": "name || '!'"}),
+    "add_nulls": lambda ds: ds.add_columns(pa.field("n", pa.float32())),
+    "add_data": lambda ds: ds.add_columns(pa.table({"w": pa.array(range(40), pa.int32())})),
+    "drop": lambda ds: ds.drop_columns(["name", "s.b"]),
+    "alter": lambda ds: ds.alter_columns({"path": "id", "name": "key"}, {"path": "x", "data_type": pa.float32()}),
+}
+
+
+@pytest.mark.parametrize("change", list(CHANGES))
+def test_changes_agree(lance, tmp_path, change):
+    """The same change made by nanolance and by pylance: the same rows (in the same order), the same
+    result, one version; and pylance reads what nanolance committed."""
+    results = {}
+    for name, mod in (("nanolance", nl), ("pylance", lance)):
+        uri = str(tmp_path / name)
+        mod.write_dataset(_rich(), uri, max_rows_per_file=13)
+        ds = mod.dataset(uri)
+        results[name] = (CHANGES[change](ds), mod.dataset(uri).version, lance.dataset(uri).to_table(),
+                         nl.dataset(uri).to_table())
+    (r_ours, v_ours, read_by_pylance, read_by_us), (r_theirs, v_theirs, theirs, _) = results["nanolance"], results["pylance"]
+    assert r_ours == r_theirs
+    assert v_ours == v_theirs == 2
+    assert read_by_pylance == theirs
+    assert read_by_us == theirs
+
+
+def test_compaction(lance, tmp_path):
+    uri = str(tmp_path / "ds")
+    nl.write_dataset(_rich(), uri, max_rows_per_file=5)
+    ds = nl.dataset(uri)
+    ds.delete("id % 7 = 0")
+    before = lance.dataset(uri).to_table()
+    metrics = ds.optimize.compact_files(target_rows_per_fragment=100)
+    assert metrics.fragments_removed == 8 and metrics.fragments_added == 1
+    assert len(nl.dataset(uri).get_fragments()) == 1
+    assert lance.dataset(uri).to_table() == before
+    assert nl.dataset(uri).to_table() == before
+
+
+def test_changes_after_pylance_changes(lance, tmp_path):
+    """A dataset pylance changed (deletions, a dropped and an added column) keeps changing under
+    nanolance -- the columns' files and ids no longer line up with a fresh write."""
+    uri = str(tmp_path / "ds")
+    lance.write_dataset(_rich(), uri, max_rows_per_file=13)
+    ds = lance.dataset(uri)
+    ds.delete("id < 4")
+    ds.drop_columns(["s"])
+    ds.add_columns({"y": "id + 1"})
+    ours = nl.dataset(uri)
+    ours.update({"name": "'u'"}, where="id = 10")
+    ours.delete("id = 11")
+    nl.write_dataset(lance.dataset(uri).to_table().slice(0, 2), uri, mode="append")
+    got = lance.dataset(uri).to_table()
+    assert got == nl.dataset(uri).to_table()
+    assert got.num_rows == 36 - 1 + 2
+    assert got.filter(pa.compute.field("id") == 10).column("name").to_pylist() == ["u"]
+
+
+def test_concurrent_commits_lose_nothing(tmp_path):
+    """Writers racing for the next version: each delete either lands or is refused as a commit
+    conflict, and every one that landed is in the final version. Committing a stale manifest on top
+    of a version it never saw would drop that version's delete silently."""
+    import threading
+
+    uri = str(tmp_path / "ds")
+    nl.write_dataset(_rich(64), uri)
+    for round_ in range(4):
+        start = threading.Barrier(8)
+        landed, refused = [], []
+
+        def delete(i):
+            start.wait()
+            try:
+                nl.dataset(uri).delete(f"id = {i}")
+                landed.append(i)
+            except Exception as exc:  # noqa: BLE001 -- the message is what is checked
+                assert "commit conflict" in str(exc).lower(), exc
+                refused.append(i)
+
+        ids = [round_ * 8 + k for k in range(8)]
+        threads = [threading.Thread(target=delete, args=(i,)) for i in ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(landed) + len(refused) == 8 and landed
+        left = set(nl.dataset(uri).to_table(columns=["id"]).column("id").to_pylist())
+        assert not left & set(landed), "a committed delete was lost"
+        assert set(refused) <= left

@@ -9,6 +9,7 @@
 #include "nanolance/data_file_writer.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/manifest_writer.hpp"
+#include "nanolance/writer_internal.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <nanoarrow/nanoarrow.h>
@@ -65,6 +66,9 @@ struct WriterState {
     std::map<std::string, std::vector<std::uint8_t>> schema_metadata;
     /// Table config recorded when the commit creates the dataset (nano_lance_writer_set_initial_config).
     std::map<std::string, std::string> initial_config;
+    /// Field ids of the schema taken from the first batch start here (writer_set_field_id_base): new
+    /// columns for an existing dataset, numbered after its fields.
+    std::int32_t field_id_base = 0;
 };
 
 /// Commit what is pending as one fragment (defined with nano_lance_writer_commit).
@@ -661,6 +665,8 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
         if (!nano_lance::lance_schema_mapping_from_manifest(manifest, state->schema_mapping, load_error)) {
             return set_error(writer, NANO_LANCE_UNSUPPORTED, load_error);
         }
+        // The new fragment is one file with every column, whatever files the latest fragment has.
+        nano_lance::renumber_columns_for_one_file(state->schema_mapping);
 
         state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
         const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
@@ -845,11 +851,19 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
     }
     if (!state->has_schema) {
         state->schema_mapping = std::move(batch_mapping);
+        if (state->field_id_base != 0) {
+            for (auto& f : state->schema_mapping.fields) {
+                f.id += state->field_id_base;
+                if (f.parent_id >= 0) {
+                    f.parent_id += state->field_id_base;
+                }
+            }
+        }
         state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
         const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
         state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
         state->has_schema = true;
-    } else if (!nano_lance::schema_mappings_equal(state->schema_mapping, batch_mapping)) {
+    } else if (!nano_lance::schema_mappings_equivalent(state->schema_mapping, batch_mapping)) {
         // `state->schema_mapping` is the ingest-shape mapping captured on the first batch; compare the
         // new batch's ingest mapping directly. (Finalization to the packed blob layout happens at commit,
         // not here — finalizing only the candidate made every 2nd+ blob batch look like a schema change.)
@@ -1334,3 +1348,36 @@ uint64_t nano_lance_writer_pending_bytes(const NanoLanceWriter* writer) {
 }
 
 }  // extern "C"
+
+namespace nano_lance {
+
+bool writer_set_field_id_base(NanoLanceWriter* writer, std::int32_t first_id, std::string& error) {
+    auto* state = state_from(writer);
+    if (state == nullptr || state->has_schema) {
+        error = "the field id base must be set on a new writer before its first batch";
+        return false;
+    }
+    state->field_id_base = first_id;
+    return true;
+}
+
+bool writer_take_staged(NanoLanceWriter* writer, std::vector<NewFragment>& out, LanceSchemaMapping& mapping,
+                        std::string& error, bool keep_empty) {
+    auto* state = state_from(writer);
+    if (state == nullptr || !state->stage) {
+        error = "not a staged writer";
+        return false;
+    }
+    if (state->pending_rows != 0U || (keep_empty && state->pending_batches != 0U)) {
+        if (commit_pending(writer, state, state->append_only_commits) != NANO_LANCE_OK) {
+            error = writer->last_error;
+            return false;
+        }
+    }
+    out = std::move(state->staged);
+    state->staged.clear();
+    mapping = out.empty() ? state->schema_mapping : state->staged_schema;
+    return true;
+}
+
+}  // namespace nano_lance
