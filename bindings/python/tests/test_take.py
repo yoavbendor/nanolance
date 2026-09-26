@@ -9,6 +9,10 @@ row by row through the page's per-row index.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -132,3 +136,22 @@ def test_full_read_of_a_rust_map_with_a_constant_key(lance_mod, tmp_path):
     path = tmp_path / "map.lance"
     lance_mod.write_dataset(table, str(path), data_storage_version="2.2")
     assert pa.table(nanolance.read_table(path)).to_pydict() == table.to_pydict()
+
+
+def test_take_without_the_decoded_column_cache(tmp_path):
+    """Small columns are decoded once and kept for later takes (NANOLANCE_TAKE_CACHE_MB, default
+    256); with the cache off every take decodes just the pages it touches. Both give the same rows."""
+    table = _table(5_000)
+    path = tmp_path / "c.lance"
+    nanolance.write_table(table, path)
+    idx = [4_999, 0, 77, 77, 2_500, 1_023, 1_024]
+    script = (
+        "import sys, pyarrow as pa, nanolance\n"
+        f"t = pa.table(nanolance.take({str(path)!r}, {idx!r}))\n"
+        "sys.stdout.write(repr(t.to_pydict()))\n"
+    )
+    expected = repr(table.take(pa.array(idx, pa.int64())).to_pydict())
+    for budget in ("0", "256"):
+        env = {**os.environ, "NANOLANCE_TAKE_CACHE_MB": budget}
+        out = subprocess.run([sys.executable, "-c", script], env=env, check=True, capture_output=True, text=True)
+        assert out.stdout == expected, f"NANOLANCE_TAKE_CACHE_MB={budget}"

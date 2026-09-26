@@ -27,6 +27,9 @@
 #include <optional>
 #include <memory>
 #include <utility>
+#include <cstdlib>
+#include <unordered_map>
+#include <mutex>
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -3846,6 +3849,79 @@ bool take_full_zip_rows(const std::filesystem::path& path, const std::string& co
     return true;
 }
 
+/// Small columns, decoded whole and kept for take(). Rows of a list or struct column are found by
+/// decoding their page, and a mini-batch of 64 random rows touches nearly every page of a small
+/// column -- COCO's `objects` decoded all 11.5 MB of itself for every batch, 5 of a shuffled epoch's
+/// 6.6 seconds. A column whose pages hold at most kCacheColumnBytes is instead decoded once and each
+/// take picks its rows from that copy.
+///
+/// Bounded: at most NANOLANCE_TAKE_CACHE_MB of decoded columns (default 256; 0 turns the cache off,
+/// for a device that would rather decode again than hold them), dropped all at once when full. Keyed
+/// by file path, size and modification time and the field -- Lance never rewrites a data file in place.
+constexpr std::uint64_t kCacheColumnBytes = std::uint64_t{16} << 20U;
+
+std::uint64_t take_cache_budget() {
+    static const std::uint64_t budget = [] {
+        const char* env = std::getenv("NANOLANCE_TAKE_CACHE_MB");
+        if (env == nullptr || *env == '\0') {
+            return std::uint64_t{256} << 20U;
+        }
+        return static_cast<std::uint64_t>(std::strtoull(env, nullptr, 10)) << 20U;
+    }();
+    return budget;
+}
+
+std::uint64_t decoded_bytes(const ColumnValues& v) {
+    std::uint64_t bytes = v.fixed.size() + v.variable.offsets.size() + v.variable.data.size() + v.validity.size() +
+                          v.item_validity.size();
+    for (const auto& layer : v.layers) {
+        bytes += layer.offsets.size() * sizeof(std::int64_t) + layer.validity.size();
+    }
+    return bytes;
+}
+
+std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::path& path, const pb::Field& field,
+                                                       const pb::ColumnMetadata& column, std::string& error) {
+    struct Entry {
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type mtime{};
+        std::shared_ptr<const ColumnValues> values;
+        std::uint64_t bytes = 0;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::string, Entry> cache;
+    static std::uint64_t held = 0;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return nullptr;
+    }
+    const auto key = path.string() + '#' + std::to_string(field.id);
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        const auto it = cache.find(key);
+        if (it != cache.end() && it->second.size == size && it->second.mtime == mtime) {
+            return it->second.values;
+        }
+    }
+    auto whole = std::make_shared<ColumnValues>();
+    if (!decode_lance_physical_column(path, field, column, *whole, error)) {
+        return nullptr;
+    }
+    const auto bytes = decoded_bytes(*whole);
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (bytes <= take_cache_budget()) {
+        if (held + bytes > take_cache_budget()) {
+            cache.clear();
+            held = 0;
+        }
+        cache[key] = Entry{size, mtime, whole, bytes};
+        held += bytes;
+    }
+    return whole;
+}
+
 }  // namespace
 
 bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
@@ -3907,6 +3983,28 @@ bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_pa
             out.validity.resize(static_cast<std::size_t>((out_row + 7U) / 8U), 0U);
         }
         return true;
+    }
+
+    // A small column: from the decoded copy (see cached_whole_column).
+    std::uint64_t encoded = 0;
+    for (const auto& page : column_metadata.pages) {
+        for (const auto size : page.buffer_sizes) {
+            encoded += size;
+        }
+    }
+    if (!rows.empty() && take_cache_budget() != 0U && encoded <= kCacheColumnBytes) {
+        const auto whole = cached_whole_column(data_file_path, on_disk_field, column_metadata, error);
+        if (whole == nullptr && !error.empty()) {
+            return false;
+        }
+        if (whole != nullptr) {
+            out = *whole;
+            std::vector<std::uint8_t> keep(static_cast<std::size_t>(page_first.back()), 0U);
+            for (const auto r : rows) {
+                keep[static_cast<std::size_t>(r)] = 1U;
+            }
+            return compact_column_values(out, keep, page_first.back(), value_bytes, error);
+        }
     }
 
     // Otherwise decode the touched pages -- only those -- and pick the rows out.
