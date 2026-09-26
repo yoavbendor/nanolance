@@ -4040,7 +4040,8 @@ std::shared_ptr<const MiniBlockPageIndex> miniblock_page_index(const std::filesy
         return nullptr;
     }
     const auto key = path.string() + '#' + std::to_string(size) + '#' +
-                     std::to_string(mtime.time_since_epoch().count()) + '#' + std::to_string(page.buffer_offsets[0]);
+                     std::to_string(static_cast<long long>(
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(mtime.time_since_epoch()).count())) + '#' + std::to_string(page.buffer_offsets[0]);
     {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto it = cache.find(key);

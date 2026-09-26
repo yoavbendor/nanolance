@@ -10,8 +10,14 @@ one core and both on all cores. A regression is
   * any read that returned wrong data or failed, or a cross read (each writer's file read by the
     other side) that is missing -- correctness, no tolerance;
   * a data type whose read (or write) ratio fell below --dataset-floor x its baseline (default 0.5:
-    twice as slow relative to Rust as it was) both on one core and on all cores;
-  * a geometric mean over data types below --mean-floor x its baseline (default 0.75).
+    twice as slow relative to Rust as it was) both on one core and on all cores -- for operations
+    that take at least --min-ms (default 2 ms) for nanolance: below that, at the quick scale, a
+    shared runner's scheduling is most of the time (a 0.3 ms write fell 3x on every CI run with no
+    code change);
+  * a geometric mean over data types below --mean-floor x its baseline (default 0.75), for the
+    all-cores metrics only when the machine has the baseline's core count (on another one, the
+    all-cores ratios measure the machine: the 4-core baseline's 2.9x write mean is 2.0x on every
+    CI runner, commit after commit).
 
 The floors are loose on purpose: a CI runner is noisy, has another core count, and runs the quick
 matrix (a tenth of the rows). What they catch is a real step back -- a fast path gone, a page
@@ -47,7 +53,11 @@ def geomean(xs):
     return math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else None
 
 
-def compare(base, new, dataset_floor, mean_floor):
+def nl_ms(rec, what, nl):
+    return rec.get(what, {}).get(nl) or 0.0
+
+
+def compare(base, new, dataset_floor, mean_floor, min_ms=0.0):
     problems, lines = [], []
     B, N = base["datasets"], new["datasets"]
     for name, rec in N.items():
@@ -68,11 +78,14 @@ def compare(base, new, dataset_floor, mean_floor):
                 if not metric.startswith(op):
                     continue
                 b, n = ratio(B[name], what, rust, nl), ratio(N[name], what, rust, nl)
+                if min(nl_ms(B[name], what, nl), nl_ms(N[name], what, nl)) < min_ms:
+                    continue  # too short to time on a shared machine
                 if b is not None and n is not None:
                     fell.append((metric, b, n, n < dataset_floor * b))
             if fell and all(f[3] for f in fell):
                 detail = ", ".join(f"{m} {n:.2f}x (baseline {b:.2f}x)" for m, b, n, _ in fell)
                 problems.append(f"{name}: {op} fell below {dataset_floor}x its baseline everywhere: {detail}")
+    same_cores = base.get("environment", {}).get("cores") == new.get("environment", {}).get("cores")
     for metric, (what, rust, nl) in METRICS.items():
         pairs = []
         for name in N:
@@ -85,7 +98,9 @@ def compare(base, new, dataset_floor, mean_floor):
             continue
         gb, gn = geomean([b for b, _ in pairs]), geomean([n for _, n in pairs])
         lines.append(f"{metric:18s} baseline {gb:5.2f}x  now {gn:5.2f}x  ({len(pairs)} data types)")
-        if gn < mean_floor * gb:
+        if metric.endswith("all cores") and not same_cores:
+            lines[-1] += "  (informational: another core count than the baseline's)"
+        elif gn < mean_floor * gb:
             problems.append(f"{metric}: mean {gn:.2f}x Rust, baseline {gb:.2f}x (floor {mean_floor * gb:.2f}x)")
     return problems, lines
 
@@ -96,12 +111,13 @@ def main(argv=None):
     ap.add_argument("new")
     ap.add_argument("--dataset-floor", type=float, default=0.5)
     ap.add_argument("--mean-floor", type=float, default=0.75)
+    ap.add_argument("--min-ms", type=float, default=2.0)
     args = ap.parse_args(argv)
     with open(args.baseline) as f:
         base = json.load(f)
     with open(args.new) as f:
         new = json.load(f)
-    problems, lines = compare(base, new, args.dataset_floor, args.mean_floor)
+    problems, lines = compare(base, new, args.dataset_floor, args.mean_floor, args.min_ms)
     print("nanolance vs Rust Lance (Rust's time / nanolance's; above 1x nanolance is faster):")
     for line in lines:
         print("  " + line)
