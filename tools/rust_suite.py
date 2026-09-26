@@ -135,6 +135,15 @@ def build_shim(build_dir: Path) -> Path:
         if proc.returncode != 0:
             print(proc.stdout[-6000:])
             sys.exit("building libnanolance_rust_shim failed")
+    # The test binary links zstd and lz4 of its own; exported copies of nanolance's would let calls
+    # bind across versions (Lance's own compression tests crashed on a CI runner that way).
+    shim = build_dir / "libnanolance_rust_shim.so"
+    if shutil.which("nm") and shim.exists():
+        exported = subprocess.run(["nm", "-D", "--defined-only", str(shim)], stdout=subprocess.PIPE, text=True).stdout
+        leaked = [line.split()[-1] for line in exported.splitlines()
+                  if re.search(r" (ZSTD|ZDICT|HUF|FSE|LZ4|XXH)", line)]
+        if leaked:
+            sys.exit(f"libnanolance_rust_shim exports compression symbols ({', '.join(leaked[:5])}, ...)")
     return build_dir
 
 

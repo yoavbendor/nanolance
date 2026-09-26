@@ -32,7 +32,12 @@ The work happens in these steps:
 - In lance-file, the hook reads every file the tests write with `write_lance_file` as it is.
 - Results are compared the way the test compares the Rust decoder's: the Arrow type, then the values.
 
-CI runs it nightly (`.github/workflows/rust-suite.yml`). It also runs when the suite itself changes.
+CI runs it nightly (`.github/workflows/rust-suite.yml`). The shim exports its two functions and
+nothing else. The test binary links zstd and lz4 of its own, and when the shim also exported
+nanolance's copies, calls could bind across the two versions. One of Lance's compression tests
+crashed on a CI runner that way, though it never calls nanolance. The runner refuses a shim that
+exports those symbols. When the test binary does crash, the runner runs the tests again one at a
+time and names the test that died. It also runs when the suite itself changes.
 
 ## Outcomes
 

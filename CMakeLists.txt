@@ -344,6 +344,13 @@ option(NANOLANCE_BUILD_RUST_SHIM "Build the library tools/rust_suite.py links in
 if(NANOLANCE_BUILD_RUST_SHIM)
     add_library(nanolance_rust_shim SHARED tests/rust_suite/nanolance_rust_shim.cpp)
     target_link_libraries(nanolance_rust_shim PRIVATE nanolance)
+    # Export the shim's two functions and nothing else. The test binary links zstd and lz4 of its own
+    # (Rust's zstd-sys / lz4-sys); exported copies of nanolance's -- another version -- let calls on
+    # either side bind to the other's, and Lance's own compression tests crashed.
+    set_target_properties(nanolance_rust_shim PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+    if(NOT APPLE)
+        target_link_options(nanolance_rust_shim PRIVATE -Wl,--exclude-libs,ALL -Wl,-Bsymbolic)
+    endif()
 endif()
 
 # Apply our own warning policy (opt-in via NANOLANCE_WERROR) only to nanolance's targets, not to the

@@ -78,7 +78,7 @@ void align64(std::ofstream& out) {
 
 extern "C" {
 
-int nanolance_rust_write_file(const char* path, const std::uint8_t* data, std::size_t data_len,
+__attribute__((visibility("default"))) int nanolance_rust_write_file(const char* path, const std::uint8_t* data, std::size_t data_len,
                               const std::uint8_t* columns, std::size_t columns_len, const ArrowSchema* schema,
                               std::uint64_t num_rows, char* msg, std::size_t msg_cap) {
     // The field, named if the test left it unnamed (a name is all it changes).
@@ -186,7 +186,7 @@ int nanolance_rust_write_file(const char* path, const std::uint8_t* data, std::s
     return 0;
 }
 
-int nanolance_rust_read(const char* path, std::uint64_t offset, std::uint64_t length, const std::uint64_t* indices,
+__attribute__((visibility("default"))) int nanolance_rust_read(const char* path, std::uint64_t offset, std::uint64_t length, const std::uint64_t* indices,
                         std::size_t n_indices, int take, ArrowArrayStream* out, char* msg, std::size_t msg_cap) {
     nano_lance::LanceScanRequest request;
     ArrowSchema schema{};
