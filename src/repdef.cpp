@@ -4,6 +4,7 @@
 #include "nanolance/repdef.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <cstddef>
 
 namespace nano_lance::repdef {
@@ -192,10 +193,26 @@ bool unravel(const std::vector<std::uint16_t>& rep_in, bool has_rep, const std::
         std::int64_t curlen = 0;
         std::size_t write = 0;
         layer.offsets.reserve(rep.size() + 1U);
-        for (std::size_t read = 0; read < rep.size(); ++read) {
+        const std::size_t num_levels = rep.size();
+        for (std::size_t read = 0; read < num_levels; ++read) {
             const auto r = rep[read];
             if (r == 0U) {
-                ++curlen;  // continues the current list
+                // Continues the current list -- as do, in a long list (an audio clip, a point cloud),
+                // most of the levels after it: skip them sixteen at a time.
+                std::size_t end = read + 1U;
+                while (end + 16U <= num_levels) {
+                    std::uint64_t w[4];
+                    std::memcpy(w, rep.data() + end, sizeof(w));
+                    if ((w[0] | w[1] | w[2] | w[3]) != 0U) {
+                        break;
+                    }
+                    end += 16U;
+                }
+                while (end < num_levels && rep[end] == 0U) {
+                    ++end;
+                }
+                curlen += static_cast<std::int64_t>(end - read);
+                read = end - 1U;
                 continue;
             }
             rep[write] = static_cast<std::uint16_t>(r - 1U);
