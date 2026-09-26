@@ -30,6 +30,10 @@ and is put through what a training job does with its data, by each engine:
                 every row once, in a seeded random order (Parquet has no row-level random access,
                 so it has no number here)
 
+The reads are also run crosswise -- nanolance on the files Rust Lance wrote and Rust Lance on
+nanolance's -- since a reader is only as good as its worst file: pylance lays a list column out as
+one very large page, which nanolance's take() once decoded whole for every batch.
+
 Every operation reports wall time and CPU time (user + system of the whole process, so every thread
 an engine starts is counted): a single-threaded reader and a thread-pool reader are compared on the
 same cost. Each is the median of --runs runs after a warm-up, files in the page cache. Before any
@@ -203,11 +207,15 @@ def run_dataset(name, spec, table, runs, work: Path):
         "rust-lance": lambda p, cols: lance.dataset(str(p)).to_table(columns=cols),
         "parquet": lambda p, cols: pq.read_table(p, columns=cols),
     }
+    # Each Lance reader also on the other's files: the same data, written the other way.
+    cross = {"nanolance on rust file": ("nanolance", "rust-lance"),
+             "rust-lance on nanolance file": ("rust-lance", "nanolance")}
+    read_runs = [(e, readers[e], paths[e]) for e in readers] + \
+                [(k, readers[r], paths[f]) for k, (r, f) in cross.items()]
     for op, cols in (("scan", None), ("meta", meta_cols)):
         rec["ops"][op] = {}
         want = table if cols is None else table.select(cols)
-        for engine, read in readers.items():
-            p = paths[engine]
+        for engine, read, p in read_runs:
             if not same(read(p, cols), want):
                 rec["errors"][f"{op} {engine}"] = "returned different data"
                 continue
@@ -220,26 +228,29 @@ def run_dataset(name, spec, table, runs, work: Path):
     batches = [order[i:i + BATCH].tolist() for i in range(0, len(order), BATCH)]
     cols = spec["train"]
     want = table.select(cols)
-    rust_ds = {}
 
-    def nl_epoch(p=paths["nanolance"]):
+    def nl_epoch(p):
         for b in batches:
             nanolance.take(p, b, columns=cols)
 
-    def rust_epoch(p=paths["rust-lance"]):
+    def rust_epoch(p):
         ds = lance.dataset(str(p))  # opened once per epoch, as a loader would
         for b in batches:
             ds.take(b, columns=cols)
 
+    nl_take = lambda p, b: pa.table(nanolance.take(p, b, columns=cols))  # noqa: E731
+    rust_take = lambda p, b: lance.dataset(str(p)).take(b, columns=cols)  # noqa: E731
     for engine, p, epoch, take in (
-        ("nanolance", paths["nanolance"], nl_epoch, lambda p, b: pa.table(nanolance.take(p, b, columns=cols))),
-        ("rust-lance", paths["rust-lance"], rust_epoch, lambda p, b: lance.dataset(str(p)).take(b, columns=cols)),
+        ("nanolance", paths["nanolance"], nl_epoch, nl_take),
+        ("rust-lance", paths["rust-lance"], rust_epoch, rust_take),
+        ("nanolance on rust file", paths["rust-lance"], nl_epoch, nl_take),
+        ("rust-lance on nanolance file", paths["nanolance"], rust_epoch, rust_take),
     ):
         ok = all(same(take(p, b), want.take(pa.array(b))) for b in batches[:5] + batches[-2:])
         if not ok:
             rec["errors"][f"shuffled {engine}"] = "returned different data"
             continue
-        wall, cpu = measure(epoch, runs)
+        wall, cpu = measure(lambda: epoch(p), runs)
         rec["ops"].setdefault("shuffled", {})[engine] = {"wall_ms": wall, "cpu_ms": cpu}
         print(f"  {name} shuffled {engine:10s} {wall:9.1f} ms wall {cpu:9.1f} ms CPU  ({len(batches)} batches)",
               flush=True)

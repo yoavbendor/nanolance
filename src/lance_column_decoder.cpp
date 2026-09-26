@@ -4095,6 +4095,7 @@ bool take_windows(const std::filesystem::path& path, const pb::ColumnMetadata& c
             part.buffer_sizes[0] = (last - first + 1U) * index->word_bytes;
             part.buffer_offsets[1] += index->byte_start[first];
             part.buffer_sizes[1] = index->byte_start[last + 1U] - index->byte_start[first];
+            part.length = before[last + 1U] - before[first];  // about the rows it decodes
             NestedPageWindow window;
             window.active = true;
             window.chunk_items.assign(index->items.begin() + static_cast<std::ptrdiff_t>(first),
@@ -4106,6 +4107,103 @@ bool take_windows(const std::filesystem::path& path, const pb::ColumnMetadata& c
         }
     }
     return true;
+}
+
+/// A full read of a list column whose pages include very large ones (pylance's one-page audio
+/// column): each such page is decoded as windows of about scan_window_bytes() of chunks rather than
+/// whole, so the levels, offsets and scratch buffers of one window are what is ever held besides
+/// the output -- a 156 MB page was held three to four times over, ~900 MB, and faulted in at a
+/// cost of 1.7 s against Rust's 0.5 s. Window k keeps the rows that END in its chunks; the part of
+/// a row begun in an earlier window is decoded again from that row's first chunk.
+/// NANOLANCE_LIST_WINDOW_KB sets the window (default 4096; pages over four windows are split).
+std::uint64_t scan_window_bytes() {
+    static const std::uint64_t bytes = [] {
+        const char* env = std::getenv("NANOLANCE_LIST_WINDOW_KB");
+        const auto kb = env == nullptr || *env == '\0' ? 4096ULL : std::strtoull(env, nullptr, 10);
+        return std::max<std::uint64_t>(1U, kb) << 10U;
+    }();
+    return bytes;
+}
+
+bool decode_nested_column_windowed(const std::filesystem::path& path, const pb::Field& field,
+                                   const pb::ColumnMetadata& column, bool& used, ColumnValues& out,
+                                   std::string& error) {
+    used = false;
+    pb::ColumnMetadata subset;
+    std::vector<NestedPageWindow> windows;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> keep_rows;  // per window: [from, to) of decoded rows
+    for (const auto& page : column.pages) {
+        std::shared_ptr<const MiniBlockPageIndex> index;
+        page_layout::PageLayout layout;
+        std::string why;
+        if (page.buffer_sizes.size() >= 2U && page.buffer_sizes[1] > 4U * scan_window_bytes() &&
+            page_layout::decode_page_layout(page.encoding, layout, why) &&
+            layout.kind == page_layout::LayoutKind::kMiniBlock) {
+            index = miniblock_page_index(path, page, layout.mini_block, error);
+            if (index == nullptr && !error.empty()) {
+                return false;
+            }
+        }
+        if (index == nullptr) {
+            subset.pages.push_back(page);
+            windows.emplace_back();
+            keep_rows.emplace_back(0, page.length);
+            continue;
+        }
+        used = true;
+        const auto& before = index->rows_before;
+        const auto chunks = index->items.size();
+        const auto end_chunk = [&](std::uint64_t r) {
+            return static_cast<std::size_t>(std::upper_bound(before.begin() + 1, before.end(), r) - before.begin() - 1);
+        };
+        std::size_t cut = 0;  // the window's rows end in chunks [cut, next)
+        while (cut < chunks) {
+            std::size_t next = cut + 1U;
+            while (next < chunks && (index->byte_start[next] - index->byte_start[cut] < scan_window_bytes() ||
+                                     before[next] == before[cut])) {
+                ++next;
+            }
+            const auto a = before[cut];
+            const auto b = before[next];
+            const std::size_t first = a == 0U ? 0U : end_chunk(a - 1U);
+            pb::ColumnPage part = page;
+            part.buffer_offsets[0] += first * index->word_bytes;
+            part.buffer_sizes[0] = (next - first) * index->word_bytes;
+            part.buffer_offsets[1] += index->byte_start[first];
+            part.buffer_sizes[1] = index->byte_start[next] - index->byte_start[first];
+            part.length = before[next] - before[first];  // about the rows it decodes (sizes reservations)
+            NestedPageWindow window;
+            window.active = true;
+            window.chunk_items.assign(index->items.begin() + static_cast<std::ptrdiff_t>(first),
+                                      index->items.begin() + static_cast<std::ptrdiff_t>(next));
+            subset.pages.push_back(std::move(part));
+            windows.push_back(std::move(window));
+            keep_rows.emplace_back(a - before[first], b - before[first]);
+            cut = next;
+        }
+    }
+    if (!used) {
+        return true;
+    }
+    if (!decode_nested_column(path, field, subset, out, error, &windows)) {
+        return false;
+    }
+    std::vector<std::uint8_t> keep;
+    for (std::size_t w = 0; w < windows.size(); ++w) {
+        const auto n = windows[w].active ? windows[w].rows : subset.pages[w].length;
+        const auto [from, to] = keep_rows[w];
+        if (to > n || from > to) {
+            error = "column '" + field.name + "': a page window decoded fewer rows than its index promised";
+            return false;
+        }
+        const auto base = keep.size();
+        keep.resize(base + static_cast<std::size_t>(n), 0U);
+        std::fill(keep.begin() + static_cast<std::ptrdiff_t>(base + from),
+                  keep.begin() + static_cast<std::ptrdiff_t>(base + to), std::uint8_t{1});
+    }
+    const std::size_t value_bytes =
+        lance_field_is_variable_width(field.logical_type) ? 0U : lance_logical_type_value_bytes(field.logical_type);
+    return compact_column_values(out, keep, keep.size(), value_bytes, error);
 }
 
 }  // namespace
@@ -4263,6 +4361,13 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     if (column_is_nested(column_metadata)) {
         error.clear();
         out = ColumnValues{};
+        bool windowed = false;
+        if (!decode_nested_column_windowed(data_file_path, on_disk_field, column_metadata, windowed, out, error)) {
+            return false;
+        }
+        if (windowed) {
+            return true;
+        }
         return decode_nested_column(data_file_path, on_disk_field, column_metadata, out, error);
     }
     return decode_column_impl(data_file_path, on_disk_field, column_metadata, out, error, nullptr);

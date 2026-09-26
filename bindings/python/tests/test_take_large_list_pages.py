@@ -7,6 +7,9 @@ index (which rows finish in which chunk) and decodes only the chunks holding the
 turning a leading part-row into a row of its own that is then dropped. What has to hold: the rows
 come back exactly as pylance's take returns them, for rows at page and chunk edges, rows spanning
 many chunks, empty and null lists, lists of lists, of strings, of structs, and maps.
+
+Full reads of such a page are windowed the same way (bounded memory: the 156 MB page was held
+three to four times over), and checked here with windows forced small.
 """
 
 from __future__ import annotations
@@ -78,7 +81,18 @@ for idx in sets:
     got = pa.table(nanolance.take(path, idx, columns=columns))
     got.validate(full=True)
     assert got.to_pydict() == ds.take(idx, columns=columns).to_pydict(), idx[:6]
+# A full read and a row range, with the page decoded in windows (NANOLANCE_LIST_WINDOW_KB).
+whole = ds.to_table(columns=columns)
+got = pa.table(nanolance.read_table(path, columns=columns))
+got.validate(full=True)
+assert got.to_pydict() == whole.to_pydict(), "full read"
+n = whole.num_rows
+part = pa.table(nanolance.read_table(path, columns=columns, offset=n // 3, length=n // 3))
+assert part.to_pydict() == whole.slice(n // 3, n // 3).to_pydict(), "row range"
 """
+
+# Every page windowed: 4 KiB windows, so pages over 16 KiB are split on scans too.
+_WINDOWED = {"NANOLANCE_TAKE_CACHE_MB": "0", "NANOLANCE_LIST_WINDOW_KB": "4"}
 
 
 @pytest.mark.parametrize("name", list(SHAPES))
@@ -94,8 +108,9 @@ def test_take_from_rusts_large_list_pages(lance_mod, tmp_path, name):
         expected = table.select(["c"]).take(pa.array(idx, pa.int64())).to_pydict()
         assert got.to_pydict() == expected, (name, idx[:6])
         assert ds.take(idx, columns=["c"]).to_pydict() == expected
-    env = {**os.environ, "NANOLANCE_TAKE_CACHE_MB": "0"}
-    subprocess.run([sys.executable, "-c", _CHILD, str(path), json.dumps(sets), '["c"]'], env=env, check=True)
+    for knobs in ({"NANOLANCE_TAKE_CACHE_MB": "0"}, _WINDOWED):
+        subprocess.run([sys.executable, "-c", _CHILD, str(path), json.dumps(sets), '["c"]'],
+                       env={**os.environ, **knobs}, check=True)
 
 
 def test_audio_clips_are_one_page_of_many_chunks(lance_mod, tmp_path):
@@ -123,7 +138,7 @@ def test_take_from_nanolance_list_pages(lance_mod, tmp_path):
         got = pa.table(nanolance.take(path, idx))
         assert got.to_pydict() == table.take(pa.array(idx, pa.int64())).to_pydict()
         assert got.to_pydict() == ds.take(idx).to_pydict()
-    env = {**os.environ, "NANOLANCE_TAKE_CACHE_MB": "0"}
     sets = _index_sets(table.num_rows, seed=3)
-    subprocess.run([sys.executable, "-c", _CHILD, str(path), json.dumps(sets), json.dumps(table.column_names)],
-                   env=env, check=True)
+    for knobs in ({"NANOLANCE_TAKE_CACHE_MB": "0"}, _WINDOWED):
+        subprocess.run([sys.executable, "-c", _CHILD, str(path), json.dumps(sets), json.dumps(table.column_names)],
+                       env={**os.environ, **knobs}, check=True)

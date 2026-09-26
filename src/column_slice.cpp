@@ -4,6 +4,7 @@
 #include "nanolance/column_slice.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -212,35 +213,72 @@ bool slice_leaf(ColumnValues& values, std::uint64_t first, std::uint64_t count, 
     return true;
 }
 
-bool compact_leaf(ColumnValues& values, const std::vector<std::uint8_t>& keep, std::uint64_t total,
-                  std::size_t value_bytes, std::string& error) {
-    if (keep.size() != total) {
-        error = "keep mask does not cover the column's rows";
-        return false;
+/// Copy `count` bits of `src` from `from` to `dst` (zeroed) at `at`; returns how many were 0.
+std::uint64_t copy_bits(const std::vector<std::uint8_t>& src, std::uint64_t from, std::uint64_t count,
+                        std::vector<std::uint8_t>& dst, std::uint64_t at) {
+    std::uint64_t zeros = 0;
+    std::uint64_t i = 0;
+    if (((from | at) & 7U) == 0U) {  // byte-aligned: whole bytes at a time
+        const auto bytes = static_cast<std::size_t>(count >> 3U);
+        const auto* in = src.data() + (from >> 3U);
+        auto* out = dst.data() + (at >> 3U);
+        std::memcpy(out, in, bytes);
+        for (std::size_t k = 0; k < bytes; ++k) {
+            zeros += 8U - static_cast<std::uint64_t>(std::popcount(in[k]));
+        }
+        i = static_cast<std::uint64_t>(bytes) << 3U;
     }
+    for (; i < count; ++i) {
+        if (bit_set(src, from + i)) {
+            const auto d = at + i;
+            dst[static_cast<std::size_t>(d >> 3U)] |= static_cast<std::uint8_t>(1U << (d & 7U));
+        } else {
+            ++zeros;
+        }
+    }
+    return zeros;
+}
+
+/// Kept rows as runs [begin, end): a take, a range or a deletion file keeps long runs of a list's
+/// items, which are moved a run at a time.
+using RowRuns = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+RowRuns runs_of(const std::vector<std::uint8_t>& keep) {
+    RowRuns runs;
+    const auto total = static_cast<std::uint64_t>(keep.size());
+    for (std::uint64_t i = 0; i < total;) {
+        const auto* zero = static_cast<const std::uint8_t*>(
+            std::memchr(keep.data() + i, 0, static_cast<std::size_t>(total - i)));
+        const auto end = zero == nullptr ? total : static_cast<std::uint64_t>(zero - keep.data());
+        if (end > i) {
+            runs.emplace_back(i, end);
+        }
+        i = end;
+        while (i < total && keep[static_cast<std::size_t>(i)] == 0U) {
+            ++i;
+        }
+    }
+    return runs;
+}
+
+/// Keep `runs` (ascending, disjoint) of a leaf's `total` rows, moving them to the front in place.
+bool compact_leaf_runs(ColumnValues& values, const RowRuns& runs, std::uint64_t total, std::size_t value_bytes,
+                       std::string& error) {
     if (values.fixed_borrowed != nullptr) {
         error = "cannot compact a column holding a borrowed buffer";
         return false;
     }
 
-    if (std::find(keep.begin(), keep.end(), std::uint8_t{0}) == keep.end()) {
-        return true;  // nothing deleted in this column's rows; leave every buffer untouched
-    }
-    // Kept rows as runs [begin, end): a take or a range keeps long runs of a list's items, copied a
-    // run at a time rather than a value at a time.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
     std::uint64_t count = 0;
-    for (std::uint64_t i = 0; i < total;) {
-        if (keep[static_cast<std::size_t>(i)] == 0U) {
-            ++i;
-            continue;
+    for (const auto& [b, e] : runs) {
+        if (b >= e || e > total) {
+            error = "kept rows are outside the column";
+            return false;
         }
-        const auto begin = i;
-        while (i < total && keep[static_cast<std::size_t>(i)] != 0U) {
-            ++i;
-        }
-        runs.emplace_back(begin, i);
-        count += i - begin;
+        count += e - b;
+    }
+    if (count == total) {
+        return true;  // nothing dropped; leave every buffer untouched
     }
     std::vector<std::uint64_t> kept;
     const auto kept_rows = [&]() -> const std::vector<std::uint64_t>& {
@@ -274,6 +312,17 @@ bool compact_leaf(ColumnValues& values, const std::vector<std::uint8_t>& keep, s
                 error = "variable-width offsets cover fewer rows than the column claims";
                 return false;
             }
+            for (const auto& [b, e] : runs) {
+                auto previous = read_offset(values.variable.offsets, b, values.variable.large);
+                for (auto row = b; row < e; ++row) {
+                    const auto end = read_offset(values.variable.offsets, row + 1U, values.variable.large);
+                    if (end < previous || end > values.variable.data.size()) {
+                        error = "variable-width offset runs past the data buffer";
+                        return false;
+                    }
+                    previous = end;
+                }
+            }
             break;
         }
         case ColumnValues::Kind::BlobV2External:
@@ -292,17 +341,10 @@ bool compact_leaf(ColumnValues& values, const std::vector<std::uint8_t>& keep, s
         }
         std::vector<std::uint8_t> bitmap(bitmap_bytes(count * per_row), 0U);
         std::uint64_t item_nulls = 0;
-        const auto& kept_list = kept_rows();
-        for (std::uint64_t i = 0; i < count; ++i) {
-            const auto src_row = kept_list[static_cast<std::size_t>(i)];
-            for (std::uint64_t j = 0; j < per_row; ++j) {
-                const auto dst = i * per_row + j;
-                if (bit_set(values.item_validity, src_row * per_row + j)) {
-                    bitmap[static_cast<std::size_t>(dst >> 3U)] |= static_cast<std::uint8_t>(1U << (dst & 7U));
-                } else {
-                    ++item_nulls;
-                }
-            }
+        std::uint64_t dst = 0;
+        for (const auto& [b, e] : runs) {
+            item_nulls += copy_bits(values.item_validity, b * per_row, (e - b) * per_row, bitmap, dst);
+            dst += (e - b) * per_row;
         }
         values.item_null_count = item_nulls;
         values.item_validity = item_nulls == 0U ? std::vector<std::uint8_t>{} : std::move(bitmap);
@@ -311,13 +353,10 @@ bool compact_leaf(ColumnValues& values, const std::vector<std::uint8_t>& keep, s
     if (!values.validity.empty()) {
         std::vector<std::uint8_t> bitmap(bitmap_bytes(count), 0U);
         std::uint64_t nulls = 0;
-        const auto& kept_list = kept_rows();
-        for (std::uint64_t i = 0; i < count; ++i) {
-            if (bit_set(values.validity, kept_list[static_cast<std::size_t>(i)])) {
-                bitmap[static_cast<std::size_t>(i >> 3U)] |= static_cast<std::uint8_t>(1U << (i & 7U));
-            } else {
-                ++nulls;
-            }
+        std::uint64_t dst = 0;
+        for (const auto& [b, e] : runs) {
+            nulls += copy_bits(values.validity, b, e - b, bitmap, dst);
+            dst += e - b;
         }
         values.null_count = nulls;
         values.validity = nulls == 0U ? std::vector<std::uint8_t>{} : std::move(bitmap);
@@ -326,43 +365,47 @@ bool compact_leaf(ColumnValues& values, const std::vector<std::uint8_t>& keep, s
     switch (values.kind) {
         case ColumnValues::Kind::FixedWidth: {
             if (!values.fixed.empty()) {
-                std::vector<std::uint8_t> out(static_cast<std::size_t>(count) * value_bytes);
+                // In place: every run moves toward the front, never past a byte still to be read.
                 std::size_t at = 0;
                 for (const auto& [b, e] : runs) {
                     const auto bytes = static_cast<std::size_t>(e - b) * value_bytes;
-                    std::memcpy(out.data() + at, values.fixed.data() + static_cast<std::size_t>(b) * value_bytes, bytes);
+                    const auto from = static_cast<std::size_t>(b) * value_bytes;
+                    if (from != at) {
+                        std::memmove(values.fixed.data() + at, values.fixed.data() + from, bytes);
+                    }
                     at += bytes;
                 }
-                values.fixed = std::move(out);
+                values.fixed.resize(at);
             }
             break;
         }
         case ColumnValues::Kind::VariableWidth: {
             const bool large = values.variable.large;
             const std::size_t offset_width = large ? 8U : 4U;
-            std::vector<std::uint8_t> offsets((count + 1U) * offset_width);
-            std::vector<std::uint8_t> data;
+            // In place, as for fixed width: row i's new offset slot is at or before its old one, and
+            // each run's bytes move toward the front. Every offset a run needs is read before any
+            // slot at or after the run's start is written.
+            auto& offsets = values.variable.offsets;
+            auto& data = values.variable.data;
             std::uint64_t cumulative = 0;
-            write_offset(offsets.data(), 0U, large);
             std::uint64_t i = 0;
             for (const auto& [b, e] : runs) {
-                const auto run_begin = read_offset(values.variable.offsets, b, large);
+                const auto run_begin = read_offset(offsets, b, large);
+                const auto run_end = read_offset(offsets, e, large);  // validated above
+                const auto shift = run_begin - cumulative;
                 for (auto row = b; row < e; ++row) {
-                    const auto begin = read_offset(values.variable.offsets, row, large);
-                    const auto end = read_offset(values.variable.offsets, row + 1U, large);
-                    if (end < begin || end > values.variable.data.size()) {
-                        error = "variable-width offset runs past the data buffer";
-                        return false;
-                    }
-                    cumulative += end - begin;
-                    write_offset(offsets.data() + static_cast<std::size_t>(++i) * offset_width, cumulative, large);
+                    const auto end = read_offset(offsets, row + 1U, large);
+                    write_offset(offsets.data() + static_cast<std::size_t>(++i) * offset_width, end - shift, large);
                 }
-                const auto run_end = read_offset(values.variable.offsets, e, large);
-                data.insert(data.end(), values.variable.data.begin() + static_cast<std::ptrdiff_t>(run_begin),
-                            values.variable.data.begin() + static_cast<std::ptrdiff_t>(run_end));
+                if (shift != 0U) {
+                    std::memmove(data.data() + cumulative, data.data() + run_begin,
+                                 static_cast<std::size_t>(run_end - run_begin));
+                }
+                cumulative += run_end - run_begin;
             }
-            values.variable.offsets = std::move(offsets);
-            values.variable.data = std::move(data);
+            write_offset(offsets.data(), 0U, large);
+            offsets.resize(static_cast<std::size_t>(count + 1U) * offset_width);
+            data.resize(static_cast<std::size_t>(cumulative));
             break;
         }
         case ColumnValues::Kind::BlobV2External: {
@@ -397,6 +440,15 @@ bool compact_leaf(ColumnValues& values, const std::vector<std::uint8_t>& keep, s
     values.structural_dict_rle_plan = StructuralDictRlePlan{};
     values.fixed_rle_plan = FixedRlePlan{};
     return true;
+}
+
+bool compact_leaf(ColumnValues& values, const std::vector<std::uint8_t>& keep, std::uint64_t total,
+                  std::size_t value_bytes, std::string& error) {
+    if (keep.size() != total) {
+        error = "keep mask does not cover the column's rows";
+        return false;
+    }
+    return compact_leaf_runs(values, runs_of(keep), total, value_bytes, error);
 }
 
 
@@ -516,52 +568,61 @@ bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>
         return false;
     }
     // Each layer turns "which of my entries survive" into "which of my children survive": a deleted
-    // row drops every list and item under it, however deep.
+    // row drops every list and item under it, however deep. Survivors are carried as runs, so a
+    // long list costs one run, not a flag per item.
     std::vector<ColumnValues::NestedLayer> cut(values.layers.size());
-    std::vector<std::uint8_t> keep_here = keep;
+    RowRuns here = runs_of(keep);
     for (std::size_t k = 0; k < values.layers.size(); ++k) {
         const auto& layer = values.layers[k];
         auto& out = cut[k];
         out.is_list = layer.is_list;
-        // A struct keeps exactly the entries it is told to, and so do its children.
-        std::vector<std::uint8_t> keep_children =
-            layer.is_list ? std::vector<std::uint8_t>(static_cast<std::size_t>(layer.offsets.back()), 0U) : keep_here;
+        RowRuns children;
         if (layer.is_list) {
             out.offsets.push_back(0);
         }
-        for (std::uint64_t i = 0; i < layer.length; ++i) {
-            if (keep_here[static_cast<std::size_t>(i)] == 0U) {
-                continue;
-            }
+        for (const auto& [b, e] : here) {
             if (layer.is_list) {
-                const auto begin = layer.offsets[static_cast<std::size_t>(i)];
-                const auto end = layer.offsets[static_cast<std::size_t>(i + 1U)];
-                for (auto c = begin; c < end; ++c) {
-                    keep_children[static_cast<std::size_t>(c)] = 1U;
+                // A run of lists keeps one contiguous run of children.
+                const auto first = static_cast<std::uint64_t>(layer.offsets[static_cast<std::size_t>(b)]);
+                const auto last = static_cast<std::uint64_t>(layer.offsets[static_cast<std::size_t>(e)]);
+                if (last > first) {
+                    if (!children.empty() && children.back().second == first) {
+                        children.back().second = last;
+                    } else {
+                        children.emplace_back(first, last);
+                    }
                 }
-                out.offsets.push_back(out.offsets.back() + (end - begin));
+            } else {
+                children.emplace_back(b, e);  // a struct keeps exactly the entries it is told to
             }
-            const bool valid = layer.validity.empty() || bit_set(layer.validity, i);
-            if (!valid && out.validity.empty()) {
-                out.validity.assign(bitmap_bytes(out.length + 1U), 0U);
-                for (std::uint64_t b = 0; b < out.length; ++b) {
-                    out.validity[static_cast<std::size_t>(b >> 3U)] |= static_cast<std::uint8_t>(1U << (b & 7U));
+            for (auto i = b; i < e; ++i) {
+                if (layer.is_list) {
+                    const auto begin = layer.offsets[static_cast<std::size_t>(i)];
+                    const auto end = layer.offsets[static_cast<std::size_t>(i + 1U)];
+                    out.offsets.push_back(out.offsets.back() + (end - begin));
                 }
-            }
-            if (!out.validity.empty()) {
-                out.validity.resize(bitmap_bytes(out.length + 1U), 0U);
-                if (valid) {
-                    out.validity[static_cast<std::size_t>(out.length >> 3U)] |=
-                        static_cast<std::uint8_t>(1U << (out.length & 7U));
-                } else {
-                    ++out.null_count;
+                const bool valid = layer.validity.empty() || bit_set(layer.validity, i);
+                if (!valid && out.validity.empty()) {
+                    out.validity.assign(bitmap_bytes(out.length + 1U), 0U);
+                    for (std::uint64_t v = 0; v < out.length; ++v) {
+                        out.validity[static_cast<std::size_t>(v >> 3U)] |= static_cast<std::uint8_t>(1U << (v & 7U));
+                    }
                 }
+                if (!out.validity.empty()) {
+                    out.validity.resize(bitmap_bytes(out.length + 1U), 0U);
+                    if (valid) {
+                        out.validity[static_cast<std::size_t>(out.length >> 3U)] |=
+                            static_cast<std::uint8_t>(1U << (out.length & 7U));
+                    } else {
+                        ++out.null_count;
+                    }
+                }
+                ++out.length;
             }
-            ++out.length;
         }
-        keep_here = std::move(keep_children);
+        here = std::move(children);
     }
-    if (!compact_leaf(values, keep_here, items, value_bytes, error)) {
+    if (!compact_leaf_runs(values, here, items, value_bytes, error)) {
         return false;
     }
     values.layers = std::move(cut);

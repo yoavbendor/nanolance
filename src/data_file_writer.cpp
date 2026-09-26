@@ -1809,13 +1809,14 @@ bool write_nested_column(std::ofstream& out, const LanceField& field, const Colu
     }
     // Pages are cut at row boundaries. A page may hold many chunks; what bounds it is the reader's
     // working set, so keep a page to a few MiB of values and a bounded number of rows -- and, when
-    // rows are large (a waveform, a long token list), to about one row: a random-access read
-    // (take) decodes whole pages, so a page of one 32 KiB row costs a mini-batch that row, where
-    // an 8 MiB page cost it 250 rows. Each page's row count is sized from the bytes per row the
-    // previous page measured, instead of trying 32,768 rows and halving: with 32 KiB rows that
-    // built ~1 GB before the first page fit, and doubled back past the limit after every page.
+    // rows are large (a waveform, a long token list), to 1 MiB. Measured on Speech Commands (32 KiB
+    // rows): one-row pages cost Rust Lance a page per row (a shuffled epoch 1.4 s, a scan 0.8 s);
+    // 8 MiB pages cost nanolance's own scan 2x in page-sized intermediates; 1 MiB costs neither
+    // (Rust 0.5 s / 0.58 s). take() reads only the chunks holding its rows, whatever the page size.
+    // Each page's row count is sized from the bytes per row the previous page measured, instead of
+    // trying 32,768 rows and halving: with 32 KiB rows that built ~1 GB before the first page fit.
     constexpr std::size_t kMaxValueBytes = std::size_t{8} << 20U;
-    constexpr std::size_t kLargeRowPageBytes = std::size_t{32} << 10U;
+    constexpr std::size_t kLargeRowPageBytes = std::size_t{1} << 20U;
     constexpr std::size_t kLargeRowBytes = std::size_t{4} << 10U;
     constexpr std::uint64_t kMaxRowsPerPage = 32768U;
     column.encoding = column_encoding_bytes();
