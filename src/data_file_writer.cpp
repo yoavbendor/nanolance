@@ -1275,7 +1275,10 @@ std::vector<std::uint8_t> item_value_encoding(ItemEncoding encoding, const Lance
 bool gather_chunk_values(const LanceField& field, const ColumnValues& values, ItemEncoding encoding,
                          const std::vector<std::uint64_t>& items, std::size_t first, std::size_t count,
                          std::vector<std::uint8_t>& out, std::string& error) {
-    out.clear();
+    // Appended to `out` (a page's payload, at a chunk's value section): gathering into a scratch
+    // buffer that zero-filled first and was copied into the payload after was a third of a binary
+    // column's write.
+    const auto base = out.size();
     if (encoding == ItemEncoding::kVariable) {
         const bool large = values.variable.large;
         const auto width = static_cast<std::size_t>(large ? 8U : 4U);
@@ -1306,22 +1309,40 @@ bool gather_chunk_values(const LanceField& field, const ColumnValues& values, It
             error = "a list chunk's strings exceed 4 GiB";
             return false;
         }
-        out.resize(static_cast<std::size_t>(total));
+        out.reserve(base + static_cast<std::size_t>(total) + 8U);
+        out.resize(base + header);  // the offsets; the bytes are appended after them
         std::uint64_t at = header;
         const auto put = [&](std::size_t slot) {
             if (large) {
-                std::memcpy(out.data() + slot * 8U, &at, 8U);
+                std::memcpy(out.data() + base + slot * 8U, &at, 8U);
             } else {
                 const auto narrow = static_cast<std::uint32_t>(at);
-                std::memcpy(out.data() + slot * 4U, &narrow, 4U);
+                std::memcpy(out.data() + base + slot * 4U, &narrow, 4U);
             }
         };
         put(0U);
+        const auto* bytes = values.variable.data.data();
+        bool consecutive = count != 0U;
+        for (std::size_t k = first + 1U; k < first + count && consecutive; ++k) {
+            consecutive = items[k] == items[k - 1U] + 1U;
+        }
+        if (consecutive) {
+            // A flat column's chunk (and most lists'): its values are one run of the value buffer.
+            const auto begin = offset(items[first]);
+            for (std::size_t k = 0; k < count; ++k) {
+                at = header + static_cast<std::uint64_t>(offset(items[first + k] + 1U) - begin);
+                put(k + 1U);
+            }
+            const auto end = offset(items[first + count - 1U] + 1U);
+            out.insert(out.end(), bytes + begin, bytes + end);
+            pad8(out);
+            return true;
+        }
         for (std::size_t k = 0; k < count; ++k) {
             const auto begin = offset(items[first + k]);
             const auto end = offset(items[first + k] + 1U);
             if (end > begin) {
-                std::memcpy(out.data() + at, values.variable.data.data() + begin, static_cast<std::size_t>(end - begin));
+                out.insert(out.end(), bytes + begin, bytes + end);
             }
             at += static_cast<std::uint64_t>(end - begin);
             put(k + 1U);
@@ -1346,10 +1367,10 @@ bool gather_chunk_values(const LanceField& field, const ColumnValues& values, It
     }
     if (encoding == ItemEncoding::kBool) {
         // Flat(1): the items' bits, LSB first -- the same packing a flat bool page uses.
-        out.assign((count + 7U) / 8U, 0U);
+        out.resize(base + (count + 7U) / 8U, 0U);
         for (std::size_t k = 0; k < count; ++k) {
             if (data[items[first + k]] != 0U) {
-                out[k >> 3U] |= static_cast<std::uint8_t>(1U << (k & 7U));
+                out[base + (k >> 3U)] |= static_cast<std::uint8_t>(1U << (k & 7U));
             }
         }
         return true;
@@ -1370,10 +1391,12 @@ bool gather_chunk_values(const LanceField& field, const ColumnValues& values, It
         chunk = gathered.data();
     }
     if (encoding == ItemEncoding::kBitpacked) {
-        build_bitpacked_chunk(chunk, count, width, out);
+        thread_local std::vector<std::uint8_t> packed;
+        build_bitpacked_chunk(chunk, count, width, packed);
+        out.insert(out.end(), packed.begin(), packed.end());
         return true;
     }
-    out.assign(chunk, chunk + count * width);
+    out.insert(out.end(), chunk, chunk + count * width);
     return true;
 }
 
@@ -1616,7 +1639,13 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
     constexpr std::size_t kValuesPerChunk = 1024U;  // 2^10: the log in every non-final chunk's word
     constexpr std::size_t kMaxChunkLevelBytes = 65535U;
     too_big = false;
-    page = NestedPageBuffers{};
+    // Emptied, not replaced: the caller reuses one set across pages, and keeping the capacity saves
+    // faulting a fresh payload in for every page.
+    page.control.clear();
+    page.payload.clear();
+    page.dictionary.clear();
+    page.rep_index.clear();
+    page.descriptor.clear();
     const auto encoding = item_encoding_for(field, values);
     std::vector<std::string_view> distinct;
     std::vector<std::uint32_t> indices;
@@ -1650,6 +1679,37 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
     std::vector<std::uint8_t> value_bytes;
     std::vector<std::uint64_t> rep_index;
     const auto num_chunks = std::max<std::size_t>(1U, (ser.items.size() + kValuesPerChunk - 1U) / kValuesPerChunk);
+    {
+        // The payload in one allocation: values (an upper bound for bit-packed ones), levels, and a
+        // chunk header and padding apiece. Growing it chunk by chunk re-copied it every doubling.
+        std::size_t estimate = num_chunks * 64U + (ser.has_rep ? num_levels * 2U : 0U) +
+                               (ser.has_def ? num_levels * 2U : 0U);
+        if (encoding == ItemEncoding::kVariable && !dictionary) {
+            const auto& v = fsst ? fsst_values : values;
+            const auto& its = fsst ? fsst_items : ser.items;
+            const bool large = v.variable.large;
+            const auto* raw = v.variable.offsets.data();
+            const auto entries = v.variable.offsets.size() / (large ? 8U : 4U);
+            const auto at = [&](std::uint64_t i) -> std::uint64_t {
+                if (large) {
+                    std::uint64_t x = 0;
+                    std::memcpy(&x, raw + i * 8U, 8U);
+                    return x;
+                }
+                std::uint32_t x = 0;
+                std::memcpy(&x, raw + i * 4U, 4U);
+                return x;
+            };
+            for (const auto item : its) {
+                if (item + 1U < entries) {
+                    estimate += static_cast<std::size_t>(at(item + 1U) - at(item)) + (large ? 8U : 4U);
+                }
+            }
+        } else if (encoding != ItemEncoding::kBool) {
+            estimate += ser.items.size() * std::max<std::size_t>(4U, lance_logical_type_value_bytes(field.logical_type));
+        }
+        page.payload.reserve(estimate);
+    }
     for (std::size_t c = 0; c < num_chunks; ++c) {
         const bool last = c + 1U == num_chunks;
         const auto values_here = last ? ser.items.size() - item_at : kValuesPerChunk;
@@ -1681,12 +1741,10 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
             // The chunk holds its items' dictionary indices, bit-packed like any u32 column.
             build_bitpacked_chunk(reinterpret_cast<const std::uint8_t*>(indices.data() + item_at), values_here, 4U,
                                   value_bytes);
-        } else if (!gather_chunk_values(field, fsst ? fsst_values : values, encoding, fsst ? fsst_items : ser.items,
-                                        item_at, values_here, value_bytes, error)) {
-            return false;
         }
         // Chunk: [u16 levels][u16 rep bytes][u16 def bytes][u32 value bytes] padded to 8, then each
-        // buffer padded to 8.
+        // buffer padded to 8. Values other than dictionary indices are gathered in place, after the
+        // levels, and their size patched into the header.
         const auto chunk_start = page.payload.size();
         auto& chunk = page.payload;
         append_le16(chunk, static_cast<std::uint16_t>(ser.has_rep || ser.has_def ? chunk_levels : 0U));
@@ -1696,7 +1754,8 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
         if (ser.has_def) {
             append_le16(chunk, static_cast<std::uint16_t>(def_bytes.size()));
         }
-        append_le32(chunk, static_cast<std::uint32_t>(value_bytes.size()));
+        const auto value_size_at = chunk.size();
+        append_le32(chunk, 0U);
         pad8(chunk);
         if (ser.has_rep) {
             chunk.insert(chunk.end(), rep_bytes.begin(), rep_bytes.end());
@@ -1706,7 +1765,15 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
             chunk.insert(chunk.end(), def_bytes.begin(), def_bytes.end());
             pad8(chunk);
         }
-        chunk.insert(chunk.end(), value_bytes.begin(), value_bytes.end());
+        const auto values_at = chunk.size();
+        if (dictionary) {
+            chunk.insert(chunk.end(), value_bytes.begin(), value_bytes.end());
+        } else if (!gather_chunk_values(field, fsst ? fsst_values : values, encoding, fsst ? fsst_items : ser.items,
+                                        item_at, values_here, chunk, error)) {
+            return false;
+        }
+        const auto value_size = static_cast<std::uint32_t>(chunk.size() - values_at);
+        std::memcpy(chunk.data() + value_size_at, &value_size, 4U);  // little-endian, as append_le32
         pad8(chunk);
         const auto footprint = chunk.size() - chunk_start;
         const std::uint32_t log_values = last ? 0U : 10U;
