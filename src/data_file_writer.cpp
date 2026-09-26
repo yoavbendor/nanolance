@@ -1483,6 +1483,74 @@ bool plan_item_dictionary(const ColumnValues& values, const std::vector<std::uin
     ids.reserve(std::min<std::size_t>(items.size(), 4096U));
     std::uint64_t plain_bytes = 0;
     std::uint64_t dict_bytes = 0;
+    const auto limit = std::min<std::size_t>(kMaxDistinct, items.size() / 2U);
+    // With threads to spare: each part of the items builds its own dictionary (first-appearance
+    // order within the part), then the parts are merged in order -- which is exactly the whole page's
+    // first-appearance order -- and the indices remapped. Declining when the distinct count passes
+    // the limit is the same test on the merged count, since that count only grows.
+    constexpr std::size_t kItemsPerPart = 16384U;
+    const auto parts = std::min<std::size_t>(parallel::threads(), items.size() / kItemsPerPart);
+    if (parts > 1U) {
+        struct Part {
+            std::unordered_map<std::string_view, std::uint32_t> ids;
+            std::vector<std::string_view> distinct;
+            std::uint64_t plain_bytes = 0;
+            bool over = false;
+        };
+        std::vector<Part> part(parts);
+        std::vector<std::size_t> first(parts + 1U);
+        for (std::size_t k = 0; k <= parts; ++k) {
+            first[k] = items.size() * k / parts;
+        }
+        indices.resize(items.size());
+        parallel::for_each(parts, [&](std::size_t k) {
+            auto& p = part[k];
+            p.ids.reserve(4096U);
+            for (auto j = first[k]; j < first[k + 1U]; ++j) {
+                const auto value = value_at(items[j]);
+                p.plain_bytes += value.size() + 4U;
+                const auto [it, inserted] = p.ids.try_emplace(value, static_cast<std::uint32_t>(p.distinct.size()));
+                if (inserted) {
+                    p.distinct.push_back(value);
+                    if (p.distinct.size() > limit) {
+                        p.over = true;
+                        return;
+                    }
+                }
+                indices[j] = it->second;
+            }
+        });
+        std::vector<std::vector<std::uint32_t>> remap(parts);
+        for (std::size_t k = 0; k < parts; ++k) {
+            if (part[k].over) {
+                distinct.clear();
+                indices.clear();
+                return false;
+            }
+            plain_bytes += part[k].plain_bytes;
+            remap[k].resize(part[k].distinct.size());
+            for (std::size_t d = 0; d < part[k].distinct.size(); ++d) {
+                const auto value = part[k].distinct[d];
+                const auto [it, inserted] = ids.try_emplace(value, static_cast<std::uint32_t>(distinct.size()));
+                if (inserted) {
+                    distinct.push_back(value);
+                    dict_bytes += value.size() + 4U;
+                    if (distinct.size() > limit) {
+                        distinct.clear();
+                        indices.clear();
+                        return false;
+                    }
+                }
+                remap[k][d] = it->second;
+            }
+        }
+        parallel::for_each(parts, [&](std::size_t k) {
+            for (auto j = first[k]; j < first[k + 1U]; ++j) {
+                indices[j] = remap[k][indices[j]];
+            }
+        });
+    }
+    if (parts <= 1U) {
     indices.reserve(items.size());
     for (const auto i : items) {
         const auto value = value_at(i);
@@ -1498,6 +1566,7 @@ bool plan_item_dictionary(const ColumnValues& values, const std::vector<std::uin
             }
         }
         indices.push_back(it->second);
+    }
     }
     std::uint32_t index_bits = 1;
     while (index_bits < 32U && (std::uint64_t{1} << index_bits) < distinct.size()) {
@@ -1610,13 +1679,65 @@ bool plan_item_fsst(const fsst::Encoder& encoder, const ColumnValues& values, co
         }
     };
     put(0U, 0U);
+    // With threads to spare, the items in parts compressed side by side (a string column's write
+    // was 70% here): part k compresses into its own worst-case region of the scratch -- twice the
+    // raw bytes before it -- with offsets relative to that region, and a pass after closes the gaps
+    // and rebases the offsets. The same bytes as one thread.
+    constexpr std::size_t kItemsPerPart = 4096U;
+    const auto parts = std::min<std::size_t>(parallel::threads(), items.size() / kItemsPerPart);
     std::size_t at = 0;
-    std::size_t slot = 0;
-    for (const auto i : items) {
-        const auto begin = variable_offset(values, i);
-        const auto size = static_cast<std::size_t>(variable_offset(values, i + 1U) - begin);
-        at += fsst::compress_into(encoder, values.variable.data.data() + begin, size, scratch.data() + at);
-        put(++slot, at);
+    if (parts <= 1U) {
+        std::size_t slot = 0;
+        for (const auto i : items) {
+            const auto begin = variable_offset(values, i);
+            const auto size = static_cast<std::size_t>(variable_offset(values, i + 1U) - begin);
+            at += fsst::compress_into(encoder, values.variable.data.data() + begin, size, scratch.data() + at);
+            put(++slot, at);
+        }
+    } else {
+        std::vector<std::size_t> first(parts + 1U);   // items of part k: [first[k], first[k+1])
+        std::vector<std::size_t> region(parts + 1U);  // where part k compresses to
+        std::vector<std::size_t> written(parts);
+        for (std::size_t k = 0; k <= parts; ++k) {
+            first[k] = items.size() * k / parts;
+        }
+        std::size_t raw_before = 0;
+        for (std::size_t k = 0; k < parts; ++k) {
+            region[k] = 2U * raw_before;
+            for (auto j = first[k]; j < first[k + 1U]; ++j) {
+                raw_before += static_cast<std::size_t>(variable_offset(values, items[j] + 1U) -
+                                                       variable_offset(values, items[j]));
+            }
+        }
+        auto* dst = scratch.data();
+        parallel::for_each(parts, [&](std::size_t k) {
+            std::size_t local = 0;
+            for (auto j = first[k]; j < first[k + 1U]; ++j) {
+                const auto begin = variable_offset(values, items[j]);
+                const auto size = static_cast<std::size_t>(variable_offset(values, items[j] + 1U) - begin);
+                local += fsst::compress_into(encoder, values.variable.data.data() + begin, size,
+                                             dst + region[k] + local);
+                put(j + 1U, local);
+            }
+            written[k] = local;
+        });
+        for (std::size_t k = 0; k < parts; ++k) {
+            if (region[k] != at) {
+                std::memmove(dst + at, dst + region[k], written[k]);
+            }
+            for (auto j = first[k]; j < first[k + 1U]; ++j) {
+                std::uint64_t local = 0;
+                if (large) {
+                    std::memcpy(&local, offsets + (j + 1U) * 8U, 8U);
+                } else {
+                    std::int32_t narrow = 0;
+                    std::memcpy(&narrow, offsets + (j + 1U) * 4U, 4U);
+                    local = static_cast<std::uint64_t>(narrow);
+                }
+                put(j + 1U, at + local);
+            }
+            at += written[k];
+        }
     }
     packed.variable.data.assign(scratch.data(), scratch.data() + at);
     return (at + fsst::kSymbolTableBytes) * 10U < raw * 9U;
