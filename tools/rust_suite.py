@@ -166,9 +166,17 @@ def run(crate: str, src: Path, shim_dir: Path, log: Path, name_filter: str | Non
         print(proc.stdout[-6000:])
         sys.exit("cargo test did not run")
     if "test result:" not in proc.stdout:
-        # The test binary died (a crash inside nanolance takes the process with it).
-        print(proc.stdout[-4000:])
-        sys.exit("the test binary did not finish: a crash? (rerun with --filter and --threads 1 to find it)")
+        # The test binary died: a crash inside nanolance takes the process with it. Run the tests again
+        # one at a time, where libtest names each test before running it, to say which one it was.
+        print(proc.stdout[-3000:])
+        Path(env["NANOLANCE_RUST_TMP"]).mkdir(parents=True, exist_ok=True)
+        again = subprocess.run(cmd[:cmd.index("--") + 1] + ([name_filter] if name_filter else []) +
+                               ["--test-threads", "1"], cwd=src, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True)
+        started = [line for line in again.stdout.splitlines() if line.startswith("test ")]
+        last = started[-1] if started else "(none)"
+        print(again.stdout[-3000:])
+        sys.exit(f"the test binary crashed; run one test at a time, it died in: {last}")
     return results
 
 

@@ -15,9 +15,9 @@ one core and both on all cores. A regression is
     shared runner's scheduling is most of the time (a 0.3 ms write fell 3x on every CI run with no
     code change);
   * a geometric mean over data types below --mean-floor x its baseline (default 0.75), for the
-    all-cores metrics only when the machine has the baseline's core count (on another one, the
-    all-cores ratios measure the machine: the 4-core baseline's 2.9x write mean is 2.0x on every
-    CI runner, commit after commit).
+    all-cores metrics only on the baseline's machine (the same CPU and core count). On another one
+    the all-cores ratios measure the machine: the baseline's 2.9x write mean is 2.0x on every CI
+    runner, a 4-core machine too, commit after commit.
 
 The floors are loose on purpose: a CI runner is noisy, has another core count, and runs the quick
 matrix (a tenth of the rows). What they catch is a real step back -- a fast path gone, a page
@@ -85,7 +85,11 @@ def compare(base, new, dataset_floor, mean_floor, min_ms=0.0):
             if fell and all(f[3] for f in fell):
                 detail = ", ".join(f"{m} {n:.2f}x (baseline {b:.2f}x)" for m, b, n, _ in fell)
                 problems.append(f"{name}: {op} fell below {dataset_floor}x its baseline everywhere: {detail}")
-    same_cores = base.get("environment", {}).get("cores") == new.get("environment", {}).get("cores")
+    # The same machine, as far as the environment says: all-cores ratios depend on the cores and on
+    # how they share memory -- a 4-core CI runner reads 2.0x on the write mean where the 4-core
+    # machine the baseline came from reads 2.9x, run after run.
+    be, ne = base.get("environment", {}), new.get("environment", {})
+    same_cores = be.get("cores") == ne.get("cores") and be.get("cpu") == ne.get("cpu")
     for metric, (what, rust, nl) in METRICS.items():
         pairs = []
         for name in N:
@@ -99,7 +103,7 @@ def compare(base, new, dataset_floor, mean_floor, min_ms=0.0):
         gb, gn = geomean([b for b, _ in pairs]), geomean([n for _, n in pairs])
         lines.append(f"{metric:18s} baseline {gb:5.2f}x  now {gn:5.2f}x  ({len(pairs)} data types)")
         if metric.endswith("all cores") and not same_cores:
-            lines[-1] += "  (informational: another core count than the baseline's)"
+            lines[-1] += "  (informational: another machine than the baseline's)"
         elif gn < mean_floor * gb:
             problems.append(f"{metric}: mean {gn:.2f}x Rust, baseline {gb:.2f}x (floor {mean_floor * gb:.2f}x)")
     return problems, lines
