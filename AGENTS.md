@@ -259,6 +259,24 @@ Reads, takes and writes run on several threads (`src/parallel.cpp`; README "Thre
   over a few datasets, `--write` and `--take` included, is the check for the pool itself.
 - **A write memory budget turns column-parallel writes off** (edge devices: resident bytes first).
 
+## 6b. Guarding performance and real-data findings
+
+A fix for a slowdown or a bloat needs a test that fails when it is undone -- a correctness test
+still passes when the rows come back right but slowly. Don't time it (CI machines are noisy):
+
+- **Guard the work, not the clock.** `nanolance._work_stats()` / `nano_lance_work_stats()` count bytes
+  read and the largest read, page windows, the row ranges a read was cut into, bytes a write buffered,
+  buffer-pool and take-cache hits. Add the bound to `bindings/python/tests/test_work_guards.py`, set
+  from the measured value with room to spare, then undo the fix locally and watch the guard fail.
+  A new kind of work gets a new counter (`include/nanolance/work_stats.hpp`).
+- **Keep the shape that found it.** A bug found on real data gets a focused test and, if its shape is
+  new, a place in `test_training_shapes.py` (COCO- and Speech-Commands-shaped tables, both writers,
+  1 and 4 threads). `test_real_datasets.py` reruns the checks on the real files when
+  `NANOLANCE_DATASETS` points at them (`tools/bench_multimodal.py` lists the downloads).
+- **The matrix is checked in CI** as ratios to Rust Lance (`tools/bench_compare.py` against
+  `bench/results/matrix-quick.json`). A change that moves performance on purpose regenerates it:
+  `python tools/bench_matrix.py --quick --runs 3 --out bench/results/matrix-quick.json`.
+
 ## 7. When adding a new Lance encoding (how this codebase does it)
 
 1. Find the authoritative format in the Lance Rust source (`protos/encodings_v2_1.proto` for the

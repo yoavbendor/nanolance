@@ -50,6 +50,15 @@ jobs:
         working-directory: bindings/python
         run: pytest -m "not bench"
 
+      # The same suite with every read cut into 1 KiB row ranges on 8 threads: every page of every
+      # column split mid-page, the path a large read takes on a many-core machine (AGENTS.md 6a).
+      - name: Run pytest under the parallel-read stress setting
+        working-directory: bindings/python
+        env:
+          NANOLANCE_THREADS: "8"
+          NANOLANCE_MORSEL_KB: "1"
+        run: pytest -m "not bench" -q
+
       - name: Run benchmark smoke (informational)
         working-directory: bindings/python
         run: pytest -m bench

@@ -388,6 +388,18 @@ def get_threads() -> int:
     return int(_nanolance.get_threads())
 
 
+def _work_stats() -> dict:
+    """Counters of the work nanolance did since the last :func:`_reset_work_stats`: bytes read from
+    data files and the largest single read, page windows decoded, row ranges reads were cut into,
+    bytes column-parallel writes buffered, buffer-pool and take-cache hits. For tests that guard how a
+    result was produced; not a stable API."""
+    return dict(_nanolance._work_stats())
+
+
+def _reset_work_stats() -> None:
+    _nanolance._reset_work_stats()
+
+
 __all__ = [
     "write_table",
     "read_table",

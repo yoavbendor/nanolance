@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/buffer_pool.hpp"
+#include "nanolance/work_stats.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -73,6 +74,9 @@ std::vector<std::uint8_t> take(std::size_t bytes) {
         out = std::move(it->second.second);
         p.buffers.erase(it);
         out.clear();
+        work_stats::add(work_stats::counters().buffer_pool_hits, 1U);
+    } else {
+        work_stats::add(work_stats::counters().buffer_pool_misses, 1U);
     }
     p.evict(0);
     return out;

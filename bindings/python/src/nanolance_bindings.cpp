@@ -436,6 +436,24 @@ NB_MODULE(_nanolance, m) {
           "Threads nanolance may use (1: all work on the calling thread; 0: the default).");
     m.def("get_threads", [] { return nano_lance_threads(); },
           "Threads nanolance may use: set_threads, else NANOLANCE_THREADS, else the CPUs available.");
+    m.def("_work_stats", [] {
+        NanoLanceWorkStats w{};
+        nano_lance_work_stats(&w);
+        nb::dict d;
+        d["data_bytes_read"] = w.data_bytes_read;
+        d["data_reads"] = w.data_reads;
+        d["largest_read"] = w.largest_read;
+        d["page_windows"] = w.page_windows;
+        d["read_morsels"] = w.read_morsels;
+        d["fragment_reads"] = w.fragment_reads;
+        d["parallel_column_writes"] = w.parallel_column_writes;
+        d["write_buffered_bytes"] = w.write_buffered_bytes;
+        d["buffer_pool_hits"] = w.buffer_pool_hits;
+        d["buffer_pool_misses"] = w.buffer_pool_misses;
+        d["take_cache_hits"] = w.take_cache_hits;
+        return d;
+    }, "Counters of the work done since the last reset (tests and diagnostics; not a stable API).");
+    m.def("_reset_work_stats", [] { nano_lance_reset_work_stats(); });
     m.def("open_stream", &read_table_stream, nb::arg("path"), nb::arg("columns") = nb::none(),
           nb::arg("offset") = 0, nb::arg("length") = -1,
           "Open a Lance dataset as a streaming Arrow handle: one batch decoded per pull, so peak "

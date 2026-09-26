@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/work_stats.hpp"
 
 #include "nanolance/read_safety.hpp"
 
@@ -276,6 +277,12 @@ bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::ui
     }
     out.resize(static_cast<std::size_t>(size));
     in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(size));
+    {
+        auto& stats = work_stats::counters();
+        work_stats::add(stats.data_bytes_read, size);
+        work_stats::add(stats.data_reads, 1U);
+        work_stats::raise_to(stats.largest_read, size);
+    }
     if (!in || static_cast<std::uint64_t>(in.gcount()) != size) {
         error = "failed to read data file byte range";
         // The stream's position is now wherever the short read left it, and `in` is in a failed state

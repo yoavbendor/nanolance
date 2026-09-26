@@ -3,6 +3,7 @@
 
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/parallel.hpp"
+#include "nanolance/work_stats.hpp"
 #include "nanolance/nano_lance_reader.h"
 
 #include <cerrno>
@@ -446,3 +447,24 @@ extern "C" void nano_lance_table_read_result_free(struct ArrowSchema* schema, st
 void nano_lance_set_threads(size_t threads) { nano_lance::parallel::set_threads(threads); }
 
 size_t nano_lance_threads(void) { return nano_lance::parallel::threads(); }
+
+void nano_lance_work_stats(NanoLanceWorkStats* out) {
+    if (out == nullptr) {
+        return;
+    }
+    const auto& c = nano_lance::work_stats::counters();
+    const auto get = [](const std::atomic<std::uint64_t>& x) { return x.load(std::memory_order_relaxed); };
+    out->data_bytes_read = get(c.data_bytes_read);
+    out->data_reads = get(c.data_reads);
+    out->largest_read = get(c.largest_read);
+    out->page_windows = get(c.page_windows);
+    out->read_morsels = get(c.read_morsels);
+    out->fragment_reads = get(c.fragment_reads);
+    out->parallel_column_writes = get(c.parallel_column_writes);
+    out->write_buffered_bytes = get(c.write_buffered_bytes);
+    out->buffer_pool_hits = get(c.buffer_pool_hits);
+    out->buffer_pool_misses = get(c.buffer_pool_misses);
+    out->take_cache_hits = get(c.take_cache_hits);
+}
+
+void nano_lance_reset_work_stats(void) { nano_lance::work_stats::reset(); }

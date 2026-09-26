@@ -84,6 +84,17 @@ jobs:
         run: |
           python3 tools/bench.py | tee /tmp/bench.txt
 
+      # nanolance against Rust Lance on the 27-type matrix (a tenth of the rows), compared as ratios
+      # to Rust measured in the same run with bench/results/matrix-quick.json: fails on any wrong or
+      # missing read, a data type twice as slow relative to Rust on one core and on all cores, or a
+      # mean 25% down (tools/bench_compare.py).
+      - name: Benchmark matrix (quick) + regression check
+        run: |
+          python3 -m pip install --quiet --break-system-packages ./bindings/python numpy \
+            || python3 -m pip install --quiet ./bindings/python numpy
+          python3 tools/bench_matrix.py --quick --runs 3 --out /tmp/matrix-quick.json
+          python3 tools/bench_compare.py bench/results/matrix-quick.json /tmp/matrix-quick.json
+
       - name: Profile native read (callgrind on pcap_ref)
         run: |
           DS=/tmp/nlb/pcap_ref_nl.lance

@@ -151,12 +151,14 @@ bool slice_leaf(ColumnValues& values, std::uint64_t first, std::uint64_t count, 
     switch (values.kind) {
         case ColumnValues::Kind::FixedWidth: {
             if (!values.fixed.empty()) {
+                // In place: a copy would drop the buffer's capacity, which the buffer pool hands the
+                // next read (a parallel read slices every row range it decodes).
                 const auto begin = static_cast<std::size_t>(first) * value_bytes;
                 const auto bytes = static_cast<std::size_t>(count) * value_bytes;
-                std::vector<std::uint8_t> sliced(values.fixed.begin() + static_cast<std::ptrdiff_t>(begin),
-                                                 values.fixed.begin() +
-                                                     static_cast<std::ptrdiff_t>(begin + bytes));
-                values.fixed = std::move(sliced);
+                if (begin != 0U && bytes != 0U) {
+                    std::memmove(values.fixed.data(), values.fixed.data() + begin, bytes);
+                }
+                values.fixed.resize(bytes);
             }
             break;
         }
@@ -166,17 +168,19 @@ bool slice_leaf(ColumnValues& values, std::uint64_t first, std::uint64_t count, 
             const auto data_begin = read_offset(values.variable.offsets, first, large);
             const auto data_end = read_offset(values.variable.offsets, first + count, large);
 
-            std::vector<std::uint8_t> offsets((count + 1U) * offset_width);
+            // In place, front to back: offset i is read (at first + i) before slot i is written.
+            auto& offsets = values.variable.offsets;
             for (std::uint64_t i = 0; i <= count; ++i) {
-                const auto raw = read_offset(values.variable.offsets, first + i, large);
-                write_offset(offsets.data() + static_cast<std::size_t>(i) * offset_width,
-                             raw - data_begin, large);
+                const auto raw = read_offset(offsets, first + i, large);
+                write_offset(offsets.data() + static_cast<std::size_t>(i) * offset_width, raw - data_begin, large);
             }
-            std::vector<std::uint8_t> data(
-                values.variable.data.begin() + static_cast<std::ptrdiff_t>(data_begin),
-                values.variable.data.begin() + static_cast<std::ptrdiff_t>(data_end));
-            values.variable.offsets = std::move(offsets);
-            values.variable.data = std::move(data);
+            offsets.resize(static_cast<std::size_t>(count + 1U) * offset_width);
+            auto& data = values.variable.data;
+            const auto data_bytes = static_cast<std::size_t>(data_end - data_begin);
+            if (data_begin != 0U && data_bytes != 0U) {
+                std::memmove(data.data(), data.data() + data_begin, data_bytes);
+            }
+            data.resize(data_bytes);
             break;
         }
         case ColumnValues::Kind::BlobV2External: {

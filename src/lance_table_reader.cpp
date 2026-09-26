@@ -12,6 +12,7 @@
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/parallel.hpp"
+#include "nanolance/work_stats.hpp"
 #include "nanolance/path_safety.hpp"
 #include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
@@ -1328,6 +1329,8 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
         phys_end = std::max(phys_end, phys_first);
     }
     const auto morsels = plan_morsels(columns, phys_first, phys_end);
+    work_stats::add(work_stats::counters().fragment_reads, 1U);
+    work_stats::add(work_stats::counters().read_morsels, morsels.size());
     const bool whole = morsels.size() == 1U && phys_first == 0U && phys_end == physical;
 
     // Decode: every (morsel, column) is its own task.

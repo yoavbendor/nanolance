@@ -3,6 +3,7 @@
 
 #include "nanolance/data_file_writer.hpp"
 #include "nanolance/parallel.hpp"
+#include "nanolance/work_stats.hpp"
 
 #include "lance_minimal.pb.hpp"
 #include "nanolance/blob_v2_external.hpp"
@@ -2991,7 +2992,9 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 return false;
             }
         }
+        work_stats::add(work_stats::counters().parallel_column_writes, 1U);
         for (auto& e : encoded) {
+            work_stats::add(work_stats::counters().write_buffered_bytes, e.bytes.data().size());
             align64(out);
             const auto base = pos(out);
             const auto& bytes = e.bytes.data();

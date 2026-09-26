@@ -3,6 +3,7 @@
 
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/buffer_pool.hpp"
+#include "nanolance/work_stats.hpp"
 
 #include "nanolance/page_layout.hpp"
 
@@ -3962,6 +3963,7 @@ std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::p
         const std::lock_guard<std::mutex> lock(mutex);
         const auto it = cache.find(key);
         if (it != cache.end() && it->second.size == size && it->second.mtime == mtime) {
+            work_stats::add(work_stats::counters().take_cache_hits, 1U);
             return it->second.values;
         }
     }
@@ -4137,6 +4139,7 @@ bool take_windows(const std::filesystem::path& path, const pb::ColumnMetadata& c
             subset.pages.push_back(std::move(part));
             windows.push_back(std::move(window));
             first_row.push_back(before[first]);
+            work_stats::add(work_stats::counters().page_windows, 1U);
             page_of.push_back(p);
         }
     }
@@ -4194,6 +4197,7 @@ void append_page_windows(const MiniBlockPageIndex& index, const pb::ColumnPage& 
         subset.pages.push_back(std::move(part));
         windows.push_back(std::move(window));
         keep_rows.emplace_back(a - before[first], b - before[first]);
+        work_stats::add(work_stats::counters().page_windows, 1U);
         cut = next;
     }
 }
@@ -4573,6 +4577,7 @@ bool decode_lance_physical_column_range(const std::filesystem::path& data_file_p
                 part.buffer_sizes[1] = index->byte_start[c1] - index->byte_start[c0];
                 part.length = before[c1] - before[c0];
                 part_first = before[c0];
+                work_stats::add(work_stats::counters().page_windows, 1U);
             }
             if (subset.pages.empty()) {
                 subset_first = page_begin + part_first;

@@ -103,6 +103,26 @@ void nano_lance_set_threads(size_t threads);
 /// The current thread count (see nano_lance_set_threads).
 size_t nano_lance_threads(void);
 
+/// Counters of the work done since the last reset, process-wide: what a test asserts to guard HOW a
+/// result was produced (a take reading a few MB, not the page; a column-parallel write that did or did
+/// not buffer). For tests and diagnostics; the fields may change between versions.
+typedef struct NanoLanceWorkStats {
+    uint64_t data_bytes_read;
+    uint64_t data_reads;
+    uint64_t largest_read;
+    uint64_t page_windows;
+    uint64_t read_morsels;
+    uint64_t fragment_reads;
+    uint64_t parallel_column_writes;
+    uint64_t write_buffered_bytes;
+    uint64_t buffer_pool_hits;
+    uint64_t buffer_pool_misses;
+    uint64_t take_cache_hits;
+} NanoLanceWorkStats;
+
+void nano_lance_work_stats(NanoLanceWorkStats* out);
+void nano_lance_reset_work_stats(void);
+
 /// Cumulative block-cache hit/miss counters since process start (both 0 when no cache is active). Pass
 /// nullptr to skip either output.
 void nano_lance_block_cache_stats(uint64_t* out_hits, uint64_t* out_misses);
