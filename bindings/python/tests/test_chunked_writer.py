@@ -69,11 +69,19 @@ def test_read_is_chunked_per_fragment(tmp_path):
         for chunk_id in range(4):
             w.write_batch(_make_batch(SCHEMA, chunk_id, 1_000))
 
-    # The read handle exports an Arrow C stream that yields one batch per fragment,
-    # so a consumer can process it chunk by chunk without materializing one array.
-    reader = pa.RecordBatchReader.from_stream(nanolance.read_table(path))
-    batches = list(reader)
+    # The read handle exports an Arrow C stream that yields one batch per fragment (on one thread;
+    # with more, possibly several per fragment), so a consumer can process it chunk by chunk
+    # without materializing one array.
+    threads = nanolance.get_threads()
+    try:
+        nanolance.set_threads(1)
+        batches = list(pa.RecordBatchReader.from_stream(nanolance.read_table(path)))
+    finally:
+        nanolance.set_threads(threads)
     assert len(batches) == 4
+    assert sum(b.num_rows for b in batches) == 4_000
+    batches = list(pa.RecordBatchReader.from_stream(nanolance.read_table(path)))
+    assert len(batches) >= 4
     assert sum(b.num_rows for b in batches) == 4_000
 
 

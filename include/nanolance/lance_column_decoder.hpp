@@ -30,4 +30,16 @@ bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_pa
                                        const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
                                        ColumnValues& out, std::string& error);
 
+/// Can a page give up a row range without being decoded whole? A list page with a repetition index
+/// (only the chunks holding the rows), or a FullZip page of large values (only the rows).
+bool lance_page_row_addressable(const pb::ColumnPage& page);
+
+/// Rows [first, first + count) of one column: the pages the range touches, decoded and trimmed --
+/// for a list page with a repetition index, only the chunks holding those rows. How a parallel read
+/// splits a fragment into row ranges it decodes independently (lance_table_reader.cpp).
+bool decode_lance_physical_column_range(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                                        const pb::ColumnMetadata& column_metadata, std::uint64_t first,
+                                        std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
+                                        std::string& error);
+
 }  // namespace nano_lance

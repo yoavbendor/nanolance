@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/lance_table_reader.hpp"
+#include "nanolance/parallel.hpp"
 #include "nanolance/nano_lance_reader.h"
 
 #include <cerrno>
@@ -441,3 +442,7 @@ extern "C" void nano_lance_table_read_result_free(struct ArrowSchema* schema, st
     }
     std::free(batches);
 }
+
+void nano_lance_set_threads(size_t threads) { nano_lance::parallel::set_threads(threads); }
+
+size_t nano_lance_threads(void) { return nano_lance::parallel::threads(); }

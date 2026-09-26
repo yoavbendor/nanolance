@@ -432,6 +432,10 @@ NB_MODULE(_nanolance, m) {
     m.def("take", &take_rows, nb::arg("path"), nb::arg("indices"), nb::arg("columns") = nb::none(),
           "Read the rows at `indices` (ascending, distinct), reading only the fragments and pages -- for "
           "large values only the rows -- that hold them.");
+    m.def("set_threads", [](std::size_t n) { nano_lance_set_threads(n); }, nb::arg("threads"),
+          "Threads nanolance may use (1: all work on the calling thread; 0: the default).");
+    m.def("get_threads", [] { return nano_lance_threads(); },
+          "Threads nanolance may use: set_threads, else NANOLANCE_THREADS, else the CPUs available.");
     m.def("open_stream", &read_table_stream, nb::arg("path"), nb::arg("columns") = nb::none(),
           nb::arg("offset") = 0, nb::arg("length") = -1,
           "Open a Lance dataset as a streaming Arrow handle: one batch decoded per pull, so peak "

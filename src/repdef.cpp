@@ -18,7 +18,17 @@ bool is_item_layer(std::uint8_t kind) {
 /// Append one entry's validity. Every entry is valid until the first null, so the bitmap is only
 /// materialized then (`hint`: roughly how many entries the layer will have, to size it once); after
 /// that a byte is added every eighth entry.
-inline void append_bit(UnraveledLayer& layer, bool valid, std::size_t hint = 0) {
+// Called per list entry in unravel's hottest loop; left to itself the compiler outlines it (20% of a
+// list<list<int32>> read). Always inline.
+#if defined(__GNUC__) || defined(__clang__)
+#define NANOLANCE_ALWAYS_INLINE __attribute__((always_inline)) inline
+#elif defined(_MSC_VER)
+#define NANOLANCE_ALWAYS_INLINE __forceinline
+#else
+#define NANOLANCE_ALWAYS_INLINE inline
+#endif
+
+NANOLANCE_ALWAYS_INLINE void append_bit(UnraveledLayer& layer, bool valid, std::size_t hint = 0) {
     const auto at = layer.length++;
     if (layer.validity.empty()) {
         if (valid) {
@@ -192,7 +202,13 @@ bool unravel(const std::vector<std::uint16_t>& rep_in, bool has_rep, const std::
         const std::uint64_t children = out.back().length;
         std::int64_t curlen = 0;
         std::size_t write = 0;
-        layer.offsets.reserve(rep.size() + 1U);
+        // Offsets through a pointer into storage sized for the most there can be (one per level that
+        // starts a list here, plus the end), trimmed after: push_back here was not inlined, 9% of a
+        // nested read.
+        const auto starts = rep.size() - static_cast<std::size_t>(std::count(rep.begin(), rep.end(), std::uint16_t{0}));
+        layer.offsets.resize(starts + 1U);
+        auto* offsets = layer.offsets.data();
+        std::size_t n_offsets = 0;
         const std::size_t num_levels = rep.size();
         for (std::size_t read = 0; read < num_levels; ++read) {
             const auto r = rep[read];
@@ -220,31 +236,32 @@ bool unravel(const std::vector<std::uint16_t>& rep_in, bool has_rep, const std::
                 const auto d = def[read];
                 def[write] = d;
                 if (d == 0U) {
-                    layer.offsets.push_back(curlen);
+                    offsets[n_offsets++] = curlen;
                     ++curlen;
                     append_bit(layer, true, rep.size());
                 } else if (d > max_level) {
                     // An outer layer's null or empty list: no list here.
                 } else if ((null_level != 0U && d == null_level) || d > upper_null) {
-                    layer.offsets.push_back(curlen);
+                    offsets[n_offsets++] = curlen;
                     append_bit(layer, false, rep.size());
                 } else if (empty_level != 0U && d == empty_level) {
-                    layer.offsets.push_back(curlen);
+                    offsets[n_offsets++] = curlen;
                     append_bit(layer, true, rep.size());
                 } else {
                     // A valid list whose first child is null.
-                    layer.offsets.push_back(curlen);
+                    offsets[n_offsets++] = curlen;
                     ++curlen;
                     append_bit(layer, true, rep.size());
                 }
             } else {
-                layer.offsets.push_back(curlen);
+                offsets[n_offsets++] = curlen;
                 ++curlen;
                 append_bit(layer, true, rep.size());
             }
             ++write;
         }
-        layer.offsets.push_back(curlen);
+        offsets[n_offsets++] = curlen;
+        layer.offsets.resize(n_offsets);
         rep.resize(write);
         if (has_def) {
             def.resize(write);

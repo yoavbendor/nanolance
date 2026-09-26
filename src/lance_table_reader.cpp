@@ -8,14 +8,18 @@
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/deletion_vector.hpp"
 #include "nanolance/bool_bitpack.hpp"
+#include "nanolance/buffer_pool.hpp"
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
+#include "nanolance/parallel.hpp"
 #include "nanolance/path_safety.hpp"
 #include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <map>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -517,7 +521,9 @@ struct ColumnPlan {
 /// nanoarrow hands `allocator->private_data` straight back to us; it is the vector itself.
 void release_adopted_vector(struct ArrowBufferAllocator* allocator, std::uint8_t* /*ptr*/,
                             std::int64_t /*size*/) {
-    delete static_cast<std::vector<std::uint8_t>*>(allocator->private_data);
+    auto* owned = static_cast<std::vector<std::uint8_t>*>(allocator->private_data);
+    buffer_pool::give(std::move(*owned));  // large ones are kept for the next read (buffer_pool.hpp)
+    delete owned;
 }
 
 /// Hand a decoded vector's memory to `out` WITHOUT copying it.
@@ -1028,10 +1034,146 @@ struct PlannedFile {
     bool partial() const { return skip != 0U || take != rows; }
 };
 
-bool read_data_file_batch(const std::filesystem::path& dataset_path, const PlannedFile& planned,
-                          const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema, ArrowArray& batch,
-                          std::string& error,
-                          const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr) {
+/// One column of one data file, as the fragment's read decodes it.
+struct ColumnSource {
+    std::filesystem::path path;
+    const pb::Field* on_disk = nullptr;
+    const pb::ColumnMetadata* metadata = nullptr;
+    std::int32_t field_id = 0;
+    std::size_t value_bytes = 0;  // as compaction and slicing count it
+    std::uint64_t encoded_bytes = 0;
+};
+
+/// A parallel read cuts a fragment into row ranges ("morsels") of at least this many encoded bytes,
+/// decoded independently and returned as a batch each -- no concatenation afterwards.
+/// NANOLANCE_MORSEL_KB overrides it (default 2048: below that, waking threads and building more
+/// batches costs about what it saves; under 64 the tests' setting, which cuts every page).
+std::uint64_t morsel_min_bytes() {
+    static const std::uint64_t bytes = [] {
+        const char* env = std::getenv("NANOLANCE_MORSEL_KB");
+        const auto kb = env == nullptr || *env == '\0' ? 2048ULL : std::strtoull(env, nullptr, 10);
+        return std::max<std::uint64_t>(1U, kb) << 10U;
+    }();
+    return bytes;
+}
+
+/// Physical row ranges covering [first, end): one with a single thread or a small read; otherwise up
+/// to two per thread, cut at page boundaries of the column holding the most bytes (so it is split
+/// with no page decoded twice) -- or, when its pages can give up row ranges (lance_page_row_addressable),
+/// evenly. A page no cut can avoid is decoded by every morsel it overlaps, so a plan that would decode
+/// over a quarter more than the whole is halved until it does not: a column of a few large pages
+/// is not worth splitting.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vector<ColumnSource>& columns,
+                                                                  std::uint64_t first, std::uint64_t end) {
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> single{{first, end}};
+    const auto threads = parallel::threads();
+    if (threads <= 1U || end - first < 2U || columns.empty()) {
+        return single;
+    }
+    struct PageInfo {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uint64_t bytes = 0;
+        bool addressable = false;
+    };
+    std::vector<std::vector<PageInfo>> pages(columns.size());
+    std::uint64_t range_bytes = 0;  // encoded bytes of the pages the range touches
+    std::size_t heaviest = 0;
+    std::uint64_t heaviest_bytes = 0;
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        std::uint64_t row = 0;
+        std::uint64_t column_bytes = 0;
+        for (const auto& page : columns[c].metadata->pages) {
+            PageInfo info;
+            info.begin = row;
+            info.end = row + page.length;
+            row = info.end;
+            if (info.end <= first || info.begin >= end) {
+                continue;
+            }
+            for (const auto size : page.buffer_sizes) {
+                info.bytes += size;
+            }
+            info.addressable = lance_page_row_addressable(page);
+            column_bytes += info.bytes;
+            pages[c].push_back(info);
+        }
+        range_bytes += column_bytes;
+        if (column_bytes > heaviest_bytes) {
+            heaviest_bytes = column_bytes;
+            heaviest = c;
+        }
+    }
+    // Work: encoded bytes, or for fixed-width values the decoded bytes when larger (bit-packed small
+    // integers decode to four or eight times their size).
+    std::uint64_t work = 0;
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        std::uint64_t bytes = 0;
+        for (const auto& page : pages[c]) {
+            bytes += page.bytes;
+        }
+        work += std::max(bytes, (end - first) * columns[c].value_bytes);
+    }
+    auto want = std::min<std::uint64_t>(2U * threads, work / morsel_min_bytes());
+    // What a plan decodes: every overlapped page, whole unless it is row-addressable.
+    const auto cost = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& plan) {
+        double total = 0;
+        for (const auto& column : pages) {
+            for (const auto& page : column) {
+                for (const auto& [a, b] : plan) {
+                    const auto lo = std::max(a, page.begin);
+                    const auto hi = std::min(b, page.end);
+                    if (lo < hi) {
+                        total += page.addressable ? static_cast<double>(page.bytes) * static_cast<double>(hi - lo) /
+                                                        static_cast<double>(page.end - page.begin)
+                                                  : static_cast<double>(page.bytes);
+                    }
+                }
+            }
+        }
+        return total;
+    };
+    const auto& spine = pages[heaviest];
+    const bool spine_addressable =
+        std::all_of(spine.begin(), spine.end(), [](const PageInfo& p) { return p.addressable; });
+    const bool test_setting = morsel_min_bytes() < (std::uint64_t{64} << 10U);
+    for (; want > 1U; want /= 2U) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> plan;
+        std::uint64_t at = first;
+        for (std::uint64_t k = 1; k < want; ++k) {
+            std::uint64_t cut = first + (end - first) * k / want;
+            if (!spine_addressable && !test_setting) {
+                // The page boundary nearest the k-th share of the heaviest column's bytes.
+                const auto target = heaviest_bytes * k / want;
+                std::uint64_t acc = 0;
+                cut = 0;
+                for (const auto& page : spine) {
+                    acc += page.bytes;
+                    if (acc >= target) {
+                        cut = page.end;
+                        break;
+                    }
+                }
+            }
+            if (cut > at && cut < end) {
+                plan.emplace_back(at, cut);
+                at = cut;
+            }
+        }
+        plan.emplace_back(at, end);
+        // Morsels under 64 KiB are a test setting: cut evenly, through any page, whatever it costs.
+        if (plan.size() > 1U && (test_setting || cost(plan) <= 1.25 * static_cast<double>(range_bytes))) {
+            return plan;
+        }
+    }
+    return single;
+}
+
+/// One fragment's rows as Arrow batches: one batch, or with several threads one per morsel.
+bool read_data_file_batches(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                            const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
+                            std::vector<ArrowArray>& out, std::string& error,
+                            const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr) {
     if (planned.files.empty()) {
         error = "fragment has no data files";
         return false;
@@ -1041,10 +1183,16 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
     // than once per page buffer (see DataFileReadScope).
     const DataFileReadScope read_scope;
 
-    // One fragment, one batch -- however many files its columns are split across.
-    std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
+    // One fragment -- however many files its columns are split across.
+    struct OpenFile {
+        pb::FileDescriptor descriptor;
+        std::vector<pb::ColumnMetadata> columns;
+    };
+    std::vector<OpenFile> files(planned.files.size());
+    std::vector<ColumnSource> columns;
     std::int64_t length = -1;
-    for (const auto& data_file : planned.files) {
+    for (std::size_t f = 0; f < planned.files.size(); ++f) {
+        const auto& data_file = planned.files[f];
         // data_file.path is attacker-controlled (it comes out of the untrusted manifest). Confine it
         // under <dataset>/data/ so a hostile ".."/absolute path can't make the reader open a file
         // outside the dataset. The writer only ever stores a bare filename here, so legitimate
@@ -1055,13 +1203,12 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
             return false;
         }
         const auto& path = *jailed;
-        pb::FileDescriptor descriptor{};
+        auto& open = files[f];
         LanceDataFileFooterLayout layout{};
-        if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
+        if (!read_lance_data_file_footer_and_descriptor(path, open.descriptor, layout, error)) {
             return false;
         }
-        std::vector<pb::ColumnMetadata> column_metadatas;
-        if (!read_lance_data_file_column_metadatas(path, layout, column_metadatas, error)) {
+        if (!read_lance_data_file_column_metadatas(path, layout, open.columns, error)) {
             return false;
         }
         if (data_file.fields.size() != data_file.column_indices.size()) {
@@ -1071,8 +1218,8 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
         // Every file of a fragment describes the SAME rows. A disagreement means the manifest and the
         // files are out of step, and merging them would silently pad or truncate a column.
         if (length < 0) {
-            length = static_cast<std::int64_t>(descriptor.length);
-        } else if (static_cast<std::uint64_t>(length) != descriptor.length) {
+            length = static_cast<std::int64_t>(open.descriptor.length);
+        } else if (static_cast<std::uint64_t>(length) != open.descriptor.length) {
             error = "data files within one fragment disagree on their row count";
             return false;
         }
@@ -1083,30 +1230,37 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
             if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
 
             const auto column_index = data_file.column_indices[i];
-            if (column_index < 0 ||
-                static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
+            if (column_index < 0 || static_cast<std::size_t>(column_index) >= open.columns.size()) {
                 error = "data file column index out of range";
                 return false;
             }
-            const auto* on_disk = find_descriptor_field(descriptor, field_id);
+            const auto* on_disk = find_descriptor_field(open.descriptor, field_id);
             if (on_disk == nullptr) {
                 error = "data file references unknown field id";
                 return false;
             }
-            ColumnValues values;
-            if (!decode_lance_physical_column(path, *on_disk,
-                                              column_metadatas[static_cast<std::size_t>(column_index)],
-                                              values, error)) {
-                return false;
+            ColumnSource source;
+            source.path = path;
+            source.on_disk = on_disk;
+            source.metadata = &open.columns[static_cast<std::size_t>(column_index)];
+            source.field_id = field_id;
+            const auto* field = find_mapping_field(mapping, field_id);
+            source.value_bytes = field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            for (const auto& page : source.metadata->pages) {
+                for (const auto size : page.buffer_sizes) {
+                    source.encoded_bytes += size;
+                }
             }
-            decoded_by_field_id.emplace(field_id, std::move(values));
+            columns.push_back(std::move(source));
         }
     }
+    const auto physical = static_cast<std::uint64_t>(length);
 
     // Deletions first, then the row range: a range is expressed in LOGICAL row numbers, which only
     // exist once the deleted rows are gone.
+    std::vector<std::uint8_t> keep;  // empty: no deletions
     if (planned.deletion_file.present) {
-        if (static_cast<std::uint64_t>(length) != planned.physical_rows) {
+        if (physical != planned.physical_rows) {
             error = "data file holds " + std::to_string(length) +
                     " rows but the manifest claims " + std::to_string(planned.physical_rows) +
                     "; refusing to apply a deletion vector against rows that do not line up";
@@ -1116,50 +1270,131 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
         if (!read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
             return false;
         }
-        std::vector<std::uint8_t> keep(static_cast<std::size_t>(length), 1U);
+        keep.assign(static_cast<std::size_t>(physical), 1U);
         for (const auto row : deleted) {
-            if (row >= static_cast<std::uint64_t>(length)) {
+            if (row >= physical) {
                 error = "deletion file names row " + std::to_string(row) + " but the fragment holds " +
                         std::to_string(length);
                 return false;
             }
             keep[row] = 0U;
         }
-        for (auto& [field_id, values] : decoded_by_field_id) {
-            const auto* field = find_mapping_field(mapping, field_id);
-            const std::size_t value_bytes =
-                field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
-            if (!compact_column_values(values, keep, static_cast<std::uint64_t>(length), value_bytes,
-                                       error)) {
-                return false;
-            }
-        }
-        length = static_cast<std::int64_t>(planned.rows);
     }
+    const auto logical = keep.empty() ? physical
+                                      : static_cast<std::uint64_t>(std::count(keep.begin(), keep.end(), 1U));
+    // The plan's skip/take came from the MANIFEST's per-fragment row count, while the rows are here in
+    // the data file. If the two disagree, the arithmetic that decided which files to skip was wrong,
+    // and a silently misaligned row range is exactly the failure this must not have.
+    if ((planned.partial() || !keep.empty()) && logical != planned.rows) {
+        error = "data file holds " + std::to_string(logical) + " rows but the manifest claims " +
+                std::to_string(planned.rows) + "; refusing to guess which rows a range covers";
+        return false;
+    }
+    const auto want_first = planned.partial() ? planned.skip : 0U;
+    const auto want_end = planned.partial() ? planned.skip + planned.take : logical;
+    // The physical rows holding logical rows [want_first, want_end).
+    std::uint64_t phys_first = want_first;
+    std::uint64_t phys_end = want_end;
+    std::vector<std::uint64_t> logical_before;  // with deletions: logical rows before each physical row
+    if (!keep.empty()) {
+        logical_before.resize(static_cast<std::size_t>(physical) + 1U, 0U);
+        for (std::size_t r = 0; r < keep.size(); ++r) {
+            logical_before[r + 1U] = logical_before[r] + keep[r];
+        }
+        phys_first = static_cast<std::uint64_t>(
+            std::upper_bound(logical_before.begin(), logical_before.end(), want_first) - logical_before.begin() - 1);
+        phys_end = want_end == 0U ? 0U
+                                  : static_cast<std::uint64_t>(std::lower_bound(logical_before.begin(),
+                                                                                logical_before.end(), want_end) -
+                                                               logical_before.begin());
+        phys_end = std::max(phys_end, phys_first);
+    }
+    const auto morsels = plan_morsels(columns, phys_first, phys_end);
+    const bool whole = morsels.size() == 1U && phys_first == 0U && phys_end == physical;
 
-    if (planned.partial()) {
-        // The plan's skip/take came from the MANIFEST's per-fragment row count, while the rows are
-        // here in the data file. If the two disagree, the arithmetic that decided which files to skip
-        // was wrong, and a silently misaligned row range is exactly the failure this must not have.
-        if (static_cast<std::uint64_t>(length) != planned.rows) {
-            error = "data file holds " + std::to_string(length) +
-                    " rows but the manifest claims " + std::to_string(planned.rows) +
-                    "; refusing to guess which rows a range covers";
+    // Decode: every (morsel, column) is its own task.
+    const auto n_columns = columns.size();
+    std::vector<ColumnValues> decoded(morsels.size() * n_columns);
+    std::vector<std::string> errors(decoded.size());
+    parallel::for_each(decoded.size(), [&](std::size_t t) {
+        const auto& morsel = morsels[t / n_columns];
+        const auto& c = columns[t % n_columns];
+        if (whole) {
+            decode_lance_physical_column(c.path, *c.on_disk, *c.metadata, decoded[t], errors[t]);
+        } else {
+            decode_lance_physical_column_range(c.path, *c.on_disk, *c.metadata, morsel.first,
+                                               morsel.second - morsel.first, c.value_bytes, decoded[t], errors[t]);
+        }
+    });
+    for (const auto& e : errors) {
+        if (!e.empty()) {
+            error = e;
             return false;
         }
-        for (auto& [field_id, values] : decoded_by_field_id) {
-            const auto* field = find_mapping_field(mapping, field_id);
-            const std::size_t value_bytes =
-                field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
-            if (!slice_column_values(values, planned.skip, planned.take,
-                                     static_cast<std::uint64_t>(length), value_bytes, error)) {
-                return false;
-            }
-        }
-        length = static_cast<std::int64_t>(planned.take);
     }
 
-    return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id, length, batch, error);
+    // Each morsel: its deletions, its part of the range, its batch.
+    std::vector<ArrowArray> batches(morsels.size(), ArrowArray{});
+    std::vector<std::uint8_t> built(morsels.size(), 0U);
+    std::vector<std::string> batch_errors(morsels.size());
+    parallel::for_each(morsels.size(), [&](std::size_t k) {
+        auto& why = batch_errors[k];
+        const auto [p0, p1] = morsels[k];
+        std::uint64_t rows = p1 - p0;
+        std::uint64_t logical_first = p0;
+        std::unordered_map<std::int32_t, ColumnValues> by_field;
+        for (std::size_t c = 0; c < n_columns; ++c) {
+            by_field.emplace(columns[c].field_id, std::move(decoded[k * n_columns + c]));
+        }
+        if (!keep.empty()) {
+            const std::vector<std::uint8_t> part(keep.begin() + static_cast<std::ptrdiff_t>(p0),
+                                                 keep.begin() + static_cast<std::ptrdiff_t>(p1));
+            for (std::size_t c = 0; c < n_columns; ++c) {
+                if (!compact_column_values(by_field[columns[c].field_id], part, p1 - p0, columns[c].value_bytes,
+                                           why)) {
+                    return;
+                }
+            }
+            logical_first = logical_before[p0];
+            rows = logical_before[p1] - logical_first;
+        }
+        const auto lo = std::max(logical_first, want_first);
+        const auto hi = std::min(logical_first + rows, want_end);
+        if (hi <= lo && !(morsels.size() == 1U)) {
+            return;  // nothing of the range here
+        }
+        const auto take = hi > lo ? hi - lo : 0U;
+        if (lo != logical_first || take != rows) {
+            for (std::size_t c = 0; c < n_columns; ++c) {
+                if (!slice_column_values(by_field[columns[c].field_id], lo - logical_first, take, rows,
+                                         columns[c].value_bytes, why)) {
+                    return;
+                }
+            }
+        }
+        if (build_batch_from_schema(batch_schema, mapping, by_field, static_cast<std::int64_t>(take), batches[k],
+                                    why)) {
+            built[k] = 1U;
+        }
+    });
+    bool ok = true;
+    for (std::size_t k = 0; k < morsels.size(); ++k) {
+        if (!batch_errors[k].empty() && ok) {
+            error = batch_errors[k];
+            ok = false;
+        }
+    }
+    for (std::size_t k = 0; k < morsels.size(); ++k) {
+        if (built[k] == 0U) {
+            continue;
+        }
+        if (ok) {
+            out.push_back(batches[k]);
+        } else if (batches[k].release != nullptr) {
+            ArrowArrayRelease(&batches[k]);
+        }
+    }
+    return ok;
 }
 
 /// A data file's parsed footer, descriptor and column metadata, kept for take(): a shuffled epoch calls
@@ -1255,7 +1490,9 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
         physical = logical;
     }
 
-    std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
+    // The columns to take, then taken side by side (each is its own file reads and decode).
+    std::vector<std::shared_ptr<const CachedFileMetadata>> files;
+    std::vector<ColumnSource> columns;
     for (const auto& data_file : planned.files) {
         const auto jailed = safe_join_under(dataset_path / "data", data_file.path);
         if (!jailed) {
@@ -1267,6 +1504,7 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
         if (!cached_file_metadata(path, file, error)) {
             return false;
         }
+        files.push_back(file);
         const auto& descriptor = file->descriptor;
         const auto& column_metadatas = file->columns;
         if (descriptor.length != planned.physical_rows) {
@@ -1292,15 +1530,29 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
                 return false;
             }
             const auto* field = find_mapping_field(mapping, field_id);
-            const std::size_t value_bytes = field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
-            ColumnValues values;
-            if (!decode_lance_physical_column_rows(path, *on_disk,
-                                                   column_metadatas[static_cast<std::size_t>(column_index)],
-                                                   physical, value_bytes, values, error)) {
-                return false;
-            }
-            decoded_by_field_id.emplace(field_id, std::move(values));
+            ColumnSource source;
+            source.path = path;
+            source.on_disk = on_disk;
+            source.metadata = &column_metadatas[static_cast<std::size_t>(column_index)];
+            source.field_id = field_id;
+            source.value_bytes = field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            columns.push_back(std::move(source));
         }
+    }
+    std::vector<ColumnValues> decoded(columns.size());
+    std::vector<std::string> errors(columns.size());
+    parallel::for_each(columns.size(), [&](std::size_t c) {
+        const auto& source = columns[c];
+        decode_lance_physical_column_rows(source.path, *source.on_disk, *source.metadata, physical,
+                                          source.value_bytes, decoded[c], errors[c]);
+    });
+    std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        if (!errors[c].empty()) {
+            error = errors[c];
+            return false;
+        }
+        decoded_by_field_id.emplace(columns[c].field_id, std::move(decoded[c]));
     }
     return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id,
                                    static_cast<std::int64_t>(logical.size()), batch, error);
@@ -1480,17 +1732,30 @@ bool open_read_plan(const std::filesystem::path& dataset_path,
     return true;
 }
 
-/// Decode every data file up front. The eager reads' second half.
+/// Decode every data file up front. The eager reads' second half. Fragments are decoded side by
+/// side when there are threads to spare (each may itself split into morsels); the batches come back
+/// in fragment order either way.
 bool read_all_batches(const ReadPlan& plan, ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
                       std::string& error) {
-    for (const auto& planned : plan.files) {
-        ArrowArray batch{};
-        if (!read_data_file_batch(plan.dataset_path, planned, plan.mapping, out_schema, batch, error,
-                                  plan.allowed())) {
-            release_partial_read(out_schema, out_batches);
-            return false;
+    std::vector<std::vector<ArrowArray>> per_file(plan.files.size());
+    std::vector<std::string> errors(plan.files.size());
+    parallel::for_each(plan.files.size(), [&](std::size_t f) {
+        read_data_file_batches(plan.dataset_path, plan.files[f], plan.mapping, out_schema, per_file[f], errors[f],
+                               plan.allowed());
+    });
+    for (std::size_t f = 0; f < per_file.size(); ++f) {
+        if (!errors[f].empty() && error.empty()) {
+            error = errors[f];
         }
-        out_batches.push_back(batch);
+    }
+    for (auto& batches : per_file) {
+        for (auto& batch : batches) {
+            out_batches.push_back(batch);
+        }
+    }
+    if (!error.empty()) {
+        release_partial_read(out_schema, out_batches);
+        return false;
     }
     return true;
 }
@@ -1597,8 +1862,16 @@ struct LanceTableStream::Impl {
     ArrowSchema schema{};   // the stream's own copy; the caller got a deep copy at open()
     std::size_t cursor = 0;
     bool trusted_input = false;
+    std::deque<ArrowArray> pending;  // the current fragment's batches not yet handed out
 
-    ~Impl() { release_schema_if_held(schema); }
+    ~Impl() {
+        for (auto& batch : pending) {
+            if (batch.release != nullptr) {
+                ArrowArrayRelease(&batch);
+            }
+        }
+        release_schema_if_held(schema);
+    }
 };
 
 LanceTableStream::LanceTableStream() = default;
@@ -1647,23 +1920,29 @@ bool LanceTableStream::next(ArrowArray& out_batch, std::string& error) {
         error = "stream is not open";
         return false;
     }
-    if (impl_->cursor >= impl_->plan.files.size()) {
-        return true;  // end of stream: out_batch.release stays null
+    // A fragment may come back as several batches (one per morsel of a parallel read).
+    while (impl_->pending.empty()) {
+        if (impl_->cursor >= impl_->plan.files.size()) {
+            return true;  // end of stream: out_batch.release stays null
+        }
+        // The limits are per-thread and scoped, so a trusted stream has to re-establish them on every
+        // next() -- open()'s scope ended when open() returned.
+        std::optional<ScopedReadLimits> trusted_scope;
+        if (impl_->trusted_input) {
+            trusted_scope.emplace(trusted_read_limits());
+        }
+        const auto& planned = impl_->plan.files[impl_->cursor];
+        std::vector<ArrowArray> batches;
+        if (!read_data_file_batches(impl_->plan.dataset_path, planned, impl_->plan.mapping, impl_->schema, batches,
+                                    error, impl_->plan.allowed())) {
+            out_batch = ArrowArray{};
+            return false;
+        }
+        ++impl_->cursor;
+        impl_->pending.insert(impl_->pending.end(), batches.begin(), batches.end());
     }
-
-    // The limits are per-thread and scoped, so a trusted stream has to re-establish them on every
-    // next() -- open()'s scope ended when open() returned.
-    std::optional<ScopedReadLimits> trusted_scope;
-    if (impl_->trusted_input) {
-        trusted_scope.emplace(trusted_read_limits());
-    }
-    const auto& planned = impl_->plan.files[impl_->cursor];
-    if (!read_data_file_batch(impl_->plan.dataset_path, planned, impl_->plan.mapping, impl_->schema,
-                              out_batch, error, impl_->plan.allowed())) {
-        out_batch = ArrowArray{};
-        return false;
-    }
-    ++impl_->cursor;
+    out_batch = impl_->pending.front();
+    impl_->pending.pop_front();
     return true;
 }
 

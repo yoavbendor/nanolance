@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/data_file_writer.hpp"
+#include "nanolance/parallel.hpp"
 
 #include "lance_minimal.pb.hpp"
 #include "nanolance/blob_v2_external.hpp"
@@ -22,6 +23,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <streambuf>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -63,6 +65,35 @@ void align64(std::ostream& out) {
     static constexpr std::array<char, 64> zeros{};
     out.write(zeros.data(), static_cast<std::streamsize>(padding));
 }
+
+/// An output stream's buffer held in memory: where a column is encoded when columns are encoded in
+/// parallel. tellp() reports bytes written, so pos()/align64() count from the column's own start.
+class VectorStreambuf : public std::streambuf {
+   public:
+    const std::vector<char>& data() const { return bytes_; }
+    void release() { std::vector<char>().swap(bytes_); }
+
+   protected:
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        bytes_.insert(bytes_.end(), s, s + n);
+        return n;
+    }
+    int_type overflow(int_type c) override {
+        if (!traits_type::eq_int_type(c, traits_type::eof())) {
+            bytes_.push_back(traits_type::to_char_type(c));
+        }
+        return traits_type::not_eof(c);
+    }
+    pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override {
+        if (off == 0 && dir == std::ios_base::cur && (which & std::ios_base::out) != 0) {
+            return pos_type(static_cast<off_type>(bytes_.size()));
+        }
+        return pos_type(off_type(-1));
+    }
+
+   private:
+    std::vector<char> bytes_;
+};
 
 std::uint32_t bits_per_value(const LanceField& field) {
     // bool is the one type whose on-disk width is not a whole number of bytes: 1 bit per value,
@@ -1164,7 +1195,7 @@ void pad8(std::vector<std::uint8_t>& out) {
     }
 }
 
-std::uint64_t write_buffer(std::ofstream& out, const std::vector<std::uint8_t>& bytes) {
+std::uint64_t write_buffer(std::ostream& out, const std::vector<std::uint8_t>& bytes) {
     align64(out);
     const auto at = pos(out);
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
@@ -1764,7 +1795,7 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
     return true;
 }
 
-bool write_nested_column(std::ofstream& out, const LanceField& field, const ColumnValues& values, std::uint64_t rows,
+bool write_nested_column(std::ostream& out, const LanceField& field, const ColumnValues& values, std::uint64_t rows,
                          pb::ColumnMetadata& column, std::string& error, const fsst::Encoder* fsst_encoder = nullptr,
                          bool plain = false) {
     // One FSST table for the whole column, used by every page it pays on.
@@ -1911,7 +1942,7 @@ constexpr std::uint64_t kFullZipMinAverageValueBytes = 4096U;
 /// offsets where each row starts (Lance requires one for variable-width FullZip pages) -- which is what
 /// lets a reader fetch one row without reading the page: a shuffled mini-batch of 64 images out of
 /// thousands reads 64 images, not the column. Pages are cut at ~8 MiB of values, at least one row.
-bool write_full_zip_variable_column(std::ofstream& out, const ColumnValues& values, std::uint64_t rows,
+bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& values, std::uint64_t rows,
                                     pb::ColumnMetadata& column, std::string& error) {
     constexpr std::size_t kPageBytes = std::size_t{8} << 20U;
     const bool large = values.variable.large;
@@ -2016,7 +2047,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                            int compression_level,
                            bool compress,
                            DataFileResult& result,
-                           std::string& error) {
+                           std::string& error,
+                           bool parallel_columns) {
     error.clear();
     if (mapping.fields.empty()) {
         error = "cannot write Lance data file without mapped fields";
@@ -2043,9 +2075,9 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         return false;
     }
 
-    std::vector<pb::ColumnMetadata> columns;
-    columns.reserve(physical_fields.size());
-    for (std::size_t field_index = 0; field_index < physical_fields.size(); ++field_index) {
+    // One column's pages, written to `out` (the file, or with several threads a buffer of its own).
+    const auto encode_column = [&](std::size_t field_index, std::ostream& out,
+                                   std::vector<pb::ColumnMetadata>& columns, std::string& error) -> bool {
         const auto& field = *physical_fields[field_index];
         const auto& values = column_values[field_index];
 
@@ -2104,7 +2136,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.encoding = blob_v2_column_page_encoding();
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         if (values.needs_nested_pages()) {
@@ -2113,7 +2145,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 return false;
             }
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         // Arrow's null type: every row is null and there is no value to store at all.
@@ -2126,7 +2158,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.encoding = all_null_constant_layout_message();
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         // Constant column (tagged by the writer): ConstantLayout. The single value comes from the
@@ -2175,7 +2207,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             }
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         // Run-length encoded fixed-width column (tagged by the writer): one chunk with two buffers
@@ -2240,7 +2272,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                                                   static_cast<std::uint8_t>(length_bytes * 8U), rows);
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         // Dictionary + RLE for a low-cardinality variable-width column: distinct values in buffer[2],
@@ -2348,7 +2380,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 page_layout_bytes_dict_rle(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large);
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         // Structural dictionary for scattered low-cardinality strings: flat bitpacked u32 indices in
@@ -2437,7 +2469,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows, values.variable.large);
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         std::vector<MiniblockChunk> chunks;
@@ -2521,7 +2553,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 column.pages.push_back(std::move(page));
             }
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         // Bitpack / bool / byte-stream-split+zstd fixed-width columns: STREAM one chunk at a time
@@ -2606,7 +2638,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 column.pages.push_back(std::move(page));
             }
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         // A string column FSST can compress (roadmap F2) goes to the multi-chunk page writer: one
@@ -2624,7 +2656,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 return false;
             }
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         // Every other string or binary column goes to the multi-chunk page writer too, in its plain
@@ -2658,7 +2690,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 return false;
             }
             columns.push_back(std::move(column));
-            continue;
+            return true;
         }
 
         // zstd variable-width columns keep the two-phase build (chunks are unequal-sized, driven by
@@ -2717,6 +2749,57 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             column.pages.push_back(std::move(page));
         }
         columns.push_back(std::move(column));
+        return true;
+    };
+
+    std::vector<pb::ColumnMetadata> columns;
+    columns.reserve(physical_fields.size());
+    if (!parallel_columns || parallel::threads() <= 1U || physical_fields.size() <= 1U) {
+        for (std::size_t field_index = 0; field_index < physical_fields.size(); ++field_index) {
+            if (!encode_column(field_index, out, columns, error)) {
+                return false;
+            }
+        }
+    } else {
+        // Columns encoded side by side into memory, then appended in order, each at a 64-byte
+        // boundary as the sequential writer places them, its page offsets moved by where it lands.
+        // Costs holding the fragment's encoded columns at once; one thread keeps the streaming path.
+        struct Encoded {
+            VectorStreambuf bytes;
+            std::vector<pb::ColumnMetadata> columns;
+            std::string error;
+            bool ok = false;
+        };
+        std::vector<Encoded> encoded(physical_fields.size());
+        parallel::for_each(encoded.size(), [&](std::size_t field_index) {
+            auto& e = encoded[field_index];
+            std::ostream sink(&e.bytes);
+            e.ok = encode_column(field_index, sink, e.columns, e.error) && sink.good();
+            if (!e.ok && e.error.empty()) {
+                e.error = "failed to buffer column '" + physical_fields[field_index]->name + "'";
+            }
+        });
+        for (auto& e : encoded) {
+            if (!e.ok) {
+                error = e.error;
+                return false;
+            }
+        }
+        for (auto& e : encoded) {
+            align64(out);
+            const auto base = pos(out);
+            const auto& bytes = e.bytes.data();
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            for (auto& column : e.columns) {
+                for (auto& page : column.pages) {
+                    for (auto& offset : page.buffer_offsets) {
+                        offset += base;
+                    }
+                }
+                columns.push_back(std::move(column));
+            }
+            e.bytes.release();
+        }
     }
 
     pb::FileDescriptor descriptor;

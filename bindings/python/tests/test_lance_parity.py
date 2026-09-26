@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import random
 
 import pyarrow as pa
@@ -695,11 +697,21 @@ def test_stream_yields_the_same_rows_as_a_full_read(fragmented_dataset):
 
 
 def test_stream_delivers_one_batch_per_fragment(fragmented_dataset):
-    """The point of the exercise: batches arrive as they are decoded, not all at the end."""
+    """The point of the exercise: batches arrive as they are decoded, not all at the end. One per
+    fragment on one thread; with more, a fragment may come as several (one per row range decoded in
+    parallel), but no batch spans two fragments."""
     path, table, fragments = fragmented_dataset
+    threads = nanolance.get_threads()
+    try:
+        nanolance.set_threads(1)
+        per_fragment = [b.num_rows for b in pa.RecordBatchReader.from_stream(nanolance.open_stream(path))]
+    finally:
+        nanolance.set_threads(threads)
+    assert len(per_fragment) == fragments
+    assert sum(per_fragment) == table.num_rows
     sizes = [b.num_rows for b in pa.RecordBatchReader.from_stream(nanolance.open_stream(path))]
-    assert len(sizes) == fragments
     assert sum(sizes) == table.num_rows
+    assert set(itertools.accumulate(per_fragment)) <= set(itertools.accumulate(sizes))
 
 
 def test_stream_projects(fragmented_dataset):

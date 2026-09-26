@@ -236,6 +236,25 @@ on-disk size shrank.
   attribute boundary — the win only shows up compiling the whole translation unit at this target, which
   is what this flag does.
 
+## 6a. Threads: rules for code on the read and write paths
+
+Reads, takes and writes run on several threads (`src/parallel.cpp`; README "Threads"). Keep it safe:
+
+- **No shared mutable state without a lock.** Per-call scratch is `thread_local` (see the `packed`,
+  `scratch` and zstd context buffers); process-wide caches take a mutex. A new `static` that is written
+  after start-up needs one too.
+- **Per-thread settings travel with the task.** The read limits (`read_safety.hpp`) and the file
+  validation scope (`DataFileReadScope`) are thread-local; `parallel::for_each` re-establishes both on
+  whichever thread runs a task. Anything else thread-local that a decode depends on must do the same.
+- **Never assume one batch per fragment** in a reader test: iterate every batch (the C++ tests show the
+  pattern), or `set_threads(1)` when the one-per-fragment shape is itself what is tested.
+- **Files must not depend on the thread count.** `test_parallel.py` checks it byte for byte.
+- **Test with the stress settings** before pushing a read-path change:
+  `NANOLANCE_THREADS=8 NANOLANCE_MORSEL_KB=1` for both `ctest` and `pytest` (1 KiB morsels cut every
+  page of every column mid-page). A ThreadSanitizer build (`-fsanitize=thread`) of `tools/nlbench`
+  over a few datasets, `--write` and `--take` included, is the check for the pool itself.
+- **A write memory budget turns column-parallel writes off** (edge devices: resident bytes first).
+
 ## 7. When adding a new Lance encoding (how this codebase does it)
 
 1. Find the authoritative format in the Lance Rust source (`protos/encodings_v2_1.proto` for the

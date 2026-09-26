@@ -95,6 +95,14 @@ int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t 
 int nano_lance_block_cache_configure(const char* cache_dir, int max_blocks, char* error_message,
                                      size_t error_message_capacity);
 
+/// Threads nanolance may use for reads and writes, the calling thread included. 1 keeps everything on
+/// the calling thread (no worker is ever started). 0 restores the default: NANOLANCE_THREADS if set,
+/// else the CPUs this process may run on. Takes effect for reads and writes started afterwards.
+void nano_lance_set_threads(size_t threads);
+
+/// The current thread count (see nano_lance_set_threads).
+size_t nano_lance_threads(void);
+
 /// Cumulative block-cache hit/miss counters since process start (both 0 when no cache is active). Pass
 /// nullptr to skip either output.
 void nano_lance_block_cache_stats(uint64_t* out_hits, uint64_t* out_misses);

@@ -1165,7 +1165,10 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
                                            state->compression_level,
                                            state->compression,
                                            data_file,
-                                           writer_error)) {
+                                           writer_error,
+                                           // A memory budget means resident bytes matter more
+                                           // than speed: stream each column to the file.
+                                           state->max_pending_bytes == 0U)) {
         return set_error(writer, NANO_LANCE_IO_ERROR, writer_error);
     }
 

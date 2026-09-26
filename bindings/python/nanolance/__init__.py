@@ -369,6 +369,25 @@ def count_rows(path: Union[str, os.PathLike]) -> int:
     return int(_nanolance.count_rows(Path(path)))
 
 
+def set_threads(threads: int) -> None:
+    """Threads nanolance may use for reads and writes, the calling thread included.
+
+    ``1`` keeps all work on the calling thread -- no worker thread is started, and the code path is the
+    single-threaded one. ``0`` restores the default: the ``NANOLANCE_THREADS`` environment variable if
+    set, else the CPUs this process may run on (its affinity mask, so ``taskset`` and container CPU
+    limits count). With more than one thread a large read comes back as several record batches per
+    fragment -- one per row range decoded in parallel -- rather than one.
+    """
+    if threads < 0:
+        raise ValueError("threads must be >= 0")
+    _nanolance.set_threads(int(threads))
+
+
+def get_threads() -> int:
+    """The number of threads nanolance may use (see :func:`set_threads`)."""
+    return int(_nanolance.get_threads())
+
+
 __all__ = [
     "write_table",
     "read_table",
@@ -376,6 +395,8 @@ __all__ = [
     "open_stream",
     "read_schema",
     "count_rows",
+    "set_threads",
+    "get_threads",
     "WriteOptions",
     "LanceWriter",
     "__version__",

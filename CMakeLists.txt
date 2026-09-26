@@ -269,6 +269,7 @@ add_library(nanolance STATIC
     src/array_accessor.cpp
     src/blob_builder.cpp
     src/blob_v2_external.cpp
+    src/buffer_pool.cpp
     src/column_slice.cpp
     src/data_file_reader.cpp
     src/deletion_vector.cpp
@@ -278,6 +279,7 @@ add_library(nanolance STATIC
     src/lance_column_decoder.cpp
     src/lance_table_reader.cpp
     src/page_layout.cpp
+    src/parallel.cpp
     src/repdef.cpp
     src/nano_lance_table_reader_c.cpp
     src/manifest_writer.cpp
@@ -292,7 +294,9 @@ target_include_directories(nanolance PUBLIC
     "${_NANOLANCE_GEN_INCLUDE}"
     "${nanoarrow_SOURCE_DIR}/src"
 )
+find_package(Threads REQUIRED)
 target_link_libraries(nanolance PUBLIC
+    Threads::Threads
     nanolance_reader
     nanolance_proto
     nanoarrow_ipc_static

@@ -398,6 +398,27 @@ This is a **nanolance-only** layout — stock Lance/lance-c cannot read those bl
 off by default and create-mode only (not append). nanolance's own reader resolves the URIs
 transparently, so the data you read back is identical either way.
 
+## Threads
+
+nanolance uses the machine's cores for reads and writes, with nothing to add: a ~200-line pool on
+`std::thread` (`src/parallel.cpp`), no runtime library.
+
+| | What runs side by side |
+|---|---|
+| Read | a fragment is cut into row ranges ("morsels"), each decoded -- every column of it -- on its own thread and returned as its own Arrow batch; fragments too. A list page with a repetition index and any MiniBlock page give up a row range without being decoded whole; a plan that would decode more than a quarter extra is not split. |
+| take | the columns of each fragment |
+| Write | the columns of a data file, encoded into memory and appended in order: the file is byte-for-byte what one thread writes |
+
+- **Count**: `nanolance.set_threads(n)` / `nano_lance_set_threads(n)`, else `NANOLANCE_THREADS`, else the
+  CPUs the process may run on (its affinity mask: `taskset` and container limits count).
+- **One thread** is the single-threaded code path, not a pool of one: nothing is started, nothing split.
+- **A write memory budget** (`max_pending_bytes`) keeps columns streaming to the file one at a time.
+- **Batches**: with several threads a large fragment comes back as several record batches rather than one.
+- **Buffer pool**: released output buffers of 1 MiB and up are kept (at most `NANOLANCE_BUFFER_POOL_MB`,
+  default 128; 0 turns it off; two seconds idle and they go), so a repeated read does not page-fault
+  its output in again -- what Rust and pyarrow get from their pooling allocators.
+- A process forked after reading (a PyTorch DataLoader worker) starts a pool of its own.
+
 ## Compression (Lance-compatible)
 
 `nano_lance_writer_set_compression(&writer, true)` (CLI: `--compress`) turns on Lance-compatible
