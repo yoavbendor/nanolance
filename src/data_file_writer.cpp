@@ -72,6 +72,7 @@ class VectorStreambuf : public std::streambuf {
    public:
     const std::vector<char>& data() const { return bytes_; }
     void release() { std::vector<char>().swap(bytes_); }
+    void reserve(std::size_t bytes) { bytes_.reserve(bytes); }
 
    protected:
     std::streamsize xsputn(const char* s, std::streamsize n) override {
@@ -2942,7 +2943,23 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
 
     std::vector<pb::ColumnMetadata> columns;
     columns.reserve(physical_fields.size());
-    if (!parallel_columns || parallel::threads() <= 1U || physical_fields.size() <= 1U) {
+    // Columns side by side only when no one column is most of the data: a column encoded into
+    // memory is copied again into the file, and for the column that dominates (COCO's images, 800 of
+    // 828 MB; Speech Commands' waveforms) that costs more than the others' encoding saves -- measured
+    // 1.95 s streaming against 3.28 s buffered. Such a column still uses threads inside its pages.
+    const auto raw_bytes = [&](std::size_t i) {
+        const auto& v = column_values[i];
+        return static_cast<std::uint64_t>(v.fixed_size() + v.variable.data.size() + v.variable.offsets.size() +
+                                          v.blob_v2.packed_payload.size());
+    };
+    std::uint64_t total_raw = 0;
+    std::uint64_t largest_raw = 0;
+    for (std::size_t i = 0; i < physical_fields.size(); ++i) {
+        total_raw += raw_bytes(i);
+        largest_raw = std::max(largest_raw, raw_bytes(i));
+    }
+    const bool one_column_dominates = largest_raw * 2U > total_raw;
+    if (!parallel_columns || parallel::threads() <= 1U || physical_fields.size() <= 1U || one_column_dominates) {
         for (std::size_t field_index = 0; field_index < physical_fields.size(); ++field_index) {
             if (!encode_column(field_index, out, columns, error)) {
                 return false;
@@ -2961,6 +2978,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         std::vector<Encoded> encoded(physical_fields.size());
         parallel::for_each(encoded.size(), [&](std::size_t field_index) {
             auto& e = encoded[field_index];
+            e.bytes.reserve(static_cast<std::size_t>(raw_bytes(field_index) + (raw_bytes(field_index) >> 4U) + 4096U));
             std::ostream sink(&e.bytes);
             e.ok = encode_column(field_index, sink, e.columns, e.error) && sink.good();
             if (!e.ok && e.error.empty()) {
