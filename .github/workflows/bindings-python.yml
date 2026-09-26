@@ -7,6 +7,9 @@ on:
     paths:
       - "bindings/python/**"
       - "tools/pylance_suite.py"
+      - "tools/lance_c_*.py"
+      - "compat/**"
+      - "tests/lance_c/**"
       - "include/**"
       - "src/**"
       - "CMakeLists.txt"
@@ -15,6 +18,9 @@ on:
     paths:
       - "bindings/python/**"
       - "tools/pylance_suite.py"
+      - "tools/lance_c_*.py"
+      - "compat/**"
+      - "tests/lance_c/**"
       - "include/**"
       - "src/**"
       - "CMakeLists.txt"
@@ -68,6 +74,12 @@ jobs:
         run: |
           python3 -m pip install pytest-xdist pytest-timeout pandas polars duckdb tqdm ml_dtypes pydantic "pylance==12.0.0"
           python3 tools/pylance_suite.py --report pylance-suite.json
+
+      # lance-c's own C and C++ tests, at the lance-c commit whose header compat/lance-c vendors,
+      # against nanolance's liblance_c (docs/LANCE_C_COMPAT.md). Fails when a test listed in
+      # tests/lance_c/expected_pass.txt stops passing.
+      - name: lance-c's C/C++ tests against liblance_c
+        run: python3 tools/lance_c_suite.py --build-dir build-lance-c
 
       - name: Run benchmark smoke (informational)
         working-directory: bindings/python

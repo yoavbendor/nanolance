@@ -87,7 +87,7 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **128**, every one of which pylance also passes |
+| nanolance.lance | **129**, every one of which pylance also passes |
 
 By test file, where nanolance passes any:
 

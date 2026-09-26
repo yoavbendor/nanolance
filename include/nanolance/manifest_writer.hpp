@@ -34,6 +34,8 @@ struct CommitExtras {
     const std::map<std::string, std::vector<std::uint8_t>>* schema_metadata = nullptr;
     /// Upserted into the table metadata.
     std::map<std::string, std::string> table_metadata;
+    /// Upserted into the table config, when the commit creates the dataset (not on later commits).
+    std::map<std::string, std::string> initial_config;
 };
 
 /// Publish one new version holding `fragments` (possibly none), numbered after the latest one. Table

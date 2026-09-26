@@ -63,6 +63,8 @@ struct WriterState {
     nano_lance::LanceSchemaMapping staged_schema;  // the on-disk schema the staged files were written with
     /// The Arrow schema metadata of the first batch, recorded in the manifest.
     std::map<std::string, std::vector<std::uint8_t>> schema_metadata;
+    /// Table config recorded when the commit creates the dataset (nano_lance_writer_set_initial_config).
+    std::map<std::string, std::string> initial_config;
 };
 
 /// Commit what is pending as one fragment (defined with nano_lance_writer_commit).
@@ -1263,6 +1265,7 @@ int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* versio
     std::uint64_t version = 0;
     nano_lance::CommitExtras extras;
     extras.schema_metadata = commit_mode == nano_lance::CommitMode::Append ? nullptr : &state->schema_metadata;
+    extras.initial_config = state->initial_config;
     std::filesystem::create_directories(state->dataset_path / "data", ec);
     if (!nano_lance::commit_dataset_version(state->dataset_path, mapping, state->staged, commit_mode, version, error,
                                             extras)) {
@@ -1272,6 +1275,19 @@ int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* versio
     if (version_out != nullptr) {
         *version_out = version;
     }
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* key, const char* value) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (key == nullptr || value == nullptr || key[0] == '\0') {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "config key and value are required");
+    }
+    state->initial_config[key] = value;
     clear_error(writer);
     return NANO_LANCE_OK;
 }

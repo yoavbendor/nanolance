@@ -92,6 +92,10 @@ lance.dataset("out.lance", version=1).take([2, 0])
 What it covers, what raises `NotImplementedError`, and how many of pylance's tests pass:
 [docs/PYLANCE_COMPAT.md](docs/PYLANCE_COMPAT.md).
 
+From C or C++, nanolance builds `liblance_c`: lance-c's C API (`#include <lance/lance.h>`,
+`LanceC::lance_c`) over nanolance, so code written for lance-c links unchanged, without a Rust
+toolchain. lance-c's own tests run against it in CI: [docs/LANCE_C_COMPAT.md](docs/LANCE_C_COMPAT.md).
+
 Already have parquet? Convert it and compare, without writing any code:
 
 ```console

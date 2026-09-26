@@ -175,6 +175,11 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
         error = "failed to set schema field name";
         return false;
     }
+    // The schema says what the manifest says. Every field used to come back nullable, so a table read
+    // from a dataset with a non-nullable column could not be appended to it again.
+    if (!field.nullable) {
+        schema.flags &= ~ARROW_FLAG_NULLABLE;
+    }
     for (const auto& kv : field.metadata) {
         // How nanolance encoded a fragment's pages is not part of the schema a reader sees.
         if (kv.first == "nanolance:packing" || kv.first == "nanolance:const-value") {

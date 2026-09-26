@@ -230,6 +230,11 @@ bool commit_dataset_version(const std::filesystem::path& dataset_path, const Lan
     for (const auto& kv : extras.table_metadata) {
         manifest.table_metadata[kv.first] = kv.second;
     }
+    if (!exists) {
+        for (const auto& kv : extras.initial_config) {
+            manifest.config[kv.first] = kv.second;
+        }
+    }
 
     std::uint64_t next_id = 0;
     if (mode == CommitMode::Append) {

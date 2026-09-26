@@ -172,6 +172,8 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append);
 /// A write with no rows publishes a version with no fragments (the schema of the batches seen, or of
 /// the dataset appended to). `version_out` may be NULL.
 int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* version_out);
+/// Staged writers only: a table config entry to record if the finishing commit creates the dataset.
+int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* key, const char* value);
 int nano_lance_writer_close(NanoLanceWriter* writer);
 
 const char* nano_lance_writer_last_error(const NanoLanceWriter* writer);

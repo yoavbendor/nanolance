@@ -2,9 +2,9 @@
  "pylance_version": "12.0.0",
  "target": "nanolance.lance",
  "totals": {
-  "failed": 985,
+  "failed": 984,
   "skipped": 347,
-  "passed": 128
+  "passed": 129
  },
  "files": {
   ".py": {
@@ -56,8 +56,8 @@
    "failed": 6
   },
   "tests/test_dataset.py": {
-   "failed": 201,
-   "passed": 49,
+   "passed": 50,
+   "failed": 200,
    "skipped": 5
   },
   "tests/test_debug.py": {
@@ -151,8 +151,8 @@
    "failed": 1
   },
   "tests/test_pydantic.py": {
-   "passed": 4,
-   "failed": 8
+   "failed": 8,
+   "passed": 4
   },
   "tests/test_row_addr_prefilter.py": {
    "failed": 12,

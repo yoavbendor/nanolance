@@ -307,12 +307,43 @@ target_link_libraries(nanolance PUBLIC
 
 add_library(nanolance::nanolance ALIAS nanolance)
 
+# liblance_c: the C API of the lance-c project (compat/lance-c/include/lance/lance.h) over nanolance,
+# so code written against lance-c builds and links unchanged. Same library name and CMake targets
+# (LanceC::lance_c) as lance-c's; see docs/LANCE_C_COMPAT.md.
+option(NANOLANCE_BUILD_LANCE_C "Build liblance_c, lance-c's C API over nanolance" ON)
+if(NANOLANCE_BUILD_LANCE_C)
+    add_library(lance_c STATIC src/lance_c.cpp)
+    target_compile_features(lance_c PUBLIC cxx_std_20)
+    target_include_directories(lance_c PUBLIC
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/compat/lance-c/include>")
+    target_link_libraries(lance_c PUBLIC nanolance)
+    add_library(LanceC::lance_c ALIAS lance_c)
+    add_library(LanceC::lance_c_static ALIAS lance_c)
+
+    # lance-c's own C and C++ tests, with the drivers tools/lance_c_suite.py generates around them.
+    set(NANOLANCE_LANCE_C_UPSTREAM_TESTS "" CACHE PATH
+        "lance-c's tests/cpp with generated drivers (set by tools/lance_c_suite.py)")
+    if(NANOLANCE_LANCE_C_UPSTREAM_TESTS)
+        add_executable(lance_c_upstream_c "${NANOLANCE_LANCE_C_UPSTREAM_TESTS}/driver_c.c")
+        add_executable(lance_c_upstream_cpp "${NANOLANCE_LANCE_C_UPSTREAM_TESTS}/driver_cpp.cpp")
+        foreach(t lance_c_upstream_c lance_c_upstream_cpp)
+            target_link_libraries(${t} PRIVATE lance_c)
+            target_compile_options(${t} PRIVATE -UNDEBUG)
+            set_target_properties(${t} PROPERTIES LINKER_LANGUAGE CXX)
+        endforeach()
+        set_target_properties(lance_c_upstream_cpp PROPERTIES CXX_STANDARD 17)
+    endif()
+endif()
+
 # Apply our own warning policy (opt-in via NANOLANCE_WERROR) only to nanolance's targets, not to the
 # FetchContent'd dependencies.
 if(NANOLANCE_WARNING_FLAGS)
     target_compile_options(nanolance_proto PRIVATE ${NANOLANCE_WARNING_FLAGS})
     target_compile_options(nanolance_reader PRIVATE ${NANOLANCE_WARNING_FLAGS})
     target_compile_options(nanolance PRIVATE ${NANOLANCE_WARNING_FLAGS})
+    if(TARGET lance_c)
+        target_compile_options(lance_c PRIVATE ${NANOLANCE_WARNING_FLAGS})
+    endif()
 endif()
 
 if(NANOLANCE_ENABLE_AVX2)

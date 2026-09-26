@@ -55,6 +55,7 @@ tests/test_dataset.py::test_version_id
 tests/test_dataset.py::test_with_row_offset
 tests/test_dataset.py::test_write_dataset_pydantic_list_rejects_invalid_item[dict]
 tests/test_dataset.py::test_write_dataset_pydantic_list_rejects_invalid_item[different_model]
+tests/test_dataset.py::test_write_dataset_pydantic_optional_field_typed_correctly_when_all_none
 tests/test_file.py::test_aborted_write
 tests/test_file.py::test_batch_sizes
 tests/test_file.py::test_field_meta
