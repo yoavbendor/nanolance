@@ -383,3 +383,56 @@ def test_concurrent_commits_lose_nothing(tmp_path):
         left = set(nl.dataset(uri).to_table(columns=["id"]).column("id").to_pylist())
         assert not left & set(landed), "a committed delete was lost"
         assert set(refused) <= left
+
+
+def test_constant_pages_with_different_values(lance, tmp_path, monkeypatch):
+    """Lance picks each page's layout on its own: a column of 1024 threes, then 1024 eights, ... is a
+    run of constant pages, each with its own value. nanolance planned a column from its first page
+    and read every row as 3. Found by lance-encoding's test_miniblock_bitpack (tools/rust_suite.py).
+    Also read by a bare file name, which once resolved to <cwd>/data/<name>."""
+    from lance.file import LanceFileWriter
+
+    values = (3, 8, 16, 100)
+    schema = pa.schema([("c", pa.int32()), ("s", pa.string())])
+    writer = LanceFileWriter(str(tmp_path / "f.lance"), schema, data_cache_bytes=4096, version="2.2")
+    for v in values:
+        writer.write_batch(pa.table({"c": pa.array([v] * 1024, pa.int32()), "s": [f"v{v}"] * 1024}, schema=schema))
+    writer.close()
+    want = pa.table({"c": pa.array([v for v in values for _ in range(1024)], pa.int32()),
+                     "s": [f"v{v}" for v in values for _ in range(1024)]})
+
+    monkeypatch.chdir(tmp_path)
+    reader = nl.file.LanceFileReader("f.lance")
+    assert reader.read_all().to_table() == want
+    assert reader.read_range(1000, 2000).to_table() == want.slice(1000, 2000)
+    assert reader.take_rows([5, 1030, 3000, 4095]).to_table() == want.take([5, 1030, 3000, 4095])
+
+
+def _pylance_written_shapes():
+    from tests.test_lance_lists import SHAPES as LIST_SHAPES
+    from tests.test_write_encoding_matrix import SHAPES as MATRIX
+
+    shapes = [(f"matrix-{name}", table) for name, table, _ in MATRIX]
+    shapes += [(f"list-{name}", pa.table({"c": make()})) for name, make in LIST_SHAPES.items() if "map" not in name]
+    return shapes
+
+
+@pytest.mark.parametrize("version", ["2.1", "2.2"])
+def test_pylance_written_shapes_read_back(lance, tmp_path, version):
+    """Every shape of the encoding matrix and the list tests, written by pylance in format 2.1 (the
+    default of earlier pylance releases) and 2.2, reads back as pylance reads it. The first run found
+    2.1 refused outright (the footer's major and minor were read swapped, which only 2.2 hid) and a
+    fixed_size_binary constant wider than 32 bytes refused (its value is a one-buffer scalar)."""
+    failures = []
+    for name, table in _pylance_written_shapes():
+        uri = str(tmp_path / f"{name}-{version}")
+        lance.write_dataset(table, uri, data_storage_version=version)
+        want = lance.dataset(uri).to_table()
+        try:
+            got = nl.dataset(uri).to_table()
+        except Exception as exc:  # noqa: BLE001 -- collected, then reported together
+            failures.append(f"{name}: {exc}")
+            continue
+        if got != want:
+            failures.append(f"{name}: different rows")
+    assert not failures, failures

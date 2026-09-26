@@ -175,12 +175,16 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
 
     std::uint16_t minor = 0;
     std::uint16_t major = 0;
-    if (!read_le16(tail.data() + magic_idx - 4U, minor) || !read_le16(tail.data() + magic_idx - 2U, major)) {
+    // Major first, then minor, then the magic (lance-file's footer; its version tests spell it out).
+    if (!read_le16(tail.data() + magic_idx - 4U, major) || !read_le16(tail.data() + magic_idx - 2U, minor)) {
         error = "failed to read data file version";
         return false;
     }
-    if (minor != 2U || major != 2U) {
-        error = "unsupported Lance data file version (expected 2.2)";
+    // 2.1 and 2.2 share the structural page layouts; 2.2 adds encodings a 2.1 file never holds. 2.0
+    // (legacy array encodings) and 2.3 are not read.
+    if (major != 2U || (minor != 1U && minor != 2U)) {
+        error = "unsupported Lance data file version " + std::to_string(major) + "." + std::to_string(minor) +
+                " (nanolance reads 2.1 and 2.2)";
         return false;
     }
 

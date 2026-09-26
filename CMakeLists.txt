@@ -338,6 +338,14 @@ if(NANOLANCE_BUILD_LANCE_C)
     endif()
 endif()
 
+# What lance-encoding's own tests call to read their round trips back with nanolance
+# (tools/rust_suite.py). A shared library, so the whole tree must be built position independent.
+option(NANOLANCE_BUILD_RUST_SHIM "Build the library tools/rust_suite.py links into lance-encoding's tests" OFF)
+if(NANOLANCE_BUILD_RUST_SHIM)
+    add_library(nanolance_rust_shim SHARED tests/rust_suite/nanolance_rust_shim.cpp)
+    target_link_libraries(nanolance_rust_shim PRIVATE nanolance)
+endif()
+
 # Apply our own warning policy (opt-in via NANOLANCE_WERROR) only to nanolance's targets, not to the
 # FetchContent'd dependencies.
 if(NANOLANCE_WARNING_FLAGS)

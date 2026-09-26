@@ -2396,8 +2396,11 @@ bool open_file_plan(const std::filesystem::path& file_path, const LanceScanReque
     if (!open_read_plan_from_manifest(file_path.parent_path(), manifest, request, plan, out_schema, error)) {
         return false;
     }
+    // A bare file name ("x.lance") has an empty parent, and an empty data_dir means <dataset>/data:
+    // name the current directory instead.
+    const auto dir = file_path.parent_path().empty() ? std::filesystem::path(".") : file_path.parent_path();
     for (auto& planned : plan.files) {
-        planned.data_dir = file_path.parent_path();
+        planned.data_dir = dir;
     }
     return true;
 }

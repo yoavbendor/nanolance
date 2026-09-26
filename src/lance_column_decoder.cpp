@@ -923,9 +923,9 @@ template <class T>
 }
 
 /// Inverse of the writer's encode_scalar_variable_value: a Lance scalar value buffer holding a
-/// length-1 string/binary array, laid out as [u32 num_buffers][u32 buffer_len ...][buffers]. For
-/// utf8/binary that is two buffers -- offsets [0, len] and the data -- and the value we want is the
-/// data buffer whole. Every length is untrusted, so each is bounds-checked before use.
+/// length-1 array, laid out as [u32 num_buffers][u32 buffer_len ...][buffers]. For utf8/binary that
+/// is two buffers -- offsets [0, len] and the data -- and the value we want is the data buffer whole;
+/// for a fixed-width value it is one buffer, the value. Every length is untrusted, so each is bounds-checked before use.
 [[nodiscard]] bool decode_scalar_variable_value(const std::vector<std::uint8_t>& buffer,
                                                 std::vector<std::uint8_t>& out, std::string& error) {
     if (buffer.size() < 4U) {
@@ -933,9 +933,24 @@ template <class T>
         return false;
     }
     const auto num_buffers = load_le<std::uint32_t>(buffer.data());
+    // A fixed-width value too wide to inline in the descriptor (a fixed_size_binary(33) constant) is
+    // the same layout with ONE buffer: the value's bytes.
+    if (num_buffers == 1U) {
+        if (buffer.size() < 8U) {
+            error = "constant value buffer shorter than its header";
+            return false;
+        }
+        const auto len = load_le<std::uint32_t>(buffer.data() + 4U);
+        if (len > buffer.size() - 8U) {
+            error = "constant value buffer's data range exceeds the buffer";
+            return false;
+        }
+        out.assign(buffer.begin() + 8, buffer.begin() + 8 + static_cast<std::ptrdiff_t>(len));
+        return true;
+    }
     if (num_buffers != 2U) {
         error = "constant value buffer declares " + std::to_string(num_buffers) +
-                " buffers; expected 2 (offsets + data)";
+                " buffers; expected 1 (a fixed-width value) or 2 (offsets + data)";
         return false;
     }
     std::uint64_t header = 0;
@@ -4423,6 +4438,127 @@ bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_pa
     return compact_column_values(out, keep, subset_rows, value_bytes, error);
 }
 
+namespace {
+
+/// Can one plan, made from the first page, decode every page of this flat column? Rust Lance picks
+/// each page's layout on its own: a column of 1024 threes then 1024 eights is two constant pages with
+/// different values, and a column can start constant and turn bit-packed. The one-plan decode reads
+/// such a column as its first page repeated (lance-encoding's test_miniblock_bitpack caught it).
+/// Pages that are flat or bit-packed mini-blocks mix freely -- that decode plans each page itself.
+bool pages_share_one_plan(const pb::Field& field, const pb::ColumnMetadata& column_metadata) {
+    if (column_metadata.pages.size() < 2U) {
+        return true;
+    }
+    std::optional<ColumnEncodingKind> first;
+    for (const auto& page : column_metadata.pages) {
+        if (page.encoding.empty()) {
+            return true;  // an older nanolance file: the field metadata decides, for every page
+        }
+        pb::ColumnMetadata one_page;
+        one_page.pages.push_back(page);
+        const auto plan = classify_column_encoding(field, one_page);
+        if (plan.kind == ColumnEncodingKind::kConstant) {
+            return false;  // each constant page has its own value
+        }
+        auto kind = plan.kind == ColumnEncodingKind::kBitpack ? ColumnEncodingKind::kFlat : plan.kind;
+        if (!first) {
+            first = kind;
+        } else if (*first != kind) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Append a flat column's decoded values to `dst`, which holds `dst_rows` rows.
+bool append_flat_values(ColumnValues& dst, std::uint64_t dst_rows, ColumnValues& src, std::uint64_t src_rows,
+                        std::string& error) {
+    if (!src.layers.empty() || src.kind == ColumnValues::Kind::BlobV2External) {
+        error = "a column whose pages use different layouts is read only for flat values";
+        return false;
+    }
+    if (dst_rows == 0U && dst.fixed.empty() && dst.variable.data.empty() && dst.variable.offsets.empty()) {
+        dst.kind = src.kind;
+        dst.variable.large = src.variable.large;
+        dst.items_per_row = src.items_per_row;
+    }
+    if (src.kind != dst.kind || src.variable.large != dst.variable.large || src.items_per_row != dst.items_per_row) {
+        error = "the column's pages decode to different value layouts";
+        return false;
+    }
+    if (src.kind == ColumnValues::Kind::FixedWidth) {
+        dst.fixed.insert(dst.fixed.end(), src.fixed.begin(), src.fixed.end());
+    } else {
+        const std::size_t width = src.variable.large ? 8U : 4U;
+        if (src.variable.offsets.size() < (src_rows + 1U) * width) {
+            error = "a page's offsets cover fewer rows than the page";
+            return false;
+        }
+        auto read_offset = [&](const std::vector<std::uint8_t>& o, std::size_t i) -> std::uint64_t {
+            if (width == 8U) {
+                std::uint64_t v = 0;
+                std::memcpy(&v, o.data() + i * 8U, 8U);
+                return v;
+            }
+            std::uint32_t v = 0;
+            std::memcpy(&v, o.data() + i * 4U, 4U);
+            return v;
+        };
+        if (dst.variable.offsets.empty()) {
+            dst.variable.offsets.assign(width, 0U);
+        }
+        const std::uint64_t base = dst.variable.data.size();
+        const std::uint64_t first = read_offset(src.variable.offsets, 0);
+        for (std::uint64_t i = 1; i <= src_rows; ++i) {
+            const std::uint64_t v = base + read_offset(src.variable.offsets, static_cast<std::size_t>(i)) - first;
+            if (width == 4U && v > std::numeric_limits<std::uint32_t>::max()) {
+                error = "the column's strings exceed 32-bit offsets";
+                return false;
+            }
+            const auto at = dst.variable.offsets.size();
+            dst.variable.offsets.resize(at + width);
+            if (width == 8U) {
+                std::memcpy(dst.variable.offsets.data() + at, &v, 8U);
+            } else {
+                const auto v32 = static_cast<std::uint32_t>(v);
+                std::memcpy(dst.variable.offsets.data() + at, &v32, 4U);
+            }
+        }
+        dst.variable.data.insert(dst.variable.data.end(),
+                                 src.variable.data.begin() + static_cast<std::ptrdiff_t>(first),
+                                 src.variable.data.end());
+    }
+    append_validity_bits(dst.validity, dst.null_count, dst_rows, src.validity, src.null_count, src_rows);
+    if (src.items_per_row != 0U) {
+        append_validity_bits(dst.item_validity, dst.item_null_count, dst_rows * src.items_per_row, src.item_validity,
+                             src.item_null_count, src_rows * src.items_per_row);
+    }
+    return true;
+}
+
+/// decode_column_impl for a flat column, one page at a time when its pages need plans of their own.
+bool decode_flat_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                        const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
+    if (pages_share_one_plan(on_disk_field, column_metadata)) {
+        return decode_column_impl(data_file_path, on_disk_field, column_metadata, out, error, nullptr);
+    }
+    out = ColumnValues{};
+    std::uint64_t rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        pb::ColumnMetadata one_page = column_metadata;
+        one_page.pages.assign(1U, page);
+        ColumnValues part;
+        if (!decode_column_impl(data_file_path, on_disk_field, one_page, part, error, nullptr) ||
+            !append_flat_values(out, rows, part, page.length, error)) {
+            return false;
+        }
+        rows += page.length;
+    }
+    return true;
+}
+
+}  // namespace
+
 bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
                                   const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
     if (column_is_nested(column_metadata)) {
@@ -4434,7 +4570,7 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
         }
         return decode_nested_rows(data_file_path, on_disk_field, column_metadata, 0, rows, out, error);
     }
-    return decode_column_impl(data_file_path, on_disk_field, column_metadata, out, error, nullptr);
+    return decode_flat_column(data_file_path, on_disk_field, column_metadata, out, error);
 }
 
 std::uint32_t lance_page_list_depth(const pb::ColumnPage& page) {
@@ -4592,7 +4728,7 @@ bool decode_lance_physical_column_range(const std::filesystem::path& data_file_p
         subset_first = first;
         subset_rows = column_metadata.pages.front().length;
     }
-    if (!decode_column_impl(data_file_path, on_disk_field, subset, out, error, nullptr)) {
+    if (!decode_flat_column(data_file_path, on_disk_field, subset, out, error)) {
         return false;
     }
     if (first == subset_first && count == subset_rows) {

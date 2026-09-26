@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Lance's own Rust tests for its encodings and file format (lance-encoding, lance-file), at the release
+# pylance 12.0.0 is built from, with every round trip and every file they write also read back by
+# nanolance (tools/rust_suite.py, docs/RUST_SUITE.md). Nightly, since it compiles the crates' test
+# suites; also on changes to the suite itself, and by hand.
+name: Rust encoding tests
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  push:
+    branches: [main, "claude/**", "cursor/**"]
+    paths:
+      - "tools/rust_suite.py"
+      - "tests/rust_suite/**"
+      - ".github/workflows/rust-suite.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-suite-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13 protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache fetched deps and the crates' build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .deps
+            ~/.cargo/registry
+          key: rust-suite-${{ runner.os }}-${{ hashFiles('tools/rust_suite.py', 'CMakeLists.txt') }}
+
+      # Fails when a test listed in tests/rust_suite/expected_pass.txt no longer reads back, or when
+      # nanolance returns different rows for any round trip not named in known_mismatch.txt.
+      - name: lance-encoding and lance-file tests, read back by nanolance
+        run: python3 tools/rust_suite.py --report rust-suite.json
+
+      - name: Upload the summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-suite
+          path: rust-suite.json
+          if-no-files-found: ignore

@@ -98,6 +98,9 @@ From C or C++, nanolance builds `liblance_c`: lance-c's C API (`#include <lance/
 `LanceC::lance_c`) over nanolance, so code written for lance-c links unchanged, without a Rust
 toolchain. lance-c's own tests run against it in CI: [docs/LANCE_C_COMPAT.md](docs/LANCE_C_COMPAT.md).
 
+Lance's own Rust encoding tests (lance-encoding and lance-file) run nightly with every round trip
+and file they write also read back by nanolance: [docs/RUST_SUITE.md](docs/RUST_SUITE.md).
+
 Already have parquet? Convert it and compare, without writing any code:
 
 ```console

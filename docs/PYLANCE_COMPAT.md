@@ -44,8 +44,11 @@ compared, results are checked against pylance on the same files, in both directi
 | Changes | `delete`, `update` (SQL values), `merge_insert` (`when_matched_update_all` with a condition, `when_not_matched_insert_all`, `when_not_matched_by_source_delete`, `execute`), `add_columns` (SQL expressions, a `pa.field` / schema of null columns, or a reader), `drop_columns`, `alter_columns` (rename, nullability, data type), `optimize.compact_files`. Each is one version, and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column. |
 | Files | `lance.file`: `LanceFileReader` (`read_all`, `read_range`, `take_rows`, `num_rows`, `metadata`, `file_statistics`, `read_global_buffer`), `LanceFileWriter`, `LanceFileSession` (local), `stable_version` |
 
-Datasets and files are written in format 2.2, which is pylance 12's default. A request for another
-version (`data_storage_version="2.0"`, `LanceFileWriter(version="2.1")`) raises.
+Datasets and files are written in format 2.2, which is pylance 12's default. A request to write
+another version (`data_storage_version="2.0"`, `LanceFileWriter(version="2.1")`) raises. Formats 2.1
+(the default of earlier pylance releases) and 2.2 are both read:
+`test_pylance_written_shapes_read_back` has pylance write every shape of the encoding matrix and the
+list tests in each, and nanolance must read back what pylance does. Format 2.0 is not read.
 
 ## What is not implemented
 
@@ -147,6 +150,17 @@ The runs found these bugs in nanolance's core. All are fixed and pinned in
   one could publish the other's manifest and still report success. A change now commits as the
   version after the one it read, the publish refuses to replace an existing version, and the temp
   name is each writer's own (`test_concurrent_commits_lose_nothing`).
+
+- **Reading format 2.1 was refused outright**, and a fixed-size-binary constant wider than 32 bytes
+  in a pylance-written 2.2 dataset was refused. The file footer holds the major version and then
+  the minor, and nanolance read them swapped. That was invisible while only 2.2 was accepted. A
+  wide fixed-width constant is stored as a one-buffer scalar, which nanolance did not read. Both
+  were found with the Rust suite below and are pinned by `test_pylance_written_shapes_read_back`.
+- **A column of constant pages with different values read as its first page's value.** Lance
+  picks each page's layout on its own, and pylance writes this shape too
+  (`test_constant_pages_with_different_values`).
+
+The Rust crates' own encoding tests run against nanolance too: see [RUST_SUITE.md](RUST_SUITE.md).
 
 The same work made the manifest codec keep everything pylance writes, so nanolance no longer drops
 it: timestamps, writer version, table config and metadata, schema metadata, feature flags, and

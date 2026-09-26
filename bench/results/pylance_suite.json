@@ -3,7 +3,7 @@
  "target": "nanolance.lance",
  "totals": {
   "failed": 924,
-  "skipped": 347,
+  "skipped": 377,
   "passed": 189
  },
  "files": {
@@ -12,16 +12,16 @@
    "skipped": 9
   },
   "tests/compat/test_file_formats.py": {
-   "skipped": 44
+   "skipped": 54
   },
   "tests/compat/test_index_sequence.py": {
    "skipped": 133
   },
   "tests/compat/test_scalar_indices.py": {
-   "skipped": 48
+   "skipped": 60
   },
   "tests/compat/test_vector_indices.py": {
-   "skipped": 32
+   "skipped": 40
   },
   "tests/compat/test_venv_manager.py": {
    "skipped": 12
@@ -56,8 +56,8 @@
    "failed": 6
   },
   "tests/test_dataset.py": {
-   "passed": 79,
    "failed": 171,
+   "passed": 79,
    "skipped": 5
   },
   "tests/test_debug.py": {

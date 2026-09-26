@@ -1,0 +1,121 @@
+{
+  "crates": [
+    "lance-encoding 12.0.0",
+    "lance-file 12.0.0"
+  ],
+  "tests_run": 1986,
+  "rust_failed": [],
+  "nanolance": {
+    "no round trip": 523,
+    "pass": 859,
+    "refused": 604
+  },
+  "round_trips": {
+    "refused": 2678,
+    "pass": 8309
+  },
+  "top_refusals": [
+    {
+      "count": 1009,
+      "reason": "file: schema: column 'c': fixed_size_list of '+s' is not supported; the element must be a fixed-width number, decimal or temporal type"
+    },
+    {
+      "count": 843,
+      "reason": "read: column 'c': page layout: unexpected encoding type url '/lance.encodings.ArrayEncoding'"
+    },
+    {
+      "count": 283,
+      "reason": "read: the file has N columns for N leaf fields; nanolance reads files whose every leaf field is one column"
+    },
+    {
+      "count": 169,
+      "reason": "file: schema: dictionary-encoded column 'c' is not supported: nanolance would store only the integer indices and discard the dictionary values. Cast it to its v"
+    },
+    {
+      "count": 144,
+      "reason": "file: schema: column 'c': fixed_size_list of 'b' is not supported; the element must be a fixed-width number, decimal or temporal type"
+    },
+    {
+      "count": 48,
+      "reason": "read: blob control buffer size does not match row count (narrow/wideN/wideN)"
+    },
+    {
+      "count": 48,
+      "reason": "file: schema: struct field has no children: row"
+    },
+    {
+      "count": 42,
+      "reason": "read: column page is missing buffer offsets"
+    },
+    {
+      "count": 15,
+      "reason": "file: format VN_N (nanolance reads N.N and N.N)"
+    },
+    {
+      "count": 9,
+      "reason": "file: schema: dictionary-encoded column 'item' is not supported: nanolance would store only the integer indices and discard the dictionary values. Cast it to it"
+    },
+    {
+      "count": 9,
+      "reason": "read: column 'item': unsupported page layout: Unsupported layout (PageLayout field N)"
+    },
+    {
+      "count": 8,
+      "reason": "read: column 'item' page N: a chunk declares levels but carries no level buffer"
+    },
+    {
+      "count": 7,
+      "reason": "read: rle run count mismatch between values and lengths"
+    },
+    {
+      "count": 6,
+      "reason": "file: schema: column 'c': fixed_size_list of '+w:N' is not supported; the element must be a fixed-width number, decimal or temporal type"
+    },
+    {
+      "count": 6,
+      "reason": "read: list array has no element child for "
+    },
+    {
+      "count": 6,
+      "reason": "read: rle chunk buffer sizes invalid"
+    },
+    {
+      "count": 6,
+      "reason": "read: column 'c': unsupported page layout: FullZip{values=FixedSizeList{NxUnknown(field N),validity},value_bits=N,def_bits=N,layers=[nullable-item],rows=N} (uns"
+    },
+    {
+      "count": 6,
+      "reason": "read: column 'c': unsupported page layout: FullZip{values=FixedSizeList{NxUnknown(field N),validity},value_bits=N,layers=[valid-item],rows=N} (unsupported FullZ"
+    },
+    {
+      "count": 3,
+      "reason": "read: column 'c': unsupported page layout: Unsupported layout (PageLayout field N)"
+    },
+    {
+      "count": 3,
+      "reason": "read: unsupported on-disk logical type for manifest recovery: dict:string:intN:false"
+    },
+    {
+      "count": 1,
+      "reason": "read: column 'inner' page N: a page declares an implausible N levels"
+    },
+    {
+      "count": 1,
+      "reason": "read: column 'value': unsupported page layout: FullZip{values=Unknown(field N),offset_bits=N,rep_bits=N,def_bits=N,layers=[valid-item,emptyable-list],rows=N,vis"
+    },
+    {
+      "count": 1,
+      "reason": "read: column 'value': unsupported page layout: FullZip{values=Unknown(field N),offset_bits=N,rep_bits=N,def_bits=N,layers=[valid-item,emptyable-list,valid-list]"
+    },
+    {
+      "count": 1,
+      "reason": "file: schema: column 'item': fixed_size_list of '+s' is not supported; the element must be a fixed-width number, decimal or temporal type"
+    },
+    {
+      "count": 1,
+      "reason": "read: column 'keys': unsupported page layout: Unsupported layout (PageLayout field N)"
+    }
+  ],
+  "top_type_differences": [],
+  "mismatched_tests": []
+}
