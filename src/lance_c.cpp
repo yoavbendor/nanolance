@@ -16,6 +16,7 @@
 #include "lance/lance.h"
 
 #include "nanolance/arrow_slice.hpp"
+#include "nanolance/blob_v2_external.hpp"
 #include "nanolance/dataset.hpp"
 #include "nanolance/dataset_ops.hpp"
 #include "nanolance/data_file_reader.hpp"
@@ -34,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -95,7 +97,12 @@ struct LanceScanner {
     }
 };
 
-struct LanceBlobFile {};
+/// One value of a Blob v2 column: where its bytes are, and the read cursor. Owns its location, so it
+/// outlives the dataset handle.
+struct LanceBlobFile {
+    nano_lance::BlobV2Location location;
+    uint64_t cursor = 0;
+};
 struct LanceIndexSegmentBuilder {};
 struct LanceIndexSegmentMetadata {};
 struct LanceFtsQueryContext {};
@@ -437,6 +444,10 @@ bool open_scan(const LanceScanner& scanner, ArrowArrayStream& out) {
     request.with_row_id = row_id;
     request.with_row_address = row_address;
     request.filter = scanner.filter.empty() ? nullptr : &scanner.filter;
+    // lance-c returns a blob column as its description unless asked for the bytes.
+    request.blob_handling = scanner.blob_handling == LANCE_BLOB_HANDLING_ALL_BINARY
+                                ? nano_lance::BlobHandling::Binary
+                                : nano_lance::BlobHandling::Descriptions;
     auto& c = nano_lance::work_stats::counters();
     self->bytes_at_open = c.data_bytes_read.load(std::memory_order_relaxed);
     self->reads_at_open = c.data_reads.load(std::memory_order_relaxed);
@@ -599,6 +610,7 @@ int32_t take_impl(const LanceDataset* dataset, const uint64_t* rows, size_t coun
     request.columns = columns != nullptr ? &names : nullptr;
     request.with_row_id = row_id;
     request.with_row_address = row_address;
+    request.blob_handling = nano_lance::BlobHandling::Descriptions;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
     std::string error;
@@ -1825,24 +1837,225 @@ int32_t lance_dataset_add_columns_stream(LanceDataset* dataset, struct ArrowArra
     });
 }
 
-int32_t lance_dataset_take_blobs(const LanceDataset*, const uint64_t*, size_t, const char*, LanceBlobFile**) {
-    NL_UNSUPPORTED_INT("blob files");
+}  // extern "C"
+
+namespace {
+
+/// Blob handles for `rows` (row indices, or row ids when `by_id`), in their order. All or nothing:
+/// on failure `out` is untouched.
+int32_t take_blobs(const LanceDataset* dataset, const uint64_t* rows, size_t count, const char* column,
+                   LanceBlobFile** out, bool by_id) {
+    if (dataset == nullptr || column == nullptr || out == nullptr || (rows == nullptr && count != 0U)) {
+        invalid("dataset, column, out and (when num > 0) the rows must not be NULL");
+        return -1;
+    }
+    if (count == 0U) {
+        clear_error();
+        return 0;
+    }
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        const std::vector<uint64_t> wanted(rows, rows + count);
+        std::vector<uint64_t> sorted(wanted);
+        std::sort(sorted.begin(), sorted.end());
+        sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+        const std::vector<std::string> names = {column};
+        nano_lance::LanceScanRequest request;
+        request.has_version = true;
+        request.version = dataset->version;
+        request.columns = &names;
+        request.blob_handling = nano_lance::BlobHandling::Locations;
+        ArrowSchema schema{};
+        std::vector<ArrowArray> batches;
+        std::string error;
+        const bool ok = by_id ? nano_lance::lance_dataset_take_rows(dataset->path, request, sorted, schema, batches, error)
+                              : nano_lance::lance_dataset_take(dataset->path, request, sorted, schema, batches, error);
+        if (!ok) {
+            fail(error);
+            return -1;
+        }
+        struct Cleanup {
+            ArrowSchema& schema;
+            std::vector<ArrowArray>& batches;
+            ~Cleanup() {
+                for (auto& b : batches) {
+                    if (b.release != nullptr) {
+                        b.release(&b);
+                    }
+                }
+                if (schema.release != nullptr) {
+                    schema.release(&schema);
+                }
+            }
+        } cleanup{schema, batches};
+        const ArrowSchema* field = schema.n_children == 1 ? schema.children[0] : nullptr;
+        if (field == nullptr || field->n_children != 6 || std::strcmp(field->children[5]->name, "file") != 0) {
+            invalid("column is not a blob column");
+            return -1;
+        }
+        // One handle (or none, for a null value) per row of `sorted`, in order.
+        std::vector<std::unique_ptr<LanceBlobFile>> taken;
+        taken.reserve(sorted.size());
+        for (auto& batch : batches) {
+            ArrowArrayView view{};
+            ArrowError aerr{};
+            if (ArrowArrayViewInitFromSchema(&view, &schema, &aerr) != NANOARROW_OK ||
+                ArrowArrayViewSetArray(&view, &batch, &aerr) != NANOARROW_OK) {
+                ArrowArrayViewReset(&view);
+                fail(std::string("cannot read the blob descriptions: ") + aerr.message);
+                return -1;
+            }
+            const ArrowArrayView* blob = view.children[0];
+            for (int64_t r = 0; r < batch.length; ++r) {
+                if (ArrowArrayViewIsNull(blob, r)) {
+                    taken.emplace_back(nullptr);
+                    continue;
+                }
+                auto handle = std::make_unique<LanceBlobFile>();
+                const auto kind = static_cast<uint8_t>(ArrowArrayViewGetUIntUnsafe(blob->children[0], r));
+                handle->location.position = ArrowArrayViewGetUIntUnsafe(blob->children[1], r);
+                handle->location.size = ArrowArrayViewGetUIntUnsafe(blob->children[2], r);
+                const auto file = ArrowArrayViewGetStringUnsafe(blob->children[5], r);
+                handle->location.file.assign(file.data, static_cast<std::size_t>(file.size_bytes));
+                handle->location.external = kind == nano_lance::kBlobKindExternal;
+                if (kind == nano_lance::kBlobKindDedicated) {
+                    handle->location.position = 0;
+                }
+                taken.push_back(std::move(handle));
+            }
+            ArrowArrayViewReset(&view);
+        }
+        if (taken.size() != sorted.size()) {
+            fail("take returned " + std::to_string(taken.size()) + " blobs for " + std::to_string(sorted.size()));
+            return -1;
+        }
+        // Repeats of a row get handles of their own: each has its own cursor.
+        for (std::size_t i = 0; i < wanted.size(); ++i) {
+            const auto k = static_cast<std::size_t>(std::lower_bound(sorted.begin(), sorted.end(), wanted[i]) -
+                                                    sorted.begin());
+            out[i] = taken[k] == nullptr ? nullptr : new LanceBlobFile(*taken[k]);
+        }
+        clear_error();
+        return 0;
+    });
 }
-int32_t lance_dataset_take_blobs_by_indices(const LanceDataset*, const uint64_t*, size_t, const char*,
-                                            LanceBlobFile**) {
-    NL_UNSUPPORTED_INT("blob files");
+
+/// `len` bytes of `blob` from blob-relative `offset` into `dst`.
+bool read_blob(const LanceBlobFile& blob, uint64_t offset, uint8_t* dst, std::size_t len) {
+    std::vector<std::uint8_t> bytes;
+    std::string error;
+    if (!nano_lance::blob_v2_read(blob.location, offset, len, bytes, error)) {
+        set_error(LANCE_ERR_IO, error);
+        return false;
+    }
+    if (len != 0U) {
+        std::memcpy(dst, bytes.data(), len);
+    }
+    return true;
 }
-uint64_t lance_blob_file_size(const LanceBlobFile*) {
-    not_supported("blob files");
+
+}  // namespace
+
+extern "C" {
+
+int32_t lance_dataset_take_blobs(const LanceDataset* dataset, const uint64_t* row_ids, size_t num_row_ids,
+                                 const char* column, LanceBlobFile** out) {
+    return take_blobs(dataset, row_ids, num_row_ids, column, out, true);
+}
+
+int32_t lance_dataset_take_blobs_by_indices(const LanceDataset* dataset, const uint64_t* indices, size_t num_indices,
+                                            const char* column, LanceBlobFile** out) {
+    return take_blobs(dataset, indices, num_indices, column, out, false);
+}
+
+uint64_t lance_blob_file_size(const LanceBlobFile* blob) {
+    if (blob == nullptr) {
+        invalid("blob must not be NULL");
+        return 0;
+    }
+    clear_error();
+    return blob->location.size;
+}
+
+int32_t lance_blob_file_read(LanceBlobFile* blob, uint8_t* dst, size_t dst_len) {
+    if (blob == nullptr) {
+        invalid("blob must not be NULL");
+        return -1;
+    }
+    const uint64_t remaining = blob->cursor >= blob->location.size ? 0U : blob->location.size - blob->cursor;
+    if (remaining > dst_len || (dst == nullptr && remaining != 0U)) {
+        invalid("dst is smaller than the bytes remaining in the blob");
+        return -1;
+    }
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        if (remaining != 0U && !read_blob(*blob, blob->cursor, dst, static_cast<std::size_t>(remaining))) {
+            return -1;
+        }
+        blob->cursor += remaining;
+        clear_error();
+        return 0;
+    });
+}
+
+int32_t lance_blob_file_read_up_to(LanceBlobFile* blob, uint8_t* dst, size_t len, size_t* bytes_read) {
+    if (blob == nullptr || bytes_read == nullptr || (dst == nullptr && len != 0U)) {
+        invalid("blob, bytes_read and (when len > 0) dst must not be NULL");
+        return -1;
+    }
+    const uint64_t remaining = blob->cursor >= blob->location.size ? 0U : blob->location.size - blob->cursor;
+    const auto n = static_cast<std::size_t>(std::min<uint64_t>(len, remaining));
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        if (n != 0U && !read_blob(*blob, blob->cursor, dst, n)) {
+            return -1;
+        }
+        blob->cursor += n;
+        *bytes_read = n;
+        clear_error();
+        return 0;
+    });
+}
+
+int32_t lance_blob_file_read_range(const LanceBlobFile* blob, uint64_t offset, uint8_t* dst, size_t len) {
+    if (blob == nullptr || (dst == nullptr && len != 0U)) {
+        invalid("blob and (when len > 0) dst must not be NULL");
+        return -1;
+    }
+    if (len == 0U) {
+        clear_error();
+        return 0;
+    }
+    if (offset > std::numeric_limits<uint64_t>::max() - len || offset + len > blob->location.size) {
+        invalid("the range ends past the end of the blob");
+        return -1;
+    }
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        if (!read_blob(*blob, offset, dst, len)) {
+            return -1;
+        }
+        clear_error();
+        return 0;
+    });
+}
+
+int32_t lance_blob_file_seek(LanceBlobFile* blob, uint64_t pos) {
+    if (blob == nullptr) {
+        invalid("blob must not be NULL");
+        return -1;
+    }
+    blob->cursor = pos;
+    clear_error();
     return 0;
 }
-int32_t lance_blob_file_read(LanceBlobFile*, uint8_t*, size_t) { NL_UNSUPPORTED_INT("blob files"); }
-int32_t lance_blob_file_read_up_to(LanceBlobFile*, uint8_t*, size_t, size_t*) { NL_UNSUPPORTED_INT("blob files"); }
-int32_t lance_blob_file_read_range(const LanceBlobFile*, uint64_t, uint8_t*, size_t) {
-    NL_UNSUPPORTED_INT("blob files");
+
+int32_t lance_blob_file_tell(const LanceBlobFile* blob, uint64_t* pos) {
+    if (blob == nullptr || pos == nullptr) {
+        invalid("blob and pos must not be NULL");
+        return -1;
+    }
+    *pos = blob->cursor;
+    clear_error();
+    return 0;
 }
-int32_t lance_blob_file_seek(LanceBlobFile*, uint64_t) { NL_UNSUPPORTED_INT("blob files"); }
-int32_t lance_blob_file_tell(const LanceBlobFile*, uint64_t*) { NL_UNSUPPORTED_INT("blob files"); }
+
 void lance_blob_file_close(LanceBlobFile* blob) { delete blob; }
 
 int32_t lance_dataset_create_vector_index(LanceDataset*, const char*, const char*, const LanceVectorIndexParams*,

@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, TypedDict, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import pyarrow as pa
 
@@ -354,7 +354,7 @@ class LanceDataset:
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
             fragments=fragments, full_text_query=full_text_query, with_row_id=with_row_id,
             with_row_address=with_row_address, include_deleted_rows=include_deleted_rows, order_by=order_by,
-            substrait_filter=substrait_filter, scan_stats_callback=scan_stats_callback,
+            substrait_filter=substrait_filter, scan_stats_callback=scan_stats_callback, blob_handling=blob_handling,
         )
         options.update({k: v for k, v in given.items() if v is not None})
         return LanceScanner(self, **options)
@@ -414,7 +414,9 @@ class LanceDataset:
     def take_rows(self, row_ids, columns=None, **kwargs) -> pa.Table:
         return self._take_rows(row_ids, columns, **kwargs)
 
-    def _take(self, wanted: List[int], names, addresses: bool, with_row_id=False, with_row_address=False):
+    def _take(self, wanted: List[int], names, addresses: bool, with_row_id=False, with_row_address=False,
+              blob_handling=None):
+        blob_handling = _nanolance.BLOB_DESCRIPTIONS if blob_handling is None else blob_handling
         order = None
         if names is not None and any(n in ("_rowid", "_rowaddr") for n in names):
             order = list(names)
@@ -426,7 +428,7 @@ class LanceDataset:
         distinct = sorted(set(wanted))
         with native():
             table = pa.table(_nanolance._ds_take(self._uri, self._version, distinct, names, with_row_id,
-                                                 with_row_address, addresses))
+                                                 with_row_address, addresses, blob_handling))
         if order is not None:
             table = table.select(order)
         elif names is not None:
@@ -435,6 +437,46 @@ class LanceDataset:
             return table
         position = {row: k for k, row in enumerate(distinct)}
         return table.take(pa.array([position[i] for i in wanted], pa.int64()))
+
+    # ── blobs ───────────────────────────────────────────────────────────────────────────────────────
+
+    def _blob_rows(self, blob_column: str, ids, addresses, indices):
+        """The Locations read of `blob_column` for the selected rows, in selection order."""
+        given = [(k, v) for k, v in (("ids", ids), ("addresses", addresses), ("indices", indices)) if v is not None]
+        if len(given) != 1:
+            raise ValueError("Exactly one of ids, addresses, or indices must be specified")
+        kind, values = given[0]
+        wanted = _index_list(values)
+        if kind == "indices":
+            n = self.count_rows()
+            for i in wanted:
+                if i < 0 or i >= n:
+                    raise IndexError(f"index {i} is out of bounds for a dataset of {n} rows")
+        field = self.schema.field(blob_column) if blob_column in self.schema.names else None
+        if field is None:
+            raise ValueError(f"column {blob_column!r} does not exist")
+        table = self._take(wanted, [blob_column], addresses=kind != "indices",
+                           with_row_address=True, blob_handling=_nanolance.BLOB_LOCATIONS)
+        column = table.column(blob_column)
+        if not pa.types.is_struct(column.type) or column.type.get_field_index("file") < 0:
+            raise ValueError(f"column {blob_column!r} is not a blob column")
+        return table.column("_rowaddr").to_pylist(), column.to_pylist()
+
+    def take_blobs(self, blob_column: str, ids=None, addresses=None, indices=None) -> List[Optional["BlobFile"]]:
+        """One file-like :class:`lance.BlobFile` per selected row (``None`` for a null value)."""
+        from .blob import BlobFile
+
+        _, rows = self._blob_rows(blob_column, ids, addresses, indices)
+        return [None if r is None else
+                BlobFile(r["file"], r["kind"] == 3, 0 if r["kind"] == 2 else r["position"], r["size"])
+                for r in rows]
+
+    def read_blobs(self, blob_column: str, ids=None, addresses=None, indices=None, *, io_buffer_size=None,
+                   preserve_order=None) -> List[Tuple[int, Optional[bytes]]]:
+        """``(row_address, bytes)`` per selected row (``None`` for a null value), in selection order."""
+        addrs, _ = self._blob_rows(blob_column, ids, addresses, indices)
+        files = self.take_blobs(blob_column, ids=ids, addresses=addresses, indices=indices)
+        return [(a, None if f is None else f.readall()) for a, f in zip(addrs, files)]
 
     def sample(self, num_rows: int, columns=None, randomize_order: bool = True, **kwargs) -> pa.Table:
         import random
@@ -532,11 +574,24 @@ class LanceDataset:
             "create_index", "create_scalar_index", "drop_index", "list_indices", "describe_indices",
             "index_statistics", "cleanup_old_versions", "merge", "tags", "branches", "create_branch", "sql",
             "shallow_clone", "deep_clone", "commit", "commit_batch", "session", "stats", "join", "delta",
-            "take_blobs", "read_blobs", "has_index", "prewarm_index", "lance_schema", "validate",
+            "has_index", "prewarm_index", "lance_schema", "validate",
         }
         if name in known:
             raise unsupported(f"LanceDataset.{name}")
         raise AttributeError(name)
+
+
+def _blob_mode(blob_handling) -> int:
+    """pylance's blob_handling names, as nanolance's reader modes. The default, as in pylance: a blob
+    column comes back as its description."""
+    if blob_handling is None:
+        return _nanolance.BLOB_DESCRIPTIONS
+    name = str(getattr(blob_handling, "value", blob_handling)).lower()
+    if name in ("all_binary", "allbinary"):
+        return _nanolance.BLOB_BINARY
+    if name in ("blobs_descriptions", "all_descriptions", "blobsdescriptions", "alldescriptions"):
+        return _nanolance.BLOB_DESCRIPTIONS
+    raise ValueError(f"unknown blob_handling {blob_handling!r}")
 
 
 def _version_summary(info: dict) -> Dict[str, str]:
@@ -686,7 +741,7 @@ class LanceScanner:
     def __init__(self, ds: LanceDataset, columns=None, filter=None, limit=None, offset=None, nearest=None,
                  batch_size=None, fragments=None, full_text_query=None, with_row_id=False, with_row_address=False,
                  include_deleted_rows=None, order_by=None, substrait_filter=None, scan_stats_callback=None,
-                 **ignored):
+                 blob_handling=None, **ignored):
         if nearest is not None:
             raise unsupported("vector search (nearest=...)")
         if full_text_query is not None:
@@ -698,6 +753,7 @@ class LanceScanner:
         if order_by:
             raise unsupported("order_by")
         self._filter = _filter_sql(filter)
+        self._blob_handling = _blob_mode(blob_handling)
         if limit is not None and int(limit) < 0:
             raise ValueError("limit must be non-negative")
         if offset is not None and int(offset) < 0:
@@ -736,10 +792,11 @@ class LanceScanner:
             self._drop_rowaddr = True
             with native():
                 return _nanolance._ds_scan(self._ds.uri, self._ds.version, [], self._fragment_ids, offset, length,
-                                           False, True, stream, self._filter)
+                                           False, True, stream, self._filter, self._blob_handling)
         with native():
             return _nanolance._ds_scan(self._ds.uri, self._ds.version, self._names, self._fragment_ids, offset,
-                                       length, self._with_row_id, self._with_row_address, stream, self._filter)
+                                       length, self._with_row_id, self._with_row_address, stream, self._filter,
+                                       self._blob_handling)
 
     _drop_rowaddr = False
 

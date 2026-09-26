@@ -5,6 +5,7 @@
 
 #include "arrow_capsule.hpp"
 
+#include <nanolance/blob_v2_external.hpp>
 #include <nanolance/dataset.hpp>
 #include <nanolance/dataset_ops.hpp>
 #include <nanolance/lance_table_reader.hpp>
@@ -400,8 +401,10 @@ ExportedTable table_of(ArrowSchema& schema, std::vector<ArrowArray>& batches) {
 nb::object ds_scan(const std::filesystem::path& path, std::optional<std::uint64_t> version,
                    std::optional<std::vector<std::string>> columns,
                    std::optional<std::vector<std::uint64_t>> fragment_ids, std::uint64_t offset, std::int64_t length,
-                   bool with_row_id, bool with_row_address, bool stream, std::optional<std::string> filter) {
+                   bool with_row_id, bool with_row_address, bool stream, std::optional<std::string> filter,
+                   int blob_handling) {
     auto request = make_request(version, columns, fragment_ids, with_row_id, with_row_address);
+    request.blob_handling = static_cast<nano_lance::BlobHandling>(blob_handling);
     request.filter = filter ? &*filter : nullptr;
     request.range.offset = offset;
     request.range.length = length < 0 ? nano_lance::LanceRowRange::kAllRows : static_cast<std::uint64_t>(length);
@@ -435,8 +438,9 @@ nb::object ds_scan(const std::filesystem::path& path, std::optional<std::uint64_
 
 ExportedTable ds_take(const std::filesystem::path& path, std::optional<std::uint64_t> version,
                       const std::vector<std::uint64_t>& rows, std::optional<std::vector<std::string>> columns,
-                      bool with_row_id, bool with_row_address, bool addresses) {
-    const auto request = make_request(version, columns, std::nullopt, with_row_id, with_row_address);
+                      bool with_row_id, bool with_row_address, bool addresses, int blob_handling) {
+    auto request = make_request(version, columns, std::nullopt, with_row_id, with_row_address);
+    request.blob_handling = static_cast<nano_lance::BlobHandling>(blob_handling);
     std::string error;
     ArrowSchema schema{};
     std::vector<ArrowArray> batches;
@@ -827,9 +831,36 @@ NB_MODULE(_nanolance, m) {
     m.def("_reset_work_stats", [] { nano_lance_reset_work_stats(); });
     m.def("_ds_scan", &ds_scan, nb::arg("path"), nb::arg("version").none(), nb::arg("columns").none(),
           nb::arg("fragment_ids").none(), nb::arg("offset"), nb::arg("length"), nb::arg("with_row_id"),
-          nb::arg("with_row_address"), nb::arg("stream"), nb::arg("filter").none() = nb::none());
+          nb::arg("with_row_address"), nb::arg("stream"), nb::arg("filter").none() = nb::none(),
+          nb::arg("blob_handling") = 0);
     m.def("_ds_take", &ds_take, nb::arg("path"), nb::arg("version").none(), nb::arg("rows"),
-          nb::arg("columns").none(), nb::arg("with_row_id"), nb::arg("with_row_address"), nb::arg("addresses"));
+          nb::arg("columns").none(), nb::arg("with_row_id"), nb::arg("with_row_address"), nb::arg("addresses"),
+          nb::arg("blob_handling") = 0);
+    m.def("_blob_read", [](const std::string& file, bool external, std::uint64_t position, std::uint64_t size,
+                           std::uint64_t offset, std::uint64_t length) {
+        nano_lance::BlobV2Location location;
+        location.file = file;
+        location.external = external;
+        location.position = position;
+        location.size = size;
+        std::vector<std::uint8_t> bytes;
+        std::string error;
+        bool ok = false;
+        {
+            nb::gil_scoped_release release;
+            ok = nano_lance::blob_v2_read(location, offset, length, bytes, error);
+        }
+        if (!ok) {
+            throw_dataset(error);
+        }
+        return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }, nb::arg("file"), nb::arg("external"), nb::arg("position"), nb::arg("size"), nb::arg("offset"),
+       nb::arg("length"));
+    // BlobHandling, in the order of the C++ enum.
+    m.attr("BLOB_INGEST") = 0;
+    m.attr("BLOB_DESCRIPTIONS") = 1;
+    m.attr("BLOB_BINARY") = 2;
+    m.attr("BLOB_LOCATIONS") = 3;
     m.def("_ds_schema", &ds_schema, nb::arg("path"), nb::arg("version").none());
     m.def("_ds_info", &ds_info, nb::arg("path"), nb::arg("version").none());
     m.def("_ds_versions", &ds_versions, nb::arg("path"));

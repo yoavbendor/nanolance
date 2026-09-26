@@ -110,8 +110,8 @@
    "failed": 3
   },
   "tests/test_lance.py": {
-   "passed": 9,
-   "failed": 14
+   "failed": 14,
+   "passed": 9
   },
   "tests/test_log.py": {
    "failed": 18

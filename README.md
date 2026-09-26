@@ -183,6 +183,7 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 | `utf8`, `binary`, `fixed_size_binary(N)` | round-trips (high-cardinality strings FSST-compressed, as stock Lance does) |
 | `struct` (nested, arbitrarily deep) | round-trips |
 | `lance.blob.v2` external references | round-trips (the headline feature) |
+| `lance.blob.v2` as pylance writes it: inline, packed, dedicated, external, empty and null blobs | read (as descriptions, as bytes, or as file handles); nanolance writes external blobs only |
 | nulls in a fixed-width column (int, float, bool, temporal, decimal, `fixed_size_binary`) | round-trips |
 | nulls in a `utf8`/`binary` column | round-trips |
 | a null **struct** (as opposed to a null field inside one) | round-trips (written with its own definition level, as Lance does) |

@@ -34,6 +34,23 @@ struct LanceRowRange {
 
 /// What a read asks of a dataset, beyond its path: the version, the columns, the fragments, the rows,
 /// and Lance's row identity columns. A default request is a full read of the latest version.
+/// How a read returns a Lance Blob v2 column.
+enum class BlobHandling {
+    /// nanolance's own shape, what its writer takes: struct<data, uri, position, size>, with `data`
+    /// null (the bytes stay where they are).
+    Ingest,
+    /// Lance's description of each blob, as pylance and lance-c return it by default:
+    /// struct<kind: uint8, position: uint64, size: uint64, blob_id: uint32, blob_uri: utf8>.
+    /// `kind` is 0 inline (in the data file), 1 packed (in a shared sidecar file), 2 dedicated (a
+    /// sidecar file of its own), 3 external (at blob_uri).
+    Descriptions,
+    /// The bytes themselves (large_binary), read from wherever each blob is stored.
+    Binary,
+    /// The description plus `file`: the local file (or, for an external blob, the URI) holding the
+    /// bytes -- what a blob file handle reads from without reading the bytes up front.
+    Locations,
+};
+
 struct LanceScanRequest {
     /// Top-level columns to read (their children come along). Null reads every column; an empty list
     /// reads none, which is only useful with a row id column.
@@ -56,6 +73,8 @@ struct LanceScanRequest {
     /// Read the rows of the fragments' deletion files too (every physical row, in file order): what an
     /// operation that writes a new column for existing fragments needs.
     bool include_deleted_rows = false;
+    /// How Blob v2 columns come back (see BlobHandling).
+    BlobHandling blob_handling = BlobHandling::Ingest;
 };
 
 /// A read as `request` describes it. See lance_table_read_dataset for the ownership rules.

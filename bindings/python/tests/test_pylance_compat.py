@@ -436,3 +436,61 @@ def test_pylance_written_shapes_read_back(lance, tmp_path, version):
         if got != want:
             failures.append(f"{name}: different rows")
     assert not failures, failures
+
+
+def _pylance_blob_dataset(lance, tmp_path):
+    """Every Blob v2 storage kind pylance writes, in two fragments: inline (8 bytes), packed (128),
+    dedicated (4096), empty, null, and external (a range of a local file) -- beside a nullable column."""
+    payload = bytes((i * 7 + 3) % 256 for i in range(4096))
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"x" * 100 + payload + b"y" * 100)
+    schema = pa.schema([
+        pa.field("id", pa.uint32(), nullable=False),
+        lance.blob_field("blob", nullable=True, inline_size_threshold=16, dedicated_size_threshold=256),
+        pa.field("raw", pa.binary()),
+    ])
+    uri = str(tmp_path / "blobs")
+    for first, mode in ((0, "create"), (100, "append")):
+        blobs = [lance.Blob.from_bytes(payload[:8]), lance.Blob.from_bytes(payload[:128]),
+                 lance.Blob.from_bytes(payload), lance.Blob.from_bytes(b""), None,
+                 lance.Blob.from_uri(outside.as_uri(), position=100, size=300)]
+        table = pa.table([
+            pa.array(range(first, first + len(blobs)), pa.uint32()),
+            lance.blob_array(blobs),
+            pa.array([b"raw"] * 4 + [None, b"r"], pa.binary()),
+        ], schema=schema)
+        lance.write_dataset(table, uri, mode=mode, data_storage_version="2.2",
+                            allow_external_blob_outside_bases=True)
+    return uri
+
+
+def test_pylance_blobs_read_back(lance, tmp_path):
+    """A Blob v2 column as pylance writes it reads back as pylance reads it: as descriptions (the
+    default), as bytes (all_binary), and as file handles (take_blobs), whatever the storage kind. The
+    first run found nanolance could read only its own external blobs -- every other kind, and any
+    null, failed -- and that a batch with a blob column dropped the nulls of every other column."""
+    uri = _pylance_blob_dataset(lance, tmp_path)
+    ours, theirs = nl.dataset(uri), lance.dataset(uri)
+    assert ours.to_table() == theirs.to_table()
+    assert ours.to_table(blob_handling="all_binary") == theirs.to_table(blob_handling="all_binary")
+    assert ours.to_table(filter="id % 2 = 0", blob_handling="all_binary") == \
+        theirs.to_table(filter="id % 2 = 0", blob_handling="all_binary")
+    assert ours.take([11, 4, 0, 7]) == theirs.take([11, 4, 0, 7])
+
+    def contents(files):
+        return [None if f is None else (f.size(), f.readall()) for f in files]
+
+    everything = list(range(12))
+    assert contents(ours.take_blobs("blob", indices=everything)) == contents(theirs.take_blobs("blob", indices=everything))
+    ids = theirs.to_table(columns=["id"], with_row_id=True).column("_rowid").to_pylist()
+    assert contents(ours.take_blobs("blob", ids=ids[3:9])) == contents(theirs.take_blobs("blob", ids=ids[3:9]))
+    assert ours.read_blobs("blob", indices=[5, 1, 4]) == theirs.read_blobs("blob", indices=[5, 1, 4])
+
+    # A handle reads only what it is asked for, from wherever the blob is.
+    for index in (1, 2, 5):
+        mine, pylances = ours.take_blobs("blob", indices=[index])[0], theirs.take_blobs("blob", indices=[index])[0]
+        assert mine.read_range(3, 5) == pylances.read_range(3, 5)
+        mine.seek(-4, 2)
+        assert mine.read() == pylances.read_range(pylances.size() - 4, 4)
+    with pytest.raises(ValueError):
+        ours.take_blobs("raw", indices=[0])

@@ -12,7 +12,9 @@ c/nanolance::test_open_and_metadata
 c/nanolance::test_restore_to_current
 c/nanolance::test_scan
 c/nanolance::test_scan_with_limit
+c/nanolance::test_scanner_blob_handling
 c/nanolance::test_shared_session
+c/nanolance::test_take_blobs
 c/nanolance::test_update
 c/nanolance::test_versions
 c/pylance::test_add_columns
@@ -28,7 +30,9 @@ c/pylance::test_open_and_metadata
 c/pylance::test_restore_to_current
 c/pylance::test_scan
 c/pylance::test_scan_with_limit
+c/pylance::test_scanner_blob_handling
 c/pylance::test_shared_session
+c/pylance::test_take_blobs
 c/pylance::test_update
 c/pylance::test_versions
 cpp/nanolance::test_add_columns
@@ -51,8 +55,10 @@ cpp/nanolance::test_nearest_smoke
 cpp/nanolance::test_raii_cleanup
 cpp/nanolance::test_restore_to_current
 cpp/nanolance::test_scanner_async_stream_ownership
+cpp/nanolance::test_scanner_blob_handling
 cpp/nanolance::test_scanner_fluent
 cpp/nanolance::test_shared_session
+cpp/nanolance::test_take_blobs
 cpp/nanolance::test_update
 cpp/nanolance::test_versions
 cpp/pylance::test_add_columns
@@ -75,7 +81,9 @@ cpp/pylance::test_nearest_smoke
 cpp/pylance::test_raii_cleanup
 cpp/pylance::test_restore_to_current
 cpp/pylance::test_scanner_async_stream_ownership
+cpp/pylance::test_scanner_blob_handling
 cpp/pylance::test_scanner_fluent
 cpp/pylance::test_shared_session
+cpp/pylance::test_take_blobs
 cpp/pylance::test_update
 cpp/pylance::test_versions

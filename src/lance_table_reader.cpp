@@ -86,8 +86,46 @@ bool set_schema_metadata(ArrowSchema& schema, const std::string& key, const std:
     return true;
 }
 
+/// A Blob v2 column as `blob` asks for it (anything but Ingest), with pylance's types and metadata.
+bool init_blob_schema(const LanceField& field, BlobHandling blob, ArrowSchema& schema, std::string& error) {
+    ArrowSchemaInit(&schema);
+    bool ok = true;
+    if (blob == BlobHandling::Binary) {
+        ok = ArrowSchemaSetType(&schema, NANOARROW_TYPE_LARGE_BINARY) == NANOARROW_OK;
+    } else {
+        struct Child {
+            const char* name;
+            ArrowType type;
+        };
+        std::vector<Child> children = {{"kind", NANOARROW_TYPE_UINT8},
+                                       {"position", NANOARROW_TYPE_UINT64},
+                                       {"size", NANOARROW_TYPE_UINT64},
+                                       {"blob_id", NANOARROW_TYPE_UINT32},
+                                       {"blob_uri", NANOARROW_TYPE_STRING}};
+        if (blob == BlobHandling::Locations) {
+            children.push_back({"file", NANOARROW_TYPE_STRING});
+        }
+        ok = ArrowSchemaSetTypeStruct(&schema, static_cast<int64_t>(children.size())) == NANOARROW_OK;
+        for (std::size_t i = 0; ok && i < children.size(); ++i) {
+            ok = ArrowSchemaSetType(schema.children[i], children[i].type) == NANOARROW_OK &&
+                 ArrowSchemaSetName(schema.children[i], children[i].name) == NANOARROW_OK;
+            schema.children[i]->flags &= ~ARROW_FLAG_NULLABLE;
+        }
+        ok = ok && set_schema_metadata(schema, "lance-encoding:packed", "true") &&
+             set_schema_metadata(schema, "lance-encoding:blob", "true");
+    }
+    ok = ok && ArrowSchemaSetName(&schema, field.name.c_str()) == NANOARROW_OK;
+    if (!ok) {
+        error = "failed to build the schema of blob column " + field.name;
+    }
+    return ok;
+}
+
 bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& mapping, ArrowSchema& schema,
-                            std::string& error) {
+                            std::string& error, BlobHandling blob = BlobHandling::Ingest) {
+    if (blob != BlobHandling::Ingest && field.extension_name == "lance.blob.v2") {
+        return init_blob_schema(field, blob, schema, error);
+    }
     ArrowSchemaInit(&schema);
     std::uint64_t fsl_items = 0;
     if (field.logical_type == "struct") {
@@ -110,7 +148,7 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
             return false;
         }
         for (std::size_t i = 0; i < children.size(); ++i) {
-            if (!init_schema_from_field(*children[i], mapping, *schema.children[i], error)) {
+            if (!init_schema_from_field(*children[i], mapping, *schema.children[i], error, blob)) {
                 return false;
             }
         }
@@ -222,7 +260,8 @@ bool set_dataset_schema_metadata(ArrowSchema& schema, const pb::Manifest& manife
     return ok;
 }
 
-bool build_schema_from_mapping(const LanceSchemaMapping& mapping, ArrowSchema& schema, std::string& error) {
+bool build_schema_from_mapping(const LanceSchemaMapping& mapping, ArrowSchema& schema, std::string& error,
+                               BlobHandling blob = BlobHandling::Ingest) {
     std::vector<const LanceField*> roots;
     for (const auto& field : mapping.fields) {
         if (field.parent_id == -1) {
@@ -243,7 +282,7 @@ bool build_schema_from_mapping(const LanceSchemaMapping& mapping, ArrowSchema& s
             error = "failed to set root struct type";
             return false;
         }
-        return init_schema_from_field(*roots[0], mapping, *schema.children[0], error);
+        return init_schema_from_field(*roots[0], mapping, *schema.children[0], error, blob);
     }
     ArrowSchemaInit(&schema);
     if (ArrowSchemaAllocateChildren(&schema, static_cast<int64_t>(roots.size())) != NANOARROW_OK) {
@@ -255,7 +294,7 @@ bool build_schema_from_mapping(const LanceSchemaMapping& mapping, ArrowSchema& s
         return false;
     }
     for (std::size_t i = 0; i < roots.size(); ++i) {
-        if (!init_schema_from_field(*roots[i], mapping, *schema.children[i], error)) {
+        if (!init_schema_from_field(*roots[i], mapping, *schema.children[i], error, blob)) {
             return false;
         }
     }
@@ -379,30 +418,79 @@ bool append_uint64_value(ArrowArray& array, const std::uint64_t value, std::stri
     return true;
 }
 
-bool append_blob_v2_row(ArrowArray& struct_array, const std::vector<std::uint8_t>& row_bytes,
-                        const std::vector<std::string>* uri_dictionary, std::string& error) {
+/// One Blob v2 row, in the shape the read asked for (see BlobHandling).
+bool append_blob_v2_row(ArrowArray& array, const std::vector<std::uint8_t>& row_bytes,
+                        const std::vector<std::string>* uri_dictionary, BlobHandling shape,
+                        const std::filesystem::path& data_file, std::string& error) {
     BlobV2ExternalDescriptor descriptor{};
     if (!blob_v2_unpack_descriptor_row(row_bytes, descriptor, error)) {
         return false;
     }
     // Dictionary-encoded rows carry an empty inline URI and a blob_id index into the dictionary.
-    if (uri_dictionary != nullptr && !uri_dictionary->empty() && descriptor.blob_uri.empty()) {
+    if (uri_dictionary != nullptr && !uri_dictionary->empty() && descriptor.blob_uri.empty() &&
+        descriptor.kind == kBlobKindExternal) {
         if (descriptor.blob_id >= uri_dictionary->size()) {
             error = "blob_id out of range for URI dictionary";
             return false;
         }
         descriptor.blob_uri = (*uri_dictionary)[descriptor.blob_id];
+        descriptor.blob_id = 0;
     }
-    auto* data = struct_array.children[0];
-    auto* uri = struct_array.children[1];
-    auto* position = struct_array.children[2];
-    auto* size_field = struct_array.children[3];
-    if (!append_null_binary(*data, error) || !append_one_string(*uri, descriptor.blob_uri, error) ||
-        !append_uint64_value(*position, descriptor.position, error) ||
-        !append_uint64_value(*size_field, descriptor.size, error)) {
-        return false;
+    const auto read_bytes = [&](std::vector<std::uint8_t>& bytes) {
+        BlobV2Location location;
+        return blob_v2_locate(descriptor, data_file, location, error) &&
+               blob_v2_read(location, 0, location.size, bytes, error);
+    };
+    const auto append_bytes = [&](ArrowArray& target, const std::vector<std::uint8_t>& bytes) {
+        ArrowBufferView view{};
+        view.data.data = bytes.data();
+        view.size_bytes = static_cast<int64_t>(bytes.size());
+        if (ArrowArrayAppendBytes(&target, view) != NANOARROW_OK) {
+            error = "failed to append blob bytes";
+            return false;
+        }
+        return true;
+    };
+    switch (shape) {
+        case BlobHandling::Binary: {
+            std::vector<std::uint8_t> bytes;
+            return read_bytes(bytes) && append_bytes(array, bytes);
+        }
+        case BlobHandling::Descriptions:
+        case BlobHandling::Locations: {
+            bool ok = append_uint64_value(*array.children[0], descriptor.kind, error) &&
+                      append_uint64_value(*array.children[1], descriptor.position, error) &&
+                      append_uint64_value(*array.children[2], descriptor.size, error) &&
+                      append_uint64_value(*array.children[3], descriptor.blob_id, error) &&
+                      append_one_string(*array.children[4], descriptor.blob_uri, error);
+            if (ok && shape == BlobHandling::Locations) {
+                BlobV2Location location;
+                ok = blob_v2_locate(descriptor, data_file, location, error) &&
+                     append_one_string(*array.children[5], location.file, error);
+            }
+            break;
+        }
+        case BlobHandling::Ingest: {
+            // nanolance's shape: `uri` for an external blob, `data` for one stored in the dataset
+            // (Lance's inline, packed and dedicated kinds, read from where they are).
+            auto* data = array.children[0];
+            bool ok = true;
+            if (descriptor.kind == kBlobKindExternal) {
+                ok = append_null_binary(*data, error) && append_one_string(*array.children[1], descriptor.blob_uri, error);
+            } else {
+                std::vector<std::uint8_t> bytes;
+                ok = read_bytes(bytes) && append_bytes(*data, bytes) &&
+                     append_one_string(*array.children[1], "", error);
+            }
+            ok = ok && append_uint64_value(*array.children[2], descriptor.position, error) &&
+                 append_uint64_value(*array.children[3], descriptor.size, error);
+            if (!ok) {
+                return false;
+            }
+            break;
+        }
     }
-    if (ArrowArrayFinishElement(&struct_array) != NANOARROW_OK) {
+    if (ArrowArrayFinishElement(&array) != NANOARROW_OK) {
         error = "failed to finish blob struct element";
         return false;
     }
@@ -411,25 +499,45 @@ bool append_blob_v2_row(ArrowArray& struct_array, const std::vector<std::uint8_t
 
 bool append_column_value_at_row(const LanceField& field, const ColumnValues& values, const std::int64_t row,
                                 const std::vector<std::string>* uri_dictionary, ArrowArray& array,
-                                std::string& error) {
+                                std::string& error, BlobHandling blob_shape = BlobHandling::Ingest) {
     if (field.extension_name == "lance.blob.v2") {
         if (values.kind != ColumnValues::Kind::BlobV2External) {
             error = "expected blob v2 packed values for " + field.name;
             return false;
         }
-        std::size_t offset = 0;
-        for (std::int64_t i = 0; i < row; ++i) {
-            if (static_cast<std::size_t>(i) >= values.blob_v2.row_packed_sizes.size()) {
-                error = "blob row index out of range";
-                return false;
-            }
-            offset += values.blob_v2.row_packed_sizes[static_cast<std::size_t>(i)];
-        }
-        if (static_cast<std::size_t>(row) >= values.blob_v2.row_packed_sizes.size()) {
+        const auto& sizes = values.blob_v2.row_packed_sizes;
+        if (row < 0 || static_cast<std::size_t>(row) >= sizes.size()) {
             error = "blob row index out of range";
             return false;
         }
-        const auto row_size = values.blob_v2.row_packed_sizes[static_cast<std::size_t>(row)];
+        if (!values.validity.empty() &&
+            ((values.validity[static_cast<std::size_t>(row) / 8U] >> (static_cast<std::size_t>(row) % 8U)) & 1U) == 0U) {
+            if (ArrowArrayAppendNull(&array, 1) != NANOARROW_OK) {
+                error = "failed to append a null blob";
+                return false;
+            }
+            return true;
+        }
+        // Rows are appended in order: continue from the previous row's offset instead of summing
+        // every earlier row's size again (which made a column of n blobs cost n^2).
+        thread_local struct {
+            const std::uint32_t* sizes = nullptr;
+            const std::uint8_t* payload = nullptr;
+            std::int64_t row = 0;
+            std::size_t offset = 0;
+        } cursor;
+        if (cursor.sizes != sizes.data() || cursor.payload != values.blob_v2.packed_payload.data() ||
+            cursor.row > row) {
+            cursor.sizes = sizes.data();
+            cursor.payload = values.blob_v2.packed_payload.data();
+            cursor.row = 0;
+            cursor.offset = 0;
+        }
+        for (; cursor.row < row; ++cursor.row) {
+            cursor.offset += sizes[static_cast<std::size_t>(cursor.row)];
+        }
+        const std::size_t offset = cursor.offset;
+        const auto row_size = sizes[static_cast<std::size_t>(row)];
         if (offset + row_size > values.blob_v2.packed_payload.size()) {
             error = "blob packed row out of range";
             return false;
@@ -437,7 +545,7 @@ bool append_column_value_at_row(const LanceField& field, const ColumnValues& val
         const std::vector<std::uint8_t> row_bytes(
             values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(offset),
             values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(offset + row_size));
-        return append_blob_v2_row(array, row_bytes, uri_dictionary, error);
+        return append_blob_v2_row(array, row_bytes, uri_dictionary, blob_shape, values.blob_v2.data_file, error);
     }
     if (lance_field_is_variable_width(field.logical_type)) {
         return append_string_at_row(array, values.variable, static_cast<std::size_t>(row), error);
@@ -540,6 +648,7 @@ struct ColumnPlan {
     const LanceField* field = nullptr;      // Blob path needs the full field
     ColumnValues* values = nullptr;
     const std::vector<std::string>* dict = nullptr;
+    BlobHandling blob_shape = BlobHandling::Ingest;  // Blob: the shape the batch schema asks for
     std::size_t width = 0;                   // Fixed
     FixedFmt fmt = FixedFmt::kUnsupported;   // Fixed
     /// The struct and list arrays from the top-level field down to the leaf `array`, outermost
@@ -862,6 +971,11 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         if (is_blob) {
             plan.kind = ColumnPlan::Kind::Blob;
             plan.dict = dict_for(field->id);
+            const std::string format = node_schema->format != nullptr ? node_schema->format : "";
+            plan.blob_shape = format == "Z"                   ? BlobHandling::Binary
+                              : node_schema->n_children == 6  ? BlobHandling::Locations
+                              : node_schema->n_children == 5  ? BlobHandling::Descriptions
+                                                              : BlobHandling::Ingest;
         } else if (is_fsl) {
             // One physical column of N-element rows. The decoded bytes ARE the child's values buffer:
             // N elements per row, back to back.
@@ -1010,6 +1124,19 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     }
     for (std::int64_t row = 0; row < length; ++row) {
         for (auto& plan : plans) {
+            // A null value, in any column but a blob (whose own append handles it). Without this, every
+            // other column of a batch with a blob column read its nulls back as values.
+            if ((plan.kind == ColumnPlan::Kind::Variable || plan.kind == ColumnPlan::Kind::Fixed) &&
+                !plan.values->validity.empty() &&
+                ((plan.values->validity[static_cast<std::size_t>(row) / 8U] >> (static_cast<std::size_t>(row) % 8U)) &
+                 1U) == 0U) {
+                if (ArrowArrayAppendNull(plan.array, 1) != NANOARROW_OK) {
+                    error = "failed to append a null";
+                    ArrowArrayRelease(&batch);
+                    return false;
+                }
+                continue;
+            }
             switch (plan.kind) {
                 case ColumnPlan::Kind::Skip:
                 case ColumnPlan::Kind::FixedSizeList:  // refused above: this path builds no nested arrays
@@ -1032,7 +1159,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                     }
                     break;
                 case ColumnPlan::Kind::Blob:
-                    if (!append_column_value_at_row(*plan.field, *plan.values, row, plan.dict, *plan.array, error)) {
+                    if (!append_column_value_at_row(*plan.field, *plan.values, row, plan.dict, *plan.array, error,
+                                                    plan.blob_shape)) {
                         ArrowArrayRelease(&batch);
                         return false;
                     }
@@ -2134,7 +2262,7 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
             error = "failed to build an empty schema";
             return false;
         }
-    } else if (!build_schema_from_mapping(output_mapping, out_schema, error)) {
+    } else if (!build_schema_from_mapping(output_mapping, out_schema, error, request.blob_handling)) {
         release_schema_if_held(out_schema);
         return false;
     }

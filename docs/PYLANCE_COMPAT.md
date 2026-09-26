@@ -42,6 +42,7 @@ compared, results are checked against pylance on the same files, in both directi
 | Fragments | `get_fragments`, `get_fragment`; `LanceFragment`: `fragment_id`, `metadata` (`FragmentMetadata`, `DataFile`, `DeletionFile`), `count_rows`, `physical_rows`, `num_deletions`, `to_table`, `to_batches`, `scanner`, `head`, `take` |
 | Filters | `filter=` on `to_table`, `to_batches`, `scanner`, `count_rows` and fragments: an SQL string or a pyarrow compute expression. Comparisons, `AND` / `OR` / `NOT` with SQL's three-valued logic, `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE` / `ILIKE`, arithmetic, `CAST`, `DATE` / `TIMESTAMP` literals, struct fields (`s.a`), and the functions `lower`, `upper`, `length`, `abs`, `coalesce`, `starts_with`, `ends_with`, `contains`. With a filter, `offset` and `limit` count the rows that pass, as in pylance. |
 | Changes | `delete`, `update` (SQL values), `merge_insert` (`when_matched_update_all` with a condition, `when_not_matched_insert_all`, `when_not_matched_by_source_delete`, `execute`), `add_columns` (SQL expressions, a `pa.field` / schema of null columns, or a reader), `drop_columns`, `alter_columns` (rename, nullability, data type), `optimize.compact_files`. Each is one version, and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column. |
+| Blobs | Blob v2 columns, every storage kind pylance writes (inline, packed, dedicated, external, empty, null): `to_table` returns their descriptions, as pylance does, and `blob_handling="all_binary"` their bytes. `take_blobs` (by `ids`, `addresses` or `indices`) returns `lance.BlobFile` handles (`read`, `readall`, `readinto`, `seek`, `tell`, `size`, `read_range`, `read_ranges`), and `read_blobs` the bytes. A handle reads only the bytes asked for, where they are. |
 | Files | `lance.file`: `LanceFileReader` (`read_all`, `read_range`, `take_rows`, `num_rows`, `metadata`, `file_statistics`, `read_global_buffer`), `LanceFileWriter`, `LanceFileSession` (local), `stable_version` |
 
 Datasets and files are written in format 2.2, which is pylance 12's default. A request to write
@@ -62,6 +63,8 @@ them is silently ignored:
   a change built on a version another writer has since replaced fails with "commit conflict".
 - Indexes of every kind, vector search (`nearest`), full-text search.
 - Tags and branches, stable row ids, multiple base paths, shallow and deep clones.
+- Writing Lance's inline, packed and dedicated blob layouts (`lance.blob_field`, `lance.blob_array`):
+  nanolance writes external blobs, and reads every kind.
 - Object stores and namespaces (`s3://`, `gs://`, REST and directory namespaces).
 - torch and Hugging Face integration, UDFs, blob-file APIs, the memtable write-ahead log
   (`mem_wal`).
@@ -159,6 +162,11 @@ The runs found these bugs in nanolance's core. All are fixed and pinned in
 - **A column of constant pages with different values read as its first page's value.** Lance
   picks each page's layout on its own, and pylance writes this shape too
   (`test_constant_pages_with_different_values`).
+
+- **A Blob v2 column from pylance could not be read,** and a batch with a blob column dropped the
+  nulls of every other column. nanolance read only its own blob layout, which has external blobs
+  and no nulls. `test_pylance_blobs_read_back` compares descriptions, bytes, handles and
+  `read_blobs` with pylance for every storage kind.
 
 The Rust crates' own encoding tests run against nanolance too: see [RUST_SUITE.md](RUST_SUITE.md).
 

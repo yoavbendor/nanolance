@@ -42,9 +42,10 @@ returns a silently different result. nanolance is not affiliated with the Lance 
 | Versions | `lance_dataset_versions`, `lance_versions_count` / `id_at` / `timestamp_ms_at` / `close` |
 | Statistics | `lance_dataset_calculate_data_stats`, `lance_data_statistics_count` / `field_id_at` / `bytes_on_disk_at` / `close` |
 | Random access | `lance_dataset_take` (input order and repeats kept), `lance_dataset_take_rows` (by `_rowid`) |
-| Scans | `lance_scanner_new` (projection), `set_limit`, `set_offset`, `set_batch_size`, `with_row_id`, `with_row_address`, `set_fragment_ids`, `set_blob_handling` (argument checks), `set_statistics_callback` (bytes and reads), the tuning setters (accepted, no effect on results), `to_arrow_stream`, `next` + `lance_batch_to_arrow` / `lance_batch_free`, `scan_async` + `async_stream_free`, `poll_next` (always ready: decoding is synchronous) |
+| Scans | `lance_scanner_new` (projection), `set_limit`, `set_offset`, `set_batch_size`, `with_row_id`, `with_row_address`, `set_fragment_ids`, `set_blob_handling` (a blob column as its description by default, as its bytes with `ALL_BINARY`), `set_statistics_callback` (bytes and reads), the tuning setters (accepted, no effect on results), `to_arrow_stream`, `next` + `lance_batch_to_arrow` / `lance_batch_free`, `scan_async` + `async_stream_free`, `poll_next` (always ready: decoding is synchronous) |
 | Filters | an SQL filter in `lance_scanner_new`, and `lance_scanner_additional_sql_filter` (combined with `AND`). The dialect is nanolance's SQL subset, shared with the Python module (`docs/PYLANCE_COMPAT.md`); with a filter, the scanner's offset and limit count the rows that pass. |
 | Changes | `lance_dataset_delete`, `update`, `merge_insert` (every `when_matched` mode but `UPDATE_IF`, both `when_not_matched`, `when_not_matched_by_source` keep / delete / delete-if), `compact_files`, `drop_columns`, `alter_columns`, `add_columns_sql` / `add_columns_nulls` / `add_columns_stream`. Each commits one version and moves the handle to it, as lance-c does. A writer whose change is built on a replaced version gets `LANCE_ERR_COMMIT_CONFLICT`. |
+| Blobs | `lance_dataset_take_blobs` (by row id) and `take_blobs_by_indices`, and the handles they return: `lance_blob_file_size` / `read` / `read_up_to` / `read_range` / `seek` / `tell` / `close`. Every Blob v2 storage kind Lance writes is read where it is, and only the bytes asked for: inline (in the data file), packed and dedicated (in the sidecar `.blob` files beside it), external (at its URI: a local path, `file://`, or `s3://` in a build with S3). A null value is a NULL handle; an empty one, a handle of size 0. |
 | Writes | `lance_dataset_write`, `lance_dataset_write_with_params` (create / append / overwrite, `max_rows_per_file`, `max_bytes_per_file`), `lance_write_fragments` (data files, no manifest). A create records lance-c's auto-cleanup policy in the table config. nanolance does not reclaim versions itself; Lance applies the policy when it next commits. |
 | Indexes | `lance_dataset_index_count` (0) and `lance_dataset_index_list_json` (`[]`), since a dataset nanolance opens has no index it can use |
 
@@ -53,11 +54,11 @@ URIs: local paths, `file://`, and `memory://` (a directory private to the proces
 
 ## Not implemented yet
 
-`LANCE_MERGE_WHEN_MATCHED_UPDATE_IF` (its condition compares source and target rows).
-
-**Blob v2 files**: `lance_dataset_take_blobs*`, `lance_blob_file_*`, and scanning a Blob v2
-dataset that pylance wrote. nanolance writes and reads its own Blob v2 layout but not yet the
-packed and dedicated layouts Lance writes.
+- `LANCE_MERGE_WHEN_MATCHED_UPDATE_IF` (its condition compares source and target rows).
+- `lance_scanner_set_include_deleted_rows(true)`: deleted rows would have to come back with a NULL
+  `_rowid`.
+- Writing Lance's inline, packed and dedicated blob layouts. nanolance writes external blobs; it
+  reads all of them.
 
 ## Out of scope
 
@@ -80,8 +81,9 @@ driver `#include`s it and runs each test function in its own child process, in t
 `main()` does. It is built with `NDEBUG` undefined so the `assert()`s of the C++ test are live. CI
 runs the suite in `.github/workflows/bindings-python.yml`.
 
-**80 of 106 pass: 16 of 22 C tests and 24 of 31 C++ tests, per fixture writer.** Before filters
-and dataset changes it was 52 of 106. (An earlier version of this page said "52 of 80": the runner
+**88 of 106 pass: 18 of 22 C tests and 26 of 31 C++ tests, per fixture writer.** Every test that
+fails needs an index. Before filters and dataset changes it was 52 of 106, and 80 before Lance's
+blob layouts were read. (An earlier version of this page said "52 of 80": the runner
 missed tests whose result line was printed on the same line as the test's own output, so failing
 tests went uncounted. It now parses every result and fails if the count does not match the tests
 the driver ran.) Every implemented group above has a test that passes. The ones that fail today:
@@ -89,7 +91,6 @@ the driver ran.) Every implemented group above has a test that passes. The ones 
 | Tests | Why |
 |---|---|
 | index_lifecycle, index_segment_builder(_progress), vector_models_and_reusable_segments, commit_index_segments | indexes: out of scope |
-| scanner_blob_handling, take_blobs | Lance's Blob v2 layouts |
 
 Four C++ tests pass on purpose without the feature: `nearest_smoke`, `fts_smoke`,
 `index_segments_smoke` and `multivector_rejects_flat_column`. Upstream wrote them to prove the
@@ -98,6 +99,14 @@ wrappers compile, link and report errors, and they accept an error as the outcom
 The same run under AddressSanitizer and UBSan (`build-asan`) reports no error in `liblance_c`.
 
 ## Found on the way
+
+The blob tests found that nanolance read Blob v2 only in its own layout. That layout has external
+blobs only and no nulls. A pylance-written blob column (inline, packed, dedicated or empty values,
+or any null) failed to read: each row's definition level sat in front of the descriptor, and
+nanolance read every row one byte off. They also found a quieter bug. In a batch that holds a blob
+column, every other column read its nulls back as values: the row-by-row batch builder that blob
+columns need never looked at validity. Both are fixed, and `test_pylance_blobs_read_back` in the
+Python tests pins them against pylance.
 
 The fixtures, a dataset with a non-nullable column appended to, exposed a nanolance reader bug: the
 Arrow schema it returned marked every field nullable, whatever the manifest said. Reading a table

@@ -5,10 +5,13 @@
 
 #include "nanolance/array_accessor.hpp"
 #include "nanolance/blob_builder.hpp"
+#include "nanolance/nano_lance_reader.h"
 
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <cstring>
 #include <limits>
 
@@ -687,6 +690,104 @@ void BlobV2ColumnView::uri(std::int64_t row, const char** data, std::int64_t* si
     const ArrowStringView sv = ArrowArrayViewGetStringUnsafe(uri_, row);
     *data = sv.data;
     *size = sv.size_bytes;
+}
+
+std::filesystem::path blob_v2_sidecar_path(const std::filesystem::path& data_file, const std::uint32_t blob_id) {
+    std::uint32_t reversed = 0;
+    for (int bit = 0; bit < 32; ++bit) {
+        if ((blob_id >> bit) & 1U) {
+            reversed |= 1U << (31 - bit);
+        }
+    }
+    std::string name(32, '0');
+    for (int bit = 0; bit < 32; ++bit) {
+        if ((reversed >> (31 - bit)) & 1U) {
+            name[static_cast<std::size_t>(bit)] = '1';
+        }
+    }
+    return data_file.parent_path() / data_file.stem() / (name + ".blob");
+}
+
+bool blob_v2_locate(const BlobV2ExternalDescriptor& descriptor, const std::filesystem::path& data_file,
+                    BlobV2Location& out, std::string& error) {
+    out = BlobV2Location{};
+    out.size = descriptor.size;
+    switch (descriptor.kind) {
+        case kBlobKindInline:
+            out.file = data_file.string();
+            out.position = descriptor.position;
+            return true;
+        case kBlobKindPacked:
+            out.file = blob_v2_sidecar_path(data_file, descriptor.blob_id).string();
+            out.position = descriptor.position;
+            return true;
+        case kBlobKindDedicated:
+            out.file = blob_v2_sidecar_path(data_file, descriptor.blob_id).string();
+            return true;
+        case kBlobKindExternal:
+            out.file = descriptor.blob_uri;
+            out.external = true;
+            out.position = descriptor.position;
+            return true;
+        default:
+            error = "unknown blob kind " + std::to_string(descriptor.kind);
+            return false;
+    }
+}
+
+bool blob_v2_read(const BlobV2Location& location, const std::uint64_t offset, const std::uint64_t length,
+                  std::vector<std::uint8_t>& out, std::string& error) {
+    out.clear();
+    if (offset > location.size || length > location.size - offset) {
+        error = "read past the end of the blob";
+        return false;
+    }
+    if (length == 0U) {
+        return true;
+    }
+    if (location.position > std::numeric_limits<std::uint64_t>::max() - offset) {
+        error = "blob position overflows";
+        return false;
+    }
+    const std::uint64_t at = location.position + offset;
+    if (length > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        error = "blob too large to read into memory";
+        return false;
+    }
+    out.resize(static_cast<std::size_t>(length));
+    if (location.external) {
+        std::size_t got = 0;
+        char message[512] = {0};
+        if (nano_lance_fetch_external_blob(location.file.c_str(), at, length, out.data(), out.size(), &got, message,
+                                           sizeof(message)) != NANO_LANCE_READER_OK ||
+            got != out.size()) {
+            error = std::string("cannot read external blob ") + location.file + ": " + message;
+            out.clear();
+            return false;
+        }
+        return true;
+    }
+    std::ifstream in(location.file, std::ios::binary);
+    std::error_code ec;
+    const auto file_size = std::filesystem::file_size(location.file, ec);
+    if (!in || ec) {
+        error = "cannot open blob file " + location.file;
+        out.clear();
+        return false;
+    }
+    if (at > file_size || length > file_size - at) {
+        error = "blob range is past the end of " + location.file;
+        out.clear();
+        return false;
+    }
+    in.seekg(static_cast<std::streamoff>(at));
+    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(length));
+    if (!in) {
+        error = "cannot read blob file " + location.file;
+        out.clear();
+        return false;
+    }
+    return true;
 }
 
 }  // namespace nano_lance

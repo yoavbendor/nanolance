@@ -2146,6 +2146,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     const bool blob_packed = field_metadata_is_true(on_disk_field, "lance-encoding:blob");
     if (blob_packed) {
         out.kind = ColumnValues::Kind::BlobV2External;
+        out.blob_v2.data_file = data_file_path;
         // Hoisted out of the loop (not freshly declared per page): read_lance_data_file_bytes reuses
         // whatever capacity/bytes are already here rather than re-zeroing a fresh buffer every page.
         std::vector<std::uint8_t> control;
@@ -2158,17 +2159,59 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
             if (!blob_v2_control_buffer_to_row_sizes(control, page.length, row_sizes, error)) {
                 return false;
             }
+            // A nullable blob column (pylance writes one whenever a row is null) puts a control word
+            // -- the row's definition level -- in front of every row, and a null row is that word
+            // alone. nanolance's own blob columns are never null and carry none.
+            std::size_t control_bytes = 0;
+            std::uint32_t def_mask = 0;
+            if (!page.encoding.empty()) {
+                page_layout::PageLayout layout;
+                std::string why;
+                if (page_layout::decode_page_layout(page.encoding, layout, why) &&
+                    layout.kind == page_layout::LayoutKind::kFullZip) {
+                    if (layout.full_zip.bits_rep != 0U) {
+                        error = "column '" + on_disk_field.name + "': a blob column inside a list is not read";
+                        return false;
+                    }
+                    const auto bits = layout.full_zip.bits_def;
+                    if (bits > 16U) {
+                        error = "blob page declares an implausible definition width";
+                        return false;
+                    }
+                    control_bytes = bits == 0U ? 0U : bits <= 8U ? 1U : 2U;
+                    def_mask = bits == 0U ? 0U : ((1U << bits) - 1U);
+                }
+            }
             std::size_t offset = 0;
             for (const auto row_size : row_sizes) {
-                if (offset + row_size > values.size()) {
+                if (offset + row_size > values.size() || row_size < control_bytes) {
                     error = "blob packed row exceeds values buffer";
                     return false;
                 }
+                std::uint32_t def = 0;
+                for (std::size_t b = 0; b < control_bytes; ++b) {
+                    def |= static_cast<std::uint32_t>(values[offset + b]) << (8U * b);
+                }
+                def &= def_mask;
+                const auto row = out.blob_v2.row_packed_sizes.size();
+                if (def != 0U || !out.validity.empty()) {
+                    if (out.validity.empty()) {
+                        out.validity.assign((row + 8U) / 8U, 0xFFU);
+                    }
+                    out.validity.resize((row + 8U) / 8U, 0xFFU);
+                    if (def != 0U) {
+                        out.validity[row / 8U] &= static_cast<std::uint8_t>(~(1U << (row % 8U)));
+                        ++out.null_count;
+                    } else {
+                        out.validity[row / 8U] |= static_cast<std::uint8_t>(1U << (row % 8U));
+                    }
+                }
+                const auto payload = def != 0U ? 0U : row_size - static_cast<std::uint32_t>(control_bytes);
                 out.blob_v2.packed_payload.insert(
                     out.blob_v2.packed_payload.end(),
-                    values.begin() + static_cast<std::ptrdiff_t>(offset),
-                    values.begin() + static_cast<std::ptrdiff_t>(offset + row_size));
-                out.blob_v2.row_packed_sizes.push_back(row_size);
+                    values.begin() + static_cast<std::ptrdiff_t>(offset + control_bytes),
+                    values.begin() + static_cast<std::ptrdiff_t>(offset + control_bytes + payload));
+                out.blob_v2.row_packed_sizes.push_back(payload);
                 offset += row_size;
             }
             if (offset != values.size()) {

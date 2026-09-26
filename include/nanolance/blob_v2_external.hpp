@@ -7,6 +7,7 @@
 #include "nanolance/schema_mapper.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,32 @@ std::vector<std::uint8_t> blob_v2_build_control_buffer(const std::vector<std::ui
 /// Parse a Lance blob v2 control buffer into per-row packed sizes (`num_rows` must match the on-disk fragment row count).
 bool blob_v2_control_buffer_to_row_sizes(const std::vector<std::uint8_t>& control, std::uint64_t num_rows,
                                            std::vector<std::uint32_t>& row_packed_sizes, std::string& error);
+
+/// Lance's Blob v2 storage kinds (the descriptor's `kind`).
+constexpr std::uint8_t kBlobKindInline = 0;     // in the data file, at `position`
+constexpr std::uint8_t kBlobKindPacked = 1;     // in a sidecar file shared with other blobs, at `position`
+constexpr std::uint8_t kBlobKindDedicated = 2;  // a sidecar file of its own
+constexpr std::uint8_t kBlobKindExternal = 3;   // at `blob_uri`, `position`
+
+/// Where a blob's bytes are: a local file or an external URI, and the range within it.
+struct BlobV2Location {
+    std::string file;  // local path, or the URI for an external blob
+    bool external = false;
+    std::uint64_t position = 0;
+    std::uint64_t size = 0;
+};
+
+/// The sidecar file Lance keeps packed and dedicated blobs in, beside `data_file`:
+/// <data dir>/<data file stem>/<blob id, bit-reversed, as 32 binary digits>.blob.
+std::filesystem::path blob_v2_sidecar_path(const std::filesystem::path& data_file, std::uint32_t blob_id);
+
+/// Resolve a descriptor read from `data_file` to where its bytes are.
+bool blob_v2_locate(const BlobV2ExternalDescriptor& descriptor, const std::filesystem::path& data_file,
+                    BlobV2Location& out, std::string& error);
+
+/// Read `length` bytes of the blob at `location`, starting `offset` bytes into it.
+bool blob_v2_read(const BlobV2Location& location, std::uint64_t offset, std::uint64_t length,
+                  std::vector<std::uint8_t>& out, std::string& error);
 
 /// Find top-level `lance.blob.v2` extension struct in a mapped schema, if present.
 const LanceField* find_blob_v2_parent(const LanceSchemaMapping& mapping);
