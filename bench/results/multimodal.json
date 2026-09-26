@@ -1,0 +1,249 @@
+{
+ "environment": {
+  "date": "2026-09-26 07:20 UTC",
+  "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+  "cores": 4,
+  "os": "Linux 6.18.44-fc-v37",
+  "pylance": "12.0.0",
+  "pyarrow": "25.0.1",
+  "nanolance_commit": "3a60464"
+ },
+ "runs": 3,
+ "batch": 64,
+ "datasets": {
+  "coco": {
+   "title": "COCO 2017 val",
+   "what": "images, captions, boxes, polygons, keypoints",
+   "rows": 5000,
+   "arrow_bytes": 827902032,
+   "columns": [
+    "image_id",
+    "file_name",
+    "width",
+    "height",
+    "license",
+    "image",
+    "captions",
+    "objects"
+   ],
+   "ops": {
+    "write": {
+     "nanolance": {
+      "wall_ms": 991.1465670002144,
+      "cpu_ms": 991.9270000000005
+     },
+     "nanolance 1 thread": {
+      "wall_ms": 1044.7998549998374,
+      "cpu_ms": 1015.6810000000007
+     },
+     "rust-lance": {
+      "wall_ms": 3052.9882040000302,
+      "cpu_ms": 3067.6620000000057
+     },
+     "parquet": {
+      "wall_ms": 1763.2397269999274,
+      "cpu_ms": 1741.9569999999994
+     }
+    },
+    "scan": {
+     "nanolance": {
+      "wall_ms": 389.4682879999891,
+      "cpu_ms": 1093.0999999999997
+     },
+     "nanolance 1 thread": {
+      "wall_ms": 979.433180000342,
+      "cpu_ms": 977.6410000000055
+     },
+     "rust-lance": {
+      "wall_ms": 4131.751986000381,
+      "cpu_ms": 4338.323000000002
+     },
+     "parquet": {
+      "wall_ms": 1679.687789000127,
+      "cpu_ms": 1701.4930000000136
+     },
+     "nanolance on rust file": {
+      "wall_ms": 419.33653600062826,
+      "cpu_ms": 1291.5200000000054
+     },
+     "rust-lance on nanolance file": {
+      "wall_ms": 1911.6249299995616,
+      "cpu_ms": 2020.7139999999981
+     }
+    },
+    "meta": {
+     "nanolance": {
+      "wall_ms": 9.326035000412958,
+      "cpu_ms": 30.810000000002447
+     },
+     "nanolance 1 thread": {
+      "wall_ms": 27.417885000431852,
+      "cpu_ms": 27.44600000001185
+     },
+     "rust-lance": {
+      "wall_ms": 29.26010800001677,
+      "cpu_ms": 37.12199999999655
+     },
+     "parquet": {
+      "wall_ms": 34.05012899929716,
+      "cpu_ms": 39.48799999999153
+     },
+     "nanolance on rust file": {
+      "wall_ms": 10.55887199981953,
+      "cpu_ms": 35.05799999999226
+     },
+     "rust-lance on nanolance file": {
+      "wall_ms": 24.671811999724014,
+      "cpu_ms": 26.33799999999553
+     }
+    },
+    "shuffled": {
+     "nanolance": {
+      "wall_ms": 374.8637050002799,
+      "cpu_ms": 543.71900000001
+     },
+     "nanolance 1 thread": {
+      "wall_ms": 494.8216120001234,
+      "cpu_ms": 493.34100000001513
+     },
+     "rust-lance": {
+      "wall_ms": 890.7467859999088,
+      "cpu_ms": 1441.0069999999848
+     },
+     "nanolance on rust file": {
+      "wall_ms": 450.5680880001819,
+      "cpu_ms": 616.3549999999987
+     },
+     "rust-lance on nanolance file": {
+      "wall_ms": 852.2703250000632,
+      "cpu_ms": 1353.0900000000088
+     }
+    }
+   },
+   "size": {
+    "nanolance": 825676064,
+    "nanolance 1 thread": 825676064,
+    "rust-lance": 820855399,
+    "parquet": 815273903
+   },
+   "errors": {},
+   "shuffled_batches": 79
+  },
+  "speech": {
+   "title": "Speech Commands v0.02 test",
+   "what": "one-second audio clips and their words",
+   "rows": 4890,
+   "arrow_bytes": 156784548,
+   "columns": [
+    "file",
+    "label",
+    "speaker",
+    "utterance",
+    "sample_rate",
+    "waveform"
+   ],
+   "ops": {
+    "write": {
+     "nanolance": {
+      "wall_ms": 1060.1898309996614,
+      "cpu_ms": 1043.8200000000109
+     },
+     "nanolance 1 thread": {
+      "wall_ms": 1044.079629999942,
+      "cpu_ms": 1031.6830000000152
+     },
+     "rust-lance": {
+      "wall_ms": 1897.74635699996,
+      "cpu_ms": 1890.1460000000156
+     },
+     "parquet": {
+      "wall_ms": 1645.9028989993385,
+      "cpu_ms": 1643.7700000000177
+     }
+    },
+    "scan": {
+     "nanolance": {
+      "wall_ms": 86.08314200046152,
+      "cpu_ms": 269.98600000001716
+     },
+     "nanolance 1 thread": {
+      "wall_ms": 220.1211500005229,
+      "cpu_ms": 220.12399999999843
+     },
+     "rust-lance": {
+      "wall_ms": 378.0163100000209,
+      "cpu_ms": 407.1230000000128
+     },
+     "parquet": {
+      "wall_ms": 828.3463380003013,
+      "cpu_ms": 821.5959999999995
+     },
+     "nanolance on rust file": {
+      "wall_ms": 86.25615699929767,
+      "cpu_ms": 311.5579999999909
+     },
+     "rust-lance on nanolance file": {
+      "wall_ms": 414.92365800058906,
+      "cpu_ms": 453.1519999999887
+     }
+    },
+    "meta": {
+     "nanolance": {
+      "wall_ms": 0.6210640003700973,
+      "cpu_ms": 0.914000000022952
+     },
+     "nanolance 1 thread": {
+      "wall_ms": 0.7567030006612185,
+      "cpu_ms": 0.7650000000012369
+     },
+     "rust-lance": {
+      "wall_ms": 2.7771300001404597,
+      "cpu_ms": 3.2290000000045893
+     },
+     "parquet": {
+      "wall_ms": 1.3634080005431315,
+      "cpu_ms": 2.1420000000205164
+     },
+     "nanolance on rust file": {
+      "wall_ms": 0.30548600079782773,
+      "cpu_ms": 0.47699999998940257
+     },
+     "rust-lance on nanolance file": {
+      "wall_ms": 4.074755000146979,
+      "cpu_ms": 4.607999999961976
+     }
+    },
+    "shuffled": {
+     "nanolance": {
+      "wall_ms": 285.5973659998199,
+      "cpu_ms": 287.77500000001055
+     },
+     "nanolance 1 thread": {
+      "wall_ms": 263.2081379997544,
+      "cpu_ms": 261.8810000000167
+     },
+     "rust-lance": {
+      "wall_ms": 309.56734099981986,
+      "cpu_ms": 426.12600000001066
+     },
+     "nanolance on rust file": {
+      "wall_ms": 265.9448100002919,
+      "cpu_ms": 270.49399999998514
+     },
+     "rust-lance on nanolance file": {
+      "wall_ms": 393.5295249993942,
+      "cpu_ms": 588.2370000000208
+     }
+    }
+   },
+   "size": {
+    "nanolance": 167298954,
+    "nanolance 1 thread": 167298954,
+    "rust-lance": 159176865,
+    "parquet": 111821651
+   },
+   "errors": {},
+   "shuffled_batches": 77
+  }
+ }
+}

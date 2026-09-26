@@ -49,7 +49,7 @@ TEMPLATE = r"""<!doctype html>
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 var(--body); }
 .wrap { max-width: 1120px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 64px; }
-header > *, section > *, .tiles > *, .grid2 > * { min-width: 0; }  /* let wide charts scroll inside their card */
+header > *, section > *, .tiles > *, .grid2 > *, #train > * { min-width: 0; }  /* let wide charts scroll inside their card */
 h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; letter-spacing: -0.01em; }
 h1 { font-size: clamp(30px, 5vw, 46px); font-weight: 800; line-height: 1.05; }
 h2 { font-size: 24px; font-weight: 700; margin-bottom: 6px; }
@@ -121,6 +121,12 @@ pre { font: 12.5px/1.5 var(--mono); background: var(--surface); border: 1px soli
     <p class="small" id="tiles-note"></p>
   </section>
 
+  <section aria-labelledby="h-train" id="train-section" hidden>
+    <h2 id="h-train">Training data: COCO and Speech Commands</h2>
+    <p class="muted" id="train-intro"></p>
+    <div id="train" style="display:grid;gap:14px"></div>
+  </section>
+
   <section aria-labelledby="h-read">
     <h2 id="h-read">Read speed, by data type</h2>
     <p class="muted">How many times faster nanolance's C++ reader is than Rust Lance, each reading the file its own writer made. Right of the line, nanolance is faster. The number at the end of each row is the one-core ratio; hover a row for the milliseconds.</p>
@@ -183,6 +189,7 @@ pre { font: 12.5px/1.5 var(--mono); background: var(--surface); border: 1px soli
     <pre>cmake -S . -B build -DCMAKE_BUILD_TYPE=Release &amp;&amp; cmake --build build -j
 pip install ./bindings/python pylance pyarrow numpy
 python tools/bench_matrix.py        # bench/results/matrix.json
+python tools/bench_multimodal.py --data DIR   # COCO + Speech Commands, downloaded to DIR
 python tools/bench_report.py        # docs/BENCHMARKS.md
 python tools/bench_html.py          # this page</pre>
   </section>
@@ -191,6 +198,7 @@ python tools/bench_html.py          # this page</pre>
 
 <script id="data" type="application/json">__DATA__</script>
 <script id="notes-data" type="application/json">__NOTES__</script>
+<script id="mm-data" type="application/json">__MULTIMODAL__</script>
 <script>
 (function () {
   const DATA = JSON.parse(document.getElementById("data").textContent);
@@ -439,6 +447,39 @@ python tools/bench_html.py          # this page</pre>
     tabs.append(b); });
   renderTable("all");
 
+  // Training data (tools/bench_multimodal.py), when present.
+  const MM = JSON.parse(document.getElementById("mm-data").textContent);
+  if (MM && MM.datasets) {
+    document.getElementById("train-section").hidden = false;
+    document.getElementById("train-intro").textContent =
+      `Two widely used datasets in the shape a training pipeline keeps them, through what a training job does. ` +
+      `Wall time in ms, median of ${MM.runs} runs (CPU time, every thread, below it); a shuffled epoch reads every row ` +
+      `once in random mini-batches of ${MM.batch} with take(). Measured ${MM.environment.date} on ${MM.environment.cores} cores.`;
+    const OPS = [["write", "Write the dataset"], ["scan", "Read an epoch in order"], ["meta", "Read all but images / audio"],
+                 ["shuffled", "Shuffled epoch (take)"]];
+    const ENG = [["nanolance", "nanolance"], ["rust-lance", "Rust Lance"], ["x", "nanolance vs Rust"],
+                 ["nanolance 1 thread", "nanolance, 1 thread"], ["parquet", "Parquet"]];
+    const fmt = v => v == null ? "—" : (v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString());
+    const host = document.getElementById("train");
+    Object.values(MM.datasets).forEach(rec => {
+      const card = el("div", {class: "card"});
+      card.append(el("h3", {}, rec.title), el("p", {class: "muted small"}, `${rec.what} · ${rec.rows.toLocaleString()} rows, ${Math.round(rec.arrow_bytes / 1e6)} MB`));
+      const wrap = el("div", {class: "table-scroll"}); const t = el("table");
+      const h = el("tr"); h.append(el("th", {}, "")); ENG.forEach(([, l]) => h.append(el("th", {}, l))); t.append(h);
+      OPS.forEach(([op, label]) => {
+        const row = rec.ops[op] || {}; const tr = el("tr"); tr.append(el("td", {}, label));
+        const nl = row["nanolance"], rs = row["rust-lance"];
+        ENG.forEach(([k]) => { const td = el("td");
+          if (k === "x") { td.append(el("b", {}, nl && rs ? fmtX(rs.wall_ms / nl.wall_ms) : "—")); tr.append(td); return; }
+          const v = row[k];
+          if (v) { td.append(fmt(v.wall_ms)); const c = el("span", {class: "desc"}, fmt(v.cpu_ms) + " CPU"); td.append(c); } else td.append("—");
+          if (k === "nanolance" && v && rs && v.wall_ms <= rs.wall_ms) td.className = "win";
+          tr.append(td); });
+        t.append(tr); });
+      wrap.append(t); card.append(wrap); host.append(card);
+    });
+  }
+
   // Notes and method.
   const notes = document.getElementById("notes");
   NOTES.findings.forEach(([title, body]) => { const c = el("div", {class: "card"}); c.append(el("h3", {}, title)); const p = el("p", {class: "muted"}, body); p.style.marginTop = "6px"; c.append(p); notes.append(c); });
@@ -455,8 +496,11 @@ def main(argv):
     notes_path = src.with_name("notes.json")
     notes = json.loads(notes_path.read_text()) if notes_path.exists() else {"findings": [], "method": []}
     data = json.loads(src.read_text())
+    mm_path = src.with_name("multimodal.json")
+    multimodal = json.loads(mm_path.read_text()) if mm_path.exists() else None
     html = TEMPLATE.replace("__DATA__", json.dumps(data).replace("</", "<\\/")).replace(
-        "__NOTES__", json.dumps(notes).replace("</", "<\\/"))
+        "__NOTES__", json.dumps(notes).replace("</", "<\\/")).replace(
+        "__MULTIMODAL__", json.dumps(multimodal).replace("</", "<\\/"))
     dst.write_text(html)
     print(f"wrote {dst}")
 

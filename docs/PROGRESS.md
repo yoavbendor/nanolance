@@ -2366,3 +2366,30 @@ boundaries, deletions, and columns of 1 to 4,097 rows.
 - **Two Phase 4 items were closed by measuring rather than implementing** (4.3 default-init buffers,
   4.4 mmap), and one unplanned refactor was rejected the same way (making `MiniBlockChunkView` an
   actual view, 3.8% for a span type threaded through six signatures). The numbers are above.
+
+### Every core, and real training data
+
+Asked: use more cores without a large library and without slowing one core; prove it on a widely
+used dataset. Done with a ~200-line `std::thread` pool (`src/parallel.cpp`) and no dependency:
+
+- **Reads** cut a fragment into row ranges decoded side by side, one Arrow batch each (no
+  concatenation). Cuts need pages that give up a row range: list pages via their repetition index,
+  flat MiniBlock pages via their chunk counts, FullZip pages via their row index -- the same windows
+  that made take() on Rust's one-page audio column 118 s -> 0.45 s per epoch and cut a full read of it
+  from 1.9 s / 921 MB peak to 0.49 s / 192 MB. Morsels are sized by decode work (values x width, 32 per
+  string, 32 per list layer), so columns that decode in a millisecond or two stay whole.
+- **Writes** encode a file's columns side by side (unless one column is most of the data: COCO's
+  images stream), and inside a page split FSST compression, page dictionaries and level serialization
+  across threads -- byte-for-byte the file one thread writes.
+- **A buffer pool** reuses released output buffers: glibc does not recycle memory across threads, and
+  without it parallel memory-bound reads re-faulted their output every run.
+- **One thread is the old path.** No pool, no split; A/B against the pre-threading build pinned to one
+  core, every dataset read and wrote as fast or faster (lists faster still: `unravel` inlines
+  `append_bit` and writes offsets by pointer, list<list<int32>> 10.9 -> 6.5 ms).
+
+Result on 4 cores (docs/BENCHMARKS.md): reads 2.78x Rust Lance with both on all cores, 2.91x with
+both on one; writes 1.92x / 1.48x; 26 of 27 reads and 21 of 27 writes faster on all cores. COCO 2017
+val: write 1.0 s vs 3.1 s, an epoch 0.39 s vs 4.1 s, a shuffled epoch 0.38 s vs 0.89 s; Speech Commands:
+1.06 / 0.09 / 0.29 s vs 1.90 / 0.38 / 0.31 s. Still behind Rust on all cores: writes of a single
+large list or map column (a column's pages are cut sequentially) and of random binary blobs.
+Verified with ASAN and ThreadSanitizer, and the suites run at 1, 4, and 8 threads with 1 KiB morsels.

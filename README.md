@@ -472,20 +472,26 @@ pylance 12 and through the `lance` crate itself with no Python (`tools/lance_rs_
 Parquet: 27 Arrow data types (numbers, dates, strings, nulls, vectors, structs, lists, maps and a
 mixed table), each written and read by nanolance C++, nanolance Python and Rust on one core and on all
 cores, every read checked against the source before it is timed, every file read by the other side,
-with peak memory and program size. In short (geometric means; nanolance on one thread):
+with peak memory and program size -- plus two real training datasets, COCO 2017 val (images,
+captions, boxes, polygons) and Speech Commands (audio). In short (geometric means, 4-core machine):
 
-| | vs Rust Lance, 4 cores | vs Rust Lance, 1 core |
+| | both on all cores | both on 1 core |
 |---|---:|---:|
-| Read | 1.44x faster | 2.02x faster |
-| Write | 1.37x faster | 1.34x faster |
-| Peak memory, read | 3.2x less | |
-| Peak memory, write with a 4 MiB budget | 3.2x less | |
+| Read | 2.78x faster than Rust Lance | 2.91x faster |
+| Write | 1.92x faster | 1.48x faster |
+| Data types faster, all cores | 26 of 27 reads (the 27th a tie), 21 of 27 writes | |
+| Peak memory, read | 3.1x less | |
+| Peak memory, write with a 4 MiB budget | 3.3x less | |
 | File size | 99% of Rust's | |
 | Reader + writer program, stripped | 2.5 MB against 165 MB | |
 
-Numbers, dates and strings are where nanolance leads (reads 2.8-3.4x faster than four-core Rust on
-numeric and temporal types); lists and maps are where Rust leads (nanolance reads them at 0.61x
-four-core Rust). Python costs Rust Lance nothing measurable, so pylance is a fair stand-in for Rust.
+| Training data, all cores | nanolance | Rust Lance |
+|---|---:|---:|
+| COCO: write the dataset / read an epoch / shuffled epoch | 1.0 s / 0.39 s / 0.38 s | 3.1 s / 4.1 s / 0.89 s |
+| Speech Commands: write / read an epoch / shuffled epoch | 1.06 s / 0.09 s / 0.29 s | 1.90 s / 0.38 s / 0.31 s |
+
+Where Rust on all cores still leads: writing a single large list or map column (map<string,int64>
+34 vs 51 ms) and random binary blobs. Python costs Rust Lance little, so pylance is a fair stand-in.
 Reproduce with `python tools/bench_matrix.py && python tools/bench_report.py && python tools/bench_html.py`
 (the last renders `bench/results/report.html`, with charts; the Rust-native columns need
 `cargo build --release` in `tools/lance_rs_bench`).

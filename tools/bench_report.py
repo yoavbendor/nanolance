@@ -246,6 +246,52 @@ def render(data) -> str:
     return "\n".join(out) + "\n"
 
 
+MM_ENGINES = [("nanolance", "nanolance"), ("nanolance 1 thread", "nanolance, 1 thread"), ("rust-lance", "Rust Lance"),
+              ("parquet", "Parquet"), ("nanolance on rust file", "nanolance reading Rust's file"),
+              ("rust-lance on nanolance file", "Rust reading nanolance's file")]
+MM_OPS = [("write", "write the dataset"), ("scan", "read every column"), ("meta", "read all but images / audio"),
+          ("shuffled", "one shuffled epoch in mini-batches (take)")]
+
+
+def render_multimodal(mm) -> str:
+    """The training-data benchmark (tools/bench_multimodal.py): COCO 2017 val and Speech Commands."""
+    out = []
+    w = out.append
+    env = mm["environment"]
+    w("## Training data: COCO and Speech Commands")
+    w("")
+    w("_From `bench/results/multimodal.json`, produced by `tools/bench_multimodal.py` (the datasets are "
+      "downloaded separately; see its header)._ Two widely used datasets in the shape a training pipeline "
+      "keeps them, put through what a training job does: build the dataset, read an epoch in file order, "
+      "read everything but the images or audio, and read a shuffled epoch in mini-batches of "
+      f"{mm['batch']} rows. Median of {mm['runs']} runs after a warm-up, files in the page cache; "
+      f"nanolance `{env['nanolance_commit']}`, pylance {env['pylance']}, {env['cores']} cores, {env['date']}. "
+      "Wall time and CPU time (every thread of the process) in ms; each result checked against the "
+      "source table before it was timed.")
+    w("")
+    for name, rec in mm["datasets"].items():
+        w(f"### {rec['title']}: {rec['what']}")
+        w("")
+        w(f"{rec['rows']:,} rows, {rec['arrow_bytes'] / 1e6:,.0f} MB in memory. Files: " + ", ".join(
+            f"{label} {rec['size'][key] / 1e6:,.1f} MB" for key, label in MM_ENGINES if key in rec["size"]) + ".")
+        w("")
+        w("| | " + " | ".join(label for _, label in MM_OPS) + " |")
+        w("|---|" + "---:|" * len(MM_OPS))
+        for key, label in MM_ENGINES:
+            cells = []
+            for op, _ in MM_OPS:
+                v = rec["ops"].get(op, {}).get(key)
+                fmt = (lambda x: f"{x:,.1f}" if x < 10 else f"{x:,.0f}")
+                cells.append("—" if v is None else f"{fmt(v['wall_ms'])} <small>({fmt(v['cpu_ms'])} CPU)</small>")
+            if any(c != "—" for c in cells):
+                w(f"| {label} | " + " | ".join(cells) + " |")
+        w("")
+        if rec["errors"]:
+            w("Failures: " + "; ".join(f"{k}: {v}" for k, v in rec["errors"].items()))
+            w("")
+    return "\n".join(out) + "\n"
+
+
 def main(argv):
     src = Path(argv[1]) if len(argv) > 1 else ROOT / "bench" / "results" / "matrix.json"
     dst = Path(argv[2]) if len(argv) > 2 else ROOT / "docs" / "BENCHMARKS.md"
@@ -253,7 +299,11 @@ def main(argv):
     notes = src.with_name("notes.json")  # the findings and method, shared with bench_html.py
     if notes.exists():
         data["_notes"] = json.loads(notes.read_text())
-    dst.write_text(render(data))
+    text = render(data)
+    multimodal = src.with_name("multimodal.json")
+    if multimodal.exists():
+        text += "\n" + render_multimodal(json.loads(multimodal.read_text()))
+    dst.write_text(text)
     print(f"wrote {dst}")
 
 
