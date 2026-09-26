@@ -11,6 +11,7 @@
 #include "nanolance/buffer_pool.hpp"
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
+#include "nanolance/page_layout.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
 #include "nanolance/path_safety.hpp"
@@ -175,12 +176,43 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
         return false;
     }
     for (const auto& kv : field.metadata) {
+        // How nanolance encoded a fragment's pages is not part of the schema a reader sees.
+        if (kv.first == "nanolance:packing" || kv.first == "nanolance:const-value") {
+            continue;
+        }
         if (!set_schema_metadata(schema, kv.first, kv.second)) {
             error = "failed to set schema metadata";
             return false;
         }
     }
     return true;
+}
+
+/// The dataset's Arrow schema metadata (Manifest.schema_metadata) on the top-level schema.
+bool set_dataset_schema_metadata(ArrowSchema& schema, const pb::Manifest& manifest, std::string& error) {
+    if (manifest.schema_metadata.empty()) {
+        return true;
+    }
+    ArrowBuffer buffer;
+    if (ArrowMetadataBuilderInit(&buffer, schema.metadata) != NANOARROW_OK) {
+        error = "failed to build schema metadata";
+        return false;
+    }
+    for (const auto& [key, value] : manifest.schema_metadata) {
+        ArrowStringView k{key.data(), static_cast<std::int64_t>(key.size())};
+        ArrowStringView v{reinterpret_cast<const char*>(value.data()), static_cast<std::int64_t>(value.size())};
+        if (ArrowMetadataBuilderSet(&buffer, k, v) != NANOARROW_OK) {
+            ArrowBufferReset(&buffer);
+            error = "failed to build schema metadata";
+            return false;
+        }
+    }
+    const bool ok = ArrowSchemaSetMetadata(&schema, reinterpret_cast<const char*>(buffer.data)) == NANOARROW_OK;
+    ArrowBufferReset(&buffer);
+    if (!ok) {
+        error = "failed to set schema metadata";
+    }
+    return ok;
 }
 
 bool build_schema_from_mapping(const LanceSchemaMapping& mapping, ArrowSchema& schema, std::string& error) {
@@ -1032,6 +1064,7 @@ struct PlannedFile {
     std::uint64_t rows = 0;            // LOGICAL rows: physical minus deleted. What a read returns.
     std::uint64_t skip = 0;            // logical rows to drop from the front
     std::uint64_t take = 0;            // logical rows to keep
+    std::filesystem::path data_dir;    // where the data files are; empty: <dataset>/data
 
     bool partial() const { return skip != 0U || take != rows; }
 };
@@ -1189,10 +1222,123 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
 }
 
 /// One fragment's rows as Arrow batches: one batch, or with several threads one per morsel.
+
+/// Which of Lance's row identity columns a read adds after the data columns.
+struct RowIdColumns {
+    bool row_id = false;       // `_rowid`
+    bool row_address = false;  // `_rowaddr`
+
+    bool any() const { return row_id || row_address; }
+};
+
+/// A row's address: its fragment in the high 32 bits, its offset in the fragment's data files (deleted
+/// rows counted) in the low. Without stable row ids it is also the row's id.
+std::uint64_t row_address(std::uint64_t fragment_id, std::uint64_t offset) {
+    return (fragment_id << 32U) | offset;
+}
+
+bool make_u64_array(const std::vector<std::uint64_t>& values, ArrowArray& out, std::string& error) {
+    if (ArrowArrayInitFromType(&out, NANOARROW_TYPE_UINT64) != NANOARROW_OK) {
+        error = "failed to allocate a row id column";
+        return false;
+    }
+    auto* data = ArrowArrayBuffer(&out, 1);
+    if (ArrowBufferAppend(data, values.data(), static_cast<std::int64_t>(values.size() * sizeof(std::uint64_t))) !=
+        NANOARROW_OK) {
+        ArrowArrayRelease(&out);
+        error = "failed to fill a row id column";
+        return false;
+    }
+    out.length = static_cast<std::int64_t>(values.size());
+    out.null_count = 0;
+    if (ArrowArrayFinishBuildingDefault(&out, nullptr) != NANOARROW_OK) {
+        ArrowArrayRelease(&out);
+        error = "failed to finish a row id column";
+        return false;
+    }
+    return true;
+}
+
+/// Replace `batch` (a struct array) by one with the row identity columns of `physical` (offsets in
+/// fragment `fragment_id`) after its own. `batch.release` null means a batch without data columns.
+bool add_row_id_columns(ArrowArray& batch, std::int64_t length, std::uint64_t fragment_id,
+                        const std::vector<std::uint64_t>& physical, const RowIdColumns& ids, std::string& error) {
+    std::vector<std::uint64_t> addresses(physical.size());
+    for (std::size_t i = 0; i < physical.size(); ++i) {
+        addresses[i] = row_address(fragment_id, physical[i]);
+    }
+    const auto own = batch.release == nullptr ? 0 : batch.n_children;
+    const auto extra = static_cast<std::int64_t>(ids.row_id) + static_cast<std::int64_t>(ids.row_address);
+    ArrowArray out{};
+    if (ArrowArrayInitFromType(&out, NANOARROW_TYPE_STRUCT) != NANOARROW_OK ||
+        ArrowArrayAllocateChildren(&out, own + extra) != NANOARROW_OK) {
+        if (out.release != nullptr) {
+            ArrowArrayRelease(&out);
+        }
+        error = "failed to allocate a batch with row ids";
+        return false;
+    }
+    for (std::int64_t c = 0; c < own; ++c) {
+        ArrowArrayMove(batch.children[c], out.children[c]);
+    }
+    auto next = own;
+    if (ids.row_id && !make_u64_array(addresses, *out.children[next++], error)) {
+        ArrowArrayRelease(&out);
+        return false;
+    }
+    if (ids.row_address && !make_u64_array(addresses, *out.children[next++], error)) {
+        ArrowArrayRelease(&out);
+        return false;
+    }
+    out.length = length;
+    out.null_count = 0;
+    if (batch.release != nullptr) {
+        ArrowArrayRelease(&batch);
+    }
+    batch = out;
+    return true;
+}
+
+/// `schema` with the row identity columns after its own fields.
+bool add_row_id_fields(ArrowSchema& schema, const RowIdColumns& ids, std::string& error) {
+    ArrowSchema out{};
+    ArrowSchemaInit(&out);
+    const auto own = schema.n_children;
+    const auto extra = static_cast<std::int64_t>(ids.row_id) + static_cast<std::int64_t>(ids.row_address);
+    if (ArrowSchemaSetTypeStruct(&out, own + extra) != NANOARROW_OK ||
+        ArrowSchemaSetMetadata(&out, schema.metadata) != NANOARROW_OK) {
+        ArrowSchemaRelease(&out);
+        error = "failed to allocate a schema with row ids";
+        return false;
+    }
+    for (std::int64_t c = 0; c < own; ++c) {
+        ArrowSchemaRelease(out.children[c]);
+        ArrowSchemaMove(schema.children[c], out.children[c]);
+    }
+    auto next = own;
+    for (const char* name : {"_rowid", "_rowaddr"}) {
+        if ((name[4] == 'i' && !ids.row_id) || (name[4] == 'a' && !ids.row_address)) {
+            continue;
+        }
+        auto* child = out.children[next++];
+        if (ArrowSchemaSetType(child, NANOARROW_TYPE_UINT64) != NANOARROW_OK ||
+            ArrowSchemaSetName(child, name) != NANOARROW_OK) {
+            ArrowSchemaRelease(&out);
+            error = "failed to add a row id field";
+            return false;
+        }
+        // Nullable, as pylance declares them, though they never hold a null.
+    }
+    ArrowSchemaRelease(&schema);
+    ArrowSchemaMove(&out, &schema);
+    return true;
+}
+
 bool read_data_file_batches(const std::filesystem::path& dataset_path, const PlannedFile& planned,
                             const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
                             std::vector<ArrowArray>& out, std::string& error,
-                            const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr) {
+                            const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr,
+                            const RowIdColumns& ids = {}) {
     if (planned.files.empty()) {
         error = "fragment has no data files";
         return false;
@@ -1216,7 +1362,8 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
         // under <dataset>/data/ so a hostile ".."/absolute path can't make the reader open a file
         // outside the dataset. The writer only ever stores a bare filename here, so legitimate
         // datasets are unaffected.
-        const auto jailed = safe_join_under(dataset_path / "data", data_file.path);
+        const auto jailed = safe_join_under(planned.data_dir.empty() ? dataset_path / "data" : planned.data_dir,
+                                            data_file.path);
         if (!jailed) {
             error = "data file path escapes the dataset directory";
             return false;
@@ -1393,10 +1540,29 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
                 }
             }
         }
-        if (build_batch_from_schema(batch_schema, mapping, by_field, static_cast<std::int64_t>(take), batches[k],
-                                    why)) {
-            built[k] = 1U;
+        if (n_columns != 0U && !build_batch_from_schema(batch_schema, mapping, by_field,
+                                                        static_cast<std::int64_t>(take), batches[k], why)) {
+            return;
         }
+        if (ids.any()) {
+            // The physical rows of this batch: the morsel's rows that survive deletion, then the range.
+            std::vector<std::uint64_t> physical_rows;
+            physical_rows.reserve(static_cast<std::size_t>(take));
+            std::uint64_t logical_row = logical_first;
+            for (std::uint64_t p = p0; p < p1 && physical_rows.size() < take; ++p) {
+                if (!keep.empty() && keep[p] == 0U) {
+                    continue;
+                }
+                if (logical_row++ >= lo) {
+                    physical_rows.push_back(p);
+                }
+            }
+            if (!add_row_id_columns(batches[k], static_cast<std::int64_t>(take), planned.fragment_id, physical_rows,
+                                    ids, why)) {
+                return;
+            }
+        }
+        built[k] = 1U;
     });
     bool ok = true;
     for (std::size_t k = 0; k < morsels.size(); ++k) {
@@ -1470,52 +1636,61 @@ bool cached_file_metadata(const std::filesystem::path& path, std::shared_ptr<con
 /// One fragment's share of a take: `logical` are its requested rows, ascending, fragment-local and
 /// counted without the deleted ones. Deleted rows are mapped out first, then every projected column
 /// decodes just those physical rows (decode_lance_physical_column_rows).
+/// The physical offsets (deleted rows counted) of a fragment's `logical` rows (ascending).
+bool physical_rows_of(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                      const std::vector<std::uint64_t>& logical, std::vector<std::uint64_t>& physical,
+                      std::string& error) {
+    physical.clear();
+    physical.reserve(logical.size());
+    if (!planned.deletion_file.present) {
+        physical = logical;
+        return true;
+    }
+    std::vector<std::uint32_t> deleted;
+    if (!read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
+        return false;
+    }
+    std::sort(deleted.begin(), deleted.end());
+    std::size_t d = 0;
+    std::uint64_t next_logical = 0;
+    std::size_t want = 0;
+    for (std::uint64_t row = 0; row < planned.physical_rows && want < logical.size(); ++row) {
+        while (d < deleted.size() && deleted[d] < row) {
+            ++d;
+        }
+        if (d < deleted.size() && deleted[d] == row) {
+            continue;
+        }
+        if (next_logical == logical[want]) {
+            physical.push_back(row);
+            ++want;
+        }
+        ++next_logical;
+    }
+    if (physical.size() != logical.size()) {
+        error = "fragment " + std::to_string(planned.fragment_id) + " has fewer rows than the take asks for";
+        return false;
+    }
+    return true;
+}
+
+/// Decode the rows at `physical` (offsets in the fragment's data files, ascending) into one batch.
 bool take_from_data_file(const std::filesystem::path& dataset_path, const PlannedFile& planned,
                          const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
-                         const std::vector<std::uint64_t>& logical, ArrowArray& batch, std::string& error,
+                         const std::vector<std::uint64_t>& physical, ArrowArray& batch, std::string& error,
                          const std::unordered_set<std::int32_t>* allowed_field_ids) {
     if (planned.files.empty()) {
         error = "fragment has no data files";
         return false;
     }
     const DataFileReadScope read_scope;
-    std::vector<std::uint64_t> physical;
-    physical.reserve(logical.size());
-    if (planned.deletion_file.present) {
-        std::vector<std::uint32_t> deleted;
-        if (!read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
-            return false;
-        }
-        std::sort(deleted.begin(), deleted.end());
-        std::size_t d = 0;
-        std::uint64_t next_logical = 0;
-        std::size_t want = 0;
-        for (std::uint64_t row = 0; row < planned.physical_rows && want < logical.size(); ++row) {
-            while (d < deleted.size() && deleted[d] < row) {
-                ++d;
-            }
-            if (d < deleted.size() && deleted[d] == row) {
-                continue;
-            }
-            if (next_logical == logical[want]) {
-                physical.push_back(row);
-                ++want;
-            }
-            ++next_logical;
-        }
-        if (physical.size() != logical.size()) {
-            error = "fragment " + std::to_string(planned.fragment_id) + " has fewer rows than the take asks for";
-            return false;
-        }
-    } else {
-        physical = logical;
-    }
 
     // The columns to take, then taken side by side (each is its own file reads and decode).
     std::vector<std::shared_ptr<const CachedFileMetadata>> files;
     std::vector<ColumnSource> columns;
     for (const auto& data_file : planned.files) {
-        const auto jailed = safe_join_under(dataset_path / "data", data_file.path);
+        const auto jailed = safe_join_under(planned.data_dir.empty() ? dataset_path / "data" : planned.data_dir,
+                                            data_file.path);
         if (!jailed) {
             error = "data file path escapes the dataset directory";
             return false;
@@ -1576,7 +1751,7 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
         decoded_by_field_id.emplace(columns[c].field_id, std::move(decoded[c]));
     }
     return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id,
-                                   static_cast<std::int64_t>(logical.size()), batch, error);
+                                   static_cast<std::int64_t>(physical.size()), batch, error);
 }
 
 /// ArrowSchemaRelease dereferences `release` unconditionally, and releasing sets it to null, so
@@ -1616,20 +1791,57 @@ struct ReadPlan {
     std::vector<PlannedFile> files;  // flattened in fragment-id order, range-filtered
     std::unordered_set<std::int32_t> allowed_ids;
     bool projected = false;
+    RowIdColumns ids;
+    /// With row id columns: the schema of the data columns alone, which batches are built against
+    /// before the row ids are added. Null otherwise (the output schema is the data schema).
+    std::shared_ptr<ArrowSchema> data_schema;
 
     const std::unordered_set<std::int32_t>* allowed() const { return projected ? &allowed_ids : nullptr; }
+    const ArrowSchema& batch_schema(const ArrowSchema& out_schema) const {
+        return data_schema ? *data_schema : out_schema;
+    }
 };
 
-/// Parse the manifest and build the Arrow schema. `column_names` null means every column.
-bool open_read_plan(const std::filesystem::path& dataset_path,
-                    const std::vector<std::string>* column_names, const LanceRowRange& range,
-                    ReadPlan& plan, ArrowSchema& out_schema, std::string& error) {
-    plan.dataset_path = dataset_path;
-
-    pb::Manifest manifest{};
+bool load_request_manifest(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                           pb::Manifest& manifest, std::string& error) {
+    if (request.has_version) {
+        return load_manifest_version(dataset_path, request.version, manifest, error);
+    }
     std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    return load_latest_manifest(dataset_path, manifest, version, error);
+}
+
+bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb::Manifest& manifest,
+                                  const LanceScanRequest& request, ReadPlan& plan, ArrowSchema& out_schema,
+                                  std::string& error);
+
+/// Parse the manifest and build the Arrow schema. `column_names` null means every column.
+bool open_read_plan(const std::filesystem::path& dataset_path, const LanceScanRequest& request, ReadPlan& plan,
+                    ArrowSchema& out_schema, std::string& error) {
+    pb::Manifest manifest{};
+    if (!load_request_manifest(dataset_path, request, manifest, error)) {
         release_schema_if_held(out_schema);
+        return false;
+    }
+    return open_read_plan_from_manifest(dataset_path, manifest, request, plan, out_schema, error);
+}
+
+bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb::Manifest& manifest,
+                                  const LanceScanRequest& request, ReadPlan& plan, ArrowSchema& out_schema,
+                                  std::string& error) {
+    plan.dataset_path = dataset_path;
+    const auto* column_names = request.columns;
+    const auto& range = request.range;
+    plan.ids.row_id = request.with_row_id;
+    plan.ids.row_address = request.with_row_address;
+    if (column_names != nullptr && column_names->empty() && !plan.ids.any()) {
+        release_schema_if_held(out_schema);
+        error = "a read must name at least one column";
+        return false;
+    }
+    if (plan.ids.row_id && (manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
+        release_schema_if_held(out_schema);
+        error = "row ids of a dataset with stable row ids are not supported";
         return false;
     }
     LanceSchemaMapping full_mapping;
@@ -1676,14 +1888,54 @@ bool open_read_plan(const std::filesystem::path& dataset_path,
         }
     }
 
-    if (!build_schema_from_mapping(plan.mapping, out_schema, error)) {
+    if (plan.mapping.fields.empty()) {
+        ArrowSchemaInit(&out_schema);
+        if (ArrowSchemaSetTypeStruct(&out_schema, 0) != NANOARROW_OK) {
+            release_schema_if_held(out_schema);
+            error = "failed to build an empty schema";
+            return false;
+        }
+    } else if (!build_schema_from_mapping(plan.mapping, out_schema, error)) {
         release_schema_if_held(out_schema);
         return false;
     }
+    if (!set_dataset_schema_metadata(out_schema, manifest, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    if (plan.ids.any()) {
+        plan.data_schema = std::shared_ptr<ArrowSchema>(new ArrowSchema{}, [](ArrowSchema* schema) {
+            release_schema_if_held(*schema);
+            delete schema;
+        });
+        if (ArrowSchemaDeepCopy(&out_schema, plan.data_schema.get()) != NANOARROW_OK ||
+            !add_row_id_fields(out_schema, plan.ids, error)) {
+            release_schema_if_held(out_schema);
+            if (error.empty()) {
+                error = "failed to copy the schema";
+            }
+            return false;
+        }
+    }
 
-    std::vector<pb::DataFragment> fragments = manifest.fragments;
-    std::sort(fragments.begin(), fragments.end(),
-              [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
+    std::vector<pb::DataFragment> fragments;
+    if (request.fragment_ids != nullptr) {
+        // The fragments asked for, in the order asked.
+        for (const auto id : *request.fragment_ids) {
+            const auto it = std::find_if(manifest.fragments.begin(), manifest.fragments.end(),
+                                         [&](const pb::DataFragment& f) { return f.id == id; });
+            if (it == manifest.fragments.end()) {
+                release_schema_if_held(out_schema);
+                error = "fragment " + std::to_string(id) + " not found";
+                return false;
+            }
+            fragments.push_back(*it);
+        }
+    } else {
+        fragments = manifest.fragments;
+        std::sort(fragments.begin(), fragments.end(),
+                  [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
+    }
 
     const bool ranged = !range.is_whole_dataset();
     std::uint64_t cursor = 0;  // absolute row index of the next fragment's first row
@@ -1761,8 +2013,8 @@ bool read_all_batches(const ReadPlan& plan, ArrowSchema& out_schema, std::vector
     std::vector<std::vector<ArrowArray>> per_file(plan.files.size());
     std::vector<std::string> errors(plan.files.size());
     parallel::for_each(plan.files.size(), [&](std::size_t f) {
-        read_data_file_batches(plan.dataset_path, plan.files[f], plan.mapping, out_schema, per_file[f], errors[f],
-                               plan.allowed());
+        read_data_file_batches(plan.dataset_path, plan.files[f], plan.mapping, plan.batch_schema(out_schema),
+                               per_file[f], errors[f], plan.allowed(), plan.ids);
     });
     for (std::size_t f = 0; f < per_file.size(); ++f) {
         if (!errors[f].empty() && error.empty()) {
@@ -1781,8 +2033,7 @@ bool read_all_batches(const ReadPlan& plan, ArrowSchema& out_schema, std::vector
     return true;
 }
 
-bool read_dataset_eager(const std::filesystem::path& dataset_path,
-                        const std::vector<std::string>* column_names, const LanceRowRange& range,
+bool read_dataset_eager(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
                         ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
                         std::string& error, bool trusted_input) {
     error.clear();
@@ -1794,26 +2045,212 @@ bool read_dataset_eager(const std::filesystem::path& dataset_path,
         trusted_scope.emplace(trusted_read_limits());
     }
     ReadPlan plan;
-    if (!open_read_plan(dataset_path, column_names, range, plan, out_schema, error)) {
+    if (!open_read_plan(dataset_path, request, plan, out_schema, error)) {
         return false;
     }
     return read_all_batches(plan, out_schema, out_batches, error);
 }
 
+bool read_dataset_eager(const std::filesystem::path& dataset_path,
+                        const std::vector<std::string>* column_names, const LanceRowRange& range,
+                        ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
+                        std::string& error, bool trusted_input) {
+    LanceScanRequest request;
+    request.columns = column_names;
+    request.range = range;
+    return read_dataset_eager(dataset_path, request, out_schema, out_batches, error, trusted_input);
+}
+
+/// Take rows given as physical offsets per fragment (`by_fragment`, ascending), one batch per fragment.
+bool take_physical(const ReadPlan& plan, ArrowSchema& out_schema,
+                   const std::vector<std::pair<const PlannedFile*, std::vector<std::uint64_t>>>& by_fragment,
+                   std::vector<ArrowArray>& out_batches, std::string& error);
+
 }  // namespace
 
-bool lance_table_take(const std::filesystem::path& dataset_path, const std::vector<std::string>* column_names,
-                      const std::vector<std::uint64_t>& indices, ArrowSchema& out_schema,
-                      std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+bool lance_dataset_scan(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                        ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches, std::string& error,
+                        bool trusted_input) {
+    return read_dataset_eager(dataset_path, request, out_schema, out_batches, error, trusted_input);
+}
+
+namespace {
+
+/// A standalone data file, as a one-fragment dataset: its own schema (the file's descriptor) with its
+/// leaf fields numbered as the file's columns, and the file's directory as the data directory.
+bool open_file_plan(const std::filesystem::path& file_path, const LanceScanRequest& request, ReadPlan& plan,
+                    ArrowSchema& out_schema, std::string& error, LanceFileInfo* info = nullptr) {
+    pb::FileDescriptor descriptor;
+    LanceDataFileFooterLayout layout{};
+    if (!read_lance_data_file_footer_and_descriptor(file_path, descriptor, layout, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    pb::Manifest manifest;
+    manifest.fields = descriptor.fields;
+    pb::DataFile file;
+    file.path = file_path.filename().string();
+    std::unordered_set<std::int32_t> parents;
+    for (const auto& f : descriptor.fields) {
+        if (f.parent_id >= 0) {
+            parents.insert(f.parent_id);
+        }
+    }
+    std::int32_t column = 0;
+    for (const auto& f : descriptor.fields) {
+        if (parents.count(f.id) == 0U) {
+            file.fields.push_back(f.id);
+            file.column_indices.push_back(column++);
+        }
+    }
+    if (static_cast<std::uint32_t>(column) != layout.num_columns) {
+        release_schema_if_held(out_schema);
+        error = "the file has " + std::to_string(layout.num_columns) + " columns for " + std::to_string(column) +
+                " leaf fields; nanolance reads files whose every leaf field is one column";
+        return false;
+    }
+    pb::DataFragment fragment;
+    fragment.physical_rows = descriptor.length;
+    fragment.files.push_back(file);
+    manifest.fragments.push_back(fragment);
+    if (info != nullptr) {
+        info->num_rows = descriptor.length;
+        info->num_columns = layout.num_columns;
+        std::vector<pb::ColumnMetadata> columns;
+        if (!read_lance_data_file_column_metadatas(file_path, layout, columns, error)) {
+            release_schema_if_held(out_schema);
+            return false;
+        }
+        info->pages.clear();
+        for (const auto& c : columns) {
+            auto& pages = info->pages.emplace_back();
+            for (const auto& p : c.pages) {
+                LanceFileInfo::Page page;
+                page.rows = p.length;
+                page_layout::PageLayout layout_of_page;
+                std::string ignored;
+                page.encoding = page_layout::decode_page_layout(p.encoding, layout_of_page, ignored)
+                                    ? page_layout::describe(layout_of_page)
+                                    : std::string("unknown");
+                for (std::size_t b = 0; b < p.buffer_offsets.size() && b < p.buffer_sizes.size(); ++b) {
+                    page.buffers.emplace_back(p.buffer_offsets[b], p.buffer_sizes[b]);
+                }
+                pages.push_back(std::move(page));
+            }
+        }
+    }
+    if (!open_read_plan_from_manifest(file_path.parent_path(), manifest, request, plan, out_schema, error)) {
+        return false;
+    }
+    for (auto& planned : plan.files) {
+        planned.data_dir = file_path.parent_path();
+    }
+    return true;
+}
+
+}  // namespace
+
+bool lance_file_read(const std::filesystem::path& file_path, const LanceScanRequest& request,
+                     ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches, std::string& error) {
     error.clear();
     out_batches.clear();
     ArrowSchemaInit(&out_schema);
-    std::optional<ScopedReadLimits> trusted_scope;
+    ReadPlan plan;
+    if (!open_file_plan(file_path, request, plan, out_schema, error)) {
+        return false;
+    }
+    return read_all_batches(plan, out_schema, out_batches, error);
+}
+
+bool lance_file_take(const std::filesystem::path& file_path, const LanceScanRequest& request,
+                     const std::vector<std::uint64_t>& rows, ArrowSchema& out_schema,
+                     std::vector<ArrowArray>& out_batches, std::string& error) {
+    error.clear();
+    out_batches.clear();
+    ArrowSchemaInit(&out_schema);
+    ReadPlan plan;
+    LanceScanRequest whole = request;
+    whole.range = LanceRowRange{};
+    if (!open_file_plan(file_path, whole, plan, out_schema, error)) {
+        return false;
+    }
+    std::vector<std::uint64_t> wanted(rows);
+    std::sort(wanted.begin(), wanted.end());
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    if (plan.files.empty()) {
+        if (!wanted.empty()) {
+            release_schema_if_held(out_schema);
+            error = "row " + std::to_string(wanted.front()) + " is past the end of the file (0 rows)";
+            return false;
+        }
+        return true;
+    }
+    if (!wanted.empty() && wanted.back() >= plan.files.front().physical_rows) {
+        release_schema_if_held(out_schema);
+        error = "row " + std::to_string(wanted.back()) + " is past the end of the file (" +
+                std::to_string(plan.files.front().physical_rows) + " rows)";
+        return false;
+    }
+    std::vector<std::pair<const PlannedFile*, std::vector<std::uint64_t>>> by_fragment;
+    if (!wanted.empty()) {
+        by_fragment.emplace_back(&plan.files.front(), wanted);
+    }
+    return take_physical(plan, out_schema, by_fragment, out_batches, error);
+}
+
+bool lance_file_info(const std::filesystem::path& file_path, LanceFileInfo& info, ArrowSchema& out_schema,
+                     std::string& error) {
+    error.clear();
+    ArrowSchemaInit(&out_schema);
+    ReadPlan plan;
+    return open_file_plan(file_path, LanceScanRequest{}, plan, out_schema, error, &info);
+}
+
+namespace {
+
+bool take_physical(const ReadPlan& plan, ArrowSchema& out_schema,
+                   const std::vector<std::pair<const PlannedFile*, std::vector<std::uint64_t>>>& by_fragment,
+                   std::vector<ArrowArray>& out_batches, std::string& error) {
+    for (const auto& [planned, physical] : by_fragment) {
+        ArrowArray batch{};
+        if (!plan.mapping.fields.empty() &&
+            !take_from_data_file(plan.dataset_path, *planned, plan.mapping, plan.batch_schema(out_schema), physical,
+                                 batch, error, plan.allowed())) {
+            release_partial_read(out_schema, out_batches);
+            return false;
+        }
+        if (plan.ids.any() && !add_row_id_columns(batch, static_cast<std::int64_t>(physical.size()),
+                                                  planned->fragment_id, physical, plan.ids, error)) {
+            release_partial_read(out_schema, out_batches);
+            return false;
+        }
+        out_batches.push_back(batch);
+    }
+    return true;
+}
+
+bool open_take(const std::filesystem::path& dataset_path, const LanceScanRequest& request, ReadPlan& plan,
+               ArrowSchema& out_schema, std::string& error,
+               std::optional<ScopedReadLimits>& trusted_scope, bool trusted_input) {
+    error.clear();
+    ArrowSchemaInit(&out_schema);
     if (trusted_input) {
         trusted_scope.emplace(trusted_read_limits());
     }
+    LanceScanRequest whole = request;
+    whole.range = LanceRowRange{};
+    return open_read_plan(dataset_path, whole, plan, out_schema, error);
+}
+
+}  // namespace
+
+bool lance_dataset_take(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                        const std::vector<std::uint64_t>& indices, ArrowSchema& out_schema,
+                        std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+    out_batches.clear();
+    std::optional<ScopedReadLimits> trusted_scope;
     ReadPlan plan;
-    if (!open_read_plan(dataset_path, column_names, LanceRowRange{}, plan, out_schema, error)) {
+    if (!open_take(dataset_path, request, plan, out_schema, error, trusted_scope, trusted_input)) {
         return false;
     }
     std::vector<std::uint64_t> wanted(indices);
@@ -1829,6 +2266,7 @@ bool lance_table_take(const std::filesystem::path& dataset_path, const std::vect
                 " rows)";
         return false;
     }
+    std::vector<std::pair<const PlannedFile*, std::vector<std::uint64_t>>> by_fragment;
     std::uint64_t cursor = 0;
     std::size_t w = 0;
     for (const auto& planned : plan.files) {
@@ -1841,15 +2279,57 @@ bool lance_table_take(const std::filesystem::path& dataset_path, const std::vect
         if (logical.empty()) {
             continue;
         }
-        ArrowArray batch{};
-        if (!take_from_data_file(plan.dataset_path, planned, plan.mapping, out_schema, logical, batch, error,
-                                 plan.allowed())) {
-            release_partial_read(out_schema, out_batches);
+        std::vector<std::uint64_t> physical;
+        if (!physical_rows_of(plan.dataset_path, planned, logical, physical, error)) {
+            release_schema_if_held(out_schema);
             return false;
         }
-        out_batches.push_back(batch);
+        by_fragment.emplace_back(&planned, std::move(physical));
     }
-    return true;
+    return take_physical(plan, out_schema, by_fragment, out_batches, error);
+}
+
+bool lance_dataset_take_rows(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                             const std::vector<std::uint64_t>& addresses, ArrowSchema& out_schema,
+                             std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+    out_batches.clear();
+    std::optional<ScopedReadLimits> trusted_scope;
+    ReadPlan plan;
+    if (!open_take(dataset_path, request, plan, out_schema, error, trusted_scope, trusted_input)) {
+        return false;
+    }
+    std::vector<std::uint64_t> wanted(addresses);
+    std::sort(wanted.begin(), wanted.end());
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    std::map<std::uint64_t, const PlannedFile*> fragments;
+    for (const auto& planned : plan.files) {
+        fragments.emplace(planned.fragment_id, &planned);
+    }
+    std::vector<std::pair<const PlannedFile*, std::vector<std::uint64_t>>> by_fragment;
+    for (const auto address : wanted) {
+        const auto fragment_id = address >> 32U;
+        const auto offset = address & 0xFFFFFFFFULL;
+        const auto it = fragments.find(fragment_id);
+        if (it == fragments.end() || offset >= it->second->physical_rows) {
+            release_schema_if_held(out_schema);
+            error = "row address " + std::to_string(address) + " (fragment " + std::to_string(fragment_id) +
+                    ", row " + std::to_string(offset) + ") is not in the dataset";
+            return false;
+        }
+        if (by_fragment.empty() || by_fragment.back().first != it->second) {
+            by_fragment.emplace_back(it->second, std::vector<std::uint64_t>{});
+        }
+        by_fragment.back().second.push_back(offset);
+    }
+    return take_physical(plan, out_schema, by_fragment, out_batches, error);
+}
+
+bool lance_table_take(const std::filesystem::path& dataset_path, const std::vector<std::string>* column_names,
+                      const std::vector<std::uint64_t>& indices, ArrowSchema& out_schema,
+                      std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+    LanceScanRequest request;
+    request.columns = column_names;
+    return lance_dataset_take(dataset_path, request, indices, out_schema, out_batches, error, trusted_input);
 }
 
 bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
@@ -1910,6 +2390,15 @@ bool LanceTableStream::open_range(const std::filesystem::path& dataset_path,
                                   const std::vector<std::string>* column_names,
                                   const LanceRowRange& range, ArrowSchema& out_schema,
                                   LanceTableStream& out, std::string& error, bool trusted_input) {
+    LanceScanRequest request;
+    request.columns = column_names;
+    request.range = range;
+    return open_request(dataset_path, request, out_schema, out, error, trusted_input);
+}
+
+bool LanceTableStream::open_request(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                                    ArrowSchema& out_schema, LanceTableStream& out, std::string& error,
+                                    bool trusted_input) {
     error.clear();
     ArrowSchemaInit(&out_schema);
 
@@ -1920,12 +2409,12 @@ bool LanceTableStream::open_range(const std::filesystem::path& dataset_path,
 
     auto impl = std::make_unique<Impl>();
     impl->trusted_input = trusted_input;
-    if (!open_read_plan(dataset_path, column_names, range, impl->plan, out_schema, error)) {
+    if (!open_read_plan(dataset_path, request, impl->plan, out_schema, error)) {
         return false;
     }
     // The stream keeps its own schema: read_data_file_batch builds each batch against one, and the
     // caller owns (and may release) the schema it was handed the moment open() returns.
-    if (ArrowSchemaDeepCopy(&out_schema, &impl->schema) != NANOARROW_OK) {
+    if (ArrowSchemaDeepCopy(&impl->plan.batch_schema(out_schema), &impl->schema) != NANOARROW_OK) {
         release_schema_if_held(out_schema);
         error = "failed to copy the dataset schema for the stream";
         return false;
@@ -1955,7 +2444,7 @@ bool LanceTableStream::next(ArrowArray& out_batch, std::string& error) {
         const auto& planned = impl_->plan.files[impl_->cursor];
         std::vector<ArrowArray> batches;
         if (!read_data_file_batches(impl_->plan.dataset_path, planned, impl_->plan.mapping, impl_->schema, batches,
-                                    error, impl_->plan.allowed())) {
+                                    error, impl_->plan.allowed(), impl_->plan.ids)) {
             out_batch = ArrowArray{};
             return false;
         }
@@ -1970,12 +2459,16 @@ bool LanceTableStream::next(ArrowArray& out_batch, std::string& error) {
 
 bool lance_table_read_schema(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
                              std::string& error) {
+    return lance_dataset_schema(dataset_path, LanceScanRequest{}, out_schema, error);
+}
+
+bool lance_dataset_schema(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                          ArrowSchema& out_schema, std::string& error) {
     error.clear();
     ArrowSchemaInit(&out_schema);
 
     pb::Manifest manifest{};
-    std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    if (!load_request_manifest(dataset_path, request, manifest, error)) {
         release_schema_if_held(out_schema);
         return false;
     }
@@ -1985,6 +2478,10 @@ bool lance_table_read_schema(const std::filesystem::path& dataset_path, ArrowSch
         return false;
     }
     if (!build_schema_from_mapping(mapping, out_schema, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    if (!set_dataset_schema_metadata(out_schema, manifest, error)) {
         release_schema_if_held(out_schema);
         return false;
     }

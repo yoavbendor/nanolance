@@ -6,6 +6,7 @@ on:
     branches: [main, "claude/**", "cursor/**"]
     paths:
       - "bindings/python/**"
+      - "tools/pylance_suite.py"
       - "include/**"
       - "src/**"
       - "CMakeLists.txt"
@@ -13,6 +14,7 @@ on:
   pull_request:
     paths:
       - "bindings/python/**"
+      - "tools/pylance_suite.py"
       - "include/**"
       - "src/**"
       - "CMakeLists.txt"
@@ -58,6 +60,14 @@ jobs:
           NANOLANCE_THREADS: "8"
           NANOLANCE_MORSEL_KB: "1"
         run: pytest -m "not bench" -q
+
+      # pylance's own test suite, at the release nanolance.lance tracks, against nanolance.lance
+      # (docs/PYLANCE_COMPAT.md). Fails when a test listed in tests/pylance_suite/expected_pass.txt
+      # stops passing.
+      - name: pylance's test suite against nanolance.lance
+        run: |
+          python3 -m pip install pytest-xdist pytest-timeout pandas polars duckdb tqdm ml_dtypes pydantic "pylance==12.0.0"
+          python3 tools/pylance_suite.py --report pylance-suite.json
 
       - name: Run benchmark smoke (informational)
         working-directory: bindings/python

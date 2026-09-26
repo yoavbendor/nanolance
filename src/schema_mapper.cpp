@@ -252,7 +252,10 @@ bool read_metadata_key(const ArrowSchema& schema, const char* key, std::string& 
     key_view.data = key;
     key_view.size_bytes = static_cast<int64_t>(std::strlen(key));
     struct ArrowStringView value_view {};
-    if (ArrowMetadataGetValue(schema.metadata, key_view, &value_view) != NANOARROW_OK) {
+    // ArrowMetadataGetValue succeeds for a key that is not there, leaving the value's data null. Reading
+    // that as "present" made any schema-level metadata (pandas always adds some) look like an Arrow
+    // extension type on the root, and the write failed with "struct array for '' is missing child".
+    if (ArrowMetadataGetValue(schema.metadata, key_view, &value_view) != NANOARROW_OK || value_view.data == nullptr) {
         return false;
     }
     value.assign(value_view.data, value_view.data + value_view.size_bytes);
@@ -423,7 +426,10 @@ bool map_field(const ArrowSchema& field,
         return false;
     }
 
-    if (is_struct || !extension_name.empty()) {
+    // A column of an extension type Lance does not define is stored as its storage type. Treating every
+    // extension as non-physical dropped such a column's data without a word: an
+    // arrow.fixed_shape_tensor column read back with no rows.
+    if (is_struct || lance_extension_is_lance_owned(extension_name)) {
         out.column_index = -1;
     } else {
         out.column_index = next_column++;

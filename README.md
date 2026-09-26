@@ -78,6 +78,20 @@ for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")
     ...
 ```
 
+Already using pylance? `nanolance.lance` speaks its API: the reads, writes, versions, fragments,
+row ids and file API that pylance 12's own test suite exercises, run against nanolance in CI:
+
+```python
+import nanolance.lance as lance          # or nanolance.lance.install_as_lance(), then `import lance`
+
+ds = lance.write_dataset(table, "out.lance", mode="append")
+ds.to_table(columns=["name"], limit=10, with_row_id=True)
+lance.dataset("out.lance", version=1).take([2, 0])
+```
+
+What it covers, what raises `NotImplementedError`, and how many of pylance's tests pass:
+[docs/PYLANCE_COMPAT.md](docs/PYLANCE_COMPAT.md).
+
 Already have parquet? Convert it and compare, without writing any code:
 
 ```console

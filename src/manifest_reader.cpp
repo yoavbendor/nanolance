@@ -145,18 +145,33 @@ bool read_manifest_file(const std::filesystem::path& manifest_path, std::vector<
     return true;
 }
 
-bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifest& out, std::uint64_t& version_out,
-                          std::string& error) {
+std::vector<std::uint64_t> list_manifest_versions(const std::filesystem::path& dataset_path, std::string& error) {
+    error.clear();
+    std::vector<std::uint64_t> versions;
+    const auto versions_dir = dataset_path / "_versions";
+    std::error_code ec;
+    if (!std::filesystem::exists(versions_dir, ec)) {
+        return versions;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(versions_dir, ec)) {
+        if (ec) {
+            error = "failed to iterate _versions: " + ec.message();
+            return {};
+        }
+        std::uint64_t version = 0;
+        if (entry.is_regular_file() && parse_manifest_version(entry.path().filename().string(), version)) {
+            versions.push_back(version);
+        }
+    }
+    std::sort(versions.begin(), versions.end());
+    versions.erase(std::unique(versions.begin(), versions.end()), versions.end());
+    return versions;
+}
+
+bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint64_t v, pb::Manifest& out,
+                           std::string& error) {
     error.clear();
     out = pb::Manifest{};
-    const std::uint64_t v = highest_manifest_version(dataset_path, error);
-    if (!error.empty()) {
-        return false;
-    }
-    if (v == 0) {
-        error = "no manifest found under _versions";
-        return false;
-    }
     // The version is scheme-independent, so try both spellings rather than assuming one. A dataset
     // nanolance appended to after pylance created it can legitimately hold a mix.
     std::error_code path_ec;
@@ -166,6 +181,10 @@ bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifes
         inverted << std::setfill('0') << std::setw(static_cast<int>(kManifestV2Digits))
                  << (std::numeric_limits<std::uint64_t>::max() - v);
         manifest_path = dataset_path / "_versions" / (inverted.str() + ".manifest");
+        if (!std::filesystem::exists(manifest_path, path_ec)) {
+            error = "version " + std::to_string(v) + " not found";
+            return false;
+        }
     }
     std::vector<std::uint8_t> body;
     if (!read_manifest_file(manifest_path, body, error)) {
@@ -188,6 +207,24 @@ bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifes
             error = "manifest fragment file count exceeds safety limit";
             return false;
         }
+    }
+    return true;
+}
+
+bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifest& out, std::uint64_t& version_out,
+                          std::string& error) {
+    error.clear();
+    out = pb::Manifest{};
+    const std::uint64_t v = highest_manifest_version(dataset_path, error);
+    if (!error.empty()) {
+        return false;
+    }
+    if (v == 0) {
+        error = "no manifest found under _versions";
+        return false;
+    }
+    if (!load_manifest_version(dataset_path, v, out, error)) {
+        return false;
     }
     version_out = v;
     return true;

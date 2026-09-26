@@ -335,7 +335,7 @@ bool finalize_blob_v2_schema_for_write(LanceSchemaMapping& mapping, std::string&
 
     std::int32_t blob_column_index = 0;
     for (const auto& field : mapping.fields) {
-        if (field.parent_id == -1 && field.extension_name.empty() && field.column_index >= 0) {
+        if (field.parent_id == -1 && !lance_extension_is_lance_owned(field.extension_name) && field.column_index >= 0) {
             blob_column_index = std::max(blob_column_index, field.column_index + 1);
         }
     }

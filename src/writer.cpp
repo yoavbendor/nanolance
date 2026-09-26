@@ -56,6 +56,13 @@ struct WriterState {
     /// write_batch has committed at least once on its own: the caller's final commit is then an
     /// append whatever it says, and a no-op when nothing is left pending.
     bool flushed_by_budget = false;
+    /// Staged mode (NanoLanceWriteOptions::stage_fragments): a commit writes its data file and stages
+    /// the fragment; nano_lance_writer_finish publishes them all as one version.
+    bool stage = false;
+    std::vector<nano_lance::NewFragment> staged;
+    nano_lance::LanceSchemaMapping staged_schema;  // the on-disk schema the staged files were written with
+    /// The Arrow schema metadata of the first batch, recorded in the manifest.
+    std::map<std::string, std::vector<std::uint8_t>> schema_metadata;
 };
 
 /// Commit what is pending as one fragment (defined with nano_lance_writer_commit).
@@ -619,6 +626,7 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
     state->borrow_buffers = opts.borrow_buffers;
     state->append_only_commits = opts.append;
     state->max_pending_bytes = opts.max_pending_bytes;
+    state->stage = opts.stage_fragments;
 
     for (std::size_t i = 0; i < opts.num_column_encodings; ++i) {
         const auto& entry = opts.column_encodings[i];
@@ -822,6 +830,18 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
 
     const auto* batch_blob_field = nano_lance::find_blob_v2_parent(batch_mapping);
     if (!state->has_schema) {
+        ArrowMetadataReader reader;
+        if (schema->metadata != nullptr && ArrowMetadataReaderInit(&reader, schema->metadata) == NANOARROW_OK) {
+            ArrowStringView key;
+            ArrowStringView value;
+            while (reader.remaining_keys > 0 && ArrowMetadataReaderRead(&reader, &key, &value) == NANOARROW_OK) {
+                const auto* bytes = reinterpret_cast<const std::uint8_t*>(value.data);
+                state->schema_metadata[std::string(key.data, static_cast<std::size_t>(key.size_bytes))] =
+                    std::vector<std::uint8_t>(bytes, bytes + value.size_bytes);
+            }
+        }
+    }
+    if (!state->has_schema) {
         state->schema_mapping = std::move(batch_mapping);
         state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
         const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
@@ -900,10 +920,11 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
 extern "C++" {  // an internal helper, inside the extern "C" block
 namespace {
 int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) {
-    if (state->pending_rows == 0) {
+    // A staged writer may commit a batch of no rows on purpose: a Lance file of a schema alone.
+    if (state->pending_rows == 0 && !(state->stage && state->pending_batches != 0U)) {
         return set_error(writer, NANO_LANCE_INVALID_STATE, "no pending rows to commit");
     }
-    if (state->append_only_commits && !is_append) {
+    if (state->append_only_commits && !is_append && !state->stage) {
         return set_error(writer, NANO_LANCE_INVALID_STATE,
                          "commit requires is_append=true after the first manifest was written");
     }
@@ -960,7 +981,8 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     // structural switch. (Stock Lance reads the encoding from the data-file PageLayout; this metadata
     // is nanolance's own read-side signal and an inert write hint to Lance.)
     for (auto& field : disk_schema.fields) {
-        if (!nano_lance::lance_field_is_physical(field) || !field.extension_name.empty()) {
+        if (!nano_lance::lance_field_is_physical(field) ||
+            nano_lance::lance_extension_is_lance_owned(field.extension_name)) {
             continue;
         }
         // Declared encodings (set_column_encoding) override the automatic tagging below and later skip
@@ -1041,7 +1063,7 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
         const auto physical = nano_lance::lance_physical_fields(disk_schema);
         for (std::size_t i = 0; i < physical.size() && i < commit_columns.size(); ++i) {
             const auto* pf = physical[i];
-            if (!pf->extension_name.empty()) {
+            if (nano_lance::lance_extension_is_lance_owned(pf->extension_name)) {
                 continue;
             }
             // A fixed_size_list stays flat. Every structural encoding here would describe a row as one
@@ -1172,18 +1194,22 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
         return set_error(writer, NANO_LANCE_IO_ERROR, writer_error);
     }
 
-    std::uint64_t version = 0;
-    if (!nano_lance::write_dataset_manifest(state->dataset_path,
-                                            disk_schema,
-                                            data_file,
-                                            state->pending_rows,
-                                            is_append,
-                                            version,
-                                            writer_error)) {
-        return set_error(writer, NANO_LANCE_IO_ERROR, writer_error);
+    if (state->stage) {
+        state->staged.push_back(nano_lance::NewFragment{data_file, state->pending_rows});
+        state->staged_schema = disk_schema;
+    } else {
+        std::uint64_t version = 0;
+        nano_lance::CommitExtras extras;
+        extras.schema_metadata = is_append ? nullptr : &state->schema_metadata;
+        if (!nano_lance::commit_dataset_version(state->dataset_path, disk_schema,
+                                                {nano_lance::NewFragment{data_file, state->pending_rows}},
+                                                is_append ? nano_lance::CommitMode::Append
+                                                          : nano_lance::CommitMode::Overwrite,
+                                                version, writer_error, extras)) {
+            return set_error(writer, NANO_LANCE_IO_ERROR, writer_error);
+        }
+        state->append_only_commits = true;
     }
-
-    state->append_only_commits = true;
     state->pending_batches = 0;
     state->pending_rows = 0;
     state->column_values.clear();
@@ -1198,6 +1224,57 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
 }
 }  // namespace
 }  // extern "C++"
+
+int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* version_out) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (state->closed) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is already closed");
+    }
+    if (!state->stage) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "finish needs a writer opened with stage_fragments");
+    }
+    nano_lance::CommitMode commit_mode;
+    switch (mode) {
+        case NANO_LANCE_COMMIT_CREATE: commit_mode = nano_lance::CommitMode::Create; break;
+        case NANO_LANCE_COMMIT_APPEND: commit_mode = nano_lance::CommitMode::Append; break;
+        case NANO_LANCE_COMMIT_OVERWRITE: commit_mode = nano_lance::CommitMode::Overwrite; break;
+        default: return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "unknown commit mode");
+    }
+    std::error_code ec;
+    std::string error;
+    if (commit_mode == nano_lance::CommitMode::Create &&
+        nano_lance::highest_manifest_version(state->dataset_path, error) != 0U) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE,
+                         "Dataset already exists: " + state->dataset_path.string());
+    }
+    if (state->pending_rows != 0U) {
+        const int rc = commit_pending(writer, state, commit_mode == nano_lance::CommitMode::Append);
+        if (rc != NANO_LANCE_OK) {
+            return rc;
+        }
+    }
+    if (!state->has_schema) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "no schema: write at least one batch");
+    }
+    const auto& mapping = state->staged.empty() ? state->schema_mapping : state->staged_schema;
+    std::uint64_t version = 0;
+    nano_lance::CommitExtras extras;
+    extras.schema_metadata = commit_mode == nano_lance::CommitMode::Append ? nullptr : &state->schema_metadata;
+    std::filesystem::create_directories(state->dataset_path / "data", ec);
+    if (!nano_lance::commit_dataset_version(state->dataset_path, mapping, state->staged, commit_mode, version, error,
+                                            extras)) {
+        return set_error(writer, NANO_LANCE_IO_ERROR, error);
+    }
+    state->staged.clear();
+    if (version_out != nullptr) {
+        *version_out = version;
+    }
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
 
 int nano_lance_writer_close(NanoLanceWriter* writer) {
     if (writer == nullptr) {

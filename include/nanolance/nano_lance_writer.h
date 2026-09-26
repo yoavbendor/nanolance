@@ -70,7 +70,18 @@ typedef struct NanoLanceWriteOptions {
     /// Memory budget, in bytes, for rows buffered between commits; 0 = unlimited (the default). See
     /// set_max_pending_bytes.
     uint64_t max_pending_bytes;
+    /// Stage fragments instead of publishing a version per commit: each commit (and each flush by
+    /// max_pending_bytes) writes a data file, and nano_lance_writer_finish publishes all of them as
+    /// one version -- how a Lance write behaves. Readers see nothing until then.
+    bool stage_fragments;
 } NanoLanceWriteOptions;
+
+/// How nano_lance_writer_finish relates the new version to what is at the path.
+enum {
+    NANO_LANCE_COMMIT_CREATE = 0,    // fail if a dataset exists there
+    NANO_LANCE_COMMIT_APPEND = 1,    // add the fragments to the latest version
+    NANO_LANCE_COMMIT_OVERWRITE = 2  // a new version holding only these fragments (or create one)
+};
 
 /// Fill `options` with the defaults. Equivalent to zero-initializing it.
 void nano_lance_write_options_init(NanoLanceWriteOptions* options);
@@ -157,6 +168,10 @@ int nano_lance_writer_set_borrow_buffers(NanoLanceWriter* writer, bool enable);
 int nano_lance_writer_set_max_pending_bytes(NanoLanceWriter* writer, uint64_t max_pending_bytes);
 int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, struct ArrowSchema* schema);
 int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append);
+/// Staged writers only: commit what is pending, then publish every staged fragment as one version.
+/// A write with no rows publishes a version with no fragments (the schema of the batches seen, or of
+/// the dataset appended to). `version_out` may be NULL.
+int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* version_out);
 int nano_lance_writer_close(NanoLanceWriter* writer);
 
 const char* nano_lance_writer_last_error(const NanoLanceWriter* writer);

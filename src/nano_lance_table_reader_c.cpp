@@ -365,6 +365,20 @@ int open_stream_impl(const char* dataset_path, const char* const* column_names, 
 
 }  // namespace
 
+namespace nano_lance {
+void lance_table_stream_export(LanceTableStream&& stream, ArrowSchema&& schema, ArrowArrayStream& out) {
+    auto self = std::make_unique<StreamPrivate>();
+    self->stream = std::move(stream);
+    self->schema = schema;
+    std::memset(&schema, 0, sizeof(schema));
+    out.get_schema = &stream_get_schema;
+    out.get_next = &stream_get_next;
+    out.get_last_error = &stream_get_last_error;
+    out.release = &stream_release;
+    out.private_data = self.release();
+}
+}  // namespace nano_lance
+
 extern "C" int nano_lance_table_open_stream(const char* dataset_path, const char* const* column_names,
                                             size_t column_count, int trusted_input,
                                             struct ArrowArrayStream* out_stream, char* error_message,

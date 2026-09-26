@@ -1,0 +1,197 @@
+{
+ "pylance_version": "12.0.0",
+ "target": "nanolance.lance",
+ "totals": {
+  "failed": 985,
+  "skipped": 347,
+  "passed": 128
+ },
+ "files": {
+  ".py": {
+   "failed": 4,
+   "skipped": 9
+  },
+  "tests/compat/test_file_formats.py": {
+   "skipped": 44
+  },
+  "tests/compat/test_index_sequence.py": {
+   "skipped": 133
+  },
+  "tests/compat/test_scalar_indices.py": {
+   "skipped": 48
+  },
+  "tests/compat/test_vector_indices.py": {
+   "skipped": 32
+  },
+  "tests/compat/test_venv_manager.py": {
+   "skipped": 12
+  },
+  "tests/test_arrow.py": {
+   "failed": 19,
+   "passed": 1
+  },
+  "tests/test_backwards_compatibility.py": {
+   "failed": 1
+  },
+  "tests/test_coerce_query_vector.py": {
+   "failed": 10
+  },
+  "tests/test_column_names.py": {
+   "passed": 5,
+   "failed": 22
+  },
+  "tests/test_commit_index.py": {
+   "failed": 6
+  },
+  "tests/test_compat_version_snapshot.py": {
+   "passed": 1
+  },
+  "tests/test_count_pushdown.py": {
+   "failed": 4
+  },
+  "tests/test_create_empty_index.py": {
+   "failed": 2
+  },
+  "tests/test_custom_registry.py": {
+   "failed": 6
+  },
+  "tests/test_dataset.py": {
+   "failed": 201,
+   "passed": 49,
+   "skipped": 5
+  },
+  "tests/test_debug.py": {
+   "failed": 4
+  },
+  "tests/test_delta.py": {
+   "failed": 5
+  },
+  "tests/test_file.py": {
+   "passed": 27,
+   "failed": 13
+  },
+  "tests/test_filter.py": {
+   "failed": 26,
+   "skipped": 1
+  },
+  "tests/test_fork.py": {
+   "passed": 1
+  },
+  "tests/test_fragment.py": {
+   "failed": 84,
+   "passed": 1
+  },
+  "tests/test_fragment_typing.py": {
+   "failed": 3
+  },
+  "tests/test_hnsw.py": {
+   "failed": 1
+  },
+  "tests/test_indices.py": {
+   "failed": 27,
+   "skipped": 15
+  },
+  "tests/test_ingestion.py": {
+   "failed": 2
+  },
+  "tests/test_integration.py": {
+   "skipped": 1,
+   "failed": 1
+  },
+  "tests/test_ivf_centroids.py": {
+   "failed": 1
+  },
+  "tests/test_json.py": {
+   "failed": 13,
+   "passed": 5
+  },
+  "tests/test_kmeans.py": {
+   "failed": 3
+  },
+  "tests/test_lance.py": {
+   "passed": 9,
+   "failed": 14
+  },
+  "tests/test_log.py": {
+   "failed": 18
+  },
+  "tests/test_map_type.py": {
+   "passed": 12,
+   "failed": 7
+  },
+  "tests/test_mem_wal.py": {
+   "failed": 20
+  },
+  "tests/test_memory_leaks.py": {
+   "failed": 1
+  },
+  "tests/test_migration.py": {
+   "failed": 4
+  },
+  "tests/test_multi_base.py": {
+   "failed": 33
+  },
+  "tests/test_namespace_dir.py": {
+   "failed": 101
+  },
+  "tests/test_namespace_integration.py": {
+   "skipped": 30
+  },
+  "tests/test_namespace_rest.py": {
+   "failed": 33
+  },
+  "tests/test_optimize.py": {
+   "failed": 22
+  },
+  "tests/test_order_by.py": {
+   "failed": 3
+  },
+  "tests/test_otel.py": {
+   "skipped": 2,
+   "failed": 1
+  },
+  "tests/test_pydantic.py": {
+   "passed": 4,
+   "failed": 8
+  },
+  "tests/test_row_addr_prefilter.py": {
+   "failed": 12,
+   "passed": 1
+  },
+  "tests/test_s3_ddb.py": {
+   "skipped": 12
+  },
+  "tests/test_sampler.py": {
+   "failed": 9,
+   "skipped": 1
+  },
+  "tests/test_scalar_index.py": {
+   "failed": 186,
+   "passed": 10
+  },
+  "tests/test_schema.py": {
+   "failed": 4
+  },
+  "tests/test_schema_evolution.py": {
+   "failed": 23
+  },
+  "tests/test_session.py": {
+   "failed": 9
+  },
+  "tests/test_table_ops.py": {
+   "failed": 8
+  },
+  "tests/test_table_provider.py": {
+   "skipped": 2
+  },
+  "tests/test_tracing.py": {
+   "passed": 2
+  },
+  "tests/test_udf.py": {
+   "failed": 2
+  },
+  "tests/test_vector.py": {
+   "failed": 9
+  }
+ }
+}

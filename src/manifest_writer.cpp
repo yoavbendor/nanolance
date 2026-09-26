@@ -5,11 +5,13 @@
 
 #include "lance_minimal.pb.hpp"
 #include "nanolance/manifest_reader.hpp"
+#include "nanolance/version.hpp"
 #include <sstream>
 #include <iomanip>
 #include "nanolance/schema_mapper.hpp"
 
 #include <array>
+#include <chrono>
 #include <algorithm>
 #include <fstream>
 #include <limits>
@@ -131,13 +133,48 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     return true;
 }
 
-bool write_dataset_manifest(const std::filesystem::path& dataset_path,
-                            const LanceSchemaMapping& mapping,
-                            const DataFileResult& data_file,
-                            std::uint64_t rows,
-                            bool is_append,
-                            std::uint64_t& version,
-                            std::string& error) {
+namespace {
+
+pb::Field manifest_field(const LanceField& mapped_field) {
+    pb::Field field;
+    field.name = mapped_field.name;
+    field.logical_type = lance_on_disk_logical_type(mapped_field.logical_type);
+    field.id = mapped_field.id;
+    field.parent_id = mapped_field.parent_id;
+    field.type = 2;
+    field.nullable = mapped_field.nullable;
+    for (const auto& kv : mapped_field.metadata) {
+        // Per-file encoding choices live in each data file's own schema; the dataset's is logical.
+        if (kv.first == "nanolance:packing" || kv.first == "nanolance:const-value") {
+            continue;
+        }
+        field.metadata[kv.first] = std::vector<std::uint8_t>(kv.second.begin(), kv.second.end());
+    }
+    return field;
+}
+
+pb::DataFile manifest_data_file(const LanceSchemaMapping& mapping, const DataFileResult& data_file) {
+    pb::DataFile file;
+    file.path = data_file.relative_path.filename().generic_string();
+    file.file_major_version = 2;
+    file.file_minor_version = 2;
+    file.file_size_bytes = data_file.file_size_bytes;
+    for (const auto* mapped_field : lance_physical_fields(mapping)) {
+        file.fields.push_back(mapped_field->id);
+        file.column_indices.push_back(mapped_field->column_index);
+    }
+    return file;
+}
+
+}  // namespace
+
+const char* nanolance_writer_version() {
+    return nanolance::library_version();
+}
+
+bool commit_dataset_version(const std::filesystem::path& dataset_path, const LanceSchemaMapping& mapping,
+                            const std::vector<NewFragment>& fragments, CommitMode mode, std::uint64_t& version,
+                            std::string& error, const CommitExtras& extras) {
     error.clear();
     const auto versions_dir = dataset_path / "_versions";
     std::error_code ec;
@@ -149,75 +186,124 @@ bool write_dataset_manifest(const std::filesystem::path& dataset_path,
 
     bool unused_v2 = false;
     version = next_version(versions_dir, unused_v2);
-    if (is_append && version == 1) {
+    const bool exists = version > 1U;
+    if (mode == CommitMode::Create && exists) {
+        error = "dataset already exists: " + dataset_path.string();
+        return false;
+    }
+    if (mode == CommitMode::Append && !exists) {
         error = "append requested but no manifest version exists";
         return false;
+    }
+
+    pb::Manifest prior;
+    if (exists) {
+        std::uint64_t prior_version = 0;
+        if (!load_latest_manifest(dataset_path, prior, prior_version, error)) {
+            return false;
+        }
+        if (mode == CommitMode::Append && (prior.writer_feature_flags & pb::kFlagStableRowIds) != 0U) {
+            // Every fragment of such a dataset carries its row ids; ours would carry none.
+            error = "appending to a dataset with stable row ids is not supported";
+            return false;
+        }
     }
 
     pb::Manifest manifest;
     manifest.version = version;
     manifest.data_format.file_format = "lance";
     manifest.data_format.version = "2.2";
-    for (const auto& mapped_field : mapping.fields) {
-        pb::Field field;
-        field.name = mapped_field.name;
-        field.logical_type = lance_on_disk_logical_type(mapped_field.logical_type);
-        field.id = mapped_field.id;
-        field.parent_id = mapped_field.parent_id;
-        field.type = 2;
-        field.nullable = mapped_field.nullable;
-        for (const auto& kv : mapped_field.metadata) {
-            field.metadata[kv.first] = std::vector<std::uint8_t>(kv.second.begin(), kv.second.end());
-        }
-        manifest.fields.push_back(std::move(field));
+    manifest.has_timestamp = true;
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    manifest.timestamp_seconds = static_cast<std::int64_t>(nanos / 1000000000LL);
+    manifest.timestamp_nanos = static_cast<std::int32_t>(nanos % 1000000000LL);
+    manifest.writer_library = "nanolance";
+    manifest.writer_version = nanolance_writer_version();
+    if (exists) {
+        // What belongs to the table rather than to its data survives every commit.
+        manifest.config = prior.config;
+        manifest.table_metadata = prior.table_metadata;
+        manifest.unknown = prior.unknown;
+        manifest.next_row_id = prior.next_row_id;
     }
-    pb::DataFile manifest_file;
-    manifest_file.path = data_file.relative_path.filename().generic_string();
-    manifest_file.file_major_version = 2;
-    manifest_file.file_minor_version = 2;
-    manifest_file.file_size_bytes = data_file.file_size_bytes;
-    for (const auto* mapped_field : lance_physical_fields(mapping)) {
-        manifest_file.fields.push_back(mapped_field->id);
-        manifest_file.column_indices.push_back(mapped_field->column_index);
+    for (const auto& kv : extras.table_metadata) {
+        manifest.table_metadata[kv.first] = kv.second;
     }
 
-    if (is_append) {
-        pb::Manifest prior;
-        std::uint64_t prior_ver = 0;
-        if (!load_latest_manifest(dataset_path, prior, prior_ver, error)) {
-            return false;
-        }
-        std::uint64_t max_frag_id = 0;
+    std::uint64_t next_id = 0;
+    if (mode == CommitMode::Append) {
+        // The prior schema, as read -- its field records carry what this codec does not model.
+        manifest.fields = prior.fields;
+        manifest.schema_metadata = prior.schema_metadata;
+        manifest.data_format = prior.data_format;
+        manifest.reader_feature_flags = prior.reader_feature_flags;
+        manifest.writer_feature_flags = prior.writer_feature_flags;
+        manifest.fragments = prior.fragments;
         for (const auto& fr : prior.fragments) {
-            max_frag_id = std::max(max_frag_id, fr.id);
+            next_id = std::max(next_id, fr.id + 1U);
         }
         if (prior.has_max_fragment_id) {
-            max_frag_id = std::max(max_frag_id, static_cast<std::uint64_t>(prior.max_fragment_id));
+            next_id = std::max(next_id, static_cast<std::uint64_t>(prior.max_fragment_id) + 1U);
         }
-        const std::uint64_t next_frag_id = max_frag_id + 1U;
-        if (next_frag_id > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
-            error = "fragment id overflow for manifest append";
+    } else {
+        for (const auto& mapped_field : mapping.fields) {
+            manifest.fields.push_back(manifest_field(mapped_field));
+        }
+        if (exists && prior.has_max_fragment_id) {
+            next_id = static_cast<std::uint64_t>(prior.max_fragment_id) + 1U;
+        }
+    }
+    if (extras.schema_metadata != nullptr) {
+        manifest.schema_metadata = *extras.schema_metadata;
+    }
+    if (mode == CommitMode::Overwrite || mode == CommitMode::Create) {
+        next_id = exists && prior.has_max_fragment_id ? next_id : 0U;
+    }
+    for (const auto& fragment : fragments) {
+        if (next_id > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+            error = "fragment id overflow";
             return false;
         }
-        manifest.fragments = prior.fragments;
-        pb::DataFragment new_fragment;
-        new_fragment.id = next_frag_id;
-        new_fragment.physical_rows = rows;
-        new_fragment.files.push_back(std::move(manifest_file));
-        manifest.fragments.push_back(std::move(new_fragment));
-        manifest.has_max_fragment_id = true;
-        manifest.max_fragment_id = static_cast<std::uint32_t>(next_frag_id);
-    } else {
-        manifest.has_max_fragment_id = true;
-        manifest.max_fragment_id = 0;
-        pb::DataFragment fragment;
-        fragment.id = 0;
-        fragment.physical_rows = rows;
-        fragment.files.push_back(std::move(manifest_file));
-        manifest.fragments.push_back(std::move(fragment));
+        pb::DataFragment added;
+        added.id = next_id++;
+        added.physical_rows = fragment.rows;
+        added.files.push_back(manifest_data_file(mapping, fragment.data_file));
+        manifest.fragments.push_back(std::move(added));
     }
-
+    std::uint64_t max_id = 0;
+    bool any = false;
+    bool deletions = false;
+    for (const auto& fr : manifest.fragments) {
+        max_id = std::max(max_id, fr.id);
+        any = true;
+        deletions = deletions || fr.deletion_file.present;
+    }
+    if (exists && prior.has_max_fragment_id) {
+        max_id = std::max(max_id, static_cast<std::uint64_t>(prior.max_fragment_id));
+        any = true;
+    }
+    if (any) {
+        manifest.has_max_fragment_id = true;
+        manifest.max_fragment_id = static_cast<std::uint32_t>(max_id);
+    }
+    if (deletions) {
+        manifest.reader_feature_flags |= pb::kFlagDeletionFiles;
+        manifest.writer_feature_flags |= pb::kFlagDeletionFiles;
+    }
     return publish_manifest(dataset_path, manifest, error);
+}
+
+bool write_dataset_manifest(const std::filesystem::path& dataset_path,
+                            const LanceSchemaMapping& mapping,
+                            const DataFileResult& data_file,
+                            std::uint64_t rows,
+                            bool is_append,
+                            std::uint64_t& version,
+                            std::string& error) {
+    // A commit that is not an append replaces whatever is there: what the writer has always done.
+    return commit_dataset_version(dataset_path, mapping, {NewFragment{data_file, rows}},
+                                  is_append ? CommitMode::Append : CommitMode::Overwrite, version, error);
 }
 
 }  // namespace nano_lance

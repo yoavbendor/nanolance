@@ -35,6 +35,13 @@ struct LanceSchemaMapping {
     std::vector<LanceField> fields;
 };
 
+/// An Arrow extension type Lance itself defines (lance.blob.v2, ...), which nanolance lays out on its
+/// own terms. Any other extension type (arrow.fixed_shape_tensor, arrow.uuid, a user's) is stored as
+/// its storage type, with the extension recorded in the field's metadata.
+inline bool lance_extension_is_lance_owned(const std::string& extension_name) {
+    return extension_name.rfind("lance.", 0) == 0;
+}
+
 inline bool lance_field_is_physical(const LanceField& field) {
     return field.column_index >= 0;
 }

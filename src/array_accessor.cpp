@@ -564,7 +564,7 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
 
     std::string element;
     std::uint64_t items = 0;
-    if (field.logical_type == "null" || !field.extension_name.empty()) {
+    if (field.logical_type == "null" || lance_extension_is_lance_owned(field.extension_name)) {
         error = "column '" + field.name + "': a list of " + field.logical_type + " cannot be written yet";
         return false;
     }
@@ -603,7 +603,7 @@ bool is_nested_leaf(const LanceSchemaMapping& mapping, const LanceField& field) 
     bool any = false;
     for (const LanceField* f = field.parent_id < 0 ? nullptr : find_field_by_id(mapping, field.parent_id); f != nullptr;
          f = f->parent_id < 0 ? nullptr : find_field_by_id(mapping, f->parent_id)) {
-        if (!f->extension_name.empty()) {
+        if (lance_extension_is_lance_owned(f->extension_name)) {
             return false;
         }
         any = true;

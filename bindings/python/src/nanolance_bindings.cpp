@@ -5,11 +5,14 @@
 
 #include "arrow_capsule.hpp"
 
+#include <nanolance/dataset.hpp>
+#include <nanolance/lance_table_reader.hpp>
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
+#include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/string_view.h>
@@ -365,6 +368,308 @@ ExportedTable take_rows(const std::filesystem::path& path, const std::vector<std
     return out;
 }
 
+
+// ── Dataset-level API, for the pylance-compatible module (nanolance.lance) ─────────────────────────
+
+[[noreturn]] void throw_dataset(const std::string& error) {
+    throw std::runtime_error(error);
+}
+
+nano_lance::LanceScanRequest make_request(std::optional<std::uint64_t> version,
+                                          const std::optional<std::vector<std::string>>& columns,
+                                          const std::optional<std::vector<std::uint64_t>>& fragment_ids,
+                                          bool with_row_id, bool with_row_address) {
+    nano_lance::LanceScanRequest request;
+    request.has_version = version.has_value();
+    request.version = version.value_or(0U);
+    request.columns = columns ? &*columns : nullptr;
+    request.fragment_ids = fragment_ids ? &*fragment_ids : nullptr;
+    request.with_row_id = with_row_id;
+    request.with_row_address = with_row_address;
+    return request;
+}
+
+ExportedTable table_of(ArrowSchema& schema, std::vector<ArrowArray>& batches) {
+    ExportedTable out = ExportedTable::from_read_result(&schema, batches.data(), batches.size());
+    return out;
+}
+
+nb::object ds_scan(const std::filesystem::path& path, std::optional<std::uint64_t> version,
+                   std::optional<std::vector<std::string>> columns,
+                   std::optional<std::vector<std::uint64_t>> fragment_ids, std::uint64_t offset, std::int64_t length,
+                   bool with_row_id, bool with_row_address, bool stream) {
+    auto request = make_request(version, columns, fragment_ids, with_row_id, with_row_address);
+    request.range.offset = offset;
+    request.range.length = length < 0 ? nano_lance::LanceRowRange::kAllRows : static_cast<std::uint64_t>(length);
+    std::string error;
+    ArrowSchema schema{};
+    if (stream) {
+        nano_lance::LanceTableStream reader;
+        bool ok = false;
+        {
+            nb::gil_scoped_release release;
+            ok = nano_lance::LanceTableStream::open_request(path, request, schema, reader, error);
+        }
+        if (!ok) {
+            throw_dataset(error);
+        }
+        ArrowArrayStream out{};
+        nano_lance::lance_table_stream_export(std::move(reader), std::move(schema), out);
+        return nb::cast(ExportedStream::adopt(std::move(out)));
+    }
+    std::vector<ArrowArray> batches;
+    bool ok = false;
+    {
+        nb::gil_scoped_release release;
+        ok = nano_lance::lance_dataset_scan(path, request, schema, batches, error);
+    }
+    if (!ok) {
+        throw_dataset(error);
+    }
+    return nb::cast(table_of(schema, batches));
+}
+
+ExportedTable ds_take(const std::filesystem::path& path, std::optional<std::uint64_t> version,
+                      const std::vector<std::uint64_t>& rows, std::optional<std::vector<std::string>> columns,
+                      bool with_row_id, bool with_row_address, bool addresses) {
+    const auto request = make_request(version, columns, std::nullopt, with_row_id, with_row_address);
+    std::string error;
+    ArrowSchema schema{};
+    std::vector<ArrowArray> batches;
+    bool ok = false;
+    {
+        nb::gil_scoped_release release;
+        ok = addresses ? nano_lance::lance_dataset_take_rows(path, request, rows, schema, batches, error)
+                       : nano_lance::lance_dataset_take(path, request, rows, schema, batches, error);
+    }
+    if (!ok) {
+        throw_dataset(error);
+    }
+    return table_of(schema, batches);
+}
+
+ExportedSchema ds_schema(const std::filesystem::path& path, std::optional<std::uint64_t> version) {
+    const auto request = make_request(version, std::nullopt, std::nullopt, false, false);
+    std::string error;
+    ArrowSchema schema{};
+    if (!nano_lance::lance_dataset_schema(path, request, schema, error)) {
+        throw_dataset(error);
+    }
+    return ExportedSchema::adopt(std::move(schema));
+}
+
+nb::dict version_dict(const nano_lance::DatasetVersionInfo& v) {
+    nb::dict d;
+    d["version"] = v.version;
+    d["timestamp_ns"] = v.timestamp_ns;
+    d["tag"] = v.tag;
+    d["writer_library"] = v.writer_library;
+    d["writer_version"] = v.writer_version;
+    return d;
+}
+
+nb::dict ds_info(const std::filesystem::path& path, std::optional<std::uint64_t> version) {
+    nano_lance::DatasetInfo info;
+    std::string error;
+    if (!nano_lance::dataset_info(path, version.has_value(), version.value_or(0U), info, error)) {
+        throw_dataset(error);
+    }
+    nb::dict d = version_dict(info.version);
+    d["latest_version"] = info.latest_version;
+    d["data_storage_version"] = info.data_storage_version;
+    d["max_fragment_id"] = info.has_max_fragment_id ? nb::cast(info.max_fragment_id) : nb::none();
+    d["config"] = info.config;
+    d["table_metadata"] = info.table_metadata;
+    nb::dict schema_metadata;
+    for (const auto& kv : info.schema_metadata) {
+        schema_metadata[nb::bytes(kv.first.data(), kv.first.size())] = nb::bytes(kv.second.data(), kv.second.size());
+    }
+    d["schema_metadata"] = schema_metadata;
+    d["reader_feature_flags"] = info.reader_feature_flags;
+    d["writer_feature_flags"] = info.writer_feature_flags;
+    nb::list fragments;
+    for (const auto& f : info.fragments) {
+        nb::dict fd;
+        fd["id"] = f.id;
+        fd["physical_rows"] = f.physical_rows;
+        fd["deleted_rows"] = f.deleted_rows;
+        fd["deletion_file"] = f.has_deletion_file ? nb::cast(f.deletion_file) : nb::none();
+        nb::list files;
+        for (const auto& file : f.files) {
+            nb::dict fi;
+            fi["path"] = file.path;
+            fi["fields"] = file.fields;
+            fi["major_version"] = file.major_version;
+            fi["minor_version"] = file.minor_version;
+            fi["size_bytes"] = file.size_bytes;
+            files.append(fi);
+        }
+        fd["files"] = files;
+        fragments.append(fd);
+    }
+    d["fragments"] = fragments;
+    return d;
+}
+
+nb::list ds_versions(const std::filesystem::path& path) {
+    std::vector<nano_lance::DatasetVersionInfo> versions;
+    std::string error;
+    if (!nano_lance::dataset_versions(path, versions, error)) {
+        throw_dataset(error);
+    }
+    nb::list out;
+    for (const auto& v : versions) {
+        out.append(version_dict(v));
+    }
+    return out;
+}
+
+template <typename F>
+std::uint64_t new_version_or_throw(F&& f) {
+    std::uint64_t version = 0;
+    std::string error;
+    if (!f(version, error)) {
+        throw_dataset(error);
+    }
+    return version;
+}
+
+ExportedTable file_read(const std::filesystem::path& path, std::optional<std::vector<std::string>> columns,
+                        std::uint64_t offset, std::int64_t length) {
+    nano_lance::LanceScanRequest request;
+    request.columns = columns ? &*columns : nullptr;
+    request.range.offset = offset;
+    request.range.length = length < 0 ? nano_lance::LanceRowRange::kAllRows : static_cast<std::uint64_t>(length);
+    std::string error;
+    ArrowSchema schema{};
+    std::vector<ArrowArray> batches;
+    bool ok = false;
+    {
+        nb::gil_scoped_release release;
+        ok = nano_lance::lance_file_read(path, request, schema, batches, error);
+    }
+    if (!ok) {
+        throw_dataset(error);
+    }
+    return table_of(schema, batches);
+}
+
+ExportedTable file_take(const std::filesystem::path& path, const std::vector<std::uint64_t>& rows,
+                        std::optional<std::vector<std::string>> columns) {
+    nano_lance::LanceScanRequest request;
+    request.columns = columns ? &*columns : nullptr;
+    std::string error;
+    ArrowSchema schema{};
+    std::vector<ArrowArray> batches;
+    bool ok = false;
+    {
+        nb::gil_scoped_release release;
+        ok = nano_lance::lance_file_take(path, request, rows, schema, batches, error);
+    }
+    if (!ok) {
+        throw_dataset(error);
+    }
+    return table_of(schema, batches);
+}
+
+nb::tuple file_info(const std::filesystem::path& path) {
+    nano_lance::LanceFileInfo info;
+    ArrowSchema schema{};
+    std::string error;
+    if (!nano_lance::lance_file_info(path, info, schema, error)) {
+        throw_dataset(error);
+    }
+    nb::list columns;
+    for (const auto& pages : info.pages) {
+        nb::list column;
+        for (const auto& page : pages) {
+            nb::list buffers;
+            for (const auto& [offset, size] : page.buffers) {
+                buffers.append(nb::make_tuple(offset, size));
+            }
+            column.append(nb::make_tuple(page.rows, buffers, page.encoding));
+        }
+        columns.append(column);
+    }
+    return nb::make_tuple(info.num_rows, info.num_columns, ExportedSchema::adopt(std::move(schema)), columns);
+}
+
+/// A writer that stages fragments and publishes them as one version at finish() -- a Lance write.
+class StagedWriter {
+public:
+    StagedWriter(const std::filesystem::path& path, const LanceWriterOptions& opts, bool append,
+                 std::int64_t max_rows_per_file, std::uint64_t max_bytes_per_file)
+        : max_rows_per_file_(max_rows_per_file) {
+        NanoLanceWriteOptions options{};
+        options.compression_level = opts.compression_level;
+        options.append = append;
+        options.compression = opts.compression;
+        options.disable_structural_encoding = !opts.structural_encoding;
+        options.max_pending_bytes = max_bytes_per_file;
+        options.stage_fragments = true;
+        const int rc = nano_lance_writer_open(&writer_, path.string().c_str(), &options);
+        if (rc != NANO_LANCE_OK) {
+            throw_lance_writer("open", rc, &writer_);
+        }
+        open_ = true;
+        nano_lance_writer_set_ignore_nullability(&writer_, true);
+    }
+    ~StagedWriter() {
+        if (open_) {
+            nano_lance_writer_close(&writer_);
+        }
+    }
+    StagedWriter(const StagedWriter&) = delete;
+    StagedWriter& operator=(const StagedWriter&) = delete;
+
+    void write_batch(nb::handle batch) {
+        auto imported = nanolance_py::arrow_capsule::import_batch(batch);
+        const std::int64_t rows = imported.second->length;
+        int rc = NANO_LANCE_OK;
+        {
+            nb::gil_scoped_release release;
+            rc = nano_lance_write_batch(&writer_, imported.second.get(), imported.first.get());
+        }
+        if (rc != NANO_LANCE_OK) {
+            throw_lance_writer("write", rc, &writer_);
+        }
+        pending_ += rows;
+        if (max_rows_per_file_ > 0 && pending_ >= max_rows_per_file_) {
+            rc = nano_lance_writer_commit(&writer_, false);
+            if (rc != NANO_LANCE_OK) {
+                throw_lance_writer("write", rc, &writer_);
+            }
+            pending_ = 0;
+        }
+    }
+
+    std::uint64_t finish(int mode, bool keep_empty) {
+        std::uint64_t version = 0;
+        int rc = NANO_LANCE_OK;
+        {
+            nb::gil_scoped_release release;
+            if (keep_empty && pending_ == 0) {
+                rc = nano_lance_writer_commit(&writer_, false);
+            }
+            if (rc == NANO_LANCE_OK) {
+                rc = nano_lance_writer_finish(&writer_, mode, &version);
+            }
+        }
+        if (rc != NANO_LANCE_OK) {
+            throw_lance_writer("commit", rc, &writer_);
+        }
+        nano_lance_writer_close(&writer_);
+        open_ = false;
+        return version;
+    }
+
+private:
+    NanoLanceWriter writer_{};
+    std::int64_t max_rows_per_file_ = 0;
+    std::int64_t pending_ = 0;
+    bool open_ = false;
+};
+
 }  // namespace
 
 NB_MODULE(_nanolance, m) {
@@ -454,6 +759,58 @@ NB_MODULE(_nanolance, m) {
         return d;
     }, "Counters of the work done since the last reset (tests and diagnostics; not a stable API).");
     m.def("_reset_work_stats", [] { nano_lance_reset_work_stats(); });
+    m.def("_ds_scan", &ds_scan, nb::arg("path"), nb::arg("version").none(), nb::arg("columns").none(),
+          nb::arg("fragment_ids").none(), nb::arg("offset"), nb::arg("length"), nb::arg("with_row_id"),
+          nb::arg("with_row_address"), nb::arg("stream"));
+    m.def("_ds_take", &ds_take, nb::arg("path"), nb::arg("version").none(), nb::arg("rows"),
+          nb::arg("columns").none(), nb::arg("with_row_id"), nb::arg("with_row_address"), nb::arg("addresses"));
+    m.def("_ds_schema", &ds_schema, nb::arg("path"), nb::arg("version").none());
+    m.def("_ds_info", &ds_info, nb::arg("path"), nb::arg("version").none());
+    m.def("_ds_versions", &ds_versions, nb::arg("path"));
+    m.def("_ds_latest_version", [](const std::filesystem::path& path) {
+        std::uint64_t v = 0;
+        std::string error;
+        if (!nano_lance::dataset_latest_version(path, v, error)) {
+            throw_dataset(error);
+        }
+        return v;
+    });
+    m.def("_ds_restore", [](const std::filesystem::path& path, std::uint64_t version) {
+        return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
+            return nano_lance::dataset_restore(path, version, v, e);
+        });
+    });
+    m.def("_ds_update_config", [](const std::filesystem::path& path, const std::map<std::string, std::string>& upsert,
+                                  const std::vector<std::string>& remove) {
+        return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
+            return nano_lance::dataset_update_config(path, upsert, remove, v, e);
+        });
+    });
+    m.def("_ds_update_table_metadata", [](const std::filesystem::path& path,
+                                          const std::map<std::string, std::string>& values, bool replace) {
+        return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
+            return nano_lance::dataset_update_table_metadata(path, values, replace, v, e);
+        });
+    });
+    m.def("_ds_update_schema_metadata", [](const std::filesystem::path& path,
+                                           const std::map<std::string, std::string>& values, bool replace) {
+        return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
+            return nano_lance::dataset_update_schema_metadata(path, values, replace, v, e);
+        });
+    });
+    m.def("_file_read", &file_read, nb::arg("path"), nb::arg("columns").none(), nb::arg("offset"),
+          nb::arg("length"));
+    m.def("_file_take", &file_take, nb::arg("path"), nb::arg("rows"), nb::arg("columns").none());
+    m.def("_file_info", &file_info, nb::arg("path"));
+    nb::class_<StagedWriter>(m, "_StagedWriter")
+        .def(nb::init<const std::filesystem::path&, const LanceWriterOptions&, bool, std::int64_t, std::uint64_t>(),
+             nb::arg("path"), nb::arg("options"), nb::arg("append"), nb::arg("max_rows_per_file"),
+             nb::arg("max_bytes_per_file"))
+        .def("write_batch", &StagedWriter::write_batch)
+        .def("finish", &StagedWriter::finish, nb::arg("mode"), nb::arg("keep_empty") = false);
+    m.attr("COMMIT_CREATE") = static_cast<int>(NANO_LANCE_COMMIT_CREATE);
+    m.attr("COMMIT_APPEND") = static_cast<int>(NANO_LANCE_COMMIT_APPEND);
+    m.attr("COMMIT_OVERWRITE") = static_cast<int>(NANO_LANCE_COMMIT_OVERWRITE);
     m.def("open_stream", &read_table_stream, nb::arg("path"), nb::arg("columns") = nb::none(),
           nb::arg("offset") = 0, nb::arg("length") = -1,
           "Open a Lance dataset as a streaming Arrow handle: one batch decoded per pull, so peak "

@@ -32,6 +32,73 @@ struct LanceRowRange {
     bool is_whole_dataset() const { return offset == 0U && length == kAllRows; }
 };
 
+/// What a read asks of a dataset, beyond its path: the version, the columns, the fragments, the rows,
+/// and Lance's row identity columns. A default request is a full read of the latest version.
+struct LanceScanRequest {
+    /// Top-level columns to read (their children come along). Null reads every column; an empty list
+    /// reads none, which is only useful with a row id column.
+    const std::vector<std::string>* columns = nullptr;
+    /// Logical rows (deleted rows not counted) over the fragments read.
+    LanceRowRange range;
+    /// The version to read; the latest when `has_version` is false.
+    bool has_version = false;
+    std::uint64_t version = 0;
+    /// Fragments to read, in this order. Null reads every fragment, by id.
+    const std::vector<std::uint64_t>* fragment_ids = nullptr;
+    /// Add `_rowid` / `_rowaddr` (uint64) after the data columns. A row's address is its fragment id
+    /// in the high 32 bits and its offset in the fragment (deleted rows counted) in the low; without
+    /// stable row ids -- all nanolance writes -- the row id is the address.
+    bool with_row_id = false;
+    bool with_row_address = false;
+};
+
+/// A read as `request` describes it. See lance_table_read_dataset for the ownership rules.
+bool lance_dataset_scan(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                        ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches, std::string& error,
+                        bool trusted_input = false);
+
+/// lance_table_take with the version, projection and row id columns of `request` (its range is ignored).
+bool lance_dataset_take(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                        const std::vector<std::uint64_t>& indices, ArrowSchema& out_schema,
+                        std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input = false);
+
+/// The rows at row `addresses` (see LanceScanRequest::with_row_address): ascending, each once, one
+/// batch per fragment. A deleted row is still addressable.
+bool lance_dataset_take_rows(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                             const std::vector<std::uint64_t>& addresses, ArrowSchema& out_schema,
+                             std::vector<ArrowArray>& out_batches, std::string& error,
+                             bool trusted_input = false);
+
+/// A standalone Lance data file (what pylance's LanceFileWriter writes, or one of a dataset's files).
+struct LanceFileInfo {
+    std::uint64_t num_rows = 0;
+    std::uint32_t num_columns = 0;
+    /// Per column, per page: its rows and the (offset, size) of each of its buffers.
+    struct Page {
+        std::uint64_t rows = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> buffers;
+        std::string encoding;  // the page layout, described
+    };
+    std::vector<std::vector<Page>> pages;
+};
+
+/// Read a standalone data file, as `request` asks (its columns and range; the version, fragment and
+/// row id fields do not apply). The file's own schema is the schema.
+bool lance_file_read(const std::filesystem::path& file_path, const LanceScanRequest& request,
+                     ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches, std::string& error);
+
+/// The rows of a standalone data file at `rows` (ascending, each once; one batch).
+bool lance_file_take(const std::filesystem::path& file_path, const LanceScanRequest& request,
+                     const std::vector<std::uint64_t>& rows, ArrowSchema& out_schema,
+                     std::vector<ArrowArray>& out_batches, std::string& error);
+
+/// A standalone data file's row count and schema.
+bool lance_file_info(const std::filesystem::path& file_path, LanceFileInfo& info, ArrowSchema& out_schema,
+                     std::string& error);
+
+/// The schema of `request`'s version (its other fields are ignored).
+bool lance_dataset_schema(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                          ArrowSchema& out_schema, std::string& error);
 
 /// Read all committed rows from a nano_lance_writer dataset into Arrow batches (writer parity only).
 /// Rebuilds ingest-shaped schemas (e.g. dematerialized `lance.blob.v2` children).
@@ -140,6 +207,11 @@ public:
                            ArrowSchema& out_schema, LanceTableStream& out, std::string& error,
                            bool trusted_input = false);
 
+    /// As `open`, for a whole scan request.
+    static bool open_request(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                             ArrowSchema& out_schema, LanceTableStream& out, std::string& error,
+                             bool trusted_input = false);
+
     /// Decode the next data file. Returns false on failure; on success with no data left,
     /// `out_batch.release` is null. The caller owns each batch it receives.
     bool next(ArrowArray& out_batch, std::string& error);
@@ -148,5 +220,8 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+/// Hand an opened stream and its schema to an ArrowArrayStream, which owns both from then on.
+void lance_table_stream_export(LanceTableStream&& stream, ArrowSchema&& schema, ArrowArrayStream& out);
 
 }  // namespace nano_lance

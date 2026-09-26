@@ -283,6 +283,7 @@ add_library(nanolance STATIC
     src/repdef.cpp
     src/nano_lance_table_reader_c.cpp
     src/manifest_writer.cpp
+    src/dataset.cpp
     src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp
