@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <deque>
 #include <map>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -1046,12 +1047,13 @@ struct ColumnSource {
 
 /// A parallel read cuts a fragment into row ranges ("morsels") of at least this many encoded bytes,
 /// decoded independently and returned as a batch each -- no concatenation afterwards.
-/// NANOLANCE_MORSEL_KB overrides it (default 2048: below that, waking threads and building more
-/// batches costs about what it saves; under 64 the tests' setting, which cuts every page).
+/// NANOLANCE_MORSEL_KB overrides it (default 4096 of decode work: below that -- reads of a millisecond
+/// or two -- waking threads and building more batches costs about what it saves; under 64 the tests'
+/// setting, which cuts every page).
 std::uint64_t morsel_min_bytes() {
     static const std::uint64_t bytes = [] {
         const char* env = std::getenv("NANOLANCE_MORSEL_KB");
-        const auto kb = env == nullptr || *env == '\0' ? 2048ULL : std::strtoull(env, nullptr, 10);
+        const auto kb = env == nullptr || *env == '\0' ? 4096ULL : std::strtoull(env, nullptr, 10);
         return std::max<std::uint64_t>(1U, kb) << 10U;
     }();
     return bytes;
@@ -1074,6 +1076,8 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
         std::uint64_t begin = 0;
         std::uint64_t end = 0;
         std::uint64_t bytes = 0;
+        std::uint64_t items = 0;  // values it decodes to
+        std::uint32_t lists = 0;  // list layers to unravel
         bool addressable = false;
     };
     std::vector<std::vector<PageInfo>> pages(columns.size());
@@ -1095,6 +1099,8 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
                 info.bytes += size;
             }
             info.addressable = lance_page_row_addressable(page);
+            info.items = lance_page_items(page);
+            info.lists = lance_page_list_depth(page);
             column_bytes += info.bytes;
             pages[c].push_back(info);
         }
@@ -1104,17 +1110,29 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
             heaviest = c;
         }
     }
-    // Work: encoded bytes, or for fixed-width values the decoded bytes when larger (bit-packed small
-    // integers decode to four or eight times their size).
+    // Work: per page, its encoded bytes or what it decodes to, whichever is more -- bit-packed small
+    // integers decode to four or eight times their size, a page of dictionary-coded strings to many
+    // times its (value count x the value width; a string counts as 32 bytes -- dictionary lookup or
+    // FSST expansion, an offset, the bytes -- which is about what one costs to decode against an int).
     std::uint64_t work = 0;
     for (std::size_t c = 0; c < columns.size(); ++c) {
-        std::uint64_t bytes = 0;
+        // The values' own type (a list column's items), as the decoder sees it.
+        const auto& leaf_type = columns[c].on_disk->logical_type;
+        const std::uint64_t per_value = lance_field_is_variable_width(leaf_type)
+                                            ? 32U
+                                            : std::max<std::uint64_t>(1U, lance_logical_type_value_bytes(leaf_type));
         for (const auto& page : pages[c]) {
-            bytes += page.bytes;
+            const auto rows = std::max<std::uint64_t>(1U, page.end - page.begin);
+            const auto rows_here = std::min(end, page.end) - std::max(first, page.begin);
+            // A list page also costs its levels to unravel, per list layer, whatever its items'
+            // width -- and has a level for every row, empty lists included.
+            const auto units = page.lists != 0U ? std::max(page.items, rows) : page.items;
+            const auto weight = page.lists != 0U ? std::max<std::uint64_t>(per_value, 32U * page.lists) : per_value;
+            work += std::max(page.bytes, units * rows_here / rows * weight);
         }
-        work += std::max(bytes, (end - first) * columns[c].value_bytes);
     }
     auto want = std::min<std::uint64_t>(2U * threads, work / morsel_min_bytes());
+
     // What a plan decodes: every overlapped page, whole unless it is row-addressable.
     const auto cost = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& plan) {
         double total = 0;

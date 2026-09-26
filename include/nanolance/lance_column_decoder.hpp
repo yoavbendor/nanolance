@@ -34,6 +34,14 @@ bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_pa
 /// (only the chunks holding the rows), or a FullZip page of large values (only the rows).
 bool lance_page_row_addressable(const pb::ColumnPage& page);
 
+/// The values a page decodes to -- its rows, or for a list page its items -- as a measure of decode
+/// work: a dictionary-encoded page of strings is small on disk and large once decoded.
+std::uint64_t lance_page_items(const pb::ColumnPage& page);
+
+/// How many list layers the page's levels describe (0: none). Unravelling them is decode work of its
+/// own, per layer.
+std::uint32_t lance_page_list_depth(const pb::ColumnPage& page);
+
 /// Rows [first, first + count) of one column: the pages the range touches, decoded and trimmed --
 /// for a list page with a repetition index, only the chunks holding those rows. How a parallel read
 /// splits a fragment into row ranges it decodes independently (lance_table_reader.cpp).

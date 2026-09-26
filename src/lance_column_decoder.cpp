@@ -4433,6 +4433,45 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
     return decode_column_impl(data_file_path, on_disk_field, column_metadata, out, error, nullptr);
 }
 
+std::uint32_t lance_page_list_depth(const pb::ColumnPage& page) {
+    page_layout::PageLayout layout;
+    std::string why;
+    if (page.encoding.empty() || !page_layout::decode_page_layout(page.encoding, layout, why)) {
+        return 0;
+    }
+    const std::vector<std::uint8_t>* layers = nullptr;
+    if (layout.kind == page_layout::LayoutKind::kMiniBlock && layout.mini_block.has_repetition) {
+        layers = &layout.mini_block.layers;
+    } else if (layout.kind == page_layout::LayoutKind::kFullZip && layout.full_zip.bits_rep != 0U) {
+        layers = &layout.full_zip.layers;
+    } else if (layout.kind == page_layout::LayoutKind::kConstant && layout.constant.num_rep_values != 0U) {
+        layers = &layout.constant.layers;
+    }
+    if (layers == nullptr) {
+        return 0;
+    }
+    std::uint32_t depth = 0;
+    for (const auto kind : *layers) {
+        depth += repdef::is_list_layer(kind) ? 1U : 0U;
+    }
+    return std::max<std::uint32_t>(depth, 1U);
+}
+
+std::uint64_t lance_page_items(const pb::ColumnPage& page) {
+    page_layout::PageLayout layout;
+    std::string why;
+    if (page.encoding.empty() || !page_layout::decode_page_layout(page.encoding, layout, why)) {
+        return page.length;
+    }
+    if (layout.kind == page_layout::LayoutKind::kMiniBlock && layout.mini_block.has_repetition) {
+        return std::max<std::uint64_t>(page.length, layout.mini_block.num_items);
+    }
+    if (layout.kind == page_layout::LayoutKind::kFullZip && layout.full_zip.bits_rep != 0U) {
+        return std::max<std::uint64_t>(page.length, layout.full_zip.num_visible_items);
+    }
+    return page.length;
+}
+
 bool lance_page_row_addressable(const pb::ColumnPage& page) {
     page_layout::PageLayout layout;
     FullZipPageParams params;

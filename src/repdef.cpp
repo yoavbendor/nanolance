@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/repdef.hpp"
+#include "nanolance/parallel.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -450,18 +451,43 @@ public:
         }
         out.has_def = next > 1U;
         out.has_rep = list_depth_[0] != 0U;
-        // Pass 1 counted what pass 2 will push, so every output is allocated once.
+        // Pass 1 counted what pass 2 will write, so every output is sized once and written in place
+        // -- by one serializer, or by several at their own offsets (serialize with threads).
         if (out.has_rep) {
-            out.rep.reserve(static_cast<std::size_t>(levels_));
+            out.rep.resize(static_cast<std::size_t>(levels_));
         }
         if (out.has_def) {
-            out.def.reserve(static_cast<std::size_t>(levels_));
+            out.def.resize(static_cast<std::size_t>(levels_));
         }
         if (out.has_rep || out.has_def) {
-            out.is_slot.reserve(static_cast<std::size_t>(levels_));
+            out.is_slot.resize(static_cast<std::size_t>(levels_));
         }
-        out.items.reserve(static_cast<std::size_t>(items_));
+        out.items.resize(static_cast<std::size_t>(items_));
         out_ = &out;
+        level_at_ = 0;
+        item_at_ = 0;
+    }
+
+    /// For one of several serializers over consecutive row ranges: OR in another's pass-1 flags
+    /// and add its counts, so assign_levels numbers the levels for all of them.
+    void merge_counts(const Serializer& other) {
+        for (std::size_t k = 0; k < flags_.size(); ++k) {
+            flags_[k].has_null = flags_[k].has_null || other.flags_[k].has_null;
+            flags_[k].has_empty = flags_[k].has_empty || other.flags_[k].has_empty;
+        }
+        levels_ += other.levels_;
+        items_ += other.items_;
+    }
+    std::uint64_t counted_levels() const { return levels_; }
+    std::uint64_t counted_items() const { return items_; }
+
+    /// Emit into `from`'s output, starting at the given level and item positions.
+    void adopt_levels(const Serializer& from, std::uint64_t level_at, std::uint64_t item_at) {
+        null_level_ = from.null_level_;
+        empty_level_ = from.empty_level_;
+        out_ = from.out_;
+        level_at_ = level_at;
+        item_at_ = item_at;
     }
 
     std::uint16_t row_rep() const { return list_depth_.empty() ? 0U : list_depth_[0]; }
@@ -470,17 +496,19 @@ private:
     static constexpr std::uint64_t kNoSlot = ~std::uint64_t{0};
 
     void push(std::uint16_t rep, std::uint16_t def, std::uint64_t slot) {
+        const auto at = static_cast<std::size_t>(level_at_);
         if (out_->has_rep) {
-            out_->rep.push_back(rep);
+            out_->rep[at] = rep;
         }
         if (out_->has_def) {
-            out_->def.push_back(def);
+            out_->def[at] = def;
         }
         if (out_->has_rep || out_->has_def) {
-            out_->is_slot.push_back(slot != kNoSlot ? 1U : 0U);
+            out_->is_slot[at] = slot != kNoSlot ? 1U : 0U;
+            ++level_at_;
         }
         if (slot != kNoSlot) {
-            out_->items.push_back(slot);
+            out_->items[static_cast<std::size_t>(item_at_++)] = slot;
         }
     }
 
@@ -494,6 +522,8 @@ private:
     Serialized* out_ = nullptr;
     std::uint64_t levels_ = 0;  // counted by pass 1: the levels pass 2 emits
     std::uint64_t items_ = 0;   // ... and the value slots
+    std::uint64_t level_at_ = 0;  // pass 2: where the next level goes
+    std::uint64_t item_at_ = 0;   // ... and the next value slot
 };
 
 }  // namespace
@@ -504,6 +534,60 @@ bool serialize(const std::vector<SerializeLayer>& layers, const std::vector<std:
     Serializer s(layers, item_validity);
     if (!s.check(first_row, num_rows, error)) {
         return false;
+    }
+    // With threads to spare, both passes run over parts of the rows side by side: pass 1's flags
+    // and counts merged, the levels numbered once, and each part's pass 2 writing at its own offset
+    // -- the same output as one pass over all the rows.
+    constexpr std::uint64_t kRowsPerPart = 8192U;
+    const auto parts = static_cast<std::size_t>(
+        std::min<std::uint64_t>(parallel::threads(), num_rows / kRowsPerPart));
+    if (parts > 1U) {
+        std::vector<Serializer> part;
+        part.reserve(parts);
+        for (std::size_t k = 0; k < parts; ++k) {
+            part.emplace_back(layers, item_validity);
+        }
+        const auto row_of = [&](std::size_t k) { return first_row + num_rows * k / parts; };
+        std::vector<std::string> errors(parts);
+        parallel::for_each(parts, [&](std::size_t k) {
+            for (auto r = row_of(k); r < row_of(k + 1U); ++r) {
+                if (!part[k].visit(0, r, 0, false, errors[k])) {
+                    return;
+                }
+            }
+        });
+        for (const auto& e : errors) {
+            if (!e.empty()) {
+                error = e;
+                return false;
+            }
+        }
+        std::vector<std::uint64_t> level_at(parts, 0U);
+        std::vector<std::uint64_t> item_at(parts, 0U);
+        for (std::size_t k = 1; k < parts; ++k) {
+            level_at[k] = level_at[k - 1U] + part[k - 1U].counted_levels();
+            item_at[k] = item_at[k - 1U] + part[k - 1U].counted_items();
+            part[0].merge_counts(part[k]);
+        }
+        part[0].assign_levels(out);
+        for (std::size_t k = 1; k < parts; ++k) {
+            part[k].adopt_levels(part[0], level_at[k], item_at[k]);
+        }
+        const auto rep = part[0].row_rep();
+        parallel::for_each(parts, [&](std::size_t k) {
+            for (auto r = row_of(k); r < row_of(k + 1U); ++r) {
+                if (!part[k].visit(0, r, rep, true, errors[k])) {
+                    return;
+                }
+            }
+        });
+        for (const auto& e : errors) {
+            if (!e.empty()) {
+                error = e;
+                return false;
+            }
+        }
+        return true;
     }
     for (std::uint64_t r = first_row; r < first_row + num_rows; ++r) {
         if (!s.visit(0, r, 0, false, error)) {
