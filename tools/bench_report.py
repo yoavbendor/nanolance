@@ -67,10 +67,10 @@ def render(data) -> str:
       f"**Date:** {env['date']}. Every number is the median of {data['runs']} runs after one warm-up, "
       "files in the page cache.")
     w("")
-    w("**Threads.** nanolance reads and writes on one thread, and its C++ runs are pinned to one core. "
-      "Rust Lance runs twice: on all cores (its default) and pinned to one core with one CPU and one "
-      "I/O thread, so both the out-of-the-box and the per-core comparison are here. pyarrow's Parquet "
-      "uses all cores.")
+    w("**Threads.** Both libraries run twice: on all cores (each one's default) and pinned to one core "
+      "-- nanolance on one thread, which is its single-threaded code path, not a pool of one; Rust Lance "
+      "with one CPU and one I/O thread (and one tokio worker for the crate). So the per-core comparison and "
+      "the out-of-the-box one are both here. nanolance Python runs on all cores; pyarrow's Parquet too.")
     w("")
     w("**Correctness.** Every read was checked against the source table before it was timed; a reader "
       "that returns different data is listed as a failure, not a time.")
@@ -80,25 +80,31 @@ def render(data) -> str:
     def collect(fn):
         return [fn(r) for r in D.values()]
 
-    read_1c = geomean(collect(lambda r: ratio(r["read_ms"].get("rust-lance-1c <- rust-lance"),
-                                              r["read_ms"].get("nanolance-cpp <- nanolance"))))
-    read_4c = geomean(collect(lambda r: ratio(r["read_ms"].get("rust-lance <- rust-lance"),
-                                              r["read_ms"].get("nanolance-cpp <- nanolance"))))
-    read_retain_4c = geomean(collect(lambda r: ratio(r["read_ms"].get("rust-lance <- rust-lance"),
-                                                     r["read_ms"].get("nanolance-cpp-retain <- nanolance"))))
-    write_1c = geomean(collect(lambda r: ratio(r["write_ms"].get("rust-lance-1c"), r["write_ms"].get("nanolance-cpp"))))
-    write_4c = geomean(collect(lambda r: ratio(r["write_ms"].get("rust-lance"), r["write_ms"].get("nanolance-cpp"))))
+    def g(rust, nl, what="read_ms"):
+        return geomean(collect(lambda r: ratio(r[what].get(rust), r[what].get(nl))))
+
+    read_1c = g("rust-lance-1c <- rust-lance", "nanolance-cpp <- nanolance")
+    read_mt = g("rust-lance <- rust-lance", "nanolance-cpp-mt <- nanolance")
+    read_1v4 = g("rust-lance <- rust-lance", "nanolance-cpp <- nanolance")
+    write_1c = g("rust-lance-1c", "nanolance-cpp", "write_ms")
+    write_mt = g("rust-lance", "nanolance-cpp-mt", "write_ms")
+    write_1v4 = g("rust-lance", "nanolance-cpp", "write_ms")
     size = geomean(collect(lambda r: ratio(r["size"].get("nanolance"), r["size"].get("rust-lance"))))
     failures = sum(len(r["errors"]) for r in D.values())
     w("## Summary")
     w("")
     w("Geometric mean over all datasets, nanolance C++ against Rust Lance (above 1x: nanolance is faster):")
     w("")
-    w("| | vs Rust Lance on 1 core | vs Rust Lance on all cores |")
-    w("|---|---:|---:|")
-    w(f"| Read (each reads its own file) | {fx(read_1c)} | {fx(read_4c)} |")
-    w(f"| Read, nanolance with a memory-retaining allocator | | {fx(read_retain_4c)} |")
-    w(f"| Write | {fx(write_1c)} | {fx(write_4c)} |")
+    w("| | both on 1 core | both on all cores | nanolance on 1 core, Rust on all |")
+    w("|---|---:|---:|---:|")
+    w(f"| Read (each reads its own file) | {fx(read_1c)} | {fx(read_mt)} | {fx(read_1v4)} |")
+    w(f"| Write | {fx(write_1c)} | {fx(write_mt)} | {fx(write_1v4)} |")
+    w("")
+    wins_r = sum(1 for r in D.values() if (ratio(r["read_ms"].get("rust-lance <- rust-lance"),
+                                                  r["read_ms"].get("nanolance-cpp-mt <- nanolance")) or 0) > 1)
+    wins_w = sum(1 for r in D.values() if (ratio(r["write_ms"].get("rust-lance"),
+                                                  r["write_ms"].get("nanolance-cpp-mt")) or 0) > 1)
+    w(f"Both on all cores, nanolance is faster on **{wins_r} of {len(D)}** reads and **{wins_w} of {len(D)}** writes.")
     w("")
     w(f"File size, nanolance / Rust Lance: **{size:.3f}** (geometric mean). "
       f"Reads that returned wrong data or failed: **{failures}**.")
@@ -114,10 +120,10 @@ def render(data) -> str:
         py_write1 = geomean(collect(lambda r: ratio(r["write_ms"].get("rust-lance-1c"),
                                                     r["write_ms"].get("rust-native-1c"))))
         nat_read = geomean(collect(lambda r: ratio(r["read_ms"].get("rust-native <- rust-lance"),
-                                                   r["read_ms"].get("nanolance-cpp <- nanolance"))))
+                                                   r["read_ms"].get("nanolance-cpp-mt <- nanolance"))))
         nat_read1 = geomean(collect(lambda r: ratio(r["read_ms"].get("rust-native-1c <- rust-lance"),
                                                     r["read_ms"].get("nanolance-cpp <- nanolance"))))
-        nat_write = geomean(collect(lambda r: ratio(r["write_ms"].get("rust-native"), r["write_ms"].get("nanolance-cpp"))))
+        nat_write = geomean(collect(lambda r: ratio(r["write_ms"].get("rust-native"), r["write_ms"].get("nanolance-cpp-mt"))))
         nat_write1 = geomean(collect(lambda r: ratio(r["write_ms"].get("rust-native-1c"),
                                                      r["write_ms"].get("nanolance-cpp"))))
         w("### Without Python: the lance crate itself")
@@ -125,7 +131,7 @@ def render(data) -> str:
         w("The same comparison against `tools/lance_rs_bench`, a Rust program using the `lance` crate (12.0.0, "
           "the version pylance 12.0.0 is built from) with no Python in the process:")
         w("")
-        w("| | vs Rust native on 1 core | vs Rust native on all cores |")
+        w("| | both on 1 core | both on all cores |")
         w("|---|---:|---:|")
         w(f"| Read | {fx(nat_read1)} | {fx(nat_read)} |")
         w(f"| Write | {fx(nat_write1)} | {fx(nat_write)} |")
@@ -202,15 +208,15 @@ def render(data) -> str:
         w("")
         w("**Read**, ms (each reader on the file its own writer made, then the cross reads):")
         w("")
-        w("| dataset | rows | nanolance C++ | + retaining malloc | nanolance Python | Rust Lance 1 core | "
-          "Rust Lance all cores | Rust native 1 core | Rust native all cores | Parquet | Rust reads nanolance's | "
-          "nanolance reads Rust's |")
-        w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        w("| dataset | rows | nanolance C++ 1 core | nanolance C++ all cores | + retaining malloc | nanolance Python | "
+          "Rust Lance 1 core | Rust Lance all cores | Rust native 1 core | Rust native all cores | Parquet | "
+          "Rust reads nanolance's | nanolance reads Rust's |")
+        w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for n in names:
             r = D[n]
             R = r["read_ms"]
             w(f"| `{n}` — {r['description']} | {r['rows']:,} | {ms(R.get('nanolance-cpp <- nanolance'))} | "
-              f"{ms(R.get('nanolance-cpp-retain <- nanolance'))} | {ms(R.get('nanolance-py <- nanolance'))} | "
+              f"{ms(R.get('nanolance-cpp-mt <- nanolance'))} | {ms(R.get('nanolance-cpp-retain <- nanolance'))} | {ms(R.get('nanolance-py <- nanolance'))} | "
               f"{ms(R.get('rust-lance-1c <- rust-lance'))} | {ms(R.get('rust-lance <- rust-lance'))} | "
               f"{ms(R.get('rust-native-1c <- rust-lance'))} | {ms(R.get('rust-native <- rust-lance'))} | "
               f"{ms(R.get('parquet <- parquet'))} | {ms(R.get('rust-lance <- nanolance'))} | "
@@ -218,13 +224,14 @@ def render(data) -> str:
         w("")
         w("**Write** (ms) and **size** (MB):")
         w("")
-        w("| dataset | nanolance C++ | + 4 MiB budget | nanolance Python | Rust Lance 1 core | Rust Lance all cores | "
-          "Rust native 1 core | Rust native all cores | Parquet | size nanolance | size Rust Lance | size Parquet |")
-        w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        w("| dataset | nanolance C++ 1 core | nanolance C++ all cores | + 4 MiB budget | nanolance Python | "
+          "Rust Lance 1 core | Rust Lance all cores | Rust native 1 core | Rust native all cores | Parquet | "
+          "size nanolance | size Rust Lance | size Parquet |")
+        w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for n in names:
             r = D[n]
             W, S = r["write_ms"], r["size"]
-            w(f"| `{n}` | {ms(W.get('nanolance-cpp'))} | {ms(W.get('nanolance-cpp-budget'))} | {ms(W.get('nanolance-py'))} | "
+            w(f"| `{n}` | {ms(W.get('nanolance-cpp'))} | {ms(W.get('nanolance-cpp-mt'))} | {ms(W.get('nanolance-cpp-budget'))} | {ms(W.get('nanolance-py'))} | "
               f"{ms(W.get('rust-lance-1c'))} | {ms(W.get('rust-lance'))} | {ms(W.get('rust-native-1c'))} | "
               f"{ms(W.get('rust-native'))} | {ms(W.get('parquet'))} | {mb(S.get('nanolance'))} | "
               f"{mb(S.get('rust-lance'))} | {mb(S.get('parquet'))} |")

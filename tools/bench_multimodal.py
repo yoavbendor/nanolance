@@ -178,10 +178,22 @@ def dir_bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
 
+def one_thread(fn):
+    """`fn` run with nanolance on one thread (its single-threaded code path), then back to all cores."""
+    def wrapped(*args):
+        nanolance.set_threads(1)
+        try:
+            return fn(*args)
+        finally:
+            nanolance.set_threads(0)
+    return wrapped
+
+
 def run_dataset(name, spec, table, runs, work: Path):
     rec = {"title": spec["title"], "what": spec["what"], "rows": table.num_rows, "arrow_bytes": table.nbytes,
            "columns": table.column_names, "ops": {}, "size": {}, "errors": {}}
-    paths = {"nanolance": work / f"{name}_nl.lance", "rust-lance": work / f"{name}_rust.lance",
+    paths = {"nanolance": work / f"{name}_nl.lance", "nanolance 1 thread": work / f"{name}_nl1.lance",
+             "rust-lance": work / f"{name}_rust.lance",
              "parquet": work / f"{name}.parquet"}
 
     def fresh(p):
@@ -189,6 +201,7 @@ def run_dataset(name, spec, table, runs, work: Path):
 
     writers = {
         "nanolance": lambda p: nanolance.write_table(table, p),
+        "nanolance 1 thread": one_thread(lambda p: nanolance.write_table(table, p)),
         "rust-lance": lambda p: lance.write_dataset(table, str(p), data_storage_version="2.2"),
         "parquet": lambda p: pq.write_table(table, p, compression="zstd"),
     }
@@ -204,6 +217,7 @@ def run_dataset(name, spec, table, runs, work: Path):
     meta_cols = [c for c in table.column_names if c not in spec["heavy"]]
     readers = {
         "nanolance": lambda p, cols: pa.table(nanolance.read_table(p, columns=cols)),
+        "nanolance 1 thread": one_thread(lambda p, cols: pa.table(nanolance.read_table(p, columns=cols))),
         "rust-lance": lambda p, cols: lance.dataset(str(p)).to_table(columns=cols),
         "parquet": lambda p, cols: pq.read_table(p, columns=cols),
     }
@@ -242,6 +256,7 @@ def run_dataset(name, spec, table, runs, work: Path):
     rust_take = lambda p, b: lance.dataset(str(p)).take(b, columns=cols)  # noqa: E731
     for engine, p, epoch, take in (
         ("nanolance", paths["nanolance"], nl_epoch, nl_take),
+        ("nanolance 1 thread", paths["nanolance"], one_thread(nl_epoch), nl_take),
         ("rust-lance", paths["rust-lance"], rust_epoch, rust_take),
         ("nanolance on rust file", paths["rust-lance"], nl_epoch, nl_take),
         ("rust-lance on nanolance file", paths["nanolance"], rust_epoch, rust_take),

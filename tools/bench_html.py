@@ -219,17 +219,17 @@ python tools/bench_html.py          # this page</pre>
 
   // Tiles.
   const read1 = geo(names.map(n => ratio(R(n, "rust-lance-1c <- rust-lance"), R(n, "nanolance-cpp <- nanolance"))));
-  const read4 = geo(names.map(n => ratio(R(n, "rust-lance <- rust-lance"), R(n, "nanolance-cpp <- nanolance"))));
-  const write4 = geo(names.map(n => ratio(W(n, "rust-lance"), W(n, "nanolance-cpp"))));
+  const read4 = geo(names.map(n => ratio(R(n, "rust-lance <- rust-lance"), R(n, "nanolance-cpp-mt <- nanolance"))));
+  const write4 = geo(names.map(n => ratio(W(n, "rust-lance"), W(n, "nanolance-cpp-mt"))));
   const write1 = geo(names.map(n => ratio(W(n, "rust-lance-1c"), W(n, "nanolance-cpp"))));
   const size = geo(names.map(n => ratio(D[n].size["nanolance"], D[n].size["rust-lance"])));
   const CROSS = ["nanolance-cpp <- rust-lance", "nanolance-py <- rust-lance", "rust-lance <- nanolance"];
   const interopReads = names.length * CROSS.length;
   const crossOk = names.reduce((s, n) => s + CROSS.filter(k => R(n, k) != null).length, 0);
   let tiles = [
-    ["Read, per core", fmtX(read1), "nanolance C++ vs Rust Lance on one core (geometric mean)"],
-    ["Read, out of the box", fmtX(read4), "nanolance on one core vs Rust Lance on all " + env.cores],
-    ["Write", fmtX(write4), `vs Rust Lance on all cores; ${fmtX(write1)} vs one core`],
+    ["Read, all cores", fmtX(read4), `nanolance C++ vs Rust Lance, both on all ${env.cores} cores (geometric mean)`],
+    ["Read, one core", fmtX(read1), "nanolance C++ vs Rust Lance, both pinned to one core"],
+    ["Write", fmtX(write4), `both on all cores; ${fmtX(write1)} both on one core`],
     ["File size", (size * 100).toFixed(1) + "%", "of Rust Lance's, same data"],
     ["Cross-reads verified", `${crossOk} / ${interopReads}`, "each reading the other's file, value by value"],
   ];
@@ -312,23 +312,25 @@ python tools/bench_html.py          # this page</pre>
 
   const TICKS = [0.125, 0.25, 0.5, 1, 2, 4, 8, 16, 32];
   const READ_SERIES = [
-    {label: "vs Rust Lance, 1 core", color: "--rust1", value: n => ratio(R(n, "rust-lance-1c <- rust-lance"), R(n, "nanolance-cpp <- nanolance"))},
-    {label: "vs Rust Lance, all cores", color: "--rust", value: n => ratio(R(n, "rust-lance <- rust-lance"), R(n, "nanolance-cpp <- nanolance"))},
+    {label: "both on all cores", color: "--rust", value: n => ratio(R(n, "rust-lance <- rust-lance"), R(n, "nanolance-cpp-mt <- nanolance"))},
+    {label: "both on 1 core", color: "--rust1", value: n => ratio(R(n, "rust-lance-1c <- rust-lance"), R(n, "nanolance-cpp <- nanolance"))},
   ];
   legend("legend-read", READ_SERIES);
   dotPlot("chart-read", READ_SERIES, {min: 0.5, max: 2, ticks: TICKS, tickLabel: t => t + "×", valueLabel: fmtX,
     leftLabel: "← Rust Lance faster", rightLabel: "nanolance faster →", aria: "Read speed ratio per data type",
-    tip: n => [["var(--nl)", fmtMs(R(n, "nanolance-cpp <- nanolance")) + " ms", "nanolance C++"],
+    tip: n => [["var(--nl)", fmtMs(R(n, "nanolance-cpp-mt <- nanolance")) + " ms", "nanolance C++, all cores"],
+               ["var(--nl)", fmtMs(R(n, "nanolance-cpp <- nanolance")) + " ms", "nanolance C++, 1 core"],
                ["var(--rust1)", fmtMs(R(n, "rust-lance-1c <- rust-lance")) + " ms", "Rust Lance, 1 core"],
                ["var(--rust)", fmtMs(R(n, "rust-lance <- rust-lance")) + " ms", "Rust Lance, all cores"]]});
   const WRITE_SERIES = [
-    {label: "vs Rust Lance, 1 core", color: "--rust1", value: n => ratio(W(n, "rust-lance-1c"), W(n, "nanolance-cpp"))},
-    {label: "vs Rust Lance, all cores", color: "--rust", value: n => ratio(W(n, "rust-lance"), W(n, "nanolance-cpp"))},
+    {label: "both on all cores", color: "--rust", value: n => ratio(W(n, "rust-lance"), W(n, "nanolance-cpp-mt"))},
+    {label: "both on 1 core", color: "--rust1", value: n => ratio(W(n, "rust-lance-1c"), W(n, "nanolance-cpp"))},
   ];
   legend("legend-write", WRITE_SERIES);
   dotPlot("chart-write", WRITE_SERIES, {min: 0.5, max: 2, ticks: TICKS, tickLabel: t => t + "×", valueLabel: fmtX,
     leftLabel: "← Rust Lance faster", rightLabel: "nanolance faster →", aria: "Write speed ratio per data type",
-    tip: n => [["var(--nl)", fmtMs(W(n, "nanolance-cpp")) + " ms", "nanolance C++"],
+    tip: n => [["var(--nl)", fmtMs(W(n, "nanolance-cpp-mt")) + " ms", "nanolance C++, all cores"],
+               ["var(--nl)", fmtMs(W(n, "nanolance-cpp")) + " ms", "nanolance C++, 1 core"],
                ["var(--rust1)", fmtMs(W(n, "rust-lance-1c")) + " ms", "Rust Lance, 1 core"],
                ["var(--rust)", fmtMs(W(n, "rust-lance")) + " ms", "Rust Lance, all cores"]]});
   const SIZE_SERIES = [{label: "nanolance / Rust Lance", color: "--nl", value: n => ratio(D[n].size["nanolance"], D[n].size["rust-lance"])}];
@@ -391,6 +393,7 @@ python tools/bench_html.py          # this page</pre>
   const COLS = [
     ["rows", n => D[n].rows.toLocaleString()],
     ["read · nanolance C++", n => fmtMs(R(n, "nanolance-cpp <- nanolance")), "rc"],
+    ["read · nanolance all cores", n => fmtMs(R(n, "nanolance-cpp-mt <- nanolance"))],
     ["read · + retaining malloc", n => fmtMs(R(n, "nanolance-cpp-retain <- nanolance"))],
     ["read · nanolance Python", n => fmtMs(R(n, "nanolance-py <- nanolance"))],
     ["read · Rust 1 core", n => fmtMs(R(n, "rust-lance-1c <- rust-lance")), "rr"],
@@ -399,6 +402,7 @@ python tools/bench_html.py          # this page</pre>
     ["read · Rust native all cores", n => fmtMs(R(n, "rust-native <- rust-lance"))],
     ["read · Parquet", n => fmtMs(R(n, "parquet <- parquet"))],
     ["write · nanolance C++", n => fmtMs(W(n, "nanolance-cpp")), "wc"],
+    ["write · nanolance all cores", n => fmtMs(W(n, "nanolance-cpp-mt"))],
     ["write · + 4 MiB budget", n => fmtMs(W(n, "nanolance-cpp-budget"))],
     ["write · nanolance Python", n => fmtMs(W(n, "nanolance-py"))],
     ["write · Rust 1 core", n => fmtMs(W(n, "rust-lance-1c")), "wr"],

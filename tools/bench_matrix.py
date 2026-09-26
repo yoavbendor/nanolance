@@ -13,7 +13,8 @@ WHAT IS MEASURED, per dataset (one column of one type, so a number can be attrib
           nanolance-py    nanolance.write_table from Python
           rust-lance      lance.write_dataset (pylance 12, Lance format 2.2), all cores
           rust-lance-1c   the same, pinned to one core with one CPU and one I/O thread -- the
-                          per-core comparison, since nanolance is single-threaded by design
+                          per-core comparison (nanolance-cpp runs pinned to one core as well)
+          nanolance-cpp-mt  the same on all cores (nanolance's default thread count)
           nanolance-cpp-budget  the same with max_pending_bytes = 4 MiB, the edge-device setting
           rust-native     the lance crate itself (tools/lance_rs_bench, no Python), all cores
           rust-native-1c  the same pinned to one core, one tokio worker, one CPU and one I/O thread
@@ -21,6 +22,7 @@ WHAT IS MEASURED, per dataset (one column of one type, so a number can be attrib
   read    each Lance reader reads BOTH Lance files (the one nanolance wrote and the one Rust Lance
           wrote), so the matrix answers "can I mix them" as well as "how fast":
           nanolance-cpp   lance_table_read_dataset into Arrow arrays (tools/nlbench), pinned to one core
+          nanolance-cpp-mt  the same on all cores
           nanolance-cpp-retain  the same with glibc told to keep freed memory
                           (MALLOC_MMAP_THRESHOLD_/MALLOC_TRIM_THRESHOLD_). By default glibc hands a
                           read's buffers back to the OS and the next read page-faults them in again;
@@ -313,6 +315,18 @@ def run_one(name, table, runs, work: Path, verbose):
     except Exception as e:  # noqa: BLE001 -- recorded, not hidden
         rec["errors"]["write nanolance-cpp"] = str(e)[:300]
 
+    # The same on every core (the process's CPUs; nanolance's default).
+    mt_path = work / f"{name}_nlmt.lance"
+    try:
+        out = native([str(NLBENCH), "--write", str(ipc_path), str(mt_path), str(runs + 1)])
+        rec["write_ms"]["nanolance-cpp-mt"] = out["warm_median_ms"]
+        rec["peak_mb"]["nanolance-cpp-mt write"] = out["peak_rss_mb"]
+        if not same(pa.table(nanolance.read_table(mt_path)), table):
+            rec["errors"]["write nanolance-cpp-mt"] = "wrote different data"
+    except Exception as e:  # noqa: BLE001
+        rec["errors"]["write nanolance-cpp-mt"] = str(e)[:300]
+    shutil.rmtree(mt_path, ignore_errors=True)
+
     # The same with the writer's memory budget (max_pending_bytes): it commits a fragment whenever
     # it holds 4 MiB -- what an edge device would set to bound its resident memory while saving.
     budget_path = work / f"{name}_nlbudget.lance"
@@ -400,6 +414,15 @@ def run_one(name, table, runs, work: Path, verbose):
             r = subprocess.run(pinned([str(NLBENCH), str(path), str(runs + 1)]), capture_output=True, text=True,
                                env={**os.environ, **RETAINING_MALLOC})
             rec["read_ms"][f"nanolance-cpp-retain <- {file_label}"] = json.loads(r.stdout)["warm_median_ms"]
+        except Exception as e:  # noqa: BLE001
+            rec["errors"][f"read {key}"] = str(e)[:300]
+        key = f"nanolance-cpp-mt <- {file_label}"
+        try:
+            out = native([str(NLBENCH), str(path), str(runs + 1)])
+            if out["rows"] != table.num_rows:
+                raise RuntimeError(f"read {out['rows']} rows, expected {table.num_rows}")
+            rec["read_ms"][key] = out["warm_median_ms"]
+            rec["peak_mb"][f"nanolance-cpp-mt read <- {file_label}"] = out["peak_rss_mb"]
         except Exception as e:  # noqa: BLE001
             rec["errors"][f"read {key}"] = str(e)[:300]
         if RUST_BENCH.exists():
