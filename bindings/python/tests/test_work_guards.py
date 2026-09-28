@@ -219,6 +219,28 @@ def test_a_repeated_parallel_read_reuses_its_buffers(tmp_path, threads):
     assert stats["buffer_pool_hits"] >= 1 and stats["buffer_pool_misses"] == 0, stats
 
 
+@pytest.mark.skipif(_knob_overridden("NANOLANCE_BUFFER_POOL_MB"), reason="tuning knob set")
+@pytest.mark.parametrize("n_threads", [1, 4])
+def test_a_repeated_read_of_dictionary_strings_reuses_its_buffers(tmp_path, threads, n_threads):
+    """pcap_ref's URIs: 40 strings in runs, a dictionary-coded column expanded to 9.6 MB. Its data
+    grew by a plain reserve and its offsets (800 KB) sat under the pool's minimum, so neither came
+    from the pool, and the pool, keeping the old buffers from glibc, made every read fault ~7 MB in
+    afresh: 3.5 ms against 1.7 ms for the same read before there was a pool."""
+    n = 200_000
+    uris = pa.array([f"s3://my-bucket/captures/2026-06-09T12_{i * 40 // n:02d}_00.pcapng" for i in range(n)])
+    path = tmp_path / "uris.lance"
+    nanolance.write_table(pa.table({"uri": uris}), path, compression=True)
+    threads(n_threads)
+    for _ in range(2):  # the first read fills the pool
+        got = pa.table(nanolance.read_table(path))
+        del got
+        gc.collect()
+    stats, got = _stats_of(lambda: pa.table(nanolance.read_table(path)))
+    assert got.column("uri").equals(pa.chunked_array([uris]))
+    # The data and the offsets, both from the pool.
+    assert stats["buffer_pool_hits"] >= 2 and stats["buffer_pool_misses"] == 0, stats
+
+
 @pytest.mark.skipif(_knob_overridden("NANOLANCE_TAKE_CACHE_MB"), reason="tuning knob set")
 def test_a_small_column_is_decoded_once_for_many_takes(tmp_path):
     table = _list_of_strings(n=20_000)

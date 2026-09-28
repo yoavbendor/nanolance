@@ -13,7 +13,10 @@
 namespace nano_lance::buffer_pool {
 namespace {
 
-constexpr std::size_t kMinBuffer = std::size_t{1} << 20U;
+// Down to 256 KiB: glibc serves blocks from 128 KiB up with a fresh mmap of their own, and only raises
+// that threshold once a large block is freed -- which the pool, keeping the large ones, stops
+// happening. A 200,000-row string column's offsets (800 KB) were then faulted in on every read.
+constexpr std::size_t kMinBuffer = std::size_t{256} << 10U;
 constexpr auto kIdle = std::chrono::seconds(2);
 
 using Clock = std::chrono::steady_clock;

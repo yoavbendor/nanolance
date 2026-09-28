@@ -118,6 +118,20 @@ void grow_to(std::vector<std::uint8_t>& out, std::size_t bytes) {
     advise_huge_pages(out);
 }
 
+/// reserve_more for decoded bytes: the same geometric growth, but through grow_to, so a large output
+/// takes a buffer the pool kept from an earlier read. A plain reserve left the pool's buffers unused
+/// while glibc handed out fresh memory, and the pool, holding the old buffers out of glibc's reach,
+/// turned every read of a dictionary-coded string column into new page faults: pcap_ref's URIs
+/// faulted ~7 MB in per read (1,765 faults, 3 ms of system time), where the read without the pool
+/// faulted 90 pages.
+using nano_lance::reserve_more;
+void reserve_more(std::vector<std::uint8_t>& v, std::size_t extra) {
+    const auto needed = v.size() + extra;
+    if (needed > v.capacity()) {
+        grow_to(v, needed > v.capacity() * 2U ? needed : v.capacity() * 2U);
+    }
+}
+
 void reserve_capped(std::vector<std::uint8_t>& out, std::uint64_t bytes) {
     constexpr std::uint64_t kReserveCap = std::uint64_t{256} << 20U;
     grow_to(out, static_cast<std::size_t>(std::min(bytes, kReserveCap)));
@@ -2524,12 +2538,22 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
             const bool first_page = out.variable.offsets.empty();
             std::uint64_t cumulative = out.variable.data.size();  // byte offset (continues across pages)
 
-            // Expand: bulk-fill data once per run; collect offsets in a typed temp, then one bulk copy.
-            auto expand = [&](auto& offs) -> bool {
-                offs.reserve(total_rows + (first_page ? 1U : 0U));
-                using OT = typename std::decay_t<decltype(offs)>::value_type;
+            // Expand: bulk-fill data once per run, and write each offset straight into the output --
+            // not into a temporary copied over afterwards, which cost a second fresh buffer per page.
+            auto expand = [&](auto zero) -> bool {
+                using OT = decltype(zero);
+                const std::size_t count = total_rows + (first_page ? 1U : 0U);
+                const std::size_t base = out.variable.offsets.size();
+                reserve_more(out.variable.offsets, count * sizeof(OT));
+                out.variable.offsets.resize(base + count * sizeof(OT));
+                std::uint8_t* dst = out.variable.offsets.data() + base;
+                const auto put = [&dst](std::uint64_t offset) {
+                    const auto o = static_cast<OT>(offset);
+                    std::memcpy(dst, &o, sizeof(OT));
+                    dst += sizeof(OT);
+                };
                 if (first_page) {
-                    offs.push_back(static_cast<OT>(cumulative));
+                    put(cumulative);
                 }
                 for (const auto& [index, run] : runs) {
                     const std::size_t len = dict.entry_size(index);
@@ -2538,22 +2562,12 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     }
                     for (std::uint8_t c = 0; c < run; ++c) {
                         cumulative += len;
-                        offs.push_back(static_cast<OT>(cumulative));
+                        put(cumulative);
                     }
                 }
-                const std::size_t base = out.variable.offsets.size();
-                out.variable.offsets.resize(base + offs.size() * sizeof(OT));
-                std::memcpy(out.variable.offsets.data() + base, offs.data(), offs.size() * sizeof(OT));
                 return true;
             };
-            bool ok = false;
-            if (out.variable.large) {
-                std::vector<std::uint64_t> offs;
-                ok = expand(offs);
-            } else {
-                std::vector<std::uint32_t> offs;
-                ok = expand(offs);
-            }
+            const bool ok = out.variable.large ? expand(std::uint64_t{0}) : expand(std::uint32_t{0});
             if (!ok) {
                 error = "dict-rle expansion overflows";
                 return false;
