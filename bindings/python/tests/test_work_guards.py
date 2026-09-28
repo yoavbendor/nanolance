@@ -246,3 +246,29 @@ def test_take_of_images_reads_just_those_images(lance_mod, tmp_path, writer):
     assert got.column("image").to_pylist() == table.column("image").take(pa.array(rows)).to_pylist()
     # Measured (nanolance's file): 808 KB for 800 KB of images -- each image plus its index entry.
     assert stats["data_bytes_read"] < 1.25 * len(rows) * 20_000 + 65_536, stats
+
+
+@pytest.mark.parametrize("version", ["2.1", "2.2"])
+@pytest.mark.parametrize("nulls", ["none", "rows", "elements"])
+def test_take_of_embeddings_reads_just_those_rows(lance_mod, tmp_path, version, nulls):
+    """Lance keeps a 512-d float32 embedding in FullZip pages of fixed-width rows. take() of 256 rows
+    from MNIST's published Lance table read the whole 123 MB page (1.4 s; pylance 8 ms): the fixed
+    stride locates each row, so it now reads 2 KB a row."""
+    rng = np.random.default_rng(11)
+    n, dim = 10_000, 512
+    values = rng.standard_normal(n * dim, dtype=np.float32)
+    mask = None
+    if nulls == "elements":
+        mask = rng.random(n * dim) < 0.01
+    items = pa.array(values, pa.float32(), mask=mask)
+    emb = pa.FixedSizeListArray.from_arrays(items, dim)
+    if nulls == "rows":
+        emb = pa.FixedSizeListArray.from_arrays(items, dim, mask=pa.array(rng.random(n) < 0.1))
+    table = pa.table({"id": pa.array(range(n), pa.int64()), "emb": emb})
+    path = tmp_path / "emb.lance"
+    lance_mod.write_dataset(table, str(path), data_storage_version=version)
+    rows = sorted(rng.choice(n, 256, replace=False).tolist())
+    stats, got = _stats_of(lambda: pa.table(nanolance.take(path, rows, columns=["emb"])))
+    want = lance_mod.dataset(str(path)).take(rows, columns=["emb"]).column("emb")
+    assert got.column("emb").equals(want)
+    assert stats["data_bytes_read"] < 2 * len(rows) * (dim * 4 + 64 + 1) + 65_536, stats

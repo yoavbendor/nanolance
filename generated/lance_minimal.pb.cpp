@@ -484,6 +484,17 @@ bool decode_field_message(const std::vector<std::uint8_t>& bytes, Field& field) 
     return true;
 }
 
+/// A protobuf int32: negative values travel as the 10-byte varint of their 64-bit sign extension.
+/// Lance writes -2 as the field id of a column a data file still holds but the schema dropped.
+bool as_int32(std::uint64_t value, std::int32_t& out) {
+    const auto v = static_cast<std::int64_t>(value);
+    if (v < std::numeric_limits<std::int32_t>::min() || v > std::numeric_limits<std::int32_t>::max()) {
+        return false;
+    }
+    out = static_cast<std::int32_t>(v);
+    return true;
+}
+
 bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& file) {
     file = DataFile{};
     std::size_t pos = 0;
@@ -496,15 +507,16 @@ bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& 
         const auto field_number = static_cast<std::uint32_t>(key >> 3U);
         const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
         std::uint64_t value = 0;
+        std::int32_t i32 = 0;
         if (field_number == 1 && wire_type == kWireBytes) {
             if (!read_string(bytes, pos, file.path)) {
                 return false;
             }
         } else if (field_number == 2 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
-            if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            if (!as_int32(value, i32)) {
                 return false;
             }
-            file.fields.push_back(static_cast<std::int32_t>(value));
+            file.fields.push_back(i32);
         } else if (field_number == 2 && wire_type == kWireBytes) {
             // packed repeated int32 — proto3 default encoding for numeric repeated fields
             std::vector<std::uint8_t> packed;
@@ -512,14 +524,14 @@ bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& 
             std::size_t pp = 0;
             while (pp < packed.size()) {
                 if (!read_varint(packed, pp, value)) { return false; }
-                if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) { return false; }
-                file.fields.push_back(static_cast<std::int32_t>(value));
+                if (!as_int32(value, i32)) { return false; }
+                file.fields.push_back(i32);
             }
         } else if (field_number == 3 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
-            if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            if (!as_int32(value, i32)) {
                 return false;
             }
-            file.column_indices.push_back(static_cast<std::int32_t>(value));
+            file.column_indices.push_back(i32);
         } else if (field_number == 3 && wire_type == kWireBytes) {
             // packed repeated int32
             std::vector<std::uint8_t> packed;
@@ -527,8 +539,8 @@ bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& 
             std::size_t pp = 0;
             while (pp < packed.size()) {
                 if (!read_varint(packed, pp, value)) { return false; }
-                if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) { return false; }
-                file.column_indices.push_back(static_cast<std::int32_t>(value));
+                if (!as_int32(value, i32)) { return false; }
+                file.column_indices.push_back(i32);
             }
         } else if (field_number == 4 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
             if (value > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {

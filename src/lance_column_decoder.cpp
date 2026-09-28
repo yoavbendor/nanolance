@@ -3846,19 +3846,75 @@ bool column_is_nested(const pb::ColumnMetadata& column_metadata) {
 
 namespace {
 
-/// The rows of a single-layer, variable-width FullZip page that `take_full_zip_rows` can read straight
-/// through the repetition index, or false for any page it cannot (lists, nullable structs, fixed width,
-/// no index): those take the decode-the-page path.
+/// Whether `take_full_zip_rows` can read a single-layer FullZip page's rows straight from the file:
+/// a variable-width page through its repetition index, a fixed-width one (an embedding, say) by its
+/// stride, since every row there is a control word and a value slot, null rows included. Lists,
+/// nullable structs and variable-width pages without an index take the decode-the-page path.
 bool full_zip_row_addressable(const pb::ColumnPage& page, page_layout::PageLayout& layout, FullZipPageParams& params) {
     std::string why;
-    if (page.encoding.empty() || page.buffer_offsets.size() < 2U || page.buffer_sizes.size() < 2U ||
+    if (page.encoding.empty() || page.buffer_offsets.empty() || page.buffer_sizes.empty() ||
         !page_layout::decode_page_layout(page.encoding, layout, why) ||
         layout.kind != page_layout::LayoutKind::kFullZip || layout.full_zip.layers.size() != 1U ||
-        !full_zip_page_params(layout, page.length, params, why)) {
+        !full_zip_page_params(layout, page.length, params, why) || params.bits_rep != 0U) {
         return false;
     }
-    return params.bits_rep == 0U && params.length_bytes != 0U && params.control_bytes <= 1U &&
+    if (params.length_bytes == 0U) {
+        return params.value_bytes != 0U && params.control_bytes <= 2U &&
+               page.buffer_sizes[0] / (params.control_bytes + params.value_bytes) == page.length &&
+               page.buffer_sizes[0] % (params.control_bytes + params.value_bytes) == 0U;
+    }
+    return page.buffer_offsets.size() >= 2U && page.buffer_sizes.size() >= 2U && params.control_bytes <= 1U &&
            params.bits_def <= 1U;
+}
+
+/// Fixed-width `take_full_zip_rows`: row k of the page is at k * (control word + value slot).
+bool take_full_zip_fixed_rows(const std::filesystem::path& path, const std::string& column,
+                              const pb::ColumnPage& page, const FullZipPageParams& params,
+                              const std::vector<std::uint64_t>& rows, std::size_t begin, std::size_t end,
+                              std::uint64_t page_first, ColumnValues& out, std::uint64_t& out_row,
+                              std::string& error) {
+    const std::uint64_t stride = params.control_bytes + params.value_bytes;
+    const auto item_bytes = params.value_bytes - params.item_validity_bytes;
+    const std::uint32_t def_mask = params.bits_def == 0U ? 0U : ((1U << params.bits_def) - 1U);
+    thread_local std::vector<std::uint8_t> bytes;
+    for (std::size_t i = begin; i < end;) {
+        // Rows that sit next to each other in the page are one read.
+        std::size_t j = i + 1U;
+        while (j < end && rows[j] == rows[j - 1U] + 1U) {
+            ++j;
+        }
+        const auto first_local = rows[i] - page_first;
+        const auto count = rows[j - 1U] - rows[i] + 1U;
+        if (!read_lance_data_file_bytes(path, page.buffer_offsets[0] + first_local * stride, count * stride, bytes,
+                                        error)) {
+            return false;
+        }
+        if (bytes.size() != count * stride) {
+            error = "column '" + column + "': FullZip page is shorter than its rows";
+            return false;
+        }
+        for (std::uint64_t k = 0; k < count; ++k) {
+            const std::uint8_t* at = bytes.data() + k * stride;
+            std::uint32_t word = 0;
+            std::memcpy(&word, at, params.control_bytes);  // little-endian
+            at += params.control_bytes;
+            if (params.items != 0U) {
+                append_item_validity(out, params.item_validity_bytes != 0U ? at : nullptr, 0U, params.items,
+                                     out_row * params.items);
+            }
+            at += params.item_validity_bytes;
+            out.fixed.insert(out.fixed.end(), at, at + item_bytes);
+            out.validity.resize(static_cast<std::size_t>((out_row + 8U) / 8U), 0U);
+            if ((word & def_mask) == 0U) {
+                out.validity[static_cast<std::size_t>(out_row >> 3U)] |= static_cast<std::uint8_t>(1U << (out_row & 7U));
+            } else {
+                ++out.null_count;
+            }
+            ++out_row;
+        }
+        i = j;
+    }
+    return true;
 }
 
 /// Append rows `[begin, end)` of `rows` -- all inside `page`, as page-local row numbers relative to
@@ -3867,6 +3923,9 @@ bool take_full_zip_rows(const std::filesystem::path& path, const std::string& co
                         const FullZipPageParams& params, const std::vector<std::uint64_t>& rows, std::size_t begin,
                         std::size_t end, std::uint64_t page_first, ColumnValues& out, std::uint64_t& out_row,
                         std::string& error) {
+    if (params.length_bytes == 0U) {
+        return take_full_zip_fixed_rows(path, column, page, params, rows, begin, end, page_first, out, out_row, error);
+    }
     const auto index_size = page.buffer_sizes[1];
     const auto entries = page.length + 1U;
     if (index_size == 0U || index_size % entries != 0U) {
@@ -4375,10 +4434,25 @@ bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_pa
         page_layout::PageLayout layout;
         addressable = full_zip_row_addressable(column_metadata.pages[touched[t].first], layout, params[t]);
     }
+    // One kind across the pages taken from, and a fixed width that is the type's.
+    for (std::size_t t = 1; t < touched.size() && addressable; ++t) {
+        addressable = (params[t].length_bytes == 0U) == (params[0].length_bytes == 0U) &&
+                      params[t].value_bytes == params[0].value_bytes && params[t].items == params[0].items;
+    }
+    if (addressable && params[0].length_bytes == 0U) {
+        addressable = lance_logical_type_value_bytes(on_disk_field.logical_type) ==
+                      params[0].value_bytes - params[0].item_validity_bytes;
+    }
     if (addressable) {
-        out.kind = ColumnValues::Kind::VariableWidth;
-        out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-        append_list_offset(out.variable.offsets, 0, out.variable.large);
+        if (params[0].length_bytes == 0U) {
+            out.kind = ColumnValues::Kind::FixedWidth;
+            out.items_per_row = params[0].items;
+            reserve_more(out.fixed, rows.size() * (params[0].value_bytes - params[0].item_validity_bytes));
+        } else {
+            out.kind = ColumnValues::Kind::VariableWidth;
+            out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+            append_list_offset(out.variable.offsets, 0, out.variable.large);
+        }
         std::uint64_t out_row = 0;
         for (std::size_t t = 0; t < touched.size(); ++t) {
             const auto& [p, span] = touched[t];

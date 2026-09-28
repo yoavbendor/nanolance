@@ -273,6 +273,8 @@ still passes when the rows come back right but slowly. Don't time it (CI machine
   new, a place in `test_training_shapes.py` (COCO- and Speech-Commands-shaped tables, both writers,
   1 and 4 threads). `test_real_datasets.py` reruns the checks on the real files when
   `NANOLANCE_DATASETS` points at them (`tools/bench_multimodal.py` lists the downloads).
+  `tools/real_lance_check.py` reads Lance datasets published on the Hugging Face Hub with both
+  engines and compares them (`docs/REAL_DATASETS.md`); run it before calling a read path done.
 - **The matrix is checked in CI** as ratios to Rust Lance (`tools/bench_compare.py` against
   `bench/results/matrix-quick.json`). A change that moves performance on purpose regenerates it:
   `python tools/bench_matrix.py --quick --runs 3 --out bench/results/matrix-quick.json`.

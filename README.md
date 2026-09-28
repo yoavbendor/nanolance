@@ -101,6 +101,11 @@ toolchain. lance-c's own tests run against it in CI: [docs/LANCE_C_COMPAT.md](do
 Lance's own Rust encoding tests (lance-encoding and lance-file) run nightly with every round trip
 and file they write also read back by nanolance: [docs/RUST_SUITE.md](docs/RUST_SUITE.md).
 
+To try it on real data: `tools/real_lance_check.py` downloads Lance datasets people have published on
+the Hugging Face Hub and checks nanolance against pylance on them. The datasets hold embeddings,
+images, audio, video and LanceDB tables. How to run it, what it found, and the COCO / Speech
+Commands benchmark are in [docs/REAL_DATASETS.md](docs/REAL_DATASETS.md).
+
 Already have parquet? Convert it and compare, without writing any code:
 
 ```console

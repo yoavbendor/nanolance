@@ -138,8 +138,8 @@ int main() {
         manifest.fields.push_back(f);
         nano_lance::pb::DataFile df;
         df.path = "fragment-1.lance";
-        df.fields = {2};
-        df.column_indices = {0};
+        df.fields = {2, -2};  // -2: a column the schema dropped, still in the file (real LanceDB tables)
+        df.column_indices = {0, 1};
         df.file_major_version = 2;
         df.file_minor_version = 2;
         df.file_size_bytes = 2048;
@@ -156,8 +156,8 @@ int main() {
         require(decoded.fragments.size() == 1 && decoded.fragments[0].physical_rows == 100, "fragment rows");
         require(decoded.fragments[0].files.size() == 1 && decoded.fragments[0].files[0].path == "fragment-1.lance",
                 "fragment file");
-        require(decoded.fragments[0].files[0].fields.size() == 1 && decoded.fragments[0].files[0].fields[0] == 2,
-                "data file fields");
+        require(decoded.fragments[0].files[0].fields == std::vector<std::int32_t>{2, -2}, "data file fields");
+        require(decoded.fragments[0].files[0].column_indices == std::vector<std::int32_t>{0, 1}, "column indices");
     }
     {
         nano_lance::pb::FileDescriptor d;

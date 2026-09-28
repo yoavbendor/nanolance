@@ -10,6 +10,22 @@ two items the backlog called large are small.
 
 ---
 
+## Found on published datasets (2026-09-28)
+
+`tools/real_lance_check.py` read 24 tables from Lance datasets on the Hugging Face Hub
+(`docs/REAL_DATASETS.md`). None mismatched. Two gaps matter most for what people actually store:
+
+- **Lance file format 2.0** (footer `0.3`): all 6 refusals. LanceDB wrote 2.0 by default, so most
+  LanceDB tables on the Hub are 2.0, and so is one of fineweb-edu's files. 2.0 uses the
+  `ArrayEncoding` tree of `encodings_v2_0.proto` (Flat, Nullable, Binary, Dictionary, FixedSizeList,
+  List, Struct, Fsst, Bitpacked), not the structural layouts of 2.1. Lance's own tests of it are in
+  the Rust suite: 1,128 refused round trips (`docs/RUST_SUITE.md`) to turn into passes.
+- **`take` on `list<string>` in FullZip pages** decodes each touched page whole: MS MARCO's
+  `passage_text`, 256 rows, reads 193 MB in 533 ms (pylance: 6 ms). A FullZip list page has a
+  repetition index (buffer 1, one entry per row) giving each row's byte range. Read those ranges,
+  as `take_full_zip_rows` does for flat pages, and unravel just their levels. The work guard is
+  `data_bytes_read`.
+
 ## What the survey found
 
 ### Two gaps nobody had listed

@@ -183,8 +183,12 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
     // 2.1 and 2.2 share the structural page layouts; 2.2 adds encodings a 2.1 file never holds. 2.0
     // (legacy array encodings) and 2.3 are not read.
     if (major != 2U || (minor != 1U && minor != 2U)) {
-        error = "unsupported Lance data file version " + std::to_string(major) + "." + std::to_string(minor) +
-                " (nanolance reads 2.1 and 2.2)";
+        // The footer spells format 2.0 as 0.3, and the legacy (v1) format as 0.1 or 0.2.
+        const std::string footer = std::to_string(major) + "." + std::to_string(minor);
+        const std::string format = major == 0U && minor == 3U                  ? "2.0 (footer 0.3)"
+                                   : major == 0U && (minor == 1U || minor == 2U) ? "legacy v1 (footer " + footer + ")"
+                                                                               : footer;
+        error = "unsupported Lance file format " + format + " (nanolance reads 2.1 and 2.2)";
         return false;
     }
 
