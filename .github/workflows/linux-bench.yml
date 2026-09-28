@@ -82,6 +82,9 @@ jobs:
         env:
           BENCH_TMP: /tmp/nlb
         run: |
+          # bench.py times nanolance in-process too (the Python binding), beside the CLI.
+          python3 -m pip install --quiet --break-system-packages ./bindings/python numpy \
+            || python3 -m pip install --quiet ./bindings/python numpy
           python3 tools/bench.py | tee /tmp/bench.txt
 
       # nanolance against Rust Lance on the 27-type matrix (a tenth of the rows), compared as ratios

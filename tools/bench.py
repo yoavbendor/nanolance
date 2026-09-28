@@ -3,6 +3,7 @@
 import os, glob, json, shutil, subprocess, tempfile, time, statistics
 import pyarrow as pa, pyarrow.ipc as ipc, pyarrow.parquet as pq
 import lance
+import nanolance
 
 # Cross-platform paths: build dir relative to repo root (override with NL_BUILD), scratch in BENCH_TMP.
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -134,7 +135,20 @@ def run_one(name, tbl, N, rust_tbl=None):
     rn_native = json.loads(out.stdout)["best_ms"]
     rn_lance = best_read(lambda: lance.dataset(nf).to_table())
     assert lance.dataset(nf).to_table().num_rows == N, "lance row count on nanolance file"
-    rows.append(("nanolance", wn_core, wn_proc, szn, rn_native, rn_lance))
+    rows.append(("nanolance (cli)", wn_core, wn_proc, szn, rn_native, rn_lance))
+
+    # ---- nanolance in-process (the Python binding) ----  measured the way rust lance is: a warm
+    # process handed the Arrow table in memory, so no process start and no Arrow IPC to parse.
+    npf = f"{TMP}/{name}_nlpy.lance"
+    def w_nlpy():
+        shutil.rmtree(npf, ignore_errors=True)
+        t0=time.perf_counter(); nanolance.write_table(tbl, npf, compression=True); return (time.perf_counter()-t0)*1000
+    w_nlpy()  # warm-up, as the in-process writers above get from their earlier iterations
+    wy = best_of(w_nlpy, WRITE_ITERS)
+    szy = dsize(npf+"/data/*.lance")
+    ry = best_read(lambda: pa.table(nanolance.read_table(npf)))
+    assert pa.table(nanolance.read_table(npf)).equals(tbl), "nanolance in-process round trip"
+    rows.append(("nanolance (py)", wy, wy, szy, ry, None))
 
     # ---- report ----
     print(f"{'engine':16} {'write(core)':>11} {'write(proc)':>11} {'B/row':>8} {'read ms':>9} {'read(lance)':>12}")
@@ -149,10 +163,12 @@ def main():
     ds, N, rust_overrides = make_datasets()
     for name, tbl in ds.items():
         run_one(name, tbl, N, rust_overrides.get(name))
-    print(f"\nnote: best of {WRITE_ITERS} writes / {READ_ITERS} reads. write(core)=in-process encode work "
-          "(parquet/lance: the write call; nanolance: ingest+encode+commit, EXCLUDING process startup + "
-          "Arrow-IPC parse). write(proc)=full wall clock (nanolance includes subprocess startup + IPC parse). "
-          "read ms=native reader; read(lance)=rust-lance reading the nanolance file.")
+    print(f"\nnote: best of {WRITE_ITERS} writes / {READ_ITERS} reads. parquet, rust lance and nanolance (py) "
+          "write and read in this Python process, from the Arrow table in memory: compare these three. "
+          "nanolance (cli) runs arrowipc2lance and nlbench as subprocesses: write(core)=ingest+encode+commit "
+          "in a fresh process (its first-touch page faults included), write(proc)=its whole wall clock "
+          "(process start + Arrow IPC parse from stdin + write); read ms=nlbench; read(lance)=rust lance "
+          "reading the file nanolance wrote.")
 
 if __name__ == "__main__":
     main()

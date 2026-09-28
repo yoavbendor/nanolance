@@ -16,3 +16,11 @@ Two independent claims, each reproducible and each with its own results page:
 Reproduce the write/read comparison locally with `bench/run-local-bench.sh` (writes
 `bench/linux-local-results.md`, kept separate from the CI-owned file so local runs and the CI
 auto-commit never collide on the same path).
+
+Reading the write/read table: `parquet`, `rust lance` and `nanolance (py)` all write and read in
+the benchmark's own Python process, from the Arrow table already in memory. Those three rows are the
+like-for-like comparison. `nanolance (cli)` runs `arrowipc2lance` and `nlbench` as separate
+processes. Its `write(proc)` is their whole wall clock: process start, then parsing the Arrow IPC
+stream from stdin (on `pcap_ref`, 14 MB of IPC takes about 9 ms, mostly page faults), then the write.
+Even its `write(core)` runs in a fresh process, whose first allocations fault in new pages. So the
+CLI rows measure the command-line tool, not the encoder.
