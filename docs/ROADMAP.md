@@ -23,11 +23,12 @@ two items the backlog called large are small.
   2.0 Hub tables read equal to pylance, and the Rust suite's 2.0 round trips pass but for types
   nanolance refuses in every format (`docs/RUST_SUITE.md`). Still open: Constant pages (Lance
   cannot read them either).
-- **`take` on `list<string>` in FullZip pages** decodes each touched page whole: MS MARCO's
-  `passage_text`, 256 rows, reads 193 MB in 533 ms (pylance: 6 ms). A FullZip list page has a
-  repetition index (buffer 1, one entry per row) giving each row's byte range. Read those ranges,
-  as `take_full_zip_rows` does for flat pages, and unravel just their levels. The work guard is
-  `data_bytes_read`.
+- **Done (2026-10-01): `take` on `list<string>` in FullZip pages** decoded each touched page whole:
+  MS MARCO's `passage_text`, 256 rows, read 193 MB. A FullZip list page has a repetition index
+  (buffer 1, one entry per row) giving each row's byte range; take and row ranges now read just
+  those ranges and unravel their levels (`take_windows`, `decode_nested_rows`), large pages are
+  read in windows, and the parallel reader splits them. MS MARCO: 3 ms (pylance 7). The work guard
+  is `data_bytes_read`.
 
 ## What the survey found
 

@@ -77,8 +77,8 @@ nanolance / pylance, in ms:
 | lance-format/eurosat-lance train | satellite images, 512-d embeddings | 6.1 / 21.1 | 1.3 / 8.0 |
 | lance-format/handwriting-ocr train | images, transcriptions | 6.2 / 77.5 | 1.6 / 9.9 |
 | lance-format/librispeech-clean-lance dev_clean | audio, transcripts, 384-d embeddings | 224 / 1,345 | 34.7 / 54.0 |
-| lance-format/squad-v2-lance train | text, `list<string>` answers, 384-d embeddings | 5.0 / 8.5 | **63.8 / 13.8** |
-| lance-format/ms-marco-v2.1-lance validation | passages as `list<string>`, 384-d embeddings | 45.5 / 45.1 | **2,835 / 21.2** |
+| lance-format/squad-v2-lance train | text, `list<string>` answers, 384-d embeddings | 5.0 / 8.5 | **63.8 / 13.8** (since: 2.1 / 18.6) |
+| lance-format/ms-marco-v2.1-lance validation | passages as `list<string>`, 384-d embeddings | 45.5 / 45.1 | **2,835 / 21.2** (since: 6.8 / 26.7) |
 | davanstrien/emb-test-wiki-lance | 241,787 passages, 384-d embeddings | 7.2 / 18.8 | 1.5 / 8.0 |
 | prrao87/tea-hypervectors | images, `large_list<large_string>` | 25.6 / 154.5 | 107 / 163 |
 | lancedb/magical_kingdom, Jacob235/fred-vector-index, Litian2002/robotics-papers-vecdb, lhoestq/wiki-dpr-lance-example, carpelan/sbl-lance | LanceDB tables with embeddings | refused: format 2.0 (read since: see below) | |
@@ -94,8 +94,15 @@ What these runs found:
   can list field id -2, for a column the schema dropped, and protobuf spells a negative `int32` as a
   10-byte varint. The manifest decoder refused it.
 - **Fixed since:** Lance file format 2.0 (footer `0.3`). See the next section.
-- **Open:** `take` on `list<string>` columns in FullZip pages decodes the whole page. MS MARCO's
-  `passage_text` reads 193 MB for 256 rows. Scans are at parity. See `ROADMAP.md`.
+- **Fixed since (2026-10-01):** `take` on `list<string>` columns in FullZip pages decoded the whole
+  page: MS MARCO's `passage_text` read 193 MB for 256 rows (2.8 s). Such a page keeps where each row
+  starts (its repetition index), so a take now reads just those rows' bytes -- 0.7 MB, 3 ms, against
+  pylance's 7 -- and so does a row range (10 rows: 0.2 ms). A large page is also read in windows of
+  about 4 MiB, on several threads: the whole column in 183 ms (pylance: 416).
+  (`test_work_guards.py::test_take_and_ranges_of_long_strings_in_lists`)
+- **Fixed since:** SQuAD's slow take was its `context` column, which the take cache served by
+  copying the whole decoded column (100 MB) and then dropping all but the rows asked for: 68 ms. It
+  now copies only those rows out of the cached decode: 0.3 ms.
 
 ### Formats 2.0 and 2.2 (2026-10-01, pylance 12.0.0)
 

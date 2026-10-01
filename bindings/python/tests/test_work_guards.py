@@ -18,6 +18,8 @@ bound them, with room to spare, from the values measured when the fix went in.
     4 threads slower than one. A column that is most of the data now streams.
   * Parallel reads faulted their output memory in on every read: the buffer pool reuses it, and
     row-range slicing keeps the capacity it reuses.
+  * take() on a list of long strings (MS MARCO's passages, a FullZip page) decoded the whole 193 MB
+    page; so did a range of 10 rows. Both now read the rows through the page's repetition index.
 
 Tests that depend on a tuning knob skip when the environment overrides it (the stress settings the
 suite is also run with: NANOLANCE_MORSEL_KB, NANOLANCE_TAKE_CACHE_MB, ...).
@@ -294,3 +296,72 @@ def test_take_of_embeddings_reads_just_those_rows(lance_mod, tmp_path, version, 
     want = lance_mod.dataset(str(path)).take(rows, columns=["emb"]).column("emb")
     assert got.column("emb").equals(want)
     assert stats["data_bytes_read"] < 2 * len(rows) * (dim * 4 + 64 + 1) + 65_536, stats
+
+
+def _passages(rng, n, shape):
+    """Rows of long strings (so Lance writes FullZip pages) in lists, with the awkward rows mixed in."""
+    words = np.array(["passage", "query", "answer", "lorem", "ipsum", "dolor", "retrieval", "embedding"])
+
+    def text():
+        return " ".join(rng.choice(words, rng.integers(40, 90)))
+
+    rows = []
+    for i in range(n):
+        if shape != "plain" and i % 17 == 0:
+            rows.append(None)  # a null list
+        elif shape != "plain" and i % 13 == 0:
+            rows.append([])  # an empty list
+        else:
+            items = [text() for _ in range(rng.integers(1, 6))]
+            if shape != "plain" and i % 7 == 0:
+                items[0] = None  # a null item
+            rows.append(items)
+    return rows
+
+
+@pytest.mark.parametrize("version", ["2.1", "2.2"])
+@pytest.mark.parametrize("kind", ["list<string>", "large_list<large_string>", "list<binary> zstd",
+                                  "list<list<string>>", "list<struct<string>>"])
+def test_take_and_ranges_of_long_strings_in_lists(lance_mod, tmp_path, version, kind):
+    """A list of long strings (MS MARCO's `passage_text`) is a FullZip page whose repetition index
+    says where each row starts. take() of 256 rows decoded the whole 193 MB page (2.8 s; pylance 21
+    ms), and so did a range of 10 rows: both now read just those rows' bytes."""
+    rng = np.random.default_rng(7)
+    n = 6_000
+    values = _passages(rng, n, "awkward")
+    if kind == "list<string>":
+        col = pa.array(values, pa.list_(pa.string()))
+    elif kind == "large_list<large_string>":
+        col = pa.array(values, pa.large_list(pa.large_string()))
+    elif kind == "list<binary> zstd":
+        col = pa.array([None if v is None else [None if s is None else s.encode() for s in v] for v in values],
+                       pa.list_(pa.binary()))
+    elif kind == "list<list<string>>":
+        col = pa.array([None if v is None else [v[: len(v) // 2], v[len(v) // 2:]] for v in values],
+                       pa.list_(pa.list_(pa.string())))
+    else:
+        col = pa.array([None if v is None else [{"s": s} for s in v] for v in values],
+                       pa.list_(pa.struct([("s", pa.string())])))
+    field = pa.field("c", col.type, metadata={"lance-encoding:compression": "zstd"} if "zstd" in kind else None)
+    table = pa.table({"id": pa.array(range(n)), "c": col}, schema=pa.schema([pa.field("id", pa.int64()), field]))
+    path = str(tmp_path / "t.lance")
+    lance_mod.write_dataset(table, path, data_storage_version=version)
+    import nanolance.lance as nl
+
+    ours, theirs = nl.dataset(path), lance_mod.dataset(path)
+    whole = sum(os.path.getsize(f) for f in glob.glob(f"{path}/data/*.lance"))
+
+    rows = sorted(rng.choice(n, 256, replace=False).tolist())
+    stats, got = _stats_of(lambda: ours.take(rows, columns=["c"]))
+    assert got.equals(theirs.take(rows, columns=["c"]))
+    assert stats["data_bytes_read"] < whole / 4, stats
+    assert stats["page_windows"] >= 1, stats  # FullZip row windows, not whole pages
+    run = list(range(2_000, 2_050))  # one read
+    assert ours.take(run, columns=["c"]).equals(theirs.take(run, columns=["c"]))
+
+    for offset, limit in [(0, 10), (3_001, 7), (n - 5, 5), (1_000, 3_000)]:
+        stats, got = _stats_of(lambda: ours.to_table(columns=["c"], offset=offset, limit=limit))
+        assert got.equals(theirs.to_table(columns=["c"], offset=offset, limit=limit)), (offset, limit)
+        if limit <= 10:
+            assert stats["data_bytes_read"] < whole / 20, (offset, limit, stats)
+    assert ours.to_table().equals(theirs.to_table())

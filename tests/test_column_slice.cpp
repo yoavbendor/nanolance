@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -253,6 +254,122 @@ int main() {
         require(nano_lance::slice_column_values(values, 3, 7, 20, kValueBytes, error), error);
         require(values.validity.empty() && values.null_count == 0U,
                 "slicing a null-free column must not produce a bitmap");
+    }
+
+    // gather_column_values must give exactly what copying the column and compacting it gives --
+    // flat, variable-width, fixed_size_list with element nulls, and lists of lists and of structs --
+    // and leave its source as it was (it reads a cached decode that other takes share).
+    {
+        std::mt19937_64 rng(42);
+        const auto bit = [&](unsigned percent) { return rng() % 100U < percent; };
+        const auto bitmap = [&](std::uint64_t n, unsigned null_percent, std::uint64_t& nulls) {
+            std::vector<std::uint8_t> bits((n + 7U) / 8U, 0U);
+            nulls = 0;
+            for (std::uint64_t i = 0; i < n; ++i) {
+                if (bit(null_percent)) {
+                    ++nulls;
+                } else {
+                    bits[i >> 3U] |= static_cast<std::uint8_t>(1U << (i & 7U));
+                }
+            }
+            if (nulls == 0U) {
+                bits.clear();
+            }
+            return bits;
+        };
+        for (int trial = 0; trial < 400; ++trial) {
+            const int shape = trial % 5;  // 0 fixed, 1 utf8, 2 large utf8 in a list, 3 fsl, 4 list<struct<list<utf8>>>
+            const std::uint64_t rows = 1U + rng() % 300U;
+            nano_lance::ColumnValues src;
+            std::size_t value_bytes = 4;
+            std::uint64_t leaf = rows;
+            if (shape >= 2 && shape != 3) {
+                // Lists above the leaf, outermost first.
+                const int depth = shape == 2 ? 1 : 3;
+                std::uint64_t level = rows;
+                for (int k = 0; k < depth; ++k) {
+                    nano_lance::ColumnValues::NestedLayer layer;
+                    layer.is_list = !(shape == 4 && k == 1);
+                    layer.length = level;
+                    layer.validity = bitmap(level, 10, layer.null_count);
+                    if (layer.is_list) {
+                        layer.offsets.push_back(0);
+                        for (std::uint64_t i = 0; i < level; ++i) {
+                            layer.offsets.push_back(layer.offsets.back() + static_cast<std::int64_t>(rng() % 4U));
+                        }
+                        level = static_cast<std::uint64_t>(layer.offsets.back());
+                    }
+                    src.layers.push_back(std::move(layer));
+                }
+                leaf = level;
+            }
+            if (shape == 0 || shape == 3) {
+                src.kind = nano_lance::ColumnValues::Kind::FixedWidth;
+                if (shape == 3) {
+                    src.items_per_row = 3;
+                    value_bytes = 12;
+                    src.item_validity = bitmap(leaf * 3U, 5, src.item_null_count);
+                }
+                src.fixed.resize(leaf * value_bytes);
+                for (auto& b : src.fixed) {
+                    b = static_cast<std::uint8_t>(rng());
+                }
+            } else {
+                src.kind = nano_lance::ColumnValues::Kind::VariableWidth;
+                src.variable.large = shape == 2;
+                value_bytes = 0;
+                const std::size_t width = src.variable.large ? 8U : 4U;
+                src.variable.offsets.assign(width, 0U);
+                std::uint64_t end = 0;
+                for (std::uint64_t i = 0; i < leaf; ++i) {
+                    const auto n = rng() % 9U;
+                    for (std::uint64_t c = 0; c < n; ++c) {
+                        src.variable.data.push_back(static_cast<std::uint8_t>('a' + rng() % 26U));
+                    }
+                    end += n;
+                    src.variable.offsets.resize(src.variable.offsets.size() + width);
+                    std::memcpy(src.variable.offsets.data() + (i + 1U) * width, &end, width);
+                }
+            }
+            src.validity = bitmap(leaf, 15, src.null_count);
+            src.rows = leaf;
+            std::vector<std::uint8_t> keep(rows, 0U);
+            const unsigned density = static_cast<unsigned>(rng() % 101U);
+            for (auto& k : keep) {
+                k = bit(density) ? 1U : 0U;
+            }
+            const auto before = src;
+            auto compacted = src;
+            nano_lance::ColumnValues gathered;
+            std::string e1;
+            std::string e2;
+            require(nano_lance::compact_column_values(compacted, keep, rows, value_bytes, e1), e1);
+            require(nano_lance::gather_column_values(src, keep, rows, value_bytes, gathered, e2), e2);
+            const auto label = "gather trial " + std::to_string(trial) + " shape " + std::to_string(shape);
+            require(gathered.kind == compacted.kind && gathered.rows == compacted.rows, label + ": rows");
+            require(gathered.fixed == compacted.fixed, label + ": fixed values");
+            require(gathered.variable.data == compacted.variable.data &&
+                        gathered.variable.offsets == compacted.variable.offsets,
+                    label + ": variable values");
+            require(gathered.validity == compacted.validity && gathered.null_count == compacted.null_count,
+                    label + ": validity");
+            require(gathered.item_validity == compacted.item_validity &&
+                        gathered.item_null_count == compacted.item_null_count &&
+                        gathered.items_per_row == compacted.items_per_row,
+                    label + ": element validity");
+            require(gathered.layers.size() == compacted.layers.size(), label + ": layers");
+            for (std::size_t k = 0; k < gathered.layers.size(); ++k) {
+                const auto& g = gathered.layers[k];
+                const auto& c = compacted.layers[k];
+                require(g.is_list == c.is_list && g.offsets == c.offsets && g.validity == c.validity &&
+                            g.null_count == c.null_count && g.length == c.length,
+                        label + ": layer " + std::to_string(k));
+            }
+            require(src.fixed == before.fixed && src.variable.data == before.variable.data &&
+                        src.variable.offsets == before.variable.offsets && src.validity == before.validity &&
+                        src.rows == before.rows && src.layers.size() == before.layers.size(),
+                    label + ": the source was changed");
+        }
     }
 
     std::cout << "column slice ok\n";
