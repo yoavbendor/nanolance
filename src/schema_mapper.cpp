@@ -961,6 +961,14 @@ bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchem
             if (f.parent_id >= 0) {
                 parents.insert(f.parent_id);
             }
+        }
+        // A list or struct is no column of the files nanolance writes (2.2), whatever the dataset's
+        // own files do: format 2.0 gives every parent a column of its own, which made rows read from
+        // a LanceDB table's list column fail to append ("field definition mismatch").
+        for (auto& f : out.fields) {
+            if (parents.count(f.id) != 0U) {
+                f.column_index = -1;
+            }
             next = std::max(next, f.column_index + 1);
         }
         auto inside_lance_extension = [&](const LanceField& f) {

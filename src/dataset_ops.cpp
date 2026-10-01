@@ -11,6 +11,7 @@
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/deletion_vector.hpp"
 #include "nanolance/expr.hpp"
+#include "nanolance/index_maintenance.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/manifest_writer.hpp"
@@ -173,6 +174,7 @@ bool apply_deletions(const std::filesystem::path& path, pb::Manifest& manifest, 
 
 std::uint64_t next_fragment_id(const pb::Manifest& manifest) {
     std::uint64_t next = manifest.has_max_fragment_id ? static_cast<std::uint64_t>(manifest.max_fragment_id) + 1U : 0U;
+    next = std::max(next, first_fragment_id_after_indices(manifest.indices));
     for (const auto& f : manifest.fragments) {
         next = std::max(next, f.id + 1U);
     }
@@ -262,8 +264,29 @@ void add_fragments(pb::Manifest& manifest, const LanceSchemaMapping& mapping, co
     }
 }
 
-bool commit(const std::filesystem::path& path, pb::Manifest manifest, std::uint64_t& new_version, std::string& error) {
+/// Publish `manifest` as the next version. With `retain_indices`, an index on a field the change
+/// removed goes too -- Lance's retain_relevant_indices, which its Delete, Update, Merge and Project
+/// commits apply (a compaction narrows coverage instead; see index_maintenance.hpp).
+bool commit(const std::filesystem::path& path, pb::Manifest manifest, std::uint64_t& new_version, std::string& error,
+            bool retain_indices = true) {
+    if (retain_indices) {
+        retain_relevant_indices(manifest.indices, manifest.fields, manifest.fragments);
+    }
+    // Lance keeps fragments in id order, and validate() refuses a dataset whose fragments are not: a
+    // compaction's new fragments (the highest ids) go last, not where the fragments they replace were.
+    std::stable_sort(manifest.fragments.begin(), manifest.fragments.end(),
+                     [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
     return commit_next_version(path, std::move(manifest), new_version, error);
+}
+
+/// Every fragment of a dataset with stable row ids carries its rows' ids; one nanolance writes would
+/// carry none, and the dataset's row ids (and any index keyed on them) would no longer resolve.
+bool refuse_stable_row_ids(const pb::Manifest& manifest, const char* operation, std::string& error) {
+    if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) == 0U) {
+        return false;
+    }
+    error = std::string(operation) + " on a dataset with stable row ids is not supported";
+    return true;
 }
 
 // ── keys (merge insert) ─────────────────────────────────────────────────────────────────────────
@@ -488,6 +511,9 @@ bool dataset_update(const std::filesystem::path& dataset_path, const std::string
     if (!load_latest(dataset_path, manifest, version, error)) {
         return false;
     }
+    if (refuse_stable_row_ids(manifest, "update", error)) {
+        return false;
+    }
     LanceScanRequest request;
     request.has_version = true;
     request.version = version;
@@ -603,6 +629,9 @@ bool dataset_merge_insert(const std::filesystem::path& dataset_path, const Merge
     pb::Manifest manifest;
     std::uint64_t version = 0;
     if (!load_latest(dataset_path, manifest, version, error)) {
+        return false;
+    }
+    if (refuse_stable_row_ids(manifest, "merge_insert", error)) {
         return false;
     }
     // The dataset's schema, to put the source's columns in its order.
@@ -1200,6 +1229,9 @@ bool dataset_compact_files(const std::filesystem::path& dataset_path, const Comp
     if (!load_latest(dataset_path, manifest, version, error)) {
         return false;
     }
+    if (refuse_stable_row_ids(manifest, "compaction", error)) {
+        return false;
+    }
     new_version = version;
     const auto target = std::max<std::uint64_t>(options.target_rows_per_fragment, 1U);
     auto rows_of = [](const pb::DataFragment& f) {
@@ -1242,6 +1274,7 @@ bool dataset_compact_files(const std::filesystem::path& dataset_path, const Comp
         return true;
     }
     std::vector<pb::DataFragment> rebuilt;
+    std::vector<std::uint64_t> rewritten_ids;
     std::size_t next_bin = 0;
     auto id = next_fragment_id(manifest);
     std::vector<pb::DataFragment> old = manifest.fragments;
@@ -1251,6 +1284,7 @@ bool dataset_compact_files(const std::filesystem::path& dataset_path, const Comp
             std::vector<std::uint64_t> ids;
             for (const auto m : members) {
                 ids.push_back(old[m].id);
+                rewritten_ids.push_back(old[m].id);
                 // Lance counts a fragment's deletion file among the files a compaction removes.
                 metrics.files_removed += old[m].files.size() + (old[m].deletion_file.present ? 1U : 0U);
             }
@@ -1300,7 +1334,10 @@ bool dataset_compact_files(const std::filesystem::path& dataset_path, const Comp
         manifest.reader_feature_flags &= ~pb::kFlagDeletionFiles;
         manifest.writer_feature_flags &= ~pb::kFlagDeletionFiles;
     }
-    return commit(dataset_path, std::move(manifest), new_version, error);
+    // An index keeps covering the fragments the compaction left alone. Those it rewrote leave its
+    // coverage -- it points at their rows' old addresses -- and Lance scans them instead.
+    drop_fragments_from_indices(manifest.indices, rewritten_ids);
+    return commit(dataset_path, std::move(manifest), new_version, error, false);
 }
 
 }  // namespace nano_lance

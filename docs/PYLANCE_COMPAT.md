@@ -53,6 +53,26 @@ list tests in 2.1 and 2.2, and nanolance must read back what pylance does. `test
 does the same for 2.0 -- nested structs and lists, dictionaries, FSST/zstd/lz4 strings, blob
 columns, packed structs, deletions, ranges and takes.
 
+## Indexes
+
+nanolance builds no index and reads none, but it keeps the ones a dataset has. Every commit it makes
+-- append, delete, update, `merge_insert`, column changes, compaction, restore -- writes the
+version's indices into the new manifest by Lance's own rules (`src/index_maintenance.cpp`, after
+lance-table's `index_maintenance.rs`), so pylance goes on using them:
+
+| nanolance commit | what happens to an index |
+|---|---|
+| append, delete, update, `merge_insert`, add columns, rename | kept as it is: new fragments are not covered (pylance scans them, and `optimize_indices` adds them), deleted rows are masked |
+| drop a column, change its type | an index on that column is dropped |
+| compaction | the fragments it rewrites leave every index's coverage (the index points at their rows' old places) |
+| overwrite | every index is dropped |
+| restore | that version's indices come back |
+
+A new fragment never takes an id an index covers. `test_index_preservation.py` builds BTree, Bitmap,
+full-text and IVF_PQ indexes with pylance, changes the dataset with nanolance, and checks every
+indexed query against a plain scan. A dataset whose index section nanolance cannot read stays
+readable, but nanolance refuses to commit to it rather than drop its indices.
+
 ## What is not implemented
 
 These raise `NotImplementedError` (`nanolance.lance.NotSupportedError`) naming the feature. None of
@@ -63,7 +83,8 @@ them is silently ignored:
 - The transaction API (`LanceOperation`, `commit`, `write_fragments`), `LanceFragment.merge_columns`
   / `update_columns`, `cleanup_old_versions`. Conflicting writers are refused rather than retried:
   a change built on a version another writer has since replaced fails with "commit conflict".
-- Indexes of every kind, vector search (`nearest`), full-text search.
+- Building or querying indexes of any kind, vector search (`nearest`), full-text search. An index
+  pylance built is kept, though: see "Indexes" below.
 - Tags and branches, stable row ids, multiple base paths, shallow and deep clones.
 - Writing Lance's inline, packed and dedicated blob layouts (`lance.blob_field`, `lance.blob_array`):
   nanolance writes external blobs, and reads every kind.

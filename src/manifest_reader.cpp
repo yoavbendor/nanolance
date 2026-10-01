@@ -35,6 +35,44 @@ std::uint64_t read_le64(const unsigned char* p) {
 
 constexpr std::size_t kManifestV2Digits = 20U;
 
+/// The IndexSection message at `position` of a manifest file: [u32 length][protobuf], as Lance's
+/// write_protobuf lays every message out.
+bool read_index_section(const std::filesystem::path& manifest_path, std::uint64_t position,
+                        std::vector<pb::IndexMetadata>& out, std::string& error) {
+    std::ifstream in(manifest_path, std::ios::binary);
+    if (!in) {
+        error = "failed to open manifest file";
+        return false;
+    }
+    in.seekg(0, std::ios::end);
+    const auto file_size = static_cast<std::uint64_t>(in.tellg());
+    unsigned char len_le[4]{};
+    if (position > file_size || file_size - position < 4U) {
+        error = "manifest index section is past the end of the file";
+        return false;
+    }
+    in.seekg(static_cast<std::streamoff>(position), std::ios::beg);
+    if (!read_exact(in, len_le, 4)) {
+        error = "failed to read the manifest index section";
+        return false;
+    }
+    const std::uint32_t length = read_le32(len_le);
+    if (length > file_size - position - 4U) {
+        error = "manifest index section runs past the end of the file";
+        return false;
+    }
+    std::vector<std::uint8_t> body(length);
+    if (length != 0U && !read_exact(in, body.data(), length)) {
+        error = "failed to read the manifest index section";
+        return false;
+    }
+    if (!pb::decode_index_section(body, out, error)) {
+        error = "manifest index section: " + error;
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool parse_manifest_version(const std::string& name, std::uint64_t& version_out) {
@@ -192,11 +230,20 @@ bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint6
         error = "failed to decode manifest protobuf";
         return false;
     }
+    // The version's indices, which a commit must carry on (see index_maintenance.hpp). A reader does
+    // not need them, so one it cannot parse fails only a later commit, which would otherwise drop them.
+    if (out.has_index_section) {
+        std::string index_error;
+        if (!read_index_section(manifest_path, out.index_section, out.indices, index_error)) {
+            out.indices.clear();
+            out.index_section_error = index_error;
+        }
+    }
     // Bound element counts as defense-in-depth against a hostile manifest that packs an enormous number
     // of (possibly tiny/empty) fields/fragments/files to amplify downstream allocations.
     const auto& limits = default_read_limits();
     if (out.fields.size() > limits.max_manifest_elements ||
-        out.fragments.size() > limits.max_manifest_elements) {
+        out.fragments.size() > limits.max_manifest_elements || out.indices.size() > limits.max_manifest_elements) {
         error = "manifest element count exceeds safety limit";
         return false;
     }

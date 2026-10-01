@@ -100,6 +100,12 @@ What these runs found:
   pylance's 7 -- and so does a row range (10 rows: 0.2 ms). A large page is also read in windows of
   about 4 MiB, on several threads: the whole column in 183 ms (pylance: 416).
   (`test_work_guards.py::test_take_and_ranges_of_long_strings_in_lists`)
+- **Fixed since:** appending to a Hub table. nanolance writes 2.2 files, and appended to a 2.0 or
+  2.1 dataset they made it unreadable by pylance ("mixed data-file-version capability is not
+  enabled"): Lance sets that capability, a manifest feature flag, when its own commits mix versions,
+  and nanolance now does too. Rows read back from a LanceDB (2.0) table with list or struct columns
+  would not append at all. And each append dropped the table's indexes. A nanolance append to every
+  one of the 78 tables now validates in pylance, reads back, and keeps the 16 indexed tables' indexes.
 - **Fixed since:** SQuAD's slow take was its `context` column, which the take cache served by
   copying the whole decoded column (100 MB) and then dropping all but the rows asked for: 68 ms. It
   now copies only those rows out of the cached decode: 0.3 ms.

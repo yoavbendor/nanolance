@@ -1,5 +1,6 @@
 # pylance 12.0.0 tests that pass against nanolance.lance (tools/pylance_suite.py --update)
 tests/test_arrow.py::test_roundtrip_take_ext_types
+tests/test_backwards_compatibility.py::test_legacy_string_encoding
 tests/test_column_names.py::TestCaseOnlyDifferentColumnNames::test_create_table_preserves_all_cases
 tests/test_column_names.py::TestCaseOnlyDifferentColumnNames::test_filter_resolves_exact_case_match
 tests/test_column_names.py::TestMixedCaseColumnNames::test_alter_column_with_mixed_case

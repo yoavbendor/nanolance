@@ -1,5 +1,7 @@
 #include "lance_minimal.pb.hpp"
 
+#include "nanolance/roaring_bitmap.hpp"
+
 #include <cstddef>
 #include <limits>
 #include <utility>
@@ -780,7 +782,13 @@ bool decode_manifest_message(const std::vector<std::uint8_t>& bytes, Manifest& m
                 return false;
             }
             (field_number == 16 ? manifest.config : manifest.table_metadata)[std::move(k)] = std::move(value);
-        } else if (field_number == 4 || field_number == 6 || field_number == 21) {
+        } else if (field_number == 6 && wire_type == kWireVarint) {
+            // Where this file's index section is; the reader loads it into `indices`.
+            if (!read_varint(bytes, pos, manifest.index_section)) {
+                return false;
+            }
+            manifest.has_index_section = true;
+        } else if (field_number == 4 || field_number == 21) {
             // Positions inside the manifest file this came from: meaningless in any other file.
             if (!skip_field(bytes, pos, wire_type)) {
                 return false;
@@ -919,7 +927,127 @@ std::vector<std::uint8_t> encode_manifest(const Manifest& manifest) {
     for (const auto& kv : manifest.table_metadata) {
         write_string_map_entry(out, 19, kv.first, kv.second);
     }
+    if (manifest.has_index_section) {
+        write_uint64(out, 6, manifest.index_section);
+    }
     out.insert(out.end(), manifest.unknown.begin(), manifest.unknown.end());
+    return out;
+}
+
+namespace {
+
+bool decode_index_metadata(const std::vector<std::uint8_t>& bytes, IndexMetadata& index, std::string& error) {
+    index = IndexMetadata{};
+    index.raw = bytes;
+    std::size_t pos = 0;
+    while (pos < bytes.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(bytes, pos, key)) {
+            error = "index metadata is truncated";
+            return false;
+        }
+        const auto field_number = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        bool ok = true;
+        std::uint64_t v = 0;
+        std::int32_t id = 0;
+        std::vector<std::uint8_t> nested;
+        if (field_number == 2 && wire_type == kWireVarint) {
+            ok = read_varint(bytes, pos, v) && as_int32(v, id);
+            index.fields.push_back(id);
+        } else if (field_number == 2 && wire_type == kWireBytes) {  // packed
+            ok = read_bytes(bytes, pos, nested);
+            for (std::size_t at = 0; ok && at < nested.size();) {
+                ok = read_varint(nested, at, v) && as_int32(v, id);
+                index.fields.push_back(id);
+            }
+        } else if (field_number == 3 && wire_type == kWireBytes) {
+            ok = read_string(bytes, pos, index.name);
+        } else if (field_number == 4 && wire_type == kWireVarint) {
+            ok = read_varint(bytes, pos, index.dataset_version);
+        } else if (field_number == 5 && wire_type == kWireBytes) {
+            ok = read_bytes(bytes, pos, nested);
+            if (ok && !roaring::decode(nested.data(), nested.size(), index.fragment_ids, error)) {
+                error = "index '" + index.name + "': " + error;
+                return false;
+            }
+            index.has_fragment_bitmap = true;
+        } else {
+            ok = skip_field(bytes, pos, wire_type);
+        }
+        if (!ok) {
+            error = "index metadata is malformed";
+            return false;
+        }
+    }
+    return true;
+}
+
+/// An index's message: as read, but for field 5 when the writer changed its fragments.
+std::vector<std::uint8_t> encode_index_metadata(const IndexMetadata& index) {
+    if (!index.fragment_bitmap_changed) {
+        return index.raw;
+    }
+    std::vector<std::uint8_t> out;
+    std::size_t pos = 0;
+    while (pos < index.raw.size()) {
+        const auto key_start = pos;
+        std::uint64_t key = 0;
+        if (!read_varint(index.raw, pos, key)) {
+            break;  // decode_index_metadata accepted it, so this does not happen
+        }
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        std::vector<std::uint8_t> kept;
+        if (!keep_field(index.raw, key_start, pos, wire_type, kept)) {
+            break;
+        }
+        if ((key >> 3U) != 5U) {
+            out.insert(out.end(), kept.begin(), kept.end());
+        }
+    }
+    if (index.has_fragment_bitmap) {
+        write_message(out, 5, roaring::encode(index.fragment_ids));
+    }
+    return out;
+}
+
+}  // namespace
+
+bool decode_index_section(const std::vector<std::uint8_t>& bytes, std::vector<IndexMetadata>& out,
+                          std::string& error) {
+    out.clear();
+    std::size_t pos = 0;
+    while (pos < bytes.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(bytes, pos, key)) {
+            error = "index section is truncated";
+            return false;
+        }
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        if ((key >> 3U) == 1U && wire_type == kWireBytes) {
+            std::vector<std::uint8_t> nested;
+            if (!read_bytes(bytes, pos, nested)) {
+                error = "index section is truncated";
+                return false;
+            }
+            IndexMetadata index;
+            if (!decode_index_metadata(nested, index, error)) {
+                return false;
+            }
+            out.push_back(std::move(index));
+        } else if (!skip_field(bytes, pos, wire_type)) {
+            error = "index section is malformed";
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<std::uint8_t> encode_index_section(const std::vector<IndexMetadata>& indices) {
+    std::vector<std::uint8_t> out;
+    for (const auto& index : indices) {
+        write_message(out, 1, encode_index_metadata(index));
+    }
     return out;
 }
 

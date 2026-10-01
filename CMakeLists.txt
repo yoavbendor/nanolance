@@ -218,9 +218,10 @@ set(NANOLANCE_PYTHON "${NANO_LANCE_WRITER_PYTHON}" CACHE FILEPATH "Alias of NANO
 
 set(NANO_LANCE_BLOB_V2_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/golden/blob_v2")
 
-add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp)
+add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/roaring_bitmap.cpp)
 target_compile_features(nanolance_proto PUBLIC cxx_std_20)
 target_include_directories(nanolance_proto PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/generated")
+target_include_directories(nanolance_proto PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 add_library(nanolance_reader STATIC
     src/manifest_reader.cpp
@@ -271,6 +272,7 @@ add_library(nanolance STATIC
     src/blob_v2_external.cpp
     src/buffer_pool.cpp
     src/column_slice.cpp
+    src/index_maintenance.cpp
     src/data_file_reader.cpp
     src/deletion_vector.cpp
     src/data_file_writer.cpp
@@ -691,6 +693,10 @@ add_executable(nano_lance_column_slice_test tests/test_column_slice.cpp)
 target_compile_features(nano_lance_column_slice_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_column_slice_test PRIVATE nanolance)
 
+add_executable(nano_lance_roaring_bitmap_test tests/test_roaring_bitmap.cpp)
+target_compile_features(nano_lance_roaring_bitmap_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_roaring_bitmap_test PRIVATE nanolance)
+
 add_executable(nano_lance_external_blob_test tests/test_nano_lance_external_blob.cpp)
 target_compile_features(nano_lance_external_blob_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_external_blob_test PRIVATE nanolance_reader)
@@ -834,6 +840,7 @@ add_test(NAME nano_lance_table_stream COMMAND $<TARGET_FILE:nano_lance_table_str
 set_tests_properties(nano_lance_table_stream PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_column_slice COMMAND $<TARGET_FILE:nano_lance_column_slice_test>)
+add_test(NAME nano_lance_roaring_bitmap COMMAND $<TARGET_FILE:nano_lance_roaring_bitmap_test>)
 add_test(NAME nano_lance_expr COMMAND $<TARGET_FILE:nano_lance_expr_test>)
 set_tests_properties(nano_lance_column_slice PROPERTIES LABELS "smoke")
 

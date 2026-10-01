@@ -4,6 +4,7 @@
 #include "nanolance/manifest_writer.hpp"
 
 #include "lance_minimal.pb.hpp"
+#include "nanolance/index_maintenance.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/version.hpp"
 #include <sstream>
@@ -90,6 +91,63 @@ std::uint64_t next_version(const std::filesystem::path& versions_dir, bool& v2_o
 
 }  // namespace
 
+namespace {
+
+/// A Lance file version as one number -- 1 for v1, 20 to 23 for 2.0 to 2.3 -- from a data file's
+/// major/minor (Lance's from_data_file_numbers), or 0 when it is none of these.
+int data_file_version(std::uint32_t major, std::uint32_t minor) {
+    if (major == 0U && minor <= 2U) {
+        return 1;
+    }
+    if ((major == 0U && minor == 3U) || (major == 2U && minor <= 3U)) {
+        return major == 0U ? 20 : 20 + static_cast<int>(minor);
+    }
+    return 0;
+}
+
+/// The same from the manifest's data storage version ("2.1", or "legacy" / "0.x" for v1).
+int storage_version(const std::string& version) {
+    if (version == "legacy" || version.rfind("0.", 0) == 0) {
+        return 1;
+    }
+    if (version.size() == 3U && version[0] == '2' && version[1] == '.' && version[2] >= '0' && version[2] <= '3') {
+        return 20 + (version[2] - '0');
+    }
+    return 0;
+}
+
+/// nanolance writes 2.2 files, into datasets of any 2.x version. Lance reads data files of another
+/// 2.x version than the manifest's default only when the manifest says so (kFlagMixedDataFileVersions,
+/// which Lance's own commits set the same way); v1 and v2 files never mix.
+bool check_data_file_versions(pb::Manifest& manifest, std::string& error) {
+    const int default_version = storage_version(manifest.data_format.version);
+    if (default_version == 0) {
+        return true;  // a version this build does not know: left as it is
+    }
+    bool v1 = default_version == 1;
+    bool v2 = default_version != 1;
+    bool other = false;
+    for (const auto& fragment : manifest.fragments) {
+        for (const auto& file : fragment.files) {
+            const int version = data_file_version(file.file_major_version, file.file_minor_version);
+            v1 = v1 || version == 1;
+            v2 = v2 || version >= 20;
+            other = other || (version != 0 && version != default_version);
+        }
+    }
+    if (v1 && v2) {
+        error = "the dataset is in Lance's v1 (legacy) format, which nanolance does not write";
+        return false;
+    }
+    if (other) {
+        manifest.reader_feature_flags |= pb::kFlagMixedDataFileVersions;
+        manifest.writer_feature_flags |= pb::kFlagMixedDataFileVersions;
+    }
+    return true;
+}
+
+}  // namespace
+
 bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
                       std::string& error) {
     error.clear();
@@ -101,7 +159,27 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
         return false;
     }
 
-    const auto manifest_bytes = pb::encode_manifest(manifest);
+    if (!manifest.index_section_error.empty()) {
+        // Committing would drop indices this version has but could not be read.
+        error = "the dataset's indices could not be read, and a commit would drop them: " +
+                manifest.index_section_error;
+        return false;
+    }
+    // The indices go first, [u32 length][IndexSection] as Lance writes them, and the manifest points
+    // at them (field 6). Without indices there is no section, and no stale pointer either.
+    std::vector<std::uint8_t> index_section;
+    pb::Manifest written = manifest;
+    if (!check_data_file_versions(written, error)) {
+        return false;
+    }
+    written.has_index_section = !manifest.indices.empty();
+    std::uint64_t manifest_position = 4;
+    if (written.has_index_section) {
+        index_section = pb::encode_index_section(manifest.indices);
+        written.index_section = 4;
+        manifest_position = 4U + 4U + index_section.size();
+    }
+    const auto manifest_bytes = pb::encode_manifest(written);
     bool existing_is_v2 = false;
     const bool first = next_version(versions_dir, existing_is_v2) == 1U;
     // A new dataset gets V2 names, Lance's default (enable_v2_manifest_paths); an existing one keeps its
@@ -119,7 +197,10 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
         return false;
     }
     write_le32(out, 0);
-    const std::uint64_t manifest_position = 4;
+    if (written.has_index_section) {
+        write_le32(out, static_cast<std::uint32_t>(index_section.size()));
+        out.write(reinterpret_cast<const char*>(index_section.data()), static_cast<std::streamsize>(index_section.size()));
+    }
     write_le32(out, static_cast<std::uint32_t>(manifest_bytes.size()));
     out.write(reinterpret_cast<const char*>(manifest_bytes.data()),
               static_cast<std::streamsize>(manifest_bytes.size()));
@@ -281,6 +362,10 @@ bool commit_dataset_version(const std::filesystem::path& dataset_path, const Lan
         manifest.reader_feature_flags = prior.reader_feature_flags;
         manifest.writer_feature_flags = prior.writer_feature_flags;
         manifest.fragments = prior.fragments;
+        // An append keeps every index as it is; the new fragments are simply not covered.
+        manifest.indices = prior.indices;
+        manifest.index_section_error = prior.index_section_error;
+        next_id = first_fragment_id_after_indices(prior.indices);
         for (const auto& fr : prior.fragments) {
             next_id = std::max(next_id, fr.id + 1U);
         }

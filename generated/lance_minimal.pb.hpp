@@ -64,6 +64,26 @@ struct DataFragment {
     std::vector<std::uint8_t> unknown;  // see Field::unknown (row id sequences, version metadata, ...)
 };
 
+/// One index of a dataset version (table.proto IndexMetadata), as the manifest file's index section
+/// holds it. Only what the writer must adjust is decoded; the message is otherwise kept as read, so
+/// an index type this codec has never heard of survives a commit byte for byte.
+struct IndexMetadata {
+    std::vector<std::uint8_t> raw;     // the message as read
+    std::vector<std::int32_t> fields;  // 2: the field ids it covers
+    std::string name;                  // 3
+    std::uint64_t dataset_version = 0; // 4: the version it was built at
+    /// 5: the fragments it covers (a Roaring bitmap on disk), ascending. Absent: coverage unknown.
+    bool has_fragment_bitmap = false;
+    std::vector<std::uint32_t> fragment_ids;
+    /// The writer changed `fragment_ids`: field 5 is written anew rather than copied from `raw`.
+    bool fragment_bitmap_changed = false;
+};
+
+/// An IndexSection message: the indices, each re-encoded only where the writer changed it.
+bool decode_index_section(const std::vector<std::uint8_t>& bytes, std::vector<IndexMetadata>& out,
+                          std::string& error);
+std::vector<std::uint8_t> encode_index_section(const std::vector<IndexMetadata>& indices);
+
 struct Manifest {
     std::vector<Field> fields;
     std::vector<DataFragment> fragments;
@@ -86,6 +106,15 @@ struct Manifest {
     std::uint64_t next_row_id = 0;           // field 14
     std::map<std::string, std::string> config;          // field 16
     std::map<std::string, std::string> table_metadata;  // field 19
+    /// Field 6: where the index section sits in the manifest file. Read with the manifest (see
+    /// load_manifest_version, which fills `indices` from it); written by publish_manifest, which
+    /// writes `indices` into the new file and points this at them.
+    bool has_index_section = false;
+    std::uint64_t index_section = 0;
+    std::vector<IndexMetadata> indices;
+    /// Set when the index section could not be read: `indices` is then empty and a commit refuses,
+    /// rather than publish a version that silently lost them.
+    std::string index_section_error;
     /// Wire bytes of the other fields (base paths, branch, ...). The ones that point INTO the manifest
     /// file this was read from (version_aux_data, index_section, transaction_section) are not kept:
     /// they would point at the wrong bytes of a new file.
@@ -98,6 +127,10 @@ constexpr std::uint64_t kFlagStableRowIds = 1U << 1U;
 constexpr std::uint64_t kFlagUseV2Format = 1U << 2U;
 constexpr std::uint64_t kFlagTableConfig = 1U << 3U;
 constexpr std::uint64_t kFlagMultipleBasePaths = 1U << 4U;
+/// Data files of several 2.x versions in one dataset: Lance 12 sets it (reader and writer) on a
+/// commit that adds files of another version than the manifest's default, and refuses to read such a
+/// dataset without it.
+constexpr std::uint64_t kFlagMixedDataFileVersions = 1U << 8U;
 
 struct Metadata {
     std::uint64_t page_table_position = 0;

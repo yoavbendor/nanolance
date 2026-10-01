@@ -187,3 +187,34 @@ def test_packed_struct(lance, tmp_path):
 
     for f in sorted(glob.glob(f"{path}/data/*.lance")):
         assert nl_file.LanceFileReader(f).read_all().to_table().equals(LanceFileReader(f).read_all().to_table())
+
+
+@pytest.mark.parametrize("version", ["2.0", "2.1"])
+def test_append_to_an_older_format(lance, tmp_path, version):
+    """nanolance writes 2.2 files. Appended to a 2.0 or 2.1 dataset -- most of the Hub's -- they made
+    it unreadable by pylance ("mixed data-file-version capability is not enabled"); Lance's own
+    commits set that capability (a manifest feature flag) when they mix versions, and nanolance now
+    does too. And rows read back from a 2.0 table with lists or structs would not append at all:
+    format 2.0 gives a list its own column, and nanolance compared that with a batch's schema."""
+    path = str(tmp_path / "t.lance")
+    n = 400
+    rng = np.random.default_rng(2)
+    first = pa.table({
+        "id": pa.array(np.arange(n, dtype=np.int64)),
+        "name": pa.array([f"n{i}" if i % 9 else None for i in range(n)]),
+        "tags": pa.array([[f"t{j}" for j in range(i % 4)] if i % 11 else None for i in range(n)],
+                         pa.list_(pa.string())),
+        "point": pa.StructArray.from_arrays([pa.array(rng.integers(0, 100, n, dtype=np.int16)),
+                                             pa.array([f"p{i % 5}" for i in range(n)])], names=["x", "label"]),
+        "objs": pa.array([[{"a": i, "b": f"s{i}"}] * (i % 3) for i in range(n)],
+                         pa.list_(pa.struct([("a", pa.int64()), ("b", pa.string())]))),
+        "emb": pa.FixedSizeListArray.from_arrays(pa.array(rng.standard_normal(n * 8, dtype=np.float32)), 8),
+    })
+    lance.write_dataset(first, path, data_storage_version=version, max_rows_per_file=200)
+    more = nl.dataset(path).to_table(offset=10, limit=50)  # what a user appends: rows like the others
+    nl.write_dataset(more, path, mode="append")
+    ds = lance.dataset(path)
+    ds.validate()
+    assert ds.count_rows() == 450
+    assert ds.to_table().equals(pa.concat_tables([first, more]))
+    assert nl.dataset(path).to_table().equals(ds.to_table())
