@@ -12,6 +12,7 @@
 #include "nanolance/arrow_slice.hpp"
 #include "nanolance/expr.hpp"
 #include "nanolance/lance_column_decoder.hpp"
+#include "nanolance/lance_v20_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/page_layout.hpp"
 #include "nanolance/parallel.hpp"
@@ -1212,7 +1213,119 @@ struct ColumnSource {
     std::int32_t field_id = 0;
     std::size_t value_bytes = 0;  // as compaction and slicing count it
     std::uint64_t encoded_bytes = 0;
+    /// Format 2.0, a leaf below a list (or a string stored as list<uint8>): the columns it needs
+    /// besides its own. Null otherwise.
+    std::shared_ptr<const v20::LeafContext> v20;
 };
+
+/// Format 2.0 gives every field a column of its own -- a struct's (which holds nothing: 2.0 structs
+/// are never null) and a list's (its offsets) as well as each leaf's. nanolance reads leaves, so
+/// those parents are no source; a leaf below a list carries the list columns above it instead.
+bool is_parent_field(const LanceSchemaMapping& mapping, std::int32_t field_id) {
+    return std::any_of(mapping.fields.begin(), mapping.fields.end(),
+                       [&](const LanceField& f) { return f.parent_id == field_id; });
+}
+
+/// What a 2.0 leaf needs from its file besides its own column, or null when it needs nothing.
+bool v20_leaf_context(const LanceSchemaMapping& mapping, const LanceField& leaf,
+                      const std::unordered_map<std::int32_t, std::int32_t>& column_of,
+                      const std::vector<pb::ColumnMetadata>& columns, std::int32_t leaf_column,
+                      std::shared_ptr<const v20::LeafContext>& out, std::string& error) {
+    out.reset();
+    auto context = std::make_shared<v20::LeafContext>();
+    std::vector<const LanceField*> chain;
+    for (const auto* f = find_mapping_field(mapping, leaf.parent_id); f != nullptr;
+         f = find_mapping_field(mapping, f->parent_id)) {
+        chain.push_back(f);
+        if (chain.size() > 64U) {
+            error = "field '" + leaf.name + "' nests too deeply";
+            return false;
+        }
+    }
+    std::reverse(chain.begin(), chain.end());
+    for (const auto* f : chain) {
+        v20::Ancestor a;
+        a.is_list = lance_logical_type_is_list(f->logical_type);
+        a.name = f->name;
+        if (a.is_list) {
+            const auto it = column_of.find(f->id);
+            if (it == column_of.end() || it->second < 0 || static_cast<std::size_t>(it->second) >= columns.size()) {
+                error = "list '" + f->name + "' has no column in its data file";
+                return false;
+            }
+            a.column = &columns[static_cast<std::size_t>(it->second)];
+        }
+        context->ancestors.push_back(std::move(a));
+    }
+    if (lance_field_is_variable_width(leaf.logical_type) && leaf_column >= 0 &&
+        static_cast<std::size_t>(leaf_column) < columns.size() &&
+        v20::column_is_list_encoded(columns[static_cast<std::size_t>(leaf_column)])) {
+        if (static_cast<std::size_t>(leaf_column) + 1U >= columns.size()) {
+            error = "column '" + leaf.name + "' is stored as a list of bytes but its bytes column is missing";
+            return false;
+        }
+        context->binary_items = &columns[static_cast<std::size_t>(leaf_column) + 1U];
+    }
+    if (context->has_lists() || context->binary_items != nullptr) {
+        out = std::move(context);
+    }
+    return true;
+}
+
+/// Format 2.0: a struct its writer packed into one column (field metadata `packed`). Its fields are
+/// in no data file's field list; each is read out of the struct's column instead. Nothing to do for
+/// any other parent field, which is read through its leaves.
+bool v20_packed_struct_sources(const LanceSchemaMapping& mapping, const LanceField& parent,
+                               const std::unordered_map<std::int32_t, std::int32_t>& column_of,
+                               const std::filesystem::path& path, const pb::FileDescriptor& descriptor,
+                               const std::vector<pb::ColumnMetadata>& columns, std::int32_t column_index,
+                               const std::unordered_set<std::int32_t>* allowed_field_ids,
+                               std::vector<ColumnSource>& out, std::string& error) {
+    if (column_index < 0 || static_cast<std::size_t>(column_index) >= columns.size() ||
+        !v20::column_is_packed_struct(columns[static_cast<std::size_t>(column_index)])) {
+        return true;
+    }
+    int k = 0;
+    for (const auto& child : mapping.fields) {
+        if (child.parent_id != parent.id) {
+            continue;
+        }
+        const int slot = k++;
+        if (allowed_field_ids != nullptr && allowed_field_ids->count(child.id) == 0U) {
+            continue;
+        }
+        if (is_parent_field(mapping, child.id)) {
+            error = "packed struct '" + parent.name + "': its field '" + child.name + "' has fields of its own";
+            return false;
+        }
+        const auto* on_disk = find_descriptor_field(descriptor, child.id);
+        if (on_disk == nullptr) {
+            error = "data file references unknown field id";
+            return false;
+        }
+        std::shared_ptr<const v20::LeafContext> above;
+        if (!v20_leaf_context(mapping, child, column_of, columns, column_index, above, error)) {
+            return false;
+        }
+        auto context = above != nullptr ? std::make_shared<v20::LeafContext>(*above)
+                                        : std::make_shared<v20::LeafContext>();
+        context->packed_child = slot;
+        ColumnSource source;
+        source.path = path;
+        source.on_disk = on_disk;
+        source.metadata = &columns[static_cast<std::size_t>(column_index)];
+        source.field_id = child.id;
+        source.value_bytes = lance_logical_type_value_bytes(child.logical_type);
+        source.v20 = std::move(context);
+        for (const auto& page : source.metadata->pages) {
+            for (const auto size : page.buffer_sizes) {
+                source.encoded_bytes += size;
+            }
+        }
+        out.push_back(std::move(source));
+    }
+    return true;
+}
 
 /// A parallel read cuts a fragment into row ranges ("morsels") of at least this many encoded bytes,
 /// decoded independently and returned as a batch each -- no concatenation afterwards.
@@ -1239,6 +1352,11 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vec
     const std::vector<std::pair<std::uint64_t, std::uint64_t>> single{{first, end}};
     const auto threads = parallel::threads();
     if (threads <= 1U || end - first < 2U || columns.empty()) {
+        return single;
+    }
+    // A 2.0 leaf below a list is decoded whole (its pages count items, not rows), so cutting the
+    // rows would decode it once per morsel.
+    if (std::any_of(columns.begin(), columns.end(), [](const ColumnSource& c) { return c.v20 != nullptr; })) {
         return single;
     }
     struct PageInfo {
@@ -1371,10 +1489,14 @@ struct RowIdColumns {
 /// after the fragment was written (pylance's add_columns with a pa.field writes no data). They read
 /// as nulls, as in Lance.
 std::vector<const LanceField*> fields_missing_from(const PlannedFile& planned, const LanceSchemaMapping& mapping,
-                                                   const std::unordered_set<std::int32_t>* allowed_field_ids) {
+                                                   const std::unordered_set<std::int32_t>* allowed_field_ids,
+                                                   const std::vector<ColumnSource>& sources) {
     std::unordered_set<std::int32_t> held;
     for (const auto& file : planned.files) {
         held.insert(file.fields.begin(), file.fields.end());
+    }
+    for (const auto& source : sources) {  // a 2.0 packed struct's fields, which no file lists
+        held.insert(source.field_id);
     }
     std::vector<const LanceField*> missing;
     for (const auto& f : mapping.fields) {
@@ -1572,6 +1694,11 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
             error = "data file field/column index mismatch";
             return false;
         }
+        const bool v20_file = layout.is_v2_0();
+        std::unordered_map<std::int32_t, std::int32_t> column_of;
+        for (std::size_t i = 0; v20_file && i < data_file.fields.size(); ++i) {
+            column_of.emplace(data_file.fields[i], data_file.column_indices[i]);
+        }
         // Every file of a fragment describes the SAME rows. A disagreement means the manifest and the
         // files are out of step, and merging them would silently pad or truncate a column.
         if (length < 0) {
@@ -1585,8 +1712,16 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
             const auto field_id = data_file.fields[i];
             // Skip columns not in the projection (if one is set), and columns the schema no longer
             // has: a dropped column's data stays in the files it was written to.
-            if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
             if (find_mapping_field(mapping, field_id) == nullptr) continue;
+            if (v20_file && is_parent_field(mapping, field_id)) {  // read through its leaves
+                if (!v20_packed_struct_sources(mapping, *find_mapping_field(mapping, field_id), column_of, path,
+                                               open.descriptor, open.columns, data_file.column_indices[i],
+                                               allowed_field_ids, columns, error)) {
+                    return false;
+                }
+                continue;
+            }
+            if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
 
             const auto column_index = data_file.column_indices[i];
             if (column_index < 0 || static_cast<std::size_t>(column_index) >= open.columns.size()) {
@@ -1605,6 +1740,10 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
             source.field_id = field_id;
             const auto* field = find_mapping_field(mapping, field_id);
             source.value_bytes = field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            if (v20_file && field != nullptr &&
+                !v20_leaf_context(mapping, *field, column_of, open.columns, column_index, source.v20, error)) {
+                return false;
+            }
             for (const auto& page : source.metadata->pages) {
                 for (const auto size : page.buffer_sizes) {
                     source.encoded_bytes += size;
@@ -1614,7 +1753,7 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
         }
     }
     const auto physical = static_cast<std::uint64_t>(length);
-    const auto missing = fields_missing_from(planned, mapping, allowed_field_ids);
+    const auto missing = fields_missing_from(planned, mapping, allowed_field_ids, columns);
 
     // Deletions first, then the row range: a range is expressed in LOGICAL row numbers, which only
     // exist once the deleted rows are gone.
@@ -1681,7 +1820,14 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
     parallel::for_each(decoded.size(), [&](std::size_t t) {
         const auto& morsel = morsels[t / n_columns];
         const auto& c = columns[t % n_columns];
-        if (whole) {
+        if (c.v20 != nullptr) {
+            if (whole) {
+                v20::decode_column(c.path, *c.on_disk, *c.metadata, c.v20.get(), decoded[t], errors[t]);
+            } else {
+                v20::decode_column_range(c.path, *c.on_disk, *c.metadata, c.v20.get(), morsel.first,
+                                         morsel.second - morsel.first, c.value_bytes, decoded[t], errors[t]);
+            }
+        } else if (whole) {
             decode_lance_physical_column(c.path, *c.on_disk, *c.metadata, decoded[t], errors[t]);
         } else {
             decode_lance_physical_column_range(c.path, *c.on_disk, *c.metadata, morsel.first,
@@ -1976,10 +2122,23 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
             error = "data file field/column index mismatch";
             return false;
         }
+        const bool v20_file = file->layout.is_v2_0();
+        std::unordered_map<std::int32_t, std::int32_t> column_of;
+        for (std::size_t i = 0; v20_file && i < data_file.fields.size(); ++i) {
+            column_of.emplace(data_file.fields[i], data_file.column_indices[i]);
+        }
         for (std::size_t i = 0; i < data_file.fields.size(); ++i) {
             const auto field_id = data_file.fields[i];
-            if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
             if (find_mapping_field(mapping, field_id) == nullptr) continue;
+            if (v20_file && is_parent_field(mapping, field_id)) {  // read through its leaves
+                if (!v20_packed_struct_sources(mapping, *find_mapping_field(mapping, field_id), column_of, path,
+                                               descriptor, column_metadatas, data_file.column_indices[i],
+                                               allowed_field_ids, columns, error)) {
+                    return false;
+                }
+                continue;
+            }
+            if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
             const auto column_index = data_file.column_indices[i];
             if (column_index < 0 || static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
                 error = "data file column index out of range";
@@ -1997,6 +2156,10 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
             source.metadata = &column_metadatas[static_cast<std::size_t>(column_index)];
             source.field_id = field_id;
             source.value_bytes = field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            if (v20_file && field != nullptr &&
+                !v20_leaf_context(mapping, *field, column_of, column_metadatas, column_index, source.v20, error)) {
+                return false;
+            }
             columns.push_back(std::move(source));
         }
     }
@@ -2004,8 +2167,13 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
     std::vector<std::string> errors(columns.size());
     parallel::for_each(columns.size(), [&](std::size_t c) {
         const auto& source = columns[c];
-        decode_lance_physical_column_rows(source.path, *source.on_disk, *source.metadata, physical,
-                                          source.value_bytes, decoded[c], errors[c]);
+        if (source.v20 != nullptr) {
+            v20::decode_column_rows(source.path, *source.on_disk, *source.metadata, source.v20.get(), physical,
+                                    source.value_bytes, decoded[c], errors[c]);
+        } else {
+            decode_lance_physical_column_rows(source.path, *source.on_disk, *source.metadata, physical,
+                                              source.value_bytes, decoded[c], errors[c]);
+        }
     });
     std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
     for (std::size_t c = 0; c < columns.size(); ++c) {
@@ -2015,7 +2183,7 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
         }
         decoded_by_field_id.emplace(columns[c].field_id, std::move(decoded[c]));
     }
-    for (const auto* field : fields_missing_from(planned, mapping, allowed_field_ids)) {
+    for (const auto* field : fields_missing_from(planned, mapping, allowed_field_ids, columns)) {
         if (!null_column_values(*field, physical.size(), decoded_by_field_id[field->id], error)) {
             return false;
         }
@@ -2479,10 +2647,38 @@ bool open_file_plan(const std::filesystem::path& file_path, const LanceScanReque
         }
     }
     std::int32_t column = 0;
-    for (const auto& f : descriptor.fields) {
-        if (parents.count(f.id) == 0U) {
+    if (layout.is_v2_0()) {
+        // Format 2.0: every field is a column, in schema order -- structs and lists too -- and a
+        // string an older writer stored as list<uint8> is two (its offsets, then its bytes). A
+        // packed struct's fields are not: they are read out of the struct's column.
+        std::vector<pb::ColumnMetadata> metas;
+        if (!read_lance_data_file_column_metadatas(file_path, layout, metas, error)) {
+            release_schema_if_held(out_schema);
+            return false;
+        }
+        std::unordered_set<std::int32_t> packed;
+        for (const auto& f : descriptor.fields) {
+            if (packed.count(f.parent_id) != 0U) {
+                packed.insert(f.id);
+                continue;
+            }
+            if (parents.count(f.id) != 0U && static_cast<std::size_t>(column) < metas.size() &&
+                v20::column_is_packed_struct(metas[static_cast<std::size_t>(column)])) {
+                packed.insert(f.id);
+            }
             file.fields.push_back(f.id);
-            file.column_indices.push_back(column++);
+            file.column_indices.push_back(column);
+            const bool bytes_as_list = lance_field_is_variable_width(f.logical_type) &&
+                                       static_cast<std::size_t>(column) < metas.size() &&
+                                       v20::column_is_list_encoded(metas[static_cast<std::size_t>(column)]);
+            column += bytes_as_list ? 2 : 1;
+        }
+    } else {
+        for (const auto& f : descriptor.fields) {
+            if (parents.count(f.id) == 0U) {
+                file.fields.push_back(f.id);
+                file.column_indices.push_back(column++);
+            }
         }
     }
     if (static_cast<std::uint32_t>(column) != layout.num_columns) {

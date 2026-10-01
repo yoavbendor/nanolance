@@ -7,6 +7,7 @@ against pylance.
     python tools/real_lance_check.py fetch ID [ID ...] --dest DIR [--max-gb 1] [--only data/x.lance]
     python tools/real_lance_check.py check DIR [--rows 5000] [--takes 256] [--full] [--json out.json]
     python tools/real_lance_check.py run --dest DIR [--max-gb 1]          # fetch the suggested set, check
+    python tools/real_lance_check.py rewrite DIR --dest OUT --version 2.2 # pylance rewrites them, then check OUT
 
 Nothing is downloaded into this repository, and nothing is redistributed: each dataset keeps the
 license its card on the Hub gives it.
@@ -35,6 +36,11 @@ Outcomes, per check and per table as the worst of its checks:
   refused   nanolance raised an error (it names what it does not read)
   mismatch  different rows from pylance. A wrong result: please report it with the dataset name
   pylance   pylance itself failed (a partial download, or a format newer than pylance 12.0.0)
+
+rewrite has pylance write each table under DIR again (its first --rows rows; a partial download's
+first data file) in another Lance file format -- --version 2.0, 2.1 or 2.2 -- cut into files of
+--rows-per-file rows, with the same schema and field metadata. The Hub holds 2.0 and 2.1 tables
+only; this is how real data gets tested in 2.2. Check OUT afterwards.
 
 Each check also records both engines' wall time: the faster of --repeat runs (default 2), files in
 the page cache.
@@ -398,6 +404,40 @@ def complete_tables(base: Path) -> dict:
     return out
 
 
+def rewrite(args) -> int:
+    """pylance writes each table under args.dir again in format args.version; the count written."""
+    import lance
+    import lance.file as lf
+    import pyarrow as pa
+    base = Path(args.dir).resolve()
+    known = complete_tables(base)
+    written = 0
+    for root in find_tables(base):
+        rel = root.relative_to(base) if root != base else Path("table")
+        out = (args.dest / rel).resolve()
+        try:
+            if known.get(root.resolve(), True):
+                table = lance.dataset(str(root)).to_table(limit=args.rows)
+            else:
+                data = sorted((root / "data").glob("*.lance"))
+                if not data:
+                    continue
+                reader = lf.LanceFileReader(str(data[0]))
+                table = reader.read_range(0, min(reader.num_rows(), args.rows)).to_table()
+            if out.exists():
+                import shutil
+                shutil.rmtree(out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            lance.write_dataset(table, str(out), data_storage_version=args.version,
+                                max_rows_per_file=max(1, args.rows_per_file))
+            written += 1
+            print(f"wrote    {rel}  {table.num_rows} rows, format {args.version}", flush=True)
+        except Exception as e:  # noqa: BLE001 -- one table failing does not stop the rest
+            print(f"skipped  {rel}: {type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}",
+                  flush=True)
+    return written
+
+
 def check(args) -> list:
     args.dir = Path(args.dir).resolve()
     known = complete_tables(args.dir)
@@ -458,6 +498,12 @@ def main(argv=None) -> int:
         p.add_argument("--max-gb", type=float, default=1.0, help="data files per table, in GB (default 1)")
         p.add_argument("--indices", action="store_true", help="also fetch _indices/")
         p.add_argument("--jobs", type=int, default=4)
+    p = sub.add_parser("rewrite", help="pylance writes the tables under DIR again in another format version")
+    p.add_argument("dir")
+    p.add_argument("--dest", required=True, type=Path)
+    p.add_argument("--version", default="2.2", help="Lance file format to write: 2.0, 2.1 or 2.2 (default 2.2)")
+    p.add_argument("--rows", type=int, default=20_000, help="rows of each table to rewrite (default 20000)")
+    p.add_argument("--rows-per-file", type=int, default=7_000, help="rows per data file (default 7000)")
     for name in ("check", "run"):
         p = sub.choices.get(name) or sub.add_parser(name)
         if name == "check":
@@ -485,6 +531,8 @@ def main(argv=None) -> int:
         for repo, only, what in SUGGESTED:
             print(f"{repo:45} {what}" + (f"  [{', '.join(only)}]" if only else ""))
         return 0
+    if args.cmd == "rewrite":
+        return 0 if rewrite(args) else 1
     if args.cmd in ("fetch", "run"):
         todo = [(i, args.only) for i in args.ids] if args.cmd == "fetch" else [(r, o) for r, o, _ in SUGGESTED]
         for repo, only in todo:

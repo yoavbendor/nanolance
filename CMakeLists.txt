@@ -277,6 +277,7 @@ add_library(nanolance STATIC
     src/fsst.cpp
     src/lz4_block.cpp
     src/lance_column_decoder.cpp
+    src/lance_v20_decoder.cpp
     src/lance_table_reader.cpp
     src/page_layout.cpp
     src/parallel.cpp

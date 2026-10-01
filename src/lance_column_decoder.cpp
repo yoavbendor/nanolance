@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/lance_column_decoder.hpp"
+#include "nanolance/lance_v20_decoder.hpp"
 #include "nanolance/buffer_pool.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -1295,6 +1296,9 @@ struct ColumnEncodingPlan {
     /// where the bit width is written: `InlineBitpacking(N)` puts it at the head of each block,
     /// `Bitpacked{N, Flat(width)}` puts it in the descriptor. Zero means the entries are flat.
     std::uint32_t dict_packed_width = 0;  // set only for the out-of-line spelling
+    /// kDict: the indices are `Flat(N)` -- N-bit integers end to end -- rather than FastLanes packed.
+    /// Format 2.2 writes them so for a small page of 64-bit values (Flat(32) indices). Zero: packed.
+    std::uint32_t dict_flat_index_bits = 0;
     bool dict_inline_bitpacked = false;
     bool dict_out_of_line_bitpacked = false;
     /// kVariable: the offset width the descriptor declares for the value block, in bits. Only the
@@ -1870,6 +1874,19 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             out.variable_offset_bits = inner->values == nullptr ? 0U : inner->values->bits_per_value;
             return true;
         case page_layout::CompressiveKind::kFlat:
+            if (has_dictionary) {
+                // Dictionary indices stored flat. Read as values they were the wrong width (or,
+                // when it happened to match, the indices themselves).
+                if (inner->bits_per_value != 8U && inner->bits_per_value != 16U && inner->bits_per_value != 32U) {
+                    out.kind = ColumnEncodingKind::kUnsupported;
+                    out.unsupported_reason = "dictionary indices of " + std::to_string(inner->bits_per_value) +
+                                             " bits in " + page_layout::describe(layout);
+                    return true;
+                }
+                out.kind = ColumnEncodingKind::kDict;
+                out.dict_flat_index_bits = inner->bits_per_value;
+                return true;
+            }
             // bool is Flat{bits_per_value: 1}; that IS how stock Lance represents it, so the
             // descriptor distinguishes it from a byte-wide flat column with no help from metadata.
             out.kind = inner->bits_per_value == 1U ? ColumnEncodingKind::kBoolPacked : ColumnEncodingKind::kFlat;
@@ -2623,17 +2640,32 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
             }
             indices_bytes.clear();  // hoisted out of the loop; accumulates fresh per page via insert()
             std::uint64_t rows_remaining = page.length;
+            const std::size_t flat_width = encoding_plan.dict_flat_index_bits / 8U;
             for (const auto& chunk : index_chunks) {
                 const auto count = chunk.items != 0U ? chunk.items
                                    : encoding_plan.repdef != nullptr
                                        ? static_cast<std::uint64_t>(chunk.repdef_values)
-                                       : std::min<std::uint64_t>(1024U, rows_remaining);
+                                   : flat_width != 0U ? static_cast<std::uint64_t>(chunk.values.size() / flat_width)
+                                                      : std::min<std::uint64_t>(1024U, rows_remaining);
                 if (count == 0U || count > rows_remaining) {
                     error = "dict index chunk covers " + std::to_string(count) + " values with " +
                             std::to_string(rows_remaining) + " left in the page";
                     return false;
                 }
-                if (!unpack_bitpacked_page_dispatch(chunk.values, count, 4U, indices_bytes, error)) {
+                if (flat_width != 0U) {
+                    if (chunk.values.size() != count * flat_width) {
+                        error = "dict index chunk holds " + std::to_string(chunk.values.size()) + " bytes for " +
+                                std::to_string(count) + " indices";
+                        return false;
+                    }
+                    const auto base = indices_bytes.size();
+                    indices_bytes.resize(base + static_cast<std::size_t>(count) * 4U);
+                    for (std::uint64_t i = 0; i < count; ++i) {
+                        std::uint32_t index = 0;
+                        std::memcpy(&index, chunk.values.data() + i * flat_width, flat_width);  // little-endian
+                        std::memcpy(indices_bytes.data() + base + i * 4U, &index, 4U);
+                    }
+                } else if (!unpack_bitpacked_page_dispatch(chunk.values, count, 4U, indices_bytes, error)) {
                     return false;
                 }
                 rows_remaining -= count;
@@ -4411,6 +4443,10 @@ bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_pa
                                        const pb::ColumnMetadata& column_metadata,
                                        const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
                                        ColumnValues& out, std::string& error) {
+    if (v20::is_v20_column(column_metadata)) {
+        return v20::decode_column_rows(data_file_path, on_disk_field, column_metadata, nullptr, rows, value_bytes,
+                                       out, error);
+    }
     error.clear();
     out = ColumnValues{};
     for (std::size_t i = 1; i < rows.size(); ++i) {
@@ -4691,8 +4727,83 @@ bool decode_flat_column(const std::filesystem::path& data_file_path, const pb::F
 
 }  // namespace
 
+bool decompress_general_buffer(const std::string& scheme, const std::uint8_t* data, std::size_t size,
+                               std::vector<std::uint8_t>& out, std::string& error) {
+    out.clear();
+    if (scheme.empty() || scheme == "none") {
+        out.assign(data, data + size);
+        return true;
+    }
+    if (size == 0U) {
+        return true;  // Lance's decompressors leave an empty buffer empty
+    }
+    std::vector<std::uint8_t> framed;
+    if (scheme == "lz4") {
+        framed.assign(data, data + size);
+        return lz4_block::decompress_sized(framed, out, error);
+    }
+    if (scheme != "zstd") {
+        error = "unsupported buffer compression '" + scheme + "'";
+        return false;
+    }
+    // [u64 raw size][frame], or from older Lance a bare frame; Lance tells them apart the same way
+    // (a frame's magic, then its reserved bit).
+    static constexpr std::uint8_t kZstdMagic[4] = {0x28U, 0xB5U, 0x2FU, 0xFDU};
+    const bool bare = size >= 5U && std::memcmp(data, kZstdMagic, 4U) == 0 && (data[4] & 0x08U) == 0U;
+    if (!bare) {
+        framed.assign(data, data + size);
+        return zstd_unframe_buffer(framed, out, error);
+    }
+    const unsigned long long content = ZSTD_getFrameContentSize(data, size);
+    if (content != ZSTD_CONTENTSIZE_UNKNOWN && content != ZSTD_CONTENTSIZE_ERROR) {
+        framed.resize(size + 8U);
+        const std::uint64_t declared = content;
+        std::memcpy(framed.data(), &declared, 8U);
+        std::memcpy(framed.data() + 8U, data, size);
+        return zstd_unframe_buffer(framed, out, error);
+    }
+    // A frame that does not say how large it is: stream it, growing the output only as bytes arrive
+    // and never past the bound zstd itself can produce from this many compressed bytes.
+    const std::uint64_t bound = std::min<std::uint64_t>(default_read_limits().max_uncompressed_bytes,
+                                                        static_cast<std::uint64_t>(size) * kZstdMaxExpansion);
+    std::unique_ptr<ZSTD_DStream, std::size_t (*)(ZSTD_DStream*)> stream(ZSTD_createDStream(), &ZSTD_freeDStream);
+    if (stream == nullptr || ZSTD_isError(ZSTD_initDStream(stream.get())) != 0U) {
+        error = "zstd stream could not be created";
+        return false;
+    }
+    ZSTD_inBuffer in{data, size, 0};
+    std::size_t produced = 0;
+    std::size_t ret = 1;
+    while (ret != 0U) {
+        if (produced == out.size()) {
+            if (produced >= bound) {
+                error = "zstd buffer decompresses past what its size allows";
+                return false;
+            }
+            out.resize(static_cast<std::size_t>(std::min<std::uint64_t>(bound, std::max<std::size_t>(produced * 2U, 1U << 16U))));
+        }
+        ZSTD_outBuffer dst{out.data(), out.size(), produced};
+        const auto before_in = in.pos;
+        ret = ZSTD_decompressStream(stream.get(), &dst, &in);
+        if (ZSTD_isError(ret) != 0U) {
+            error = "zstd decompress failed";
+            return false;
+        }
+        if (dst.pos == produced && in.pos == before_in && ret != 0U) {
+            error = "zstd buffer is truncated";
+            return false;
+        }
+        produced = dst.pos;
+    }
+    out.resize(produced);
+    return true;
+}
+
 bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
                                   const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
+    if (v20::is_v20_column(column_metadata)) {
+        return v20::decode_column(data_file_path, on_disk_field, column_metadata, nullptr, out, error);
+    }
     if (column_is_nested(column_metadata)) {
         error.clear();
         out = ColumnValues{};
@@ -4768,6 +4879,10 @@ bool decode_lance_physical_column_range(const std::filesystem::path& data_file_p
                                         const pb::ColumnMetadata& column_metadata, std::uint64_t first,
                                         std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
                                         std::string& error) {
+    if (v20::is_v20_column(column_metadata)) {
+        return v20::decode_column_range(data_file_path, on_disk_field, column_metadata, nullptr, first, count,
+                                        value_bytes, out, error);
+    }
     error.clear();
     out = ColumnValues{};
     std::uint64_t rows = 0;

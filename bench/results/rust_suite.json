@@ -7,25 +7,17 @@
   "rust_failed": [],
   "nanolance": {
     "no round trip": 523,
-    "pass": 859,
-    "refused": 604
+    "pass": 1028,
+    "refused": 435
   },
   "round_trips": {
-    "refused": 2678,
-    "pass": 8309
+    "pass": 9347,
+    "refused": 1640
   },
   "top_refusals": [
     {
       "count": 1009,
       "reason": "file: schema: column 'c': fixed_size_list of '+s' is not supported; the element must be a fixed-width number, decimal or temporal type"
-    },
-    {
-      "count": 843,
-      "reason": "read: column 'c': page layout: unexpected encoding type url '/lance.encodings.ArrayEncoding'"
-    },
-    {
-      "count": 283,
-      "reason": "read: the file has N columns for N leaf fields; nanolance reads files whose every leaf field is one column"
     },
     {
       "count": 169,
@@ -36,20 +28,16 @@
       "reason": "file: schema: column 'c': fixed_size_list of 'b' is not supported; the element must be a fixed-width number, decimal or temporal type"
     },
     {
+      "count": 138,
+      "reason": "read: the file has N columns for N leaf fields; nanolance reads files whose every leaf field is one column"
+    },
+    {
       "count": 48,
       "reason": "read: blob control buffer size does not match row count (narrow/wideN/wideN)"
     },
     {
       "count": 48,
       "reason": "file: schema: struct field has no children: row"
-    },
-    {
-      "count": 42,
-      "reason": "read: column page is missing buffer offsets"
-    },
-    {
-      "count": 15,
-      "reason": "file: format VN_N (nanolance reads N.N and N.N)"
     },
     {
       "count": 9,
@@ -64,16 +52,16 @@
       "reason": "read: column 'item' page N: a chunk declares levels but carries no level buffer"
     },
     {
+      "count": 8,
+      "reason": "read: list array has no element child for "
+    },
+    {
       "count": 7,
       "reason": "read: rle run count mismatch between values and lengths"
     },
     {
       "count": 6,
       "reason": "file: schema: column 'c': fixed_size_list of '+w:N' is not supported; the element must be a fixed-width number, decimal or temporal type"
-    },
-    {
-      "count": 6,
-      "reason": "read: list array has no element child for "
     },
     {
       "count": 6,
@@ -86,6 +74,10 @@
     {
       "count": 6,
       "reason": "read: column 'c': unsupported page layout: FullZip{values=FixedSizeList{NxUnknown(field N),validity},value_bits=N,layers=[valid-item],rows=N} (unsupported FullZ"
+    },
+    {
+      "count": 5,
+      "reason": "file: format VN_N (nanolance reads N.N, N.N and N.N)"
     },
     {
       "count": 3,
@@ -114,6 +106,14 @@
     {
       "count": 1,
       "reason": "read: column 'keys': unsupported page layout: Unsupported layout (PageLayout field N)"
+    },
+    {
+      "count": 1,
+      "reason": "read: column 'value': unsupported page layout: Unsupported layout (PageLayout field N)"
+    },
+    {
+      "count": 1,
+      "reason": "read: column 'sparse': unsupported page layout: Unsupported layout (PageLayout field N)"
     }
   ],
   "top_type_differences": [],

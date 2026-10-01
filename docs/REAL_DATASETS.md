@@ -38,6 +38,10 @@ python tools/real_lance_check.py check ~/lance-hub --json hub.json
 # Or the whole suggested set, fetched and checked in one go: about 4 GB at the default --max-gb 1.
 # A table whose smallest data file is larger is skipped, and the output says how large it is.
 python tools/real_lance_check.py run --dest ~/lance-hub
+
+# The Hub has no format 2.2 tables. pylance writes what you fetched again, in 2.2 (or 2.0, 2.1):
+python tools/real_lance_check.py rewrite ~/lance-hub --dest ~/lance-hub-2.2 --version 2.2
+python tools/real_lance_check.py check ~/lance-hub-2.2
 python tools/real_lance_check.py run --dest ~/lance-hub --max-gb 20   # adds laion-1m and openvid files: tens of GB
 ```
 
@@ -77,8 +81,8 @@ nanolance / pylance, in ms:
 | lance-format/ms-marco-v2.1-lance validation | passages as `list<string>`, 384-d embeddings | 45.5 / 45.1 | **2,835 / 21.2** |
 | davanstrien/emb-test-wiki-lance | 241,787 passages, 384-d embeddings | 7.2 / 18.8 | 1.5 / 8.0 |
 | prrao87/tea-hypervectors | images, `large_list<large_string>` | 25.6 / 154.5 | 107 / 163 |
-| lancedb/magical_kingdom, Jacob235/fred-vector-index, Litian2002/robotics-papers-vecdb, lhoestq/wiki-dpr-lance-example, carpelan/sbl-lance | LanceDB tables with embeddings | refused: format 2.0 | |
-| lance-format/fineweb-edu (its smallest data file) | text, 384-d embeddings | refused: format 2.0 | |
+| lancedb/magical_kingdom, Jacob235/fred-vector-index, Litian2002/robotics-papers-vecdb, lhoestq/wiki-dpr-lance-example, carpelan/sbl-lance | LanceDB tables with embeddings | refused: format 2.0 (read since: see below) | |
+| lance-format/fineweb-edu (its smallest data file) | text, 384-d embeddings | refused: format 2.0 (read since) | |
 
 What these runs found:
 
@@ -89,10 +93,59 @@ What these runs found:
 - **Fixed:** a LanceDB table would not open ("failed to decode manifest protobuf"). A data file
   can list field id -2, for a column the schema dropped, and protobuf spells a negative `int32` as a
   10-byte varint. The manifest decoder refused it.
-- **Open:** Lance file format 2.0 (footer `0.3`). LanceDB wrote it by default for a long time, so
-  most LanceDB tables on the Hub are 2.0. nanolance reads 2.1 and 2.2 (see `ROADMAP.md`).
+- **Fixed since:** Lance file format 2.0 (footer `0.3`). See the next section.
 - **Open:** `take` on `list<string>` columns in FullZip pages decodes the whole page. MS MARCO's
   `passage_text` reads 193 MB for 256 rows. Scans are at parity. See `ROADMAP.md`.
+
+### Formats 2.0 and 2.2 (2026-10-01, pylance 12.0.0)
+
+A survey of the Hub's Lance tables -- one data file's footer each, 621 tables in 107 datasets --
+found these formats:
+
+| format | tables | datasets |
+|---|---|---|
+| 2.1 | 330 | 46 |
+| 2.0 (footer 0.3) | 281 | 52 |
+| 2.2 | **0** | 0 |
+| unknown (no data file reachable) | 10 | 10 |
+
+2.0 is what LanceDB wrote by default for a long time, so nearly every LanceDB table is 2.0. 2.2 is
+pylance 12's default but no one has published a table in it yet, so the 2.2 runs below use Hub data
+that pylance wrote again (`rewrite`).
+
+nanolance now reads 2.0. All of these pass, none mismatch:
+
+| set | tables | outcome |
+|---|---|---|
+| the 24 tables above (2.1 and 2.0) | 20 that fit on disk | 20 pass, the 5 LanceDB 2.0 tables among them |
+| 2.0 tables from the survey: MMEB-train and BToks (video, image-text), LanceDB GraphRAG indexes, robotics data, Swedish library catalogs | 57 | 57 pass |
+| all 77 rewritten by pylance as **2.2** | 77 | 77 pass |
+| all 77 rewritten by pylance as 2.0 | 77 | 77 pass |
+
+nanolance / pylance in ms, files in the page cache:
+
+| 2.0 table | first rows | take 256 random rows |
+|---|---|---|
+| Litian2002/robotics-papers-vecdb | 47.0 / 46.3 | 9.8 / 37.9 |
+| carpelan/sbl-lance | 53.6 / 96.4 | 11.8 / 21.5 |
+| lhoestq/wiki-dpr-lance-example | 14.2 / 9.6 | 1.6 / 7.8 |
+| Jacob235/fred-vector-index | 11.0 / 9.6 | 23.4 / 23.1 |
+| shrav2324/kdrama-graphrag-index entity descriptions | 1.8 / 3.3 | 2.0 / 4.8 |
+| carpelan/faltjagare-lance | 2.4 / 4.0 | 12.5 / 8.0 |
+
+What these runs found:
+
+- **Fixed:** a 2.2 dictionary with `Flat` indices. 2.2 dictionary-codes a small page of 64-bit
+  values (tea-hypervectors' `elevation_meters`: 166 rows, 37 values) with plain 32-bit indices
+  instead of bit-packed ones. nanolance read the indices as the column's values: refused here
+  ("miniblock page chunks cover 83 of 166 rows") because the widths differ, but it would have
+  returned the indices themselves had they matched. They are now looked up
+  (`test_rust_mixed_pages.py::test_dictionary_with_flat_indices`).
+- **Fixed:** a manifest whose trailer says version 0.1 (older LanceDB) was refused. Lance does not
+  check that number, and neither does nanolance now.
+- **Fixed:** 2.0 blob columns (a packed struct of positions and sizes; makeshifted's robotics
+  data) and `list<null>` columns (fred-vector-index). Structs a writer packed on purpose
+  (field metadata `packed`) read too.
 
 ## 2. COCO 2017 and Speech Commands, written and read by both engines
 

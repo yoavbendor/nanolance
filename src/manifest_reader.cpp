@@ -115,11 +115,9 @@ bool read_manifest_file(const std::filesystem::path& manifest_path, std::vector<
         error = "manifest trailer magic is not LANC";
         return false;
     }
-    const std::uint16_t minor = static_cast<std::uint16_t>(trailer[10] | (static_cast<unsigned>(trailer[11]) << 8U));
-    if (minor != 2U) {
-        error = "unsupported manifest minor version (expected 2)";
-        return false;
-    }
+    // The trailer's version (bytes 8..12) is the writer's, not a layout: Lance reads every manifest the
+    // same way -- [u32 length][protobuf] at the trailer's position -- whatever it says. LanceDB
+    // tables written by older Lance say 0.1 (newer ones 0.2).
     const std::uint64_t manifest_position = read_le64(trailer);
     if (manifest_position > file_size - 16U) {
         error = "invalid manifest_position in trailer";

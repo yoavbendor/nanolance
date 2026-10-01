@@ -19,6 +19,11 @@ struct LanceDataFileFooterLayout {
     std::uint64_t column_offsets_start = 0;
     std::uint64_t global_offsets_start = 0;
     std::uint32_t num_columns = 0;
+    /// The format: 2.1 or 2.2, or 2.0 (whose footer says 0.3).
+    std::uint16_t major_version = 0;
+    std::uint16_t minor_version = 0;
+    /// Format 2.0: every field is a column (a struct's and a list's too), pages carry ArrayEncodings.
+    bool is_v2_0() const { return major_version == 0U && minor_version == 3U; }
 };
 
 /// Read tail footer, validate magic/version, decode protobuf `FileDescriptor` at `global_buffer_offset`.

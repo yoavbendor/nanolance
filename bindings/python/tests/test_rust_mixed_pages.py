@@ -12,6 +12,7 @@ nanolance's fixed-width reader refused because it decoded every page with the fi
 
 from __future__ import annotations
 
+import decimal
 import glob
 import re
 
@@ -76,3 +77,29 @@ def test_pages_without_levels_in_a_nullable_column(lance_mod, tmp_path, nulls_wh
     assert any(layers) and not all(layers), "expected pages both with and without definition levels"
     _same(path, lance_mod, table)
     assert pa.table(nanolance.read_table(path)).column("x").null_count == int(mask.sum())
+
+
+@pytest.mark.parametrize("version", ["2.1", "2.2"])
+@pytest.mark.parametrize("dtype", [pa.int64(), pa.float64(), pa.timestamp("ns"), pa.decimal128(12, 2)])
+def test_dictionary_with_flat_indices(lance_mod, tmp_path, version, dtype):
+    """Format 2.2 dictionary-codes a small page of 64- or 128-bit values with `Flat(32)` indices
+    rather than bit-packed ones. Read as the column's values, the indices were half the width
+    ("miniblock page chunks cover 83 of 166 rows", from a Hub table rewritten as 2.2)."""
+    import nanolance.lance as nl
+
+    rng = np.random.default_rng(4)
+    n = 166
+    codes = rng.integers(0, 37, n) * 50 + 150
+    if dtype == pa.int64():
+        values = pa.array(codes, mask=rng.random(n) < 0.15)
+    elif pa.types.is_decimal(dtype):
+        values = pa.array([decimal.Decimal(int(c)) / 100 for c in codes], dtype)
+    else:
+        values = pa.array(codes).cast(dtype)
+    path = str(tmp_path / "t.lance")
+    lance_mod.write_dataset(pa.table({"v": values}), path, data_storage_version=version)
+    ours, theirs = nl.dataset(path), lance_mod.dataset(path)
+    assert ours.to_table().equals(theirs.to_table())
+    rows = [0, 1, 50, 83, 84, 165]
+    assert ours.take(rows).equals(theirs.take(rows))
+    assert ours.to_table(offset=40, limit=90).equals(theirs.to_table(offset=40, limit=90))

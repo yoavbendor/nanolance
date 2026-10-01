@@ -5,7 +5,7 @@
 // nanolance_hook.rs and tools/rust_suite.py). Built only for that run, as a shared library.
 //
 // nanolance_rust_write_file wraps the Rust encoder's output -- its data bytes, positioned as the start
-// of a file, and its page tables -- into a Lance 2.2 file: the schema (a file descriptor), each
+// of a file, and its page tables -- into a Lance 2.2 file (2.0 for 2.0 pages): the schema (a file descriptor), each
 // column's metadata, and the footer, laid out as Lance's file writer lays them out.
 // nanolance_rust_read then reads that file as a nanolance user would.
 
@@ -115,9 +115,10 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
             page.encoding = in.bytes();
             column.pages.push_back(std::move(page));
         }
-        if (in.get<std::uint32_t>() != 0U) {
-            set_message(msg, msg_cap, "column-level buffers (not written by 2.1+ files)");
-            return 1;
+        const auto column_buffers = in.get<std::uint32_t>();
+        for (std::uint32_t b = 0; in.ok && b < column_buffers; ++b) {
+            column.buffer_offsets.push_back(in.get<std::uint64_t>());
+            column.buffer_sizes.push_back(in.get<std::uint64_t>());
         }
         column.encoding = in.bytes();
         if (!in.ok) {
@@ -127,6 +128,18 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
     if (!in.ok) {
         set_message(msg, msg_cap, "malformed column framing");
         return 2;
+    }
+
+    // Format 2.0 pages (lance-encoding's `Array` test encoding) make a 2.0 file: footer 0.3, and a
+    // column for every field, structs and lists included -- as the encoder laid them out.
+    bool v2_0 = false;
+    static const std::string kLegacy = "/lance.encodings.ArrayEncoding";
+    for (const auto& column : metadata) {
+        for (const auto& page : column.pages) {
+            const auto& e = page.encoding;
+            v2_0 = v2_0 || (e.size() >= 2U + kLegacy.size() &&
+                            std::memcmp(e.data() + 2, kLegacy.data(), kLegacy.size()) == 0);
+        }
     }
 
     nano_lance::pb::FileDescriptor descriptor;
@@ -175,8 +188,8 @@ __attribute__((visibility("default"))) int nanolance_rust_write_file(const char*
     write_le(out, global_offsets, 8);
     write_le(out, 1, 4);
     write_le(out, metadata.size(), 4);
-    write_le(out, 2, 2);  // major
-    write_le(out, 2, 2);  // minor
+    write_le(out, v2_0 ? 0 : 2, 2);  // major (2.0's footer says 0.3)
+    write_le(out, v2_0 ? 3 : 2, 2);  // minor
     out.write("LANC", 4);
     out.close();
     if (!out) {

@@ -60,16 +60,17 @@ on any mismatch that `tests/rust_suite/known_mismatch.txt` does not name. That f
 | | |
 |---|---|
 | tests run (lance-encoding 1,809, lance-file 177) | 1,986; each also passes in Rust |
-| tests with round trips that nanolance reads back, all equal | **859** (`expected_pass.txt`) |
-| tests where nanolance refuses some round trip | 604 |
+| tests with round trips that nanolance reads back, all equal | **1,028** (`expected_pass.txt`) |
+| tests where nanolance refuses some round trip | 435 |
 | tests with no round trip (unit tests of one component) | 523 |
-| round trips read back equal | **8,309** |
-| round trips refused | 2,678, of which 1,128 are format 2.0 |
+| round trips read back equal | **9,347** |
+| round trips refused | 1,640, of which 90 are format 2.0 (types refused in every format) |
 | round trips with different rows | **0** |
 
 By layout, nanolance reads 2,739 of lance-encoding's 2,926 round trips in the u16 mini-block
 layout, 2,789 of 3,456 in the u32 layout and 2,763 of 3,451 in the sparse layout. Of the files
-lance-file writes, it reads 13 of 14 in format 2.1 and 5 of 7 in 2.2.
+lance-file writes, it reads 10 of 10 in format 2.0, 13 of 14 in 2.1 and 5 of 7 in 2.2. Of the
+1,118 round trips in lance-encoding's `Array` test encoding, which is format 2.0, it reads 1,028.
 
 The runs so far found three bugs in nanolance, all fixed and pinned by tests that do not need Rust:
 
@@ -89,8 +90,8 @@ What nanolance refuses, by round trips (each refused round trip is counted under
 
 - **Fixed-size lists of structs or of booleans** (1,160). nanolance's schema mapping takes
   fixed-size lists of numbers, decimals and temporal types.
-- **Format 2.0** (853): lance-encoding's `Array` test encoding, and 10 lance-file files. Format
-  2.3 is also refused (5 files).
+- **Format 2.3** (5 files). Format 2.0 is read since 2026-10-01: its 90 refusals are types
+  refused in every format (fixed-size lists of booleans, Arrow dictionaries, empty structs).
 - **Several fields in one column** (138 in the structural formats): packed structs
   (`lance-encoding:packed`) and Lance's blob struct.
 - **Arrow dictionary types** (178). nanolance's schema mapping refuses the type rather than return

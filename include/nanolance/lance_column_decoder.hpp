@@ -50,4 +50,10 @@ bool decode_lance_physical_column_range(const std::filesystem::path& data_file_p
                                         std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
                                         std::string& error);
 
+/// A buffer compressed by Lance's general buffer compressor (`Compression.scheme`: "zstd", "lz4" or
+/// "none"/empty), decompressed into `out`. Bounded: never more than zstd/lz4 can produce from the
+/// bytes given, nor the decoded-size limit.
+bool decompress_general_buffer(const std::string& scheme, const std::uint8_t* data, std::size_t size,
+                               std::vector<std::uint8_t>& out, std::string& error);
+
 }  // namespace nano_lance

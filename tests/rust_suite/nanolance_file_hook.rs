@@ -28,9 +28,9 @@ pub(crate) fn check(path: &object_store::path::Path, data: &[RecordBatch], versi
     let Some(first) = data.first() else {
         return;  // nothing written, nothing to compare
     };
-    if !matches!(version, ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2) {
-        // nanolance reads formats 2.1 and 2.2 (pylance 12 writes 2.2 by default).
-        outcome.note("refused", format!("format {version:?} (nanolance reads 2.1 and 2.2)"), "file");
+    if !matches!(version, ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2) {
+        // nanolance reads formats 2.0, 2.1 and 2.2 (pylance 12 writes 2.2 by default).
+        outcome.note("refused", format!("format {version:?} (nanolance reads 2.0, 2.1 and 2.2)"), "file");
         outcome.log(&log_path, &kind, &data_type, rows as u64);
         return;
     }

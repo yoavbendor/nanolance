@@ -46,10 +46,12 @@ compared, results are checked against pylance on the same files, in both directi
 | Files | `lance.file`: `LanceFileReader` (`read_all`, `read_range`, `take_rows`, `num_rows`, `metadata`, `file_statistics`, `read_global_buffer`), `LanceFileWriter`, `LanceFileSession` (local), `stable_version` |
 
 Datasets and files are written in format 2.2, which is pylance 12's default. A request to write
-another version (`data_storage_version="2.0"`, `LanceFileWriter(version="2.1")`) raises. Formats 2.1
-(the default of earlier pylance releases) and 2.2 are both read:
+another version (`data_storage_version="2.0"`, `LanceFileWriter(version="2.1")`) raises. Formats 2.0,
+2.1 (the default of earlier pylance releases) and 2.2 are all read:
 `test_pylance_written_shapes_read_back` has pylance write every shape of the encoding matrix and the
-list tests in each, and nanolance must read back what pylance does. Format 2.0 is not read.
+list tests in 2.1 and 2.2, and nanolance must read back what pylance does. `test_format_v2_0.py`
+does the same for 2.0 -- nested structs and lists, dictionaries, FSST/zstd/lz4 strings, blob
+columns, packed structs, deletions, ranges and takes.
 
 ## What is not implemented
 

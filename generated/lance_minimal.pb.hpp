@@ -113,8 +113,13 @@ struct ColumnPage {
 };
 
 struct ColumnMetadata {
+    /// The column's own encoding (an Any: /lance.encodings.ColumnEncoding in format 2.0, where it
+    /// marks blob columns).
     std::vector<std::uint8_t> encoding;
     std::vector<ColumnPage> pages;
+    /// Column-level buffers (format 2.0 can keep a dictionary there); none in 2.1 files.
+    std::vector<std::uint64_t> buffer_offsets;
+    std::vector<std::uint64_t> buffer_sizes;
 };
 
 std::vector<std::uint8_t> encode_manifest(const Manifest& manifest);

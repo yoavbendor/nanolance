@@ -47,6 +47,8 @@ speedup). Full details, the threat model, and a reviewer checklist: **[docs/SAFE
 - **What it is:** a write-centric C++ library that emits **Lance v2.2** datasets and reads back what it
   wrote — no Rust `lance` core. Everything it writes is readable by stock `lance`
   (verified against `pylance` 12.0.0) **unless** a feature is marked *nanolance-only* below.
+  It reads Lance file formats 2.0, 2.1 and 2.2 — 2.0 being what most LanceDB tables on the Hugging
+  Face Hub are in ([docs/REAL_DATASETS.md](docs/REAL_DATASETS.md)).
 - **Headline benefit:** rows keep big payloads **external** (`uri` + `position` + `size`, never copied),
   so a packet table costs a few bytes/row regardless of payload size; bytes are fetched on demand (local
   file or `s3://`).

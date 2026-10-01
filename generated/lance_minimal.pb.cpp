@@ -987,6 +987,12 @@ std::vector<std::uint8_t> encode_column_metadata(const ColumnMetadata& metadata)
     for (const auto& page : metadata.pages) {
         write_message(out, 2, encode_column_page(page));
     }
+    for (const auto offset : metadata.buffer_offsets) {
+        write_uint64(out, 3, offset);
+    }
+    for (const auto size : metadata.buffer_sizes) {
+        write_uint64(out, 4, size);
+    }
     return out;
 }
 
@@ -994,6 +1000,7 @@ bool decode_column_metadata(const std::vector<std::uint8_t>& bytes, ColumnMetada
     std::size_t pos = 0;
     while (pos < bytes.size()) {
         std::uint64_t key = 0;
+        std::uint64_t value = 0;
         if (!read_varint(bytes, pos, key)) {
             return false;
         }
@@ -1006,6 +1013,28 @@ bool decode_column_metadata(const std::vector<std::uint8_t>& bytes, ColumnMetada
                 return false;
             }
             metadata.pages.push_back(std::move(page));
+        } else if (field_number == 1 && wire_type == kWireBytes) {
+            std::vector<std::uint8_t> wrapped;
+            if (!read_bytes(bytes, pos, wrapped) || !decode_direct_encoding(wrapped, metadata.encoding)) {
+                return false;
+            }
+        } else if ((field_number == 3 || field_number == 4) && wire_type == kWireVarint) {
+            if (!read_varint(bytes, pos, value)) {
+                return false;
+            }
+            (field_number == 3 ? metadata.buffer_offsets : metadata.buffer_sizes).push_back(value);
+        } else if ((field_number == 3 || field_number == 4) && wire_type == kWireBytes) {
+            std::vector<std::uint8_t> packed;
+            if (!read_bytes(bytes, pos, packed)) {
+                return false;
+            }
+            std::size_t packed_pos = 0;
+            while (packed_pos < packed.size()) {
+                if (!read_varint(packed, packed_pos, value)) {
+                    return false;
+                }
+                (field_number == 3 ? metadata.buffer_offsets : metadata.buffer_sizes).push_back(value);
+            }
         } else if (!skip_field(bytes, pos, wire_type)) {
             return false;
         }
