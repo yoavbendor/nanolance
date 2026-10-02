@@ -1,10 +1,10 @@
 # pcapng -> Lance example, built on nanom (the parser-combinator sibling of examples/pcapng2lance).
 #
 # This directory is OPT-IN and OFF by default (see NANOLANCE_BUILD_PCAPNG2LANCE_NANOM in the top-level
-# CMakeLists). nanom is referenced only here — a plain nanolance build, and the default `pcapng2lance`
-# example build, never touch it. The point of the example is to benchmark nanom's scan+parse+tabulate
-# path head-to-head against nanotins on the exact same L1 Lance output; nothing in nanolance depends on
-# nanom, so keeping it non-mandatory keeps the core build free of the extra submodule.
+# CMakeLists). The point of the example is to benchmark nanom's scan+parse+tabulate path head-to-head
+# against nanotins on the exact same L1 Lance output. The core library uses nanom only for its protobuf
+# metadata codec (headers only, pinned and fetched by the top-level CMakeLists); this example brings its
+# own nanom checkout as a submodule, so the core build never needs the submodule.
 
 # nanom is header-only and vendored as a git submodule under extern/nanom.
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/nanom/CMakeLists.txt")

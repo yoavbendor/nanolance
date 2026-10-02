@@ -218,10 +218,28 @@ set(NANOLANCE_PYTHON "${NANO_LANCE_WRITER_PYTHON}" CACHE FILEPATH "Alias of NANO
 
 set(NANO_LANCE_BLOB_V2_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/golden/blob_v2")
 
+# --- nanom (header-only): Lance's protobuf metadata model and codec ---
+# The manifest / file-descriptor / column-metadata wire format is nanom_formats::lance
+# (nanom/formats/lance_protobuf.hpp), read and written by nanom's protobuf codec. Pinned; point
+# FETCHCONTENT_SOURCE_DIR_NANOM at a local checkout to develop both together. Headers only: nanom's
+# own tests and benches are not pulled into this build, and only nanolance_proto's one .cpp sees
+# them (C++23), so nanolance's public headers stay C++20.
+FetchContent_Declare(nanom
+    GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
+    GIT_TAG 353f154e52b721602c2b90da7930133291cbe3a9
+    GIT_SHALLOW FALSE)
+FetchContent_GetProperties(nanom)
+if(NOT nanom_POPULATED)
+    FetchContent_Populate(nanom)
+endif()
+add_library(nanolance_nanom INTERFACE)
+target_include_directories(nanolance_nanom SYSTEM INTERFACE "${nanom_SOURCE_DIR}/include")
+
 add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/roaring_bitmap.cpp)
-target_compile_features(nanolance_proto PUBLIC cxx_std_20)
+target_compile_features(nanolance_proto PUBLIC cxx_std_20 PRIVATE cxx_std_23)
 target_include_directories(nanolance_proto PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/generated")
 target_include_directories(nanolance_proto PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(nanolance_proto PRIVATE nanolance_nanom)
 
 add_library(nanolance_reader STATIC
     src/manifest_reader.cpp
@@ -952,6 +970,14 @@ if(NANOLANCE_BUILD_TOOLS)
                 "${NANO_LANCE_WRITER_PYTHON}"
     )
     set_tests_properties(app_bool_pylance_interop_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
+
+    add_test(
+        NAME app_deletion_append_pylance_smoke
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_deletion_append_pylance.sh"
+                "$<TARGET_FILE:arrowipc2lance>"
+                "${NANO_LANCE_WRITER_PYTHON}"
+    )
+    set_tests_properties(app_deletion_append_pylance_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
 
     # Negative: nlance-stitch must reject datasets with different schemas. Builds a pcapng2lance L1 table
     # and an arrowipc2lance (id/score) table and asserts the stitch fails. Lives here because it needs
