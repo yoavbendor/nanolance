@@ -2465,6 +2465,27 @@ The file moved into `nanolance_proto`, the one target compiled as C++23.
 decodes got faster. Reading a 4,000-fragment dataset of 12,000 small pages, where per-page cost
 matters most, took 120-127 ms against 122-129 ms (best of 15, four alternating runs).
 
+### Format 2.0 encodings through nanom
+
+`src/lance_v20_decoder.cpp` reads a 2.0 page's `/lance.encodings.ArrayEncoding` tree, and a
+column's `ColumnEncoding` (the blob marker), with nanom's model. The `Enc` tree the decoder
+dispatches on is unchanged.
+
+To make that possible, nanolance's own sources now compile as C++23. That adds no requirement:
+`nanolance_proto` already needed a C++23 compiler, and the public headers and API stay C++20.
+
+**Compared side by side with the hand-written parser:**
+- Every 2.0 page encoding written by pylance (plain, nullable, list, struct, dictionary, FSST,
+  packed struct, blob) decodes identically.
+- 300,000 mutated encodings under ASan / UBSan: the new parser is never more lenient, and it
+  refuses 213 more malformed inputs.
+- 2 mutants decode differently, both a message field occurring twice. The new parser merges the
+  occurrences as protobuf specifies; the old one kept the last.
+
+**Speed.** The parse alone runs at 0.78x (330 ns against 260 ns per page). End to end, the worst
+case (a 4,000-fragment 2.0 dataset of 12,000 small pages) reads in 116.6-119.0 ms against
+114.8-116.3 ms (best of 15, three alternating runs): about 1.5% slower, on the legacy format only.
+
 ### Deliberate deviations (not defects)
 
 - **The nullable opt-out was not needed** — simpler than planned.

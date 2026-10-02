@@ -14,6 +14,8 @@
 #include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
+#include <nanom/formats/lance_encodings.hpp>
+
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -28,98 +30,13 @@ namespace {
 
 // ── The ArrayEncoding tree ───────────────────────────────────────────────────────────────────────
 
-constexpr std::uint8_t kWireVarint = 0;
-constexpr std::uint8_t kWireBytes = 2;
+// The wire format of these trees -- lance.encodings' ArrayEncoding and its variants -- is declared in
+// nanom/formats/lance_encodings.hpp and read by nanom's protobuf codec, which checks every length
+// and varint. Children are pb_lazy there: each is decoded (and checked) here, one level deeper.
+namespace nm = ::nanom;
+namespace wire = ::nanom_formats::lance;
+
 constexpr int kMaxDepth = 16;  // a hostile descriptor cannot recurse without bound
-
-struct Cursor {
-    const std::uint8_t* data = nullptr;
-    std::size_t size = 0;
-    std::size_t pos = 0;
-    bool done() const { return pos >= size; }
-};
-
-bool read_varint(Cursor& c, std::uint64_t& out) {
-    std::uint64_t value = 0;
-    unsigned shift = 0;
-    while (c.pos < c.size) {
-        const std::uint8_t byte = c.data[c.pos++];
-        if (shift >= 64U) {
-            return false;
-        }
-        value |= static_cast<std::uint64_t>(byte & 0x7FU) << shift;
-        if ((byte & 0x80U) == 0U) {
-            out = value;
-            return true;
-        }
-        shift += 7U;
-    }
-    return false;
-}
-
-bool read_sub(Cursor& c, Cursor& out) {
-    std::uint64_t len = 0;
-    if (!read_varint(c, len) || len > c.size - c.pos) {
-        return false;
-    }
-    out = Cursor{c.data + c.pos, static_cast<std::size_t>(len), 0};
-    c.pos += static_cast<std::size_t>(len);
-    return true;
-}
-
-bool skip_field(Cursor& c, std::uint8_t wire) {
-    std::uint64_t scratch = 0;
-    Cursor sub;
-    switch (wire) {
-        case kWireVarint:
-            return read_varint(c, scratch);
-        case kWireBytes:
-            return read_sub(c, sub);
-        case 1:
-            if (c.size - c.pos < 8U) return false;
-            c.pos += 8U;
-            return true;
-        case 5:
-            if (c.size - c.pos < 4U) return false;
-            c.pos += 4U;
-            return true;
-        default:
-            return false;
-    }
-}
-
-/// One field of a message: (number, wire type) and, for a length-delimited one, its payload.
-struct Tag {
-    std::uint32_t field = 0;
-    std::uint8_t wire = 0;
-    std::uint64_t varint = 0;
-    Cursor sub;
-};
-
-/// Walk a message's fields; `fn(tag)` returns false to fail the parse.
-template <class Fn>
-bool for_each_field(Cursor c, Fn&& fn) {
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            return false;
-        }
-        Tag t;
-        t.field = static_cast<std::uint32_t>(key >> 3U);
-        t.wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (t.wire == kWireVarint) {
-            if (!read_varint(c, t.varint)) return false;
-        } else if (t.wire == kWireBytes) {
-            if (!read_sub(c, t.sub)) return false;
-        } else if (!skip_field(c, t.wire)) {
-            return false;
-        }
-        if (!fn(t)) {
-            return false;
-        }
-    }
-    return true;
-}
 
 struct BufferRef {
     std::uint32_t index = 0;
@@ -178,20 +95,42 @@ struct Enc {
     std::vector<std::uint32_t> packed_widths;
 };
 
-bool parse_enc(Cursor c, Enc& out, int depth, std::string& error);
+bool parse_enc(const wire::ArrayEncoding& w, Enc& out, int depth, std::string& error);
 
-bool parse_child(const Cursor& c, std::unique_ptr<Enc>& out, int depth, std::string& error) {
+bool parse_child(const nm::pb_lazy<wire::ArrayEncoding>& lazy, std::unique_ptr<Enc>& out, int depth,
+                 std::string& error) {
+    if (!lazy) {
+        return true;
+    }
+    wire::ArrayEncoding w;
+    if (!lazy.decode_into(w)) {
+        error = "malformed format 2.0 encoding";
+        return false;
+    }
     out = std::make_unique<Enc>();
-    return parse_enc(c, *out, depth + 1, error);
+    return parse_enc(w, *out, depth + 1, error);
 }
 
-bool parse_buffer(const Cursor& c, BufferRef& out) {
-    out.present = true;
-    return for_each_field(c, [&](const Tag& t) {
-        if (t.wire == kWireVarint && t.field == 1U) out.index = static_cast<std::uint32_t>(t.varint);
-        if (t.wire == kWireVarint && t.field == 2U) out.type = static_cast<std::uint32_t>(t.varint);
-        return true;
+BufferRef buffer_of(const std::optional<wire::Buffer>& b) {
+    BufferRef out;
+    if (b) {
+        out.present = true;
+        out.index = static_cast<std::uint32_t>(*b->buffer_index);
+        out.type = static_cast<std::uint32_t>(*b->buffer_type);
+    }
+    return out;
+}
+
+/// The variant a oneof message sets that this build does not model: the field number of the first
+/// length-delimited record kept in its pb_unknown.
+std::uint32_t unknown_variant(const nm::unknown_fields& u) {
+    std::uint32_t field = 0;
+    nm::for_each_unknown(u, [&](std::uint64_t f, std::uint8_t wire_type) {
+        if (field == 0U && wire_type == 2U) {
+            field = static_cast<std::uint32_t>(f);
+        }
     });
+    return field;
 }
 
 const char* variant_name(std::uint32_t field) {
@@ -206,171 +145,128 @@ const char* variant_name(std::uint32_t field) {
     return field < sizeof(kNames) / sizeof(kNames[0]) ? kNames[field] : "unknown";
 }
 
-bool parse_enc(Cursor c, Enc& out, int depth, std::string& error) {
+bool parse_enc(const wire::ArrayEncoding& w, Enc& out, int depth, std::string& error) {
     if (depth > kMaxDepth) {
         error = "format 2.0 encoding nests too deeply";
         return false;
     }
-    Cursor variant;
-    std::uint32_t which = 0;
-    if (!for_each_field(c, [&](const Tag& t) {
-            if (t.wire == kWireBytes) {
-                which = t.field;
-                variant = t.sub;
-            }
-            return true;
-        })) {
-        error = "malformed format 2.0 encoding";
+    const auto members = wire::oneof_members(w);
+    if (members > 1U) {
+        error = "malformed format 2.0 encoding (more than one variant)";
         return false;
     }
-    out.variant = which;
     bool ok = true;
-    switch (which) {
-        case 1:  // Flat
-            out.kind = Kind::kFlat;
-            ok = for_each_field(variant, [&](const Tag& t) {
-                if (t.field == 1U && t.wire == kWireVarint) out.bits = t.varint;
-                if (t.field == 2U && t.wire == kWireBytes && !parse_buffer(t.sub, out.buffer)) return false;
-                if (t.field == 3U && t.wire == kWireBytes) {
-                    return for_each_field(t.sub, [&](const Tag& u) {
-                        if (u.field == 1U && u.wire == kWireBytes) {
-                            out.compression.assign(u.sub.data, u.sub.data + u.sub.size);
-                        }
-                        return true;
-                    });
-                }
-                return true;
-            });
-            break;
-        case 2:  // Nullable { oneof no_nulls = 1 / some_nulls = 2 / all_nulls = 3 }
-            out.kind = Kind::kNullable;
-            ok = for_each_field(variant, [&](const Tag& t) {
-                if (t.wire != kWireBytes) return true;
-                out.nulls = static_cast<int>(t.field);
-                if (t.field == 1U) {
-                    return for_each_field(t.sub, [&](const Tag& u) {
-                        return !(u.field == 1U && u.wire == kWireBytes) || parse_child(u.sub, out.a, depth, error);
-                    });
-                }
-                if (t.field == 2U) {
-                    return for_each_field(t.sub, [&](const Tag& u) {
-                        if (u.field == 1U && u.wire == kWireBytes) return parse_child(u.sub, out.a, depth, error);
-                        if (u.field == 2U && u.wire == kWireBytes) return parse_child(u.sub, out.b, depth, error);
-                        return true;
-                    });
-                }
-                return true;
-            });
-            break;
-        case 3:  // FixedSizeList { dimension = 1, items = 2, has_validity = 3 }
-            out.kind = Kind::kFixedSizeList;
-            ok = for_each_field(variant, [&](const Tag& t) {
-                if (t.field == 1U && t.wire == kWireVarint) out.dimension = static_cast<std::uint32_t>(t.varint);
-                if (t.field == 2U && t.wire == kWireBytes) return parse_child(t.sub, out.a, depth, error);
-                return true;
-            });
-            break;
-        case 4:  // List { offsets = 1, null_offset_adjustment = 2, num_items = 3 }
-            out.kind = Kind::kList;
-            ok = for_each_field(variant, [&](const Tag& t) {
-                if (t.field == 1U && t.wire == kWireBytes) return parse_child(t.sub, out.a, depth, error);
-                if (t.field == 2U && t.wire == kWireVarint) out.null_offset_adjustment = t.varint;
-                if (t.field == 3U && t.wire == kWireVarint) out.num_items = t.varint;
-                return true;
-            });
-            break;
-        case 5:
-            out.kind = Kind::kStruct;
-            break;
-        case 6:  // Binary { indices = 1, bytes = 2, null_adjustment = 3 }
-            out.kind = Kind::kBinary;
-            ok = for_each_field(variant, [&](const Tag& t) {
-                if (t.field == 1U && t.wire == kWireBytes) return parse_child(t.sub, out.a, depth, error);
-                if (t.field == 2U && t.wire == kWireBytes) return parse_child(t.sub, out.b, depth, error);
-                if (t.field == 3U && t.wire == kWireVarint) out.null_adjustment = t.varint;
-                return true;
-            });
-            break;
-        case 7:  // Dictionary { indices = 1, items = 2, num_dictionary_items = 3 }
-            out.kind = Kind::kDictionary;
-            ok = for_each_field(variant, [&](const Tag& t) {
-                if (t.field == 1U && t.wire == kWireBytes) return parse_child(t.sub, out.a, depth, error);
-                if (t.field == 2U && t.wire == kWireBytes) return parse_child(t.sub, out.b, depth, error);
-                if (t.field == 3U && t.wire == kWireVarint) {
-                    out.num_dictionary_items = static_cast<std::uint32_t>(t.varint);
-                }
-                return true;
-            });
-            break;
-        case 8:  // Fsst { binary = 1, symbol_table = 2 }
-            out.kind = Kind::kFsst;
-            ok = for_each_field(variant, [&](const Tag& t) {
-                if (t.field == 1U && t.wire == kWireBytes) return parse_child(t.sub, out.a, depth, error);
-                if (t.field == 2U && t.wire == kWireBytes) {
-                    out.symbol_table.assign(t.sub.data, t.sub.data + t.sub.size);
-                }
-                return true;
-            });
-            break;
-        case 9:  // PackedStruct { repeated inner = 1, buffer = 2 }
-            out.kind = Kind::kPackedStruct;
-            ok = for_each_field(variant, [&](const Tag& t) {
-                if (t.field == 1U && t.wire == kWireBytes) {
-                    Enc child;
-                    if (!parse_enc(t.sub, child, depth + 1, error)) return false;
-                    // Lance packs fixed-width children only -- a number or a fixed-size list of
-                    // them, never null, so a nullable wrapper adds nothing here.
-                    const Enc* flat = &child;
-                    while (flat->kind == Kind::kNullable && flat->nulls == 1 && flat->a) flat = flat->a.get();
-                    std::uint64_t items = 1;
-                    if (flat->kind == Kind::kFixedSizeList && flat->a) {
-                        items = flat->dimension;
-                        flat = flat->a.get();
-                        while (flat->kind == Kind::kNullable && flat->nulls == 1 && flat->a) flat = flat->a.get();
-                    }
-                    if (flat->kind != Kind::kFlat || flat->bits == 0U || flat->bits % 8U != 0U || items == 0U ||
-                        items > 65536U || flat->bits > 1024U) {
-                        error = "format 2.0 packed struct with a child that is not fixed-width";
-                        return false;
-                    }
-                    out.packed_widths.push_back(static_cast<std::uint32_t>(items * (flat->bits / 8U)));
-                }
-                if (t.field == 2U && t.wire == kWireBytes && !parse_buffer(t.sub, out.buffer)) return false;
-                return true;
-            });
-            break;
-        case 10:  // Bitpacked { compressed = 1, uncompressed = 2, buffer = 3, signed = 4 }
-        case 12:  // BitpackedForNonNeg { compressed = 1, uncompressed = 2, buffer = 3 }
-            out.kind = which == 10U ? Kind::kBitpacked : Kind::kBitpackedForNonNeg;
-            ok = for_each_field(variant, [&](const Tag& t) {
-                if (t.field == 1U && t.wire == kWireVarint) out.compressed_bits = t.varint;
-                if (t.field == 2U && t.wire == kWireVarint) out.uncompressed_bits = t.varint;
-                if (t.field == 3U && t.wire == kWireBytes && !parse_buffer(t.sub, out.buffer)) return false;
-                if (t.field == 4U && t.wire == kWireVarint) out.is_signed = t.varint != 0U;
-                return true;
-            });
-            break;
-        case 11:  // FixedSizeBinary { bytes = 1, byte_width = 2 }
-            out.kind = Kind::kFixedSizeBinary;
-            ok = for_each_field(variant, [&](const Tag& t) {
-                if (t.field == 1U && t.wire == kWireBytes) return parse_child(t.sub, out.a, depth, error);
-                if (t.field == 2U && t.wire == kWireVarint) out.byte_width = static_cast<std::uint32_t>(t.varint);
-                return true;
-            });
-            break;
-        case 13:
-            out.kind = Kind::kConstant;
-            break;
-        case 0:
-            out.kind = Kind::kNone;
-            break;
-        default:
-            out.kind = Kind::kOther;
-            break;
+    if (members == 0U) {
+        out.kind = Kind::kNone;
+    } else if (const auto& v = *w.flat) {
+        out.variant = 1U;
+        out.kind = Kind::kFlat;
+        out.bits = *v->bits_per_value;
+        out.buffer = buffer_of(*v->buffer);
+        if (const auto& c = *v->compression) {
+            out.compression = std::string(*c->scheme);
+        }
+    } else if (const auto& v = *w.nullable) {  // oneof { no_nulls = 1, some_nulls = 2, all_nulls = 3 }
+        out.variant = 2U;
+        out.kind = Kind::kNullable;
+        const auto nulls = wire::oneof_members(*v);
+        if (nulls > 1U) {
+            ok = false;
+        } else if (const auto& n = *v->no_nulls) {
+            out.nulls = 1;
+            ok = parse_child(*n->values, out.a, depth, error);
+        } else if (const auto& n = *v->some_nulls) {
+            out.nulls = 2;
+            ok = parse_child(*n->validity, out.a, depth, error) && parse_child(*n->values, out.b, depth, error);
+        } else if (*v->all_nulls) {
+            out.nulls = 3;
+        } else {
+            out.nulls = static_cast<int>(unknown_variant(*v->unknown));  // refused downstream, by number
+        }
+    } else if (const auto& v = *w.fixed_size_list) {
+        out.variant = 3U;
+        out.kind = Kind::kFixedSizeList;
+        out.dimension = static_cast<std::uint32_t>(*v->dimension);
+        ok = parse_child(*v->items, out.a, depth, error);
+    } else if (const auto& v = *w.list) {
+        out.variant = 4U;
+        out.kind = Kind::kList;
+        out.null_offset_adjustment = *v->null_offset_adjustment;
+        out.num_items = *v->num_items;
+        ok = parse_child(*v->offsets, out.a, depth, error);
+    } else if (*w.struct_) {
+        out.variant = 5U;
+        out.kind = Kind::kStruct;
+    } else if (const auto& v = *w.binary) {
+        out.variant = 6U;
+        out.kind = Kind::kBinary;
+        out.null_adjustment = *v->null_adjustment;
+        ok = parse_child(*v->indices, out.a, depth, error) && parse_child(*v->bytes, out.b, depth, error);
+    } else if (const auto& v = *w.dictionary) {
+        out.variant = 7U;
+        out.kind = Kind::kDictionary;
+        out.num_dictionary_items = static_cast<std::uint32_t>(*v->num_dictionary_items);
+        ok = parse_child(*v->indices, out.a, depth, error) && parse_child(*v->items, out.b, depth, error);
+    } else if (const auto& v = *w.fsst) {
+        out.variant = 8U;
+        out.kind = Kind::kFsst;
+        const auto* table = reinterpret_cast<const std::uint8_t*>(v->symbol_table->data());
+        out.symbol_table.assign(table, table + v->symbol_table->size());
+        ok = parse_child(*v->binary, out.a, depth, error);
+    } else if (const auto& v = *w.packed_struct) {
+        out.variant = 9U;
+        out.kind = Kind::kPackedStruct;
+        out.buffer = buffer_of(*v->buffer);
+        for (const auto& inner : *v->inner) {
+            Enc child;
+            if (!parse_enc(inner, child, depth + 1, error)) {
+                return false;
+            }
+            // Lance packs fixed-width children only -- a number or a fixed-size list of them, never
+            // null, so a nullable wrapper adds nothing here.
+            const Enc* flat = &child;
+            while (flat->kind == Kind::kNullable && flat->nulls == 1 && flat->a) flat = flat->a.get();
+            std::uint64_t items = 1;
+            if (flat->kind == Kind::kFixedSizeList && flat->a) {
+                items = flat->dimension;
+                flat = flat->a.get();
+                while (flat->kind == Kind::kNullable && flat->nulls == 1 && flat->a) flat = flat->a.get();
+            }
+            if (flat->kind != Kind::kFlat || flat->bits == 0U || flat->bits % 8U != 0U || items == 0U ||
+                items > 65536U || flat->bits > 1024U) {
+                error = "format 2.0 packed struct with a child that is not fixed-width";
+                return false;
+            }
+            out.packed_widths.push_back(static_cast<std::uint32_t>(items * (flat->bits / 8U)));
+        }
+    } else if (const auto& v = *w.bitpacked) {
+        out.variant = 10U;
+        out.kind = Kind::kBitpacked;
+        out.compressed_bits = *v->compressed_bits_per_value;
+        out.uncompressed_bits = *v->uncompressed_bits_per_value;
+        out.buffer = buffer_of(*v->buffer);
+        out.is_signed = *v->signed_ != 0U;
+    } else if (const auto& v = *w.fixed_size_binary) {
+        out.variant = 11U;
+        out.kind = Kind::kFixedSizeBinary;
+        out.byte_width = static_cast<std::uint32_t>(*v->byte_width);
+        ok = parse_child(*v->bytes, out.a, depth, error);
+    } else if (const auto& v = *w.bitpacked_for_non_neg) {
+        out.variant = 12U;
+        out.kind = Kind::kBitpackedForNonNeg;
+        out.compressed_bits = *v->compressed_bits_per_value;
+        out.uncompressed_bits = *v->uncompressed_bits_per_value;
+        out.buffer = buffer_of(*v->buffer);
+    } else if (*w.constant) {
+        out.variant = 13U;
+        out.kind = Kind::kConstant;
+    } else {
+        out.variant = unknown_variant(*w.unknown);
+        out.kind = Kind::kOther;
     }
     if (!ok) {
         if (error.empty()) {
-            error = std::string("malformed format 2.0 ") + variant_name(which) + " encoding";
+            error = std::string("malformed format 2.0 ") + variant_name(out.variant) + " encoding";
         }
         return false;
     }
@@ -378,30 +274,28 @@ bool parse_enc(Cursor c, Enc& out, int depth, std::string& error) {
 }
 
 /// A page's (or column's) encoding: Any { type_url = 1, value = 2 } around the ArrayEncoding.
-bool parse_page_encoding(const std::vector<std::uint8_t>& any, Enc& out, std::string& error) {
-    std::string url;
-    Cursor payload;
-    bool have = false;
-    if (!for_each_field(Cursor{any.data(), any.size(), 0}, [&](const Tag& t) {
-            if (t.field == 1U && t.wire == kWireBytes) url.assign(t.sub.data, t.sub.data + t.sub.size);
-            if (t.field == 2U && t.wire == kWireBytes) {
-                payload = t.sub;
-                have = true;
-            }
-            return true;
-        })) {
+bool parse_page_encoding(const std::vector<std::uint8_t>& any_bytes, Enc& out, std::string& error) {
+    wire::EncodingAny any;
+    const auto in = nm::from(std::span<const std::byte>(reinterpret_cast<const std::byte*>(any_bytes.data()),
+                                                        any_bytes.size()));
+    if (!nm::protobuf_decode(in, any)) {
         error = "malformed page encoding";
         return false;
     }
-    if (url != "/lance.encodings.ArrayEncoding") {
-        error = "not a format 2.0 page (encoding '" + url + "')";
+    if (*any.type_url != "/lance.encodings.ArrayEncoding") {
+        error = "not a format 2.0 page (encoding '" + std::string(*any.type_url) + "')";
         return false;
     }
-    if (!have) {
+    if (!*any.value) {
         out.kind = Kind::kNone;
         return true;
     }
-    return parse_enc(payload, out, 0, error);
+    wire::ArrayEncoding w;
+    if (!nm::protobuf_decode(nm::from(**any.value), w)) {
+        error = "malformed format 2.0 encoding";
+        return false;
+    }
+    return parse_enc(w, out, 0, error);
 }
 
 // ── Decoded arrays ───────────────────────────────────────────────────────────────────────────────
@@ -1211,19 +1105,14 @@ bool is_blob_column(const pb::ColumnMetadata& column) {
     if (column.encoding.empty()) {
         return false;
     }
-    std::string url;
-    bool blob = false;
-    const bool ok = for_each_field(Cursor{column.encoding.data(), column.encoding.size(), 0}, [&](const Tag& t) {
-        if (t.field == 1U && t.wire == kWireBytes) url.assign(t.sub.data, t.sub.data + t.sub.size);
-        if (t.field == 2U && t.wire == kWireBytes) {
-            return for_each_field(t.sub, [&](const Tag& u) {
-                blob = blob || (u.field == 3U && u.wire == kWireBytes);
-                return true;
-            });
-        }
-        return true;
-    });
-    return ok && blob && url == "/lance.encodings.ColumnEncoding";
+    wire::EncodingAny any;
+    const auto in = nm::from(std::span<const std::byte>(reinterpret_cast<const std::byte*>(column.encoding.data()),
+                                                        column.encoding.size()));
+    if (!nm::protobuf_decode(in, any) || *any.type_url != "/lance.encodings.ColumnEncoding" || !*any.value) {
+        return false;
+    }
+    wire::ColumnEncoding20 encoding;
+    return nm::protobuf_decode(nm::from(**any.value), encoding) && encoding.blob->has_value();
 }
 
 /// A 2.0 blob column's page: (position, size) per row, the bytes elsewhere in the same data file. A

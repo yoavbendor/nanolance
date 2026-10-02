@@ -226,7 +226,7 @@ set(NANO_LANCE_BLOB_V2_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/golden/blob_v2")
 # them (C++23), so nanolance's public headers stay C++20.
 FetchContent_Declare(nanom
     GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
-    GIT_TAG 64fbf3ae80efab0d62209be24dc29c18a4a49f6f
+    GIT_TAG 6a25ec18b9f7242aee1d64d26b4c4c2800926089
     GIT_SHALLOW FALSE)
 FetchContent_GetProperties(nanom)
 if(NOT nanom_POPULATED)
@@ -315,7 +315,9 @@ add_library(nanolance STATIC
     src/writer.cpp
     src/writer_cxx.cpp
 )
-target_compile_features(nanolance PUBLIC cxx_std_20)
+# The library's own sources compile as C++23 (nanom, which reads and writes Lance's protobuf, needs
+# it; nanolance_proto already does). Its public headers and API stay C++20.
+target_compile_features(nanolance PUBLIC cxx_std_20 PRIVATE cxx_std_23)
 target_include_directories(nanolance PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${_NANOLANCE_GEN_INCLUDE}"
@@ -330,6 +332,7 @@ target_link_libraries(nanolance PUBLIC
     nanoarrow_static
     "${NANOLANCE_ZSTD_TARGET}"
 )
+target_link_libraries(nanolance PRIVATE nanolance_nanom)
 
 add_library(nanolance::nanolance ALIAS nanolance)
 
