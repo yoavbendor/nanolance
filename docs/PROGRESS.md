@@ -2486,6 +2486,32 @@ To make that possible, nanolance's own sources now compile as C++23. That adds n
 case (a 4,000-fragment 2.0 dataset of 12,000 small pages) reads in 116.6-119.0 ms against
 114.8-116.3 ms (best of 15, three alternating runs): about 1.5% slower, on the legacy format only.
 
+### Page descriptors written through nanom
+
+`src/data_file_writer.cpp` no longer assembles page descriptors from byte strings and hand-placed
+keys and lengths. A small internal helper, `src/lance_descriptors.hpp`, builds each
+CompressiveEncoding (Flat, Variable, OutOfLineBitpacking, InlineBitpacking, Fsst, Rle,
+ByteStreamSplit, General, FixedSizeList) and each layout (MiniBlock, Constant, FullZip) on nanom's
+model, and nanom computes every length prefix and varint. The column encoding is built the same
+way. The old code baked in one-byte lengths in places (`0x12, 0x06, ...`), correct only while a
+bit width fit in one varint byte.
+
+**Same bytes.** Data files written by the previous and the new writer are byte-identical, across
+three inputs in three modes (default, `--compress`, `--no-structural`), plus a large-value input.
+The outputs cover:
+- flat, nullable, bool and fixed-size-list columns;
+- dictionary, dictionary + RLE, RLE and constant columns;
+- inline bitpacking;
+- zstd strings and BSS + zstd floats;
+- FSST;
+- lists of numbers, strings and long strings, empty lists, maps, structs;
+- FullZip pages, with and without nulls.
+
+Changing one bit width in one builder changes 2 of those files, so the comparison does catch a
+difference. 56/56 ctest and the Python suite (1,808 tests, pylance interop included) pass.
+
+**Speed.** Write speed is unchanged: 1.00-1.05x across those inputs.
+
 ### Deliberate deviations (not defects)
 
 - **The nullable opt-out was not needed** — simpler than planned.
