@@ -80,15 +80,17 @@ std::vector<std::string> read_strings(const std::filesystem::path& ds) {
     std::vector<ArrowArray> batches;
     std::string error;
     require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error);
-    const ArrowArray* col = (batches[0].n_children > 0) ? batches[0].children[0] : &batches[0];
-    const auto* off = static_cast<const std::int32_t*>(col->buffers[1]);
-    const auto* data = static_cast<const char*>(col->buffers[2]);
     std::vector<std::string> out;
-    for (std::int64_t i = 0; i < col->length; ++i) {
-        out.emplace_back(data + off[i], static_cast<std::size_t>(off[i + 1] - off[i]));
+    for (auto& batch : batches) {  // several with a parallel read: one per row range
+        const ArrowArray* col = (batch.n_children > 0) ? batch.children[0] : &batch;
+        const auto* off = static_cast<const std::int32_t*>(col->buffers[1]);
+        const auto* data = static_cast<const char*>(col->buffers[2]);
+        for (std::int64_t i = 0; i < col->length; ++i) {
+            out.emplace_back(data + off[i], static_cast<std::size_t>(off[i + 1] - off[i]));
+        }
+        ArrowArrayRelease(&batch);
     }
     ArrowSchemaRelease(&schema);
-    ArrowArrayRelease(&batches[0]);
     return out;
 }
 

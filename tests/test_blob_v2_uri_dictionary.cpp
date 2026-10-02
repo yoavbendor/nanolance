@@ -109,11 +109,6 @@ std::vector<std::string> read_uris(const std::filesystem::path& ds) {
     std::vector<ArrowArray> batches;
     std::string error;
     require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error);
-    require(batches.size() == 1U, "expected one batch");
-
-    // Root struct -> payload_ref struct -> uri utf8 child.
-    const ArrowArray* payload = child_by_name(schema, batches[0], "payload_ref");
-    require(payload != nullptr, "payload_ref column missing");
     ArrowSchema* payload_schema = nullptr;
     for (std::int64_t i = 0; i < schema.n_children; ++i) {
         if (std::string(schema.children[i]->name) == "payload_ref") {
@@ -121,12 +116,18 @@ std::vector<std::string> read_uris(const std::filesystem::path& ds) {
         }
     }
     require(payload_schema != nullptr, "payload_ref schema missing");
-    const ArrowArray* uri = child_by_name(*payload_schema, *payload, "uri");
-    require(uri != nullptr, "uri child missing");
-    auto uris = read_strings(*uri);
-
+    std::vector<std::string> uris;
+    for (auto& batch : batches) {  // several with a parallel read: one per row range
+        // Root struct -> payload_ref struct -> uri utf8 child.
+        const ArrowArray* payload = child_by_name(schema, batch, "payload_ref");
+        require(payload != nullptr, "payload_ref column missing");
+        const ArrowArray* uri = child_by_name(*payload_schema, *payload, "uri");
+        require(uri != nullptr, "uri child missing");
+        const auto part = read_strings(*uri);
+        uris.insert(uris.end(), part.begin(), part.end());
+        ArrowArrayRelease(&batch);
+    }
     ArrowSchemaRelease(&schema);
-    ArrowArrayRelease(&batches[0]);
     return uris;
 }
 

@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/array_accessor.hpp"
+
+#include "nanolance/bool_bitpack.hpp"
 #include "nanolance/read_safety.hpp"
 
 #include <nanoarrow/nanoarrow.h>
@@ -306,13 +308,11 @@ bool append_fixed_width(const ArrowArray& array,
     // length bytes out of a length/8-byte buffer (which read far past the buffer and crashed).
     if (field.logical_type == "bool") {
         const auto* bits = static_cast<const std::uint8_t*>(array.buffers[1]);
-        const auto base = static_cast<std::size_t>(array.offset);
+        const auto at = out.fixed.size();
         reserve_more(out.fixed, static_cast<std::size_t>(array.length));
-        for (std::int64_t i = 0; i < array.length; ++i) {
-            const auto bit_index = base + static_cast<std::size_t>(i);
-            const auto byte = bits[bit_index >> 3U];
-            out.fixed.push_back(static_cast<std::uint8_t>((byte >> (bit_index & 7U)) & 1U));
-        }
+        out.fixed.resize(at + static_cast<std::size_t>(array.length));
+        boolpack::unpack_lsb_first(bits, static_cast<std::size_t>(array.offset),
+                                   static_cast<std::size_t>(array.length), out.fixed.data() + at);
         return true;
     }
     // Use the shared width table so every fixed-width logical type (incl. fixed_size_binary:N) agrees
@@ -564,8 +564,7 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
 
     std::string element;
     std::uint64_t items = 0;
-    if (field.logical_type == "null" || !field.extension_name.empty() ||
-        lance_fixed_size_list_parts(field.logical_type, element, items)) {
+    if (field.logical_type == "null" || lance_extension_is_lance_owned(field.extension_name)) {
         error = "column '" + field.name + "': a list of " + field.logical_type + " cannot be written yet";
         return false;
     }
@@ -588,6 +587,11 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
     if (lance_field_is_variable_width(field.logical_type)) {
         return append_variable_width(leaf, field, out, error);
     }
+    // A fixed_size_list item (a bounding box, an embedding) is one fixed-width value of N elements,
+    // taken from the child array; a null item is fine, a null element inside a valid one is refused.
+    if (lance_fixed_size_list_parts(field.logical_type, element, items)) {
+        return append_fixed_size_list(leaf, field, element, items, out, error);
+    }
     return append_fixed_width(leaf, field, out, error);
 }
 
@@ -599,7 +603,7 @@ bool is_nested_leaf(const LanceSchemaMapping& mapping, const LanceField& field) 
     bool any = false;
     for (const LanceField* f = field.parent_id < 0 ? nullptr : find_field_by_id(mapping, field.parent_id); f != nullptr;
          f = f->parent_id < 0 ? nullptr : find_field_by_id(mapping, f->parent_id)) {
-        if (!f->extension_name.empty()) {
+        if (lance_extension_is_lance_owned(f->extension_name)) {
             return false;
         }
         any = true;

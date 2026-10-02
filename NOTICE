@@ -22,6 +22,24 @@ The generated protobuf code (generated/lance_minimal.pb.*) and the proto pin not
 (third_party/lance_proto/) are based on those Apache-2.0 definitions.
 
 -------------------------------------------------------------------------------
+lance-c headers
+-------------------------------------------------------------------------------
+compat/lance-c/include/lance/lance.h and lance.hpp are copied unmodified from the
+lance-c project at the commit named in compat/lance-c/UPSTREAM, so that nanolance's
+liblance_c (src/lance_c.cpp) offers exactly lance-c's C and C++ API:
+
+    lance-c - https://github.com/lance-format/lance-c
+    Copyright The Lance Authors. Licensed under the Apache License, Version 2.0
+    (compat/lance-c/LICENSE).
+
+nanolance's implementation of that API is independent of lance-c's and is not
+affiliated with the Lance project.
+
+The pylance-compatible Python module (bindings/python/nanolance/lance) follows the
+names and signatures of pylance's API (https://github.com/lance-format/lance,
+Apache-2.0); its input coercion follows pylance's lance.types._coerce_reader.
+
+-------------------------------------------------------------------------------
 Other third-party software
 -------------------------------------------------------------------------------
 These are pulled in at build time via CMake FetchContent (not redistributed here):

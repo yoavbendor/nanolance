@@ -1,0 +1,496 @@
+"""nanolance.lance, the pylance-compatible API, checked against pylance itself.
+
+pylance's own test suite runs against nanolance.lance too (tools/pylance_suite.py, with the list of
+tests it passes in tests/pylance_suite/expected_pass.txt). This file keeps what that suite cannot:
+every result here is compared with what pylance returns for the same files, in both directions --
+datasets nanolance writes read by pylance, and pylance's read by nanolance -- plus the bugs the
+suite found in nanolance's core, pinned where they were fixed.
+"""
+
+from __future__ import annotations
+
+import sys
+import uuid
+
+import numpy as np
+import pyarrow as pa
+import pytest
+
+import nanolance
+import nanolance.lance as nl
+from tests.support import require_pylance
+
+
+@pytest.fixture(scope="module")
+def lance():
+    return require_pylance()
+
+
+def table(n=20, start=0):
+    return pa.table({
+        "id": pa.array(range(start, start + n), pa.int64()),
+        "name": pa.array([f"row {i}" for i in range(start, start + n)]),
+        "score": pa.array(np.linspace(0, 1, n), pa.float64()),
+    })
+
+
+# ── what nanolance writes, pylance reads, and back ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("writer", ["nanolance", "pylance"])
+def test_versions_and_modes_agree(lance, tmp_path, writer):
+    mod = nl if writer == "nanolance" else lance
+    uri = str(tmp_path / "ds")
+    mod.write_dataset(table(10), uri)
+    mod.write_dataset(table(5, 10), uri, mode="append")
+    mod.write_dataset(table(3, 100), uri, mode="overwrite")
+    with pytest.raises(OSError, match="already exists"):
+        mod.write_dataset(table(1), uri, mode="create")
+    for reader in (nl, lance):
+        ds = reader.dataset(uri)
+        assert ds.version == 3
+        assert [v["version"] for v in ds.versions()] == [1, 2, 3]
+        assert ds.to_table() == table(3, 100)
+        assert reader.dataset(uri, version=2).to_table() == pa.concat_tables([table(10), table(5, 10)])
+        assert ds.checkout_version(1).count_rows() == 10
+        assert [f.fragment_id for f in reader.dataset(uri, version=2).get_fragments()] == [0, 1]
+
+
+def test_one_version_per_write(lance, tmp_path):
+    uri = str(tmp_path / "ds")
+    ds = nl.write_dataset(table(100), uri, max_rows_per_file=30)
+    assert ds.version == 1
+    assert [f.count_rows() for f in ds.get_fragments()] == [30, 30, 30, 10]
+    assert lance.dataset(uri).to_table() == table(100)
+    assert lance.dataset(uri).versions()[0]["metadata"] == ds.versions()[0]["metadata"]
+
+
+@pytest.mark.parametrize("writer", ["nanolance", "pylance"])
+def test_scans_agree(lance, tmp_path, writer):
+    mod = nl if writer == "nanolance" else lance
+    uri = str(tmp_path / "ds")
+    mod.write_dataset(table(50), uri, max_rows_per_file=20)
+    ours, theirs = nl.dataset(uri), lance.dataset(uri)
+    for kwargs in [
+        {},
+        {"columns": ["score", "id"]},
+        {"limit": 7, "offset": 13},
+        {"offset": 45},
+        {"with_row_id": True},
+        {"with_row_address": True, "columns": ["name"]},
+        {"columns": ["_rowaddr", "id", "_rowid"]},
+        {"columns": ["_rowoffset"], "offset": 3, "limit": 4},
+    ]:
+        assert ours.to_table(**kwargs) == theirs.to_table(**kwargs), kwargs
+    frag = ours.get_fragments()[1]
+    assert frag.to_table() == theirs.get_fragments()[1].to_table()
+    assert (ours.scanner(fragments=[frag]).to_table()
+            == theirs.scanner(fragments=[theirs.get_fragments()[1]]).to_table())
+    assert ours.take([49, 0, 21, 0]) == theirs.take([49, 0, 21, 0])
+    assert ours.head(3) == theirs.head(3)
+    assert ours.count_rows() == theirs.count_rows() == 50
+    assert ours.schema == theirs.schema
+
+
+def test_row_ids_after_deletes_and_appends(lance, tmp_path):
+    """Deleted rows stay deleted when nanolance appends -- a fragment's deletion file used to be
+    dropped when nanolance rewrote the manifest, bringing the rows back -- and row ids (fragment id
+    << 32 | offset) are pylance's."""
+    uri = str(tmp_path / "ds")
+    lance.write_dataset(pa.table({"a": list(range(10))}), uri).delete("a < 3")
+    nanolance.write_table(pa.table({"a": [100]}), uri, append=True)
+    nl.write_dataset(pa.table({"a": [200]}), uri, mode="append")
+    want = [3, 4, 5, 6, 7, 8, 9, 100, 200]
+    assert lance.dataset(uri).to_table()["a"].to_pylist() == want
+    assert pa.table(nanolance.read_table(uri))["a"].to_pylist() == want
+    assert nl.dataset(uri).to_table(with_row_id=True) == lance.dataset(uri).to_table(with_row_id=True)
+    rows = [3, 2**32, 2 * 2**32]
+    assert nl.dataset(uri)._take_rows(rows) == lance.dataset(uri)._take_rows(rows)
+
+
+def test_table_config_and_metadata_survive(lance, tmp_path):
+    uri = str(tmp_path / "ds")
+    ds = nl.write_dataset(table(4), uri)
+    ds.update_config({"team": "vision"})
+    ds.update_metadata({"owner": "me"})
+    nl.write_dataset(table(2, 4), uri, mode="append")
+    for reader in (nl, lance):
+        got = reader.dataset(uri)
+        assert got.config()["team"] == "vision"
+        assert got.metadata["owner"] == "me" if reader is nl else True
+    lance.dataset(uri).update_config({"more": "yes"})
+    nl.write_dataset(table(1, 6), uri, mode="append")
+    assert nl.dataset(uri).config() == lance.dataset(uri).config()
+
+
+def test_restore(lance, tmp_path):
+    uri = str(tmp_path / "ds")
+    nl.write_dataset(table(3), uri)
+    nl.write_dataset(table(9), uri, mode="overwrite")
+    nl.dataset(uri, version=1).restore()
+    assert lance.dataset(uri).version == 3
+    assert lance.dataset(uri).to_table() == table(3)
+
+
+def test_memory_uri():
+    ds = nl.write_dataset(table(3), "memory://compat-test")
+    assert nl.dataset("memory://compat-test").to_table() == table(3)
+    assert ds.version == 1
+
+
+def test_unsupported_is_loud(tmp_path):
+    ds = nl.write_dataset(table(3), str(tmp_path / "ds"))
+    with pytest.raises(NotImplementedError):
+        ds.create_index("score", "IVF_PQ")
+    with pytest.raises(NotImplementedError):
+        nl.write_dataset(table(3), str(tmp_path / "old"), data_storage_version="2.0")
+
+
+def test_install_as_lance(tmp_path):
+    """install_as_lance() makes `import lance` nanolance's for this process, `lance.dataset` stays the
+    function (not the submodule of the same name), and uninstall gives the real one back."""
+    saved = {k: v for k, v in sys.modules.items() if k == "lance" or k.startswith("lance.")}
+    try:
+        nl.install_as_lance()
+        import lance as alias
+        import lance.dataset  # noqa: F401 -- must not rebind alias.dataset to the module
+        from lance.file import LanceFileReader
+
+        assert alias is nl
+        assert callable(alias.dataset) and not isinstance(alias.dataset, type(sys))
+        assert LanceFileReader is nl.file.LanceFileReader
+        alias.write_dataset(table(2), str(tmp_path / "ds"))
+        assert alias.dataset(str(tmp_path / "ds")).count_rows() == 2
+    finally:
+        nl.uninstall_as_lance()
+        sys.modules.update(saved)
+
+
+# ── files ──────────────────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("writer", ["nanolance", "pylance"])
+def test_files_agree(lance, tmp_path, writer):
+    from lance.file import LanceFileReader as TheirReader, LanceFileWriter as TheirWriter
+
+    Writer = nl.file.LanceFileWriter if writer == "nanolance" else TheirWriter
+    path = str(tmp_path / "f.lance")
+    data = table(40)
+    with Writer(path) as w:
+        for batch in data.to_batches(max_chunksize=16):
+            w.write_batch(batch)
+    for Reader in (nl.file.LanceFileReader, TheirReader):
+        r = Reader(path)
+        assert r.num_rows() == 40
+        assert r.read_all().to_table() == data
+        assert r.read_range(5, 10).to_table() == data.slice(5, 10)
+        assert r.take_rows([2, 7, 39]).to_table() == data.take([2, 7, 39])
+        with pytest.raises(ValueError, match="ascending"):
+            r.take_rows([39, 2])
+        assert r.metadata().num_rows == 40
+        assert r.metadata().schema == data.schema
+        assert Reader(path, columns=["name"]).read_all().to_table() == data.select(["name"])
+
+
+def test_schema_only_file(tmp_path):
+    path = str(tmp_path / "f.lance")
+    schema = pa.schema([("a", pa.int64())])
+    with nl.file.LanceFileWriter(path, schema):
+        pass
+    assert nl.file.LanceFileReader(path).metadata().schema == schema
+    with pytest.raises(ValueError, match="Schema is unknown"):
+        with nl.file.LanceFileWriter(str(tmp_path / "g.lance")):
+            pass
+
+
+# ── core bugs the pylance suite found ──────────────────────────────────────────────────────────────
+
+
+def test_schema_metadata_is_written_and_read(lance, tmp_path):
+    """Any schema-level metadata -- pandas adds some to every table -- made the writer fail with
+    "struct array for '' is missing child": a missing metadata key was read as present."""
+    t = table(3).replace_schema_metadata({"source": "unit test", "pandas": '{"x": 1}'})
+    uri = str(tmp_path / "ds")
+    nanolance.write_table(t, uri)
+    assert pa.table(nanolance.read_table(uri)).schema.metadata == t.schema.metadata
+    assert lance.dataset(uri).schema.metadata == t.schema.metadata
+    assert nl.dataset(uri).schema.metadata == t.schema.metadata
+
+
+def test_extension_columns_keep_their_rows(lance, tmp_path):
+    """A column of an Arrow extension type (other than Lance's own blob) was mapped as having no data:
+    the file held no column for it and a read returned no rows."""
+    tensor = pa.ExtensionArray.from_storage(
+        pa.fixed_shape_tensor(pa.float32(), [2, 3]),
+        pa.FixedSizeListArray.from_arrays(pa.array(np.arange(18, dtype=np.float32)), 6),
+    )
+    uuids = pa.array([uuid.uuid4().bytes for _ in range(3)], pa.uuid())
+    t = pa.table({"tensor": tensor, "uuid": uuids, "id": [1, 2, 3]})
+    uri = str(tmp_path / "ds")
+    nanolance.write_table(t, uri)
+    assert pa.table(nanolance.read_table(uri)) == t
+    assert lance.dataset(uri).to_table() == t
+    assert nl.dataset(uri).take([2, 0]) == t.take([2, 0])
+
+
+def test_encoding_hints_stay_out_of_the_schema(tmp_path):
+    """nanolance's per-file encoding notes (constant values, packing) are not part of the dataset's
+    schema: a constant column's field used to come back with them as field metadata."""
+    uri = str(tmp_path / "ds")
+    nl.write_dataset(pa.table({"z": [1.5] * 10}), uri)
+    assert nl.dataset(uri).schema.field("z").metadata in (None, {})
+
+
+# ── filters and changes (the shared C++ core: nanolance/expr.hpp, dataset_ops.hpp) ────────────────
+
+
+def _rich(n=40):
+    import datetime
+
+    return pa.table({
+        "id": pa.array(range(n), pa.int64()),
+        "name": pa.array([f"n{i}" if i % 3 else None for i in range(n)]),
+        "x": pa.array([i * 0.5 for i in range(n)]),
+        "d": pa.array([datetime.date(2024, 1, 1) + datetime.timedelta(days=i) for i in range(n)]),
+        "s": pa.array([{"a": i, "b": str(i)} for i in range(n)]),
+    })
+
+
+FILTERS = [
+    "id > 30", "name IS NULL", "name LIKE 'n1%'", "id IN (1, 2, 3) OR x >= 18", "id BETWEEN 3 AND 9 AND NOT (name = 'n4')",
+    "d = date '2024-01-05'", "s.a < 3", "lower(name) = 'n2'", "id % 2 = 0", "name != 'n1'", "x * 2 > 15",
+    "NOT id IN (1, 2)", "id NOT BETWEEN 2 AND 37", "id > 1000",
+]
+
+
+@pytest.mark.parametrize("sql", FILTERS)
+def test_filters_agree(lance, tmp_path, sql):
+    uri = str(tmp_path / "ds")
+    nl.write_dataset(_rich(), uri, max_rows_per_file=13)
+    ours, theirs = nl.dataset(uri), lance.dataset(uri)
+    assert ours.to_table(filter=sql) == theirs.to_table(filter=sql)
+    assert ours.count_rows(filter=sql) == theirs.count_rows(filter=sql)
+    kw = dict(filter=sql, limit=5, offset=2, columns=["name", "id"], with_row_id=True)
+    assert ours.to_table(**kw) == theirs.to_table(**kw)
+
+
+def test_pyarrow_expression_filters(lance, tmp_path):
+    import pyarrow.compute as pc
+
+    uri = str(tmp_path / "ds")
+    nl.write_dataset(_rich(), uri)
+    ours, theirs = nl.dataset(uri), lance.dataset(uri)
+    for expr in [pc.field("id") > 35, (pc.field("id") > 1) & (pc.field("name") == "n2"),
+                 pc.field("id").isin([4, 5]), ~pc.field("name").is_null()]:
+        assert ours.to_table(filter=expr) == theirs.to_table(filter=expr), str(expr)
+
+
+CHANGES = {
+    "delete": lambda ds: ds.delete("id < 3 or id = 17"),
+    "update": lambda ds: ds.update({"name": "'x'", "x": "x + 100"}, where="id >= 30"),
+    "update_all": lambda ds: ds.update({"id": "id * 2"}),
+    "merge_upsert": lambda ds: ds.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute(
+        pa.table({"id": [5, 500], "name": ["m", "n"], "x": [1.0, 2.0], "d": _rich().column("d").take([0, 1]),
+                  "s": pa.array([{"a": 1, "b": "1"}, {"a": 2, "b": "2"}])})),
+    "merge_delete_by_source": lambda ds: ds.merge_insert("id").when_not_matched_by_source_delete("id > 30").execute(
+        _rich().slice(0, 5)),
+    "add_sql": lambda ds: ds.add_columns({"y": "id * 2", "z": "name || '!'"}),
+    "add_nulls": lambda ds: ds.add_columns(pa.field("n", pa.float32())),
+    "add_data": lambda ds: ds.add_columns(pa.table({"w": pa.array(range(40), pa.int32())})),
+    "drop": lambda ds: ds.drop_columns(["name", "s.b"]),
+    "alter": lambda ds: ds.alter_columns({"path": "id", "name": "key"}, {"path": "x", "data_type": pa.float32()}),
+}
+
+
+@pytest.mark.parametrize("change", list(CHANGES))
+def test_changes_agree(lance, tmp_path, change):
+    """The same change made by nanolance and by pylance: the same rows (in the same order), the same
+    result, one version; and pylance reads what nanolance committed."""
+    results = {}
+    for name, mod in (("nanolance", nl), ("pylance", lance)):
+        uri = str(tmp_path / name)
+        mod.write_dataset(_rich(), uri, max_rows_per_file=13)
+        ds = mod.dataset(uri)
+        results[name] = (CHANGES[change](ds), mod.dataset(uri).version, lance.dataset(uri).to_table(),
+                         nl.dataset(uri).to_table())
+    (r_ours, v_ours, read_by_pylance, read_by_us), (r_theirs, v_theirs, theirs, _) = results["nanolance"], results["pylance"]
+    assert r_ours == r_theirs
+    assert v_ours == v_theirs == 2
+    assert read_by_pylance == theirs
+    assert read_by_us == theirs
+
+
+def test_compaction(lance, tmp_path):
+    uri = str(tmp_path / "ds")
+    nl.write_dataset(_rich(), uri, max_rows_per_file=5)
+    ds = nl.dataset(uri)
+    ds.delete("id % 7 = 0")
+    before = lance.dataset(uri).to_table()
+    metrics = ds.optimize.compact_files(target_rows_per_fragment=100)
+    assert metrics.fragments_removed == 8 and metrics.fragments_added == 1
+    assert len(nl.dataset(uri).get_fragments()) == 1
+    assert lance.dataset(uri).to_table() == before
+    assert nl.dataset(uri).to_table() == before
+
+
+def test_changes_after_pylance_changes(lance, tmp_path):
+    """A dataset pylance changed (deletions, a dropped and an added column) keeps changing under
+    nanolance -- the columns' files and ids no longer line up with a fresh write."""
+    uri = str(tmp_path / "ds")
+    lance.write_dataset(_rich(), uri, max_rows_per_file=13)
+    ds = lance.dataset(uri)
+    ds.delete("id < 4")
+    ds.drop_columns(["s"])
+    ds.add_columns({"y": "id + 1"})
+    ours = nl.dataset(uri)
+    ours.update({"name": "'u'"}, where="id = 10")
+    ours.delete("id = 11")
+    nl.write_dataset(lance.dataset(uri).to_table().slice(0, 2), uri, mode="append")
+    got = lance.dataset(uri).to_table()
+    assert got == nl.dataset(uri).to_table()
+    assert got.num_rows == 36 - 1 + 2
+    assert got.filter(pa.compute.field("id") == 10).column("name").to_pylist() == ["u"]
+
+
+def test_concurrent_commits_lose_nothing(tmp_path):
+    """Writers racing for the next version: each delete either lands or is refused as a commit
+    conflict, and every one that landed is in the final version. Committing a stale manifest on top
+    of a version it never saw would drop that version's delete silently."""
+    import threading
+
+    uri = str(tmp_path / "ds")
+    nl.write_dataset(_rich(64), uri)
+    for round_ in range(4):
+        start = threading.Barrier(8)
+        landed, refused = [], []
+
+        def delete(i):
+            start.wait()
+            try:
+                nl.dataset(uri).delete(f"id = {i}")
+                landed.append(i)
+            except Exception as exc:  # noqa: BLE001 -- the message is what is checked
+                assert "commit conflict" in str(exc).lower(), exc
+                refused.append(i)
+
+        ids = [round_ * 8 + k for k in range(8)]
+        threads = [threading.Thread(target=delete, args=(i,)) for i in ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(landed) + len(refused) == 8 and landed
+        left = set(nl.dataset(uri).to_table(columns=["id"]).column("id").to_pylist())
+        assert not left & set(landed), "a committed delete was lost"
+        assert set(refused) <= left
+
+
+def test_constant_pages_with_different_values(lance, tmp_path, monkeypatch):
+    """Lance picks each page's layout on its own: a column of 1024 threes, then 1024 eights, ... is a
+    run of constant pages, each with its own value. nanolance planned a column from its first page
+    and read every row as 3. Found by lance-encoding's test_miniblock_bitpack (tools/rust_suite.py).
+    Also read by a bare file name, which once resolved to <cwd>/data/<name>."""
+    from lance.file import LanceFileWriter
+
+    values = (3, 8, 16, 100)
+    schema = pa.schema([("c", pa.int32()), ("s", pa.string())])
+    writer = LanceFileWriter(str(tmp_path / "f.lance"), schema, data_cache_bytes=4096, version="2.2")
+    for v in values:
+        writer.write_batch(pa.table({"c": pa.array([v] * 1024, pa.int32()), "s": [f"v{v}"] * 1024}, schema=schema))
+    writer.close()
+    want = pa.table({"c": pa.array([v for v in values for _ in range(1024)], pa.int32()),
+                     "s": [f"v{v}" for v in values for _ in range(1024)]})
+
+    monkeypatch.chdir(tmp_path)
+    reader = nl.file.LanceFileReader("f.lance")
+    assert reader.read_all().to_table() == want
+    assert reader.read_range(1000, 2000).to_table() == want.slice(1000, 2000)
+    assert reader.take_rows([5, 1030, 3000, 4095]).to_table() == want.take([5, 1030, 3000, 4095])
+
+
+def _pylance_written_shapes():
+    from tests.test_lance_lists import SHAPES as LIST_SHAPES
+    from tests.test_write_encoding_matrix import SHAPES as MATRIX
+
+    shapes = [(f"matrix-{name}", table) for name, table, _ in MATRIX]
+    shapes += [(f"list-{name}", pa.table({"c": make()})) for name, make in LIST_SHAPES.items() if "map" not in name]
+    return shapes
+
+
+@pytest.mark.parametrize("version", ["2.1", "2.2"])
+def test_pylance_written_shapes_read_back(lance, tmp_path, version):
+    """Every shape of the encoding matrix and the list tests, written by pylance in format 2.1 (the
+    default of earlier pylance releases) and 2.2, reads back as pylance reads it. The first run found
+    2.1 refused outright (the footer's major and minor were read swapped, which only 2.2 hid) and a
+    fixed_size_binary constant wider than 32 bytes refused (its value is a one-buffer scalar)."""
+    failures = []
+    for name, table in _pylance_written_shapes():
+        uri = str(tmp_path / f"{name}-{version}")
+        lance.write_dataset(table, uri, data_storage_version=version)
+        want = lance.dataset(uri).to_table()
+        try:
+            got = nl.dataset(uri).to_table()
+        except Exception as exc:  # noqa: BLE001 -- collected, then reported together
+            failures.append(f"{name}: {exc}")
+            continue
+        if got != want:
+            failures.append(f"{name}: different rows")
+    assert not failures, failures
+
+
+def _pylance_blob_dataset(lance, tmp_path):
+    """Every Blob v2 storage kind pylance writes, in two fragments: inline (8 bytes), packed (128),
+    dedicated (4096), empty, null, and external (a range of a local file) -- beside a nullable column."""
+    payload = bytes((i * 7 + 3) % 256 for i in range(4096))
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"x" * 100 + payload + b"y" * 100)
+    schema = pa.schema([
+        pa.field("id", pa.uint32(), nullable=False),
+        lance.blob_field("blob", nullable=True, inline_size_threshold=16, dedicated_size_threshold=256),
+        pa.field("raw", pa.binary()),
+    ])
+    uri = str(tmp_path / "blobs")
+    for first, mode in ((0, "create"), (100, "append")):
+        blobs = [lance.Blob.from_bytes(payload[:8]), lance.Blob.from_bytes(payload[:128]),
+                 lance.Blob.from_bytes(payload), lance.Blob.from_bytes(b""), None,
+                 lance.Blob.from_uri(outside.as_uri(), position=100, size=300)]
+        table = pa.table([
+            pa.array(range(first, first + len(blobs)), pa.uint32()),
+            lance.blob_array(blobs),
+            pa.array([b"raw"] * 4 + [None, b"r"], pa.binary()),
+        ], schema=schema)
+        lance.write_dataset(table, uri, mode=mode, data_storage_version="2.2",
+                            allow_external_blob_outside_bases=True)
+    return uri
+
+
+def test_pylance_blobs_read_back(lance, tmp_path):
+    """A Blob v2 column as pylance writes it reads back as pylance reads it: as descriptions (the
+    default), as bytes (all_binary), and as file handles (take_blobs), whatever the storage kind. The
+    first run found nanolance could read only its own external blobs -- every other kind, and any
+    null, failed -- and that a batch with a blob column dropped the nulls of every other column."""
+    uri = _pylance_blob_dataset(lance, tmp_path)
+    ours, theirs = nl.dataset(uri), lance.dataset(uri)
+    assert ours.to_table() == theirs.to_table()
+    assert ours.to_table(blob_handling="all_binary") == theirs.to_table(blob_handling="all_binary")
+    assert ours.to_table(filter="id % 2 = 0", blob_handling="all_binary") == \
+        theirs.to_table(filter="id % 2 = 0", blob_handling="all_binary")
+    assert ours.take([11, 4, 0, 7]) == theirs.take([11, 4, 0, 7])
+
+    def contents(files):
+        return [None if f is None else (f.size(), f.readall()) for f in files]
+
+    everything = list(range(12))
+    assert contents(ours.take_blobs("blob", indices=everything)) == contents(theirs.take_blobs("blob", indices=everything))
+    ids = theirs.to_table(columns=["id"], with_row_id=True).column("_rowid").to_pylist()
+    assert contents(ours.take_blobs("blob", ids=ids[3:9])) == contents(theirs.take_blobs("blob", ids=ids[3:9]))
+    assert ours.read_blobs("blob", indices=[5, 1, 4]) == theirs.read_blobs("blob", indices=[5, 1, 4])
+
+    # A handle reads only what it is asked for, from wherever the blob is.
+    for index in (1, 2, 5):
+        mine, pylances = ours.take_blobs("blob", indices=[index])[0], theirs.take_blobs("blob", indices=[index])[0]
+        assert mine.read_range(3, 5) == pylances.read_range(3, 5)
+        mine.seek(-4, 2)
+        assert mine.read() == pylances.read_range(pylances.size() - 4, 4)
+    with pytest.raises(ValueError):
+        ours.take_blobs("raw", indices=[0])

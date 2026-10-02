@@ -218,9 +218,10 @@ set(NANOLANCE_PYTHON "${NANO_LANCE_WRITER_PYTHON}" CACHE FILEPATH "Alias of NANO
 
 set(NANO_LANCE_BLOB_V2_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/golden/blob_v2")
 
-add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp)
+add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/roaring_bitmap.cpp)
 target_compile_features(nanolance_proto PUBLIC cxx_std_20)
 target_include_directories(nanolance_proto PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/generated")
+target_include_directories(nanolance_proto PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 add_library(nanolance_reader STATIC
     src/manifest_reader.cpp
@@ -269,18 +270,29 @@ add_library(nanolance STATIC
     src/array_accessor.cpp
     src/blob_builder.cpp
     src/blob_v2_external.cpp
+    src/buffer_pool.cpp
     src/column_slice.cpp
+    src/index_maintenance.cpp
+    src/lance_file_writer.cpp
+    src/scalar_index.cpp
+    src/index_search.cpp
     src/data_file_reader.cpp
     src/deletion_vector.cpp
     src/data_file_writer.cpp
     src/fsst.cpp
     src/lz4_block.cpp
     src/lance_column_decoder.cpp
+    src/lance_v20_decoder.cpp
     src/lance_table_reader.cpp
     src/page_layout.cpp
+    src/parallel.cpp
     src/repdef.cpp
     src/nano_lance_table_reader_c.cpp
     src/manifest_writer.cpp
+    src/dataset.cpp
+    src/expr.cpp
+    src/arrow_slice.cpp
+    src/dataset_ops.cpp
     src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp
@@ -292,7 +304,9 @@ target_include_directories(nanolance PUBLIC
     "${_NANOLANCE_GEN_INCLUDE}"
     "${nanoarrow_SOURCE_DIR}/src"
 )
+find_package(Threads REQUIRED)
 target_link_libraries(nanolance PUBLIC
+    Threads::Threads
     nanolance_reader
     nanolance_proto
     nanoarrow_ipc_static
@@ -302,12 +316,58 @@ target_link_libraries(nanolance PUBLIC
 
 add_library(nanolance::nanolance ALIAS nanolance)
 
+# liblance_c: the C API of the lance-c project (compat/lance-c/include/lance/lance.h) over nanolance,
+# so code written against lance-c builds and links unchanged. Same library name and CMake targets
+# (LanceC::lance_c) as lance-c's; see docs/LANCE_C_COMPAT.md.
+option(NANOLANCE_BUILD_LANCE_C "Build liblance_c, lance-c's C API over nanolance" ON)
+if(NANOLANCE_BUILD_LANCE_C)
+    add_library(lance_c STATIC src/lance_c.cpp)
+    target_compile_features(lance_c PUBLIC cxx_std_20)
+    target_include_directories(lance_c PUBLIC
+        "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/compat/lance-c/include>")
+    target_link_libraries(lance_c PUBLIC nanolance)
+    add_library(LanceC::lance_c ALIAS lance_c)
+    add_library(LanceC::lance_c_static ALIAS lance_c)
+
+    # lance-c's own C and C++ tests, with the drivers tools/lance_c_suite.py generates around them.
+    set(NANOLANCE_LANCE_C_UPSTREAM_TESTS "" CACHE PATH
+        "lance-c's tests/cpp with generated drivers (set by tools/lance_c_suite.py)")
+    if(NANOLANCE_LANCE_C_UPSTREAM_TESTS)
+        add_executable(lance_c_upstream_c "${NANOLANCE_LANCE_C_UPSTREAM_TESTS}/driver_c.c")
+        add_executable(lance_c_upstream_cpp "${NANOLANCE_LANCE_C_UPSTREAM_TESTS}/driver_cpp.cpp")
+        foreach(t lance_c_upstream_c lance_c_upstream_cpp)
+            target_link_libraries(${t} PRIVATE lance_c)
+            target_compile_options(${t} PRIVATE -UNDEBUG)
+            set_target_properties(${t} PROPERTIES LINKER_LANGUAGE CXX)
+        endforeach()
+        set_target_properties(lance_c_upstream_cpp PROPERTIES CXX_STANDARD 17)
+    endif()
+endif()
+
+# What lance-encoding's own tests call to read their round trips back with nanolance
+# (tools/rust_suite.py). A shared library, so the whole tree must be built position independent.
+option(NANOLANCE_BUILD_RUST_SHIM "Build the library tools/rust_suite.py links into lance-encoding's tests" OFF)
+if(NANOLANCE_BUILD_RUST_SHIM)
+    add_library(nanolance_rust_shim SHARED tests/rust_suite/nanolance_rust_shim.cpp)
+    target_link_libraries(nanolance_rust_shim PRIVATE nanolance)
+    # Export the shim's two functions and nothing else. The test binary links zstd and lz4 of its own
+    # (Rust's zstd-sys / lz4-sys); exported copies of nanolance's -- another version -- let calls on
+    # either side bind to the other's, and Lance's own compression tests crashed.
+    set_target_properties(nanolance_rust_shim PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+    if(NOT APPLE)
+        target_link_options(nanolance_rust_shim PRIVATE -Wl,--exclude-libs,ALL -Wl,-Bsymbolic)
+    endif()
+endif()
+
 # Apply our own warning policy (opt-in via NANOLANCE_WERROR) only to nanolance's targets, not to the
 # FetchContent'd dependencies.
 if(NANOLANCE_WARNING_FLAGS)
     target_compile_options(nanolance_proto PRIVATE ${NANOLANCE_WARNING_FLAGS})
     target_compile_options(nanolance_reader PRIVATE ${NANOLANCE_WARNING_FLAGS})
     target_compile_options(nanolance PRIVATE ${NANOLANCE_WARNING_FLAGS})
+    if(TARGET lance_c)
+        target_compile_options(lance_c PRIVATE ${NANOLANCE_WARNING_FLAGS})
+    endif()
 endif()
 
 if(NANOLANCE_ENABLE_AVX2)
@@ -510,6 +570,10 @@ add_executable(nano_lance_compression_roundtrip_test tests/test_compression_roun
 target_compile_features(nano_lance_compression_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_compression_roundtrip_test PRIVATE nanolance)
 
+add_executable(nano_lance_writer_memory_test tests/test_writer_memory.cpp)
+target_compile_features(nano_lance_writer_memory_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_writer_memory_test PRIVATE nanolance)
+
 add_executable(nano_lance_bool_roundtrip_test tests/test_bool_roundtrip.cpp)
 target_compile_features(nano_lance_bool_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_bool_roundtrip_test PRIVATE nanolance)
@@ -624,9 +688,17 @@ add_executable(nano_lance_table_stream_test tests/test_table_stream.cpp)
 target_compile_features(nano_lance_table_stream_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_table_stream_test PRIVATE nanolance)
 
+add_executable(nano_lance_expr_test tests/test_expr.cpp)
+target_compile_features(nano_lance_expr_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_expr_test PRIVATE nanolance)
+
 add_executable(nano_lance_column_slice_test tests/test_column_slice.cpp)
 target_compile_features(nano_lance_column_slice_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_column_slice_test PRIVATE nanolance)
+
+add_executable(nano_lance_roaring_bitmap_test tests/test_roaring_bitmap.cpp)
+target_compile_features(nano_lance_roaring_bitmap_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_roaring_bitmap_test PRIVATE nanolance)
 
 add_executable(nano_lance_external_blob_test tests/test_nano_lance_external_blob.cpp)
 target_compile_features(nano_lance_external_blob_test PRIVATE cxx_std_20)
@@ -669,6 +741,8 @@ set_tests_properties(nano_lance_blob_v2_external_preprocess PROPERTIES LABELS "s
 add_test(NAME nano_lance_blob_v2_uri_dictionary COMMAND $<TARGET_FILE:nano_lance_blob_v2_uri_dictionary_test>)
 set_tests_properties(nano_lance_blob_v2_uri_dictionary PROPERTIES LABELS "smoke")
 
+add_test(NAME nano_lance_writer_memory COMMAND $<TARGET_FILE:nano_lance_writer_memory_test>)
+set_tests_properties(nano_lance_writer_memory PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_compression_roundtrip COMMAND $<TARGET_FILE:nano_lance_compression_roundtrip_test>)
 set_tests_properties(nano_lance_compression_roundtrip PROPERTIES LABELS "smoke")
 
@@ -769,6 +843,8 @@ add_test(NAME nano_lance_table_stream COMMAND $<TARGET_FILE:nano_lance_table_str
 set_tests_properties(nano_lance_table_stream PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_column_slice COMMAND $<TARGET_FILE:nano_lance_column_slice_test>)
+add_test(NAME nano_lance_roaring_bitmap COMMAND $<TARGET_FILE:nano_lance_roaring_bitmap_test>)
+add_test(NAME nano_lance_expr COMMAND $<TARGET_FILE:nano_lance_expr_test>)
 set_tests_properties(nano_lance_column_slice PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_external_blob COMMAND $<TARGET_FILE:nano_lance_external_blob_test>)

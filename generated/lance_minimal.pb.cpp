@@ -1,5 +1,8 @@
 #include "lance_minimal.pb.hpp"
 
+#include "nanolance/roaring_bitmap.hpp"
+
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <utility>
@@ -132,6 +135,26 @@ bool skip_field(const std::vector<std::uint8_t>& data, std::size_t& pos, std::ui
     return false;
 }
 
+/// Skip a field this codec does not model, appending its wire bytes (key included) to `unknown` so an
+/// encoder can write it back.
+bool keep_field(const std::vector<std::uint8_t>& data, std::size_t key_start, std::size_t& pos, std::uint8_t wire_type,
+                std::vector<std::uint8_t>& unknown) {
+    if (!skip_field(data, pos, wire_type)) {
+        return false;
+    }
+    unknown.insert(unknown.end(), data.begin() + static_cast<std::ptrdiff_t>(key_start),
+                   data.begin() + static_cast<std::ptrdiff_t>(pos));
+    return true;
+}
+
+void write_string_map_entry(std::vector<std::uint8_t>& out, std::uint32_t field_number, const std::string& key,
+                            const std::string& value) {
+    std::vector<std::uint8_t> entry;
+    write_string(entry, 1, key);
+    write_string(entry, 2, value);
+    write_message(out, field_number, entry);
+}
+
 std::vector<std::uint8_t> encode_data_storage_format(const DataStorageFormat& format) {
     std::vector<std::uint8_t> out;
     write_string(out, 1, format.file_format);
@@ -168,13 +191,26 @@ std::vector<std::uint8_t> encode_field_message(const Field& field) {
         map_entry.insert(map_entry.end(), meta.second.begin(), meta.second.end());
         write_message(out, 10, map_entry);
     }
+    out.insert(out.end(), field.unknown.begin(), field.unknown.end());
     return out;
 }
 
-std::vector<std::uint8_t> encode_schema_message(const std::vector<Field>& fields) {
+std::vector<std::uint8_t> encode_schema_message(const std::vector<Field>& fields,
+                                                const std::map<std::string, std::vector<std::uint8_t>>* metadata =
+                                                    nullptr) {
     std::vector<std::uint8_t> out;
     for (const auto& field : fields) {
         write_message(out, 1, encode_field_message(field));
+    }
+    if (metadata != nullptr) {
+        for (const auto& [key, value] : *metadata) {
+            std::vector<std::uint8_t> entry;
+            write_string(entry, 1, key);
+            write_key(entry, 2, kWireBytes);
+            write_varint(entry, value.size());
+            entry.insert(entry.end(), value.begin(), value.end());
+            write_message(out, 5, entry);
+        }
     }
     return out;
 }
@@ -191,6 +227,19 @@ std::vector<std::uint8_t> encode_data_file_message(const DataFile& file) {
     write_uint64(out, 4, file.file_major_version);
     write_uint64(out, 5, file.file_minor_version);
     write_uint64(out, 6, file.file_size_bytes);
+    out.insert(out.end(), file.unknown.begin(), file.unknown.end());
+    return out;
+}
+
+std::vector<std::uint8_t> encode_deletion_file_message(const DeletionFile& file) {
+    std::vector<std::uint8_t> out;
+    if (file.file_type != 0U) {
+        write_uint64(out, 1, file.file_type);
+    }
+    write_uint64(out, 2, file.read_version);
+    write_uint64(out, 3, file.id);
+    write_uint64(out, 4, file.num_deleted_rows);
+    out.insert(out.end(), file.unknown.begin(), file.unknown.end());
     return out;
 }
 
@@ -200,7 +249,13 @@ std::vector<std::uint8_t> encode_data_fragment_message(const DataFragment& fragm
     for (const auto& file : fragment.files) {
         write_message(out, 2, encode_data_file_message(file));
     }
+    // The deletion file was not written back here at one time, so appending to a dataset with deleted
+    // rows brought them back.
+    if (fragment.deletion_file.present) {
+        write_message(out, 3, encode_deletion_file_message(fragment.deletion_file));
+    }
     write_uint64(out, 4, fragment.physical_rows);
+    out.insert(out.end(), fragment.unknown.begin(), fragment.unknown.end());
     return out;
 }
 
@@ -390,6 +445,7 @@ bool decode_field_message(const std::vector<std::uint8_t>& bytes, Field& field) 
     std::size_t pos = 0;
     bool nullable_wire_seen = false;
     while (pos < bytes.size()) {
+        const std::size_t key_start = pos;
         std::uint64_t key = 0;
         if (!read_varint(bytes, pos, key)) {
             return false;
@@ -427,7 +483,7 @@ bool decode_field_message(const std::vector<std::uint8_t>& bytes, Field& field) 
                 return false;
             }
             field.metadata[std::move(mk)] = std::move(mv);
-        } else if (!skip_field(bytes, pos, wire_type)) {
+        } else if (!keep_field(bytes, key_start, pos, wire_type, field.unknown)) {
             return false;
         }
     }
@@ -443,10 +499,22 @@ bool decode_field_message(const std::vector<std::uint8_t>& bytes, Field& field) 
     return true;
 }
 
+/// A protobuf int32: negative values travel as the 10-byte varint of their 64-bit sign extension.
+/// Lance writes -2 as the field id of a column a data file still holds but the schema dropped.
+bool as_int32(std::uint64_t value, std::int32_t& out) {
+    const auto v = static_cast<std::int64_t>(value);
+    if (v < std::numeric_limits<std::int32_t>::min() || v > std::numeric_limits<std::int32_t>::max()) {
+        return false;
+    }
+    out = static_cast<std::int32_t>(v);
+    return true;
+}
+
 bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& file) {
     file = DataFile{};
     std::size_t pos = 0;
     while (pos < bytes.size()) {
+        const std::size_t key_start = pos;
         std::uint64_t key = 0;
         if (!read_varint(bytes, pos, key)) {
             return false;
@@ -454,15 +522,16 @@ bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& 
         const auto field_number = static_cast<std::uint32_t>(key >> 3U);
         const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
         std::uint64_t value = 0;
+        std::int32_t i32 = 0;
         if (field_number == 1 && wire_type == kWireBytes) {
             if (!read_string(bytes, pos, file.path)) {
                 return false;
             }
         } else if (field_number == 2 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
-            if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            if (!as_int32(value, i32)) {
                 return false;
             }
-            file.fields.push_back(static_cast<std::int32_t>(value));
+            file.fields.push_back(i32);
         } else if (field_number == 2 && wire_type == kWireBytes) {
             // packed repeated int32 — proto3 default encoding for numeric repeated fields
             std::vector<std::uint8_t> packed;
@@ -470,14 +539,14 @@ bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& 
             std::size_t pp = 0;
             while (pp < packed.size()) {
                 if (!read_varint(packed, pp, value)) { return false; }
-                if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) { return false; }
-                file.fields.push_back(static_cast<std::int32_t>(value));
+                if (!as_int32(value, i32)) { return false; }
+                file.fields.push_back(i32);
             }
         } else if (field_number == 3 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
-            if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            if (!as_int32(value, i32)) {
                 return false;
             }
-            file.column_indices.push_back(static_cast<std::int32_t>(value));
+            file.column_indices.push_back(i32);
         } else if (field_number == 3 && wire_type == kWireBytes) {
             // packed repeated int32
             std::vector<std::uint8_t> packed;
@@ -485,8 +554,8 @@ bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& 
             std::size_t pp = 0;
             while (pp < packed.size()) {
                 if (!read_varint(packed, pp, value)) { return false; }
-                if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) { return false; }
-                file.column_indices.push_back(static_cast<std::int32_t>(value));
+                if (!as_int32(value, i32)) { return false; }
+                file.column_indices.push_back(i32);
             }
         } else if (field_number == 4 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
             if (value > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
@@ -500,7 +569,7 @@ bool decode_data_file_message(const std::vector<std::uint8_t>& bytes, DataFile& 
             file.file_minor_version = static_cast<std::uint32_t>(value);
         } else if (field_number == 6 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
             file.file_size_bytes = value;
-        } else if (!skip_field(bytes, pos, wire_type)) {
+        } else if (!keep_field(bytes, key_start, pos, wire_type, file.unknown)) {
             return false;
         }
     }
@@ -512,6 +581,7 @@ bool decode_deletion_file_message(const std::vector<std::uint8_t>& bytes, Deleti
     out.present = true;
     std::size_t pos = 0;
     while (pos < bytes.size()) {
+        const std::size_t key_start = pos;
         std::uint64_t key = 0;
         if (!read_varint(bytes, pos, key)) {
             return false;
@@ -527,7 +597,7 @@ bool decode_deletion_file_message(const std::vector<std::uint8_t>& bytes, Deleti
             out.id = value;
         } else if (field_number == 4 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
             out.num_deleted_rows = value;
-        } else if (!skip_field(bytes, pos, wire_type)) {
+        } else if (!keep_field(bytes, key_start, pos, wire_type, out.unknown)) {
             return false;
         }
     }
@@ -538,6 +608,7 @@ bool decode_data_fragment_message(const std::vector<std::uint8_t>& bytes, DataFr
     fragment = DataFragment{};
     std::size_t pos = 0;
     while (pos < bytes.size()) {
+        const std::size_t key_start = pos;
         std::uint64_t key = 0;
         if (!read_varint(bytes, pos, key)) {
             return false;
@@ -567,6 +638,66 @@ bool decode_data_fragment_message(const std::vector<std::uint8_t>& bytes, DataFr
             }
         } else if (field_number == 4 && wire_type == kWireVarint && read_varint(bytes, pos, value)) {
             fragment.physical_rows = value;
+        } else if (!keep_field(bytes, key_start, pos, wire_type, fragment.unknown)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool decode_string_map_entry(const std::vector<std::uint8_t>& nested, std::string& key, std::string& value) {
+    std::vector<std::uint8_t> bytes;
+    if (!decode_map_metadata_entry(nested, key, bytes)) {
+        return false;
+    }
+    value.assign(bytes.begin(), bytes.end());
+    return true;
+}
+
+bool decode_timestamp(const std::vector<std::uint8_t>& bytes, Manifest& manifest) {
+    std::size_t pos = 0;
+    manifest.has_timestamp = true;
+    while (pos < bytes.size()) {
+        std::uint64_t key = 0;
+        std::uint64_t value = 0;
+        if (!read_varint(bytes, pos, key)) {
+            return false;
+        }
+        const auto field_number = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        if (wire_type == kWireVarint && (field_number == 1 || field_number == 2)) {
+            if (!read_varint(bytes, pos, value)) {
+                return false;
+            }
+            if (field_number == 1) {
+                manifest.timestamp_seconds = static_cast<std::int64_t>(value);
+            } else {
+                manifest.timestamp_nanos = static_cast<std::int32_t>(value);
+            }
+        } else if (!skip_field(bytes, pos, wire_type)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool decode_writer_version(const std::vector<std::uint8_t>& bytes, Manifest& manifest) {
+    std::size_t pos = 0;
+    while (pos < bytes.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(bytes, pos, key)) {
+            return false;
+        }
+        const auto field_number = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        if (wire_type == kWireBytes && field_number == 1) {
+            if (!read_string(bytes, pos, manifest.writer_library)) {
+                return false;
+            }
+        } else if (wire_type == kWireBytes && field_number == 2) {
+            if (!read_string(bytes, pos, manifest.writer_version)) {
+                return false;
+            }
         } else if (!skip_field(bytes, pos, wire_type)) {
             return false;
         }
@@ -578,14 +709,16 @@ bool decode_manifest_message(const std::vector<std::uint8_t>& bytes, Manifest& m
     manifest = Manifest{};
     std::size_t pos = 0;
     while (pos < bytes.size()) {
+        const std::size_t key_start = pos;
         std::uint64_t key = 0;
         if (!read_varint(bytes, pos, key)) {
             return false;
         }
         const auto field_number = static_cast<std::uint32_t>(key >> 3U);
         const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        std::uint64_t v = 0;
+        std::vector<std::uint8_t> nested;
         if (field_number == 1 && wire_type == kWireBytes) {
-            std::vector<std::uint8_t> nested;
             if (!read_bytes(bytes, pos, nested)) {
                 return false;
             }
@@ -595,7 +728,6 @@ bool decode_manifest_message(const std::vector<std::uint8_t>& bytes, Manifest& m
             }
             manifest.fields.push_back(std::move(f));
         } else if (field_number == 2 && wire_type == kWireBytes) {
-            std::vector<std::uint8_t> nested;
             if (!read_bytes(bytes, pos, nested)) {
                 return false;
             }
@@ -608,8 +740,30 @@ bool decode_manifest_message(const std::vector<std::uint8_t>& bytes, Manifest& m
             if (!read_varint(bytes, pos, manifest.version)) {
                 return false;
             }
+        } else if (field_number == 5 && wire_type == kWireBytes) {
+            std::string k;
+            std::vector<std::uint8_t> value;
+            if (!read_bytes(bytes, pos, nested) || !decode_map_metadata_entry(nested, k, value)) {
+                return false;
+            }
+            manifest.schema_metadata[std::move(k)] = std::move(value);
+        } else if (field_number == 7 && wire_type == kWireBytes) {
+            if (!read_bytes(bytes, pos, nested) || !decode_timestamp(nested, manifest)) {
+                return false;
+            }
+        } else if (field_number == 8 && wire_type == kWireBytes) {
+            if (!read_string(bytes, pos, manifest.tag)) {
+                return false;
+            }
+        } else if (field_number == 9 && wire_type == kWireVarint) {
+            if (!read_varint(bytes, pos, manifest.reader_feature_flags)) {
+                return false;
+            }
+        } else if (field_number == 10 && wire_type == kWireVarint) {
+            if (!read_varint(bytes, pos, manifest.writer_feature_flags)) {
+                return false;
+            }
         } else if (field_number == 11 && wire_type == kWireVarint) {
-            std::uint64_t v = 0;
             if (!read_varint(bytes, pos, v)) {
                 return false;
             }
@@ -618,19 +772,49 @@ bool decode_manifest_message(const std::vector<std::uint8_t>& bytes, Manifest& m
             }
             manifest.has_max_fragment_id = true;
             manifest.max_fragment_id = static_cast<std::uint32_t>(v);
+        } else if (field_number == 12 && wire_type == kWireBytes) {
+            if (!read_string(bytes, pos, manifest.transaction_file)) {
+                return false;
+            }
+        } else if (field_number == 13 && wire_type == kWireBytes) {
+            if (!read_bytes(bytes, pos, nested) || !decode_writer_version(nested, manifest)) {
+                return false;
+            }
+        } else if (field_number == 14 && wire_type == kWireVarint) {
+            if (!read_varint(bytes, pos, manifest.next_row_id)) {
+                return false;
+            }
         } else if (field_number == 15 && wire_type == kWireBytes) {
-            std::vector<std::uint8_t> nested;
             if (!read_bytes(bytes, pos, nested) || !decode_data_storage_format(nested, manifest.data_format)) {
                 return false;
             }
-        } else if (!skip_field(bytes, pos, wire_type)) {
+        } else if ((field_number == 16 || field_number == 19) && wire_type == kWireBytes) {
+            std::string k;
+            std::string value;
+            if (!read_bytes(bytes, pos, nested) || !decode_string_map_entry(nested, k, value)) {
+                return false;
+            }
+            (field_number == 16 ? manifest.config : manifest.table_metadata)[std::move(k)] = std::move(value);
+        } else if (field_number == 6 && wire_type == kWireVarint) {
+            // Where this file's index section is; the reader loads it into `indices`.
+            if (!read_varint(bytes, pos, manifest.index_section)) {
+                return false;
+            }
+            manifest.has_index_section = true;
+        } else if (field_number == 4 || field_number == 21) {
+            // Positions inside the manifest file this came from: meaningless in any other file.
+            if (!skip_field(bytes, pos, wire_type)) {
+                return false;
+            }
+        } else if (!keep_field(bytes, key_start, pos, wire_type, manifest.unknown)) {
             return false;
         }
     }
     return true;
 }
 
-bool decode_schema_message(const std::vector<std::uint8_t>& bytes, std::vector<Field>& fields) {
+bool decode_schema_message(const std::vector<std::uint8_t>& bytes, std::vector<Field>& fields,
+                           std::map<std::string, std::vector<std::uint8_t>>* metadata = nullptr) {
     fields.clear();
     std::size_t pos = 0;
     while (pos < bytes.size()) {
@@ -650,6 +834,14 @@ bool decode_schema_message(const std::vector<std::uint8_t>& bytes, std::vector<F
                 return false;
             }
             fields.push_back(std::move(f));
+        } else if (field_number == 5 && wire_type == kWireBytes && metadata != nullptr) {
+            std::vector<std::uint8_t> nested;
+            std::string k;
+            std::vector<std::uint8_t> v;
+            if (!read_bytes(bytes, pos, nested) || !decode_map_metadata_entry(nested, k, v)) {
+                return false;
+            }
+            (*metadata)[std::move(k)] = std::move(v);
         } else if (!skip_field(bytes, pos, wire_type)) {
             return false;
         }
@@ -672,7 +864,7 @@ bool decode_file_descriptor_message(const std::vector<std::uint8_t>& bytes, File
             if (!read_bytes(bytes, pos, nested)) {
                 return false;
             }
-            if (!decode_schema_message(nested, descriptor.fields)) {
+            if (!decode_schema_message(nested, descriptor.fields, &descriptor.schema_metadata)) {
                 return false;
             }
         } else if (field_number == 2 && wire_type == kWireVarint) {
@@ -690,7 +882,7 @@ bool decode_file_descriptor_message(const std::vector<std::uint8_t>& bytes, File
 
 std::vector<std::uint8_t> encode_file_descriptor(const FileDescriptor& descriptor) {
     std::vector<std::uint8_t> out;
-    write_message(out, 1, encode_schema_message(descriptor.fields));
+    write_message(out, 1, encode_schema_message(descriptor.fields, &descriptor.schema_metadata));
     write_uint64(out, 2, descriptor.length);
     return out;
 }
@@ -708,10 +900,274 @@ std::vector<std::uint8_t> encode_manifest(const Manifest& manifest) {
         write_message(out, 2, encode_data_fragment_message(fragment));
     }
     write_uint64(out, 3, manifest.version);
+    for (const auto& meta : manifest.schema_metadata) {
+        std::vector<std::uint8_t> entry;
+        write_string(entry, 1, meta.first);
+        write_key(entry, 2, kWireBytes);
+        write_varint(entry, meta.second.size());
+        entry.insert(entry.end(), meta.second.begin(), meta.second.end());
+        write_message(out, 5, entry);
+    }
+    if (manifest.has_timestamp) {
+        std::vector<std::uint8_t> ts;
+        if (manifest.timestamp_seconds != 0) {
+            write_uint64(ts, 1, static_cast<std::uint64_t>(manifest.timestamp_seconds));
+        }
+        if (manifest.timestamp_nanos != 0) {
+            write_uint64(ts, 2, static_cast<std::uint64_t>(manifest.timestamp_nanos));
+        }
+        write_message(out, 7, ts);
+    }
+    if (!manifest.tag.empty()) {
+        write_string(out, 8, manifest.tag);
+    }
+    if (manifest.reader_feature_flags != 0U) {
+        write_uint64(out, 9, manifest.reader_feature_flags);
+    }
+    if (manifest.writer_feature_flags != 0U) {
+        write_uint64(out, 10, manifest.writer_feature_flags);
+    }
     if (manifest.has_max_fragment_id) {
         write_uint64(out, 11, manifest.max_fragment_id);
     }
+    if (!manifest.transaction_file.empty()) {
+        write_string(out, 12, manifest.transaction_file);
+    }
+    if (!manifest.writer_library.empty() || !manifest.writer_version.empty()) {
+        std::vector<std::uint8_t> wv;
+        write_string(wv, 1, manifest.writer_library);
+        write_string(wv, 2, manifest.writer_version);
+        write_message(out, 13, wv);
+    }
+    if (manifest.next_row_id != 0U) {
+        write_uint64(out, 14, manifest.next_row_id);
+    }
     write_message(out, 15, encode_data_storage_format(manifest.data_format));
+    for (const auto& kv : manifest.config) {
+        write_string_map_entry(out, 16, kv.first, kv.second);
+    }
+    for (const auto& kv : manifest.table_metadata) {
+        write_string_map_entry(out, 19, kv.first, kv.second);
+    }
+    if (manifest.has_index_section) {
+        write_uint64(out, 6, manifest.index_section);
+    }
+    out.insert(out.end(), manifest.unknown.begin(), manifest.unknown.end());
+    return out;
+}
+
+namespace {
+
+bool decode_index_metadata(const std::vector<std::uint8_t>& bytes, IndexMetadata& index, std::string& error) {
+    index = IndexMetadata{};
+    index.raw = bytes;
+    std::size_t pos = 0;
+    while (pos < bytes.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(bytes, pos, key)) {
+            error = "index metadata is truncated";
+            return false;
+        }
+        const auto field_number = static_cast<std::uint32_t>(key >> 3U);
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        bool ok = true;
+        std::uint64_t v = 0;
+        std::int32_t id = 0;
+        std::vector<std::uint8_t> nested;
+        if (field_number == 2 && wire_type == kWireVarint) {
+            ok = read_varint(bytes, pos, v) && as_int32(v, id);
+            index.fields.push_back(id);
+        } else if (field_number == 2 && wire_type == kWireBytes) {  // packed
+            ok = read_bytes(bytes, pos, nested);
+            for (std::size_t at = 0; ok && at < nested.size();) {
+                ok = read_varint(nested, at, v) && as_int32(v, id);
+                index.fields.push_back(id);
+            }
+        } else if (field_number == 1 && wire_type == kWireBytes) {
+            ok = read_bytes(bytes, pos, nested);
+            std::size_t at = 0;
+            std::uint64_t k = 0;
+            std::vector<std::uint8_t> id_bytes;
+            while (ok && at < nested.size()) {
+                ok = read_varint(nested, at, k);
+                if (ok && k == ((1U << 3U) | kWireBytes)) {
+                    ok = read_bytes(nested, at, id_bytes);
+                } else if (ok) {
+                    ok = skip_field(nested, at, static_cast<std::uint8_t>(k & 0x07U));
+                }
+            }
+            if (ok && id_bytes.size() == index.uuid.size()) {
+                std::copy(id_bytes.begin(), id_bytes.end(), index.uuid.begin());
+            }
+        } else if (field_number == 3 && wire_type == kWireBytes) {
+            ok = read_string(bytes, pos, index.name);
+        } else if (field_number == 4 && wire_type == kWireVarint) {
+            ok = read_varint(bytes, pos, index.dataset_version);
+        } else if (field_number == 6 && wire_type == kWireBytes) {
+            ok = read_bytes(bytes, pos, nested);
+            std::size_t at = 0;
+            std::uint64_t k = 0;
+            while (ok && at < nested.size()) {
+                ok = read_varint(nested, at, k);
+                if (ok && k == ((1U << 3U) | kWireBytes)) {
+                    ok = read_string(nested, at, index.details_type_url);
+                } else if (ok) {
+                    ok = skip_field(nested, at, static_cast<std::uint8_t>(k & 0x07U));
+                }
+            }
+        } else if (field_number == 7 && wire_type == kWireVarint) {
+            ok = read_varint(bytes, pos, v);
+            index.index_version = static_cast<std::uint32_t>(v);
+        } else if (field_number == 8 && wire_type == kWireVarint) {
+            ok = read_varint(bytes, pos, index.created_at);
+        } else if (field_number == 10 && wire_type == kWireBytes) {
+            ok = read_bytes(bytes, pos, nested);
+            IndexMetadata::File file;
+            std::size_t at = 0;
+            std::uint64_t k = 0;
+            while (ok && at < nested.size()) {
+                ok = read_varint(nested, at, k);
+                if (ok && k == ((1U << 3U) | kWireBytes)) {
+                    ok = read_string(nested, at, file.path);
+                } else if (ok && k == ((2U << 3U) | kWireVarint)) {
+                    ok = read_varint(nested, at, file.size);
+                } else if (ok) {
+                    ok = skip_field(nested, at, static_cast<std::uint8_t>(k & 0x07U));
+                }
+            }
+            index.files.push_back(std::move(file));
+        } else if (field_number == 5 && wire_type == kWireBytes) {
+            ok = read_bytes(bytes, pos, nested);
+            if (ok && !roaring::decode(nested.data(), nested.size(), index.fragment_ids, error)) {
+                error = "index '" + index.name + "': " + error;
+                return false;
+            }
+            index.has_fragment_bitmap = true;
+        } else {
+            ok = skip_field(bytes, pos, wire_type);
+        }
+        if (!ok) {
+            error = "index metadata is malformed";
+            return false;
+        }
+    }
+    return true;
+}
+
+/// An index's message: as read, but for field 5 when the writer changed its fragments.
+std::vector<std::uint8_t> encode_index_metadata(const IndexMetadata& index) {
+    if (!index.fragment_bitmap_changed) {
+        return index.raw;
+    }
+    std::vector<std::uint8_t> out;
+    std::size_t pos = 0;
+    while (pos < index.raw.size()) {
+        const auto key_start = pos;
+        std::uint64_t key = 0;
+        if (!read_varint(index.raw, pos, key)) {
+            break;  // decode_index_metadata accepted it, so this does not happen
+        }
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        std::vector<std::uint8_t> kept;
+        if (!keep_field(index.raw, key_start, pos, wire_type, kept)) {
+            break;
+        }
+        if ((key >> 3U) != 5U) {
+            out.insert(out.end(), kept.begin(), kept.end());
+        }
+    }
+    if (index.has_fragment_bitmap) {
+        write_message(out, 5, roaring::encode(index.fragment_ids));
+    }
+    return out;
+}
+
+}  // namespace
+
+IndexMetadata make_index_metadata(const std::array<std::uint8_t, 16>& uuid, const std::vector<std::int32_t>& fields,
+                                  const std::string& name, std::uint64_t dataset_version,
+                                  const std::vector<std::uint32_t>& fragment_ids, const std::string& details_type_url,
+                                  std::uint32_t index_version, std::uint64_t created_at,
+                                  const std::vector<IndexMetadata::File>& files) {
+    std::vector<std::uint8_t> out;
+    write_message(out, 1, [&] {
+        std::vector<std::uint8_t> id;
+        write_message(id, 1, std::vector<std::uint8_t>(uuid.begin(), uuid.end()));
+        return id;
+    }());
+    std::vector<std::uint8_t> packed;
+    for (const auto f : fields) {
+        write_varint(packed, static_cast<std::uint64_t>(static_cast<std::int64_t>(f)));
+    }
+    write_message(out, 2, packed);
+    write_string(out, 3, name);
+    write_uint64(out, 4, dataset_version);
+    write_message(out, 5, roaring::encode(fragment_ids));
+    std::vector<std::uint8_t> details;
+    write_string(details, 1, details_type_url);
+    write_message(out, 6, details);
+    write_uint64(out, 7, index_version);
+    write_uint64(out, 8, created_at);
+    for (const auto& file : files) {
+        std::vector<std::uint8_t> f;
+        write_string(f, 1, file.path);
+        write_uint64(f, 2, file.size);
+        write_message(out, 10, f);
+    }
+    IndexMetadata index;
+    std::string error;
+    decode_index_metadata(out, index, error);  // what was just written decodes
+    return index;
+}
+
+std::string uuid_string(const std::array<std::uint8_t, 16>& uuid) {
+    static const char* hex = "0123456789abcdef";
+    std::string s;
+    for (std::size_t i = 0; i < uuid.size(); ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) {
+            s.push_back('-');
+        }
+        s.push_back(hex[uuid[i] >> 4U]);
+        s.push_back(hex[uuid[i] & 0x0FU]);
+    }
+    return s;
+}
+
+bool decode_index_section(const std::vector<std::uint8_t>& bytes, std::vector<IndexMetadata>& out,
+                          std::string& error) {
+    out.clear();
+    std::size_t pos = 0;
+    while (pos < bytes.size()) {
+        std::uint64_t key = 0;
+        if (!read_varint(bytes, pos, key)) {
+            error = "index section is truncated";
+            return false;
+        }
+        const auto wire_type = static_cast<std::uint8_t>(key & 0x07U);
+        if ((key >> 3U) == 1U && wire_type == kWireBytes) {
+            std::vector<std::uint8_t> nested;
+            if (!read_bytes(bytes, pos, nested)) {
+                error = "index section is truncated";
+                return false;
+            }
+            IndexMetadata index;
+            if (!decode_index_metadata(nested, index, error)) {
+                return false;
+            }
+            out.push_back(std::move(index));
+        } else if (!skip_field(bytes, pos, wire_type)) {
+            error = "index section is malformed";
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<std::uint8_t> encode_index_section(const std::vector<IndexMetadata>& indices) {
+    std::vector<std::uint8_t> out;
+    for (const auto& index : indices) {
+        write_message(out, 1, encode_index_metadata(index));
+    }
     return out;
 }
 
@@ -779,6 +1235,12 @@ std::vector<std::uint8_t> encode_column_metadata(const ColumnMetadata& metadata)
     for (const auto& page : metadata.pages) {
         write_message(out, 2, encode_column_page(page));
     }
+    for (const auto offset : metadata.buffer_offsets) {
+        write_uint64(out, 3, offset);
+    }
+    for (const auto size : metadata.buffer_sizes) {
+        write_uint64(out, 4, size);
+    }
     return out;
 }
 
@@ -786,6 +1248,7 @@ bool decode_column_metadata(const std::vector<std::uint8_t>& bytes, ColumnMetada
     std::size_t pos = 0;
     while (pos < bytes.size()) {
         std::uint64_t key = 0;
+        std::uint64_t value = 0;
         if (!read_varint(bytes, pos, key)) {
             return false;
         }
@@ -798,6 +1261,28 @@ bool decode_column_metadata(const std::vector<std::uint8_t>& bytes, ColumnMetada
                 return false;
             }
             metadata.pages.push_back(std::move(page));
+        } else if (field_number == 1 && wire_type == kWireBytes) {
+            std::vector<std::uint8_t> wrapped;
+            if (!read_bytes(bytes, pos, wrapped) || !decode_direct_encoding(wrapped, metadata.encoding)) {
+                return false;
+            }
+        } else if ((field_number == 3 || field_number == 4) && wire_type == kWireVarint) {
+            if (!read_varint(bytes, pos, value)) {
+                return false;
+            }
+            (field_number == 3 ? metadata.buffer_offsets : metadata.buffer_sizes).push_back(value);
+        } else if ((field_number == 3 || field_number == 4) && wire_type == kWireBytes) {
+            std::vector<std::uint8_t> packed;
+            if (!read_bytes(bytes, pos, packed)) {
+                return false;
+            }
+            std::size_t packed_pos = 0;
+            while (packed_pos < packed.size()) {
+                if (!read_varint(packed, packed_pos, value)) {
+                    return false;
+                }
+                (field_number == 3 ? metadata.buffer_offsets : metadata.buffer_sizes).push_back(value);
+            }
         } else if (!skip_field(bytes, pos, wire_type)) {
             return false;
         }

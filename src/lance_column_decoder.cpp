@@ -2,12 +2,16 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/lance_column_decoder.hpp"
+#include "nanolance/lance_v20_decoder.hpp"
+#include "nanolance/buffer_pool.hpp"
+#include "nanolance/work_stats.hpp"
 
 #include "nanolance/page_layout.hpp"
 
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/bool_bitpack.hpp"
 #include "nanolance/byte_stream_split.hpp"
+#include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
 #include "nanolance/fsst.hpp"
@@ -18,6 +22,7 @@
 
 #include <zstd.h>
 
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <algorithm>
@@ -25,6 +30,16 @@
 #include <optional>
 #include <memory>
 #include <utility>
+#include <cstdlib>
+#include <unordered_map>
+#include <mutex>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 namespace nano_lance {
 namespace {
@@ -60,9 +75,91 @@ const std::vector<std::uint8_t>* field_metadata_bytes(const pb::Field& field, co
 /// front. The row counts behind `bytes` are the file's own claim: a small file declaring 16 billion
 /// int64 rows asked for 128 GiB here before one value was read. Past the cap the vector grows
 /// geometrically as real values arrive, which costs one or two copies, not a quadratic.
+/// Ask for transparent huge pages behind the untouched part of a large output buffer (Linux).
+///
+/// A column's output is usually a fresh allocation, which glibc serves from newly mapped memory, so
+/// every 4 KiB page of it is faulted in as it is first written -- on a warm, repeated read that was
+/// about half the time of a large string or vector column. Backed by 2 MiB pages it takes 512x fewer
+/// faults. This is what glibc's own glibc.malloc.hugetlb=1 tunable does for every large allocation,
+/// here only for the buffers a read returns, from 8 MiB up. It is advice: where THP is off
+/// (/sys/kernel/mm/transparent_hugepage/enabled = never) or on other systems nothing changes. The
+/// cost is at most one partly used 2 MiB page at the end of each such buffer.
+void advise_huge_pages(std::vector<std::uint8_t>& out) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    constexpr std::size_t kMinBytes = std::size_t{8} << 20U;
+    constexpr std::uintptr_t kHuge = std::uintptr_t{2} << 20U;
+    if (out.capacity() < kMinBytes) {
+        return;
+    }
+    const auto base = reinterpret_cast<std::uintptr_t>(out.data());
+    const auto begin = (base + out.size() + kHuge - 1U) & ~(kHuge - 1U);
+    const auto end = (base + out.capacity()) & ~(kHuge - 1U);
+    if (end > begin) {
+        (void)madvise(reinterpret_cast<void*>(begin), end - begin, MADV_HUGEPAGE);
+    }
+#else
+    (void)out;
+#endif
+}
+
+/// Grow `out`'s capacity to `bytes`: from the buffer pool when it holds a fit (already faulted in),
+/// otherwise a fresh reservation advised onto huge pages.
+void grow_to(std::vector<std::uint8_t>& out, std::size_t bytes) {
+    if (bytes <= out.capacity()) {
+        return;
+    }
+    auto pooled = buffer_pool::take(bytes);
+    if (pooled.capacity() >= bytes) {
+        pooled.insert(pooled.end(), out.begin(), out.end());
+        out.swap(pooled);
+        buffer_pool::give(std::move(pooled));
+        return;
+    }
+    out.reserve(bytes);
+    advise_huge_pages(out);
+}
+
+/// reserve_more for decoded bytes: the same geometric growth, but through grow_to, so a large output
+/// takes a buffer the pool kept from an earlier read. A plain reserve left the pool's buffers unused
+/// while glibc handed out fresh memory, and the pool, holding the old buffers out of glibc's reach,
+/// turned every read of a dictionary-coded string column into new page faults: pcap_ref's URIs
+/// faulted ~7 MB in per read (1,765 faults, 3 ms of system time), where the read without the pool
+/// faulted 90 pages.
+using nano_lance::reserve_more;
+void reserve_more(std::vector<std::uint8_t>& v, std::size_t extra) {
+    const auto needed = v.size() + extra;
+    if (needed > v.capacity()) {
+        grow_to(v, needed > v.capacity() * 2U ? needed : v.capacity() * 2U);
+    }
+}
+
 void reserve_capped(std::vector<std::uint8_t>& out, std::uint64_t bytes) {
     constexpr std::uint64_t kReserveCap = std::uint64_t{256} << 20U;
-    out.reserve(static_cast<std::size_t>(std::min(bytes, kReserveCap)));
+    grow_to(out, static_cast<std::size_t>(std::min(bytes, kReserveCap)));
+}
+
+/// After a page of a column whose final size the page table does not give (strings, list items):
+/// when `out` would outgrow its capacity at the rate seen so far, reserve for the whole column --
+/// the projection plus an eighth -- instead of letting it double its way there. Each doubling copies
+/// everything so far into fresh memory, and with glibc's allocator fresh memory for a large buffer is
+/// new pages the kernel has to fault in: a 45 MB string column touched ~105 MB per read. Capped like
+/// reserve_capped (the row count is the file's claim); a projection that falls short grows by at
+/// least half again, so a bad guess still costs a geometric number of copies.
+void reserve_projected(std::vector<std::uint8_t>& out, std::uint64_t rows_done, std::uint64_t rows_total) {
+    constexpr std::uint64_t kReserveCap = std::uint64_t{256} << 20U;
+    if (rows_done == 0U || rows_done >= rows_total || out.empty()) {
+        return;
+    }
+    const auto per_row = static_cast<double>(out.size()) / static_cast<double>(rows_done);
+    const auto projected = per_row * static_cast<double>(rows_total) * 1.125 + 64.0;
+    if (projected <= static_cast<double>(out.capacity())) {
+        return;
+    }
+    const auto want = std::max<std::uint64_t>(static_cast<std::uint64_t>(std::min(projected, static_cast<double>(kReserveCap))),
+                                              static_cast<std::uint64_t>(out.capacity()) + out.capacity() / 2U);
+    if (want > out.capacity() && fits_size_t(want)) {
+        grow_to(out, static_cast<std::size_t>(want));
+    }
 }
 
 [[nodiscard]] bool append_repeated_value(std::vector<std::uint8_t>& out, const std::uint8_t* val,
@@ -193,6 +290,37 @@ bool zstd_unframe_buffer(const std::vector<std::uint8_t>& framed, std::vector<st
         error = "zstd decompress failed for variable-width column";
         return false;
     }
+    return true;
+}
+
+/// One per-value-compressed FullZip value (General{zstd | lz4} around Variable), appended to `out`.
+/// zstd values are [u64 raw size][frame] -- or, in files from older Lance, a bare frame -- and lz4 values
+/// [u32 raw size][block]; both go through the same bounded decoders the MiniBlock paths use.
+bool decompress_full_zip_value(page_layout::BufferScheme scheme, const std::uint8_t* data, std::size_t size,
+                               std::vector<std::uint8_t>& out, std::string& error) {
+    thread_local std::vector<std::uint8_t> framed;
+    thread_local std::vector<std::uint8_t> raw;
+    framed.assign(data, data + size);
+    if (scheme == page_layout::BufferScheme::kZstd) {
+        static constexpr std::uint8_t kZstdMagic[4] = {0x28U, 0xB5U, 0x2FU, 0xFDU};
+        if (size >= 4U && std::memcmp(data, kZstdMagic, 4U) == 0) {
+            const unsigned long long content = ZSTD_getFrameContentSize(data, size);
+            if (content == ZSTD_CONTENTSIZE_UNKNOWN || content == ZSTD_CONTENTSIZE_ERROR) {
+                error = "zstd value without a declared content size";
+                return false;
+            }
+            framed.resize(size + 8U);
+            std::memmove(framed.data() + 8U, data, size);
+            const std::uint64_t declared = content;
+            std::memcpy(framed.data(), &declared, 8U);
+        }
+        if (!zstd_unframe_buffer(framed, raw, error)) {
+            return false;
+        }
+    } else if (!lz4_block::decompress_sized(framed, raw, error)) {
+        return false;
+    }
+    out.insert(out.end(), raw.begin(), raw.end());
     return true;
 }
 
@@ -810,9 +938,9 @@ template <class T>
 }
 
 /// Inverse of the writer's encode_scalar_variable_value: a Lance scalar value buffer holding a
-/// length-1 string/binary array, laid out as [u32 num_buffers][u32 buffer_len ...][buffers]. For
-/// utf8/binary that is two buffers -- offsets [0, len] and the data -- and the value we want is the
-/// data buffer whole. Every length is untrusted, so each is bounds-checked before use.
+/// length-1 array, laid out as [u32 num_buffers][u32 buffer_len ...][buffers]. For utf8/binary that
+/// is two buffers -- offsets [0, len] and the data -- and the value we want is the data buffer whole;
+/// for a fixed-width value it is one buffer, the value. Every length is untrusted, so each is bounds-checked before use.
 [[nodiscard]] bool decode_scalar_variable_value(const std::vector<std::uint8_t>& buffer,
                                                 std::vector<std::uint8_t>& out, std::string& error) {
     if (buffer.size() < 4U) {
@@ -820,9 +948,24 @@ template <class T>
         return false;
     }
     const auto num_buffers = load_le<std::uint32_t>(buffer.data());
+    // A fixed-width value too wide to inline in the descriptor (a fixed_size_binary(33) constant) is
+    // the same layout with ONE buffer: the value's bytes.
+    if (num_buffers == 1U) {
+        if (buffer.size() < 8U) {
+            error = "constant value buffer shorter than its header";
+            return false;
+        }
+        const auto len = load_le<std::uint32_t>(buffer.data() + 4U);
+        if (len > buffer.size() - 8U) {
+            error = "constant value buffer's data range exceeds the buffer";
+            return false;
+        }
+        out.assign(buffer.begin() + 8, buffer.begin() + 8 + static_cast<std::ptrdiff_t>(len));
+        return true;
+    }
     if (num_buffers != 2U) {
         error = "constant value buffer declares " + std::to_string(num_buffers) +
-                " buffers; expected 2 (offsets + data)";
+                " buffers; expected 1 (a fixed-width value) or 2 (offsets + data)";
         return false;
     }
     std::uint64_t header = 0;
@@ -848,12 +991,40 @@ template <class T>
 /// Turn `count` decoded levels into validity bits. Rows accumulate across chunks into one contiguous
 /// bitmap, so a chunk whose row count is not a multiple of 8 leaves the next chunk starting mid-byte;
 /// each bit therefore goes at its ABSOLUTE row index rather than at a per-chunk offset.
+/// Eight definition levels as one validity byte: bit k set when level k is 0 (valid). SSE2 compares
+/// all eight at once where it is available (every x86-64 CPU); elsewhere the loop is branch-free.
+inline std::uint8_t valid_bits8(const std::uint16_t* levels) {
+#if defined(__SSE2__)
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(levels));
+    const __m128i zero = _mm_cmpeq_epi16(v, _mm_setzero_si128());  // 0xFFFF per valid level
+    return static_cast<std::uint8_t>(_mm_movemask_epi8(_mm_packs_epi16(zero, zero)) & 0xFF);
+#else
+    std::uint8_t b = 0;
+    for (unsigned k = 0; k < 8U; ++k) {
+        b = static_cast<std::uint8_t>(b | ((levels[k] == 0U ? 1U : 0U) << k));
+    }
+    return b;
+#endif
+}
+
 bool append_levels_to_validity(const std::uint16_t* levels, std::uint32_t count,
                                std::uint64_t rows_already_appended, std::vector<std::uint8_t>& out_validity,
                                std::uint64_t& out_null_count) {
     const auto total_rows = rows_already_appended + count;
     out_validity.resize(static_cast<std::size_t>((total_rows + 7U) / 8U), 0U);
-    for (std::uint32_t i = 0; i < count; ++i) {
+    std::uint32_t i = 0;
+    // Byte-aligned, as nearly every chunk is (1024 levels at a time): eight levels per byte written.
+    if ((rows_already_appended & 7U) == 0U) {
+        auto* dst = out_validity.data() + static_cast<std::size_t>(rows_already_appended >> 3U);
+        std::uint64_t valid = 0;
+        for (; i + 8U <= count; i += 8U) {
+            const auto b = valid_bits8(levels + i);
+            *dst++ = b;
+            valid += static_cast<std::uint64_t>(std::popcount(b));
+        }
+        out_null_count += i - valid;
+    }
+    for (; i < count; ++i) {
         if (levels[i] != 0U) {
             ++out_null_count;  // level 1 == null; the bit stays clear
             continue;
@@ -1073,6 +1244,11 @@ struct ItemView {
     /// repetition levels beside them.
     std::vector<std::uint16_t> full_zip_levels;
     std::vector<std::uint16_t> full_zip_rep;
+    /// The FullZip page is a window of a list page's rows (see take_windows): its layout's counts are
+    /// the whole page's, so the levels and values are counted from the bytes instead, and the values
+    /// handed back in `full_zip_visible`.
+    bool full_zip_window = false;
+    std::uint64_t full_zip_visible = 0;
 };
 
 struct ColumnEncodingPlan {
@@ -1125,6 +1301,9 @@ struct ColumnEncodingPlan {
     /// where the bit width is written: `InlineBitpacking(N)` puts it at the head of each block,
     /// `Bitpacked{N, Flat(width)}` puts it in the descriptor. Zero means the entries are flat.
     std::uint32_t dict_packed_width = 0;  // set only for the out-of-line spelling
+    /// kDict: the indices are `Flat(N)` -- N-bit integers end to end -- rather than FastLanes packed.
+    /// Format 2.2 writes them so for a small page of 64-bit values (Flat(32) indices). Zero: packed.
+    std::uint32_t dict_flat_index_bits = 0;
     bool dict_inline_bitpacked = false;
     bool dict_out_of_line_bitpacked = false;
     /// kVariable: the offset width the descriptor declares for the value block, in bits. Only the
@@ -1351,11 +1530,64 @@ struct FullZipPageParams {
     std::size_t value_bytes = 0;   // fixed width; 0 for variable width
     std::size_t length_bytes = 0;  // variable width: the length prefix, 4 or 8; 0 for fixed width
     std::optional<fsst::SymbolTable> fsst;
+    /// Variable width: General{zstd | lz4} around the values -- each value compressed on its own, as
+    /// Lance writes large binary (images, audio): zstd as [u64 raw size][frame], lz4 as [u32][block].
+    page_layout::BufferScheme value_scheme = page_layout::BufferScheme::kNone;
     /// fixed_size_list with element validity: each slot starts with ceil(items/8) bytes of per-element
     /// validity bits, then the items. `value_bytes` counts both.
     std::uint64_t items = 0;
     std::size_t item_validity_bytes = 0;
 };
+
+/// The levels (control words) in `data`, a run of whole rows of a FullZip list page, and how many of
+/// them carry a value -- what the page's layout states for the page as a whole.
+bool count_full_zip_levels(const std::vector<std::uint8_t>& data, const FullZipPageParams& params,
+                           std::uint64_t& levels, std::uint64_t& visible, std::string& why) {
+    levels = 0;
+    visible = 0;
+    if (params.control_bytes == 0U) {
+        why = "a FullZip page window without control words";
+        return false;
+    }
+    const std::uint32_t def_mask = params.bits_def == 0U ? 0U : ((1U << params.bits_def) - 1U);
+    std::size_t at = 0;
+    while (at < data.size()) {
+        if (data.size() - at < params.control_bytes) {
+            why = "FullZip page window truncated in a control word";
+            return false;
+        }
+        std::uint32_t word = 0;
+        std::memcpy(&word, data.data() + at, params.control_bytes);  // little-endian
+        at += params.control_bytes;
+        ++levels;
+        const auto def = word & def_mask;
+        if (def > params.max_visible_def) {
+            continue;  // an empty or null list
+        }
+        ++visible;
+        if (params.length_bytes == 0U) {
+            if (data.size() - at < params.value_bytes) {
+                why = "FullZip page window truncated in a value";
+                return false;
+            }
+            at += params.value_bytes;
+        } else if (def == 0U) {
+            if (data.size() - at < params.length_bytes) {
+                why = "FullZip page window truncated in a length";
+                return false;
+            }
+            std::uint64_t length = 0;
+            std::memcpy(&length, data.data() + at, params.length_bytes);
+            at += params.length_bytes;
+            if (length > data.size() - at) {
+                why = "FullZip value runs past its page window";
+                return false;
+            }
+            at += static_cast<std::size_t>(length);
+        }
+    }
+    return true;
+}
 
 /// Fills `out` from a FullZip layout, or explains why it cannot be read.
 bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t page_rows,
@@ -1435,6 +1667,13 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
                 return false;
             }
             out.fsst = table;
+            values = values->values.get();
+        } else if (values->kind == page_layout::CompressiveKind::kGeneral) {
+            if (values->scheme != page_layout::BufferScheme::kZstd && values->scheme != page_layout::BufferScheme::kLz4) {
+                why = "unsupported FullZip value compression scheme " + std::to_string(values->wire_scheme);
+                return false;
+            }
+            out.value_scheme = values->scheme;
             values = values->values.get();
         }
         if (values == nullptr || values->kind != page_layout::CompressiveKind::kVariable) {
@@ -1690,6 +1929,19 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             out.variable_offset_bits = inner->values == nullptr ? 0U : inner->values->bits_per_value;
             return true;
         case page_layout::CompressiveKind::kFlat:
+            if (has_dictionary) {
+                // Dictionary indices stored flat. Read as values they were the wrong width (or,
+                // when it happened to match, the indices themselves).
+                if (inner->bits_per_value != 8U && inner->bits_per_value != 16U && inner->bits_per_value != 32U) {
+                    out.kind = ColumnEncodingKind::kUnsupported;
+                    out.unsupported_reason = "dictionary indices of " + std::to_string(inner->bits_per_value) +
+                                             " bits in " + page_layout::describe(layout);
+                    return true;
+                }
+                out.kind = ColumnEncodingKind::kDict;
+                out.dict_flat_index_bits = inner->bits_per_value;
+                return true;
+            }
             // bool is Flat{bits_per_value: 1}; that IS how stock Lance represents it, so the
             // descriptor distinguishes it from a byte-wide flat column with no help from metadata.
             out.kind = inner->bits_per_value == 1U ? ColumnEncodingKind::kBoolPacked : ColumnEncodingKind::kFlat;
@@ -1809,8 +2061,26 @@ bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& 
         !apply_item_view(plan, chunks, error)) {
         return false;
     }
+    // `validity_rows` counts every row read so far, with or without levels. Lance (and nanolance)
+    // leave definition levels out of a page with no null in it even when other pages of the column
+    // have some, so a page without them is all valid: its bits are appended when the bitmap already
+    // exists, and the first page with levels back-fills the rows before it.
+    const auto set_valid = [&out](std::uint64_t first, std::uint64_t count) {
+        const auto end = first + count;
+        out.validity.resize(static_cast<std::size_t>((end + 7U) / 8U), 0U);
+        for (auto row = first; row < end; ++row) {
+            out.validity[static_cast<std::size_t>(row >> 3U)] |= static_cast<std::uint8_t>(1U << (row & 7U));
+        }
+    };
     if (plan.repdef == nullptr) {
+        if (!out.validity.empty()) {
+            set_valid(validity_rows, page_rows);
+        }
+        validity_rows += page_rows;
         return true;
+    }
+    if (out.validity.empty() && validity_rows != 0U) {
+        set_valid(0U, validity_rows);
     }
     std::uint64_t covered = 0;
     for (const auto& chunk : chunks) {
@@ -1962,6 +2232,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     const bool blob_packed = field_metadata_is_true(on_disk_field, "lance-encoding:blob");
     if (blob_packed) {
         out.kind = ColumnValues::Kind::BlobV2External;
+        out.blob_v2.data_file = data_file_path;
         // Hoisted out of the loop (not freshly declared per page): read_lance_data_file_bytes reuses
         // whatever capacity/bytes are already here rather than re-zeroing a fresh buffer every page.
         std::vector<std::uint8_t> control;
@@ -1974,17 +2245,59 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
             if (!blob_v2_control_buffer_to_row_sizes(control, page.length, row_sizes, error)) {
                 return false;
             }
+            // A nullable blob column (pylance writes one whenever a row is null) puts a control word
+            // -- the row's definition level -- in front of every row, and a null row is that word
+            // alone. nanolance's own blob columns are never null and carry none.
+            std::size_t control_bytes = 0;
+            std::uint32_t def_mask = 0;
+            if (!page.encoding.empty()) {
+                page_layout::PageLayout layout;
+                std::string why;
+                if (page_layout::decode_page_layout(page.encoding, layout, why) &&
+                    layout.kind == page_layout::LayoutKind::kFullZip) {
+                    if (layout.full_zip.bits_rep != 0U) {
+                        error = "column '" + on_disk_field.name + "': a blob column inside a list is not read";
+                        return false;
+                    }
+                    const auto bits = layout.full_zip.bits_def;
+                    if (bits > 16U) {
+                        error = "blob page declares an implausible definition width";
+                        return false;
+                    }
+                    control_bytes = bits == 0U ? 0U : bits <= 8U ? 1U : 2U;
+                    def_mask = bits == 0U ? 0U : ((1U << bits) - 1U);
+                }
+            }
             std::size_t offset = 0;
             for (const auto row_size : row_sizes) {
-                if (offset + row_size > values.size()) {
+                if (offset + row_size > values.size() || row_size < control_bytes) {
                     error = "blob packed row exceeds values buffer";
                     return false;
                 }
+                std::uint32_t def = 0;
+                for (std::size_t b = 0; b < control_bytes; ++b) {
+                    def |= static_cast<std::uint32_t>(values[offset + b]) << (8U * b);
+                }
+                def &= def_mask;
+                const auto row = out.blob_v2.row_packed_sizes.size();
+                if (def != 0U || !out.validity.empty()) {
+                    if (out.validity.empty()) {
+                        out.validity.assign((row + 8U) / 8U, 0xFFU);
+                    }
+                    out.validity.resize((row + 8U) / 8U, 0xFFU);
+                    if (def != 0U) {
+                        out.validity[row / 8U] &= static_cast<std::uint8_t>(~(1U << (row % 8U)));
+                        ++out.null_count;
+                    } else {
+                        out.validity[row / 8U] |= static_cast<std::uint8_t>(1U << (row % 8U));
+                    }
+                }
+                const auto payload = def != 0U ? 0U : row_size - static_cast<std::uint32_t>(control_bytes);
                 out.blob_v2.packed_payload.insert(
                     out.blob_v2.packed_payload.end(),
-                    values.begin() + static_cast<std::ptrdiff_t>(offset),
-                    values.begin() + static_cast<std::ptrdiff_t>(offset + row_size));
-                out.blob_v2.row_packed_sizes.push_back(row_size);
+                    values.begin() + static_cast<std::ptrdiff_t>(offset + control_bytes),
+                    values.begin() + static_cast<std::ptrdiff_t>(offset + control_bytes + payload));
+                out.blob_v2.row_packed_sizes.push_back(payload);
                 offset += row_size;
             }
             if (offset != values.size()) {
@@ -2297,12 +2610,22 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
             const bool first_page = out.variable.offsets.empty();
             std::uint64_t cumulative = out.variable.data.size();  // byte offset (continues across pages)
 
-            // Expand: bulk-fill data once per run; collect offsets in a typed temp, then one bulk copy.
-            auto expand = [&](auto& offs) -> bool {
-                offs.reserve(total_rows + (first_page ? 1U : 0U));
-                using OT = typename std::decay_t<decltype(offs)>::value_type;
+            // Expand: bulk-fill data once per run, and write each offset straight into the output --
+            // not into a temporary copied over afterwards, which cost a second fresh buffer per page.
+            auto expand = [&](auto zero) -> bool {
+                using OT = decltype(zero);
+                const std::size_t count = total_rows + (first_page ? 1U : 0U);
+                const std::size_t base = out.variable.offsets.size();
+                reserve_more(out.variable.offsets, count * sizeof(OT));
+                out.variable.offsets.resize(base + count * sizeof(OT));
+                std::uint8_t* dst = out.variable.offsets.data() + base;
+                const auto put = [&dst](std::uint64_t offset) {
+                    const auto o = static_cast<OT>(offset);
+                    std::memcpy(dst, &o, sizeof(OT));
+                    dst += sizeof(OT);
+                };
                 if (first_page) {
-                    offs.push_back(static_cast<OT>(cumulative));
+                    put(cumulative);
                 }
                 for (const auto& [index, run] : runs) {
                     const std::size_t len = dict.entry_size(index);
@@ -2311,22 +2634,12 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     }
                     for (std::uint8_t c = 0; c < run; ++c) {
                         cumulative += len;
-                        offs.push_back(static_cast<OT>(cumulative));
+                        put(cumulative);
                     }
                 }
-                const std::size_t base = out.variable.offsets.size();
-                out.variable.offsets.resize(base + offs.size() * sizeof(OT));
-                std::memcpy(out.variable.offsets.data() + base, offs.data(), offs.size() * sizeof(OT));
                 return true;
             };
-            bool ok = false;
-            if (out.variable.large) {
-                std::vector<std::uint64_t> offs;
-                ok = expand(offs);
-            } else {
-                std::vector<std::uint32_t> offs;
-                ok = expand(offs);
-            }
+            const bool ok = out.variable.large ? expand(std::uint64_t{0}) : expand(std::uint32_t{0});
             if (!ok) {
                 error = "dict-rle expansion overflows";
                 return false;
@@ -2382,17 +2695,32 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
             }
             indices_bytes.clear();  // hoisted out of the loop; accumulates fresh per page via insert()
             std::uint64_t rows_remaining = page.length;
+            const std::size_t flat_width = encoding_plan.dict_flat_index_bits / 8U;
             for (const auto& chunk : index_chunks) {
                 const auto count = chunk.items != 0U ? chunk.items
                                    : encoding_plan.repdef != nullptr
                                        ? static_cast<std::uint64_t>(chunk.repdef_values)
-                                       : std::min<std::uint64_t>(1024U, rows_remaining);
+                                   : flat_width != 0U ? static_cast<std::uint64_t>(chunk.values.size() / flat_width)
+                                                      : std::min<std::uint64_t>(1024U, rows_remaining);
                 if (count == 0U || count > rows_remaining) {
                     error = "dict index chunk covers " + std::to_string(count) + " values with " +
                             std::to_string(rows_remaining) + " left in the page";
                     return false;
                 }
-                if (!unpack_bitpacked_page_dispatch(chunk.values, count, 4U, indices_bytes, error)) {
+                if (flat_width != 0U) {
+                    if (chunk.values.size() != count * flat_width) {
+                        error = "dict index chunk holds " + std::to_string(chunk.values.size()) + " bytes for " +
+                                std::to_string(count) + " indices";
+                        return false;
+                    }
+                    const auto base = indices_bytes.size();
+                    indices_bytes.resize(base + static_cast<std::size_t>(count) * 4U);
+                    for (std::uint64_t i = 0; i < count; ++i) {
+                        std::uint32_t index = 0;
+                        std::memcpy(&index, chunk.values.data() + i * flat_width, flat_width);  // little-endian
+                        std::memcpy(indices_bytes.data() + base + i * 4U, &index, 4U);
+                    }
+                } else if (!unpack_bitpacked_page_dispatch(chunk.values, count, 4U, indices_bytes, error)) {
                     return false;
                 }
                 rows_remaining -= count;
@@ -2419,15 +2747,13 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 }
                 continue;
             }
-            const bool first_page = out.variable.offsets.empty();
-            std::uint64_t cumulative = out.variable.data.size();
-            // Same reasoning as expand_fsst_values(): a row's length comes from the dictionary entry
-            // its index selects, so the offsets are built per row -- but only grown once per page.
-            reserve_more(out.variable.offsets,
-                         static_cast<std::size_t>(page.length) * (out.variable.large ? 8U : 4U));
-            if (first_page) {
-                append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
+            if (out.variable.offsets.empty()) {
+                append_list_offset(out.variable.offsets, 0, out.variable.large);
             }
+            // Two passes over the indices: the page's expanded size first (checking every index),
+            // then the values copied into a buffer grown once. Growing it value by value doubled a
+            // large column into place, faulting in about twice its size of fresh memory per read.
+            std::uint64_t page_bytes = 0;
             for (std::uint64_t r = 0; r < page.length; ++r) {
                 std::uint32_t index = 0;
                 std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
@@ -2435,11 +2761,42 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     error = "dict index out of range";
                     return false;
                 }
+                page_bytes += dict.entry_size(index);
+            }
+            const std::size_t data_base = out.variable.data.size();
+            std::uint64_t data_end = 0;
+            if (!checked_add(static_cast<std::uint64_t>(data_base), page_bytes, data_end) || !fits_size_t(data_end) ||
+                data_end > default_read_limits().max_uncompressed_bytes ||
+                (!out.variable.large && data_end > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()))) {
+                error = "dictionary column expands past the decoded-size limit";
+                return false;
+            }
+            const auto width = static_cast<std::size_t>(out.variable.large ? 8U : 4U);
+            const std::size_t offsets_base = out.variable.offsets.size();
+            if (data_end > out.variable.data.capacity()) {
+                out.variable.data.reserve(static_cast<std::size_t>(data_end));
+                advise_huge_pages(out.variable.data);
+            }
+            out.variable.data.resize(static_cast<std::size_t>(data_end));
+            out.variable.offsets.resize(offsets_base + static_cast<std::size_t>(page.length) * width);
+            std::uint8_t* dest = out.variable.data.data() + data_base;
+            std::uint8_t* offsets = out.variable.offsets.data() + offsets_base;
+            auto cumulative = static_cast<std::uint64_t>(data_base);
+            for (std::uint64_t r = 0; r < page.length; ++r) {
+                std::uint32_t index = 0;
+                std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
                 const std::size_t len = dict.entry_size(index);
-                const std::uint8_t* src = dict.entry(index);
-                out.variable.data.insert(out.variable.data.end(), src, src + len);
+                if (len != 0U) {
+                    std::memcpy(dest, dict.entry(index), len);
+                }
+                dest += len;
                 cumulative += len;
-                append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
+                if (out.variable.large) {
+                    std::memcpy(offsets + r * 8U, &cumulative, 8U);
+                } else {
+                    const auto narrow = static_cast<std::int32_t>(cumulative);
+                    std::memcpy(offsets + r * 4U, &narrow, 4U);
+                }
             }
         }
         return true;
@@ -2488,6 +2845,13 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
             }
             if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[0], page.buffer_sizes[0], data, error)) {
                 return false;
+            }
+            if (item_view && item_view->full_zip_window) {
+                if (!count_full_zip_levels(data, params, params.levels, params.visible, why)) {
+                    error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) + ": " + why;
+                    return false;
+                }
+                item_view->full_zip_visible += params.visible;
             }
             if (params.levels > std::numeric_limits<std::uint32_t>::max()) {
                 error = "FullZip page row count exceeds 2^32";
@@ -2592,6 +2956,14 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                                                     out.variable.data, error)) {
                             return false;
                         }
+                    } else if (params.value_scheme != page_layout::BufferScheme::kNone && length != 0U) {
+                        if (!decompress_full_zip_value(params.value_scheme, data.data() + at,
+                                                       static_cast<std::size_t>(length), out.variable.data, error)) {
+                            error = "column '" + on_disk_field.name + "': " + error;
+                            return false;
+                        }
+                    } else if (params.value_scheme != page_layout::BufferScheme::kNone) {
+                        // An empty compressed value is an empty value (Lance's decompressor skips it).
                     } else {
                         out.variable.data.insert(out.variable.data.end(), data.begin() + static_cast<std::ptrdiff_t>(at),
                                                  data.begin() + static_cast<std::ptrdiff_t>(at + length));
@@ -2750,6 +3122,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         std::vector<std::uint8_t> fsst_offsets;
         std::vector<std::uint8_t> fsst_data;
         std::uint64_t validity_rows = 0;
+        std::uint64_t rows_done = 0;
         ColumnEncodingPlan later_page;
         for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
             const auto& page = column_metadata.pages[page_index];
@@ -2855,11 +3228,18 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     return false;
                 }
                 remaining -= chunk_values;
+                // Per chunk, not only per page: a column of one or two big pages would otherwise
+                // double its way through the first of them.
+                reserve_projected(out.variable.data, rows_done + page.length - remaining, declared_rows);
+                reserve_projected(out.variable.offsets, rows_done + page.length - remaining, declared_rows);
             }
             if (remaining != 0U) {
                 error = "variable-width page chunks cover fewer rows than the page declares";
                 return false;
             }
+            rows_done += page.length;
+            reserve_projected(out.variable.data, rows_done, declared_rows);
+            reserve_projected(out.variable.offsets, rows_done, declared_rows);
         }
         return true;
     }
@@ -2870,7 +3250,6 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         internal_type = "utf8";
     }
     const auto bytes_per_value = lance_logical_type_value_bytes(internal_type);
-    const bool bitpacked = encoding_plan.kind == ColumnEncodingKind::kBitpack;
     // Reserve the whole column upfront: unpack_bitpacked_page() (and the plain-copy branch below) grow
     // out.fixed one FastLanes chunk (<=1024 values) at a time via insert(), so without this a column of
     // many chunks reallocates and re-copies everything already written on almost every chunk.
@@ -2882,15 +3261,60 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;
     std::vector<MiniBlockChunkView> chunks;
-    const bool nullable = encoding_plan.repdef != nullptr;
+    // Every page carries its own descriptor, and Rust Lance chooses per page: a float64 column
+    // bit-packs its full pages and writes the short last one Flat, and a page with no nulls in it
+    // carries no definition levels even when other pages do. Decoding every page with the first
+    // page's plan read Flat bytes as bit-packed ones ("invalid bit width") and refused level-less
+    // pages. So each later page is planned from its own descriptor (it must still be Flat or
+    // bit-packed), and a page without levels counts as all valid -- backfilled, if an earlier
+    // level-less page came before the first null.
+    const auto plan_page = [&](std::size_t page_index, ColumnEncodingPlan& later) -> const ColumnEncodingPlan* {
+        const auto& page = column_metadata.pages[page_index];
+        if (page_index == 0U || page.encoding.empty()) {
+            return &encoding_plan;
+        }
+        pb::ColumnMetadata one_page;
+        one_page.pages.push_back(page);
+        later = ColumnEncodingPlan{};
+        if (!classify_from_descriptor(one_page, later)) {
+            return &encoding_plan;
+        }
+        if (later.kind != ColumnEncodingKind::kFlat && later.kind != ColumnEncodingKind::kBitpack) {
+            error = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) +
+                    " is neither flat nor bit-packed like the column's first page" +
+                    (later.unsupported_reason.empty() ? "" : ": " + later.unsupported_reason);
+            return nullptr;
+        }
+        later.item_view = encoding_plan.item_view;
+        return &later;
+    };
+    bool any_levels = false;
+    {
+        ColumnEncodingPlan scratch;
+        for (std::size_t i = 0; i < column_metadata.pages.size() && !any_levels; ++i) {
+            const auto* plan = plan_page(i, scratch);
+            if (plan == nullptr) {
+                return false;
+            }
+            any_levels = plan->repdef != nullptr;
+        }
+    }
     std::uint64_t validity_rows = 0;
     std::uint64_t page_rows_before = 0;
-    for (const auto& page : column_metadata.pages) {
+    ColumnEncodingPlan later_page;
+    for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
+        const auto& page = column_metadata.pages[page_index];
+        const auto* plan = plan_page(page_index, later_page);
+        if (plan == nullptr) {
+            return false;
+        }
+        const bool bitpacked = plan->kind == ColumnEncodingKind::kBitpack;
+        const bool nullable = plan->repdef != nullptr;
         if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
             return false;
         }
-        if (!split_miniblock_payload(payload, encoding_plan.chunk_shape, chunks, error) ||
-            !apply_item_view(encoding_plan, chunks, error)) {
+        if (!split_miniblock_payload(payload, plan->chunk_shape, chunks, error) ||
+            !apply_item_view(*plan, chunks, error)) {
             return false;
         }
         // How many values a chunk holds depends on how it is encoded, and the header only states it
@@ -2933,11 +3357,19 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     error = "column declares definition levels but a chunk carries none";
                     return false;
                 }
-                if (!append_definition_levels(chunk.repdef, *encoding_plan.repdef, chunk.repdef_values,
+                if (!append_definition_levels(chunk.repdef, *plan->repdef, chunk.repdef_values,
                                               validity_rows, out.validity, out.null_count, error)) {
                     return false;
                 }
                 validity_rows += chunk.repdef_values;
+            } else if (any_levels) {
+                // A page with no nulls in a column that has some: its rows are all valid.
+                const auto end = validity_rows + chunk_values;
+                out.validity.resize(static_cast<std::size_t>((end + 7U) / 8U), 0U);
+                for (auto row = validity_rows; row < end; ++row) {
+                    out.validity[static_cast<std::size_t>(row >> 3U)] |= static_cast<std::uint8_t>(1U << (row & 7U));
+                }
+                validity_rows = end;
             }
             if (bitpacked) {
                 if (!unpack_bitpacked_page_dispatch(chunk.values, chunk_values, bytes_per_value, out.fixed,
@@ -2976,7 +3408,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         }
         page_rows_before += page.length;
     }
-    if (nullable && validity_rows != declared_rows) {
+    if (any_levels && validity_rows != declared_rows) {
         error = "definition levels cover " + std::to_string(validity_rows) + " rows but the column has " +
                 std::to_string(declared_rows);
         return false;
@@ -3056,7 +3488,11 @@ bool append_leaf_values(ColumnValues& dst, ColumnValues& src, std::string& error
             error = "list pages decoded to different value kinds";
             return false;
         }
-        dst.fixed.insert(dst.fixed.end(), src.fixed.begin(), src.fixed.end());
+        if (dst.fixed.empty()) {
+            std::swap(dst.fixed, src.fixed);  // the first page: take its buffer rather than copy it
+        } else {
+            dst.fixed.insert(dst.fixed.end(), src.fixed.begin(), src.fixed.end());
+        }
         return true;
     }
     if (src.kind != ColumnValues::Kind::VariableWidth || src.variable.large != dst.variable.large) {
@@ -3111,8 +3547,19 @@ bool decode_level_buffer(const std::vector<std::uint8_t>& bytes, const page_layo
 /// count, with each chunk's value count taken from the page's metadata words -- so every value
 /// encoding (bit-packing, dictionaries, FSST, RLE) works inside a list without a second copy. A
 /// constant page (all lists empty or null, or one repeated item) carries its levels as buffers.
+/// Part of a list column's MiniBlock page, for take(): chunks [first, last] of it, cut out by
+/// adjusting the page's metadata and payload buffer offsets (see take_windows). Its first level may
+/// continue a row begun in an earlier chunk, and its last row may run on into a later one: the
+/// decoder makes the leading fragment a row of its own, and the caller drops both.
+struct NestedPageWindow {
+    bool active = false;
+    std::vector<std::uint64_t> chunk_items;  // values in each chunk of the window
+    std::uint64_t rows = 0;                  // out: rows (fragments included) the window decoded to
+};
+
 bool decode_nested_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
-                        const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
+                        const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
+                        std::vector<NestedPageWindow>* windows = nullptr) {
     const auto& logical_type = on_disk_field.logical_type;
     const bool variable = lance_field_is_variable_width(logical_type);
     if (variable) {
@@ -3139,9 +3586,17 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
     std::vector<MiniBlockChunkView> chunks;
     std::vector<std::uint16_t> rep;
     std::vector<std::uint16_t> def;
+    std::uint64_t rows_total = 0;
+    for (const auto& page : column_metadata.pages) {
+        rows_total += page.length;  // only guides reserve_projected; overflow would just skip it
+    }
+    std::uint64_t rows_done = 0;
     for (std::size_t page_index = 0; page_index < column_metadata.pages.size(); ++page_index) {
         const auto& page = column_metadata.pages[page_index];
         const auto where = "column '" + on_disk_field.name + "' page " + std::to_string(page_index) + ": ";
+        NestedPageWindow* window =
+            windows != nullptr && (*windows)[page_index].active ? &(*windows)[page_index] : nullptr;
+        std::uint64_t page_rows = page.length;
         page_layout::PageLayout layout;
         std::string why;
         if (!page_layout::decode_page_layout(page.encoding, layout, why)) {
@@ -3170,9 +3625,13 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             chunk_shape.num_buffers = mb.num_buffers != 0U ? mb.num_buffers : 2U;
             if (!read_page_buffers(data_file_path, page, false, control, payload, error) ||
                 !split_miniblock_payload(payload, chunk_shape, chunks, error) ||
-                !chunk_items_from_metadata(control, mb.has_large_chunk, mb.num_items, items, error)) {
+                (window == nullptr &&
+                 !chunk_items_from_metadata(control, mb.has_large_chunk, mb.num_items, items, error))) {
                 error = where + error;
                 return false;
+            }
+            if (window != nullptr) {
+                items = window->chunk_items;
             }
             if (items.size() != chunks.size()) {
                 error = where + std::to_string(chunks.size()) + " chunks but " + std::to_string(items.size()) +
@@ -3206,6 +3665,32 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             has_def = chunk_shape.has_definition;
             num_items = mb.num_items;
             layer_kinds = &mb.layers;
+            if (window != nullptr) {
+                num_items = 0;
+                for (const auto n : items) {
+                    num_items += n;
+                }
+                // A window starting mid-row: its leading levels become a row of their own (dropped
+                // by the caller). Whatever list they continue, the layers outside it are valid, so
+                // promoting the first level to a row start keeps the levels well formed.
+                std::uint16_t max_rep = 0;
+                for (const auto kind : mb.layers) {
+                    max_rep = static_cast<std::uint16_t>(max_rep + (repdef::is_list_layer(kind) ? 1U : 0U));
+                }
+                if (!has_rep) {
+                    // No list (a nullable struct's child): one value slot per row, so a window of
+                    // chunks is whole rows.
+                    page_rows = num_items;
+                } else {
+                    if (rep.empty()) {
+                        error = where + "a page window holds no repetition levels";
+                        return false;
+                    }
+                    rep[0] = max_rep;
+                    page_rows = static_cast<std::uint64_t>(std::count(rep.begin(), rep.end(), max_rep));
+                }
+                window->rows = page_rows;
+            }
         } else if (layout.kind == page_layout::LayoutKind::kConstant) {
             // Buffers: [rep, def] after the value when the value is not inline; no value at all when
             // every item is null or there are none.
@@ -3226,9 +3711,12 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
                 error = where + error;
                 return false;
             }
-            // A constant under a nullable struct but in no list stores an empty repetition buffer.
+            // A constant under a nullable struct but in no list stores an empty repetition buffer; one
+            // under lists whose every layer is all-valid (a map's constant key, say) stores an empty
+            // definition buffer -- there is nothing to define. With both empty the page has no levels
+            // to infer its items from, and the definition path reports that.
             has_rep = !rep.empty();
-            has_def = true;
+            has_def = !def.empty() || rep.empty();
             layer_kinds = &c.layers;
         } else if (layout.kind == page_layout::LayoutKind::kFullZip) {
             // Long values under lists or null structs: the levels are in each value's control word,
@@ -3248,8 +3736,18 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             pb::ColumnMetadata one_page;
             one_page.pages.push_back(page);
             auto view = std::make_shared<ItemView>();
+            view->full_zip_window = window != nullptr;
             if (!decode_column_impl(data_file_path, on_disk_field, one_page, full_zip_values, error, view)) {
                 return false;
+            }
+            if (window != nullptr) {
+                // Whole rows of a list page: the values counted from its bytes; rows as the caller cut.
+                if (!has_rep) {
+                    error = where + "a FullZip page window without lists";
+                    return false;
+                }
+                num_items = view->full_zip_visible;
+                window->rows = page_rows;
             }
             if (has_def) {
                 def = std::move(view->full_zip_levels);
@@ -3264,9 +3762,9 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             error = where + error;
             return false;
         }
-        if (unraveled.back().length != page.length) {
+        if (unraveled.back().length != page_rows) {
             error = where + "levels describe " + std::to_string(unraveled.back().length) + " rows, the page " +
-                    std::to_string(page.length);
+                    std::to_string(page_rows);
             return false;
         }
         const auto page_items = unraveled[0].length;
@@ -3356,10 +3854,35 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
             page_values.kind = out.kind;
             page_values.variable.large = out.variable.large;
         }
+        // fixed_size_list items (bounding boxes, embeddings): Lance marks every element of a null item
+        // null as well. Those element bits say nothing the item's own validity does not, so they are
+        // dropped; a null element inside a VALID item is not something this reader can carry.
+        if (!page_values.item_validity.empty()) {
+            const auto per_item = page_values.items_per_row;
+            const auto& item_bits = unraveled[0].validity;
+            for (std::uint64_t k = 0; k < page_items && per_item != 0U; ++k) {
+                if (!item_bits.empty() && ((item_bits[static_cast<std::size_t>(k >> 3U)] >> (k & 7U)) & 1U) == 0U) {
+                    continue;
+                }
+                for (std::uint64_t e = k * per_item; e < (k + 1U) * per_item; ++e) {
+                    if (static_cast<std::size_t>(e >> 3U) < page_values.item_validity.size() &&
+                        ((page_values.item_validity[static_cast<std::size_t>(e >> 3U)] >> (e & 7U)) & 1U) == 0U) {
+                        error = where + "a null element inside a fixed_size_list item is not read yet";
+                        return false;
+                    }
+                }
+            }
+            page_values.item_validity.clear();
+            page_values.item_null_count = 0;
+        }
         if (!append_leaf_values(out, page_values, error)) {
             error = where + error;
             return false;
         }
+        rows_done += page_rows;
+        reserve_projected(out.fixed, rows_done, rows_total);
+        reserve_projected(out.variable.data, rows_done, rows_total);
+        reserve_projected(out.variable.offsets, rows_done, rows_total);
 
         // The page's layers: layer k (innermost first, k >= 1) lands in layers[size - k].
         append_validity_bits(item_validity, item_nulls, items_total, unraveled[0].validity, unraveled[0].null_count,
@@ -3439,14 +3962,1411 @@ bool column_is_nested(const pb::ColumnMetadata& column_metadata) {
 
 }  // namespace
 
+namespace {
+
+/// Whether `take_full_zip_rows` can read a single-layer FullZip page's rows straight from the file:
+/// a variable-width page through its repetition index, a fixed-width one (an embedding, say) by its
+/// stride, since every row there is a control word and a value slot, null rows included. Lists,
+/// nullable structs and variable-width pages without an index take the decode-the-page path.
+bool full_zip_row_addressable(const pb::ColumnPage& page, page_layout::PageLayout& layout, FullZipPageParams& params) {
+    std::string why;
+    if (page.encoding.empty() || page.buffer_offsets.empty() || page.buffer_sizes.empty() ||
+        !page_layout::decode_page_layout(page.encoding, layout, why) ||
+        layout.kind != page_layout::LayoutKind::kFullZip || layout.full_zip.layers.size() != 1U ||
+        !full_zip_page_params(layout, page.length, params, why) || params.bits_rep != 0U) {
+        return false;
+    }
+    if (params.length_bytes == 0U) {
+        return params.value_bytes != 0U && params.control_bytes <= 2U &&
+               page.buffer_sizes[0] / (params.control_bytes + params.value_bytes) == page.length &&
+               page.buffer_sizes[0] % (params.control_bytes + params.value_bytes) == 0U;
+    }
+    return page.buffer_offsets.size() >= 2U && page.buffer_sizes.size() >= 2U && params.control_bytes <= 1U &&
+           params.bits_def <= 1U;
+}
+
+/// Fixed-width `take_full_zip_rows`: row k of the page is at k * (control word + value slot).
+bool take_full_zip_fixed_rows(const std::filesystem::path& path, const std::string& column,
+                              const pb::ColumnPage& page, const FullZipPageParams& params,
+                              const std::vector<std::uint64_t>& rows, std::size_t begin, std::size_t end,
+                              std::uint64_t page_first, ColumnValues& out, std::uint64_t& out_row,
+                              std::string& error) {
+    const std::uint64_t stride = params.control_bytes + params.value_bytes;
+    const auto item_bytes = params.value_bytes - params.item_validity_bytes;
+    const std::uint32_t def_mask = params.bits_def == 0U ? 0U : ((1U << params.bits_def) - 1U);
+    thread_local std::vector<std::uint8_t> bytes;
+    for (std::size_t i = begin; i < end;) {
+        // Rows that sit next to each other in the page are one read.
+        std::size_t j = i + 1U;
+        while (j < end && rows[j] == rows[j - 1U] + 1U) {
+            ++j;
+        }
+        const auto first_local = rows[i] - page_first;
+        const auto count = rows[j - 1U] - rows[i] + 1U;
+        if (!read_lance_data_file_bytes(path, page.buffer_offsets[0] + first_local * stride, count * stride, bytes,
+                                        error)) {
+            return false;
+        }
+        if (bytes.size() != count * stride) {
+            error = "column '" + column + "': FullZip page is shorter than its rows";
+            return false;
+        }
+        for (std::uint64_t k = 0; k < count; ++k) {
+            const std::uint8_t* at = bytes.data() + k * stride;
+            std::uint32_t word = 0;
+            std::memcpy(&word, at, params.control_bytes);  // little-endian
+            at += params.control_bytes;
+            if (params.items != 0U) {
+                append_item_validity(out, params.item_validity_bytes != 0U ? at : nullptr, 0U, params.items,
+                                     out_row * params.items);
+            }
+            at += params.item_validity_bytes;
+            out.fixed.insert(out.fixed.end(), at, at + item_bytes);
+            out.validity.resize(static_cast<std::size_t>((out_row + 8U) / 8U), 0U);
+            if ((word & def_mask) == 0U) {
+                out.validity[static_cast<std::size_t>(out_row >> 3U)] |= static_cast<std::uint8_t>(1U << (out_row & 7U));
+            } else {
+                ++out.null_count;
+            }
+            ++out_row;
+        }
+        i = j;
+    }
+    return true;
+}
+
+/// Append rows `[begin, end)` of `rows` -- all inside `page`, as page-local row numbers relative to
+/// `page_first` -- reading each row's bytes through the page's repetition index.
+bool take_full_zip_rows(const std::filesystem::path& path, const std::string& column, const pb::ColumnPage& page,
+                        const FullZipPageParams& params, const std::vector<std::uint64_t>& rows, std::size_t begin,
+                        std::size_t end, std::uint64_t page_first, ColumnValues& out, std::uint64_t& out_row,
+                        std::string& error) {
+    if (params.length_bytes == 0U) {
+        return take_full_zip_fixed_rows(path, column, page, params, rows, begin, end, page_first, out, out_row, error);
+    }
+    const auto index_size = page.buffer_sizes[1];
+    const auto entries = page.length + 1U;
+    if (index_size == 0U || index_size % entries != 0U) {
+        error = "column '" + column + "': FullZip repetition index does not have one entry per row";
+        return false;
+    }
+    const auto width = index_size / entries;
+    if (width != 1U && width != 2U && width != 4U && width != 8U) {
+        error = "column '" + column + "': FullZip repetition index entries are " + std::to_string(width) + " bytes";
+        return false;
+    }
+    thread_local std::vector<std::uint8_t> index;
+    thread_local std::vector<std::uint8_t> bytes;
+    if (!read_lance_data_file_bytes(path, page.buffer_offsets[1], index_size, index, error)) {
+        return false;
+    }
+    const auto entry = [&](std::uint64_t k) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, index.data() + k * width, static_cast<std::size_t>(width));
+        return v;
+    };
+    const auto data_size = page.buffer_sizes[0];
+    for (std::size_t i = begin; i < end;) {
+        // Rows that sit next to each other in the page are one read.
+        std::size_t j = i + 1U;
+        while (j < end && rows[j] == rows[j - 1U] + 1U) {
+            ++j;
+        }
+        const auto first_local = rows[i] - page_first;
+        const auto last_local = rows[j - 1U] - page_first;
+        const auto start = entry(first_local);
+        const auto stop = entry(last_local + 1U);
+        if (stop < start || stop > data_size) {
+            error = "column '" + column + "': FullZip repetition index points past the page";
+            return false;
+        }
+        if (!read_lance_data_file_bytes(path, page.buffer_offsets[0] + start, stop - start, bytes, error)) {
+            return false;
+        }
+        for (auto local = first_local; local <= last_local; ++local) {
+            const auto row_begin = entry(local) - start;
+            const auto row_end = entry(local + 1U) - start;
+            if (row_end < row_begin || row_end > bytes.size()) {
+                error = "column '" + column + "': FullZip repetition index is not increasing";
+                return false;
+            }
+            std::size_t at = static_cast<std::size_t>(row_begin);
+            std::uint32_t def = 0;
+            if (params.control_bytes == 1U) {
+                if (at >= row_end) {
+                    error = "column '" + column + "': FullZip row has no control word";
+                    return false;
+                }
+                def = bytes[at++] & ((1U << params.bits_def) - 1U);
+            }
+            if (def == 0U) {
+                if (row_end - at < params.length_bytes) {
+                    error = "column '" + column + "': FullZip row truncated in its length";
+                    return false;
+                }
+                std::uint64_t length = 0;
+                std::memcpy(&length, bytes.data() + at, params.length_bytes);
+                at += params.length_bytes;
+                if (length != row_end - at) {
+                    error = "column '" + column + "': FullZip row length disagrees with its index entries";
+                    return false;
+                }
+                if (params.fsst) {
+                    if (!fsst::decompress_value(*params.fsst, bytes.data() + at, static_cast<std::size_t>(length),
+                                                out.variable.data, error)) {
+                        return false;
+                    }
+                } else if (params.value_scheme != page_layout::BufferScheme::kNone) {
+                    if (length != 0U && !decompress_full_zip_value(params.value_scheme, bytes.data() + at,
+                                                                   static_cast<std::size_t>(length), out.variable.data,
+                                                                   error)) {
+                        return false;
+                    }
+                } else {
+                    out.variable.data.insert(out.variable.data.end(), bytes.begin() + static_cast<std::ptrdiff_t>(at),
+                                             bytes.begin() + static_cast<std::ptrdiff_t>(at + length));
+                }
+                if (out.variable.data.size() > default_read_limits().max_uncompressed_bytes) {
+                    error = "column '" + column + "' exceeds the decoded-size limit";
+                    return false;
+                }
+                out.validity.resize(static_cast<std::size_t>((out_row + 8U) / 8U), 0U);
+                out.validity[static_cast<std::size_t>(out_row >> 3U)] |= static_cast<std::uint8_t>(1U << (out_row & 7U));
+            } else {
+                out.validity.resize(static_cast<std::size_t>((out_row + 8U) / 8U), 0U);
+                ++out.null_count;
+            }
+            append_list_offset(out.variable.offsets, static_cast<std::int64_t>(out.variable.data.size()),
+                               out.variable.large);
+            ++out_row;
+        }
+        i = j;
+    }
+    return true;
+}
+
+/// Small columns, decoded whole and kept for take(). Rows of a list or struct column are found by
+/// decoding their page, and a mini-batch of 64 random rows touches nearly every page of a small
+/// column -- COCO's `objects` decoded all 11.5 MB of itself for every batch, 5 of a shuffled epoch's
+/// 6.6 seconds. A column whose pages hold at most kCacheColumnBytes is instead decoded once and each
+/// take picks its rows from that copy.
+///
+/// Bounded: at most NANOLANCE_TAKE_CACHE_MB of decoded columns (default 256; 0 turns the cache off,
+/// for a device that would rather decode again than hold them), dropped all at once when full. Keyed
+/// by file path, size and modification time and the field -- Lance never rewrites a data file in place.
+constexpr std::uint64_t kCacheColumnBytes = std::uint64_t{16} << 20U;
+
+std::uint64_t take_cache_budget() {
+    static const std::uint64_t budget = [] {
+        const char* env = std::getenv("NANOLANCE_TAKE_CACHE_MB");
+        if (env == nullptr || *env == '\0') {
+            return std::uint64_t{256} << 20U;
+        }
+        return static_cast<std::uint64_t>(std::strtoull(env, nullptr, 10)) << 20U;
+    }();
+    return budget;
+}
+
+std::uint64_t decoded_bytes(const ColumnValues& v) {
+    std::uint64_t bytes = v.fixed.size() + v.variable.offsets.size() + v.variable.data.size() + v.validity.size() +
+                          v.item_validity.size();
+    for (const auto& layer : v.layers) {
+        bytes += layer.offsets.size() * sizeof(std::int64_t) + layer.validity.size();
+    }
+    return bytes;
+}
+
+/// When a take decodes a column whole for the cache: never (its rows are read from the chunks that
+/// hold them, which costs about what picking them from a copy does), on its second take, or on its
+/// first.
+enum class CacheFill { Never, SecondTake, FirstTake };
+
+/// A column this small is decoded whole on its first take whatever the rows: that costs little more
+/// than finding them.
+constexpr std::uint64_t kSmallColumnBytes = std::uint64_t{1} << 20U;
+
+/// The cached copy of a column, or -- as `fill` says, when the column is worth caching -- one
+/// decoded now. Null (and no error) when there is none to use: the caller reads just the rows it needs.
+///
+/// A list column is decoded whole on its second take, not its first: a one-off take (an indexed
+/// query's rows) reads only the chunks holding its rows, a repeated one (a training epoch) gets the
+/// copy from then on. A copy that would overflow the budget is admitted only by dropping copies unused for a
+/// while; otherwise it is not kept -- clearing the cache for it made a working set over the budget
+/// decode every column whole on every take.
+std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::path& path, const pb::Field& field,
+                                                       const pb::ColumnMetadata& column, std::string& error,
+                                                       CacheFill fill) {
+    using Clock = std::chrono::steady_clock;
+    struct Entry {
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type mtime{};
+        std::shared_ptr<const ColumnValues> values;  // null: taken once, not decoded
+        std::uint64_t bytes = 0;
+        Clock::time_point used{};
+        bool rejected = false;  // decoded once and not admitted: not decoded whole again
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::string, Entry> cache;
+    static std::uint64_t held = 0;
+    constexpr auto kIdle = std::chrono::seconds(10);
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return nullptr;
+    }
+    const auto key = path.string() + '#' + std::to_string(field.id);
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        const auto it = cache.find(key);
+        const bool current = it != cache.end() && it->second.size == size && it->second.mtime == mtime;
+        if (current && it->second.values != nullptr) {
+            work_stats::add(work_stats::counters().take_cache_hits, 1U);
+            it->second.used = Clock::now();
+            return it->second.values;
+        }
+        if (current && it->second.rejected) {
+            if (Clock::now() - it->second.used <= kIdle || held > 0U) {
+                return nullptr;
+            }
+        }
+        if (fill == CacheFill::Never) {
+            return nullptr;
+        }
+        if (!current && fill == CacheFill::SecondTake) {
+            if (it != cache.end()) {
+                held -= it->second.bytes;
+            }
+            cache[key] = Entry{size, mtime, nullptr, 0, Clock::now()};  // taken once
+            return nullptr;
+        }
+    }
+    auto whole = std::make_shared<ColumnValues>();
+    if (!decode_lance_physical_column(path, field, column, *whole, error)) {
+        return nullptr;
+    }
+    const auto bytes = decoded_bytes(*whole);
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (bytes <= take_cache_budget()) {
+        if (held + bytes > take_cache_budget()) {
+            const auto now = Clock::now();
+            for (auto it = cache.begin(); it != cache.end();) {
+                if (it->second.values != nullptr && now - it->second.used > kIdle) {
+                    held -= it->second.bytes;
+                    it = cache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        auto& entry = cache[key];
+        held -= entry.bytes;
+        if (held + bytes <= take_cache_budget()) {
+            entry = Entry{size, mtime, whole, bytes, Clock::now()};
+            held += bytes;
+        } else {
+            entry = Entry{size, mtime, nullptr, 0, Clock::now(), true};
+        }
+    } else {
+        cache[key] = Entry{size, mtime, nullptr, 0, Clock::now(), true};
+    }
+    return whole;
+}
+
+/// Rows of flat MiniBlock pages, decoding only the chunks that hold them (as a range read does for
+/// its rows). False with no error when a touched page is not one.
+bool take_flat_miniblock_chunks(const std::filesystem::path& path, const pb::Field& field,
+                                const pb::ColumnMetadata& column, const std::vector<std::uint64_t>& rows,
+                                const std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>>& touched,
+                                const std::vector<std::uint64_t>& page_first, std::size_t value_bytes,
+                                ColumnValues& out, bool& done, std::string& error);
+
+/// Where a MiniBlock list page's chunks sit in its payload, how many values each holds, and how many
+/// rows finish before each -- from the page's metadata words and its repetition index. Read once per
+/// page and kept: a shuffled epoch comes back to the same page for every batch.
+struct MiniBlockPageIndex {
+    std::size_t word_bytes = 2;
+    std::vector<std::uint64_t> byte_start;   // chunks + 1
+    std::vector<std::uint64_t> items;        // chunks
+    std::vector<std::uint64_t> rows_before;  // chunks + 1; the last is the page's row count
+};
+
+/// Pages with fewer chunks are decoded whole: a window would save little.
+constexpr std::size_t kMinWindowChunks = 8;
+
+std::shared_ptr<const MiniBlockPageIndex> miniblock_page_index(const std::filesystem::path& path,
+                                                               const pb::ColumnPage& page,
+                                                               const page_layout::MiniBlock& mb, std::string& error) {
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::shared_ptr<const MiniBlockPageIndex>> cache;
+    const std::size_t word = mb.has_large_chunk ? 4U : 2U;
+    const std::size_t rep_at = mb.dictionary != nullptr ? 3U : 2U;
+    // A list page needs its repetition index to say where rows end; a flat page's rows are its
+    // values, which the metadata words count.
+    const bool flat = !mb.has_repetition;
+    if (page.buffer_sizes.size() != page.buffer_offsets.size() || page.buffer_sizes.size() < 2U ||
+        page.buffer_sizes[0] % word != 0U) {
+        return nullptr;
+    }
+    const auto chunks = static_cast<std::size_t>(page.buffer_sizes[0] / word);
+    const auto stride = static_cast<std::uint64_t>(mb.repetition_index_depth) + 1U;
+    if (flat ? chunks < 2U
+             : mb.repetition_index_depth == 0U || page.buffer_offsets.size() <= rep_at || chunks < kMinWindowChunks ||
+                   page.buffer_sizes[rep_at] != chunks * stride * 8U) {
+        return nullptr;
+    }
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return nullptr;
+    }
+    const auto key = path.string() + '#' + std::to_string(size) + '#' +
+                     std::to_string(static_cast<long long>(
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(mtime.time_since_epoch()).count())) + '#' + std::to_string(page.buffer_offsets[0]);
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        const auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+    }
+    std::vector<std::uint8_t> control;
+    std::vector<std::uint8_t> rep_index;
+    auto index = std::make_shared<MiniBlockPageIndex>();
+    if (!read_lance_data_file_bytes(path, page.buffer_offsets[0], page.buffer_sizes[0], control, error) ||
+        (!flat &&
+         !read_lance_data_file_bytes(path, page.buffer_offsets[rep_at], page.buffer_sizes[rep_at], rep_index, error))) {
+        return nullptr;
+    }
+    std::string why;  // metadata that does not add up: no index, the page is decoded whole
+    if (!chunk_items_from_metadata(control, mb.has_large_chunk, flat ? page.length : mb.num_items, index->items,
+                                   why)) {
+        return nullptr;
+    }
+    index->word_bytes = word;
+    index->byte_start.assign(chunks + 1U, 0U);
+    index->rows_before.assign(chunks + 1U, 0U);
+    for (std::size_t c = 0; c < chunks; ++c) {
+        std::uint32_t w = 0;
+        std::memcpy(&w, control.data() + c * word, word);
+        index->byte_start[c + 1U] = index->byte_start[c] + ((static_cast<std::uint64_t>(w) >> 4U) + 1U) * 8U;
+        std::uint64_t finished = index->items[c];
+        if (!flat) {
+            std::memcpy(&finished, rep_index.data() + c * stride * 8U, 8U);
+        }
+        if (finished > page.length - index->rows_before[c]) {
+            return nullptr;  // more rows than the page holds
+        }
+        index->rows_before[c + 1U] = index->rows_before[c] + finished;
+    }
+    // Only an index that agrees with the page is used; anything else decodes the page whole.
+    if (index->byte_start.back() != page.buffer_sizes[1] || index->rows_before.back() != page.length) {
+        return nullptr;
+    }
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (cache.size() >= 4096U) {
+        cache.clear();
+    }
+    cache.emplace(key, index);
+    return index;
+}
+
+/// Where each row of a FullZip list page starts in its data buffer, and where the last ends: the
+/// page's repetition index (buffer 1, one entry per row and one more, 1 to 8 bytes each). Read once
+/// per page and kept, as miniblock_page_index is. Null when the page has none that adds up.
+std::shared_ptr<const std::vector<std::uint64_t>> full_zip_row_starts(const std::filesystem::path& path,
+                                                                     const pb::ColumnPage& page,
+                                                                     std::string& error) {
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::shared_ptr<const std::vector<std::uint64_t>>> cache;
+    if (page.buffer_offsets.size() < 2U || page.buffer_sizes.size() != page.buffer_offsets.size()) {
+        return nullptr;
+    }
+    const auto entries = page.length + 1U;
+    const auto index_size = page.buffer_sizes[1];
+    const auto width = index_size / entries;
+    if (index_size == 0U || index_size % entries != 0U || (width != 1U && width != 2U && width != 4U && width != 8U)) {
+        return nullptr;
+    }
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return nullptr;
+    }
+    const auto key = path.string() + '#' + std::to_string(size) + '#' +
+                     std::to_string(static_cast<long long>(
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(mtime.time_since_epoch()).count())) +
+                     '#' + std::to_string(page.buffer_offsets[1]);
+    {
+        const std::lock_guard<std::mutex> lock(mutex);
+        const auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+    }
+    std::vector<std::uint8_t> raw;
+    if (!read_lance_data_file_bytes(path, page.buffer_offsets[1], index_size, raw, error)) {
+        return nullptr;
+    }
+    auto starts = std::make_shared<std::vector<std::uint64_t>>(static_cast<std::size_t>(entries));
+    for (std::uint64_t k = 0; k < entries; ++k) {
+        std::uint64_t v = 0;
+        std::memcpy(&v, raw.data() + k * width, static_cast<std::size_t>(width));  // little-endian
+        if (k != 0U && v < (*starts)[k - 1U]) {
+            return nullptr;  // not increasing: the page is decoded whole, which checks it properly
+        }
+        (*starts)[k] = v;
+    }
+    if (starts->front() != 0U || starts->back() != page.buffer_sizes[0]) {
+        return nullptr;
+    }
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (cache.size() >= 4096U) {
+        cache.clear();
+    }
+    cache.emplace(key, starts);
+    return starts;
+}
+
+/// Is this a FullZip page holding lists (repetition levels in its control words)?
+bool full_zip_list_page(const page_layout::PageLayout& layout) {
+    return layout.kind == page_layout::LayoutKind::kFullZip && layout.full_zip.bits_rep != 0U;
+}
+
+/// For take() on a list column: each touched page, whole -- or, for a MiniBlock page with a
+/// repetition index and many chunks (pylance writes a column of audio clips as one 150 MB page),
+/// just the runs of chunks holding the requested rows. The i-th output page comes from page
+/// `page_of[i]`, and its first decoded row is that page's row `first_row[i]`.
+bool take_windows(const std::filesystem::path& path, const pb::ColumnMetadata& column,
+                  const std::vector<std::uint64_t>& rows,
+                  const std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>>& touched,
+                  const std::vector<std::uint64_t>& page_first, pb::ColumnMetadata& subset,
+                  std::vector<NestedPageWindow>& windows, std::vector<std::uint64_t>& first_row,
+                  std::vector<std::size_t>& page_of, std::string& error) {
+    subset.pages.clear();
+    windows.clear();
+    first_row.clear();
+    page_of.clear();
+    for (const auto& [p, span] : touched) {
+        const auto& page = column.pages[p];
+        page_layout::PageLayout layout;
+        std::string why;
+        std::shared_ptr<const MiniBlockPageIndex> index;
+        const bool laid_out = page_layout::decode_page_layout(page.encoding, layout, why);
+        if (laid_out && layout.kind == page_layout::LayoutKind::kMiniBlock) {
+            index = miniblock_page_index(path, page, layout.mini_block, error);
+            if (index == nullptr && !error.empty()) {
+                return false;
+            }
+        }
+        // A FullZip list page (long strings in lists: MS MARCO's passages) keeps where each row
+        // starts, so a run of requested rows is one read of just their bytes.
+        std::shared_ptr<const std::vector<std::uint64_t>> starts;
+        if (laid_out && full_zip_list_page(layout)) {
+            starts = full_zip_row_starts(path, page, error);
+            if (starts == nullptr && !error.empty()) {
+                return false;
+            }
+        }
+        if (starts != nullptr) {
+            for (auto i = span.first; i < span.second;) {
+                const auto a = rows[i] - page_first[p];
+                auto b = a + 1U;
+                for (++i; i < span.second && rows[i] - page_first[p] == b; ++i) {
+                    ++b;
+                }
+                pb::ColumnPage part = page;
+                part.buffer_offsets[0] += (*starts)[a];
+                part.buffer_sizes[0] = (*starts)[b] - (*starts)[a];
+                part.length = b - a;
+                NestedPageWindow window;
+                window.active = true;
+                window.rows = b - a;
+                subset.pages.push_back(std::move(part));
+                windows.push_back(std::move(window));
+                first_row.push_back(a);
+                work_stats::add(work_stats::counters().page_windows, 1U);
+                page_of.push_back(p);
+            }
+            continue;
+        }
+        if (index == nullptr) {
+            subset.pages.push_back(page);
+            windows.emplace_back();
+            first_row.push_back(0);
+            page_of.push_back(p);
+            continue;
+        }
+        // Row r ends in the first chunk c with rows_before[c + 1] > r, and starts in the chunk where
+        // row r - 1 ends (or the next one). Rows whose chunk runs meet or touch share one window.
+        const auto& before = index->rows_before;
+        const auto end_chunk = [&](std::uint64_t r) {
+            return static_cast<std::size_t>(std::upper_bound(before.begin() + 1, before.end(), r) - before.begin() - 1);
+        };
+        for (auto i = span.first; i < span.second;) {
+            const auto r = rows[i] - page_first[p];
+            const std::size_t first = r == 0U ? 0U : end_chunk(r - 1U);
+            std::size_t last = end_chunk(r);
+            ++i;
+            while (i < span.second) {
+                const auto next = rows[i] - page_first[p];
+                if ((next == 0U ? 0U : end_chunk(next - 1U)) > last + 1U) {
+                    break;
+                }
+                last = std::max(last, end_chunk(next));
+                ++i;
+            }
+            pb::ColumnPage part = page;
+            part.buffer_offsets[0] += first * index->word_bytes;
+            part.buffer_sizes[0] = (last - first + 1U) * index->word_bytes;
+            part.buffer_offsets[1] += index->byte_start[first];
+            part.buffer_sizes[1] = index->byte_start[last + 1U] - index->byte_start[first];
+            part.length = before[last + 1U] - before[first];  // about the rows it decodes
+            NestedPageWindow window;
+            window.active = true;
+            window.chunk_items.assign(index->items.begin() + static_cast<std::ptrdiff_t>(first),
+                                      index->items.begin() + static_cast<std::ptrdiff_t>(last + 1U));
+            subset.pages.push_back(std::move(part));
+            windows.push_back(std::move(window));
+            first_row.push_back(before[first]);
+            work_stats::add(work_stats::counters().page_windows, 1U);
+            page_of.push_back(p);
+        }
+    }
+    return true;
+}
+
+/// A list column's very large pages (pylance's one-page audio column) are decoded as windows of
+/// about scan_window_bytes() of chunks rather than whole, so the levels, offsets and scratch buffers
+/// of one window are what is ever held besides the output -- a 156 MB page was held three to four
+/// times over, ~900 MB, and faulted in at a cost of 1.7 s against Rust's 0.5 s. A row range (a
+/// morsel of a parallel read) is cut the same way. NANOLANCE_LIST_WINDOW_KB sets the window
+/// (default 4096; whole pages over four windows are split).
+std::uint64_t scan_window_bytes() {
+    static const std::uint64_t bytes = [] {
+        const char* env = std::getenv("NANOLANCE_LIST_WINDOW_KB");
+        const auto kb = env == nullptr || *env == '\0' ? 4096ULL : std::strtoull(env, nullptr, 10);
+        return std::max<std::uint64_t>(1U, kb) << 10U;
+    }();
+    return bytes;
+}
+
+/// Windows over one MiniBlock list page's rows [r0, r1): runs of about scan_window_bytes() of chunks,
+/// window k keeping the rows that END in its chunks. Each window starts at the chunk where its first
+/// row starts, so the part of a row begun in the previous window is decoded again there.
+void append_page_windows(const MiniBlockPageIndex& index, const pb::ColumnPage& page, std::uint64_t r0,
+                         std::uint64_t r1, pb::ColumnMetadata& subset, std::vector<NestedPageWindow>& windows,
+                         std::vector<std::pair<std::uint64_t, std::uint64_t>>& keep_rows) {
+    const auto& before = index.rows_before;
+    const auto chunks = index.items.size();
+    const auto end_chunk = [&](std::uint64_t r) {
+        return static_cast<std::size_t>(std::upper_bound(before.begin() + 1, before.end(), r) - before.begin() - 1);
+    };
+    for (std::size_t cut = end_chunk(r0); cut < chunks;) {
+        const auto a = std::max(before[cut], r0);
+        if (a >= r1) {
+            break;
+        }
+        std::size_t next = cut + 1U;
+        while (next < chunks && before[next] < r1 &&
+               (before[next] <= a || index.byte_start[next] - index.byte_start[cut] < scan_window_bytes())) {
+            ++next;
+        }
+        const auto b = std::min(before[next], r1);
+        const std::size_t first = a == 0U ? 0U : end_chunk(a - 1U);
+        pb::ColumnPage part = page;
+        part.buffer_offsets[0] += first * index.word_bytes;
+        part.buffer_sizes[0] = (next - first) * index.word_bytes;
+        part.buffer_offsets[1] += index.byte_start[first];
+        part.buffer_sizes[1] = index.byte_start[next] - index.byte_start[first];
+        part.length = before[next] - before[first];  // about the rows it decodes (sizes reservations)
+        NestedPageWindow window;
+        window.active = true;
+        window.chunk_items.assign(index.items.begin() + static_cast<std::ptrdiff_t>(first),
+                                  index.items.begin() + static_cast<std::ptrdiff_t>(next));
+        subset.pages.push_back(std::move(part));
+        windows.push_back(std::move(window));
+        keep_rows.emplace_back(a - before[first], b - before[first]);
+        work_stats::add(work_stats::counters().page_windows, 1U);
+        cut = next;
+    }
+}
+
+/// Rows [begin, end) of a list column. A page the range covers only in part, or one too large to
+/// hold whole (see scan_window_bytes), is read as windows of its chunks when it carries a
+/// repetition index; other pages are decoded whole and trimmed.
+bool decode_nested_rows(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+                        std::uint64_t begin, std::uint64_t end, ColumnValues& out, std::string& error) {
+    pb::ColumnMetadata subset;
+    std::vector<NestedPageWindow> windows;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> keep_rows;  // per subset page: decoded rows to keep
+    bool trimmed = false;
+    std::uint64_t page_begin = 0;
+    for (const auto& page : column.pages) {
+        const auto page_end = page_begin + page.length;
+        if (page_end <= begin || page_begin >= end) {
+            page_begin = page_end;
+            trimmed = true;
+            continue;
+        }
+        const auto r0 = std::max(begin, page_begin) - page_begin;
+        const auto r1 = std::min(end, page_end) - page_begin;
+        const bool partial = r0 != 0U || r1 != page.length;
+        std::shared_ptr<const MiniBlockPageIndex> index;
+        std::shared_ptr<const std::vector<std::uint64_t>> starts;
+        page_layout::PageLayout layout;
+        std::string why;
+        if (page.buffer_sizes.size() >= 2U && page_layout::decode_page_layout(page.encoding, layout, why)) {
+            if (layout.kind == page_layout::LayoutKind::kMiniBlock &&
+                (partial || page.buffer_sizes[1] > 4U * scan_window_bytes())) {
+                index = miniblock_page_index(path, page, layout.mini_block, error);
+            } else if (full_zip_list_page(layout) && (partial || page.buffer_sizes[0] > 4U * scan_window_bytes())) {
+                starts = full_zip_row_starts(path, page, error);
+            }
+            if (index == nullptr && starts == nullptr && !error.empty()) {
+                return false;
+            }
+        }
+        if (starts != nullptr) {
+            // A FullZip list page: windows of whole rows, about scan_window_bytes() each.
+            for (auto a = r0; a < r1;) {
+                auto b = a + 1U;
+                while (b < r1 && (*starts)[b] - (*starts)[a] < scan_window_bytes()) {
+                    ++b;
+                }
+                pb::ColumnPage part = page;
+                part.buffer_offsets[0] += (*starts)[a];
+                part.buffer_sizes[0] = (*starts)[b] - (*starts)[a];
+                part.length = b - a;
+                NestedPageWindow window;
+                window.active = true;
+                window.rows = b - a;
+                subset.pages.push_back(std::move(part));
+                windows.push_back(std::move(window));
+                keep_rows.emplace_back(0, b - a);
+                work_stats::add(work_stats::counters().page_windows, 1U);
+                a = b;
+            }
+            trimmed = true;
+        } else if (index != nullptr) {
+            append_page_windows(*index, page, r0, r1, subset, windows, keep_rows);
+            trimmed = true;
+        } else {
+            subset.pages.push_back(page);
+            windows.emplace_back();
+            keep_rows.emplace_back(r0, r1);
+            trimmed = trimmed || partial;
+        }
+        page_begin = page_end;
+    }
+    if (!trimmed) {
+        return decode_nested_column(path, field, column, out, error);
+    }
+    if (subset.pages.empty()) {  // no rows: the column's shape only
+        subset.pages.push_back(column.pages.front());
+        windows.emplace_back();
+        keep_rows.emplace_back(0, 0);
+    }
+    if (!decode_nested_column(path, field, subset, out, error, &windows)) {
+        return false;
+    }
+    std::vector<std::uint8_t> keep;
+    for (std::size_t w = 0; w < windows.size(); ++w) {
+        const auto n = windows[w].active ? windows[w].rows : subset.pages[w].length;
+        const auto [from, to] = keep_rows[w];
+        if (to > n || from > to) {
+            error = "column '" + field.name + "': a page window decoded fewer rows than its index promised";
+            return false;
+        }
+        const auto base = keep.size();
+        keep.resize(base + static_cast<std::size_t>(n), 0U);
+        std::fill(keep.begin() + static_cast<std::ptrdiff_t>(base + from),
+                  keep.begin() + static_cast<std::ptrdiff_t>(base + to), std::uint8_t{1});
+    }
+    const std::size_t value_bytes =
+        lance_field_is_variable_width(field.logical_type) ? 0U : lance_logical_type_value_bytes(field.logical_type);
+    return compact_column_values(out, keep, keep.size(), value_bytes, error);
+}
+
+}  // namespace
+
+namespace {
+
+bool decode_flat_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                        const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error);
+
+bool take_flat_miniblock_chunks(const std::filesystem::path& path, const pb::Field& field,
+                                const pb::ColumnMetadata& column, const std::vector<std::uint64_t>& rows,
+                                const std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>>& touched,
+                                const std::vector<std::uint64_t>& page_first, std::size_t value_bytes,
+                                ColumnValues& out, bool& done, std::string& error) {
+    done = false;
+    pb::ColumnMetadata subset = column;
+    subset.pages.clear();
+    std::vector<std::uint8_t> keep;
+    for (const auto& [p, span] : touched) {
+        const auto& page = column.pages[p];
+        page_layout::PageLayout layout;
+        std::string why;
+        if (!page_layout::decode_page_layout(page.encoding, layout, why) ||
+            layout.kind != page_layout::LayoutKind::kMiniBlock || layout.mini_block.has_repetition) {
+            return true;
+        }
+        const auto index = miniblock_page_index(path, page, layout.mini_block, error);
+        if (index == nullptr) {
+            return error.empty();
+        }
+        const auto& before = index->rows_before;
+        const auto chunk_of = [&](std::uint64_t r) {
+            return static_cast<std::size_t>(std::upper_bound(before.begin(), before.end(), r) - before.begin() - 1);
+        };
+        // Runs of rows whose chunks meet or touch are one part of the page.
+        for (auto i = span.first; i < span.second;) {
+            const auto c0 = chunk_of(rows[i] - page_first[p]);
+            auto c1 = c0;
+            auto j = i + 1;
+            while (j < span.second && chunk_of(rows[j] - page_first[p]) <= c1 + 1U) {
+                c1 = chunk_of(rows[j] - page_first[p]);
+                ++j;
+            }
+            pb::ColumnPage part = page;
+            part.buffer_offsets[0] += c0 * index->word_bytes;
+            part.buffer_sizes[0] = (c1 + 1U - c0) * index->word_bytes;
+            part.buffer_offsets[1] += index->byte_start[c0];
+            part.buffer_sizes[1] = index->byte_start[c1 + 1U] - index->byte_start[c0];
+            part.length = before[c1 + 1U] - before[c0];
+            const auto base = keep.size();
+            keep.resize(base + static_cast<std::size_t>(part.length), 0U);
+            for (auto k = i; k < j; ++k) {
+                keep[base + static_cast<std::size_t>(rows[k] - page_first[p] - before[c0])] = 1U;
+            }
+            subset.pages.push_back(std::move(part));
+            work_stats::add(work_stats::counters().page_windows, 1U);
+            i = j;
+        }
+    }
+    if (!decode_flat_column(path, field, subset, out, error) ||
+        !compact_column_values(out, keep, keep.size(), value_bytes, error)) {
+        return false;
+    }
+    done = true;
+    return true;
+}
+
+}  // namespace
+
+bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                                       const pb::ColumnMetadata& column_metadata,
+                                       const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
+                                       ColumnValues& out, std::string& error) {
+    if (v20::is_v20_column(column_metadata)) {
+        return v20::decode_column_rows(data_file_path, on_disk_field, column_metadata, nullptr, rows, value_bytes,
+                                       out, error);
+    }
+    error.clear();
+    out = ColumnValues{};
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        if (rows[i] <= rows[i - 1U]) {
+            error = "rows to take must be strictly ascending";
+            return false;
+        }
+    }
+    // Which pages hold a requested row, and where each page starts.
+    std::vector<std::uint64_t> page_first(column_metadata.pages.size() + 1U, 0U);
+    for (std::size_t p = 0; p < column_metadata.pages.size(); ++p) {
+        page_first[p + 1U] = page_first[p] + column_metadata.pages[p].length;
+    }
+    if (!rows.empty() && rows.back() >= page_first.back()) {
+        error = "row " + std::to_string(rows.back()) + " is past the column's " + std::to_string(page_first.back()) +
+                " rows";
+        return false;
+    }
+    std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>> touched;  // page, [begin, end) of rows
+    for (std::size_t i = 0; i < rows.size();) {
+        const auto p = static_cast<std::size_t>(
+            std::upper_bound(page_first.begin(), page_first.end(), rows[i]) - page_first.begin() - 1);
+        std::size_t j = i;
+        while (j < rows.size() && rows[j] < page_first[p + 1U]) {
+            ++j;
+        }
+        touched.push_back({p, {i, j}});
+        i = j;
+    }
+
+    // Every touched page row-addressable: read just the rows.
+    bool addressable = !touched.empty() && !column_is_nested(column_metadata);
+    std::vector<FullZipPageParams> params(touched.size());
+    for (std::size_t t = 0; t < touched.size() && addressable; ++t) {
+        page_layout::PageLayout layout;
+        addressable = full_zip_row_addressable(column_metadata.pages[touched[t].first], layout, params[t]);
+    }
+    // One kind across the pages taken from, and a fixed width that is the type's.
+    for (std::size_t t = 1; t < touched.size() && addressable; ++t) {
+        addressable = (params[t].length_bytes == 0U) == (params[0].length_bytes == 0U) &&
+                      params[t].value_bytes == params[0].value_bytes && params[t].items == params[0].items;
+    }
+    if (addressable && params[0].length_bytes == 0U) {
+        addressable = lance_logical_type_value_bytes(on_disk_field.logical_type) ==
+                      params[0].value_bytes - params[0].item_validity_bytes;
+    }
+    if (addressable) {
+        if (params[0].length_bytes == 0U) {
+            out.kind = ColumnValues::Kind::FixedWidth;
+            out.items_per_row = params[0].items;
+            reserve_more(out.fixed, rows.size() * (params[0].value_bytes - params[0].item_validity_bytes));
+        } else {
+            out.kind = ColumnValues::Kind::VariableWidth;
+            out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
+            append_list_offset(out.variable.offsets, 0, out.variable.large);
+        }
+        std::uint64_t out_row = 0;
+        for (std::size_t t = 0; t < touched.size(); ++t) {
+            const auto& [p, span] = touched[t];
+            if (!take_full_zip_rows(data_file_path, on_disk_field.name, column_metadata.pages[p], params[t], rows,
+                                    span.first, span.second, page_first[p], out, out_row, error)) {
+                return false;
+            }
+        }
+        if (out.null_count == 0U) {
+            out.validity.clear();
+        } else {
+            out.validity.resize(static_cast<std::size_t>((out_row + 7U) / 8U), 0U);
+        }
+        return true;
+    }
+
+    // A small column: from the decoded copy (see cached_whole_column) -- unless every page it would
+    // take from is a FullZip list page, whose rows take_windows reads on their own. Copying the
+    // decoded column out of the cache cost more than that: long strings decode to several times
+    // what they take on disk.
+    const bool full_zip_lists =
+        !touched.empty() && std::all_of(touched.begin(), touched.end(), [&](const auto& t) {
+            page_layout::PageLayout layout;
+            std::string why;
+            return page_layout::decode_page_layout(column_metadata.pages[t.first].encoding, layout, why) &&
+                   full_zip_list_page(layout);
+        });
+    std::uint64_t encoded = 0;
+    for (const auto& page : column_metadata.pages) {
+        for (const auto size : page.buffer_sizes) {
+            encoded += size;
+        }
+    }
+    // Rows that touch few of a flat page's chunks are read from those chunks; the cache would decode
+    // the column whole on a second take.
+    // (A list page's chunks are found the same way, through its repetition index.)
+    const bool nested = column_is_nested(column_metadata);
+    std::size_t chunks_touched = 0;
+    std::size_t chunks_total = 0;
+    bool chunked = !rows.empty();
+    for (std::size_t t = 0; t < touched.size() && chunked; ++t) {
+        const auto& page = column_metadata.pages[touched[t].first];
+        page_layout::PageLayout layout;
+        std::string why;
+        chunked = page_layout::decode_page_layout(page.encoding, layout, why) &&
+                  layout.kind == page_layout::LayoutKind::kMiniBlock &&
+                  layout.mini_block.has_repetition == nested;
+        if (chunked) {
+            const auto index = miniblock_page_index(data_file_path, page, layout.mini_block, error);
+            if (index == nullptr) {
+                if (!error.empty()) {
+                    return false;
+                }
+                chunked = false;
+                break;
+            }
+            chunks_total += index->items.size();
+            std::size_t last = SIZE_MAX;
+            for (auto i = touched[t].second.first; i < touched[t].second.second; ++i) {
+                const auto r = rows[i] - page_first[touched[t].first];
+                const auto c = static_cast<std::size_t>(
+                    std::upper_bound(index->rows_before.begin(), index->rows_before.end(), r) -
+                    index->rows_before.begin() - 1);
+                chunks_touched += c != last ? 1U : 0U;
+                last = c;
+            }
+        }
+    }
+    chunked = chunked && chunks_touched * 4U <= chunks_total;
+    if (!rows.empty() && !full_zip_lists && take_cache_budget() != 0U && encoded <= kCacheColumnBytes) {
+        const auto whole = cached_whole_column(data_file_path, on_disk_field, column_metadata, error,
+                                               encoded <= kSmallColumnBytes ? CacheFill::FirstTake
+                                               : chunked                    ? CacheFill::Never
+                                               : nested                     ? CacheFill::SecondTake
+                                                                            : CacheFill::FirstTake);
+        if (whole == nullptr && !error.empty()) {
+            return false;
+        }
+        if (whole != nullptr) {
+            // Just the rows asked for, out of the cached copy -- not the copy itself.
+            std::vector<std::uint8_t> keep(static_cast<std::size_t>(page_first.back()), 0U);
+            for (const auto r : rows) {
+                keep[static_cast<std::size_t>(r)] = 1U;
+            }
+            return gather_column_values(*whole, keep, page_first.back(), value_bytes, out, error);
+        }
+    }
+
+    if (chunked && !nested) {
+        bool done = false;
+        if (!take_flat_miniblock_chunks(data_file_path, on_disk_field, column_metadata, rows, touched, page_first,
+                                        value_bytes, out, done, error)) {
+            return false;
+        }
+        if (done) {
+            return true;
+        }
+    }
+
+    // A list column: the touched pages, or of a large page just the chunks holding the rows.
+    if (!rows.empty() && column_is_nested(column_metadata)) {
+        pb::ColumnMetadata subset;
+        std::vector<NestedPageWindow> windows;
+        std::vector<std::uint64_t> first_row;
+        std::vector<std::size_t> page_of;
+        if (!take_windows(data_file_path, column_metadata, rows, touched, page_first, subset, windows, first_row,
+                          page_of, error)) {
+            return false;
+        }
+        const bool any_window =
+            std::any_of(windows.begin(), windows.end(), [](const NestedPageWindow& w) { return w.active; });
+        if (any_window) {
+            if (!decode_nested_column(data_file_path, on_disk_field, subset, out, error, &windows)) {
+                return false;
+            }
+            // Keep each requested row: windows come in row order, as do the requests. A window's
+            // leading fragment and trailing part-row are never asked for, so stay unkept.
+            std::vector<std::uint8_t> keep;
+            std::size_t next = 0;
+            for (std::size_t w = 0; w < windows.size(); ++w) {
+                const auto p = page_of[w];
+                const auto n = windows[w].active ? windows[w].rows : subset.pages[w].length;
+                const auto lo = page_first[p] + first_row[w];
+                const auto hi = std::min(lo + n, page_first[p + 1U]);
+                const auto base = keep.size();
+                keep.resize(base + static_cast<std::size_t>(n), 0U);
+                while (next < rows.size() && rows[next] >= lo && rows[next] < hi) {
+                    keep[base + static_cast<std::size_t>(rows[next] - lo)] = 1U;
+                    ++next;
+                }
+            }
+            if (next != rows.size()) {
+                error = "column '" + on_disk_field.name + "': a page window did not cover the rows asked for";
+                return false;
+            }
+            return compact_column_values(out, keep, keep.size(), value_bytes, error);
+        }
+    }
+
+    // Otherwise decode the touched pages -- only those -- and pick the rows out.
+    pb::ColumnMetadata subset = column_metadata;
+    subset.pages.clear();
+    std::uint64_t subset_rows = 0;
+    std::vector<std::uint8_t> keep;
+    for (const auto& [p, span] : touched) {
+        subset.pages.push_back(column_metadata.pages[p]);
+        keep.resize(static_cast<std::size_t>(subset_rows + column_metadata.pages[p].length), 0U);
+        for (auto i = span.first; i < span.second; ++i) {
+            keep[static_cast<std::size_t>(subset_rows + rows[i] - page_first[p])] = 1U;
+        }
+        subset_rows += column_metadata.pages[p].length;
+    }
+    if (subset.pages.empty()) {
+        // No rows asked for: decode nothing, but return the column's shape (kind, offset width).
+        subset.pages.push_back(column_metadata.pages.front());
+        keep.assign(static_cast<std::size_t>(column_metadata.pages.front().length), 0U);
+        subset_rows = column_metadata.pages.front().length;
+    }
+    if (!decode_lance_physical_column(data_file_path, on_disk_field, subset, out, error)) {
+        return false;
+    }
+    return compact_column_values(out, keep, subset_rows, value_bytes, error);
+}
+
+namespace {
+
+/// Can one plan, made from the first page, decode every page of this flat column? Rust Lance picks
+/// each page's layout on its own: a column of 1024 threes then 1024 eights is two constant pages with
+/// different values, and a column can start constant and turn bit-packed. The one-plan decode reads
+/// such a column as its first page repeated (lance-encoding's test_miniblock_bitpack caught it).
+/// Pages that are flat or bit-packed mini-blocks mix freely -- that decode plans each page itself.
+bool pages_share_one_plan(const pb::Field& field, const pb::ColumnMetadata& column_metadata) {
+    if (column_metadata.pages.size() < 2U) {
+        return true;
+    }
+    std::optional<ColumnEncodingKind> first;
+    for (const auto& page : column_metadata.pages) {
+        if (page.encoding.empty()) {
+            return true;  // an older nanolance file: the field metadata decides, for every page
+        }
+        pb::ColumnMetadata one_page;
+        one_page.pages.push_back(page);
+        const auto plan = classify_column_encoding(field, one_page);
+        if (plan.kind == ColumnEncodingKind::kConstant) {
+            return false;  // each constant page has its own value
+        }
+        auto kind = plan.kind == ColumnEncodingKind::kBitpack ? ColumnEncodingKind::kFlat : plan.kind;
+        if (!first) {
+            first = kind;
+        } else if (*first != kind) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Append a flat column's decoded values to `dst`, which holds `dst_rows` rows.
+bool append_flat_values(ColumnValues& dst, std::uint64_t dst_rows, ColumnValues& src, std::uint64_t src_rows,
+                        std::string& error) {
+    if (!src.layers.empty() || src.kind == ColumnValues::Kind::BlobV2External) {
+        error = "a column whose pages use different layouts is read only for flat values";
+        return false;
+    }
+    if (dst_rows == 0U && dst.fixed.empty() && dst.variable.data.empty() && dst.variable.offsets.empty()) {
+        dst.kind = src.kind;
+        dst.variable.large = src.variable.large;
+        dst.items_per_row = src.items_per_row;
+    }
+    if (src.kind != dst.kind || src.variable.large != dst.variable.large || src.items_per_row != dst.items_per_row) {
+        error = "the column's pages decode to different value layouts";
+        return false;
+    }
+    if (src.kind == ColumnValues::Kind::FixedWidth) {
+        dst.fixed.insert(dst.fixed.end(), src.fixed.begin(), src.fixed.end());
+    } else {
+        const std::size_t width = src.variable.large ? 8U : 4U;
+        if (src.variable.offsets.size() < (src_rows + 1U) * width) {
+            error = "a page's offsets cover fewer rows than the page";
+            return false;
+        }
+        auto read_offset = [&](const std::vector<std::uint8_t>& o, std::size_t i) -> std::uint64_t {
+            if (width == 8U) {
+                std::uint64_t v = 0;
+                std::memcpy(&v, o.data() + i * 8U, 8U);
+                return v;
+            }
+            std::uint32_t v = 0;
+            std::memcpy(&v, o.data() + i * 4U, 4U);
+            return v;
+        };
+        if (dst.variable.offsets.empty()) {
+            dst.variable.offsets.assign(width, 0U);
+        }
+        const std::uint64_t base = dst.variable.data.size();
+        const std::uint64_t first = read_offset(src.variable.offsets, 0);
+        for (std::uint64_t i = 1; i <= src_rows; ++i) {
+            const std::uint64_t v = base + read_offset(src.variable.offsets, static_cast<std::size_t>(i)) - first;
+            if (width == 4U && v > std::numeric_limits<std::uint32_t>::max()) {
+                error = "the column's strings exceed 32-bit offsets";
+                return false;
+            }
+            const auto at = dst.variable.offsets.size();
+            dst.variable.offsets.resize(at + width);
+            if (width == 8U) {
+                std::memcpy(dst.variable.offsets.data() + at, &v, 8U);
+            } else {
+                const auto v32 = static_cast<std::uint32_t>(v);
+                std::memcpy(dst.variable.offsets.data() + at, &v32, 4U);
+            }
+        }
+        dst.variable.data.insert(dst.variable.data.end(),
+                                 src.variable.data.begin() + static_cast<std::ptrdiff_t>(first),
+                                 src.variable.data.end());
+    }
+    append_validity_bits(dst.validity, dst.null_count, dst_rows, src.validity, src.null_count, src_rows);
+    if (src.items_per_row != 0U) {
+        append_validity_bits(dst.item_validity, dst.item_null_count, dst_rows * src.items_per_row, src.item_validity,
+                             src.item_null_count, src_rows * src.items_per_row);
+    }
+    return true;
+}
+
+/// decode_column_impl for a flat column, one page at a time when its pages need plans of their own.
+bool decode_flat_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                        const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
+    if (pages_share_one_plan(on_disk_field, column_metadata)) {
+        return decode_column_impl(data_file_path, on_disk_field, column_metadata, out, error, nullptr);
+    }
+    out = ColumnValues{};
+    std::uint64_t rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        pb::ColumnMetadata one_page = column_metadata;
+        one_page.pages.assign(1U, page);
+        ColumnValues part;
+        if (!decode_column_impl(data_file_path, on_disk_field, one_page, part, error, nullptr) ||
+            !append_flat_values(out, rows, part, page.length, error)) {
+            return false;
+        }
+        rows += page.length;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool decompress_general_buffer(const std::string& scheme, const std::uint8_t* data, std::size_t size,
+                               std::vector<std::uint8_t>& out, std::string& error) {
+    out.clear();
+    if (scheme.empty() || scheme == "none") {
+        out.assign(data, data + size);
+        return true;
+    }
+    if (size == 0U) {
+        return true;  // Lance's decompressors leave an empty buffer empty
+    }
+    std::vector<std::uint8_t> framed;
+    if (scheme == "lz4") {
+        framed.assign(data, data + size);
+        return lz4_block::decompress_sized(framed, out, error);
+    }
+    if (scheme != "zstd") {
+        error = "unsupported buffer compression '" + scheme + "'";
+        return false;
+    }
+    // [u64 raw size][frame], or from older Lance a bare frame; Lance tells them apart the same way
+    // (a frame's magic, then its reserved bit).
+    static constexpr std::uint8_t kZstdMagic[4] = {0x28U, 0xB5U, 0x2FU, 0xFDU};
+    const bool bare = size >= 5U && std::memcmp(data, kZstdMagic, 4U) == 0 && (data[4] & 0x08U) == 0U;
+    if (!bare) {
+        framed.assign(data, data + size);
+        return zstd_unframe_buffer(framed, out, error);
+    }
+    const unsigned long long content = ZSTD_getFrameContentSize(data, size);
+    if (content != ZSTD_CONTENTSIZE_UNKNOWN && content != ZSTD_CONTENTSIZE_ERROR) {
+        framed.resize(size + 8U);
+        const std::uint64_t declared = content;
+        std::memcpy(framed.data(), &declared, 8U);
+        std::memcpy(framed.data() + 8U, data, size);
+        return zstd_unframe_buffer(framed, out, error);
+    }
+    // A frame that does not say how large it is: stream it, growing the output only as bytes arrive
+    // and never past the bound zstd itself can produce from this many compressed bytes.
+    const std::uint64_t bound = std::min<std::uint64_t>(default_read_limits().max_uncompressed_bytes,
+                                                        static_cast<std::uint64_t>(size) * kZstdMaxExpansion);
+    std::unique_ptr<ZSTD_DStream, std::size_t (*)(ZSTD_DStream*)> stream(ZSTD_createDStream(), &ZSTD_freeDStream);
+    if (stream == nullptr || ZSTD_isError(ZSTD_initDStream(stream.get())) != 0U) {
+        error = "zstd stream could not be created";
+        return false;
+    }
+    ZSTD_inBuffer in{data, size, 0};
+    std::size_t produced = 0;
+    std::size_t ret = 1;
+    while (ret != 0U) {
+        if (produced == out.size()) {
+            if (produced >= bound) {
+                error = "zstd buffer decompresses past what its size allows";
+                return false;
+            }
+            out.resize(static_cast<std::size_t>(std::min<std::uint64_t>(bound, std::max<std::size_t>(produced * 2U, 1U << 16U))));
+        }
+        ZSTD_outBuffer dst{out.data(), out.size(), produced};
+        const auto before_in = in.pos;
+        ret = ZSTD_decompressStream(stream.get(), &dst, &in);
+        if (ZSTD_isError(ret) != 0U) {
+            error = "zstd decompress failed";
+            return false;
+        }
+        if (dst.pos == produced && in.pos == before_in && ret != 0U) {
+            error = "zstd buffer is truncated";
+            return false;
+        }
+        produced = dst.pos;
+    }
+    out.resize(produced);
+    return true;
+}
+
 bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
                                   const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
+    if (v20::is_v20_column(column_metadata)) {
+        return v20::decode_column(data_file_path, on_disk_field, column_metadata, nullptr, out, error);
+    }
     if (column_is_nested(column_metadata)) {
         error.clear();
         out = ColumnValues{};
-        return decode_nested_column(data_file_path, on_disk_field, column_metadata, out, error);
+        std::uint64_t rows = 0;
+        for (const auto& page : column_metadata.pages) {
+            rows += page.length;
+        }
+        return decode_nested_rows(data_file_path, on_disk_field, column_metadata, 0, rows, out, error);
     }
-    return decode_column_impl(data_file_path, on_disk_field, column_metadata, out, error, nullptr);
+    return decode_flat_column(data_file_path, on_disk_field, column_metadata, out, error);
+}
+
+std::uint32_t lance_page_list_depth(const pb::ColumnPage& page) {
+    page_layout::PageLayout layout;
+    std::string why;
+    if (page.encoding.empty() || !page_layout::decode_page_layout(page.encoding, layout, why)) {
+        return 0;
+    }
+    const std::vector<std::uint8_t>* layers = nullptr;
+    if (layout.kind == page_layout::LayoutKind::kMiniBlock && layout.mini_block.has_repetition) {
+        layers = &layout.mini_block.layers;
+    } else if (layout.kind == page_layout::LayoutKind::kFullZip && layout.full_zip.bits_rep != 0U) {
+        layers = &layout.full_zip.layers;
+    } else if (layout.kind == page_layout::LayoutKind::kConstant && layout.constant.num_rep_values != 0U) {
+        layers = &layout.constant.layers;
+    }
+    if (layers == nullptr) {
+        return 0;
+    }
+    std::uint32_t depth = 0;
+    for (const auto kind : *layers) {
+        depth += repdef::is_list_layer(kind) ? 1U : 0U;
+    }
+    return std::max<std::uint32_t>(depth, 1U);
+}
+
+std::uint64_t lance_page_items(const pb::ColumnPage& page) {
+    page_layout::PageLayout layout;
+    std::string why;
+    if (page.encoding.empty() || !page_layout::decode_page_layout(page.encoding, layout, why)) {
+        return page.length;
+    }
+    if (layout.kind == page_layout::LayoutKind::kMiniBlock && layout.mini_block.has_repetition) {
+        return std::max<std::uint64_t>(page.length, layout.mini_block.num_items);
+    }
+    if (layout.kind == page_layout::LayoutKind::kFullZip && layout.full_zip.bits_rep != 0U) {
+        return std::max<std::uint64_t>(page.length, layout.full_zip.num_visible_items);
+    }
+    return page.length;
+}
+
+bool lance_page_row_addressable(const pb::ColumnPage& page) {
+    page_layout::PageLayout layout;
+    FullZipPageParams params;
+    if (full_zip_row_addressable(page, layout, params)) {
+        return true;
+    }
+    std::string why;
+    if (page.encoding.empty() || !page_layout::decode_page_layout(page.encoding, layout, why)) {
+        return false;
+    }
+    if (full_zip_list_page(layout)) {  // its repetition index says where each row starts
+        const auto entries = page.length + 1U;
+        return page.buffer_sizes.size() >= 2U && page.buffer_sizes[1] != 0U && page.buffer_sizes[1] % entries == 0U;
+    }
+    if (layout.kind != page_layout::LayoutKind::kMiniBlock) {
+        return false;
+    }
+    const auto& mb = layout.mini_block;
+    const std::size_t rep_at = mb.dictionary != nullptr ? 3U : 2U;
+    const std::size_t word = mb.has_large_chunk ? 4U : 2U;
+    if (!mb.has_repetition) {  // flat: chunks of counted values
+        return page.buffer_sizes.size() >= 2U && page.buffer_sizes[0] >= 2U * word;
+    }
+    return mb.repetition_index_depth != 0U && page.buffer_offsets.size() > rep_at;
+}
+
+bool decode_lance_physical_column_range(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                                        const pb::ColumnMetadata& column_metadata, std::uint64_t first,
+                                        std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
+                                        std::string& error) {
+    if (v20::is_v20_column(column_metadata)) {
+        return v20::decode_column_range(data_file_path, on_disk_field, column_metadata, nullptr, first, count,
+                                        value_bytes, out, error);
+    }
+    error.clear();
+    out = ColumnValues{};
+    std::uint64_t rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        rows += page.length;
+    }
+    if (first > rows || count > rows - first) {
+        error = "column '" + on_disk_field.name + "': rows [" + std::to_string(first) + ", +" +
+                std::to_string(count) + ") are past its " + std::to_string(rows);
+        return false;
+    }
+    if (column_metadata.pages.empty()) {
+        return decode_lance_physical_column(data_file_path, on_disk_field, column_metadata, out, error);
+    }
+    if (column_is_nested(column_metadata)) {
+        return decode_nested_rows(data_file_path, on_disk_field, column_metadata, first, first + count, out, error);
+    }
+    // Large values in FullZip pages: just the rows, through each page's per-row index.
+    {
+        bool addressable = count != 0U;
+        std::uint64_t page_begin = 0;
+        for (const auto& page : column_metadata.pages) {
+            const auto page_end = page_begin + page.length;
+            if (addressable && page_end > first && page_begin < first + count) {
+                page_layout::PageLayout layout;
+                FullZipPageParams params;
+                addressable = full_zip_row_addressable(page, layout, params);
+            }
+            page_begin = page_end;
+        }
+        if (addressable) {
+            std::vector<std::uint64_t> rows(static_cast<std::size_t>(count));
+            for (std::uint64_t r = 0; r < count; ++r) {
+                rows[static_cast<std::size_t>(r)] = first + r;
+            }
+            return decode_lance_physical_column_rows(data_file_path, on_disk_field, column_metadata, rows,
+                                                     value_bytes, out, error);
+        }
+    }
+    // The pages the range touches, decoded and trimmed -- of a MiniBlock page the range covers only
+    // in part, just the chunks holding its rows.
+    pb::ColumnMetadata subset = column_metadata;
+    subset.pages.clear();
+    std::uint64_t page_begin = 0;
+    std::uint64_t subset_first = 0;
+    std::uint64_t subset_rows = 0;
+    for (const auto& page : column_metadata.pages) {
+        const auto page_end = page_begin + page.length;
+        if (page_end > first && page_begin < first + count) {
+            const auto r0 = std::max(first, page_begin) - page_begin;
+            const auto r1 = std::min(first + count, page_end) - page_begin;
+            std::shared_ptr<const MiniBlockPageIndex> index;
+            page_layout::PageLayout layout;
+            std::string why;
+            if ((r0 != 0U || r1 != page.length) && page_layout::decode_page_layout(page.encoding, layout, why) &&
+                layout.kind == page_layout::LayoutKind::kMiniBlock && !layout.mini_block.has_repetition) {
+                index = miniblock_page_index(data_file_path, page, layout.mini_block, error);
+                if (index == nullptr && !error.empty()) {
+                    return false;
+                }
+            }
+            pb::ColumnPage part = page;
+            std::uint64_t part_first = 0;
+            if (index != nullptr) {
+                const auto& before = index->rows_before;
+                const auto chunk_of = [&](std::uint64_t r) {
+                    return static_cast<std::size_t>(std::upper_bound(before.begin(), before.end(), r) -
+                                                    before.begin() - 1);
+                };
+                const auto c0 = chunk_of(r0);
+                const auto c1 = chunk_of(r1 - 1U) + 1U;
+                part.buffer_offsets[0] += c0 * index->word_bytes;
+                part.buffer_sizes[0] = (c1 - c0) * index->word_bytes;
+                part.buffer_offsets[1] += index->byte_start[c0];
+                part.buffer_sizes[1] = index->byte_start[c1] - index->byte_start[c0];
+                part.length = before[c1] - before[c0];
+                part_first = before[c0];
+                work_stats::add(work_stats::counters().page_windows, 1U);
+            }
+            if (subset.pages.empty()) {
+                subset_first = page_begin + part_first;
+            }
+            subset_rows += part.length;
+            subset.pages.push_back(std::move(part));
+        }
+        page_begin = page_end;
+    }
+    if (subset.pages.empty()) {  // no rows: the column's shape only
+        subset.pages.push_back(column_metadata.pages.front());
+        subset_first = first;
+        subset_rows = column_metadata.pages.front().length;
+    }
+    if (!decode_flat_column(data_file_path, on_disk_field, subset, out, error)) {
+        return false;
+    }
+    if (first == subset_first && count == subset_rows) {
+        return true;
+    }
+    return slice_column_values(out, first - subset_first, count, subset_rows, value_bytes, error);
 }
 
 }  // namespace nano_lance

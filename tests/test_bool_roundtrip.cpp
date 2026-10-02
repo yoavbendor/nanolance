@@ -73,17 +73,17 @@ std::vector<bool> read_bools(const std::filesystem::path& ds) {
     std::vector<ArrowArray> batches;
     std::string error;
     require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error);
-    require(batches.size() == 1U, "one batch");
-    const ArrowArray* col = (batches[0].n_children > 0) ? batches[0].children[0] : &batches[0];
-    const auto* bits = static_cast<const std::uint8_t*>(col->buffers[1]);
     std::vector<bool> out;
-    out.reserve(static_cast<std::size_t>(col->length));
-    for (std::int64_t i = 0; i < col->length; ++i) {
-        const auto idx = static_cast<std::size_t>(i);
-        out.push_back(((bits[idx >> 3U] >> (idx & 7U)) & 1U) != 0U);
+    for (auto& batch : batches) {  // several with a parallel read: one per row range
+        const ArrowArray* col = (batch.n_children > 0) ? batch.children[0] : &batch;
+        const auto* bits = static_cast<const std::uint8_t*>(col->buffers[1]);
+        for (std::int64_t i = 0; i < col->length; ++i) {
+            const auto idx = static_cast<std::size_t>(i + col->offset);
+            out.push_back(((bits[idx >> 3U] >> (idx & 7U)) & 1U) != 0U);
+        }
+        ArrowArrayRelease(&batch);
     }
     ArrowSchemaRelease(&schema);
-    ArrowArrayRelease(&batches[0]);
     return out;
 }
 

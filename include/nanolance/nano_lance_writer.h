@@ -67,7 +67,21 @@ typedef struct NanoLanceWriteOptions {
     /// points at are read during this call only, and need not outlive it.
     const NanoLanceColumnEncoding* column_encodings;
     size_t num_column_encodings;
+    /// Memory budget, in bytes, for rows buffered between commits; 0 = unlimited (the default). See
+    /// set_max_pending_bytes.
+    uint64_t max_pending_bytes;
+    /// Stage fragments instead of publishing a version per commit: each commit (and each flush by
+    /// max_pending_bytes) writes a data file, and nano_lance_writer_finish publishes all of them as
+    /// one version -- how a Lance write behaves. Readers see nothing until then.
+    bool stage_fragments;
 } NanoLanceWriteOptions;
+
+/// How nano_lance_writer_finish relates the new version to what is at the path.
+enum {
+    NANO_LANCE_COMMIT_CREATE = 0,    // fail if a dataset exists there
+    NANO_LANCE_COMMIT_APPEND = 1,    // add the fragments to the latest version
+    NANO_LANCE_COMMIT_OVERWRITE = 2  // a new version holding only these fragments (or create one)
+};
 
 /// Fill `options` with the defaults. Equivalent to zero-initializing it.
 void nano_lance_write_options_init(NanoLanceWriteOptions* options);
@@ -133,12 +147,41 @@ int nano_lance_writer_set_column_encoding(NanoLanceWriter* writer, const char* f
 /// falls back to the copying path (correct, just not zero-copy). Variable-width and bool columns
 /// always copy. Off by default; must be set before any batch is written.
 int nano_lance_writer_set_borrow_buffers(NanoLanceWriter* writer, bool enable);
+/// Bound the memory the writer holds for uncommitted rows -- for edge devices that must keep their
+/// resident set small while saving. The writer buffers every batch until a commit, so without a
+/// budget a session's whole data is in memory at once. With one, write_batch commits a fragment
+/// itself whenever the buffered data reaches `max_pending_bytes`, then frees it.
+///
+///   * Plan for a peak of about 3-4x the budget, plus one batch (a batch is never split): buffers
+///     grow by doubling, so the batch that crosses the budget can leave up to twice it allocated,
+///     and encoding a fragment needs working space of its own. Measured: a 4 MiB budget peaked at
+///     17 MiB of RSS writing 52 MiB (unbounded: 145 MiB); 2 MiB at 7.6 MiB, 8 MiB at 15.4 MiB
+///     (tests/test_writer_memory.cpp, docs/PROGRESS.md). Borrowed buffers (set_borrow_buffers)
+///     count toward the budget: they stay pinned until the flush.
+///   * Each flush is a commit: one data file and one dataset version. A tight budget means more,
+///     smaller fragments, which costs a little on read and a manifest write per flush. A few MiB to
+///     tens of MiB is a reasonable range; far below the size of one batch it just flushes every batch.
+///   * The caller's own nano_lance_writer_commit is unchanged: after write_batch has flushed, it
+///     appends whatever is still pending (whatever `is_append` says) and is a no-op if nothing is.
+///   * 0 turns it off. May be changed at any time. Not combinable with blob URI dictionary mode,
+///     whose layout cannot be appended to.
+int nano_lance_writer_set_max_pending_bytes(NanoLanceWriter* writer, uint64_t max_pending_bytes);
 int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, struct ArrowSchema* schema);
 int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append);
+/// Staged writers only: commit what is pending, then publish every staged fragment as one version.
+/// A write with no rows publishes a version with no fragments (the schema of the batches seen, or of
+/// the dataset appended to). `version_out` may be NULL.
+int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* version_out);
+/// Staged writers only: a table config entry to record if the finishing commit creates the dataset.
+int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* key, const char* value);
 int nano_lance_writer_close(NanoLanceWriter* writer);
 
 const char* nano_lance_writer_last_error(const NanoLanceWriter* writer);
 uint64_t nano_lance_writer_pending_batches(const NanoLanceWriter* writer);
+/// Rows buffered and not yet committed.
+uint64_t nano_lance_writer_pending_rows(const NanoLanceWriter* writer);
+/// Bytes the writer holds for uncommitted rows, as max_pending_bytes counts them.
+uint64_t nano_lance_writer_pending_bytes(const NanoLanceWriter* writer);
 
 #ifdef __cplusplus
 }

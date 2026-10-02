@@ -113,33 +113,37 @@ int main() {
     std::vector<ArrowArray> batches;
     std::string error;
     require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error);
-    require(batches.size() == 1U, "one batch");
-    require(batches[0].n_children == 5, "five columns");
-    const ArrowArray& col_ts = *batches[0].children[0];
-    const ArrowArray& col_gain = *batches[0].children[1];
-    const ArrowArray& col_flag = *batches[0].children[2];
-    const ArrowArray& col_uri = *batches[0].children[3];
-    const ArrowArray& col_mac = *batches[0].children[4];
-    require(static_cast<std::size_t>(col_ts.length) == n, "row count");
+    std::size_t row = 0;
+    for (auto& batch : batches) {  // several with a parallel read: one per row range
+        require(batch.n_children == 5, "five columns");
+        const ArrowArray& col_ts = *batch.children[0];
+        const ArrowArray& col_gain = *batch.children[1];
+        const ArrowArray& col_flag = *batch.children[2];
+        const ArrowArray& col_uri = *batch.children[3];
+        const ArrowArray& col_mac = *batch.children[4];
+        const auto m = static_cast<std::size_t>(col_ts.length);
+        require(row + m <= n, "row count");
 
-    require(std::memcmp(col_ts.buffers[1], ts.data(), n * 8U) == 0, "ts values");
-    require(std::memcmp(col_gain.buffers[1], gain.data(), n * 8U) == 0, "gain values");
-    const auto* flag_bits = static_cast<const std::uint8_t*>(col_flag.buffers[1]);
-    for (std::size_t i = 0; i < n; ++i) {
-        require(((flag_bits[i >> 3U] >> (i & 7U)) & 1U) == flag_bytes[i], "flag values");
+        require(std::memcmp(col_ts.buffers[1], ts.data() + row, m * 8U) == 0, "ts values");
+        require(std::memcmp(col_gain.buffers[1], gain.data() + row, m * 8U) == 0, "gain values");
+        const auto* flag_bits = static_cast<const std::uint8_t*>(col_flag.buffers[1]);
+        for (std::size_t i = 0; i < m; ++i) {
+            require(((flag_bits[i >> 3U] >> (i & 7U)) & 1U) == flag_bytes[row + i], "flag values");
+        }
+        const auto* uri_offsets = static_cast<const std::int32_t*>(col_uri.buffers[1]);
+        const auto* uri_data = static_cast<const char*>(col_uri.buffers[2]);
+        for (std::size_t i = 0; i < m; ++i) {
+            const std::string_view got(uri_data + uri_offsets[i],
+                                       static_cast<std::size_t>(uri_offsets[i + 1] - uri_offsets[i]));
+            require(got == uri[row + i], "uri values");
+        }
+
+        require(std::memcmp(col_mac.buffers[1], mac.data() + row, m * 6U) == 0, "mac values (fixed_size_binary)");
+        row += m;
+        ArrowArrayRelease(&batch);
     }
-    const auto* uri_offsets = static_cast<const std::int32_t*>(col_uri.buffers[1]);
-    const auto* uri_data = static_cast<const char*>(col_uri.buffers[2]);
-    for (std::size_t i = 0; i < n; ++i) {
-        const std::string_view got(uri_data + uri_offsets[i],
-                                   static_cast<std::size_t>(uri_offsets[i + 1] - uri_offsets[i]));
-        require(got == uri[i], "uri values");
-    }
-
-    require(std::memcmp(col_mac.buffers[1], mac.data(), n * 6U) == 0, "mac values (fixed_size_binary)");
-
+    require(row == n, "row count");
     ArrowSchemaRelease(&schema);
-    ArrowArrayRelease(&batches[0]);
     std::filesystem::remove_all(ds, ec);
     std::cerr << "typed writer: 5-column compile-time schema round-trips OK (borrow + declarations)\n";
     return 0;

@@ -35,6 +35,13 @@ struct LanceSchemaMapping {
     std::vector<LanceField> fields;
 };
 
+/// An Arrow extension type Lance itself defines (lance.blob.v2, ...), which nanolance lays out on its
+/// own terms. Any other extension type (arrow.fixed_shape_tensor, arrow.uuid, a user's) is stored as
+/// its storage type, with the extension recorded in the field's metadata.
+inline bool lance_extension_is_lance_owned(const std::string& extension_name) {
+    return extension_name.rfind("lance.", 0) == 0;
+}
+
 inline bool lance_field_is_physical(const LanceField& field) {
     return field.column_index >= 0;
 }
@@ -214,6 +221,16 @@ std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& m
 /// (see append_batch_column_values), where the data is.
 bool map_arrow_schema(const ArrowSchema& schema, LanceSchemaMapping& mapping, std::string& error,
                       bool ignore_nullability = false);
+/// The same schema, field for field -- names, types, nullability, nesting -- whatever the field ids
+/// and column positions. What an append checks a batch against: a dataset's field ids need not run
+/// 0..n (a dropped or re-typed column leaves a gap), a new batch's always do.
+bool schema_mappings_equivalent(const LanceSchemaMapping& left, const LanceSchemaMapping& right);
+
+/// Number the physical fields' columns 0..n in field order: the layout of one new data file holding
+/// every column. A mapping read from a manifest carries each field's position in whichever file of
+/// the latest fragment holds it, and those collide once a fragment has several files.
+void renumber_columns_for_one_file(LanceSchemaMapping& mapping);
+
 bool schema_mappings_equal(const LanceSchemaMapping& left, const LanceSchemaMapping& right);
 /// Human-readable description of the first way `actual` differs from `expected` (column count, or the
 /// first field whose name/order, type, nullability, or extension differs). Returns a generic string if

@@ -9,6 +9,20 @@ following third-party software. All are permissive and Apache-2.0-compatible.
 |---|---|---|---|
 | **Lance** file format `.proto` schemas | nanolance's protobuf message types (manifest, data file, column/page metadata, encodings) are derived from Lance's `.proto` files, pinned at `v7.0.0-rc.1`. Generated into `generated/lance_minimal.pb.*`; see `third_party/lance_proto/`. nanolance does **not** link the Rust `lance` crate. | Apache-2.0 | https://github.com/lance-format/lance |
 
+## lance-c headers (vendored, unmodified)
+
+`compat/lance-c/include/lance/lance.h` and `lance.hpp`: from
+[lance-format/lance-c](https://github.com/lance-format/lance-c) at the commit in
+`compat/lance-c/UPSTREAM`. Apache License 2.0, Copyright The Lance Authors
+(`compat/lance-c/LICENSE`). They declare the API nanolance's `liblance_c` implements.
+
+## Test suites run in CI (fetched, not redistributed)
+
+pylance's `python/python/tests` (tools/pylance_suite.py) and lance-c's `tests/cpp`
+(tools/lance_c_suite.py) are fetched with git at pinned revisions into `.deps/` and run
+against nanolance; neither is copied into this repository. Both Apache License 2.0,
+Copyright The Lance Authors.
+
 ## Build-time dependencies (FetchContent, not redistributed)
 
 | Component | Used for | License | Project |

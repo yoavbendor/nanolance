@@ -39,6 +39,13 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
 /// bitmap holds up to 65,536 containers -- roughly 640 KiB of input for 16 GiB of output. Every other
 /// decode path budgets its output against `default_read_limits()`; 0 means "use that budget", and the
 /// real caller passes the manifest's `num_deleted_rows`, which is exact.
+/// Write the deletion file of fragment `fragment_id` listing `deleted` (its physical row offsets, all of
+/// them -- a deletion file replaces the fragment's previous one), named as Lance names them
+/// (`_deletions/{fragment}-{read_version}-{id}.arrow`), and describe it in `out`.
+bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_t fragment_id,
+                         std::uint64_t read_version, const std::vector<std::uint32_t>& deleted,
+                         pb::DeletionFile& out, std::string& error);
+
 bool parse_roaring_bitmap(const std::vector<std::uint8_t>& bytes,
                           std::vector<std::uint32_t>& out_sorted_values, std::string& error,
                           std::uint64_t max_values = 0);

@@ -10,6 +10,26 @@ two items the backlog called large are small.
 
 ---
 
+## Found on published datasets (2026-09-28)
+
+`tools/real_lance_check.py` read 24 tables from Lance datasets on the Hugging Face Hub
+(`docs/REAL_DATASETS.md`). None mismatched. Two gaps matter most for what people actually store:
+
+- **Done (2026-10-01): Lance file format 2.0** (footer `0.3`), all 6 refusals. LanceDB wrote 2.0 by
+  default, so most LanceDB tables on the Hub are 2.0 (281 of 621 tables). `src/lance_v20_decoder.cpp`
+  reads the `ArrayEncoding` tree of `encodings_v2_0.proto` (Flat, Nullable, Binary, Dictionary,
+  FixedSizeList, FixedSizeBinary, List, Struct, PackedStruct, Fsst, both bit-packings, blob
+  columns) into the same `ColumnValues` as 2.1, decoding only the rows a range or take needs. 57
+  2.0 Hub tables read equal to pylance, and the Rust suite's 2.0 round trips pass but for types
+  nanolance refuses in every format (`docs/RUST_SUITE.md`). Still open: Constant pages (Lance
+  cannot read them either).
+- **Done (2026-10-01): `take` on `list<string>` in FullZip pages** decoded each touched page whole:
+  MS MARCO's `passage_text`, 256 rows, read 193 MB. A FullZip list page has a repetition index
+  (buffer 1, one entry per row) giving each row's byte range; take and row ranges now read just
+  those ranges and unravel their levels (`take_windows`, `decode_nested_rows`), large pages are
+  read in windows, and the parallel reader splits them. MS MARCO: 3 ms (pylance 7). The work guard
+  is `data_bytes_read`.
+
 ## What the survey found
 
 ### Two gaps nobody had listed
@@ -199,6 +219,8 @@ for a large one. See PROGRESS, "Roadmap E4".
 | # | Task | Size | Model |
 |---|---|---|---|
 | F1 | **Page size.** nanolance writes ~1024 rows per bitpacked page; pylance put 200,000 in one. Measure read time vs page size on the bench datasets *first* — this project's instruction profiles misled four times; only wall clock is trusted. | S (measure) + M | **Opus** |
+| F1 | *(status)* **Reopened and done.** The first measurement (200,000 rows) said no change was needed and claimed bitpacked columns were already multi-chunk pages. That was wrong: the flat writer put one chunk per page, so a 2M-row int64 column became 1,954 pages of 2.5 KB, and the benchmark matrix (`tools/bench_matrix.py`) showed Rust reading it 5.7x slower than its own file (104 vs 18 ms). Every fixed-width column is now written as ~512 KiB pages of many chunks (measured from 64 KiB to 8 MiB: within noise of the best for Rust, within ~10% of the best for nanolance); Rust reads nanolance's numeric files at its own speed. See PROGRESS.md, "Performance from the benchmark matrix". | | |
+| F3 | **Memory budget for writing** — `max_pending_bytes`: write_batch flushes a fragment when the buffered data reaches it (edge devices). | S | **Done** — see PROGRESS |
 | F2 | **FSST on write** — the answer to the one bench shape nanolance still loses (`high_card`, 7.67 ms vs 5.12 ms). Encoder only; the reader exists. Correctness oracle: pylance reads it; speed oracle: the bench. | M–L | **Opus** |
 
 **Status:** F2 done — see PROGRESS, "Roadmap F2". String files are now as small as pylance's or

@@ -47,4 +47,9 @@ bool slice_column_values(ColumnValues& values, std::uint64_t first, std::uint64_
 bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>& keep,
                            std::uint64_t total, std::size_t value_bytes, std::string& error);
 
+/// `compact_column_values` without changing `src`: the rows `keep` marks, copied into `out`. Costs
+/// what the kept rows hold, not the column -- for picking rows out of a cached decode.
+bool gather_column_values(const ColumnValues& src, const std::vector<std::uint8_t>& keep, std::uint64_t total,
+                          std::size_t value_bytes, ColumnValues& out, std::string& error);
+
 }  // namespace nano_lance

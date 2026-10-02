@@ -32,6 +32,13 @@ bool read_manifest_file(const std::filesystem::path& manifest_path, std::vector<
                           std::string& error);
 
 /// Decode latest manifest under `dataset_path/_versions/`.
+/// Every version under `_versions`, ascending.
+std::vector<std::uint64_t> list_manifest_versions(const std::filesystem::path& dataset_path, std::string& error);
+
+/// Load the manifest of version `version`; an error names it when it does not exist.
+bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint64_t version, pb::Manifest& out,
+                           std::string& error);
+
 bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifest& out, std::uint64_t& version_out,
                           std::string& error);
 

@@ -123,7 +123,8 @@ int main() {
 
     char error[512] = {0};
 
-    // Full read: one batch per fragment, in order, every row present.
+    // Full read: every row present, in order -- one batch per fragment, or with several threads one
+    // per row range of it.
     {
         ArrowArrayStream stream{};
         require(nano_lance_table_open_stream(path.string().c_str(), nullptr, 0, 1, &stream, error,
@@ -140,7 +141,7 @@ int main() {
 
         std::int64_t batches = 0;
         const auto rows = drain(stream, &batches, 0);
-        require(batches == kFragments, "expected one batch per fragment");
+        require(batches >= kFragments, "expected at least one batch per fragment");
         require(rows == kFragments * kRowsPerFragment, "stream lost rows");
         stream.release(&stream);
         require(stream.release == nullptr, "release must null itself");

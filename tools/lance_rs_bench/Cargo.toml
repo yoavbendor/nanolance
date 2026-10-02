@@ -1,0 +1,25 @@
+[package]
+name = "lance_rs_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Pure-Rust counterpart of tools/nlbench for tools/bench_matrix.py: time the lance crate's writer and reader, and their peak memory"
+
+# Kept out of any parent workspace: this is a standalone tool with its own lockfile.
+[workspace]
+
+[dependencies]
+# The crate pylance 12.0.0 is built from. Default features add cloud object stores (S3, Azure,
+# GCS, ...); left out, this is the smallest binary the lance crate can give a local-files user.
+lance = { version = "=12.0.0", default-features = false }
+lance-file = "=12.0.0"
+arrow-array = "58"
+arrow-ipc = "58"
+arrow-schema = "58"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = false

@@ -1,0 +1,47 @@
+{
+ "findings": [
+  [
+   "Reads: 2.8× faster than Rust Lance on all cores, 2.9× per core",
+   "Both on all four cores, nanolance reads 26 of the 27 data types faster than Rust Lance (the 27th, list<list<int32>>, is a tie: 5.1 against 5.0 ms), 2.78× on average; both pinned to one core, 2.91×. Numbers and dates: 3.3–5.1× (a 2M-row int64 id column: 7.6 against 13.4 ms). Strings: 2.9×. Lists, maps and structs: 1.5×."
+  ],
+  [
+   "Writes: 1.9× faster on all cores, 1.5× per core",
+   "Both on all cores nanolance writes 21 of 27 data types faster, 1.92× on average; one core each, 1.48×. Rust Lance on all cores still writes five list and map columns faster (map<string,int64> 34 against 51 ms, list<int64> 52 against 64) and random binary blobs (27 against 36 ms): a single large list column's pages are built one after another."
+  ],
+  [
+   "Every core, and one: same code, same files",
+   "nanolance uses every core for reads, writes and random-access takes: a fragment is read as row ranges decoded side by side (one Arrow batch each, nothing concatenated), a data file's columns are encoded side by side, and inside a column FSST compression, page dictionaries and list levels are split across threads. On one thread (set_threads(1), NANOLANCE_THREADS=1, or a process pinned to one CPU) nothing is started or split: the single-threaded code path, no slower than before threads existed. The files are byte-for-byte the same at any thread count. The pool is ~200 lines of std::thread, no runtime library."
+  ],
+  [
+   "Without Python, the same picture",
+   "Against the lance crate itself (tools/lance_rs_bench, the crate pylance 12.0.0 is built from, no Python in the process) nanolance reads 3.3× faster on all cores and 2.6× on one, and writes 1.9× and 1.4× faster. pylance costs the crate little: 1.14× its read time on one core, 0.84× on all, 1.02× for writes."
+  ],
+  [
+   "A read needs the table and little else",
+   "nanolance's peak memory for a read is the table it returns plus a few MB; the lance crate's is the table plus 34–65 MB, and 35 MB to read even a 1,000-row dataset: 3.1× more on average (geometric mean)."
+  ],
+  [
+   "A write in a fixed amount of memory",
+   "Without a limit, nanolance holds a write until commit. Its 4 MiB writer budget, the edge-device setting, commits a fragment whenever it holds 4 MiB, streams columns one at a time (no column-parallel buffering), and peaks at 3.3× less memory than the lance crate (int64 ids: 7.0 against 33.5 MB)."
+  ],
+  [
+   "2.5 MB against 165 MB",
+   "A stripped program that reads and writes Lance is 2.5 MB with nanolance and 165 MB with the lance crate, built for local files only (pylance's native library, with the cloud object stores, is 213 MB). nanolance links two third-party libraries, nanoarrow and zstd; the lance crate brings 371 crates."
+  ],
+  [
+   "Files interchange both ways",
+   "Every file each Lance writer produced was read by the other side and checked value by value: 81 of 81 cross reads, no failures."
+  ]
+ ],
+ "method": [
+  "Machine: Intel Xeon @ 2.80 GHz, 4 cores, 16 GB, Linux 6.18. Rust Lance is pylance 12.0.0 and the lance crate 12.0.0 it is built from, both writing and reading Lance file format 2.2; pyarrow 25.0.1; nanolance built Release at the commit shown above.",
+  "27 data types, 50,000 to 2,000,000 rows each (tens of MB in memory), one column per data type except the 10-column event table. Every writer receives the same input: the table as 64K-row Arrow batches.",
+  "Every time is the median of 5 runs after one warm-up, with the files in the page cache: the warm, repeated read a query service sees.",
+  "nanolance C++ runs twice, timed inside one process by tools/nlbench: on all 4 cores (its default) and pinned to one core, where it runs single-threaded. A read is lance_table_read_dataset into Arrow arrays; a write is writer open, write_batch per batch, commit. glibc's default allocator unless a column says otherwise.",
+  "Rust Lance through pylance: lance.dataset(path).to_table() and lance.write_dataset(...) on all 4 cores, and in a separate process pinned to one core with LANCE_CPU_THREADS=1 and LANCE_IO_THREADS=1. Without Python: tools/lance_rs_bench (Dataset::open + scan into record batches; Dataset::write), the same two ways, one tokio worker on one core; built with the crate's default features off (local files only) and thin LTO.",
+  "Peak memory: nlbench and lance_rs_bench reset the kernel's high-water mark (/proc/self/clear_refs) before each run and report the most any run added over what the process already held: the input batches of a write; nothing for a read, whose peak includes the table it returns. The budgeted write sets nanolance's max_pending_bytes to 4 MiB.",
+  "Program sizes are the benchmark programs themselves (reader, writer and Arrow IPC input), stripped; the Python sizes are each package's installed native library.",
+  "Python times (nanolance.read_table / write_table) include conversion to and from pyarrow.Table. Parquet is pyarrow.parquet with zstd on all cores, as a familiar yardstick.",
+  "Before any read was timed, its result was compared with the source table (values and types), Rust-native reads included (dumped to Arrow IPC and compared). A reader that returned anything else would be listed as a failure, not a time; this run had none."
+ ]
+}

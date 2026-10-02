@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/work_stats.hpp"
 
 #include "nanolance/read_safety.hpp"
 
@@ -174,45 +175,60 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
 
     std::uint16_t minor = 0;
     std::uint16_t major = 0;
-    if (!read_le16(tail.data() + magic_idx - 4U, minor) || !read_le16(tail.data() + magic_idx - 2U, major)) {
+    // Major first, then minor, then the magic (lance-file's footer; its version tests spell it out).
+    if (!read_le16(tail.data() + magic_idx - 4U, major) || !read_le16(tail.data() + magic_idx - 2U, minor)) {
         error = "failed to read data file version";
         return false;
     }
-    if (minor != 2U || major != 2U) {
-        error = "unsupported Lance data file version (expected 2.2)";
+    // 2.1 and 2.2 share the structural page layouts; 2.2 adds encodings a 2.1 file never holds. 2.0
+    // (footer 0.3: ArrayEncoding pages, lance_v20_decoder.cpp) has the same container. 2.3 and the
+    // legacy v1 format are not read.
+    const bool v2_0 = major == 0U && minor == 3U;
+    if (!v2_0 && (major != 2U || (minor != 1U && minor != 2U))) {
+        // The footer spells format 2.0 as 0.3, and the legacy (v1) format as 0.1 or 0.2.
+        const std::string footer = std::to_string(major) + "." + std::to_string(minor);
+        const std::string format = major == 0U && minor == 3U                  ? "2.0 (footer 0.3)"
+                                   : major == 0U && (minor == 1U || minor == 2U) ? "legacy v1 (footer " + footer + ")"
+                                                                               : footer;
+        error = "unsupported Lance file format " + format + " (nanolance reads 2.0, 2.1 and 2.2)";
         return false;
     }
 
     std::uint32_t num_columns = 0;
-    std::uint32_t const1 = 0;
-    if (!read_le32(tail.data() + magic_idx - 8U, num_columns) || !read_le32(tail.data() + magic_idx - 12U, const1)) {
+    std::uint32_t num_global_buffers = 0;
+    if (!read_le32(tail.data() + magic_idx - 8U, num_columns) ||
+        !read_le32(tail.data() + magic_idx - 12U, num_global_buffers)) {
         error = "failed to read data file column counts";
         return false;
     }
-    if (const1 != 1U) {
-        error = "unexpected Lance data file footer constant";
+    // Global buffer 0 is the schema; Lance's index files add more (a label list's null rows).
+    if (num_global_buffers == 0U || num_global_buffers > 1024U) {
+        error = "unexpected Lance data file global buffer count";
         return false;
     }
 
-    const std::size_t u64_block = magic_idx - 52U;
-    std::uint64_t global_buffer_offset = 0;
-    std::uint64_t descriptor_size = 0;
     std::uint64_t column_metadata_start = 0;
     std::uint64_t column_offsets_start = 0;
     std::uint64_t global_offsets_start = 0;
-    if (!read_le64(tail.data() + u64_block + 0U, global_buffer_offset) ||
-        !read_le64(tail.data() + u64_block + 8U, descriptor_size) ||
-        !read_le64(tail.data() + u64_block + 16U, column_metadata_start) ||
-        !read_le64(tail.data() + u64_block + 24U, column_offsets_start) ||
-        !read_le64(tail.data() + u64_block + 32U, global_offsets_start)) {
+    if (!read_le64(tail.data() + magic_idx - 36U, column_metadata_start) ||
+        !read_le64(tail.data() + magic_idx - 28U, column_offsets_start) ||
+        !read_le64(tail.data() + magic_idx - 20U, global_offsets_start)) {
         error = "failed to read data file footer offset block";
         return false;
     }
-
+    // The global buffer table sits right before those offsets, as every Lance writer lays it out.
     const std::uint64_t tail_base = file_size - static_cast<std::uint64_t>(tail_len);
-    const std::uint64_t abs_u64_block = tail_base + u64_block;
-    if (global_offsets_start != abs_u64_block) {
+    const std::uint64_t table_bytes = 16ULL * num_global_buffers;
+    if (magic_idx < 36U + table_bytes || global_offsets_start != tail_base + magic_idx - 36U - table_bytes) {
         error = "data file footer global_offsets_start mismatch";
+        return false;
+    }
+    const std::size_t u64_block = magic_idx - 36U - static_cast<std::size_t>(table_bytes);
+    std::uint64_t global_buffer_offset = 0;
+    std::uint64_t descriptor_size = 0;
+    if (!read_le64(tail.data() + u64_block, global_buffer_offset) ||
+        !read_le64(tail.data() + u64_block + 8U, descriptor_size)) {
+        error = "failed to read data file footer offset block";
         return false;
     }
     if (!fits_size_t(descriptor_size) || !range_in_bounds(global_buffer_offset, descriptor_size, file_size)) {
@@ -237,13 +253,36 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
         return false;
     }
 
+    layout.major_version = major;
+    layout.minor_version = minor;
     layout.global_buffer_offset = global_buffer_offset;
     layout.descriptor_size = descriptor_size;
     layout.column_metadata_start = column_metadata_start;
     layout.column_offsets_start = column_offsets_start;
     layout.global_offsets_start = global_offsets_start;
     layout.num_columns = num_columns;
+    layout.num_global_buffers = num_global_buffers;
     return true;
+}
+
+bool read_lance_file_global_buffer(const std::filesystem::path& path, const LanceDataFileFooterLayout& layout,
+                                   std::uint32_t index, std::vector<std::uint8_t>& out, std::string& error) {
+    out.clear();
+    if (index >= layout.num_global_buffers) {
+        error = "the file has no global buffer " + std::to_string(index);
+        return false;
+    }
+    std::vector<std::uint8_t> entry;
+    if (!read_lance_data_file_bytes(path, layout.global_offsets_start + 16ULL * index, 16U, entry, error)) {
+        return false;
+    }
+    std::uint64_t offset = 0;
+    std::uint64_t size = 0;
+    if (!read_le64(entry.data(), offset) || !read_le64(entry.data() + 8U, size)) {
+        error = "failed to read a global buffer entry";
+        return false;
+    }
+    return read_lance_data_file_bytes(path, offset, size, out, error);
 }
 
 bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::uint64_t offset,
@@ -276,6 +315,12 @@ bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::ui
     }
     out.resize(static_cast<std::size_t>(size));
     in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(size));
+    {
+        auto& stats = work_stats::counters();
+        work_stats::add(stats.data_bytes_read, size);
+        work_stats::add(stats.data_reads, 1U);
+        work_stats::raise_to(stats.largest_read, size);
+    }
     if (!in || static_cast<std::uint64_t>(in.gcount()) != size) {
         error = "failed to read data file byte range";
         // The stream's position is now wherever the short read left it, and `in` is in a failed state

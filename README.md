@@ -47,6 +47,11 @@ speedup). Full details, the threat model, and a reviewer checklist: **[docs/SAFE
 - **What it is:** a write-centric C++ library that emits **Lance v2.2** datasets and reads back what it
   wrote — no Rust `lance` core. Everything it writes is readable by stock `lance`
   (verified against `pylance` 12.0.0) **unless** a feature is marked *nanolance-only* below.
+  It reads Lance file formats 2.0, 2.1 and 2.2 — 2.0 being what most LanceDB tables on the Hugging
+  Face Hub are in ([docs/REAL_DATASETS.md](docs/REAL_DATASETS.md)). It builds and uses Lance's
+  scalar indexes (BTree, Bitmap, LabelList) in Lance's own format: pylance uses an index nanolance
+  built, and nanolance one pylance built, with the same results. A dataset's other indexes (vector,
+  full-text) survive its appends, deletes, updates and compactions.
 - **Headline benefit:** rows keep big payloads **external** (`uri` + `position` + `size`, never copied),
   so a packet table costs a few bytes/row regardless of payload size; bytes are fetched on demand (local
   file or `s3://`).
@@ -77,6 +82,34 @@ nanolance.read_table("out.lance", columns=["name"])
 for batch in pa.RecordBatchReader.from_stream(nanolance.open_stream("out.lance")):
     ...
 ```
+
+Already using pylance? `nanolance.lance` speaks its API: the reads, writes, filters, versions,
+fragments, row ids, dataset changes (delete, update, merge insert, schema evolution, compaction) and
+file API that pylance 12's own test suite exercises, run against nanolance in CI:
+
+```python
+import nanolance.lance as lance          # or nanolance.lance.install_as_lance(), then `import lance`
+
+ds = lance.write_dataset(table, "out.lance", mode="append")
+ds.to_table(columns=["name"], filter="id > 10 AND name LIKE 'a%'", limit=10, with_row_id=True)
+ds.delete("id < 3")
+lance.dataset("out.lance", version=1).take([2, 0])
+```
+
+What it covers, what raises `NotImplementedError`, and how many of pylance's tests pass:
+[docs/PYLANCE_COMPAT.md](docs/PYLANCE_COMPAT.md).
+
+From C or C++, nanolance builds `liblance_c`: lance-c's C API (`#include <lance/lance.h>`,
+`LanceC::lance_c`) over nanolance, so code written for lance-c links unchanged, without a Rust
+toolchain. lance-c's own tests run against it in CI: [docs/LANCE_C_COMPAT.md](docs/LANCE_C_COMPAT.md).
+
+Lance's own Rust encoding tests (lance-encoding and lance-file) run nightly with every round trip
+and file they write also read back by nanolance: [docs/RUST_SUITE.md](docs/RUST_SUITE.md).
+
+To try it on real data: `tools/real_lance_check.py` downloads Lance datasets people have published on
+the Hugging Face Hub and checks nanolance against pylance on them. The datasets hold embeddings,
+images, audio, video and LanceDB tables. How to run it, what it found, and the COCO / Speech
+Commands benchmark are in [docs/REAL_DATASETS.md](docs/REAL_DATASETS.md).
 
 Already have parquet? Convert it and compare, without writing any code:
 
@@ -138,6 +171,12 @@ if (!writer.commit()) { return writer.error(); }     // is_append follows what o
   table.
 - **To get small files, model external refs as plain `uri`/`position`/`size` columns**, *not* the packed
   `lance.blob.v2` descriptor (~41 B/row vs ~3.4 B/row). See [AGENTS.md §4](AGENTS.md#4-data-model-how-to-actually-get-small-files-important).
+- **Memory while saving is bounded only if you bound it.** The writer holds every row until a commit,
+  so by default a whole session is resident. On a memory-constrained device set
+  `max_pending_bytes` (C options struct / `set_max_pending_bytes`, C++ `WriteOptions` and typed
+  `writer::options`, Python `LanceWriter(max_pending_bytes=...)`, CLI `--max-pending-bytes`):
+  `write_batch` then commits a fragment itself whenever the buffered data reaches the budget. Plan
+  for a peak of about 3-4x the budget plus one batch; a smaller budget means more, smaller fragments.
 - **The reader is hardened against untrusted files** — bounds/overflow-checked decode, allocation
   budgets, ASan+UBSan CI, and continuous fuzzing. See [docs/SAFETY.md](docs/SAFETY.md) for the threat
   model and reviewer checklist.
@@ -154,6 +193,7 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 | `utf8`, `binary`, `fixed_size_binary(N)` | round-trips (high-cardinality strings FSST-compressed, as stock Lance does) |
 | `struct` (nested, arbitrarily deep) | round-trips |
 | `lance.blob.v2` external references | round-trips (the headline feature) |
+| `lance.blob.v2` as pylance writes it: inline, packed, dedicated, external, empty and null blobs | read (as descriptions, as bytes, or as file handles); nanolance writes external blobs only |
 | nulls in a fixed-width column (int, float, bool, temporal, decimal, `fixed_size_binary`) | round-trips |
 | nulls in a `utf8`/`binary` column | round-trips |
 | a null **struct** (as opposed to a null field inside one) | round-trips (written with its own definition level, as Lance does) |
@@ -164,7 +204,7 @@ it. Nothing writes a file nanolance (or stock Lance) cannot read back.
 | `date32`, `date64`, `time32` (s/ms), `time64` (us/ns) | round-trips |
 | `decimal128`, `decimal256` | round-trips |
 | `timestamp` with a **UTC-offset** timezone (`+05:30`) | **refused** — Lance supports IANA zone names only and panics on offsets, so pylance cannot write one either; use a named zone |
-| `list`, `large_list`, `map`, lists of structs, structs of lists | round-trips — null and empty lists, null items, any nesting depth; a list of `fixed_size_list` is refused |
+| `list`, `large_list`, `map`, lists of structs, structs of lists | round-trips — null and empty lists, null items, any nesting depth, `fixed_size_list` items (bounding boxes, embeddings); a null element inside a valid `fixed_size_list` item is refused |
 | `large_utf8`, `large_binary` | round-trips — plain, nullable, dictionary-encoded, constant, and as list, struct or map items |
 | Arrow `dictionary<...>` columns | **refused** — cast to the value type; nanolance dictionary-encodes low-cardinality strings on disk by itself, so the file stays the same size |
 
@@ -188,7 +228,7 @@ Lance's string compressor switches on):
 | `list`, `large_list`, `list<list<…>>` of any type above, long values (FullZip) included — null lists, empty lists, null items | yes |
 | a list of structs, a struct holding lists — with nulls at any level | yes |
 | `map` | yes |
-| a list of `fixed_size_list` | no — refused by name |
+| a list of `fixed_size_list` | yes (a null element inside a valid item is refused by name) |
 
 nanolance also reads Lance datasets pylance has **modified**: multiple versions, `append`,
 `overwrite`, `update`, `delete` (both the Arrow-IPC and roaring-bitmap deletion formats) and
@@ -392,6 +432,27 @@ This is a **nanolance-only** layout — stock Lance/lance-c cannot read those bl
 off by default and create-mode only (not append). nanolance's own reader resolves the URIs
 transparently, so the data you read back is identical either way.
 
+## Threads
+
+nanolance uses the machine's cores for reads and writes, with nothing to add: a ~200-line pool on
+`std::thread` (`src/parallel.cpp`), no runtime library.
+
+| | What runs side by side |
+|---|---|
+| Read | a fragment is cut into row ranges ("morsels"), each decoded -- every column of it -- on its own thread and returned as its own Arrow batch; fragments too. A list page with a repetition index and any MiniBlock page give up a row range without being decoded whole; a plan that would decode more than a quarter extra is not split. |
+| take | the columns of each fragment |
+| Write | the columns of a data file, encoded into memory and appended in order: the file is byte-for-byte what one thread writes |
+
+- **Count**: `nanolance.set_threads(n)` / `nano_lance_set_threads(n)`, else `NANOLANCE_THREADS`, else the
+  CPUs the process may run on (its affinity mask: `taskset` and container limits count).
+- **One thread** is the single-threaded code path, not a pool of one: nothing is started, nothing split.
+- **A write memory budget** (`max_pending_bytes`) keeps columns streaming to the file one at a time.
+- **Batches**: with several threads a large fragment comes back as several record batches rather than one.
+- **Buffer pool**: released output buffers of 1 MiB and up are kept (at most `NANOLANCE_BUFFER_POOL_MB`,
+  default 128; 0 turns it off; two seconds idle and they go), so a repeated read does not page-fault
+  its output in again -- what Rust and pyarrow get from their pooling allocators.
+- A process forked after reading (a PyTorch DataLoader worker) starts a pool of its own.
+
 ## Compression (Lance-compatible)
 
 `nano_lance_writer_set_compression(&writer, true)` (CLI: `--compress`) turns on Lance-compatible
@@ -440,7 +501,40 @@ Standalone configures use **`GIT_SHALLOW TRUE`** on FetchContent to keep *future
 
 ## Benchmarking
 
-Performance benchmarks (pcap-style columns: run-length URI + monotonic position + constant size) and native-reader profiles are in [bench/linux-ci-results.md](bench/linux-ci-results.md) (CI-owned; local runs go to [bench/linux-local-results.md](bench/linux-local-results.md) via `bench/run-local-bench.sh`). External blob fetching (nanolance vs. Rust Lance) is in [bench/README_blob_fetch.md](bench/README_blob_fetch.md). The per-column compression ratios and method selection are documented in [AGENTS.md](AGENTS.md#3-enabling-the-compression-that-was-measured).
+**[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** has the full comparison against Rust Lance -- through
+pylance 12 and through the `lance` crate itself with no Python (`tools/lance_rs_bench`) -- and
+Parquet: 27 Arrow data types (numbers, dates, strings, nulls, vectors, structs, lists, maps and a
+mixed table), each written and read by nanolance C++, nanolance Python and Rust on one core and on all
+cores, every read checked against the source before it is timed, every file read by the other side,
+with peak memory and program size -- plus two real training datasets, COCO 2017 val (images,
+captions, boxes, polygons) and Speech Commands (audio). In short (geometric means, 4-core machine):
+
+| | both on all cores | both on 1 core |
+|---|---:|---:|
+| Read | 2.78x faster than Rust Lance | 2.91x faster |
+| Write | 1.92x faster | 1.48x faster |
+| Data types faster, all cores | 26 of 27 reads (the 27th a tie), 21 of 27 writes | |
+| Peak memory, read | 3.1x less | |
+| Peak memory, write with a 4 MiB budget | 3.3x less | |
+| File size | 99% of Rust's | |
+| Reader + writer program, stripped | 2.5 MB against 165 MB | |
+
+| Training data, all cores | nanolance | Rust Lance |
+|---|---:|---:|
+| COCO: write the dataset / read an epoch / shuffled epoch | 1.0 s / 0.39 s / 0.38 s | 3.1 s / 4.1 s / 0.89 s |
+| Speech Commands: write / read an epoch / shuffled epoch | 1.06 s / 0.09 s / 0.29 s | 1.90 s / 0.38 s / 0.31 s |
+
+Where Rust on all cores still leads: writing a single large list or map column (map<string,int64>
+34 vs 51 ms) and random binary blobs. Python costs Rust Lance little, so pylance is a fair stand-in.
+Reproduce with `python tools/bench_matrix.py && python tools/bench_report.py && python tools/bench_html.py`
+(the last renders `bench/results/report.html`, with charts; the Rust-native columns need
+`cargo build --release` in `tools/lance_rs_bench`).
+
+Older, narrower benchmarks: pcap-style columns and native-reader profiles in
+[bench/linux-ci-results.md](bench/linux-ci-results.md) (CI-owned; local runs go to
+[bench/linux-local-results.md](bench/linux-local-results.md) via `bench/run-local-bench.sh`), external
+blob fetching in [bench/README_blob_fetch.md](bench/README_blob_fetch.md), per-column compression in
+[AGENTS.md](AGENTS.md#3-enabling-the-compression-that-was-measured).
 
 ## Version
 

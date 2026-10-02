@@ -131,11 +131,13 @@ def test_nested_columns_beside_flat_ones_with_compression(lance_mod, tmp_path):
         assert got == table.column(name).to_pylist(), f"stock Lance mis-read column {name!r} on its own"
 
 
-def test_a_list_of_vectors_is_refused_by_name(tmp_path):
+def test_a_list_of_vectors(lance_mod, tmp_path):
+    """Refused until the COCO benchmark needed it (bounding boxes per object); tests/test_fsl_in_lists.py
+    covers the rest."""
     table = pa.table({"c": pa.array([[[1.0, 2.0]] * (i % 3) for i in range(50)], pa.list_(pa.list_(pa.float32(), 2)))})
-    with pytest.raises(Exception) as excinfo:
-        nanolance.write_table(table, tmp_path / "x.lance")
-    assert "cannot be written yet" in str(excinfo.value)
+    path = tmp_path / "x.lance"
+    nanolance.write_table(table, path)
+    _both_readers_agree(lance_mod, path, table)
 
 
 def test_list_children_with_their_own_offset(lance_mod, tmp_path):

@@ -53,17 +53,14 @@ Lifecycle rules:
   null field inside one), and a null in a `lance.blob.v2` external-reference column.
   `nano_lance_writer_set_ignore_nullability` is a no-op kept for compatibility; the manifest's
   nullable flag now mirrors the Arrow schema, as pylance's does.
-- Types nanolance cannot round-trip are refused at `write_batch` rather than written: `list`,
-  `large_utf8`/`large_binary`, Arrow `dictionary` columns, Arrow's `null` type, and a `timestamp`
-  whose timezone is a UTC offset rather than an IANA name (Lance panics on those). Supported:
-  int/uint 8–64, `float`, `double`, `bool`, `utf8`, `binary`, `fixed_size_binary(N)`, `timestamp`
-  (s/ms/us/ns, optionally with an IANA timezone), `date32/64`, `time32/64`, `decimal128/256`,
-  nested `struct`, and `lance.blob.v2` external references.
-- nanolance reads back everything it writes, and now every non-nested column type the Rust `lance`
-  crate writes: fixed-width and temporal types, nullable columns (bit-packed *and* run-length-encoded
-  definition levels), `utf8`/`large_utf8`/`binary` including FSST-compressed ones, and categorical
-  columns with their LZ4-compressed dictionary. `list` and `struct` are still refused **by name**,
-  not misread (see README "What nanolance can read").
+- Types nanolance cannot round-trip are refused at `write_batch` rather than written: Arrow
+  `dictionary` columns, a `timestamp` whose timezone is a UTC offset rather than an IANA name (Lance
+  panics on those), a list of `fixed_size_list`, and a null element inside a valid `fixed_size_list`
+  row. Everything else round-trips, including `list`/`large_list`/`map` at any nesting depth,
+  `large_utf8`/`large_binary`, `float16`, `duration` and `fixed_size_list` vectors -- README "Type
+  coverage" is the exact table.
+- nanolance reads back everything it writes, and the columns the Rust `lance` crate writes for those
+  types, nested ones included (README "What nanolance can read").
 - `commit(is_append=false)` creates; `commit(is_append=true)` (or `nano_lance_writer_init_append`)
   adds a fragment to an existing dataset.
 
@@ -190,39 +187,24 @@ Tips that help the encoders:
 
 ## 4a. Measured performance vs Parquet and Rust Lance
 
-200k rows, Ubuntu CI, clang Release, best-of-5 writes / best-of-7 reads. Reproduce with
-`tools/bench.py`; the live numbers are committed to `bench/linux-ci-results.md` by the GitHub Actions
-workflow on every push (CI-owned file). Local runs write `bench/linux-local-results.md` via
-`bench/run-local-bench.sh` so they never clash with the CI auto-commit.
+`docs/BENCHMARKS.md` (from `tools/bench_matrix.py`) is the current, complete comparison: 27 data
+types, nanolance C++ and Python against Rust Lance (pylance, and the `lance` crate with no Python via
+`tools/lance_rs_bench`) on one core and on all cores, with Parquet as a yardstick, every read
+verified, plus peak memory and program size, and COCO / Speech Commands training epochs
+(`tools/bench_multimodal.py`). Geometric means on 4 cores: reads 2.78x faster than Rust Lance with both
+on all cores and 2.91x with both on one; writes 1.92x / 1.48x; 26 of 27 reads and 21 of 27 writes
+faster on all cores; files 99% of Rust's size; peak read memory 3.1x less than the lance crate, and
+write memory 3.3x less with a 4 MiB `max_pending_bytes`; a stripped reader+writer program is 2.5 MB
+against 165 MB. Where Rust (all cores) still leads: writes of one large list/map column and of random
+binary blobs -- a column's pages are cut one after another (§6a has the threading rules).
+Where Parquet's files are smaller: sorted or low-range numbers (delta and dictionary
+encodings), where both Lance writers produce the same larger files.
 
-**Write-core ratio vs rust lance per dataset** (after the write-path optimization rounds — scan
-early-exits, plan reuse, chunk streaming through reused scratch buffers, reused zstd contexts):
-
-| dataset | nanolance vs rust lance (write core) |
-|---|---|
-| `float_smooth` (byte-stream-split + zstd) | **~0.75× — faster** |
-| `bool_flags` (1-bit packing) | **~0.4× — faster** |
-| `pcap_ref` (dict-RLE URI + bitpack + constant) | **~1.05× — parity** |
-| `wide_int` (integer bitpack) | ~1.2× |
-| `high_card` (zstd strings) | ~1.5× (remaining gap) |
-
-- **Size:** at Lance parity, **beats Parquet** — the design goal.
-- **Fair-comparison note (floats):** rust lance's *default* leaves floats essentially uncompressed
-  (~raw 12 B/row); `tools/bench.py` sets `lance-encoding:compression=zstd` + `lance-encoding:bss=on`
-  field metadata on the rust write of `float_smooth` so both engines do byte-stream-split + zstd
-  (~8.4-8.7 B/row) — without that, the bench compared our compressed write to rust's uncompressed one.
-- **Write:** `write(core)` excludes subprocess startup + Arrow-IPC parse (3–9 ms of the CLI's wall
-  clock); `write(proc)` in the bench includes them.
-- **Read:** float/bool reads are at or beyond rust-lance parity (nanolance reads compressed floats
-  ~2.5× faster than rust reads its own); integer-bitpack reads ~1.3×; string-heavy reads ~1.6-1.8×
-  remain the gap (memory-bandwidth bound on column materialization).
-
-Where Parquet wins: high-cardinality strings and monotonic **high-range** integers (Parquet
-delta-encodes; Lance and nanolance bitpack absolute values). Store such columns as app-level deltas to
-recover the win. The **flat** fixed-width path (uncompressed floats/doubles and any non-bitpacked
-fixed width) now chunks at the same 32 KB miniblock max as the variable-width path; the old 800-byte
-cap turned a large float column into thousands of tiny one-chunk pages and made float/struct writes
-allocation-bound (fixed — float/struct writes are now at Lance parity or faster).
+Allocator note: with glibc's default allocator a large read pays page faults for fresh memory;
+nanolance asks for transparent huge pages on outputs of 8 MiB or more, and keeps released output
+buffers for reuse (`NANOLANCE_BUFFER_POOL_MB`, default 128) -- parallel reads depend on it, since glibc
+does not recycle memory across threads. A retaining allocator (jemalloc, mimalloc, or
+`MALLOC_MMAP_THRESHOLD_`/`MALLOC_TRIM_THRESHOLD_`) can still gain a little on one thread.
 
 ## 5. Verifying Lance interop (do this after changes)
 
@@ -257,6 +239,45 @@ on-disk size shrank.
   benefit on the FastLanes pack/unpack kernels specifically, because it blocks inlining across the
   attribute boundary — the win only shows up compiling the whole translation unit at this target, which
   is what this flag does.
+
+## 6a. Threads: rules for code on the read and write paths
+
+Reads, takes and writes run on several threads (`src/parallel.cpp`; README "Threads"). Keep it safe:
+
+- **No shared mutable state without a lock.** Per-call scratch is `thread_local` (see the `packed`,
+  `scratch` and zstd context buffers); process-wide caches take a mutex. A new `static` that is written
+  after start-up needs one too.
+- **Per-thread settings travel with the task.** The read limits (`read_safety.hpp`) and the file
+  validation scope (`DataFileReadScope`) are thread-local; `parallel::for_each` re-establishes both on
+  whichever thread runs a task. Anything else thread-local that a decode depends on must do the same.
+- **Never assume one batch per fragment** in a reader test: iterate every batch (the C++ tests show the
+  pattern), or `set_threads(1)` when the one-per-fragment shape is itself what is tested.
+- **Files must not depend on the thread count.** `test_parallel.py` checks it byte for byte.
+- **Test with the stress settings** before pushing a read-path change:
+  `NANOLANCE_THREADS=8 NANOLANCE_MORSEL_KB=1` for both `ctest` and `pytest` (1 KiB morsels cut every
+  page of every column mid-page). A ThreadSanitizer build (`-fsanitize=thread`) of `tools/nlbench`
+  over a few datasets, `--write` and `--take` included, is the check for the pool itself.
+- **A write memory budget turns column-parallel writes off** (edge devices: resident bytes first).
+
+## 6b. Guarding performance and real-data findings
+
+A fix for a slowdown or a bloat needs a test that fails when it is undone -- a correctness test
+still passes when the rows come back right but slowly. Don't time it (CI machines are noisy):
+
+- **Guard the work, not the clock.** `nanolance._work_stats()` / `nano_lance_work_stats()` count bytes
+  read and the largest read, page windows, the row ranges a read was cut into, bytes a write buffered,
+  buffer-pool and take-cache hits. Add the bound to `bindings/python/tests/test_work_guards.py`, set
+  from the measured value with room to spare, then undo the fix locally and watch the guard fail.
+  A new kind of work gets a new counter (`include/nanolance/work_stats.hpp`).
+- **Keep the shape that found it.** A bug found on real data gets a focused test and, if its shape is
+  new, a place in `test_training_shapes.py` (COCO- and Speech-Commands-shaped tables, both writers,
+  1 and 4 threads). `test_real_datasets.py` reruns the checks on the real files when
+  `NANOLANCE_DATASETS` points at them (`tools/bench_multimodal.py` lists the downloads).
+  `tools/real_lance_check.py` reads Lance datasets published on the Hugging Face Hub with both
+  engines and compares them (`docs/REAL_DATASETS.md`); run it before calling a read path done.
+- **The matrix is checked in CI** as ratios to Rust Lance (`tools/bench_compare.py` against
+  `bench/results/matrix-quick.json`). A change that moves performance on purpose regenerates it:
+  `python tools/bench_matrix.py --quick --runs 3 --out bench/results/matrix-quick.json`.
 
 ## 7. When adding a new Lance encoding (how this codebase does it)
 

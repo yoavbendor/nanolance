@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -29,6 +30,9 @@ struct BlobV2ExternalColumnValues {
     std::vector<std::string> uri_dictionary;
     /// Dedup lookup used only while building `uri_dictionary` on the write side.
     std::unordered_map<std::string, std::uint32_t> uri_to_id;
+    /// Read side: the data file the rows came from. Lance's inline blobs live in it, and its packed
+    /// and dedicated ones in sidecar files beside it (<data dir>/<file stem>/<blob id>.blob).
+    std::filesystem::path data_file;
 };
 
 /// Structural-dictionary plan for a scattered low-cardinality string column, computed once by the

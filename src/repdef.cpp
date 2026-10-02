@@ -2,8 +2,10 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/repdef.hpp"
+#include "nanolance/parallel.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <cstddef>
 
 namespace nano_lance::repdef {
@@ -14,26 +16,40 @@ bool is_item_layer(std::uint8_t kind) {
     return kind == kAllValidItem || kind == kNullableItem;
 }
 
-void append_bit(UnraveledLayer& layer, bool valid) {
-    const auto at = layer.length;
-    if (!valid && layer.validity.empty()) {
-        // First null: materialize every entry so far as valid.
-        layer.validity.assign(static_cast<std::size_t>((at + 8U) / 8U), 0U);
-        for (std::uint64_t i = 0; i < at; ++i) {
-            layer.validity[static_cast<std::size_t>(i >> 3U)] |= static_cast<std::uint8_t>(1U << (i & 7U));
-        }
-    }
-    if (!layer.validity.empty()) {
-        if (layer.validity.size() < static_cast<std::size_t>((at + 8U) / 8U)) {
-            layer.validity.resize(static_cast<std::size_t>((at + 8U) / 8U), 0U);
-        }
+/// Append one entry's validity. Every entry is valid until the first null, so the bitmap is only
+/// materialized then (`hint`: roughly how many entries the layer will have, to size it once); after
+/// that a byte is added every eighth entry.
+// Called per list entry in unravel's hottest loop; left to itself the compiler outlines it (20% of a
+// list<list<int32>> read). Always inline.
+#if defined(__GNUC__) || defined(__clang__)
+#define NANOLANCE_ALWAYS_INLINE __attribute__((always_inline)) inline
+#elif defined(_MSC_VER)
+#define NANOLANCE_ALWAYS_INLINE __forceinline
+#else
+#define NANOLANCE_ALWAYS_INLINE inline
+#endif
+
+NANOLANCE_ALWAYS_INLINE void append_bit(UnraveledLayer& layer, bool valid, std::size_t hint = 0) {
+    const auto at = layer.length++;
+    if (layer.validity.empty()) {
         if (valid) {
-            layer.validity[static_cast<std::size_t>(at >> 3U)] |= static_cast<std::uint8_t>(1U << (at & 7U));
-        } else {
-            ++layer.null_count;
+            return;
         }
+        // First null: materialize every entry so far as valid.
+        layer.validity.reserve(std::max<std::size_t>(hint, static_cast<std::size_t>(at) + 1U) / 8U + 1U);
+        layer.validity.assign(static_cast<std::size_t>(at / 8U), 0xFFU);
+        layer.validity.push_back(static_cast<std::uint8_t>((1U << (at & 7U)) - 1U));
+        ++layer.null_count;
+        return;
     }
-    ++layer.length;
+    if ((at & 7U) == 0U) {
+        layer.validity.push_back(0U);
+    }
+    if (valid) {
+        layer.validity.back() |= static_cast<std::uint8_t>(1U << (at & 7U));
+    } else {
+        ++layer.null_count;
+    }
 }
 
 }  // namespace
@@ -130,7 +146,7 @@ bool unravel(const std::vector<std::uint16_t>& rep_in, bool has_rep, const std::
                 const bool nullable = kind == kNullableItem;
                 for (const auto level : def) {
                     if (levels_to_rep[level] <= rep_cmp) {
-                        append_bit(layer, !nullable || level <= def_cmp);
+                        append_bit(layer, !nullable || level <= def_cmp, def.size());
                     }
                 }
             }
@@ -187,10 +203,33 @@ bool unravel(const std::vector<std::uint16_t>& rep_in, bool has_rep, const std::
         const std::uint64_t children = out.back().length;
         std::int64_t curlen = 0;
         std::size_t write = 0;
-        for (std::size_t read = 0; read < rep.size(); ++read) {
+        // Offsets through a pointer into storage sized for the most there can be (one per level that
+        // starts a list here, plus the end), trimmed after: push_back here was not inlined, 9% of a
+        // nested read.
+        const auto starts = rep.size() - static_cast<std::size_t>(std::count(rep.begin(), rep.end(), std::uint16_t{0}));
+        layer.offsets.resize(starts + 1U);
+        auto* offsets = layer.offsets.data();
+        std::size_t n_offsets = 0;
+        const std::size_t num_levels = rep.size();
+        for (std::size_t read = 0; read < num_levels; ++read) {
             const auto r = rep[read];
             if (r == 0U) {
-                ++curlen;  // continues the current list
+                // Continues the current list -- as do, in a long list (an audio clip, a point cloud),
+                // most of the levels after it: skip them sixteen at a time.
+                std::size_t end = read + 1U;
+                while (end + 16U <= num_levels) {
+                    std::uint64_t w[4];
+                    std::memcpy(w, rep.data() + end, sizeof(w));
+                    if ((w[0] | w[1] | w[2] | w[3]) != 0U) {
+                        break;
+                    }
+                    end += 16U;
+                }
+                while (end < num_levels && rep[end] == 0U) {
+                    ++end;
+                }
+                curlen += static_cast<std::int64_t>(end - read);
+                read = end - 1U;
                 continue;
             }
             rep[write] = static_cast<std::uint16_t>(r - 1U);
@@ -198,31 +237,32 @@ bool unravel(const std::vector<std::uint16_t>& rep_in, bool has_rep, const std::
                 const auto d = def[read];
                 def[write] = d;
                 if (d == 0U) {
-                    layer.offsets.push_back(curlen);
+                    offsets[n_offsets++] = curlen;
                     ++curlen;
-                    append_bit(layer, true);
+                    append_bit(layer, true, rep.size());
                 } else if (d > max_level) {
                     // An outer layer's null or empty list: no list here.
                 } else if ((null_level != 0U && d == null_level) || d > upper_null) {
-                    layer.offsets.push_back(curlen);
-                    append_bit(layer, false);
+                    offsets[n_offsets++] = curlen;
+                    append_bit(layer, false, rep.size());
                 } else if (empty_level != 0U && d == empty_level) {
-                    layer.offsets.push_back(curlen);
-                    append_bit(layer, true);
+                    offsets[n_offsets++] = curlen;
+                    append_bit(layer, true, rep.size());
                 } else {
                     // A valid list whose first child is null.
-                    layer.offsets.push_back(curlen);
+                    offsets[n_offsets++] = curlen;
                     ++curlen;
-                    append_bit(layer, true);
+                    append_bit(layer, true, rep.size());
                 }
             } else {
-                layer.offsets.push_back(curlen);
+                offsets[n_offsets++] = curlen;
                 ++curlen;
-                append_bit(layer, true);
+                append_bit(layer, true, rep.size());
             }
             ++write;
         }
-        layer.offsets.push_back(curlen);
+        offsets[n_offsets++] = curlen;
+        layer.offsets.resize(n_offsets);
         rep.resize(write);
         if (has_def) {
             def.resize(write);
@@ -289,6 +329,8 @@ public:
             const bool valid = valid_at(&item_validity_, idx);
             if (!emit) {
                 flags_[k].has_null = flags_[k].has_null || !valid;
+                ++levels_;
+                ++items_;
                 return true;
             }
             push(rep, valid ? 0U : null_level_[k], idx);
@@ -300,6 +342,8 @@ public:
             if (!valid) {
                 if (!emit) {
                     flags_[k].has_null = true;
+                    ++levels_;
+                    items_ += lists_below_[k] ? 0U : 1U;
                     return true;
                 }
                 push(rep, null_level_[k], lists_below_[k] ? kNoSlot : idx);
@@ -317,6 +361,7 @@ public:
         if (!valid) {
             if (!emit) {
                 flags_[k].has_null = true;
+                ++levels_;
                 return true;
             }
             push(rep, null_level_[k], kNoSlot);
@@ -329,6 +374,7 @@ public:
         if (end == begin) {
             if (!emit) {
                 flags_[k].has_empty = true;
+                ++levels_;
                 return true;
             }
             push(rep, empty_level_[k], kNoSlot);
@@ -337,6 +383,28 @@ public:
         // The first child inherits the level that starts this list (and any around it); each later
         // child starts a new entry one list level in.
         const auto continuation = static_cast<std::uint16_t>(list_depth_[k] - 1U);
+        if (k + 1U == layers_.size()) {
+            // The innermost list: its children are the items themselves, so visit them in a loop
+            // here rather than one call each -- the bulk of a list column's levels.
+            auto& item_flags = flags_[k + 1U];
+            if (!emit) {
+                const auto n = static_cast<std::uint64_t>(end - begin);
+                levels_ += n;
+                items_ += n;
+                if (!item_validity_.empty() && !item_flags.has_null) {
+                    for (auto c = begin; c < end && !item_flags.has_null; ++c) {
+                        item_flags.has_null = !valid_at(&item_validity_, static_cast<std::uint64_t>(c));
+                    }
+                }
+                return true;
+            }
+            const auto null_level = null_level_[k + 1U];
+            for (auto c = begin; c < end; ++c) {
+                const bool item_valid = valid_at(&item_validity_, static_cast<std::uint64_t>(c));
+                push(c == begin ? rep : continuation, item_valid ? 0U : null_level, static_cast<std::uint64_t>(c));
+            }
+            return true;
+        }
         for (auto c = begin; c < end; ++c) {
             if (!visit(k + 1U, static_cast<std::uint64_t>(c), c == begin ? rep : continuation, emit, error)) {
                 return false;
@@ -383,7 +451,43 @@ public:
         }
         out.has_def = next > 1U;
         out.has_rep = list_depth_[0] != 0U;
+        // Pass 1 counted what pass 2 will write, so every output is sized once and written in place
+        // -- by one serializer, or by several at their own offsets (serialize with threads).
+        if (out.has_rep) {
+            out.rep.resize(static_cast<std::size_t>(levels_));
+        }
+        if (out.has_def) {
+            out.def.resize(static_cast<std::size_t>(levels_));
+        }
+        if (out.has_rep || out.has_def) {
+            out.is_slot.resize(static_cast<std::size_t>(levels_));
+        }
+        out.items.resize(static_cast<std::size_t>(items_));
         out_ = &out;
+        level_at_ = 0;
+        item_at_ = 0;
+    }
+
+    /// For one of several serializers over consecutive row ranges: OR in another's pass-1 flags
+    /// and add its counts, so assign_levels numbers the levels for all of them.
+    void merge_counts(const Serializer& other) {
+        for (std::size_t k = 0; k < flags_.size(); ++k) {
+            flags_[k].has_null = flags_[k].has_null || other.flags_[k].has_null;
+            flags_[k].has_empty = flags_[k].has_empty || other.flags_[k].has_empty;
+        }
+        levels_ += other.levels_;
+        items_ += other.items_;
+    }
+    std::uint64_t counted_levels() const { return levels_; }
+    std::uint64_t counted_items() const { return items_; }
+
+    /// Emit into `from`'s output, starting at the given level and item positions.
+    void adopt_levels(const Serializer& from, std::uint64_t level_at, std::uint64_t item_at) {
+        null_level_ = from.null_level_;
+        empty_level_ = from.empty_level_;
+        out_ = from.out_;
+        level_at_ = level_at;
+        item_at_ = item_at;
     }
 
     std::uint16_t row_rep() const { return list_depth_.empty() ? 0U : list_depth_[0]; }
@@ -392,17 +496,19 @@ private:
     static constexpr std::uint64_t kNoSlot = ~std::uint64_t{0};
 
     void push(std::uint16_t rep, std::uint16_t def, std::uint64_t slot) {
+        const auto at = static_cast<std::size_t>(level_at_);
         if (out_->has_rep) {
-            out_->rep.push_back(rep);
+            out_->rep[at] = rep;
         }
         if (out_->has_def) {
-            out_->def.push_back(def);
+            out_->def[at] = def;
         }
         if (out_->has_rep || out_->has_def) {
-            out_->is_slot.push_back(slot != kNoSlot);
+            out_->is_slot[at] = slot != kNoSlot ? 1U : 0U;
+            ++level_at_;
         }
         if (slot != kNoSlot) {
-            out_->items.push_back(slot);
+            out_->items[static_cast<std::size_t>(item_at_++)] = slot;
         }
     }
 
@@ -414,6 +520,10 @@ private:
     std::vector<std::uint16_t> null_level_;
     std::vector<std::uint16_t> empty_level_;
     Serialized* out_ = nullptr;
+    std::uint64_t levels_ = 0;  // counted by pass 1: the levels pass 2 emits
+    std::uint64_t items_ = 0;   // ... and the value slots
+    std::uint64_t level_at_ = 0;  // pass 2: where the next level goes
+    std::uint64_t item_at_ = 0;   // ... and the next value slot
 };
 
 }  // namespace
@@ -424,6 +534,60 @@ bool serialize(const std::vector<SerializeLayer>& layers, const std::vector<std:
     Serializer s(layers, item_validity);
     if (!s.check(first_row, num_rows, error)) {
         return false;
+    }
+    // With threads to spare, both passes run over parts of the rows side by side: pass 1's flags
+    // and counts merged, the levels numbered once, and each part's pass 2 writing at its own offset
+    // -- the same output as one pass over all the rows.
+    constexpr std::uint64_t kRowsPerPart = 8192U;
+    const auto parts = static_cast<std::size_t>(
+        std::min<std::uint64_t>(parallel::threads(), num_rows / kRowsPerPart));
+    if (parts > 1U) {
+        std::vector<Serializer> part;
+        part.reserve(parts);
+        for (std::size_t k = 0; k < parts; ++k) {
+            part.emplace_back(layers, item_validity);
+        }
+        const auto row_of = [&](std::size_t k) { return first_row + num_rows * k / parts; };
+        std::vector<std::string> errors(parts);
+        parallel::for_each(parts, [&](std::size_t k) {
+            for (auto r = row_of(k); r < row_of(k + 1U); ++r) {
+                if (!part[k].visit(0, r, 0, false, errors[k])) {
+                    return;
+                }
+            }
+        });
+        for (const auto& e : errors) {
+            if (!e.empty()) {
+                error = e;
+                return false;
+            }
+        }
+        std::vector<std::uint64_t> level_at(parts, 0U);
+        std::vector<std::uint64_t> item_at(parts, 0U);
+        for (std::size_t k = 1; k < parts; ++k) {
+            level_at[k] = level_at[k - 1U] + part[k - 1U].counted_levels();
+            item_at[k] = item_at[k - 1U] + part[k - 1U].counted_items();
+            part[0].merge_counts(part[k]);
+        }
+        part[0].assign_levels(out);
+        for (std::size_t k = 1; k < parts; ++k) {
+            part[k].adopt_levels(part[0], level_at[k], item_at[k]);
+        }
+        const auto rep = part[0].row_rep();
+        parallel::for_each(parts, [&](std::size_t k) {
+            for (auto r = row_of(k); r < row_of(k + 1U); ++r) {
+                if (!part[k].visit(0, r, rep, true, errors[k])) {
+                    return;
+                }
+            }
+        });
+        for (const auto& e : errors) {
+            if (!e.empty()) {
+                error = e;
+                return false;
+            }
+        }
+        return true;
     }
     for (std::uint64_t r = first_row; r < first_row + num_rows; ++r) {
         if (!s.visit(0, r, 0, false, error)) {

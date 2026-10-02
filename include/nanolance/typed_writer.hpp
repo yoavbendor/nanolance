@@ -311,6 +311,10 @@ public:
         bool structural = true;       // bitpack/constant/RLE/dict detection for auto_detect columns
         bool borrow_buffers = true;   // zero-copy fixed-width ingest; spans must outlive commit()
         bool append = false;          // open an existing dataset instead of creating
+        /// Memory budget for uncommitted rows (bytes; 0 = unlimited): write_batch commits a fragment
+        /// itself when the buffered data reaches it -- for devices that must keep their resident set
+        /// small. Borrowed spans count toward it and are released at each such flush.
+        std::uint64_t max_pending_bytes = 0;
     };
 
     explicit writer(const char* dataset_path, options opts = {}) : opts_(opts) {
@@ -321,6 +325,7 @@ public:
         ok_ = ok_ && nano_lance_writer_set_compression(&w_, opts.compress) == NANO_LANCE_OK;
         ok_ = ok_ && nano_lance_writer_set_structural_encoding(&w_, opts.structural) == NANO_LANCE_OK;
         ok_ = ok_ && nano_lance_writer_set_borrow_buffers(&w_, opts.borrow_buffers) == NANO_LANCE_OK;
+        ok_ = ok_ && nano_lance_writer_set_max_pending_bytes(&w_, opts.max_pending_bytes) == NANO_LANCE_OK;
         // Compile-time-declared encodings become per-field declarations, skipping the detection scans.
         (apply_declaration<Columns>(), ...);
     }

@@ -1,0 +1,475 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanolance Benchmarks</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800&family=IBM+Plex+Mono:wght@400;500&family=Public+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --ink: #14171c; --ink-2: #4b5361; --ink-3: #6b7482;
+  --rule: #e2e6ec; --grid: #eceff3; --tint: #eef3fa;
+  --nl: #2a78d6; --rust: #eb6834; --rust1: #1baf7a; --parity: #9aa3b1;
+  --op-write: #4a3aa7; --op-budget: #eda100; --op-read: #e87ba4;
+  --good: #0ca30c; --bad: #d03b3b;
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --body: "Public Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111418; --surface: #171b21; --ink: #eef1f5; --ink-2: #b4bcc8; --ink-3: #8b94a2;
+    --rule: #2a313b; --grid: #232932; --tint: #1c2530;
+    --nl: #3987e5; --rust: #d95926; --rust1: #199e70; --parity: #6b7482;
+    --op-write: #9085e9; --op-budget: #c98500; --op-read: #d55181;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111418; --surface: #171b21; --ink: #eef1f5; --ink-2: #b4bcc8; --ink-3: #8b94a2;
+  --rule: #2a313b; --grid: #232932; --tint: #1c2530;
+  --nl: #3987e5; --rust: #d95926; --rust1: #199e70; --parity: #6b7482;
+  --op-write: #9085e9; --op-budget: #c98500; --op-read: #d55181;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 var(--body); }
+.wrap { max-width: 1120px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 64px; }
+header > *, section > *, .tiles > *, .grid2 > *, #train > * { min-width: 0; }  /* let wide charts scroll inside their card */
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; letter-spacing: -0.01em; }
+h1 { font-size: clamp(30px, 5vw, 46px); font-weight: 800; line-height: 1.05; }
+h2 { font-size: 24px; font-weight: 700; margin-bottom: 6px; }
+h3 { font-size: 16px; font-weight: 700; }
+p { margin: 0; max-width: 68ch; }
+.muted { color: var(--ink-2); }
+.small { font-size: 13px; color: var(--ink-3); }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+header { display: grid; gap: 14px; padding-bottom: 22px; border-bottom: 1px solid var(--rule); }
+.eyebrow { font: 500 12px/1.4 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
+.env { display: flex; flex-wrap: wrap; gap: 6px 14px; font: 12.5px/1.4 var(--mono); color: var(--ink-2); }
+.env span b { color: var(--ink); font-weight: 500; }
+section { padding-block: 34px 6px; display: grid; gap: 14px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px 18px; display: grid; gap: 4px; }
+.tile .label { font-size: 13px; color: var(--ink-2); }
+.tile .value { font: 600 34px/1.1 var(--body); font-variant-numeric: proportional-nums; }
+.tile .note { font-size: 12.5px; color: var(--ink-3); }
+.card { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--ink-2); align-items: center; }
+.key { display: inline-flex; align-items: center; gap: 7px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.chart-scroll { overflow-x: auto; }
+svg text { font-family: var(--body); fill: var(--ink-2); font-size: 12px; }
+svg .cat { font: 700 11px var(--mono); letter-spacing: .06em; fill: var(--ink-3); text-transform: uppercase; }
+svg .ds { fill: var(--ink); font-size: 12.5px; }
+svg .axis { fill: var(--ink-3); font: 11px var(--mono); }
+.tip { position: fixed; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--rule);
+  border-radius: 8px; padding: 8px 10px; font-size: 12.5px; box-shadow: 0 6px 20px rgba(0,0,0,.12); display: none; z-index: 5; max-width: 300px; }
+.tip .v { font: 600 14px var(--mono); }
+.tip .row { display: flex; gap: 8px; align-items: center; }
+.tip .lk { width: 12px; height: 2px; display: inline-block; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.tabs button { font: 500 13px var(--body); color: var(--ink-2); background: transparent; border: 1px solid var(--rule);
+  border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+.tabs button[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.tabs button:focus-visible { outline: 2px solid var(--nl); outline-offset: 2px; }
+.table-scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 7px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+th { font: 600 12px var(--body); color: var(--ink-2); background: var(--tint); position: sticky; top: 0; }
+th:first-child, td:first-child { text-align: left; }
+td { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+td:first-child { font-family: var(--body); }
+td .desc { display: block; color: var(--ink-3); font-size: 12px; }
+td.win { color: var(--good); font-weight: 500; }
+tr:last-child td { border-bottom: 0; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 14px; }
+ul { margin: 0; padding-left: 20px; max-width: 72ch; }
+li + li { margin-top: 6px; }
+code { font-family: var(--mono); font-size: .92em; background: var(--tint); padding: 1px 5px; border-radius: 4px; }
+pre { font: 12.5px/1.5 var(--mono); background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 12px 14px; overflow-x: auto; margin: 0; }
+.check { color: var(--good); font-weight: 600; }
+.fail { color: var(--bad); font-weight: 600; }
+@media (prefers-reduced-motion: no-preference) { .tabs button { transition: background .12s; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Lance file format 2.2 · C++ and Python · measured, not claimed</div>
+    <h1>nanolance benchmarks</h1>
+    <p class="muted" id="lede"></p>
+    <div class="env" id="env"></div>
+  </header>
+
+  <section aria-labelledby="h-summary">
+    <h2 id="h-summary">At a glance</h2>
+    <div class="tiles" id="tiles"></div>
+    <p class="small" id="tiles-note"></p>
+  </section>
+
+  <section aria-labelledby="h-train" id="train-section" hidden>
+    <h2 id="h-train">Training data: COCO and Speech Commands</h2>
+    <p class="muted" id="train-intro"></p>
+    <div id="train" style="display:grid;gap:14px"></div>
+  </section>
+
+  <section aria-labelledby="h-read">
+    <h2 id="h-read">Read speed, by data type</h2>
+    <p class="muted">How many times faster nanolance's C++ reader is than Rust Lance, each reading the file its own writer made. Right of the line, nanolance is faster. The number at the end of each row is the one-core ratio; hover a row for the milliseconds.</p>
+    <div class="legend" id="legend-read"></div>
+    <div class="card chart-scroll"><div id="chart-read"></div></div>
+  </section>
+
+  <section aria-labelledby="h-write">
+    <h2 id="h-write">Write speed, by data type</h2>
+    <p class="muted">The same comparison for writing: nanolance's C API (open, write_batch per 64K-row batch, commit) against <code>lance.write_dataset</code> given the same batches. The number at the end of each row is the one-core ratio.</p>
+    <div class="legend" id="legend-write"></div>
+    <div class="card chart-scroll"><div id="chart-write"></div></div>
+  </section>
+
+  <section aria-labelledby="h-size">
+    <h2 id="h-size">File size</h2>
+    <p class="muted">Bytes on disk, nanolance's file against Rust Lance's for the same data. Left of the line, nanolance's file is smaller.</p>
+    <div class="card chart-scroll"><div id="chart-size"></div></div>
+  </section>
+
+  <section aria-labelledby="h-memory">
+    <h2 id="h-memory">Memory</h2>
+    <p class="muted">How many times more memory the Rust <code>lance</code> crate (no Python, all cores) needed than nanolance for the same write or read: the peak each process added over what it already held, the returned table included for a read. Right of the line, nanolance needs less. The budgeted write is nanolance with a 4 MiB writer budget, the edge-device setting. The number at the end of each row is the write ratio.</p>
+    <div class="legend" id="legend-memory"></div>
+    <div class="card chart-scroll"><div id="chart-memory"></div></div>
+  </section>
+
+  <section aria-labelledby="h-footprint">
+    <h2 id="h-footprint">What it takes to ship</h2>
+    <p class="muted">Size of a program that reads and writes Lance, and of the native library each Python package installs; and how much third-party code comes with it.</p>
+    <div class="table-scroll"><table id="footprint"></table></div>
+    <p class="small" id="footprint-note"></p>
+    <h3 style="margin-top:10px">Does Python slow Rust Lance down?</h3>
+    <p class="muted">pylance against a Rust program using the same <code>lance</code> crate with no Python in the process (<code>tools/lance_rs_bench</code>). Above 1×, the Rust program is faster. The Rust comparisons elsewhere on this page use pylance.</p>
+    <div class="table-scroll"><table id="pycost"></table></div>
+  </section>
+
+  <section aria-labelledby="h-interop">
+    <h2 id="h-interop">They read each other's files</h2>
+    <p class="muted">Every file nanolance wrote was read by Rust Lance, and every file Rust Lance wrote was read by nanolance, from C++ and from Python. Each read was checked value by value against the source table before it was timed.</p>
+    <div class="table-scroll"><table id="interop"></table></div>
+  </section>
+
+  <section aria-labelledby="h-tables">
+    <h2 id="h-tables">Every number</h2>
+    <p class="muted">Medians in milliseconds; peak memory and sizes in MB. The faster of nanolance C++ and Rust Lance (1 core) is marked.</p>
+    <div class="tabs" id="tabs" role="group" aria-label="Data type group"></div>
+    <div class="table-scroll"><table id="full"></table></div>
+  </section>
+
+  <section aria-labelledby="h-reading">
+    <h2 id="h-reading">Reading the results</h2>
+    <div class="grid2" id="notes"></div>
+  </section>
+
+  <section aria-labelledby="h-method">
+    <h2 id="h-method">How it was measured</h2>
+    <ul id="method"></ul>
+    <p class="muted">To reproduce on your own hardware:</p>
+    <pre>cmake -S . -B build -DCMAKE_BUILD_TYPE=Release &amp;&amp; cmake --build build -j
+pip install ./bindings/python pylance pyarrow numpy
+python tools/bench_matrix.py        # bench/results/matrix.json
+python tools/bench_multimodal.py --data DIR   # COCO + Speech Commands, downloaded to DIR
+python tools/bench_report.py        # docs/BENCHMARKS.md
+python tools/bench_html.py          # this page</pre>
+  </section>
+</div>
+<div class="tip" id="tip" role="tooltip"></div>
+
+<script id="data" type="application/json">{"environment": {"date": "2026-09-26 07:06 UTC", "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz", "cores": 4, "memory_gb": 16, "os": "Linux 6.18.44-fc-v37", "python": "3.11.15", "pylance": "12.0.0", "pyarrow": "25.0.1", "nanolance_commit": "f852c5a", "build": "Release"}, "footprint": {"nanolance": {"bench_binary_bytes": 2685376, "python_native_lib_bytes": 2861544, "third_party": ["nanoarrow (its IPC reader bundles flatcc)", "zstd"], "binary": "tools/nlbench: reader + writer + Arrow IPC input, static, stripped"}, "rust": {"bench_binary_bytes": 165338472, "python_native_lib_bytes": 212871952, "crates": 371, "binary": "tools/lance_rs_bench: lance 12.0.0, default features off (local files only), thin LTO, stripped"}}, "runs": 5, "scale": 1.0, "datasets": {"int64_ids": {"rows": 2000000, "arrow_bytes": 16000000, "write_ms": {"nanolance-cpp": 9.86623, "nanolance-cpp-mt": 9.70689, "nanolance-cpp-budget": 10.6123, "rust-native": 22.1181, "rust-native-1c": 18.5094, "nanolance-py": 10.968475000026956, "rust-lance": 37.5738679999813, "parquet": 90.01862700006313, "rust-lance-1c": 18.894820000241452}, "read_ms": {"nanolance-py <- nanolance": 5.703165999875637, "rust-lance <- nanolance": 13.732828000229347, "nanolance-cpp <- nanolance": 4.87271, "nanolance-cpp-retain <- nanolance": 3.80575, "nanolance-cpp-mt <- nanolance": 7.55114, "rust-native <- nanolance": 16.9377, "rust-native-1c <- nanolance": 17.6847, "rust-lance-1c <- nanolance": 20.629409999855852, "nanolance-py <- rust-lance": 2.4715680001463625, "rust-lance <- rust-lance": 13.372380999953748, "nanolance-cpp <- rust-lance": 3.99695, "nanolance-cpp-retain <- rust-lance": 3.31204, "nanolance-cpp-mt <- rust-lance": 2.33552, "rust-native <- rust-lance": 16.5892, "rust-native-1c <- rust-lance": 14.8376, "rust-lance-1c <- rust-lance": 17.215074999967328, "parquet <- parquet": 16.887257999769645}, "size": {"rust-native": 5611586, "nanolance": 5613064, "rust-lance": 5613171, "parquet": 2600896}, "peak_mb": {"nanolance-cpp write": 30.75, "nanolance-cpp-mt write": 30.75, "nanolance-cpp-budget write": 6.98828, "rust-native write": 33.5, "rust-native-1c write": 33.83, "nanolance-cpp read <- nanolance": 17.5586, "nanolance-cpp-mt read <- nanolance": 31.3242, "rust-native read <- nanolance": 52.67, "rust-native-1c read <- nanolance": 51.54, "nanolance-cpp read <- rust-lance": 17.7227, "nanolance-cpp-mt read <- rust-lance": 18.6758, "rust-native read <- rust-lance": 51.18, "rust-native-1c read <- rust-lance": 50.25}, "errors": {}, "category": "numeric", "description": "int64, increasing ids"}, "int32_small": {"rows": 2000000, "arrow_bytes": 8000000, "write_ms": {"nanolance-cpp": 4.43015, "nanolance-cpp-mt": 4.71912, "nanolance-cpp-budget": 5.50412, "rust-native": 17.4108, "rust-native-1c": 13.8679, "nanolance-py": 5.328717999873334, "rust-lance": 19.633512999917002, "parquet": 36.54143199992177, "rust-lance-1c": 13.997813999594655}, "read_ms": {"nanolance-py <- nanolance": 1.8951000001834473, "rust-lance <- nanolance": 11.342199999944569, "nanolance-cpp <- nanolance": 1.92982, "nanolance-cpp-retain <- nanolance": 1.63849, "nanolance-cpp-mt <- nanolance": 1.75897, "rust-native <- nanolance": 12.3281, "rust-native-1c <- nanolance": 8.8205, "rust-lance-1c <- nanolance": 10.790334999910556, "nanolance-py <- rust-lance": 1.5136750002966437, "rust-lance <- rust-lance": 11.122377999981836, "nanolance-cpp <- rust-lance": 1.70445, "nanolance-cpp-retain <- rust-lance": 1.41674, "nanolance-cpp-mt <- rust-lance": 1.4094, "rust-native <- rust-lance": 11.3199, "rust-native-1c <- rust-lance": 8.4443, "rust-lance-1c <- rust-lance": 10.589761000119324, "parquet <- parquet": 6.00485299992215}, "size": {"rust-native": 2540736, "nanolance": 2541256, "rust-lance": 2541566, "parquet": 2515618}, "peak_mb": {"nanolance-cpp write": 15.3711, "nanolance-cpp-mt write": 15.3711, "nanolance-cpp-budget write": 6.96094, "rust-native write": 23.5, "rust-native-1c write": 23.38, "nanolance-cpp read <- nanolance": 9.85938, "nanolance-cpp-mt read <- nanolance": 9.83984, "rust-native read <- nanolance": 42.86, "rust-native-1c read <- nanolance": 44.25, "nanolance-cpp read <- rust-lance": 9.80078, "nanolance-cpp-mt read <- rust-lance": 10.4961, "rust-native read <- rust-lance": 43.05, "rust-native-1c read <- rust-lance": 43.15}, "errors": {}, "category": "numeric", "description": "int32, values 0-999"}, "uint8_codes": {"rows": 2000000, "arrow_bytes": 2000000, "write_ms": {"nanolance-cpp": 2.86921, "nanolance-cpp-mt": 2.78121, "nanolance-cpp-budget": 2.79017, "rust-native": 16.8997, "rust-native-1c": 14.2591, "nanolance-py": 1.5914900000097987, "rust-lance": 17.359187999772985, "parquet": 26.196761000392144, "rust-lance-1c": 13.34820200008835}, "read_ms": {"nanolance-py <- nanolance": 0.5340539996723237, "rust-lance <- nanolance": 9.405007000168553, "nanolance-cpp <- nanolance": 0.796808, "nanolance-cpp-retain <- nanolance": 0.449435, "nanolance-cpp-mt <- nanolance": 0.835504, "rust-native <- nanolance": 8.5723, "rust-native-1c <- nanolance": 4.9525, "rust-lance-1c <- nanolance": 4.887703999884252, "nanolance-py <- rust-lance": 0.5673569999089523, "rust-lance <- rust-lance": 8.114717999887944, "nanolance-cpp <- rust-lance": 1.28006, "nanolance-cpp-retain <- rust-lance": 0.523993, "nanolance-cpp-mt <- rust-lance": 1.26804, "rust-native <- rust-lance": 8.0059, "rust-native-1c <- rust-lance": 3.8269, "rust-lance-1c <- rust-lance": 4.662273000121786, "parquet <- parquet": 6.252675000268937}, "size": {"rust-native": 2006400, "nanolance": 2002056, "rust-lance": 2006566, "parquet": 684613}, "peak_mb": {"nanolance-cpp write": 3.62891, "nanolance-cpp-mt write": 3.75, "nanolance-cpp-budget write": 3.75, "rust-native write": 18.68, "rust-native-1c write": 19.99, "nanolance-cpp read <- nanolance": 4.14844, "nanolance-cpp-mt read <- nanolance": 4.09375, "rust-native read <- nanolance": 36.53, "rust-native-1c read <- nanolance": 38.0, "nanolance-cpp read <- rust-lance": 4.28516, "nanolance-cpp-mt read <- rust-lance": 5.65625, "rust-native read <- rust-lance": 38.83, "rust-native-1c read <- rust-lance": 39.07}, "errors": {}, "category": "numeric", "description": "uint8, 5 distinct codes"}, "int64_random": {"rows": 2000000, "arrow_bytes": 16000000, "write_ms": {"nanolance-cpp": 12.0098, "nanolance-cpp-mt": 10.8817, "nanolance-cpp-budget": 11.5481, "rust-native": 42.3645, "rust-native-1c": 34.9414, "nanolance-py": 13.286544000038703, "rust-lance": 33.69101199996294, "parquet": 46.80941000015082, "rust-lance-1c": 34.077407000040694}, "read_ms": {"nanolance-py <- nanolance": 5.514551999112882, "rust-lance <- nanolance": 14.113100000031409, "nanolance-cpp <- nanolance": 4.07939, "nanolance-cpp-retain <- nanolance": 3.3852, "nanolance-cpp-mt <- nanolance": 6.34333, "rust-native <- nanolance": 17.85, "rust-native-1c <- nanolance": 19.2319, "rust-lance-1c <- nanolance": 22.338665000461333, "nanolance-py <- rust-lance": 2.6434110004629474, "rust-lance <- rust-lance": 16.995705999761412, "nanolance-cpp <- rust-lance": 6.8174, "nanolance-cpp-retain <- rust-lance": 4.07998, "nanolance-cpp-mt <- rust-lance": 4.638, "rust-native <- rust-lance": 16.0176, "rust-native-1c <- rust-lance": 17.794, "rust-lance-1c <- rust-lance": 19.614167000327143, "parquet <- parquet": 8.239025999500882}, "size": {"rust-native": 16047426, "nanolance": 16014536, "rust-lance": 16049034, "parquet": 16523208}, "peak_mb": {"nanolance-cpp write": 30.75, "nanolance-cpp-mt write": 30.75, "nanolance-cpp-budget write": 6.88281, "rust-native write": 38.07, "rust-native-1c write": 36.95, "nanolance-cpp read <- nanolance": 17.5078, "nanolance-cpp-mt read <- nanolance": 29.3203, "rust-native read <- nanolance": 49.96, "rust-native-1c read <- nanolance": 52.15, "nanolance-cpp read <- rust-lance": 17.7188, "nanolance-cpp-mt read <- rust-lance": 24.6914, "rust-native read <- rust-lance": 54.27, "rust-native-1c read <- rust-lance": 58.47}, "errors": {}, "category": "numeric", "description": "int64, random (incompressible)"}, "float64_smooth": {"rows": 2000000, "arrow_bytes": 16000000, "write_ms": {"nanolance-cpp": 11.6635, "nanolance-cpp-mt": 9.75763, "nanolance-cpp-budget": 11.3793, "rust-native": 43.9866, "rust-native-1c": 38.6271, "nanolance-py": 12.874425000518386, "rust-lance": 38.73646899955929, "parquet": 63.50154600022506, "rust-lance-1c": 36.37802599951101}, "read_ms": {"nanolance-py <- nanolance": 5.211557999245997, "rust-lance <- nanolance": 14.962893999836524, "nanolance-cpp <- nanolance": 5.36726, "nanolance-cpp-retain <- nanolance": 3.70137, "nanolance-cpp-mt <- nanolance": 4.9169, "rust-native <- nanolance": 17.1577, "rust-native-1c <- nanolance": 19.0629, "rust-lance-1c <- nanolance": 23.649740000109887, "nanolance-py <- rust-lance": 3.5610019995147013, "rust-lance <- rust-lance": 15.784752999934426, "nanolance-cpp <- rust-lance": 5.57869, "nanolance-cpp-retain <- rust-lance": 5.22706, "nanolance-cpp-mt <- rust-lance": 3.59311, "rust-native <- rust-lance": 14.1887, "rust-native-1c <- rust-lance": 17.5536, "rust-lance-1c <- rust-lance": 20.505849999608472, "parquet <- parquet": 16.353889999663807}, "size": {"rust-native": 15962180, "nanolance": 16014536, "rust-lance": 15958410, "parquet": 15691094}, "peak_mb": {"nanolance-cpp write": 30.75, "nanolance-cpp-mt write": 30.75, "nanolance-cpp-budget write": 6.875, "rust-native write": 44.14, "rust-native-1c write": 45.7, "nanolance-cpp read <- nanolance": 17.5547, "nanolance-cpp-mt read <- nanolance": 33.0703, "rust-native read <- nanolance": 51.89, "rust-native-1c read <- nanolance": 53.9, "nanolance-cpp read <- rust-lance": 19.8203, "nanolance-cpp-mt read <- rust-lance": 24.5078, "rust-native read <- rust-lance": 54.49, "rust-native-1c read <- rust-lance": 55.04}, "errors": {}, "category": "numeric", "description": "float64, smooth signal"}, "float32_random": {"rows": 2000000, "arrow_bytes": 8000000, "write_ms": {"nanolance-cpp": 4.3105, "nanolance-cpp-mt": 4.70539, "nanolance-cpp-budget": 5.49494, "rust-native": 18.8461, "rust-native-1c": 15.6805, "nanolance-py": 5.10228500024823, "rust-lance": 22.250965999774053, "parquet": 63.24291599958087, "rust-lance-1c": 15.66912999987835}, "read_ms": {"nanolance-py <- nanolance": 1.9029909999517258, "rust-lance <- nanolance": 10.368588999881467, "nanolance-cpp <- nanolance": 1.99209, "nanolance-cpp-retain <- nanolance": 1.51381, "nanolance-cpp-mt <- nanolance": 1.87075, "rust-native <- nanolance": 12.1406, "rust-native-1c <- nanolance": 10.3378, "rust-lance-1c <- nanolance": 13.441558000522491, "nanolance-py <- rust-lance": 1.296441999329545, "rust-lance <- rust-lance": 10.575553999842668, "nanolance-cpp <- rust-lance": 3.20121, "nanolance-cpp-retain <- rust-lance": 1.79828, "nanolance-cpp-mt <- rust-lance": 2.55512, "rust-native <- rust-lance": 10.5122, "rust-native-1c <- rust-lance": 12.1174, "rust-lance-1c <- rust-lance": 11.881060000632715, "parquet <- parquet": 10.79922600001737}, "size": {"rust-native": 8024002, "nanolance": 8007432, "rust-lance": 8024845, "parquet": 8503980}, "peak_mb": {"nanolance-cpp write": 15.3711, "nanolance-cpp-mt write": 15.3711, "nanolance-cpp-budget write": 6.83203, "rust-native write": 26.05, "rust-native-1c write": 27.22, "nanolance-cpp read <- nanolance": 9.80078, "nanolance-cpp-mt read <- nanolance": 9.79688, "rust-native read <- nanolance": 43.59, "rust-native-1c read <- nanolance": 45.46, "nanolance-cpp read <- rust-lance": 10.0352, "nanolance-cpp-mt read <- rust-lance": 12.5508, "rust-native read <- rust-lance": 44.15, "rust-native-1c read <- rust-lance": 44.01}, "errors": {}, "category": "numeric", "description": "float32, random"}, "bool_flags": {"rows": 2000000, "arrow_bytes": 250000, "write_ms": {"nanolance-cpp": 2.28088, "nanolance-cpp-mt": 2.26461, "nanolance-cpp-budget": 2.21422, "rust-native": 3.6126, "rust-native-1c": 1.3854, "nanolance-py": 1.5591779992973898, "rust-lance": 5.3146990003369865, "parquet": 21.16007200038439, "rust-lance-1c": 1.7884240005514584}, "read_ms": {"nanolance-py <- nanolance": 0.5928939999648719, "rust-lance <- nanolance": 8.447498999885283, "nanolance-cpp <- nanolance": 0.530603, "nanolance-cpp-retain <- nanolance": 0.455636, "nanolance-cpp-mt <- nanolance": 0.514589, "rust-native <- nanolance": 7.9192, "rust-native-1c <- nanolance": 3.0741, "rust-lance-1c <- nanolance": 3.775916000449797, "nanolance-py <- rust-lance": 0.7480990007024957, "rust-lance <- rust-lance": 8.33127100031561, "nanolance-cpp <- rust-lance": 0.501877, "nanolance-cpp-retain <- rust-lance": 0.529134, "nanolance-cpp-mt <- rust-lance": 0.832864, "rust-native <- rust-lance": 7.9523, "rust-native-1c <- rust-lance": 3.3488, "rust-lance-1c <- rust-lance": 4.433438999512873, "parquet <- parquet": 8.810025999991922}, "size": {"rust-native": 256382, "nanolance": 251016, "rust-lance": 256382, "parquet": 235147}, "peak_mb": {"nanolance-cpp write": 3.625, "nanolance-cpp-mt write": 3.69922, "nanolance-cpp-budget write": 3.625, "rust-native write": 16.66, "rust-native-1c write": 16.5, "nanolance-cpp read <- nanolance": 3.66797, "nanolance-cpp-mt read <- nanolance": 3.57812, "rust-native read <- nanolance": 34.14, "rust-native-1c read <- nanolance": 35.82, "nanolance-cpp read <- rust-lance": 2.57031, "nanolance-cpp-mt read <- rust-lance": 3.80078, "rust-native read <- rust-lance": 34.73, "rust-native-1c read <- rust-lance": 36.29}, "errors": {}, "category": "numeric", "description": "bool, 30% true"}, "timestamp_us": {"rows": 2000000, "arrow_bytes": 16000000, "write_ms": {"nanolance-cpp": 14.5749, "nanolance-cpp-mt": 14.1496, "nanolance-cpp-budget": 14.3461, "rust-native": 43.8399, "rust-native-1c": 31.3876, "nanolance-py": 14.707796000038798, "rust-lance": 34.66225200008921, "parquet": 90.78549199966801, "rust-lance-1c": 31.64982499947655}, "read_ms": {"nanolance-py <- nanolance": 5.872349000128452, "rust-lance <- nanolance": 14.338720000523608, "nanolance-cpp <- nanolance": 6.07258, "nanolance-cpp-retain <- nanolance": 5.31264, "nanolance-cpp-mt <- nanolance": 6.01218, "rust-native <- nanolance": 19.1165, "rust-native-1c <- nanolance": 19.8842, "rust-lance-1c <- nanolance": 24.120575000779354, "nanolance-py <- rust-lance": 3.5890859999199165, "rust-lance <- rust-lance": 13.77410500026599, "nanolance-cpp <- rust-lance": 6.04148, "nanolance-cpp-retain <- rust-lance": 5.2701, "nanolance-cpp-mt <- rust-lance": 3.84368, "rust-native <- rust-lance": 16.4447, "rust-native-1c <- rust-lance": 20.0835, "rust-lance-1c <- rust-lance": 18.687636999857205, "parquet <- parquet": 17.0094719996996}, "size": {"rust-native": 12795348, "nanolance": 12799752, "rust-lance": 12796952, "parquet": 4752483}, "peak_mb": {"nanolance-cpp write": 30.75, "nanolance-cpp-mt write": 30.75, "nanolance-cpp-budget write": 6.94531, "rust-native write": 42.33, "rust-native-1c write": 42.55, "nanolance-cpp read <- nanolance": 17.668, "nanolance-cpp-mt read <- nanolance": 32.5469, "rust-native read <- nanolance": 51.0, "rust-native-1c read <- nanolance": 53.09, "nanolance-cpp read <- rust-lance": 19.2148, "nanolance-cpp-mt read <- rust-lance": 21.3398, "rust-native read <- rust-lance": 51.28, "rust-native-1c read <- rust-lance": 53.46}, "errors": {}, "category": "temporal", "description": "timestamp[us], 1.5 ms apart with jitter"}, "date32": {"rows": 2000000, "arrow_bytes": 8000000, "write_ms": {"nanolance-cpp": 5.21134, "nanolance-cpp-mt": 5.35371, "nanolance-cpp-budget": 6.05877, "rust-native": 17.3333, "rust-native-1c": 15.0463, "nanolance-py": 6.093363000218233, "rust-lance": 24.996420000206854, "parquet": 37.225033000140684, "rust-lance-1c": 14.905342999554705}, "read_ms": {"nanolance-py <- nanolance": 2.5034270001924597, "rust-lance <- nanolance": 13.31670200033841, "nanolance-cpp <- nanolance": 2.46248, "nanolance-cpp-retain <- nanolance": 2.00927, "nanolance-cpp-mt <- nanolance": 2.23127, "rust-native <- nanolance": 12.6948, "rust-native-1c <- nanolance": 11.0564, "rust-lance-1c <- nanolance": 11.664114999803132, "nanolance-py <- rust-lance": 1.6537689998585847, "rust-lance <- rust-lance": 11.801214999650256, "nanolance-cpp <- rust-lance": 1.99628, "nanolance-cpp-retain <- rust-lance": 1.75458, "nanolance-cpp-mt <- rust-lance": 1.43274, "rust-native <- rust-lance": 12.1501, "rust-native-1c <- rust-lance": 9.4066, "rust-lance-1c <- rust-lance": 10.16438799979369, "parquet <- parquet": 6.58928999928321}, "size": {"rust-native": 3791306, "nanolance": 3791880, "rust-lance": 3792136, "parquet": 3027946}, "peak_mb": {"nanolance-cpp write": 15.3711, "nanolance-cpp-mt write": 15.3711, "nanolance-cpp-budget write": 6.97266, "rust-native write": 24.09, "rust-native-1c write": 25.47, "nanolance-cpp read <- nanolance": 10.0273, "nanolance-cpp-mt read <- nanolance": 9.85938, "rust-native read <- nanolance": 44.73, "rust-native-1c read <- nanolance": 44.46, "nanolance-cpp read <- rust-lance": 10.0898, "nanolance-cpp-mt read <- rust-lance": 11.418, "rust-native read <- rust-lance": 44.37, "rust-native-1c read <- rust-lance": 42.54}, "errors": {}, "category": "temporal", "description": "date32, ten years of days"}, "decimal128": {"rows": 500000, "arrow_bytes": 8000000, "write_ms": {"nanolance-cpp": 6.27954, "nanolance-cpp-mt": 4.80238, "nanolance-cpp-budget": 5.16147, "rust-native": 10.6039, "rust-native-1c": 7.418, "nanolance-py": 5.960202000096615, "rust-lance": 11.909434000699548, "parquet": 41.19174900006328, "rust-lance-1c": 18.47724700019171}, "read_ms": {"nanolance-py <- nanolance": 2.0992099998693448, "rust-lance <- nanolance": 5.570272999648296, "nanolance-cpp <- nanolance": 2.10648, "nanolance-cpp-retain <- nanolance": 1.65991, "nanolance-cpp-mt <- nanolance": 2.17904, "rust-native <- nanolance": 9.7443, "rust-native-1c <- nanolance": 8.3313, "rust-lance-1c <- nanolance": 11.805159000687127, "nanolance-py <- rust-lance": 2.507766999769956, "rust-lance <- rust-lance": 6.5976830001091, "nanolance-cpp <- rust-lance": 5.50434, "nanolance-cpp-retain <- rust-lance": 2.39873, "nanolance-cpp-mt <- rust-lance": 4.98867, "rust-native <- rust-lance": 5.673, "rust-native-1c <- rust-lance": 6.1584, "rust-lance-1c <- rust-lance": 6.7656659994099755, "parquet <- parquet": 18.18905399977666}, "size": {"rust-native": 8023789, "nanolance": 8007432, "rust-lance": 8023962, "parquet": 2395236}, "peak_mb": {"nanolance-cpp write": 14.6211, "nanolance-cpp-mt write": 14.6211, "nanolance-cpp-budget write": 6.87109, "rust-native write": 34.52, "rust-native-1c write": 34.38, "nanolance-cpp read <- nanolance": 9.875, "nanolance-cpp-mt read <- nanolance": 9.80078, "rust-native read <- nanolance": 44.62, "rust-native-1c read <- nanolance": 46.45, "nanolance-cpp read <- rust-lance": 15.2266, "nanolance-cpp-mt read <- rust-lance": 15.3477, "rust-native read <- rust-lance": 47.82, "rust-native-1c read <- rust-lance": 46.37}, "errors": {}, "category": "temporal", "description": "decimal128(18, 4) prices"}, "string_lowcard": {"rows": 1000000, "arrow_bytes": 8874330, "write_ms": {"nanolance-cpp": 35.3543, "nanolance-cpp-mt": 30.7731, "nanolance-cpp-budget": 31.5724, "rust-native": 38.1587, "rust-native-1c": 40.6916, "nanolance-py": 23.796265999408206, "rust-lance": 46.144894000462955, "parquet": 34.457558000212885, "rust-lance-1c": 36.05754000000161}, "read_ms": {"nanolance-py <- nanolance": 2.441611999529414, "rust-lance <- nanolance": 14.075834999857761, "nanolance-cpp <- nanolance": 12.7398, "nanolance-cpp-retain <- nanolance": 13.755, "nanolance-cpp-mt <- nanolance": 4.53802, "rust-native <- nanolance": 16.0752, "rust-native-1c <- nanolance": 20.1836, "rust-lance-1c <- nanolance": 21.90759800032538, "nanolance-py <- rust-lance": 2.6726369997049915, "rust-lance <- rust-lance": 13.638886000080674, "nanolance-cpp <- rust-lance": 12.7585, "nanolance-cpp-retain <- rust-lance": 13.0807, "nanolance-cpp-mt <- rust-lance": 4.86491, "rust-native <- rust-lance": 14.646, "rust-native-1c <- rust-lance": 21.6896, "rust-lance-1c <- rust-lance": 21.012743000028422, "parquet <- parquet": 21.54463199985912}, "size": {"rust-native": 395428, "nanolance": 395272, "rust-lance": 396601, "parquet": 380403}, "peak_mb": {"nanolance-cpp write": 15.6289, "nanolance-cpp-mt write": 15.6875, "nanolance-cpp-budget write": 8.09375, "rust-native write": 25.3, "rust-native-1c write": 27.02, "nanolance-cpp read <- nanolance": 14.5312, "nanolance-cpp-mt read <- nanolance": 14.6094, "rust-native read <- nanolance": 44.27, "rust-native-1c read <- nanolance": 45.79, "nanolance-cpp read <- rust-lance": 19.4336, "nanolance-cpp-mt read <- rust-lance": 16.9023, "rust-native read <- rust-lance": 44.78, "rust-native-1c read <- rust-lance": 45.74}, "errors": {}, "category": "string", "description": "utf8, 8 distinct values (log levels)"}, "string_ids": {"rows": 1000000, "arrow_bytes": 18000000, "write_ms": {"nanolance-cpp": 90.7238, "nanolance-cpp-mt": 65.2555, "nanolance-cpp-budget": 114.178, "rust-native": 106.1175, "rust-native-1c": 102.045, "nanolance-py": 68.06778600002872, "rust-lance": 118.64977200002613, "parquet": 83.60886299942649, "rust-lance-1c": 87.66388499952882}, "read_ms": {"nanolance-py <- nanolance": 7.0945909992587985, "rust-lance <- nanolance": 19.427219000135665, "nanolance-cpp <- nanolance": 18.068, "nanolance-cpp-retain <- nanolance": 18.1753, "nanolance-cpp-mt <- nanolance": 6.4651, "rust-native <- nanolance": 23.7838, "rust-native-1c <- nanolance": 36.1021, "rust-lance-1c <- nanolance": 41.924666999875626, "nanolance-py <- rust-lance": 8.76209000034578, "rust-lance <- rust-lance": 21.852274000593752, "nanolance-cpp <- rust-lance": 22.7631, "nanolance-cpp-retain <- rust-lance": 21.836, "nanolance-cpp-mt <- rust-lance": 9.75769, "rust-native <- rust-lance": 27.1913, "rust-native-1c <- rust-lance": 41.1839, "rust-lance-1c <- rust-lance": 44.89805699995486, "parquet <- parquet": 38.140216000101645}, "size": {"rust-native": 10906192, "nanolance": 10406856, "rust-lance": 10889373, "parquet": 5777551}, "peak_mb": {"nanolance-cpp write": 41.6875, "nanolance-cpp-mt write": 41.625, "nanolance-cpp-budget write": 12.1328, "rust-native write": 39.92, "rust-native-1c write": 40.12, "nanolance-cpp read <- nanolance": 19.7109, "nanolance-cpp-mt read <- nanolance": 22.6836, "rust-native read <- nanolance": 55.35, "rust-native-1c read <- nanolance": 53.98, "nanolance-cpp read <- rust-lance": 24.2734, "nanolance-cpp-mt read <- rust-lance": 29.125, "rust-native read <- rust-lance": 54.34, "rust-native-1c read <- rust-lance": 53.18}, "errors": {}, "category": "string", "description": "utf8, unique ids (~15 bytes)"}, "string_urls": {"rows": 500000, "arrow_bytes": 27948550, "write_ms": {"nanolance-cpp": 111.233, "nanolance-cpp-mt": 68.4281, "nanolance-cpp-budget": 74.3469, "rust-native": 104.2023, "rust-native-1c": 105.0721, "nanolance-py": 67.17171400032385, "rust-lance": 102.01275100007479, "parquet": 78.96402000005764, "rust-lance-1c": 93.25134299979254}, "read_ms": {"nanolance-py <- nanolance": 5.651230000694341, "rust-lance <- nanolance": 13.453599000058603, "nanolance-cpp <- nanolance": 13.121, "nanolance-cpp-retain <- nanolance": 13.3826, "nanolance-cpp-mt <- nanolance": 5.13865, "rust-native <- nanolance": 22.7911, "rust-native-1c <- nanolance": 35.0532, "rust-lance-1c <- nanolance": 31.921024000439502, "nanolance-py <- rust-lance": 39.075290000255336, "rust-lance <- rust-lance": 17.279851000239432, "nanolance-cpp <- rust-lance": 17.4151, "nanolance-cpp-retain <- rust-lance": 16.1009, "nanolance-cpp-mt <- rust-lance": 51.014, "rust-native <- rust-lance": 24.1566, "rust-native-1c <- rust-lance": 37.7203, "rust-lance-1c <- rust-lance": 42.34885500045493, "parquet <- parquet": 38.192608999452204}, "size": {"rust-native": 8862863, "nanolance": 7822600, "rust-lance": 8779165, "parquet": 4182591}, "peak_mb": {"nanolance-cpp write": 51.625, "nanolance-cpp-mt write": 51.5625, "nanolance-cpp-budget write": 17.1562, "rust-native write": 43.66, "rust-native-1c write": 41.12, "nanolance-cpp read <- nanolance": 31.0391, "nanolance-cpp-mt read <- nanolance": 34.8359, "rust-native read <- nanolance": 64.06, "rust-native-1c read <- nanolance": 63.07, "nanolance-cpp read <- rust-lance": 33.332, "nanolance-cpp-mt read <- rust-lance": 56.5938, "rust-native read <- rust-lance": 62.8, "rust-native-1c read <- rust-lance": 64.16}, "errors": {}, "category": "string", "description": "utf8, URLs (~55 bytes)"}, "string_text": {"rows": 500000, "arrow_bytes": 26064306, "write_ms": {"nanolance-cpp": 70.189, "nanolance-cpp-mt": 40.8901, "nanolance-cpp-budget": 76.8106, "rust-native": 84.7054, "rust-native-1c": 81.0511, "nanolance-py": 59.27141600022878, "rust-lance": 89.22281300056056, "parquet": 113.1025699996826, "rust-lance-1c": 75.46044899936533}, "read_ms": {"nanolance-py <- nanolance": 7.919691000097373, "rust-lance <- nanolance": 16.59128099981899, "nanolance-cpp <- nanolance": 17.6035, "nanolance-cpp-retain <- nanolance": 17.0893, "nanolance-cpp-mt <- nanolance": 8.26361, "rust-native <- nanolance": 23.7426, "rust-native-1c <- nanolance": 32.7416, "rust-lance-1c <- nanolance": 36.04163799991511, "nanolance-py <- rust-lance": 22.886201999426703, "rust-lance <- rust-lance": 16.95207200009463, "nanolance-cpp <- rust-lance": 18.8773, "nanolance-cpp-retain <- rust-lance": 17.5232, "nanolance-cpp-mt <- rust-lance": 34.6121, "rust-native <- rust-lance": 26.149, "rust-native-1c <- rust-lance": 37.0332, "rust-lance-1c <- rust-lance": 40.22856600022351, "parquet <- parquet": 43.579705000411195}, "size": {"rust-native": 7306442, "nanolance": 7272008, "rust-lance": 7343834, "parquet": 6369772}, "peak_mb": {"nanolance-cpp write": 47.0039, "nanolance-cpp-mt write": 47.0039, "nanolance-cpp-budget write": 16.3789, "rust-native write": 33.69, "rust-native-1c write": 34.8, "nanolance-cpp read <- nanolance": 28.5, "nanolance-cpp-mt read <- nanolance": 34.1523, "rust-native read <- nanolance": 62.29, "rust-native-1c read <- nanolance": 62.45, "nanolance-cpp read <- rust-lance": 31.6016, "nanolance-cpp-mt read <- rust-lance": 52.0625, "rust-native read <- rust-lance": 60.53, "rust-native-1c read <- rust-lance": 61.62}, "errors": {}, "category": "string", "description": "utf8, sentences (~50 bytes)"}, "string_long": {"rows": 50000, "arrow_bytes": 44988784, "write_ms": {"nanolance-cpp": 126.007, "nanolance-cpp-mt": 72.7159, "nanolance-cpp-budget": 126.46, "rust-native": 112.4208, "rust-native-1c": 108.6271, "nanolance-py": 39.737749999403604, "rust-lance": 105.30520399970555, "parquet": 158.4120580000672, "rust-lance-1c": 100.47496599963779}, "read_ms": {"nanolance-py <- nanolance": 10.952594999253051, "rust-lance <- nanolance": 16.941740000220307, "nanolance-cpp <- nanolance": 19.5102, "nanolance-cpp-retain <- nanolance": 15.6328, "nanolance-cpp-mt <- nanolance": 8.60533, "rust-native <- nanolance": 37.7195, "rust-native-1c <- nanolance": 43.6814, "rust-lance-1c <- nanolance": 51.37036800078931, "nanolance-py <- rust-lance": 21.992736000356672, "rust-lance <- rust-lance": 20.530408000013267, "nanolance-cpp <- rust-lance": 68.6464, "nanolance-cpp-retain <- rust-lance": 28.7281, "nanolance-cpp-mt <- rust-lance": 33.3761, "rust-native <- rust-lance": 33.2547, "rust-native-1c <- rust-lance": 32.1319, "rust-lance-1c <- rust-lance": 53.6071760006962, "parquet <- parquet": 60.91527300031885}, "size": {"rust-native": 8933954, "nanolance": 8585288, "rust-lance": 8946434, "parquet": 9735401}, "peak_mb": {"nanolance-cpp write": 111.484, "nanolance-cpp-mt write": 111.711, "nanolance-cpp-budget write": 111.469, "rust-native write": 54.22, "rust-native-1c write": 30.06, "nanolance-cpp read <- nanolance": 57.2266, "nanolance-cpp-mt read <- nanolance": 62.6758, "rust-native read <- nanolance": 94.72, "rust-native-1c read <- nanolance": 88.18, "nanolance-cpp read <- rust-lance": 106.801, "nanolance-cpp-mt read <- rust-lance": 103.082, "rust-native read <- rust-lance": 90.71, "rust-native-1c read <- rust-lance": 87.92}, "errors": {}, "category": "string", "description": "utf8, ~1 KB documents"}, "binary_blobs": {"rows": 500000, "arrow_bytes": 21999910, "write_ms": {"nanolance-cpp": 39.2524, "nanolance-cpp-mt": 36.2698, "nanolance-cpp-budget": 16.9124, "rust-native": 21.7727, "rust-native-1c": 18.4554, "nanolance-py": 23.471131000405876, "rust-lance": 26.68066199930763, "parquet": 55.33440500039433, "rust-lance-1c": 19.771436000155518}, "read_ms": {"nanolance-py <- nanolance": 3.910047999852395, "rust-lance <- nanolance": 13.189004000196292, "nanolance-cpp <- nanolance": 7.80628, "nanolance-cpp-retain <- nanolance": 7.87576, "nanolance-cpp-mt <- nanolance": 2.95219, "rust-native <- nanolance": 18.1357, "rust-native-1c <- nanolance": 23.8115, "rust-lance-1c <- nanolance": 30.939870000111114, "nanolance-py <- rust-lance": 5.066372999863233, "rust-lance <- rust-lance": 15.248243000314687, "nanolance-cpp <- rust-lance": 7.45749, "nanolance-cpp-retain <- rust-lance": 6.4441, "nanolance-cpp-mt <- rust-lance": 9.35926, "rust-native <- rust-lance": 17.3846, "rust-native-1c <- rust-lance": 27.5881, "rust-lance-1c <- rust-lance": 30.872389000251133, "parquet <- parquet": 41.046558999369154}, "size": {"rust-native": 22154228, "nanolance": 22011528, "rust-lance": 22154689, "parquet": 21529679}, "peak_mb": {"nanolance-cpp write": 44.1016, "nanolance-cpp-mt write": 44.0664, "nanolance-cpp-budget write": 10.6914, "rust-native write": 43.18, "rust-native-1c write": 44.77, "nanolance-cpp read <- nanolance": 27.0781, "nanolance-cpp-mt read <- nanolance": 35.4062, "rust-native read <- nanolance": 57.76, "rust-native-1c read <- nanolance": 57.68, "nanolance-cpp read <- rust-lance": 34.5078, "nanolance-cpp-mt read <- rust-lance": 41.2578, "rust-native read <- rust-lance": 62.18, "rust-native-1c read <- rust-lance": 60.75}, "errors": {}, "category": "string", "description": "binary, 16-64 random bytes"}, "uuid_fsb16": {"rows": 1000000, "arrow_bytes": 16000000, "write_ms": {"nanolance-cpp": 9.20991, "nanolance-cpp-mt": 9.52843, "nanolance-cpp-budget": 10.5745, "rust-native": 35.3261, "rust-native-1c": 24.1199, "nanolance-py": 11.217567999665334, "rust-lance": 22.570221000023594, "parquet": 32.93982900049741, "rust-lance-1c": 25.42352400087111}, "read_ms": {"nanolance-py <- nanolance": 2.723696000430209, "rust-lance <- nanolance": 9.040513999934774, "nanolance-cpp <- nanolance": 4.0737, "nanolance-cpp-retain <- nanolance": 3.17859, "nanolance-cpp-mt <- nanolance": 5.56742, "rust-native <- nanolance": 14.23, "rust-native-1c <- nanolance": 19.5638, "rust-lance-1c <- nanolance": 20.807250000871136, "nanolance-py <- rust-lance": 3.5134489999109064, "rust-lance <- rust-lance": 11.176904000421928, "nanolance-cpp <- rust-lance": 5.18198, "nanolance-cpp-retain <- rust-lance": 4.69294, "nanolance-cpp-mt <- rust-lance": 6.47392, "rust-native <- rust-lance": 11.4512, "rust-native-1c <- rust-lance": 20.6407, "rust-lance-1c <- rust-lance": 30.278104999524658, "parquet <- parquet": 11.597861999689485}, "size": {"rust-native": 16047304, "nanolance": 16014600, "rust-lance": 16048079, "parquet": 16128192}, "peak_mb": {"nanolance-cpp write": 30.25, "nanolance-cpp-mt write": 30.25, "nanolance-cpp-budget write": 6.83594, "rust-native write": 40.01, "rust-native-1c write": 39.45, "nanolance-cpp read <- nanolance": 17.5586, "nanolance-cpp-mt read <- nanolance": 30.4414, "rust-native read <- nanolance": 58.75, "rust-native-1c read <- nanolance": 53.96, "nanolance-cpp read <- rust-lance": 23.0117, "nanolance-cpp-mt read <- rust-lance": 33.0742, "rust-native read <- rust-lance": 55.25, "rust-native-1c read <- rust-lance": 57.78}, "errors": {}, "category": "string", "description": "fixed_size_binary(16), UUIDs"}, "int64_nulls": {"rows": 2000000, "arrow_bytes": 16250000, "write_ms": {"nanolance-cpp": 23.5997, "nanolance-cpp-mt": 19.3145, "nanolance-cpp-budget": 20.3342, "rust-native": 61.3408, "rust-native-1c": 51.967, "nanolance-py": 20.68783600043389, "rust-lance": 73.35288599915657, "parquet": 106.95807699994475, "rust-lance-1c": 50.185045000034734}, "read_ms": {"nanolance-py <- nanolance": 5.407646000094246, "rust-lance <- nanolance": 18.61189800001739, "nanolance-cpp <- nanolance": 6.02364, "nanolance-cpp-retain <- nanolance": 5.43166, "nanolance-cpp-mt <- nanolance": 7.98357, "rust-native <- nanolance": 21.5476, "rust-native-1c <- nanolance": 24.8586, "rust-lance-1c <- nanolance": 29.04947400020319, "nanolance-py <- rust-lance": 3.789929999584274, "rust-lance <- rust-lance": 16.194589000406268, "nanolance-cpp <- rust-lance": 4.95059, "nanolance-cpp-retain <- rust-lance": 4.625, "nanolance-cpp-mt <- rust-lance": 2.39813, "rust-native <- rust-lance": 20.492, "rust-native-1c <- rust-lance": 24.7016, "rust-lance-1c <- rust-lance": 27.24097099962819, "parquet <- parquet": 22.794131000409834}, "size": {"rust-native": 5280090, "nanolance": 5281544, "rust-lance": 5281903, "parquet": 2661056}, "peak_mb": {"nanolance-cpp write": 30.3125, "nanolance-cpp-mt write": 30.3125, "nanolance-cpp-budget write": 6.94531, "rust-native write": 38.27, "rust-native-1c write": 38.24, "nanolance-cpp read <- nanolance": 17.8555, "nanolance-cpp-mt read <- nanolance": 31.3047, "rust-native read <- nanolance": 53.91, "rust-native-1c read <- nanolance": 52.5, "nanolance-cpp read <- rust-lance": 17.6758, "nanolance-cpp-mt read <- rust-lance": 19.0547, "rust-native read <- rust-lance": 53.44, "rust-native-1c read <- rust-lance": 52.99}, "errors": {}, "category": "nullable", "description": "int64, 10% null"}, "string_nulls": {"rows": 500000, "arrow_bytes": 23728483, "write_ms": {"nanolance-cpp": 97.2759, "nanolance-cpp-mt": 69.589, "nanolance-cpp-budget": 77.9408, "rust-native": 102.1952, "rust-native-1c": 92.7616, "nanolance-py": 51.40325699994719, "rust-lance": 112.28926999956457, "parquet": 107.9714290008269, "rust-lance-1c": 86.60495099957188}, "read_ms": {"nanolance-py <- nanolance": 7.477840000319702, "rust-lance <- nanolance": 16.5763250006421, "nanolance-cpp <- nanolance": 17.3409, "nanolance-cpp-retain <- nanolance": 17.1454, "nanolance-cpp-mt <- nanolance": 7.1315, "rust-native <- nanolance": 21.2115, "rust-native-1c <- nanolance": 28.2107, "rust-lance-1c <- nanolance": 32.64537500035658, "nanolance-py <- rust-lance": 8.882848999746784, "rust-lance <- rust-lance": 16.23943100003089, "nanolance-cpp <- rust-lance": 18.099, "nanolance-cpp-retain <- rust-lance": 17.7553, "nanolance-cpp-mt <- rust-lance": 25.4938, "rust-native <- rust-lance": 25.1788, "rust-native-1c <- rust-lance": 28.9698, "rust-lance-1c <- rust-lance": 41.0197840001274, "parquet <- parquet": 39.55706199940323}, "size": {"rust-native": 7039354, "nanolance": 6950088, "rust-lance": 7020846, "parquet": 5829608}, "peak_mb": {"nanolance-cpp write": 47.5625, "nanolance-cpp-mt write": 47.5508, "nanolance-cpp-budget write": 15.1602, "rust-native write": 33.04, "rust-native-1c write": 33.59, "nanolance-cpp read <- nanolance": 27.3086, "nanolance-cpp-mt read <- nanolance": 29.2266, "rust-native read <- nanolance": 61.85, "rust-native-1c read <- nanolance": 59.53, "nanolance-cpp read <- rust-lance": 29.0391, "nanolance-cpp-mt read <- rust-lance": 49.8672, "rust-native read <- rust-lance": 58.35, "rust-native-1c read <- rust-lance": 57.98}, "errors": {}, "category": "nullable", "description": "utf8 sentences, 10% null"}, "vector_f32x128": {"rows": 100000, "arrow_bytes": 51200000, "write_ms": {"nanolance-cpp": 78.3249, "nanolance-cpp-mt": 78.14, "nanolance-cpp-budget": 49.6224, "rust-native": 172.6642, "rust-native-1c": 62.0309, "nanolance-py": 67.87868599985813, "rust-lance": 136.65319599931536, "parquet": 226.3525859998481, "rust-lance-1c": 62.6718269995763}, "read_ms": {"nanolance-py <- nanolance": 8.869615000548947, "rust-lance <- nanolance": 20.36070699978154, "nanolance-cpp <- nanolance": 18.8553, "nanolance-cpp-retain <- nanolance": 17.0064, "nanolance-cpp-mt <- nanolance": 11.8606, "rust-native <- nanolance": 34.4043, "rust-native-1c <- nanolance": 56.0567, "rust-lance-1c <- nanolance": 73.32162300008349, "nanolance-py <- rust-lance": 26.750648000415822, "rust-lance <- rust-lance": 22.168415999658464, "nanolance-cpp <- rust-lance": 72.4982, "nanolance-cpp-retain <- rust-lance": 29.3809, "nanolance-cpp-mt <- rust-lance": 40.3163, "rust-native <- rust-lance": 49.574, "rust-native-1c <- rust-lance": 48.6747, "rust-lance-1c <- rust-lance": 80.37315699948522, "parquet <- parquet": 159.6602489998986}, "size": {"rust-native": 51200341, "nanolance": 51246216, "rust-lance": 51200341, "parquet": 47941303}, "peak_mb": {"nanolance-cpp write": 81.1211, "nanolance-cpp-mt write": 81.1133, "nanolance-cpp-budget write": 32.6367, "rust-native write": 76.19, "rust-native-1c write": 75.61, "nanolance-cpp read <- nanolance": 51.082, "nanolance-cpp-mt read <- nanolance": 75.3242, "rust-native read <- nanolance": 101.75, "rust-native-1c read <- nanolance": 96.96, "nanolance-cpp read <- rust-lance": 97.625, "nanolance-cpp-mt read <- rust-lance": 97.6758, "rust-native read <- rust-lance": 116.34, "rust-native-1c read <- rust-lance": 114.3}, "errors": {}, "category": "nested", "description": "fixed_size_list<float32, 128> embeddings"}, "struct_mixed": {"rows": 500000, "arrow_bytes": 14388900, "write_ms": {"nanolance-cpp": 54.9504, "nanolance-cpp-mt": 51.5705, "nanolance-cpp-budget": 64.6245, "rust-native": 54.2579, "rust-native-1c": 49.0294, "nanolance-py": 53.17466699943907, "rust-lance": 52.74820300019201, "parquet": 94.90340599950287, "rust-lance-1c": 46.84373700001743}, "read_ms": {"nanolance-py <- nanolance": 3.97679599973344, "rust-lance <- nanolance": 10.348454999984824, "nanolance-cpp <- nanolance": 7.23067, "nanolance-cpp-retain <- nanolance": 6.68413, "nanolance-cpp-mt <- nanolance": 4.97834, "rust-native <- nanolance": 17.3103, "rust-native-1c <- nanolance": 19.4227, "rust-lance-1c <- nanolance": 24.03090100051486, "nanolance-py <- rust-lance": 4.353267000624328, "rust-lance <- rust-lance": 9.866280000096594, "nanolance-cpp <- rust-lance": 8.35944, "nanolance-cpp-retain <- rust-lance": 8.33746, "nanolance-cpp-mt <- rust-lance": 5.00554, "rust-native <- rust-lance": 14.2596, "rust-native-1c <- rust-lance": 18.7078, "rust-lance-1c <- rust-lance": 24.357493999559665, "parquet <- parquet": 29.668289000255754}, "size": {"rust-native": 8922914, "nanolance": 8907240, "rust-lance": 8928188, "parquet": 5758715}, "peak_mb": {"nanolance-cpp write": 23.8125, "nanolance-cpp-mt write": 35.3945, "nanolance-cpp-budget write": 14.6133, "rust-native write": 36.84, "rust-native-1c write": 31.59, "nanolance-cpp read <- nanolance": 16.2109, "nanolance-cpp-mt read <- nanolance": 22.1836, "rust-native read <- nanolance": 51.73, "rust-native-1c read <- nanolance": 50.16, "nanolance-cpp read <- rust-lance": 18.3047, "nanolance-cpp-mt read <- rust-lance": 23.1328, "rust-native read <- rust-lance": 50.59, "rust-native-1c read <- rust-lance": 50.82}, "errors": {}, "category": "nested", "description": "struct<id: int64, name: utf8, score: float64>"}, "list_int64": {"rows": 500000, "arrow_bytes": 17997536, "write_ms": {"nanolance-cpp": 59.2779, "nanolance-cpp-mt": 64.4066, "nanolance-cpp-budget": 50.3116, "rust-native": 67.2808, "rust-native-1c": 84.4432, "nanolance-py": 37.37764800007426, "rust-lance": 51.73143999945751, "parquet": 151.32450399960362, "rust-lance-1c": 81.23311800045485}, "read_ms": {"nanolance-py <- nanolance": 8.105368000542512, "rust-lance <- nanolance": 18.84337499996036, "nanolance-cpp <- nanolance": 25.8758, "nanolance-cpp-retain <- nanolance": 28.9826, "nanolance-cpp-mt <- nanolance": 10.4301, "rust-native <- nanolance": 24.1628, "rust-native-1c <- nanolance": 33.1301, "rust-lance-1c <- nanolance": 33.63226399960695, "nanolance-py <- rust-lance": 7.893044999946142, "rust-lance <- rust-lance": 19.254181999713182, "nanolance-cpp <- rust-lance": 25.735, "nanolance-cpp-retain <- rust-lance": 27.8156, "nanolance-cpp-mt <- rust-lance": 7.86242, "rust-native <- rust-lance": 26.8859, "rust-native-1c <- rust-lance": 38.5216, "rust-lance-1c <- rust-lance": 36.91508400061139, "parquet <- parquet": 58.890332000373746}, "size": {"rust-native": 5885660, "nanolance": 5843528, "rust-lance": 5898310, "parquet": 7642648}, "peak_mb": {"nanolance-cpp write": 39.0664, "nanolance-cpp-mt write": 38.9375, "nanolance-cpp-budget write": 10.3398, "rust-native write": 34.3, "rust-native-1c write": 33.76, "nanolance-cpp read <- nanolance": 28.8828, "nanolance-cpp-mt read <- nanolance": 38.2617, "rust-native read <- nanolance": 60.58, "rust-native-1c read <- nanolance": 59.96, "nanolance-cpp read <- rust-lance": 29.4805, "nanolance-cpp-mt read <- rust-lance": 31.7188, "rust-native read <- rust-lance": 62.63, "rust-native-1c read <- rust-lance": 62.18}, "errors": {}, "category": "nested", "description": "list<int64>, 0-8 items"}, "list_string": {"rows": 300000, "arrow_bytes": 8283115, "write_ms": {"nanolance-cpp": 52.5291, "nanolance-cpp-mt": 49.5146, "nanolance-cpp-budget": 47.4477, "rust-native": 38.4298, "rust-native-1c": 56.3959, "nanolance-py": 38.12016800020501, "rust-lance": 40.567044999988866, "parquet": 48.23005900016142, "rust-lance-1c": 52.88862900033564}, "read_ms": {"nanolance-py <- nanolance": 8.905591000257118, "rust-lance <- nanolance": 14.985173999775725, "nanolance-cpp <- nanolance": 18.6652, "nanolance-cpp-retain <- nanolance": 19.7808, "nanolance-cpp-mt <- nanolance": 10.8875, "rust-native <- nanolance": 20.404, "rust-native-1c <- nanolance": 29.8609, "rust-lance-1c <- nanolance": 28.009629000735004, "nanolance-py <- rust-lance": 8.75182500021765, "rust-lance <- rust-lance": 14.805597999838938, "nanolance-cpp <- rust-lance": 21.4682, "nanolance-cpp-retain <- rust-lance": 21.6559, "nanolance-cpp-mt <- rust-lance": 11.2128, "rust-native <- rust-lance": 20.1664, "rust-native-1c <- rust-lance": 28.5721, "rust-lance-1c <- rust-lance": 27.721412000573764, "parquet <- parquet": 27.850250000483356}, "size": {"rust-native": 1180409, "nanolance": 1180168, "rust-lance": 1183331, "parquet": 928687}, "peak_mb": {"nanolance-cpp write": 29.1875, "nanolance-cpp-mt write": 29.043, "nanolance-cpp-budget write": 11.4844, "rust-native write": 23.81, "rust-native-1c write": 22.83, "nanolance-cpp read <- nanolance": 17.0234, "nanolance-cpp-mt read <- nanolance": 20.1445, "rust-native read <- nanolance": 47.93, "rust-native-1c read <- nanolance": 48.09, "nanolance-cpp read <- rust-lance": 15.2695, "nanolance-cpp-mt read <- rust-lance": 16.1758, "rust-native read <- rust-lance": 49.9, "rust-native-1c read <- rust-lance": 47.77}, "errors": {}, "category": "nested", "description": "list<utf8> tags, 0-5 items"}, "map_string_int64": {"rows": 300000, "arrow_bytes": 9600000, "write_ms": {"nanolance-cpp": 62.3397, "nanolance-cpp-mt": 51.1822, "nanolance-cpp-budget": 54.9021, "rust-native": 35.2552, "rust-native-1c": 51.466, "nanolance-py": 35.38222499992116, "rust-lance": 33.59795899996243, "parquet": 70.31103300050745, "rust-lance-1c": 62.59793100070965}, "read_ms": {"nanolance-py <- nanolance": 9.497495999312378, "rust-lance <- nanolance": 18.954727000163984, "nanolance-cpp <- nanolance": 27.2993, "nanolance-cpp-retain <- nanolance": 25.4441, "nanolance-cpp-mt <- nanolance": 10.836, "rust-native <- nanolance": 20.209, "rust-native-1c <- nanolance": 26.3725, "rust-lance-1c <- nanolance": 22.305469999992056, "nanolance-py <- rust-lance": 11.627572999714175, "rust-lance <- rust-lance": 18.16642799985857, "nanolance-cpp <- rust-lance": 30.2869, "nanolance-cpp-retain <- rust-lance": 26.6675, "nanolance-cpp-mt <- rust-lance": 10.7071, "rust-native <- rust-lance": 18.4466, "rust-native-1c <- rust-lance": 24.8404, "rust-lance-1c <- rust-lance": 21.730974999627506, "parquet <- parquet": 26.59541800039733}, "size": {"rust-native": 2126418, "nanolance": 2112792, "rust-lance": 2128507, "parquet": 999892}, "peak_mb": {"nanolance-cpp write": 28.5039, "nanolance-cpp-mt write": 31.6172, "nanolance-cpp-budget write": 14.0547, "rust-native write": 29.5, "rust-native-1c write": 32.05, "nanolance-cpp read <- nanolance": 20.0586, "nanolance-cpp-mt read <- nanolance": 25.3984, "rust-native read <- nanolance": 47.37, "rust-native-1c read <- nanolance": 49.27, "nanolance-cpp read <- rust-lance": 19.5156, "nanolance-cpp-mt read <- rust-lance": 23.4648, "rust-native read <- rust-lance": 49.25, "rust-native-1c read <- rust-lance": 47.73}, "errors": {}, "category": "nested", "description": "map<utf8, int64>, 0-4 entries"}, "list_struct": {"rows": 200000, "arrow_bytes": 5225000, "write_ms": {"nanolance-cpp": 30.367, "nanolance-cpp-mt": 22.7005, "nanolance-cpp-budget": 31.3709, "rust-native": 24.6929, "rust-native-1c": 28.0956, "nanolance-py": 17.760021999492892, "rust-lance": 21.432552999613108, "parquet": 40.22906400041393, "rust-lance-1c": 31.427115999576927}, "read_ms": {"nanolance-py <- nanolance": 5.886345999897458, "rust-lance <- nanolance": 10.308975000043574, "nanolance-cpp <- nanolance": 12.8424, "nanolance-cpp-retain <- nanolance": 10.7512, "nanolance-cpp-mt <- nanolance": 6.63756, "rust-native <- nanolance": 9.8, "rust-native-1c <- nanolance": 11.5395, "rust-lance-1c <- nanolance": 11.424642000747554, "nanolance-py <- rust-lance": 4.949998000483902, "rust-lance <- rust-lance": 7.755638999697112, "nanolance-cpp <- rust-lance": 10.875, "nanolance-cpp-retain <- rust-lance": 10.7871, "nanolance-cpp-mt <- rust-lance": 6.6787, "rust-native <- rust-lance": 9.2374, "rust-native-1c <- rust-lance": 10.3481, "rust-lance-1c <- rust-lance": 11.025052000150026, "parquet <- parquet": 14.49709900043672}, "size": {"rust-native": 1184027, "nanolance": 1185432, "rust-lance": 1183507, "parquet": 610055}, "peak_mb": {"nanolance-cpp write": 14.6562, "nanolance-cpp-mt write": 14.6562, "nanolance-cpp-budget write": 9.70312, "rust-native write": 25.46, "rust-native-1c write": 23.64, "nanolance-cpp read <- nanolance": 11.4727, "nanolance-cpp-mt read <- nanolance": 15.375, "rust-native read <- nanolance": 44.55, "rust-native-1c read <- nanolance": 43.56, "nanolance-cpp read <- rust-lance": 13.4336, "nanolance-cpp-mt read <- rust-lance": 16.7812, "rust-native read <- rust-lance": 43.99, "rust-native-1c read <- rust-lance": 43.4}, "errors": {}, "category": "nested", "description": "list<struct<x: int32, label: utf8>>, 0-3 items"}, "list_list_int32": {"rows": 200000, "arrow_bytes": 2800000, "write_ms": {"nanolance-cpp": 12.5728, "nanolance-cpp-mt": 15.9495, "nanolance-cpp-budget": 12.7477, "rust-native": 17.4353, "rust-native-1c": 15.6772, "nanolance-py": 6.614641999476589, "rust-lance": 11.843671999486105, "parquet": 22.001102000103856, "rust-lance-1c": 16.302293999615358}, "read_ms": {"nanolance-py <- nanolance": 3.2494910001332755, "rust-lance <- nanolance": 4.818291999981739, "nanolance-cpp <- nanolance": 6.66025, "nanolance-cpp-retain <- nanolance": 6.5957, "nanolance-cpp-mt <- nanolance": 5.05796, "rust-native <- nanolance": 5.5943, "rust-native-1c <- nanolance": 5.4019, "rust-lance-1c <- nanolance": 6.458734999796434, "nanolance-py <- rust-lance": 3.2623940005578334, "rust-lance <- rust-lance": 4.974481999852287, "nanolance-cpp <- rust-lance": 8.39641, "nanolance-cpp-retain <- rust-lance": 6.51834, "nanolance-cpp-mt <- rust-lance": 5.92661, "rust-native <- rust-lance": 5.913, "rust-native-1c <- rust-lance": 5.9053, "rust-lance-1c <- rust-lance": 5.943117000242637, "parquet <- parquet": 5.980453000120178}, "size": {"rust-native": 630537, "nanolance": 630216, "rust-lance": 630537, "parquet": 795971}, "peak_mb": {"nanolance-cpp write": 8.40234, "nanolance-cpp-mt write": 8.4375, "nanolance-cpp-budget write": 4.78516, "rust-native write": 25.62, "rust-native-1c write": 24.98, "nanolance-cpp read <- nanolance": 12.2422, "nanolance-cpp-mt read <- nanolance": 14.082, "rust-native read <- nanolance": 40.3, "rust-native-1c read <- nanolance": 39.63, "nanolance-cpp read <- rust-lance": 12.1016, "nanolance-cpp-mt read <- rust-lance": 13.582, "rust-native read <- rust-lance": 41.05, "rust-native-1c read <- rust-lance": 38.68}, "errors": {}, "category": "nested", "description": "list<list<int32>>"}, "mixed_events": {"rows": 300000, "arrow_bytes": 41706471, "write_ms": {"nanolance-cpp": 125.966, "nanolance-cpp-mt": 72.2115, "nanolance-cpp-budget": 139.524, "rust-native": 83.8279, "rust-native-1c": 171.1587, "nanolance-py": 79.49998399999458, "rust-lance": 108.88109300049109, "parquet": 299.6505310002249, "rust-lance-1c": 158.71848200004024}, "read_ms": {"nanolance-py <- nanolance": 14.953009999771893, "rust-lance <- nanolance": 36.20160799982841, "nanolance-cpp <- nanolance": 51.2659, "nanolance-cpp-retain <- nanolance": 49.0688, "nanolance-cpp-mt <- nanolance": 17.1367, "rust-native <- nanolance": 50.8323, "rust-native-1c <- nanolance": 91.8294, "rust-lance-1c <- nanolance": 67.81237899940606, "nanolance-py <- rust-lance": 14.805175000219606, "rust-lance <- rust-lance": 36.75342700080364, "nanolance-cpp <- rust-lance": 42.3216, "nanolance-cpp-retain <- rust-lance": 42.2588, "nanolance-cpp-mt <- rust-lance": 15.0453, "rust-native <- rust-lance": 41.4878, "rust-native-1c <- rust-lance": 80.7533, "rust-lance-1c <- rust-lance": 82.40367600046739, "parquet <- parquet": 33.185836000484414}, "size": {"rust-native": 18357070, "nanolance": 18313896, "rust-lance": 18312392, "parquet": 16282598}, "peak_mb": {"nanolance-cpp write": 66.9883, "nanolance-cpp-mt write": 99.2852, "nanolance-cpp-budget write": 18.457, "rust-native write": 32.45, "rust-native-1c write": 27.84, "nanolance-cpp read <- nanolance": 49.6406, "nanolance-cpp-mt read <- nanolance": 50.2266, "rust-native read <- nanolance": 83.83, "rust-native-1c read <- nanolance": 84.16, "nanolance-cpp read <- rust-lance": 49.7969, "nanolance-cpp-mt read <- rust-lance": 53.168, "rust-native read <- rust-lance": 89.51, "rust-native-1c read <- rust-lance": 88.58}, "errors": {}, "category": "mixed", "description": "10-column event table (ints, timestamps, strings, list, struct, nulls)"}}}</script>
+<script id="notes-data" type="application/json">{"findings": [["Reads: 2.8\u00d7 faster than Rust Lance on all cores, 2.9\u00d7 per core", "Both on all four cores, nanolance reads 26 of the 27 data types faster than Rust Lance (the 27th, list<list<int32>>, is a tie: 5.1 against 5.0 ms), 2.78\u00d7 on average; both pinned to one core, 2.91\u00d7. Numbers and dates: 3.3\u20135.1\u00d7 (a 2M-row int64 id column: 7.6 against 13.4 ms). Strings: 2.9\u00d7. Lists, maps and structs: 1.5\u00d7."], ["Writes: 1.9\u00d7 faster on all cores, 1.5\u00d7 per core", "Both on all cores nanolance writes 21 of 27 data types faster, 1.92\u00d7 on average; one core each, 1.48\u00d7. Rust Lance on all cores still writes five list and map columns faster (map<string,int64> 34 against 51 ms, list<int64> 52 against 64) and random binary blobs (27 against 36 ms): a single large list column's pages are built one after another."], ["Every core, and one: same code, same files", "nanolance uses every core for reads, writes and random-access takes: a fragment is read as row ranges decoded side by side (one Arrow batch each, nothing concatenated), a data file's columns are encoded side by side, and inside a column FSST compression, page dictionaries and list levels are split across threads. On one thread (set_threads(1), NANOLANCE_THREADS=1, or a process pinned to one CPU) nothing is started or split: the single-threaded code path, no slower than before threads existed. The files are byte-for-byte the same at any thread count. The pool is ~200 lines of std::thread, no runtime library."], ["Without Python, the same picture", "Against the lance crate itself (tools/lance_rs_bench, the crate pylance 12.0.0 is built from, no Python in the process) nanolance reads 3.3\u00d7 faster on all cores and 2.6\u00d7 on one, and writes 1.9\u00d7 and 1.4\u00d7 faster. pylance costs the crate little: 1.14\u00d7 its read time on one core, 0.84\u00d7 on all, 1.02\u00d7 for writes."], ["A read needs the table and little else", "nanolance's peak memory for a read is the table it returns plus a few MB; the lance crate's is the table plus 34\u201365 MB, and 35 MB to read even a 1,000-row dataset: 3.1\u00d7 more on average (geometric mean)."], ["A write in a fixed amount of memory", "Without a limit, nanolance holds a write until commit. Its 4 MiB writer budget, the edge-device setting, commits a fragment whenever it holds 4 MiB, streams columns one at a time (no column-parallel buffering), and peaks at 3.3\u00d7 less memory than the lance crate (int64 ids: 7.0 against 33.5 MB)."], ["2.5 MB against 165 MB", "A stripped program that reads and writes Lance is 2.5 MB with nanolance and 165 MB with the lance crate, built for local files only (pylance's native library, with the cloud object stores, is 213 MB). nanolance links two third-party libraries, nanoarrow and zstd; the lance crate brings 371 crates."], ["Files interchange both ways", "Every file each Lance writer produced was read by the other side and checked value by value: 81 of 81 cross reads, no failures."]], "method": ["Machine: Intel Xeon @ 2.80 GHz, 4 cores, 16 GB, Linux 6.18. Rust Lance is pylance 12.0.0 and the lance crate 12.0.0 it is built from, both writing and reading Lance file format 2.2; pyarrow 25.0.1; nanolance built Release at the commit shown above.", "27 data types, 50,000 to 2,000,000 rows each (tens of MB in memory), one column per data type except the 10-column event table. Every writer receives the same input: the table as 64K-row Arrow batches.", "Every time is the median of 5 runs after one warm-up, with the files in the page cache: the warm, repeated read a query service sees.", "nanolance C++ runs twice, timed inside one process by tools/nlbench: on all 4 cores (its default) and pinned to one core, where it runs single-threaded. A read is lance_table_read_dataset into Arrow arrays; a write is writer open, write_batch per batch, commit. glibc's default allocator unless a column says otherwise.", "Rust Lance through pylance: lance.dataset(path).to_table() and lance.write_dataset(...) on all 4 cores, and in a separate process pinned to one core with LANCE_CPU_THREADS=1 and LANCE_IO_THREADS=1. Without Python: tools/lance_rs_bench (Dataset::open + scan into record batches; Dataset::write), the same two ways, one tokio worker on one core; built with the crate's default features off (local files only) and thin LTO.", "Peak memory: nlbench and lance_rs_bench reset the kernel's high-water mark (/proc/self/clear_refs) before each run and report the most any run added over what the process already held: the input batches of a write; nothing for a read, whose peak includes the table it returns. The budgeted write sets nanolance's max_pending_bytes to 4 MiB.", "Program sizes are the benchmark programs themselves (reader, writer and Arrow IPC input), stripped; the Python sizes are each package's installed native library.", "Python times (nanolance.read_table / write_table) include conversion to and from pyarrow.Table. Parquet is pyarrow.parquet with zstd on all cores, as a familiar yardstick.", "Before any read was timed, its result was compared with the source table (values and types), Rust-native reads included (dumped to Arrow IPC and compared). A reader that returned anything else would be listed as a failure, not a time; this run had none."]}</script>
+<script id="mm-data" type="application/json">{"environment": {"date": "2026-09-26 07:20 UTC", "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz", "cores": 4, "os": "Linux 6.18.44-fc-v37", "pylance": "12.0.0", "pyarrow": "25.0.1", "nanolance_commit": "3a60464"}, "runs": 3, "batch": 64, "datasets": {"coco": {"title": "COCO 2017 val", "what": "images, captions, boxes, polygons, keypoints", "rows": 5000, "arrow_bytes": 827902032, "columns": ["image_id", "file_name", "width", "height", "license", "image", "captions", "objects"], "ops": {"write": {"nanolance": {"wall_ms": 991.1465670002144, "cpu_ms": 991.9270000000005}, "nanolance 1 thread": {"wall_ms": 1044.7998549998374, "cpu_ms": 1015.6810000000007}, "rust-lance": {"wall_ms": 3052.9882040000302, "cpu_ms": 3067.6620000000057}, "parquet": {"wall_ms": 1763.2397269999274, "cpu_ms": 1741.9569999999994}}, "scan": {"nanolance": {"wall_ms": 389.4682879999891, "cpu_ms": 1093.0999999999997}, "nanolance 1 thread": {"wall_ms": 979.433180000342, "cpu_ms": 977.6410000000055}, "rust-lance": {"wall_ms": 4131.751986000381, "cpu_ms": 4338.323000000002}, "parquet": {"wall_ms": 1679.687789000127, "cpu_ms": 1701.4930000000136}, "nanolance on rust file": {"wall_ms": 419.33653600062826, "cpu_ms": 1291.5200000000054}, "rust-lance on nanolance file": {"wall_ms": 1911.6249299995616, "cpu_ms": 2020.7139999999981}}, "meta": {"nanolance": {"wall_ms": 9.326035000412958, "cpu_ms": 30.810000000002447}, "nanolance 1 thread": {"wall_ms": 27.417885000431852, "cpu_ms": 27.44600000001185}, "rust-lance": {"wall_ms": 29.26010800001677, "cpu_ms": 37.12199999999655}, "parquet": {"wall_ms": 34.05012899929716, "cpu_ms": 39.48799999999153}, "nanolance on rust file": {"wall_ms": 10.55887199981953, "cpu_ms": 35.05799999999226}, "rust-lance on nanolance file": {"wall_ms": 24.671811999724014, "cpu_ms": 26.33799999999553}}, "shuffled": {"nanolance": {"wall_ms": 374.8637050002799, "cpu_ms": 543.71900000001}, "nanolance 1 thread": {"wall_ms": 494.8216120001234, "cpu_ms": 493.34100000001513}, "rust-lance": {"wall_ms": 890.7467859999088, "cpu_ms": 1441.0069999999848}, "nanolance on rust file": {"wall_ms": 450.5680880001819, "cpu_ms": 616.3549999999987}, "rust-lance on nanolance file": {"wall_ms": 852.2703250000632, "cpu_ms": 1353.0900000000088}}}, "size": {"nanolance": 825676064, "nanolance 1 thread": 825676064, "rust-lance": 820855399, "parquet": 815273903}, "errors": {}, "shuffled_batches": 79}, "speech": {"title": "Speech Commands v0.02 test", "what": "one-second audio clips and their words", "rows": 4890, "arrow_bytes": 156784548, "columns": ["file", "label", "speaker", "utterance", "sample_rate", "waveform"], "ops": {"write": {"nanolance": {"wall_ms": 1060.1898309996614, "cpu_ms": 1043.8200000000109}, "nanolance 1 thread": {"wall_ms": 1044.079629999942, "cpu_ms": 1031.6830000000152}, "rust-lance": {"wall_ms": 1897.74635699996, "cpu_ms": 1890.1460000000156}, "parquet": {"wall_ms": 1645.9028989993385, "cpu_ms": 1643.7700000000177}}, "scan": {"nanolance": {"wall_ms": 86.08314200046152, "cpu_ms": 269.98600000001716}, "nanolance 1 thread": {"wall_ms": 220.1211500005229, "cpu_ms": 220.12399999999843}, "rust-lance": {"wall_ms": 378.0163100000209, "cpu_ms": 407.1230000000128}, "parquet": {"wall_ms": 828.3463380003013, "cpu_ms": 821.5959999999995}, "nanolance on rust file": {"wall_ms": 86.25615699929767, "cpu_ms": 311.5579999999909}, "rust-lance on nanolance file": {"wall_ms": 414.92365800058906, "cpu_ms": 453.1519999999887}}, "meta": {"nanolance": {"wall_ms": 0.6210640003700973, "cpu_ms": 0.914000000022952}, "nanolance 1 thread": {"wall_ms": 0.7567030006612185, "cpu_ms": 0.7650000000012369}, "rust-lance": {"wall_ms": 2.7771300001404597, "cpu_ms": 3.2290000000045893}, "parquet": {"wall_ms": 1.3634080005431315, "cpu_ms": 2.1420000000205164}, "nanolance on rust file": {"wall_ms": 0.30548600079782773, "cpu_ms": 0.47699999998940257}, "rust-lance on nanolance file": {"wall_ms": 4.074755000146979, "cpu_ms": 4.607999999961976}}, "shuffled": {"nanolance": {"wall_ms": 285.5973659998199, "cpu_ms": 287.77500000001055}, "nanolance 1 thread": {"wall_ms": 263.2081379997544, "cpu_ms": 261.8810000000167}, "rust-lance": {"wall_ms": 309.56734099981986, "cpu_ms": 426.12600000001066}, "nanolance on rust file": {"wall_ms": 265.9448100002919, "cpu_ms": 270.49399999998514}, "rust-lance on nanolance file": {"wall_ms": 393.5295249993942, "cpu_ms": 588.2370000000208}}}, "size": {"nanolance": 167298954, "nanolance 1 thread": 167298954, "rust-lance": 159176865, "parquet": 111821651}, "errors": {}, "shuffled_batches": 77}}}</script>
+<script>
+(function () {
+  const DATA = JSON.parse(document.getElementById("data").textContent);
+  const NOTES = JSON.parse(document.getElementById("notes-data").textContent);
+  const D = DATA.datasets, env = DATA.environment;
+  const CATS = [["numeric","Integers, floats, booleans"],["temporal","Dates, times, decimals"],["string","Strings and binary"],
+                ["nullable","Nulls"],["nested","Vectors, structs, lists, maps"],["mixed","A realistic table"]];
+  const names = CATS.flatMap(([c]) => Object.keys(D).filter(n => D[n].category === c));
+  const el = (tag, attrs = {}, text) => { const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); if (text != null) e.textContent = text; return e; };
+  const svgEl = (tag, attrs = {}) => { const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); return e; };
+  const fmtMs = v => v == null ? "—" : (v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : Math.round(v).toLocaleString());
+  const fmtX = v => v == null ? "—" : (v >= 10 ? v.toFixed(0) : v.toFixed(v >= 2 ? 1 : 2)) + "×";
+  const geo = a => { a = a.filter(v => v > 0); return a.length ? Math.exp(a.reduce((s, v) => s + Math.log(v), 0) / a.length) : null; };
+  const R = (n, k) => D[n].read_ms[k], W = (n, k) => D[n].write_ms[k];
+  const ratio = (a, b) => (a && b) ? a / b : null;
+
+  // Header.
+  document.getElementById("lede").textContent =
+    `${names.length} data types — numbers, dates, strings, nulls, vectors, structs, lists and maps — each written and read by nanolance (C++ and Python) and by Rust Lance, with Parquet alongside as a yardstick. Same machine, same data, every read verified.`;
+  const envEl = document.getElementById("env");
+  [["CPU", `${env.cpu}, ${env.cores} cores`], ["RAM", `${env.memory_gb} GB`], ["Rust Lance", `pylance ${env.pylance}`],
+   ["pyarrow", env.pyarrow], ["nanolance", env.nanolance_commit], ["Measured", env.date]].forEach(([k, v]) => {
+    const s = el("span"); s.append(k + " "); s.append(el("b", {}, v)); envEl.append(s); });
+
+  // Tiles.
+  const read1 = geo(names.map(n => ratio(R(n, "rust-lance-1c <- rust-lance"), R(n, "nanolance-cpp <- nanolance"))));
+  const read4 = geo(names.map(n => ratio(R(n, "rust-lance <- rust-lance"), R(n, "nanolance-cpp-mt <- nanolance"))));
+  const write4 = geo(names.map(n => ratio(W(n, "rust-lance"), W(n, "nanolance-cpp-mt"))));
+  const write1 = geo(names.map(n => ratio(W(n, "rust-lance-1c"), W(n, "nanolance-cpp"))));
+  const size = geo(names.map(n => ratio(D[n].size["nanolance"], D[n].size["rust-lance"])));
+  const CROSS = ["nanolance-cpp <- rust-lance", "nanolance-py <- rust-lance", "rust-lance <- nanolance"];
+  const interopReads = names.length * CROSS.length;
+  const crossOk = names.reduce((s, n) => s + CROSS.filter(k => R(n, k) != null).length, 0);
+  let tiles = [
+    ["Read, all cores", fmtX(read4), `nanolance C++ vs Rust Lance, both on all ${env.cores} cores (geometric mean)`],
+    ["Read, one core", fmtX(read1), "nanolance C++ vs Rust Lance, both pinned to one core"],
+    ["Write", fmtX(write4), `both on all cores; ${fmtX(write1)} both on one core`],
+    ["File size", (size * 100).toFixed(1) + "%", "of Rust Lance's, same data"],
+    ["Cross-reads verified", `${crossOk} / ${interopReads}`, "each reading the other's file, value by value"],
+  ];
+  const P = (n, k) => (D[n].peak_mb || {})[k];
+  const memW = geo(names.map(n => ratio(P(n, "rust-native write"), P(n, "nanolance-cpp write"))));
+  const memR = geo(names.map(n => ratio(P(n, "rust-native read <- rust-lance"), P(n, "nanolance-cpp read <- nanolance"))));
+  const FP = DATA.footprint;
+  if (FP && FP.nanolance.bench_binary_bytes && FP.rust.bench_binary_bytes)
+    tiles.push(["Program size", (FP.nanolance.bench_binary_bytes / 1e6).toFixed(1) + " MB",
+                `reader + writer, stripped; the lance crate: ${(FP.rust.bench_binary_bytes / 1e6).toFixed(0)} MB`]);
+  const memB = geo(names.map(n => ratio(P(n, "rust-native write"), P(n, "nanolance-cpp-budget write"))));
+  if (memW && memR)
+    tiles.push(["Less memory to read", fmtX(memR), `peak vs the lance crate; writes ${fmtX(memW)}, ${fmtX(memB)} with a 4 MiB budget`]);
+  const tilesEl = document.getElementById("tiles");
+  tiles.forEach(([l, v, n]) => { const t = el("div", {class: "tile"}); t.append(el("div", {class: "label"}, l), el("div", {class: "value"}, v), el("div", {class: "note"}, n)); tilesEl.append(t); });
+  document.getElementById("tiles-note").textContent = "Speed ratios are Rust Lance's time divided by nanolance's: above 1× means nanolance is faster. Averages are geometric means across all data types.";
+
+  // Tooltip.
+  const tip = document.getElementById("tip");
+  function showTip(evt, rows, title) {
+    tip.replaceChildren();
+    tip.append(el("div", {class: "small"}, title));
+    rows.forEach(([color, value, label]) => { const r = el("div", {class: "row"});
+      const k = el("span", {class: "lk"}); k.style.background = color; r.append(k, el("span", {class: "v"}, value), el("span", {class: "small"}, label)); tip.append(r); });
+    tip.style.display = "block";
+    const x = Math.min(evt.clientX + 14, window.innerWidth - tip.offsetWidth - 8);
+    const y = Math.min(evt.clientY + 14, window.innerHeight - tip.offsetHeight - 8);
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  }
+  const hideTip = () => { tip.style.display = "none"; };
+
+  function legend(id, series) {
+    const l = document.getElementById(id);
+    series.forEach(s => { const k = el("span", {class: "key"}); const d = el("span", {class: "dot"}); d.style.background = `var(${s.color})`; k.append(d, s.label); l.append(k); });
+  }
+
+  // Ratio dot plot: one row per dataset, log x axis, parity line at 1.
+  function dotPlot(targetId, series, opts) {
+    const rowH = 24, catH = 26, left = 250, right = 70, top = 34, width = 900;
+    const rows = [];
+    CATS.forEach(([c, title]) => { const ns = names.filter(n => D[n].category === c); if (!ns.length) return; rows.push({cat: title}); ns.forEach(n => rows.push({n})); });
+    const height = top + rows.reduce((h, r) => h + (r.cat ? catH : rowH), 0) + 30;
+    const vals = [];
+    rows.forEach(r => { if (r.n) series.forEach(s => { const v = s.value(r.n); if (v) vals.push(v); }); });
+    const lo = Math.min(opts.min, ...vals) * 0.85, hi = Math.max(opts.max, ...vals) * 1.15;
+    const x = v => left + (Math.log(v) - Math.log(lo)) / (Math.log(hi) - Math.log(lo)) * (width - left - right);
+    const svg = svgEl("svg", {viewBox: `0 0 ${width} ${height}`, width: "100%", role: "img", "aria-label": opts.aria, style: `min-width:${720}px`});
+    const ticks = opts.ticks.filter(t => t >= lo && t <= hi);
+    ticks.forEach(t => {
+      svg.append(svgEl("line", {x1: x(t), x2: x(t), y1: top - 8, y2: height - 26, stroke: t === 1 ? "var(--parity)" : "var(--grid)", "stroke-width": t === 1 ? 1.5 : 1}));
+      const tx = svgEl("text", {x: x(t), y: height - 10, "text-anchor": "middle", class: "axis"}); tx.textContent = opts.tickLabel(t); svg.append(tx);
+    });
+    const hl = svgEl("text", {x: x(1) - 8, y: top - 16, "text-anchor": "end", class: "axis"}); hl.textContent = opts.leftLabel; svg.append(hl);
+    const hr = svgEl("text", {x: x(1) + 8, y: top - 16, "text-anchor": "start", class: "axis"}); hr.textContent = opts.rightLabel; svg.append(hr);
+    let y = top;
+    rows.forEach(r => {
+      if (r.cat) { const t = svgEl("text", {x: 0, y: y + 17, class: "cat"}); t.textContent = r.cat; svg.append(t); y += catH; return; }
+      const cy = y + rowH / 2;
+      svg.append(svgEl("line", {x1: left, x2: width - right, y1: cy, y2: cy, stroke: "var(--grid)", "stroke-width": 1}));
+      const lab = svgEl("text", {x: 0, y: cy + 4, class: "ds"}); lab.textContent = r.n; svg.append(lab);
+      const pts = series.map(s => ({s, v: s.value(r.n)})).filter(p => p.v);
+      if (pts.length === 2) svg.append(svgEl("line", {x1: x(pts[0].v), x2: x(pts[1].v), y1: cy, y2: cy, stroke: "var(--ink-3)", "stroke-width": 1, opacity: .5}));
+      pts.forEach(p => {
+        const c = svgEl("circle", {cx: x(p.v), cy, r: 5, fill: `var(${p.s.color})`, stroke: "var(--surface)", "stroke-width": 2});
+        svg.append(c);
+      });
+      // Label the primary series value at the row's end.
+      const primary = pts[0];
+      if (primary) { const t = svgEl("text", {x: width - right + 8, y: cy + 4, class: "axis"}); t.textContent = opts.valueLabel(primary.v); svg.append(t); }
+      const hit = svgEl("rect", {x: left, y, width: width - left - right, height: rowH, fill: "transparent", tabindex: 0, "aria-label": r.n});
+      const show = evt => showTip(evt, opts.tip(r.n), `${r.n} — ${D[r.n].description}`);
+      hit.addEventListener("pointermove", show); hit.addEventListener("pointerleave", hideTip);
+      hit.addEventListener("focus", e => { const b = e.target.getBoundingClientRect(); show({clientX: b.left + 40, clientY: b.top}); });
+      hit.addEventListener("blur", hideTip);
+      svg.append(hit);
+      y += rowH;
+    });
+    document.getElementById(targetId).append(svg);
+  }
+
+  const TICKS = [0.125, 0.25, 0.5, 1, 2, 4, 8, 16, 32];
+  const READ_SERIES = [
+    {label: "both on all cores", color: "--rust", value: n => ratio(R(n, "rust-lance <- rust-lance"), R(n, "nanolance-cpp-mt <- nanolance"))},
+    {label: "both on 1 core", color: "--rust1", value: n => ratio(R(n, "rust-lance-1c <- rust-lance"), R(n, "nanolance-cpp <- nanolance"))},
+  ];
+  legend("legend-read", READ_SERIES);
+  dotPlot("chart-read", READ_SERIES, {min: 0.5, max: 2, ticks: TICKS, tickLabel: t => t + "×", valueLabel: fmtX,
+    leftLabel: "← Rust Lance faster", rightLabel: "nanolance faster →", aria: "Read speed ratio per data type",
+    tip: n => [["var(--nl)", fmtMs(R(n, "nanolance-cpp-mt <- nanolance")) + " ms", "nanolance C++, all cores"],
+               ["var(--nl)", fmtMs(R(n, "nanolance-cpp <- nanolance")) + " ms", "nanolance C++, 1 core"],
+               ["var(--rust1)", fmtMs(R(n, "rust-lance-1c <- rust-lance")) + " ms", "Rust Lance, 1 core"],
+               ["var(--rust)", fmtMs(R(n, "rust-lance <- rust-lance")) + " ms", "Rust Lance, all cores"]]});
+  const WRITE_SERIES = [
+    {label: "both on all cores", color: "--rust", value: n => ratio(W(n, "rust-lance"), W(n, "nanolance-cpp-mt"))},
+    {label: "both on 1 core", color: "--rust1", value: n => ratio(W(n, "rust-lance-1c"), W(n, "nanolance-cpp"))},
+  ];
+  legend("legend-write", WRITE_SERIES);
+  dotPlot("chart-write", WRITE_SERIES, {min: 0.5, max: 2, ticks: TICKS, tickLabel: t => t + "×", valueLabel: fmtX,
+    leftLabel: "← Rust Lance faster", rightLabel: "nanolance faster →", aria: "Write speed ratio per data type",
+    tip: n => [["var(--nl)", fmtMs(W(n, "nanolance-cpp-mt")) + " ms", "nanolance C++, all cores"],
+               ["var(--nl)", fmtMs(W(n, "nanolance-cpp")) + " ms", "nanolance C++, 1 core"],
+               ["var(--rust1)", fmtMs(W(n, "rust-lance-1c")) + " ms", "Rust Lance, 1 core"],
+               ["var(--rust)", fmtMs(W(n, "rust-lance")) + " ms", "Rust Lance, all cores"]]});
+  const SIZE_SERIES = [{label: "nanolance / Rust Lance", color: "--nl", value: n => ratio(D[n].size["nanolance"], D[n].size["rust-lance"])}];
+  dotPlot("chart-size", SIZE_SERIES, {min: 0.8, max: 1.25, ticks: [0.5, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 2], tickLabel: t => Math.round(t * 100) + "%",
+    valueLabel: v => (v * 100).toFixed(0) + "%", leftLabel: "← nanolance smaller", rightLabel: "nanolance larger →", aria: "File size ratio per data type",
+    tip: n => [["var(--nl)", (D[n].size["nanolance"] / 1e6).toFixed(2) + " MB", "nanolance"],
+               ["var(--rust)", (D[n].size["rust-lance"] / 1e6).toFixed(2) + " MB", "Rust Lance"],
+               ["var(--rust1)", ((D[n].size["parquet"] || 0) / 1e6).toFixed(2) + " MB", "Parquet (zstd)"]]});
+
+  // Memory.
+  const MEM_SERIES = [
+    {label: "write", color: "--op-write", value: n => ratio(P(n, "rust-native write"), P(n, "nanolance-cpp write"))},
+    {label: "write, 4 MiB budget", color: "--op-budget", value: n => ratio(P(n, "rust-native write"), P(n, "nanolance-cpp-budget write"))},
+    {label: "read", color: "--op-read", value: n => ratio(P(n, "rust-native read <- rust-lance"), P(n, "nanolance-cpp read <- nanolance"))},
+  ];
+  const fmtMB = v => v == null ? "—" : (v < 10 ? v.toFixed(1) : Math.round(v)) + " MB";
+  if (names.some(n => D[n].peak_mb)) {
+    legend("legend-memory", MEM_SERIES);
+    dotPlot("chart-memory", MEM_SERIES, {min: 0.5, max: 4, ticks: [0.5, 1, 2, 4, 8, 16, 32, 64], tickLabel: t => t + "×", valueLabel: fmtX,
+      leftLabel: "← nanolance needs more", rightLabel: "nanolance needs less →", aria: "Peak memory ratio per data type",
+      tip: n => [["var(--op-write)", fmtMB(P(n, "nanolance-cpp write")) + " / " + fmtMB(P(n, "rust-native write")), "write: nanolance / Rust"],
+                 ["var(--op-budget)", fmtMB(P(n, "nanolance-cpp-budget write")), "nanolance write, 4 MiB budget"],
+                 ["var(--op-read)", fmtMB(P(n, "nanolance-cpp read <- nanolance")) + " / " + fmtMB(P(n, "rust-native read <- rust-lance")), "read: nanolance / Rust"]]});
+  } else { document.getElementById("h-memory").parentElement.hidden = true; }
+
+  // Footprint and the cost of Python.
+  if (FP) {
+    const f = document.getElementById("footprint");
+    const mb = v => v == null ? "—" : (v / 1e6).toFixed(1) + " MB";
+    const h = el("tr"); ["", "nanolance", "Rust Lance"].forEach(t => h.append(el("th", {}, t))); f.append(h);
+    [["Reader + writer program, stripped", mb(FP.nanolance.bench_binary_bytes), mb(FP.rust.bench_binary_bytes)],
+     ["Python package's native library", mb(FP.nanolance.python_native_lib_bytes), mb(FP.rust.python_native_lib_bytes)],
+     ["Third-party code linked in", `${FP.nanolance.third_party.length} libraries`, FP.rust.crates != null ? `${FP.rust.crates} crates` : "—"]]
+      .forEach(row => { const tr = el("tr"); row.forEach(v => tr.append(el("td", {}, v))); f.append(tr); });
+    document.getElementById("footprint-note").textContent =
+      `nanolance's third-party code: ${FP.nanolance.third_party.join(", ")}. Programs: ${FP.nanolance.binary}; ${FP.rust.binary}. pylance's library also carries the cloud object stores the Rust program leaves out.`;
+  }
+  const pc = document.getElementById("pycost");
+  const pcRows = [["Read, 1 core", n => ratio(R(n, "rust-lance-1c <- rust-lance"), R(n, "rust-native-1c <- rust-lance"))],
+                  ["Read, all cores", n => ratio(R(n, "rust-lance <- rust-lance"), R(n, "rust-native <- rust-lance"))],
+                  ["Write, 1 core", n => ratio(W(n, "rust-lance-1c"), W(n, "rust-native-1c"))],
+                  ["Write, all cores", n => ratio(W(n, "rust-lance"), W(n, "rust-native"))]];
+  if (names.some(n => W(n, "rust-native"))) {
+    const h = el("tr"); ["", "pylance time ÷ Rust program time (geometric mean)"].forEach(t => h.append(el("th", {}, t))); pc.append(h);
+    pcRows.forEach(([label, f]) => { const tr = el("tr"); tr.append(el("td", {}, label), el("td", {}, fmtX(geo(names.map(f))))); pc.append(tr); });
+  }
+
+  // Interop table.
+  const inter = document.getElementById("interop");
+  const pairs = [["nanolance-cpp <- rust-lance", "nanolance C++ reads Rust's"], ["nanolance-py <- rust-lance", "nanolance Python reads Rust's"],
+                 ["rust-lance <- nanolance", "Rust reads nanolance's"], ["nanolance-cpp <- nanolance", "nanolance C++ reads its own"],
+                 ["rust-lance <- rust-lance", "Rust reads its own"], ["parquet <- parquet", "Parquet"]];
+  const ih = el("tr"); ih.append(el("th", {}, "data type")); pairs.forEach(([, l]) => ih.append(el("th", {}, l))); inter.append(ih);
+  names.forEach(n => { const tr = el("tr"); tr.append(el("td", {}, n));
+    pairs.forEach(([k]) => { const v = R(n, k); const td = el("td"); if (v != null) { const s = el("span", {class: "check"}, "✓ "); td.append(s, fmtMs(v) + " ms"); } else { td.append(el("span", {class: "fail"}, "✗ failed")); } tr.append(td); });
+    inter.append(tr); });
+
+  // Full tables with category tabs.
+  const full = document.getElementById("full");
+  const COLS = [
+    ["rows", n => D[n].rows.toLocaleString()],
+    ["read · nanolance C++", n => fmtMs(R(n, "nanolance-cpp <- nanolance")), "rc"],
+    ["read · nanolance all cores", n => fmtMs(R(n, "nanolance-cpp-mt <- nanolance"))],
+    ["read · + retaining malloc", n => fmtMs(R(n, "nanolance-cpp-retain <- nanolance"))],
+    ["read · nanolance Python", n => fmtMs(R(n, "nanolance-py <- nanolance"))],
+    ["read · Rust 1 core", n => fmtMs(R(n, "rust-lance-1c <- rust-lance")), "rr"],
+    ["read · Rust all cores", n => fmtMs(R(n, "rust-lance <- rust-lance"))],
+    ["read · Rust native 1 core", n => fmtMs(R(n, "rust-native-1c <- rust-lance"))],
+    ["read · Rust native all cores", n => fmtMs(R(n, "rust-native <- rust-lance"))],
+    ["read · Parquet", n => fmtMs(R(n, "parquet <- parquet"))],
+    ["write · nanolance C++", n => fmtMs(W(n, "nanolance-cpp")), "wc"],
+    ["write · nanolance all cores", n => fmtMs(W(n, "nanolance-cpp-mt"))],
+    ["write · + 4 MiB budget", n => fmtMs(W(n, "nanolance-cpp-budget"))],
+    ["write · nanolance Python", n => fmtMs(W(n, "nanolance-py"))],
+    ["write · Rust 1 core", n => fmtMs(W(n, "rust-lance-1c")), "wr"],
+    ["write · Rust all cores", n => fmtMs(W(n, "rust-lance"))],
+    ["write · Rust native 1 core", n => fmtMs(W(n, "rust-native-1c"))],
+    ["write · Rust native all cores", n => fmtMs(W(n, "rust-native"))],
+    ["write · Parquet", n => fmtMs(W(n, "parquet"))],
+    ["peak MB · nanolance write", n => fmtMs(P(n, "nanolance-cpp write"))],
+    ["peak MB · + budget", n => fmtMs(P(n, "nanolance-cpp-budget write"))],
+    ["peak MB · Rust write", n => fmtMs(P(n, "rust-native write"))],
+    ["peak MB · nanolance read", n => fmtMs(P(n, "nanolance-cpp read <- nanolance"))],
+    ["peak MB · Rust read", n => fmtMs(P(n, "rust-native read <- rust-lance"))],
+    ["MB · nanolance", n => (D[n].size["nanolance"] / 1e6).toFixed(2)],
+    ["MB · Rust Lance", n => (D[n].size["rust-lance"] / 1e6).toFixed(2)],
+    ["MB · Parquet", n => ((D[n].size["parquet"] || 0) / 1e6).toFixed(2)],
+  ];
+  function renderTable(cat) {
+    full.replaceChildren();
+    const h = el("tr"); h.append(el("th", {}, "data type")); COLS.forEach(([t]) => h.append(el("th", {}, t))); full.append(h);
+    names.filter(n => cat === "all" || D[n].category === cat).forEach(n => {
+      const tr = el("tr"); const first = el("td"); first.append(el("span", {class: "mono"}, n), el("span", {class: "desc"}, D[n].description)); tr.append(first);
+      const rWin = (R(n, "nanolance-cpp <- nanolance") || 1e9) <= (R(n, "rust-lance-1c <- rust-lance") || 1e9);
+      const wWin = (W(n, "nanolance-cpp") || 1e9) <= (W(n, "rust-lance-1c") || 1e9);
+      COLS.forEach(([, f, tag]) => { const td = el("td", {}, f(n));
+        if ((tag === "rc" && rWin) || (tag === "rr" && !rWin) || (tag === "wc" && wWin) || (tag === "wr" && !wWin)) td.className = "win";
+        tr.append(td); });
+      full.append(tr); });
+  }
+  const tabs = document.getElementById("tabs");
+  [["all", "All"], ...CATS].forEach(([c, t], i) => {
+    if (c !== "all" && !names.some(n => D[n].category === c)) return;
+    const b = el("button", {type: "button", "aria-pressed": i === 0 ? "true" : "false", id: "tab-" + c}, t);
+    b.addEventListener("click", () => { tabs.querySelectorAll("button").forEach(x => x.setAttribute("aria-pressed", "false")); b.setAttribute("aria-pressed", "true"); renderTable(c); });
+    tabs.append(b); });
+  renderTable("all");
+
+  // Training data (tools/bench_multimodal.py), when present.
+  const MM = JSON.parse(document.getElementById("mm-data").textContent);
+  if (MM && MM.datasets) {
+    document.getElementById("train-section").hidden = false;
+    document.getElementById("train-intro").textContent =
+      `Two widely used datasets in the shape a training pipeline keeps them, through what a training job does. ` +
+      `Wall time in ms, median of ${MM.runs} runs (CPU time, every thread, below it); a shuffled epoch reads every row ` +
+      `once in random mini-batches of ${MM.batch} with take(). Measured ${MM.environment.date} on ${MM.environment.cores} cores.`;
+    const OPS = [["write", "Write the dataset"], ["scan", "Read an epoch in order"], ["meta", "Read all but images / audio"],
+                 ["shuffled", "Shuffled epoch (take)"]];
+    const ENG = [["nanolance", "nanolance"], ["rust-lance", "Rust Lance"], ["x", "nanolance vs Rust"],
+                 ["nanolance 1 thread", "nanolance, 1 thread"], ["parquet", "Parquet"]];
+    const fmt = v => v == null ? "—" : (v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString());
+    const host = document.getElementById("train");
+    Object.values(MM.datasets).forEach(rec => {
+      const card = el("div", {class: "card"});
+      card.append(el("h3", {}, rec.title), el("p", {class: "muted small"}, `${rec.what} · ${rec.rows.toLocaleString()} rows, ${Math.round(rec.arrow_bytes / 1e6)} MB`));
+      const wrap = el("div", {class: "table-scroll"}); const t = el("table");
+      const h = el("tr"); h.append(el("th", {}, "")); ENG.forEach(([, l]) => h.append(el("th", {}, l))); t.append(h);
+      OPS.forEach(([op, label]) => {
+        const row = rec.ops[op] || {}; const tr = el("tr"); tr.append(el("td", {}, label));
+        const nl = row["nanolance"], rs = row["rust-lance"];
+        ENG.forEach(([k]) => { const td = el("td");
+          if (k === "x") { td.append(el("b", {}, nl && rs ? fmtX(rs.wall_ms / nl.wall_ms) : "—")); tr.append(td); return; }
+          const v = row[k];
+          if (v) { td.append(fmt(v.wall_ms)); const c = el("span", {class: "desc"}, fmt(v.cpu_ms) + " CPU"); td.append(c); } else td.append("—");
+          if (k === "nanolance" && v && rs && v.wall_ms <= rs.wall_ms) td.className = "win";
+          tr.append(td); });
+        t.append(tr); });
+      wrap.append(t); card.append(wrap); host.append(card);
+    });
+  }
+
+  // Notes and method.
+  const notes = document.getElementById("notes");
+  NOTES.findings.forEach(([title, body]) => { const c = el("div", {class: "card"}); c.append(el("h3", {}, title)); const p = el("p", {class: "muted"}, body); p.style.marginTop = "6px"; c.append(p); notes.append(c); });
+  const method = document.getElementById("method");
+  NOTES.method.forEach(t => method.append(el("li", {}, t)));
+})();
+</script>

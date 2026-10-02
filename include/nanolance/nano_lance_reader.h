@@ -95,6 +95,35 @@ int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t 
 int nano_lance_block_cache_configure(const char* cache_dir, int max_blocks, char* error_message,
                                      size_t error_message_capacity);
 
+/// Threads nanolance may use for reads and writes, the calling thread included. 1 keeps everything on
+/// the calling thread (no worker is ever started). 0 restores the default: NANOLANCE_THREADS if set,
+/// else the CPUs this process may run on. Takes effect for reads and writes started afterwards.
+void nano_lance_set_threads(size_t threads);
+
+/// The current thread count (see nano_lance_set_threads).
+size_t nano_lance_threads(void);
+
+/// Counters of the work done since the last reset, process-wide: what a test asserts to guard HOW a
+/// result was produced (a take reading a few MB, not the page; a column-parallel write that did or did
+/// not buffer). For tests and diagnostics; the fields may change between versions.
+typedef struct NanoLanceWorkStats {
+    uint64_t data_bytes_read;
+    uint64_t data_reads;
+    uint64_t largest_read;
+    uint64_t page_windows;
+    uint64_t read_morsels;
+    uint64_t fragment_reads;
+    uint64_t parallel_column_writes;
+    uint64_t write_buffered_bytes;
+    uint64_t buffer_pool_hits;
+    uint64_t buffer_pool_misses;
+    uint64_t take_cache_hits;
+    uint64_t indexed_fragments; /* fragments a scalar index narrowed a filter to */
+} NanoLanceWorkStats;
+
+void nano_lance_work_stats(NanoLanceWorkStats* out);
+void nano_lance_reset_work_stats(void);
+
 /// Cumulative block-cache hit/miss counters since process start (both 0 when no cache is active). Pass
 /// nullptr to skip either output.
 void nano_lance_block_cache_stats(uint64_t* out_hits, uint64_t* out_misses);
@@ -166,6 +195,19 @@ int nano_lance_table_read_dataset_range(const char* dataset_path, const char* co
                                         int trusted_input, struct ArrowSchema* out_schema,
                                         struct ArrowArray** out_batches, size_t* out_batch_count,
                                         char* error_message, size_t error_message_capacity);
+
+/// Read the rows at \p indices (\p index_count of them): logical row numbers, deleted rows not
+/// counted -- random access, e.g. a shuffled training mini-batch. \p column_names / \p column_count
+/// project as in nano_lance_table_read_dataset_range.
+///
+/// Rows come back in ascending order, each once, one batch per fragment touched. Only fragments and
+/// pages holding a requested row are read, and for large values (FullZip pages) only the rows
+/// themselves. An index past the end is an error. Free the
+/// result with nano_lance_table_read_result_free.
+int nano_lance_table_take(const char* dataset_path, const char* const* column_names, size_t column_count,
+                          const uint64_t* indices, size_t index_count, int trusted_input,
+                          struct ArrowSchema* out_schema, struct ArrowArray** out_batches,
+                          size_t* out_batch_count, char* error_message, size_t error_message_capacity);
 
 /// nano_lance_table_open_stream restricted to a row range; see
 /// nano_lance_table_read_dataset_range for what a range costs.

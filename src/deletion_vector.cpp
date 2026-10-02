@@ -3,6 +3,13 @@
 
 #include "nanolance/deletion_vector.hpp"
 
+#include <nanoarrow/nanoarrow.h>
+#include <nanoarrow/nanoarrow_ipc.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+
 #include "nanolance/read_safety.hpp"
 
 #include <zstd.h>
@@ -700,6 +707,104 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
                 " offsets but the manifest claims " + std::to_string(deletion_file.num_deleted_rows);
         return false;
     }
+    return true;
+}
+
+bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_t fragment_id,
+                         std::uint64_t read_version, const std::vector<std::uint32_t>& deleted,
+                         pb::DeletionFile& out, std::string& error) {
+    error.clear();
+    std::error_code ec;
+    std::filesystem::create_directories(dataset_path / "_deletions", ec);
+    if (ec) {
+        error = "failed to create _deletions: " + ec.message();
+        return false;
+    }
+    static std::atomic<std::uint64_t> counter{0};
+    const std::uint64_t id =
+        (static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) * 0x9E3779B97F4A7C15ULL) ^
+        (counter.fetch_add(1) + 1U) ^ (static_cast<std::uint64_t>(fragment_id) << 40U);
+    const auto name = std::to_string(fragment_id) + "-" + std::to_string(read_version) + "-" +
+                      std::to_string(id & 0x7FFFFFFFFFFFFFFFULL) + ".arrow";
+    const auto path = dataset_path / "_deletions" / name;
+
+    // One non-nullable uint32 column, "row_id": what Lance writes (and reads) as an ARROW_ARRAY
+    // deletion file.
+    ArrowSchema schema{};
+    ArrowArray array{};
+    ArrowArrayView view{};
+    ArrowIpcOutputStream stream{};
+    ArrowIpcWriter writer{};
+    ArrowError aerr{};
+    bool view_init = false;
+    bool writer_init = false;
+    auto cleanup = [&] {
+        if (writer_init) {
+            ArrowIpcWriterReset(&writer);
+        } else if (stream.release != nullptr) {
+            stream.release(&stream);
+        }
+        if (view_init) {
+            ArrowArrayViewReset(&view);
+        }
+        if (array.release != nullptr) {
+            array.release(&array);
+        }
+        if (schema.release != nullptr) {
+            schema.release(&schema);
+        }
+    };
+    ArrowSchemaInit(&schema);
+    bool ok = ArrowSchemaSetTypeStruct(&schema, 1) == NANOARROW_OK &&
+              ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_UINT32) == NANOARROW_OK &&
+              ArrowSchemaSetName(schema.children[0], "row_id") == NANOARROW_OK;
+    if (ok) {
+        schema.children[0]->flags = 0;
+        ok = ArrowArrayInitFromSchema(&array, &schema, &aerr) == NANOARROW_OK &&
+             ArrowArrayStartAppending(&array) == NANOARROW_OK;
+    }
+    for (std::size_t i = 0; ok && i < deleted.size(); ++i) {
+        ok = ArrowArrayAppendUInt(array.children[0], deleted[i]) == NANOARROW_OK;
+    }
+    if (ok) {
+        array.length = static_cast<std::int64_t>(deleted.size());
+        ok = ArrowArrayFinishBuildingDefault(&array, &aerr) == NANOARROW_OK &&
+             ArrowArrayViewInitFromSchema(&view, &schema, &aerr) == NANOARROW_OK;
+        view_init = ok;
+        ok = ok && ArrowArrayViewSetArray(&view, &array, &aerr) == NANOARROW_OK;
+    }
+    FILE* file = ok ? std::fopen(path.string().c_str(), "wb") : nullptr;
+    if (ok && file == nullptr) {
+        error = "failed to open " + path.string() + " for writing";
+        cleanup();
+        return false;
+    }
+    if (ok) {
+        ok = ArrowIpcOutputStreamInitFile(&stream, file, 1) == NANOARROW_OK;
+        if (!ok) {
+            std::fclose(file);
+        }
+    }
+    if (ok) {
+        ok = ArrowIpcWriterInit(&writer, &stream) == NANOARROW_OK;
+        writer_init = ok;
+    }
+    ok = ok && ArrowIpcWriterStartFile(&writer, &aerr) == NANOARROW_OK &&
+         ArrowIpcWriterWriteSchema(&writer, &schema, &aerr) == NANOARROW_OK &&
+         ArrowIpcWriterWriteArrayView(&writer, &view, &aerr) == NANOARROW_OK &&
+         ArrowIpcWriterFinalizeFile(&writer, &aerr) == NANOARROW_OK;
+    cleanup();
+    if (!ok) {
+        error = std::string("failed to write the deletion file: ") + aerr.message;
+        std::filesystem::remove(path, ec);
+        return false;
+    }
+    out = pb::DeletionFile{};
+    out.present = true;
+    out.file_type = 0;
+    out.read_version = read_version;
+    out.id = id & 0x7FFFFFFFFFFFFFFFULL;
+    out.num_deleted_rows = deleted.size();
     return true;
 }
 

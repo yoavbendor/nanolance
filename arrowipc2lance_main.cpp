@@ -64,6 +64,7 @@ int nanolance_cli_import(int argc, char** argv) {
     bool compress = false;
     bool no_structural = false;
     int compression_level = 3;
+    std::uint64_t max_pending_bytes = 0;
 
     app.add_option("-o,--output", output_path, "Output Lance dataset path");
     app.add_option("-i,--input", input_path,
@@ -80,6 +81,11 @@ int nanolance_cli_import(int argc, char** argv) {
     app.add_flag("--no-structural", no_structural,
                  "Disable structural encodings (bitpacking/constant/RLE/dictionary); emit plain pages");
     app.add_option("-l,--compression-level", compression_level, "Zstd compression level")->default_val(3);
+    app.add_option("--max-pending-bytes", max_pending_bytes,
+                   "Flush a fragment whenever the writer holds this many bytes of unwritten rows, bounding "
+                   "memory (0 = off: one fragment for the whole stream). A batch is never split, so peak "
+                   "memory is about this plus one IPC batch.")
+        ->default_val(0);
 
     try {
         app.parse(argc, argv);
@@ -214,6 +220,13 @@ int nanolance_cli_import(int argc, char** argv) {
         close_input_if_owned();
         return structural_status;
     }
+    const int budget_status = nano_lance_writer_set_max_pending_bytes(&writer, max_pending_bytes);
+    if (budget_status != NANO_LANCE_OK) {
+        std::cerr << nano_lance_writer_last_error(&writer) << '\n';
+        nano_lance_writer_close(&writer);
+        close_input_if_owned();
+        return budget_status;
+    }
 
     ArrowIpcInputStream ipc_input{};
     int err = ArrowIpcInputStreamInitFile(&ipc_input, input_file, close_input ? 1 : 0);
@@ -229,6 +242,10 @@ int nanolance_cli_import(int argc, char** argv) {
     ArrowIpcArrayStreamReaderOptions options{};
     std::memset(&options, 0, sizeof(options));
     options.field_index = -1;
+    // Decoded arrays point into the message body instead of copies of it: each batch is written and
+    // released before the next is read, so nothing outlives the body. Halves the IPC parse (19 -> 9 ms
+    // for 14 MB), most of it page faults on the copies.
+    options.use_shared_buffers = 1;
     err = ArrowIpcArrayStreamReaderInit(&ipc_stream, &ipc_input, &options);
     if (err != NANOARROW_OK) {
         std::cerr << "ArrowIpcArrayStreamReaderInit failed\n";
@@ -254,9 +271,12 @@ int nanolance_cli_import(int argc, char** argv) {
     using clock = std::chrono::steady_clock;
 
     std::uint64_t batches = 0;
+    double ipc_ms = 0.0;
     while (g_stop_requested == 0) {
         ArrowArray batch{};
+        const auto ipc_t0 = clock::now();
         err = ipc_stream.get_next(&ipc_stream, &batch);
+        ipc_ms += std::chrono::duration<double, std::milli>(clock::now() - ipc_t0).count();
         if (err != NANOARROW_OK) {
             std::cerr << "IPC stream batch read failed\n";
             schema.release(&schema);
@@ -301,13 +321,17 @@ int nanolance_cli_import(int argc, char** argv) {
         }
     }
 
+    const auto close_t0 = clock::now();
     const int close_status = nano_lance_writer_close(&writer);
+    const double close_ms = std::chrono::duration<double, std::milli>(clock::now() - close_t0).count();
     if (close_status != NANO_LANCE_OK) {
         std::cerr << nano_lance_writer_last_error(&writer) << '\n';
         return close_status;
     }
     std::cerr << argv[0] << ": committed " << batches << " complete IPC batches to " << output_path << '\n';
     std::cerr << "nl_write_ms=" << core_write_ms << '\n';  // core ingest+encode+commit only (machine-readable)
+    std::cerr << "nl_ipc_ms=" << ipc_ms << '\n';           // Arrow IPC parse of the input batches
+    std::cerr << "nl_close_ms=" << close_ms << '\n';
     return 0;
 }
 

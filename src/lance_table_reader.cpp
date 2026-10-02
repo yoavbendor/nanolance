@@ -3,21 +3,36 @@
 
 #include "nanolance/lance_table_reader.hpp"
 
+#include "nanolance/index_search.hpp"
+
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/deletion_vector.hpp"
+#include "nanolance/bool_bitpack.hpp"
+#include "nanolance/buffer_pool.hpp"
+#include "nanolance/arrow_slice.hpp"
+#include "nanolance/expr.hpp"
 #include "nanolance/lance_column_decoder.hpp"
+#include "nanolance/lance_v20_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
+#include "nanolance/page_layout.hpp"
+#include "nanolance/parallel.hpp"
+#include "nanolance/work_stats.hpp"
 #include "nanolance/path_safety.hpp"
 #include "nanolance/read_safety.hpp"
 #include "nanolance/schema_mapper.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <map>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -74,8 +89,46 @@ bool set_schema_metadata(ArrowSchema& schema, const std::string& key, const std:
     return true;
 }
 
+/// A Blob v2 column as `blob` asks for it (anything but Ingest), with pylance's types and metadata.
+bool init_blob_schema(const LanceField& field, BlobHandling blob, ArrowSchema& schema, std::string& error) {
+    ArrowSchemaInit(&schema);
+    bool ok = true;
+    if (blob == BlobHandling::Binary) {
+        ok = ArrowSchemaSetType(&schema, NANOARROW_TYPE_LARGE_BINARY) == NANOARROW_OK;
+    } else {
+        struct Child {
+            const char* name;
+            ArrowType type;
+        };
+        std::vector<Child> children = {{"kind", NANOARROW_TYPE_UINT8},
+                                       {"position", NANOARROW_TYPE_UINT64},
+                                       {"size", NANOARROW_TYPE_UINT64},
+                                       {"blob_id", NANOARROW_TYPE_UINT32},
+                                       {"blob_uri", NANOARROW_TYPE_STRING}};
+        if (blob == BlobHandling::Locations) {
+            children.push_back({"file", NANOARROW_TYPE_STRING});
+        }
+        ok = ArrowSchemaSetTypeStruct(&schema, static_cast<int64_t>(children.size())) == NANOARROW_OK;
+        for (std::size_t i = 0; ok && i < children.size(); ++i) {
+            ok = ArrowSchemaSetType(schema.children[i], children[i].type) == NANOARROW_OK &&
+                 ArrowSchemaSetName(schema.children[i], children[i].name) == NANOARROW_OK;
+            schema.children[i]->flags &= ~ARROW_FLAG_NULLABLE;
+        }
+        ok = ok && set_schema_metadata(schema, "lance-encoding:packed", "true") &&
+             set_schema_metadata(schema, "lance-encoding:blob", "true");
+    }
+    ok = ok && ArrowSchemaSetName(&schema, field.name.c_str()) == NANOARROW_OK;
+    if (!ok) {
+        error = "failed to build the schema of blob column " + field.name;
+    }
+    return ok;
+}
+
 bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& mapping, ArrowSchema& schema,
-                            std::string& error) {
+                            std::string& error, BlobHandling blob = BlobHandling::Ingest) {
+    if (blob != BlobHandling::Ingest && field.extension_name == "lance.blob.v2") {
+        return init_blob_schema(field, blob, schema, error);
+    }
     ArrowSchemaInit(&schema);
     std::uint64_t fsl_items = 0;
     if (field.logical_type == "struct") {
@@ -98,7 +151,7 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
             return false;
         }
         for (std::size_t i = 0; i < children.size(); ++i) {
-            if (!init_schema_from_field(*children[i], mapping, *schema.children[i], error)) {
+            if (!init_schema_from_field(*children[i], mapping, *schema.children[i], error, blob)) {
                 return false;
             }
         }
@@ -165,7 +218,16 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
         error = "failed to set schema field name";
         return false;
     }
+    // The schema says what the manifest says. Every field used to come back nullable, so a table read
+    // from a dataset with a non-nullable column could not be appended to it again.
+    if (!field.nullable) {
+        schema.flags &= ~ARROW_FLAG_NULLABLE;
+    }
     for (const auto& kv : field.metadata) {
+        // How nanolance encoded a fragment's pages is not part of the schema a reader sees.
+        if (kv.first == "nanolance:packing" || kv.first == "nanolance:const-value") {
+            continue;
+        }
         if (!set_schema_metadata(schema, kv.first, kv.second)) {
             error = "failed to set schema metadata";
             return false;
@@ -174,7 +236,35 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
     return true;
 }
 
-bool build_schema_from_mapping(const LanceSchemaMapping& mapping, ArrowSchema& schema, std::string& error) {
+/// The dataset's Arrow schema metadata (Manifest.schema_metadata) on the top-level schema.
+bool set_dataset_schema_metadata(ArrowSchema& schema, const pb::Manifest& manifest, std::string& error) {
+    if (manifest.schema_metadata.empty()) {
+        return true;
+    }
+    ArrowBuffer buffer;
+    if (ArrowMetadataBuilderInit(&buffer, schema.metadata) != NANOARROW_OK) {
+        error = "failed to build schema metadata";
+        return false;
+    }
+    for (const auto& [key, value] : manifest.schema_metadata) {
+        ArrowStringView k{key.data(), static_cast<std::int64_t>(key.size())};
+        ArrowStringView v{reinterpret_cast<const char*>(value.data()), static_cast<std::int64_t>(value.size())};
+        if (ArrowMetadataBuilderSet(&buffer, k, v) != NANOARROW_OK) {
+            ArrowBufferReset(&buffer);
+            error = "failed to build schema metadata";
+            return false;
+        }
+    }
+    const bool ok = ArrowSchemaSetMetadata(&schema, reinterpret_cast<const char*>(buffer.data)) == NANOARROW_OK;
+    ArrowBufferReset(&buffer);
+    if (!ok) {
+        error = "failed to set schema metadata";
+    }
+    return ok;
+}
+
+bool build_schema_from_mapping(const LanceSchemaMapping& mapping, ArrowSchema& schema, std::string& error,
+                               BlobHandling blob = BlobHandling::Ingest) {
     std::vector<const LanceField*> roots;
     for (const auto& field : mapping.fields) {
         if (field.parent_id == -1) {
@@ -195,7 +285,7 @@ bool build_schema_from_mapping(const LanceSchemaMapping& mapping, ArrowSchema& s
             error = "failed to set root struct type";
             return false;
         }
-        return init_schema_from_field(*roots[0], mapping, *schema.children[0], error);
+        return init_schema_from_field(*roots[0], mapping, *schema.children[0], error, blob);
     }
     ArrowSchemaInit(&schema);
     if (ArrowSchemaAllocateChildren(&schema, static_cast<int64_t>(roots.size())) != NANOARROW_OK) {
@@ -207,7 +297,7 @@ bool build_schema_from_mapping(const LanceSchemaMapping& mapping, ArrowSchema& s
         return false;
     }
     for (std::size_t i = 0; i < roots.size(); ++i) {
-        if (!init_schema_from_field(*roots[i], mapping, *schema.children[i], error)) {
+        if (!init_schema_from_field(*roots[i], mapping, *schema.children[i], error, blob)) {
             return false;
         }
     }
@@ -331,30 +421,79 @@ bool append_uint64_value(ArrowArray& array, const std::uint64_t value, std::stri
     return true;
 }
 
-bool append_blob_v2_row(ArrowArray& struct_array, const std::vector<std::uint8_t>& row_bytes,
-                        const std::vector<std::string>* uri_dictionary, std::string& error) {
+/// One Blob v2 row, in the shape the read asked for (see BlobHandling).
+bool append_blob_v2_row(ArrowArray& array, const std::vector<std::uint8_t>& row_bytes,
+                        const std::vector<std::string>* uri_dictionary, BlobHandling shape,
+                        const std::filesystem::path& data_file, std::string& error) {
     BlobV2ExternalDescriptor descriptor{};
     if (!blob_v2_unpack_descriptor_row(row_bytes, descriptor, error)) {
         return false;
     }
     // Dictionary-encoded rows carry an empty inline URI and a blob_id index into the dictionary.
-    if (uri_dictionary != nullptr && !uri_dictionary->empty() && descriptor.blob_uri.empty()) {
+    if (uri_dictionary != nullptr && !uri_dictionary->empty() && descriptor.blob_uri.empty() &&
+        descriptor.kind == kBlobKindExternal) {
         if (descriptor.blob_id >= uri_dictionary->size()) {
             error = "blob_id out of range for URI dictionary";
             return false;
         }
         descriptor.blob_uri = (*uri_dictionary)[descriptor.blob_id];
+        descriptor.blob_id = 0;
     }
-    auto* data = struct_array.children[0];
-    auto* uri = struct_array.children[1];
-    auto* position = struct_array.children[2];
-    auto* size_field = struct_array.children[3];
-    if (!append_null_binary(*data, error) || !append_one_string(*uri, descriptor.blob_uri, error) ||
-        !append_uint64_value(*position, descriptor.position, error) ||
-        !append_uint64_value(*size_field, descriptor.size, error)) {
-        return false;
+    const auto read_bytes = [&](std::vector<std::uint8_t>& bytes) {
+        BlobV2Location location;
+        return blob_v2_locate(descriptor, data_file, location, error) &&
+               blob_v2_read(location, 0, location.size, bytes, error);
+    };
+    const auto append_bytes = [&](ArrowArray& target, const std::vector<std::uint8_t>& bytes) {
+        ArrowBufferView view{};
+        view.data.data = bytes.data();
+        view.size_bytes = static_cast<int64_t>(bytes.size());
+        if (ArrowArrayAppendBytes(&target, view) != NANOARROW_OK) {
+            error = "failed to append blob bytes";
+            return false;
+        }
+        return true;
+    };
+    switch (shape) {
+        case BlobHandling::Binary: {
+            std::vector<std::uint8_t> bytes;
+            return read_bytes(bytes) && append_bytes(array, bytes);
+        }
+        case BlobHandling::Descriptions:
+        case BlobHandling::Locations: {
+            bool ok = append_uint64_value(*array.children[0], descriptor.kind, error) &&
+                      append_uint64_value(*array.children[1], descriptor.position, error) &&
+                      append_uint64_value(*array.children[2], descriptor.size, error) &&
+                      append_uint64_value(*array.children[3], descriptor.blob_id, error) &&
+                      append_one_string(*array.children[4], descriptor.blob_uri, error);
+            if (ok && shape == BlobHandling::Locations) {
+                BlobV2Location location;
+                ok = blob_v2_locate(descriptor, data_file, location, error) &&
+                     append_one_string(*array.children[5], location.file, error);
+            }
+            break;
+        }
+        case BlobHandling::Ingest: {
+            // nanolance's shape: `uri` for an external blob, `data` for one stored in the dataset
+            // (Lance's inline, packed and dedicated kinds, read from where they are).
+            auto* data = array.children[0];
+            bool ok = true;
+            if (descriptor.kind == kBlobKindExternal) {
+                ok = append_null_binary(*data, error) && append_one_string(*array.children[1], descriptor.blob_uri, error);
+            } else {
+                std::vector<std::uint8_t> bytes;
+                ok = read_bytes(bytes) && append_bytes(*data, bytes) &&
+                     append_one_string(*array.children[1], "", error);
+            }
+            ok = ok && append_uint64_value(*array.children[2], descriptor.position, error) &&
+                 append_uint64_value(*array.children[3], descriptor.size, error);
+            if (!ok) {
+                return false;
+            }
+            break;
+        }
     }
-    if (ArrowArrayFinishElement(&struct_array) != NANOARROW_OK) {
+    if (ArrowArrayFinishElement(&array) != NANOARROW_OK) {
         error = "failed to finish blob struct element";
         return false;
     }
@@ -363,25 +502,45 @@ bool append_blob_v2_row(ArrowArray& struct_array, const std::vector<std::uint8_t
 
 bool append_column_value_at_row(const LanceField& field, const ColumnValues& values, const std::int64_t row,
                                 const std::vector<std::string>* uri_dictionary, ArrowArray& array,
-                                std::string& error) {
+                                std::string& error, BlobHandling blob_shape = BlobHandling::Ingest) {
     if (field.extension_name == "lance.blob.v2") {
         if (values.kind != ColumnValues::Kind::BlobV2External) {
             error = "expected blob v2 packed values for " + field.name;
             return false;
         }
-        std::size_t offset = 0;
-        for (std::int64_t i = 0; i < row; ++i) {
-            if (static_cast<std::size_t>(i) >= values.blob_v2.row_packed_sizes.size()) {
-                error = "blob row index out of range";
-                return false;
-            }
-            offset += values.blob_v2.row_packed_sizes[static_cast<std::size_t>(i)];
-        }
-        if (static_cast<std::size_t>(row) >= values.blob_v2.row_packed_sizes.size()) {
+        const auto& sizes = values.blob_v2.row_packed_sizes;
+        if (row < 0 || static_cast<std::size_t>(row) >= sizes.size()) {
             error = "blob row index out of range";
             return false;
         }
-        const auto row_size = values.blob_v2.row_packed_sizes[static_cast<std::size_t>(row)];
+        if (!values.validity.empty() &&
+            ((values.validity[static_cast<std::size_t>(row) / 8U] >> (static_cast<std::size_t>(row) % 8U)) & 1U) == 0U) {
+            if (ArrowArrayAppendNull(&array, 1) != NANOARROW_OK) {
+                error = "failed to append a null blob";
+                return false;
+            }
+            return true;
+        }
+        // Rows are appended in order: continue from the previous row's offset instead of summing
+        // every earlier row's size again (which made a column of n blobs cost n^2).
+        thread_local struct {
+            const std::uint32_t* sizes = nullptr;
+            const std::uint8_t* payload = nullptr;
+            std::int64_t row = 0;
+            std::size_t offset = 0;
+        } cursor;
+        if (cursor.sizes != sizes.data() || cursor.payload != values.blob_v2.packed_payload.data() ||
+            cursor.row > row) {
+            cursor.sizes = sizes.data();
+            cursor.payload = values.blob_v2.packed_payload.data();
+            cursor.row = 0;
+            cursor.offset = 0;
+        }
+        for (; cursor.row < row; ++cursor.row) {
+            cursor.offset += sizes[static_cast<std::size_t>(cursor.row)];
+        }
+        const std::size_t offset = cursor.offset;
+        const auto row_size = sizes[static_cast<std::size_t>(row)];
         if (offset + row_size > values.blob_v2.packed_payload.size()) {
             error = "blob packed row out of range";
             return false;
@@ -389,7 +548,7 @@ bool append_column_value_at_row(const LanceField& field, const ColumnValues& val
         const std::vector<std::uint8_t> row_bytes(
             values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(offset),
             values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(offset + row_size));
-        return append_blob_v2_row(array, row_bytes, uri_dictionary, error);
+        return append_blob_v2_row(array, row_bytes, uri_dictionary, blob_shape, values.blob_v2.data_file, error);
     }
     if (lance_field_is_variable_width(field.logical_type)) {
         return append_string_at_row(array, values.variable, static_cast<std::size_t>(row), error);
@@ -492,6 +651,7 @@ struct ColumnPlan {
     const LanceField* field = nullptr;      // Blob path needs the full field
     ColumnValues* values = nullptr;
     const std::vector<std::string>* dict = nullptr;
+    BlobHandling blob_shape = BlobHandling::Ingest;  // Blob: the shape the batch schema asks for
     std::size_t width = 0;                   // Fixed
     FixedFmt fmt = FixedFmt::kUnsupported;   // Fixed
     /// The struct and list arrays from the top-level field down to the leaf `array`, outermost
@@ -514,7 +674,9 @@ struct ColumnPlan {
 /// nanoarrow hands `allocator->private_data` straight back to us; it is the vector itself.
 void release_adopted_vector(struct ArrowBufferAllocator* allocator, std::uint8_t* /*ptr*/,
                             std::int64_t /*size*/) {
-    delete static_cast<std::vector<std::uint8_t>*>(allocator->private_data);
+    auto* owned = static_cast<std::vector<std::uint8_t>*>(allocator->private_data);
+    buffer_pool::give(std::move(*owned));  // large ones are kept for the next read (buffer_pool.hpp)
+    delete owned;
 }
 
 /// Hand a decoded vector's memory to `out` WITHOUT copying it.
@@ -663,14 +825,8 @@ bool fill_fixed_child(ArrowArray* child, std::vector<std::uint8_t>&& bytes, std:
     // value in the Arrow buffer, so the bits have to be packed somewhere. They are packed into a fresh
     // vector, which is then adopted -- so this path still copies once (unavoidably) rather than twice.
     if (fmt == FixedFmt::kBool) {
-        const auto packed_bytes = static_cast<std::size_t>((rows + 7) / 8);
-        std::vector<std::uint8_t> packed(packed_bytes, 0U);
-        for (std::int64_t i = 0; i < rows; ++i) {
-            if (bytes[static_cast<std::size_t>(i)] != 0U) {
-                packed[static_cast<std::size_t>(i) >> 3U] |=
-                    static_cast<std::uint8_t>(1U << (static_cast<std::size_t>(i) & 7U));
-            }
-        }
+        std::vector<std::uint8_t> packed;
+        boolpack::pack_lsb_first(bytes.data(), static_cast<std::size_t>(rows), packed);
         if (!adopt_into_buffer(std::move(packed), data, error)) {
             return false;
         }
@@ -798,7 +954,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         plan.array = node_array;
         plan.field = field;
         plan.nodes = std::move(path);
-        if (plan.under_list() && (is_blob || is_fsl || field->column_index < 0)) {
+        if (plan.under_list() && (is_blob || field->column_index < 0)) {
             collect_error = "column '" + field->name + "': a list of " +
                             (is_blob ? std::string("blobs") : field->logical_type) + " is not read yet";
             return false;
@@ -818,6 +974,11 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         if (is_blob) {
             plan.kind = ColumnPlan::Kind::Blob;
             plan.dict = dict_for(field->id);
+            const std::string format = node_schema->format != nullptr ? node_schema->format : "";
+            plan.blob_shape = format == "Z"                   ? BlobHandling::Binary
+                              : node_schema->n_children == 6  ? BlobHandling::Locations
+                              : node_schema->n_children == 5  ? BlobHandling::Descriptions
+                                                              : BlobHandling::Ingest;
         } else if (is_fsl) {
             // One physical column of N-element rows. The decoded bytes ARE the child's values buffer:
             // N elements per row, back to back.
@@ -966,6 +1127,19 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     }
     for (std::int64_t row = 0; row < length; ++row) {
         for (auto& plan : plans) {
+            // A null value, in any column but a blob (whose own append handles it). Without this, every
+            // other column of a batch with a blob column read its nulls back as values.
+            if ((plan.kind == ColumnPlan::Kind::Variable || plan.kind == ColumnPlan::Kind::Fixed) &&
+                !plan.values->validity.empty() &&
+                ((plan.values->validity[static_cast<std::size_t>(row) / 8U] >> (static_cast<std::size_t>(row) % 8U)) &
+                 1U) == 0U) {
+                if (ArrowArrayAppendNull(plan.array, 1) != NANOARROW_OK) {
+                    error = "failed to append a null";
+                    ArrowArrayRelease(&batch);
+                    return false;
+                }
+                continue;
+            }
             switch (plan.kind) {
                 case ColumnPlan::Kind::Skip:
                 case ColumnPlan::Kind::FixedSizeList:  // refused above: this path builds no nested arrays
@@ -988,7 +1162,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                     }
                     break;
                 case ColumnPlan::Kind::Blob:
-                    if (!append_column_value_at_row(*plan.field, *plan.values, row, plan.dict, *plan.array, error)) {
+                    if (!append_column_value_at_row(*plan.field, *plan.values, row, plan.dict, *plan.array, error,
+                                                    plan.blob_shape)) {
                         ArrowArrayRelease(&batch);
                         return false;
                     }
@@ -1027,89 +1202,681 @@ struct PlannedFile {
     std::uint64_t rows = 0;            // LOGICAL rows: physical minus deleted. What a read returns.
     std::uint64_t skip = 0;            // logical rows to drop from the front
     std::uint64_t take = 0;            // logical rows to keep
+    std::filesystem::path data_dir;    // where the data files are; empty: <dataset>/data
+    /// A filtered read a scalar index answered: the only physical rows that may pass (ascending).
+    std::shared_ptr<const std::vector<std::uint32_t>> candidates;
 
     bool partial() const { return skip != 0U || take != rows; }
 };
 
-bool read_data_file_batch(const std::filesystem::path& dataset_path, const PlannedFile& planned,
-                          const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema, ArrowArray& batch,
-                          std::string& error,
-                          const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr) {
+/// One column of one data file, as the fragment's read decodes it.
+struct ColumnSource {
+    std::filesystem::path path;
+    const pb::Field* on_disk = nullptr;
+    const pb::ColumnMetadata* metadata = nullptr;
+    std::int32_t field_id = 0;
+    std::size_t value_bytes = 0;  // as compaction and slicing count it
+    std::uint64_t encoded_bytes = 0;
+    /// Format 2.0, a leaf below a list (or a string stored as list<uint8>): the columns it needs
+    /// besides its own. Null otherwise.
+    std::shared_ptr<const v20::LeafContext> v20;
+};
+
+/// Format 2.0 gives every field a column of its own -- a struct's (which holds nothing: 2.0 structs
+/// are never null) and a list's (its offsets) as well as each leaf's. nanolance reads leaves, so
+/// those parents are no source; a leaf below a list carries the list columns above it instead.
+bool is_parent_field(const LanceSchemaMapping& mapping, std::int32_t field_id) {
+    return std::any_of(mapping.fields.begin(), mapping.fields.end(),
+                       [&](const LanceField& f) { return f.parent_id == field_id; });
+}
+
+/// What a 2.0 leaf needs from its file besides its own column, or null when it needs nothing.
+bool v20_leaf_context(const LanceSchemaMapping& mapping, const LanceField& leaf,
+                      const std::unordered_map<std::int32_t, std::int32_t>& column_of,
+                      const std::vector<pb::ColumnMetadata>& columns, std::int32_t leaf_column,
+                      std::shared_ptr<const v20::LeafContext>& out, std::string& error) {
+    out.reset();
+    auto context = std::make_shared<v20::LeafContext>();
+    std::vector<const LanceField*> chain;
+    for (const auto* f = find_mapping_field(mapping, leaf.parent_id); f != nullptr;
+         f = find_mapping_field(mapping, f->parent_id)) {
+        chain.push_back(f);
+        if (chain.size() > 64U) {
+            error = "field '" + leaf.name + "' nests too deeply";
+            return false;
+        }
+    }
+    std::reverse(chain.begin(), chain.end());
+    for (const auto* f : chain) {
+        v20::Ancestor a;
+        a.is_list = lance_logical_type_is_list(f->logical_type);
+        a.name = f->name;
+        if (a.is_list) {
+            const auto it = column_of.find(f->id);
+            if (it == column_of.end() || it->second < 0 || static_cast<std::size_t>(it->second) >= columns.size()) {
+                error = "list '" + f->name + "' has no column in its data file";
+                return false;
+            }
+            a.column = &columns[static_cast<std::size_t>(it->second)];
+        }
+        context->ancestors.push_back(std::move(a));
+    }
+    if (lance_field_is_variable_width(leaf.logical_type) && leaf_column >= 0 &&
+        static_cast<std::size_t>(leaf_column) < columns.size() &&
+        v20::column_is_list_encoded(columns[static_cast<std::size_t>(leaf_column)])) {
+        if (static_cast<std::size_t>(leaf_column) + 1U >= columns.size()) {
+            error = "column '" + leaf.name + "' is stored as a list of bytes but its bytes column is missing";
+            return false;
+        }
+        context->binary_items = &columns[static_cast<std::size_t>(leaf_column) + 1U];
+    }
+    if (context->has_lists() || context->binary_items != nullptr) {
+        out = std::move(context);
+    }
+    return true;
+}
+
+/// Format 2.0: a struct its writer packed into one column (field metadata `packed`). Its fields are
+/// in no data file's field list; each is read out of the struct's column instead. Nothing to do for
+/// any other parent field, which is read through its leaves.
+bool v20_packed_struct_sources(const LanceSchemaMapping& mapping, const LanceField& parent,
+                               const std::unordered_map<std::int32_t, std::int32_t>& column_of,
+                               const std::filesystem::path& path, const pb::FileDescriptor& descriptor,
+                               const std::vector<pb::ColumnMetadata>& columns, std::int32_t column_index,
+                               const std::unordered_set<std::int32_t>* allowed_field_ids,
+                               std::vector<ColumnSource>& out, std::string& error) {
+    if (column_index < 0 || static_cast<std::size_t>(column_index) >= columns.size() ||
+        !v20::column_is_packed_struct(columns[static_cast<std::size_t>(column_index)])) {
+        return true;
+    }
+    int k = 0;
+    for (const auto& child : mapping.fields) {
+        if (child.parent_id != parent.id) {
+            continue;
+        }
+        const int slot = k++;
+        if (allowed_field_ids != nullptr && allowed_field_ids->count(child.id) == 0U) {
+            continue;
+        }
+        if (is_parent_field(mapping, child.id)) {
+            error = "packed struct '" + parent.name + "': its field '" + child.name + "' has fields of its own";
+            return false;
+        }
+        const auto* on_disk = find_descriptor_field(descriptor, child.id);
+        if (on_disk == nullptr) {
+            error = "data file references unknown field id";
+            return false;
+        }
+        std::shared_ptr<const v20::LeafContext> above;
+        if (!v20_leaf_context(mapping, child, column_of, columns, column_index, above, error)) {
+            return false;
+        }
+        auto context = above != nullptr ? std::make_shared<v20::LeafContext>(*above)
+                                        : std::make_shared<v20::LeafContext>();
+        context->packed_child = slot;
+        ColumnSource source;
+        source.path = path;
+        source.on_disk = on_disk;
+        source.metadata = &columns[static_cast<std::size_t>(column_index)];
+        source.field_id = child.id;
+        source.value_bytes = lance_logical_type_value_bytes(child.logical_type);
+        source.v20 = std::move(context);
+        for (const auto& page : source.metadata->pages) {
+            for (const auto size : page.buffer_sizes) {
+                source.encoded_bytes += size;
+            }
+        }
+        out.push_back(std::move(source));
+    }
+    return true;
+}
+
+/// A parallel read cuts a fragment into row ranges ("morsels") of at least this many encoded bytes,
+/// decoded independently and returned as a batch each -- no concatenation afterwards.
+/// NANOLANCE_MORSEL_KB overrides it (default 4096 of decode work: below that -- reads of a millisecond
+/// or two -- waking threads and building more batches costs about what it saves; under 64 the tests'
+/// setting, which cuts every page).
+std::uint64_t morsel_min_bytes() {
+    static const std::uint64_t bytes = [] {
+        const char* env = std::getenv("NANOLANCE_MORSEL_KB");
+        const auto kb = env == nullptr || *env == '\0' ? 4096ULL : std::strtoull(env, nullptr, 10);
+        return std::max<std::uint64_t>(1U, kb) << 10U;
+    }();
+    return bytes;
+}
+
+/// Physical row ranges covering [first, end): one with a single thread or a small read; otherwise up
+/// to two per thread, cut at page boundaries of the column holding the most bytes (so it is split
+/// with no page decoded twice) -- or, when its pages can give up row ranges (lance_page_row_addressable),
+/// evenly. A page no cut can avoid is decoded by every morsel it overlaps, so a plan that would decode
+/// over a quarter more than the whole is halved until it does not: a column of a few large pages
+/// is not worth splitting.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> plan_morsels(const std::vector<ColumnSource>& columns,
+                                                                  std::uint64_t first, std::uint64_t end) {
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> single{{first, end}};
+    const auto threads = parallel::threads();
+    if (threads <= 1U || end - first < 2U || columns.empty()) {
+        return single;
+    }
+    // A 2.0 leaf below a list is decoded whole (its pages count items, not rows), so cutting the
+    // rows would decode it once per morsel.
+    if (std::any_of(columns.begin(), columns.end(), [](const ColumnSource& c) { return c.v20 != nullptr; })) {
+        return single;
+    }
+    struct PageInfo {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t items = 0;  // values it decodes to
+        std::uint32_t lists = 0;  // list layers to unravel
+        bool addressable = false;
+    };
+    std::vector<std::vector<PageInfo>> pages(columns.size());
+    std::uint64_t range_bytes = 0;  // encoded bytes of the pages the range touches
+    std::size_t heaviest = 0;
+    std::uint64_t heaviest_bytes = 0;
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        std::uint64_t row = 0;
+        std::uint64_t column_bytes = 0;
+        for (const auto& page : columns[c].metadata->pages) {
+            PageInfo info;
+            info.begin = row;
+            info.end = row + page.length;
+            row = info.end;
+            if (info.end <= first || info.begin >= end) {
+                continue;
+            }
+            for (const auto size : page.buffer_sizes) {
+                info.bytes += size;
+            }
+            info.addressable = lance_page_row_addressable(page);
+            info.items = lance_page_items(page);
+            info.lists = lance_page_list_depth(page);
+            column_bytes += info.bytes;
+            pages[c].push_back(info);
+        }
+        range_bytes += column_bytes;
+        if (column_bytes > heaviest_bytes) {
+            heaviest_bytes = column_bytes;
+            heaviest = c;
+        }
+    }
+    // Work: per page, its encoded bytes or what it decodes to, whichever is more -- bit-packed small
+    // integers decode to four or eight times their size, a page of dictionary-coded strings to many
+    // times its (value count x the value width; a string counts as 32 bytes -- dictionary lookup or
+    // FSST expansion, an offset, the bytes -- which is about what one costs to decode against an int).
+    std::uint64_t work = 0;
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        // The values' own type (a list column's items), as the decoder sees it.
+        const auto& leaf_type = columns[c].on_disk->logical_type;
+        const std::uint64_t per_value = lance_field_is_variable_width(leaf_type)
+                                            ? 32U
+                                            : std::max<std::uint64_t>(1U, lance_logical_type_value_bytes(leaf_type));
+        for (const auto& page : pages[c]) {
+            const auto rows = std::max<std::uint64_t>(1U, page.end - page.begin);
+            const auto rows_here = std::min(end, page.end) - std::max(first, page.begin);
+            // A list page also costs its levels to unravel, per list layer, whatever its items'
+            // width -- and has a level for every row, empty lists included.
+            const auto units = page.lists != 0U ? std::max(page.items, rows) : page.items;
+            const auto weight = page.lists != 0U ? std::max<std::uint64_t>(per_value, 32U * page.lists) : per_value;
+            work += std::max(page.bytes, units * rows_here / rows * weight);
+        }
+    }
+    auto want = std::min<std::uint64_t>(2U * threads, work / morsel_min_bytes());
+
+    // What a plan decodes: every overlapped page, whole unless it is row-addressable.
+    const auto cost = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& plan) {
+        double total = 0;
+        for (const auto& column : pages) {
+            for (const auto& page : column) {
+                for (const auto& [a, b] : plan) {
+                    const auto lo = std::max(a, page.begin);
+                    const auto hi = std::min(b, page.end);
+                    if (lo < hi) {
+                        total += page.addressable ? static_cast<double>(page.bytes) * static_cast<double>(hi - lo) /
+                                                        static_cast<double>(page.end - page.begin)
+                                                  : static_cast<double>(page.bytes);
+                    }
+                }
+            }
+        }
+        return total;
+    };
+    const auto& spine = pages[heaviest];
+    const bool spine_addressable =
+        std::all_of(spine.begin(), spine.end(), [](const PageInfo& p) { return p.addressable; });
+    const bool test_setting = morsel_min_bytes() < (std::uint64_t{64} << 10U);
+    for (; want > 1U; want /= 2U) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> plan;
+        std::uint64_t at = first;
+        for (std::uint64_t k = 1; k < want; ++k) {
+            std::uint64_t cut = first + (end - first) * k / want;
+            if (!spine_addressable && !test_setting) {
+                // The page boundary nearest the k-th share of the heaviest column's bytes.
+                const auto target = heaviest_bytes * k / want;
+                std::uint64_t acc = 0;
+                cut = 0;
+                for (const auto& page : spine) {
+                    acc += page.bytes;
+                    if (acc >= target) {
+                        cut = page.end;
+                        break;
+                    }
+                }
+            }
+            if (cut > at && cut < end) {
+                plan.emplace_back(at, cut);
+                at = cut;
+            }
+        }
+        plan.emplace_back(at, end);
+        // Morsels under 64 KiB are a test setting: cut evenly, through any page, whatever it costs.
+        if (plan.size() > 1U && (test_setting || cost(plan) <= 1.25 * static_cast<double>(range_bytes))) {
+            return plan;
+        }
+    }
+    return single;
+}
+
+/// One fragment's rows as Arrow batches: one batch, or with several threads one per morsel.
+
+/// Which of Lance's row identity columns a read adds after the data columns.
+struct RowIdColumns {
+    bool row_id = false;       // `_rowid`
+    bool row_address = false;  // `_rowaddr`
+
+    bool any() const { return row_id || row_address; }
+};
+
+/// What a scan filters by: `expr` (null for no filter), bound to `schema`, reading the columns `ids`.
+/// The fields a read wants that no data file of the fragment holds: columns added to the schema
+/// after the fragment was written (pylance's add_columns with a pa.field writes no data). They read
+/// as nulls, as in Lance.
+std::vector<const LanceField*> fields_missing_from(const PlannedFile& planned, const LanceSchemaMapping& mapping,
+                                                   const std::unordered_set<std::int32_t>* allowed_field_ids,
+                                                   const std::vector<ColumnSource>& sources) {
+    std::unordered_set<std::int32_t> held;
+    for (const auto& file : planned.files) {
+        held.insert(file.fields.begin(), file.fields.end());
+    }
+    for (const auto& source : sources) {  // a 2.0 packed struct's fields, which no file lists
+        held.insert(source.field_id);
+    }
+    std::vector<const LanceField*> missing;
+    for (const auto& f : mapping.fields) {
+        if (f.column_index < 0 || held.count(f.id) != 0U ||
+            (allowed_field_ids != nullptr && allowed_field_ids->count(f.id) == 0U)) {
+            continue;
+        }
+        missing.push_back(&f);
+    }
+    return missing;
+}
+
+/// `rows` nulls of `field`'s type.
+bool null_column_values(const LanceField& field, std::uint64_t rows, ColumnValues& out, std::string& error) {
+    out = ColumnValues{};
+    out.rows = rows;
+    out.validity.assign(static_cast<std::size_t>((rows + 7U) / 8U), 0U);
+    out.null_count = rows;
+    if (lance_field_is_variable_width(field.logical_type)) {
+        out.kind = ColumnValues::Kind::VariableWidth;
+        out.variable.large = lance_logical_type_has_large_offsets(field.logical_type);
+        out.variable.offsets.assign(static_cast<std::size_t>(rows + 1U) * (out.variable.large ? 8U : 4U), 0U);
+        return true;
+    }
+    const auto width = lance_logical_type_value_bytes(field.logical_type);
+    if (width == 0U || field.logical_type == "struct" || field.logical_type.rfind("list", 0) == 0 ||
+        field.logical_type.rfind("large_list", 0) == 0) {
+        error = "column '" + field.name + "' has no data in this fragment, and nulls of type " +
+                field.logical_type + " are not read yet";
+        return false;
+    }
+    out.kind = ColumnValues::Kind::FixedWidth;
+    out.fixed.assign(static_cast<std::size_t>(rows) * width, 0U);
+    std::string element;
+    std::uint64_t items = 0;
+    if (lance_fixed_size_list_parts(field.logical_type, element, items)) {
+        out.items_per_row = items;
+    }
+    return true;
+}
+
+struct FilterSpec {
+    const expr::Expression* expr = nullptr;
+    const ArrowSchema* schema = nullptr;
+    const std::vector<std::int32_t>* ids = nullptr;
+};
+
+/// A row's address: its fragment in the high 32 bits, its offset in the fragment's data files (deleted
+/// rows counted) in the low. Without stable row ids it is also the row's id.
+std::uint64_t row_address(std::uint64_t fragment_id, std::uint64_t offset) {
+    return (fragment_id << 32U) | offset;
+}
+
+bool make_u64_array(const std::vector<std::uint64_t>& values, ArrowArray& out, std::string& error) {
+    if (ArrowArrayInitFromType(&out, NANOARROW_TYPE_UINT64) != NANOARROW_OK) {
+        error = "failed to allocate a row id column";
+        return false;
+    }
+    auto* data = ArrowArrayBuffer(&out, 1);
+    if (ArrowBufferAppend(data, values.data(), static_cast<std::int64_t>(values.size() * sizeof(std::uint64_t))) !=
+        NANOARROW_OK) {
+        ArrowArrayRelease(&out);
+        error = "failed to fill a row id column";
+        return false;
+    }
+    out.length = static_cast<std::int64_t>(values.size());
+    out.null_count = 0;
+    if (ArrowArrayFinishBuildingDefault(&out, nullptr) != NANOARROW_OK) {
+        ArrowArrayRelease(&out);
+        error = "failed to finish a row id column";
+        return false;
+    }
+    return true;
+}
+
+/// Replace `batch` (a struct array) by one with the row identity columns of `physical` (offsets in
+/// fragment `fragment_id`) after its own. `batch.release` null means a batch without data columns.
+bool add_row_id_columns(ArrowArray& batch, std::int64_t length, std::uint64_t fragment_id,
+                        const std::vector<std::uint64_t>& physical, const RowIdColumns& ids, std::string& error) {
+    std::vector<std::uint64_t> addresses(physical.size());
+    for (std::size_t i = 0; i < physical.size(); ++i) {
+        addresses[i] = row_address(fragment_id, physical[i]);
+    }
+    const auto own = batch.release == nullptr ? 0 : batch.n_children;
+    const auto extra = static_cast<std::int64_t>(ids.row_id) + static_cast<std::int64_t>(ids.row_address);
+    ArrowArray out{};
+    if (ArrowArrayInitFromType(&out, NANOARROW_TYPE_STRUCT) != NANOARROW_OK ||
+        ArrowArrayAllocateChildren(&out, own + extra) != NANOARROW_OK) {
+        if (out.release != nullptr) {
+            ArrowArrayRelease(&out);
+        }
+        error = "failed to allocate a batch with row ids";
+        return false;
+    }
+    for (std::int64_t c = 0; c < own; ++c) {
+        ArrowArrayMove(batch.children[c], out.children[c]);
+    }
+    auto next = own;
+    if (ids.row_id && !make_u64_array(addresses, *out.children[next++], error)) {
+        ArrowArrayRelease(&out);
+        return false;
+    }
+    if (ids.row_address && !make_u64_array(addresses, *out.children[next++], error)) {
+        ArrowArrayRelease(&out);
+        return false;
+    }
+    out.length = length;
+    out.null_count = 0;
+    if (batch.release != nullptr) {
+        ArrowArrayRelease(&batch);
+    }
+    batch = out;
+    return true;
+}
+
+/// `schema` with the row identity columns after its own fields.
+bool add_row_id_fields(ArrowSchema& schema, const RowIdColumns& ids, std::string& error) {
+    ArrowSchema out{};
+    ArrowSchemaInit(&out);
+    const auto own = schema.n_children;
+    const auto extra = static_cast<std::int64_t>(ids.row_id) + static_cast<std::int64_t>(ids.row_address);
+    if (ArrowSchemaSetTypeStruct(&out, own + extra) != NANOARROW_OK ||
+        ArrowSchemaSetMetadata(&out, schema.metadata) != NANOARROW_OK) {
+        ArrowSchemaRelease(&out);
+        error = "failed to allocate a schema with row ids";
+        return false;
+    }
+    for (std::int64_t c = 0; c < own; ++c) {
+        ArrowSchemaRelease(out.children[c]);
+        ArrowSchemaMove(schema.children[c], out.children[c]);
+    }
+    auto next = own;
+    for (const char* name : {"_rowid", "_rowaddr"}) {
+        if ((name[4] == 'i' && !ids.row_id) || (name[4] == 'a' && !ids.row_address)) {
+            continue;
+        }
+        auto* child = out.children[next++];
+        if (ArrowSchemaSetType(child, NANOARROW_TYPE_UINT64) != NANOARROW_OK ||
+            ArrowSchemaSetName(child, name) != NANOARROW_OK) {
+            ArrowSchemaRelease(&out);
+            error = "failed to add a row id field";
+            return false;
+        }
+        // Nullable, as pylance declares them, though they never hold a null.
+    }
+    ArrowSchemaRelease(&schema);
+    ArrowSchemaMove(&out, &schema);
+    return true;
+}
+
+/// Keep the decoded rows (`take` of them, the missing fields among them as nulls) that `filter`
+/// passes: every column compacted, `physical_rows` too when `track_rows`. `out_rows` is what is left.
+bool filter_decoded_rows(const FilterSpec& filter, const LanceSchemaMapping& mapping,
+                         const std::vector<ColumnSource>& columns, const std::vector<const LanceField*>& missing,
+                         std::unordered_map<std::int32_t, ColumnValues>& by_field, std::uint64_t take, bool track_rows,
+                         std::vector<std::uint64_t>& physical_rows, std::uint64_t& out_rows, std::string& why) {
+    const auto n_columns = columns.size();
+    out_rows = take;
+    // Evaluate on copies of the filter's columns (building a batch consumes its inputs), then drop the
+    // rows that do not pass from every column.
+    std::unordered_map<std::int32_t, ColumnValues> copies;
+    for (const auto id : *filter.ids) {
+        const auto it = by_field.find(id);
+        if (it != by_field.end()) {
+            copies.emplace(id, it->second);
+        }
+    }
+    std::vector<std::uint8_t> pass;
+    if (filter.schema->n_children == 0) {
+        ArrowArray empty{};
+        if (ArrowArrayInitFromSchema(&empty, filter.schema, nullptr) != NANOARROW_OK) {
+            why = "failed to build the filter batch";
+            return false;
+        }
+        empty.length = static_cast<std::int64_t>(take);
+        const bool ok = filter.expr->filter(empty, pass, why);
+        ArrowArrayRelease(&empty);
+        if (!ok) {
+            return false;
+        }
+    } else {
+        ArrowArray probe{};
+        if (!build_batch_from_schema(*filter.schema, mapping, copies, static_cast<std::int64_t>(take), probe, why)) {
+            return false;
+        }
+        const bool ok = filter.expr->filter(probe, pass, why);
+        ArrowArrayRelease(&probe);
+        if (!ok) {
+            return false;
+        }
+    }
+    out_rows = static_cast<std::uint64_t>(std::count(pass.begin(), pass.end(), 1U));
+    if (out_rows == take) {
+        return true;
+    }
+    for (std::size_t c = 0; c < n_columns; ++c) {
+        if (!compact_column_values(by_field[columns[c].field_id], pass, take, columns[c].value_bytes, why)) {
+            return false;
+        }
+    }
+    for (const auto* field : missing) {
+        if (!null_column_values(*field, out_rows, by_field[field->id], why)) {
+            return false;
+        }
+    }
+    if (track_rows) {
+        std::vector<std::uint64_t> kept;
+        kept.reserve(static_cast<std::size_t>(out_rows));
+        for (std::size_t r = 0; r < physical_rows.size(); ++r) {
+            if (pass[r] != 0U) {
+                kept.push_back(physical_rows[r]);
+            }
+        }
+        physical_rows = std::move(kept);
+    }
+    return true;
+}
+
+bool read_candidate_rows(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                         const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
+                         std::vector<ArrowArray>& out, std::string& error,
+                         const std::unordered_set<std::int32_t>* allowed_field_ids, const RowIdColumns& ids,
+                         const FilterSpec& filter);
+
+bool read_data_file_batches(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                            const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
+                            std::vector<ArrowArray>& out, std::string& error,
+                            const std::unordered_set<std::int32_t>* allowed_field_ids = nullptr,
+                            const RowIdColumns& ids = {}, const FilterSpec& filter = {}) {
     if (planned.files.empty()) {
         error = "fragment has no data files";
         return false;
+    }
+    if (planned.candidates != nullptr && filter.expr != nullptr && !planned.partial()) {
+        return read_candidate_rows(dataset_path, planned, mapping, batch_schema, out, error, allowed_field_ids, ids,
+                                   filter);
+    }
+    // Late materialization: a filter that reads fewer columns than the read returns is evaluated on
+    // its own columns first; when few rows pass, only those rows of the other columns are decoded.
+    if (filter.expr != nullptr && filter.schema->n_children != 0 && !planned.partial()) {
+        std::unordered_set<std::int32_t> filter_only(filter.ids->begin(), filter.ids->end());
+        const bool more = std::any_of(mapping.fields.begin(), mapping.fields.end(), [&](const LanceField& f) {
+            return filter_only.count(f.id) == 0U && (allowed_field_ids == nullptr || allowed_field_ids->count(f.id) != 0U);
+        });
+        if (more) {
+            std::vector<ArrowArray> passed;
+            RowIdColumns addresses;
+            addresses.row_address = true;
+            if (!read_data_file_batches(dataset_path, planned, mapping, *filter.schema, passed, error, &filter_only,
+                                        addresses, filter)) {
+                return false;
+            }
+            auto rows = std::make_shared<std::vector<std::uint32_t>>();
+            for (auto& b : passed) {
+                const ArrowArray* addr = b.children[b.n_children - 1];
+                const auto* v = static_cast<const std::uint64_t*>(addr->buffers[1]) + addr->offset;
+                for (std::int64_t r = 0; r < addr->length; ++r) {
+                    rows->push_back(static_cast<std::uint32_t>(v[r] & 0xFFFFFFFFULL));
+                }
+                ArrowArrayRelease(&b);
+            }
+            if (rows->empty()) {
+                return true;
+            }
+            if (rows->size() * 8U < planned.physical_rows) {
+                PlannedFile narrowed = planned;
+                narrowed.candidates = std::move(rows);
+                return read_candidate_rows(dataset_path, narrowed, mapping, batch_schema, out, error,
+                                           allowed_field_ids, ids, filter);
+            }
+        }
     }
 
     // One batch is one read operation, so each data file it touches is validated once here rather
     // than once per page buffer (see DataFileReadScope).
     const DataFileReadScope read_scope;
 
-    // One fragment, one batch -- however many files its columns are split across.
-    std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
+    // One fragment -- however many files its columns are split across.
+    struct OpenFile {
+        pb::FileDescriptor descriptor;
+        std::vector<pb::ColumnMetadata> columns;
+    };
+    std::vector<OpenFile> files(planned.files.size());
+    std::vector<ColumnSource> columns;
     std::int64_t length = -1;
-    for (const auto& data_file : planned.files) {
+    for (std::size_t f = 0; f < planned.files.size(); ++f) {
+        const auto& data_file = planned.files[f];
         // data_file.path is attacker-controlled (it comes out of the untrusted manifest). Confine it
         // under <dataset>/data/ so a hostile ".."/absolute path can't make the reader open a file
         // outside the dataset. The writer only ever stores a bare filename here, so legitimate
         // datasets are unaffected.
-        const auto jailed = safe_join_under(dataset_path / "data", data_file.path);
+        const auto jailed = safe_join_under(planned.data_dir.empty() ? dataset_path / "data" : planned.data_dir,
+                                            data_file.path);
         if (!jailed) {
             error = "data file path escapes the dataset directory";
             return false;
         }
         const auto& path = *jailed;
-        pb::FileDescriptor descriptor{};
+        auto& open = files[f];
         LanceDataFileFooterLayout layout{};
-        if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
+        if (!read_lance_data_file_footer_and_descriptor(path, open.descriptor, layout, error)) {
             return false;
         }
-        std::vector<pb::ColumnMetadata> column_metadatas;
-        if (!read_lance_data_file_column_metadatas(path, layout, column_metadatas, error)) {
+        if (!read_lance_data_file_column_metadatas(path, layout, open.columns, error)) {
             return false;
         }
         if (data_file.fields.size() != data_file.column_indices.size()) {
             error = "data file field/column index mismatch";
             return false;
         }
+        const bool v20_file = layout.is_v2_0();
+        std::unordered_map<std::int32_t, std::int32_t> column_of;
+        for (std::size_t i = 0; v20_file && i < data_file.fields.size(); ++i) {
+            column_of.emplace(data_file.fields[i], data_file.column_indices[i]);
+        }
         // Every file of a fragment describes the SAME rows. A disagreement means the manifest and the
         // files are out of step, and merging them would silently pad or truncate a column.
         if (length < 0) {
-            length = static_cast<std::int64_t>(descriptor.length);
-        } else if (static_cast<std::uint64_t>(length) != descriptor.length) {
+            length = static_cast<std::int64_t>(open.descriptor.length);
+        } else if (static_cast<std::uint64_t>(length) != open.descriptor.length) {
             error = "data files within one fragment disagree on their row count";
             return false;
         }
 
         for (std::size_t i = 0; i < data_file.fields.size(); ++i) {
             const auto field_id = data_file.fields[i];
-            // Skip columns not in the projection (if one is set).
+            // Skip columns not in the projection (if one is set), and columns the schema no longer
+            // has: a dropped column's data stays in the files it was written to.
+            if (find_mapping_field(mapping, field_id) == nullptr) continue;
+            if (v20_file && is_parent_field(mapping, field_id)) {  // read through its leaves
+                if (!v20_packed_struct_sources(mapping, *find_mapping_field(mapping, field_id), column_of, path,
+                                               open.descriptor, open.columns, data_file.column_indices[i],
+                                               allowed_field_ids, columns, error)) {
+                    return false;
+                }
+                continue;
+            }
             if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
 
             const auto column_index = data_file.column_indices[i];
-            if (column_index < 0 ||
-                static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
+            if (column_index < 0 || static_cast<std::size_t>(column_index) >= open.columns.size()) {
                 error = "data file column index out of range";
                 return false;
             }
-            const auto* on_disk = find_descriptor_field(descriptor, field_id);
+            const auto* on_disk = find_descriptor_field(open.descriptor, field_id);
             if (on_disk == nullptr) {
                 error = "data file references unknown field id";
                 return false;
             }
-            ColumnValues values;
-            if (!decode_lance_physical_column(path, *on_disk,
-                                              column_metadatas[static_cast<std::size_t>(column_index)],
-                                              values, error)) {
+            ColumnSource source;
+            source.path = path;
+            source.on_disk = on_disk;
+            source.metadata = &open.columns[static_cast<std::size_t>(column_index)];
+            source.field_id = field_id;
+            const auto* field = find_mapping_field(mapping, field_id);
+            source.value_bytes = field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            if (v20_file && field != nullptr &&
+                !v20_leaf_context(mapping, *field, column_of, open.columns, column_index, source.v20, error)) {
                 return false;
             }
-            decoded_by_field_id.emplace(field_id, std::move(values));
+            for (const auto& page : source.metadata->pages) {
+                for (const auto size : page.buffer_sizes) {
+                    source.encoded_bytes += size;
+                }
+            }
+            columns.push_back(std::move(source));
         }
     }
+    const auto physical = static_cast<std::uint64_t>(length);
+    const auto missing = fields_missing_from(planned, mapping, allowed_field_ids, columns);
 
     // Deletions first, then the row range: a range is expressed in LOGICAL row numbers, which only
     // exist once the deleted rows are gone.
+    std::vector<std::uint8_t> keep;  // empty: no deletions
     if (planned.deletion_file.present) {
-        if (static_cast<std::uint64_t>(length) != planned.physical_rows) {
+        if (physical != planned.physical_rows) {
             error = "data file holds " + std::to_string(length) +
                     " rows but the manifest claims " + std::to_string(planned.physical_rows) +
                     "; refusing to apply a deletion vector against rows that do not line up";
@@ -1119,50 +1886,444 @@ bool read_data_file_batch(const std::filesystem::path& dataset_path, const Plann
         if (!read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
             return false;
         }
-        std::vector<std::uint8_t> keep(static_cast<std::size_t>(length), 1U);
+        keep.assign(static_cast<std::size_t>(physical), 1U);
         for (const auto row : deleted) {
-            if (row >= static_cast<std::uint64_t>(length)) {
+            if (row >= physical) {
                 error = "deletion file names row " + std::to_string(row) + " but the fragment holds " +
                         std::to_string(length);
                 return false;
             }
             keep[row] = 0U;
         }
-        for (auto& [field_id, values] : decoded_by_field_id) {
-            const auto* field = find_mapping_field(mapping, field_id);
-            const std::size_t value_bytes =
-                field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
-            if (!compact_column_values(values, keep, static_cast<std::uint64_t>(length), value_bytes,
-                                       error)) {
-                return false;
-            }
-        }
-        length = static_cast<std::int64_t>(planned.rows);
     }
+    const auto logical = keep.empty() ? physical
+                                      : static_cast<std::uint64_t>(std::count(keep.begin(), keep.end(), 1U));
+    // The plan's skip/take came from the MANIFEST's per-fragment row count, while the rows are here in
+    // the data file. If the two disagree, the arithmetic that decided which files to skip was wrong,
+    // and a silently misaligned row range is exactly the failure this must not have.
+    if ((planned.partial() || !keep.empty()) && logical != planned.rows) {
+        error = "data file holds " + std::to_string(logical) + " rows but the manifest claims " +
+                std::to_string(planned.rows) + "; refusing to guess which rows a range covers";
+        return false;
+    }
+    const auto want_first = planned.partial() ? planned.skip : 0U;
+    const auto want_end = planned.partial() ? planned.skip + planned.take : logical;
+    // The physical rows holding logical rows [want_first, want_end).
+    std::uint64_t phys_first = want_first;
+    std::uint64_t phys_end = want_end;
+    std::vector<std::uint64_t> logical_before;  // with deletions: logical rows before each physical row
+    if (!keep.empty()) {
+        logical_before.resize(static_cast<std::size_t>(physical) + 1U, 0U);
+        for (std::size_t r = 0; r < keep.size(); ++r) {
+            logical_before[r + 1U] = logical_before[r] + keep[r];
+        }
+        phys_first = static_cast<std::uint64_t>(
+            std::upper_bound(logical_before.begin(), logical_before.end(), want_first) - logical_before.begin() - 1);
+        phys_end = want_end == 0U ? 0U
+                                  : static_cast<std::uint64_t>(std::lower_bound(logical_before.begin(),
+                                                                                logical_before.end(), want_end) -
+                                                               logical_before.begin());
+        phys_end = std::max(phys_end, phys_first);
+    }
+    const auto morsels = plan_morsels(columns, phys_first, phys_end);
+    work_stats::add(work_stats::counters().fragment_reads, 1U);
+    work_stats::add(work_stats::counters().read_morsels, morsels.size());
+    const bool whole = morsels.size() == 1U && phys_first == 0U && phys_end == physical;
 
-    if (planned.partial()) {
-        // The plan's skip/take came from the MANIFEST's per-fragment row count, while the rows are
-        // here in the data file. If the two disagree, the arithmetic that decided which files to skip
-        // was wrong, and a silently misaligned row range is exactly the failure this must not have.
-        if (static_cast<std::uint64_t>(length) != planned.rows) {
-            error = "data file holds " + std::to_string(length) +
-                    " rows but the manifest claims " + std::to_string(planned.rows) +
-                    "; refusing to guess which rows a range covers";
+    // Decode: every (morsel, column) is its own task.
+    const auto n_columns = columns.size();
+    std::vector<ColumnValues> decoded(morsels.size() * n_columns);
+    std::vector<std::string> errors(decoded.size());
+    parallel::for_each(decoded.size(), [&](std::size_t t) {
+        const auto& morsel = morsels[t / n_columns];
+        const auto& c = columns[t % n_columns];
+        if (c.v20 != nullptr) {
+            if (whole) {
+                v20::decode_column(c.path, *c.on_disk, *c.metadata, c.v20.get(), decoded[t], errors[t]);
+            } else {
+                v20::decode_column_range(c.path, *c.on_disk, *c.metadata, c.v20.get(), morsel.first,
+                                         morsel.second - morsel.first, c.value_bytes, decoded[t], errors[t]);
+            }
+        } else if (whole) {
+            decode_lance_physical_column(c.path, *c.on_disk, *c.metadata, decoded[t], errors[t]);
+        } else {
+            decode_lance_physical_column_range(c.path, *c.on_disk, *c.metadata, morsel.first,
+                                               morsel.second - morsel.first, c.value_bytes, decoded[t], errors[t]);
+        }
+    });
+    for (const auto& e : errors) {
+        if (!e.empty()) {
+            error = e;
             return false;
         }
-        for (auto& [field_id, values] : decoded_by_field_id) {
-            const auto* field = find_mapping_field(mapping, field_id);
-            const std::size_t value_bytes =
-                field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
-            if (!slice_column_values(values, planned.skip, planned.take,
-                                     static_cast<std::uint64_t>(length), value_bytes, error)) {
-                return false;
-            }
-        }
-        length = static_cast<std::int64_t>(planned.take);
     }
 
-    return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id, length, batch, error);
+    // Each morsel: its deletions, its part of the range, its batch.
+    std::vector<ArrowArray> batches(morsels.size(), ArrowArray{});
+    std::vector<std::uint8_t> built(morsels.size(), 0U);
+    std::vector<std::string> batch_errors(morsels.size());
+    parallel::for_each(morsels.size(), [&](std::size_t k) {
+        auto& why = batch_errors[k];
+        const auto [p0, p1] = morsels[k];
+        std::uint64_t rows = p1 - p0;
+        std::uint64_t logical_first = p0;
+        std::unordered_map<std::int32_t, ColumnValues> by_field;
+        for (std::size_t c = 0; c < n_columns; ++c) {
+            by_field.emplace(columns[c].field_id, std::move(decoded[k * n_columns + c]));
+        }
+        if (!keep.empty()) {
+            const std::vector<std::uint8_t> part(keep.begin() + static_cast<std::ptrdiff_t>(p0),
+                                                 keep.begin() + static_cast<std::ptrdiff_t>(p1));
+            for (std::size_t c = 0; c < n_columns; ++c) {
+                if (!compact_column_values(by_field[columns[c].field_id], part, p1 - p0, columns[c].value_bytes,
+                                           why)) {
+                    return;
+                }
+            }
+            logical_first = logical_before[p0];
+            rows = logical_before[p1] - logical_first;
+        }
+        const auto lo = std::max(logical_first, want_first);
+        const auto hi = std::min(logical_first + rows, want_end);
+        if (hi <= lo && !(morsels.size() == 1U)) {
+            return;  // nothing of the range here
+        }
+        const auto take = hi > lo ? hi - lo : 0U;
+        if (lo != logical_first || take != rows) {
+            for (std::size_t c = 0; c < n_columns; ++c) {
+                if (!slice_column_values(by_field[columns[c].field_id], lo - logical_first, take, rows,
+                                         columns[c].value_bytes, why)) {
+                    return;
+                }
+            }
+        }
+        for (const auto* field : missing) {
+            if (!null_column_values(*field, take, by_field[field->id], why)) {
+                return;
+            }
+        }
+        std::vector<std::uint64_t> physical_rows;
+        if (ids.any()) {
+            // The physical rows of this batch: the morsel's rows that survive deletion, then the range.
+            physical_rows.reserve(static_cast<std::size_t>(take));
+            std::uint64_t logical_row = logical_first;
+            for (std::uint64_t p = p0; p < p1 && physical_rows.size() < take; ++p) {
+                if (!keep.empty() && keep[p] == 0U) {
+                    continue;
+                }
+                if (logical_row++ >= lo) {
+                    physical_rows.push_back(p);
+                }
+            }
+        }
+        std::uint64_t out_rows = take;
+        if (filter.expr != nullptr) {
+            if (!filter_decoded_rows(filter, mapping, columns, missing, by_field, take, ids.any(), physical_rows,
+                                     out_rows, why)) {
+                return;
+            }
+            if (out_rows == 0U) {
+                return;  // nothing of this morsel passes
+            }
+        }
+        if (batch_schema.n_children != 0 &&
+            !build_batch_from_schema(batch_schema, mapping, by_field, static_cast<std::int64_t>(out_rows), batches[k],
+                                     why)) {
+            return;
+        }
+        if (ids.any() && !add_row_id_columns(batches[k], static_cast<std::int64_t>(out_rows), planned.fragment_id,
+                                             physical_rows, ids, why)) {
+            return;
+        }
+        built[k] = 1U;
+    });
+    bool ok = true;
+    for (std::size_t k = 0; k < morsels.size(); ++k) {
+        if (!batch_errors[k].empty() && ok) {
+            error = batch_errors[k];
+            ok = false;
+        }
+    }
+    for (std::size_t k = 0; k < morsels.size(); ++k) {
+        if (built[k] == 0U) {
+            continue;
+        }
+        if (ok) {
+            out.push_back(batches[k]);
+        } else if (batches[k].release != nullptr) {
+            ArrowArrayRelease(&batches[k]);
+        }
+    }
+    return ok;
+}
+
+/// A data file's parsed footer, descriptor and column metadata, kept for take(): a shuffled epoch calls
+/// take once per mini-batch, and re-reading and re-parsing a file's page table every time (4,890 pages
+/// for the Speech Commands waveforms) cost more than decoding the rows. Keyed by path, file size and
+/// modification time -- Lance never rewrites a data file in place, a new version writes new files --
+/// and bounded, so a long-running loader over many datasets does not grow without limit.
+struct CachedFileMetadata {
+    pb::FileDescriptor descriptor;
+    LanceDataFileFooterLayout layout{};
+    std::vector<pb::ColumnMetadata> columns;
+};
+
+bool cached_file_metadata(const std::filesystem::path& path, std::shared_ptr<const CachedFileMetadata>& out,
+                          std::string& error) {
+    struct Entry {
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type mtime{};
+        std::shared_ptr<const CachedFileMetadata> metadata;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::string, Entry> cache;
+    constexpr std::size_t kMaxFiles = 256U;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
+    const auto key = path.string();
+    if (!ec) {
+        const std::lock_guard<std::mutex> lock(mutex);
+        const auto it = cache.find(key);
+        if (it != cache.end() && it->second.size == size && it->second.mtime == mtime) {
+            out = it->second.metadata;
+            return true;
+        }
+    }
+    auto fresh = std::make_shared<CachedFileMetadata>();
+    if (!read_lance_data_file_footer_and_descriptor(path, fresh->descriptor, fresh->layout, error) ||
+        !read_lance_data_file_column_metadatas(path, fresh->layout, fresh->columns, error)) {
+        return false;
+    }
+    out = fresh;
+    if (!ec) {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (cache.size() >= kMaxFiles) {
+            cache.clear();
+        }
+        cache[key] = Entry{size, mtime, fresh};
+    }
+    return true;
+}
+
+/// One fragment's share of a take: `logical` are its requested rows, ascending, fragment-local and
+/// counted without the deleted ones. Deleted rows are mapped out first, then every projected column
+/// decodes just those physical rows (decode_lance_physical_column_rows).
+/// The physical offsets (deleted rows counted) of a fragment's `logical` rows (ascending).
+bool physical_rows_of(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                      const std::vector<std::uint64_t>& logical, std::vector<std::uint64_t>& physical,
+                      std::string& error) {
+    physical.clear();
+    physical.reserve(logical.size());
+    if (!planned.deletion_file.present) {
+        physical = logical;
+        return true;
+    }
+    std::vector<std::uint32_t> deleted;
+    if (!read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
+        return false;
+    }
+    std::sort(deleted.begin(), deleted.end());
+    std::size_t d = 0;
+    std::uint64_t next_logical = 0;
+    std::size_t want = 0;
+    for (std::uint64_t row = 0; row < planned.physical_rows && want < logical.size(); ++row) {
+        while (d < deleted.size() && deleted[d] < row) {
+            ++d;
+        }
+        if (d < deleted.size() && deleted[d] == row) {
+            continue;
+        }
+        if (next_logical == logical[want]) {
+            physical.push_back(row);
+            ++want;
+        }
+        ++next_logical;
+    }
+    if (physical.size() != logical.size()) {
+        error = "fragment " + std::to_string(planned.fragment_id) + " has fewer rows than the take asks for";
+        return false;
+    }
+    return true;
+}
+
+/// Decode the rows at `physical` (offsets in the fragment's data files, ascending), by field; the
+/// fields the files lack as nulls (listed in `missing`).
+bool decode_data_file_rows(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                           const LanceSchemaMapping& mapping, const std::vector<std::uint64_t>& physical,
+                           const std::unordered_set<std::int32_t>* allowed_field_ids, std::vector<ColumnSource>& columns,
+                           std::vector<const LanceField*>& missing,
+                           std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id, std::string& error) {
+    if (planned.files.empty()) {
+        error = "fragment has no data files";
+        return false;
+    }
+    const DataFileReadScope read_scope;
+
+    // The columns to take, then taken side by side (each is its own file reads and decode).
+    std::vector<std::shared_ptr<const CachedFileMetadata>> files;
+    columns.clear();
+    for (const auto& data_file : planned.files) {
+        const auto jailed = safe_join_under(planned.data_dir.empty() ? dataset_path / "data" : planned.data_dir,
+                                            data_file.path);
+        if (!jailed) {
+            error = "data file path escapes the dataset directory";
+            return false;
+        }
+        const auto& path = *jailed;
+        std::shared_ptr<const CachedFileMetadata> file;
+        if (!cached_file_metadata(path, file, error)) {
+            return false;
+        }
+        files.push_back(file);
+        const auto& descriptor = file->descriptor;
+        const auto& column_metadatas = file->columns;
+        if (descriptor.length != planned.physical_rows) {
+            error = "data file holds " + std::to_string(descriptor.length) + " rows but the manifest claims " +
+                    std::to_string(planned.physical_rows);
+            return false;
+        }
+        if (data_file.fields.size() != data_file.column_indices.size()) {
+            error = "data file field/column index mismatch";
+            return false;
+        }
+        const bool v20_file = file->layout.is_v2_0();
+        std::unordered_map<std::int32_t, std::int32_t> column_of;
+        for (std::size_t i = 0; v20_file && i < data_file.fields.size(); ++i) {
+            column_of.emplace(data_file.fields[i], data_file.column_indices[i]);
+        }
+        for (std::size_t i = 0; i < data_file.fields.size(); ++i) {
+            const auto field_id = data_file.fields[i];
+            if (find_mapping_field(mapping, field_id) == nullptr) continue;
+            if (v20_file && is_parent_field(mapping, field_id)) {  // read through its leaves
+                if (!v20_packed_struct_sources(mapping, *find_mapping_field(mapping, field_id), column_of, path,
+                                               descriptor, column_metadatas, data_file.column_indices[i],
+                                               allowed_field_ids, columns, error)) {
+                    return false;
+                }
+                continue;
+            }
+            if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
+            const auto column_index = data_file.column_indices[i];
+            if (column_index < 0 || static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
+                error = "data file column index out of range";
+                return false;
+            }
+            const auto* on_disk = find_descriptor_field(descriptor, field_id);
+            if (on_disk == nullptr) {
+                error = "data file references unknown field id";
+                return false;
+            }
+            const auto* field = find_mapping_field(mapping, field_id);
+            ColumnSource source;
+            source.path = path;
+            source.on_disk = on_disk;
+            source.metadata = &column_metadatas[static_cast<std::size_t>(column_index)];
+            source.field_id = field_id;
+            source.value_bytes = field == nullptr ? 0U : lance_logical_type_value_bytes(field->logical_type);
+            if (v20_file && field != nullptr &&
+                !v20_leaf_context(mapping, *field, column_of, column_metadatas, column_index, source.v20, error)) {
+                return false;
+            }
+            columns.push_back(std::move(source));
+        }
+    }
+    std::vector<ColumnValues> decoded(columns.size());
+    std::vector<std::string> errors(columns.size());
+    parallel::for_each(columns.size(), [&](std::size_t c) {
+        const auto& source = columns[c];
+        if (source.v20 != nullptr) {
+            v20::decode_column_rows(source.path, *source.on_disk, *source.metadata, source.v20.get(), physical,
+                                    source.value_bytes, decoded[c], errors[c]);
+        } else {
+            decode_lance_physical_column_rows(source.path, *source.on_disk, *source.metadata, physical,
+                                              source.value_bytes, decoded[c], errors[c]);
+        }
+    });
+    decoded_by_field_id.clear();
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        if (!errors[c].empty()) {
+            error = errors[c];
+            return false;
+        }
+        decoded_by_field_id.emplace(columns[c].field_id, std::move(decoded[c]));
+    }
+    missing = fields_missing_from(planned, mapping, allowed_field_ids, columns);
+    for (const auto* field : missing) {
+        if (!null_column_values(*field, physical.size(), decoded_by_field_id[field->id], error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Decode the rows at `physical` (offsets in the fragment's data files, ascending) into one batch.
+bool take_from_data_file(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                         const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
+                         const std::vector<std::uint64_t>& physical, ArrowArray& batch, std::string& error,
+                         const std::unordered_set<std::int32_t>* allowed_field_ids) {
+    std::vector<ColumnSource> columns;
+    std::vector<const LanceField*> missing;
+    std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
+    return decode_data_file_rows(dataset_path, planned, mapping, physical, allowed_field_ids, columns, missing,
+                                 decoded_by_field_id, error) &&
+           build_batch_from_schema(batch_schema, mapping, decoded_by_field_id,
+                                   static_cast<std::int64_t>(physical.size()), batch, error);
+}
+
+/// A filtered read of the rows an index left (planned.candidates): those not deleted are decoded
+/// and filtered like any others, as one batch.
+bool read_candidate_rows(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                         const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
+                         std::vector<ArrowArray>& out, std::string& error,
+                         const std::unordered_set<std::int32_t>* allowed_field_ids, const RowIdColumns& ids,
+                         const FilterSpec& filter) {
+    std::vector<std::uint64_t> physical;
+    physical.reserve(planned.candidates->size());
+    std::vector<std::uint32_t> deleted;
+    if (planned.deletion_file.present &&
+        !read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
+        return false;
+    }
+    std::sort(deleted.begin(), deleted.end());
+    for (const auto row : *planned.candidates) {
+        if (row < planned.physical_rows && !std::binary_search(deleted.begin(), deleted.end(), row)) {
+            physical.push_back(row);
+        }
+    }
+    work_stats::add(work_stats::counters().fragment_reads, 1U);
+    if (physical.empty()) {
+        return true;
+    }
+    std::vector<ColumnSource> columns;
+    std::vector<const LanceField*> missing;
+    std::unordered_map<std::int32_t, ColumnValues> by_field;
+    if (!decode_data_file_rows(dataset_path, planned, mapping, physical, allowed_field_ids, columns, missing, by_field,
+                               error)) {
+        return false;
+    }
+    std::uint64_t out_rows = 0;
+    if (!filter_decoded_rows(filter, mapping, columns, missing, by_field, physical.size(), ids.any(), physical,
+                             out_rows, error)) {
+        return false;
+    }
+    if (out_rows == 0U) {
+        return true;
+    }
+    ArrowArray batch{};
+    if (batch_schema.n_children != 0 &&
+        !build_batch_from_schema(batch_schema, mapping, by_field, static_cast<std::int64_t>(out_rows), batch, error)) {
+        return false;
+    }
+    if (ids.any() &&
+        !add_row_id_columns(batch, static_cast<std::int64_t>(out_rows), planned.fragment_id, physical, ids, error)) {
+        if (batch.release != nullptr) {
+            ArrowArrayRelease(&batch);
+        }
+        return false;
+    }
+    out.push_back(batch);
+    return true;
 }
 
 /// ArrowSchemaRelease dereferences `release` unconditionally, and releasing sets it to null, so
@@ -1202,20 +2363,68 @@ struct ReadPlan {
     std::vector<PlannedFile> files;  // flattened in fragment-id order, range-filtered
     std::unordered_set<std::int32_t> allowed_ids;
     bool projected = false;
+    RowIdColumns ids;
+    /// With row id columns: the schema of the data columns alone, which batches are built against
+    /// before the row ids are added. Null otherwise (the output schema is the data schema).
+    std::shared_ptr<ArrowSchema> data_schema;
+    /// A filter: the expression (bound to filter_schema, the struct of the columns it reads) and the
+    /// field ids of those columns. With a filter, the request's row range applies to the rows that
+    /// pass (post_range), not to the dataset's.
+    std::shared_ptr<expr::Expression> filter;
+    std::shared_ptr<ArrowSchema> filter_schema;
+    std::vector<std::int32_t> filter_ids;
+    bool has_post_range = false;
+    LanceRowRange post_range;
 
     const std::unordered_set<std::int32_t>* allowed() const { return projected ? &allowed_ids : nullptr; }
+    FilterSpec filter_spec() const {
+        return FilterSpec{filter.get(), filter_schema.get(), &filter_ids};
+    }
+    const ArrowSchema& batch_schema(const ArrowSchema& out_schema) const {
+        return data_schema ? *data_schema : out_schema;
+    }
 };
 
-/// Parse the manifest and build the Arrow schema. `column_names` null means every column.
-bool open_read_plan(const std::filesystem::path& dataset_path,
-                    const std::vector<std::string>* column_names, const LanceRowRange& range,
-                    ReadPlan& plan, ArrowSchema& out_schema, std::string& error) {
-    plan.dataset_path = dataset_path;
-
-    pb::Manifest manifest{};
+bool load_request_manifest(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                           pb::Manifest& manifest, std::string& error) {
+    if (request.has_version) {
+        return load_manifest_version(dataset_path, request.version, manifest, error);
+    }
     std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    return load_latest_manifest(dataset_path, manifest, version, error);
+}
+
+bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb::Manifest& manifest,
+                                  const LanceScanRequest& request, ReadPlan& plan, ArrowSchema& out_schema,
+                                  std::string& error);
+
+/// Parse the manifest and build the Arrow schema. `column_names` null means every column.
+bool open_read_plan(const std::filesystem::path& dataset_path, const LanceScanRequest& request, ReadPlan& plan,
+                    ArrowSchema& out_schema, std::string& error) {
+    pb::Manifest manifest{};
+    if (!load_request_manifest(dataset_path, request, manifest, error)) {
         release_schema_if_held(out_schema);
+        return false;
+    }
+    return open_read_plan_from_manifest(dataset_path, manifest, request, plan, out_schema, error);
+}
+
+bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb::Manifest& manifest,
+                                  const LanceScanRequest& request, ReadPlan& plan, ArrowSchema& out_schema,
+                                  std::string& error) {
+    plan.dataset_path = dataset_path;
+    const auto* column_names = request.columns;
+    const auto& range = request.range;
+    plan.ids.row_id = request.with_row_id;
+    plan.ids.row_address = request.with_row_address;
+    if (column_names != nullptr && column_names->empty() && !plan.ids.any()) {
+        release_schema_if_held(out_schema);
+        error = "a read must name at least one column";
+        return false;
+    }
+    if (plan.ids.row_id && (manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
+        release_schema_if_held(out_schema);
+        error = "row ids of a dataset with stable row ids are not supported";
         return false;
     }
     LanceSchemaMapping full_mapping;
@@ -1224,54 +2433,199 @@ bool open_read_plan(const std::filesystem::path& dataset_path,
         return false;
     }
 
-    if (column_names == nullptr) {
-        plan.mapping = std::move(full_mapping);
-    } else {
-        // Collect the requested top-level columns and ALL their descendants: a projected struct
-        // column is only meaningful together with the children that hold its data.
-        for (const auto& col_name : *column_names) {
-            const LanceField* root = nullptr;
+    // A top-level column and ALL its descendants: a struct column is only meaningful together with
+    // the children that hold its data.
+    auto add_subtree = [&](std::int32_t root, std::unordered_set<std::int32_t>& into) {
+        std::vector<std::int32_t> queue = {root};
+        while (!queue.empty()) {
+            const auto id = queue.back();
+            queue.pop_back();
+            into.insert(id);
             for (const auto& f : full_mapping.fields) {
-                if (f.parent_id == -1 && f.name == col_name) {
-                    root = &f;
-                    break;
+                if (f.parent_id == id) {
+                    queue.push_back(f.id);
                 }
             }
+        }
+    };
+    auto find_root = [&](const std::string& name, bool fold) -> const LanceField* {
+        for (const auto& f : full_mapping.fields) {
+            if (f.parent_id != -1) {
+                continue;
+            }
+            if (f.name == name) {
+                return &f;
+            }
+        }
+        if (fold) {
+            const LanceField* found = nullptr;
+            for (const auto& f : full_mapping.fields) {
+                if (f.parent_id == -1 && f.name.size() == name.size() &&
+                    std::equal(f.name.begin(), f.name.end(), name.begin(), [](char a, char b) {
+                        return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+                    })) {
+                    if (found != nullptr) {
+                        return nullptr;
+                    }
+                    found = &f;
+                }
+            }
+            return found;
+        }
+        return nullptr;
+    };
+
+    std::unordered_set<std::int32_t> output_ids;
+    if (column_names != nullptr) {
+        for (const auto& col_name : *column_names) {
+            const LanceField* root = find_root(col_name, false);
             if (root == nullptr) {
                 release_schema_if_held(out_schema);
                 error = "projected column '" + col_name + "' not found in schema";
                 return false;
             }
-            std::vector<std::int32_t> queue = {root->id};
-            while (!queue.empty()) {
-                const auto id = queue.back();
-                queue.pop_back();
-                plan.allowed_ids.insert(id);
-                for (const auto& f : full_mapping.fields) {
-                    if (f.parent_id == id) {
-                        queue.push_back(f.id);
-                    }
-                }
-            }
+            add_subtree(root->id, output_ids);
         }
+    }
+
+    // The filter, and the columns it reads: decoded too, even when not returned.
+    std::unordered_set<std::int32_t> filter_ids;
+    if (request.filter != nullptr && !request.filter->empty()) {
+        auto parsed = std::make_shared<expr::Expression>();
+        if (!expr::Expression::parse(*request.filter, *parsed, error)) {
+            release_schema_if_held(out_schema);
+            return false;
+        }
+        for (const auto& name : parsed->columns()) {
+            const LanceField* root = find_root(name, true);
+            if (root == nullptr && name.find('.') != std::string::npos) {
+                root = find_root(name.substr(0, name.find('.')), true);
+            }
+            if (root == nullptr) {
+                release_schema_if_held(out_schema);
+                error = "filter column '" + name + "' not found in schema";
+                return false;
+            }
+            add_subtree(root->id, filter_ids);
+        }
+        plan.filter = std::move(parsed);
+    }
+
+    LanceSchemaMapping output_mapping;
+    if (column_names == nullptr) {
+        output_mapping = full_mapping;
+        plan.mapping = std::move(full_mapping);
+    } else {
         plan.projected = true;
+        plan.allowed_ids = output_ids;
+        plan.allowed_ids.insert(filter_ids.begin(), filter_ids.end());
         for (const auto& f : full_mapping.fields) {
             if (plan.allowed_ids.count(f.id) != 0U) {
                 plan.mapping.fields.push_back(f);
             }
+            if (output_ids.count(f.id) != 0U) {
+                output_mapping.fields.push_back(f);
+            }
+        }
+    }
+    if (plan.filter) {
+        LanceSchemaMapping filter_mapping;
+        for (const auto& f : plan.mapping.fields) {
+            if (filter_ids.count(f.id) != 0U) {
+                filter_mapping.fields.push_back(f);
+                plan.filter_ids.push_back(f.id);
+            }
+        }
+        plan.filter_schema = std::shared_ptr<ArrowSchema>(new ArrowSchema{}, [](ArrowSchema* schema) {
+            release_schema_if_held(*schema);
+            delete schema;
+        });
+        ArrowSchemaInit(plan.filter_schema.get());
+        if (filter_mapping.fields.empty()) {
+            if (ArrowSchemaSetTypeStruct(plan.filter_schema.get(), 0) != NANOARROW_OK) {
+                release_schema_if_held(out_schema);
+                error = "failed to build the filter schema";
+                return false;
+            }
+        } else if (!build_schema_from_mapping(filter_mapping, *plan.filter_schema, error)) {
+            release_schema_if_held(out_schema);
+            return false;
+        }
+        if (!plan.filter->bind(*plan.filter_schema, error)) {
+            release_schema_if_held(out_schema);
+            return false;
         }
     }
 
-    if (!build_schema_from_mapping(plan.mapping, out_schema, error)) {
+    if (output_mapping.fields.empty()) {
+        ArrowSchemaInit(&out_schema);
+        if (ArrowSchemaSetTypeStruct(&out_schema, 0) != NANOARROW_OK) {
+            release_schema_if_held(out_schema);
+            error = "failed to build an empty schema";
+            return false;
+        }
+    } else if (!build_schema_from_mapping(output_mapping, out_schema, error, request.blob_handling)) {
         release_schema_if_held(out_schema);
         return false;
     }
+    if (!set_dataset_schema_metadata(out_schema, manifest, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    if (plan.ids.any()) {
+        plan.data_schema = std::shared_ptr<ArrowSchema>(new ArrowSchema{}, [](ArrowSchema* schema) {
+            release_schema_if_held(*schema);
+            delete schema;
+        });
+        if (ArrowSchemaDeepCopy(&out_schema, plan.data_schema.get()) != NANOARROW_OK ||
+            !add_row_id_fields(out_schema, plan.ids, error)) {
+            release_schema_if_held(out_schema);
+            if (error.empty()) {
+                error = "failed to copy the schema";
+            }
+            return false;
+        }
+    }
 
-    std::vector<pb::DataFragment> fragments = manifest.fragments;
-    std::sort(fragments.begin(), fragments.end(),
-              [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
+    // A filter a scalar index answers: per fragment it covers, the only rows that may pass.
+    IndexCandidates candidates;
+    if (plan.filter && request.use_scalar_index && !request.include_deleted_rows && !manifest.indices.empty()) {
+        std::string why;
+        if (!index_candidates(dataset_path, manifest, *plan.filter, candidates, why)) {
+            candidates.rows.clear();  // an index that cannot be read is not used: the read scans
+        }
+    }
 
-    const bool ranged = !range.is_whole_dataset();
+    std::vector<pb::DataFragment> fragments;
+    if (request.fragment_ids != nullptr) {
+        // The fragments asked for, in the order asked.
+        for (const auto id : *request.fragment_ids) {
+            const auto it = std::find_if(manifest.fragments.begin(), manifest.fragments.end(),
+                                         [&](const pb::DataFragment& f) { return f.id == id; });
+            if (it == manifest.fragments.end()) {
+                release_schema_if_held(out_schema);
+                error = "fragment " + std::to_string(id) + " not found";
+                return false;
+            }
+            fragments.push_back(*it);
+        }
+    } else {
+        fragments = manifest.fragments;
+        std::sort(fragments.begin(), fragments.end(),
+                  [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
+    }
+
+    if (request.include_deleted_rows) {
+        for (auto& fragment : fragments) {
+            fragment.deletion_file = pb::DeletionFile{};
+        }
+    }
+    // A filtered read decodes whole fragments; its range counts the rows that pass the filter.
+    if (plan.filter && !range.is_whole_dataset()) {
+        plan.has_post_range = true;
+        plan.post_range = range;
+    }
+    const bool ranged = !plan.filter && !range.is_whole_dataset();
     std::uint64_t cursor = 0;  // absolute row index of the next fragment's first row
     for (auto& fragment : fragments) {
         if (fragment.files.empty()) {
@@ -1304,6 +2658,18 @@ bool open_read_plan(const std::filesystem::path& dataset_path,
         planned.rows = rows;
 
         if (!ranged) {
+            const auto answered = candidates.rows.find(fragment.id);
+            if (answered != candidates.rows.end()) {
+                work_stats::add(work_stats::counters().indexed_fragments, 1U);
+                if (answered->second.empty()) {
+                    continue;  // no row of it can pass
+                }
+                // Too many rows to pick out one by one: reading the fragment through is faster.
+                if (answered->second.size() * 8U < fragment.physical_rows) {
+                    planned.candidates =
+                        std::make_shared<const std::vector<std::uint32_t>>(std::move(answered->second));
+                }
+            }
             planned.files = std::move(fragment.files);
             planned.skip = 0U;
             planned.take = rows;
@@ -1339,23 +2705,40 @@ bool open_read_plan(const std::filesystem::path& dataset_path,
     return true;
 }
 
-/// Decode every data file up front. The eager reads' second half.
+/// Decode every data file up front. The eager reads' second half. Fragments are decoded side by
+/// side when there are threads to spare (each may itself split into morsels); the batches come back
+/// in fragment order either way.
 bool read_all_batches(const ReadPlan& plan, ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
                       std::string& error) {
-    for (const auto& planned : plan.files) {
-        ArrowArray batch{};
-        if (!read_data_file_batch(plan.dataset_path, planned, plan.mapping, out_schema, batch, error,
-                                  plan.allowed())) {
-            release_partial_read(out_schema, out_batches);
-            return false;
+    std::vector<std::vector<ArrowArray>> per_file(plan.files.size());
+    std::vector<std::string> errors(plan.files.size());
+    parallel::for_each(plan.files.size(), [&](std::size_t f) {
+        read_data_file_batches(plan.dataset_path, plan.files[f], plan.mapping, plan.batch_schema(out_schema),
+                               per_file[f], errors[f], plan.allowed(), plan.ids, plan.filter_spec());
+    });
+    for (std::size_t f = 0; f < per_file.size(); ++f) {
+        if (!errors[f].empty() && error.empty()) {
+            error = errors[f];
         }
-        out_batches.push_back(batch);
+    }
+    for (auto& batches : per_file) {
+        for (auto& batch : batches) {
+            out_batches.push_back(batch);
+        }
+    }
+    if (!error.empty()) {
+        release_partial_read(out_schema, out_batches);
+        return false;
+    }
+    if (plan.has_post_range) {
+        const auto& r = plan.post_range;
+        slice_batches(out_batches, r.offset,
+                      r.length == LanceRowRange::kAllRows ? -1 : static_cast<std::int64_t>(r.length));
     }
     return true;
 }
 
-bool read_dataset_eager(const std::filesystem::path& dataset_path,
-                        const std::vector<std::string>* column_names, const LanceRowRange& range,
+bool read_dataset_eager(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
                         ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
                         std::string& error, bool trusted_input) {
     error.clear();
@@ -1367,13 +2750,323 @@ bool read_dataset_eager(const std::filesystem::path& dataset_path,
         trusted_scope.emplace(trusted_read_limits());
     }
     ReadPlan plan;
-    if (!open_read_plan(dataset_path, column_names, range, plan, out_schema, error)) {
+    if (!open_read_plan(dataset_path, request, plan, out_schema, error)) {
         return false;
     }
     return read_all_batches(plan, out_schema, out_batches, error);
 }
 
+bool read_dataset_eager(const std::filesystem::path& dataset_path,
+                        const std::vector<std::string>* column_names, const LanceRowRange& range,
+                        ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches,
+                        std::string& error, bool trusted_input) {
+    LanceScanRequest request;
+    request.columns = column_names;
+    request.range = range;
+    return read_dataset_eager(dataset_path, request, out_schema, out_batches, error, trusted_input);
+}
+
+/// Take rows given as physical offsets per fragment (`by_fragment`, ascending), one batch per fragment.
+bool take_physical(const ReadPlan& plan, ArrowSchema& out_schema,
+                   const std::vector<std::pair<const PlannedFile*, std::vector<std::uint64_t>>>& by_fragment,
+                   std::vector<ArrowArray>& out_batches, std::string& error);
+
 }  // namespace
+
+bool lance_dataset_scan(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                        ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches, std::string& error,
+                        bool trusted_input) {
+    return read_dataset_eager(dataset_path, request, out_schema, out_batches, error, trusted_input);
+}
+
+namespace {
+
+/// A standalone data file, as a one-fragment dataset: its own schema (the file's descriptor) with its
+/// leaf fields numbered as the file's columns, and the file's directory as the data directory.
+bool open_file_plan(const std::filesystem::path& file_path, const LanceScanRequest& request, ReadPlan& plan,
+                    ArrowSchema& out_schema, std::string& error, LanceFileInfo* info = nullptr) {
+    pb::FileDescriptor descriptor;
+    LanceDataFileFooterLayout layout{};
+    if (!read_lance_data_file_footer_and_descriptor(file_path, descriptor, layout, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    pb::Manifest manifest;
+    manifest.fields = descriptor.fields;
+    pb::DataFile file;
+    file.path = file_path.filename().string();
+    std::unordered_set<std::int32_t> parents;
+    for (const auto& f : descriptor.fields) {
+        if (f.parent_id >= 0) {
+            parents.insert(f.parent_id);
+        }
+    }
+    std::int32_t column = 0;
+    if (layout.is_v2_0()) {
+        // Format 2.0: every field is a column, in schema order -- structs and lists too -- and a
+        // string an older writer stored as list<uint8> is two (its offsets, then its bytes). A
+        // packed struct's fields are not: they are read out of the struct's column.
+        std::vector<pb::ColumnMetadata> metas;
+        if (!read_lance_data_file_column_metadatas(file_path, layout, metas, error)) {
+            release_schema_if_held(out_schema);
+            return false;
+        }
+        std::unordered_set<std::int32_t> packed;
+        for (const auto& f : descriptor.fields) {
+            if (packed.count(f.parent_id) != 0U) {
+                packed.insert(f.id);
+                continue;
+            }
+            if (parents.count(f.id) != 0U && static_cast<std::size_t>(column) < metas.size() &&
+                v20::column_is_packed_struct(metas[static_cast<std::size_t>(column)])) {
+                packed.insert(f.id);
+            }
+            file.fields.push_back(f.id);
+            file.column_indices.push_back(column);
+            const bool bytes_as_list = lance_field_is_variable_width(f.logical_type) &&
+                                       static_cast<std::size_t>(column) < metas.size() &&
+                                       v20::column_is_list_encoded(metas[static_cast<std::size_t>(column)]);
+            column += bytes_as_list ? 2 : 1;
+        }
+    } else {
+        for (const auto& f : descriptor.fields) {
+            if (parents.count(f.id) == 0U) {
+                file.fields.push_back(f.id);
+                file.column_indices.push_back(column++);
+            }
+        }
+    }
+    if (static_cast<std::uint32_t>(column) != layout.num_columns) {
+        release_schema_if_held(out_schema);
+        error = "the file has " + std::to_string(layout.num_columns) + " columns for " + std::to_string(column) +
+                " leaf fields; nanolance reads files whose every leaf field is one column";
+        return false;
+    }
+    pb::DataFragment fragment;
+    fragment.physical_rows = descriptor.length;
+    fragment.files.push_back(file);
+    manifest.fragments.push_back(fragment);
+    if (info != nullptr) {
+        info->num_rows = descriptor.length;
+        info->num_columns = layout.num_columns;
+        std::vector<pb::ColumnMetadata> columns;
+        if (!read_lance_data_file_column_metadatas(file_path, layout, columns, error)) {
+            release_schema_if_held(out_schema);
+            return false;
+        }
+        info->pages.clear();
+        for (const auto& c : columns) {
+            auto& pages = info->pages.emplace_back();
+            for (const auto& p : c.pages) {
+                LanceFileInfo::Page page;
+                page.rows = p.length;
+                page_layout::PageLayout layout_of_page;
+                std::string ignored;
+                page.encoding = page_layout::decode_page_layout(p.encoding, layout_of_page, ignored)
+                                    ? page_layout::describe(layout_of_page)
+                                    : std::string("unknown");
+                for (std::size_t b = 0; b < p.buffer_offsets.size() && b < p.buffer_sizes.size(); ++b) {
+                    page.buffers.emplace_back(p.buffer_offsets[b], p.buffer_sizes[b]);
+                }
+                pages.push_back(std::move(page));
+            }
+        }
+    }
+    if (!open_read_plan_from_manifest(file_path.parent_path(), manifest, request, plan, out_schema, error)) {
+        return false;
+    }
+    // A bare file name ("x.lance") has an empty parent, and an empty data_dir means <dataset>/data:
+    // name the current directory instead.
+    const auto dir = file_path.parent_path().empty() ? std::filesystem::path(".") : file_path.parent_path();
+    for (auto& planned : plan.files) {
+        planned.data_dir = dir;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool lance_file_read(const std::filesystem::path& file_path, const LanceScanRequest& request,
+                     ArrowSchema& out_schema, std::vector<ArrowArray>& out_batches, std::string& error) {
+    error.clear();
+    out_batches.clear();
+    ArrowSchemaInit(&out_schema);
+    ReadPlan plan;
+    if (!open_file_plan(file_path, request, plan, out_schema, error)) {
+        return false;
+    }
+    return read_all_batches(plan, out_schema, out_batches, error);
+}
+
+bool lance_file_take(const std::filesystem::path& file_path, const LanceScanRequest& request,
+                     const std::vector<std::uint64_t>& rows, ArrowSchema& out_schema,
+                     std::vector<ArrowArray>& out_batches, std::string& error) {
+    error.clear();
+    out_batches.clear();
+    ArrowSchemaInit(&out_schema);
+    ReadPlan plan;
+    LanceScanRequest whole = request;
+    whole.range = LanceRowRange{};
+    if (!open_file_plan(file_path, whole, plan, out_schema, error)) {
+        return false;
+    }
+    std::vector<std::uint64_t> wanted(rows);
+    std::sort(wanted.begin(), wanted.end());
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    if (plan.files.empty()) {
+        if (!wanted.empty()) {
+            release_schema_if_held(out_schema);
+            error = "row " + std::to_string(wanted.front()) + " is past the end of the file (0 rows)";
+            return false;
+        }
+        return true;
+    }
+    if (!wanted.empty() && wanted.back() >= plan.files.front().physical_rows) {
+        release_schema_if_held(out_schema);
+        error = "row " + std::to_string(wanted.back()) + " is past the end of the file (" +
+                std::to_string(plan.files.front().physical_rows) + " rows)";
+        return false;
+    }
+    std::vector<std::pair<const PlannedFile*, std::vector<std::uint64_t>>> by_fragment;
+    if (!wanted.empty()) {
+        by_fragment.emplace_back(&plan.files.front(), wanted);
+    }
+    return take_physical(plan, out_schema, by_fragment, out_batches, error);
+}
+
+bool lance_file_info(const std::filesystem::path& file_path, LanceFileInfo& info, ArrowSchema& out_schema,
+                     std::string& error) {
+    error.clear();
+    ArrowSchemaInit(&out_schema);
+    ReadPlan plan;
+    return open_file_plan(file_path, LanceScanRequest{}, plan, out_schema, error, &info);
+}
+
+namespace {
+
+bool take_physical(const ReadPlan& plan, ArrowSchema& out_schema,
+                   const std::vector<std::pair<const PlannedFile*, std::vector<std::uint64_t>>>& by_fragment,
+                   std::vector<ArrowArray>& out_batches, std::string& error) {
+    for (const auto& [planned, physical] : by_fragment) {
+        ArrowArray batch{};
+        if (!plan.mapping.fields.empty() &&
+            !take_from_data_file(plan.dataset_path, *planned, plan.mapping, plan.batch_schema(out_schema), physical,
+                                 batch, error, plan.allowed())) {
+            release_partial_read(out_schema, out_batches);
+            return false;
+        }
+        if (plan.ids.any() && !add_row_id_columns(batch, static_cast<std::int64_t>(physical.size()),
+                                                  planned->fragment_id, physical, plan.ids, error)) {
+            release_partial_read(out_schema, out_batches);
+            return false;
+        }
+        out_batches.push_back(batch);
+    }
+    return true;
+}
+
+bool open_take(const std::filesystem::path& dataset_path, const LanceScanRequest& request, ReadPlan& plan,
+               ArrowSchema& out_schema, std::string& error,
+               std::optional<ScopedReadLimits>& trusted_scope, bool trusted_input) {
+    error.clear();
+    ArrowSchemaInit(&out_schema);
+    if (trusted_input) {
+        trusted_scope.emplace(trusted_read_limits());
+    }
+    LanceScanRequest whole = request;
+    whole.range = LanceRowRange{};
+    return open_read_plan(dataset_path, whole, plan, out_schema, error);
+}
+
+}  // namespace
+
+bool lance_dataset_take(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                        const std::vector<std::uint64_t>& indices, ArrowSchema& out_schema,
+                        std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+    out_batches.clear();
+    std::optional<ScopedReadLimits> trusted_scope;
+    ReadPlan plan;
+    if (!open_take(dataset_path, request, plan, out_schema, error, trusted_scope, trusted_input)) {
+        return false;
+    }
+    std::vector<std::uint64_t> wanted(indices);
+    std::sort(wanted.begin(), wanted.end());
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    std::uint64_t total = 0;
+    for (const auto& planned : plan.files) {
+        total += planned.rows;
+    }
+    if (!wanted.empty() && wanted.back() >= total) {
+        release_schema_if_held(out_schema);
+        error = "row " + std::to_string(wanted.back()) + " is past the end of the dataset (" + std::to_string(total) +
+                " rows)";
+        return false;
+    }
+    std::vector<std::pair<const PlannedFile*, std::vector<std::uint64_t>>> by_fragment;
+    std::uint64_t cursor = 0;
+    std::size_t w = 0;
+    for (const auto& planned : plan.files) {
+        const auto first = cursor;
+        cursor += planned.rows;
+        std::vector<std::uint64_t> logical;
+        while (w < wanted.size() && wanted[w] < cursor) {
+            logical.push_back(wanted[w++] - first);
+        }
+        if (logical.empty()) {
+            continue;
+        }
+        std::vector<std::uint64_t> physical;
+        if (!physical_rows_of(plan.dataset_path, planned, logical, physical, error)) {
+            release_schema_if_held(out_schema);
+            return false;
+        }
+        by_fragment.emplace_back(&planned, std::move(physical));
+    }
+    return take_physical(plan, out_schema, by_fragment, out_batches, error);
+}
+
+bool lance_dataset_take_rows(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                             const std::vector<std::uint64_t>& addresses, ArrowSchema& out_schema,
+                             std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+    out_batches.clear();
+    std::optional<ScopedReadLimits> trusted_scope;
+    ReadPlan plan;
+    if (!open_take(dataset_path, request, plan, out_schema, error, trusted_scope, trusted_input)) {
+        return false;
+    }
+    std::vector<std::uint64_t> wanted(addresses);
+    std::sort(wanted.begin(), wanted.end());
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    std::map<std::uint64_t, const PlannedFile*> fragments;
+    for (const auto& planned : plan.files) {
+        fragments.emplace(planned.fragment_id, &planned);
+    }
+    std::vector<std::pair<const PlannedFile*, std::vector<std::uint64_t>>> by_fragment;
+    for (const auto address : wanted) {
+        const auto fragment_id = address >> 32U;
+        const auto offset = address & 0xFFFFFFFFULL;
+        const auto it = fragments.find(fragment_id);
+        if (it == fragments.end() || offset >= it->second->physical_rows) {
+            release_schema_if_held(out_schema);
+            error = "row address " + std::to_string(address) + " (fragment " + std::to_string(fragment_id) +
+                    ", row " + std::to_string(offset) + ") is not in the dataset";
+            return false;
+        }
+        if (by_fragment.empty() || by_fragment.back().first != it->second) {
+            by_fragment.emplace_back(it->second, std::vector<std::uint64_t>{});
+        }
+        by_fragment.back().second.push_back(offset);
+    }
+    return take_physical(plan, out_schema, by_fragment, out_batches, error);
+}
+
+bool lance_table_take(const std::filesystem::path& dataset_path, const std::vector<std::string>* column_names,
+                      const std::vector<std::uint64_t>& indices, ArrowSchema& out_schema,
+                      std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+    LanceScanRequest request;
+    request.columns = column_names;
+    return lance_dataset_take(dataset_path, request, indices, out_schema, out_batches, error, trusted_input);
+}
 
 bool lance_table_read_dataset(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
                               std::vector<ArrowArray>& out_batches, std::string& error,
@@ -1406,8 +3099,19 @@ struct LanceTableStream::Impl {
     ArrowSchema schema{};   // the stream's own copy; the caller got a deep copy at open()
     std::size_t cursor = 0;
     bool trusted_input = false;
+    std::deque<ArrowArray> pending;  // the current fragment's batches not yet handed out
+    // A filtered read's row range, counted over the rows that pass: rows still to skip, and to return.
+    std::uint64_t skip = 0;
+    std::uint64_t remaining = LanceRowRange::kAllRows;
 
-    ~Impl() { release_schema_if_held(schema); }
+    ~Impl() {
+        for (auto& batch : pending) {
+            if (batch.release != nullptr) {
+                ArrowArrayRelease(&batch);
+            }
+        }
+        release_schema_if_held(schema);
+    }
 };
 
 LanceTableStream::LanceTableStream() = default;
@@ -1425,6 +3129,15 @@ bool LanceTableStream::open_range(const std::filesystem::path& dataset_path,
                                   const std::vector<std::string>* column_names,
                                   const LanceRowRange& range, ArrowSchema& out_schema,
                                   LanceTableStream& out, std::string& error, bool trusted_input) {
+    LanceScanRequest request;
+    request.columns = column_names;
+    request.range = range;
+    return open_request(dataset_path, request, out_schema, out, error, trusted_input);
+}
+
+bool LanceTableStream::open_request(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                                    ArrowSchema& out_schema, LanceTableStream& out, std::string& error,
+                                    bool trusted_input) {
     error.clear();
     ArrowSchemaInit(&out_schema);
 
@@ -1435,15 +3148,19 @@ bool LanceTableStream::open_range(const std::filesystem::path& dataset_path,
 
     auto impl = std::make_unique<Impl>();
     impl->trusted_input = trusted_input;
-    if (!open_read_plan(dataset_path, column_names, range, impl->plan, out_schema, error)) {
+    if (!open_read_plan(dataset_path, request, impl->plan, out_schema, error)) {
         return false;
     }
     // The stream keeps its own schema: read_data_file_batch builds each batch against one, and the
     // caller owns (and may release) the schema it was handed the moment open() returns.
-    if (ArrowSchemaDeepCopy(&out_schema, &impl->schema) != NANOARROW_OK) {
+    if (ArrowSchemaDeepCopy(&impl->plan.batch_schema(out_schema), &impl->schema) != NANOARROW_OK) {
         release_schema_if_held(out_schema);
         error = "failed to copy the dataset schema for the stream";
         return false;
+    }
+    if (impl->plan.has_post_range) {
+        impl->skip = impl->plan.post_range.offset;
+        impl->remaining = impl->plan.post_range.length;
     }
     out.impl_ = std::move(impl);
     return true;
@@ -1456,35 +3173,73 @@ bool LanceTableStream::next(ArrowArray& out_batch, std::string& error) {
         error = "stream is not open";
         return false;
     }
-    if (impl_->cursor >= impl_->plan.files.size()) {
-        return true;  // end of stream: out_batch.release stays null
+    // A fragment may come back as several batches (one per morsel of a parallel read).
+    while (impl_->pending.empty()) {
+        if (impl_->cursor >= impl_->plan.files.size()) {
+            return true;  // end of stream: out_batch.release stays null
+        }
+        // The limits are per-thread and scoped, so a trusted stream has to re-establish them on every
+        // next() -- open()'s scope ended when open() returned.
+        std::optional<ScopedReadLimits> trusted_scope;
+        if (impl_->trusted_input) {
+            trusted_scope.emplace(trusted_read_limits());
+        }
+        const auto& planned = impl_->plan.files[impl_->cursor];
+        std::vector<ArrowArray> batches;
+        if (!read_data_file_batches(impl_->plan.dataset_path, planned, impl_->plan.mapping, impl_->schema, batches,
+                                    error, impl_->plan.allowed(), impl_->plan.ids, impl_->plan.filter_spec())) {
+            out_batch = ArrowArray{};
+            return false;
+        }
+        ++impl_->cursor;
+        impl_->pending.insert(impl_->pending.end(), batches.begin(), batches.end());
     }
-
-    // The limits are per-thread and scoped, so a trusted stream has to re-establish them on every
-    // next() -- open()'s scope ended when open() returned.
-    std::optional<ScopedReadLimits> trusted_scope;
-    if (impl_->trusted_input) {
-        trusted_scope.emplace(trusted_read_limits());
+    out_batch = impl_->pending.front();
+    impl_->pending.pop_front();
+    if (impl_->plan.has_post_range) {
+        // Skip and cut to the range, then stop reading once it is complete.
+        auto rows = static_cast<std::uint64_t>(out_batch.length);
+        if (impl_->remaining == 0U || impl_->skip >= rows) {
+            impl_->skip -= std::min(impl_->skip, rows);
+            ArrowArrayRelease(&out_batch);
+            out_batch = ArrowArray{};
+            if (impl_->remaining == 0U) {
+                for (auto& b : impl_->pending) {
+                    ArrowArrayRelease(&b);
+                }
+                impl_->pending.clear();
+                impl_->cursor = impl_->plan.files.size();
+                return true;
+            }
+            return next(out_batch, error);
+        }
+        const auto first = impl_->skip;
+        const auto count = std::min(rows - first, impl_->remaining);
+        impl_->skip = 0;
+        if (impl_->remaining != LanceRowRange::kAllRows) {
+            impl_->remaining -= count;
+        }
+        if (first != 0U || count != rows) {
+            auto shared = std::make_shared<SharedBatch>(std::move(out_batch));
+            out_batch = slice_batch(shared, static_cast<std::int64_t>(first), static_cast<std::int64_t>(count));
+        }
     }
-    const auto& planned = impl_->plan.files[impl_->cursor];
-    if (!read_data_file_batch(impl_->plan.dataset_path, planned, impl_->plan.mapping, impl_->schema,
-                              out_batch, error, impl_->plan.allowed())) {
-        out_batch = ArrowArray{};
-        return false;
-    }
-    ++impl_->cursor;
     return true;
 }
 
 
 bool lance_table_read_schema(const std::filesystem::path& dataset_path, ArrowSchema& out_schema,
                              std::string& error) {
+    return lance_dataset_schema(dataset_path, LanceScanRequest{}, out_schema, error);
+}
+
+bool lance_dataset_schema(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
+                          ArrowSchema& out_schema, std::string& error) {
     error.clear();
     ArrowSchemaInit(&out_schema);
 
     pb::Manifest manifest{};
-    std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    if (!load_request_manifest(dataset_path, request, manifest, error)) {
         release_schema_if_held(out_schema);
         return false;
     }
@@ -1494,6 +3249,10 @@ bool lance_table_read_schema(const std::filesystem::path& dataset_path, ArrowSch
         return false;
     }
     if (!build_schema_from_mapping(mapping, out_schema, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    if (!set_dataset_schema_metadata(out_schema, manifest, error)) {
         release_schema_if_held(out_schema);
         return false;
     }

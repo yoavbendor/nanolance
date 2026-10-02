@@ -101,6 +101,12 @@ class LanceWriter:
     ``max_rows_per_fragment`` > 0 to flush a fragment (and free the writer's
     internal buffer) once that many rows accumulate, bounding memory for very
     large writes. The resulting multi-fragment dataset reads back as one table.
+
+    ``max_pending_bytes`` > 0 bounds the same buffer in BYTES instead, which is
+    what a memory-constrained device actually has to budget: the writer flushes
+    a fragment whenever the data it holds reaches that size. Plan for a peak of
+    about 3-4x the budget plus one batch (buffer growth and encoding need room of
+    their own). Either limit, or both, may be set.
     """
 
     def __init__(
@@ -115,6 +121,7 @@ class LanceWriter:
         blob_uri_dictionary: bool | None = None,
         append: bool | None = None,
         max_rows_per_fragment: int = 0,
+        max_pending_bytes: int = 0,
     ) -> None:
         opts = options or WriteOptions()
         if compression is not None:
@@ -137,7 +144,11 @@ class LanceWriter:
         native.blob_uri_dictionary = opts.blob_uri_dictionary
         native.ignore_nullability = opts.ignore_nullability
         native.append = opts.append
-        self._writer = _nanolance.LanceWriter(Path(path), native, int(max_rows_per_fragment))
+        if max_rows_per_fragment < 0 or max_pending_bytes < 0:
+            raise ValueError("max_rows_per_fragment and max_pending_bytes must be >= 0")
+        self._writer = _nanolance.LanceWriter(
+            Path(path), native, int(max_rows_per_fragment), int(max_pending_bytes)
+        )
 
     def write_batch(self, batch) -> None:
         """Append one Arrow-exportable ``RecordBatch`` (pyarrow, polars, nanom, ...)."""
@@ -241,6 +252,54 @@ def read_table(
     return _nanolance.read_table(Path(path), _normalize_columns(columns), start, count)
 
 
+def take(
+    path: Union[str, os.PathLike],
+    indices: Sequence[int],
+    columns: Optional[Sequence[str]] = None,
+):
+    """Read the rows at ``indices`` -- random access, e.g. a shuffled training mini-batch::
+
+        batch = nanolance.take("coco.lance", [4031, 17, 2980, 511], columns=["image", "caption"])
+
+    Rows come back in the order of ``indices``, repeats included, as :meth:`lance.LanceDataset.take`
+    returns them; indices count rows the way a full read does (deleted rows are not counted).
+
+    Only the fragments and pages holding a requested row are read. For large values -- images, audio,
+    documents, which nanolance and Lance store as FullZip pages -- only the requested rows themselves
+    are read, through each page's per-row index, so a batch of 64 images out of 100,000 reads 64
+    images.
+
+    Returns a ``pyarrow.Table`` when the rows need reordering (``indices`` not strictly ascending),
+    which needs pyarrow; otherwise the same Arrow-exportable handle as :func:`read_table`. The
+    reordered table is assembled from zero-copy slices of the rows read -- one per run of rows that
+    stay adjacent -- so no value is copied; call ``combine_chunks()`` if you need one chunk.
+    """
+    wanted = [int(i) for i in indices]
+    if any(i < 0 for i in wanted):
+        raise IndexError("indices must not be negative")
+    total = count_rows(path)
+    if wanted and max(wanted) >= total:
+        raise IndexError(f"index {max(wanted)} is past the end of the dataset ({total} rows)")
+    distinct = sorted(set(wanted))
+    handle = _nanolance.take(Path(path), distinct, _normalize_columns(columns))
+    if wanted == distinct:
+        return handle
+    import pyarrow as pa  # reordering needs Arrow's slicing; pyarrow is what Arrow users have
+
+    table = pa.table(handle)
+    position = {row: k for k, row in enumerate(distinct)}
+    pieces = []
+    start = prev = position[wanted[0]]
+    for i in wanted[1:]:
+        k = position[i]
+        if k != prev + 1:
+            pieces.append(table.slice(start, prev - start + 1))
+            start = k
+        prev = k
+    pieces.append(table.slice(start, prev - start + 1))
+    return pa.concat_tables(pieces)
+
+
 def open_stream(
     path: Union[str, os.PathLike],
     columns: Optional[Sequence[str]] = None,
@@ -310,12 +369,46 @@ def count_rows(path: Union[str, os.PathLike]) -> int:
     return int(_nanolance.count_rows(Path(path)))
 
 
+def set_threads(threads: int) -> None:
+    """Threads nanolance may use for reads and writes, the calling thread included.
+
+    ``1`` keeps all work on the calling thread -- no worker thread is started, and the code path is the
+    single-threaded one. ``0`` restores the default: the ``NANOLANCE_THREADS`` environment variable if
+    set, else the CPUs this process may run on (its affinity mask, so ``taskset`` and container CPU
+    limits count). With more than one thread a large read comes back as several record batches per
+    fragment -- one per row range decoded in parallel -- rather than one.
+    """
+    if threads < 0:
+        raise ValueError("threads must be >= 0")
+    _nanolance.set_threads(int(threads))
+
+
+def get_threads() -> int:
+    """The number of threads nanolance may use (see :func:`set_threads`)."""
+    return int(_nanolance.get_threads())
+
+
+def _work_stats() -> dict:
+    """Counters of the work nanolance did since the last :func:`_reset_work_stats`: bytes read from
+    data files and the largest single read, page windows decoded, row ranges reads were cut into,
+    bytes column-parallel writes buffered, buffer-pool and take-cache hits. For tests that guard how a
+    result was produced; not a stable API."""
+    return dict(_nanolance._work_stats())
+
+
+def _reset_work_stats() -> None:
+    _nanolance._reset_work_stats()
+
+
 __all__ = [
     "write_table",
     "read_table",
+    "take",
     "open_stream",
     "read_schema",
     "count_rows",
+    "set_threads",
+    "get_threads",
     "WriteOptions",
     "LanceWriter",
     "__version__",

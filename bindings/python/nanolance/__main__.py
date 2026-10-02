@@ -84,7 +84,10 @@ def _convert(args: argparse.Namespace) -> int:
     rows = 0
     columns = args.columns or None
     with LanceWriter(
-        dest, options=options, max_rows_per_fragment=args.rows_per_fragment
+        dest,
+        options=options,
+        max_rows_per_fragment=args.rows_per_fragment,
+        max_pending_bytes=args.max_pending_bytes,
     ) as writer:
         for batch in reader.iter_batches(batch_size=args.batch_size, columns=columns):
             if batch.num_rows == 0:
@@ -199,6 +202,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "rows per Lance fragment, the analogue of a parquet row group "
             f"(default: {DEFAULT_ROWS_PER_FRAGMENT}; 0 = one fragment for everything)"
+        ),
+    )
+    convert.add_argument(
+        "--max-pending-bytes",
+        type=int,
+        default=0,
+        help=(
+            "flush a fragment whenever the writer holds this many bytes of unwritten rows, "
+            "bounding memory in bytes rather than rows (default: 0 = off)"
         ),
     )
     convert.add_argument(

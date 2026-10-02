@@ -127,15 +127,20 @@ void verify_roundtrip(const std::filesystem::path& ds, const std::vector<std::ui
     std::vector<ArrowArray> batches;
     std::string error;
     require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error);
-    require(batches.size() == 1U, "one batch");
-    require(batches[0].n_children == 2, "two columns");
-    const auto* got_ts = static_cast<const std::uint64_t*>(batches[0].children[0]->buffers[1]);
-    const auto* got_caplen = static_cast<const std::uint32_t*>(batches[0].children[1]->buffers[1]);
-    require(static_cast<std::size_t>(batches[0].children[0]->length) == ts.size(), "ts length");
-    require(std::memcmp(got_ts, ts.data(), ts.size() * 8U) == 0, "ts values");
-    require(std::memcmp(got_caplen, caplen.data(), caplen.size() * 4U) == 0, "caplen values");
+    std::size_t row = 0;
+    for (auto& batch : batches) {  // several with a parallel read: one per row range
+        require(batch.n_children == 2, "two columns");
+        const auto n = static_cast<std::size_t>(batch.children[0]->length);
+        require(row + n <= ts.size(), "ts length");
+        const auto* got_ts = static_cast<const std::uint64_t*>(batch.children[0]->buffers[1]);
+        const auto* got_caplen = static_cast<const std::uint32_t*>(batch.children[1]->buffers[1]);
+        require(std::memcmp(got_ts, ts.data() + row, n * 8U) == 0, "ts values");
+        require(std::memcmp(got_caplen, caplen.data() + row, n * 4U) == 0, "caplen values");
+        row += n;
+        ArrowArrayRelease(&batch);
+    }
+    require(row == ts.size(), "ts length");
     ArrowSchemaRelease(&schema);
-    ArrowArrayRelease(&batches[0]);
 }
 
 }  // namespace
