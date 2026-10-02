@@ -226,7 +226,7 @@ set(NANO_LANCE_BLOB_V2_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/golden/blob_v2")
 # them (C++23), so nanolance's public headers stay C++20.
 FetchContent_Declare(nanom
     GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
-    GIT_TAG 353f154e52b721602c2b90da7930133291cbe3a9
+    GIT_TAG 64fbf3ae80efab0d62209be24dc29c18a4a49f6f
     GIT_SHALLOW FALSE)
 FetchContent_GetProperties(nanom)
 if(NOT nanom_POPULATED)
@@ -235,7 +235,7 @@ endif()
 add_library(nanolance_nanom INTERFACE)
 target_include_directories(nanolance_nanom SYSTEM INTERFACE "${nanom_SOURCE_DIR}/include")
 
-add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/roaring_bitmap.cpp)
+add_library(nanolance_proto STATIC generated/lance_minimal.pb.cpp src/roaring_bitmap.cpp src/page_layout.cpp)
 target_compile_features(nanolance_proto PUBLIC cxx_std_20 PRIVATE cxx_std_23)
 target_include_directories(nanolance_proto PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/generated")
 target_include_directories(nanolance_proto PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -302,7 +302,6 @@ add_library(nanolance STATIC
     src/lance_column_decoder.cpp
     src/lance_v20_decoder.cpp
     src/lance_table_reader.cpp
-    src/page_layout.cpp
     src/parallel.cpp
     src/repdef.cpp
     src/nano_lance_table_reader_c.cpp

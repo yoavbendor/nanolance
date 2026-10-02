@@ -2442,6 +2442,29 @@ Truncated or malformed messages are still rejected.
     start-up dominates);
   - creating a 2M-row dataset: 0.98–1.11x.
 
+### Page descriptors through nanom
+
+`src/page_layout.cpp` no longer parses protobuf by hand. A page's `/lance.encodings21.PageLayout`
+descriptor is decoded with nanom's model (`nanom/formats/lance_encodings.hpp`). The model's
+encoding children are `pb_lazy`, so the descriptor tree is decoded node by node without
+allocating. The result is converted to the same `Compressive` / `MiniBlock` / `Constant` /
+`FullZip` structs the decoder dispatches on; `page_layout.hpp` is unchanged.
+
+The file moved into `nanolance_proto`, the one target compiled as C++23.
+
+**Same answers as the hand-written parser.** Both parsers were compiled side by side.
+- Every descriptor of files written by pylance (formats 2.1, 2.2, zstd) and by nanolance decodes
+  to the same structure and the same `describe()` line.
+- On 300,000 mutated descriptors under ASan / UBSan, the new parser never accepted what the old
+  one refused, and never disagreed on what both accepted.
+- It refuses 826 more mutants, all malformed: field number 0, two members of one oneof, a
+  repeated message field, trailing garbage.
+
+**Speed.** Parsing a descriptor in isolation runs at 0.83-0.86x of the hand-written parser (about
+400 ns against 340 ns). End to end it is at parity, because the manifest and column-metadata
+decodes got faster. Reading a 4,000-fragment dataset of 12,000 small pages, where per-page cost
+matters most, took 120-127 ms against 122-129 ms (best of 15, four alternating runs).
+
 ### Deliberate deviations (not defects)
 
 - **The nullable opt-out was not needed** — simpler than planned.
