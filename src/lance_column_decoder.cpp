@@ -4176,17 +4176,39 @@ std::uint64_t decoded_bytes(const ColumnValues& v) {
     return bytes;
 }
 
+/// When a take decodes a column whole for the cache: never (its rows are read from the chunks that
+/// hold them, which costs about what picking them from a copy does), on its second take, or on its
+/// first.
+enum class CacheFill { Never, SecondTake, FirstTake };
+
+/// A column this small is decoded whole on its first take whatever the rows: that costs little more
+/// than finding them.
+constexpr std::uint64_t kSmallColumnBytes = std::uint64_t{1} << 20U;
+
+/// The cached copy of a column, or -- as `fill` says, when the column is worth caching -- one
+/// decoded now. Null (and no error) when there is none to use: the caller reads just the rows it needs.
+///
+/// A list column is decoded whole on its second take, not its first: a one-off take (an indexed
+/// query's rows) reads only the chunks holding its rows, a repeated one (a training epoch) gets the
+/// copy from then on. A copy that would overflow the budget is admitted only by dropping copies unused for a
+/// while; otherwise it is not kept -- clearing the cache for it made a working set over the budget
+/// decode every column whole on every take.
 std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::path& path, const pb::Field& field,
-                                                       const pb::ColumnMetadata& column, std::string& error) {
+                                                       const pb::ColumnMetadata& column, std::string& error,
+                                                       CacheFill fill) {
+    using Clock = std::chrono::steady_clock;
     struct Entry {
         std::uintmax_t size = 0;
         std::filesystem::file_time_type mtime{};
-        std::shared_ptr<const ColumnValues> values;
+        std::shared_ptr<const ColumnValues> values;  // null: taken once, not decoded
         std::uint64_t bytes = 0;
+        Clock::time_point used{};
+        bool rejected = false;  // decoded once and not admitted: not decoded whole again
     };
     static std::mutex mutex;
     static std::unordered_map<std::string, Entry> cache;
     static std::uint64_t held = 0;
+    constexpr auto kIdle = std::chrono::seconds(10);
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
     const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
@@ -4197,9 +4219,26 @@ std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::p
     {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto it = cache.find(key);
-        if (it != cache.end() && it->second.size == size && it->second.mtime == mtime) {
+        const bool current = it != cache.end() && it->second.size == size && it->second.mtime == mtime;
+        if (current && it->second.values != nullptr) {
             work_stats::add(work_stats::counters().take_cache_hits, 1U);
+            it->second.used = Clock::now();
             return it->second.values;
+        }
+        if (current && it->second.rejected) {
+            if (Clock::now() - it->second.used <= kIdle || held > 0U) {
+                return nullptr;
+            }
+        }
+        if (fill == CacheFill::Never) {
+            return nullptr;
+        }
+        if (!current && fill == CacheFill::SecondTake) {
+            if (it != cache.end()) {
+                held -= it->second.bytes;
+            }
+            cache[key] = Entry{size, mtime, nullptr, 0, Clock::now()};  // taken once
+            return nullptr;
         }
     }
     auto whole = std::make_shared<ColumnValues>();
@@ -4210,14 +4249,37 @@ std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::p
     const std::lock_guard<std::mutex> lock(mutex);
     if (bytes <= take_cache_budget()) {
         if (held + bytes > take_cache_budget()) {
-            cache.clear();
-            held = 0;
+            const auto now = Clock::now();
+            for (auto it = cache.begin(); it != cache.end();) {
+                if (it->second.values != nullptr && now - it->second.used > kIdle) {
+                    held -= it->second.bytes;
+                    it = cache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
-        cache[key] = Entry{size, mtime, whole, bytes};
-        held += bytes;
+        auto& entry = cache[key];
+        held -= entry.bytes;
+        if (held + bytes <= take_cache_budget()) {
+            entry = Entry{size, mtime, whole, bytes, Clock::now()};
+            held += bytes;
+        } else {
+            entry = Entry{size, mtime, nullptr, 0, Clock::now(), true};
+        }
+    } else {
+        cache[key] = Entry{size, mtime, nullptr, 0, Clock::now(), true};
     }
     return whole;
 }
+
+/// Rows of flat MiniBlock pages, decoding only the chunks that hold them (as a range read does for
+/// its rows). False with no error when a touched page is not one.
+bool take_flat_miniblock_chunks(const std::filesystem::path& path, const pb::Field& field,
+                                const pb::ColumnMetadata& column, const std::vector<std::uint64_t>& rows,
+                                const std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>>& touched,
+                                const std::vector<std::uint64_t>& page_first, std::size_t value_bytes,
+                                ColumnValues& out, bool& done, std::string& error);
 
 /// Where a MiniBlock list page's chunks sit in its payload, how many values each holds, and how many
 /// rows finish before each -- from the page's metadata words and its repetition index. Read once per
@@ -4630,6 +4692,71 @@ bool decode_nested_rows(const std::filesystem::path& path, const pb::Field& fiel
 
 }  // namespace
 
+namespace {
+
+bool decode_flat_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                        const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error);
+
+bool take_flat_miniblock_chunks(const std::filesystem::path& path, const pb::Field& field,
+                                const pb::ColumnMetadata& column, const std::vector<std::uint64_t>& rows,
+                                const std::vector<std::pair<std::size_t, std::pair<std::size_t, std::size_t>>>& touched,
+                                const std::vector<std::uint64_t>& page_first, std::size_t value_bytes,
+                                ColumnValues& out, bool& done, std::string& error) {
+    done = false;
+    pb::ColumnMetadata subset = column;
+    subset.pages.clear();
+    std::vector<std::uint8_t> keep;
+    for (const auto& [p, span] : touched) {
+        const auto& page = column.pages[p];
+        page_layout::PageLayout layout;
+        std::string why;
+        if (!page_layout::decode_page_layout(page.encoding, layout, why) ||
+            layout.kind != page_layout::LayoutKind::kMiniBlock || layout.mini_block.has_repetition) {
+            return true;
+        }
+        const auto index = miniblock_page_index(path, page, layout.mini_block, error);
+        if (index == nullptr) {
+            return error.empty();
+        }
+        const auto& before = index->rows_before;
+        const auto chunk_of = [&](std::uint64_t r) {
+            return static_cast<std::size_t>(std::upper_bound(before.begin(), before.end(), r) - before.begin() - 1);
+        };
+        // Runs of rows whose chunks meet or touch are one part of the page.
+        for (auto i = span.first; i < span.second;) {
+            const auto c0 = chunk_of(rows[i] - page_first[p]);
+            auto c1 = c0;
+            auto j = i + 1;
+            while (j < span.second && chunk_of(rows[j] - page_first[p]) <= c1 + 1U) {
+                c1 = chunk_of(rows[j] - page_first[p]);
+                ++j;
+            }
+            pb::ColumnPage part = page;
+            part.buffer_offsets[0] += c0 * index->word_bytes;
+            part.buffer_sizes[0] = (c1 + 1U - c0) * index->word_bytes;
+            part.buffer_offsets[1] += index->byte_start[c0];
+            part.buffer_sizes[1] = index->byte_start[c1 + 1U] - index->byte_start[c0];
+            part.length = before[c1 + 1U] - before[c0];
+            const auto base = keep.size();
+            keep.resize(base + static_cast<std::size_t>(part.length), 0U);
+            for (auto k = i; k < j; ++k) {
+                keep[base + static_cast<std::size_t>(rows[k] - page_first[p] - before[c0])] = 1U;
+            }
+            subset.pages.push_back(std::move(part));
+            work_stats::add(work_stats::counters().page_windows, 1U);
+            i = j;
+        }
+    }
+    if (!decode_flat_column(path, field, subset, out, error) ||
+        !compact_column_values(out, keep, keep.size(), value_bytes, error)) {
+        return false;
+    }
+    done = true;
+    return true;
+}
+
+}  // namespace
+
 bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
                                        const pb::ColumnMetadata& column_metadata,
                                        const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
@@ -4727,8 +4854,48 @@ bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_pa
             encoded += size;
         }
     }
+    // Rows that touch few of a flat page's chunks are read from those chunks; the cache would decode
+    // the column whole on a second take.
+    // (A list page's chunks are found the same way, through its repetition index.)
+    const bool nested = column_is_nested(column_metadata);
+    std::size_t chunks_touched = 0;
+    std::size_t chunks_total = 0;
+    bool chunked = !rows.empty();
+    for (std::size_t t = 0; t < touched.size() && chunked; ++t) {
+        const auto& page = column_metadata.pages[touched[t].first];
+        page_layout::PageLayout layout;
+        std::string why;
+        chunked = page_layout::decode_page_layout(page.encoding, layout, why) &&
+                  layout.kind == page_layout::LayoutKind::kMiniBlock &&
+                  layout.mini_block.has_repetition == nested;
+        if (chunked) {
+            const auto index = miniblock_page_index(data_file_path, page, layout.mini_block, error);
+            if (index == nullptr) {
+                if (!error.empty()) {
+                    return false;
+                }
+                chunked = false;
+                break;
+            }
+            chunks_total += index->items.size();
+            std::size_t last = SIZE_MAX;
+            for (auto i = touched[t].second.first; i < touched[t].second.second; ++i) {
+                const auto r = rows[i] - page_first[touched[t].first];
+                const auto c = static_cast<std::size_t>(
+                    std::upper_bound(index->rows_before.begin(), index->rows_before.end(), r) -
+                    index->rows_before.begin() - 1);
+                chunks_touched += c != last ? 1U : 0U;
+                last = c;
+            }
+        }
+    }
+    chunked = chunked && chunks_touched * 4U <= chunks_total;
     if (!rows.empty() && !full_zip_lists && take_cache_budget() != 0U && encoded <= kCacheColumnBytes) {
-        const auto whole = cached_whole_column(data_file_path, on_disk_field, column_metadata, error);
+        const auto whole = cached_whole_column(data_file_path, on_disk_field, column_metadata, error,
+                                               encoded <= kSmallColumnBytes ? CacheFill::FirstTake
+                                               : chunked                    ? CacheFill::Never
+                                               : nested                     ? CacheFill::SecondTake
+                                                                            : CacheFill::FirstTake);
         if (whole == nullptr && !error.empty()) {
             return false;
         }
@@ -4739,6 +4906,17 @@ bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_pa
                 keep[static_cast<std::size_t>(r)] = 1U;
             }
             return gather_column_values(*whole, keep, page_first.back(), value_bytes, out, error);
+        }
+    }
+
+    if (chunked && !nested) {
+        bool done = false;
+        if (!take_flat_miniblock_chunks(data_file_path, on_disk_field, column_metadata, rows, touched, page_first,
+                                        value_bytes, out, done, error)) {
+            return false;
+        }
+        if (done) {
+            return true;
         }
     }
 

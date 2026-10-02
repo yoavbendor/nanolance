@@ -2393,3 +2393,39 @@ val: write 1.0 s vs 3.1 s, an epoch 0.39 s vs 4.1 s, a shuffled epoch 0.38 s vs 
 1.06 / 0.09 / 0.29 s vs 1.90 / 0.38 / 0.31 s. Still behind Rust on all cores: writes of a single
 large list or map column (a column's pages are cut sequentially) and of random binary blobs.
 Verified with ASAN and ThreadSanitizer, and the suites run at 1, 4, and 8 threads with 1 KiB morsels.
+
+## Scalar indexes: BTree, Bitmap, LabelList, built and used
+
+Asked: build and use Lance's indexes, so that the same index serves pylance and nanolance with the same
+results, at about pylance's speed, starting with the scalar indexes (the plan: BTree, Bitmap and
+LabelList; then IVF_PQ / IVF_FLAT; then LanceDB's full-text defaults).
+
+- **Building** (`src/scalar_index.cpp`): the column is scanned with row addresses (deleted rows left
+  out), its values -- a label list's elements -- ordered nulls first, then ascending (IEEE total order
+  for floats), ties by row address, and written as Lance writes them: BTree's `page_data.lance` and
+  `page_lookup.lance` (4096-row pages, min / max / null count, `batch_size` metadata), Bitmap's and
+  LabelList's `bitmap_page_lookup.lance` (serialized RowAddrTreeMaps; a label list's null lists in
+  global buffer 1). The manifest entry is field for field Lance's. A BTree sorts in parallel on 8-byte
+  key prefixes taken past the column's common prefix; a bitmap groups by hash and sorts only the
+  distinct values. Standalone Lance files with schema metadata and extra global buffers came first
+  (`write_lance_file`), and the reader learned files with more than one global buffer.
+- **Using** (`src/index_search.cpp`): a filter's AND / OR / NOT structure over single-column
+  predicates (`expr::Condition`, `expr::Predicate`), each evaluated with the filter engine's own
+  semantics on an index's keys or a BTree page's bounds, gives per covered fragment the rows that may
+  pass; the reader decodes only those (`read_candidate_rows`) and applies the whole filter to them.
+- **What it took besides**: `array_has_any` / `array_has_all` / `array_contains` in the filter engine
+  (list columns); float comparisons as DataFusion makes them (NaN equal to NaN and greater than all,
+  -0.0 equal to 0.0); a vectorized path for column-against-constant predicates (`f > 3.5` over 5M rows
+  95 -> 25 ms); late materialization (a selective filter's other columns are taken for the rows that
+  pass); and take() reading only the chunks holding its rows of a flat MiniBlock page, with the
+  whole-column take cache no longer thrashing once its budget is full (all columns of 1,000 scattered
+  rows of 5M: 338 -> 20-45 ms).
+- **Verified**: pylance lists, validates and answers from nanolance's indexes (its plans name them;
+  `test_scalar_index.py`), their contents equal pylance's for the same data, and nanolance answers
+  from either builder's indexes exactly as a scan does. 216 of pylance's own tests pass (190 before),
+  lance-c's `test_index_lifecycle` passes. ASan clean on the index tests and on 5M-row queries.
+- **Speed** (`docs/BENCHMARKS.md`, "Scalar indexes"): building 1.5-3.6x faster than pylance; indexed
+  reads 1.1-3.2x faster but for a one-row lookup returning every column (2.9 ms vs 1.3 ms).
+- **Not yet**: the other scalar index kinds (INVERTED is Phase 3), vector indexes (Phase 2), build
+  options, stable row ids, and decimal comparisons in the filter engine (an index on a decimal column
+  is built, but nanolance's filters cannot compare decimals yet).

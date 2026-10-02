@@ -2238,7 +2238,8 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                            bool compress,
                            DataFileResult& result,
                            std::string& error,
-                           bool parallel_columns) {
+                           bool parallel_columns,
+                           const LanceFileExtras* extras) {
     error.clear();
     if (mapping.fields.empty()) {
         error = "cannot write Lance data file without mapped fields";
@@ -2250,8 +2251,9 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         return false;
     }
 
-    const auto relative_path = std::filesystem::path("data") / file_name;
-    const auto full_path = dataset_path / relative_path;
+    const auto relative_path =
+        extras != nullptr && !extras->path.empty() ? extras->path : std::filesystem::path("data") / file_name;
+    const auto full_path = extras != nullptr && !extras->path.empty() ? extras->path : dataset_path / relative_path;
     std::error_code ec;
     std::filesystem::create_directories(full_path.parent_path(), ec);
     if (ec) {
@@ -3027,6 +3029,18 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         }
         descriptor.fields.push_back(std::move(field));
     }
+    if (extras != nullptr) {
+        descriptor.schema_metadata = extras->schema_metadata;
+    }
+    // Global buffers past the schema's: written before it, listed after it.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> extra_buffers;
+    if (extras != nullptr) {
+        for (const auto& buffer : extras->global_buffers) {
+            align64(out);
+            extra_buffers.emplace_back(pos(out), buffer.size());
+            out.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        }
+    }
     const auto descriptor_bytes = pb::encode_file_descriptor(descriptor);
     align64(out);
     const auto global_buffer_offset = pos(out);
@@ -3052,11 +3066,15 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
     const auto global_offsets_start = pos(out);
     write_le64(out, global_buffer_offset);
     write_le64(out, descriptor_bytes.size());
+    for (const auto& [offset, size] : extra_buffers) {
+        write_le64(out, offset);
+        write_le64(out, size);
+    }
 
     write_le64(out, column_metadata_start);
     write_le64(out, column_offsets_start);
     write_le64(out, global_offsets_start);
-    write_le32(out, 1);
+    write_le32(out, static_cast<std::uint32_t>(1U + extra_buffers.size()));
     write_le32(out, static_cast<std::uint32_t>(columns.size()));
     write_le16(out, 2);
     write_le16(out, 2);

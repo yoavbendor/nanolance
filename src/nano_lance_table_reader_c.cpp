@@ -479,6 +479,7 @@ void nano_lance_work_stats(NanoLanceWorkStats* out) {
     out->buffer_pool_hits = get(c.buffer_pool_hits);
     out->buffer_pool_misses = get(c.buffer_pool_misses);
     out->take_cache_hits = get(c.take_cache_hits);
+    out->indexed_fragments = get(c.indexed_fragments);
 }
 
 void nano_lance_reset_work_stats(void) { nano_lance::work_stats::reset(); }

@@ -25,7 +25,9 @@
 ///                   [NOT] LIKE / ILIKE 'pat%'
 ///   arithmetic      + - * / % and unary minus; || concatenates strings
 ///   functions       lower, upper, length / char_length, abs, coalesce, starts_with, ends_with,
-///                   contains, is_null, is_valid, CAST(x AS type)
+///                   contains, is_null, is_valid, CAST(x AS type); on a list column,
+///                   array_has_any(c, ['a', 'b']), array_has_all(c, [...]), array_contains(c, 'a')
+///                   (array_has, list_has, list_has_any, list_has_all likewise)
 ///
 /// A column compared with a string or DATE / TIMESTAMP literal compares as the column's type, as
 /// DataFusion coerces it. What the dialect does not cover is refused with an error naming it, never
@@ -33,6 +35,51 @@
 namespace nano_lance::expr {
 
 struct Node;
+
+class Predicate;
+
+/// A filter's shape as an index sees it: AND, OR and NOT over predicates, each a test of one
+/// column against constants. Any other part of the filter is `Other`, which no index answers.
+struct Condition {
+    enum class Kind { And, Or, Not, Predicate, Other };
+    Kind kind = Kind::Other;
+    std::vector<Condition> children;              // And, Or (two), Not (one)
+    std::shared_ptr<const Predicate> predicate;  // Predicate
+};
+
+/// A test of one column against constants: `x < 5`, `x IN (1, 2)`, `x BETWEEN 1 AND 9`,
+/// `x IS NULL`, `array_has_any(tags, ['a', 'b'])`, ... Evaluated with the filter's own semantics, on
+/// any values of the column's type -- an index's keys, a page's bounds.
+class Predicate {
+public:
+    enum class Test { Compare, In, Between, IsNull, IsNotNull, HasAny, HasAll, Has };
+
+    Test test() const { return test_; }
+    /// The column, as written ("s.child" is {"s", "child"}).
+    const std::vector<std::string>& column() const { return column_; }
+    /// Compare: "=", "!=", "<", "<=", ">", ">=", the column on the left (`5 > x` is `x < 5`).
+    const std::string& op() const { return op_; }
+    /// The constants: In's items, Between's two bounds, Compare's and Has's one, and the items of
+    /// HasAny's and HasAll's list.
+    std::size_t constants() const { return constants_.size(); }
+
+    /// `column <op> constant k`, a Compare.
+    Predicate compare_with(const std::string& op, std::size_t k) const;
+
+    /// Evaluate on `values`, of the column's type -- for HasAny, HasAll and Has, of its elements'
+    /// type, and then TRUE for an element the test names. `pass[i]` is 1 where the test is TRUE.
+    bool filter(const ArrowSchema& type, const ArrowArray& values, std::vector<std::uint8_t>& pass,
+                std::string& error) const;
+
+    std::string to_string() const;
+
+private:
+    friend class Expression;
+    Test test_ = Test::Compare;
+    std::vector<std::string> column_;
+    std::string op_;
+    std::vector<std::shared_ptr<const Node>> constants_;
+};
 
 /// A parsed expression.
 class Expression {
@@ -73,9 +120,13 @@ public:
     /// The expression as SQL (normalized; for messages and tests).
     std::string to_string() const;
 
+    /// The expression's predicates an index could answer, in its AND / OR / NOT structure.
+    Condition conditions() const;
+
     bool empty() const { return root_ == nullptr; }
 
 private:
+    friend class Predicate;
     std::unique_ptr<Node> root_;
     struct Binding;
     std::unique_ptr<Binding> binding_;

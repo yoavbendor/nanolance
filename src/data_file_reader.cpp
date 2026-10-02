@@ -195,35 +195,40 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
     }
 
     std::uint32_t num_columns = 0;
-    std::uint32_t const1 = 0;
-    if (!read_le32(tail.data() + magic_idx - 8U, num_columns) || !read_le32(tail.data() + magic_idx - 12U, const1)) {
+    std::uint32_t num_global_buffers = 0;
+    if (!read_le32(tail.data() + magic_idx - 8U, num_columns) ||
+        !read_le32(tail.data() + magic_idx - 12U, num_global_buffers)) {
         error = "failed to read data file column counts";
         return false;
     }
-    if (const1 != 1U) {
-        error = "unexpected Lance data file footer constant";
+    // Global buffer 0 is the schema; Lance's index files add more (a label list's null rows).
+    if (num_global_buffers == 0U || num_global_buffers > 1024U) {
+        error = "unexpected Lance data file global buffer count";
         return false;
     }
 
-    const std::size_t u64_block = magic_idx - 52U;
-    std::uint64_t global_buffer_offset = 0;
-    std::uint64_t descriptor_size = 0;
     std::uint64_t column_metadata_start = 0;
     std::uint64_t column_offsets_start = 0;
     std::uint64_t global_offsets_start = 0;
-    if (!read_le64(tail.data() + u64_block + 0U, global_buffer_offset) ||
-        !read_le64(tail.data() + u64_block + 8U, descriptor_size) ||
-        !read_le64(tail.data() + u64_block + 16U, column_metadata_start) ||
-        !read_le64(tail.data() + u64_block + 24U, column_offsets_start) ||
-        !read_le64(tail.data() + u64_block + 32U, global_offsets_start)) {
+    if (!read_le64(tail.data() + magic_idx - 36U, column_metadata_start) ||
+        !read_le64(tail.data() + magic_idx - 28U, column_offsets_start) ||
+        !read_le64(tail.data() + magic_idx - 20U, global_offsets_start)) {
         error = "failed to read data file footer offset block";
         return false;
     }
-
+    // The global buffer table sits right before those offsets, as every Lance writer lays it out.
     const std::uint64_t tail_base = file_size - static_cast<std::uint64_t>(tail_len);
-    const std::uint64_t abs_u64_block = tail_base + u64_block;
-    if (global_offsets_start != abs_u64_block) {
+    const std::uint64_t table_bytes = 16ULL * num_global_buffers;
+    if (magic_idx < 36U + table_bytes || global_offsets_start != tail_base + magic_idx - 36U - table_bytes) {
         error = "data file footer global_offsets_start mismatch";
+        return false;
+    }
+    const std::size_t u64_block = magic_idx - 36U - static_cast<std::size_t>(table_bytes);
+    std::uint64_t global_buffer_offset = 0;
+    std::uint64_t descriptor_size = 0;
+    if (!read_le64(tail.data() + u64_block, global_buffer_offset) ||
+        !read_le64(tail.data() + u64_block + 8U, descriptor_size)) {
+        error = "failed to read data file footer offset block";
         return false;
     }
     if (!fits_size_t(descriptor_size) || !range_in_bounds(global_buffer_offset, descriptor_size, file_size)) {
@@ -256,7 +261,28 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
     layout.column_offsets_start = column_offsets_start;
     layout.global_offsets_start = global_offsets_start;
     layout.num_columns = num_columns;
+    layout.num_global_buffers = num_global_buffers;
     return true;
+}
+
+bool read_lance_file_global_buffer(const std::filesystem::path& path, const LanceDataFileFooterLayout& layout,
+                                   std::uint32_t index, std::vector<std::uint8_t>& out, std::string& error) {
+    out.clear();
+    if (index >= layout.num_global_buffers) {
+        error = "the file has no global buffer " + std::to_string(index);
+        return false;
+    }
+    std::vector<std::uint8_t> entry;
+    if (!read_lance_data_file_bytes(path, layout.global_offsets_start + 16ULL * index, 16U, entry, error)) {
+        return false;
+    }
+    std::uint64_t offset = 0;
+    std::uint64_t size = 0;
+    if (!read_le64(entry.data(), offset) || !read_le64(entry.data() + 8U, size)) {
+        error = "failed to read a global buffer entry";
+        return false;
+    }
+    return read_lance_data_file_bytes(path, offset, size, out, error);
 }
 
 bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::uint64_t offset,

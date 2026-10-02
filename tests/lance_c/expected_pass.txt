@@ -48,6 +48,7 @@ cpp/nanolance::test_delete_rows
 cpp/nanolance::test_drop_columns
 cpp/nanolance::test_error_exception
 cpp/nanolance::test_fts_smoke
+cpp/nanolance::test_index_lifecycle
 cpp/nanolance::test_index_segments_smoke
 cpp/nanolance::test_merge_insert
 cpp/nanolance::test_multivector_rejects_flat_column
@@ -74,6 +75,7 @@ cpp/pylance::test_delete_rows
 cpp/pylance::test_drop_columns
 cpp/pylance::test_error_exception
 cpp/pylance::test_fts_smoke
+cpp/pylance::test_index_lifecycle
 cpp/pylance::test_index_segments_smoke
 cpp/pylance::test_merge_insert
 cpp/pylance::test_multivector_rejects_flat_column

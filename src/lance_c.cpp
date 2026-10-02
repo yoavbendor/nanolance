@@ -25,6 +25,7 @@
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/nano_lance_writer.h"
 #include "nanolance/path_safety.hpp"
+#include "nanolance/scalar_index.hpp"
 #include "nanolance/work_stats.hpp"
 
 #include "lance_minimal.pb.hpp"
@@ -32,9 +33,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <limits>
 #include <map>
 #include <memory>
@@ -2062,9 +2065,28 @@ int32_t lance_dataset_create_vector_index(LanceDataset*, const char*, const char
                                           bool) {
     NL_UNSUPPORTED_INT("indexes");
 }
-int32_t lance_dataset_create_scalar_index(LanceDataset*, const char*, const char*, LanceScalarIndexType, const char*,
-                                          bool) {
-    NL_UNSUPPORTED_INT("indexes");
+int32_t lance_dataset_create_scalar_index(LanceDataset* dataset, const char* column, const char* index_name,
+                                          LanceScalarIndexType index_type, const char* params_json, bool replace) {
+    if (dataset == nullptr || column == nullptr || column[0] == '\0') {
+        invalid("dataset and column must not be NULL or empty");
+        return -1;
+    }
+    nano_lance::ScalarIndexType type{};
+    switch (index_type) {
+        case LANCE_SCALAR_BTREE: type = nano_lance::ScalarIndexType::BTree; break;
+        case LANCE_SCALAR_BITMAP: type = nano_lance::ScalarIndexType::Bitmap; break;
+        case LANCE_SCALAR_LABEL_LIST: type = nano_lance::ScalarIndexType::LabelList; break;
+        default: NL_UNSUPPORTED_INT("this scalar index type");
+    }
+    if (params_json != nullptr && params_json[0] != '\0' && std::string(params_json) != "{}") {
+        NL_UNSUPPORTED_INT("scalar index parameters");
+    }
+    nano_lance::ScalarIndexOptions options;
+    options.name = index_name != nullptr ? index_name : "";
+    options.replace = replace;
+    return mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_create_scalar_index(dataset->path, column, type, options, v, e);
+    });
 }
 LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar(const LanceDataset*, const char*, const char*,
                                                                  int32_t, const char*,
@@ -2136,26 +2158,82 @@ int32_t lance_dataset_commit_index_segments(LanceDataset*, const char*, const ch
                                             const size_t*, size_t) {
     NL_UNSUPPORTED_INT("indexes");
 }
-int32_t lance_dataset_drop_index(LanceDataset*, const char*) { NL_UNSUPPORTED_INT("indexes"); }
+int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name) {
+    if (dataset == nullptr || name == nullptr) {
+        invalid("dataset and name must not be NULL");
+        return -1;
+    }
+    return mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_drop_index(dataset->path, name, v, e);
+    });
+}
 uint64_t lance_dataset_index_count(const LanceDataset* dataset) {
-    // A dataset nanolance opens has no indexes it can use.
     if (dataset == nullptr) {
         invalid("dataset must not be NULL");
         return 0;
     }
+    std::vector<nano_lance::IndexInfo> indices;
+    std::string error;
+    if (!nano_lance::dataset_list_indices(dataset->path, true, dataset->version, indices, error)) {
+        fail(error);
+        return 0;
+    }
+    std::set<std::string> names;
+    for (const auto& i : indices) {
+        names.insert(i.name);
+    }
     clear_error();
-    return 0;
+    return names.size();
 }
 const char* lance_dataset_index_list_json(const LanceDataset* dataset) {
     if (dataset == nullptr) {
         invalid("dataset must not be NULL");
         return nullptr;
     }
-    clear_error();
-    char* out = static_cast<char*>(std::malloc(3));
-    if (out != nullptr) {
-        std::memcpy(out, "[]", 3);
+    std::vector<nano_lance::IndexInfo> indices;
+    std::string error;
+    if (!nano_lance::dataset_list_indices(dataset->path, true, dataset->version, indices, error)) {
+        fail(error);
+        return nullptr;
     }
+    const auto quote = [](const std::string& s) {
+        std::string out = "\"";
+        for (const char c : s) {
+            if (c == '"' || c == '\\') {
+                out += '\\';
+                out += c;
+            } else if (static_cast<unsigned char>(c) < 0x20U) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(c)));
+                out += buf;
+            } else {
+                out += c;
+            }
+        }
+        return out + "\"";
+    };
+    std::string json = "[";
+    for (const auto& i : indices) {
+        json += json.size() > 1 ? "," : "";
+        json += "{\"name\":" + quote(i.name) + ",\"uuid\":" + quote(i.uuid) + ",\"type\":" + quote(i.type) +
+                ",\"fields\":[";
+        for (std::size_t k = 0; k < i.fields.size(); ++k) {
+            json += (k > 0 ? "," : "") + quote(i.fields[k]);
+        }
+        json += "],\"fragment_ids\":[";
+        for (std::size_t k = 0; k < i.fragment_ids.size(); ++k) {
+            json += (k > 0 ? "," : "") + std::to_string(i.fragment_ids[k]);
+        }
+        json += "],\"dataset_version\":" + std::to_string(i.dataset_version) + "}";
+    }
+    json += "]";
+    char* out = static_cast<char*>(std::malloc(json.size() + 1U));
+    if (out == nullptr) {
+        fail("out of memory");
+        return nullptr;
+    }
+    std::memcpy(out, json.c_str(), json.size() + 1U);
+    clear_error();
     return out;
 }
 uint64_t lance_dataset_index_segment_count(const LanceDataset*, const char*) {

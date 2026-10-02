@@ -292,6 +292,35 @@ def render_multimodal(mm) -> str:
     return "\n".join(out) + "\n"
 
 
+def render_scalar_index(si) -> str:
+    """The scalar index benchmark (tools/bench_scalar_index.py)."""
+    out = []
+    w = out.append
+    env = si["environment"]
+    w("## Scalar indexes")
+    w("")
+    w("_From `bench/results/scalar_index.json`, produced by `tools/bench_scalar_index.py` (generated data)._ "
+      f"{si['rows']:,} rows in {si['fragments']} fragments: building each index on the unindexed data, then "
+      "filtered reads with them, each engine on the indexes it built (nanolance also without its index). "
+      f"Median of {si['runs']} runs after a warm-up, files in the page cache; nanolance "
+      f"`{env['nanolance_commit']}`, pylance {env['pylance']}, {env['cores']} cores, {env['date']}. "
+      "Every query's rows were checked against pylance's. Times in ms.")
+    w("")
+    w("| build | pylance | nanolance |")
+    w("|---|---:|---:|")
+    for name, rec in si["builds"].items():
+        w(f"| {name} | {rec['pylance']:,.0f} | {rec['nanolance']:,.0f} |")
+    w("")
+    fmt = lambda x: f"{x:,.1f}" if x < 100 else f"{x:,.0f}"
+    w("| query | columns | rows | pylance | nanolance | nanolance, no index |")
+    w("|---|---|---:|---:|---:|---:|")
+    for key, rec in si["queries"].items():
+        columns, query = key.split("|", 1)
+        w(f"| `{query}` | {columns} | {rec['rows']:,} | {fmt(rec['pylance'])} | {fmt(rec['nanolance'])} | "
+          f"{fmt(rec['nanolance_no_index'])} |")
+    return "\n".join(out) + "\n"
+
+
 def main(argv):
     src = Path(argv[1]) if len(argv) > 1 else ROOT / "bench" / "results" / "matrix.json"
     dst = Path(argv[2]) if len(argv) > 2 else ROOT / "docs" / "BENCHMARKS.md"
@@ -303,6 +332,9 @@ def main(argv):
     multimodal = src.with_name("multimodal.json")
     if multimodal.exists():
         text += "\n" + render_multimodal(json.loads(multimodal.read_text()))
+    scalar_index = src.with_name("scalar_index.json")
+    if scalar_index.exists():
+        text += "\n" + render_scalar_index(json.loads(scalar_index.read_text()))
     dst.write_text(text)
     print(f"wrote {dst}")
 

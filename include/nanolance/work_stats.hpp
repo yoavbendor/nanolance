@@ -26,6 +26,7 @@ struct Counters {
     std::atomic<std::uint64_t> buffer_pool_hits{0};     // output buffers reused from the pool
     std::atomic<std::uint64_t> buffer_pool_misses{0};   // large ones it could not supply
     std::atomic<std::uint64_t> take_cache_hits{0};      // take() columns served from a decoded copy
+    std::atomic<std::uint64_t> indexed_fragments{0};    // fragments a scalar index narrowed a filter to
 };
 
 inline Counters& counters() {
@@ -47,7 +48,7 @@ inline void reset() {
     auto& c = counters();
     for (auto* x : {&c.data_bytes_read, &c.data_reads, &c.largest_read, &c.page_windows, &c.read_morsels,
                     &c.fragment_reads, &c.parallel_column_writes, &c.write_buffered_bytes, &c.buffer_pool_hits,
-                    &c.buffer_pool_misses, &c.take_cache_hits}) {
+                    &c.buffer_pool_misses, &c.take_cache_hits, &c.indexed_fragments}) {
         x->store(0, std::memory_order_relaxed);
     }
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -30,6 +31,9 @@ struct Field {
 struct FileDescriptor {
     std::vector<Field> fields;
     std::uint64_t length = 0;
+    /// The schema's own metadata (Schema field 5): what Lance's index files keep about themselves
+    /// (a BTree's page size, a bitmap index's statistics).
+    std::map<std::string, std::vector<std::uint8_t>> schema_metadata;
 };
 
 struct DataFile {
@@ -77,7 +81,26 @@ struct IndexMetadata {
     std::vector<std::uint32_t> fragment_ids;
     /// The writer changed `fragment_ids`: field 5 is written anew rather than copied from `raw`.
     bool fragment_bitmap_changed = false;
+    std::array<std::uint8_t, 16> uuid{};  // 1: UUID{bytes=1}
+    std::string details_type_url;         // 6: the index_details Any's type, e.g. "/lance.table.BTreeIndexDetails"
+    std::uint32_t index_version = 0;      // 7
+    std::uint64_t created_at = 0;         // 8: milliseconds since the epoch
+    struct File {
+        std::string path;  // relative to _indices/<uuid>/
+        std::uint64_t size = 0;
+    };
+    std::vector<File> files;  // 10
 };
+
+/// A new index's message, field for field as Lance writes one; `raw` and the decoded fields agree.
+IndexMetadata make_index_metadata(const std::array<std::uint8_t, 16>& uuid, const std::vector<std::int32_t>& fields,
+                                  const std::string& name, std::uint64_t dataset_version,
+                                  const std::vector<std::uint32_t>& fragment_ids, const std::string& details_type_url,
+                                  std::uint32_t index_version, std::uint64_t created_at,
+                                  const std::vector<IndexMetadata::File>& files);
+
+/// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", the directory name of an index under _indices/.
+std::string uuid_string(const std::array<std::uint8_t, 16>& uuid);
 
 /// An IndexSection message: the indices, each re-encoded only where the writer changed it.
 bool decode_index_section(const std::vector<std::uint8_t>& bytes, std::vector<IndexMetadata>& out,

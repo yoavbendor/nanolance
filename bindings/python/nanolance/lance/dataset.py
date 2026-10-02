@@ -355,6 +355,7 @@ class LanceDataset:
             fragments=fragments, full_text_query=full_text_query, with_row_id=with_row_id,
             with_row_address=with_row_address, include_deleted_rows=include_deleted_rows, order_by=order_by,
             substrait_filter=substrait_filter, scan_stats_callback=scan_stats_callback, blob_handling=blob_handling,
+            use_scalar_index=use_scalar_index,
         )
         options.update({k: v for k, v in given.items() if v is not None})
         return LanceScanner(self, **options)
@@ -367,7 +368,7 @@ class LanceDataset:
         return self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
             full_text_query=full_text_query, with_row_id=with_row_id, with_row_address=with_row_address,
-            include_deleted_rows=include_deleted_rows, order_by=order_by, **kwargs,
+            include_deleted_rows=include_deleted_rows, order_by=order_by, use_scalar_index=use_scalar_index, **kwargs,
         ).to_table()
 
     def to_batches(self, columns=None, filter=None, limit=None, offset=None, nearest=None, batch_size=None,
@@ -378,7 +379,7 @@ class LanceDataset:
         return self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
             full_text_query=full_text_query, with_row_id=with_row_id, with_row_address=with_row_address,
-            order_by=order_by, **kwargs,
+            order_by=order_by, use_scalar_index=use_scalar_index, **kwargs,
         ).to_batches()
 
     def to_pandas(self, columns=None, filter=None, limit=None, offset=None, **kwargs):
@@ -563,6 +564,56 @@ class LanceDataset:
             _nanolance._ds_alter_columns(self._uri, items)
         self._refresh_latest()
 
+    # ── indices ───────────────────────────────────────────────────────────────────────────────────
+
+    def create_scalar_index(self, column: str, index_type: str, name: Optional[str] = None, *,
+                            replace: bool = True, **kwargs) -> "LanceDataset":
+        """Build a BTREE, BITMAP or LABEL_LIST index on `column`, in Lance's own format: pylance and
+        LanceDB use it as one they built. Commits a new version."""
+        if kwargs:
+            raise unsupported(f"create_scalar_index options {sorted(kwargs)}")
+        with native():
+            _nanolance._ds_create_scalar_index(self._uri, str(column), str(index_type), name or "", bool(replace))
+        self._refresh_latest()
+        return self
+
+    def drop_index(self, name: str) -> None:
+        with native():
+            _nanolance._ds_drop_index(self._uri, str(name))
+        self._refresh_latest()
+
+    def list_indices(self) -> List[Dict[str, Any]]:
+        with native():
+            indices = _nanolance._ds_list_indices(self._uri, self._version)
+        return [{"name": i["name"], "type": i["type"], "uuid": i["uuid"], "fields": i["fields"],
+                 "version": i["dataset_version"], "fragment_ids": set(i["fragment_ids"]), "base_id": None}
+                for i in indices]
+
+    def has_index(self) -> bool:
+        return bool(self.list_indices())
+
+    def describe_indices(self) -> List["IndexDescription"]:
+        with native():
+            indices = _nanolance._ds_list_indices(self._uri, self._version)
+        by_name: Dict[str, List[dict]] = {}
+        for i in indices:
+            by_name.setdefault(i["name"], []).append(i)
+        out = []
+        for name, segments in by_name.items():
+            first = segments[0]
+            out.append(IndexDescription(
+                name=name, type_url=first["type_url"], index_type=first["type"] if first["type_url"] else "Unknown",
+                fields=list(first["field_ids"]), field_names=list(first["fields"]),
+                num_rows_indexed=sum(s["rows_indexed"] for s in segments),
+                total_size_bytes=sum(s["size_bytes"] for s in segments), details={},
+                segments=[IndexSegmentDescription(
+                    uuid=s["uuid"], fragment_ids=set(s["fragment_ids"]), index_version=s["index_version"],
+                    dataset_version_at_last_update=s["dataset_version"], size_bytes=s["size_bytes"],
+                    created_at=datetime.fromtimestamp(s["created_at"] / 1000) if s["created_at"] else None,
+                    base_id=None, covering_fields=list(first["field_ids"])) for s in segments],
+            ))
+        return out
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
@@ -571,10 +622,10 @@ class LanceDataset:
 
     def __getattr__(self, name: str):
         known = {
-            "create_index", "create_scalar_index", "drop_index", "list_indices", "describe_indices",
+            "create_index",
             "index_statistics", "cleanup_old_versions", "merge", "tags", "branches", "create_branch", "sql",
             "shallow_clone", "deep_clone", "commit", "commit_batch", "session", "stats", "join", "delta",
-            "has_index", "prewarm_index", "lance_schema", "validate",
+            "prewarm_index", "lance_schema", "validate",
         }
         if name in known:
             raise unsupported(f"LanceDataset.{name}")
@@ -735,13 +786,36 @@ class DatasetOptimizer:
         raise unsupported("indexes")
 
 
+class IndexSegmentDescription:
+    """One segment of an index. Mirrors ``lance.indices.IndexSegmentDescription``."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+    def __repr__(self) -> str:
+        return f"IndexSegmentDescription(uuid={self.uuid!r}, fragment_ids={sorted(self.fragment_ids)})"
+
+
+class IndexDescription:
+    """An index of a dataset, its segments together. Mirrors ``lance.indices.IndexDescription``."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+    def __repr__(self) -> str:
+        return (f"IndexDescription(name={self.name!r}, type_url={self.type_url!r}, "
+                f"num_rows_indexed={self.num_rows_indexed}, fields={self.fields}, "
+                f"field_names={self.field_names}, num_segments={len(self.segments)}, "
+                f"total_size_bytes={self.total_size_bytes})")
+
+
 class LanceScanner:
     """A configured read. Mirrors ``lance.LanceScanner``."""
 
     def __init__(self, ds: LanceDataset, columns=None, filter=None, limit=None, offset=None, nearest=None,
                  batch_size=None, fragments=None, full_text_query=None, with_row_id=False, with_row_address=False,
                  include_deleted_rows=None, order_by=None, substrait_filter=None, scan_stats_callback=None,
-                 blob_handling=None, **ignored):
+                 blob_handling=None, use_scalar_index=None, **ignored):
         if nearest is not None:
             raise unsupported("vector search (nearest=...)")
         if full_text_query is not None:
@@ -778,6 +852,7 @@ class LanceScanner:
         self._fragment_ids = None if fragments is None else [int(getattr(f, "fragment_id", f)) for f in fragments]
         self._with_row_id = bool(with_row_id)
         self._with_row_address = bool(with_row_address)
+        self._use_scalar_index = use_scalar_index is not False
 
     def _read(self, stream: bool):
         if self._filter is None:
@@ -792,11 +867,12 @@ class LanceScanner:
             self._drop_rowaddr = True
             with native():
                 return _nanolance._ds_scan(self._ds.uri, self._ds.version, [], self._fragment_ids, offset, length,
-                                           False, True, stream, self._filter, self._blob_handling)
+                                           False, True, stream, self._filter, self._blob_handling,
+                                           self._use_scalar_index)
         with native():
             return _nanolance._ds_scan(self._ds.uri, self._ds.version, self._names, self._fragment_ids, offset,
                                        length, self._with_row_id, self._with_row_address, stream, self._filter,
-                                       self._blob_handling)
+                                       self._blob_handling, self._use_scalar_index)
 
     _drop_rowaddr = False
 
@@ -842,7 +918,8 @@ class LanceScanner:
         if self._names is None and not (self._with_row_id or self._with_row_address):
             # Count by reading only what the filter needs (a row address column when it needs nothing).
             counter = LanceScanner(self._ds, columns=[], filter=self._filter, limit=self._limit, offset=self._offset,
-                                   fragments=self._fragment_ids, with_row_address=True)
+                                   fragments=self._fragment_ids, with_row_address=True,
+                                   use_scalar_index=self._use_scalar_index)
             return counter.to_table().num_rows
         return self.to_table().num_rows
 
@@ -855,7 +932,14 @@ class LanceScanner:
         return self._ds.schema
 
     def explain_plan(self, verbose: bool = False) -> str:
-        return f"nanolance scan of {self._ds.uri} v{self._ds.version}"
+        lines = [f"nanolance scan of {self._ds.uri} v{self._ds.version}"]
+        if self._filter is not None:
+            lines.append(f"  filter={self._filter}")
+            if self._use_scalar_index:
+                with native():
+                    lines += ["  " + line for line in _nanolance._ds_explain_filter(
+                        self._ds.uri, self._ds.version, self._filter)]
+        return "\n".join(lines)
 
     def analyze_plan(self) -> str:
         return self.explain_plan()

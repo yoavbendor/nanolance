@@ -48,8 +48,10 @@ speedup). Full details, the threat model, and a reviewer checklist: **[docs/SAFE
   wrote — no Rust `lance` core. Everything it writes is readable by stock `lance`
   (verified against `pylance` 12.0.0) **unless** a feature is marked *nanolance-only* below.
   It reads Lance file formats 2.0, 2.1 and 2.2 — 2.0 being what most LanceDB tables on the Hugging
-  Face Hub are in ([docs/REAL_DATASETS.md](docs/REAL_DATASETS.md)). It builds no indexes, but a
-  dataset's existing ones (built with pylance) survive its appends, deletes, updates and compactions.
+  Face Hub are in ([docs/REAL_DATASETS.md](docs/REAL_DATASETS.md)). It builds and uses Lance's
+  scalar indexes (BTree, Bitmap, LabelList) in Lance's own format: pylance uses an index nanolance
+  built, and nanolance one pylance built, with the same results. A dataset's other indexes (vector,
+  full-text) survive its appends, deletes, updates and compactions.
 - **Headline benefit:** rows keep big payloads **external** (`uri` + `position` + `size`, never copied),
   so a packet table costs a few bytes/row regardless of payload size; bytes are fetched on demand (local
   file or `s3://`).

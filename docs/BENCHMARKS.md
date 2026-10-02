@@ -258,3 +258,32 @@ _From `bench/results/multimodal.json`, produced by `tools/bench_multimodal.py` (
 | nanolance reading Rust's file | — | 86 <small>(312 CPU)</small> | 0.3 <small>(0.5 CPU)</small> | 266 <small>(270 CPU)</small> |
 | Rust reading nanolance's file | — | 415 <small>(453 CPU)</small> | 4.1 <small>(4.6 CPU)</small> | 394 <small>(588 CPU)</small> |
 
+
+## Scalar indexes
+
+_From `bench/results/scalar_index.json`, produced by `tools/bench_scalar_index.py` (generated data)._ 5,000,000 rows in 5 fragments: building each index on the unindexed data, then filtered reads with them, each engine on the indexes it built (nanolance also without its index). Median of 5 runs after a warm-up, files in the page cache; nanolance `67da872 with uncommitted changes (the scalar index commit)`, pylance 12.0.0, 4 cores, 2026-10-02 03:39 UTC. Every query's rows were checked against pylance's. Times in ms.
+
+| build | pylance | nanolance |
+|---|---:|---:|
+| id BTREE | 1,159 | 793 |
+| f BTREE | 1,245 | 773 |
+| s BTREE | 2,194 | 1,472 |
+| cat BITMAP | 1,387 | 386 |
+| tags LABEL_LIST | 2,261 | 974 |
+
+| query | columns | rows | pylance | nanolance | nanolance, no index |
+|---|---|---:|---:|---:|---:|
+| `id = 123456` | id | 1 | 1.4 | 0.6 | 15.7 |
+| `id < 1000` | id | 1,000 | 7.5 | 3.0 | 17.5 |
+| `id BETWEEN 1000000 AND 1100000` | id | 100,001 | 24.1 | 14.3 | 34.4 |
+| `s = 'user_00012345'` | id | 0 | 0.8 | 0.5 | 49.0 |
+| `cat = 'c7'` | id | 100,135 | 22.7 | 8.0 | 38.0 |
+| `array_has_any(tags, ['t5'])` | id | 49,718 | 17.8 | 15.9 | 772 |
+| `cat = 'c7' AND id < 50000` | id | 1,053 | 9.6 | 8.9 | 31.2 |
+| `id = 123456` | all | 1 | 1.3 | 2.9 | 20.0 |
+| `id < 1000` | all | 1,000 | 30.5 | 11.4 | 33.3 |
+| `id BETWEEN 1000000 AND 1100000` | all | 100,001 | 142 | 54.2 | 83.5 |
+| `s = 'user_00012345'` | all | 0 | 0.8 | 0.6 | 46.8 |
+| `cat = 'c7'` | all | 100,135 | 139 | 43.1 | 80.6 |
+| `array_has_any(tags, ['t5'])` | all | 49,718 | 130 | 43.1 | 870 |
+| `cat = 'c7' AND id < 50000` | all | 1,053 | 36.2 | 18.2 | 44.9 |

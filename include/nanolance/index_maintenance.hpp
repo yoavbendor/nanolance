@@ -8,8 +8,8 @@
 #include <cstdint>
 #include <vector>
 
-/// Keeping a dataset's indices across the commits nanolance makes. nanolance builds no index, but a
-/// dataset pylance indexed must keep its indices when nanolance appends to it, deletes from it or
+/// Keeping a dataset's indices across the commits nanolance makes. nanolance builds only scalar
+/// indices (scalar_index.hpp), but a dataset pylance indexed must keep all its indices when nanolance appends to it, deletes from it or
 /// changes its columns -- dropping them silently turns every indexed query into a full scan.
 ///
 /// An index claims a set of fields and of fragments (its fragment bitmap). These are Lance's own

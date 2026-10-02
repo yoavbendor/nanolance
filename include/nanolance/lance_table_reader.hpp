@@ -75,6 +75,9 @@ struct LanceScanRequest {
     bool include_deleted_rows = false;
     /// How Blob v2 columns come back (see BlobHandling).
     BlobHandling blob_handling = BlobHandling::Ingest;
+    /// With a filter: read only the rows the dataset's scalar indices say may pass (BTree, Bitmap,
+    /// LabelList; index_search.hpp). The rows returned are the same either way.
+    bool use_scalar_index = true;
 };
 
 /// A read as `request` describes it. See lance_table_read_dataset for the ownership rules.

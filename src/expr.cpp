@@ -258,6 +258,9 @@ struct ColumnRef {
     std::vector<int64_t> indices;
     ArrowType type = NANOARROW_TYPE_UNINITIALIZED;
     ArrowTimeUnit unit = NANOARROW_TIME_UNIT_SECOND;
+    // A list column (an array function's argument): its elements' type.
+    ArrowType item_type = NANOARROW_TYPE_UNINITIALIZED;
+    ArrowTimeUnit item_unit = NANOARROW_TIME_UNIT_SECOND;
 };
 
 struct Node {
@@ -966,7 +969,17 @@ bool scalar_type(ArrowType t) {
     }
 }
 
-bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::string& error) {
+bool is_list_type(ArrowType t) {
+    return t == NANOARROW_TYPE_LIST || t == NANOARROW_TYPE_LARGE_LIST || t == NANOARROW_TYPE_FIXED_SIZE_LIST;
+}
+
+bool is_array_function(const std::string& name) {
+    return name == "array_has_any" || name == "array_has_all" || name == "array_has" || name == "array_contains" ||
+           name == "list_has_any" || name == "list_has_all" || name == "list_has" || name == "list_contains";
+}
+
+bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::string& error,
+               bool under_array_function = false) {
     if (n.op == Op::Column) {
         auto& c = n.column;
         c.indices.clear();
@@ -999,6 +1012,17 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
         }
         c.type = sv.type;
         c.unit = sv.time_unit;
+        c.item_type = NANOARROW_TYPE_UNINITIALIZED;
+        if (under_array_function && is_list_type(sv.type)) {
+            ArrowSchemaView item;
+            if (ArrowSchemaViewInit(&item, at->children[0], &aerr) != NANOARROW_OK || !scalar_type(item.type)) {
+                error = "column '" + joined + "' is a list of a type filters cannot compare";
+                return false;
+            }
+            c.item_type = item.type;
+            c.item_unit = item.time_unit;
+            return true;
+        }
         if (!scalar_type(sv.type) && !under_null_test) {
             error = "column '" + joined + "' has a type filters cannot compare (only IS NULL / IS NOT NULL)";
             return false;
@@ -1007,8 +1031,10 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
     }
     const bool null_test = n.op == Op::IsNull || n.op == Op::IsNotNull ||
                            (n.op == Op::Func && (n.name == "is_null" || n.name == "is_valid"));
+    const bool array_function = n.op == Op::Func && is_array_function(n.name);
     for (auto& a : n.args) {
-        if (!bind_node(*a, schema, null_test && a.get() == n.args.front().get(), error)) {
+        const bool first = a.get() == n.args.front().get();
+        if (!bind_node(*a, schema, null_test && first, error, array_function && first)) {
             return false;
         }
     }
@@ -1018,6 +1044,8 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
             {"character_length", {1, 1}}, {"abs", {1, 1}},   {"coalesce", {1, 64}}, {"starts_with", {2, 2}},
             {"ends_with", {2, 2}},  {"contains", {2, 2}},    {"is_null", {1, 1}},  {"is_valid", {1, 1}},
             {"invert", {1, 1}},     {"and_", {2, 2}},        {"or_", {2, 2}},      {"equal", {2, 2}},
+            {"array_has_any", {2, 2}}, {"array_has_all", {2, 2}}, {"array_has", {2, 2}}, {"array_contains", {2, 2}},
+            {"list_has_any", {2, 2}},  {"list_has_all", {2, 2}},  {"list_has", {2, 2}},  {"list_contains", {2, 2}},
         };
         const auto it = arity.find(n.name);
         if (it == arity.end()) {
@@ -1100,6 +1128,8 @@ struct Context {
     }
 };
 
+Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowTimeUnit unit);
+
 Value read_column(const ColumnRef& c, int64_t row, Context& ctx) {
     const ArrowArrayView* view = ctx.batch;
     int64_t at = row;
@@ -1113,7 +1143,31 @@ Value read_column(const ColumnRef& c, int64_t row, Context& ctx) {
     if (ArrowArrayViewIsNull(view, at)) {
         return Value::null();
     }
-    switch (c.type) {
+    if (c.item_type != NANOARROW_TYPE_UNINITIALIZED) {
+        int64_t begin = 0;
+        int64_t end = 0;
+        if (c.type == NANOARROW_TYPE_FIXED_SIZE_LIST) {
+            const auto size = view->layout.child_size_elements;
+            begin = (view->offset + at) * size;
+            end = begin + size;
+        } else {
+            begin = ArrowArrayViewListChildOffset(view, at);
+            end = ArrowArrayViewListChildOffset(view, at + 1);
+        }
+        std::vector<Value> items;
+        items.reserve(static_cast<std::size_t>(end - begin));
+        for (auto e = begin; e < end; ++e) {
+            items.push_back(ArrowArrayViewIsNull(view->children[0], e)
+                                ? Value::null()
+                                : read_scalar(view->children[0], e, c.item_type, c.item_unit));
+        }
+        return Value::list(std::move(items));
+    }
+    return read_scalar(view, at, c.type, c.unit);
+}
+
+Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowTimeUnit unit) {
+    switch (type) {
         case NANOARROW_TYPE_BOOL: return Value::boolean(ArrowArrayViewGetIntUnsafe(view, at) != 0);
         case NANOARROW_TYPE_INT8:
         case NANOARROW_TYPE_INT16:
@@ -1146,7 +1200,7 @@ Value read_column(const ColumnRef& c, int64_t row, Context& ctx) {
         }
         case NANOARROW_TYPE_DATE32: return Value::date(ArrowArrayViewGetIntUnsafe(view, at));
         case NANOARROW_TYPE_DATE64: return Value::timestamp(ArrowArrayViewGetIntUnsafe(view, at) * 1000000LL);
-        case NANOARROW_TYPE_TIMESTAMP: return Value::timestamp(ArrowArrayViewGetIntUnsafe(view, at) * unit_to_ns(c.unit));
+        case NANOARROW_TYPE_TIMESTAMP: return Value::timestamp(ArrowArrayViewGetIntUnsafe(view, at) * unit_to_ns(unit));
         default:
             // Bound only under a null test, where the value itself is never read: any non-null.
             return Value::boolean(true);
@@ -1157,8 +1211,13 @@ Value read_column(const ColumnRef& c, int64_t row, Context& ctx) {
 std::optional<int> compare(const Value& a, const Value& b) {
     if (a.numeric() && b.numeric()) {
         if (a.kind == Kind::Double || b.kind == Kind::Double) {
+            // As DataFusion compares floats: NaN equals NaN and is greater than every other value;
+            // -0.0 equals 0.0.
             const double x = a.as_double();
             const double y = b.as_double();
+            if (std::isnan(x) || std::isnan(y)) {
+                return std::isnan(x) == std::isnan(y) ? 0 : (std::isnan(x) ? 1 : -1);
+            }
             return x < y ? -1 : (x > y ? 1 : 0);
         }
         if (a.kind == Kind::Int && b.kind == Kind::Int) {
@@ -1596,6 +1655,49 @@ Value eval(const Node& n, int64_t row, Context& ctx) {
                 }
                 return x.is_null() || y.is_null() ? Value::null() : Value::boolean(false);
             }
+            if (is_array_function(f)) {
+                // DataFusion's array_has / array_has_any / array_has_all: a NULL list is NULL; a NULL
+                // element matches nothing.
+                const Value list = eval(*n.args[0], row, ctx);
+                const Value b = eval(*n.args[1], row, ctx);
+                if ((f == "array_has_all" || f == "list_has_all") && b.kind == Kind::List && b.items->empty()) {
+                    return Value::boolean(true);  // as DataFusion folds it, a NULL list included
+                }
+                if (list.is_null() || b.is_null()) {
+                    return Value::null();
+                }
+                if (list.kind != Kind::List) {
+                    return ctx.fail(f + "() needs a list as its first argument");
+                }
+                const auto has = [&](const Value& v) {
+                    if (v.is_null()) {
+                        return false;
+                    }
+                    for (const auto& item : *list.items) {
+                        if (!item.is_null()) {
+                            const auto c = compare(item, v);
+                            if (c && *c == 0) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                };
+                const bool any = f == "array_has_any" || f == "list_has_any";
+                const bool all = f == "array_has_all" || f == "list_has_all";
+                if (!any && !all) {
+                    return Value::boolean(has(b));
+                }
+                if (b.kind != Kind::List) {
+                    return ctx.fail(f + "() needs a list such as ['a', 'b'] as its second argument");
+                }
+                for (const auto& v : *b.items) {
+                    if (has(v) == any) {
+                        return Value::boolean(any);
+                    }
+                }
+                return Value::boolean(all);
+            }
             const Value a = eval(*n.args[0], row, ctx);
             if (a.is_null()) {
                 return a;
@@ -1835,6 +1937,319 @@ bool view_batch(const ArrowSchema& schema, const ArrowArray& batch, ViewGuard& g
 
 }  // namespace
 
+namespace {
+
+// ── vectorized filters ──────────────────────────────────────────────────────────────────────────
+//
+// The common filters -- a column against constants (=, <, IN, BETWEEN, IS NULL), joined by AND, OR
+// and NOT -- evaluated a column at a time rather than a row at a time, with exactly eval()'s
+// semantics. A state per row: 0 FALSE, 1 TRUE, 2 NULL. Anything else is left to eval().
+
+constexpr std::uint8_t kFalse = 0;
+constexpr std::uint8_t kTrue = 1;
+constexpr std::uint8_t kNull = 2;
+
+/// A top-level column's view, or null.
+const ArrowArrayView* fast_column(const Node& n, const ArrowArrayView& batch) {
+    if (n.op != Op::Column || n.column.indices.size() != 1U || n.column.item_type != NANOARROW_TYPE_UNINITIALIZED) {
+        return nullptr;
+    }
+    return batch.children[n.column.indices.front()];
+}
+
+/// The comparison outcome wanted: c is compare(value, literal).
+bool wanted(Op op, int c) {
+    switch (op) {
+        case Op::Eq: return c == 0;
+        case Op::Ne: return c != 0;
+        case Op::Lt: return c < 0;
+        case Op::Le: return c <= 0;
+        case Op::Gt: return c > 0;
+        default: return c >= 0;
+    }
+}
+
+Op flip(Op op) {
+    switch (op) {
+        case Op::Lt: return Op::Gt;
+        case Op::Le: return Op::Ge;
+        case Op::Gt: return Op::Lt;
+        case Op::Ge: return Op::Le;
+        default: return op;
+    }
+}
+
+template <typename T>
+int three_way(T a, T b) {
+    return a < b ? -1 : (b < a ? 1 : 0);
+}
+
+int double_way(double x, double y) {
+    if (std::isnan(x) || std::isnan(y)) {
+        return std::isnan(x) == std::isnan(y) ? 0 : (std::isnan(x) ? 1 : -1);
+    }
+    return three_way(x, y);
+}
+
+/// `ways[r]` = compare(column value r, literal) for the non-null rows of a numeric, temporal or
+/// string column -- false when the pair is not one this handles.
+bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit, const Value& lit, int64_t n,
+                    std::vector<std::int8_t>& ways) {
+    ways.assign(static_cast<std::size_t>(n), 0);
+    const auto width = v.layout.element_size_bits[1] / 8;
+    const std::uint8_t* data = v.buffer_views[1].data.as_uint8;
+    const auto signed_at = [&](int64_t r) -> std::int64_t {
+        const auto i = v.offset + r;
+        switch (width) {
+            case 1: return reinterpret_cast<const std::int8_t*>(data)[i];
+            case 2: return reinterpret_cast<const std::int16_t*>(data)[i];
+            case 4: return reinterpret_cast<const std::int32_t*>(data)[i];
+            default: return reinterpret_cast<const std::int64_t*>(data)[i];
+        }
+    };
+    const auto unsigned_at = [&](int64_t r) -> std::uint64_t {
+        const auto i = v.offset + r;
+        switch (width) {
+            case 1: return data[i];
+            case 2: return reinterpret_cast<const std::uint16_t*>(data)[i];
+            case 4: return reinterpret_cast<const std::uint32_t*>(data)[i];
+            default: return reinterpret_cast<const std::uint64_t*>(data)[i];
+        }
+    };
+    switch (type) {
+        case NANOARROW_TYPE_INT8:
+        case NANOARROW_TYPE_INT16:
+        case NANOARROW_TYPE_INT32:
+        case NANOARROW_TYPE_INT64:
+        case NANOARROW_TYPE_TIME32:
+        case NANOARROW_TYPE_TIME64:
+        case NANOARROW_TYPE_DURATION:
+            if (lit.kind == Kind::Int) {
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(three_way(signed_at(r), lit.i));
+            } else if (lit.kind == Kind::UInt) {
+                for (int64_t r = 0; r < n; ++r) {
+                    const auto x = signed_at(r);
+                    ways[r] = static_cast<std::int8_t>(x < 0 ? -1 : three_way(static_cast<std::uint64_t>(x), lit.u));
+                }
+            } else if (lit.kind == Kind::Double) {
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(static_cast<double>(signed_at(r)), lit.d));
+            } else {
+                return false;
+            }
+            return true;
+        case NANOARROW_TYPE_UINT8:
+        case NANOARROW_TYPE_UINT16:
+        case NANOARROW_TYPE_UINT32:
+        case NANOARROW_TYPE_UINT64:
+            if (lit.kind == Kind::UInt) {
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(three_way(unsigned_at(r), lit.u));
+            } else if (lit.kind == Kind::Int) {
+                for (int64_t r = 0; r < n; ++r) {
+                    ways[r] = static_cast<std::int8_t>(lit.i < 0 ? 1 : three_way(unsigned_at(r), static_cast<std::uint64_t>(lit.i)));
+                }
+            } else if (lit.kind == Kind::Double) {
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(static_cast<double>(unsigned_at(r)), lit.d));
+            } else {
+                return false;
+            }
+            return true;
+        case NANOARROW_TYPE_FLOAT:
+        case NANOARROW_TYPE_DOUBLE: {
+            if (!lit.numeric()) {
+                return false;
+            }
+            const double y = lit.as_double();
+            if (type == NANOARROW_TYPE_FLOAT) {
+                const auto* f = reinterpret_cast<const float*>(data) + v.offset;
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(f[r], y));
+            } else {
+                const auto* d = reinterpret_cast<const double*>(data) + v.offset;
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(d[r], y));
+            }
+            return true;
+        }
+        case NANOARROW_TYPE_DATE32:
+        case NANOARROW_TYPE_DATE64:
+        case NANOARROW_TYPE_TIMESTAMP: {
+            if (!lit.temporal()) {
+                return false;
+            }
+            const auto y = lit.as_ns();
+            const std::int64_t scale = type == NANOARROW_TYPE_DATE32   ? kNsPerDay
+                                       : type == NANOARROW_TYPE_DATE64 ? 1000000LL
+                                                                       : unit_to_ns(unit);
+            for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(three_way(signed_at(r) * scale, y));
+            return true;
+        }
+        case NANOARROW_TYPE_STRING:
+        case NANOARROW_TYPE_LARGE_STRING:
+            if (lit.kind != Kind::String && lit.kind != Kind::Binary) {
+                return false;
+            }
+            for (int64_t r = 0; r < n; ++r) {
+                const auto sv = ArrowArrayViewGetStringUnsafe(&v, r);
+                const int c = std::string_view(sv.data, static_cast<std::size_t>(sv.size_bytes)).compare(lit.s);
+                ways[r] = static_cast<std::int8_t>(c < 0 ? -1 : (c > 0 ? 1 : 0));
+            }
+            return true;
+        default:
+            return false;
+    }
+}
+
+void set_nulls(const ArrowArrayView& v, int64_t n, std::vector<std::uint8_t>& state) {
+    if (v.null_count == 0 || v.buffer_views[0].data.data == nullptr) {
+        return;
+    }
+    for (int64_t r = 0; r < n; ++r) {
+        if (ArrowArrayViewIsNull(&v, r)) {
+            state[static_cast<std::size_t>(r)] = kNull;
+        }
+    }
+}
+
+bool fast_eval(const Node& n, const ArrowArrayView& batch, int64_t length, std::vector<std::uint8_t>& out) {
+    const auto rows = static_cast<std::size_t>(length);
+    switch (n.op) {
+        case Op::And:
+        case Op::Or: {
+            std::vector<std::uint8_t> b;
+            if (!fast_eval(*n.args[0], batch, length, out) || !fast_eval(*n.args[1], batch, length, b)) {
+                return false;
+            }
+            const bool is_and = n.op == Op::And;
+            for (std::size_t r = 0; r < rows; ++r) {
+                const auto x = out[r];
+                const auto y = b[r];
+                if (is_and) {
+                    out[r] = x == kFalse || y == kFalse ? kFalse : (x == kNull || y == kNull ? kNull : kTrue);
+                } else {
+                    out[r] = x == kTrue || y == kTrue ? kTrue : (x == kNull || y == kNull ? kNull : kFalse);
+                }
+            }
+            return true;
+        }
+        case Op::Not:
+            if (!fast_eval(*n.args[0], batch, length, out)) {
+                return false;
+            }
+            for (auto& x : out) {
+                x = x == kNull ? kNull : static_cast<std::uint8_t>(x == kTrue ? kFalse : kTrue);
+            }
+            return true;
+        case Op::IsNull:
+        case Op::IsNotNull: {
+            const auto* v = fast_column(*n.args[0], batch);
+            if (v == nullptr) {
+                return false;
+            }
+            out.assign(rows, n.op == Op::IsNull ? kFalse : kTrue);
+            for (int64_t r = 0; r < length && v->null_count != 0; ++r) {
+                if (ArrowArrayViewIsNull(v, r)) {
+                    out[static_cast<std::size_t>(r)] = n.op == Op::IsNull ? kTrue : kFalse;
+                }
+            }
+            return true;
+        }
+        case Op::Eq:
+        case Op::Ne:
+        case Op::Lt:
+        case Op::Le:
+        case Op::Gt:
+        case Op::Ge: {
+            const bool left = n.args[0]->op == Op::Column && n.args[1]->op == Op::Literal;
+            const bool right = n.args[1]->op == Op::Column && n.args[0]->op == Op::Literal;
+            if (!left && !right) {
+                return false;
+            }
+            const Node& col = left ? *n.args[0] : *n.args[1];
+            const Value& lit = (left ? n.args[1] : n.args[0])->literal;
+            const auto* v = fast_column(col, batch);
+            if (v == nullptr) {
+                return false;
+            }
+            const Op op = left ? n.op : flip(n.op);
+            if (lit.is_null()) {
+                out.assign(rows, kNull);
+                return true;
+            }
+            std::vector<std::int8_t> ways;
+            if (!compare_column(*v, col.column.type, col.column.unit, lit, length, ways)) {
+                return false;
+            }
+            out.resize(rows);
+            for (std::size_t r = 0; r < rows; ++r) {
+                out[r] = wanted(op, ways[r]) ? kTrue : kFalse;
+            }
+            set_nulls(*v, length, out);
+            return true;
+        }
+        case Op::In:
+        case Op::NotIn:
+        case Op::Between:
+        case Op::NotBetween: {
+            const auto* v = fast_column(*n.args[0], batch);
+            if (v == nullptr || !std::all_of(n.args.begin() + 1, n.args.end(), [](const std::unique_ptr<Node>& a) {
+                    return a->op == Op::Literal;
+                })) {
+                return false;
+            }
+            const auto& c = n.args[0]->column;
+            std::vector<std::int8_t> ways;
+            if (n.op == Op::Between || n.op == Op::NotBetween) {
+                if (n.args.size() != 3U || n.args[1]->literal.is_null() || n.args[2]->literal.is_null()) {
+                    return false;
+                }
+                std::vector<std::int8_t> upper;
+                if (!compare_column(*v, c.type, c.unit, n.args[1]->literal, length, ways) ||
+                    !compare_column(*v, c.type, c.unit, n.args[2]->literal, length, upper)) {
+                    return false;
+                }
+                const bool negate = n.op == Op::NotBetween;
+                out.resize(rows);
+                for (std::size_t r = 0; r < rows; ++r) {
+                    const bool in = ways[r] >= 0 && upper[r] <= 0;
+                    out[r] = in != negate ? kTrue : kFalse;
+                }
+                set_nulls(*v, length, out);
+                return true;
+            }
+            // x IN (a, b): TRUE if any equals; else NULL if any item is NULL; else FALSE.
+            out.assign(rows, kFalse);
+            bool null_item = false;
+            for (std::size_t k = 1; k < n.args.size(); ++k) {
+                const auto& lit = n.args[k]->literal;
+                if (lit.is_null()) {
+                    null_item = true;
+                    continue;
+                }
+                if (!compare_column(*v, c.type, c.unit, lit, length, ways)) {
+                    return false;
+                }
+                for (std::size_t r = 0; r < rows; ++r) {
+                    if (ways[r] == 0) {
+                        out[r] = kTrue;
+                    }
+                }
+            }
+            for (auto& x : out) {
+                if (x == kFalse && null_item) {
+                    x = kNull;
+                }
+                if (n.op == Op::NotIn && x != kNull) {
+                    x = x == kTrue ? kFalse : kTrue;
+                }
+            }
+            set_nulls(*v, length, out);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
 bool Expression::filter(const ArrowArray& batch, std::vector<std::uint8_t>& keep, std::string& error) const {
     error.clear();
     if (!binding_) {
@@ -1846,6 +2261,13 @@ bool Expression::filter(const ArrowArray& batch, std::vector<std::uint8_t>& keep
         return false;
     }
     keep.assign(static_cast<std::size_t>(batch.length), 0U);
+    std::vector<std::uint8_t> state;
+    if (fast_eval(*root_, guard.view, batch.length, state)) {
+        for (std::size_t r = 0; r < keep.size(); ++r) {
+            keep[r] = state[r] == kTrue ? 1U : 0U;
+        }
+        return true;
+    }
     Context ctx;
     ctx.batch = &guard.view;
     ctx.error = &error;
@@ -2053,5 +2475,268 @@ bool Expression::result_type(const std::string& name, ArrowSchema& out, std::str
 }
 
 std::string Expression::to_string() const { return root_ ? print(*root_) : std::string(); }
+
+// ── conditions: the filter as an index sees it ──────────────────────────────────────────────────
+
+namespace {
+
+std::unique_ptr<Node> clone(const Node& n) {
+    auto out = std::make_unique<Node>();
+    out->op = n.op;
+    out->literal = n.literal;
+    out->column = n.column;
+    out->name = n.name;
+    for (const auto& a : n.args) {
+        out->args.push_back(clone(*a));
+    }
+    return out;
+}
+
+bool constant(const Node& n) {
+    if (n.op == Op::Column) {
+        return false;
+    }
+    return std::all_of(n.args.begin(), n.args.end(), [](const std::unique_ptr<Node>& a) { return constant(*a); });
+}
+
+std::shared_ptr<const Node> shared_clone(const Node& n) { return std::shared_ptr<const Node>(clone(n).release()); }
+
+std::shared_ptr<const Node> literal_node(const Value& v) {
+    auto n = std::make_shared<Node>();
+    n->op = Op::Literal;
+    n->literal = v;
+    return n;
+}
+
+const char* flipped(Op op) {
+    switch (op) {
+        case Op::Eq: return "=";
+        case Op::Ne: return "!=";
+        case Op::Lt: return ">";
+        case Op::Le: return ">=";
+        case Op::Gt: return "<";
+        case Op::Ge: return "<=";
+        default: return "?";
+    }
+}
+
+Op op_of(const std::string& op) {
+    if (op == "=") return Op::Eq;
+    if (op == "!=") return Op::Ne;
+    if (op == "<") return Op::Lt;
+    if (op == "<=") return Op::Le;
+    if (op == ">") return Op::Gt;
+    return Op::Ge;
+}
+
+}  // namespace
+
+Condition Expression::conditions() const {
+    struct Walk {
+        static Condition at(const Node& n) {
+            Condition c;
+            auto leaf = [&](Predicate p) {
+                c.kind = Condition::Kind::Predicate;
+                c.predicate = std::make_shared<const Predicate>(std::move(p));
+                return c;
+            };
+            switch (n.op) {
+                case Op::And:
+                case Op::Or:
+                    c.kind = n.op == Op::And ? Condition::Kind::And : Condition::Kind::Or;
+                    c.children.push_back(at(*n.args[0]));
+                    c.children.push_back(at(*n.args[1]));
+                    return c;
+                case Op::Not:
+                    c.kind = Condition::Kind::Not;
+                    c.children.push_back(at(*n.args[0]));
+                    return c;
+                case Op::Eq:
+                case Op::Ne:
+                case Op::Lt:
+                case Op::Le:
+                case Op::Gt:
+                case Op::Ge: {
+                    const bool left = n.args[0]->op == Op::Column && constant(*n.args[1]);
+                    const bool right = n.args[1]->op == Op::Column && constant(*n.args[0]);
+                    if (!left && !right) {
+                        return c;
+                    }
+                    Predicate p;
+                    p.test_ = Predicate::Test::Compare;
+                    p.column_ = (left ? n.args[0] : n.args[1])->column.path;
+                    p.op_ = left ? op_text(n.op) : flipped(n.op);
+                    p.constants_.push_back(shared_clone(left ? *n.args[1] : *n.args[0]));
+                    return leaf(std::move(p));
+                }
+                case Op::In:
+                case Op::Between: {
+                    if (n.args[0]->op != Op::Column ||
+                        !std::all_of(n.args.begin() + 1, n.args.end(),
+                                     [](const std::unique_ptr<Node>& a) { return constant(*a); })) {
+                        return c;
+                    }
+                    Predicate p;
+                    p.test_ = n.op == Op::In ? Predicate::Test::In : Predicate::Test::Between;
+                    p.column_ = n.args[0]->column.path;
+                    for (std::size_t k = 1; k < n.args.size(); ++k) {
+                        p.constants_.push_back(shared_clone(*n.args[k]));
+                    }
+                    return leaf(std::move(p));
+                }
+                case Op::IsNull:
+                case Op::IsNotNull: {
+                    if (n.args[0]->op != Op::Column) {
+                        return c;
+                    }
+                    Predicate p;
+                    p.test_ = n.op == Op::IsNull ? Predicate::Test::IsNull : Predicate::Test::IsNotNull;
+                    p.column_ = n.args[0]->column.path;
+                    return leaf(std::move(p));
+                }
+                case Op::Func: {
+                    if (!is_array_function(n.name) || n.args.size() != 2U || n.args[0]->op != Op::Column ||
+                        n.args[1]->op != Op::Literal) {
+                        return c;
+                    }
+                    const bool any = n.name == "array_has_any" || n.name == "list_has_any";
+                    const bool all = n.name == "array_has_all" || n.name == "list_has_all";
+                    const auto& v = n.args[1]->literal;
+                    Predicate p;
+                    p.column_ = n.args[0]->column.path;
+                    if (any || all) {
+                        if (v.kind != Kind::List) {
+                            return c;
+                        }
+                        p.test_ = any ? Predicate::Test::HasAny : Predicate::Test::HasAll;
+                        for (const auto& item : *v.items) {
+                            p.constants_.push_back(literal_node(item));
+                        }
+                    } else {
+                        if (v.kind == Kind::List) {
+                            return c;
+                        }
+                        p.test_ = Predicate::Test::Has;
+                        p.constants_.push_back(literal_node(v));
+                    }
+                    return leaf(std::move(p));
+                }
+                default:
+                    return c;
+            }
+        }
+    };
+    if (!root_) {
+        return {};
+    }
+    return Walk::at(*root_);
+}
+
+Predicate Predicate::compare_with(const std::string& op, std::size_t k) const {
+    Predicate p;
+    p.test_ = Test::Compare;
+    p.column_ = column_;
+    p.op_ = op;
+    p.constants_.push_back(constants_.at(k));
+    return p;
+}
+
+namespace {
+
+/// The predicate as a tree over a column named `key`.
+std::unique_ptr<Node> predicate_node(Predicate::Test test, const std::string& op,
+                                     const std::vector<std::shared_ptr<const Node>>& constants,
+                                     const std::string& key) {
+    auto column = std::make_unique<Node>();
+    column->op = Op::Column;
+    column->column.path = {key};
+    auto n = std::make_unique<Node>();
+    n->args.push_back(std::move(column));
+    switch (test) {
+        case Predicate::Test::Compare: n->op = op_of(op); break;
+        case Predicate::Test::In:
+        case Predicate::Test::HasAny:
+        case Predicate::Test::HasAll:
+        case Predicate::Test::Has: n->op = Op::In; break;  // on the elements: one the test names
+        case Predicate::Test::Between: n->op = Op::Between; break;
+        case Predicate::Test::IsNull: n->op = Op::IsNull; break;
+        case Predicate::Test::IsNotNull: n->op = Op::IsNotNull; break;
+    }
+    for (const auto& c : constants) {
+        n->args.push_back(clone(*c));
+    }
+    return n;
+}
+
+void no_release_array(ArrowArray* array) { array->release = nullptr; }
+
+}  // namespace
+
+bool Predicate::filter(const ArrowSchema& type, const ArrowArray& values, std::vector<std::uint8_t>& pass,
+                       std::string& error) const {
+    error.clear();
+    if ((test_ == Test::HasAny || test_ == Test::HasAll || test_ == Test::In) && constants_.empty()) {
+        pass.assign(static_cast<std::size_t>(values.length), 0U);
+        return true;
+    }
+    static const char* kKey = "__index_key";
+    Expression e;
+    e.root_ = predicate_node(test_, op_, constants_, kKey);
+    ArrowSchema schema;
+    ArrowSchemaInit(&schema);
+    if (ArrowSchemaSetTypeStruct(&schema, 1) != NANOARROW_OK) {
+        schema.release(&schema);
+        error = "out of memory";
+        return false;
+    }
+    schema.children[0]->release(schema.children[0]);
+    if (ArrowSchemaDeepCopy(&type, schema.children[0]) != NANOARROW_OK ||
+        ArrowSchemaSetName(schema.children[0], kKey) != NANOARROW_OK) {
+        schema.release(&schema);
+        error = "out of memory";
+        return false;
+    }
+    const bool bound = e.bind(schema, error);
+    schema.release(&schema);
+    if (!bound) {
+        return false;
+    }
+    // A struct batch around `values`, borrowing them.
+    ArrowArray child = values;
+    child.release = no_release_array;
+    ArrowArray* children[1] = {&child};
+    const void* buffers[1] = {nullptr};
+    ArrowArray batch{};
+    batch.length = values.length;
+    batch.n_buffers = 1;
+    batch.buffers = buffers;
+    batch.n_children = 1;
+    batch.children = children;
+    batch.release = no_release_array;
+    return e.filter(batch, pass, error);
+}
+
+std::string Predicate::to_string() const {
+    std::string column;
+    for (const auto& p : column_) {
+        column += (column.empty() ? "" : ".") + p;
+    }
+    std::string list;
+    for (const auto& c : constants_) {
+        list += (list.empty() ? "" : ", ") + print(*c);
+    }
+    switch (test_) {
+        case Test::Compare: return column + " " + op_ + " " + print(*constants_.front());
+        case Test::Between:
+            return column + " >= " + print(*constants_[0]) + " && " + column + " <= " + print(*constants_[1]);
+        case Test::In: return column + " IN [" + list + "]";
+        case Test::IsNull: return column + " IS NULL";
+        case Test::IsNotNull: return column + " IS NOT NULL";
+        case Test::HasAny: return "array_has_any(" + column + ", [" + list + "])";
+        case Test::HasAll: return "array_has_all(" + column + ", [" + list + "])";
+        case Test::Has: return "array_has(" + column + ", " + list + ")";
+    }
+    return column;
+}
 
 }  // namespace nano_lance::expr

@@ -2,6 +2,7 @@
 
 #include "nanolance/roaring_bitmap.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <utility>
@@ -194,10 +195,22 @@ std::vector<std::uint8_t> encode_field_message(const Field& field) {
     return out;
 }
 
-std::vector<std::uint8_t> encode_schema_message(const std::vector<Field>& fields) {
+std::vector<std::uint8_t> encode_schema_message(const std::vector<Field>& fields,
+                                                const std::map<std::string, std::vector<std::uint8_t>>* metadata =
+                                                    nullptr) {
     std::vector<std::uint8_t> out;
     for (const auto& field : fields) {
         write_message(out, 1, encode_field_message(field));
+    }
+    if (metadata != nullptr) {
+        for (const auto& [key, value] : *metadata) {
+            std::vector<std::uint8_t> entry;
+            write_string(entry, 1, key);
+            write_key(entry, 2, kWireBytes);
+            write_varint(entry, value.size());
+            entry.insert(entry.end(), value.begin(), value.end());
+            write_message(out, 5, entry);
+        }
     }
     return out;
 }
@@ -800,7 +813,8 @@ bool decode_manifest_message(const std::vector<std::uint8_t>& bytes, Manifest& m
     return true;
 }
 
-bool decode_schema_message(const std::vector<std::uint8_t>& bytes, std::vector<Field>& fields) {
+bool decode_schema_message(const std::vector<std::uint8_t>& bytes, std::vector<Field>& fields,
+                           std::map<std::string, std::vector<std::uint8_t>>* metadata = nullptr) {
     fields.clear();
     std::size_t pos = 0;
     while (pos < bytes.size()) {
@@ -820,6 +834,14 @@ bool decode_schema_message(const std::vector<std::uint8_t>& bytes, std::vector<F
                 return false;
             }
             fields.push_back(std::move(f));
+        } else if (field_number == 5 && wire_type == kWireBytes && metadata != nullptr) {
+            std::vector<std::uint8_t> nested;
+            std::string k;
+            std::vector<std::uint8_t> v;
+            if (!read_bytes(bytes, pos, nested) || !decode_map_metadata_entry(nested, k, v)) {
+                return false;
+            }
+            (*metadata)[std::move(k)] = std::move(v);
         } else if (!skip_field(bytes, pos, wire_type)) {
             return false;
         }
@@ -842,7 +864,7 @@ bool decode_file_descriptor_message(const std::vector<std::uint8_t>& bytes, File
             if (!read_bytes(bytes, pos, nested)) {
                 return false;
             }
-            if (!decode_schema_message(nested, descriptor.fields)) {
+            if (!decode_schema_message(nested, descriptor.fields, &descriptor.schema_metadata)) {
                 return false;
             }
         } else if (field_number == 2 && wire_type == kWireVarint) {
@@ -860,7 +882,7 @@ bool decode_file_descriptor_message(const std::vector<std::uint8_t>& bytes, File
 
 std::vector<std::uint8_t> encode_file_descriptor(const FileDescriptor& descriptor) {
     std::vector<std::uint8_t> out;
-    write_message(out, 1, encode_schema_message(descriptor.fields));
+    write_message(out, 1, encode_schema_message(descriptor.fields, &descriptor.schema_metadata));
     write_uint64(out, 2, descriptor.length);
     return out;
 }
@@ -961,10 +983,59 @@ bool decode_index_metadata(const std::vector<std::uint8_t>& bytes, IndexMetadata
                 ok = read_varint(nested, at, v) && as_int32(v, id);
                 index.fields.push_back(id);
             }
+        } else if (field_number == 1 && wire_type == kWireBytes) {
+            ok = read_bytes(bytes, pos, nested);
+            std::size_t at = 0;
+            std::uint64_t k = 0;
+            std::vector<std::uint8_t> id_bytes;
+            while (ok && at < nested.size()) {
+                ok = read_varint(nested, at, k);
+                if (ok && k == ((1U << 3U) | kWireBytes)) {
+                    ok = read_bytes(nested, at, id_bytes);
+                } else if (ok) {
+                    ok = skip_field(nested, at, static_cast<std::uint8_t>(k & 0x07U));
+                }
+            }
+            if (ok && id_bytes.size() == index.uuid.size()) {
+                std::copy(id_bytes.begin(), id_bytes.end(), index.uuid.begin());
+            }
         } else if (field_number == 3 && wire_type == kWireBytes) {
             ok = read_string(bytes, pos, index.name);
         } else if (field_number == 4 && wire_type == kWireVarint) {
             ok = read_varint(bytes, pos, index.dataset_version);
+        } else if (field_number == 6 && wire_type == kWireBytes) {
+            ok = read_bytes(bytes, pos, nested);
+            std::size_t at = 0;
+            std::uint64_t k = 0;
+            while (ok && at < nested.size()) {
+                ok = read_varint(nested, at, k);
+                if (ok && k == ((1U << 3U) | kWireBytes)) {
+                    ok = read_string(nested, at, index.details_type_url);
+                } else if (ok) {
+                    ok = skip_field(nested, at, static_cast<std::uint8_t>(k & 0x07U));
+                }
+            }
+        } else if (field_number == 7 && wire_type == kWireVarint) {
+            ok = read_varint(bytes, pos, v);
+            index.index_version = static_cast<std::uint32_t>(v);
+        } else if (field_number == 8 && wire_type == kWireVarint) {
+            ok = read_varint(bytes, pos, index.created_at);
+        } else if (field_number == 10 && wire_type == kWireBytes) {
+            ok = read_bytes(bytes, pos, nested);
+            IndexMetadata::File file;
+            std::size_t at = 0;
+            std::uint64_t k = 0;
+            while (ok && at < nested.size()) {
+                ok = read_varint(nested, at, k);
+                if (ok && k == ((1U << 3U) | kWireBytes)) {
+                    ok = read_string(nested, at, file.path);
+                } else if (ok && k == ((2U << 3U) | kWireVarint)) {
+                    ok = read_varint(nested, at, file.size);
+                } else if (ok) {
+                    ok = skip_field(nested, at, static_cast<std::uint8_t>(k & 0x07U));
+                }
+            }
+            index.files.push_back(std::move(file));
         } else if (field_number == 5 && wire_type == kWireBytes) {
             ok = read_bytes(bytes, pos, nested);
             if (ok && !roaring::decode(nested.data(), nested.size(), index.fragment_ids, error)) {
@@ -1012,6 +1083,55 @@ std::vector<std::uint8_t> encode_index_metadata(const IndexMetadata& index) {
 }
 
 }  // namespace
+
+IndexMetadata make_index_metadata(const std::array<std::uint8_t, 16>& uuid, const std::vector<std::int32_t>& fields,
+                                  const std::string& name, std::uint64_t dataset_version,
+                                  const std::vector<std::uint32_t>& fragment_ids, const std::string& details_type_url,
+                                  std::uint32_t index_version, std::uint64_t created_at,
+                                  const std::vector<IndexMetadata::File>& files) {
+    std::vector<std::uint8_t> out;
+    write_message(out, 1, [&] {
+        std::vector<std::uint8_t> id;
+        write_message(id, 1, std::vector<std::uint8_t>(uuid.begin(), uuid.end()));
+        return id;
+    }());
+    std::vector<std::uint8_t> packed;
+    for (const auto f : fields) {
+        write_varint(packed, static_cast<std::uint64_t>(static_cast<std::int64_t>(f)));
+    }
+    write_message(out, 2, packed);
+    write_string(out, 3, name);
+    write_uint64(out, 4, dataset_version);
+    write_message(out, 5, roaring::encode(fragment_ids));
+    std::vector<std::uint8_t> details;
+    write_string(details, 1, details_type_url);
+    write_message(out, 6, details);
+    write_uint64(out, 7, index_version);
+    write_uint64(out, 8, created_at);
+    for (const auto& file : files) {
+        std::vector<std::uint8_t> f;
+        write_string(f, 1, file.path);
+        write_uint64(f, 2, file.size);
+        write_message(out, 10, f);
+    }
+    IndexMetadata index;
+    std::string error;
+    decode_index_metadata(out, index, error);  // what was just written decodes
+    return index;
+}
+
+std::string uuid_string(const std::array<std::uint8_t, 16>& uuid) {
+    static const char* hex = "0123456789abcdef";
+    std::string s;
+    for (std::size_t i = 0; i < uuid.size(); ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) {
+            s.push_back('-');
+        }
+        s.push_back(hex[uuid[i] >> 4U]);
+        s.push_back(hex[uuid[i] & 0x0FU]);
+    }
+    return s;
+}
 
 bool decode_index_section(const std::vector<std::uint8_t>& bytes, std::vector<IndexMetadata>& out,
                           std::string& error) {

@@ -1,6 +1,7 @@
 """A dataset's indices survive the commits nanolance makes.
 
-nanolance builds no index, but it writes to datasets pylance indexed: append, delete, update,
+nanolance builds only scalar indices (test_scalar_index.py), but it writes to datasets pylance indexed
+with any kind: append, delete, update,
 merge_insert, column changes, compaction. Each commit used to drop the manifest's index section, so
 pylance saw no indices afterwards and every indexed query became a full scan. nanolance now carries
 them on by Lance's own rules (src/index_maintenance.cpp): an index keeps the fragments it covers, a

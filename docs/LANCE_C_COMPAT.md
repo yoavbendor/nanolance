@@ -47,7 +47,7 @@ returns a silently different result. nanolance is not affiliated with the Lance 
 | Changes | `lance_dataset_delete`, `update`, `merge_insert` (every `when_matched` mode but `UPDATE_IF`, both `when_not_matched`, `when_not_matched_by_source` keep / delete / delete-if), `compact_files`, `drop_columns`, `alter_columns`, `add_columns_sql` / `add_columns_nulls` / `add_columns_stream`. Each commits one version and moves the handle to it, as lance-c does. A writer whose change is built on a replaced version gets `LANCE_ERR_COMMIT_CONFLICT`. |
 | Blobs | `lance_dataset_take_blobs` (by row id) and `take_blobs_by_indices`, and the handles they return: `lance_blob_file_size` / `read` / `read_up_to` / `read_range` / `seek` / `tell` / `close`. Every Blob v2 storage kind Lance writes is read where it is, and only the bytes asked for: inline (in the data file), packed and dedicated (in the sidecar `.blob` files beside it), external (at its URI: a local path, `file://`, or `s3://` in a build with S3). A null value is a NULL handle; an empty one, a handle of size 0. |
 | Writes | `lance_dataset_write`, `lance_dataset_write_with_params` (create / append / overwrite, `max_rows_per_file`, `max_bytes_per_file`), `lance_write_fragments` (data files, no manifest). A create records lance-c's auto-cleanup policy in the table config. nanolance does not reclaim versions itself; Lance applies the policy when it next commits. |
-| Indexes | `lance_dataset_index_count` (0) and `lance_dataset_index_list_json` (`[]`), since nanolance uses no index. The changes above keep the indices a dataset has, by Lance's rules (`docs/PYLANCE_COMPAT.md`, "Indexes"). |
+| Indexes | `lance_dataset_create_scalar_index` (BTREE, BITMAP, LABEL_LIST; no parameters), `lance_dataset_drop_index`, `lance_dataset_index_count` and `lance_dataset_index_list_json`. Scans use BTree, Bitmap and LabelList indexes, whoever built them. The changes above keep the indices a dataset has, by Lance's rules (`docs/PYLANCE_COMPAT.md`, "Indexes"). |
 
 URIs: local paths, `file://`, and `memory://` (a directory private to the process). Object stores
 (`s3://`, ...) return `LANCE_ERR_NOT_SUPPORTED`. `storage_opts` is accepted and ignored.
@@ -62,8 +62,8 @@ URIs: local paths, `file://`, and `memory://` (a directory private to the proces
 
 ## Out of scope
 
-Vector and scalar indexes, index segments, vector search (`nearest`), full-text search, and
-Substrait filters.
+Vector indexes, INVERTED (full-text) indexes, index segments and their builders, vector search
+(`nearest`), full-text search, and Substrait filters.
 
 ## lance-c's own tests
 
@@ -81,16 +81,16 @@ driver `#include`s it and runs each test function in its own child process, in t
 `main()` does. It is built with `NDEBUG` undefined so the `assert()`s of the C++ test are live. CI
 runs the suite in `.github/workflows/bindings-python.yml`.
 
-**88 of 106 pass: 18 of 22 C tests and 26 of 31 C++ tests, per fixture writer.** Every test that
-fails needs an index. Before filters and dataset changes it was 52 of 106, and 80 before Lance's
-blob layouts were read. (An earlier version of this page said "52 of 80": the runner
+**90 of 106 pass: 18 of 22 C tests and 27 of 31 C++ tests, per fixture writer.** Every test that
+fails needs a vector index or index segments. It was 88 before scalar indexes, 52 of 106 before
+filters and dataset changes, and 80 before Lance's blob layouts were read. (An earlier version of this page said "52 of 80": the runner
 missed tests whose result line was printed on the same line as the test's own output, so failing
 tests went uncounted. It now parses every result and fails if the count does not match the tests
 the driver ran.) Every implemented group above has a test that passes. The ones that fail today:
 
 | Tests | Why |
 |---|---|
-| index_lifecycle, index_segment_builder(_progress), vector_models_and_reusable_segments, commit_index_segments | indexes: out of scope |
+| index_segment_builder(_progress), vector_models_and_reusable_segments, commit_index_segments | vector indexes and index segments: out of scope |
 
 Four C++ tests pass on purpose without the feature: `nearest_smoke`, `fts_smoke`,
 `index_segments_smoke` and `multivector_rejects_flat_column`. Upstream wrote them to prove the

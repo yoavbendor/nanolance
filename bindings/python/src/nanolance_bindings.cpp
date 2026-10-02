@@ -11,6 +11,7 @@
 #include <nanolance/lance_table_reader.hpp>
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
+#include <nanolance/scalar_index.hpp>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
@@ -402,8 +403,9 @@ nb::object ds_scan(const std::filesystem::path& path, std::optional<std::uint64_
                    std::optional<std::vector<std::string>> columns,
                    std::optional<std::vector<std::uint64_t>> fragment_ids, std::uint64_t offset, std::int64_t length,
                    bool with_row_id, bool with_row_address, bool stream, std::optional<std::string> filter,
-                   int blob_handling) {
+                   int blob_handling, bool use_scalar_index) {
     auto request = make_request(version, columns, fragment_ids, with_row_id, with_row_address);
+    request.use_scalar_index = use_scalar_index;
     request.blob_handling = static_cast<nano_lance::BlobHandling>(blob_handling);
     request.filter = filter ? &*filter : nullptr;
     request.range.offset = offset;
@@ -826,13 +828,14 @@ NB_MODULE(_nanolance, m) {
         d["buffer_pool_hits"] = w.buffer_pool_hits;
         d["buffer_pool_misses"] = w.buffer_pool_misses;
         d["take_cache_hits"] = w.take_cache_hits;
+        d["indexed_fragments"] = w.indexed_fragments;
         return d;
     }, "Counters of the work done since the last reset (tests and diagnostics; not a stable API).");
     m.def("_reset_work_stats", [] { nano_lance_reset_work_stats(); });
     m.def("_ds_scan", &ds_scan, nb::arg("path"), nb::arg("version").none(), nb::arg("columns").none(),
           nb::arg("fragment_ids").none(), nb::arg("offset"), nb::arg("length"), nb::arg("with_row_id"),
           nb::arg("with_row_address"), nb::arg("stream"), nb::arg("filter").none() = nb::none(),
-          nb::arg("blob_handling") = 0);
+          nb::arg("blob_handling") = 0, nb::arg("use_scalar_index") = true);
     m.def("_ds_take", &ds_take, nb::arg("path"), nb::arg("version").none(), nb::arg("rows"),
           nb::arg("columns").none(), nb::arg("with_row_id"), nb::arg("with_row_address"), nb::arg("addresses"),
           nb::arg("blob_handling") = 0);
@@ -961,6 +964,58 @@ NB_MODULE(_nanolance, m) {
         std::uint64_t version = 0;
         run_op([&](std::string& e) { return nano_lance::dataset_add_columns_stream(path, stream, version, e); });
         return version;
+    });
+    m.def("_ds_create_scalar_index", [](const std::filesystem::path& path, const std::string& column,
+                                          const std::string& index_type, const std::string& name, bool replace) {
+        nano_lance::ScalarIndexType type{};
+        if (!nano_lance::parse_scalar_index_type(index_type, type)) {
+            throw nb::value_error(("unsupported index type '" + index_type + "'").c_str());
+        }
+        nano_lance::ScalarIndexOptions options;
+        options.name = name;
+        options.replace = replace;
+        std::uint64_t version = 0;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_create_scalar_index(path, column, type, options, version, e);
+        });
+        return version;
+    });
+    m.def("_ds_drop_index", [](const std::filesystem::path& path, const std::string& name) {
+        std::uint64_t version = 0;
+        run_op([&](std::string& e) { return nano_lance::dataset_drop_index(path, name, version, e); });
+        return version;
+    });
+    m.def("_ds_list_indices", [](const std::filesystem::path& path, std::optional<std::uint64_t> version) {
+        std::vector<nano_lance::IndexInfo> indices;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_list_indices(path, version.has_value(), version.value_or(0), indices, e);
+        });
+        nb::list out;
+        for (const auto& i : indices) {
+            nb::dict d;
+            d["name"] = i.name;
+            d["uuid"] = i.uuid;
+            d["type"] = i.type;
+            d["fields"] = i.fields;
+            d["fragment_ids"] = i.fragment_ids;
+            d["dataset_version"] = i.dataset_version;
+            d["index_version"] = i.index_version;
+            d["type_url"] = i.type_url;
+            d["field_ids"] = i.field_ids;
+            d["created_at"] = i.created_at;
+            d["size_bytes"] = i.size_bytes;
+            d["rows_indexed"] = i.rows_indexed;
+            out.append(d);
+        }
+        return out;
+    });
+    m.def("_ds_explain_filter", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
+                                   const std::string& filter) {
+        std::vector<std::string> lines;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_explain_filter(path, version.has_value(), version.value_or(0), filter, lines, e);
+        });
+        return lines;
     });
     m.def("_ds_drop_columns", [](const std::filesystem::path& path, const std::vector<std::string>& columns) {
         std::uint64_t version = 0;

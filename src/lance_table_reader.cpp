@@ -3,6 +3,8 @@
 
 #include "nanolance/lance_table_reader.hpp"
 
+#include "nanolance/index_search.hpp"
+
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
@@ -1201,6 +1203,8 @@ struct PlannedFile {
     std::uint64_t skip = 0;            // logical rows to drop from the front
     std::uint64_t take = 0;            // logical rows to keep
     std::filesystem::path data_dir;    // where the data files are; empty: <dataset>/data
+    /// A filtered read a scalar index answered: the only physical rows that may pass (ascending).
+    std::shared_ptr<const std::vector<std::uint32_t>> candidates;
 
     bool partial() const { return skip != 0U || take != rows; }
 };
@@ -1647,6 +1651,80 @@ bool add_row_id_fields(ArrowSchema& schema, const RowIdColumns& ids, std::string
     return true;
 }
 
+/// Keep the decoded rows (`take` of them, the missing fields among them as nulls) that `filter`
+/// passes: every column compacted, `physical_rows` too when `track_rows`. `out_rows` is what is left.
+bool filter_decoded_rows(const FilterSpec& filter, const LanceSchemaMapping& mapping,
+                         const std::vector<ColumnSource>& columns, const std::vector<const LanceField*>& missing,
+                         std::unordered_map<std::int32_t, ColumnValues>& by_field, std::uint64_t take, bool track_rows,
+                         std::vector<std::uint64_t>& physical_rows, std::uint64_t& out_rows, std::string& why) {
+    const auto n_columns = columns.size();
+    out_rows = take;
+    // Evaluate on copies of the filter's columns (building a batch consumes its inputs), then drop the
+    // rows that do not pass from every column.
+    std::unordered_map<std::int32_t, ColumnValues> copies;
+    for (const auto id : *filter.ids) {
+        const auto it = by_field.find(id);
+        if (it != by_field.end()) {
+            copies.emplace(id, it->second);
+        }
+    }
+    std::vector<std::uint8_t> pass;
+    if (filter.schema->n_children == 0) {
+        ArrowArray empty{};
+        if (ArrowArrayInitFromSchema(&empty, filter.schema, nullptr) != NANOARROW_OK) {
+            why = "failed to build the filter batch";
+            return false;
+        }
+        empty.length = static_cast<std::int64_t>(take);
+        const bool ok = filter.expr->filter(empty, pass, why);
+        ArrowArrayRelease(&empty);
+        if (!ok) {
+            return false;
+        }
+    } else {
+        ArrowArray probe{};
+        if (!build_batch_from_schema(*filter.schema, mapping, copies, static_cast<std::int64_t>(take), probe, why)) {
+            return false;
+        }
+        const bool ok = filter.expr->filter(probe, pass, why);
+        ArrowArrayRelease(&probe);
+        if (!ok) {
+            return false;
+        }
+    }
+    out_rows = static_cast<std::uint64_t>(std::count(pass.begin(), pass.end(), 1U));
+    if (out_rows == take) {
+        return true;
+    }
+    for (std::size_t c = 0; c < n_columns; ++c) {
+        if (!compact_column_values(by_field[columns[c].field_id], pass, take, columns[c].value_bytes, why)) {
+            return false;
+        }
+    }
+    for (const auto* field : missing) {
+        if (!null_column_values(*field, out_rows, by_field[field->id], why)) {
+            return false;
+        }
+    }
+    if (track_rows) {
+        std::vector<std::uint64_t> kept;
+        kept.reserve(static_cast<std::size_t>(out_rows));
+        for (std::size_t r = 0; r < physical_rows.size(); ++r) {
+            if (pass[r] != 0U) {
+                kept.push_back(physical_rows[r]);
+            }
+        }
+        physical_rows = std::move(kept);
+    }
+    return true;
+}
+
+bool read_candidate_rows(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                         const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
+                         std::vector<ArrowArray>& out, std::string& error,
+                         const std::unordered_set<std::int32_t>* allowed_field_ids, const RowIdColumns& ids,
+                         const FilterSpec& filter);
+
 bool read_data_file_batches(const std::filesystem::path& dataset_path, const PlannedFile& planned,
                             const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
                             std::vector<ArrowArray>& out, std::string& error,
@@ -1655,6 +1733,45 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
     if (planned.files.empty()) {
         error = "fragment has no data files";
         return false;
+    }
+    if (planned.candidates != nullptr && filter.expr != nullptr && !planned.partial()) {
+        return read_candidate_rows(dataset_path, planned, mapping, batch_schema, out, error, allowed_field_ids, ids,
+                                   filter);
+    }
+    // Late materialization: a filter that reads fewer columns than the read returns is evaluated on
+    // its own columns first; when few rows pass, only those rows of the other columns are decoded.
+    if (filter.expr != nullptr && filter.schema->n_children != 0 && !planned.partial()) {
+        std::unordered_set<std::int32_t> filter_only(filter.ids->begin(), filter.ids->end());
+        const bool more = std::any_of(mapping.fields.begin(), mapping.fields.end(), [&](const LanceField& f) {
+            return filter_only.count(f.id) == 0U && (allowed_field_ids == nullptr || allowed_field_ids->count(f.id) != 0U);
+        });
+        if (more) {
+            std::vector<ArrowArray> passed;
+            RowIdColumns addresses;
+            addresses.row_address = true;
+            if (!read_data_file_batches(dataset_path, planned, mapping, *filter.schema, passed, error, &filter_only,
+                                        addresses, filter)) {
+                return false;
+            }
+            auto rows = std::make_shared<std::vector<std::uint32_t>>();
+            for (auto& b : passed) {
+                const ArrowArray* addr = b.children[b.n_children - 1];
+                const auto* v = static_cast<const std::uint64_t*>(addr->buffers[1]) + addr->offset;
+                for (std::int64_t r = 0; r < addr->length; ++r) {
+                    rows->push_back(static_cast<std::uint32_t>(v[r] & 0xFFFFFFFFULL));
+                }
+                ArrowArrayRelease(&b);
+            }
+            if (rows->empty()) {
+                return true;
+            }
+            if (rows->size() * 8U < planned.physical_rows) {
+                PlannedFile narrowed = planned;
+                narrowed.candidates = std::move(rows);
+                return read_candidate_rows(dataset_path, narrowed, mapping, batch_schema, out, error,
+                                           allowed_field_ids, ids, filter);
+            }
+        }
     }
 
     // One batch is one read operation, so each data file it touches is validated once here rather
@@ -1901,63 +2018,9 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
         }
         std::uint64_t out_rows = take;
         if (filter.expr != nullptr) {
-            // Evaluate on copies of the filter's columns (building a batch consumes its inputs), then
-            // drop the rows that do not pass from every column.
-            std::unordered_map<std::int32_t, ColumnValues> copies;
-            for (const auto id : *filter.ids) {
-                const auto it = by_field.find(id);
-                if (it != by_field.end()) {
-                    copies.emplace(id, it->second);
-                }
-            }
-            std::vector<std::uint8_t> pass;
-            if (filter.schema->n_children == 0) {
-                ArrowArray empty{};
-                if (ArrowArrayInitFromSchema(&empty, filter.schema, nullptr) != NANOARROW_OK) {
-                    why = "failed to build the filter batch";
-                    return;
-                }
-                empty.length = static_cast<std::int64_t>(take);
-                const bool ok = filter.expr->filter(empty, pass, why);
-                ArrowArrayRelease(&empty);
-                if (!ok) {
-                    return;
-                }
-            } else {
-                ArrowArray probe{};
-                if (!build_batch_from_schema(*filter.schema, mapping, copies, static_cast<std::int64_t>(take), probe,
-                                             why)) {
-                    return;
-                }
-                const bool ok = filter.expr->filter(probe, pass, why);
-                ArrowArrayRelease(&probe);
-                if (!ok) {
-                    return;
-                }
-            }
-            out_rows = static_cast<std::uint64_t>(std::count(pass.begin(), pass.end(), 1U));
-            if (out_rows != take) {
-                for (std::size_t c = 0; c < n_columns; ++c) {
-                    if (!compact_column_values(by_field[columns[c].field_id], pass, take, columns[c].value_bytes,
-                                               why)) {
-                        return;
-                    }
-                }
-                for (const auto* field : missing) {
-                    if (!null_column_values(*field, out_rows, by_field[field->id], why)) {
-                        return;
-                    }
-                }
-                if (ids.any()) {
-                    std::vector<std::uint64_t> kept;
-                    kept.reserve(static_cast<std::size_t>(out_rows));
-                    for (std::size_t r = 0; r < physical_rows.size(); ++r) {
-                        if (pass[r] != 0U) {
-                            kept.push_back(physical_rows[r]);
-                        }
-                    }
-                    physical_rows = std::move(kept);
-                }
+            if (!filter_decoded_rows(filter, mapping, columns, missing, by_field, take, ids.any(), physical_rows,
+                                     out_rows, why)) {
+                return;
             }
             if (out_rows == 0U) {
                 return;  // nothing of this morsel passes
@@ -2084,11 +2147,13 @@ bool physical_rows_of(const std::filesystem::path& dataset_path, const PlannedFi
     return true;
 }
 
-/// Decode the rows at `physical` (offsets in the fragment's data files, ascending) into one batch.
-bool take_from_data_file(const std::filesystem::path& dataset_path, const PlannedFile& planned,
-                         const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
-                         const std::vector<std::uint64_t>& physical, ArrowArray& batch, std::string& error,
-                         const std::unordered_set<std::int32_t>* allowed_field_ids) {
+/// Decode the rows at `physical` (offsets in the fragment's data files, ascending), by field; the
+/// fields the files lack as nulls (listed in `missing`).
+bool decode_data_file_rows(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                           const LanceSchemaMapping& mapping, const std::vector<std::uint64_t>& physical,
+                           const std::unordered_set<std::int32_t>* allowed_field_ids, std::vector<ColumnSource>& columns,
+                           std::vector<const LanceField*>& missing,
+                           std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id, std::string& error) {
     if (planned.files.empty()) {
         error = "fragment has no data files";
         return false;
@@ -2097,7 +2162,7 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
 
     // The columns to take, then taken side by side (each is its own file reads and decode).
     std::vector<std::shared_ptr<const CachedFileMetadata>> files;
-    std::vector<ColumnSource> columns;
+    columns.clear();
     for (const auto& data_file : planned.files) {
         const auto jailed = safe_join_under(planned.data_dir.empty() ? dataset_path / "data" : planned.data_dir,
                                             data_file.path);
@@ -2175,7 +2240,7 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
                                               source.value_bytes, decoded[c], errors[c]);
         }
     });
-    std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
+    decoded_by_field_id.clear();
     for (std::size_t c = 0; c < columns.size(); ++c) {
         if (!errors[c].empty()) {
             error = errors[c];
@@ -2183,13 +2248,82 @@ bool take_from_data_file(const std::filesystem::path& dataset_path, const Planne
         }
         decoded_by_field_id.emplace(columns[c].field_id, std::move(decoded[c]));
     }
-    for (const auto* field : fields_missing_from(planned, mapping, allowed_field_ids, columns)) {
+    missing = fields_missing_from(planned, mapping, allowed_field_ids, columns);
+    for (const auto* field : missing) {
         if (!null_column_values(*field, physical.size(), decoded_by_field_id[field->id], error)) {
             return false;
         }
     }
-    return build_batch_from_schema(batch_schema, mapping, decoded_by_field_id,
+    return true;
+}
+
+/// Decode the rows at `physical` (offsets in the fragment's data files, ascending) into one batch.
+bool take_from_data_file(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                         const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
+                         const std::vector<std::uint64_t>& physical, ArrowArray& batch, std::string& error,
+                         const std::unordered_set<std::int32_t>* allowed_field_ids) {
+    std::vector<ColumnSource> columns;
+    std::vector<const LanceField*> missing;
+    std::unordered_map<std::int32_t, ColumnValues> decoded_by_field_id;
+    return decode_data_file_rows(dataset_path, planned, mapping, physical, allowed_field_ids, columns, missing,
+                                 decoded_by_field_id, error) &&
+           build_batch_from_schema(batch_schema, mapping, decoded_by_field_id,
                                    static_cast<std::int64_t>(physical.size()), batch, error);
+}
+
+/// A filtered read of the rows an index left (planned.candidates): those not deleted are decoded
+/// and filtered like any others, as one batch.
+bool read_candidate_rows(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                         const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
+                         std::vector<ArrowArray>& out, std::string& error,
+                         const std::unordered_set<std::int32_t>* allowed_field_ids, const RowIdColumns& ids,
+                         const FilterSpec& filter) {
+    std::vector<std::uint64_t> physical;
+    physical.reserve(planned.candidates->size());
+    std::vector<std::uint32_t> deleted;
+    if (planned.deletion_file.present &&
+        !read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
+        return false;
+    }
+    std::sort(deleted.begin(), deleted.end());
+    for (const auto row : *planned.candidates) {
+        if (row < planned.physical_rows && !std::binary_search(deleted.begin(), deleted.end(), row)) {
+            physical.push_back(row);
+        }
+    }
+    work_stats::add(work_stats::counters().fragment_reads, 1U);
+    if (physical.empty()) {
+        return true;
+    }
+    std::vector<ColumnSource> columns;
+    std::vector<const LanceField*> missing;
+    std::unordered_map<std::int32_t, ColumnValues> by_field;
+    if (!decode_data_file_rows(dataset_path, planned, mapping, physical, allowed_field_ids, columns, missing, by_field,
+                               error)) {
+        return false;
+    }
+    std::uint64_t out_rows = 0;
+    if (!filter_decoded_rows(filter, mapping, columns, missing, by_field, physical.size(), ids.any(), physical,
+                             out_rows, error)) {
+        return false;
+    }
+    if (out_rows == 0U) {
+        return true;
+    }
+    ArrowArray batch{};
+    if (batch_schema.n_children != 0 &&
+        !build_batch_from_schema(batch_schema, mapping, by_field, static_cast<std::int64_t>(out_rows), batch, error)) {
+        return false;
+    }
+    if (ids.any() &&
+        !add_row_id_columns(batch, static_cast<std::int64_t>(out_rows), planned.fragment_id, physical, ids, error)) {
+        if (batch.release != nullptr) {
+            ArrowArrayRelease(&batch);
+        }
+        return false;
+    }
+    out.push_back(batch);
+    return true;
 }
 
 /// ArrowSchemaRelease dereferences `release` unconditionally, and releasing sets it to null, so
@@ -2453,6 +2587,15 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
         }
     }
 
+    // A filter a scalar index answers: per fragment it covers, the only rows that may pass.
+    IndexCandidates candidates;
+    if (plan.filter && request.use_scalar_index && !request.include_deleted_rows && !manifest.indices.empty()) {
+        std::string why;
+        if (!index_candidates(dataset_path, manifest, *plan.filter, candidates, why)) {
+            candidates.rows.clear();  // an index that cannot be read is not used: the read scans
+        }
+    }
+
     std::vector<pb::DataFragment> fragments;
     if (request.fragment_ids != nullptr) {
         // The fragments asked for, in the order asked.
@@ -2515,6 +2658,18 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
         planned.rows = rows;
 
         if (!ranged) {
+            const auto answered = candidates.rows.find(fragment.id);
+            if (answered != candidates.rows.end()) {
+                work_stats::add(work_stats::counters().indexed_fragments, 1U);
+                if (answered->second.empty()) {
+                    continue;  // no row of it can pass
+                }
+                // Too many rows to pick out one by one: reading the fragment through is faster.
+                if (answered->second.size() * 8U < fragment.physical_rows) {
+                    planned.candidates =
+                        std::make_shared<const std::vector<std::uint32_t>>(std::move(answered->second));
+                }
+            }
             planned.files = std::move(fragment.files);
             planned.skip = 0U;
             planned.take = rows;

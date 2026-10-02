@@ -1,0 +1,120 @@
+{
+ "environment": {
+  "pylance": "12.0.0",
+  "nanolance_commit": "67da872 with uncommitted changes (the scalar index commit)",
+  "cores": 4,
+  "machine": "x86_64",
+  "date": "2026-10-02 03:39 UTC"
+ },
+ "rows": 5000000,
+ "fragments": 5,
+ "runs": 5,
+ "builds": {
+  "id BTREE": {
+   "pylance": 1159.1320390002693,
+   "nanolance": 792.6277900000969
+  },
+  "f BTREE": {
+   "pylance": 1244.7842990000026,
+   "nanolance": 773.4761359997719
+  },
+  "s BTREE": {
+   "pylance": 2193.597410000166,
+   "nanolance": 1472.4237049999829
+  },
+  "cat BITMAP": {
+   "pylance": 1386.894993000169,
+   "nanolance": 386.15738099997543
+  },
+  "tags LABEL_LIST": {
+   "pylance": 2261.020032000033,
+   "nanolance": 974.3545339997581
+  }
+ },
+ "queries": {
+  "id|id = 123456": {
+   "rows": 1,
+   "pylance": 1.4350129999911587,
+   "nanolance": 0.6250910000744625,
+   "nanolance_no_index": 15.732177999780106
+  },
+  "id|id < 1000": {
+   "rows": 1000,
+   "pylance": 7.475534000150219,
+   "nanolance": 2.9966939996484143,
+   "nanolance_no_index": 17.495916999905603
+  },
+  "id|id BETWEEN 1000000 AND 1100000": {
+   "rows": 100001,
+   "pylance": 24.125244000060775,
+   "nanolance": 14.270798999859835,
+   "nanolance_no_index": 34.395126000163145
+  },
+  "id|s = 'user_00012345'": {
+   "rows": 0,
+   "pylance": 0.8428419996562297,
+   "nanolance": 0.49395399992135935,
+   "nanolance_no_index": 49.04778099989926
+  },
+  "id|cat = 'c7'": {
+   "rows": 100135,
+   "pylance": 22.673161000057007,
+   "nanolance": 7.961446000081196,
+   "nanolance_no_index": 38.009100000181206
+  },
+  "id|array_has_any(tags, ['t5'])": {
+   "rows": 49718,
+   "pylance": 17.753953999999794,
+   "nanolance": 15.893643000254087,
+   "nanolance_no_index": 772.238131999984
+  },
+  "id|cat = 'c7' AND id < 50000": {
+   "rows": 1053,
+   "pylance": 9.555266999996093,
+   "nanolance": 8.88323799972568,
+   "nanolance_no_index": 31.184487999780686
+  },
+  "all|id = 123456": {
+   "rows": 1,
+   "pylance": 1.3480769998750475,
+   "nanolance": 2.9458109997904103,
+   "nanolance_no_index": 19.981247000032454
+  },
+  "all|id < 1000": {
+   "rows": 1000,
+   "pylance": 30.51296200010256,
+   "nanolance": 11.369080999884318,
+   "nanolance_no_index": 33.293833999778144
+  },
+  "all|id BETWEEN 1000000 AND 1100000": {
+   "rows": 100001,
+   "pylance": 141.90202000008867,
+   "nanolance": 54.21546199977456,
+   "nanolance_no_index": 83.52504999993471
+  },
+  "all|s = 'user_00012345'": {
+   "rows": 0,
+   "pylance": 0.7655379999960132,
+   "nanolance": 0.5569459999605897,
+   "nanolance_no_index": 46.805472999949416
+  },
+  "all|cat = 'c7'": {
+   "rows": 100135,
+   "pylance": 139.29708300020138,
+   "nanolance": 43.094716999803495,
+   "nanolance_no_index": 80.62321799980054
+  },
+  "all|array_has_any(tags, ['t5'])": {
+   "rows": 49718,
+   "pylance": 129.56178199965507,
+   "nanolance": 43.143537000105425,
+   "nanolance_no_index": 869.6309050001219
+  },
+  "all|cat = 'c7' AND id < 50000": {
+   "rows": 1053,
+   "pylance": 36.189897999975074,
+   "nanolance": 18.219895999664004,
+   "nanolance_no_index": 44.85738599987599
+  }
+ }
+}

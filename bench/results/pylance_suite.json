@@ -2,9 +2,9 @@
  "pylance_version": "12.0.0",
  "target": "nanolance.lance",
  "totals": {
-  "failed": 923,
+  "failed": 897,
   "skipped": 377,
-  "passed": 190
+  "passed": 216
  },
  "files": {
   ".py": {
@@ -37,8 +37,8 @@
    "failed": 10
   },
   "tests/test_column_names.py": {
-   "passed": 16,
-   "failed": 11
+   "passed": 17,
+   "failed": 10
   },
   "tests/test_commit_index.py": {
    "failed": 6
@@ -56,8 +56,8 @@
    "failed": 6
   },
   "tests/test_dataset.py": {
-   "failed": 171,
-   "passed": 79,
+   "failed": 168,
+   "passed": 82,
    "skipped": 5
   },
   "tests/test_debug.py": {
@@ -79,8 +79,8 @@
    "passed": 1
   },
   "tests/test_fragment.py": {
-   "failed": 80,
-   "passed": 5
+   "failed": 76,
+   "passed": 9
   },
   "tests/test_fragment_typing.py": {
    "failed": 3
@@ -110,8 +110,8 @@
    "failed": 3
   },
   "tests/test_lance.py": {
-   "passed": 9,
-   "failed": 14
+   "failed": 14,
+   "passed": 9
   },
   "tests/test_log.py": {
    "failed": 18
@@ -124,7 +124,7 @@
    "failed": 20
   },
   "tests/test_memory_leaks.py": {
-   "failed": 1
+   "passed": 1
   },
   "tests/test_migration.py": {
    "failed": 4
@@ -148,8 +148,8 @@
    "failed": 3
   },
   "tests/test_otel.py": {
-   "failed": 1,
-   "skipped": 2
+   "skipped": 2,
+   "failed": 1
   },
   "tests/test_pydantic.py": {
    "passed": 4,
@@ -167,8 +167,8 @@
    "skipped": 1
   },
   "tests/test_scalar_index.py": {
-   "failed": 186,
-   "passed": 10
+   "failed": 169,
+   "passed": 27
   },
   "tests/test_schema.py": {
    "failed": 4

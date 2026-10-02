@@ -55,7 +55,45 @@ columns, packed structs, deletions, ranges and takes.
 
 ## Indexes
 
-nanolance builds no index and reads none, but it keeps the ones a dataset has. Every commit it makes
+### Scalar indexes: built and used
+
+`create_scalar_index(column, "BTREE" | "BITMAP" | "LABEL_LIST", name=None, replace=True)` builds
+Lance's scalar indexes in Lance's file layout (`src/scalar_index.cpp`), committed in the manifest as
+pylance commits one; `drop_index`, `list_indices`, `describe_indices` and `has_index` work as in
+pylance. Filtered reads use any BTree, Bitmap or LabelList index the dataset has, whoever built it
+(`src/index_search.cpp`):
+
+| index | files | answers |
+|---|---|---|
+| BTREE | `page_data.lance` (values sorted, nulls first, with row ids), `page_lookup.lance` (each 4096-row page's min, max, null count) | `=`, `<`, `<=`, `>`, `>=`, `!=`, `IN`, `BETWEEN`, `IS [NOT] NULL` |
+| BITMAP | `bitmap_page_lookup.lance` (one row bitmap per distinct value, null first) | the same |
+| LABEL_LIST | the same over a list column's elements, plus its null lists (global buffer 1) | `array_has_any`, `array_has_all`, `array_contains` / `array_has`, `IS NULL` |
+
+An index narrows a read to the rows it says may pass; the whole filter is then applied to those rows,
+so an index changes how much is read, never what comes back. A predicate's AND / OR / NOT structure is
+kept (AND intersects, OR unites); fragments an index does not cover are read through. `explain_plan()`
+names the index each predicate used, in pylance's words
+(`ScalarIndexQuery: query=[x >= 1 && x <= 3]@x_idx(BTree)`); `use_scalar_index=False` reads without.
+
+`test_scalar_index.py` checks it both ways: pylance lists, validates and answers from indexes
+nanolance built (its plans show them, its results equal a scan's), their contents equal the indexes
+pylance builds from the same data (LabelList keys aside, which Lance writes in hash order), and
+nanolance answers every filter from either builder's indexes exactly as a scan does. pylance's own
+index tests that need only these index types now pass too (`test_bitmap_index`,
+`test_label_list_index`, `test_temporal_index`, `test_use_multi_index`, ...).
+
+Speed, 5M rows in 5 fragments, 4 cores (`docs/BENCHMARKS.md`, "Scalar indexes"): building is
+1.5-3.6x faster than pylance (BTree on int64 0.79 s vs 1.16 s, on strings 1.47 s vs 2.19 s; Bitmap
+0.39 s vs 1.39 s; LabelList 0.97 s vs 2.26 s), and indexed reads are 1.1-3.2x faster, but for a
+one-row lookup returning every column (2.9 ms vs 1.3 ms).
+
+Not built: Lance's other scalar indexes (INVERTED full-text, NGRAM, ZONEMAP, BLOOMFILTER, JSON, RTREE),
+vector indexes, build options (`fragment_ids`, `train=False`, ...), and indexes on a dataset with
+stable row ids. Those a dataset already has are kept, as below.
+
+### Indexes nanolance keeps
+
+Every commit nanolance makes
 -- append, delete, update, `merge_insert`, column changes, compaction, restore -- writes the
 version's indices into the new manifest by Lance's own rules (`src/index_maintenance.cpp`, after
 lance-table's `index_maintenance.rs`), so pylance goes on using them:
@@ -79,12 +117,13 @@ These raise `NotImplementedError` (`nanolance.lance.NotSupportedError`) naming t
 them is silently ignored:
 
 - `order_by`, Substrait filters, and SQL functions beyond the list above (regular expressions,
-  JSON, array functions). A function the filter dialect lacks is refused by name.
+  JSON, array functions other than `array_has_any`, `array_has_all` and `array_contains` /
+  `array_has`). A function the filter dialect lacks is refused by name.
 - The transaction API (`LanceOperation`, `commit`, `write_fragments`), `LanceFragment.merge_columns`
   / `update_columns`, `cleanup_old_versions`. Conflicting writers are refused rather than retried:
   a change built on a version another writer has since replaced fails with "commit conflict".
-- Building or querying indexes of any kind, vector search (`nearest`), full-text search. An index
-  pylance built is kept, though: see "Indexes" below.
+- Vector and full-text indexes and search (`nearest`, `full_text_query`), and scalar indexes other
+  than BTree, Bitmap and LabelList. An index pylance built is kept, though: see "Indexes" below.
 - Tags and branches, stable row ids, multiple base paths, shallow and deep clones.
 - Writing Lance's inline, packed and dedicated blob layouts (`lance.blob_field`, `lance.blob_array`):
   nanolance writes external blobs, and reads every kind.
@@ -118,20 +157,20 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **189**, every one of which pylance also passes (129 before filters and changes) |
+| nanolance.lance | **216**, every one of which pylance also passes (189 before scalar indexes) |
 
 By test file, where nanolance passes any:
 
 | file | pylance | nanolance |
 |---|---|---|
-| test_dataset.py | 250 | 79 |
+| test_dataset.py | 250 | 82 |
 | test_file.py | 40 | 27 |
+| test_scalar_index.py | 189 | 27 |
 | test_map_type.py | 19 | 17 |
-| test_column_names.py | 27 | 16 |
-| test_scalar_index.py | 189 | 10 |
+| test_column_names.py | 27 | 17 |
 | test_filter.py | 26 | 9 |
 | test_lance.py | 23 | 9 |
-| test_fragment.py | 85 | 5 |
+| test_fragment.py | 85 | 9 |
 | test_json.py | 18 | 5 |
 | test_pydantic.py | 12 | 4 |
 | test_schema_evolution.py | 23 | 2 |
@@ -139,8 +178,9 @@ By test file, where nanolance passes any:
 
 The main reasons tests fail today:
 
-- Most need indexes (175 fail on `create_scalar_index` alone), vector or full-text search,
-  namespaces (about 130), object stores or the `mem_wal`. These are out of scope.
+- Most need vector or full-text indexes and search, scalar indexes other than BTree / Bitmap /
+  LabelList or their build options (about 160 in `test_scalar_index.py`), namespaces (about 130),
+  object stores or the `mem_wal`.
 - About 90 need the transaction API, fragment-level writes, stable row ids or multiple base paths.
 - About 25 need filter functions nanolance lacks, or a data storage version other than 2.2.
 - A tail of writer gaps in nanolance itself: Arrow dictionary arrays, empty structs, a nullable
