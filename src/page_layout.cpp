@@ -3,670 +3,256 @@
 
 #include "nanolance/page_layout.hpp"
 
-#include <cstring>
+#include <nanom/formats/lance_encodings.hpp>
+
+#include <span>
+#include <string_view>
+
+// The descriptor's wire format -- lance.encodings21's PageLayout and CompressiveEncoding messages --
+// is declared once in nanom/formats/lance_encodings.hpp and read by nanom's protobuf codec, which
+// bounds-checks every length, rejects malformed varints and truncated submessages, and caps nesting.
+// This file turns that wire model into the Compressive / MiniBlock / Constant / FullZip nodes the
+// decoder dispatches on.
 
 namespace nano_lance::page_layout {
 namespace {
 
-constexpr std::uint8_t kWireVarint = 0;
-constexpr std::uint8_t kWireBytes = 2;
+namespace nm = ::nanom;
+namespace wire = ::nanom_formats::lance;
 
 /// Lance descriptors are a handful of nodes deep (General -> ByteStreamSplit -> Flat is the deepest
 /// nanolance writes). This cap exists so a hostile descriptor cannot drive unbounded recursion; it
 /// is far above anything legitimate.
 constexpr int kMaxDepth = 16;
 
-struct Cursor {
-    const std::uint8_t* data = nullptr;
-    std::size_t size = 0;
-    std::size_t pos = 0;
-
-    bool done() const { return pos >= size; }
-};
-
-bool read_varint(Cursor& c, std::uint64_t& out) {
-    std::uint64_t value = 0;
-    unsigned shift = 0;
-    while (c.pos < c.size) {
-        const std::uint8_t byte = c.data[c.pos++];
-        if (shift >= 64U) {
-            return false;  // more continuation bytes than a u64 can hold
-        }
-        value |= static_cast<std::uint64_t>(byte & 0x7FU) << shift;
-        if ((byte & 0x80U) == 0U) {
-            out = value;
-            return true;
-        }
-        shift += 7U;
-    }
-    return false;  // ran off the end mid-varint
+std::vector<std::uint8_t> owned(nm::bytes b) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(b.data());
+    return std::vector<std::uint8_t>(p, p + b.size());
 }
 
-/// Skip a field whose contents we do not model, so unknown tags never desynchronize the parse.
-bool skip_field(Cursor& c, std::uint8_t wire_type) {
-    std::uint64_t scratch = 0;
-    switch (wire_type) {
-        case kWireVarint:
-            return read_varint(c, scratch);
-        case 1:  // 64-bit
-            if (c.size - c.pos < 8U) {
-                return false;
-            }
-            c.pos += 8U;
-            return true;
-        case kWireBytes: {
-            if (!read_varint(c, scratch) || scratch > c.size - c.pos) {
-                return false;
-            }
-            c.pos += static_cast<std::size_t>(scratch);
-            return true;
+/// The field number of the first length-delimited record a pb_unknown holds: in a oneof message,
+/// the variant this build does not model.
+std::uint32_t first_unknown_variant(const nm::unknown_fields& u) {
+    std::uint32_t field = 0;
+    nm::for_each_unknown(u, [&](std::uint64_t f, std::uint8_t wire_type) {
+        if (field == 0U && wire_type == 2U) {
+            field = static_cast<std::uint32_t>(f);
         }
-        case 5:  // 32-bit
-            if (c.size - c.pos < 4U) {
-                return false;
-            }
-            c.pos += 4U;
-            return true;
-        default:
-            return false;  // groups (3/4) and anything else: refuse rather than guess
-    }
+    });
+    return field;
 }
 
-/// Read a length-delimited field's payload as a sub-cursor without copying.
-bool read_submessage(Cursor& c, Cursor& out) {
-    std::uint64_t len = 0;
-    if (!read_varint(c, len) || len > c.size - c.pos) {
+bool convert(const wire::CompressiveEncoding& w, Compressive& out, int depth, std::string& error);
+
+/// A child node: its bytes were only length-checked with the parent, so they are decoded (and
+/// fully checked) here, one level deeper.
+bool child(const nm::pb_lazy<wire::CompressiveEncoding>& lazy, std::unique_ptr<Compressive>& out, int depth,
+           std::string& error) {
+    if (!lazy) {
+        return true;
+    }
+    if (depth + 1 > kMaxDepth) {
+        error = "page layout: encoding tree nested too deeply";
         return false;
     }
-    out.data = c.data + c.pos;
-    out.size = static_cast<std::size_t>(len);
-    out.pos = 0;
-    c.pos += static_cast<std::size_t>(len);
-    return true;
-}
-
-bool read_bytes(Cursor& c, std::vector<std::uint8_t>& out) {
-    Cursor sub;
-    if (!read_submessage(c, sub)) {
+    wire::CompressiveEncoding w;
+    if (auto r = lazy.decode_into(w); !r) {
+        error = std::string("page layout: malformed CompressiveEncoding (expected ") + r.error().expected + ")";
         return false;
     }
-    out.assign(sub.data, sub.data + sub.size);
-    return true;
-}
-
-bool parse_compressive(Cursor c, Compressive& out, int depth, std::string& error);
-
-/// A node whose only content is `f1 varint` (Flat::bits_per_value, InlineBitpacking::uncompressed_bits).
-bool parse_bits_node(Cursor c, std::uint32_t& bits, std::string& error) {
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in bit-width node";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (field == 1U && wire == kWireVarint) {
-            std::uint64_t value = 0;
-            if (!read_varint(c, value)) {
-                error = "page layout: malformed bit width";
-                return false;
-            }
-            bits = static_cast<std::uint32_t>(value);
-        } else if (!skip_field(c, wire)) {
-            error = "page layout: malformed bit-width node";
-            return false;
-        }
+    auto node = std::make_unique<Compressive>();
+    if (!convert(w, *node, depth + 1, error)) {
+        return false;
     }
+    out = std::move(node);
     return true;
 }
 
-/// A node holding exactly one nested CompressiveEncoding at `child_field`.
-bool parse_wrapper_node(Cursor c, std::uint32_t child_field, std::unique_ptr<Compressive>& child,
-                        int depth, std::string& error) {
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in wrapper node";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (field == child_field && wire == kWireBytes) {
-            Cursor sub;
-            if (!read_submessage(c, sub)) {
-                error = "page layout: truncated nested encoding";
-                return false;
-            }
-            auto node = std::make_unique<Compressive>();
-            if (!parse_compressive(sub, *node, depth + 1, error)) {
-                return false;
-            }
-            child = std::move(node);
-        } else if (!skip_field(c, wire)) {
-            error = "page layout: malformed wrapper node";
-            return false;
-        }
-    }
-    return true;
-}
-
-bool parse_rle(Cursor c, Compressive& out, int depth, std::string& error) {
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in Rle";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if ((field == 1U || field == 2U) && wire == kWireBytes) {
-            Cursor sub;
-            if (!read_submessage(c, sub)) {
-                error = "page layout: truncated Rle child";
-                return false;
-            }
-            auto node = std::make_unique<Compressive>();
-            if (!parse_compressive(sub, *node, depth + 1, error)) {
-                return false;
-            }
-            (field == 1U ? out.values : out.lengths) = std::move(node);
-        } else if (!skip_field(c, wire)) {
-            error = "page layout: malformed Rle";
-            return false;
-        }
-    }
-    return true;
-}
-
-/// Fsst{ f1 symbol_table (bytes), f2 values (CompressiveEncoding) }. The symbol table is kept raw:
-/// validating it is fsst::parse_symbol_table's job, and a descriptor parser that also rejected a
-/// malformed table would report the wrong kind of error for a page nothing is going to read anyway.
-bool parse_fsst(Cursor c, Compressive& out, int depth, std::string& error) {
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in Fsst";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (field == 1U && wire == kWireBytes) {
-            if (!read_bytes(c, out.symbol_table)) {
-                error = "page layout: truncated Fsst symbol table";
-                return false;
-            }
-        } else if (field == 2U && wire == kWireBytes) {
-            Cursor sub;
-            if (!read_submessage(c, sub)) {
-                error = "page layout: truncated Fsst values";
-                return false;
-            }
-            auto node = std::make_unique<Compressive>();
-            if (!parse_compressive(sub, *node, depth + 1, error)) {
-                return false;
-            }
-            out.values = std::move(node);
-        } else if (!skip_field(c, wire)) {
-            error = "page layout: malformed Fsst";
-            return false;
-        }
-    }
-    return true;
-}
-
-/// FixedSizeList{ f1 items_per_value, f2 values (CompressiveEncoding), f3 has_validity }.
-bool parse_fixed_size_list(Cursor c, Compressive& out, int depth, std::string& error) {
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in FixedSizeList";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if ((field == 1U || field == 3U) && wire == kWireVarint) {
-            std::uint64_t value = 0;
-            if (!read_varint(c, value)) {
-                error = "page layout: malformed FixedSizeList scalar";
-                return false;
-            }
-            if (field == 1U) {
-                out.items_per_value = value;
-            } else {
-                out.has_validity = value != 0U;
-            }
-        } else if (field == 2U && wire == kWireBytes) {
-            Cursor sub;
-            if (!read_submessage(c, sub)) {
-                error = "page layout: truncated FixedSizeList values";
-                return false;
-            }
-            auto node = std::make_unique<Compressive>();
-            if (!parse_compressive(sub, *node, depth + 1, error)) {
-                return false;
-            }
-            out.values = std::move(node);
-        } else if (!skip_field(c, wire)) {
-            error = "page layout: malformed FixedSizeList";
-            return false;
-        }
-    }
-    return true;
-}
-
-bool parse_general(Cursor c, Compressive& out, int depth, std::string& error) {
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in General";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (field == 1U && wire == kWireBytes) {  // BufferCompression{ f1 scheme }
-            Cursor sub;
-            if (!read_submessage(c, sub)) {
-                error = "page layout: truncated BufferCompression";
-                return false;
-            }
-            std::uint32_t scheme = 0;
-            if (!parse_bits_node(sub, scheme, error)) {
-                return false;
-            }
-            out.wire_scheme = scheme;
-            out.scheme = scheme == static_cast<std::uint32_t>(BufferScheme::kZstd)  ? BufferScheme::kZstd
-                         : scheme == static_cast<std::uint32_t>(BufferScheme::kLz4) ? BufferScheme::kLz4
-                         : scheme == 0U                                             ? BufferScheme::kNone
-                                                                                    : BufferScheme::kUnknownScheme;
-        } else if (field == 3U && wire == kWireBytes) {  // values
-            Cursor sub;
-            if (!read_submessage(c, sub)) {
-                error = "page layout: truncated General values";
-                return false;
-            }
-            auto node = std::make_unique<Compressive>();
-            if (!parse_compressive(sub, *node, depth + 1, error)) {
-                return false;
-            }
-            out.values = std::move(node);
-        } else if (!skip_field(c, wire)) {
-            error = "page layout: malformed General";
-            return false;
-        }
-    }
-    return true;
-}
-
-bool parse_compressive(Cursor c, Compressive& out, int depth, std::string& error) {
+/// One CompressiveEncoding node. Exactly one variant is set in a valid message; an empty one stays
+/// kUnknown (callers treat it as "cannot decode"), a variant this build does not model is kept by
+/// field number so the caller refuses it by name.
+bool convert(const wire::CompressiveEncoding& w, Compressive& out, int depth, std::string& error) {
     if (depth > kMaxDepth) {
         error = "page layout: encoding tree nested too deeply";
         return false;
     }
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in CompressiveEncoding";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (wire != kWireBytes) {
-            if (!skip_field(c, wire)) {
-                error = "page layout: malformed CompressiveEncoding";
-                return false;
-            }
-            continue;
-        }
-        Cursor sub;
-        if (!read_submessage(c, sub)) {
-            error = "page layout: truncated CompressiveEncoding variant";
-            return false;
-        }
-        // The first recognized variant wins; a message carries exactly one in practice.
-        out.wire_field = field;
-        switch (field) {
-            case 1U:
-                out.kind = CompressiveKind::kFlat;
-                if (!parse_bits_node(sub, out.bits_per_value, error)) {
-                    return false;
-                }
-                break;
-            case 2U:
-                out.kind = CompressiveKind::kVariable;
-                if (!parse_wrapper_node(sub, 1U, out.values, depth, error)) {
-                    return false;
-                }
-                break;
-            case 4U:
-                // The wrapper Lance puts around a definition-level buffer: f1 is the level's
-                // uncompressed width (16 bits), f3 how the levels are actually stored (Flat(1) when
-                // the only levels are 0 and 1, i.e. a plain nullable column).
-                out.kind = CompressiveKind::kBitpacked;
-                if (!parse_bits_node(sub, out.bits_per_value, error) ||
-                    !parse_wrapper_node(sub, 3U, out.values, depth, error)) {
-                    return false;
-                }
-                break;
-            case 5U:
-                out.kind = CompressiveKind::kInlineBitpacking;
-                if (!parse_bits_node(sub, out.bits_per_value, error)) {
-                    return false;
-                }
-                break;
-            case 6U:
-                out.kind = CompressiveKind::kFsst;
-                if (!parse_fsst(sub, out, depth, error)) {
-                    return false;
-                }
-                break;
-            case 8U:
-                out.kind = CompressiveKind::kRle;
-                if (!parse_rle(sub, out, depth, error)) {
-                    return false;
-                }
-                break;
-            case 9U:
-                out.kind = CompressiveKind::kByteStreamSplit;
-                if (!parse_wrapper_node(sub, 1U, out.values, depth, error)) {
-                    return false;
-                }
-                break;
-            case 10U:
-                out.kind = CompressiveKind::kGeneral;
-                if (!parse_general(sub, out, depth, error)) {
-                    return false;
-                }
-                break;
-            case 11U:
-                out.kind = CompressiveKind::kFixedSizeList;
-                if (!parse_fixed_size_list(sub, out, depth, error)) {
-                    return false;
-                }
-                break;
-            default:
-                // Parsed successfully, just not modeled. Recording the wire field lets the caller
-                // refuse by name instead of misreading the page's buffers.
-                out.kind = CompressiveKind::kUnknown;
-                break;
-        }
+    const auto members = wire::oneof_members(w);
+    if (members > 1U) {
+        error = "page layout: CompressiveEncoding sets more than one variant";
+        return false;
+    }
+    if (members == 0U) {
         return true;
     }
-    return true;  // empty message: kUnknown, which callers treat as "cannot decode"
-}
-
-bool parse_mini_block(Cursor c, MiniBlock& out, std::string& error) {
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in MiniBlockLayout";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (wire == kWireBytes && field == 1U) {
-            // rep_compression. Its mere presence is load-bearing: the chunk header reserves a slot
-            // for the repetition buffer's size when this field exists.
-            Cursor sub;
-            if (!read_submessage(c, sub)) {
-                error = "page layout: truncated MiniBlockLayout rep_compression";
-                return false;
-            }
-            auto node = std::make_unique<Compressive>();
-            if (!parse_compressive(sub, *node, 0, error)) {
-                return false;
-            }
-            out.rep_compression = std::move(node);
-            out.has_repetition = true;
-        } else if (wire == kWireBytes && (field == 2U || field == 3U || field == 4U)) {
-            Cursor sub;
-            if (!read_submessage(c, sub)) {
-                error = "page layout: truncated MiniBlockLayout encoding";
-                return false;
-            }
-            auto node = std::make_unique<Compressive>();
-            if (!parse_compressive(sub, *node, 0, error)) {
-                return false;
-            }
-            (field == 2U   ? out.repdef_compression
-             : field == 3U ? out.value_compression
-                           : out.dictionary) = std::move(node);
-        } else if (wire == kWireBytes && field == 6U) {
-            if (!read_bytes(c, out.layers)) {
-                error = "page layout: truncated MiniBlockLayout layers";
-                return false;
-            }
-        } else if (wire == kWireVarint &&
-                   (field == 5U || field == 7U || field == 8U || field == 9U || field == 10U)) {
-            std::uint64_t value = 0;
-            if (!read_varint(c, value)) {
-                error = "page layout: malformed MiniBlockLayout scalar";
-                return false;
-            }
-            switch (field) {
-                case 5U:
-                    out.num_dictionary_items = value;
-                    break;
-                case 7U:
-                    out.num_buffers = static_cast<std::uint32_t>(value);
-                    break;
-                case 8U:
-                    out.repetition_index_depth = static_cast<std::uint32_t>(value);
-                    break;
-                case 9U:
-                    out.num_items = value;
-                    break;
-                default:
-                    out.has_large_chunk = value != 0U;
-                    break;
-            }
-        } else if (!skip_field(c, wire)) {
-            error = "page layout: malformed MiniBlockLayout";
-            return false;
-        }
+    if (const auto& v = *w.flat) {
+        out.kind = CompressiveKind::kFlat;
+        out.wire_field = 1U;
+        out.bits_per_value = static_cast<std::uint32_t>(*v->bits_per_value);
+        return true;
     }
+    if (const auto& v = *w.variable) {
+        out.kind = CompressiveKind::kVariable;
+        out.wire_field = 2U;
+        return child(*v->offsets, out.values, depth, error);
+    }
+    if (const auto& v = *w.out_of_line_bitpacking) {
+        // The wrapper Lance puts around a definition-level buffer: f1 is the level's uncompressed
+        // width (16 bits), f3 how the levels are actually stored (Flat(1) when the only levels are 0
+        // and 1, i.e. a plain nullable column).
+        out.kind = CompressiveKind::kBitpacked;
+        out.wire_field = 4U;
+        out.bits_per_value = static_cast<std::uint32_t>(*v->uncompressed_bits_per_value);
+        return child(*v->values, out.values, depth, error);
+    }
+    if (const auto& v = *w.inline_bitpacking) {
+        out.kind = CompressiveKind::kInlineBitpacking;
+        out.wire_field = 5U;
+        out.bits_per_value = static_cast<std::uint32_t>(*v->uncompressed_bits_per_value);
+        return true;
+    }
+    if (const auto& v = *w.fsst) {
+        // The symbol table is kept raw: validating it is fsst::parse_symbol_table's job.
+        out.kind = CompressiveKind::kFsst;
+        out.wire_field = 6U;
+        out.symbol_table = owned(*v->symbol_table);
+        return child(*v->values, out.values, depth, error);
+    }
+    if (const auto& v = *w.rle) {
+        out.kind = CompressiveKind::kRle;
+        out.wire_field = 8U;
+        return child(*v->values, out.values, depth, error) && child(*v->run_lengths, out.lengths, depth, error);
+    }
+    if (const auto& v = *w.byte_stream_split) {
+        out.kind = CompressiveKind::kByteStreamSplit;
+        out.wire_field = 9U;
+        return child(*v->values, out.values, depth, error);
+    }
+    if (const auto& v = *w.general) {
+        out.kind = CompressiveKind::kGeneral;
+        out.wire_field = 10U;
+        const auto scheme = static_cast<std::uint32_t>(v->compression->has_value() ? *v->compression->value().scheme : 0U);
+        out.wire_scheme = scheme;
+        out.scheme = scheme == static_cast<std::uint32_t>(BufferScheme::kZstd)  ? BufferScheme::kZstd
+                     : scheme == static_cast<std::uint32_t>(BufferScheme::kLz4) ? BufferScheme::kLz4
+                     : scheme == 0U                                             ? BufferScheme::kNone
+                                                                                : BufferScheme::kUnknownScheme;
+        return child(*v->values, out.values, depth, error);
+    }
+    if (const auto& v = *w.fixed_size_list) {
+        out.kind = CompressiveKind::kFixedSizeList;
+        out.wire_field = 11U;
+        out.items_per_value = *v->items_per_value;
+        out.has_validity = *v->has_validity != 0U;
+        return child(*v->values, out.values, depth, error);
+    }
+    // Parsed, just not modeled. Recording the wire field lets the caller refuse by name instead of
+    // misreading the page's buffers.
+    out.kind = CompressiveKind::kUnknown;
+    out.wire_field = first_unknown_variant(*w.unknown);
     return true;
 }
 
-/// FullZipLayout{ f1 bits_rep, f2 bits_def, f3 bits_per_value | f4 bits_per_offset, f5 num_items,
-/// f6 num_visible_items, f7 value_compression, f8 layers }.
-bool parse_full_zip(Cursor c, FullZip& out, std::string& error) {
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in FullZipLayout";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (wire == kWireVarint && field >= 1U && field <= 6U) {
-            std::uint64_t value = 0;
-            if (!read_varint(c, value)) {
-                error = "page layout: malformed FullZipLayout scalar";
-                return false;
-            }
-            switch (field) {
-                case 1U:
-                    out.bits_rep = static_cast<std::uint32_t>(value);
-                    break;
-                case 2U:
-                    out.bits_def = static_cast<std::uint32_t>(value);
-                    break;
-                case 3U:
-                    out.bits_per_value = static_cast<std::uint32_t>(value);
-                    break;
-                case 4U:
-                    out.bits_per_offset = static_cast<std::uint32_t>(value);
-                    break;
-                case 5U:
-                    out.num_items = value;
-                    break;
-                default:
-                    out.num_visible_items = value;
-                    break;
-            }
-        } else if (wire == kWireBytes && field == 7U) {
-            Cursor sub;
-            if (!read_submessage(c, sub)) {
-                error = "page layout: truncated FullZipLayout value_compression";
-                return false;
-            }
-            auto node = std::make_unique<Compressive>();
-            if (!parse_compressive(sub, *node, 0, error)) {
-                return false;
-            }
-            out.value_compression = std::move(node);
-        } else if (wire == kWireBytes && field == 8U) {
-            if (!read_bytes(c, out.layers)) {
-                error = "page layout: truncated FullZipLayout layers";
-                return false;
-            }
-        } else if (!skip_field(c, wire)) {
-            error = "page layout: malformed FullZipLayout";
-            return false;
-        }
+/// A layout's own encoding (the root of a tree): depth starts at 0 again, as it always has.
+bool convert_root(const nm::pb_lazy<wire::CompressiveEncoding>& lazy, std::unique_ptr<Compressive>& out,
+                  std::string& error) {
+    return child(lazy, out, -1, error);
+}
+
+bool convert(const wire::MiniBlockLayout& w, MiniBlock& out, std::string& error) {
+    // rep_compression: its mere presence is load-bearing -- the chunk header reserves a slot for the
+    // repetition buffer's size when this field exists.
+    out.has_repetition = w.rep_compression->has_value();
+    out.num_dictionary_items = *w.num_dictionary_items;
+    out.layers = owned(*w.layers);
+    out.num_buffers = static_cast<std::uint32_t>(*w.num_buffers);
+    out.repetition_index_depth = static_cast<std::uint32_t>(*w.repetition_index_depth);
+    out.num_items = *w.num_items;
+    out.has_large_chunk = *w.has_large_chunk != 0U;
+    return convert_root(*w.rep_compression, out.rep_compression, error) &&
+           convert_root(*w.def_compression, out.repdef_compression, error) &&
+           convert_root(*w.value_compression, out.value_compression, error) &&
+           convert_root(*w.dictionary, out.dictionary, error);
+}
+
+bool convert(const wire::ConstantLayout& w, Constant& out, std::string& error) {
+    out.layers = owned(*w.layers);
+    if (const auto& value = *w.inline_value) {
+        out.inline_value = owned(*value);
+    }
+    // A constant page can be nullable: the same value in every non-null row, with the definition
+    // levels in a buffer of their own. Skipping these fields meant a nullable constant column read
+    // back with every row valid -- silent corruption, not a refusal.
+    out.num_rep_values = *w.num_rep_values;
+    out.num_def_values = *w.num_def_values;
+    return convert_root(*w.rep_compression, out.rep_compression, error) &&
+           convert_root(*w.def_compression, out.def_compression, error);
+}
+
+bool convert(const wire::FullZipLayout& w, FullZip& out, std::string& error) {
+    out.bits_rep = static_cast<std::uint32_t>(*w.bits_rep);
+    out.bits_def = static_cast<std::uint32_t>(*w.bits_def);
+    out.bits_per_value = static_cast<std::uint32_t>(*w.bits_per_value);
+    out.bits_per_offset = static_cast<std::uint32_t>(*w.bits_per_offset);
+    out.num_items = *w.num_items;
+    out.num_visible_items = *w.num_visible_items;
+    out.layers = owned(*w.layers);
+    return convert_root(*w.value_compression, out.value_compression, error);
+}
+
+template <class M>
+bool decode_wire(nm::bytes bytes, M& out, const char* what, std::string& error) {
+    if (auto r = nm::protobuf_decode(nm::from(bytes), out); !r) {
+        error = std::string("page layout: malformed ") + what + " (expected " + r.error().expected + ")";
+        return false;
     }
     return true;
 }
-
-bool parse_constant(Cursor c, Constant& out, std::string& error) {
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in ConstantLayout";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (field == 5U && wire == kWireBytes) {
-            if (!read_bytes(c, out.layers)) {
-                error = "page layout: truncated ConstantLayout layers";
-                return false;
-            }
-        } else if (field == 6U && wire == kWireBytes) {
-            std::vector<std::uint8_t> value;
-            if (!read_bytes(c, value)) {
-                error = "page layout: truncated ConstantLayout inline value";
-                return false;
-            }
-            out.inline_value = std::move(value);
-        } else if (wire == kWireBytes && (field == 7U || field == 8U)) {
-            // A constant page can be nullable: the same value in every non-null row, with the
-            // definition levels in a buffer of their own. Skipping these fields meant a nullable
-            // constant column read back with every row valid -- silent corruption, not a refusal.
-            Cursor sub;
-            if (!read_submessage(c, sub)) {
-                error = "page layout: truncated ConstantLayout level encoding";
-                return false;
-            }
-            auto node = std::make_unique<Compressive>();
-            if (!parse_compressive(sub, *node, 0, error)) {
-                return false;
-            }
-            (field == 7U ? out.rep_compression : out.def_compression) = std::move(node);
-        } else if (wire == kWireVarint && (field == 9U || field == 10U)) {
-            std::uint64_t value = 0;
-            if (!read_varint(c, value)) {
-                error = "page layout: malformed ConstantLayout level count";
-                return false;
-            }
-            (field == 9U ? out.num_rep_values : out.num_def_values) = value;
-        } else if (!skip_field(c, wire)) {
-            error = "page layout: malformed ConstantLayout";
-            return false;
-        }
-    }
-    return true;
-}
-
-}  // namespace
-
-namespace {
 
 /// Parse into `out`, which the caller has already reset. Split from decode_page_layout so that
 /// function can build into a scratch value and publish it only on success -- see the note there.
 bool decode_page_layout_into(const std::vector<std::uint8_t>& encoding, PageLayout& out, std::string& error) {
-
     // Outer wrapper: f1 type_url string, f2 the PageLayout payload.
-    Cursor c{encoding.data(), encoding.size(), 0};
-    std::vector<std::uint8_t> type_url;
-    Cursor payload{};
-    bool have_payload = false;
-    while (!c.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(c, key)) {
-            error = "page layout: malformed tag in encoding wrapper";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (field == 1U && wire == kWireBytes) {
-            if (!read_bytes(c, type_url)) {
-                error = "page layout: truncated encoding type url";
-                return false;
-            }
-        } else if (field == 2U && wire == kWireBytes) {
-            if (!read_submessage(c, payload)) {
-                error = "page layout: truncated page layout payload";
-                return false;
-            }
-            have_payload = true;
-        } else if (!skip_field(c, wire)) {
-            error = "page layout: malformed encoding wrapper";
-            return false;
-        }
-    }
-
-    const std::string url(type_url.begin(), type_url.end());
-    if (!url.empty() && url.find("PageLayout") == std::string::npos) {
-        error = "page layout: unexpected encoding type url '" + url + "'";
+    wire::EncodingAny any;
+    if (!decode_wire(nm::bytes(reinterpret_cast<const std::byte*>(encoding.data()), encoding.size()), any,
+                     "encoding wrapper", error)) {
         return false;
     }
-    if (!have_payload) {
+    const std::string_view url = *any.type_url;
+    if (!url.empty() && url.find("PageLayout") == std::string_view::npos) {
+        error = "page layout: unexpected encoding type url '" + std::string(url) + "'";
+        return false;
+    }
+    if (!*any.value) {
         return true;  // wrapper with no payload; treated as "no descriptor"
     }
-
-    while (!payload.done()) {
-        std::uint64_t key = 0;
-        if (!read_varint(payload, key)) {
-            error = "page layout: malformed tag in PageLayout";
-            return false;
-        }
-        const auto field = static_cast<std::uint32_t>(key >> 3U);
-        const auto wire = static_cast<std::uint8_t>(key & 0x07U);
-        if (wire != kWireBytes) {
-            if (!skip_field(payload, wire)) {
-                error = "page layout: malformed PageLayout";
-                return false;
-            }
-            continue;
-        }
-        Cursor sub;
-        if (!read_submessage(payload, sub)) {
-            error = "page layout: truncated PageLayout variant";
-            return false;
-        }
-        if (field == 1U) {
-            out.kind = LayoutKind::kMiniBlock;
-            return parse_mini_block(sub, out.mini_block, error);
-        }
-        if (field == 2U) {
-            out.kind = LayoutKind::kConstant;
-            return parse_constant(sub, out.constant, error);
-        }
-        if (field == 3U) {
-            // Also what a lance.blob.v2 packed column's pages use; the decoder routes those by the
-            // column's `lance-encoding:blob` metadata before it ever looks at the layout.
-            out.kind = LayoutKind::kFullZip;
-            return parse_full_zip(sub, out.full_zip, error);
-        }
-        // Field 4 (BlobLayout), 5 (SparseLayout, file version 2.3+) and whatever Lance adds later are
-        // parsed but not modeled: record the field so a caller refuses by name rather than misreading
-        // the page's buffers.
-        out.kind = LayoutKind::kNone;
-        out.unknown_layout_field = field;
-        return true;
+    wire::PageLayout layout;
+    if (!decode_wire(**any.value, layout, "PageLayout", error)) {
+        return false;
     }
+    const auto members = wire::oneof_members(layout);
+    if (members > 1U) {
+        error = "page layout: PageLayout sets more than one layout";
+        return false;
+    }
+    if (const auto& v = *layout.mini_block_layout) {
+        out.kind = LayoutKind::kMiniBlock;
+        return convert(*v, out.mini_block, error);
+    }
+    if (const auto& v = *layout.constant_layout) {
+        out.kind = LayoutKind::kConstant;
+        return convert(*v, out.constant, error);
+    }
+    if (const auto& v = *layout.full_zip_layout) {
+        // Also what a lance.blob.v2 packed column's pages use; the decoder routes those by the
+        // column's `lance-encoding:blob` metadata before it ever looks at the layout.
+        out.kind = LayoutKind::kFullZip;
+        return convert(*v, out.full_zip, error);
+    }
+    // Field 4 (BlobLayout), 5 (SparseLayout, file version 2.3+) and whatever Lance adds later are
+    // parsed but not modeled: record the field so a caller refuses by name rather than misreading
+    // the page's buffers.
+    out.kind = LayoutKind::kNone;
+    out.unknown_layout_field = first_unknown_variant(*layout.unknown);
     return true;
 }
 
@@ -680,11 +266,9 @@ bool decode_page_layout(const std::vector<std::uint8_t>& encoding, PageLayout& o
     }
 
     // Build into a scratch value and publish only on success. The layout KIND is picked before its
-    // body is parsed (a PageLayout field 1 means MiniBlock whether or not the MiniBlock parses), so
-    // writing straight into `out` left a failed parse reporting kind = kMiniBlock with an empty body.
-    // A caller that checks the kind before the return value -- which is exactly how decode dispatch
-    // will read this -- would then select a decoder from a descriptor that did not parse. Found by
-    // tests/fuzz/fuzz_page_layout.cpp, 25 executions in.
+    // body is converted, so writing straight into `out` would leave a failed parse reporting a kind
+    // with an empty body -- and a caller that checks the kind before the return value would select a
+    // decoder from a descriptor that did not parse. Found by tests/fuzz/fuzz_page_layout.cpp.
     PageLayout scratch;
     if (!decode_page_layout_into(encoding, scratch, error)) {
         return false;  // `out` stays reset

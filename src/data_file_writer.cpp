@@ -5,6 +5,8 @@
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
 
+#include "lance_descriptors.hpp"
+
 #include "lance_minimal.pb.hpp"
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/bool_bitpack.hpp"
@@ -140,24 +142,6 @@ struct MiniblockChunk {
     std::vector<std::uint8_t> repdef;
 };
 
-void append_varint(std::vector<std::uint8_t>& out, std::uint64_t value) {
-    while (value >= 0x80U) {
-        out.push_back(static_cast<std::uint8_t>((value & 0x7FU) | 0x80U));
-        value >>= 7U;
-    }
-    out.push_back(static_cast<std::uint8_t>(value));
-}
-
-void write_length_delimited(std::vector<std::uint8_t>& out, std::uint32_t field_number, const std::vector<std::uint8_t>& payload) {
-    out.push_back(static_cast<std::uint8_t>((field_number << 3U) | 2U));
-    append_varint(out, payload.size());
-    out.insert(out.end(), payload.begin(), payload.end());
-}
-
-void write_string_field(std::vector<std::uint8_t>& out, std::uint32_t field_number, std::string_view value) {
-    write_length_delimited(out, field_number, std::vector<std::uint8_t>(value.begin(), value.end()));
-}
-
 /// Declared bits per value for a flat page. This is what tells every reader how wide each value is,
 /// so it must be the REAL width, not a nearby one.
 ///
@@ -183,62 +167,36 @@ std::vector<std::uint8_t> repdef_encoding_bytes();
 /// The MiniBlockLayout tail shared by every shape: f6 layers, f7 num_buffers, f9 num_items,
 /// f10 has_large_chunk. `nullable` switches layers from [1] to [3], which is how Lance announces a
 /// definition-level layer.
-std::vector<std::uint8_t> mini_block_tail(std::uint64_t num_items, std::uint8_t num_buffers, bool nullable) {
-    std::vector<std::uint8_t> tail;
-    tail.push_back(0x32U);                           // f6 layers
-    tail.push_back(0x01U);
-    tail.push_back(nullable ? 0x03U : 0x01U);
-    tail.push_back(0x38U);                           // f7 num_buffers
-    tail.push_back(num_buffers);
-    tail.push_back(0x48U);                           // f9 num_items
-    append_varint(tail, num_items);
-    tail.push_back(0x50U);                           // f10 has_large_chunk
-    tail.push_back(0x01U);
-    return tail;
+/// Fill the MiniBlockLayout fields every shape shares: one layer ([1], or [3] with a definition-level
+/// layer -- how Lance announces one), `num_buffers`, `num_items`, has_large_chunk.
+void mini_block_tail(descriptor::MiniBlock& m, std::uint64_t num_items, std::uint8_t num_buffers, bool nullable) {
+    m.layers = {nullable ? std::uint8_t{3} : std::uint8_t{1}};
+    m.num_buffers = num_buffers;
+    m.num_items = num_items;
+    m.has_large_chunk = true;
 }
 
-std::vector<std::uint8_t> build_mini_block_layout(std::uint32_t bits_per_value_token, std::uint64_t num_items,
-                                                  bool nullable = false, std::uint64_t fsl_items = 0) {
+descriptor::MiniBlock build_mini_block_layout(std::uint32_t bits_per_value_token, std::uint64_t num_items,
+                                             bool nullable = false, std::uint64_t fsl_items = 0) {
     // A fixed_size_list row is `fsl_items` flat values back to back. Lance describes that as
-    // CompressiveEncoding{ f11 FixedSizeList{ f1 items_per_value, f2 CompressiveEncoding{ f1 Flat } } },
-    // with the ELEMENT's width in the Flat -- the wrapper is what tells a reader it is a list at all.
+    // FixedSizeList{ items_per_value, values = Flat(element bits) } -- the wrapper is what tells a
+    // reader it is a list at all.
     const std::uint64_t flat_bits = fsl_items != 0U ? bits_per_value_token / fsl_items : bits_per_value_token;
-    std::vector<std::uint8_t> flat;                  // Flat{ f1 bits_per_value }
-    flat.push_back(0x08U);
-    append_varint(flat, flat_bits);
-
-    std::vector<std::uint8_t> compressive;           // CompressiveEncoding{ f1 Flat }
-    write_length_delimited(compressive, 1, flat);
-    if (fsl_items != 0U) {
-        std::vector<std::uint8_t> fixed_size_list;   // FixedSizeList{ f1 items, f2 values }
-        fixed_size_list.push_back(0x08U);
-        append_varint(fixed_size_list, fsl_items);
-        write_length_delimited(fixed_size_list, 2, compressive);
-        compressive.clear();
-        write_length_delimited(compressive, 11, fixed_size_list);
-    }
-
-    std::vector<std::uint8_t> mini;
+    descriptor::MiniBlock m;
+    m.value_compression = fsl_items != 0U ? descriptor::fixed_size_list(fsl_items, descriptor::flat(flat_bits))
+                                          : descriptor::flat(flat_bits);
     if (nullable) {
-        // f2 (how the definition levels are stored) precedes f3, matching what pylance emits.
-        write_length_delimited(mini, 2, repdef_encoding_bytes());
+        m.def_compression = repdef_encoding_bytes();
     }
-    write_length_delimited(mini, 3, compressive);    // f3 value_compression
-    const auto tail = mini_block_tail(num_items, 1U, nullable);
-    mini.insert(mini.end(), tail.begin(), tail.end());
-    return mini;
+    mini_block_tail(m, num_items, 1U, nullable);
+    return m;
 }
 
 /// page_layout_bytes for a flat page, with the nullable flag threaded through. `fsl_items` non-zero
 /// wraps the values as a fixed_size_list of that many elements per row.
 std::vector<std::uint8_t> page_layout_bytes_flat(std::uint32_t bits_token, std::uint64_t rows, bool nullable,
                                                  std::uint64_t fsl_items = 0) {
-    std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, build_mini_block_layout(bits_token, rows, nullable, fsl_items));
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
+    return descriptor::page_encoding(build_mini_block_layout(bits_token, rows, nullable, fsl_items));
 }
 
 void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value);  // defined with the other buffer writers
@@ -375,14 +333,8 @@ std::vector<std::uint8_t> pack_definition_levels(const std::vector<std::uint8_t>
 /// uncompressed width (16) and whose f3 says how the levels are actually stored (Flat(1), since the
 /// only levels here are 0 and 1). Matches pylance 12.0.0 byte for byte.
 std::vector<std::uint8_t> repdef_encoding_bytes() {
-    std::vector<std::uint8_t> flat{0x08, 0x01};                 // Flat{ f1 bits_per_value = 1 }
-    std::vector<std::uint8_t> flat_ce;
-    write_length_delimited(flat_ce, 1, flat);                   // CompressiveEncoding{ f1 Flat }
-    std::vector<std::uint8_t> wrapper{0x08, 0x10};              // f1 uncompressed_bits_per_value = 16
-    write_length_delimited(wrapper, 3, flat_ce);                // f3 values
-    std::vector<std::uint8_t> out;
-    write_length_delimited(out, 4, wrapper);                    // CompressiveEncoding{ f4 }
-    return out;
+    // OutOfLineBitpacking{ uncompressed 16, values = Flat(1) }: a plain nullable column's levels.
+    return descriptor::out_of_line_bitpacking(16U, descriptor::flat(1U));
 }
 
 std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& chunks) {
@@ -572,18 +524,8 @@ private:
     std::size_t chunks_ = 0;
 };
 
-std::vector<std::uint8_t> bytes_from_hex(std::string_view hex) {
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(hex.size() / 2U);
-    for (std::size_t i = 0; i + 1U < hex.size(); i += 2U) {
-        const auto pair = std::string(hex.substr(i, 2U));
-        bytes.push_back(static_cast<std::uint8_t>(std::stoul(pair, nullptr, 16)));
-    }
-    return bytes;
-}
-
 std::vector<std::uint8_t> column_encoding_bytes() {
-    return bytes_from_hex("0a1f2f6c616e63652e656e636f64696e67732e436f6c756d6e456e636f64696e6712020a00");
+    return descriptor::column_encoding();
 }
 
 /// MiniBlockLayout for a variable-width (utf8/binary) column: the value buffer holds the offsets
@@ -591,70 +533,39 @@ std::vector<std::uint8_t> column_encoding_bytes() {
 /// rather than the Flat encoding a fixed-width column uses. Matches IPC2Lance / the Lance reference
 /// PageLayout. `nullable` adds the f2 repdef_compression and the layers=[3] marker in the tail, in
 /// the same places variable_width_structural_payload_zstd puts them.
-std::vector<std::uint8_t> variable_width_structural_payload(std::uint32_t bits_token, std::uint64_t rows,
-                                                            bool nullable) {
-    // CompressiveEncoding{ f2 Variable{ f1 offsets = Flat{ f1 bits } } }.
-    const std::vector<std::uint8_t> value_comp{
-        0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, static_cast<std::uint8_t>(bits_token)};
-    std::vector<std::uint8_t> out;
+descriptor::MiniBlock variable_width_structural_payload(std::uint32_t bits_token, std::uint64_t rows, bool nullable) {
+    descriptor::MiniBlock m;
+    m.value_compression = descriptor::variable(descriptor::flat(bits_token));
     if (nullable) {
-        write_length_delimited(out, 2, repdef_encoding_bytes());
+        m.def_compression = repdef_encoding_bytes();
     }
-    write_length_delimited(out, 3, value_comp);
-    const auto tail = mini_block_tail(rows, 1U, nullable);
-    out.insert(out.end(), tail.begin(), tail.end());
-    return out;
+    mini_block_tail(m, rows, 1U, nullable);
+    return m;
 }
 
 std::vector<std::uint8_t> page_layout_bytes(std::uint32_t bits_token, std::uint64_t rows, bool variable_width,
                                             bool nullable = false) {
-    std::vector<std::uint8_t> page_layout;
-    if (variable_width) {
-        write_length_delimited(page_layout, 1, variable_width_structural_payload(bits_token, rows, nullable));
-    } else {
-        write_length_delimited(page_layout, 1, build_mini_block_layout(bits_token, rows, nullable));
-    }
-
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
+    return descriptor::page_encoding(variable_width ? variable_width_structural_payload(bits_token, rows, nullable)
+                                                    : build_mini_block_layout(bits_token, rows, nullable));
 }
 
 // Variable-width structural payload whose value_compression is wrapped in General(ZSTD), so the
 // chunk's value buffer is interpreted as [u64 LE uncompressed size][zstd frame]. Byte layout mirrors
 // what lance 7.0 emits for a zstd variable-width column (see memory: lance-zstd-variable-encoding).
-std::vector<std::uint8_t> variable_width_structural_payload_zstd(std::uint8_t bits_token, std::uint64_t rows,
-                                                                 bool nullable) {
-    // Uncompressed variable CompressiveEncoding body: f2 Variable{ f1 offsets = Flat{ f1 bits } }.
-    const std::vector<std::uint8_t> inner_ce{0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, bits_token};
-    // General{ f1 BufferCompression{ f1 scheme = ZSTD(2) }, f3 values = inner_ce }.
-    std::vector<std::uint8_t> general{0x0a, 0x02, 0x08, 0x02, 0x1a, static_cast<std::uint8_t>(inner_ce.size())};
-    general.insert(general.end(), inner_ce.begin(), inner_ce.end());
-    // value_compression CompressiveEncoding{ f10 General }.
-    std::vector<std::uint8_t> value_comp{0x52, static_cast<std::uint8_t>(general.size())};
-    value_comp.insert(value_comp.end(), general.begin(), general.end());
-    // MiniBlockLayout [f2 repdef,] f3 = value_compression, then the tail.
-    std::vector<std::uint8_t> out;
+descriptor::MiniBlock variable_width_structural_payload_zstd(std::uint8_t bits_token, std::uint64_t rows,
+                                                             bool nullable) {
+    descriptor::MiniBlock m;
+    m.value_compression = descriptor::general(descriptor::kZstd, descriptor::variable(descriptor::flat(bits_token)));
     if (nullable) {
-        write_length_delimited(out, 2, repdef_encoding_bytes());
+        m.def_compression = repdef_encoding_bytes();
     }
-    out.push_back(0x1aU);
-    out.push_back(static_cast<std::uint8_t>(value_comp.size()));
-    out.insert(out.end(), value_comp.begin(), value_comp.end());
-    const auto tail = mini_block_tail(rows, 1U, nullable);
-    out.insert(out.end(), tail.begin(), tail.end());
-    return out;
+    mini_block_tail(m, rows, 1U, nullable);
+    return m;
 }
 
 std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_token, std::uint64_t rows,
                                                           bool nullable = false) {
-    std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, variable_width_structural_payload_zstd(bits_token, rows, nullable));
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
+    return descriptor::page_encoding(variable_width_structural_payload_zstd(bits_token, rows, nullable));
 }
 
 // Fixed-width CompressiveEncoding wrapped General(ZSTD) -> ByteStreamSplit -> Flat, matching what stock
@@ -668,37 +579,21 @@ std::vector<std::uint8_t> page_layout_bytes_variable_zstd(std::uint8_t bits_toke
 //   -> ByteStreamSplit{ f1 values = above }                          -- f9 of CompressiveEncoding
 //   -> General{ f1 BufferCompression{f1 scheme=ZSTD(2)}, f3 values = above }   -- f10 of CompressiveEncoding
 //   -> MiniBlockLayout.value_compression (f3) = CompressiveEncoding{ f10 General = above }
-std::vector<std::uint8_t> fixed_width_structural_payload_bss_zstd(std::uint8_t bits_token, std::uint64_t rows,
-                                                                  bool nullable) {
-    const std::vector<std::uint8_t> flat_ce{0x0a, 0x02, 0x08, bits_token};
-    std::vector<std::uint8_t> bss{0x0a, static_cast<std::uint8_t>(flat_ce.size())};
-    bss.insert(bss.end(), flat_ce.begin(), flat_ce.end());
-    std::vector<std::uint8_t> bss_ce{0x4a, static_cast<std::uint8_t>(bss.size())};
-    bss_ce.insert(bss_ce.end(), bss.begin(), bss.end());
-    std::vector<std::uint8_t> general{0x0a, 0x02, 0x08, 0x02, 0x1a, static_cast<std::uint8_t>(bss_ce.size())};
-    general.insert(general.end(), bss_ce.begin(), bss_ce.end());
-    std::vector<std::uint8_t> value_comp{0x52, static_cast<std::uint8_t>(general.size())};
-    value_comp.insert(value_comp.end(), general.begin(), general.end());
-    std::vector<std::uint8_t> out;
+descriptor::MiniBlock fixed_width_structural_payload_bss_zstd(std::uint8_t bits_token, std::uint64_t rows,
+                                                              bool nullable) {
+    descriptor::MiniBlock m;
+    m.value_compression =
+        descriptor::general(descriptor::kZstd, descriptor::byte_stream_split(descriptor::flat(bits_token)));
     if (nullable) {
-        write_length_delimited(out, 2, repdef_encoding_bytes());
+        m.def_compression = repdef_encoding_bytes();
     }
-    out.push_back(0x1aU);                                         // f3 value_compression
-    out.push_back(static_cast<std::uint8_t>(value_comp.size()));
-    out.insert(out.end(), value_comp.begin(), value_comp.end());
-    const auto tail = mini_block_tail(rows, 1U, nullable);
-    out.insert(out.end(), tail.begin(), tail.end());
-    return out;
+    mini_block_tail(m, rows, 1U, nullable);
+    return m;
 }
 
 std::vector<std::uint8_t> page_layout_bytes_bss_zstd(std::uint8_t bits_token, std::uint64_t rows,
                                                      bool nullable = false) {
-    std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, fixed_width_structural_payload_bss_zstd(bits_token, rows, nullable));
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
+    return descriptor::page_encoding(fixed_width_structural_payload_bss_zstd(bits_token, rows, nullable));
 }
 
 void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value) {
@@ -734,29 +629,22 @@ std::vector<std::uint8_t> build_multibuffer_chunk(const std::vector<std::vector<
 }
 
 // MiniBlockLayout tail (f6 layers, f7 num_buffers, f9 num_items, f10 has_large_chunk).
-std::vector<std::uint8_t> miniblock_tail(std::uint64_t num_items, std::uint8_t num_buffers,
-                                         bool has_large_chunk = true) {
-    std::vector<std::uint8_t> t{0x32, 0x01, 0x01, 0x38, num_buffers, 0x48};
-    append_varint(t, num_items);
-    t.push_back(0x50);
-    t.push_back(has_large_chunk ? 0x01U : 0x00U);
-    return t;
+void miniblock_tail(descriptor::MiniBlock& m, std::uint64_t num_items, std::uint8_t num_buffers,
+                    bool has_large_chunk = true) {
+    m.layers = {1U};
+    m.num_buffers = num_buffers;
+    m.num_items = num_items;
+    m.has_large_chunk = has_large_chunk;
 }
 
 // PageLayout for a run-length-encoded fixed-width column: value_compression =
 // Rle{ values=Flat(value_bits), run_lengths=Flat(length_bits) }, num_buffers=2.
 std::vector<std::uint8_t> page_layout_bytes_rle(std::uint8_t value_bits, std::uint8_t length_bits,
                                                 std::uint64_t num_items) {
-    std::vector<std::uint8_t> structural{0x1a, 0x0e, 0x42, 0x0c, 0x0a, 0x04, 0x0a, 0x02,
-                                         0x08, value_bits, 0x12, 0x04, 0x0a, 0x02, 0x08, length_bits};
-    const auto tail = miniblock_tail(num_items, 2U);
-    structural.insert(structural.end(), tail.begin(), tail.end());
-    std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, structural);
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
+    descriptor::MiniBlock m;
+    m.value_compression = descriptor::rle(descriptor::flat(value_bits), descriptor::flat(length_bits));
+    miniblock_tail(m, num_items, 2U);
+    return descriptor::page_encoding(m);
 }
 
 // Build the dictionary's inner Variable block (Lance VariableEncoder block format):
@@ -799,46 +687,24 @@ std::uint8_t offset_bits_token(bool large) {
 // Variable+Flat(32) without general compression, num_buffers=1, has_large_chunk=true (the chunk-meta
 // words are u32 to match -- see control_buffer_for_index_chunks).
 std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items, bool large) {
-    static const std::uint8_t kF3Bitpack[] = {0x1a, 0x04, 0x2a, 0x02, 0x08, 0x20};
-    static const std::uint8_t kF4Dict[] = {0x22, 0x08, 0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20};
-    std::vector<std::uint8_t> structural(kF3Bitpack, kF3Bitpack + sizeof(kF3Bitpack));
-    structural.insert(structural.end(), kF4Dict, kF4Dict + sizeof(kF4Dict));
-    structural.back() = offset_bits_token(large);
-    structural.push_back(0x28);  // f5 num_dictionary_items
-    append_varint(structural, num_distinct);
-    const auto tail = miniblock_tail(num_items, 1U);
-    structural.insert(structural.end(), tail.begin(), tail.end());
-
-    std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, structural);
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
+    descriptor::MiniBlock m;
+    m.value_compression = descriptor::inline_bitpacking(32U);
+    m.dictionary = descriptor::variable(descriptor::flat(offset_bits_token(large)));
+    m.num_dictionary_items = num_distinct;
+    miniblock_tail(m, num_items, 1U);
+    return descriptor::page_encoding(m);
 }
 
 // PageLayout for a dictionary-encoded low-cardinality column: value_compression = Rle over u32
 // indices, dictionary = General(ZSTD)+Variable, num_dictionary_items, num_buffers=2.
 std::vector<std::uint8_t> page_layout_bytes_dict_rle(std::uint32_t num_distinct, std::uint64_t num_items,
                                                      bool large) {
-    static const std::uint8_t kF3Rle[] = {0x1a, 0x0e, 0x42, 0x0c, 0x0a, 0x04, 0x0a, 0x02,
-                                          0x08, 0x20, 0x12, 0x04, 0x0a, 0x02, 0x08, 0x08};
-    static const std::uint8_t kF4Dict[] = {0x22, 0x10, 0x52, 0x0e, 0x0a, 0x02, 0x08, 0x02, 0x1a,
-                                           0x08, 0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20};
-    std::vector<std::uint8_t> structural(kF3Rle, kF3Rle + sizeof(kF3Rle));
-    structural.insert(structural.end(), kF4Dict, kF4Dict + sizeof(kF4Dict));
-    structural.back() = offset_bits_token(large);
-    structural.push_back(0x28);  // f5 num_dictionary_items
-    append_varint(structural, num_distinct);
-    const auto tail = miniblock_tail(num_items, 2U);
-    structural.insert(structural.end(), tail.begin(), tail.end());
-
-    std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, structural);
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
+    descriptor::MiniBlock m;
+    m.value_compression = descriptor::rle(descriptor::flat(32U), descriptor::flat(8U));
+    m.dictionary = descriptor::general(descriptor::kZstd, descriptor::variable(descriptor::flat(offset_bits_token(large))));
+    m.num_dictionary_items = num_distinct;
+    miniblock_tail(m, num_items, 2U);
+    return descriptor::page_encoding(m);
 }
 
 // Lance scalar value buffer for a length-1 string/binary array: [u32 num_buffers][u32 buf_len...]
@@ -875,50 +741,31 @@ std::vector<std::uint8_t> encode_scalar_variable_value(const std::vector<std::ui
 // data buffers); variable-width (string/binary) constants omit inline_value and store the single
 // value in one data buffer instead. Bytes match lance output.
 std::vector<std::uint8_t> constant_layout_message(const std::vector<std::uint8_t>* inline_value) {
-    std::vector<std::uint8_t> constant_layout{0x2a, 0x01, 0x01};  // f5 layers = single non-null layer
-    if (inline_value != nullptr) {
-        write_length_delimited(constant_layout, 6, *inline_value);  // f6 inline_value, varint length
-    }
-    std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 2, constant_layout);  // PageLayout f2 = constant_layout
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
+    descriptor::Constant c;
+    c.layers = {1U};  // a single non-null layer
+    c.inline_value = inline_value;
+    return descriptor::page_encoding(c);
 }
 
 // PageLayout = ConstantLayout with a NULLABLE_ITEM layer and no value: Lance's spelling of a column
 // whose every row is null. Zero data buffers. Byte-identical to what pylance writes for pa.nulls(n).
 std::vector<std::uint8_t> all_null_constant_layout_message() {
-    const std::vector<std::uint8_t> constant_layout{0x2a, 0x01, 0x03};  // f5 layers = [NULLABLE_ITEM]
-    std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 2, constant_layout);
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
+    descriptor::Constant c;
+    c.layers = {3U};  // NULLABLE_ITEM, no value
+    return descriptor::page_encoding(c);
 }
 
 // MiniBlockLayout PageLayout advertising InlineBitpacking{uncompressed_bits_per_value}. Matches lance
 // output (CompressiveEncoding f5 = inline_bitpacking). See memory: lance-inline-bitpacking-format.
 std::vector<std::uint8_t> page_layout_bytes_inline_bitpacking(std::uint8_t uncompressed_bits, std::uint64_t rows,
                                                               bool nullable = false) {
-    // value_compression CompressiveEncoding{ f5 InlineBitpacking{ f1 uncompressed_bits_per_value } }.
-    const std::vector<std::uint8_t> ce{0x2a, 0x02, 0x08, uncompressed_bits};
-    std::vector<std::uint8_t> structural;
+    descriptor::MiniBlock m;
+    m.value_compression = descriptor::inline_bitpacking(uncompressed_bits);
     if (nullable) {
-        write_length_delimited(structural, 2, repdef_encoding_bytes());
+        m.def_compression = repdef_encoding_bytes();
     }
-    write_length_delimited(structural, 3, ce);  // MiniBlockLayout f3
-    const auto tail = mini_block_tail(rows, 1U, nullable);
-    structural.insert(structural.end(), tail.begin(), tail.end());
-
-    std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, 1, structural);
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
+    mini_block_tail(m, rows, 1U, nullable);
+    return descriptor::page_encoding(m);
 }
 
 // Bit width (0..bits) needed to represent the largest of `count` little-endian values of `width_bytes`.
@@ -1141,15 +988,7 @@ unsigned level_width(const std::vector<std::uint16_t>& levels) {
 /// CompressiveEncoding{ f4 Bitpacked{ uncompressed 16, values Flat(width) } } -- the spelling pylance
 /// writes for its own levels.
 std::vector<std::uint8_t> levels_encoding(unsigned width) {
-    std::vector<std::uint8_t> flat{0x08};
-    append_varint(flat, width);
-    std::vector<std::uint8_t> flat_ce;
-    write_length_delimited(flat_ce, 1, flat);
-    std::vector<std::uint8_t> bitpacked{0x08, 0x10};  // f1 uncompressed_bits_per_value = 16
-    write_length_delimited(bitpacked, 3, flat_ce);    // f3 values
-    std::vector<std::uint8_t> encoding;
-    write_length_delimited(encoding, 4, bitpacked);
-    return encoding;
+    return descriptor::out_of_line_bitpacking(16U, descriptor::flat(width));
 }
 
 /// Bit-pack `n` levels at `width`: whole 1024-level FastLanes blocks, then the tail either raw (u16
@@ -1204,15 +1043,6 @@ std::uint64_t write_buffer(std::ostream& out, const std::vector<std::uint8_t>& b
     return at;
 }
 
-std::vector<std::uint8_t> page_encoding(std::uint32_t layout_field, const std::vector<std::uint8_t>& layout) {
-    std::vector<std::uint8_t> page_layout;
-    write_length_delimited(page_layout, layout_field, layout);
-    std::vector<std::uint8_t> encoding;
-    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
-    write_length_delimited(encoding, 2, page_layout);
-    return encoding;
-}
-
 /// How a nested page's item values are encoded -- chosen once per page, since the descriptor declares
 /// one value encoding for all of its chunks.
 enum class ItemEncoding { kFlat, kBool, kBitpacked, kVariable };
@@ -1236,36 +1066,20 @@ ItemEncoding item_encoding_for(const LanceField& field, const ColumnValues& valu
 std::vector<std::uint8_t> item_value_encoding(ItemEncoding encoding, const LanceField& field, bool large) {
     switch (encoding) {
         case ItemEncoding::kVariable:
-            // CompressiveEncoding{ f2 Variable{ f1 offsets = CompressiveEncoding{ Flat(32 or 64) } } }
-            return {0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, offset_bits_token(large)};
+            return descriptor::variable(descriptor::flat(offset_bits_token(large)));
         case ItemEncoding::kBitpacked:
-            // CompressiveEncoding{ f5 InlineBitpacking{ f1 uncompressed_bits_per_value } }
-            return {0x2a, 0x02, 0x08,
-                    static_cast<std::uint8_t>(lance_logical_type_value_bytes(field.logical_type) * 8U)};
+            return descriptor::inline_bitpacking(lance_logical_type_value_bytes(field.logical_type) * 8U);
         case ItemEncoding::kBool:
         case ItemEncoding::kFlat: {
-            // A fixed_size_list item, as Lance describes it: CompressiveEncoding{ f11 FixedSizeList{
-            // f1 items_per_value, f2 values = Flat(element bits) } } -- not one wide Flat value.
+            // A fixed_size_list item, as Lance describes it: FixedSizeList{ items_per_value, values =
+            // Flat(element bits) } -- not one wide Flat value.
             std::string element;
             std::uint64_t items = 0;
             if (encoding == ItemEncoding::kFlat && lance_fixed_size_list_parts(field.logical_type, element, items)) {
-                std::vector<std::uint8_t> element_flat{0x08};
-                append_varint(element_flat, lance_logical_type_value_bytes(element) * 8U);
-                std::vector<std::uint8_t> element_encoding;
-                write_length_delimited(element_encoding, 1, element_flat);
-                std::vector<std::uint8_t> fsl{0x08};
-                append_varint(fsl, items);
-                write_length_delimited(fsl, 2, element_encoding);
-                std::vector<std::uint8_t> out;
-                write_length_delimited(out, 11, fsl);
-                return out;
+                return descriptor::fixed_size_list(items, descriptor::flat(lance_logical_type_value_bytes(element) * 8U));
             }
-            std::vector<std::uint8_t> flat{0x08};
-            append_varint(flat, encoding == ItemEncoding::kBool ? 1U
-                                                                : lance_logical_type_value_bytes(field.logical_type) * 8U);
-            std::vector<std::uint8_t> out;
-            write_length_delimited(out, 1, flat);
-            return out;
+            return descriptor::flat(encoding == ItemEncoding::kBool ? 1U
+                                                                    : lance_logical_type_value_bytes(field.logical_type) * 8U);
         }
     }
     return {};
@@ -1941,47 +1755,33 @@ bool build_nested_page(const LanceField& field, const ColumnValues& values, cons
     }
     (void)rows;
 
-    std::vector<std::uint8_t> mini;
+    descriptor::MiniBlock mini;
     if (ser.has_rep) {
-        write_length_delimited(mini, 1, levels_encoding(rep_width));
+        mini.rep_compression = levels_encoding(rep_width);
+        mini.repetition_index_depth = 1U;
     }
     if (ser.has_def) {
-        write_length_delimited(mini, 2, levels_encoding(def_width));
+        mini.def_compression = levels_encoding(def_width);
     }
     if (dictionary) {
         // Indices: InlineBitpacking(32). Dictionary: Variable{Flat(32 or 64)}, stored raw -- the same
         // block the flat string path writes (build_dict_variable_block).
         const bool large = values.variable.large;
-        write_length_delimited(mini, 3, std::vector<std::uint8_t>{0x2a, 0x02, 0x08, 0x20});
-        write_length_delimited(mini, 4, std::vector<std::uint8_t>{0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08,
-                                                                  offset_bits_token(large)});
-        mini.push_back(0x28U);  // f5 num_dictionary_items
-        append_varint(mini, distinct.size());
+        mini.value_compression = descriptor::inline_bitpacking(32U);
+        mini.dictionary = descriptor::variable(descriptor::flat(offset_bits_token(large)));
+        mini.num_dictionary_items = distinct.size();
         page.dictionary = build_dict_variable_block(distinct, large);
     } else if (fsst) {
-        // CompressiveEncoding{ f6 Fsst{ f1 symbol_table, f2 values = Variable{Flat(32 or 64)} } }
-        std::vector<std::uint8_t> fsst_message;
-        write_length_delimited(fsst_message, 1, fsst_table);
-        write_length_delimited(fsst_message, 2, item_value_encoding(encoding, field, values.variable.large));
-        std::vector<std::uint8_t> value_encoding;
-        write_length_delimited(value_encoding, 6, fsst_message);
-        write_length_delimited(mini, 3, value_encoding);
+        mini.value_compression =
+            descriptor::fsst(fsst_table, item_value_encoding(encoding, field, values.variable.large));
     } else {
-        write_length_delimited(mini, 3, item_value_encoding(encoding, field, values.variable.large));
+        mini.value_compression = item_value_encoding(encoding, field, values.variable.large);
     }
-    std::vector<std::uint8_t> layer_bytes(ser.layers.begin(), ser.layers.end());
-    write_length_delimited(mini, 6, layer_bytes);
-    mini.push_back(0x38U);  // f7 num_buffers
-    mini.push_back(0x01U);
-    if (ser.has_rep) {
-        mini.push_back(0x40U);  // f8 repetition_index_depth
-        mini.push_back(0x01U);
-    }
-    mini.push_back(0x48U);  // f9 num_items
-    append_varint(mini, ser.items.size());
-    mini.push_back(0x50U);  // f10 has_large_chunk
-    mini.push_back(0x01U);
-    page.descriptor = page_encoding(1, mini);
+    mini.layers.assign(ser.layers.begin(), ser.layers.end());
+    mini.num_buffers = 1U;
+    mini.num_items = ser.items.size();
+    mini.has_large_chunk = true;
+    page.descriptor = descriptor::page_encoding(mini);
     return true;
 }
 
@@ -2058,13 +1858,10 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
         if (ser.items.empty()) {
             // No values at all -- every list empty or null. Lance writes a ConstantLayout with no
             // value and the levels as raw u16 buffers [rep, def]; so does this.
-            std::vector<std::uint8_t> layer_bytes(ser.layers.begin(), ser.layers.end());
-            std::vector<std::uint8_t> constant;
-            write_length_delimited(constant, 5, layer_bytes);
-            constant.push_back(0x48U);  // f9 num_rep_values
-            append_varint(constant, ser.rep.size());
-            constant.push_back(0x50U);  // f10 num_def_values
-            append_varint(constant, ser.def.size());
+            descriptor::Constant constant;
+            constant.layers.assign(ser.layers.begin(), ser.layers.end());
+            constant.num_rep_values = ser.rep.size();
+            constant.num_def_values = ser.def.size();
             std::vector<std::uint8_t> raw_rep;
             std::vector<std::uint8_t> raw_def;
             append_u16_levels(raw_rep, ser.rep);
@@ -2073,7 +1870,7 @@ bool write_nested_column(std::ostream& out, const LanceField& field, const Colum
             page.buffer_sizes.push_back(raw_rep.size());
             page.buffer_offsets.push_back(write_buffer(out, raw_def));
             page.buffer_sizes.push_back(raw_def.size());
-            page.encoding = page_encoding(2, constant);
+            page.encoding = descriptor::page_encoding(constant);
         } else {
             bool too_big = false;
             const bool built_ok = build_nested_page(field, values, ser, n, fsst_encoder, plain, built, too_big, error);
@@ -2188,32 +1985,14 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
             std::memcpy(rep_index.data() + k * index_width, &starts[k], index_width);
         }
 
-        // FullZipLayout{ f2 bits_def, f4 bits_per_offset, f5 num_items, f6 num_visible_items,
-        //                f7 value_compression = Variable{ offsets = Flat(32|64) }, f8 layers }
-        std::vector<std::uint8_t> flat;
-        flat.push_back(0x08U);  // Flat.f1 bits_per_value
-        append_varint(flat, length_bytes * 8U);
-        std::vector<std::uint8_t> offsets_encoding;
-        write_length_delimited(offsets_encoding, 1, flat);
-        std::vector<std::uint8_t> variable;
-        write_length_delimited(variable, 1, offsets_encoding);
-        std::vector<std::uint8_t> value_compression;
-        write_length_delimited(value_compression, 2, variable);
-        std::vector<std::uint8_t> layout;
-        if (nulls) {
-            layout.push_back(0x10U);  // f2 bits_def
-            append_varint(layout, 1U);
-        }
-        layout.push_back(0x20U);  // f4 bits_per_offset
-        append_varint(layout, length_bytes * 8U);
-        layout.push_back(0x28U);  // f5 num_items
-        append_varint(layout, end - first);
-        layout.push_back(0x30U);  // f6 num_visible_items
-        append_varint(layout, end - first);
-        write_length_delimited(layout, 7, value_compression);
-        write_length_delimited(layout, 8,
-                               std::vector<std::uint8_t>{nulls ? static_cast<std::uint8_t>(repdef::kNullableItem)
-                                                               : static_cast<std::uint8_t>(repdef::kAllValidItem)});
+        descriptor::FullZip layout;
+        layout.bits_def = nulls ? 1U : 0U;
+        layout.bits_per_offset = length_bytes * 8U;
+        layout.num_items = end - first;
+        layout.num_visible_items = end - first;
+        layout.value_compression = descriptor::variable(descriptor::flat(length_bytes * 8U));
+        layout.layers = {nulls ? static_cast<std::uint8_t>(repdef::kNullableItem)
+                               : static_cast<std::uint8_t>(repdef::kAllValidItem)};
 
         pb::ColumnPage page;
         page.buffer_offsets.push_back(write_buffer(out, data));
@@ -2222,7 +2001,7 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
         page.buffer_sizes.push_back(rep_index.size());
         page.length = end - first;
         page.priority = 0;
-        page.encoding = page_encoding(3, layout);
+        page.encoding = descriptor::page_encoding(layout);
         column.pages.push_back(std::move(page));
         row = end;
     }

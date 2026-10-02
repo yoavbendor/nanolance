@@ -127,7 +127,7 @@ std::string file_key(const std::filesystem::path& path) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
     const auto mtime = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
-    return path.string() + "|" + std::to_string(size) + "|" + std::to_string(mtime);
+    return path.string() + "|" + std::to_string(size) + "|" + std::to_string(static_cast<long long>(mtime));  // libc++'s file_clock counts in __int128
 }
 
 bool schema_metadata(const std::filesystem::path& path, const std::string& key, std::string& value, bool& found,

@@ -26,6 +26,7 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Roadmap F — performance | **F2 done** (FSST on write); F1 (page size) open |
 | Roadmap E — small type gaps | **E1–E4 done** (float16, duration, Arrow null type, `large_utf8`/`large_binary` write) |
 | Roadmap C — lists, read side | **C0–C8 done**; only a list of `fixed_size_list` is still refused |
+| Lance metadata codec on nanom | **done** — one model in nanom, canonical proto3, deletion files now survive appends |
 | Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip; pages compressed to within ~0.2% of pylance (FSST aside) |
 
 Test suite: **54 ctest** (was 42) and **1395 pytest** (was 22), all passing -- and nothing skipped: the one
@@ -1782,9 +1783,10 @@ compressive wrapper rather than with repetition levels.
 
 ### Ergonomics
 
-8. **`nanom` is not used by the core library, deliberately** — see the section above. Revisit only
-   if nanolance moves to C++23 for other reasons; `deletion_vector.cpp` would be the first candidate,
-   and the protobuf paths the last (nanom has no varint combinator).
+8. **`nanom` in the core: done for the protobuf metadata** (see "Lance metadata on nanom's protobuf
+   codec" below). The C++23 requirement stays inside `nanolance_proto`'s one .cpp file.
+   `deletion_vector.cpp` and `page_layout.cpp` (also protobuf, hand-parsed) are the next
+   candidates.
 9. **No way to split fragments within one `nanolance import` run.** It commits exactly one fragment
    however many Arrow IPC batches it reads, so a large input becomes one large fragment — which
    `nanolance info` then warns about. Splitting means re-running per chunk with `--append`. Found
@@ -2356,6 +2358,159 @@ Verified: 54 C++ tests (also under AddressSanitizer and UBSan), the Python suite
 nullable, decimal, fixed-size binary and lists) written as multi-chunk pages with both structural
 settings and with compression, read back by both readers, row ranges and `take` across page
 boundaries, deletions, and columns of 1 to 4,097 rows.
+
+## Lance metadata on nanom's protobuf codec
+
+`generated/lance_minimal.pb.cpp` no longer hand-writes protobuf. The Lance messages nanolance
+reads and writes are declared once, in nanom's `nanom/formats/lance_protobuf.hpp`:
+
+- Manifest, with every field the index and type work added;
+- DataFragment, DataFile, DeletionFile, DataStorageFormat;
+- Field, Schema, FileDescriptor, Metadata;
+- ColumnMetadata, Page, Encoding;
+- IndexSection, IndexMetadata, IndexFile.
+
+nanom's protobuf codec reads and writes them, and this file only converts between that model and
+nanolance's structs. The public header is unchanged.
+
+nanom is header-only, pinned by commit and fetched with FetchContent
+(`FETCHCONTENT_SOURCE_DIR_NANOM` points at a local checkout). It is compiled as C++23 in that one
+.cpp file only: the public headers and every other target stay C++20.
+
+**Same behaviour as the hand-written codec.**
+- Unknown fields:
+  - Fields nanolance does not model are kept and written back, through nanom's `pb_unknown`.
+    This covers Field, DataFile, DeletionFile, DataFragment, Manifest and IndexMetadata.
+  - The manifest's positions into its own file (fields 4 and 21) are dropped.
+- Indices:
+  - An index a commit does not touch is copied byte for byte (`IndexSection` holds each index as
+    raw bytes).
+  - An index whose coverage changes is re-encoded with its new fragment bitmap, keeping the rest.
+- A side-by-side differential compiled the previous codec next to this one on 20,000 random
+  manifests. These carried random unknown fields, deletion files, timestamps, flags, the config
+  and table-metadata maps, and index-section positions. Three properties hold:
+  - this decoder reads the previous encoder's bytes exactly as the previous decoder did;
+  - the previous decoder reads this encoder's bytes the same way;
+  - both round trips agree.
+
+  5,000 index sections (made, rewritten with changed coverage, and untouched) agree the same way,
+  and untouched indices are byte-identical. The one exception is a map entry with an empty key.
+  It is no longer written, as prost leaves it out too, and the previous decoder rejected such
+  entries.
+
+**What the bytes look like now.** The output is canonical proto3, the same as Lance's prost
+writer:
+- zero and empty implicit fields are left out;
+- repeated int32 / uint64 fields are packed (`DataFile.fields` / `column_indices`,
+  `Metadata.batch_offsets`, column buffers, an index's field ids).
+
+A 1,000-fragment manifest shrinks from 262 KB to 166 KB.
+
+**Reading is more accepting.**
+- Packed `batch_offsets` are read (they used to be skipped).
+- A map entry without a key is read.
+
+Truncated or malformed messages are still rejected.
+
+**Checked:**
+- All 56 ctest targets and the 1,826-test Python suite pass, including `test_index_preservation.py`,
+  `test_scalar_index.py` and the pylance interop tests.
+- New in `tests/test_lance_minimal_pb.cpp`:
+  - a manifest written by the hand-written encoder, kept as bytes, decodes field for field;
+  - deletion files round-trip;
+  - unmodelled fields of a manifest, a field and a fragment survive a rewrite, while the in-file
+    positions are dropped;
+  - untouched indices are byte-identical, and a changed index keeps a field from a newer Lance;
+  - negative field ids, column encodings and packed batch offsets round-trip;
+  - truncations and groups are rejected.
+- `tests/smoke_deletion_append_pylance.sh`: rows deleted with pylance stay deleted after a
+  nanolance append. This was a real bug in the first hand-written encoder. Main fixed it in the
+  same period; this test now guards it.
+- nanom's own tests cover the codec:
+  - the protobuf spec's golden bytes;
+  - Google's protobuf as an oracle in both directions, including unknown-field preservation;
+  - fuzzing.
+
+**Speed** against the previous codec:
+- Micro-benchmark, 1,000-fragment x 50-column manifest, best of 7, three runs:
+  - manifest encode: 1.12–1.23x faster;
+  - manifest decode: 1.17–1.39x faster;
+  - column metadata: 2.0–2.2x faster to encode, 1.3x faster to decode;
+  - decoding manifests the previous encoder wrote: at parity.
+- End to end, `arrowipc2lance` on tmpfs, median of 7 alternating runs, three runs:
+  - appending to a 4,000-fragment dataset with a BTree index: 0.93–1.09x, i.e. parity (process
+    start-up dominates);
+  - creating a 2M-row dataset: 0.98–1.11x.
+
+### Page descriptors through nanom
+
+`src/page_layout.cpp` no longer parses protobuf by hand. A page's `/lance.encodings21.PageLayout`
+descriptor is decoded with nanom's model (`nanom/formats/lance_encodings.hpp`). The model's
+encoding children are `pb_lazy`, so the descriptor tree is decoded node by node without
+allocating. The result is converted to the same `Compressive` / `MiniBlock` / `Constant` /
+`FullZip` structs the decoder dispatches on; `page_layout.hpp` is unchanged.
+
+The file moved into `nanolance_proto`, the one target compiled as C++23.
+
+**Same answers as the hand-written parser.** Both parsers were compiled side by side.
+- Every descriptor of files written by pylance (formats 2.1, 2.2, zstd) and by nanolance decodes
+  to the same structure and the same `describe()` line.
+- On 300,000 mutated descriptors under ASan / UBSan, the new parser never accepted what the old
+  one refused, and never disagreed on what both accepted.
+- It refuses 826 more mutants, all malformed: field number 0, two members of one oneof, a
+  repeated message field, trailing garbage.
+
+**Speed.** Parsing a descriptor in isolation runs at 0.83-0.86x of the hand-written parser (about
+400 ns against 340 ns). End to end it is at parity, because the manifest and column-metadata
+decodes got faster. Reading a 4,000-fragment dataset of 12,000 small pages, where per-page cost
+matters most, took 120-127 ms against 122-129 ms (best of 15, four alternating runs).
+
+### Format 2.0 encodings through nanom
+
+`src/lance_v20_decoder.cpp` reads a 2.0 page's `/lance.encodings.ArrayEncoding` tree, and a
+column's `ColumnEncoding` (the blob marker), with nanom's model. The `Enc` tree the decoder
+dispatches on is unchanged.
+
+To make that possible, nanolance's own sources now compile as C++23. That adds no requirement:
+`nanolance_proto` already needed a C++23 compiler, and the public headers and API stay C++20.
+
+**Compared side by side with the hand-written parser:**
+- Every 2.0 page encoding written by pylance (plain, nullable, list, struct, dictionary, FSST,
+  packed struct, blob) decodes identically.
+- 300,000 mutated encodings under ASan / UBSan: the new parser is never more lenient, and it
+  refuses 213 more malformed inputs.
+- 2 mutants decode differently, both a message field occurring twice. The new parser merges the
+  occurrences as protobuf specifies; the old one kept the last.
+
+**Speed.** The parse alone runs at 0.78x (330 ns against 260 ns per page). End to end, the worst
+case (a 4,000-fragment 2.0 dataset of 12,000 small pages) reads in 116.6-119.0 ms against
+114.8-116.3 ms (best of 15, three alternating runs): about 1.5% slower, on the legacy format only.
+
+### Page descriptors written through nanom
+
+`src/data_file_writer.cpp` no longer assembles page descriptors from byte strings and hand-placed
+keys and lengths. A small internal helper, `src/lance_descriptors.hpp`, builds each
+CompressiveEncoding (Flat, Variable, OutOfLineBitpacking, InlineBitpacking, Fsst, Rle,
+ByteStreamSplit, General, FixedSizeList) and each layout (MiniBlock, Constant, FullZip) on nanom's
+model, and nanom computes every length prefix and varint. The column encoding is built the same
+way. The old code baked in one-byte lengths in places (`0x12, 0x06, ...`), correct only while a
+bit width fit in one varint byte.
+
+**Same bytes.** Data files written by the previous and the new writer are byte-identical, across
+three inputs in three modes (default, `--compress`, `--no-structural`), plus a large-value input.
+The outputs cover:
+- flat, nullable, bool and fixed-size-list columns;
+- dictionary, dictionary + RLE, RLE and constant columns;
+- inline bitpacking;
+- zstd strings and BSS + zstd floats;
+- FSST;
+- lists of numbers, strings and long strings, empty lists, maps, structs;
+- FullZip pages, with and without nulls.
+
+Changing one bit width in one builder changes 2 of those files, so the comparison does catch a
+difference. 56/56 ctest and the Python suite (1,808 tests, pylance interop included) pass.
+
+**Speed.** Write speed is unchanged: 1.00-1.05x across those inputs.
 
 ### Deliberate deviations (not defects)
 
