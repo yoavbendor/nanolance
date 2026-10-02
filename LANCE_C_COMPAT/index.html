@@ -10,13 +10,9 @@
       
       
       
-        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/bench/">
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/LANCE_C_COMPAT/">
       
       
-        <link rel="prev" href="../agents/">
-      
-      
-        <link rel="next" href="../bench-write-read/">
       
       
         
@@ -27,7 +23,7 @@
     
     
       
-        <title>Overview - nanolance</title>
+        <title>lance-c compatibility (liblance_c) - nanolance</title>
       
     
     
@@ -78,7 +74,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#benchmarks" class="md-skip">
+        <a href="#lance-c-compatibility-liblance_c" class="md-skip">
           Skip to content
         </a>
       
@@ -114,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Overview
+              lance-c compatibility (liblance_c)
             
           </span>
         </div>
@@ -367,8 +363,6 @@
       
   
   
-    
-  
   
   
     
@@ -381,11 +375,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
         
           
           <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
@@ -406,7 +400,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_5">
             <span class="md-nav__icon md-icon"></span>
             
@@ -421,19 +415,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../bench/" class="md-nav__link">
         
   
   
@@ -449,7 +434,6 @@
   
 
       </a>
-      
     </li>
   
 
@@ -735,6 +719,69 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#implemented" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Implemented
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#not-implemented-yet" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Not implemented yet
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#out-of-scope" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Out of scope
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#lance-cs-own-tests" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        lance-c's own tests
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#found-on-the-way" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Found on the way
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -753,30 +800,152 @@
   
 
 
-<h1 id="benchmarks">Benchmarks<a class="headerlink" href="#benchmarks" title="Permanent link">&para;</a></h1>
-<p>Two independent claims, each reproducible and each with its own results page:</p>
-<ol>
-<li><strong><a href="../bench-write-read/">Write/read vs Parquet &amp; Rust lance</a></strong> — nanolance's write and read
-   throughput against <code>parquet</code> (zstd) and Rust <code>lance</code>, on three synthetic schemas (a pcap-reference
-   shape, a wide-int shape, and a high-cardinality-string shape). Auto-generated on every push to
-   <code>main</code> by <a href="https://github.com/yoavbendor/nanolance/blob/main/.github/workflows/linux-bench.yml"><code>.github/workflows/linux-bench.yml</code></a>
-   — this page always reflects the latest <code>main</code>.</li>
-<li><strong><a href="../bench-trusted-parity/">Safety-parity: trusted vs default read</a></strong> — proves the memory-safety
-   posture costs nothing: <code>trusted_input=true</code> (which skips only the untrusted-input DoS/OOM budget
-   checks — every bounds check keeps running regardless, see <a href="../SAFETY/">Memory safety</a>) measures as
-   no faster than the default, fully-checked read. Reproduce locally with
-   <code>bench/read_parity_bench.sh [build_dir] [rows]</code>.</li>
-</ol>
-<p>Reproduce the write/read comparison locally with <code>bench/run-local-bench.sh</code> (writes
-<code>bench/linux-local-results.md</code>, kept separate from the CI-owned file so local runs and the CI
-auto-commit never collide on the same path).</p>
-<p>Reading the write/read table: <code>parquet</code>, <code>rust lance</code> and <code>nanolance (py)</code> all write and read in
-the benchmark's own Python process, from the Arrow table already in memory. Those three rows are the
-like-for-like comparison. <code>nanolance (cli)</code> runs <code>arrowipc2lance</code> and <code>nlbench</code> as separate
-processes. Its <code>write(proc)</code> is their whole wall clock: process start, then parsing the Arrow IPC
-stream from stdin (on <code>pcap_ref</code>, 14 MB of IPC takes about 9 ms, mostly page faults), then the write.
-Even its <code>write(core)</code> runs in a fresh process, whose first allocations fault in new pages. So the
-CLI rows measure the command-line tool, not the encoder.</p>
+<h1 id="lance-c-compatibility-liblance_c">lance-c compatibility (<code>liblance_c</code>)<a class="headerlink" href="#lance-c-compatibility-liblance_c" title="Permanent link">&para;</a></h1>
+<p>nanolance builds <code>liblance_c</code>: the C API of the <a href="https://github.com/lance-format/lance-c">lance-c</a>
+project, implemented over nanolance. A program written against lance-c compiles and links against
+nanolance unchanged:</p>
+<ul>
+<li>the same header, <code>#include &lt;lance/lance.h&gt;</code> (and the <code>lance.hpp</code> C++ wrapper);</li>
+<li>the same library name, <code>liblance_c</code>;</li>
+<li>the same CMake targets, <code>LanceC::lance_c</code> and <code>LanceC::lance_c_static</code>.</li>
+</ul>
+<p>Nothing else is needed: no Rust toolchain, no Tokio runtime, no 100 MB static library.</p>
+<div class="language-cmake highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nb">add_subdirectory</span><span class="p">(</span><span class="s">nanolance</span><span class="p">)</span><span class="w">            </span><span class="c"># or FetchContent</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nb">target_link_libraries</span><span class="p">(</span><span class="s">my_app</span><span class="w"> </span><span class="s">PRIVATE</span><span class="w"> </span><span class="s">LanceC::lance_c</span><span class="p">)</span>
+</code></pre></div>
+<div class="language-c highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;lance/lance.h&gt;</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="n">LanceDataset</span><span class="o">*</span><span class="w"> </span><span class="n">ds</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">lance_dataset_open</span><span class="p">(</span><span class="s">&quot;data.lance&quot;</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="n">LanceScanner</span><span class="o">*</span><span class="w"> </span><span class="n">sc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">lance_scanner_new</span><span class="p">(</span><span class="n">ds</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="p">[]){</span><span class="s">&quot;id&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;name&quot;</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">},</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="n">lance_scanner_set_limit</span><span class="p">(</span><span class="n">sc</span><span class="p">,</span><span class="w"> </span><span class="mi">100</span><span class="p">);</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="k">struct</span><span class="w"> </span><span class="nc">ArrowArrayStream</span><span class="w"> </span><span class="n">stream</span><span class="p">;</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="n">lance_scanner_to_arrow_stream</span><span class="p">(</span><span class="n">sc</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">stream</span><span class="p">);</span>
+</code></pre></div>
+<p>The headers in <code>compat/lance-c/include/lance/</code> are lance-c's own, copied unmodified (Apache-2.0,
+The Lance Authors) from the commit in <code>compat/lance-c/UPSTREAM</code>. Every one of the 127 functions they
+declare is defined in <code>src/lance_c.cpp</code>. What nanolance implements does the work. The rest fails
+the way lance-c reports any failure: the function's documented error value, with
+<code>lance_last_error_code()</code> set to <code>LANCE_ERR_NOT_SUPPORTED</code> and a message naming the feature. It never
+returns a silently different result. nanolance is not affiliated with the Lance project.</p>
+<h2 id="implemented">Implemented<a class="headerlink" href="#implemented" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Group</th>
+<th>Functions</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Errors</td>
+<td><code>lance_last_error_code</code>, <code>lance_last_error_message</code>, <code>lance_free_string</code>, <code>lance_free_bytes</code></td>
+</tr>
+<tr>
+<td>Sessions</td>
+<td><code>lance_session_new</code> / <code>close</code> / <code>get_cache_stats</code> (nanolance keeps no shared cache, so the stats are zero), <code>lance_dataset_open_with_session</code></td>
+</tr>
+<tr>
+<td>Datasets</td>
+<td><code>lance_dataset_open</code> (latest or a version), <code>close</code>, <code>version</code>, <code>latest_version</code>, <code>count_rows</code>, <code>schema</code>, <code>fragment_count</code>, <code>fragment_ids</code>, <code>restore</code></td>
+</tr>
+<tr>
+<td>Versions</td>
+<td><code>lance_dataset_versions</code>, <code>lance_versions_count</code> / <code>id_at</code> / <code>timestamp_ms_at</code> / <code>close</code></td>
+</tr>
+<tr>
+<td>Statistics</td>
+<td><code>lance_dataset_calculate_data_stats</code>, <code>lance_data_statistics_count</code> / <code>field_id_at</code> / <code>bytes_on_disk_at</code> / <code>close</code></td>
+</tr>
+<tr>
+<td>Random access</td>
+<td><code>lance_dataset_take</code> (input order and repeats kept), <code>lance_dataset_take_rows</code> (by <code>_rowid</code>)</td>
+</tr>
+<tr>
+<td>Scans</td>
+<td><code>lance_scanner_new</code> (projection), <code>set_limit</code>, <code>set_offset</code>, <code>set_batch_size</code>, <code>with_row_id</code>, <code>with_row_address</code>, <code>set_fragment_ids</code>, <code>set_blob_handling</code> (a blob column as its description by default, as its bytes with <code>ALL_BINARY</code>), <code>set_statistics_callback</code> (bytes and reads), the tuning setters (accepted, no effect on results), <code>to_arrow_stream</code>, <code>next</code> + <code>lance_batch_to_arrow</code> / <code>lance_batch_free</code>, <code>scan_async</code> + <code>async_stream_free</code>, <code>poll_next</code> (always ready: decoding is synchronous)</td>
+</tr>
+<tr>
+<td>Filters</td>
+<td>an SQL filter in <code>lance_scanner_new</code>, and <code>lance_scanner_additional_sql_filter</code> (combined with <code>AND</code>). The dialect is nanolance's SQL subset, shared with the Python module (<code>docs/PYLANCE_COMPAT.md</code>); with a filter, the scanner's offset and limit count the rows that pass.</td>
+</tr>
+<tr>
+<td>Changes</td>
+<td><code>lance_dataset_delete</code>, <code>update</code>, <code>merge_insert</code> (every <code>when_matched</code> mode but <code>UPDATE_IF</code>, both <code>when_not_matched</code>, <code>when_not_matched_by_source</code> keep / delete / delete-if), <code>compact_files</code>, <code>drop_columns</code>, <code>alter_columns</code>, <code>add_columns_sql</code> / <code>add_columns_nulls</code> / <code>add_columns_stream</code>. Each commits one version and moves the handle to it, as lance-c does. A writer whose change is built on a replaced version gets <code>LANCE_ERR_COMMIT_CONFLICT</code>.</td>
+</tr>
+<tr>
+<td>Blobs</td>
+<td><code>lance_dataset_take_blobs</code> (by row id) and <code>take_blobs_by_indices</code>, and the handles they return: <code>lance_blob_file_size</code> / <code>read</code> / <code>read_up_to</code> / <code>read_range</code> / <code>seek</code> / <code>tell</code> / <code>close</code>. Every Blob v2 storage kind Lance writes is read where it is, and only the bytes asked for: inline (in the data file), packed and dedicated (in the sidecar <code>.blob</code> files beside it), external (at its URI: a local path, <code>file://</code>, or <code>s3://</code> in a build with S3). A null value is a NULL handle; an empty one, a handle of size 0.</td>
+</tr>
+<tr>
+<td>Writes</td>
+<td><code>lance_dataset_write</code>, <code>lance_dataset_write_with_params</code> (create / append / overwrite, <code>max_rows_per_file</code>, <code>max_bytes_per_file</code>), <code>lance_write_fragments</code> (data files, no manifest). A create records lance-c's auto-cleanup policy in the table config. nanolance does not reclaim versions itself; Lance applies the policy when it next commits.</td>
+</tr>
+<tr>
+<td>Indexes</td>
+<td><code>lance_dataset_create_scalar_index</code> (BTREE, BITMAP, LABEL_LIST; no parameters), <code>lance_dataset_drop_index</code>, <code>lance_dataset_index_count</code> and <code>lance_dataset_index_list_json</code>. Scans use BTree, Bitmap and LabelList indexes, whoever built them. The changes above keep the indices a dataset has, by Lance's rules (<code>docs/PYLANCE_COMPAT.md</code>, "Indexes").</td>
+</tr>
+</tbody>
+</table>
+<p>URIs: local paths, <code>file://</code>, and <code>memory://</code> (a directory private to the process). Object stores
+(<code>s3://</code>, ...) return <code>LANCE_ERR_NOT_SUPPORTED</code>. <code>storage_opts</code> is accepted and ignored.</p>
+<h2 id="not-implemented-yet">Not implemented yet<a class="headerlink" href="#not-implemented-yet" title="Permanent link">&para;</a></h2>
+<ul>
+<li><code>LANCE_MERGE_WHEN_MATCHED_UPDATE_IF</code> (its condition compares source and target rows).</li>
+<li><code>lance_scanner_set_include_deleted_rows(true)</code>: deleted rows would have to come back with a NULL
+  <code>_rowid</code>.</li>
+<li>Writing Lance's inline, packed and dedicated blob layouts. nanolance writes external blobs; it
+  reads all of them.</li>
+</ul>
+<h2 id="out-of-scope">Out of scope<a class="headerlink" href="#out-of-scope" title="Permanent link">&para;</a></h2>
+<p>Vector indexes, INVERTED (full-text) indexes, index segments and their builders, vector search
+(<code>nearest</code>), full-text search, and Substrait filters.</p>
+<h2 id="lance-cs-own-tests">lance-c's own tests<a class="headerlink" href="#lance-cs-own-tests" title="Permanent link">&para;</a></h2>
+<p><code>tools/lance_c_suite.py</code> fetches lance-c's <code>tests/cpp/test_c_api.c</code> and <code>test_cpp_api.cpp</code> at the
+pinned commit into <code>.deps/</code>. It runs them against <code>liblance_c</code> on the datasets lance-c's harness
+builds (<code>tools/lance_c_fixtures.py</code>), once written by pylance and once by nanolance:</p>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>python<span class="w"> </span>tools/lance_c_suite.py<span class="w">            </span><span class="c1"># build, run, fail if a listed test no longer passes</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>python<span class="w"> </span>tools/lance_c_suite.py<span class="w"> </span>--update<span class="w">   </span><span class="c1"># rewrite tests/lance_c/expected_pass.txt</span>
+</code></pre></div>
+<p>Each upstream file is a single program that stops at its first failed assertion. So a generated
+driver <code>#include</code>s it and runs each test function in its own child process, in the order its
+<code>main()</code> does. It is built with <code>NDEBUG</code> undefined so the <code>assert()</code>s of the C++ test are live. CI
+runs the suite in <code>.github/workflows/bindings-python.yml</code>.</p>
+<p><strong>90 of 106 pass: 18 of 22 C tests and 27 of 31 C++ tests, per fixture writer.</strong> Every test that
+fails needs a vector index or index segments. It was 88 before scalar indexes, 52 of 106 before
+filters and dataset changes, and 80 before Lance's blob layouts were read. (An earlier version of this page said "52 of 80": the runner
+missed tests whose result line was printed on the same line as the test's own output, so failing
+tests went uncounted. It now parses every result and fails if the count does not match the tests
+the driver ran.) Every implemented group above has a test that passes. The ones that fail today:</p>
+<table>
+<thead>
+<tr>
+<th>Tests</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>index_segment_builder(_progress), vector_models_and_reusable_segments, commit_index_segments</td>
+<td>vector indexes and index segments: out of scope</td>
+</tr>
+</tbody>
+</table>
+<p>Four C++ tests pass on purpose without the feature: <code>nearest_smoke</code>, <code>fts_smoke</code>,
+<code>index_segments_smoke</code> and <code>multivector_rejects_flat_column</code>. Upstream wrote them to prove the
+wrappers compile, link and report errors, and they accept an error as the outcome.</p>
+<p>The same run under AddressSanitizer and UBSan (<code>build-asan</code>) reports no error in <code>liblance_c</code>.</p>
+<h2 id="found-on-the-way">Found on the way<a class="headerlink" href="#found-on-the-way" title="Permanent link">&para;</a></h2>
+<p>The blob tests found that nanolance read Blob v2 only in its own layout. That layout has external
+blobs only and no nulls. A pylance-written blob column (inline, packed, dedicated or empty values,
+or any null) failed to read: each row's definition level sat in front of the descriptor, and
+nanolance read every row one byte off. They also found a quieter bug. In a batch that holds a blob
+column, every other column read its nulls back as values: the row-by-row batch builder that blob
+columns need never looked at validity. Both are fixed, and <code>test_pylance_blobs_read_back</code> in the
+Python tests pins them against pylance.</p>
+<p>The fixtures, a dataset with a non-nullable column appended to, exposed a nanolance reader bug: the
+Arrow schema it returned marked every field nullable, whatever the manifest said. Reading a table
+and appending it back to the same dataset then failed on a nullability mismatch. The schema now
+says what the manifest says.</p>
 
 
 
@@ -807,44 +976,6 @@ CLI rows measure the command-line tool, not the encoder.</p>
       
         <footer class="md-footer">
   
-    
-      
-      <nav class="md-footer__inner md-grid" aria-label="Footer" >
-        
-          
-          <a href="../agents/" class="md-footer__link md-footer__link--prev" aria-label="Previous: AI agent integration">
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
-            </div>
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Previous
-              </span>
-              <div class="md-ellipsis">
-                AI agent integration
-              </div>
-            </div>
-          </a>
-        
-        
-          
-          <a href="../bench-write-read/" class="md-footer__link md-footer__link--next" aria-label="Next: Write/read vs Parquet &amp; Rust lance">
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Next
-              </span>
-              <div class="md-ellipsis">
-                Write/read vs Parquet & Rust lance
-              </div>
-            </div>
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
-            </div>
-          </a>
-        
-      </nav>
     
   
   <div class="md-footer-meta md-typeset">

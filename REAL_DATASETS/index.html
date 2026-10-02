@@ -1,0 +1,1225 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/REAL_DATASETS/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Testing on real data - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#testing-on-real-data" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Testing on real data
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#setup-on-a-dev-host" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setup on a dev host
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-lance-datasets-from-the-hugging-face-hub" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Lance datasets from the Hugging Face Hub
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="1. Lance datasets from the Hugging Face Hub">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#results-2026-09-28-pylance-1200-this-repository-at-the-commit-adding-this-page" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Results (2026-09-28, pylance 12.0.0, this repository at the commit adding this page)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#formats-20-and-22-2026-10-01-pylance-1200" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Formats 2.0 and 2.2 (2026-10-01, pylance 12.0.0)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-coco-2017-and-speech-commands-written-and-read-by-both-engines" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. COCO 2017 and Speech Commands, written and read by both engines
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reporting-what-you-find" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reporting what you find
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="testing-on-real-data">Testing on real data<a class="headerlink" href="#testing-on-real-data" title="Permanent link">&para;</a></h1>
+<p>Two sets of real data test nanolance. Neither is stored in this repository, and nothing here
+redistributes it. Each dataset keeps the license its source gives it.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>what it tests</th>
+<th>tool</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Lance datasets people published</strong> on the Hugging Face Hub: embeddings, images, audio, video, text, LanceDB tables</td>
+<td>reading files other writers made, checked against pylance</td>
+<td><code>tools/real_lance_check.py</code></td>
+</tr>
+<tr>
+<td><strong>COCO 2017 val and Speech Commands</strong>, raw downloads</td>
+<td>writing training data with nanolance and with pylance, then reading it back crosswise, timed</td>
+<td><code>tools/bench_multimodal.py</code>, <code>test_real_datasets.py</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="setup-on-a-dev-host">Setup on a dev host<a class="headerlink" href="#setup-on-a-dev-host" title="Permanent link">&para;</a></h2>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/yoavbendor/nanolance<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>nanolance
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>python<span class="w"> </span>-m<span class="w"> </span>venv<span class="w"> </span>.venv<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>.<span class="w"> </span>.venv/bin/activate
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">pylance</span><span class="o">==</span><span class="m">12</span>.0.0<span class="w"> </span>pyarrow<span class="w"> </span>numpy<span class="w"> </span>pytest<span class="w">   </span><span class="c1"># pylance is the reference the checks compare against</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>bindings/python<span class="w">                       </span><span class="c1"># builds nanolance (CMake, a C++17 compiler)</span>
+</code></pre></div>
+<h2 id="1-lance-datasets-from-the-hugging-face-hub">1. Lance datasets from the Hugging Face Hub<a class="headerlink" href="#1-lance-datasets-from-the-hugging-face-hub" title="Permanent link">&para;</a></h2>
+<p>The Hub lists every dataset in the Lance format, 110 when this was written:
+<a href="https://huggingface.co/datasets?format=format:lance">https://huggingface.co/datasets?format=format:lance</a>. They range from a few MB to 7.5 TB, and the
+large ones are split into data files of 1 to 70 GB. Nanolance reads single data files, so one or
+two files are enough to test a dataset that is too big to download.</p>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>list<span class="w">                 </span><span class="c1"># every Lance dataset on the Hub, smallest first</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>list<span class="w"> </span>--search<span class="w"> </span>clip<span class="w">   </span><span class="c1"># ... matching a word</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>suggested<span class="w">            </span><span class="c1"># a picked set, and what each one holds</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="c1"># Download (resumable; HF_TOKEN for gated datasets) and check:</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>fetch<span class="w"> </span>lance-format/mnist-lance<span class="w"> </span>lhoestq/wiki-dpr-lance-example<span class="w"> </span>--dest<span class="w"> </span>~/lance-hub
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>fetch<span class="w"> </span>lance-format/librispeech-clean-lance<span class="w"> </span>--only<span class="w"> </span>data/dev_clean.lance<span class="w"> </span>--dest<span class="w"> </span>~/lance-hub
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>fetch<span class="w"> </span>lance-format/fineweb-edu<span class="w"> </span>--max-gb<span class="w"> </span><span class="m">2</span><span class="w"> </span>--dest<span class="w"> </span>~/lance-hub<span class="w">   </span><span class="c1"># 1-2 of its 2,913 files</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>check<span class="w"> </span>~/lance-hub<span class="w"> </span>--json<span class="w"> </span>hub.json
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="c1"># Or the whole suggested set, fetched and checked in one go: about 4 GB at the default --max-gb 1.</span>
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="c1"># A table whose smallest data file is larger is skipped, and the output says how large it is.</span>
+<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>run<span class="w"> </span>--dest<span class="w"> </span>~/lance-hub
+<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>
+<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="c1"># The Hub has no format 2.2 tables. pylance writes what you fetched again, in 2.2 (or 2.0, 2.1):</span>
+<a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>rewrite<span class="w"> </span>~/lance-hub<span class="w"> </span>--dest<span class="w"> </span>~/lance-hub-2.2<span class="w"> </span>--version<span class="w"> </span><span class="m">2</span>.2
+<a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>check<span class="w"> </span>~/lance-hub-2.2
+<a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a>python<span class="w"> </span>tools/real_lance_check.py<span class="w"> </span>run<span class="w"> </span>--dest<span class="w"> </span>~/lance-hub<span class="w"> </span>--max-gb<span class="w"> </span><span class="m">20</span><span class="w">   </span><span class="c1"># adds laion-1m and openvid files: tens of GB</span>
+</code></pre></div>
+<p><code>fetch</code> downloads a table's manifests, then its smallest data files that fit in <code>--max-gb</code>. Indexes
+are fetched only with <code>--indices</code>, since nanolance does not read them. A complete table is checked
+as a dataset. A partial one is checked file by file.</p>
+<p>Every table is read by both engines through the same pylance API, and the results are compared:</p>
+<ul>
+<li><strong>dataset:</strong> schema, <code>count_rows</code>, the first <code>--rows</code> rows (or every fragment, with <code>--full</code>),
+  <code>take</code> of <code>--takes</code> random rows, and <code>take_blobs</code> on blob columns.</li>
+<li><strong>file:</strong> <code>LanceFileReader.read_range</code> and <code>take_rows</code> on each data file.</li>
+</ul>
+<p>Each check reports one of these outcomes:</p>
+<ul>
+<li><code>pass</code>: equal to pylance.</li>
+<li><code>type</code>: equal values, another Arrow type.</li>
+<li><code>refused</code>: nanolance raised an error that names what it does not read.</li>
+<li><code>mismatch</code>: different rows from pylance. This is a wrong result; please report it with the dataset name.</li>
+<li><code>pylance</code>: pylance itself failed.</li>
+</ul>
+<p>Timings are the faster of two runs, with files in the page cache. The command exits non-zero on any
+mismatch.</p>
+<h3 id="results-2026-09-28-pylance-1200-this-repository-at-the-commit-adding-this-page">Results (2026-09-28, pylance 12.0.0, this repository at the commit adding this page)<a class="headerlink" href="#results-2026-09-28-pylance-1200-this-repository-at-the-commit-adding-this-page" title="Permanent link">&para;</a></h3>
+<p>18 of 24 tables pass and none mismatch. All 6 refusals are Lance file format 2.0. Times are
+nanolance / pylance, in ms:</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th>what is in it</th>
+<th>first rows</th>
+<th>take 256 random rows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>lance-format/mnist-lance train</td>
+<td>PNG bytes, labels, 512-d embeddings</td>
+<td>2.8 / 7.8</td>
+<td>1.0 / 8.0</td>
+</tr>
+<tr>
+<td>lance-format/eurosat-lance train</td>
+<td>satellite images, 512-d embeddings</td>
+<td>6.1 / 21.1</td>
+<td>1.3 / 8.0</td>
+</tr>
+<tr>
+<td>lance-format/handwriting-ocr train</td>
+<td>images, transcriptions</td>
+<td>6.2 / 77.5</td>
+<td>1.6 / 9.9</td>
+</tr>
+<tr>
+<td>lance-format/librispeech-clean-lance dev_clean</td>
+<td>audio, transcripts, 384-d embeddings</td>
+<td>224 / 1,345</td>
+<td>34.7 / 54.0</td>
+</tr>
+<tr>
+<td>lance-format/squad-v2-lance train</td>
+<td>text, <code>list&lt;string&gt;</code> answers, 384-d embeddings</td>
+<td>5.0 / 8.5</td>
+<td><strong>63.8 / 13.8</strong> (since: 2.1 / 18.6)</td>
+</tr>
+<tr>
+<td>lance-format/ms-marco-v2.1-lance validation</td>
+<td>passages as <code>list&lt;string&gt;</code>, 384-d embeddings</td>
+<td>45.5 / 45.1</td>
+<td><strong>2,835 / 21.2</strong> (since: 6.8 / 26.7)</td>
+</tr>
+<tr>
+<td>davanstrien/emb-test-wiki-lance</td>
+<td>241,787 passages, 384-d embeddings</td>
+<td>7.2 / 18.8</td>
+<td>1.5 / 8.0</td>
+</tr>
+<tr>
+<td>prrao87/tea-hypervectors</td>
+<td>images, <code>large_list&lt;large_string&gt;</code></td>
+<td>25.6 / 154.5</td>
+<td>107 / 163</td>
+</tr>
+<tr>
+<td>lancedb/magical_kingdom, Jacob235/fred-vector-index, Litian2002/robotics-papers-vecdb, lhoestq/wiki-dpr-lance-example, carpelan/sbl-lance</td>
+<td>LanceDB tables with embeddings</td>
+<td>refused: format 2.0 (read since: see below)</td>
+<td></td>
+</tr>
+<tr>
+<td>lance-format/fineweb-edu (its smallest data file)</td>
+<td>text, 384-d embeddings</td>
+<td>refused: format 2.0 (read since)</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>What these runs found:</p>
+<ul>
+<li><strong>Fixed:</strong> <code>take</code> on an embedding column read the whole page. MNIST's 512-d vectors sit in one
+  123 MB FullZip page, and 256 rows took 1.4 s (pylance: 8 ms). A fixed-width FullZip row sits at a
+  fixed stride, so <code>take</code> now reads just those rows: 1.0 ms and 0.5 MB.
+  (<code>test_work_guards.py::test_take_of_embeddings_reads_just_those_rows</code>)</li>
+<li><strong>Fixed:</strong> a LanceDB table would not open ("failed to decode manifest protobuf"). A data file
+  can list field id -2, for a column the schema dropped, and protobuf spells a negative <code>int32</code> as a
+  10-byte varint. The manifest decoder refused it.</li>
+<li><strong>Fixed since:</strong> Lance file format 2.0 (footer <code>0.3</code>). See the next section.</li>
+<li><strong>Fixed since (2026-10-01):</strong> <code>take</code> on <code>list&lt;string&gt;</code> columns in FullZip pages decoded the whole
+  page: MS MARCO's <code>passage_text</code> read 193 MB for 256 rows (2.8 s). Such a page keeps where each row
+  starts (its repetition index), so a take now reads just those rows' bytes -- 0.7 MB, 3 ms, against
+  pylance's 7 -- and so does a row range (10 rows: 0.2 ms). A large page is also read in windows of
+  about 4 MiB, on several threads: the whole column in 183 ms (pylance: 416).
+  (<code>test_work_guards.py::test_take_and_ranges_of_long_strings_in_lists</code>)</li>
+<li><strong>Fixed since:</strong> appending to a Hub table. nanolance writes 2.2 files, and appended to a 2.0 or
+  2.1 dataset they made it unreadable by pylance ("mixed data-file-version capability is not
+  enabled"): Lance sets that capability, a manifest feature flag, when its own commits mix versions,
+  and nanolance now does too. Rows read back from a LanceDB (2.0) table with list or struct columns
+  would not append at all. And each append dropped the table's indexes. A nanolance append to every
+  one of the 78 tables now validates in pylance, reads back, and keeps the 16 indexed tables' indexes.</li>
+<li><strong>Fixed since:</strong> SQuAD's slow take was its <code>context</code> column, which the take cache served by
+  copying the whole decoded column (100 MB) and then dropping all but the rows asked for: 68 ms. It
+  now copies only those rows out of the cached decode: 0.3 ms.</li>
+</ul>
+<h3 id="formats-20-and-22-2026-10-01-pylance-1200">Formats 2.0 and 2.2 (2026-10-01, pylance 12.0.0)<a class="headerlink" href="#formats-20-and-22-2026-10-01-pylance-1200" title="Permanent link">&para;</a></h3>
+<p>A survey of the Hub's Lance tables -- one data file's footer each, 621 tables in 107 datasets --
+found these formats:</p>
+<table>
+<thead>
+<tr>
+<th>format</th>
+<th>tables</th>
+<th>datasets</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2.1</td>
+<td>330</td>
+<td>46</td>
+</tr>
+<tr>
+<td>2.0 (footer 0.3)</td>
+<td>281</td>
+<td>52</td>
+</tr>
+<tr>
+<td>2.2</td>
+<td><strong>0</strong></td>
+<td>0</td>
+</tr>
+<tr>
+<td>unknown (no data file reachable)</td>
+<td>10</td>
+<td>10</td>
+</tr>
+</tbody>
+</table>
+<p>2.0 is what LanceDB wrote by default for a long time, so nearly every LanceDB table is 2.0. 2.2 is
+pylance 12's default but no one has published a table in it yet, so the 2.2 runs below use Hub data
+that pylance wrote again (<code>rewrite</code>).</p>
+<p>nanolance now reads 2.0. All of these pass, none mismatch:</p>
+<table>
+<thead>
+<tr>
+<th>set</th>
+<th>tables</th>
+<th>outcome</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>the 24 tables above (2.1 and 2.0)</td>
+<td>20 that fit on disk</td>
+<td>20 pass, the 5 LanceDB 2.0 tables among them</td>
+</tr>
+<tr>
+<td>2.0 tables from the survey: MMEB-train and BToks (video, image-text), LanceDB GraphRAG indexes, robotics data, Swedish library catalogs</td>
+<td>57</td>
+<td>57 pass</td>
+</tr>
+<tr>
+<td>all 77 rewritten by pylance as <strong>2.2</strong></td>
+<td>77</td>
+<td>77 pass</td>
+</tr>
+<tr>
+<td>all 77 rewritten by pylance as 2.0</td>
+<td>77</td>
+<td>77 pass</td>
+</tr>
+</tbody>
+</table>
+<p>nanolance / pylance in ms, files in the page cache:</p>
+<table>
+<thead>
+<tr>
+<th>2.0 table</th>
+<th>first rows</th>
+<th>take 256 random rows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Litian2002/robotics-papers-vecdb</td>
+<td>47.0 / 46.3</td>
+<td>9.8 / 37.9</td>
+</tr>
+<tr>
+<td>carpelan/sbl-lance</td>
+<td>53.6 / 96.4</td>
+<td>11.8 / 21.5</td>
+</tr>
+<tr>
+<td>lhoestq/wiki-dpr-lance-example</td>
+<td>14.2 / 9.6</td>
+<td>1.6 / 7.8</td>
+</tr>
+<tr>
+<td>Jacob235/fred-vector-index</td>
+<td>11.0 / 9.6</td>
+<td>23.4 / 23.1</td>
+</tr>
+<tr>
+<td>shrav2324/kdrama-graphrag-index entity descriptions</td>
+<td>1.8 / 3.3</td>
+<td>2.0 / 4.8</td>
+</tr>
+<tr>
+<td>carpelan/faltjagare-lance</td>
+<td>2.4 / 4.0</td>
+<td>12.5 / 8.0</td>
+</tr>
+</tbody>
+</table>
+<p>What these runs found:</p>
+<ul>
+<li><strong>Fixed:</strong> a 2.2 dictionary with <code>Flat</code> indices. 2.2 dictionary-codes a small page of 64-bit
+  values (tea-hypervectors' <code>elevation_meters</code>: 166 rows, 37 values) with plain 32-bit indices
+  instead of bit-packed ones. nanolance read the indices as the column's values: refused here
+  ("miniblock page chunks cover 83 of 166 rows") because the widths differ, but it would have
+  returned the indices themselves had they matched. They are now looked up
+  (<code>test_rust_mixed_pages.py::test_dictionary_with_flat_indices</code>).</li>
+<li><strong>Fixed:</strong> a manifest whose trailer says version 0.1 (older LanceDB) was refused. Lance does not
+  check that number, and neither does nanolance now.</li>
+<li><strong>Fixed:</strong> 2.0 blob columns (a packed struct of positions and sizes; makeshifted's robotics
+  data) and <code>list&lt;null&gt;</code> columns (fred-vector-index). Structs a writer packed on purpose
+  (field metadata <code>packed</code>) read too.</li>
+</ul>
+<h2 id="2-coco-2017-and-speech-commands-written-and-read-by-both-engines">2. COCO 2017 and Speech Commands, written and read by both engines<a class="headerlink" href="#2-coco-2017-and-speech-commands-written-and-read-by-both-engines" title="Permanent link">&para;</a></h2>
+<p><code>tools/bench_multimodal.py</code>'s header lists the downloads. Put them in one directory:</p>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>mkdir<span class="w"> </span>-p<span class="w"> </span>~/datasets<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>~/datasets
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>curl<span class="w"> </span>-LO<span class="w"> </span>https://s3.amazonaws.com/fast-ai-coco/val2017.zip<span class="w">                        </span><span class="c1"># 815 MB, 5,000 JPEGs</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>curl<span class="w"> </span>-LO<span class="w"> </span>https://s3.amazonaws.com/fast-ai-coco/annotations_trainval2017.zip<span class="w">       </span><span class="c1"># 241 MB</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>unzip<span class="w"> </span>-q<span class="w"> </span>annotations_trainval2017.zip<span class="w"> </span><span class="s1">&#39;annotations/*_val2017.json&#39;</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>mkdir<span class="w"> </span>speech<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>curl<span class="w"> </span>-L<span class="w"> </span>https://storage.googleapis.com/download.tensorflow.org/data/speech_commands_test_set_v0.02.tar.gz<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>tar<span class="w"> </span>-xz<span class="w"> </span>-C<span class="w"> </span>speech<span class="w">                                                              </span><span class="c1"># 4,890 one-second clips</span>
+</code></pre></div>
+<p><code>val2017.zip</code> stays zipped; the script reads the JPEGs from it. Then, from the repository:</p>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nv">NANOLANCE_DATASETS</span><span class="o">=</span>~/datasets<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>pytest<span class="w"> </span>bindings/python/tests/test_real_datasets.py<span class="w"> </span>-v<span class="w">   </span><span class="c1"># 1,000 rows</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nv">NANOLANCE_DATASETS</span><span class="o">=</span>~/datasets<span class="w"> </span><span class="nv">NANOLANCE_DATASETS_ROWS</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>pytest<span class="w"> </span>bindings/python/tests/test_real_datasets.py
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>python<span class="w"> </span>tools/bench_multimodal.py<span class="w"> </span>--data<span class="w"> </span>~/datasets<span class="w"> </span>--runs<span class="w"> </span><span class="m">3</span><span class="w"> </span>--out<span class="w"> </span>/tmp/multimodal.json<span class="w">   </span><span class="c1"># timed; see BENCHMARKS.md</span>
+</code></pre></div>
+<p>The test writes each dataset with nanolance and with pylance. It then checks every read in both
+directions, a shuffled epoch by <code>take</code>, and the work nanolance does, at 1 and 4 threads. The
+benchmark times writing, a scan, a metadata-only read and a shuffled epoch, with Parquet alongside.</p>
+<h2 id="reporting-what-you-find">Reporting what you find<a class="headerlink" href="#reporting-what-you-find" title="Permanent link">&para;</a></h2>
+<p>A <code>mismatch</code> is a wrong result, and the most important thing to report. A <code>refused</code> names what is
+missing. Either way, the dataset name and the line from <code>check</code> are enough to reproduce it.
+<code>nlance-pagelayout &lt;table or data file&gt;</code> (built with the C++ tools) prints each column's page
+layout, which usually says why.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

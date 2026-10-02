@@ -1,0 +1,1278 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/PYLANCE_COMPAT/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>pylance compatibility (nanolance.lance) - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#pylance-compatibility-nanolancelance" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              pylance compatibility (nanolance.lance)
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#what-is-implemented" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What is implemented
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#indexes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Indexes
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Indexes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#scalar-indexes-built-and-used" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scalar indexes: built and used
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#indexes-nanolance-keeps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Indexes nanolance keeps
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-is-not-implemented" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What is not implemented
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#pylances-own-test-suite" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        pylance's own test suite
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#bugs-the-suite-found-in-nanolance-itself" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bugs the suite found in nanolance itself
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="pylance-compatibility-nanolancelance">pylance compatibility (<code>nanolance.lance</code>)<a class="headerlink" href="#pylance-compatibility-nanolancelance" title="Permanent link">&para;</a></h1>
+<p><code>nanolance.lance</code> is a pylance-compatible Python API over nanolance. Code written against pylance's
+<code>lance</code> module runs on nanolance by changing its import:</p>
+<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span> <span class="nn">nanolance.lance</span> <span class="k">as</span> <span class="nn">lance</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">&quot;data.lance&quot;</span><span class="p">,</span> <span class="n">max_rows_per_file</span><span class="o">=</span><span class="mi">1_000_000</span><span class="p">)</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span><span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="s2">&quot;label&quot;</span><span class="p">],</span> <span class="n">limit</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">with_row_id</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">ds</span><span class="o">.</span><span class="n">take</span><span class="p">([</span><span class="mi">4031</span><span class="p">,</span> <span class="mi">17</span><span class="p">,</span> <span class="mi">2980</span><span class="p">])</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">&quot;data.lance&quot;</span><span class="p">,</span> <span class="n">version</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span><span class="o">.</span><span class="n">count_rows</span><span class="p">()</span>
+</code></pre></div>
+<p>Or, leaving the code unchanged, by making <code>import lance</code> load nanolance for the process:</p>
+<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span> <span class="nn">nanolance.lance</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="n">nanolance</span><span class="o">.</span><span class="n">lance</span><span class="o">.</span><span class="n">install_as_lance</span><span class="p">()</span>   <span class="c1"># before anything imports lance</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="kn">import</span> <span class="nn">lance</span>                         <span class="c1"># nanolance&#39;s, for this process only</span>
+</code></pre></div>
+<p><code>install_as_lance()</code> changes what <code>import lance</code> means in the current process. It does not touch a
+pylance install. <code>uninstall_as_lance()</code> undoes it. No package called <code>lance</code> is published: the real
+pylance stays what <code>pip install pylance</code> gives you. nanolance is an independent implementation of
+the Lance format and is not affiliated with the Lance project.</p>
+<p>The API tracks pylance <strong>12.0.0</strong> (<code>nanolance.lance.PYLANCE_API_VERSION</code>). Where the two can be
+compared, results are checked against pylance on the same files, in both directions:
+<code>bindings/python/tests/test_pylance_compat.py</code>.</p>
+<h2 id="what-is-implemented">What is implemented<a class="headerlink" href="#what-is-implemented" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Open</td>
+<td><code>lance.dataset(uri, version=, asof=)</code>, <code>LanceDataset(...)</code>, <code>local paths</code>, <code>file://</code>, <code>memory://</code></td>
+</tr>
+<tr>
+<td>Write</td>
+<td><code>lance.write_dataset(data, uri, schema=, mode="create" / "append" / "overwrite", max_rows_per_file=, max_bytes_per_file=)</code>. Takes a table, batches, a reader, pandas, polars, dicts, lists of dicts or pydantic models, another dataset. One version per call, as in pylance. <code>LanceDataset.insert</code>, <code>LanceDataset.from_pydantic_model</code>.</td>
+</tr>
+<tr>
+<td>Read</td>
+<td><code>to_table</code>, <code>to_batches</code>, <code>scanner</code> (+ <code>ScannerBuilder</code>), <code>head</code>, <code>slice</code>, <code>take</code>, <code>_take_rows</code> / <code>take_rows</code>, <code>sample</code>, <code>count_rows</code>, <code>to_pandas</code>. <code>columns=</code> as a list or a <code>{alias: column}</code> rename, <code>limit</code>, <code>offset</code>, <code>batch_size</code>, <code>fragments=</code>, <code>with_row_id</code>, <code>with_row_address</code>, and the system columns <code>_rowid</code>, <code>_rowaddr</code>, <code>_rowoffset</code> in a projection.</td>
+</tr>
+<tr>
+<td>Versions</td>
+<td><code>version</code>, <code>latest_version</code>, <code>versions()</code> (with pylance's summary metadata), <code>checkout_version</code>, <code>checkout_latest</code>, <code>restore</code></td>
+</tr>
+<tr>
+<td>Metadata</td>
+<td><code>schema</code> (with its schema metadata), <code>data_storage_version</code>, <code>config</code> / <code>update_config</code> / <code>delete_config_keys</code>, <code>metadata</code> / <code>update_metadata</code>, <code>schema_metadata</code> / <code>update_schema_metadata</code> / <code>replace_schema_metadata</code></td>
+</tr>
+<tr>
+<td>Fragments</td>
+<td><code>get_fragments</code>, <code>get_fragment</code>; <code>LanceFragment</code>: <code>fragment_id</code>, <code>metadata</code> (<code>FragmentMetadata</code>, <code>DataFile</code>, <code>DeletionFile</code>), <code>count_rows</code>, <code>physical_rows</code>, <code>num_deletions</code>, <code>to_table</code>, <code>to_batches</code>, <code>scanner</code>, <code>head</code>, <code>take</code></td>
+</tr>
+<tr>
+<td>Filters</td>
+<td><code>filter=</code> on <code>to_table</code>, <code>to_batches</code>, <code>scanner</code>, <code>count_rows</code> and fragments: an SQL string or a pyarrow compute expression. Comparisons, <code>AND</code> / <code>OR</code> / <code>NOT</code> with SQL's three-valued logic, <code>IS [NOT] NULL</code>, <code>IN</code>, <code>BETWEEN</code>, <code>LIKE</code> / <code>ILIKE</code>, arithmetic, <code>CAST</code>, <code>DATE</code> / <code>TIMESTAMP</code> literals, struct fields (<code>s.a</code>), and the functions <code>lower</code>, <code>upper</code>, <code>length</code>, <code>abs</code>, <code>coalesce</code>, <code>starts_with</code>, <code>ends_with</code>, <code>contains</code>. With a filter, <code>offset</code> and <code>limit</code> count the rows that pass, as in pylance.</td>
+</tr>
+<tr>
+<td>Changes</td>
+<td><code>delete</code>, <code>update</code> (SQL values), <code>merge_insert</code> (<code>when_matched_update_all</code> with a condition, <code>when_not_matched_insert_all</code>, <code>when_not_matched_by_source_delete</code>, <code>execute</code>), <code>add_columns</code> (SQL expressions, a <code>pa.field</code> / schema of null columns, or a reader), <code>drop_columns</code>, <code>alter_columns</code> (rename, nullability, data type), <code>optimize.compact_files</code>. Each is one version, and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column.</td>
+</tr>
+<tr>
+<td>Blobs</td>
+<td>Blob v2 columns, every storage kind pylance writes (inline, packed, dedicated, external, empty, null): <code>to_table</code> returns their descriptions, as pylance does, and <code>blob_handling="all_binary"</code> their bytes. <code>take_blobs</code> (by <code>ids</code>, <code>addresses</code> or <code>indices</code>) returns <code>lance.BlobFile</code> handles (<code>read</code>, <code>readall</code>, <code>readinto</code>, <code>seek</code>, <code>tell</code>, <code>size</code>, <code>read_range</code>, <code>read_ranges</code>), and <code>read_blobs</code> the bytes. A handle reads only the bytes asked for, where they are.</td>
+</tr>
+<tr>
+<td>Files</td>
+<td><code>lance.file</code>: <code>LanceFileReader</code> (<code>read_all</code>, <code>read_range</code>, <code>take_rows</code>, <code>num_rows</code>, <code>metadata</code>, <code>file_statistics</code>, <code>read_global_buffer</code>), <code>LanceFileWriter</code>, <code>LanceFileSession</code> (local), <code>stable_version</code></td>
+</tr>
+</tbody>
+</table>
+<p>Datasets and files are written in format 2.2, which is pylance 12's default. A request to write
+another version (<code>data_storage_version="2.0"</code>, <code>LanceFileWriter(version="2.1")</code>) raises. Formats 2.0,
+2.1 (the default of earlier pylance releases) and 2.2 are all read:
+<code>test_pylance_written_shapes_read_back</code> has pylance write every shape of the encoding matrix and the
+list tests in 2.1 and 2.2, and nanolance must read back what pylance does. <code>test_format_v2_0.py</code>
+does the same for 2.0 -- nested structs and lists, dictionaries, FSST/zstd/lz4 strings, blob
+columns, packed structs, deletions, ranges and takes.</p>
+<h2 id="indexes">Indexes<a class="headerlink" href="#indexes" title="Permanent link">&para;</a></h2>
+<h3 id="scalar-indexes-built-and-used">Scalar indexes: built and used<a class="headerlink" href="#scalar-indexes-built-and-used" title="Permanent link">&para;</a></h3>
+<p><code>create_scalar_index(column, "BTREE" | "BITMAP" | "LABEL_LIST", name=None, replace=True)</code> builds
+Lance's scalar indexes in Lance's file layout (<code>src/scalar_index.cpp</code>), committed in the manifest as
+pylance commits one; <code>drop_index</code>, <code>list_indices</code>, <code>describe_indices</code> and <code>has_index</code> work as in
+pylance. Filtered reads use any BTree, Bitmap or LabelList index the dataset has, whoever built it
+(<code>src/index_search.cpp</code>):</p>
+<table>
+<thead>
+<tr>
+<th>index</th>
+<th>files</th>
+<th>answers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BTREE</td>
+<td><code>page_data.lance</code> (values sorted, nulls first, with row ids), <code>page_lookup.lance</code> (each 4096-row page's min, max, null count)</td>
+<td><code>=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>, <code>!=</code>, <code>IN</code>, <code>BETWEEN</code>, <code>IS [NOT] NULL</code></td>
+</tr>
+<tr>
+<td>BITMAP</td>
+<td><code>bitmap_page_lookup.lance</code> (one row bitmap per distinct value, null first)</td>
+<td>the same</td>
+</tr>
+<tr>
+<td>LABEL_LIST</td>
+<td>the same over a list column's elements, plus its null lists (global buffer 1)</td>
+<td><code>array_has_any</code>, <code>array_has_all</code>, <code>array_contains</code> / <code>array_has</code>, <code>IS NULL</code></td>
+</tr>
+</tbody>
+</table>
+<p>An index narrows a read to the rows it says may pass; the whole filter is then applied to those rows,
+so an index changes how much is read, never what comes back. A predicate's AND / OR / NOT structure is
+kept (AND intersects, OR unites); fragments an index does not cover are read through. <code>explain_plan()</code>
+names the index each predicate used, in pylance's words
+(<code>ScalarIndexQuery: query=[x &gt;= 1 &amp;&amp; x &lt;= 3]@x_idx(BTree)</code>); <code>use_scalar_index=False</code> reads without.</p>
+<p><code>test_scalar_index.py</code> checks it both ways: pylance lists, validates and answers from indexes
+nanolance built (its plans show them, its results equal a scan's), their contents equal the indexes
+pylance builds from the same data (LabelList keys aside, which Lance writes in hash order), and
+nanolance answers every filter from either builder's indexes exactly as a scan does. pylance's own
+index tests that need only these index types now pass too (<code>test_bitmap_index</code>,
+<code>test_label_list_index</code>, <code>test_temporal_index</code>, <code>test_use_multi_index</code>, ...).</p>
+<p>Speed, 5M rows in 5 fragments, 4 cores (<code>docs/BENCHMARKS.md</code>, "Scalar indexes"): building is
+1.5-3.6x faster than pylance (BTree on int64 0.79 s vs 1.16 s, on strings 1.47 s vs 2.19 s; Bitmap
+0.39 s vs 1.39 s; LabelList 0.97 s vs 2.26 s), and indexed reads are 1.1-3.2x faster, but for a
+one-row lookup returning every column (2.9 ms vs 1.3 ms).</p>
+<p>Not built: Lance's other scalar indexes (INVERTED full-text, NGRAM, ZONEMAP, BLOOMFILTER, JSON, RTREE),
+vector indexes, build options (<code>fragment_ids</code>, <code>train=False</code>, ...), and indexes on a dataset with
+stable row ids. Those a dataset already has are kept, as below.</p>
+<h3 id="indexes-nanolance-keeps">Indexes nanolance keeps<a class="headerlink" href="#indexes-nanolance-keeps" title="Permanent link">&para;</a></h3>
+<p>Every commit nanolance makes
+-- append, delete, update, <code>merge_insert</code>, column changes, compaction, restore -- writes the
+version's indices into the new manifest by Lance's own rules (<code>src/index_maintenance.cpp</code>, after
+lance-table's <code>index_maintenance.rs</code>), so pylance goes on using them:</p>
+<table>
+<thead>
+<tr>
+<th>nanolance commit</th>
+<th>what happens to an index</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>append, delete, update, <code>merge_insert</code>, add columns, rename</td>
+<td>kept as it is: new fragments are not covered (pylance scans them, and <code>optimize_indices</code> adds them), deleted rows are masked</td>
+</tr>
+<tr>
+<td>drop a column, change its type</td>
+<td>an index on that column is dropped</td>
+</tr>
+<tr>
+<td>compaction</td>
+<td>the fragments it rewrites leave every index's coverage (the index points at their rows' old places)</td>
+</tr>
+<tr>
+<td>overwrite</td>
+<td>every index is dropped</td>
+</tr>
+<tr>
+<td>restore</td>
+<td>that version's indices come back</td>
+</tr>
+</tbody>
+</table>
+<p>A new fragment never takes an id an index covers. <code>test_index_preservation.py</code> builds BTree, Bitmap,
+full-text and IVF_PQ indexes with pylance, changes the dataset with nanolance, and checks every
+indexed query against a plain scan. A dataset whose index section nanolance cannot read stays
+readable, but nanolance refuses to commit to it rather than drop its indices.</p>
+<h2 id="what-is-not-implemented">What is not implemented<a class="headerlink" href="#what-is-not-implemented" title="Permanent link">&para;</a></h2>
+<p>These raise <code>NotImplementedError</code> (<code>nanolance.lance.NotSupportedError</code>) naming the feature. None of
+them is silently ignored:</p>
+<ul>
+<li><code>order_by</code>, Substrait filters, and SQL functions beyond the list above (regular expressions,
+  JSON, array functions other than <code>array_has_any</code>, <code>array_has_all</code> and <code>array_contains</code> /
+  <code>array_has</code>). A function the filter dialect lacks is refused by name.</li>
+<li>The transaction API (<code>LanceOperation</code>, <code>commit</code>, <code>write_fragments</code>), <code>LanceFragment.merge_columns</code>
+  / <code>update_columns</code>, <code>cleanup_old_versions</code>. Conflicting writers are refused rather than retried:
+  a change built on a version another writer has since replaced fails with "commit conflict".</li>
+<li>Vector and full-text indexes and search (<code>nearest</code>, <code>full_text_query</code>), and scalar indexes other
+  than BTree, Bitmap and LabelList. An index pylance built is kept, though: see "Indexes" below.</li>
+<li>Tags and branches, stable row ids, multiple base paths, shallow and deep clones.</li>
+<li>Writing Lance's inline, packed and dedicated blob layouts (<code>lance.blob_field</code>, <code>lance.blob_array</code>):
+  nanolance writes external blobs, and reads every kind.</li>
+<li>Object stores and namespaces (<code>s3://</code>, <code>gs://</code>, REST and directory namespaces).</li>
+<li>torch and Hugging Face integration, UDFs, blob-file APIs, the memtable write-ahead log
+  (<code>mem_wal</code>).</li>
+</ul>
+<p>A name from pylance that nanolance does not implement still imports, for example
+<code>from lance.util import validate_vector_index</code>. A module that imports many names but uses a few
+keeps working. Using such a name raises <code>NotImplementedError</code>.</p>
+<h2 id="pylances-own-test-suite">pylance's own test suite<a class="headerlink" href="#pylances-own-test-suite" title="Permanent link">&para;</a></h2>
+<p><code>tools/pylance_suite.py</code> fetches pylance's tests from the Lance repository at the tracked tag, with a
+sparse git checkout into <code>.deps/</code>. Nothing is copied into this repository. It runs them with
+nanolance installed as <code>lance</code>:</p>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w">                 </span><span class="c1"># run; fail if a listed test no longer passes</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w"> </span>--update<span class="w">        </span><span class="c1"># rewrite the list of tests that pass</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w"> </span>--real-pylance<span class="w">  </span><span class="c1"># the same tests against pylance (baseline)</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w"> </span>-k<span class="w"> </span>take<span class="w">         </span><span class="c1"># extra arguments go to pytest</span>
+</code></pre></div>
+<p><code>bindings/python/tests/pylance_suite/expected_pass.txt</code> lists the tests that pass. CI runs the suite
+on every push that touches the bindings (<code>.github/workflows/bindings-python.yml</code>) and fails if a
+listed test stops passing, so the list only grows.</p>
+<p>Current results (pylance 12.0.0 tests; this machine; <code>bench/results/pylance_suite.json</code>):</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>tests passing</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>pylance itself</td>
+<td>1,473 (362 skipped, 14 failing here for environment reasons)</td>
+</tr>
+<tr>
+<td>nanolance.lance</td>
+<td><strong>216</strong>, every one of which pylance also passes (189 before scalar indexes)</td>
+</tr>
+</tbody>
+</table>
+<p>By test file, where nanolance passes any:</p>
+<table>
+<thead>
+<tr>
+<th>file</th>
+<th>pylance</th>
+<th>nanolance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>test_dataset.py</td>
+<td>250</td>
+<td>82</td>
+</tr>
+<tr>
+<td>test_file.py</td>
+<td>40</td>
+<td>27</td>
+</tr>
+<tr>
+<td>test_scalar_index.py</td>
+<td>189</td>
+<td>27</td>
+</tr>
+<tr>
+<td>test_map_type.py</td>
+<td>19</td>
+<td>17</td>
+</tr>
+<tr>
+<td>test_column_names.py</td>
+<td>27</td>
+<td>17</td>
+</tr>
+<tr>
+<td>test_filter.py</td>
+<td>26</td>
+<td>9</td>
+</tr>
+<tr>
+<td>test_lance.py</td>
+<td>23</td>
+<td>9</td>
+</tr>
+<tr>
+<td>test_fragment.py</td>
+<td>85</td>
+<td>9</td>
+</tr>
+<tr>
+<td>test_json.py</td>
+<td>18</td>
+<td>5</td>
+</tr>
+<tr>
+<td>test_pydantic.py</td>
+<td>12</td>
+<td>4</td>
+</tr>
+<tr>
+<td>test_schema_evolution.py</td>
+<td>23</td>
+<td>2</td>
+</tr>
+<tr>
+<td>others</td>
+<td></td>
+<td>6</td>
+</tr>
+</tbody>
+</table>
+<p>The main reasons tests fail today:</p>
+<ul>
+<li>Most need vector or full-text indexes and search, scalar indexes other than BTree / Bitmap /
+  LabelList or their build options (about 160 in <code>test_scalar_index.py</code>), namespaces (about 130),
+  object stores or the <code>mem_wal</code>.</li>
+<li>About 90 need the transaction API, fragment-level writes, stable row ids or multiple base paths.</li>
+<li>About 25 need filter functions nanolance lacks, or a data storage version other than 2.2.</li>
+<li>A tail of writer gaps in nanolance itself: Arrow dictionary arrays, empty structs, a nullable
+  fixed-size list of nullable values, bfloat16. Each is a real gap, listed by the run.</li>
+</ul>
+<h2 id="bugs-the-suite-found-in-nanolance-itself">Bugs the suite found in nanolance itself<a class="headerlink" href="#bugs-the-suite-found-in-nanolance-itself" title="Permanent link">&para;</a></h2>
+<p>The runs found these bugs in nanolance's core. All are fixed and pinned in
+<code>test_pylance_compat.py</code>:</p>
+<ul>
+<li><strong>Any schema-level metadata broke writes.</strong> pandas adds such metadata to every table. nanoarrow's
+  <code>ArrowMetadataGetValue</code> succeeds for a missing key and leaves the value null. nanolance read that
+  as "present", so the root looked like an extension type and the write failed with "struct array
+  for '' is missing child".</li>
+<li><strong>Columns of Arrow extension types lost their data.</strong> This covered every extension other than
+  Lance's blob, for example <code>arrow.fixed_shape_tensor</code> and <code>arrow.uuid</code>. The column was mapped as
+  having no storage: the file held nothing for it, and nanolance read it back with <strong>zero rows</strong>.</li>
+<li>
+<p><strong>Appending dropped deletion files.</strong> The manifest encoder did not write a fragment's deletion
+  file, so appending to a dataset with deleted rows brought those rows back.</p>
+</li>
+<li>
+<p><strong>Appends to a dataset with several files per fragment failed.</strong> The column indices of the
+  latest fragment's files collide (each file counts from 0), and a dataset whose field ids had gaps
+  (a dropped column) never matched a fresh batch's schema.</p>
+</li>
+<li><strong>Reading after pylance dropped a column failed.</strong> The dropped column's data stays in its files;
+  a full scan decoded it with no schema entry to size it by ("fixed-width column has no value
+  width"). Such columns are now skipped.</li>
+<li><strong>A column pylance added without data could not be read.</strong> <code>add_columns(pa.field(...))</code> writes
+  only the schema, and every existing fragment reads the column as nulls. nanolance refused the
+  scan; it now synthesizes the nulls, and appending writes the column.</li>
+<li>
+<p><strong>Racing writers could lose a change.</strong> A change committed as "the version after the latest",
+  re-read at commit time, so a change built on version N could land on top of another writer's
+  N+1 and silently discard it. And two writers racing for one version shared a temp file name, so
+  one could publish the other's manifest and still report success. A change now commits as the
+  version after the one it read, the publish refuses to replace an existing version, and the temp
+  name is each writer's own (<code>test_concurrent_commits_lose_nothing</code>).</p>
+</li>
+<li>
+<p><strong>Reading format 2.1 was refused outright</strong>, and a fixed-size-binary constant wider than 32 bytes
+  in a pylance-written 2.2 dataset was refused. The file footer holds the major version and then
+  the minor, and nanolance read them swapped. That was invisible while only 2.2 was accepted. A
+  wide fixed-width constant is stored as a one-buffer scalar, which nanolance did not read. Both
+  were found with the Rust suite below and are pinned by <code>test_pylance_written_shapes_read_back</code>.</p>
+</li>
+<li>
+<p><strong>A column of constant pages with different values read as its first page's value.</strong> Lance
+  picks each page's layout on its own, and pylance writes this shape too
+  (<code>test_constant_pages_with_different_values</code>).</p>
+</li>
+<li>
+<p><strong>A Blob v2 column from pylance could not be read,</strong> and a batch with a blob column dropped the
+  nulls of every other column. nanolance read only its own blob layout, which has external blobs
+  and no nulls. <code>test_pylance_blobs_read_back</code> compares descriptions, bytes, handles and
+  <code>read_blobs</code> with pylance for every storage kind.</p>
+</li>
+</ul>
+<p>The Rust crates' own encoding tests run against nanolance too: see <a href="../RUST_SUITE/">RUST_SUITE.md</a>.</p>
+<p>The same work made the manifest codec keep everything pylance writes, so nanolance no longer drops
+it: timestamps, writer version, table config and metadata, schema metadata, feature flags, and
+fields it does not model.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

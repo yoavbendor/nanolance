@@ -1,0 +1,2749 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/BENCHMARKS/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Benchmarks - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#benchmarks" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Benchmarks
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Summary
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Summary">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#without-python-the-lance-crate-itself" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Without Python: the lance crate itself
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Memory
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#footprint" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Footprint
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-the-numbers-say" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What the numbers say
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#method" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Method
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#integers-floats-booleans" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Integers, floats, booleans
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#dates-times-decimals" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dates, times, decimals
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#strings-and-binary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Strings and binary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#nulls" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Nulls
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#vectors-structs-lists-maps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vectors, structs, lists, maps
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#a-realistic-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A realistic table
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#training-data-coco-and-speech-commands" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Training data: COCO and Speech Commands
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Training data: COCO and Speech Commands">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#coco-2017-val-images-captions-boxes-polygons-keypoints" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        COCO 2017 val: images, captions, boxes, polygons, keypoints
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#speech-commands-v002-test-one-second-audio-clips-and-their-words" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Speech Commands v0.02 test: one-second audio clips and their words
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scalar-indexes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scalar indexes
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="benchmarks">Benchmarks<a class="headerlink" href="#benchmarks" title="Permanent link">&para;</a></h1>
+<p><em>Generated by <code>tools/bench_report.py</code> from <code>bench/results/matrix.json</code>, produced by <code>tools/bench_matrix.py</code>. Rerun both to reproduce on your own machine.</em></p>
+<p><strong>Machine:</strong> Intel(R) Xeon(R) Processor @ 2.10GHz, 4 cores, 16 GB, Linux 6.18.44-fc-v37. <strong>Versions:</strong> pylance 12.0.0 (Rust Lance, file format 2.2), pyarrow 25.0.1, Python 3.11.15, nanolance <code>f852c5a</code> (Release build). <strong>Date:</strong> 2026-09-26 07:06 UTC. Every number is the median of 5 runs after one warm-up, files in the page cache.</p>
+<p><strong>Threads.</strong> Both libraries run twice: on all cores (each one's default) and pinned to one core -- nanolance on one thread, which is its single-threaded code path, not a pool of one; Rust Lance with one CPU and one I/O thread (and one tokio worker for the crate). So the per-core comparison and the out-of-the-box one are both here. nanolance Python runs on all cores; pyarrow's Parquet too.</p>
+<p><strong>Correctness.</strong> Every read was checked against the source table before it was timed; a reader that returns different data is listed as a failure, not a time.</p>
+<h2 id="summary">Summary<a class="headerlink" href="#summary" title="Permanent link">&para;</a></h2>
+<p>Geometric mean over all datasets, nanolance C++ against Rust Lance (above 1x: nanolance is faster):</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">both on 1 core</th>
+<th style="text-align: right;">both on all cores</th>
+<th style="text-align: right;">nanolance on 1 core, Rust on all</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Read (each reads its own file)</td>
+<td style="text-align: right;">2.91x</td>
+<td style="text-align: right;">2.78x</td>
+<td style="text-align: right;">1.88x</td>
+</tr>
+<tr>
+<td>Write</td>
+<td style="text-align: right;">1.48x</td>
+<td style="text-align: right;">1.92x</td>
+<td style="text-align: right;">1.66x</td>
+</tr>
+</tbody>
+</table>
+<p>Both on all cores, nanolance is faster on <strong>26 of 27</strong> reads and <strong>21 of 27</strong> writes.</p>
+<p>File size, nanolance / Rust Lance: <strong>0.990</strong> (geometric mean). Reads that returned wrong data or failed: <strong>0</strong>.</p>
+<h3 id="without-python-the-lance-crate-itself">Without Python: the lance crate itself<a class="headerlink" href="#without-python-the-lance-crate-itself" title="Permanent link">&para;</a></h3>
+<p>The same comparison against <code>tools/lance_rs_bench</code>, a Rust program using the <code>lance</code> crate (12.0.0, the version pylance 12.0.0 is built from) with no Python in the process:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">both on 1 core</th>
+<th style="text-align: right;">both on all cores</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Read</td>
+<td style="text-align: right;">2.55x</td>
+<td style="text-align: right;">3.31x</td>
+</tr>
+<tr>
+<td>Write</td>
+<td style="text-align: right;">1.44x</td>
+<td style="text-align: right;">1.87x</td>
+</tr>
+</tbody>
+</table>
+<p>Does Python slow Rust Lance down? pylance's time over the crate's own: reads 1.14x (1 core) and 0.84x (all cores), writes 1.02x and 1.02x -- 1.00x would mean no cost.</p>
+<h2 id="memory">Memory<a class="headerlink" href="#memory" title="Permanent link">&para;</a></h2>
+<p>Peak memory each native process added for one write or read (MB): for a write, over the input batches it already held; for a read, including the table it returns. nanolance with a 4 MiB budget commits a fragment whenever it holds 4 MiB, the setting for a device that must bound its resident memory while saving. Rust is the <code>lance</code> crate on all cores.</p>
+<p>Geometric mean, Rust's peak over nanolance's: writes 1.28x (3.28x against the 4 MiB budget), reads 3.11x.</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">in-memory MB</th>
+<th style="text-align: right;">nanolance write</th>
+<th style="text-align: right;">nanolance write, 4 MiB budget</th>
+<th style="text-align: right;">Rust write</th>
+<th style="text-align: right;">nanolance read</th>
+<th style="text-align: right;">Rust read</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>int64_ids</code></td>
+<td style="text-align: right;">16.0</td>
+<td style="text-align: right;">30.8</td>
+<td style="text-align: right;">7.0</td>
+<td style="text-align: right;">33.5</td>
+<td style="text-align: right;">17.6</td>
+<td style="text-align: right;">51.2</td>
+</tr>
+<tr>
+<td><code>int32_small</code></td>
+<td style="text-align: right;">8.0</td>
+<td style="text-align: right;">15.4</td>
+<td style="text-align: right;">7.0</td>
+<td style="text-align: right;">23.5</td>
+<td style="text-align: right;">9.9</td>
+<td style="text-align: right;">43.0</td>
+</tr>
+<tr>
+<td><code>uint8_codes</code></td>
+<td style="text-align: right;">2.0</td>
+<td style="text-align: right;">3.6</td>
+<td style="text-align: right;">3.8</td>
+<td style="text-align: right;">18.7</td>
+<td style="text-align: right;">4.1</td>
+<td style="text-align: right;">38.8</td>
+</tr>
+<tr>
+<td><code>int64_random</code></td>
+<td style="text-align: right;">16.0</td>
+<td style="text-align: right;">30.8</td>
+<td style="text-align: right;">6.9</td>
+<td style="text-align: right;">38.1</td>
+<td style="text-align: right;">17.5</td>
+<td style="text-align: right;">54.3</td>
+</tr>
+<tr>
+<td><code>float64_smooth</code></td>
+<td style="text-align: right;">16.0</td>
+<td style="text-align: right;">30.8</td>
+<td style="text-align: right;">6.9</td>
+<td style="text-align: right;">44.1</td>
+<td style="text-align: right;">17.6</td>
+<td style="text-align: right;">54.5</td>
+</tr>
+<tr>
+<td><code>float32_random</code></td>
+<td style="text-align: right;">8.0</td>
+<td style="text-align: right;">15.4</td>
+<td style="text-align: right;">6.8</td>
+<td style="text-align: right;">26.1</td>
+<td style="text-align: right;">9.8</td>
+<td style="text-align: right;">44.1</td>
+</tr>
+<tr>
+<td><code>bool_flags</code></td>
+<td style="text-align: right;">0.2</td>
+<td style="text-align: right;">3.6</td>
+<td style="text-align: right;">3.6</td>
+<td style="text-align: right;">16.7</td>
+<td style="text-align: right;">3.7</td>
+<td style="text-align: right;">34.7</td>
+</tr>
+<tr>
+<td><code>timestamp_us</code></td>
+<td style="text-align: right;">16.0</td>
+<td style="text-align: right;">30.8</td>
+<td style="text-align: right;">6.9</td>
+<td style="text-align: right;">42.3</td>
+<td style="text-align: right;">17.7</td>
+<td style="text-align: right;">51.3</td>
+</tr>
+<tr>
+<td><code>date32</code></td>
+<td style="text-align: right;">8.0</td>
+<td style="text-align: right;">15.4</td>
+<td style="text-align: right;">7.0</td>
+<td style="text-align: right;">24.1</td>
+<td style="text-align: right;">10.0</td>
+<td style="text-align: right;">44.4</td>
+</tr>
+<tr>
+<td><code>decimal128</code></td>
+<td style="text-align: right;">8.0</td>
+<td style="text-align: right;">14.6</td>
+<td style="text-align: right;">6.9</td>
+<td style="text-align: right;">34.5</td>
+<td style="text-align: right;">9.9</td>
+<td style="text-align: right;">47.8</td>
+</tr>
+<tr>
+<td><code>string_lowcard</code></td>
+<td style="text-align: right;">8.9</td>
+<td style="text-align: right;">15.6</td>
+<td style="text-align: right;">8.1</td>
+<td style="text-align: right;">25.3</td>
+<td style="text-align: right;">14.5</td>
+<td style="text-align: right;">44.8</td>
+</tr>
+<tr>
+<td><code>string_ids</code></td>
+<td style="text-align: right;">18.0</td>
+<td style="text-align: right;">41.7</td>
+<td style="text-align: right;">12.1</td>
+<td style="text-align: right;">39.9</td>
+<td style="text-align: right;">19.7</td>
+<td style="text-align: right;">54.3</td>
+</tr>
+<tr>
+<td><code>string_urls</code></td>
+<td style="text-align: right;">27.9</td>
+<td style="text-align: right;">51.6</td>
+<td style="text-align: right;">17.2</td>
+<td style="text-align: right;">43.7</td>
+<td style="text-align: right;">31.0</td>
+<td style="text-align: right;">62.8</td>
+</tr>
+<tr>
+<td><code>string_text</code></td>
+<td style="text-align: right;">26.1</td>
+<td style="text-align: right;">47.0</td>
+<td style="text-align: right;">16.4</td>
+<td style="text-align: right;">33.7</td>
+<td style="text-align: right;">28.5</td>
+<td style="text-align: right;">60.5</td>
+</tr>
+<tr>
+<td><code>string_long</code></td>
+<td style="text-align: right;">45.0</td>
+<td style="text-align: right;">111</td>
+<td style="text-align: right;">111</td>
+<td style="text-align: right;">54.2</td>
+<td style="text-align: right;">57.2</td>
+<td style="text-align: right;">90.7</td>
+</tr>
+<tr>
+<td><code>binary_blobs</code></td>
+<td style="text-align: right;">22.0</td>
+<td style="text-align: right;">44.1</td>
+<td style="text-align: right;">10.7</td>
+<td style="text-align: right;">43.2</td>
+<td style="text-align: right;">27.1</td>
+<td style="text-align: right;">62.2</td>
+</tr>
+<tr>
+<td><code>uuid_fsb16</code></td>
+<td style="text-align: right;">16.0</td>
+<td style="text-align: right;">30.2</td>
+<td style="text-align: right;">6.8</td>
+<td style="text-align: right;">40.0</td>
+<td style="text-align: right;">17.6</td>
+<td style="text-align: right;">55.2</td>
+</tr>
+<tr>
+<td><code>int64_nulls</code></td>
+<td style="text-align: right;">16.2</td>
+<td style="text-align: right;">30.3</td>
+<td style="text-align: right;">6.9</td>
+<td style="text-align: right;">38.3</td>
+<td style="text-align: right;">17.9</td>
+<td style="text-align: right;">53.4</td>
+</tr>
+<tr>
+<td><code>string_nulls</code></td>
+<td style="text-align: right;">23.7</td>
+<td style="text-align: right;">47.6</td>
+<td style="text-align: right;">15.2</td>
+<td style="text-align: right;">33.0</td>
+<td style="text-align: right;">27.3</td>
+<td style="text-align: right;">58.4</td>
+</tr>
+<tr>
+<td><code>vector_f32x128</code></td>
+<td style="text-align: right;">51.2</td>
+<td style="text-align: right;">81.1</td>
+<td style="text-align: right;">32.6</td>
+<td style="text-align: right;">76.2</td>
+<td style="text-align: right;">51.1</td>
+<td style="text-align: right;">116</td>
+</tr>
+<tr>
+<td><code>struct_mixed</code></td>
+<td style="text-align: right;">14.4</td>
+<td style="text-align: right;">23.8</td>
+<td style="text-align: right;">14.6</td>
+<td style="text-align: right;">36.8</td>
+<td style="text-align: right;">16.2</td>
+<td style="text-align: right;">50.6</td>
+</tr>
+<tr>
+<td><code>list_int64</code></td>
+<td style="text-align: right;">18.0</td>
+<td style="text-align: right;">39.1</td>
+<td style="text-align: right;">10.3</td>
+<td style="text-align: right;">34.3</td>
+<td style="text-align: right;">28.9</td>
+<td style="text-align: right;">62.6</td>
+</tr>
+<tr>
+<td><code>list_string</code></td>
+<td style="text-align: right;">8.3</td>
+<td style="text-align: right;">29.2</td>
+<td style="text-align: right;">11.5</td>
+<td style="text-align: right;">23.8</td>
+<td style="text-align: right;">17.0</td>
+<td style="text-align: right;">49.9</td>
+</tr>
+<tr>
+<td><code>map_string_int64</code></td>
+<td style="text-align: right;">9.6</td>
+<td style="text-align: right;">28.5</td>
+<td style="text-align: right;">14.1</td>
+<td style="text-align: right;">29.5</td>
+<td style="text-align: right;">20.1</td>
+<td style="text-align: right;">49.2</td>
+</tr>
+<tr>
+<td><code>list_struct</code></td>
+<td style="text-align: right;">5.2</td>
+<td style="text-align: right;">14.7</td>
+<td style="text-align: right;">9.7</td>
+<td style="text-align: right;">25.5</td>
+<td style="text-align: right;">11.5</td>
+<td style="text-align: right;">44.0</td>
+</tr>
+<tr>
+<td><code>list_list_int32</code></td>
+<td style="text-align: right;">2.8</td>
+<td style="text-align: right;">8.4</td>
+<td style="text-align: right;">4.8</td>
+<td style="text-align: right;">25.6</td>
+<td style="text-align: right;">12.2</td>
+<td style="text-align: right;">41.0</td>
+</tr>
+<tr>
+<td><code>mixed_events</code></td>
+<td style="text-align: right;">41.7</td>
+<td style="text-align: right;">67.0</td>
+<td style="text-align: right;">18.5</td>
+<td style="text-align: right;">32.5</td>
+<td style="text-align: right;">49.6</td>
+<td style="text-align: right;">89.5</td>
+</tr>
+</tbody>
+</table>
+<h2 id="footprint">Footprint<a class="headerlink" href="#footprint" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">nanolance</th>
+<th style="text-align: right;">Rust Lance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reader + writer program, stripped</td>
+<td style="text-align: right;">2.7 MB</td>
+<td style="text-align: right;">165.3 MB</td>
+</tr>
+<tr>
+<td>Python package's native library</td>
+<td style="text-align: right;">2.9 MB</td>
+<td style="text-align: right;">212.9 MB</td>
+</tr>
+<tr>
+<td>Third-party code linked in</td>
+<td style="text-align: right;">2 libraries (nanoarrow (its IPC reader bundles flatcc), zstd)</td>
+<td style="text-align: right;">371 crates</td>
+</tr>
+</tbody>
+</table>
+<p>The programs: tools/nlbench: reader + writer + Arrow IPC input, static, stripped; tools/lance_rs_bench: lance 12.0.0, default features off (local files only), thin LTO, stripped. pylance's library also carries the cloud object stores, which the Rust program leaves out.</p>
+<h2 id="what-the-numbers-say">What the numbers say<a class="headerlink" href="#what-the-numbers-say" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Reads: 2.8× faster than Rust Lance on all cores, 2.9× per core.</strong> Both on all four cores, nanolance reads 26 of the 27 data types faster than Rust Lance (the 27th, list&lt;list<int32>&gt;, is a tie: 5.1 against 5.0 ms), 2.78× on average; both pinned to one core, 2.91×. Numbers and dates: 3.3–5.1× (a 2M-row int64 id column: 7.6 against 13.4 ms). Strings: 2.9×. Lists, maps and structs: 1.5×.</li>
+<li><strong>Writes: 1.9× faster on all cores, 1.5× per core.</strong> Both on all cores nanolance writes 21 of 27 data types faster, 1.92× on average; one core each, 1.48×. Rust Lance on all cores still writes five list and map columns faster (map<string,int64> 34 against 51 ms, list<int64> 52 against 64) and random binary blobs (27 against 36 ms): a single large list column's pages are built one after another.</li>
+<li><strong>Every core, and one: same code, same files.</strong> nanolance uses every core for reads, writes and random-access takes: a fragment is read as row ranges decoded side by side (one Arrow batch each, nothing concatenated), a data file's columns are encoded side by side, and inside a column FSST compression, page dictionaries and list levels are split across threads. On one thread (set_threads(1), NANOLANCE_THREADS=1, or a process pinned to one CPU) nothing is started or split: the single-threaded code path, no slower than before threads existed. The files are byte-for-byte the same at any thread count. The pool is ~200 lines of std::thread, no runtime library.</li>
+<li><strong>Without Python, the same picture.</strong> Against the lance crate itself (tools/lance_rs_bench, the crate pylance 12.0.0 is built from, no Python in the process) nanolance reads 3.3× faster on all cores and 2.6× on one, and writes 1.9× and 1.4× faster. pylance costs the crate little: 1.14× its read time on one core, 0.84× on all, 1.02× for writes.</li>
+<li><strong>A read needs the table and little else.</strong> nanolance's peak memory for a read is the table it returns plus a few MB; the lance crate's is the table plus 34–65 MB, and 35 MB to read even a 1,000-row dataset: 3.1× more on average (geometric mean).</li>
+<li><strong>A write in a fixed amount of memory.</strong> Without a limit, nanolance holds a write until commit. Its 4 MiB writer budget, the edge-device setting, commits a fragment whenever it holds 4 MiB, streams columns one at a time (no column-parallel buffering), and peaks at 3.3× less memory than the lance crate (int64 ids: 7.0 against 33.5 MB).</li>
+<li><strong>2.5 MB against 165 MB.</strong> A stripped program that reads and writes Lance is 2.5 MB with nanolance and 165 MB with the lance crate, built for local files only (pylance's native library, with the cloud object stores, is 213 MB). nanolance links two third-party libraries, nanoarrow and zstd; the lance crate brings 371 crates.</li>
+<li><strong>Files interchange both ways.</strong> Every file each Lance writer produced was read by the other side and checked value by value: 81 of 81 cross reads, no failures.</li>
+</ul>
+<h2 id="method">Method<a class="headerlink" href="#method" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Machine: Intel Xeon @ 2.80 GHz, 4 cores, 16 GB, Linux 6.18. Rust Lance is pylance 12.0.0 and the lance crate 12.0.0 it is built from, both writing and reading Lance file format 2.2; pyarrow 25.0.1; nanolance built Release at the commit shown above.</li>
+<li>27 data types, 50,000 to 2,000,000 rows each (tens of MB in memory), one column per data type except the 10-column event table. Every writer receives the same input: the table as 64K-row Arrow batches.</li>
+<li>Every time is the median of 5 runs after one warm-up, with the files in the page cache: the warm, repeated read a query service sees.</li>
+<li>nanolance C++ runs twice, timed inside one process by tools/nlbench: on all 4 cores (its default) and pinned to one core, where it runs single-threaded. A read is lance_table_read_dataset into Arrow arrays; a write is writer open, write_batch per batch, commit. glibc's default allocator unless a column says otherwise.</li>
+<li>Rust Lance through pylance: lance.dataset(path).to_table() and lance.write_dataset(...) on all 4 cores, and in a separate process pinned to one core with LANCE_CPU_THREADS=1 and LANCE_IO_THREADS=1. Without Python: tools/lance_rs_bench (Dataset::open + scan into record batches; Dataset::write), the same two ways, one tokio worker on one core; built with the crate's default features off (local files only) and thin LTO.</li>
+<li>Peak memory: nlbench and lance_rs_bench reset the kernel's high-water mark (/proc/self/clear_refs) before each run and report the most any run added over what the process already held: the input batches of a write; nothing for a read, whose peak includes the table it returns. The budgeted write sets nanolance's max_pending_bytes to 4 MiB.</li>
+<li>Program sizes are the benchmark programs themselves (reader, writer and Arrow IPC input), stripped; the Python sizes are each package's installed native library.</li>
+<li>Python times (nanolance.read_table / write_table) include conversion to and from pyarrow.Table. Parquet is pyarrow.parquet with zstd on all cores, as a familiar yardstick.</li>
+<li>Before any read was timed, its result was compared with the source table (values and types), Rust-native reads included (dumped to Arrow IPC and compared). A reader that returned anything else would be listed as a failure, not a time; this run had none.</li>
+</ul>
+<h2 id="integers-floats-booleans">Integers, floats, booleans<a class="headerlink" href="#integers-floats-booleans" title="Permanent link">&para;</a></h2>
+<p><strong>Read</strong>, ms (each reader on the file its own writer made, then the cross reads):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">rows</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ retaining malloc</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">Rust reads nanolance's</th>
+<th style="text-align: right;">nanolance reads Rust's</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>int64_ids</code> — int64, increasing ids</td>
+<td style="text-align: right;">2,000,000</td>
+<td style="text-align: right;">4.9</td>
+<td style="text-align: right;">7.6</td>
+<td style="text-align: right;">3.8</td>
+<td style="text-align: right;">5.7</td>
+<td style="text-align: right;">17.2</td>
+<td style="text-align: right;">13.4</td>
+<td style="text-align: right;">14.8</td>
+<td style="text-align: right;">16.6</td>
+<td style="text-align: right;">16.9</td>
+<td style="text-align: right;">13.7</td>
+<td style="text-align: right;">4.0</td>
+</tr>
+<tr>
+<td><code>int32_small</code> — int32, values 0-999</td>
+<td style="text-align: right;">2,000,000</td>
+<td style="text-align: right;">1.9</td>
+<td style="text-align: right;">1.8</td>
+<td style="text-align: right;">1.6</td>
+<td style="text-align: right;">1.9</td>
+<td style="text-align: right;">10.6</td>
+<td style="text-align: right;">11.1</td>
+<td style="text-align: right;">8.4</td>
+<td style="text-align: right;">11.3</td>
+<td style="text-align: right;">6.0</td>
+<td style="text-align: right;">11.3</td>
+<td style="text-align: right;">1.7</td>
+</tr>
+<tr>
+<td><code>uint8_codes</code> — uint8, 5 distinct codes</td>
+<td style="text-align: right;">2,000,000</td>
+<td style="text-align: right;">0.8</td>
+<td style="text-align: right;">0.8</td>
+<td style="text-align: right;">0.4</td>
+<td style="text-align: right;">0.5</td>
+<td style="text-align: right;">4.7</td>
+<td style="text-align: right;">8.1</td>
+<td style="text-align: right;">3.8</td>
+<td style="text-align: right;">8.0</td>
+<td style="text-align: right;">6.3</td>
+<td style="text-align: right;">9.4</td>
+<td style="text-align: right;">1.3</td>
+</tr>
+<tr>
+<td><code>int64_random</code> — int64, random (incompressible)</td>
+<td style="text-align: right;">2,000,000</td>
+<td style="text-align: right;">4.1</td>
+<td style="text-align: right;">6.3</td>
+<td style="text-align: right;">3.4</td>
+<td style="text-align: right;">5.5</td>
+<td style="text-align: right;">19.6</td>
+<td style="text-align: right;">17.0</td>
+<td style="text-align: right;">17.8</td>
+<td style="text-align: right;">16.0</td>
+<td style="text-align: right;">8.2</td>
+<td style="text-align: right;">14.1</td>
+<td style="text-align: right;">6.8</td>
+</tr>
+<tr>
+<td><code>float64_smooth</code> — float64, smooth signal</td>
+<td style="text-align: right;">2,000,000</td>
+<td style="text-align: right;">5.4</td>
+<td style="text-align: right;">4.9</td>
+<td style="text-align: right;">3.7</td>
+<td style="text-align: right;">5.2</td>
+<td style="text-align: right;">20.5</td>
+<td style="text-align: right;">15.8</td>
+<td style="text-align: right;">17.6</td>
+<td style="text-align: right;">14.2</td>
+<td style="text-align: right;">16.4</td>
+<td style="text-align: right;">15.0</td>
+<td style="text-align: right;">5.6</td>
+</tr>
+<tr>
+<td><code>float32_random</code> — float32, random</td>
+<td style="text-align: right;">2,000,000</td>
+<td style="text-align: right;">2.0</td>
+<td style="text-align: right;">1.9</td>
+<td style="text-align: right;">1.5</td>
+<td style="text-align: right;">1.9</td>
+<td style="text-align: right;">11.9</td>
+<td style="text-align: right;">10.6</td>
+<td style="text-align: right;">12.1</td>
+<td style="text-align: right;">10.5</td>
+<td style="text-align: right;">10.8</td>
+<td style="text-align: right;">10.4</td>
+<td style="text-align: right;">3.2</td>
+</tr>
+<tr>
+<td><code>bool_flags</code> — bool, 30% true</td>
+<td style="text-align: right;">2,000,000</td>
+<td style="text-align: right;">0.5</td>
+<td style="text-align: right;">0.5</td>
+<td style="text-align: right;">0.5</td>
+<td style="text-align: right;">0.6</td>
+<td style="text-align: right;">4.4</td>
+<td style="text-align: right;">8.3</td>
+<td style="text-align: right;">3.3</td>
+<td style="text-align: right;">8.0</td>
+<td style="text-align: right;">8.8</td>
+<td style="text-align: right;">8.4</td>
+<td style="text-align: right;">0.5</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Write</strong> (ms) and <strong>size</strong> (MB):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ 4 MiB budget</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">size nanolance</th>
+<th style="text-align: right;">size Rust Lance</th>
+<th style="text-align: right;">size Parquet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>int64_ids</code></td>
+<td style="text-align: right;">9.9</td>
+<td style="text-align: right;">9.7</td>
+<td style="text-align: right;">10.6</td>
+<td style="text-align: right;">11.0</td>
+<td style="text-align: right;">18.9</td>
+<td style="text-align: right;">37.6</td>
+<td style="text-align: right;">18.5</td>
+<td style="text-align: right;">22.1</td>
+<td style="text-align: right;">90.0</td>
+<td style="text-align: right;">5.61</td>
+<td style="text-align: right;">5.61</td>
+<td style="text-align: right;">2.60</td>
+</tr>
+<tr>
+<td><code>int32_small</code></td>
+<td style="text-align: right;">4.4</td>
+<td style="text-align: right;">4.7</td>
+<td style="text-align: right;">5.5</td>
+<td style="text-align: right;">5.3</td>
+<td style="text-align: right;">14.0</td>
+<td style="text-align: right;">19.6</td>
+<td style="text-align: right;">13.9</td>
+<td style="text-align: right;">17.4</td>
+<td style="text-align: right;">36.5</td>
+<td style="text-align: right;">2.54</td>
+<td style="text-align: right;">2.54</td>
+<td style="text-align: right;">2.52</td>
+</tr>
+<tr>
+<td><code>uint8_codes</code></td>
+<td style="text-align: right;">2.9</td>
+<td style="text-align: right;">2.8</td>
+<td style="text-align: right;">2.8</td>
+<td style="text-align: right;">1.6</td>
+<td style="text-align: right;">13.3</td>
+<td style="text-align: right;">17.4</td>
+<td style="text-align: right;">14.3</td>
+<td style="text-align: right;">16.9</td>
+<td style="text-align: right;">26.2</td>
+<td style="text-align: right;">2.00</td>
+<td style="text-align: right;">2.01</td>
+<td style="text-align: right;">0.68</td>
+</tr>
+<tr>
+<td><code>int64_random</code></td>
+<td style="text-align: right;">12.0</td>
+<td style="text-align: right;">10.9</td>
+<td style="text-align: right;">11.5</td>
+<td style="text-align: right;">13.3</td>
+<td style="text-align: right;">34.1</td>
+<td style="text-align: right;">33.7</td>
+<td style="text-align: right;">34.9</td>
+<td style="text-align: right;">42.4</td>
+<td style="text-align: right;">46.8</td>
+<td style="text-align: right;">16.01</td>
+<td style="text-align: right;">16.05</td>
+<td style="text-align: right;">16.52</td>
+</tr>
+<tr>
+<td><code>float64_smooth</code></td>
+<td style="text-align: right;">11.7</td>
+<td style="text-align: right;">9.8</td>
+<td style="text-align: right;">11.4</td>
+<td style="text-align: right;">12.9</td>
+<td style="text-align: right;">36.4</td>
+<td style="text-align: right;">38.7</td>
+<td style="text-align: right;">38.6</td>
+<td style="text-align: right;">44.0</td>
+<td style="text-align: right;">63.5</td>
+<td style="text-align: right;">16.01</td>
+<td style="text-align: right;">15.96</td>
+<td style="text-align: right;">15.69</td>
+</tr>
+<tr>
+<td><code>float32_random</code></td>
+<td style="text-align: right;">4.3</td>
+<td style="text-align: right;">4.7</td>
+<td style="text-align: right;">5.5</td>
+<td style="text-align: right;">5.1</td>
+<td style="text-align: right;">15.7</td>
+<td style="text-align: right;">22.3</td>
+<td style="text-align: right;">15.7</td>
+<td style="text-align: right;">18.8</td>
+<td style="text-align: right;">63.2</td>
+<td style="text-align: right;">8.01</td>
+<td style="text-align: right;">8.02</td>
+<td style="text-align: right;">8.50</td>
+</tr>
+<tr>
+<td><code>bool_flags</code></td>
+<td style="text-align: right;">2.3</td>
+<td style="text-align: right;">2.3</td>
+<td style="text-align: right;">2.2</td>
+<td style="text-align: right;">1.6</td>
+<td style="text-align: right;">1.8</td>
+<td style="text-align: right;">5.3</td>
+<td style="text-align: right;">1.4</td>
+<td style="text-align: right;">3.6</td>
+<td style="text-align: right;">21.2</td>
+<td style="text-align: right;">0.25</td>
+<td style="text-align: right;">0.26</td>
+<td style="text-align: right;">0.24</td>
+</tr>
+</tbody>
+</table>
+<h2 id="dates-times-decimals">Dates, times, decimals<a class="headerlink" href="#dates-times-decimals" title="Permanent link">&para;</a></h2>
+<p><strong>Read</strong>, ms (each reader on the file its own writer made, then the cross reads):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">rows</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ retaining malloc</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">Rust reads nanolance's</th>
+<th style="text-align: right;">nanolance reads Rust's</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>timestamp_us</code> — timestamp[us], 1.5 ms apart with jitter</td>
+<td style="text-align: right;">2,000,000</td>
+<td style="text-align: right;">6.1</td>
+<td style="text-align: right;">6.0</td>
+<td style="text-align: right;">5.3</td>
+<td style="text-align: right;">5.9</td>
+<td style="text-align: right;">18.7</td>
+<td style="text-align: right;">13.8</td>
+<td style="text-align: right;">20.1</td>
+<td style="text-align: right;">16.4</td>
+<td style="text-align: right;">17.0</td>
+<td style="text-align: right;">14.3</td>
+<td style="text-align: right;">6.0</td>
+</tr>
+<tr>
+<td><code>date32</code> — date32, ten years of days</td>
+<td style="text-align: right;">2,000,000</td>
+<td style="text-align: right;">2.5</td>
+<td style="text-align: right;">2.2</td>
+<td style="text-align: right;">2.0</td>
+<td style="text-align: right;">2.5</td>
+<td style="text-align: right;">10.2</td>
+<td style="text-align: right;">11.8</td>
+<td style="text-align: right;">9.4</td>
+<td style="text-align: right;">12.2</td>
+<td style="text-align: right;">6.6</td>
+<td style="text-align: right;">13.3</td>
+<td style="text-align: right;">2.0</td>
+</tr>
+<tr>
+<td><code>decimal128</code> — decimal128(18, 4) prices</td>
+<td style="text-align: right;">500,000</td>
+<td style="text-align: right;">2.1</td>
+<td style="text-align: right;">2.2</td>
+<td style="text-align: right;">1.7</td>
+<td style="text-align: right;">2.1</td>
+<td style="text-align: right;">6.8</td>
+<td style="text-align: right;">6.6</td>
+<td style="text-align: right;">6.2</td>
+<td style="text-align: right;">5.7</td>
+<td style="text-align: right;">18.2</td>
+<td style="text-align: right;">5.6</td>
+<td style="text-align: right;">5.5</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Write</strong> (ms) and <strong>size</strong> (MB):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ 4 MiB budget</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">size nanolance</th>
+<th style="text-align: right;">size Rust Lance</th>
+<th style="text-align: right;">size Parquet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>timestamp_us</code></td>
+<td style="text-align: right;">14.6</td>
+<td style="text-align: right;">14.1</td>
+<td style="text-align: right;">14.3</td>
+<td style="text-align: right;">14.7</td>
+<td style="text-align: right;">31.6</td>
+<td style="text-align: right;">34.7</td>
+<td style="text-align: right;">31.4</td>
+<td style="text-align: right;">43.8</td>
+<td style="text-align: right;">90.8</td>
+<td style="text-align: right;">12.80</td>
+<td style="text-align: right;">12.80</td>
+<td style="text-align: right;">4.75</td>
+</tr>
+<tr>
+<td><code>date32</code></td>
+<td style="text-align: right;">5.2</td>
+<td style="text-align: right;">5.4</td>
+<td style="text-align: right;">6.1</td>
+<td style="text-align: right;">6.1</td>
+<td style="text-align: right;">14.9</td>
+<td style="text-align: right;">25.0</td>
+<td style="text-align: right;">15.0</td>
+<td style="text-align: right;">17.3</td>
+<td style="text-align: right;">37.2</td>
+<td style="text-align: right;">3.79</td>
+<td style="text-align: right;">3.79</td>
+<td style="text-align: right;">3.03</td>
+</tr>
+<tr>
+<td><code>decimal128</code></td>
+<td style="text-align: right;">6.3</td>
+<td style="text-align: right;">4.8</td>
+<td style="text-align: right;">5.2</td>
+<td style="text-align: right;">6.0</td>
+<td style="text-align: right;">18.5</td>
+<td style="text-align: right;">11.9</td>
+<td style="text-align: right;">7.4</td>
+<td style="text-align: right;">10.6</td>
+<td style="text-align: right;">41.2</td>
+<td style="text-align: right;">8.01</td>
+<td style="text-align: right;">8.02</td>
+<td style="text-align: right;">2.40</td>
+</tr>
+</tbody>
+</table>
+<h2 id="strings-and-binary">Strings and binary<a class="headerlink" href="#strings-and-binary" title="Permanent link">&para;</a></h2>
+<p><strong>Read</strong>, ms (each reader on the file its own writer made, then the cross reads):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">rows</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ retaining malloc</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">Rust reads nanolance's</th>
+<th style="text-align: right;">nanolance reads Rust's</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>string_lowcard</code> — utf8, 8 distinct values (log levels)</td>
+<td style="text-align: right;">1,000,000</td>
+<td style="text-align: right;">12.7</td>
+<td style="text-align: right;">4.5</td>
+<td style="text-align: right;">13.8</td>
+<td style="text-align: right;">2.4</td>
+<td style="text-align: right;">21.0</td>
+<td style="text-align: right;">13.6</td>
+<td style="text-align: right;">21.7</td>
+<td style="text-align: right;">14.6</td>
+<td style="text-align: right;">21.5</td>
+<td style="text-align: right;">14.1</td>
+<td style="text-align: right;">12.8</td>
+</tr>
+<tr>
+<td><code>string_ids</code> — utf8, unique ids (~15 bytes)</td>
+<td style="text-align: right;">1,000,000</td>
+<td style="text-align: right;">18.1</td>
+<td style="text-align: right;">6.5</td>
+<td style="text-align: right;">18.2</td>
+<td style="text-align: right;">7.1</td>
+<td style="text-align: right;">44.9</td>
+<td style="text-align: right;">21.9</td>
+<td style="text-align: right;">41.2</td>
+<td style="text-align: right;">27.2</td>
+<td style="text-align: right;">38.1</td>
+<td style="text-align: right;">19.4</td>
+<td style="text-align: right;">22.8</td>
+</tr>
+<tr>
+<td><code>string_urls</code> — utf8, URLs (~55 bytes)</td>
+<td style="text-align: right;">500,000</td>
+<td style="text-align: right;">13.1</td>
+<td style="text-align: right;">5.1</td>
+<td style="text-align: right;">13.4</td>
+<td style="text-align: right;">5.7</td>
+<td style="text-align: right;">42.3</td>
+<td style="text-align: right;">17.3</td>
+<td style="text-align: right;">37.7</td>
+<td style="text-align: right;">24.2</td>
+<td style="text-align: right;">38.2</td>
+<td style="text-align: right;">13.5</td>
+<td style="text-align: right;">17.4</td>
+</tr>
+<tr>
+<td><code>string_text</code> — utf8, sentences (~50 bytes)</td>
+<td style="text-align: right;">500,000</td>
+<td style="text-align: right;">17.6</td>
+<td style="text-align: right;">8.3</td>
+<td style="text-align: right;">17.1</td>
+<td style="text-align: right;">7.9</td>
+<td style="text-align: right;">40.2</td>
+<td style="text-align: right;">17.0</td>
+<td style="text-align: right;">37.0</td>
+<td style="text-align: right;">26.1</td>
+<td style="text-align: right;">43.6</td>
+<td style="text-align: right;">16.6</td>
+<td style="text-align: right;">18.9</td>
+</tr>
+<tr>
+<td><code>string_long</code> — utf8, ~1 KB documents</td>
+<td style="text-align: right;">50,000</td>
+<td style="text-align: right;">19.5</td>
+<td style="text-align: right;">8.6</td>
+<td style="text-align: right;">15.6</td>
+<td style="text-align: right;">11.0</td>
+<td style="text-align: right;">53.6</td>
+<td style="text-align: right;">20.5</td>
+<td style="text-align: right;">32.1</td>
+<td style="text-align: right;">33.3</td>
+<td style="text-align: right;">60.9</td>
+<td style="text-align: right;">16.9</td>
+<td style="text-align: right;">68.6</td>
+</tr>
+<tr>
+<td><code>binary_blobs</code> — binary, 16-64 random bytes</td>
+<td style="text-align: right;">500,000</td>
+<td style="text-align: right;">7.8</td>
+<td style="text-align: right;">3.0</td>
+<td style="text-align: right;">7.9</td>
+<td style="text-align: right;">3.9</td>
+<td style="text-align: right;">30.9</td>
+<td style="text-align: right;">15.2</td>
+<td style="text-align: right;">27.6</td>
+<td style="text-align: right;">17.4</td>
+<td style="text-align: right;">41.0</td>
+<td style="text-align: right;">13.2</td>
+<td style="text-align: right;">7.5</td>
+</tr>
+<tr>
+<td><code>uuid_fsb16</code> — fixed_size_binary(16), UUIDs</td>
+<td style="text-align: right;">1,000,000</td>
+<td style="text-align: right;">4.1</td>
+<td style="text-align: right;">5.6</td>
+<td style="text-align: right;">3.2</td>
+<td style="text-align: right;">2.7</td>
+<td style="text-align: right;">30.3</td>
+<td style="text-align: right;">11.2</td>
+<td style="text-align: right;">20.6</td>
+<td style="text-align: right;">11.5</td>
+<td style="text-align: right;">11.6</td>
+<td style="text-align: right;">9.0</td>
+<td style="text-align: right;">5.2</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Write</strong> (ms) and <strong>size</strong> (MB):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ 4 MiB budget</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">size nanolance</th>
+<th style="text-align: right;">size Rust Lance</th>
+<th style="text-align: right;">size Parquet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>string_lowcard</code></td>
+<td style="text-align: right;">35.4</td>
+<td style="text-align: right;">30.8</td>
+<td style="text-align: right;">31.6</td>
+<td style="text-align: right;">23.8</td>
+<td style="text-align: right;">36.1</td>
+<td style="text-align: right;">46.1</td>
+<td style="text-align: right;">40.7</td>
+<td style="text-align: right;">38.2</td>
+<td style="text-align: right;">34.5</td>
+<td style="text-align: right;">0.40</td>
+<td style="text-align: right;">0.40</td>
+<td style="text-align: right;">0.38</td>
+</tr>
+<tr>
+<td><code>string_ids</code></td>
+<td style="text-align: right;">90.7</td>
+<td style="text-align: right;">65.3</td>
+<td style="text-align: right;">114</td>
+<td style="text-align: right;">68.1</td>
+<td style="text-align: right;">87.7</td>
+<td style="text-align: right;">119</td>
+<td style="text-align: right;">102</td>
+<td style="text-align: right;">106</td>
+<td style="text-align: right;">83.6</td>
+<td style="text-align: right;">10.41</td>
+<td style="text-align: right;">10.89</td>
+<td style="text-align: right;">5.78</td>
+</tr>
+<tr>
+<td><code>string_urls</code></td>
+<td style="text-align: right;">111</td>
+<td style="text-align: right;">68.4</td>
+<td style="text-align: right;">74.3</td>
+<td style="text-align: right;">67.2</td>
+<td style="text-align: right;">93.3</td>
+<td style="text-align: right;">102</td>
+<td style="text-align: right;">105</td>
+<td style="text-align: right;">104</td>
+<td style="text-align: right;">79.0</td>
+<td style="text-align: right;">7.82</td>
+<td style="text-align: right;">8.78</td>
+<td style="text-align: right;">4.18</td>
+</tr>
+<tr>
+<td><code>string_text</code></td>
+<td style="text-align: right;">70.2</td>
+<td style="text-align: right;">40.9</td>
+<td style="text-align: right;">76.8</td>
+<td style="text-align: right;">59.3</td>
+<td style="text-align: right;">75.5</td>
+<td style="text-align: right;">89.2</td>
+<td style="text-align: right;">81.1</td>
+<td style="text-align: right;">84.7</td>
+<td style="text-align: right;">113</td>
+<td style="text-align: right;">7.27</td>
+<td style="text-align: right;">7.34</td>
+<td style="text-align: right;">6.37</td>
+</tr>
+<tr>
+<td><code>string_long</code></td>
+<td style="text-align: right;">126</td>
+<td style="text-align: right;">72.7</td>
+<td style="text-align: right;">126</td>
+<td style="text-align: right;">39.7</td>
+<td style="text-align: right;">100</td>
+<td style="text-align: right;">105</td>
+<td style="text-align: right;">109</td>
+<td style="text-align: right;">112</td>
+<td style="text-align: right;">158</td>
+<td style="text-align: right;">8.59</td>
+<td style="text-align: right;">8.95</td>
+<td style="text-align: right;">9.74</td>
+</tr>
+<tr>
+<td><code>binary_blobs</code></td>
+<td style="text-align: right;">39.3</td>
+<td style="text-align: right;">36.3</td>
+<td style="text-align: right;">16.9</td>
+<td style="text-align: right;">23.5</td>
+<td style="text-align: right;">19.8</td>
+<td style="text-align: right;">26.7</td>
+<td style="text-align: right;">18.5</td>
+<td style="text-align: right;">21.8</td>
+<td style="text-align: right;">55.3</td>
+<td style="text-align: right;">22.01</td>
+<td style="text-align: right;">22.15</td>
+<td style="text-align: right;">21.53</td>
+</tr>
+<tr>
+<td><code>uuid_fsb16</code></td>
+<td style="text-align: right;">9.2</td>
+<td style="text-align: right;">9.5</td>
+<td style="text-align: right;">10.6</td>
+<td style="text-align: right;">11.2</td>
+<td style="text-align: right;">25.4</td>
+<td style="text-align: right;">22.6</td>
+<td style="text-align: right;">24.1</td>
+<td style="text-align: right;">35.3</td>
+<td style="text-align: right;">32.9</td>
+<td style="text-align: right;">16.01</td>
+<td style="text-align: right;">16.05</td>
+<td style="text-align: right;">16.13</td>
+</tr>
+</tbody>
+</table>
+<h2 id="nulls">Nulls<a class="headerlink" href="#nulls" title="Permanent link">&para;</a></h2>
+<p><strong>Read</strong>, ms (each reader on the file its own writer made, then the cross reads):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">rows</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ retaining malloc</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">Rust reads nanolance's</th>
+<th style="text-align: right;">nanolance reads Rust's</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>int64_nulls</code> — int64, 10% null</td>
+<td style="text-align: right;">2,000,000</td>
+<td style="text-align: right;">6.0</td>
+<td style="text-align: right;">8.0</td>
+<td style="text-align: right;">5.4</td>
+<td style="text-align: right;">5.4</td>
+<td style="text-align: right;">27.2</td>
+<td style="text-align: right;">16.2</td>
+<td style="text-align: right;">24.7</td>
+<td style="text-align: right;">20.5</td>
+<td style="text-align: right;">22.8</td>
+<td style="text-align: right;">18.6</td>
+<td style="text-align: right;">5.0</td>
+</tr>
+<tr>
+<td><code>string_nulls</code> — utf8 sentences, 10% null</td>
+<td style="text-align: right;">500,000</td>
+<td style="text-align: right;">17.3</td>
+<td style="text-align: right;">7.1</td>
+<td style="text-align: right;">17.1</td>
+<td style="text-align: right;">7.5</td>
+<td style="text-align: right;">41.0</td>
+<td style="text-align: right;">16.2</td>
+<td style="text-align: right;">29.0</td>
+<td style="text-align: right;">25.2</td>
+<td style="text-align: right;">39.6</td>
+<td style="text-align: right;">16.6</td>
+<td style="text-align: right;">18.1</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Write</strong> (ms) and <strong>size</strong> (MB):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ 4 MiB budget</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">size nanolance</th>
+<th style="text-align: right;">size Rust Lance</th>
+<th style="text-align: right;">size Parquet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>int64_nulls</code></td>
+<td style="text-align: right;">23.6</td>
+<td style="text-align: right;">19.3</td>
+<td style="text-align: right;">20.3</td>
+<td style="text-align: right;">20.7</td>
+<td style="text-align: right;">50.2</td>
+<td style="text-align: right;">73.4</td>
+<td style="text-align: right;">52.0</td>
+<td style="text-align: right;">61.3</td>
+<td style="text-align: right;">107</td>
+<td style="text-align: right;">5.28</td>
+<td style="text-align: right;">5.28</td>
+<td style="text-align: right;">2.66</td>
+</tr>
+<tr>
+<td><code>string_nulls</code></td>
+<td style="text-align: right;">97.3</td>
+<td style="text-align: right;">69.6</td>
+<td style="text-align: right;">77.9</td>
+<td style="text-align: right;">51.4</td>
+<td style="text-align: right;">86.6</td>
+<td style="text-align: right;">112</td>
+<td style="text-align: right;">92.8</td>
+<td style="text-align: right;">102</td>
+<td style="text-align: right;">108</td>
+<td style="text-align: right;">6.95</td>
+<td style="text-align: right;">7.02</td>
+<td style="text-align: right;">5.83</td>
+</tr>
+</tbody>
+</table>
+<h2 id="vectors-structs-lists-maps">Vectors, structs, lists, maps<a class="headerlink" href="#vectors-structs-lists-maps" title="Permanent link">&para;</a></h2>
+<p><strong>Read</strong>, ms (each reader on the file its own writer made, then the cross reads):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">rows</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ retaining malloc</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">Rust reads nanolance's</th>
+<th style="text-align: right;">nanolance reads Rust's</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vector_f32x128</code> — fixed_size_list<float32, 128> embeddings</td>
+<td style="text-align: right;">100,000</td>
+<td style="text-align: right;">18.9</td>
+<td style="text-align: right;">11.9</td>
+<td style="text-align: right;">17.0</td>
+<td style="text-align: right;">8.9</td>
+<td style="text-align: right;">80.4</td>
+<td style="text-align: right;">22.2</td>
+<td style="text-align: right;">48.7</td>
+<td style="text-align: right;">49.6</td>
+<td style="text-align: right;">160</td>
+<td style="text-align: right;">20.4</td>
+<td style="text-align: right;">72.5</td>
+</tr>
+<tr>
+<td><code>struct_mixed</code> — struct<id: int64, name: utf8, score: float64></td>
+<td style="text-align: right;">500,000</td>
+<td style="text-align: right;">7.2</td>
+<td style="text-align: right;">5.0</td>
+<td style="text-align: right;">6.7</td>
+<td style="text-align: right;">4.0</td>
+<td style="text-align: right;">24.4</td>
+<td style="text-align: right;">9.9</td>
+<td style="text-align: right;">18.7</td>
+<td style="text-align: right;">14.3</td>
+<td style="text-align: right;">29.7</td>
+<td style="text-align: right;">10.3</td>
+<td style="text-align: right;">8.4</td>
+</tr>
+<tr>
+<td><code>list_int64</code> — list<int64>, 0-8 items</td>
+<td style="text-align: right;">500,000</td>
+<td style="text-align: right;">25.9</td>
+<td style="text-align: right;">10.4</td>
+<td style="text-align: right;">29.0</td>
+<td style="text-align: right;">8.1</td>
+<td style="text-align: right;">36.9</td>
+<td style="text-align: right;">19.3</td>
+<td style="text-align: right;">38.5</td>
+<td style="text-align: right;">26.9</td>
+<td style="text-align: right;">58.9</td>
+<td style="text-align: right;">18.8</td>
+<td style="text-align: right;">25.7</td>
+</tr>
+<tr>
+<td><code>list_string</code> — list<utf8> tags, 0-5 items</td>
+<td style="text-align: right;">300,000</td>
+<td style="text-align: right;">18.7</td>
+<td style="text-align: right;">10.9</td>
+<td style="text-align: right;">19.8</td>
+<td style="text-align: right;">8.9</td>
+<td style="text-align: right;">27.7</td>
+<td style="text-align: right;">14.8</td>
+<td style="text-align: right;">28.6</td>
+<td style="text-align: right;">20.2</td>
+<td style="text-align: right;">27.9</td>
+<td style="text-align: right;">15.0</td>
+<td style="text-align: right;">21.5</td>
+</tr>
+<tr>
+<td><code>map_string_int64</code> — map<utf8, int64>, 0-4 entries</td>
+<td style="text-align: right;">300,000</td>
+<td style="text-align: right;">27.3</td>
+<td style="text-align: right;">10.8</td>
+<td style="text-align: right;">25.4</td>
+<td style="text-align: right;">9.5</td>
+<td style="text-align: right;">21.7</td>
+<td style="text-align: right;">18.2</td>
+<td style="text-align: right;">24.8</td>
+<td style="text-align: right;">18.4</td>
+<td style="text-align: right;">26.6</td>
+<td style="text-align: right;">19.0</td>
+<td style="text-align: right;">30.3</td>
+</tr>
+<tr>
+<td><code>list_struct</code> — list&lt;struct<x: int32, label: utf8>&gt;, 0-3 items</td>
+<td style="text-align: right;">200,000</td>
+<td style="text-align: right;">12.8</td>
+<td style="text-align: right;">6.6</td>
+<td style="text-align: right;">10.8</td>
+<td style="text-align: right;">5.9</td>
+<td style="text-align: right;">11.0</td>
+<td style="text-align: right;">7.8</td>
+<td style="text-align: right;">10.3</td>
+<td style="text-align: right;">9.2</td>
+<td style="text-align: right;">14.5</td>
+<td style="text-align: right;">10.3</td>
+<td style="text-align: right;">10.9</td>
+</tr>
+<tr>
+<td><code>list_list_int32</code> — list&lt;list<int32>&gt;</td>
+<td style="text-align: right;">200,000</td>
+<td style="text-align: right;">6.7</td>
+<td style="text-align: right;">5.1</td>
+<td style="text-align: right;">6.6</td>
+<td style="text-align: right;">3.2</td>
+<td style="text-align: right;">5.9</td>
+<td style="text-align: right;">5.0</td>
+<td style="text-align: right;">5.9</td>
+<td style="text-align: right;">5.9</td>
+<td style="text-align: right;">6.0</td>
+<td style="text-align: right;">4.8</td>
+<td style="text-align: right;">8.4</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Write</strong> (ms) and <strong>size</strong> (MB):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ 4 MiB budget</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">size nanolance</th>
+<th style="text-align: right;">size Rust Lance</th>
+<th style="text-align: right;">size Parquet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>vector_f32x128</code></td>
+<td style="text-align: right;">78.3</td>
+<td style="text-align: right;">78.1</td>
+<td style="text-align: right;">49.6</td>
+<td style="text-align: right;">67.9</td>
+<td style="text-align: right;">62.7</td>
+<td style="text-align: right;">137</td>
+<td style="text-align: right;">62.0</td>
+<td style="text-align: right;">173</td>
+<td style="text-align: right;">226</td>
+<td style="text-align: right;">51.25</td>
+<td style="text-align: right;">51.20</td>
+<td style="text-align: right;">47.94</td>
+</tr>
+<tr>
+<td><code>struct_mixed</code></td>
+<td style="text-align: right;">55.0</td>
+<td style="text-align: right;">51.6</td>
+<td style="text-align: right;">64.6</td>
+<td style="text-align: right;">53.2</td>
+<td style="text-align: right;">46.8</td>
+<td style="text-align: right;">52.7</td>
+<td style="text-align: right;">49.0</td>
+<td style="text-align: right;">54.3</td>
+<td style="text-align: right;">94.9</td>
+<td style="text-align: right;">8.91</td>
+<td style="text-align: right;">8.93</td>
+<td style="text-align: right;">5.76</td>
+</tr>
+<tr>
+<td><code>list_int64</code></td>
+<td style="text-align: right;">59.3</td>
+<td style="text-align: right;">64.4</td>
+<td style="text-align: right;">50.3</td>
+<td style="text-align: right;">37.4</td>
+<td style="text-align: right;">81.2</td>
+<td style="text-align: right;">51.7</td>
+<td style="text-align: right;">84.4</td>
+<td style="text-align: right;">67.3</td>
+<td style="text-align: right;">151</td>
+<td style="text-align: right;">5.84</td>
+<td style="text-align: right;">5.90</td>
+<td style="text-align: right;">7.64</td>
+</tr>
+<tr>
+<td><code>list_string</code></td>
+<td style="text-align: right;">52.5</td>
+<td style="text-align: right;">49.5</td>
+<td style="text-align: right;">47.4</td>
+<td style="text-align: right;">38.1</td>
+<td style="text-align: right;">52.9</td>
+<td style="text-align: right;">40.6</td>
+<td style="text-align: right;">56.4</td>
+<td style="text-align: right;">38.4</td>
+<td style="text-align: right;">48.2</td>
+<td style="text-align: right;">1.18</td>
+<td style="text-align: right;">1.18</td>
+<td style="text-align: right;">0.93</td>
+</tr>
+<tr>
+<td><code>map_string_int64</code></td>
+<td style="text-align: right;">62.3</td>
+<td style="text-align: right;">51.2</td>
+<td style="text-align: right;">54.9</td>
+<td style="text-align: right;">35.4</td>
+<td style="text-align: right;">62.6</td>
+<td style="text-align: right;">33.6</td>
+<td style="text-align: right;">51.5</td>
+<td style="text-align: right;">35.3</td>
+<td style="text-align: right;">70.3</td>
+<td style="text-align: right;">2.11</td>
+<td style="text-align: right;">2.13</td>
+<td style="text-align: right;">1.00</td>
+</tr>
+<tr>
+<td><code>list_struct</code></td>
+<td style="text-align: right;">30.4</td>
+<td style="text-align: right;">22.7</td>
+<td style="text-align: right;">31.4</td>
+<td style="text-align: right;">17.8</td>
+<td style="text-align: right;">31.4</td>
+<td style="text-align: right;">21.4</td>
+<td style="text-align: right;">28.1</td>
+<td style="text-align: right;">24.7</td>
+<td style="text-align: right;">40.2</td>
+<td style="text-align: right;">1.19</td>
+<td style="text-align: right;">1.18</td>
+<td style="text-align: right;">0.61</td>
+</tr>
+<tr>
+<td><code>list_list_int32</code></td>
+<td style="text-align: right;">12.6</td>
+<td style="text-align: right;">15.9</td>
+<td style="text-align: right;">12.7</td>
+<td style="text-align: right;">6.6</td>
+<td style="text-align: right;">16.3</td>
+<td style="text-align: right;">11.8</td>
+<td style="text-align: right;">15.7</td>
+<td style="text-align: right;">17.4</td>
+<td style="text-align: right;">22.0</td>
+<td style="text-align: right;">0.63</td>
+<td style="text-align: right;">0.63</td>
+<td style="text-align: right;">0.80</td>
+</tr>
+</tbody>
+</table>
+<h2 id="a-realistic-table">A realistic table<a class="headerlink" href="#a-realistic-table" title="Permanent link">&para;</a></h2>
+<p><strong>Read</strong>, ms (each reader on the file its own writer made, then the cross reads):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">rows</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ retaining malloc</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">Rust reads nanolance's</th>
+<th style="text-align: right;">nanolance reads Rust's</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mixed_events</code> — 10-column event table (ints, timestamps, strings, list, struct, nulls)</td>
+<td style="text-align: right;">300,000</td>
+<td style="text-align: right;">51.3</td>
+<td style="text-align: right;">17.1</td>
+<td style="text-align: right;">49.1</td>
+<td style="text-align: right;">15.0</td>
+<td style="text-align: right;">82.4</td>
+<td style="text-align: right;">36.8</td>
+<td style="text-align: right;">80.8</td>
+<td style="text-align: right;">41.5</td>
+<td style="text-align: right;">33.2</td>
+<td style="text-align: right;">36.2</td>
+<td style="text-align: right;">42.3</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Write</strong> (ms) and <strong>size</strong> (MB):</p>
+<table>
+<thead>
+<tr>
+<th>dataset</th>
+<th style="text-align: right;">nanolance C++ 1 core</th>
+<th style="text-align: right;">nanolance C++ all cores</th>
+<th style="text-align: right;">+ 4 MiB budget</th>
+<th style="text-align: right;">nanolance Python</th>
+<th style="text-align: right;">Rust Lance 1 core</th>
+<th style="text-align: right;">Rust Lance all cores</th>
+<th style="text-align: right;">Rust native 1 core</th>
+<th style="text-align: right;">Rust native all cores</th>
+<th style="text-align: right;">Parquet</th>
+<th style="text-align: right;">size nanolance</th>
+<th style="text-align: right;">size Rust Lance</th>
+<th style="text-align: right;">size Parquet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mixed_events</code></td>
+<td style="text-align: right;">126</td>
+<td style="text-align: right;">72.2</td>
+<td style="text-align: right;">140</td>
+<td style="text-align: right;">79.5</td>
+<td style="text-align: right;">159</td>
+<td style="text-align: right;">109</td>
+<td style="text-align: right;">171</td>
+<td style="text-align: right;">83.8</td>
+<td style="text-align: right;">300</td>
+<td style="text-align: right;">18.31</td>
+<td style="text-align: right;">18.31</td>
+<td style="text-align: right;">16.28</td>
+</tr>
+</tbody>
+</table>
+<h2 id="training-data-coco-and-speech-commands">Training data: COCO and Speech Commands<a class="headerlink" href="#training-data-coco-and-speech-commands" title="Permanent link">&para;</a></h2>
+<p><em>From <code>bench/results/multimodal.json</code>, produced by <code>tools/bench_multimodal.py</code> (the datasets are downloaded separately; see its header).</em> Two widely used datasets in the shape a training pipeline keeps them, put through what a training job does: build the dataset, read an epoch in file order, read everything but the images or audio, and read a shuffled epoch in mini-batches of 64 rows. Median of 3 runs after a warm-up, files in the page cache; nanolance <code>3a60464</code>, pylance 12.0.0, 4 cores, 2026-09-26 07:20 UTC. Wall time and CPU time (every thread of the process) in ms; each result checked against the source table before it was timed.</p>
+<h3 id="coco-2017-val-images-captions-boxes-polygons-keypoints">COCO 2017 val: images, captions, boxes, polygons, keypoints<a class="headerlink" href="#coco-2017-val-images-captions-boxes-polygons-keypoints" title="Permanent link">&para;</a></h3>
+<p>5,000 rows, 828 MB in memory. Files: nanolance 825.7 MB, nanolance, 1 thread 825.7 MB, Rust Lance 820.9 MB, Parquet 815.3 MB.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">write the dataset</th>
+<th style="text-align: right;">read every column</th>
+<th style="text-align: right;">read all but images / audio</th>
+<th style="text-align: right;">one shuffled epoch in mini-batches (take)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>nanolance</td>
+<td style="text-align: right;">991 <small>(992 CPU)</small></td>
+<td style="text-align: right;">389 <small>(1,093 CPU)</small></td>
+<td style="text-align: right;">9.3 <small>(31 CPU)</small></td>
+<td style="text-align: right;">375 <small>(544 CPU)</small></td>
+</tr>
+<tr>
+<td>nanolance, 1 thread</td>
+<td style="text-align: right;">1,045 <small>(1,016 CPU)</small></td>
+<td style="text-align: right;">979 <small>(978 CPU)</small></td>
+<td style="text-align: right;">27 <small>(27 CPU)</small></td>
+<td style="text-align: right;">495 <small>(493 CPU)</small></td>
+</tr>
+<tr>
+<td>Rust Lance</td>
+<td style="text-align: right;">3,053 <small>(3,068 CPU)</small></td>
+<td style="text-align: right;">4,132 <small>(4,338 CPU)</small></td>
+<td style="text-align: right;">29 <small>(37 CPU)</small></td>
+<td style="text-align: right;">891 <small>(1,441 CPU)</small></td>
+</tr>
+<tr>
+<td>Parquet</td>
+<td style="text-align: right;">1,763 <small>(1,742 CPU)</small></td>
+<td style="text-align: right;">1,680 <small>(1,701 CPU)</small></td>
+<td style="text-align: right;">34 <small>(39 CPU)</small></td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>nanolance reading Rust's file</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">419 <small>(1,292 CPU)</small></td>
+<td style="text-align: right;">11 <small>(35 CPU)</small></td>
+<td style="text-align: right;">451 <small>(616 CPU)</small></td>
+</tr>
+<tr>
+<td>Rust reading nanolance's file</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">1,912 <small>(2,021 CPU)</small></td>
+<td style="text-align: right;">25 <small>(26 CPU)</small></td>
+<td style="text-align: right;">852 <small>(1,353 CPU)</small></td>
+</tr>
+</tbody>
+</table>
+<h3 id="speech-commands-v002-test-one-second-audio-clips-and-their-words">Speech Commands v0.02 test: one-second audio clips and their words<a class="headerlink" href="#speech-commands-v002-test-one-second-audio-clips-and-their-words" title="Permanent link">&para;</a></h3>
+<p>4,890 rows, 157 MB in memory. Files: nanolance 167.3 MB, nanolance, 1 thread 167.3 MB, Rust Lance 159.2 MB, Parquet 111.8 MB.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">write the dataset</th>
+<th style="text-align: right;">read every column</th>
+<th style="text-align: right;">read all but images / audio</th>
+<th style="text-align: right;">one shuffled epoch in mini-batches (take)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>nanolance</td>
+<td style="text-align: right;">1,060 <small>(1,044 CPU)</small></td>
+<td style="text-align: right;">86 <small>(270 CPU)</small></td>
+<td style="text-align: right;">0.6 <small>(0.9 CPU)</small></td>
+<td style="text-align: right;">286 <small>(288 CPU)</small></td>
+</tr>
+<tr>
+<td>nanolance, 1 thread</td>
+<td style="text-align: right;">1,044 <small>(1,032 CPU)</small></td>
+<td style="text-align: right;">220 <small>(220 CPU)</small></td>
+<td style="text-align: right;">0.8 <small>(0.8 CPU)</small></td>
+<td style="text-align: right;">263 <small>(262 CPU)</small></td>
+</tr>
+<tr>
+<td>Rust Lance</td>
+<td style="text-align: right;">1,898 <small>(1,890 CPU)</small></td>
+<td style="text-align: right;">378 <small>(407 CPU)</small></td>
+<td style="text-align: right;">2.8 <small>(3.2 CPU)</small></td>
+<td style="text-align: right;">310 <small>(426 CPU)</small></td>
+</tr>
+<tr>
+<td>Parquet</td>
+<td style="text-align: right;">1,646 <small>(1,644 CPU)</small></td>
+<td style="text-align: right;">828 <small>(822 CPU)</small></td>
+<td style="text-align: right;">1.4 <small>(2.1 CPU)</small></td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr>
+<td>nanolance reading Rust's file</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">86 <small>(312 CPU)</small></td>
+<td style="text-align: right;">0.3 <small>(0.5 CPU)</small></td>
+<td style="text-align: right;">266 <small>(270 CPU)</small></td>
+</tr>
+<tr>
+<td>Rust reading nanolance's file</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">415 <small>(453 CPU)</small></td>
+<td style="text-align: right;">4.1 <small>(4.6 CPU)</small></td>
+<td style="text-align: right;">394 <small>(588 CPU)</small></td>
+</tr>
+</tbody>
+</table>
+<h2 id="scalar-indexes">Scalar indexes<a class="headerlink" href="#scalar-indexes" title="Permanent link">&para;</a></h2>
+<p><em>From <code>bench/results/scalar_index.json</code>, produced by <code>tools/bench_scalar_index.py</code> (generated data).</em> 5,000,000 rows in 5 fragments: building each index on the unindexed data, then filtered reads with them, each engine on the indexes it built (nanolance also without its index). Median of 5 runs after a warm-up, files in the page cache; nanolance <code>67da872 with uncommitted changes (the scalar index commit)</code>, pylance 12.0.0, 4 cores, 2026-10-02 03:39 UTC. Every query's rows were checked against pylance's. Times in ms.</p>
+<table>
+<thead>
+<tr>
+<th>build</th>
+<th style="text-align: right;">pylance</th>
+<th style="text-align: right;">nanolance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>id BTREE</td>
+<td style="text-align: right;">1,159</td>
+<td style="text-align: right;">793</td>
+</tr>
+<tr>
+<td>f BTREE</td>
+<td style="text-align: right;">1,245</td>
+<td style="text-align: right;">773</td>
+</tr>
+<tr>
+<td>s BTREE</td>
+<td style="text-align: right;">2,194</td>
+<td style="text-align: right;">1,472</td>
+</tr>
+<tr>
+<td>cat BITMAP</td>
+<td style="text-align: right;">1,387</td>
+<td style="text-align: right;">386</td>
+</tr>
+<tr>
+<td>tags LABEL_LIST</td>
+<td style="text-align: right;">2,261</td>
+<td style="text-align: right;">974</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>query</th>
+<th>columns</th>
+<th style="text-align: right;">rows</th>
+<th style="text-align: right;">pylance</th>
+<th style="text-align: right;">nanolance</th>
+<th style="text-align: right;">nanolance, no index</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id = 123456</code></td>
+<td>id</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1.4</td>
+<td style="text-align: right;">0.6</td>
+<td style="text-align: right;">15.7</td>
+</tr>
+<tr>
+<td><code>id &lt; 1000</code></td>
+<td>id</td>
+<td style="text-align: right;">1,000</td>
+<td style="text-align: right;">7.5</td>
+<td style="text-align: right;">3.0</td>
+<td style="text-align: right;">17.5</td>
+</tr>
+<tr>
+<td><code>id BETWEEN 1000000 AND 1100000</code></td>
+<td>id</td>
+<td style="text-align: right;">100,001</td>
+<td style="text-align: right;">24.1</td>
+<td style="text-align: right;">14.3</td>
+<td style="text-align: right;">34.4</td>
+</tr>
+<tr>
+<td><code>s = 'user_00012345'</code></td>
+<td>id</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.8</td>
+<td style="text-align: right;">0.5</td>
+<td style="text-align: right;">49.0</td>
+</tr>
+<tr>
+<td><code>cat = 'c7'</code></td>
+<td>id</td>
+<td style="text-align: right;">100,135</td>
+<td style="text-align: right;">22.7</td>
+<td style="text-align: right;">8.0</td>
+<td style="text-align: right;">38.0</td>
+</tr>
+<tr>
+<td><code>array_has_any(tags, ['t5'])</code></td>
+<td>id</td>
+<td style="text-align: right;">49,718</td>
+<td style="text-align: right;">17.8</td>
+<td style="text-align: right;">15.9</td>
+<td style="text-align: right;">772</td>
+</tr>
+<tr>
+<td><code>cat = 'c7' AND id &lt; 50000</code></td>
+<td>id</td>
+<td style="text-align: right;">1,053</td>
+<td style="text-align: right;">9.6</td>
+<td style="text-align: right;">8.9</td>
+<td style="text-align: right;">31.2</td>
+</tr>
+<tr>
+<td><code>id = 123456</code></td>
+<td>all</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">1.3</td>
+<td style="text-align: right;">2.9</td>
+<td style="text-align: right;">20.0</td>
+</tr>
+<tr>
+<td><code>id &lt; 1000</code></td>
+<td>all</td>
+<td style="text-align: right;">1,000</td>
+<td style="text-align: right;">30.5</td>
+<td style="text-align: right;">11.4</td>
+<td style="text-align: right;">33.3</td>
+</tr>
+<tr>
+<td><code>id BETWEEN 1000000 AND 1100000</code></td>
+<td>all</td>
+<td style="text-align: right;">100,001</td>
+<td style="text-align: right;">142</td>
+<td style="text-align: right;">54.2</td>
+<td style="text-align: right;">83.5</td>
+</tr>
+<tr>
+<td><code>s = 'user_00012345'</code></td>
+<td>all</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.8</td>
+<td style="text-align: right;">0.6</td>
+<td style="text-align: right;">46.8</td>
+</tr>
+<tr>
+<td><code>cat = 'c7'</code></td>
+<td>all</td>
+<td style="text-align: right;">100,135</td>
+<td style="text-align: right;">139</td>
+<td style="text-align: right;">43.1</td>
+<td style="text-align: right;">80.6</td>
+</tr>
+<tr>
+<td><code>array_has_any(tags, ['t5'])</code></td>
+<td>all</td>
+<td style="text-align: right;">49,718</td>
+<td style="text-align: right;">130</td>
+<td style="text-align: right;">43.1</td>
+<td style="text-align: right;">870</td>
+</tr>
+<tr>
+<td><code>cat = 'c7' AND id &lt; 50000</code></td>
+<td>all</td>
+<td style="text-align: right;">1,053</td>
+<td style="text-align: right;">36.2</td>
+<td style="text-align: right;">18.2</td>
+<td style="text-align: right;">44.9</td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

@@ -726,6 +726,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#found-on-published-datasets-2026-09-28" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Found on published datasets (2026-09-28)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#what-the-survey-found" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -947,6 +958,25 @@ it names the evidence, the files, the oracle that proves it done, and which mode
 backlog. That changed the picture substantially. Two gaps nobody had listed are bigger than lists, and
 two items the backlog called large are small.</p>
 <hr />
+<h2 id="found-on-published-datasets-2026-09-28">Found on published datasets (2026-09-28)<a class="headerlink" href="#found-on-published-datasets-2026-09-28" title="Permanent link">&para;</a></h2>
+<p><code>tools/real_lance_check.py</code> read 24 tables from Lance datasets on the Hugging Face Hub
+(<code>docs/REAL_DATASETS.md</code>). None mismatched. Two gaps matter most for what people actually store:</p>
+<ul>
+<li><strong>Done (2026-10-01): Lance file format 2.0</strong> (footer <code>0.3</code>), all 6 refusals. LanceDB wrote 2.0 by
+  default, so most LanceDB tables on the Hub are 2.0 (281 of 621 tables). <code>src/lance_v20_decoder.cpp</code>
+  reads the <code>ArrayEncoding</code> tree of <code>encodings_v2_0.proto</code> (Flat, Nullable, Binary, Dictionary,
+  FixedSizeList, FixedSizeBinary, List, Struct, PackedStruct, Fsst, both bit-packings, blob
+  columns) into the same <code>ColumnValues</code> as 2.1, decoding only the rows a range or take needs. 57
+  2.0 Hub tables read equal to pylance, and the Rust suite's 2.0 round trips pass but for types
+  nanolance refuses in every format (<code>docs/RUST_SUITE.md</code>). Still open: Constant pages (Lance
+  cannot read them either).</li>
+<li><strong>Done (2026-10-01): <code>take</code> on <code>list&lt;string&gt;</code> in FullZip pages</strong> decoded each touched page whole:
+  MS MARCO's <code>passage_text</code>, 256 rows, read 193 MB. A FullZip list page has a repetition index
+  (buffer 1, one entry per row) giving each row's byte range; take and row ranges now read just
+  those ranges and unravel their levels (<code>take_windows</code>, <code>decode_nested_rows</code>), large pages are
+  read in windows, and the parallel reader splits them. MS MARCO: 3 ms (pylance 7). The work guard
+  is <code>data_bytes_read</code>.</li>
+</ul>
 <h2 id="what-the-survey-found">What the survey found<a class="headerlink" href="#what-the-survey-found" title="Permanent link">&para;</a></h2>
 <h3 id="two-gaps-nobody-had-listed">Two gaps nobody had listed<a class="headerlink" href="#two-gaps-nobody-had-listed" title="Permanent link">&para;</a></h3>
 <p><strong>1. FullZip layout: any string over 255 bytes, and every real embedding.</strong> Lance picks its page layout
@@ -1354,6 +1384,18 @@ for a large one. See PROGRESS, "Roadmap E4".</p>
 <td><strong>Page size.</strong> nanolance writes ~1024 rows per bitpacked page; pylance put 200,000 in one. Measure read time vs page size on the bench datasets <em>first</em> — this project's instruction profiles misled four times; only wall clock is trusted.</td>
 <td>S (measure) + M</td>
 <td><strong>Opus</strong></td>
+</tr>
+<tr>
+<td>F1</td>
+<td><em>(status)</em> <strong>Reopened and done.</strong> The first measurement (200,000 rows) said no change was needed and claimed bitpacked columns were already multi-chunk pages. That was wrong: the flat writer put one chunk per page, so a 2M-row int64 column became 1,954 pages of 2.5 KB, and the benchmark matrix (<code>tools/bench_matrix.py</code>) showed Rust reading it 5.7x slower than its own file (104 vs 18 ms). Every fixed-width column is now written as ~512 KiB pages of many chunks (measured from 64 KiB to 8 MiB: within noise of the best for Rust, within ~10% of the best for nanolance); Rust reads nanolance's numeric files at its own speed. See PROGRESS.md, "Performance from the benchmark matrix".</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>F3</td>
+<td><strong>Memory budget for writing</strong> — <code>max_pending_bytes</code>: write_batch flushes a fragment when the buffered data reaches it (edge devices).</td>
+<td>S</td>
+<td><strong>Done</strong> — see PROGRESS</td>
 </tr>
 <tr>
 <td>F2</td>

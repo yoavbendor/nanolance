@@ -10,13 +10,9 @@
       
       
       
-        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/bench/">
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/RUST_SUITE/">
       
       
-        <link rel="prev" href="../agents/">
-      
-      
-        <link rel="next" href="../bench-write-read/">
       
       
         
@@ -27,7 +23,7 @@
     
     
       
-        <title>Overview - nanolance</title>
+        <title>Lance's Rust encoding tests, read back by nanolance - nanolance</title>
       
     
     
@@ -78,7 +74,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#benchmarks" class="md-skip">
+        <a href="#lances-rust-encoding-tests-read-back-by-nanolance" class="md-skip">
           Skip to content
         </a>
       
@@ -114,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Overview
+              Lance's Rust encoding tests, read back by nanolance
             
           </span>
         </div>
@@ -367,8 +363,6 @@
       
   
   
-    
-  
   
   
     
@@ -381,11 +375,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
         
           
           <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
@@ -406,7 +400,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_5">
             <span class="md-nav__icon md-icon"></span>
             
@@ -421,19 +415,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../bench/" class="md-nav__link">
         
   
   
@@ -449,7 +434,6 @@
   
 
       </a>
-      
     </li>
   
 
@@ -735,6 +719,36 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#outcomes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Outcomes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#results" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Results
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -753,30 +767,145 @@
   
 
 
-<h1 id="benchmarks">Benchmarks<a class="headerlink" href="#benchmarks" title="Permanent link">&para;</a></h1>
-<p>Two independent claims, each reproducible and each with its own results page:</p>
-<ol>
-<li><strong><a href="../bench-write-read/">Write/read vs Parquet &amp; Rust lance</a></strong> — nanolance's write and read
-   throughput against <code>parquet</code> (zstd) and Rust <code>lance</code>, on three synthetic schemas (a pcap-reference
-   shape, a wide-int shape, and a high-cardinality-string shape). Auto-generated on every push to
-   <code>main</code> by <a href="https://github.com/yoavbendor/nanolance/blob/main/.github/workflows/linux-bench.yml"><code>.github/workflows/linux-bench.yml</code></a>
-   — this page always reflects the latest <code>main</code>.</li>
-<li><strong><a href="../bench-trusted-parity/">Safety-parity: trusted vs default read</a></strong> — proves the memory-safety
-   posture costs nothing: <code>trusted_input=true</code> (which skips only the untrusted-input DoS/OOM budget
-   checks — every bounds check keeps running regardless, see <a href="../SAFETY/">Memory safety</a>) measures as
-   no faster than the default, fully-checked read. Reproduce locally with
-   <code>bench/read_parity_bench.sh [build_dir] [rows]</code>.</li>
-</ol>
-<p>Reproduce the write/read comparison locally with <code>bench/run-local-bench.sh</code> (writes
-<code>bench/linux-local-results.md</code>, kept separate from the CI-owned file so local runs and the CI
-auto-commit never collide on the same path).</p>
-<p>Reading the write/read table: <code>parquet</code>, <code>rust lance</code> and <code>nanolance (py)</code> all write and read in
-the benchmark's own Python process, from the Arrow table already in memory. Those three rows are the
-like-for-like comparison. <code>nanolance (cli)</code> runs <code>arrowipc2lance</code> and <code>nlbench</code> as separate
-processes. Its <code>write(proc)</code> is their whole wall clock: process start, then parsing the Arrow IPC
-stream from stdin (on <code>pcap_ref</code>, 14 MB of IPC takes about 9 ms, mostly page faults), then the write.
-Even its <code>write(core)</code> runs in a fresh process, whose first allocations fault in new pages. So the
-CLI rows measure the command-line tool, not the encoder.</p>
+<h1 id="lances-rust-encoding-tests-read-back-by-nanolance">Lance's Rust encoding tests, read back by nanolance<a class="headerlink" href="#lances-rust-encoding-tests-read-back-by-nanolance" title="Permanent link">&para;</a></h1>
+<p>Lance's Rust crates test their own encoder against their own decoder. <code>lance-encoding</code>'s tests
+encode data and decode it again: every type, null pattern, page size, compression setting and
+structural layout the Lance authors thought worth covering. They decode it whole, by row ranges and
+by row indices. <code>lance-file</code>'s tests write real files with Lance's <code>FileWriter</code>.</p>
+<p><code>tools/rust_suite.py</code> runs those tests unchanged, with one addition. Every round trip and every file
+they write is also read by nanolance and compared with what the test expects. Every layout the Rust
+writer can produce becomes a read test for nanolance, compared exactly as the Rust decoder is.</p>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>python<span class="w"> </span>tools/rust_suite.py<span class="w">                      </span><span class="c1"># fetch (once), build, run; compare with the list</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>python<span class="w"> </span>tools/rust_suite.py<span class="w"> </span>--update<span class="w">             </span><span class="c1"># ... and rewrite the list of tests that pass</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>python<span class="w"> </span>tools/rust_suite.py<span class="w"> </span>--filter<span class="w"> </span>bitpack<span class="w">     </span><span class="c1"># only tests whose name contains &quot;bitpack&quot;</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>python<span class="w"> </span>tools/rust_suite.py<span class="w"> </span>--crates<span class="w"> </span>lance-file<span class="w">  </span><span class="c1"># one crate</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="nv">NANOLANCE_RUST_KEEP</span><span class="o">=</span>/tmp/keep<span class="w"> </span>python<span class="w"> </span>tools/rust_suite.py<span class="w"> </span>--filter<span class="w"> </span>...<span class="w">   </span><span class="c1"># keep each mismatching file</span>
+</code></pre></div>
+<p>The work happens in these steps:</p>
+<ul>
+<li>The crates are the ones pylance 12.0.0 is built from: <code>lance-encoding</code> and <code>lance-file</code> 12.0.0.
+  The script downloads them from crates.io into <code>.deps/rust-suite/</code>. They are not copied into this
+  repository.</li>
+<li>It adds two modules to each crate's <code>testing</code> module (<code>tests/rust_suite/*.rs</code>) and one call where
+  the tests check their result. It also links the test binary against <code>libnanolance_rust_shim</code>
+  (<code>tests/rust_suite/nanolance_rust_shim.cpp</code>, built with CMake).</li>
+<li>In lance-encoding, each round trip's pages are the Rust encoder's own bytes. The hook wraps them
+  into a Lance 2.2 file, adding the schema, the column metadata and the footer as Lance's writer
+  lays them out. nanolance then reads that file the same three ways the test reads it: whole, by
+  row ranges and by row indices.</li>
+<li>In lance-file, the hook reads every file the tests write with <code>write_lance_file</code> as it is.</li>
+<li>Results are compared the way the test compares the Rust decoder's: the Arrow type, then the values.</li>
+</ul>
+<p>CI runs it nightly (<code>.github/workflows/rust-suite.yml</code>). The shim exports its two functions and
+nothing else. The test binary links zstd and lz4 of its own, and when the shim also exported
+nanolance's copies, calls could bind across the two versions. One of Lance's compression tests
+crashed on a CI runner that way, though it never calls nanolance. The runner refuses a shim that
+exports those symbols. When the test binary does crash, the runner runs the tests again one at a
+time and names the test that died. It also runs when the suite itself changes.</p>
+<h2 id="outcomes">Outcomes<a class="headerlink" href="#outcomes" title="Permanent link">&para;</a></h2>
+<p>Per round trip, and per test as the worst of its round trips:</p>
+<table>
+<thead>
+<tr>
+<th>outcome</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>pass</td>
+<td>read back equal, as the Rust decoder must</td>
+</tr>
+<tr>
+<td>type</td>
+<td>equal values, a different Arrow type (for example, another name for a list's item)</td>
+</tr>
+<tr>
+<td>refused</td>
+<td>nanolance declined with an error naming what it does not read</td>
+</tr>
+<tr>
+<td>mismatch</td>
+<td>nanolance returned different rows. This is a wrong result, and it is never acceptable</td>
+</tr>
+</tbody>
+</table>
+<p>A run fails when a test listed in <code>tests/rust_suite/expected_pass.txt</code> stops passing. It also fails
+on any mismatch that <code>tests/rust_suite/known_mismatch.txt</code> does not name. That file is empty.</p>
+<h2 id="results">Results<a class="headerlink" href="#results" title="Permanent link">&para;</a></h2>
+<p><code>bench/results/rust_suite.json</code> holds the latest summary. From the run on this machine:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>tests run (lance-encoding 1,809, lance-file 177)</td>
+<td>1,986; each also passes in Rust</td>
+</tr>
+<tr>
+<td>tests with round trips that nanolance reads back, all equal</td>
+<td><strong>1,028</strong> (<code>expected_pass.txt</code>)</td>
+</tr>
+<tr>
+<td>tests where nanolance refuses some round trip</td>
+<td>435</td>
+</tr>
+<tr>
+<td>tests with no round trip (unit tests of one component)</td>
+<td>523</td>
+</tr>
+<tr>
+<td>round trips read back equal</td>
+<td><strong>9,347</strong></td>
+</tr>
+<tr>
+<td>round trips refused</td>
+<td>1,640, of which 90 are format 2.0 (types refused in every format)</td>
+</tr>
+<tr>
+<td>round trips with different rows</td>
+<td><strong>0</strong></td>
+</tr>
+</tbody>
+</table>
+<p>By layout, nanolance reads 2,739 of lance-encoding's 2,926 round trips in the u16 mini-block
+layout, 2,789 of 3,456 in the u32 layout and 2,763 of 3,451 in the sparse layout. Of the files
+lance-file writes, it reads 10 of 10 in format 2.0, 13 of 14 in 2.1 and 5 of 7 in 2.2. Of the
+1,118 round trips in lance-encoding's <code>Array</code> test encoding, which is format 2.0, it reads 1,028.</p>
+<p>The runs so far found three bugs in nanolance, all fixed and pinned by tests that do not need Rust:</p>
+<ul>
+<li><strong>A wrong result.</strong> <code>test_miniblock_bitpack</code> found it. Rust Lance picks each page's layout on its
+  own, so a column of 1024 threes followed by 1024 eights is two constant pages with different
+  values. nanolance planned a column from its first page and read every row as 3. pylance's own
+  writer produces the same shape. The column is now decoded page by page when its pages need plans
+  of their own (<code>test_pylance_compat.py::test_constant_pages_with_different_values</code>).</li>
+<li><strong>Format 2.1 was refused.</strong> The file footer holds the major version and then the minor, and
+  nanolance read them swapped. That was invisible while only 2.2 was accepted. Formats 2.1 and 2.2
+  now read (<code>test_pylance_written_shapes_read_back</code> covers both).</li>
+<li><strong>A fixed-width constant too wide to inline was refused.</strong> Its value is a one-buffer scalar.</li>
+</ul>
+<p>Bare file names now also work: <code>LanceFileReader("x.lance")</code> used to look for <code>data/x.lance</code>.</p>
+<p>What nanolance refuses, by round trips (each refused round trip is counted under its first reason):</p>
+<ul>
+<li><strong>Fixed-size lists of structs or of booleans</strong> (1,160). nanolance's schema mapping takes
+  fixed-size lists of numbers, decimals and temporal types.</li>
+<li><strong>Format 2.3</strong> (5 files). Format 2.0 is read since 2026-10-01: its 90 refusals are types
+  refused in every format (fixed-size lists of booleans, Arrow dictionaries, empty structs).</li>
+<li><strong>Several fields in one column</strong> (138 in the structural formats): packed structs
+  (<code>lance-encoding:packed</code>) and Lance's blob struct.</li>
+<li><strong>Arrow dictionary types</strong> (178). nanolance's schema mapping refuses the type rather than return
+  the values as another type.</li>
+<li><strong>Lance's blob layout</strong> for <code>lance-encoding:blob</code> binary columns (48 in the structural formats).
+  nanolance reads its own blob layout, not the one Lance writes.</li>
+<li><strong>Empty structs</strong> (48).</li>
+<li>A tail of layouts nanolance does not decode yet. Each is named in the report: some FullZip
+  fixed-size lists, a few RLE and dictionary-RLE mini-blocks whose runs span chunks, and page
+  layouts it does not recognize.</li>
+</ul>
 
 
 
@@ -807,44 +936,6 @@ CLI rows measure the command-line tool, not the encoder.</p>
       
         <footer class="md-footer">
   
-    
-      
-      <nav class="md-footer__inner md-grid" aria-label="Footer" >
-        
-          
-          <a href="../agents/" class="md-footer__link md-footer__link--prev" aria-label="Previous: AI agent integration">
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
-            </div>
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Previous
-              </span>
-              <div class="md-ellipsis">
-                AI agent integration
-              </div>
-            </div>
-          </a>
-        
-        
-          
-          <a href="../bench-write-read/" class="md-footer__link md-footer__link--next" aria-label="Next: Write/read vs Parquet &amp; Rust lance">
-            <div class="md-footer__title">
-              <span class="md-footer__direction">
-                Next
-              </span>
-              <div class="md-ellipsis">
-                Write/read vs Parquet & Rust lance
-              </div>
-            </div>
-            <div class="md-footer__button md-icon">
-              
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
-            </div>
-          </a>
-        
-      </nav>
     
   
   <div class="md-footer-meta md-typeset">
