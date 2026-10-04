@@ -406,7 +406,8 @@ bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, Ro
     nulls_of(lookup, 1, max_null, max_nan);
 
     // A page may hold a match where its bounds allow one. Its min may be a null (the page starts
-    // with nulls) or a NaN (sorted first when negative): no lower bound then.
+    // with nulls): no lower bound then. A NaN min (-NaN sorts first) needs no care -- filters
+    // order -NaN below every value too -- but is still treated as unbounded (conservative).
     std::vector<std::uint8_t> keep(pages, 0);
     std::vector<std::uint8_t> pass;
     const auto bound = [&](const expr::Predicate& q, std::size_t column, std::vector<std::uint8_t>& ok) {

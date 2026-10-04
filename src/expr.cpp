@@ -1065,8 +1065,21 @@ bool temporal_type(ArrowType t) {
     return t == NANOARROW_TYPE_DATE32 || t == NANOARROW_TYPE_DATE64 || t == NANOARROW_TYPE_TIMESTAMP;
 }
 
-/// A string literal compared with a date or timestamp column becomes a date / timestamp literal,
-/// as DataFusion coerces it.
+/// `d` rounded to the nearest float32 (out of range: +-inf), held as a double.
+double round_to_float32(double d) {
+    // Past the midpoint between FLT_MAX and 2^128, float32 rounding gives infinity.
+    if (std::isfinite(d) && std::fabs(d) >= 0x1.ffffffp127) {
+        return std::copysign(std::numeric_limits<double>::infinity(), d);
+    }
+    if (std::isfinite(d) && std::fabs(d) > std::numeric_limits<float>::max()) {
+        return std::copysign(static_cast<double>(std::numeric_limits<float>::max()), d);
+    }
+    return static_cast<float>(d);
+}
+
+/// As DataFusion coerces a comparison's literals to its column's type: a string literal compared
+/// with a date or timestamp column becomes a date / timestamp literal, and a number compared with
+/// a float32 column is rounded to float32 (so `x = 0.1` matches the float32 0.1).
 bool coerce(Node& n, std::string& error) {
     for (auto& a : n.args) {
         if (!coerce(*a, error)) {
@@ -1081,11 +1094,19 @@ bool coerce(Node& n, std::string& error) {
     }
     const Node* column = nullptr;
     for (const auto& a : n.args) {
-        if (a->op == Op::Column && temporal_type(a->column.type)) {
+        if (a->op == Op::Column && (temporal_type(a->column.type) || a->column.type == NANOARROW_TYPE_FLOAT)) {
             column = a.get();
         }
     }
     if (column == nullptr) {
+        return true;
+    }
+    if (column->column.type == NANOARROW_TYPE_FLOAT) {
+        for (auto& a : n.args) {
+            if (a->op == Op::Literal && a->literal.numeric()) {
+                a->literal = Value::real(round_to_float32(a->literal.as_double()));
+            }
+        }
         return true;
     }
     for (auto& a : n.args) {
@@ -1207,18 +1228,24 @@ Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowT
     }
 }
 
+/// Floats as Lance's filters order them (scan, BTree and Bitmap alike): IEEE total order with
+/// the zeros equal -- -NaN < -inf < ... < -0 = +0 < ... < +inf < +NaN.
+int float_way(double x, double y) {
+    const bool x_nan = std::isnan(x);
+    const bool y_nan = std::isnan(y);
+    if (!x_nan && !y_nan) {
+        return x < y ? -1 : (x > y ? 1 : 0);
+    }
+    const int rx = x_nan ? (std::signbit(x) ? -1 : 1) : 0;
+    const int ry = y_nan ? (std::signbit(y) ? -1 : 1) : 0;
+    return rx < ry ? -1 : (rx > ry ? 1 : 0);
+}
+
 /// -1, 0, 1, or nullopt when the two cannot be compared.
 std::optional<int> compare(const Value& a, const Value& b) {
     if (a.numeric() && b.numeric()) {
         if (a.kind == Kind::Double || b.kind == Kind::Double) {
-            // As DataFusion compares floats: NaN equals NaN and is greater than every other value;
-            // -0.0 equals 0.0.
-            const double x = a.as_double();
-            const double y = b.as_double();
-            if (std::isnan(x) || std::isnan(y)) {
-                return std::isnan(x) == std::isnan(y) ? 0 : (std::isnan(x) ? 1 : -1);
-            }
-            return x < y ? -1 : (x > y ? 1 : 0);
+            return float_way(a.as_double(), b.as_double());
         }
         if (a.kind == Kind::Int && b.kind == Kind::Int) {
             return a.i < b.i ? -1 : (a.i > b.i ? 1 : 0);
@@ -1984,13 +2011,6 @@ int three_way(T a, T b) {
     return a < b ? -1 : (b < a ? 1 : 0);
 }
 
-int double_way(double x, double y) {
-    if (std::isnan(x) || std::isnan(y)) {
-        return std::isnan(x) == std::isnan(y) ? 0 : (std::isnan(x) ? 1 : -1);
-    }
-    return three_way(x, y);
-}
-
 /// `ways[r]` = compare(column value r, literal) for the non-null rows of a numeric, temporal or
 /// string column -- false when the pair is not one this handles.
 bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit, const Value& lit, int64_t n,
@@ -2032,7 +2052,7 @@ bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit,
                     ways[r] = static_cast<std::int8_t>(x < 0 ? -1 : three_way(static_cast<std::uint64_t>(x), lit.u));
                 }
             } else if (lit.kind == Kind::Double) {
-                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(static_cast<double>(signed_at(r)), lit.d));
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(float_way(static_cast<double>(signed_at(r)), lit.d));
             } else {
                 return false;
             }
@@ -2048,7 +2068,7 @@ bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit,
                     ways[r] = static_cast<std::int8_t>(lit.i < 0 ? 1 : three_way(unsigned_at(r), static_cast<std::uint64_t>(lit.i)));
                 }
             } else if (lit.kind == Kind::Double) {
-                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(static_cast<double>(unsigned_at(r)), lit.d));
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(float_way(static_cast<double>(unsigned_at(r)), lit.d));
             } else {
                 return false;
             }
@@ -2061,10 +2081,10 @@ bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit,
             const double y = lit.as_double();
             if (type == NANOARROW_TYPE_FLOAT) {
                 const auto* f = reinterpret_cast<const float*>(data) + v.offset;
-                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(f[r], y));
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(float_way(f[r], y));
             } else {
                 const auto* d = reinterpret_cast<const double*>(data) + v.offset;
-                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(d[r], y));
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(float_way(d[r], y));
             }
             return true;
         }

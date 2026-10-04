@@ -307,3 +307,28 @@ def test_vectorized_filters_match_the_interpreter(tmp_path, flt):
         fast = flt.format(c=c, v=v, w=w)
         slow = flt.format(c=f"coalesce({c})", v=v, w=w)
         assert _ids(ds.to_table(filter=fast, columns=["id"])) == _ids(ds.to_table(filter=slow, columns=["id"])), fast
+
+
+# Floats as Lance's filters order them: -NaN < -inf < ... < -0 = +0 < ... < +inf < +NaN; and a
+# literal compared with a float32 column is first rounded to float32 (x = 0.1 matches 0.1f, 1e39
+# is +inf). Scan, BTREE and BITMAP each answer as pylance's scan does.
+@pytest.mark.parametrize("kind", [None, "BTREE", "BITMAP"])
+def test_float_order_and_float32_literals_match_pylance(lance, tmp_path, kind):
+    neg_nan = struct.unpack("<d", struct.pack("<Q", 0xFFF8000000000000))[0]
+    vals = [1.0, neg_nan, float("inf"), float("-inf"), 2.0, float("nan"), -0.0, 0.0, None, 0.1, 0.2,
+            3.4028234663852886e38, -1e-40]
+    path = str(tmp_path / "t.lance")
+    nl.write_dataset(pa.table({"id": pa.array(range(len(vals))), "d": pa.array(vals, pa.float64()),
+                               "f": pa.array(vals, pa.float32())}), path)
+    if kind:
+        for c in ("d", "f"):
+            nl.dataset(path).create_scalar_index(c, kind)
+    theirs = lance.dataset(path)
+    for c in ("d", "f"):
+        for flt in ["{c} > 0", "{c} < 5", "{c} <= 0", "{c} = 0", "{c} = -0.0", "{c} < 0", "{c} <> 0",
+                    "{c} IN (0, 2)", "{c} < -1e308", "{c} > 1e308", "{c} BETWEEN -1 AND 1", "{c} = 0.1",
+                    "{c} > 0.1", "{c} IN (0.1, 0.2)", "{c} BETWEEN 0.1 AND 0.2", "{c} >= 3.4028235e38",
+                    "{c} < 1e39", "{c} = 0.1000000001", "{c} IS NULL", "{c} < 0 OR {c} > 2"]:
+            flt = flt.format(c=c)
+            want = _ids(theirs.to_table(filter=flt, columns=["id"], use_scalar_index=False))
+            assert _ids(nl.dataset(path).to_table(filter=flt, columns=["id"])) == want, (kind, flt)
