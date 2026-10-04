@@ -7,10 +7,11 @@
 
 #include "lance_descriptors.hpp"
 
+#include <nanom/columnar_encode.hpp>
+
 #include "lance_minimal.pb.hpp"
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/bool_bitpack.hpp"
-#include "nanolance/byte_stream_split.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
 #include "nanolance/fsst.hpp"
 #include "nanolance/repdef.hpp"
@@ -2576,8 +2577,11 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 } else {
                     // Byte-transpose (mantissa/exponent bytes grouped) so the zstd frame compresses
                     // meaningfully, then frame it: bytes become [u64 raw size][zstd].
-                    bss::transpose(values.fixed_data() + off * fixed_bytes_per_value,
-                                   fixed_bytes_per_value, count, scratch);
+                    scratch.resize(fixed_bytes_per_value * count);
+                    (void)nanom::columnar::byte_stream_split_encode(
+                        std::as_bytes(std::span(values.fixed_data() + off * fixed_bytes_per_value,
+                                                fixed_bytes_per_value * count)),
+                        fixed_bytes_per_value, count, std::as_writable_bytes(std::span(scratch)));
                     if (!zstd_frame_buffer(scratch, compression_level, framed, error)) {
                         return false;
                     }

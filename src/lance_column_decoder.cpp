@@ -10,7 +10,6 @@
 
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/bool_bitpack.hpp"
-#include "nanolance/byte_stream_split.hpp"
 #include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fastlanes_bitpack.hpp"
@@ -20,9 +19,11 @@
 #include "nanolance/repdef.hpp"
 #include "nanolance/schema_mapper.hpp"
 
+#include <nanom/columnar.hpp>
 #include <zstd.h>
 
 #include <bit>
+#include <span>
 #include <cstring>
 #include <limits>
 #include <algorithm>
@@ -3054,7 +3055,9 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 }
                 const auto base = out.fixed.size();
                 out.fixed.resize(base + raw.size());
-                bss::untranspose(raw.data(), bytes_per_value, chunk_values, out.fixed.data() + base);
+                (void)nanom::columnar::byte_stream_split(
+                    std::as_bytes(std::span(raw)), bytes_per_value, chunk_values,
+                    std::as_writable_bytes(std::span(out.fixed.data() + base, raw.size())));
                 remaining -= chunk_values;
             }
             if (remaining != 0U) {

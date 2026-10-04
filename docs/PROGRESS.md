@@ -2512,6 +2512,32 @@ difference. 56/56 ctest and the Python suite (1,808 tests, pylance interop inclu
 
 **Speed.** Write speed is unchanged: 1.00-1.05x across those inputs.
 
+### LZ4 and byte-stream-split from nanom
+
+nanolance had its own copies of two kernels nanom already ships, and parquet2nanoarrow already uses
+them. Both copies are gone:
+- `src/lz4_block.cpp` keeps only Lance's envelope: the `[u32 size]` prefix, the decoded-size limit
+  and the 255x bound checked before allocating. The block is decoded by nanom's
+  `codec::lz4_block_decompress`.
+- `include/nanolance/byte_stream_split.hpp` is deleted. The writer and the reader call nanom's
+  `byte_stream_split_encode` and `byte_stream_split`.
+
+**Same answers.** The old and new LZ4 decoders were compiled side by side under ASan / UBSan:
+- 3,000 real blocks (pyarrow's `lz4_raw`, 0 B to 200 KB, random to highly repetitive) all decode
+  identically.
+- Of 300,000 mutants of them, none is accepted by one decoder and refused by the other, and none
+  decodes differently.
+- One hand-made test block ended in a match. The LZ4 format, the reference decoder and lz4_flex
+  (which Lance writes with) all require the last sequence to be literals only, and nanom refuses
+  such a block. The test now uses a valid block, and a new test checks the refusal.
+
+Float columns written with `--compress` (byte-stream-split + zstd, widths 4 and 8, with and without
+nulls) are byte-identical to `main`'s output in all three writer modes, and pylance reads them back
+equal.
+
+**Speed.** LZ4 decoding is 2.75x faster: 1.46 GB/s instead of 0.53 GB/s on one core, over the
+same 3,000 blocks.
+
 ### Deliberate deviations (not defects)
 
 - **The nullable opt-out was not needed** — simpler than planned.
