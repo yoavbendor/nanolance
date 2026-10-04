@@ -276,8 +276,12 @@ still passes when the rows come back right but slowly. Don't time it (CI machine
   `tools/real_lance_check.py` reads Lance datasets published on the Hugging Face Hub with both
   engines and compares them (`docs/REAL_DATASETS.md`); run it before calling a read path done.
 - **The matrix is checked in CI** as ratios to Rust Lance (`tools/bench_compare.py` against
-  `bench/results/matrix-quick.json`). A change that moves performance on purpose regenerates it:
-  `python tools/bench_matrix.py --quick --runs 3 --out bench/results/matrix-quick.json`.
+  `bench/results/ci/`, one baseline per runner CPU: the ubuntu-latest pool mixes AMD and Intel, and
+  the ratios differ between them). A change that moves performance on purpose re-records them: run
+  the linux-bench workflow by hand (`matrix_runs` 7) and commit the `MATRIX_JSON` line of its log as
+  `bench/results/ci/<cpu>-<cores>c.json`, once per CPU the runs land on. A run on a CPU with no
+  baseline still checks correctness and per-type falls; its means are reported, not enforced.
+  `bench/results/matrix-quick.json` stays the dev-machine baseline for local comparisons.
 
 ## 7. When adding a new Lance encoding (how this codebase does it)
 
