@@ -1676,6 +1676,50 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#lz4-and-byte-stream-split-from-nanom" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LZ4 and byte-stream-split from nanom
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fastlanes-bit-packing-in-nanom" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        FastLanes bit packing in nanom
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fsst-in-nanom" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        FSST in nanom
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#validity-bitmaps-through-nanoms-bitmap-kernels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Validity bitmaps through nanom's bitmap kernels
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#deliberate-deviations-not-defects" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2960,6 +3004,50 @@
     <span class="md-ellipsis">
       
         Page descriptors written through nanom
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#lz4-and-byte-stream-split-from-nanom" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LZ4 and byte-stream-split from nanom
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fastlanes-bit-packing-in-nanom" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        FastLanes bit packing in nanom
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fsst-in-nanom" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        FSST in nanom
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#validity-bitmaps-through-nanoms-bitmap-kernels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Validity bitmaps through nanom's bitmap kernels
       
     </span>
   </a>
@@ -5917,6 +6005,74 @@ The outputs cover:
 <p>Changing one bit width in one builder changes 2 of those files, so the comparison does catch a
 difference. 56/56 ctest and the Python suite (1,808 tests, pylance interop included) pass.</p>
 <p><strong>Speed.</strong> Write speed is unchanged: 1.00-1.05x across those inputs.</p>
+<h3 id="lz4-and-byte-stream-split-from-nanom">LZ4 and byte-stream-split from nanom<a class="headerlink" href="#lz4-and-byte-stream-split-from-nanom" title="Permanent link">&para;</a></h3>
+<p>nanolance had its own copies of two kernels nanom already ships, and parquet2nanoarrow already uses
+them. Both copies are gone:
+- <code>src/lz4_block.cpp</code> keeps only Lance's envelope: the <code>[u32 size]</code> prefix, the decoded-size limit
+  and the 255x bound checked before allocating. The block is decoded by nanom's
+  <code>codec::lz4_block_decompress</code>.
+- <code>include/nanolance/byte_stream_split.hpp</code> is deleted. The writer and the reader call nanom's
+  <code>byte_stream_split_encode</code> and <code>byte_stream_split</code>.</p>
+<p><strong>Same answers.</strong> The old and new LZ4 decoders were compiled side by side under ASan / UBSan:
+- 3,000 real blocks (pyarrow's <code>lz4_raw</code>, 0 B to 200 KB, random to highly repetitive) all decode
+  identically.
+- Of 300,000 mutants of them, none is accepted by one decoder and refused by the other, and none
+  decodes differently.
+- One hand-made test block ended in a match. The LZ4 format, the reference decoder and lz4_flex
+  (which Lance writes with) all require the last sequence to be literals only, and nanom refuses
+  such a block. The test now uses a valid block, and a new test checks the refusal.</p>
+<p>Float columns written with <code>--compress</code> (byte-stream-split + zstd, widths 4 and 8, with and without
+nulls) are byte-identical to <code>main</code>'s output in all three writer modes, and pylance reads them back
+equal.</p>
+<p><strong>Speed.</strong> LZ4 decoding is 2.75x faster: 1.46 GB/s instead of 0.53 GB/s on one core, over the
+same 3,000 blocks.</p>
+<h3 id="fastlanes-bit-packing-in-nanom">FastLanes bit packing in nanom<a class="headerlink" href="#fastlanes-bit-packing-in-nanom" title="Permanent link">&para;</a></h3>
+<p><code>include/nanolance/fastlanes_bitpack.hpp</code> moved into nanom as <code>nanom/fastlanes.hpp</code> (unpack) and
+<code>nanom/columnar_encode.hpp</code> (pack), with:
+- a bit-by-bit reference of the layout checked against both kernels for every word type and width;
+- golden bytes from this kernel, which pylance reads;
+- fuzzing of the unpacker.</p>
+<p>The writer and both readers (2.1+ and 2.0) call nanom's <code>_unchecked</code> kernels at the same places as
+before: each call site already validates the width and the buffer sizes.</p>
+<p>Data files written from integer, nullable, boolean, dictionary, list and all-zero columns are
+byte-identical to <code>main</code>'s in all three writer modes, and pylance reads them back equal to the
+source. Reading them is at parity: 13.6-14.4 ms best of 15, old and new interleaved on one core.</p>
+<h3 id="fsst-in-nanom">FSST in nanom<a class="headerlink" href="#fsst-in-nanom" title="Permanent link">&para;</a></h3>
+<p>The FSST codec moved into nanom: <code>nanom/fsst.hpp</code> reads the table and decodes,
+<code>nanom/fsst_encode.hpp</code> trains, compresses and serializes. <code>include/nanolance/fsst.hpp</code> and
+<code>src/fsst.cpp</code> are now an adapter that keeps nanolance's calling convention (byte vectors, error
+strings with the size, symbol or code in them) over nanom's span API, so every caller, test and fuzzer
+is unchanged.</p>
+<p><strong>Same answers.</strong> The old and new codecs were compiled side by side under ASan / UBSan:
+- 400 corpora (random bytes, URL-like words, small alphabets, tiny values) train to byte-identical
+  tables;
+- their 586,694 values compress to identical bytes and round-trip;
+- across 1.76 million mutated tables and code streams, accept / refuse, outputs and error messages
+  are identical.</p>
+<p>URL, text, nullable and list-of-string columns are byte-identical to <code>main</code>'s in all three writer
+modes, and pylance reads them back equal.</p>
+<p><strong>Speed.</strong> Same machine, old and new interleaved:
+- reading those columns: parity (45.3-48.6 ms best of 9 for both);
+- writing them (training included): parity (229-241 ms);
+- the codec alone: decode and train at parity, compress 8% faster.</p>
+<h3 id="validity-bitmaps-through-nanoms-bitmap-kernels">Validity bitmaps through nanom's bitmap kernels<a class="headerlink" href="#validity-bitmaps-through-nanoms-bitmap-kernels" title="Permanent link">&para;</a></h3>
+<p>Two decoder helpers built validity bitmaps one bit at a time: <code>append_validity_bits</code>, which joins
+pages' and nested leaves' validity, and <code>append_item_validity</code>, for fixed_size_list element validity.
+Both now use nanom's word-at-a-time <code>copy_bits</code>, <code>set_bits</code> and <code>count_bits</code>, the kernels
+parquet2nanoarrow reads with. The second lost a source-bit argument that every caller passed as 0.</p>
+<p>The rest of the decoder was surveyed against nanom's value kernels, and nothing else moved:
+- <strong>Levels to validity:</strong> stays here. Lance's convention (level 0 = valid) differs from Parquet's.
+  The portable kernel tried in nanom was 2.4-5x slower than this SSE2 compare / movemask, and no
+  other nanom user needs it: the Parquet reader expands levels straight from the RLE stream.
+- <strong>UTF-8:</strong> nanolance does not validate strings, so there was nothing to replace. Adding validation
+  would be a behaviour change, not a deduplication.
+- <strong>Null spreading:</strong> does not apply. Lance stores a value slot for every row, null or not.</p>
+<p><strong>Same answers.</strong> Old and new helpers were compiled side by side under ASan / UBSan: 200,000 random
+append sequences produced identical bits, bitmap sizes and null counts. The sequences mixed absent,
+all-valid and mixed sources of 0-69 bits at every offset, with junk past the end of each source.</p>
+<p><strong>Faster.</strong> A pylance-written dataset (400,000 rows: nullable int64 and double, a fixed_size_list
+with null elements, nullable lists) reads in 16.8-17.8 ms instead of 23.0-24.5 ms (best of 15, old
+and new interleaved on one core), 1.35x. It reads back equal to the source.</p>
 <h3 id="deliberate-deviations-not-defects">Deliberate deviations (not defects)<a class="headerlink" href="#deliberate-deviations-not-defects" title="Permanent link">&para;</a></h3>
 <ul>
 <li><strong>The nullable opt-out was not needed</strong> — simpler than planned.</li>
