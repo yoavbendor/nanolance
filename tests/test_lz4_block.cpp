@@ -134,8 +134,21 @@ void a_run_is_spelled_as_an_overlapping_match() {
     // because a bulk copy would read bytes the same loop is still writing.
     std::vector<std::uint8_t> out;
     std::string error;
-    require(lz4::decompress_sized({16, 0, 0, 0, 0x1B, 'z', 0x01, 0x00}, out, error), error);
-    require(out == std::vector<std::uint8_t>(16, 'z'), "offset-1 match expands to a run");
+    // The block ends with a literal-only sequence ('y'), as the format requires of every block.
+    require(lz4::decompress_sized({17, 0, 0, 0, 0x1B, 'z', 0x01, 0x00, 0x10, 'y'}, out, error), error);
+    std::vector<std::uint8_t> expect(16, 'z');
+    expect.push_back('y');
+    require(out == expect, "offset-1 match expands to a run");
+}
+
+void a_block_must_end_with_literals() {
+    // LZ4's last sequence carries literals only (the reference decoder and lz4_flex, which Lance
+    // writes with, both end every block that way), so a block whose last sequence is a match is
+    // refused rather than accepted.
+    std::vector<std::uint8_t> out;
+    std::string error;
+    require(!lz4::decompress_sized({16, 0, 0, 0, 0x1B, 'z', 0x01, 0x00}, out, error),
+            "a block ending in a match is refused");
 }
 
 }  // namespace
@@ -145,6 +158,7 @@ int main() {
     the_output_buffer_is_replaced_not_appended();
     malformed_blocks_are_refused();
     a_run_is_spelled_as_an_overlapping_match();
+    a_block_must_end_with_literals();
     std::cout << "lz4 block tests passed\n";
     return 0;
 }

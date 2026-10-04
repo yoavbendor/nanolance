@@ -46,7 +46,12 @@
 
 #pragma once
 
-#include <array>
+// The codec itself is nanom's (nanom/fsst.hpp, nanom/fsst_encode.hpp, namespace nanom::codec::fsst):
+// the table format, the decoder and the encoder described above. This header keeps nanolance's
+// calling convention -- byte vectors and an error string -- over it.
+#include <nanom/fsst.hpp>
+#include <nanom/fsst_encode.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -55,29 +60,16 @@
 
 namespace nano_lance::fsst {
 
-/// Exact serialized size of a Lance FSST symbol table. Not a maximum: the buffer is fixed-size and
-/// zero-padded past `symbol_count`, and a table of any other length is malformed.
-inline constexpr std::size_t kSymbolTableBytes = 8U + 256U * 8U + 256U;
+using ::nanom::codec::fsst::kEscape;
+using ::nanom::codec::fsst::kMaxSymbolLength;
+using ::nanom::codec::fsst::kSymbolTableBytes;
 
-/// Longest symbol FSST can define, and therefore the most bytes one input code can expand to.
-inline constexpr std::size_t kMaxSymbolLength = 8U;
-
-/// The code that escapes the following byte as a literal.
-inline constexpr std::uint8_t kEscape = 255U;
-
-struct SymbolTable {
-    /// `encoder_switch` was 0: the values are stored verbatim and must be copied, not decoded.
-    bool passthrough = true;
-    std::uint32_t symbol_count = 0;
-    /// Symbol bytes in order. Only the first `lengths[i]` bytes of entry `i` are meaningful.
-    std::array<std::array<std::uint8_t, kMaxSymbolLength>, 256> symbols{};
-    /// Length of each symbol, validated to be 1..=8 for every declared symbol.
-    std::array<std::uint8_t, 256> lengths{};
-};
+using SymbolTable = ::nanom::codec::fsst::symbol_table;
+using Encoder = ::nanom::codec::fsst::encoder;
 
 /// Parse the `Fsst.symbol_table` bytes from the page descriptor. Returns false with `error` set if
 /// the buffer is not exactly `kSymbolTableBytes` long, carries the wrong magic, or declares a symbol
-/// length outside 1..=8.
+/// length outside 1..=8; `out` is then left untouched.
 bool parse_symbol_table(const std::vector<std::uint8_t>& bytes, SymbolTable& out, std::string& error);
 
 /// Append the decompression of `[data, data + size)` -- one value -- to `out`. `table.passthrough`
@@ -93,28 +85,6 @@ bool decompress_value(const SymbolTable& table, const std::uint8_t* data, std::s
 bool decode_checked(const SymbolTable& table, const std::uint8_t* data, std::size_t size, std::uint8_t*& dst,
                     std::string& error);
 
-/// A trained FSST table, ready to compress with. Symbol `i` is code `i`; code 255 is the escape.
-struct Encoder {
-    struct Slot {
-        std::uint64_t value = 0;  // the symbol's bytes, little-endian, zero above `length`
-        std::uint8_t length = 0;  // 0 = empty slot
-        std::uint8_t code = 0;
-    };
-    static constexpr std::uint16_t kNone = 0xFFFFU;
-
-    std::uint32_t symbol_count = 0;
-    std::array<std::uint64_t, 255> symbols{};
-    std::array<std::uint8_t, 255> lengths{};
-    /// Lookups: one-byte symbols by byte, two-byte ones by their (little-endian) u16, longer ones
-    /// in a 1024-slot table hashed on their first three bytes (one symbol per slot).
-    std::array<std::uint16_t, 256> byte_codes{};
-    std::vector<std::uint16_t> short_codes;
-    std::array<Slot, 1024> long_codes{};
-    /// For compression, by the next two bytes: (length << 8) | code of the best symbol of at most two
-    /// bytes -- the two-byte one, else the one-byte one, else the escape (length 1). Built by train().
-    std::vector<std::uint16_t> short_or_byte;
-};
-
 /// Train a table on `values` (a sample of them, if they are large). Returns false when no symbol is
 /// worth having -- empty input, say -- and the caller should store the values plain.
 bool train(const std::vector<std::pair<const std::uint8_t*, std::size_t>>& values, Encoder& out);
@@ -125,7 +95,12 @@ void compress_value(const Encoder& encoder, const std::uint8_t* data, std::size_
 
 /// `compress_value` into raw memory: writes at most 2 * size bytes at `dst` (every byte escaped)
 /// and returns how many it wrote.
-std::size_t compress_into(const Encoder& encoder, const std::uint8_t* data, std::size_t size, std::uint8_t* dst);
+inline std::size_t compress_into(const Encoder& encoder, const std::uint8_t* data, std::size_t size,
+                                 std::uint8_t* dst) {
+    return ::nanom::codec::fsst::compress_unchecked(
+        encoder, std::span<const std::byte>(reinterpret_cast<const std::byte*>(data), size),
+        reinterpret_cast<std::byte*>(dst));
+}
 
 /// The `kSymbolTableBytes` serialization `parse_symbol_table` (and Lance) reads, encoder switch on.
 std::vector<std::uint8_t> serialize(const Encoder& encoder);

@@ -2512,6 +2512,94 @@ difference. 56/56 ctest and the Python suite (1,808 tests, pylance interop inclu
 
 **Speed.** Write speed is unchanged: 1.00-1.05x across those inputs.
 
+### LZ4 and byte-stream-split from nanom
+
+nanolance had its own copies of two kernels nanom already ships, and parquet2nanoarrow already uses
+them. Both copies are gone:
+- `src/lz4_block.cpp` keeps only Lance's envelope: the `[u32 size]` prefix, the decoded-size limit
+  and the 255x bound checked before allocating. The block is decoded by nanom's
+  `codec::lz4_block_decompress`.
+- `include/nanolance/byte_stream_split.hpp` is deleted. The writer and the reader call nanom's
+  `byte_stream_split_encode` and `byte_stream_split`.
+
+**Same answers.** The old and new LZ4 decoders were compiled side by side under ASan / UBSan:
+- 3,000 real blocks (pyarrow's `lz4_raw`, 0 B to 200 KB, random to highly repetitive) all decode
+  identically.
+- Of 300,000 mutants of them, none is accepted by one decoder and refused by the other, and none
+  decodes differently.
+- One hand-made test block ended in a match. The LZ4 format, the reference decoder and lz4_flex
+  (which Lance writes with) all require the last sequence to be literals only, and nanom refuses
+  such a block. The test now uses a valid block, and a new test checks the refusal.
+
+Float columns written with `--compress` (byte-stream-split + zstd, widths 4 and 8, with and without
+nulls) are byte-identical to `main`'s output in all three writer modes, and pylance reads them back
+equal.
+
+**Speed.** LZ4 decoding is 2.75x faster: 1.46 GB/s instead of 0.53 GB/s on one core, over the
+same 3,000 blocks.
+
+### FastLanes bit packing in nanom
+
+`include/nanolance/fastlanes_bitpack.hpp` moved into nanom as `nanom/fastlanes.hpp` (unpack) and
+`nanom/columnar_encode.hpp` (pack), with:
+- a bit-by-bit reference of the layout checked against both kernels for every word type and width;
+- golden bytes from this kernel, which pylance reads;
+- fuzzing of the unpacker.
+
+The writer and both readers (2.1+ and 2.0) call nanom's `_unchecked` kernels at the same places as
+before: each call site already validates the width and the buffer sizes.
+
+Data files written from integer, nullable, boolean, dictionary, list and all-zero columns are
+byte-identical to `main`'s in all three writer modes, and pylance reads them back equal to the
+source. Reading them is at parity: 13.6-14.4 ms best of 15, old and new interleaved on one core.
+
+### FSST in nanom
+
+The FSST codec moved into nanom: `nanom/fsst.hpp` reads the table and decodes,
+`nanom/fsst_encode.hpp` trains, compresses and serializes. `include/nanolance/fsst.hpp` and
+`src/fsst.cpp` are now an adapter that keeps nanolance's calling convention (byte vectors, error
+strings with the size, symbol or code in them) over nanom's span API, so every caller, test and fuzzer
+is unchanged.
+
+**Same answers.** The old and new codecs were compiled side by side under ASan / UBSan:
+- 400 corpora (random bytes, URL-like words, small alphabets, tiny values) train to byte-identical
+  tables;
+- their 586,694 values compress to identical bytes and round-trip;
+- across 1.76 million mutated tables and code streams, accept / refuse, outputs and error messages
+  are identical.
+
+URL, text, nullable and list-of-string columns are byte-identical to `main`'s in all three writer
+modes, and pylance reads them back equal.
+
+**Speed.** Same machine, old and new interleaved:
+- reading those columns: parity (45.3-48.6 ms best of 9 for both);
+- writing them (training included): parity (229-241 ms);
+- the codec alone: decode and train at parity, compress 8% faster.
+
+### Validity bitmaps through nanom's bitmap kernels
+
+Two decoder helpers built validity bitmaps one bit at a time: `append_validity_bits`, which joins
+pages' and nested leaves' validity, and `append_item_validity`, for fixed_size_list element validity.
+Both now use nanom's word-at-a-time `copy_bits`, `set_bits` and `count_bits`, the kernels
+parquet2nanoarrow reads with. The second lost a source-bit argument that every caller passed as 0.
+
+The rest of the decoder was surveyed against nanom's value kernels, and nothing else moved:
+- **Levels to validity:** stays here. Lance's convention (level 0 = valid) differs from Parquet's.
+  The portable kernel tried in nanom was 2.4-5x slower than this SSE2 compare / movemask, and no
+  other nanom user needs it: the Parquet reader expands levels straight from the RLE stream.
+- **UTF-8:** nanolance does not validate strings, so there was nothing to replace. Adding validation
+  would be a behaviour change, not a deduplication.
+- **Null spreading:** does not apply. Lance stores a value slot for every row, null or not.
+
+**Same answers.** Old and new helpers were compiled side by side under ASan / UBSan: 200,000 random
+append sequences produced identical bits, bitmap sizes and null counts. The sequences mixed absent,
+all-valid and mixed sources of 0-69 bits at every offset, with junk past the end of each source.
+
+**Faster.** A pylance-written dataset (400,000 rows: nullable int64 and double, a fixed_size_list
+with null elements, nullable lists) reads in 16.8-17.8 ms instead of 23.0-24.5 ms (best of 15, old
+and new interleaved on one core), 1.35x. It reads back equal to the source.
+
+
 ### Deliberate deviations (not defects)
 
 - **The nullable opt-out was not needed** — simpler than planned.
