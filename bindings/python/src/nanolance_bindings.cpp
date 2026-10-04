@@ -1051,6 +1051,30 @@ NB_MODULE(_nanolance, m) {
         run_op([&](std::string& e) { return nano_lance::dataset_nearest(path, q, result, e); });
         return std::make_tuple(result.row_ids, result.distances, result.plan);
     });
+    m.def("_ds_create_vector_index", [](const std::filesystem::path& path, const std::string& column,
+                                        const std::string& type, const std::string& name, const std::string& metric,
+                                        bool replace, std::optional<std::uint32_t> num_partitions,
+                                        std::optional<std::uint32_t> target_partition_size,
+                                        std::uint32_t num_sub_vectors, std::uint32_t num_bits, std::uint32_t max_iters,
+                                        std::uint32_t sample_rate, std::optional<std::uint64_t> seed) {
+        nano_lance::VectorIndexOptions o;
+        o.type = type;
+        o.name = name;
+        if (!nano_lance::parse_vector_metric(metric, o.metric)) {
+            throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot)").c_str());
+        }
+        o.replace = replace;
+        o.num_partitions = num_partitions;
+        o.target_partition_size = target_partition_size;
+        o.num_sub_vectors = num_sub_vectors;
+        o.num_bits = num_bits;
+        o.max_iters = max_iters;
+        o.sample_rate = sample_rate;
+        o.seed = seed;
+        std::uint64_t version = 0;
+        run_op([&](std::string& e) { return nano_lance::dataset_create_vector_index(path, column, o, version, e); });
+        return version;
+    });
     m.def("_ds_drop_columns", [](const std::filesystem::path& path, const std::vector<std::string>& columns) {
         std::uint64_t version = 0;
         run_op([&](std::string& e) { return nano_lance::dataset_drop_columns(path, columns, version, e); });

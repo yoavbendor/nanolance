@@ -65,11 +65,17 @@ def indexed(lance, tmp_path_factory):
 def _same(ref, got, four_bit=False):
     rd, gd = ref.column("_distance").to_numpy(), got.column("_distance").to_numpy()
     assert len(rd) == len(gd)
-    assert np.allclose(rd, gd, rtol=1e-4, atol=1e-4), (rd[:5], gd[:5])
     if not four_bit:
+        assert np.allclose(rd, gd, rtol=1e-4, atol=1e-4), (rd[:5], gd[:5])
         assert ref.column("id").to_pylist() == got.column("id").to_pylist()
-    else:
-        assert np.allclose(np.sort(rd), np.sort(gd), rtol=1e-4, atol=1e-4)
+        return
+    # 4-bit PQ: which of equally (quantized) distant rows make the cut is arbitrary, so the rows
+    # may differ there -- and, re-scored exactly (refine), below it. The rows both return agree.
+    ref_d = dict(zip(ref.column("id").to_pylist(), rd))
+    got_d = dict(zip(got.column("id").to_pylist(), gd))
+    shared = set(ref_d) & set(got_d)
+    assert len(shared) >= 0.8 * len(ref_d), (sorted(ref_d), sorted(got_d))
+    assert all(abs(ref_d[i] - got_d[i]) <= 1e-4 + 1e-4 * abs(ref_d[i]) for i in shared)
 
 
 QUERIES = [
@@ -193,3 +199,103 @@ def test_errors_as_pylance_raises_them(lance, indexed, nearest, error):
         lance.dataset(path).to_table(nearest=nearest)
     with pytest.raises(kind, match=message):
         nl.dataset(path).to_table(nearest=nearest)
+
+
+# ── indexes nanolance builds ────────────────────────────────────────────────────────────────────
+
+def _clustered(n=6000, seed=3):
+    rng = np.random.default_rng(seed)
+    centers = rng.standard_normal((40, DIM)) * 3
+    return (centers[rng.integers(0, 40, n)] + rng.standard_normal((n, DIM))).astype(np.float32)
+
+
+def _exact_ids(v, q, metric, k):
+    if metric == "l2":
+        d = ((v - q) ** 2).sum(1)
+    elif metric == "cosine":
+        d = 1 - v @ q / (np.linalg.norm(v, axis=1) * np.linalg.norm(q))
+    else:
+        d = 1 - v @ q
+    return set(np.argsort(d, kind="stable")[:k].tolist())
+
+
+@pytest.mark.parametrize("kind,metric,kw,min_recall", [
+    ("IVF_FLAT", "l2", {}, 0.99), ("IVF_FLAT", "cosine", {}, 0.99), ("IVF_FLAT", "dot", {}, 0.99),
+    ("IVF_PQ", "l2", {"num_sub_vectors": 8}, 0.3), ("IVF_PQ", "cosine", {"num_sub_vectors": 8}, 0.3),
+    ("IVF_PQ", "dot", {"num_sub_vectors": 8}, 0.2), ("IVF_PQ", "l2", {"num_sub_vectors": 8, "num_bits": 4}, 0.08),
+])
+def test_pylance_searches_nanolances_index(lance, tmp_path, kind, metric, kw, min_recall):
+    v = _clustered()
+    path = str(tmp_path / "t.lance")
+    nl.write_dataset(_table(v, nulls=False), path, max_rows_per_file=2500)
+    nl.dataset(path).create_index("vec", kind, metric=metric, num_partitions=12, **kw)
+    ds = lance.dataset(path)
+    assert ds.list_indices()[0]["type"] == kind
+    stats = ds.stats.index_stats("vec_idx")
+    assert stats["index_type"] == kind and stats["num_indexed_rows"] == len(v) and stats["num_unindexed_rows"] == 0
+    rng = np.random.default_rng(1)
+    recall = []
+    for qi in rng.integers(0, len(v), 15):
+        q = v[qi] + rng.standard_normal(DIM).astype(np.float32) * 0.2
+        for extra in ({"k": 10}, {"k": 10, "nprobes": 12}, {"k": 25, "refine_factor": 2}):
+            nearest = {"column": "vec", "q": q, **extra}
+            ref = ds.to_table(nearest=nearest, columns=["id"])
+            got = nl.dataset(path).to_table(nearest=nearest, columns=["id"])
+            _same(ref, got, four_bit=kw.get("num_bits") == 4)
+        all_partitions = ds.to_table(nearest={"column": "vec", "q": q, "k": 10, "nprobes": 12}, columns=["id"])
+        recall.append(len(set(all_partitions.column("id").to_pylist()) & _exact_ids(v, q, metric, 10)) / 10)
+    assert np.mean(recall) >= min_recall, np.mean(recall)
+
+
+def test_build_defaults_and_maintenance(lance, tmp_path):
+    v = _clustered(9000)
+    path = str(tmp_path / "t.lance")
+    nl.write_dataset(_table(v, nulls=True), path)
+    nl.dataset(path).create_index("vec", "IVF_FLAT")  # 9000 / 4096 rows a partition: 2 partitions
+    ds = lance.dataset(path)
+    assert ds.stats.index_stats("vec_idx")["indices"][0]["num_partitions"] == 2
+    nulls = sum(1 for i in range(len(v)) if i % 97 == 5)
+    assert ds.stats.index_stats("vec_idx")["num_indexed_rows"] == len(v)  # pylance counts the fragments' rows
+    got = nl.dataset(path).to_table(nearest={"column": "vec", "q": v[1], "k": len(v)}, columns=["id"])
+    assert got.num_rows == len(v) - nulls
+    # Replaced, named, then appended to and optimized by pylance.
+    with pytest.raises(RuntimeError, match="already exists"):
+        nl.dataset(path).create_index("vec", "IVF_PQ", num_partitions=4, num_sub_vectors=4)
+    nl.dataset(path).create_index("vec", "IVF_PQ", num_partitions=4, num_sub_vectors=4, replace=True)
+    assert [i["type"] for i in lance.dataset(path).list_indices()] == ["IVF_PQ"]
+    nl.dataset(path).create_index("vec", "IVF_FLAT", name="flat_idx", num_partitions=3)
+    assert sorted(i["name"] for i in lance.dataset(path).list_indices()) == ["flat_idx", "vec_idx"]
+    nl.dataset(path).drop_index("flat_idx")
+    extra = _clustered(400, seed=8)
+    nl.write_dataset(_table(extra, start=len(v), nulls=False), path, mode="append")
+    q = extra[7]
+    for ds in (lance.dataset(path),):
+        ds.optimize.optimize_indices()
+    ds = lance.dataset(path)
+    assert ds.stats.index_stats("vec_idx")["num_unindexed_rows"] == 0
+    nearest = {"column": "vec", "q": q, "k": 10}
+    _same(ds.to_table(nearest=nearest, columns=["id"]), nl.dataset(path).to_table(nearest=nearest, columns=["id"]))
+    assert nl.dataset(path).to_table(nearest=nearest, columns=["id"]).column("id")[0].as_py() == len(v) + 7
+
+
+@pytest.mark.parametrize("n,kw,error", [
+    (1000, {"index_type": "IVF_PQ", "num_partitions": 4}, (ValueError, "num_sub_vectors are required")),
+    (1000, {"index_type": "IVF_PQ", "num_partitions": 4, "num_sub_vectors": 5},
+     (ValueError, r"dimension \(16\) must be divisible by num_sub_vectors \(5\)")),
+    (100, {"index_type": "IVF_FLAT", "num_partitions": 200}, (RuntimeError, "KMeans cannot train 200 centroids")),
+    (100, {"index_type": "IVF_PQ", "num_partitions": 2, "num_sub_vectors": 4},
+     (RuntimeError, "Not enough rows to train PQ")),
+    (1000, {"index_type": "IVF_PQ", "num_partitions": 4, "num_sub_vectors": 4, "num_bits": 3},
+     (RuntimeError, "num_bits 3 not supported")),
+    (1000, {"index_type": "IVF_XYZ", "num_partitions": 4}, (NotImplementedError, "index types supported")),
+])
+def test_build_errors_as_pylance_raises_them(lance, tmp_path, n, kw, error):
+    kind, message = error
+    for mod in (lance, nl):
+        path = str(tmp_path / f"{mod.__name__}.lance")
+        shutil.rmtree(path, ignore_errors=True)
+        lance.write_dataset(_table(_vectors(n), nulls=False), path)
+        with pytest.raises(kind, match=message):
+            mod.dataset(path).create_index("vec", **kw)
+    with pytest.raises(TypeError, match="Vector column id must be"):
+        nl.dataset(path).create_index("id", "IVF_FLAT", num_partitions=2)

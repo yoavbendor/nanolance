@@ -10,6 +10,7 @@ nothing is silently ignored when ignoring it would change a result.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from datetime import datetime
 from pathlib import Path
@@ -579,6 +580,64 @@ class LanceDataset:
         self._refresh_latest()
         return self
 
+    _VECTOR_INDEX_TYPES = ["IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ", "IVF_RQ"]
+
+    def create_index(self, column, index_type: str, name: Optional[str] = None, metric: str = "L2",
+                     replace: bool = False, num_partitions: Optional[int] = None, ivf_centroids=None,
+                     pq_codebook=None, num_sub_vectors: Optional[int] = None, accelerator=None,
+                     index_cache_size: Optional[int] = None, shuffle_partition_batches: Optional[int] = None,
+                     shuffle_partition_concurrency: Optional[int] = None, ivf_centroids_file=None,
+                     precomputed_partition_dataset=None, storage_options=None, filter_nan: bool = True,
+                     train: bool = True, fragment_ids=None, index_uuid=None, *,
+                     target_partition_size: Optional[int] = None, **kwargs) -> "LanceDataset":
+        """Build an index on `column`, in Lance's format. IVF_FLAT and IVF_PQ vector indexes (pylance
+        and LanceDB search them as their own); scalar index types go to create_scalar_index."""
+        kind = str(index_type).upper()
+        if isinstance(column, (list, tuple)):
+            if len(column) != 1:
+                raise unsupported("an index over more than one column")
+            column = column[0]
+        if not kind.startswith("IVF") and kind not in ("VECTOR",):
+            return self.create_scalar_index(column, kind, name, replace=replace, **kwargs)
+        if kind not in self._VECTOR_INDEX_TYPES:
+            raise NotImplementedError(f"Only {self._VECTOR_INDEX_TYPES} index types supported. Got {index_type}")
+        if kind not in ("IVF_FLAT", "IVF_PQ"):
+            raise unsupported(f"{kind} indexes (IVF_FLAT and IVF_PQ are supported)")
+        for option, value in (("ivf_centroids", ivf_centroids), ("pq_codebook", pq_codebook),
+                              ("ivf_centroids_file", ivf_centroids_file), ("accelerator", accelerator),
+                              ("precomputed_partition_dataset", precomputed_partition_dataset),
+                              ("fragment_ids", fragment_ids), ("index_uuid", index_uuid)):
+            if value is not None:
+                raise unsupported(f"create_index option {option}")
+        if not train:
+            raise unsupported("create_index(train=False)")
+        if kind == "IVF_PQ" and num_sub_vectors is None:
+            raise ValueError("num_partitions and num_sub_vectors are required for IVF_PQ")
+        num_bits = int(kwargs.pop("num_bits", 8))
+        max_iters = int(kwargs.pop("max_iters", 50))
+        sample_rate = int(kwargs.pop("sample_rate", 256))
+        seed = kwargs.pop("seed", None)
+        for ignored in ("one_pass_ivfpq", "skip_transpose", "streaming_sample_rate", "streaming_coreset_rate",
+                        "streaming_refine_passes", "progress", "kmeans_redos"):
+            kwargs.pop(ignored, None)
+        if kwargs:
+            raise unsupported(f"create_index options {sorted(kwargs)}")
+        field = next((f for f in self.schema if f.name == str(column)), None)
+        if field is not None:
+            storage = getattr(field.type, "storage_type", field.type)
+            if not pa.types.is_fixed_size_list(storage):
+                raise TypeError(f"Vector column {column} must be FixedSizeListArray 1-dimensional "
+                                f"FixedShapeTensorArray, got {field.type}")
+        with _lance_errors():
+            _nanolance._ds_create_vector_index(
+                self._uri, str(column), kind, name or "", str(metric).lower(), bool(replace),
+                None if num_partitions is None else int(num_partitions),
+                None if target_partition_size is None else int(target_partition_size),
+                0 if num_sub_vectors is None else int(num_sub_vectors), num_bits, max_iters, sample_rate,
+                None if seed is None else int(seed))
+        self._refresh_latest()
+        return self
+
     def drop_index(self, name: str) -> None:
         with native():
             _nanolance._ds_drop_index(self._uri, str(name))
@@ -677,6 +736,23 @@ def _index_list(indices) -> List[int]:
 
 
 _SYSTEM_COLUMNS = ("_rowid", "_rowaddr", "_rowoffset", "_distance")
+
+
+@contextlib.contextmanager
+def _lance_errors():
+    """Errors raised as pylance raises them: its Rust core's (k-means, PQ training, a name taken)
+    as RuntimeError, its Python checks' as ValueError."""
+    try:
+        yield
+    except RuntimeError as exc:
+        text = str(exc)
+        if text.startswith("dimension (") or "num_sub_vectors are required" in text:
+            raise ValueError(text) from None
+        if ("KMeans cannot train" in text or "Not enough rows to train PQ" in text or "already exists" in text
+                or "num_bits" in text):
+            raise RuntimeError(text) from None
+        from nanolance.lance._errors import translate
+        raise translate(text) from None
 
 
 def _query_vector(q) -> np.ndarray:

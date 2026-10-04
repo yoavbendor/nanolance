@@ -57,6 +57,28 @@ struct NearestResult {
 bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQuery& query, NearestResult& out,
                      std::string& error);
 
+struct VectorIndexOptions {
+    std::string type;  // "IVF_FLAT" or "IVF_PQ"
+    std::string name;  // empty: <column>_idx
+    VectorMetric metric = VectorMetric::L2;
+    bool replace = false;
+    /// Partitions: as given, else rows / target_partition_size (Lance's 4096 for IVF_FLAT, 8192 for
+    /// IVF_PQ), at least 1 and at most 4096.
+    std::optional<std::uint32_t> num_partitions;
+    std::optional<std::uint32_t> target_partition_size;
+    std::uint32_t num_sub_vectors = 0;  // IVF_PQ: required; must divide the dimension
+    std::uint32_t num_bits = 8;         // IVF_PQ: 8 or 4
+    std::uint32_t max_iters = 50;       // k-means iterations (IVF and PQ), as Lance's defaults
+    std::uint32_t sample_rate = 256;    // k-means trains on sample_rate * k vectors at most
+    std::optional<std::uint64_t> seed;  // the random sample and initial centroids
+};
+
+/// Build an IVF_FLAT / IVF_PQ index on `column` (a fixed-size list of float32) in Lance's format --
+/// one pylance and LanceDB search as their own -- and commit it as the next version. Null vectors
+/// and vectors with NaN or infinite values are left out, as Lance leaves them out.
+bool dataset_create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,
+                                 const VectorIndexOptions& options, std::uint64_t& new_version, std::string& error);
+
 /// What Lance calls a vector index, from its manifest details (VectorIndexDetails): "IVF_PQ",
 /// "IVF_FLAT", "IVF_SQ", "IVF_RQ", "IVF_HNSW_PQ", ... Empty when the details do not say.
 std::string vector_index_type(const std::vector<std::uint8_t>& details);

@@ -141,7 +141,7 @@ def test_memory_uri():
 def test_unsupported_is_loud(tmp_path):
     ds = nl.write_dataset(table(3), str(tmp_path / "ds"))
     with pytest.raises(NotImplementedError):
-        ds.create_index("score", "IVF_PQ")
+        ds.create_index("score", "IVF_HNSW_SQ")
     with pytest.raises(NotImplementedError):
         nl.write_dataset(table(3), str(tmp_path / "old"), data_storage_version="2.0")
 
