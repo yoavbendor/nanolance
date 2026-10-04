@@ -62,15 +62,20 @@ def indexed(lance, tmp_path_factory):
     return out
 
 
-def _same(ref, got, four_bit=False):
+def _same(ref, got, four_bit=False, refined=False):
     rd, gd = ref.column("_distance").to_numpy(), got.column("_distance").to_numpy()
     assert len(rd) == len(gd)
     if not four_bit:
         assert np.allclose(rd, gd, rtol=1e-4, atol=1e-4), (rd[:5], gd[:5])
         assert ref.column("id").to_pylist() == got.column("id").to_pylist()
         return
-    # 4-bit PQ: which of equally (quantized) distant rows make the cut is arbitrary, so the rows
-    # may differ there -- and, re-scored exactly (refine), below it. The rows both return agree.
+    if not refined:
+        # 4-bit PQ: which of equally (quantized) distant rows come first, or make the cut, is
+        # arbitrary -- so the rows may differ there, but not the distances.
+        assert np.allclose(rd, gd, rtol=1e-4, atol=1e-4), (rd[:5], gd[:5])
+        return
+    # Re-scored exactly (refine), different candidates at the cut can change the rows below it
+    # too. The rows both return agree.
     ref_d = dict(zip(ref.column("id").to_pylist(), rd))
     got_d = dict(zip(got.column("id").to_pylist(), gd))
     shared = set(ref_d) & set(got_d)
@@ -96,7 +101,7 @@ def test_matches_pylance_from_its_index(lance, indexed, key):
             nearest = {"column": "vec", "q": q, **extra}
             ref = lance.dataset(path).to_table(nearest=nearest, columns=["id"])
             got = nl.dataset(path).to_table(nearest=nearest, columns=["id"])
-            _same(ref, got, four_bit=key[2] == 4)
+            _same(ref, got, four_bit=key[2] == 4, refined="refine_factor" in extra)
 
 
 @pytest.mark.parametrize("prefilter", [False, True])
@@ -241,7 +246,7 @@ def test_pylance_searches_nanolances_index(lance, tmp_path, kind, metric, kw, mi
             nearest = {"column": "vec", "q": q, **extra}
             ref = ds.to_table(nearest=nearest, columns=["id"])
             got = nl.dataset(path).to_table(nearest=nearest, columns=["id"])
-            _same(ref, got, four_bit=kw.get("num_bits") == 4)
+            _same(ref, got, four_bit=kw.get("num_bits") == 4, refined="refine_factor" in extra)
         all_partitions = ds.to_table(nearest={"column": "vec", "q": q, "k": 10, "nprobes": 12}, columns=["id"])
         recall.append(len(set(all_partitions.column("id").to_pylist()) & _exact_ids(v, q, metric, 10)) / 10)
     assert np.mean(recall) >= min_recall, np.mean(recall)
@@ -275,7 +280,9 @@ def test_build_defaults_and_maintenance(lance, tmp_path):
     assert ds.stats.index_stats("vec_idx")["num_unindexed_rows"] == 0
     nearest = {"column": "vec", "q": q, "k": 10}
     _same(ds.to_table(nearest=nearest, columns=["id"]), nl.dataset(path).to_table(nearest=nearest, columns=["id"]))
-    assert nl.dataset(path).to_table(nearest=nearest, columns=["id"]).column("id")[0].as_py() == len(v) + 7
+    # PQ distances are approximate: re-scored exactly, the appended copy of the query comes first.
+    exact = {**nearest, "refine_factor": 5}
+    assert nl.dataset(path).to_table(nearest=exact, columns=["id"]).column("id")[0].as_py() == len(v) + 7
 
 
 @pytest.mark.parametrize("n,kw,error", [

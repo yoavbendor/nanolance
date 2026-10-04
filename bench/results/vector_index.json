@@ -1,0 +1,71 @@
+{
+ "environment": {
+  "pylance": "12.0.0",
+  "nanolance_commit": "d0d94bd with uncommitted changes",
+  "cores": 4,
+  "machine": "x86_64",
+  "date": "2026-10-04 14:56 UTC"
+ },
+ "rows": 200000,
+ "dim": 128,
+ "partitions": 256,
+ "runs": 5,
+ "indexes": {
+  "IVF_FLAT": {
+   "build_s": {
+    "pylance": 3.763473066000188,
+    "nanolance": 2.9682573969998884
+   },
+   "recall@10": {
+    "pylance": 1.0,
+    "nanolance": 1.0
+   },
+   "search_ms": {
+    "k=10": {
+     "pylance": 5.2825409199977,
+     "nanolance": 1.4749028799997177
+    },
+    "k=100": {
+     "pylance": 7.267673919996014,
+     "nanolance": 2.2907655200015142
+    },
+    "k=10, nprobes=32": {
+     "pylance": 8.23892321999665,
+     "nanolance": 2.2348339800009853
+    },
+    "k=10, refine_factor=4": {
+     "pylance": 21.040389360005065,
+     "nanolance": 5.973786900003688
+    }
+   }
+  },
+  "IVF_PQ": {
+   "build_s": {
+    "pylance": 16.408171954999943,
+    "nanolance": 12.74772751699993
+   },
+   "recall@10": {
+    "pylance": 0.33199999999999996,
+    "nanolance": 0.29400000000000004
+   },
+   "search_ms": {
+    "k=10": {
+     "pylance": 7.600038119999226,
+     "nanolance": 2.949516139997286
+    },
+    "k=100": {
+     "pylance": 8.405856140007018,
+     "nanolance": 3.590359259997058
+    },
+    "k=10, nprobes=32": {
+     "pylance": 4.375143819997902,
+     "nanolance": 1.4016373800041038
+    },
+    "k=10, refine_factor=4": {
+     "pylance": 10.197114160000638,
+     "nanolance": 3.4561214200039103
+    }
+   }
+  }
+ }
+}

@@ -84,3 +84,32 @@ The manifest entry's `index_details` is a `/lance.table.VectorIndexDetails` (`me
    dataset's vectors, and the best k returned with those distances.
 
 `_distance` is that distance: squared L2, `1 - cos`, or `1 - dot` (PQ: their approximations).
+
+## Building (nanolance)
+
+`create_index(column, "IVF_FLAT" | "IVF_PQ", ...)` (`src/vector_index_build.cpp`) writes the files
+and manifest entry above with Lance 12's defaults:
+
+1. **Vectors.** The column (a fixed-size list of float32) is scanned with row addresses; null
+   vectors and vectors with a NaN or infinite value are left out (Lance's `filter_nan`). Cosine
+   normalizes them (and leaves out zero vectors).
+2. **Partitions.** `num_partitions`, or rows / `target_partition_size` (4096 for IVF_FLAT, 8192 for
+   IVF_PQ), between 1 and 4096.
+3. **IVF.** k-means on at most `sample_rate` (256) vectors a partition: random initial centroids,
+   at most `max_iters` (50) Lloyd iterations, stopping when the loss moves by less than 1e-4 of
+   itself, an empty cluster splitting the largest; past 256 partitions, hierarchical -- 16 clusters,
+   each given partitions in proportion to its vectors, recursively. Squared L2 (cosine: of the
+   normalized vectors); dot assigns by the largest product. Every vector then goes to its nearest
+   centroid.
+4. **PQ.** Residuals (vector - its centroid; dot: the vector) of at most 256 * 2^nbits vectors train
+   one codebook per sub-vector by L2 k-means, whatever the metric -- Lance's v3 builder does the
+   same, and dot only scores the codes. Every row's codes are the nearest entries by L2. The
+   sub-vectors train side by side, each on its own seed.
+5. **Files.** auxiliary.idx holds the rows partition by partition (ascending row address within
+   one); codes are transposed per partition and, with 4 bits, packed two to a byte. index.idx
+   holds the centroids and the k-means loss. The manifest entry is a
+   `/lance.index.pb.VectorIndexDetails` (metric, target partition size when it decided the count,
+   `pq { num_bits, num_sub_vectors }` or `flat {}`, Lance's runtime hints), index version 1.
+
+pylance lists such an index, reports its stats, searches it with nanolance's results, and its
+`optimize_indices` adds appended rows to it.

@@ -2670,6 +2670,40 @@ LabelList; then IVF_PQ / IVF_FLAT; then LanceDB's full-text defaults).
   lance-c's `test_index_lifecycle` passes. ASan clean on the index tests and on 5M-row queries.
 - **Speed** (`docs/BENCHMARKS.md`, "Scalar indexes"): building 1.5-3.6x faster than pylance; indexed
   reads 1.1-3.2x faster but for a one-row lookup returning every column (2.9 ms vs 1.3 ms).
-- **Not yet**: the other scalar index kinds (INVERTED is Phase 3), vector indexes (Phase 2), build
-  options, stable row ids, and decimal comparisons in the filter engine (an index on a decimal column
-  is built, but nanolance's filters cannot compare decimals yet).
+- **Not yet**: the other scalar index kinds (INVERTED is Phase 3), build options, stable row ids,
+  and decimal comparisons in the filter engine (an index on a decimal column is built, but
+  nanolance's filters cannot compare decimals yet). Vector indexes: next section.
+
+## Vector indexes: IVF_FLAT and IVF_PQ, built and searched
+
+Asked: the plan's Phase 2 -- build and search Lance's IVF_PQ / IVF_FLAT indexes, so that the same
+index serves pylance and nanolance with the same results, at about pylance's speed.
+
+- **Format first** (`docs/VECTOR_INDEX.md`): what pylance 12 writes and how it searches, step for
+  step, read from the `lance` / `lance-index` 12.0.0 sources and checked by a numpy model that
+  reproduces pylance's `nearest` results from the index files alone -- including Lance's adaptive
+  probe count (a k-dependent margin, floor and cap for IVF_FLAT under L2 / cosine; a factor of the
+  nearest centroid's distance otherwise), its 4-bit PQ's u8-quantized distance tables, and ties
+  broken by row id.
+- **Searching** (`src/vector_search.cpp`): `nearest=` on pylance-built or nanolance-built indexes
+  returns pylance's rows, order and distances (IVF_FLAT and 8-bit IVF_PQ; 4-bit up to the order of
+  equal quantized distances), with refine, prefilter / post-filter, deletions, unindexed fragments
+  searched exactly, `fast_search`, `distance_range`, metric overrides and exact search without an
+  index. Partitions are scored on the thread pool; PQ tables sweep a transposed codebook.
+- **Building** (`src/vector_index_build.cpp`): Lance's k-means and defaults, PQ by L2 on residuals
+  (as Lance's v3 builder trains it -- training or encoding dot indexes by dot instead cost them most
+  of their recall), files and manifest entry as Lance writes them. pylance lists, searches and
+  `optimize_indices` them.
+- **What it took besides**: the manifest decoder keeps an index's details message; float filters
+  order NaN by its sign and round literals compared with a float32 column to float32, as Lance does
+  (pylance's `test_nan_handling`); a bind-time read of an uninitialized `ArrowSchemaView::time_unit`
+  in the filter engine (UBSan); `lance.vector.vec_to_table` and `_coerce_query_vector`.
+- **Verified**: `test_vector_search.py` (40 tests) against pylance; 241 of pylance's own tests pass
+  (216 before); ASan + UBSan clean on the index tests.
+- **Speed** (`docs/BENCHMARKS.md`, "Vector indexes"; 200,000 x 128, 256 partitions, 4 cores):
+  searches 2.6-3.7x faster than pylance (IVF_PQ k=10 2.9 ms vs 7.6 ms, IVF_FLAT 1.5 ms vs 5.3 ms),
+  builds 1.3x faster (IVF_PQ 12.7 s vs 16.4 s, IVF_FLAT 3.0 s vs 3.8 s), recall comparable
+  (k-means is randomly seeded in both).
+- **Not yet**: IVF_HNSW_*, IVF_SQ and IVF_RQ (searched exactly instead), batch and multivector
+  queries, binary (Hamming) vectors, building on float16 / float64 vectors, `IndicesBuilder`, stable
+  row ids. The k-means kernels are baseline x86-64 (no AVX dispatch): the next lever for builds.

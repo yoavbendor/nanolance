@@ -88,8 +88,40 @@ Speed, 5M rows in 5 fragments, 4 cores (`docs/BENCHMARKS.md`, "Scalar indexes"):
 one-row lookup returning every column (2.9 ms vs 1.3 ms).
 
 Not built: Lance's other scalar indexes (INVERTED full-text, NGRAM, ZONEMAP, BLOOMFILTER, JSON, RTREE),
-vector indexes, build options (`fragment_ids`, `train=False`, ...), and indexes on a dataset with
-stable row ids. Those a dataset already has are kept, as below.
+build options (`fragment_ids`, `train=False`, ...), and indexes on a dataset with stable row ids.
+Those a dataset already has are kept, as below.
+
+### Vector indexes: built and searched
+
+`to_table(nearest={...})` (and `scanner(nearest=...)`, `ScannerBuilder.nearest`) searches a vector
+column -- a fixed-size list of floats -- as pylance does, and `create_index(column, "IVF_FLAT" |
+"IVF_PQ", metric=..., num_partitions=..., num_sub_vectors=..., num_bits=...)` builds Lance's index for
+it. The format and the search, step for step, are in `docs/VECTOR_INDEX.md`.
+
+- **Searching** (`src/vector_search.cpp`) an IVF_FLAT or IVF_PQ index -- built by pylance or by
+  nanolance -- gives pylance's answer: the same rows, in the same order, with the same `_distance`,
+  under L2, cosine and dot, for Lance's default (adaptive) probing, `nprobes` / `minimum_nprobes` /
+  `maximum_nprobes`, `refine_factor` and `distance_range`. With 4-bit PQ, which ranks by quantized
+  distances, rows at equal distance may come in another order. Around the index it does what pylance
+  does: fragments the index does not cover are searched exactly (and the index's candidates
+  re-scored), deleted rows and null vectors never come back, `prefilter=True` filters before the
+  search and otherwise the k nearest are filtered, `fast_search` searches only what is indexed, and
+  a `metric` other than the index's (or `use_index=False`, or no index) searches exactly.
+- **Building** (`src/vector_index_build.cpp`) follows Lance's defaults: k-means as Lance trains it
+  (random initial centroids, at most 50 iterations, 256 training vectors a partition, hierarchical
+  past 256 partitions), partitions from rows / 4096 (IVF_FLAT) or / 8192 (IVF_PQ), PQ codebooks
+  trained and codes chosen by L2 on residuals, files and manifest entry as Lance writes them. pylance
+  lists such an index, reports its stats, searches it with nanolance's results, and
+  `optimize_indices` folds new rows into it.
+
+`test_vector_search.py` checks all of it against pylance. Speed, 200,000 vectors of 128 dimensions,
+256 partitions, 4 cores (`docs/BENCHMARKS.md`, "Vector indexes"): searches 2.6-3.7x faster than
+pylance (IVF_PQ k=10 2.9 ms vs 7.6 ms; IVF_FLAT 1.5 ms vs 5.3 ms), building 1.3x faster (IVF_PQ
+12.7 s vs 16.4 s), at the same recall.
+
+Not supported: IVF_HNSW_*, IVF_SQ and IVF_RQ indexes (a search falls back to an exact one, its plan
+says why), batch and multivector queries, binary (Hamming) vectors, building on float16 / float64
+vectors, `lance.indices.IndicesBuilder`, and a vector index on a dataset with stable row ids.
 
 ### Indexes nanolance keeps
 
@@ -122,8 +154,9 @@ them is silently ignored:
 - The transaction API (`LanceOperation`, `commit`, `write_fragments`), `LanceFragment.merge_columns`
   / `update_columns`, `cleanup_old_versions`. Conflicting writers are refused rather than retried:
   a change built on a version another writer has since replaced fails with "commit conflict".
-- Vector and full-text indexes and search (`nearest`, `full_text_query`), and scalar indexes other
-  than BTree, Bitmap and LabelList. An index pylance built is kept, though: see "Indexes" below.
+- Full-text indexes and search (`full_text_query`), vector indexes other than IVF_FLAT and IVF_PQ,
+  and scalar indexes other than BTree, Bitmap and LabelList. An index pylance built is kept, though:
+  see "Indexes" below.
 - Tags and branches, stable row ids, multiple base paths, shallow and deep clones.
 - Writing Lance's inline, packed and dedicated blob layouts (`lance.blob_field`, `lance.blob_array`):
   nanolance writes external blobs, and reads every kind.
@@ -157,30 +190,33 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **216**, every one of which pylance also passes (189 before scalar indexes) |
+| nanolance.lance | **241**, every one of which pylance also passes (216 before vector search, 189 before scalar indexes) |
 
 By test file, where nanolance passes any:
 
 | file | pylance | nanolance |
 |---|---|---|
-| test_dataset.py | 250 | 82 |
+| test_dataset.py | 250 | 86 |
+| test_scalar_index.py | 189 | 31 |
 | test_file.py | 40 | 27 |
-| test_scalar_index.py | 189 | 27 |
 | test_map_type.py | 19 | 17 |
 | test_column_names.py | 27 | 17 |
+| test_lance.py | 23 | 11 |
+| test_coerce_query_vector.py | 10 | 10 |
 | test_filter.py | 26 | 9 |
-| test_lance.py | 23 | 9 |
 | test_fragment.py | 85 | 9 |
 | test_json.py | 18 | 5 |
 | test_pydantic.py | 12 | 4 |
-| test_schema_evolution.py | 23 | 2 |
-| others | | 6 |
+| test_schema_evolution.py | 23 | 3 |
+| test_vector.py | 9 | 3 |
+| others | | 9 |
 
 The main reasons tests fail today:
 
-- Most need vector or full-text indexes and search, scalar indexes other than BTree / Bitmap /
-  LabelList or their build options (about 160 in `test_scalar_index.py`), namespaces (about 130),
-  object stores or the `mem_wal`.
+- Most need full-text indexes and search, scalar indexes other than BTree / Bitmap / LabelList or
+  their build options (about 155 in `test_scalar_index.py`), vector index kinds other than
+  IVF_FLAT / IVF_PQ or `lance.indices.IndicesBuilder` (about 30), namespaces (about 130), object
+  stores or the `mem_wal`.
 - About 90 need the transaction API, fragment-level writes, stable row ids or multiple base paths.
 - About 25 need filter functions nanolance lacks, or a data storage version other than 2.2.
 - A tail of writer gaps in nanolance itself: Arrow dictionary arrays, empty structs, a nullable

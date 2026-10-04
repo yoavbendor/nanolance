@@ -755,25 +755,45 @@ def _lance_errors():
         raise translate(text) from None
 
 
-def _query_vector(q) -> np.ndarray:
-    """A query vector as float32, coerced as pylance coerces it."""
-    if hasattr(q, "__getitem__") and not isinstance(q, (str, bytes)) and len(q) > 0 and isinstance(
-            q[0], (list, tuple, np.ndarray, pa.Array)):
-        raise unsupported("batch and multivector queries (a 2-D q)")
-    if isinstance(q, pa.Scalar):
-        q = q.value if isinstance(q, pa.ExtensionScalar) else q
-        q = q.values if isinstance(q.type, pa.FixedSizeListType) else q
-    elif isinstance(q, (list, tuple, np.ndarray)):
-        return np.asarray(np.array(q).astype("float64"), np.float32).ravel()
-    elif not isinstance(q, (pa.Array, pa.ChunkedArray)):
+def _coerce_query_vector(query):
+    """A query vector as a float array and its length, coerced as pylance's ``_coerce_query_vector``
+    (Apache-2.0, the Lance authors) coerces it; several vectors become a list array."""
+    if hasattr(query, "__getitem__") and not isinstance(query, (str, bytes)) and len(query) > 0 and isinstance(
+            query[0], (list, tuple, np.ndarray, pa.Array)):
+        dim = len(query[0])
+        vectors = []
+        for q in query:
+            if len(q) != dim:
+                raise ValueError(f"All query vectors must have the same length, but got {dim} and {len(q)}")
+            vectors.append(_coerce_query_vector(q)[0])
+        return pa.array(vectors, type=pa.list_(pa.float32())), dim
+    if isinstance(query, pa.Scalar):
+        if isinstance(query, pa.ExtensionScalar):
+            query = query.value
+        if isinstance(query.type, pa.FixedSizeListType):
+            query = query.values
+    elif isinstance(query, (list, tuple, np.ndarray)):
+        query = pa.FloatingPointArray.from_pandas(np.array(query).astype("float64"), type=pa.float32())
+    elif not isinstance(query, pa.Array):
         try:
-            q = pa.array(q)
+            query = pa.array(query)
         except Exception:
             raise TypeError("Query vectors should be an array of floats, "
-                            f"got {type(q)} which we cannot coerce to a float array") from None
-    if not (pa.types.is_floating(q.type) or pa.types.is_integer(q.type)):
-        raise TypeError(f"query vector must be list-like or pa.FloatingPointArray but received {q.type}")
-    return np.asarray(q.to_numpy(zero_copy_only=False), np.float32).ravel()
+                            f"got {type(query)} which we cannot coerce to a float array") from None
+    if not isinstance(query, pa.FloatingPointArray):
+        if pa.types.is_integer(query.type):
+            query = query.cast(pa.float32())
+        else:
+            raise TypeError(f"query vector must be list-like or pa.FloatingPointArray but received {query.type}")
+    return query, len(query)
+
+
+def _query_vector(q) -> np.ndarray:
+    """A single query vector as float32."""
+    array, _ = _coerce_query_vector(q)
+    if pa.types.is_list(array.type):
+        raise unsupported("batch and multivector queries (a 2-D q)")
+    return np.asarray(array.to_numpy(zero_copy_only=False), np.float32).ravel()
 
 
 def _nearest_query(ds, nearest) -> dict:

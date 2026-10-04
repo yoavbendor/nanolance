@@ -1004,7 +1004,7 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
                 at = at->children[k];
             }
         }
-        ArrowSchemaView sv;
+        ArrowSchemaView sv{};  // time_unit is only set for temporal types: zero, not garbage, otherwise
         ArrowError aerr;
         if (ArrowSchemaViewInit(&sv, at, &aerr) != NANOARROW_OK) {
             error = std::string("cannot read the type of column '") + joined + "': " + aerr.message;
@@ -1014,7 +1014,7 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
         c.unit = sv.time_unit;
         c.item_type = NANOARROW_TYPE_UNINITIALIZED;
         if (under_array_function && is_list_type(sv.type)) {
-            ArrowSchemaView item;
+            ArrowSchemaView item{};
             if (ArrowSchemaViewInit(&item, at->children[0], &aerr) != NANOARROW_OK || !scalar_type(item.type)) {
                 error = "column '" + joined + "' is a list of a type filters cannot compare";
                 return false;

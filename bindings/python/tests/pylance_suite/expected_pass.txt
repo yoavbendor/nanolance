@@ -1,6 +1,16 @@
 # pylance 12.0.0 tests that pass against nanolance.lance (tools/pylance_suite.py --update)
 tests/test_arrow.py::test_roundtrip_take_ext_types
 tests/test_backwards_compatibility.py::test_legacy_string_encoding
+tests/test_coerce_query_vector.py::TestCoerceQueryVectorInvalidTypes::test_integer_raises_typeerror
+tests/test_coerce_query_vector.py::TestCoerceQueryVectorInvalidTypes::test_none_raises_typeerror
+tests/test_coerce_query_vector.py::TestCoerceQueryVectorInvalidTypes::test_object_raises_typeerror
+tests/test_coerce_query_vector.py::TestCoerceQueryVectorInvalidTypes::test_string_raises_typeerror
+tests/test_coerce_query_vector.py::TestCoerceQueryVectorValidTypes::test_list_of_floats
+tests/test_coerce_query_vector.py::TestCoerceQueryVectorValidTypes::test_numpy_array
+tests/test_coerce_query_vector.py::TestCoerceQueryVectorValidTypes::test_pa_chunked_array
+tests/test_coerce_query_vector.py::TestCoerceQueryVectorValidTypes::test_pa_float_array
+tests/test_coerce_query_vector.py::TestCoerceQueryVectorValidTypes::test_pa_int_array_cast_to_float
+tests/test_coerce_query_vector.py::TestCoerceQueryVectorValidTypes::test_tuple_of_floats
 tests/test_column_names.py::TestCaseOnlyDifferentColumnNames::test_create_table_preserves_all_cases
 tests/test_column_names.py::TestCaseOnlyDifferentColumnNames::test_filter_resolves_exact_case_match
 tests/test_column_names.py::TestCaseOnlyDifferentColumnNames::test_scalar_index_on_each_case_variant
@@ -34,9 +44,11 @@ tests/test_dataset.py::test_create_update_empty_dataset[True]
 tests/test_dataset.py::test_dataset_from_record_batch_iterable
 tests/test_dataset.py::test_dataset_overwrite
 tests/test_dataset.py::test_dataset_restore
+tests/test_dataset.py::test_default_scan_options_nearest
 tests/test_dataset.py::test_default_v2_manifest_paths
 tests/test_dataset.py::test_delete_data
 tests/test_dataset.py::test_filter
+tests/test_dataset.py::test_flat_vector_search_with_delete
 tests/test_dataset.py::test_from_pydantic_model
 tests/test_dataset.py::test_from_pydantic_model_rejects_invalid_item[dict]
 tests/test_dataset.py::test_from_pydantic_model_rejects_invalid_item[different_model]
@@ -73,6 +85,7 @@ tests/test_dataset.py::test_roundtrip_reader
 tests/test_dataset.py::test_sample
 tests/test_dataset.py::test_scan_count_rows
 tests/test_dataset.py::test_scan_no_columns
+tests/test_dataset.py::test_scan_prefilter
 tests/test_dataset.py::test_scan_with_row_ids
 tests/test_dataset.py::test_scanner_schemas
 tests/test_dataset.py::test_schema_metadata_updates
@@ -88,6 +101,7 @@ tests/test_dataset.py::test_take_system_columns_values[_rowaddr]
 tests/test_dataset.py::test_take_system_columns_values[_rowid]
 tests/test_dataset.py::test_take_with_columns
 tests/test_dataset.py::test_take_with_json_column
+tests/test_dataset.py::test_tensor_type
 tests/test_dataset.py::test_tilde_paths
 tests/test_dataset.py::test_to_batches
 tests/test_dataset.py::test_update_dataset
@@ -156,6 +170,8 @@ tests/test_lance.py::test_count_rows[False]
 tests/test_lance.py::test_count_rows[True]
 tests/test_lance.py::test_input_types[False]
 tests/test_lance.py::test_input_types[True]
+tests/test_lance.py::test_nearest
+tests/test_lance.py::test_nearest_cosine
 tests/test_lance.py::test_roundtrip_schema
 tests/test_lance.py::test_table_roundtrip[False]
 tests/test_lance.py::test_table_roundtrip[True]
@@ -179,6 +195,7 @@ tests/test_map_type.py::test_nested_map_in_struct
 tests/test_map_type.py::test_query_map_column
 tests/test_map_type.py::test_simple_map_write_read
 tests/test_memory_leaks.py::TestMemoryLeaks::test_index_statistics_no_leak
+tests/test_optimize.py::test_compact_with_write
 tests/test_pydantic.py::test_naive_datetime_field
 tests/test_pydantic.py::test_nested_model_becomes_struct
 tests/test_pydantic.py::test_optional_field_is_nullable
@@ -199,7 +216,9 @@ tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[2
 tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[3-creation_options2-3]
 tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[3-creation_options3-3]
 tests/test_scalar_index.py::test_create_text_inverted_index_defaults_to_v2_without_env
+tests/test_scalar_index.py::test_describe_indices_vector_and_scalar
 tests/test_scalar_index.py::test_index_combination
+tests/test_scalar_index.py::test_indexed_vector_scan_postfilter
 tests/test_scalar_index.py::test_label_list_index
 tests/test_scalar_index.py::test_label_list_index_empty_list_filters
 tests/test_scalar_index.py::test_label_list_index_explain_null_literals
@@ -208,10 +227,16 @@ tests/test_scalar_index.py::test_label_list_index_null_list_match
 tests/test_scalar_index.py::test_label_list_index_null_literal_filters
 tests/test_scalar_index.py::test_large_string_scalar_index[BITMAP]
 tests/test_scalar_index.py::test_large_string_scalar_index[BTREE]
+tests/test_scalar_index.py::test_multi_index_create
+tests/test_scalar_index.py::test_nan_handling
 tests/test_scalar_index.py::test_null_handling
 tests/test_scalar_index.py::test_temporal_index
 tests/test_scalar_index.py::test_use_multi_index
 tests/test_schema_evolution.py::test_add_columns_exprs[False]
 tests/test_schema_evolution.py::test_add_many_columns
+tests/test_schema_evolution.py::test_drop_columns
 tests/test_tracing.py::test_tracing
 tests/test_tracing.py::test_tracing_callback
+tests/test_vector.py::test_dict
+tests/test_vector.py::test_list
+tests/test_vector.py::test_ndarray

@@ -287,3 +287,23 @@ _From `bench/results/scalar_index.json`, produced by `tools/bench_scalar_index.p
 | `cat = 'c7'` | all | 100,135 | 139 | 43.1 | 80.6 |
 | `array_has_any(tags, ['t5'])` | all | 49,718 | 130 | 43.1 | 870 |
 | `cat = 'c7' AND id < 50000` | all | 1,053 | 36.2 | 18.2 | 44.9 |
+
+## Vector indexes
+
+_From `bench/results/vector_index.json`, produced by `tools/bench_vector_index.py` (generated data)._ 200,000 vectors of 128 float32s around 1,000 centres, 256 partitions (IVF_PQ: 16 sub-vectors of 8 bits). Each engine builds the index on its own copy and searches the one it built; on pylance's index nanolance returns pylance's rows, order and distances. Recall@10 against an exact search, default probing. Search: ms a query, median of 5 passes over 50 queries, warm. nanolance `d0d94bd with uncommitted changes`, pylance 12.0.0, 4 cores, 2026-10-04 14:56 UTC.
+
+| index | build, pylance | build, nanolance | recall@10, pylance's index | recall@10, nanolance's |
+|---|---:|---:|---:|---:|
+| IVF_FLAT | 3.76 s | 2.97 s | 1.000 | 1.000 |
+| IVF_PQ | 16.41 s | 12.75 s | 0.332 | 0.294 |
+
+| index | search | pylance | nanolance |
+|---|---|---:|---:|
+| IVF_FLAT | k=10 | 5.28 | 1.47 |
+| IVF_FLAT | k=100 | 7.27 | 2.29 |
+| IVF_FLAT | k=10, nprobes=32 | 8.24 | 2.23 |
+| IVF_FLAT | k=10, refine_factor=4 | 21.04 | 5.97 |
+| IVF_PQ | k=10 | 7.60 | 2.95 |
+| IVF_PQ | k=100 | 8.41 | 3.59 |
+| IVF_PQ | k=10, nprobes=32 | 4.38 | 1.40 |
+| IVF_PQ | k=10, refine_factor=4 | 10.20 | 3.46 |

@@ -321,6 +321,34 @@ def render_scalar_index(si) -> str:
     return "\n".join(out) + "\n"
 
 
+def render_vector_index(vi) -> str:
+    """The vector index benchmark (tools/bench_vector_index.py)."""
+    out = []
+    w = out.append
+    env = vi["environment"]
+    w("## Vector indexes")
+    w("")
+    w("_From `bench/results/vector_index.json`, produced by `tools/bench_vector_index.py` (generated data)._ "
+      f"{vi['rows']:,} vectors of {vi['dim']} float32s around 1,000 centres, {vi['partitions']} partitions "
+      f"(IVF_PQ: {vi['dim'] // 8} sub-vectors of 8 bits). Each engine builds the index on its own copy and searches "
+      "the one it built; on pylance's index nanolance returns pylance's rows, order and distances. Recall@10 "
+      f"against an exact search, default probing. Search: ms a query, median of {vi['runs']} passes over 50 queries, "
+      f"warm. nanolance `{env['nanolance_commit']}`, pylance {env['pylance']}, {env['cores']} cores, {env['date']}.")
+    w("")
+    w("| index | build, pylance | build, nanolance | recall@10, pylance's index | recall@10, nanolance's |")
+    w("|---|---:|---:|---:|---:|")
+    for kind, rec in vi["indexes"].items():
+        w(f"| {kind} | {rec['build_s']['pylance']:.2f} s | {rec['build_s']['nanolance']:.2f} s | "
+          f"{rec['recall@10']['pylance']:.3f} | {rec['recall@10']['nanolance']:.3f} |")
+    w("")
+    w("| index | search | pylance | nanolance |")
+    w("|---|---|---:|---:|")
+    for kind, rec in vi["indexes"].items():
+        for name, row in rec["search_ms"].items():
+            w(f"| {kind} | {name} | {row['pylance']:.2f} | {row['nanolance']:.2f} |")
+    return "\n".join(out) + "\n"
+
+
 def main(argv):
     src = Path(argv[1]) if len(argv) > 1 else ROOT / "bench" / "results" / "matrix.json"
     dst = Path(argv[2]) if len(argv) > 2 else ROOT / "docs" / "BENCHMARKS.md"
@@ -335,6 +363,9 @@ def main(argv):
     scalar_index = src.with_name("scalar_index.json")
     if scalar_index.exists():
         text += "\n" + render_scalar_index(json.loads(scalar_index.read_text()))
+    vector_index = src.with_name("vector_index.json")
+    if vector_index.exists():
+        text += "\n" + render_vector_index(json.loads(vector_index.read_text()))
     dst.write_text(text)
     print(f"wrote {dst}")
 

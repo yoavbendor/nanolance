@@ -642,15 +642,23 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
                 std::memcpy(subs[s].v.data() + i * w, res.data() + s * w, w * sizeof(float));
             }
         }
-        for (std::size_t s = 0; s < m; ++s) {
-            double sub_loss = 0;
-            // L2 for every metric, as Lance's v3 builder trains its PQ (dot only scores the codes).
-            const auto c = kmeans_flat(subs[s], nc, false, options.max_iters, rng, sub_loss);
-            std::copy(c.begin(), c.end(), codebook.begin() + static_cast<std::ptrdiff_t>(s * nc * w));
+        // The sub-vectors train side by side, each on its own seed (so a build is reproducible
+        // whatever the thread count); L2 for every metric, as Lance's v3 builder trains its PQ (dot
+        // only scores the codes).
+        std::vector<std::uint64_t> seeds(m);
+        for (auto& seed : seeds) {
+            seed = rng();
         }
+        parallel::for_each(m, [&](std::size_t s) {
+            std::mt19937_64 sub_rng(seeds[s]);
+            double sub_loss = 0;
+            const auto c = kmeans_flat(subs[s], nc, false, options.max_iters, sub_rng, sub_loss);
+            std::copy(c.begin(), c.end(), codebook.begin() + static_cast<std::ptrdiff_t>(s * nc * w));
+        });
         // Codes: each sub-vector's nearest codebook entry by L2, whatever the metric.
         std::vector<std::uint8_t> row_codes(data.n * m);  // [row][m], rows in `order`
-        for (std::size_t s = 0; s < m; ++s) {
+        parallel::for_each(m, [&](std::size_t s) {
+            std::vector<float> res(dim);
             Rows sub;
             sub.d = w;
             sub.n = data.n;
@@ -666,7 +674,7 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
             for (std::size_t i = 0; i < data.n; ++i) {
                 row_codes[i * m + s] = static_cast<std::uint8_t>(nearest[i]);
             }
-        }
+        });
         // Transposed per partition: [code byte][row of the partition].
         codes.resize(data.n * code_bytes);
         for (std::size_t p = 0; p < partitions; ++p) {
