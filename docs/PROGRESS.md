@@ -2538,6 +2538,22 @@ equal.
 **Speed.** LZ4 decoding is 2.75x faster: 1.46 GB/s instead of 0.53 GB/s on one core, over the
 same 3,000 blocks.
 
+### FastLanes bit packing in nanom
+
+`include/nanolance/fastlanes_bitpack.hpp` moved into nanom as `nanom/fastlanes.hpp` (unpack) and
+`nanom/columnar_encode.hpp` (pack), with:
+- a bit-by-bit reference of the layout checked against both kernels for every word type and width;
+- golden bytes from this kernel, which pylance reads;
+- fuzzing of the unpacker.
+
+The writer and both readers (2.1+ and 2.0) call nanom's `_unchecked` kernels at the same places as
+before: each call site already validates the width and the buffer sizes.
+
+Data files written from integer, nullable, boolean, dictionary, list and all-zero columns are
+byte-identical to `main`'s in all three writer modes, and pylance reads them back equal to the
+source. Reading them is at parity: 13.6-14.4 ms best of 15, old and new interleaved on one core.
+
+
 ### Deliberate deviations (not defects)
 
 - **The nullable opt-out was not needed** — simpler than planned.

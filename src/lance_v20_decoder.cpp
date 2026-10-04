@@ -8,7 +8,7 @@
 
 #include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
-#include "nanolance/fastlanes_bitpack.hpp"
+#include <nanom/fastlanes.hpp>
 #include "nanolance/fsst.hpp"
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/read_safety.hpp"
@@ -559,7 +559,7 @@ bool decode_bitpacked(const Enc& enc, std::uint64_t start, std::uint64_t count, 
 
 template <class T>
 void unpack_chunks(const std::uint8_t* raw, unsigned bits, std::uint64_t skip, std::uint64_t count, std::uint8_t* dst) {
-    const std::size_t words = fastlanes::packed_words_1024<T>(bits);
+    const std::size_t words = ::nanom::columnar::fastlanes::packed_words_1024<T>(bits);
     std::vector<T> in(words == 0U ? 1U : words);
     std::vector<T> chunk(1024U);
     const std::size_t chunk_bytes = words * sizeof(T);
@@ -568,7 +568,7 @@ void unpack_chunks(const std::uint8_t* raw, unsigned bits, std::uint64_t skip, s
         if (chunk_bytes != 0U) {
             std::memcpy(in.data(), raw + c * chunk_bytes, chunk_bytes);
         }
-        fastlanes::unpack_1024<T>(bits, in.data(), chunk.data());
+        ::nanom::columnar::fastlanes::unpack_1024_unchecked<T>(bits, in.data(), chunk.data());
         const auto from = c == 0U ? skip : 0U;
         const auto take = std::min<std::uint64_t>(1024U - from, count - done);
         std::memcpy(dst + done * sizeof(T), chunk.data() + from, static_cast<std::size_t>(take) * sizeof(T));

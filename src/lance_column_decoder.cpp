@@ -12,7 +12,7 @@
 #include "nanolance/bool_bitpack.hpp"
 #include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
-#include "nanolance/fastlanes_bitpack.hpp"
+#include <nanom/fastlanes.hpp>
 #include "nanolance/fsst.hpp"
 #include "nanolance/lz4_block.hpp"
 #include "nanolance/read_safety.hpp"
@@ -722,7 +722,7 @@ bool unpack_bitpacked_page(const std::vector<std::uint8_t>& chunk, std::uint64_t
         error = "bitpacked chunk has invalid bit width";
         return false;
     }
-    const auto packed_words = nano_lance::fastlanes::packed_words_1024<T>(width);
+    const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<T>(width);
     if (chunk.size() != sizeof(T) * (1U + packed_words)) {
         error = "bitpacked chunk size does not match bit width";
         return false;
@@ -744,7 +744,7 @@ bool unpack_bitpacked_page(const std::vector<std::uint8_t>& chunk, std::uint64_t
         return false;
     }
     T values[1024];
-    nano_lance::fastlanes::unpack_1024<T>(width, packed.data(), values);
+    ::nanom::columnar::fastlanes::unpack_1024_unchecked<T>(width, packed.data(), values);
     const auto bytes = static_cast<std::size_t>(num_values) * sizeof(T);
     const auto* p = reinterpret_cast<const std::uint8_t*>(values);
     out_fixed.insert(out_fixed.end(), p, p + bytes);
@@ -801,7 +801,7 @@ template <class T>
             error = "inline-bitpacked dictionary block has invalid bit width " + std::to_string(width);
             return false;
         }
-        const auto packed_words = nano_lance::fastlanes::packed_words_1024<T>(width);
+        const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<T>(width);
         const std::size_t block_bytes = packed_words * sizeof(T);
         if (buffer.size() - at < block_bytes) {
             error = "inline-bitpacked dictionary block is truncated";
@@ -812,7 +812,7 @@ template <class T>
             std::memcpy(packed.data(), buffer.data() + at, block_bytes);
         }
         at += block_bytes;
-        nano_lance::fastlanes::unpack_1024<T>(width, packed.data(), values);
+        ::nanom::columnar::fastlanes::unpack_1024_unchecked<T>(width, packed.data(), values);
         // A block always holds 1024 values; the last one is only partly used.
         const std::size_t take = std::min<std::size_t>(1024U, count - done);
         const auto* p = reinterpret_cast<const std::uint8_t*>(values);
@@ -851,7 +851,7 @@ template <class T>
         error = std::string(what) + " is not a whole number of " + std::to_string(sizeof(T) * 8U) + "-bit words";
         return false;
     }
-    const auto packed_words = nano_lance::fastlanes::packed_words_1024<T>(width);
+    const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<T>(width);
     const auto words = buffer.size() / sizeof(T);
     const std::size_t whole_blocks = count / 1024U;
     const std::size_t tail = count % 1024U;
@@ -876,7 +876,7 @@ template <class T>
         if (packed_words != 0U) {
             std::memcpy(packed.data(), buffer.data() + word_at * sizeof(T), packed_words * sizeof(T));
         }
-        nano_lance::fastlanes::unpack_1024<T>(width, packed.data(), block);
+        ::nanom::columnar::fastlanes::unpack_1024_unchecked<T>(width, packed.data(), block);
         std::memcpy(dest + b * 1024U, block, 1024U * sizeof(T));
         word_at += packed_words;
     }
@@ -887,7 +887,7 @@ template <class T>
             if (packed_words != 0U) {
                 std::memcpy(packed.data(), buffer.data() + word_at * sizeof(T), packed_words * sizeof(T));
             }
-            nano_lance::fastlanes::unpack_1024<T>(width, packed.data(), block);
+            ::nanom::columnar::fastlanes::unpack_1024_unchecked<T>(width, packed.data(), block);
             std::memcpy(dest + whole_blocks * 1024U, block, tail * sizeof(T));
         }
     }

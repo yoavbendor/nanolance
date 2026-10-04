@@ -12,7 +12,6 @@
 #include "lance_minimal.pb.hpp"
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/bool_bitpack.hpp"
-#include "nanolance/fastlanes_bitpack.hpp"
 #include "nanolance/fsst.hpp"
 #include "nanolance/repdef.hpp"
 #include "nanolance/schema_mapper.hpp"
@@ -312,7 +311,7 @@ std::vector<std::uint8_t> pack_definition_levels(const std::vector<std::uint8_t>
     // packing saves; otherwise the levels go in raw, as plain u16 words. At width 1 that means a tail
     // of 64 or fewer values is raw -- and 64 is exactly the packed size, so a padded 64-value chunk
     // is indistinguishable from a raw one and would come back as 64 arbitrary levels.
-    const auto packed_words = nano_lance::fastlanes::packed_words_1024<std::uint16_t>(1);
+    const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<std::uint16_t>(1);
     const std::size_t padding_cost = 1U * (1024U - count);
     const std::size_t pack_savings = (16U - 1U) * count;
     if (count < 1024U && padding_cost >= pack_savings) {
@@ -321,7 +320,7 @@ std::vector<std::uint8_t> pack_definition_levels(const std::vector<std::uint8_t>
         return out;
     }
     std::vector<std::uint16_t> packed(packed_words);
-    nano_lance::fastlanes::pack_1024<std::uint16_t>(1, levels, packed.data());
+    ::nanom::columnar::fastlanes::pack_1024_unchecked<std::uint16_t>(1, levels, packed.data());
     std::vector<std::uint8_t> out(packed_words * sizeof(std::uint16_t));
     std::memcpy(out.data(), packed.data(), out.size());
     return out;
@@ -801,8 +800,8 @@ void build_bitpacked_chunk_typed(const std::uint8_t* src, std::size_t count, std
     // thread_local + resize (not a fresh zero-filled vector per chunk): bounded by <=1024 words, fully
     // overwritten by pack_1024 below -- same reuse precedent as unpack_bitpacked_page on the read side.
     thread_local std::vector<T> packed;
-    packed.resize(nano_lance::fastlanes::packed_words_1024<T>(width));
-    nano_lance::fastlanes::pack_1024<T>(width, in, packed.data());
+    packed.resize(::nanom::columnar::fastlanes::packed_words_1024<T>(width));
+    ::nanom::columnar::fastlanes::pack_1024_unchecked<T>(width, in, packed.data());
     out.resize(sizeof(T) * (1U + packed.size()));
     const T width_word = static_cast<T>(width);
     std::memcpy(out.data(), &width_word, sizeof(T));
@@ -996,7 +995,7 @@ std::vector<std::uint8_t> levels_encoding(unsigned width) {
 /// words) or padded to a full block -- whichever Lance's encoder would pick, because its decoder tells
 /// the two apart by the buffer's length alone (the rule pack_definition_levels follows at width 1).
 void pack_levels(const std::uint16_t* levels, std::size_t n, unsigned width, std::vector<std::uint8_t>& out) {
-    const auto packed_words = nano_lance::fastlanes::packed_words_1024<std::uint16_t>(width);
+    const auto packed_words = ::nanom::columnar::fastlanes::packed_words_1024<std::uint16_t>(width);
     std::vector<std::uint16_t> packed(packed_words);
     std::uint16_t block[1024];
     out.clear();
@@ -1007,7 +1006,7 @@ void pack_levels(const std::uint16_t* levels, std::size_t n, unsigned width, std
     };
     std::size_t at = 0;
     for (; at + 1024U <= n; at += 1024U) {
-        nano_lance::fastlanes::pack_1024<std::uint16_t>(width, levels + at, packed.data());
+        ::nanom::columnar::fastlanes::pack_1024_unchecked<std::uint16_t>(width, levels + at, packed.data());
         append_words(packed.data(), packed_words);
     }
     const auto tail = n - at;
@@ -1019,7 +1018,7 @@ void pack_levels(const std::uint16_t* levels, std::size_t n, unsigned width, std
         } else {
             std::fill(std::begin(block), std::end(block), std::uint16_t{0});
             std::memcpy(block, levels + at, tail * sizeof(std::uint16_t));
-            nano_lance::fastlanes::pack_1024<std::uint16_t>(width, block, packed.data());
+            ::nanom::columnar::fastlanes::pack_1024_unchecked<std::uint16_t>(width, block, packed.data());
             append_words(packed.data(), packed_words);
         }
     }

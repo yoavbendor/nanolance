@@ -226,7 +226,7 @@ set(NANO_LANCE_BLOB_V2_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/golden/blob_v2")
 # them (C++23), so nanolance's public headers stay C++20.
 FetchContent_Declare(nanom
     GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
-    GIT_TAG 6b234e66cce18ff7a9063b79dae01c34668e97ab
+    GIT_TAG 81bf38f09123ae9810d9d7a4eabd0a781828595d
     GIT_SHALLOW FALSE)
 FetchContent_GetProperties(nanom)
 if(NOT nanom_POPULATED)
