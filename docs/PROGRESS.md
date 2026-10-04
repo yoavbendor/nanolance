@@ -2657,8 +2657,9 @@ LabelList; then IVF_PQ / IVF_FLAT; then LanceDB's full-text defaults).
   semantics on an index's keys or a BTree page's bounds, gives per covered fragment the rows that may
   pass; the reader decodes only those (`read_candidate_rows`) and applies the whole filter to them.
 - **What it took besides**: `array_has_any` / `array_has_all` / `array_contains` in the filter engine
-  (list columns); float comparisons as DataFusion makes them (NaN equal to NaN and greater than all,
-  -0.0 equal to 0.0); a vectorized path for column-against-constant predicates (`f > 3.5` over 5M rows
+  (list columns); float comparisons as Lance makes them (IEEE total order with the zeros equal:
+  -NaN < -inf < ... < -0 = +0 < ... < +inf < +NaN; a literal compared with a float32 column is
+  first rounded to float32); a vectorized path for column-against-constant predicates (`f > 3.5` over 5M rows
   95 -> 25 ms); late materialization (a selective filter's other columns are taken for the rows that
   pass); and take() reading only the chunks holding its rows of a flat MiniBlock page, with the
   whole-column take cache no longer thrashing once its budget is full (all columns of 1,000 scattered
