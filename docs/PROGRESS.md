@@ -2576,6 +2576,29 @@ modes, and pylance reads them back equal.
 - writing them (training included): parity (229-241 ms);
 - the codec alone: decode and train at parity, compress 8% faster.
 
+### Validity bitmaps through nanom's bitmap kernels
+
+Two decoder helpers built validity bitmaps one bit at a time: `append_validity_bits`, which joins
+pages' and nested leaves' validity, and `append_item_validity`, for fixed_size_list element validity.
+Both now use nanom's word-at-a-time `copy_bits`, `set_bits` and `count_bits`, the kernels
+parquet2nanoarrow reads with. The second lost a source-bit argument that every caller passed as 0.
+
+The rest of the decoder was surveyed against nanom's value kernels, and nothing else moved:
+- **Levels to validity:** stays here. Lance's convention (level 0 = valid) differs from Parquet's.
+  The portable kernel tried in nanom was 2.4-5x slower than this SSE2 compare / movemask, and no
+  other nanom user needs it: the Parquet reader expands levels straight from the RLE stream.
+- **UTF-8:** nanolance does not validate strings, so there was nothing to replace. Adding validation
+  would be a behaviour change, not a deduplication.
+- **Null spreading:** does not apply. Lance stores a value slot for every row, null or not.
+
+**Same answers.** Old and new helpers were compiled side by side under ASan / UBSan: 200,000 random
+append sequences produced identical bits, bitmap sizes and null counts. The sequences mixed absent,
+all-valid and mixed sources of 0-69 bits at every offset, with junk past the end of each source.
+
+**Faster.** A pylance-written dataset (400,000 rows: nullable int64 and double, a fixed_size_list
+with null elements, nullable lists) reads in 16.8-17.8 ms instead of 23.0-24.5 ms (best of 15, old
+and new interleaved on one core), 1.35x. It reads back equal to the source.
+
 
 ### Deliberate deviations (not defects)
 

@@ -20,6 +20,7 @@
 #include "nanolance/schema_mapper.hpp"
 
 #include <nanom/columnar.hpp>
+#include <nanom/values.hpp>
 #include <zstd.h>
 
 #include <bit>
@@ -1467,43 +1468,35 @@ struct DictionaryBlock {
     return true;
 }
 
-/// Appends `count` fixed_size_list ELEMENT validity bits, read LSB-first from `src` starting at bit
-/// `src_bit`, at element `at` of `out.item_validity`. `src == nullptr` appends valid elements. The
+/// Appends `count` fixed_size_list ELEMENT validity bits, read LSB-first from the start of `src`, at
+/// element `at` of `out.item_validity`. `src == nullptr` appends valid elements. The
 /// bitmap is materialized lazily: nothing is stored until the first null element, at which point
 /// every element before it is filled in as valid.
-void append_item_validity(ColumnValues& out, const std::uint8_t* src, std::uint64_t src_bit, std::uint64_t count,
-                          std::uint64_t at) {
-    const auto set_valid_upto = [&out](std::uint64_t from, std::uint64_t to) {
-        out.item_validity.resize(static_cast<std::size_t>((to + 7U) / 8U), 0U);
-        for (std::uint64_t i = from; i < to; ++i) {
-            out.item_validity[static_cast<std::size_t>(i >> 3U)] |= static_cast<std::uint8_t>(1U << (i & 7U));
-        }
-    };
+void append_item_validity(ColumnValues& out, const std::uint8_t* src, std::uint64_t count, std::uint64_t at) {
+    namespace col = ::nanom::columnar;
+    auto& bits = out.item_validity;
     if (src == nullptr) {
-        if (!out.item_validity.empty()) {
-            set_valid_upto(at, at + count);
+        if (!bits.empty()) {
+            bits.resize(static_cast<std::size_t>((at + count + 7U) / 8U), 0U);
+            col::set_bits(bits.data(), static_cast<std::size_t>(at), static_cast<std::size_t>(count));
         }
         return;
     }
-    for (std::uint64_t i = 0; i < count; ++i) {
-        const auto b = src_bit + i;
-        const bool valid = ((src[static_cast<std::size_t>(b >> 3U)] >> (b & 7U)) & 1U) != 0U;
-        const auto dst = at + i;
-        if (out.item_validity.empty()) {
-            if (valid) {
-                continue;  // still all valid
-            }
-            set_valid_upto(0, dst);  // materialize: every element before this one was valid
+    const auto valid = col::count_bits(src, 0U, static_cast<std::size_t>(count));
+    if (bits.empty()) {
+        if (valid == count) {
+            return;  // still all valid
         }
-        if (out.item_validity.size() < static_cast<std::size_t>((dst + 8U) / 8U)) {
-            out.item_validity.resize(static_cast<std::size_t>((dst + 8U) / 8U), 0U);
-        }
-        if (valid) {
-            out.item_validity[static_cast<std::size_t>(dst >> 3U)] |= static_cast<std::uint8_t>(1U << (dst & 7U));
-        } else {
-            ++out.item_null_count;
-        }
+        // Materialize: every element before this run was valid.
+        bits.assign(static_cast<std::size_t>((at + 7U) / 8U), 0U);
+        col::set_bits(bits.data(), 0U, static_cast<std::size_t>(at));
     }
+    bits.resize(static_cast<std::size_t>((at + count + 7U) / 8U), 0U);
+    (void)col::copy_bits(std::span<const std::byte>(reinterpret_cast<const std::byte*>(src),
+                                                    static_cast<std::size_t>((count + 7U) / 8U)),
+                         static_cast<std::size_t>(count), std::as_writable_bytes(std::span(bits)),
+                         static_cast<std::size_t>(at));  // both sized above, so it cannot refuse
+    out.item_null_count += count - valid;
 }
 
 /// What decoding one FullZip page needs, derived from THAT page's descriptor. Not hoisted to the
@@ -2928,9 +2921,9 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 if (!variable) {
                     const auto first_item = (rows_so_far + r) * params.items;
                     if (params.item_validity_bytes != 0U) {
-                        append_item_validity(out, data.data() + at, 0U, params.items, first_item);
+                        append_item_validity(out, data.data() + at, params.items, first_item);
                     } else if (params.items != 0U) {
-                        append_item_validity(out, nullptr, 0U, params.items, first_item);
+                        append_item_validity(out, nullptr, params.items, first_item);
                     }
                     at += params.item_validity_bytes;
                     const auto item_bytes = params.value_bytes - params.item_validity_bytes;
@@ -3397,9 +3390,9 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                                 " bytes for " + std::to_string(items) + " elements";
                         return false;
                     }
-                    append_item_validity(out, bits.data(), 0U, items, first_item);
+                    append_item_validity(out, bits.data(), items, first_item);
                 } else {
-                    append_item_validity(out, nullptr, 0U, items, first_item);
+                    append_item_validity(out, nullptr, items, first_item);
                 }
             }
             remaining -= chunk_values;
@@ -3458,21 +3451,25 @@ bool chunk_items_from_metadata(const std::vector<std::uint8_t>& control, bool la
 /// Append `count` bits of `src` (empty = all valid) to `dst`, which already holds `at` bits.
 void append_validity_bits(std::vector<std::uint8_t>& dst, std::uint64_t& dst_nulls, std::uint64_t at,
                           const std::vector<std::uint8_t>& src, std::uint64_t src_nulls, std::uint64_t count) {
+    namespace col = ::nanom::columnar;
     if (src.empty() && dst.empty()) {
         return;  // still all valid
     }
     if (dst.empty()) {
         dst.assign(static_cast<std::size_t>((at + 7U) / 8U), 0U);
-        for (std::uint64_t i = 0; i < at; ++i) {
-            dst[static_cast<std::size_t>(i >> 3U)] |= static_cast<std::uint8_t>(1U << (i & 7U));
-        }
+        col::set_bits(dst.data(), 0U, static_cast<std::size_t>(at));
     }
     dst.resize(static_cast<std::size_t>((at + count + 7U) / 8U), 0U);
-    for (std::uint64_t i = 0; i < count; ++i) {
-        const bool valid = src.empty() || ((src[static_cast<std::size_t>(i >> 3U)] >> (i & 7U)) & 1U) != 0U;
-        if (valid) {
-            const auto d = at + i;
-            dst[static_cast<std::size_t>(d >> 3U)] |= static_cast<std::uint8_t>(1U << (d & 7U));
+    if (src.empty()) {
+        col::set_bits(dst.data(), static_cast<std::size_t>(at), static_cast<std::size_t>(count));
+    } else if (!col::copy_bits(std::as_bytes(std::span(src)), static_cast<std::size_t>(count),
+                               std::as_writable_bytes(std::span(dst)), static_cast<std::size_t>(at))) {
+        // A source bitmap shorter than its length: the bits it lacks are taken as null.
+        for (std::uint64_t i = 0; i < count && (i >> 3U) < src.size(); ++i) {
+            if (((src[static_cast<std::size_t>(i >> 3U)] >> (i & 7U)) & 1U) != 0U) {
+                const auto d = at + i;
+                dst[static_cast<std::size_t>(d >> 3U)] |= static_cast<std::uint8_t>(1U << (d & 7U));
+            }
         }
     }
     dst_nulls += src_nulls;
@@ -4020,7 +4017,7 @@ bool take_full_zip_fixed_rows(const std::filesystem::path& path, const std::stri
             std::memcpy(&word, at, params.control_bytes);  // little-endian
             at += params.control_bytes;
             if (params.items != 0U) {
-                append_item_validity(out, params.item_validity_bytes != 0U ? at : nullptr, 0U, params.items,
+                append_item_validity(out, params.item_validity_bytes != 0U ? at : nullptr, params.items,
                                      out_row * params.items);
             }
             at += params.item_validity_bytes;
