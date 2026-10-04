@@ -2553,6 +2553,29 @@ Data files written from integer, nullable, boolean, dictionary, list and all-zer
 byte-identical to `main`'s in all three writer modes, and pylance reads them back equal to the
 source. Reading them is at parity: 13.6-14.4 ms best of 15, old and new interleaved on one core.
 
+### FSST in nanom
+
+The FSST codec moved into nanom: `nanom/fsst.hpp` reads the table and decodes,
+`nanom/fsst_encode.hpp` trains, compresses and serializes. `include/nanolance/fsst.hpp` and
+`src/fsst.cpp` are now an adapter that keeps nanolance's calling convention (byte vectors, error
+strings with the size, symbol or code in them) over nanom's span API, so every caller, test and fuzzer
+is unchanged.
+
+**Same answers.** The old and new codecs were compiled side by side under ASan / UBSan:
+- 400 corpora (random bytes, URL-like words, small alphabets, tiny values) train to byte-identical
+  tables;
+- their 586,694 values compress to identical bytes and round-trip;
+- across 1.76 million mutated tables and code streams, accept / refuse, outputs and error messages
+  are identical.
+
+URL, text, nullable and list-of-string columns are byte-identical to `main`'s in all three writer
+modes, and pylance reads them back equal.
+
+**Speed.** Same machine, old and new interleaved:
+- reading those columns: parity (45.3-48.6 ms best of 9 for both);
+- writing them (training included): parity (229-241 ms);
+- the codec alone: decode and train at parity, compress 8% faster.
+
 
 ### Deliberate deviations (not defects)
 

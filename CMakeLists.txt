@@ -226,7 +226,7 @@ set(NANO_LANCE_BLOB_V2_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/golden/blob_v2")
 # them (C++23), so nanolance's public headers stay C++20.
 FetchContent_Declare(nanom
     GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
-    GIT_TAG 81bf38f09123ae9810d9d7a4eabd0a781828595d
+    GIT_TAG ffb03d35c3ce16d8ee5fd1702a6921989061383a
     GIT_SHALLOW FALSE)
 FetchContent_GetProperties(nanom)
 if(NOT nanom_POPULATED)
@@ -420,12 +420,12 @@ if(NANOLANCE_BUILD_FUZZERS)
     target_link_options(nanolance_fuzz_page_layout PRIVATE -fsanitize=fuzzer)
 
     add_executable(nanolance_fuzz_fsst tests/fuzz/fuzz_fsst.cpp)
-    target_compile_features(nanolance_fuzz_fsst PRIVATE cxx_std_20)
-    target_link_libraries(nanolance_fuzz_fsst PRIVATE nanolance)
+    target_compile_features(nanolance_fuzz_fsst PRIVATE cxx_std_23)  # nanom's FSST, via nanolance/fsst.hpp
+    target_link_libraries(nanolance_fuzz_fsst PRIVATE nanolance nanolance_nanom)
     target_link_options(nanolance_fuzz_fsst PRIVATE -fsanitize=fuzzer)
     add_executable(nanolance_fuzz_fsst_encode tests/fuzz/fuzz_fsst_encode.cpp)
-    target_compile_features(nanolance_fuzz_fsst_encode PRIVATE cxx_std_20)
-    target_link_libraries(nanolance_fuzz_fsst_encode PRIVATE nanolance)
+    target_compile_features(nanolance_fuzz_fsst_encode PRIVATE cxx_std_23)  # nanom's FSST, via nanolance/fsst.hpp
+    target_link_libraries(nanolance_fuzz_fsst_encode PRIVATE nanolance nanolance_nanom)
     target_link_options(nanolance_fuzz_fsst_encode PRIVATE -fsanitize=fuzzer)
 
     add_executable(nanolance_fuzz_lz4 tests/fuzz/fuzz_lz4.cpp)
@@ -655,8 +655,8 @@ target_link_libraries(nano_lance_repdef_test PRIVATE nanolance)
 target_compile_features(nano_lance_repdef_test PRIVATE cxx_std_20)
 
 add_executable(nano_lance_fsst_test tests/test_fsst.cpp)
-target_link_libraries(nano_lance_fsst_test PRIVATE nanolance)
-target_compile_features(nano_lance_fsst_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fsst_test PRIVATE nanolance nanolance_nanom)
+target_compile_features(nano_lance_fsst_test PRIVATE cxx_std_23)  # nanom's FSST, via nanolance/fsst.hpp
 
 add_executable(nano_lance_lz4_block_test tests/test_lz4_block.cpp)
 target_link_libraries(nano_lance_lz4_block_test PRIVATE nanolance)
