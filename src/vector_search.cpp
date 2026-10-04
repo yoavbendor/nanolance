@@ -21,6 +21,7 @@
 #include "nanolance/expr.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
+#include "nanolance/parallel.hpp"
 
 #include "lance_minimal.pb.hpp"
 
@@ -462,7 +463,8 @@ struct IvfIndex {
     std::size_t m = 0;            // sub-vectors
     std::size_t code_bytes = 0;   // m, or m / 2 with 4 bits
     bool transposed = true;
-    std::vector<float> codebook;  // [m][2^nbits][dim / m]
+    std::vector<float> codebook;    // [m][2^nbits][dim / m]
+    std::vector<float> codebook_t;  // the same as [m][dim / m][2^nbits]: a table row is one sweep
 
     mutable std::mutex mutex;
     mutable std::unordered_map<std::size_t, std::shared_ptr<const Partition>> loaded;
@@ -641,6 +643,16 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
             error = "vector index: the PQ codebook has " + std::to_string(index->codebook.size()) + " values";
             return false;
         }
+        const std::size_t nc = std::size_t{1} << index->nbits;
+        const std::size_t w = index->dim / index->m;
+        index->codebook_t.resize(index->codebook.size());
+        for (std::size_t sub = 0; sub < index->m; ++sub) {
+            for (std::size_t c = 0; c < nc; ++c) {
+                for (std::size_t j = 0; j < w; ++j) {
+                    index->codebook_t[(sub * w + j) * nc + c] = index->codebook[(sub * nc + c) * w + j];
+                }
+            }
+        }
     }
     out = index;
     cache.put(key, out);
@@ -711,16 +723,38 @@ struct RowMask {
     bool has_count = false;  // an explicit prefilter: how many rows it allows
     std::uint64_t count = 0;
 
+    /// Index the above by fragment id; call once they are set.
+    void seal() {
+        std::uint32_t top = 0;
+        for (const auto& [f, n] : physical) {
+            top = std::max(top, f + 1U);
+        }
+        frags_.assign(top, Frag{});
+        for (const auto& [f, n] : physical) {
+            if (limit.empty() || limit.count(f) != 0U) {
+                const auto r = rows.find(f);
+                frags_[f] = Frag{n, r == rows.end() ? nullptr : r->second.data(), true};
+            }
+        }
+    }
+
     bool allows(std::uint64_t id) const {
         const auto frag = static_cast<std::uint32_t>(id >> 32U);
         const auto offset = id & 0xFFFFFFFFULL;
-        const auto f = physical.find(frag);
-        if (f == physical.end() || offset >= f->second || (!limit.empty() && limit.count(frag) == 0U)) {
+        if (frag >= frags_.size()) {
             return false;
         }
-        const auto r = rows.find(frag);
-        return r == rows.end() || r->second[offset] != 0U;
+        const Frag& f = frags_[frag];
+        return f.live && offset < f.rows && (f.allowed == nullptr || f.allowed[offset] != 0U);
     }
+
+private:
+    struct Frag {
+        std::uint64_t rows = 0;
+        const std::uint8_t* allowed = nullptr;  // null: every row
+        bool live = false;
+    };
+    std::vector<Frag> frags_;
 };
 
 /// The addresses of the rows of `fragments` passing `filter` (live rows when null).
@@ -757,19 +791,35 @@ bool row_addresses(const std::filesystem::path& path, const NearestQuery& q, con
 
 // ── searching a segment ─────────────────────────────────────────────────────────────────────────
 
-/// PQ distance table for `query` (the residual for L2 / cosine): [m][2^nbits].
-std::vector<float> pq_table(const IvfIndex& index, const float* query) {
+/// PQ distance table for `query` (the residual for L2 / cosine): [m][2^nbits]. Each entry sums its
+/// sub-vector's dimensions in order, as Lance's prepared (transposed) tables do.
+void pq_table(const IvfIndex& index, const float* query, std::vector<float>& table) {
     const std::size_t nc = std::size_t{1} << index.nbits;
     const std::size_t w = index.dim / index.m;
-    std::vector<float> table(index.m * nc);
+    table.assign(index.m * nc, 0.0F);
+    const bool dot_metric = index.metric == VectorMetric::Dot;
     for (std::size_t s = 0; s < index.m; ++s) {
-        const float* sub = query + s * w;
-        for (std::size_t c = 0; c < nc; ++c) {
-            const float* centroid = index.codebook.data() + (s * nc + c) * w;
-            table[s * nc + c] = index.metric == VectorMetric::Dot ? 1.0F - dot(sub, centroid, w) : l2(sub, centroid, w);
+        float* t = table.data() + s * nc;
+        for (std::size_t j = 0; j < w; ++j) {
+            const float x = query[s * w + j];
+            const float* column = index.codebook_t.data() + (s * w + j) * nc;
+            if (dot_metric) {
+                for (std::size_t c = 0; c < nc; ++c) {
+                    t[c] += x * column[c];
+                }
+            } else {
+                for (std::size_t c = 0; c < nc; ++c) {
+                    const float diff = x - column[c];
+                    t[c] += diff * diff;
+                }
+            }
+        }
+        if (dot_metric) {
+            for (std::size_t c = 0; c < nc; ++c) {
+                t[c] = 1.0F - t[c];
+            }
         }
     }
-    return table;
 }
 
 /// Every row's PQ distance in a partition of `n` rows, as Lance computes it (k_hint: rows kept).
@@ -874,50 +924,63 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         mask.has_count ? std::min<std::uint64_t>(q.k, mask.count) : static_cast<std::uint64_t>(q.k);
 
     std::vector<float> dot_table;  // dot: one table for every partition
-    std::vector<float> residual(dim);
-    std::vector<float> d;
-    std::uint64_t found = 0;
-    std::size_t searched = 0;
-    for (std::size_t i = 0; i < most; ++i) {
-        if (i >= first && found >= max_results) {
-            break;
-        }
-        const std::size_t p = order[i];
+    if (index.pq && index.metric == VectorMetric::Dot) {
+        pq_table(index, key.data(), dot_table);
+    }
+    // One partition's best `kk` rows the mask and the distance range allow.
+    const auto score = [&](std::size_t p, std::vector<Candidate>& local, std::string& why) {
         std::shared_ptr<const Partition> part;
-        if (!index.partition(p, part, error)) {
+        if (!index.partition(p, part, why)) {
             return false;
         }
-        ++searched;
         const std::size_t n = part->ids.size();
+        std::vector<float> d;
         if (index.pq) {
-            const std::vector<float>* table = &dot_table;
             std::vector<float> own;
-            if (index.metric == VectorMetric::Dot) {
-                if (dot_table.empty()) {
-                    dot_table = pq_table(index, key.data());
-                }
-            } else {
+            if (index.metric != VectorMetric::Dot) {
+                std::vector<float> residual(dim);
                 const float* c = index.centroids.data() + p * dim;
                 for (std::size_t j = 0; j < dim; ++j) {
                     residual[j] = key[j] - c[j];
                 }
-                own = pq_table(index, residual.data());
-                table = &own;
+                pq_table(index, residual.data(), own);
             }
-            pq_distances(index, *table, part->codes, n, kk, d);
+            pq_distances(index, index.metric == VectorMetric::Dot ? dot_table : own, part->codes, n, kk, d);
         } else {
             d.resize(n);
             for (std::size_t r = 0; r < n; ++r) {
                 d[r] = distance(index.metric, part->vectors.data() + r * dim, key.data(), dim, 1.0F);
             }
         }
-        std::vector<Candidate> local;
         for (std::size_t r = 0; r < n; ++r) {
-            if (mask.allows(part->ids[r]) && in_range(d[r], q)) {
+            if (in_range(d[r], q) && mask.allows(part->ids[r])) {
                 local.push_back(Candidate{d[r], part->ids[r]});
             }
         }
         keep_best(local, kk);
+        return true;
+    };
+    // The first `first` partitions are searched whatever they hold, in parallel.
+    std::vector<std::vector<Candidate>> early(std::min(first, most));
+    std::vector<std::string> errors(early.size());
+    std::vector<std::uint8_t> ok(early.size(), 1);
+    parallel::for_each(early.size(), [&](std::size_t i) { ok[i] = score(order[i], early[i], errors[i]) ? 1 : 0; });
+    std::uint64_t found = 0;
+    for (std::size_t i = 0; i < early.size(); ++i) {
+        if (ok[i] == 0U) {
+            error = errors[i];
+            return false;
+        }
+        found += early[i].size();
+        out.insert(out.end(), early[i].begin(), early[i].end());
+    }
+    // Then one at a time while fewer than k rows were found.
+    std::size_t searched = early.size();
+    for (; searched < most && found < max_results; ++searched) {
+        std::vector<Candidate> local;
+        if (!score(order[searched], local, error)) {
+            return false;
+        }
         found += local.size();
         out.insert(out.end(), local.begin(), local.end());
     }
@@ -1358,6 +1421,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                     mask.count = addrs.size();
                 }
             }
+            mask.seal();
             std::string line;
             if (!search_segment(*loaded[s], q, f32_column, mask, kk, ann, line, error)) {
                 return false;
