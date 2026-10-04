@@ -12,6 +12,7 @@
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
 #include <nanolance/scalar_index.hpp>
+#include <nanolance/vector_search.hpp>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
@@ -21,6 +22,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/string_view.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/tuple.h>
 
 #include <cstdint>
 #include <filesystem>
@@ -1016,6 +1018,38 @@ NB_MODULE(_nanolance, m) {
             return nano_lance::dataset_explain_filter(path, version.has_value(), version.value_or(0), filter, lines, e);
         });
         return lines;
+    });
+    m.def("_ds_nearest", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
+                            const std::string& column, const std::vector<float>& key, std::uint64_t k,
+                            std::uint32_t minimum_nprobes, std::optional<std::uint32_t> maximum_nprobes,
+                            std::optional<std::uint32_t> refine_factor, std::optional<std::string> metric,
+                            bool use_index, std::optional<float> lower_bound, std::optional<float> upper_bound,
+                            std::optional<std::string> filter, bool prefilter, bool fast_search) {
+        nano_lance::NearestQuery q;
+        q.has_version = version.has_value();
+        q.version = version.value_or(0);
+        q.column = column;
+        q.key = key;
+        q.k = k;
+        q.minimum_nprobes = minimum_nprobes;
+        q.maximum_nprobes = maximum_nprobes;
+        q.refine_factor = refine_factor;
+        if (metric) {
+            nano_lance::VectorMetric m;
+            if (!nano_lance::parse_vector_metric(*metric, m)) {
+                throw nb::value_error(("unknown distance type '" + *metric + "'").c_str());
+            }
+            q.metric = m;
+        }
+        q.use_index = use_index;
+        q.lower_bound = lower_bound;
+        q.upper_bound = upper_bound;
+        q.filter = filter;
+        q.prefilter = prefilter;
+        q.fast_search = fast_search;
+        nano_lance::NearestResult result;
+        run_op([&](std::string& e) { return nano_lance::dataset_nearest(path, q, result, e); });
+        return std::make_tuple(result.row_ids, result.distances, result.plan);
     });
     m.def("_ds_drop_columns", [](const std::filesystem::path& path, const std::vector<std::string>& columns) {
         std::uint64_t version = 0;

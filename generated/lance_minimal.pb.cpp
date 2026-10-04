@@ -289,6 +289,7 @@ bool decode_index_metadata(const std::uint8_t* data, std::size_t size, IndexMeta
     }
     if (const auto& details = *w.index_details) {
         index.details_type_url = owned(*details->type_url);
+        index.details_value = owned(*details->value);
     }
     index.index_version = static_cast<std::uint32_t>(w.index_version->value_or(0));
     index.created_at = w.created_at->value_or(0);
@@ -332,7 +333,8 @@ IndexMetadata make_index_metadata(const std::array<std::uint8_t, 16>& uuid, cons
                                   const std::string& name, std::uint64_t dataset_version,
                                   const std::vector<std::uint32_t>& fragment_ids, const std::string& details_type_url,
                                   std::uint32_t index_version, std::uint64_t created_at,
-                                  const std::vector<IndexMetadata::File>& files) {
+                                  const std::vector<IndexMetadata::File>& files,
+                                  const std::vector<std::uint8_t>& details_value) {
     const auto bitmap = roaring::encode(fragment_ids);
     wire::IndexMetadata w;
     w.uuid = wire::Uuid{};
@@ -343,6 +345,9 @@ IndexMetadata make_index_metadata(const std::array<std::uint8_t, 16>& uuid, cons
     w.fragment_bitmap = view(bitmap);
     w.index_details = wire::Any{};
     (*w.index_details)->type_url = std::string_view(details_type_url);
+    if (!details_value.empty()) {
+        (*w.index_details)->value = view(details_value);
+    }
     w.index_version = static_cast<std::int32_t>(index_version);
     w.created_at = created_at;
     for (const auto& file : files) {

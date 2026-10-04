@@ -7,6 +7,7 @@
 // Lance's index files; the index is committed in the manifest's index section as Lance commits one.
 
 #include "nanolance/scalar_index.hpp"
+#include "nanolance/vector_search.hpp"
 
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/index_maintenance.hpp"
@@ -1118,6 +1119,13 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
             details.resize(details.size() - suffix.size());
         }
         info.type = details;
+        if (is_vector_index_url(url)) {
+            const auto type =  // IVF_PQ, IVF_FLAT, ...
+                vector_index_type(dataset_path / "_indices" / pb::uuid_string(index.uuid), index.details_value);
+            if (!type.empty()) {
+                info.type = type;
+            }
+        }
         for (const auto id : index.fields) {
             info.fields.push_back(path_of(id));
         }

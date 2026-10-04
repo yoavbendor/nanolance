@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypedDict, Union
 
+import numpy as np
 import pyarrow as pa
 
 from nanolance import _nanolance
@@ -355,7 +356,7 @@ class LanceDataset:
             fragments=fragments, full_text_query=full_text_query, with_row_id=with_row_id,
             with_row_address=with_row_address, include_deleted_rows=include_deleted_rows, order_by=order_by,
             substrait_filter=substrait_filter, scan_stats_callback=scan_stats_callback, blob_handling=blob_handling,
-            use_scalar_index=use_scalar_index,
+            use_scalar_index=use_scalar_index, prefilter=prefilter, fast_search=fast_search,
         )
         options.update({k: v for k, v in given.items() if v is not None})
         return LanceScanner(self, **options)
@@ -368,7 +369,8 @@ class LanceDataset:
         return self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
             full_text_query=full_text_query, with_row_id=with_row_id, with_row_address=with_row_address,
-            include_deleted_rows=include_deleted_rows, order_by=order_by, use_scalar_index=use_scalar_index, **kwargs,
+            include_deleted_rows=include_deleted_rows, order_by=order_by, use_scalar_index=use_scalar_index,
+            prefilter=prefilter, fast_search=fast_search, **kwargs,
         ).to_table()
 
     def to_batches(self, columns=None, filter=None, limit=None, offset=None, nearest=None, batch_size=None,
@@ -379,7 +381,7 @@ class LanceDataset:
         return self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
             full_text_query=full_text_query, with_row_id=with_row_id, with_row_address=with_row_address,
-            order_by=order_by, use_scalar_index=use_scalar_index, **kwargs,
+            order_by=order_by, use_scalar_index=use_scalar_index, prefilter=prefilter, **kwargs,
         ).to_batches()
 
     def to_pandas(self, columns=None, filter=None, limit=None, offset=None, **kwargs):
@@ -674,7 +676,100 @@ def _index_list(indices) -> List[int]:
     return [int(i) for i in indices]
 
 
-_SYSTEM_COLUMNS = ("_rowid", "_rowaddr", "_rowoffset")
+_SYSTEM_COLUMNS = ("_rowid", "_rowaddr", "_rowoffset", "_distance")
+
+
+def _query_vector(q) -> np.ndarray:
+    """A query vector as float32, coerced as pylance coerces it."""
+    if hasattr(q, "__getitem__") and not isinstance(q, (str, bytes)) and len(q) > 0 and isinstance(
+            q[0], (list, tuple, np.ndarray, pa.Array)):
+        raise unsupported("batch and multivector queries (a 2-D q)")
+    if isinstance(q, pa.Scalar):
+        q = q.value if isinstance(q, pa.ExtensionScalar) else q
+        q = q.values if isinstance(q.type, pa.FixedSizeListType) else q
+    elif isinstance(q, (list, tuple, np.ndarray)):
+        return np.asarray(np.array(q).astype("float64"), np.float32).ravel()
+    elif not isinstance(q, (pa.Array, pa.ChunkedArray)):
+        try:
+            q = pa.array(q)
+        except Exception:
+            raise TypeError("Query vectors should be an array of floats, "
+                            f"got {type(q)} which we cannot coerce to a float array") from None
+    if not (pa.types.is_floating(q.type) or pa.types.is_integer(q.type)):
+        raise TypeError(f"query vector must be list-like or pa.FloatingPointArray but received {q.type}")
+    return np.asarray(q.to_numpy(zero_copy_only=False), np.float32).ravel()
+
+
+def _nearest_query(ds, nearest) -> dict:
+    """``nearest={...}`` checked as pylance checks it."""
+    if not isinstance(nearest, dict):
+        raise TypeError(f"nearest must be a dict, got {type(nearest)}")
+    known = {"column", "q", "k", "metric", "distance_type", "nprobes", "minimum_nprobes", "maximum_nprobes",
+             "refine_factor", "use_index", "ef", "query_parallelism", "approx_mode", "distance_range"}
+    unknown = set(nearest) - known
+    if unknown:
+        raise TypeError(f"nearest() got unexpected keyword arguments {sorted(unknown)}")
+    column = nearest.get("column")
+    q = _query_vector(nearest.get("q"))
+    node = None
+    for i, part in enumerate(str(column).split(".")):
+        if i > 0 and not pa.types.is_struct(node.type):
+            node = None
+            break
+        node = {f.name.lower(): f for f in (ds.schema if i == 0 else node.type)}.get(part.lower())
+        if node is None:
+            break
+    if node is None:
+        raise ValueError(f"Embedding column {column} is not in the dataset")
+    arrow_type = node.type
+    storage = getattr(arrow_type, "storage_type", arrow_type)
+    if pa.types.is_fixed_size_list(storage):
+        dim = storage.list_size
+    elif pa.types.is_list(storage) and pa.types.is_fixed_size_list(storage.value_type):
+        raise unsupported("multivector search")
+    else:
+        raise TypeError(f"Query column {column} must be a vector. Got {arrow_type}.")
+    if len(q) != dim:
+        raise ValueError(f"Query vector size {len(q)} does not match index column size {dim}")
+    k, nprobes = nearest.get("k"), nearest.get("nprobes")
+    minimum, maximum = nearest.get("minimum_nprobes"), nearest.get("maximum_nprobes")
+    refine = nearest.get("refine_factor")
+    if k is not None and int(k) <= 0:
+        raise ValueError(f"Nearest-K must be > 0 but got {k}")
+    if nprobes is not None and int(nprobes) <= 0:
+        raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
+    if minimum is not None and int(minimum) < 0:
+        raise ValueError(f"Minimum nprobes must be >= 0 but got {minimum}")
+    if maximum is not None and int(maximum) < 0:
+        raise ValueError(f"Maximum nprobes must be >= 0 but got {maximum}")
+    if nprobes is not None:
+        if minimum is not None or maximum is not None:
+            raise ValueError("nprobes cannot be set in combination with minimum_nprobes or maximum_nprobes")
+        minimum = maximum = nprobes
+    if minimum is not None and maximum is not None and int(minimum) > int(maximum):
+        raise ValueError("minimum_nprobes must be <= maximum_nprobes")
+    if refine is not None and int(refine) < 1:
+        raise ValueError(f"Refine factor must be 1 or more got {refine}")
+    ef = nearest.get("ef")
+    if ef is not None and int(ef) <= 0:
+        raise ValueError(f"ef must be > 0 but got {ef}")
+    lower = upper = None
+    distance_range = nearest.get("distance_range")
+    if distance_range is not None:
+        if len(distance_range) != 2:
+            raise ValueError("distance_range must be a tuple of (lower_bound, upper_bound)")
+        lower, upper = distance_range
+    metric = nearest.get("metric") or nearest.get("distance_type")
+    return {
+        "column": str(column), "q": q.tolist(), "k": 10 if k is None else int(k),
+        "minimum_nprobes": 1 if minimum is None else int(minimum),
+        "maximum_nprobes": None if maximum is None else int(maximum),
+        "refine_factor": None if refine is None else int(refine),
+        "metric": None if metric is None else str(metric),
+        "use_index": nearest.get("use_index", True) is not False,
+        "lower_bound": None if lower is None else float(lower),
+        "upper_bound": None if upper is None else float(upper),
+    }
 
 
 def _filter_sql(filter) -> Optional[str]:
@@ -815,9 +910,10 @@ class LanceScanner:
     def __init__(self, ds: LanceDataset, columns=None, filter=None, limit=None, offset=None, nearest=None,
                  batch_size=None, fragments=None, full_text_query=None, with_row_id=False, with_row_address=False,
                  include_deleted_rows=None, order_by=None, substrait_filter=None, scan_stats_callback=None,
-                 blob_handling=None, use_scalar_index=None, **ignored):
-        if nearest is not None:
-            raise unsupported("vector search (nearest=...)")
+                 blob_handling=None, use_scalar_index=None, prefilter=None, fast_search=None, **ignored):
+        self._nearest = None if nearest is None else _nearest_query(ds, nearest)
+        self._prefilter = bool(prefilter)
+        self._fast_search = bool(fast_search)
         if full_text_query is not None:
             raise unsupported("full text search")
         if substrait_filter is not None:
@@ -900,7 +996,39 @@ class LanceScanner:
         return table
 
     def to_table(self) -> pa.Table:
+        if self._nearest is not None:
+            return self._nearest_table()
         return self._shape(pa.table(self._read(stream=False)))
+
+    def _search(self):
+        n = self._nearest
+        with native():
+            return _nanolance._ds_nearest(
+                self._ds.uri, self._ds.version, n["column"], n["q"], n["k"], n["minimum_nprobes"],
+                n["maximum_nprobes"], n["refine_factor"], n["metric"], n["use_index"], n["lower_bound"],
+                n["upper_bound"], self._filter, self._prefilter, self._fast_search)
+
+    def _nearest_table(self) -> pa.Table:
+        """The k nearest rows: the columns asked for, then ``_distance`` (then the row id columns)."""
+        ids, distances, _ = self._search()
+        names = self._names
+        if self._order is not None and "_distance" in self._order:
+            names = [c for c in names if c != "_distance"] if names is not None else None
+        table = self._ds._take(list(ids), names, addresses=True, with_row_id=self._with_row_id,
+                               with_row_address=self._with_row_address, blob_handling=self._blob_handling)
+        system = [c for c in ("_rowid", "_rowaddr") if c in table.column_names]
+        data = table.drop_columns(system)
+        out = data.append_column("_distance", pa.array(distances, pa.float32()))
+        for c in system:
+            out = out.append_column(c, table.column(c))
+        if self._offset or self._limit is not None:
+            out = out.slice(self._offset, self._limit)
+        if self._order is not None:
+            out = out.select([c for c in self._order if c in out.column_names])
+        meta = self._ds._info["schema_metadata"]
+        if meta and out.schema.metadata != meta:
+            out = out.replace_schema_metadata(meta)
+        return out
 
     def to_reader(self) -> pa.RecordBatchReader:
         table = self.to_table()
@@ -933,6 +1061,9 @@ class LanceScanner:
 
     def explain_plan(self, verbose: bool = False) -> str:
         lines = [f"nanolance scan of {self._ds.uri} v{self._ds.version}"]
+        if self._nearest is not None:
+            lines += ["  " + line for line in self._search()[2]]
+            return "\n".join(lines)
         if self._filter is not None:
             lines.append(f"  filter={self._filter}")
             if self._use_scalar_index:
@@ -980,8 +1111,18 @@ class ScannerBuilder:
     def with_fragments(self, fragments) -> "ScannerBuilder":
         return self._set(fragments=fragments)
 
-    def nearest(self, *args, **kwargs) -> "ScannerBuilder":
-        raise unsupported("vector search (nearest=...)")
+    def nearest(self, column, q, k=None, metric=None, nprobes=None, minimum_nprobes=None, maximum_nprobes=None,
+                refine_factor=None, use_index=True, ef=None, distance_range=None, **kwargs) -> "ScannerBuilder":
+        return self._set(nearest=dict(column=column, q=q, k=k, metric=metric, nprobes=nprobes,
+                                      minimum_nprobes=minimum_nprobes, maximum_nprobes=maximum_nprobes,
+                                      refine_factor=refine_factor, use_index=use_index, ef=ef,
+                                      distance_range=distance_range, **kwargs))
+
+    def prefilter(self, enabled: bool) -> "ScannerBuilder":
+        return self._set(prefilter=enabled)
+
+    def fast_search(self, enabled: bool) -> "ScannerBuilder":
+        return self._set(fast_search=enabled)
 
     def __getattr__(self, name):
         # Tuning knobs with no effect on the result (readahead, io buffers, ...).

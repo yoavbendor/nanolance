@@ -83,6 +83,7 @@ struct IndexMetadata {
     bool fragment_bitmap_changed = false;
     std::array<std::uint8_t, 16> uuid{};  // 1: UUID{bytes=1}
     std::string details_type_url;         // 6: the index_details Any's type, e.g. "/lance.table.BTreeIndexDetails"
+    std::vector<std::uint8_t> details_value;  // 6: the index_details Any's message
     std::uint32_t index_version = 0;      // 7
     std::uint64_t created_at = 0;         // 8: milliseconds since the epoch
     struct File {
@@ -97,7 +98,8 @@ IndexMetadata make_index_metadata(const std::array<std::uint8_t, 16>& uuid, cons
                                   const std::string& name, std::uint64_t dataset_version,
                                   const std::vector<std::uint32_t>& fragment_ids, const std::string& details_type_url,
                                   std::uint32_t index_version, std::uint64_t created_at,
-                                  const std::vector<IndexMetadata::File>& files);
+                                  const std::vector<IndexMetadata::File>& files,
+                                  const std::vector<std::uint8_t>& details_value = {});
 
 /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", the directory name of an index under _indices/.
 std::string uuid_string(const std::array<std::uint8_t, 16>& uuid);

@@ -20,6 +20,8 @@
 
 #include "nanolance/index_search.hpp"
 
+#include "index_files.hpp"
+
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/lance_table_reader.hpp"
@@ -42,50 +44,12 @@ namespace {
 
 // ── loaded index files ──────────────────────────────────────────────────────────────────────────
 
-/// A read of an index file: its schema and batches, owned.
-struct FileTable {
-    ArrowSchema schema{};
-    std::vector<ArrowArray> batches;
-    FileTable() = default;
-    FileTable(const FileTable&) = delete;
-    FileTable& operator=(const FileTable&) = delete;
-    ~FileTable() {
-        for (auto& b : batches) {
-            if (b.release != nullptr) {
-                b.release(&b);
-            }
-        }
-        if (schema.release != nullptr) {
-            schema.release(&schema);
-        }
-    }
-    const ArrowSchema& type(std::size_t column) const { return *schema.children[column]; }
-};
-
-bool read_table(const std::filesystem::path& path, const std::vector<std::string>* columns, const LanceRowRange& range,
-                FileTable& out, std::string& error) {
-    LanceScanRequest request;
-    request.columns = columns;
-    request.range = range;
-    if (!lance_file_read(path, request, out.schema, out.batches, error)) {
-        out.schema = ArrowSchema{};  // released by the reader on failure
-        error = path.filename().string() + ": " + error;
-        return false;
-    }
-    return true;
-}
-
-bool take_table(const std::filesystem::path& path, const std::vector<std::string>* columns,
-                const std::vector<std::uint64_t>& rows, FileTable& out, std::string& error) {
-    LanceScanRequest request;
-    request.columns = columns;
-    if (!lance_file_take(path, request, rows, out.schema, out.batches, error)) {
-        out.schema = ArrowSchema{};
-        error = path.filename().string() + ": " + error;
-        return false;
-    }
-    return true;
-}
+using index_files::FileTable;
+using index_files::IndexCache;
+using index_files::file_key;
+using index_files::read_table;
+using index_files::schema_metadata;
+using index_files::take_table;
 
 struct BTreeIndex {
     FileTable lookup;  // min, max, null_count, page_idx
@@ -99,50 +63,6 @@ struct BitmapIndex {
     std::vector<std::uint8_t> list_nulls;  // LabelList: the null lists' serialized RowAddrTreeMap
     bool has_list_nulls = false;
 };
-
-/// Loaded indices, by file identity: an index's files never change, but a path could be reused by
-/// a dataset written anew, so size and modification time are part of the key.
-template <typename T>
-class IndexCache {
-public:
-    std::shared_ptr<const T> find(const std::string& key) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = entries_.find(key);
-        return it == entries_.end() ? nullptr : it->second;
-    }
-    void put(const std::string& key, std::shared_ptr<const T> value) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (entries_.size() >= 64U) {
-            entries_.erase(entries_.begin());
-        }
-        entries_[key] = std::move(value);
-    }
-
-private:
-    std::mutex mutex_;
-    std::unordered_map<std::string, std::shared_ptr<const T>> entries_;
-};
-
-std::string file_key(const std::filesystem::path& path) {
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    const auto mtime = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
-    return path.string() + "|" + std::to_string(size) + "|" + std::to_string(static_cast<long long>(mtime));  // libc++'s file_clock counts in __int128
-}
-
-bool schema_metadata(const std::filesystem::path& path, const std::string& key, std::string& value, bool& found,
-                     LanceDataFileFooterLayout& layout, std::string& error) {
-    pb::FileDescriptor descriptor;
-    if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
-        return false;
-    }
-    const auto it = descriptor.schema_metadata.find(key);
-    found = it != descriptor.schema_metadata.end();
-    if (found) {
-        value.assign(it->second.begin(), it->second.end());
-    }
-    return true;
-}
 
 bool load_btree(const std::filesystem::path& dir, std::shared_ptr<const BTreeIndex>& out, std::string& error) {
     static IndexCache<BTreeIndex> cache;

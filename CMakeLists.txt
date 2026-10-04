@@ -294,6 +294,8 @@ add_library(nanolance STATIC
     src/lance_file_writer.cpp
     src/scalar_index.cpp
     src/index_search.cpp
+    src/index_files.cpp
+    src/vector_search.cpp
     src/data_file_reader.cpp
     src/deletion_vector.cpp
     src/data_file_writer.cpp
