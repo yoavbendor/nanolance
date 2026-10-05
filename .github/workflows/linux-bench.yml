@@ -20,6 +20,10 @@ on:
       - 'CMakeLists.txt'
       - '.github/workflows/linux-bench.yml'
   workflow_dispatch:
+    inputs:
+      matrix_runs:
+        description: "Timed runs per matrix entry (3 on every push; more for a steadier baseline)"
+        default: "3"
 
 permissions:
   contents: write
@@ -88,15 +92,34 @@ jobs:
           python3 tools/bench.py | tee /tmp/bench.txt
 
       # nanolance against Rust Lance on the 27-type matrix (a tenth of the rows), compared as ratios
-      # to Rust measured in the same run with bench/results/matrix-quick.json: fails on any wrong or
+      # to Rust measured in the same run with the baseline for this runner's CPU in bench/results/ci/
+      # (ubuntu-latest mixes CPUs, and the ratios differ between them): fails on any wrong or
       # missing read, a data type twice as slow relative to Rust on one core and on all cores, or a
       # mean 25% down (tools/bench_compare.py).
-      - name: Benchmark matrix (quick) + regression check
+      - name: Benchmark matrix (quick)
         run: |
           python3 -m pip install --quiet --break-system-packages ./bindings/python numpy \
             || python3 -m pip install --quiet ./bindings/python numpy
-          python3 tools/bench_matrix.py --quick --runs 3 --out /tmp/matrix-quick.json
-          python3 tools/bench_compare.py bench/results/matrix-quick.json /tmp/matrix-quick.json
+          python3 tools/bench_matrix.py --quick --runs "${{ github.event.inputs.matrix_runs || '3' }}" \
+            --out /tmp/matrix-quick.json
+
+      # The run's matrix, kept so the baseline can be re-recorded on this runner type: as an artifact,
+      # and as one log line (MATRIX_JSON ...) for tools that read job logs. To re-baseline, run this
+      # workflow by hand (more matrix_runs for a steadier median) and commit that JSON as
+      # bench/results/ci/<cpu>-<cores>c.json -- once per CPU the runs land on.
+      - name: Keep the matrix
+        if: always()
+        run: |
+          python3 -c "import json; print('MATRIX_JSON ' + json.dumps(json.load(open('/tmp/matrix-quick.json')), separators=(',', ':')))"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: matrix-quick
+          path: /tmp/matrix-quick.json
+          if-no-files-found: ignore
+
+      - name: Regression check
+        run: python3 tools/bench_compare.py bench/results/ci /tmp/matrix-quick.json
 
       - name: Profile native read (callgrind on pcap_ref)
         run: |
