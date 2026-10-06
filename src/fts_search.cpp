@@ -261,8 +261,14 @@ struct Partition {
     std::vector<std::uint64_t> row_ids;
     std::vector<std::uint32_t> num_tokens;
     std::uint64_t total_tokens = 0;
+    bool rows_sorted = true;  // documents in row order (as nanolance writes them)
 
     mutable std::mutex mutex;
+    mutable std::uint32_t norms_key = 0;
+    mutable std::shared_ptr<const std::vector<float>> norms;  // BM25's length norm by document, for norms_key
+
+    /// Each document's K1 * (1 - B + B * length / avg).
+    std::shared_ptr<const std::vector<float>> length_norms(float avg) const;
     mutable std::unordered_map<std::uint32_t, std::shared_ptr<const Posting>> postings;
 
     std::optional<std::uint32_t> token_id(const std::string& token) const {
@@ -376,6 +382,34 @@ bool Partition::load(const std::vector<std::uint32_t>& ids, fts::TailCodec codec
     return true;
 }
 
+constexpr float kK1 = 1.2F;
+constexpr float kB = 0.75F;
+
+/// Lance's BM25 (lance-index scorer.rs), in its f32 operation order.
+float length_norm(std::uint32_t doc_tokens, float avg_doc_length) {
+    return kK1 * (1.0F - kB + kB * static_cast<float>(doc_tokens) / avg_doc_length);
+}
+
+float doc_weight_with_norm(std::uint32_t freq, float norm) {
+    const auto f = static_cast<float>(freq);
+    return (kK1 + 1.0F) * f / (f + norm);
+}
+
+std::shared_ptr<const std::vector<float>> Partition::length_norms(float avg) const {
+    std::uint32_t key;
+    std::memcpy(&key, &avg, sizeof(key));
+    std::lock_guard<std::mutex> lock(mutex);
+    if (norms == nullptr || norms_key != key) {
+        auto v = std::make_shared<std::vector<float>>(num_tokens.size());
+        for (std::size_t d = 0; d < num_tokens.size(); ++d) {
+            (*v)[d] = length_norm(num_tokens[d], avg);
+        }
+        norms = std::move(v);
+        norms_key = key;
+    }
+    return norms;
+}
+
 index_files::IndexCache<InvertedIndex>& index_cache() {
     static index_files::IndexCache<InvertedIndex> cache;
     return cache;
@@ -468,6 +502,8 @@ bool load_partition(const std::filesystem::path& dir, std::uint64_t id, Partitio
                 const auto n = static_cast<std::uint32_t>(ArrowArrayViewGetUIntUnsafe(view.children[1], row));
                 part.num_tokens.push_back(n);
                 part.total_tokens += n;
+                const auto size = part.row_ids.size();
+                part.rows_sorted = part.rows_sorted && (size < 2 || part.row_ids[size - 2] < part.row_ids[size - 1]);
             }
             ArrowArrayViewReset(&view);
         }
@@ -537,10 +573,6 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
 
 // ── scoring ─────────────────────────────────────────────────────────────────────────────────────
 
-constexpr float kK1 = 1.2F;
-constexpr float kB = 0.75F;
-
-/// Lance's BM25 (lance-index scorer.rs), in its f32 operation order.
 float idf(std::uint64_t token_docs, std::uint64_t num_docs) {
     const auto n = static_cast<float>(num_docs);
     const auto t = static_cast<float>(token_docs);
@@ -548,35 +580,83 @@ float idf(std::uint64_t token_docs, std::uint64_t num_docs) {
 }
 
 float doc_weight(std::uint32_t freq, std::uint32_t doc_tokens, float avg_doc_length) {
-    const auto f = static_cast<float>(freq);
-    const float norm = kK1 * (1.0F - kB + kB * static_cast<float>(doc_tokens) / avg_doc_length);
-    return (kK1 + 1.0F) * f / (f + norm);
+    return doc_weight_with_norm(freq, length_norm(doc_tokens, avg_doc_length));
 }
 
 /// Hits, ascending by row id.
 using Hits = std::vector<std::pair<std::uint64_t, float>>;
 
 void sort_hits(Hits& h) {
-    std::sort(h.begin(), h.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    const auto by_row = [](const auto& a, const auto& b) { return a.first < b.first; };
+    if (!std::is_sorted(h.begin(), h.end(), by_row)) {
+        std::sort(h.begin(), h.end(), by_row);
+    }
 }
+
+/// The better of two hits: the higher score, then the lower row id.
+bool better_hit(const std::pair<std::uint64_t, float>& a, const std::pair<std::uint64_t, float>& b) {
+    return a.second != b.second ? a.second > b.second : a.first < b.first;
+}
+
+/// Hits keeping only the best `k` (all when 0): a heap whose front is the worst kept.
+class HitSink {
+public:
+    HitSink(Hits& out, std::size_t k) : out_(out), k_(k) {}
+    void add(std::uint64_t row, float score) {
+        if (k_ == 0U) {
+            out_.emplace_back(row, score);
+            return;
+        }
+        if (out_.size() < k_) {
+            out_.emplace_back(row, score);
+            std::push_heap(out_.begin(), out_.end(), better_hit);
+            return;
+        }
+        const auto& worst = out_.front();
+        if (score < worst.second || (score == worst.second && row > worst.first)) {
+            return;
+        }
+        std::pop_heap(out_.begin(), out_.end(), better_hit);
+        out_.back() = {row, score};
+        std::push_heap(out_.begin(), out_.end(), better_hit);
+    }
+
+private:
+    Hits& out_;
+    std::size_t k_;
+};
 
 /// Which rows may be returned: the live rows of the dataset (and, with a prefilter, those passing
 /// it). A fragment without a list has every row allowed; one absent from `fragments`, none.
 struct RowMask {
     std::map<std::uint32_t, std::vector<std::uint8_t>> rows;
     std::set<std::uint32_t> fragments;
+
     bool allows(std::uint64_t addr) const {
         const auto frag = static_cast<std::uint32_t>(addr >> 32U);
-        if (fragments.count(frag) == 0U) {
+        if (!cached_ || frag != cached_frag_) {
+            cached_ = true;
+            cached_frag_ = frag;
+            cached_live_ = fragments.count(frag) != 0U;
+            const auto it = rows.find(frag);
+            cached_rows_ = it == rows.end() ? nullptr : &it->second;
+        }
+        if (!cached_live_) {
             return false;
         }
-        const auto it = rows.find(frag);
-        if (it == rows.end()) {
+        if (cached_rows_ == nullptr) {
             return true;
         }
         const auto offset = static_cast<std::size_t>(addr & 0xFFFFFFFFULL);
-        return offset < it->second.size() && it->second[offset] != 0U;
+        return offset < cached_rows_->size() && (*cached_rows_)[offset] != 0U;
     }
+
+private:
+    // The last fragment looked up: hits come grouped by fragment.
+    mutable bool cached_ = false;
+    mutable std::uint32_t cached_frag_ = 0;
+    mutable bool cached_live_ = false;
+    mutable const std::vector<std::uint8_t>* cached_rows_ = nullptr;
 };
 
 int child_index(const ArrowSchema& schema, const std::string& name) {
@@ -612,6 +692,13 @@ struct Search {
     std::map<std::string, ColumnIndex> columns;  // every column with an INVERTED index
     RowMask mask;
     std::vector<std::string>* plan = nullptr;
+    // Scoring buffers, by document, kept zeroed between uses.
+    std::vector<float> scores_;
+    std::vector<std::uint32_t> seen_;
+    std::vector<std::uint32_t> touched_;
+    /// When only the best `top_k_` rows of a match can matter (a Match or MultiMatch at the root,
+    /// with a limit), a match keeps just those.
+    std::size_t top_k_ = 0;
 
     bool scan_flat(ColumnIndex& c, std::string& error);
     bool match(const FtsQuery& q, const std::string& column, float boost, Hits& out, std::string& error);
@@ -758,10 +845,10 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         weights[t] = token_docs[t] == 0U ? 0.0F : idf(token_docs[t], c.num_docs);
     }
     Hits hits;
-    // Indexed documents: their scores from the index's statistics.
-    std::vector<float> scores;
-    std::vector<std::uint32_t> seen;  // AND: distinct tokens found
-    std::vector<std::uint32_t> touched;
+    // Only the best rows when the caller needs only those (a positive boost keeps the order).
+    HitSink sink(hits, boost > 0.0F ? top_k_ : 0U);
+    // Indexed documents: their scores from the index's statistics, accumulated in a dense array per
+    // partition and read back in document (row) order.
     for (std::size_t p = 0; p < parts.size(); ++p) {
         const Partition& part = *parts[p];
         if (q.and_operator) {
@@ -773,38 +860,63 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
                 continue;
             }
         }
-        scores.assign(part.row_ids.size(), 0.0F);
-        seen.assign(q.and_operator ? part.row_ids.size() : 0U, 0U);
-        touched.clear();
-        std::vector<std::uint8_t> hit(part.row_ids.size(), 0U);
+        const std::size_t n = part.row_ids.size();
+        if (scores_.size() < n) {
+            scores_.resize(n, 0.0F);
+            seen_.resize(n, 0U);
+        }
+        touched_.clear();
+        const auto norms = part.length_norms(avg);
+        const float* norm = norms->data();
         for (const std::size_t t : order) {
             const Posting* posting = postings[p][t].get();
             if (posting == nullptr) {
                 continue;
             }
-            for (std::size_t k = 0; k < posting->docs.size(); ++k) {
-                const std::uint32_t d = posting->docs[k];
-                if (hit[d] == 0U) {
-                    hit[d] = 1U;
-                    touched.push_back(d);
+            const float w = weights[t];
+            const std::uint32_t* docs = posting->docs.data();
+            const std::uint32_t* freqs = posting->freqs.data();
+            for (std::size_t k = 0, m = posting->docs.size(); k < m; ++k) {
+                const std::uint32_t d = docs[k];
+                if (seen_[d] == 0U) {
+                    touched_.push_back(d);
                 }
-                scores[d] += weights[t] * doc_weight(posting->freqs[k], part.num_tokens[d], avg);
+                seen_[d] |= 1U;
+                scores_[d] += w * doc_weight_with_norm(freqs[k], norm[d]);
             }
         }
+        std::uint32_t need = 1U;
         if (q.and_operator) {
+            // Count each distinct token's documents (above the "touched" bit).
             for (std::size_t t = 0; t < nt; ++t) {
                 for (const std::uint32_t d : postings[p][t]->docs) {
-                    ++seen[d];
+                    seen_[d] += 2U;
                 }
             }
+            need = 1U + 2U * static_cast<std::uint32_t>(nt);
         }
-        for (const std::uint32_t d : touched) {
-            if (q.and_operator && seen[d] != nt) {
-                continue;
+        const auto emit = [&](std::uint32_t d) {
+            if (seen_[d] == need) {
+                const std::uint64_t row = part.row_ids[d];
+                if (mask.allows(row)) {
+                    sink.add(row, scores_[d]);
+                }
             }
-            const std::uint64_t row = part.row_ids[d];
-            if (mask.allows(row)) {
-                hits.emplace_back(row, scores[d]);
+            scores_[d] = 0.0F;
+            seen_[d] = 0U;
+        };
+        if (part.rows_sorted && touched_.size() * 8U > n) {
+            for (std::uint32_t d = 0; d < n; ++d) {
+                if (seen_[d] != 0U) {
+                    emit(d);
+                }
+            }
+        } else {
+            if (part.rows_sorted) {
+                std::sort(touched_.begin(), touched_.end());
+            }
+            for (const std::uint32_t d : touched_) {
+                emit(d);
             }
         }
     }
@@ -848,7 +960,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
                     s += flat_weights[t] * doc_weight(counts[d][t], dl, flat_avg);
                 }
             }
-            hits.emplace_back(c.flat.addrs[d], s);
+            sink.add(c.flat.addrs[d], s);
         }
     }
     if (boost != 1.0F) {
@@ -1243,16 +1355,22 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
             }
         }
     }
+    if (request.limit && *request.limit > 0U &&
+        (request.query.kind == FtsQuery::Kind::Match || request.query.kind == FtsQuery::Kind::MultiMatch)) {
+        // A row outside a column's best `limit` cannot be among the best `limit` of the best of the
+        // columns (ranked by score, then row id, as here).
+        s.top_k_ = static_cast<std::size_t>(*request.limit);
+    }
     Hits hits;
     if (!s.run(request.query, hits, error)) {
         return false;
     }
-    std::sort(hits.begin(), hits.end(), [](const auto& a, const auto& b) {
-        return a.second != b.second ? a.second > b.second : a.first < b.first;
-    });
     if (request.limit && hits.size() > *request.limit) {
-        hits.resize(static_cast<std::size_t>(*request.limit));
+        const auto k = static_cast<std::ptrdiff_t>(*request.limit);
+        std::nth_element(hits.begin(), hits.begin() + k, hits.end(), better_hit);
+        hits.resize(static_cast<std::size_t>(k));
     }
+    std::sort(hits.begin(), hits.end(), better_hit);
     if (request.filter && !request.prefilter) {
         out.plan.push_back("FilterExec: " + *request.filter + " (after the search)");
         if (!post_filter(dataset_path, request, hits, error)) {
