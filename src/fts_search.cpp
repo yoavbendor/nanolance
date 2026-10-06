@@ -733,7 +733,8 @@ struct Search {
     std::filesystem::path path;
     const FtsSearchRequest* request = nullptr;
     pb::Manifest manifest;
-    std::map<std::string, ColumnIndex> columns;  // every column with an INVERTED index
+    std::map<std::string, ColumnIndex> columns;    // every column with an INVERTED index
+    std::map<std::string, ColumnIndex> unindexed;  // columns searched without one
     RowMask mask;
     std::vector<std::string>* plan = nullptr;
     // Scoring buffers, by document, kept zeroed between uses.
@@ -743,6 +744,7 @@ struct Search {
     /// When only the best `top_k_` rows of a match can matter (a Match or MultiMatch at the root,
     /// with a limit), a match keeps just those.
     std::size_t top_k_ = 0;
+    std::size_t indexed_used_ = 0;  // matches answered from an index
 
     bool scan_flat(ColumnIndex& c, std::string& error);
     bool match(const FtsQuery& q, const std::string& column, float boost, Hits& out, std::string& error);
@@ -834,12 +836,41 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
 }
 
 bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hits& out, std::string& error) {
-    const auto it = columns.find(column);
+    auto it = columns.find(column);
     if (it == columns.end()) {
-        error = "Cannot perform full text search on column " + column + ": it has no INVERTED index";
-        return false;
+        // No index: every document is searched as an unindexed one, split as Lance's flat search
+        // splits it -- the simple tokenizer alone, no lower-casing, stemming, stop words, folding or
+        // length limit.
+        it = unindexed.find(column);
+        if (it == unindexed.end()) {
+            bool known = false;
+            for (const auto& f : manifest.fields) {
+                known = known || (f.parent_id == -1 && f.name == column);
+            }
+            if (!known) {
+                error = "Column " + column + " not found in the dataset";
+                return false;
+            }
+            auto index = std::make_shared<InvertedIndex>();
+            fts::AnalyzerParams raw;
+            raw.lower_case = false;
+            raw.stem = false;
+            raw.remove_stop_words = false;
+            raw.ascii_folding = false;
+            raw.max_token_length.reset();
+            if (!index->analyzer.init(raw, error)) {
+                return false;
+            }
+            ColumnIndex c;
+            c.name = column;
+            c.index = std::move(index);
+            it = unindexed.emplace(column, std::move(c)).first;
+        }
     }
     ColumnIndex& c = it->second;
+    if (columns.count(column) != 0U) {
+        ++indexed_used_;
+    }
     if (q.fuzziness.value_or(1U) != 0U) {
         error = "fuzzy full-text matching (fuzziness != 0) is not supported by nanolance";
         return false;
@@ -1399,10 +1430,6 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
                            " documents)");
         s.columns.emplace(column, std::move(c));
     }
-    if (s.columns.empty()) {
-        error = "Cannot perform full text search unless an INVERTED index has been created on at least one column";
-        return false;
-    }
     // The rows that may be returned.
     {
         std::vector<std::uint64_t> narrowed;
@@ -1449,7 +1476,13 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
         std::nth_element(hits.begin(), hits.begin() + k, hits.end(), better_hit);
         hits.resize(static_cast<std::size_t>(k));
     }
-    std::sort(hits.begin(), hits.end(), better_hit);
+    if (!request.limit && !s.unindexed.empty() && s.indexed_used_ == 0U) {
+        // Only columns without an index, and no limit: rows come in scan order, as Lance's flat
+        // search returns them.
+        sort_hits(hits);
+    } else {
+        std::sort(hits.begin(), hits.end(), better_hit);
+    }
     if (request.filter && !request.prefilter) {
         out.plan.push_back("FilterExec: " + *request.filter + " (after the search)");
         if (!post_filter(dataset_path, request, hits, error)) {

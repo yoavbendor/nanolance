@@ -305,6 +305,20 @@ def test_optimized_index_searched(lance, built, tmp_path):
         _same(_search(lance, path, q), _search(nl, path, q))
 
 
+def test_match_without_index(lance, tmp_path):
+    """A match on a column without an index searches every row, as pylance does: the simple tokenizer
+    alone, the documents' own statistics, rows in scan order (best first with a limit)."""
+    path = str(tmp_path / "bare.lance")
+    nl.write_dataset(_table(1200), path, max_rows_per_file=500)
+    lance.dataset(path).delete("id % 9 = 2")
+    from lance import query as lq
+
+    for q in _queries(n=20, seed=23) + ["The", "the", "FILE files", "résumé École"]:
+        assert _search(lance, path, lq.MatchQuery(q, "text")) == _search(nl, path, nq.MatchQuery(q, "text"))
+        _same(_search(lance, path, lq.MatchQuery(q, "text"), limit=5),
+              _search(nl, path, nq.MatchQuery(q, "text"), limit=5), limited=True)
+
+
 def test_errors(built, tmp_path):
     path = built["nanolance"]
     ds = nl.dataset(path)
@@ -314,7 +328,7 @@ def test_errors(built, tmp_path):
         ds.to_table(full_text_query=nq.MatchQuery("fil", "text", fuzziness=1))
     with pytest.raises(Exception, match="at least one should/must"):
         ds.to_table(full_text_query=nq.BooleanQuery([(nq.Occur.MUST_NOT, nq.MatchQuery("file", "text"))]))
-    with pytest.raises(Exception, match="INVERTED index"):
+    with pytest.raises(Exception, match="string column"):
         ds.to_table(full_text_query=nq.MatchQuery("file", "id"))
     bare = str(tmp_path / "bare.lance")
     nl.write_dataset(_table(50), bare)

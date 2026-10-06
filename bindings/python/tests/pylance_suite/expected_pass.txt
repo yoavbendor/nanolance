@@ -202,6 +202,7 @@ tests/test_pydantic.py::test_optional_field_is_nullable
 tests/test_pydantic.py::test_scalar_and_optional_and_list_unchanged
 tests/test_row_addr_prefilter.py::test_no_mask_reads_everything
 tests/test_scalar_index.py::test_all_null_chunk
+tests/test_scalar_index.py::test_backward_compatibility_no_fragment_ids
 tests/test_scalar_index.py::test_bitmap_empty_range
 tests/test_scalar_index.py::test_bitmap_index
 tests/test_scalar_index.py::test_bitmap_remap
@@ -215,9 +216,19 @@ tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[1
 tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[2-creation_options1-2]
 tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[3-creation_options2-3]
 tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[3-creation_options3-3]
+tests/test_scalar_index.py::test_create_scalar_index_fts_alias
 tests/test_scalar_index.py::test_create_text_inverted_index_defaults_to_v2_without_env
 tests/test_scalar_index.py::test_describe_indices_vector_and_scalar
+tests/test_scalar_index.py::test_filter_with_fts_index
+tests/test_scalar_index.py::test_fts_all_deleted
+tests/test_scalar_index.py::test_fts_deleted_rows
+tests/test_scalar_index.py::test_fts_flat_fallback_matches_wand
+tests/test_scalar_index.py::test_fts_stop_words_respect_language_for_simple_tokenizer
+tests/test_scalar_index.py::test_fts_with_other_str_scalar_index
+tests/test_scalar_index.py::test_fts_with_postfilter
+tests/test_scalar_index.py::test_full_text_search_without_index
 tests/test_scalar_index.py::test_index_combination
+tests/test_scalar_index.py::test_indexed_filter_with_fts_index
 tests/test_scalar_index.py::test_indexed_vector_scan_postfilter
 tests/test_scalar_index.py::test_label_list_index
 tests/test_scalar_index.py::test_label_list_index_empty_list_filters
@@ -230,7 +241,9 @@ tests/test_scalar_index.py::test_large_string_scalar_index[BTREE]
 tests/test_scalar_index.py::test_multi_index_create
 tests/test_scalar_index.py::test_nan_handling
 tests/test_scalar_index.py::test_null_handling
+tests/test_scalar_index.py::test_rowid_order
 tests/test_scalar_index.py::test_temporal_index
+tests/test_scalar_index.py::test_unindexed_full_text_search_on_empty_index
 tests/test_scalar_index.py::test_use_multi_index
 tests/test_schema_evolution.py::test_add_columns_exprs[False]
 tests/test_schema_evolution.py::test_add_many_columns
