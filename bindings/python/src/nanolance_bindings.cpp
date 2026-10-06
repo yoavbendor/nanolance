@@ -983,6 +983,21 @@ NB_MODULE(_nanolance, m) {
         });
         return version;
     });
+    m.def("_ds_create_inverted_index", [](const std::filesystem::path& path, const std::string& column,
+                                          const std::string& name, bool replace, const std::string& params) {
+        nano_lance::InvertedIndexOptions options;
+        options.name = name;
+        options.replace = replace;
+        std::string error;
+        if (!nano_lance::fts::parse_params(params, options.params, error)) {
+            throw nb::value_error(error.c_str());
+        }
+        std::uint64_t version = 0;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_create_inverted_index(path, column, options, version, e);
+        });
+        return version;
+    });
     m.def("_ds_drop_index", [](const std::filesystem::path& path, const std::string& name) {
         std::uint64_t version = 0;
         run_op([&](std::string& e) { return nano_lance::dataset_drop_index(path, name, version, e); });

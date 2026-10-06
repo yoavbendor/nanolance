@@ -571,12 +571,41 @@ class LanceDataset:
 
     def create_scalar_index(self, column: str, index_type: str, name: Optional[str] = None, *,
                             replace: bool = True, **kwargs) -> "LanceDataset":
-        """Build a BTREE, BITMAP or LABEL_LIST index on `column`, in Lance's own format: pylance and
-        LanceDB use it as one they built. Commits a new version."""
+        """Build a BTREE, BITMAP, LABEL_LIST or INVERTED (full-text) index on `column`, in Lance's own
+        format: pylance and LanceDB use it as one they built. Commits a new version."""
+        if str(index_type).upper() in ("INVERTED", "FTS"):
+            return self._create_inverted_index(column, name, replace, kwargs)
         if kwargs:
             raise unsupported(f"create_scalar_index options {sorted(kwargs)}")
         with native():
             _nanolance._ds_create_scalar_index(self._uri, str(column), str(index_type), name or "", bool(replace))
+        self._refresh_latest()
+        return self
+
+    _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
+                         "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
+                         "max_ngram_length", "prefix_only")
+
+    def _create_inverted_index(self, column, name, replace, kwargs) -> "LanceDataset":
+        import json
+
+        params = {}
+        for key in list(kwargs):
+            if key in self._INVERTED_OPTIONS:
+                value = kwargs.pop(key)
+                if value is not None or key in ("max_token_length", "custom_stop_words"):
+                    params[key] = value
+        for ignored in ("num_workers", "memory_limit", "progress", "train"):
+            kwargs.pop(ignored, None)
+        if kwargs:
+            raise unsupported(f"INVERTED index options {sorted(kwargs)}")
+        if isinstance(column, (list, tuple)):
+            if len(column) != 1:
+                raise unsupported("an index over more than one column")
+            column = column[0]
+        with _lance_errors():
+            _nanolance._ds_create_inverted_index(self._uri, str(column), name or "", bool(replace),
+                                                 json.dumps(params))
         self._refresh_latest()
         return self
 
@@ -1060,6 +1089,11 @@ class LanceScanner:
             self._names = [n for n in self._names if n not in _SYSTEM_COLUMNS]
             if not self._names and not (with_row_id or with_row_address):
                 with_row_address = True  # something to count rows by; not returned
+        if self._fts is not None and self._names is not None and "_score" in self._names:
+            # The score, named in the projection, comes back where it was named.
+            if self._order is None:
+                self._order = list(self._names)
+            self._names = [n for n in self._names if n != "_score"]
         self._limit = None if limit is None else int(limit)
         self._offset = 0 if offset is None else int(offset)
         self._batch_size = batch_size
@@ -1175,6 +1209,7 @@ class LanceScanner:
             order = [c for c in self._order if c in out.column_names]
             if "_score" not in order:
                 order.append("_score")
+            order += [c for c in system if c not in order]
             out = out.select(order)
         meta = self._ds._info["schema_metadata"]
         if meta and out.schema.metadata != meta:

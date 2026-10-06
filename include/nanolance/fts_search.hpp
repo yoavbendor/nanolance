@@ -10,6 +10,8 @@
 #include <string_view>
 #include <vector>
 
+#include "nanolance/fts_tokenizer.hpp"
+
 /// Full-text search over text columns with an INVERTED index (built by Lance or by nanolance;
 /// docs/FTS_INDEX.md), as Lance's `full_text_query` answers it: BM25 scores from the index's
 /// statistics for the rows it covers, and for rows in fragments it does not cover, from the index's
@@ -79,6 +81,23 @@ struct FtsSearchResult {
 
 bool dataset_full_text_search(const std::filesystem::path& dataset_path, const FtsSearchRequest& request,
                               FtsSearchResult& out, std::string& error);
+
+struct InvertedIndexOptions {
+    std::string name;  // empty: <column>_idx
+    /// An index of the same name is replaced; without `replace`, that is an error.
+    bool replace = true;
+    /// The analyzer: Lance's and LanceDB's defaults unless set. Positions (`with_position`) are not
+    /// supported.
+    fts::AnalyzerParams params;
+};
+
+/// Build an INVERTED index on `column` (a string column) in Lance's format -- one pylance and LanceDB
+/// search as their own -- and commit it as the next version: one partition of every document with
+/// tokens, token ids in order of first appearance, posting lists with Lance's block scores and
+/// impact skip data.
+bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, const std::string& column,
+                                   const InvertedIndexOptions& options, std::uint64_t& new_version,
+                                   std::string& error);
 
 /// Whether an index's details type is an INVERTED index's.
 bool is_inverted_index_url(const std::string& url);
