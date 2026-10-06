@@ -20,6 +20,13 @@ bool write_lance_file(const ArrowSchema& schema, const std::vector<const ArrowAr
     if (!map_arrow_schema(schema, mapping, error, true)) {
         return false;
     }
+    // Integers bit-packed when asked, as Lance's index files have them (row ids and counts take a few bits).
+    for (auto& field : mapping.fields) {
+        if (extras.bitpack_integers && lance_field_is_physical(field) &&
+            lance_logical_type_is_bitpackable_integer(field.logical_type)) {
+            field.metadata["nanolance:packing"] = "bitpack";
+        }
+    }
     std::vector<ColumnValues> columns(lance_physical_fields(mapping).size());
     std::uint64_t rows = 0;
     for (const auto* batch : batches) {

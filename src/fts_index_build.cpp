@@ -215,6 +215,12 @@ bool append_bytes(ArrowArray* a, const std::uint8_t* data, std::size_t size) {
     return ArrowArrayAppendBytes(a, v) == NANOARROW_OK;
 }
 
+LanceFileExtras bitpacked() {
+    LanceFileExtras extras;
+    extras.bitpack_integers = true;
+    return extras;
+}
+
 // ── the index ───────────────────────────────────────────────────────────────────────────────────
 
 struct Built {
@@ -324,7 +330,7 @@ bool write_tokens(const std::filesystem::path& dir, const Built& b, std::vector<
         }
         return false;
     }
-    return index_files::write_file(dir, "part_0_tokens.lance", schema.s, batch.a, LanceFileExtras{}, files, error);
+    return index_files::write_file(dir, "part_0_tokens.lance", schema.s, batch.a, bitpacked(), files, error);
 }
 
 bool write_docs(const std::filesystem::path& dir, const Built& b, std::vector<WrittenFile>& files, std::string& error) {
@@ -346,6 +352,7 @@ bool write_docs(const std::filesystem::path& dir, const Built& b, std::vector<Wr
         return false;
     }
     LanceFileExtras extras;
+    extras.bitpack_integers = true;
     extras.schema_metadata["total_tokens"] = index_files::bytes_of(std::to_string(b.total_tokens));
     return index_files::write_file(dir, "part_0_docs.lance", schema.s, batch.a, extras, files, error);
 }
@@ -427,6 +434,7 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
         return false;
     }
     LanceFileExtras extras;
+    extras.bitpack_integers = true;
     extras.schema_metadata["format_version"] = index_files::bytes_of("2");
     extras.schema_metadata["posting_block_size"] = index_files::bytes_of("128");
     extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of("varint_delta_v1");
@@ -448,6 +456,7 @@ bool write_metadata(const std::filesystem::path& dir, const fts::AnalyzerParams&
         return false;
     }
     LanceFileExtras extras;
+    extras.bitpack_integers = true;
     extras.schema_metadata["partitions"] = index_files::bytes_of("[0]");
     extras.schema_metadata["token_set_format"] = index_files::bytes_of("fst");
     extras.schema_metadata["params"] = index_files::bytes_of(fts::params_json(params));

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include "../src/fts_fst.hpp"
+#include "../src/fts_posting.hpp"
 
 using nano_lance::fts::FstBuilder;
 using nano_lance::fts::FstMap;
@@ -125,6 +127,88 @@ int main(int argc, char** argv) {
         std::string error;
         bytes[20] ^= 1;
         check(!map.open(bytes.data(), bytes.size(), error), "checksum mismatch refused");
+    }
+
+    // Corrupt maps (their checksums made good, so the nodes get parsed) are read without crashing.
+    {
+        std::mt19937_64 frng(11);
+        Pairs pairs;
+        for (int i = 0; i < 400; ++i) {
+            pairs.emplace_back("k" + std::to_string(i * 7919 % 100000), static_cast<std::uint64_t>(i) * 31U);
+        }
+        std::sort(pairs.begin(), pairs.end());
+        pairs.erase(std::unique(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) { return a.first == b.first; }),
+                    pairs.end());
+        const auto good = build(pairs);
+        for (int round = 0; round < 3000; ++round) {
+            auto bytes = good;
+            const int flips = 1 + static_cast<int>(frng() % 4);
+            for (int f = 0; f < flips; ++f) {
+                bytes[16 + frng() % (bytes.size() - 36)] ^= static_cast<std::uint8_t>(1U + frng() % 255U);
+            }
+            const std::uint32_t sum = nano_lance::fts::crc32c(0, bytes.data(), bytes.size() - 4);
+            const std::uint32_t masked = ((sum >> 15) | (sum << 17)) + 0xA282EAD8U;
+            std::memcpy(bytes.data() + bytes.size() - 4, &masked, 4);
+            FstMap map;
+            std::string error;
+            if (map.open(bytes.data(), bytes.size(), error)) {
+                std::size_t n = 0;
+                map.for_each([&](std::string_view, std::uint64_t) { ++n; });
+                for (int k = 0; k < 20; ++k) {
+                    (void)map.get(pairs[frng() % pairs.size()].first);
+                }
+            }
+        }
+    }
+
+    // Random posting blocks are refused or decoded, never read out of bounds.
+    {
+        std::mt19937_64 prng(5);
+        for (int round = 0; round < 20000; ++round) {
+            const std::uint32_t length = static_cast<std::uint32_t>(prng() % 400);
+            const std::size_t nblocks = (length + 127) / 128;
+            std::vector<std::vector<std::uint8_t>> storage(nblocks);
+            std::vector<nano_lance::fts::PostingBlockView> blocks;
+            for (auto& b : storage) {
+                b.resize(prng() % 600);
+                for (auto& x : b) {
+                    x = static_cast<std::uint8_t>(prng());
+                }
+                if (!b.empty() && prng() % 2 == 0 && b.size() > 8) {
+                    b[8] = static_cast<std::uint8_t>(prng() % 33);  // a plausible bit width
+                }
+                blocks.push_back({b.data(), b.size()});
+            }
+            std::vector<std::uint32_t> docs;
+            std::vector<std::uint32_t> freqs;
+            std::string error;
+            (void)nano_lance::fts::decode_posting(blocks, length, nano_lance::fts::TailCodec::VarintDelta, docs, freqs,
+                                                  error);
+            docs.clear();
+            freqs.clear();
+            (void)nano_lance::fts::decode_posting(blocks, length, nano_lance::fts::TailCodec::Fixed32, docs, freqs,
+                                                  error);
+        }
+        // And encoded blocks round-trip.
+        for (int round = 0; round < 200; ++round) {
+            const std::size_t n = 1 + prng() % 128;
+            std::vector<std::uint32_t> docs(n);
+            std::vector<std::uint32_t> freqs(n);
+            std::uint32_t d = static_cast<std::uint32_t>(prng() % 1000);
+            for (std::size_t i = 0; i < n; ++i) {
+                d += static_cast<std::uint32_t>(prng() % (round % 2 == 0 ? 3 : 100000));
+                docs[i] = d;
+                freqs[i] = 1U + static_cast<std::uint32_t>(prng() % (round % 3 == 0 ? 2 : 70000));
+            }
+            std::vector<std::uint8_t> block;
+            nano_lance::fts::encode_posting_block(docs.data(), freqs.data(), n, 1.5F, block);
+            std::vector<std::uint32_t> d2;
+            std::vector<std::uint32_t> f2;
+            std::string error;
+            const bool ok = nano_lance::fts::decode_posting({{block.data(), block.size()}}, static_cast<std::uint32_t>(n),
+                                                            nano_lance::fts::TailCodec::VarintDelta, d2, f2, error);
+            check(ok && d2 == docs && f2 == freqs, "posting block round trip");
+        }
     }
 
     // Byte-for-byte against the Rust crate.

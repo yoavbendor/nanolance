@@ -99,7 +99,10 @@ def _index_content(path, column):
         meta = dict(t.schema.metadata or {})
         meta.pop(b"partitions", None)  # which partition number Lance's workers end up with varies
         key = f.split("_", 2)[-1] if f.startswith("part_") else f
-        out[key] = (t.replace_schema_metadata(None).to_pydict(), str(t.schema.remove_metadata()), meta)
+        # nanolance tags the integer columns it bit-packs (nanolance:packing); Lance ignores the tag.
+        schema = pa.schema([f.remove_metadata() if f.metadata and all(k.startswith(b"nanolance:") for k in f.metadata)
+                            else f for f in t.schema.remove_metadata()])
+        out[key] = (t.replace_schema_metadata(None).to_pydict(), str(schema), meta)
     return out
 
 

@@ -349,6 +349,29 @@ def render_vector_index(vi) -> str:
     return "\n".join(out) + "\n"
 
 
+def render_fts_index(fi) -> str:
+    """The full-text index benchmark (tools/bench_fts.py)."""
+    out = []
+    w = out.append
+    env = fi["environment"]
+    w("## Full-text (INVERTED) indexes")
+    w("")
+    w("_From `bench/results/fts_index.json`, produced by `tools/bench_fts.py` (generated data)._ "
+      f"{fi['rows']:,} documents of about 40 words (Zipf-distributed over 30,000 made-up words, with English "
+      "stop words), Lance's default analyzer. Each engine builds the index on its own copy and searches the one "
+      "it built; on pylance's index nanolance returns pylance's scores, bit for bit. Search: ms a query, median of "
+      f"{fi['runs']} passes over 50 queries, warm. nanolance `{env['nanolance_commit']}`, pylance {env['pylance']}, "
+      f"{env['cores']} cores, {env['date']}.")
+    w("")
+    w("| | pylance | nanolance |")
+    w("|---|---:|---:|")
+    w(f"| build | {fi['build_s']['pylance']:.2f} s | {fi['build_s']['nanolance']:.2f} s |")
+    w(f"| index size | {fi['index_bytes']['pylance'] / 1e6:.1f} MB | {fi['index_bytes']['nanolance'] / 1e6:.1f} MB |")
+    for name, row in fi["search_ms"].items():
+        w(f"| {name} | {row['pylance']:.2f} ms | {row['nanolance']:.2f} ms |")
+    return "\n".join(out) + "\n"
+
+
 def main(argv):
     src = Path(argv[1]) if len(argv) > 1 else ROOT / "bench" / "results" / "matrix.json"
     dst = Path(argv[2]) if len(argv) > 2 else ROOT / "docs" / "BENCHMARKS.md"
@@ -366,6 +389,9 @@ def main(argv):
     vector_index = src.with_name("vector_index.json")
     if vector_index.exists():
         text += "\n" + render_vector_index(json.loads(vector_index.read_text()))
+    fts_index = src.with_name("fts_index.json")
+    if fts_index.exists():
+        text += "\n" + render_fts_index(json.loads(fts_index.read_text()))
     dst.write_text(text)
     print(f"wrote {dst}")
 
