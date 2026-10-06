@@ -247,9 +247,25 @@ namespace {
 
 using index_files::FileTable;
 
+constexpr std::size_t kBoundBlock = 128;
+
+/// A posting list's best BM25 document weight in each run of kBoundBlock entries, and the runs
+/// best first: what lets a search for the best few rows of one word stop early.
+struct BlockBounds {
+    std::vector<float> max_weight;
+    std::vector<std::uint32_t> order;
+};
+
 struct Posting {
     std::vector<std::uint32_t> docs;
     std::vector<std::uint32_t> freqs;
+
+    mutable std::mutex mutex;
+    mutable std::uint32_t bounds_key = 0;
+    mutable std::shared_ptr<const BlockBounds> bounds;
+
+    /// The bounds for document length norms `norm` (cached under `key`, the average length's bits).
+    std::shared_ptr<const BlockBounds> block_bounds(const float* norm, std::uint32_t key) const;
 };
 
 struct Partition {
@@ -393,6 +409,28 @@ float length_norm(std::uint32_t doc_tokens, float avg_doc_length) {
 float doc_weight_with_norm(std::uint32_t freq, float norm) {
     const auto f = static_cast<float>(freq);
     return (kK1 + 1.0F) * f / (f + norm);
+}
+
+std::shared_ptr<const BlockBounds> Posting::block_bounds(const float* norm, std::uint32_t key) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (bounds == nullptr || bounds_key != key) {
+        auto b = std::make_shared<BlockBounds>();
+        const std::size_t n = docs.size();
+        b->max_weight.resize((n + kBoundBlock - 1) / kBoundBlock, 0.0F);
+        for (std::size_t k = 0; k < n; ++k) {
+            float& m = b->max_weight[k / kBoundBlock];
+            m = std::max(m, doc_weight_with_norm(freqs[k], norm[docs[k]]));
+        }
+        b->order.resize(b->max_weight.size());
+        for (std::uint32_t i = 0; i < b->order.size(); ++i) {
+            b->order[i] = i;
+        }
+        std::stable_sort(b->order.begin(), b->order.end(),
+                         [&](std::uint32_t x, std::uint32_t y) { return b->max_weight[x] > b->max_weight[y]; });
+        bounds = std::move(b);
+        bounds_key = key;
+    }
+    return bounds;
 }
 
 std::shared_ptr<const std::vector<float>> Partition::length_norms(float avg) const {
@@ -602,7 +640,13 @@ bool better_hit(const std::pair<std::uint64_t, float>& a, const std::pair<std::u
 class HitSink {
 public:
     HitSink(Hits& out, std::size_t k) : out_(out), k_(k) {}
+    bool limited() const { return k_ != 0U; }
+    bool full() const { return k_ != 0U && out_.size() == k_; }
+    float worst() const { return out_.front().second; }
     void add(std::uint64_t row, float score) {
+        if (k_ != 0U && out_.size() == k_ && score < out_.front().second) {
+            return;
+        }
         if (k_ == 0U) {
             out_.emplace_back(row, score);
             return;
@@ -861,13 +905,48 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             }
         }
         const std::size_t n = part.row_ids.size();
+        const auto norms = part.length_norms(avg);
+        const float* norm = norms->data();
+        if (nt == 1U && sink.limited()) {
+            // One word, the best rows only: its runs best first, until no run can beat the rows
+            // kept. (A word repeated in the query scores its weight that many times over, which
+            // keeps the order.)
+            const Posting* posting = postings[p][0].get();
+            if (posting == nullptr) {
+                continue;
+            }
+            std::uint32_t key;
+            std::memcpy(&key, &avg, sizeof(key));
+            const auto bounds = posting->block_bounds(norm, key);
+            const float w = weights[0];
+            const std::size_t reps = order.size();
+            const auto score_of = [&](float dw) {
+                float total = 0.0F;
+                for (std::size_t r = 0; r < reps; ++r) {
+                    total += w * dw;
+                }
+                return total;
+            };
+            for (const std::uint32_t b : bounds->order) {
+                if (sink.full() && score_of(bounds->max_weight[b]) < sink.worst()) {
+                    break;
+                }
+                const std::size_t end = std::min(posting->docs.size(), (b + 1U) * kBoundBlock);
+                for (std::size_t k = b * kBoundBlock; k < end; ++k) {
+                    const std::uint32_t d = posting->docs[k];
+                    const std::uint64_t row = part.row_ids[d];
+                    if (mask.allows(row)) {
+                        sink.add(row, score_of(doc_weight_with_norm(posting->freqs[k], norm[d])));
+                    }
+                }
+            }
+            continue;
+        }
         if (scores_.size() < n) {
             scores_.resize(n, 0.0F);
             seen_.resize(n, 0U);
         }
         touched_.clear();
-        const auto norms = part.length_norms(avg);
-        const float* norm = norms->data();
         for (const std::size_t t : order) {
             const Posting* posting = postings[p][t].get();
             if (posting == nullptr) {
