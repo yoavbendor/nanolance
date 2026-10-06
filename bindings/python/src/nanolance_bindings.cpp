@@ -8,6 +8,7 @@
 #include <nanolance/blob_v2_external.hpp>
 #include <nanolance/dataset.hpp>
 #include <nanolance/dataset_ops.hpp>
+#include <nanolance/fts_search.hpp>
 #include <nanolance/lance_table_reader.hpp>
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
@@ -1050,6 +1051,24 @@ NB_MODULE(_nanolance, m) {
         nano_lance::NearestResult result;
         run_op([&](std::string& e) { return nano_lance::dataset_nearest(path, q, result, e); });
         return std::make_tuple(result.row_ids, result.distances, result.plan);
+    });
+    m.def("_ds_full_text_search", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
+                                     const std::string& query, std::optional<std::uint64_t> limit,
+                                     std::optional<std::string> filter, bool prefilter, bool fast_search) {
+        nano_lance::FtsSearchRequest r;
+        r.has_version = version.has_value();
+        r.version = version.value_or(0);
+        std::string error;
+        if (!nano_lance::parse_fts_query(query, r.query, error)) {
+            throw nb::value_error(error.c_str());
+        }
+        r.limit = limit;
+        r.filter = filter;
+        r.prefilter = prefilter;
+        r.fast_search = fast_search;
+        nano_lance::FtsSearchResult result;
+        run_op([&](std::string& e) { return nano_lance::dataset_full_text_search(path, r, result, e); });
+        return std::make_tuple(result.row_ids, result.scores, result.plan);
     });
     m.def("_ds_create_vector_index", [](const std::filesystem::path& path, const std::string& column,
                                         const std::string& type, const std::string& name, const std::string& metric,

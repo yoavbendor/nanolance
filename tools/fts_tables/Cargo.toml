@@ -1,0 +1,11 @@
+[package]
+name = "fts_tables"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lance-tokenizer = "=12.0.0"
+unicode-normalization = "0.1"
+frostem = { version = "1", default-features = false, features = ["english"] }
+stop-words = "=0.10.1"
+fst = "=0.4.7"

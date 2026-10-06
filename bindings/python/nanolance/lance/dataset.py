@@ -796,6 +796,27 @@ def _query_vector(q) -> np.ndarray:
     return np.asarray(array.to_numpy(zero_copy_only=False), np.float32).ravel()
 
 
+def _fts_query_json(query) -> str:
+    """``full_text_query=`` (a string, ``{"query": ..., "columns": [...]}``, or a lance.query object) as
+    the query JSON nanolance's search reads."""
+    import json
+
+    if isinstance(query, str):
+        return json.dumps(query)
+    if isinstance(query, dict):
+        if "query" in query:
+            columns = query.get("columns")
+            if isinstance(columns, str):
+                columns = [columns]
+            return json.dumps({"query": query["query"], "columns": columns})
+        return json.dumps(query)
+    inner = getattr(query, "inner", None)
+    spec = getattr(inner, "spec", None)
+    if spec is None:
+        raise TypeError(f"full_text_query must be a string, a dict or a lance.query query, got {type(query)}")
+    return json.dumps(spec)
+
+
 def _nearest_query(ds, nearest) -> dict:
     """``nearest={...}`` checked as pylance checks it."""
     if not isinstance(nearest, dict):
@@ -1010,8 +1031,9 @@ class LanceScanner:
         self._nearest = None if nearest is None else _nearest_query(ds, nearest)
         self._prefilter = bool(prefilter)
         self._fast_search = bool(fast_search)
-        if full_text_query is not None:
-            raise unsupported("full text search")
+        self._fts = None if full_text_query is None else _fts_query_json(full_text_query)
+        if self._fts is not None and self._nearest is not None:
+            raise unsupported("hybrid (vector and full-text) search")
         if substrait_filter is not None:
             raise unsupported("substrait filters")
         if include_deleted_rows:
@@ -1094,6 +1116,8 @@ class LanceScanner:
     def to_table(self) -> pa.Table:
         if self._nearest is not None:
             return self._nearest_table()
+        if self._fts is not None:
+            return self._fts_table()
         return self._shape(pa.table(self._read(stream=False)))
 
     def _search(self):
@@ -1126,6 +1150,37 @@ class LanceScanner:
             out = out.replace_schema_metadata(meta)
         return out
 
+    def _fts_search(self):
+        limit = None if self._limit is None else self._offset + self._limit
+        with native():
+            return _nanolance._ds_full_text_search(self._ds.uri, self._ds.version, self._fts, limit, self._filter,
+                                                   self._prefilter, self._fast_search)
+
+    def _fts_table(self) -> pa.Table:
+        """The matching rows, best first: the columns asked for, then ``_score`` (then the row id columns)."""
+        ids, scores, _ = self._fts_search()
+        names = self._names
+        if self._order is not None and "_score" in self._order:
+            names = [c for c in names if c != "_score"] if names is not None else None
+        table = self._ds._take(list(ids), names, addresses=True, with_row_id=self._with_row_id,
+                               with_row_address=self._with_row_address, blob_handling=self._blob_handling)
+        system = [c for c in ("_rowid", "_rowaddr") if c in table.column_names]
+        data = table.drop_columns(system)
+        out = data.append_column("_score", pa.array(scores, pa.float32()))
+        for c in system:
+            out = out.append_column(c, table.column(c))
+        if self._offset:
+            out = out.slice(self._offset)
+        if self._order is not None:
+            order = [c for c in self._order if c in out.column_names]
+            if "_score" not in order:
+                order.append("_score")
+            out = out.select(order)
+        meta = self._ds._info["schema_metadata"]
+        if meta and out.schema.metadata != meta:
+            out = out.replace_schema_metadata(meta)
+        return out
+
     def to_reader(self) -> pa.RecordBatchReader:
         table = self.to_table()
         return pa.RecordBatchReader.from_batches(table.schema, self._rebatch(table))
@@ -1139,6 +1194,8 @@ class LanceScanner:
         return self._rebatch(self.to_table())
 
     def count_rows(self) -> int:
+        if self._fts is not None:
+            return len(self._fts_search()[0][self._offset:])
         if self._names is None and not (self._with_row_id or self._with_row_address):
             # Count by reading only what the filter needs (a row address column when it needs nothing).
             counter = LanceScanner(self._ds, columns=[], filter=self._filter, limit=self._limit, offset=self._offset,
@@ -1159,6 +1216,9 @@ class LanceScanner:
         lines = [f"nanolance scan of {self._ds.uri} v{self._ds.version}"]
         if self._nearest is not None:
             lines += ["  " + line for line in self._search()[2]]
+            return "\n".join(lines)
+        if self._fts is not None:
+            lines += ["  " + line for line in self._fts_search()[2]]
             return "\n".join(lines)
         if self._filter is not None:
             lines.append(f"  filter={self._filter}")
@@ -1213,6 +1273,11 @@ class ScannerBuilder:
                                       minimum_nprobes=minimum_nprobes, maximum_nprobes=maximum_nprobes,
                                       refine_factor=refine_factor, use_index=use_index, ef=ef,
                                       distance_range=distance_range, **kwargs))
+
+    def full_text_search(self, query, columns=None) -> "ScannerBuilder":
+        if hasattr(query, "inner"):
+            return self._set(full_text_query=query)
+        return self._set(full_text_query={"query": query, "columns": columns})
 
     def prefilter(self, enabled: bool) -> "ScannerBuilder":
         return self._set(prefilter=enabled)

@@ -297,6 +297,10 @@ add_library(nanolance STATIC
     src/index_files.cpp
     src/vector_search.cpp
     src/vector_index_build.cpp
+    src/fts_tokenizer.cpp
+    src/fts_fst.cpp
+    src/fts_posting.cpp
+    src/fts_search.cpp
     src/data_file_reader.cpp
     src/deletion_vector.cpp
     src/data_file_writer.cpp
@@ -601,6 +605,14 @@ add_executable(nano_lance_bool_roundtrip_test tests/test_bool_roundtrip.cpp)
 target_compile_features(nano_lance_bool_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_bool_roundtrip_test PRIVATE nanolance)
 
+add_executable(nano_lance_fts_tokenizer_test tests/test_fts_tokenizer.cpp)
+target_compile_features(nano_lance_fts_tokenizer_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fts_tokenizer_test PRIVATE nanolance)
+
+add_executable(nano_lance_fts_fst_test tests/test_fts_fst.cpp)
+target_compile_features(nano_lance_fts_fst_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fts_fst_test PRIVATE nanolance)
+
 add_executable(nano_lance_bitpacking_roundtrip_test tests/test_bitpacking_roundtrip.cpp)
 target_compile_features(nano_lance_bitpacking_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_bitpacking_roundtrip_test PRIVATE nanolance)
@@ -784,6 +796,12 @@ set_tests_properties(nano_lance_typed_writer PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_typed_blob_writer COMMAND $<TARGET_FILE:nano_lance_typed_blob_writer_test>)
 set_tests_properties(nano_lance_typed_blob_writer PROPERTIES LABELS "smoke")
 
+add_test(NAME nano_lance_fts_tokenizer COMMAND $<TARGET_FILE:nano_lance_fts_tokenizer_test>
+         "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/fts_tokenizer/cases.txt")
+set_tests_properties(nano_lance_fts_tokenizer PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_fts_fst COMMAND $<TARGET_FILE:nano_lance_fts_fst_test>
+         "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/fts_fst")
+set_tests_properties(nano_lance_fts_fst PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_bitpacking_roundtrip COMMAND $<TARGET_FILE:nano_lance_bitpacking_roundtrip_test>)
 set_tests_properties(nano_lance_bitpacking_roundtrip PROPERTIES LABELS "smoke")
 
