@@ -2707,3 +2707,63 @@ index serves pylance and nanolance with the same results, at about pylance's spe
 - **Not yet**: IVF_HNSW_*, IVF_SQ and IVF_RQ (searched exactly instead), batch and multivector
   queries, binary (Hamming) vectors, building on float16 / float64 vectors, `IndicesBuilder`, stable
   row ids. The k-means kernels are baseline x86-64 (no AVX dispatch): the next lever for builds.
+
+## Full-text indexes: INVERTED, built and searched
+
+Asked: the plan's Phase 3. Build and search Lance's full-text (INVERTED) index with LanceDB's
+default settings, so that the same index serves pylance and nanolance with the same results, at
+about pylance's speed.
+
+- **Format first** (`docs/FTS_INDEX.md`). What Lance 12 writes and how it scores came from the
+  `lance-index` / `lance-tokenizer` / `fst` / `lance-bitpacking` sources: BitPacker4x posting blocks
+  with block scores, impact skip data, and a vocabulary in an `fst` map. A numpy model working from
+  the index files alone reproduced pylance's scores bit for bit. Search also needs the rules around
+  the index:
+  - Indexed rows always use the index's statistics, even after deletions.
+  - Unindexed fragments use the index's statistics plus their live (and prefiltered) rows'.
+  - A string query is the best of the indexed columns.
+  - A column without an index is Lance's flat search, with the bare simple tokenizer.
+- **The analyzer** (`src/fts_tokenizer.cpp`) produces Lance's tokens byte for byte:
+  - The Unicode alphanumeric, lower-case and folding tables and the stop words are generated from
+    the Rust crates by a small Rust tool (`tools/fts_tables`).
+  - The Snowball English stemmer is machine-translated from frostem's Rust (`tools/fts_stem_translate.py`).
+  - It was checked on 177k words and 98k lines; 3,000 lines are kept as goldens.
+- **The FST** (`src/fts_fst.cpp`) ports the `fst` crate's reader and builder: node encodings,
+  suffix sharing through the same registry, and the CRC32C trailer. Built maps equal the crate's
+  byte for byte (goldens from the crate). The reader survives 3,000 corrupted maps under ASan.
+- **Searching** (`src/fts_search.cpp`): Match (OR / AND, boost), MultiMatch, Boost and Boolean
+  queries, with filters before or after, deletions, unindexed fragments, `fast_search` and several
+  partitions or segments. Scores accumulate in dense per-document arrays. With a limit, each
+  match keeps only its best rows. A one-word search walks runs of 128 postings by their exact best
+  weight and stops when no run can beat the rows kept: a top-10 for a word in 90% of 500k
+  documents went from 16.9 ms to 0.3 ms.
+- **Building** (`src/fts_index_build.cpp`): parallel tokenizing, token ids by first appearance, and
+  Lance's block scores and impacts. For the same data, the files equal pylance's and LanceDB
+  0.39's, byte for byte, except the partition number and document order when Lance's workers take
+  fragments out of order. pylance and LanceDB search such an index with the same scores, and
+  pylance's `optimize_indices` merges into it.
+- **What it took besides**:
+  - `lance.query` (pylance's query classes);
+  - `_score` placement in projections;
+  - a shared JSON reader;
+  - `LanceFileExtras::bitpack_integers`, so index files bit-pack their integer columns as Lance's
+    do (the docs file 1.15 MB -> 248 KB on 98k rows).
+- **Verified**:
+  - `test_fts.py` (24 tests) checks reads, builds, every query kind, filters, deletions, unindexed
+    rows and analyzer settings against pylance.
+  - About 2,000 random queries matched pylance bit for bit while developing.
+  - 254 of pylance's own tests pass (241 before), 13 of them full-text.
+  - ASan + UBSan are clean on the tests and the fuzzing.
+- **Speed** (`docs/BENCHMARKS.md`, "Full-text (INVERTED) indexes"; 500k documents, 4 cores):
+  - builds 1.7x faster (4.1 s vs 7.1 s), for an index of the same size (16.1 MB vs 16.3 MB);
+  - searches 1.8-8.9x faster (best 10 for one common word 0.31 ms vs 2.74 ms; three words 1.23 ms
+    vs 2.65 ms; AND 1.21 ms vs 2.35 ms).
+- **Not yet**:
+  - positions and phrase queries (LanceDB's default leaves positions off);
+  - fuzzy matching;
+  - the icu, ngram, code, jieba and lindera tokenizers, and languages other than English;
+  - full-text search over list columns;
+  - format-v3 (256-document) posting blocks;
+  - stable row ids;
+  - a multi-word top-k that skips postings (WAND / MaxScore). Multi-word searches still score
+    every posting, and are already about 2x faster than pylance.

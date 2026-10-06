@@ -2,9 +2,9 @@
  "pylance_version": "12.0.0",
  "target": "nanolance.lance",
  "totals": {
-  "failed": 872,
+  "failed": 859,
   "skipped": 377,
-  "passed": 241
+  "passed": 254
  },
  "files": {
   ".py": {
@@ -89,8 +89,8 @@
    "failed": 1
   },
   "tests/test_indices.py": {
-   "skipped": 15,
-   "failed": 27
+   "failed": 27,
+   "skipped": 15
   },
   "tests/test_ingestion.py": {
    "failed": 2
@@ -110,8 +110,8 @@
    "failed": 3
   },
   "tests/test_lance.py": {
-   "passed": 11,
-   "failed": 12
+   "failed": 12,
+   "passed": 11
   },
   "tests/test_log.py": {
    "failed": 18
@@ -153,8 +153,8 @@
    "failed": 1
   },
   "tests/test_pydantic.py": {
-   "failed": 8,
-   "passed": 4
+   "passed": 4,
+   "failed": 8
   },
   "tests/test_row_addr_prefilter.py": {
    "failed": 12,
@@ -168,8 +168,8 @@
    "skipped": 1
   },
   "tests/test_scalar_index.py": {
-   "failed": 165,
-   "passed": 31
+   "failed": 152,
+   "passed": 44
   },
   "tests/test_schema.py": {
    "failed": 4

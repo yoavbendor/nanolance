@@ -87,7 +87,7 @@ Speed, 5M rows in 5 fragments, 4 cores (`docs/BENCHMARKS.md`, "Scalar indexes"):
 0.39 s vs 1.39 s; LabelList 0.97 s vs 2.26 s), and indexed reads are 1.1-3.2x faster, but for a
 one-row lookup returning every column (2.9 ms vs 1.3 ms).
 
-Not built: Lance's other scalar indexes (INVERTED full-text, NGRAM, ZONEMAP, BLOOMFILTER, JSON, RTREE),
+Not built: Lance's other scalar indexes (NGRAM, ZONEMAP, BLOOMFILTER, JSON, RTREE; INVERTED is below),
 build options (`fragment_ids`, `train=False`, ...), and indexes on a dataset with stable row ids.
 Those a dataset already has are kept, as below.
 
@@ -123,6 +123,49 @@ Not supported: IVF_HNSW_*, IVF_SQ and IVF_RQ indexes (a search falls back to an 
 says why), batch and multivector queries, binary (Hamming) vectors, building on float16 / float64
 vectors, `lance.indices.IndicesBuilder`, and a vector index on a dataset with stable row ids.
 
+### Full-text indexes: built and searched
+
+`full_text_query=` on `to_table` and `scanner` (and `ScannerBuilder.full_text_search`) searches text
+columns as pylance does. `create_scalar_index(column, "INVERTED" | "FTS", ...)` builds Lance's index,
+with LanceDB's default analyzer or the settings given. `lance.query` has pylance's query classes:
+`MatchQuery`, `MultiMatchQuery`, `BoostQuery`, `BooleanQuery` (and `&` / `|`), `PhraseQuery`.
+`docs/FTS_INDEX.md` has the format and the search, step for step.
+
+- **Searching** (`src/fts_search.cpp`) an INVERTED index, built by pylance or by nanolance, gives
+  pylance's answer: the same rows with the same `_score`, bit for bit. Lance's order among equal
+  scores is arbitrary; nanolance's is by row id. Around the index it does what pylance does:
+  - rows in fragments the index does not cover are tokenized on the fly and scored with the
+    index's statistics plus theirs;
+  - deleted rows never come back;
+  - `prefilter=True` filters before the search, and otherwise the best `limit` rows are filtered;
+  - `fast_search` searches only what is indexed;
+  - a `MatchQuery` on a column without an index is Lance's flat search: the bare simple tokenizer,
+    the documents' own statistics.
+
+  `_score` comes after the columns asked for, or where `columns` names it.
+- **Building** (`src/fts_index_build.cpp`) supports the simple, whitespace and raw tokenizers with
+  English stemming and stop words (or custom ones), lower-casing, ASCII folding and
+  `max_token_length`. For the same data, the files hold what pylance's and LanceDB's builds hold,
+  byte for byte: vocabulary (an `fst` map, ported), posting blocks, block scores and impact data.
+  Two things can differ: the partition number, and document order when Lance's workers take
+  fragments out of order. pylance and LanceDB search such an index as their own, and pylance's
+  `optimize_indices` merges new rows into it.
+
+`test_fts.py` checks all of it against pylance. Speed, 500,000 documents, 4 cores
+(`docs/BENCHMARKS.md`, "Full-text (INVERTED) indexes"):
+- building takes 4.1 s against pylance's 7.1 s, for an index of the same size;
+- searches are 1.8-8.9x faster: one common word, best 10, 0.31 ms vs 2.74 ms; three words 1.23 ms
+  vs 2.65 ms.
+
+Not supported:
+- fuzzy matching (`fuzziness` other than 0);
+- positions (`with_position=True`), and so phrase queries;
+- tokenizers other than simple, whitespace and raw (icu, ngram, code, jieba, lindera), and
+  languages other than English;
+- full-text search over list columns;
+- 256-document posting blocks (index format v3);
+- an INVERTED index on a dataset with stable row ids.
+
 ### Indexes nanolance keeps
 
 Every commit nanolance makes
@@ -154,9 +197,9 @@ them is silently ignored:
 - The transaction API (`LanceOperation`, `commit`, `write_fragments`), `LanceFragment.merge_columns`
   / `update_columns`, `cleanup_old_versions`. Conflicting writers are refused rather than retried:
   a change built on a version another writer has since replaced fails with "commit conflict".
-- Full-text indexes and search (`full_text_query`), vector indexes other than IVF_FLAT and IVF_PQ,
-  and scalar indexes other than BTree, Bitmap and LabelList. An index pylance built is kept, though:
-  see "Indexes" below.
+- Fuzzy and phrase full-text queries and the full-text features listed under "Full-text indexes",
+  vector indexes other than IVF_FLAT and IVF_PQ, and scalar indexes other than BTree, Bitmap,
+  LabelList and INVERTED. An index pylance built is kept, though: see "Indexes" below.
 - Tags and branches, stable row ids, multiple base paths, shallow and deep clones.
 - Writing Lance's inline, packed and dedicated blob layouts (`lance.blob_field`, `lance.blob_array`):
   nanolance writes external blobs, and reads every kind.
@@ -190,14 +233,14 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **241**, every one of which pylance also passes (216 before vector search, 189 before scalar indexes) |
+| nanolance.lance | **254**, every one of which pylance also passes (241 before full-text search, 216 before vector search, 189 before scalar indexes) |
 
 By test file, where nanolance passes any:
 
 | file | pylance | nanolance |
 |---|---|---|
 | test_dataset.py | 250 | 86 |
-| test_scalar_index.py | 189 | 31 |
+| test_scalar_index.py | 189 | 44 |
 | test_file.py | 40 | 27 |
 | test_map_type.py | 19 | 17 |
 | test_column_names.py | 27 | 17 |
@@ -213,8 +256,9 @@ By test file, where nanolance passes any:
 
 The main reasons tests fail today:
 
-- Most need full-text indexes and search, scalar indexes other than BTree / Bitmap / LabelList or
-  their build options (about 155 in `test_scalar_index.py`), vector index kinds other than
+- Most need full-text features nanolance lacks (positions and phrase queries, fuzzy matching, other
+  tokenizers, list columns, distributed builds), scalar indexes other than BTree / Bitmap /
+  LabelList / INVERTED or their build options (about 145 in `test_scalar_index.py`), vector index kinds other than
   IVF_FLAT / IVF_PQ or `lance.indices.IndicesBuilder` (about 30), namespaces (about 130), object
   stores or the `mem_wal`.
 - About 90 need the transaction API, fragment-level writes, stable row ids or multiple base paths.

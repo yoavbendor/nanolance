@@ -307,3 +307,19 @@ _From `bench/results/vector_index.json`, produced by `tools/bench_vector_index.p
 | IVF_PQ | k=100 | 8.41 | 3.59 |
 | IVF_PQ | k=10, nprobes=32 | 4.38 | 1.40 |
 | IVF_PQ | k=10, refine_factor=4 | 10.20 | 3.46 |
+
+## Full-text (INVERTED) indexes
+
+_From `bench/results/fts_index.json`, produced by `tools/bench_fts.py` (generated data)._ 500,000 documents of about 40 words (Zipf-distributed over 30,000 made-up words, with English stop words), Lance's default analyzer. Each engine builds the index on its own copy and searches the one it built; on pylance's index nanolance returns pylance's scores, bit for bit. Search: ms a query, median of 5 passes over 50 queries, warm. nanolance `4af2c68 with uncommitted changes`, pylance 12.0.0, 4 cores, 2026-10-06 21:02 UTC.
+
+| | pylance | nanolance |
+|---|---:|---:|
+| build | 7.07 s | 4.06 s |
+| index size | 16.3 MB | 16.1 MB |
+| 1 common word, limit 10 | 2.74 ms | 0.31 ms |
+| 1 rare word, limit 10 | 2.41 ms | 0.49 ms |
+| 2 words, limit 10 | 2.55 ms | 1.34 ms |
+| 3 words, limit 10 | 2.65 ms | 1.23 ms |
+| 3 words, limit 100 | 3.65 ms | 2.03 ms |
+| 2 words, AND, limit 10 | 2.35 ms | 1.21 ms |
+| 1 rare word, all matches | 2.86 ms | 1.25 ms |

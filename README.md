@@ -49,9 +49,11 @@ speedup). Full details, the threat model, and a reviewer checklist: **[docs/SAFE
   (verified against `pylance` 12.0.0) **unless** a feature is marked *nanolance-only* below.
   It reads Lance file formats 2.0, 2.1 and 2.2 — 2.0 being what most LanceDB tables on the Hugging
   Face Hub are in ([docs/REAL_DATASETS.md](docs/REAL_DATASETS.md)). It builds and uses Lance's
-  scalar indexes (BTree, Bitmap, LabelList) in Lance's own format: pylance uses an index nanolance
-  built, and nanolance one pylance built, with the same results. A dataset's other indexes (vector,
-  full-text) survive its appends, deletes, updates and compactions.
+  indexes in Lance's own format -- scalar (BTree, Bitmap, LabelList), vector (IVF_FLAT, IVF_PQ:
+  [docs/VECTOR_INDEX.md](docs/VECTOR_INDEX.md)) and full-text (INVERTED, LanceDB's defaults:
+  [docs/FTS_INDEX.md](docs/FTS_INDEX.md)). pylance and LanceDB use an index nanolance built, and
+  nanolance one they built, with the same results. A dataset's other indexes survive its appends,
+  deletes, updates and compactions.
 - **Headline benefit:** rows keep big payloads **external** (`uri` + `position` + `size`, never copied),
   so a packet table costs a few bytes/row regardless of payload size; bytes are fetched on demand (local
   file or `s3://`).
