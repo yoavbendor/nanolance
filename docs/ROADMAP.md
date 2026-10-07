@@ -306,6 +306,51 @@ Two cheaper levers are worth trying before a task moves models at all:
 4. **Phase C**, then **D** — lists and maps, read before write.
 5. **Phase F** once correctness work has settled; **Phase G** in parallel throughout.
 
+## Indexes: the open gaps (2026-10-07)
+
+nanolance builds and searches Lance's BTree, Bitmap, LabelList, IVF_FLAT, IVF_PQ and INVERTED
+indexes, and pylance and LanceDB use them as their own (`docs/PYLANCE_COMPAT.md`, "Indexes"). What
+pylance users rely on that nanolance does not do yet, roughly in order of how often they hit it:
+
+1. **Keeping an index up to date** (`optimize_indices`, LanceDB's `table.optimize()`). Real users
+   run it after nearly every batch of appends; nanolance raises "not supported".
+   - Rows nanolance appends stay out of every index. Searches stay correct (uncovered fragments
+     are searched directly) but slow down as unindexed data grows.
+   - Compaction is worse. pylance remaps its indexes to the moved rows; nanolance drops the
+     rewritten fragments from every index's coverage, so an index loses ground after each
+     compaction until pylance or a rebuild fixes it.
+   - Needed: Lance's append path (fold new fragments into an index as a new segment or a merge)
+     and remapping row addresses after compaction.
+2. **HNSW and quantized vector indexes**: IVF_HNSW_SQ (what many LanceDB users pick for low
+   latency), IVF_HNSW_PQ, IVF_SQ, IVF_RQ. nanolance cannot build them; on a dataset that has one it
+   answers correctly but by exact search, which does not scale. Related search gaps: batch query
+   vectors, multivector (ColBERT-style) search, Hamming distance, building on float16 / float64
+   vectors.
+3. **Stable row ids.** Optional in pylance, but some workflows depend on it. nanolance refuses to
+   build or use any index on such a dataset.
+4. **Full-text search beyond LanceDB's defaults:**
+   - positions (`with_position=True`) and phrase queries: the largest group of pylance's
+     full-text tests that still fail;
+   - fuzzy matching (`fuzziness`);
+   - other languages and their tokenizers: icu, jieba (Chinese), lindera (Japanese);
+   - the ngram tokenizer and the NGRAM index, which serve `LIKE '%x%'` and `contains` filters;
+   - full-text search over list columns;
+   - multi-word top-k that skips postings (WAND / MaxScore). Already about 2x faster than pylance
+     without it.
+5. **Other scalar index types and column types:**
+   - not built: ZONEMAP (cheap, increasingly the choice for range filters), BLOOMFILTER, NGRAM,
+     JSON, RTREE;
+   - BTree / Bitmap on decimal columns are built, but nanolance's filters cannot compare decimals;
+     duration columns need `arrow_cast` in the filter engine; pylance's large-string index type
+     test also fails (not yet diagnosed);
+   - indexes on fields inside structs (`a.b`).
+6. **Less common:** distributed builds (`fragment_ids`, `index_uuid`, merging index metadata),
+   `lance.indices.IndicesBuilder`, progress callbacks, index file format v3 (256-document posting
+   blocks).
+
+Suggested order: (1) first, since without it every index degrades as soon as nanolance writes to
+the dataset; then IVF_HNSW_SQ from (2); then phrase queries from (4).
+
 ---
 
 ## Appendix A — decoding a descriptor without protoc
