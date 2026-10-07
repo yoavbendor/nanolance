@@ -351,6 +351,59 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
 Suggested order: (1) first, since without it every index degrades as soon as nanolance writes to
 the dataset; then IVF_HNSW_SQ from (2); then phrase queries from (4).
 
+## lance-c: what is left of the C API (2026-10-07)
+
+`liblance_c` defines all 127 functions of lance-c's header (`compat/lance-c/UPSTREAM`), but 39 of
+them only return `LANCE_ERR_NOT_SUPPORTED`, and 5 more cover part of what lance-c does. All 39 are
+vector search, full-text search or index segments. Much of what they need now exists in nanolance's
+core (Phases 2 and 3 above) and only has to be wired into `src/lance_c.cpp`. `docs/LANCE_C_COMPAT.md`
+still calls vector and full-text indexes out of scope; it should be updated along with this work.
+
+1. **Wire what the core already does** (most value for the effort):
+   - Vector search, 9 functions: `lance_dataset_create_vector_index` (IVF_FLAT and IVF_PQ; the other
+     `LANCE_INDEX_*` kinds stay refused until item 2 of the index gaps), `lance_scanner_nearest`,
+     `set_nprobes`, `set_minimum_nprobes`, `set_maximum_nprobes`, `set_refine_factor`, `set_metric`,
+     `set_approx_mode` and `set_query_parallelism`.
+   - `lance_scanner_set_use_index` and `lance_scanner_set_prefilter` are accepted today but change
+     nothing; they must take effect once `nearest` works.
+   - Full-text search, 4 functions: `lance_dataset_prepare_fts_query`,
+     `lance_dataset_prepare_fts_match_query`, `lance_scanner_full_text_search` and
+     `lance_scanner_set_fts_query_context`.
+   - `lance_dataset_create_scalar_index`: accept `LANCE_SCALAR_INVERTED`, and `params_json` (the
+     analyzer settings for INVERTED, and the options the other types take). Both are refused today.
+2. **Wait on core features from the index gaps list:**
+   - `lance_scanner_set_ef`: HNSW indexes.
+   - `lance_scanner_nearest_multivector`: multivector search.
+   - `lance_dataset_prepare_fts_phrase_query`: positions in INVERTED indexes.
+3. **Index segments**, 23 functions: build an index in pieces, possibly on other machines, and
+   commit the pieces. This is the one large new subsystem; it shares its core with distributed
+   builds (item 6 of the index gaps). The four lance-c tests nanolance fails today all need it
+   (`index_segment_builder`, `index_segment_builder_progress`,
+   `vector_models_and_reusable_segments`, `commit_index_segments`).
+   - Builders: `lance_index_segment_builder_new_scalar` / `new_vector`, `lance_index_train_ivf_model`,
+     `lance_index_train_pq_model`, `lance_index_segment_builder_execute_uncommitted` and
+     `set_progress_callback`.
+   - Segment metadata: `lance_index_segment_metadata_parse` and its 10 accessors (`uuid`, `name`,
+     `dataset_version`, `index_version`, `index_type`, `index_details_type_url`, `field_count`,
+     `field_ids`, `fragment_count`, `fragment_ids`).
+   - Commit and list: `lance_dataset_commit_index_segments`, `lance_dataset_index_segment_count`,
+     `lance_dataset_index_segments`.
+   - Search with chosen segments: `lance_scanner_set_index_segments`,
+     `lance_scanner_set_scalar_index_segment`, `lance_scanner_set_fts_index_segments`.
+4. **Finish the partial ones:**
+   - `lance_dataset_merge_insert`: `LANCE_MERGE_WHEN_MATCHED_UPDATE_IF` (a condition comparing
+     source and target rows).
+   - `lance_scanner_set_include_deleted_rows(true)`: deleted rows come back with a NULL `_rowid`.
+   - `lance_dataset_take_rows` on a dataset with stable row ids (with item 3 of the index gaps).
+   - `lance_scanner_set_substrait_filter`: Substrait filters.
+   - Object-store URIs (`s3://` and others) in `lance_dataset_open` and the writes; `storage_opts`
+     is accepted and ignored today.
+   - Writes in Lance's inline, packed and dedicated blob layouts (nanolance writes external blobs
+     and reads every layout).
+
+Suggested order: item 1 (it makes vector and full-text search usable from C at once, with tests
+that already exist upstream), then item 4's `UPDATE_IF` and `include_deleted_rows`, then item 3.
+
 ---
 
 ## Appendix A — decoding a descriptor without protoc
