@@ -611,6 +611,14 @@ add_executable(nano_lance_fts_tokenizer_test tests/test_fts_tokenizer.cpp)
 target_compile_features(nano_lance_fts_tokenizer_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_fts_tokenizer_test PRIVATE nanolance)
 
+if(TARGET lance_c)
+    add_executable(nano_lance_lance_c_search_test tests/test_lance_c_search.cpp)
+    target_compile_features(nano_lance_lance_c_search_test PRIVATE cxx_std_20)
+    target_link_libraries(nano_lance_lance_c_search_test PRIVATE lance_c nanolance)
+    add_test(NAME nano_lance_lance_c_search COMMAND $<TARGET_FILE:nano_lance_lance_c_search_test>
+             "${CMAKE_CURRENT_BINARY_DIR}/lance_c_search_tmp")
+endif()
+
 add_executable(nano_lance_fts_fst_test tests/test_fts_fst.cpp)
 target_compile_features(nano_lance_fts_fst_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_fts_fst_test PRIVATE nanolance)

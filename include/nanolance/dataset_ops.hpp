@@ -31,9 +31,13 @@ bool dataset_update(const std::filesystem::path& dataset_path, const std::string
 
 /// Lance's merge insert: match `source` rows to the dataset's by the `on` columns.
 struct MergeInsertSpec {
-    enum class WhenMatched { DoNothing, UpdateAll, Fail, Delete };
+    enum class WhenMatched { DoNothing, UpdateAll, UpdateIf, Fail, Delete };
     std::vector<std::string> on;
     WhenMatched when_matched = WhenMatched::DoNothing;
+    /// UpdateIf: an SQL condition over the matched pair's columns, `source.<column>` and
+    /// `target.<column>` (`source.ts > target.ts`); a matched row is updated where it is TRUE and
+    /// left as it is otherwise.
+    std::string when_matched_condition;
     bool when_not_matched_insert_all = true;
     bool when_not_matched_by_source_delete = false;
     std::string when_not_matched_by_source_condition;  // SQL over the dataset's rows; empty: all

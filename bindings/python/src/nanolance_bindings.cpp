@@ -932,11 +932,14 @@ NB_MODULE(_nanolance, m) {
     }, nb::arg("path"), nb::arg("where").none(), nb::arg("assignments"));
     m.def("_ds_merge_insert", [](const std::filesystem::path& path, const std::vector<std::string>& on,
                                  bool update_all, bool insert_all, bool delete_by_source,
-                                 const std::string& delete_condition, nb::handle data) {
+                                 const std::string& delete_condition, nb::handle data,
+                                 const std::string& update_condition) {
         nano_lance::MergeInsertSpec spec;
         spec.on = on;
-        spec.when_matched = update_all ? nano_lance::MergeInsertSpec::WhenMatched::UpdateAll
-                                       : nano_lance::MergeInsertSpec::WhenMatched::DoNothing;
+        spec.when_matched = !update_all             ? nano_lance::MergeInsertSpec::WhenMatched::DoNothing
+                            : update_condition.empty() ? nano_lance::MergeInsertSpec::WhenMatched::UpdateAll
+                                                       : nano_lance::MergeInsertSpec::WhenMatched::UpdateIf;
+        spec.when_matched_condition = update_condition;
         spec.when_not_matched_insert_all = insert_all;
         spec.when_not_matched_by_source_delete = delete_by_source;
         spec.when_not_matched_by_source_condition = delete_condition;

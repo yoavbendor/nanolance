@@ -610,6 +610,150 @@ bool dataset_update(const std::filesystem::path& dataset_path, const std::string
 
 // ── merge insert ────────────────────────────────────────────────────────────────────────────────
 
+namespace {
+
+/// A two-child struct batch {source, target} over slices it owns.
+struct PairBatch {
+    ArrowArray source{};
+    ArrowArray target{};
+    ArrowArray* children[2] = {&source, &target};
+    const void* buffers[1] = {nullptr};
+};
+
+void release_pair(ArrowArray* array) {
+    auto* self = static_cast<PairBatch*>(array->private_data);
+    if (self->source.release != nullptr) {
+        self->source.release(&self->source);
+    }
+    if (self->target.release != nullptr) {
+        self->target.release(&self->target);
+    }
+    delete self;
+    array->release = nullptr;
+}
+
+/// merge_insert's UPDATE_IF: for each source row matching `targets[row]` (UINT64_MAX: no match),
+/// whether `condition` holds for the pair -- source columns as `source.*`, the target row's as
+/// `target.*`. Evaluated over runs of consecutive source rows matching consecutive target rows.
+bool update_if_passes(const std::filesystem::path& dataset_path, std::uint64_t version, const std::string& condition,
+                      const ArrowSchema& dataset_schema, const std::vector<std::shared_ptr<SharedBatch>>& source_batches,
+                      const std::vector<int64_t>& order, const std::vector<std::vector<std::uint64_t>>& targets,
+                      std::vector<std::vector<std::uint8_t>>& passes, std::string& error) {
+    if (condition.empty()) {
+        error = "merge insert: when_matched UPDATE_IF needs a condition";
+        return false;
+    }
+    expr::Expression expression;
+    if (!expr::Expression::parse(condition, expression, error)) {
+        return false;
+    }
+    std::vector<std::uint64_t> sorted;
+    for (const auto& t : targets) {
+        for (const auto a : t) {
+            if (a != UINT64_MAX) {
+                sorted.push_back(a);
+            }
+        }
+    }
+    std::sort(sorted.begin(), sorted.end());
+    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+    passes.assign(targets.size(), {});
+    for (std::size_t b = 0; b < targets.size(); ++b) {
+        passes[b].assign(targets[b].size(), 0U);
+    }
+    if (sorted.empty()) {
+        return true;
+    }
+    // The matched target rows, every column.
+    LanceScanRequest request;
+    request.has_version = true;
+    request.version = version;
+    OwnedSchema target_schema;
+    OwnedBatches taken;
+    if (!lance_dataset_take_rows(dataset_path, request, sorted, target_schema.s, taken.v, error)) {
+        return false;
+    }
+    std::vector<std::shared_ptr<SharedBatch>> target_batches;
+    std::vector<std::pair<std::size_t, int64_t>> where;  // sorted[k] is row .second of batch .first
+    for (auto& t : taken.v) {
+        target_batches.push_back(std::make_shared<SharedBatch>(std::move(t)));
+        for (int64_t r = 0; r < target_batches.back()->array.length; ++r) {
+            where.emplace_back(target_batches.size() - 1U, r);
+        }
+    }
+    taken.v.clear();
+    if (where.size() != sorted.size()) {
+        error = "merge insert: the matched rows could not be read";
+        return false;
+    }
+    std::vector<int64_t> identity;
+    for (int64_t i = 0; i < target_schema.s.n_children; ++i) {
+        identity.push_back(i);
+    }
+    // {source: <the dataset's columns>, target: <the dataset's columns>}
+    OwnedSchema pair_schema;
+    ArrowSchemaInit(&pair_schema.s);
+    if (ArrowSchemaSetTypeStruct(&pair_schema.s, 2) != NANOARROW_OK) {
+        error = "out of memory";
+        return false;
+    }
+    for (int i = 0; i < 2; ++i) {
+        ArrowSchema* child = pair_schema.s.children[i];
+        child->release(child);
+        if (ArrowSchemaDeepCopy(i == 0 ? &dataset_schema : &target_schema.s, child) != NANOARROW_OK ||
+            ArrowSchemaSetName(child, i == 0 ? "source" : "target") != NANOARROW_OK) {
+            error = "out of memory";
+            return false;
+        }
+    }
+    if (!expression.bind(pair_schema.s, error)) {
+        return false;
+    }
+    for (std::size_t b = 0; b < targets.size(); ++b) {
+        const auto& t = targets[b];
+        std::size_t i = 0;
+        while (i < t.size()) {
+            if (t[i] == UINT64_MAX) {
+                ++i;
+                continue;
+            }
+            const auto k = static_cast<std::size_t>(std::lower_bound(sorted.begin(), sorted.end(), t[i]) - sorted.begin());
+            std::size_t run = 1;
+            while (i + run < t.size() && t[i + run] != UINT64_MAX) {
+                const auto next =
+                    static_cast<std::size_t>(std::lower_bound(sorted.begin(), sorted.end(), t[i + run]) - sorted.begin());
+                if (next != k + run || where[next].first != where[k].first) {
+                    break;
+                }
+                ++run;
+            }
+            auto pair = std::make_unique<PairBatch>();
+            pair->source = slice_batch(source_batches[b], static_cast<int64_t>(i), static_cast<int64_t>(run), order);
+            pair->target = slice_batch(target_batches[where[k].first], where[k].second, static_cast<int64_t>(run),
+                                       identity);
+            ArrowArray batch{};
+            batch.length = static_cast<int64_t>(run);
+            batch.n_buffers = 1;
+            batch.n_children = 2;
+            batch.buffers = pair->buffers;
+            batch.children = pair->children;
+            batch.release = &release_pair;
+            batch.private_data = pair.release();
+            std::vector<std::uint8_t> keep;
+            const bool ok = expression.filter(batch, keep, error);
+            batch.release(&batch);
+            if (!ok) {
+                return false;
+            }
+            std::copy(keep.begin(), keep.end(), passes[b].begin() + static_cast<std::ptrdiff_t>(i));
+            i += run;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 bool dataset_merge_insert(const std::filesystem::path& dataset_path, const MergeInsertSpec& spec,
                           ArrowArrayStream& source, MergeInsertStats& stats, std::uint64_t& new_version,
                           std::string& error) {
@@ -722,13 +866,41 @@ bool dataset_merge_insert(const std::filesystem::path& dataset_path, const Merge
         }
     }
 
+    using WM = MergeInsertSpec::WhenMatched;
+    // UPDATE_IF: which matched source rows meet the condition.
+    std::vector<std::vector<std::uint8_t>> passes;
+    if (spec.when_matched == WM::UpdateIf) {
+        std::vector<std::vector<std::uint64_t>> targets(source_batches.size());
+        std::string k;
+        for (std::size_t b = 0; b < source_batches.size(); ++b) {
+            BatchView view;
+            if (!view.set(source_schema.s, source_batches[b]->array, error)) {
+                return false;
+            }
+            targets[b].assign(static_cast<std::size_t>(source_batches[b]->array.length), UINT64_MAX);
+            for (int64_t i = 0; i < source_batches[b]->array.length; ++i) {
+                if (key_of(view.view, source_keys, i, k)) {
+                    const auto it = target.find(k);
+                    if (it != target.end()) {
+                        targets[b][static_cast<std::size_t>(i)] = it->second;
+                    }
+                }
+            }
+        }
+        if (!update_if_passes(dataset_path, version, spec.when_matched_condition, target_schema.s, source_batches,
+                              order, targets, passes, error)) {
+            return false;
+        }
+    }
+
     // Which source rows are written, which target rows go.
     std::set<std::uint64_t> matched;
     std::map<std::uint64_t, std::vector<std::uint32_t>> deletions;
     StagedFiles staged;
     bool opened = false;
     std::string key;
-    for (const auto& shared : source_batches) {
+    for (std::size_t sb = 0; sb < source_batches.size(); ++sb) {
+        const auto& shared = source_batches[sb];
         BatchView view;
         if (!view.set(source_schema.s, shared->array, error)) {
             return false;
@@ -739,12 +911,17 @@ bool dataset_merge_insert(const std::filesystem::path& dataset_path, const Merge
             const auto it = has_key ? target.find(key) : target.end();
             if (it != target.end()) {
                 matched.insert(it->second);
-                using WM = MergeInsertSpec::WhenMatched;
                 if (spec.when_matched == WM::Fail) {
                     error = "merge insert: a source row matches an existing row, and when_matched is fail";
                     return false;
                 }
-                if (spec.when_matched == WM::UpdateAll || spec.when_matched == WM::Delete) {
+                const bool update_if =
+                    spec.when_matched == WM::UpdateIf && passes[sb][static_cast<std::size_t>(i)] != 0U;
+                if (update_if) {
+                    keep[static_cast<std::size_t>(i)] = 1U;
+                    deletions[it->second >> 32U].push_back(static_cast<std::uint32_t>(it->second & 0xFFFFFFFFULL));
+                    ++stats.updated;
+                } else if (spec.when_matched == WM::UpdateAll || spec.when_matched == WM::Delete) {
                     keep[static_cast<std::size_t>(i)] = spec.when_matched == WM::UpdateAll ? 1U : 0U;
                     deletions[it->second >> 32U].push_back(static_cast<std::uint32_t>(it->second & 0xFFFFFFFFULL));
                     ++(spec.when_matched == WM::UpdateAll ? stats.updated : stats.deleted);

@@ -966,11 +966,13 @@ class MergeInsertBuilder:
         self._insert_all = False
         self._delete_by_source = False
         self._delete_condition = ""
+        self._update_condition = ""
 
     def when_matched_update_all(self, condition: Optional[str] = None) -> "MergeInsertBuilder":
-        if condition is not None:
-            raise unsupported("when_matched_update_all(condition=...)")
+        """Update matched rows; with `condition` (SQL over `source.<col>` and `target.<col>`), only
+        those for which it is TRUE."""
         self._update_all = True
+        self._update_condition = condition or ""
         return self
 
     def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
@@ -998,7 +1000,8 @@ class MergeInsertBuilder:
         conformed = pa.RecordBatchReader.from_batches(target, (_conform(b, target) for b in reader))
         with native():
             stats, _ = _nanolance._ds_merge_insert(self._ds.uri, self._on, self._update_all, self._insert_all,
-                                                   self._delete_by_source, self._delete_condition, conformed)
+                                                   self._delete_by_source, self._delete_condition, conformed,
+                                                   self._update_condition)
         self._ds._refresh_latest()
         return {k: int(v) for k, v in stats.items()}
 
