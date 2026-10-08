@@ -15,6 +15,7 @@
 #include <nanolance/nano_lance_writer.h>
 #include <nanolance/scalar_index.hpp>
 #include <nanolance/vector_search.hpp>
+#include <nanolance/writer_internal.hpp>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
@@ -662,6 +663,14 @@ public:
         }
     }
 
+    /// An append that covers only these top-level columns (the rest read as null).
+    void project(const std::vector<std::string>& columns) {
+        std::string error;
+        if (!nano_lance::writer_project_append(&writer_, columns, error)) {
+            throw std::invalid_argument(error);
+        }
+    }
+
     std::uint64_t finish(int mode, bool keep_empty) {
         std::uint64_t version = 0;
         int rc = NANO_LANCE_OK;
@@ -911,6 +920,7 @@ NB_MODULE(_nanolance, m) {
              nb::arg("path"), nb::arg("options"), nb::arg("append"), nb::arg("max_rows_per_file"),
              nb::arg("max_bytes_per_file"))
         .def("write_batch", &StagedWriter::write_batch)
+        .def("project", &StagedWriter::project)
         .def("finish", &StagedWriter::finish, nb::arg("mode"), nb::arg("keep_empty") = false);
     m.attr("COMMIT_CREATE") = static_cast<int>(NANO_LANCE_COMMIT_CREATE);
     m.attr("COMMIT_APPEND") = static_cast<int>(NANO_LANCE_COMMIT_APPEND);
@@ -933,12 +943,17 @@ NB_MODULE(_nanolance, m) {
     m.def("_ds_merge_insert", [](const std::filesystem::path& path, const std::vector<std::string>& on,
                                  bool update_all, bool insert_all, bool delete_by_source,
                                  const std::string& delete_condition, nb::handle data,
-                                 const std::string& update_condition) {
+                                 const std::string& update_condition, const std::string& when_matched) {
         nano_lance::MergeInsertSpec spec;
         spec.on = on;
         spec.when_matched = !update_all             ? nano_lance::MergeInsertSpec::WhenMatched::DoNothing
                             : update_condition.empty() ? nano_lance::MergeInsertSpec::WhenMatched::UpdateAll
                                                        : nano_lance::MergeInsertSpec::WhenMatched::UpdateIf;
+        if (when_matched == "fail") {
+            spec.when_matched = nano_lance::MergeInsertSpec::WhenMatched::Fail;
+        } else if (when_matched == "delete") {
+            spec.when_matched = nano_lance::MergeInsertSpec::WhenMatched::Delete;
+        }
         spec.when_matched_condition = update_condition;
         spec.when_not_matched_insert_all = insert_all;
         spec.when_not_matched_by_source_delete = delete_by_source;

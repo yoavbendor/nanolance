@@ -912,7 +912,7 @@ bool dataset_merge_insert(const std::filesystem::path& dataset_path, const Merge
             if (it != target.end()) {
                 matched.insert(it->second);
                 if (spec.when_matched == WM::Fail) {
-                    error = "merge insert: a source row matches an existing row, and when_matched is fail";
+                    error = "Merge insert failed: a source row matches an existing row, and when_matched is fail";
                     return false;
                 }
                 const bool update_if =

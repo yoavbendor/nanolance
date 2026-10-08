@@ -966,7 +966,14 @@ class MergeInsertBuilder:
 
     def __init__(self, dataset: LanceDataset, on):
         if on is None:
-            raise unsupported("merge_insert without key columns (by the schema's primary key)")
+            # The schema's (unenforced) primary key, as Lance does it.
+            on = [f.name for f in dataset.schema
+                  if (f.metadata or {}).get(b"lance-schema:unenforced-primary-key", b"").lower() == b"true"]
+            if not on:
+                raise ValueError(
+                    "Invalid user input: A merge insert operation requires join keys: specify `on` columns "
+                    "explicitly or configure a primary key in the dataset schema"
+                )
         self._ds = dataset
         self._on = [on] if isinstance(on, str) else list(on)
         self._update_all = False
@@ -974,12 +981,35 @@ class MergeInsertBuilder:
         self._delete_by_source = False
         self._delete_condition = ""
         self._update_condition = ""
+        self._when_matched = ""  # "fail" / "delete"; otherwise by _update_all
+        self._write_mode = "auto"
 
     def when_matched_update_all(self, condition: Optional[str] = None) -> "MergeInsertBuilder":
         """Update matched rows; with `condition` (SQL over `source.<col>` and `target.<col>`), only
         those for which it is TRUE."""
         self._update_all = True
         self._update_condition = condition or ""
+        self._when_matched = ""
+        return self
+
+    def when_matched_fail(self) -> "MergeInsertBuilder":
+        """Fail the whole merge if a source row matches a row of the dataset."""
+        self._when_matched = "fail"
+        self._update_all = False
+        return self
+
+    def when_matched_delete(self) -> "MergeInsertBuilder":
+        """Delete the dataset's rows the source matches (the source needs only the keys)."""
+        self._when_matched = "delete"
+        self._update_all = False
+        return self
+
+    def write_mode(self, mode: str) -> "MergeInsertBuilder":
+        """How the merged rows are written. nanolance gives every mode the same results, written as
+        whole rows ('rewrite_rows'); 'rewrite_columns' is checked as Lance checks it."""
+        if mode not in ("auto", "rewrite_rows", "rewrite_columns"):
+            raise ValueError(f"Invalid write_mode: {mode}. Expected one of 'auto', 'rewrite_rows', 'rewrite_columns'")
+        self._write_mode = mode
         return self
 
     def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
@@ -1003,14 +1033,94 @@ class MergeInsertBuilder:
     def execute(self, data_obj, *, schema: Optional[pa.Schema] = None) -> Dict[str, int]:
         reader = _coerce_reader(data_obj, schema)
         target = self._ds.schema
-        _check_append_schema(target, reader.schema)
+        if not (self._update_all or self._insert_all or self._delete_by_source or self._when_matched):
+            raise ValueError("Invalid user input: The merge insert job is not configured to change the data in any way")
+        if self._when_matched == "delete" and not self._insert_all:
+            # Only the keys matter: the source may hold just those.
+            unexpected = [n for n in reader.schema.names if n not in target.names]
+            if unexpected:
+                _check_append_schema(target, reader.schema, allow_subset=True)
+            keys = reader.read_all().select(self._on)
+            with native():
+                stats, _ = _nanolance._ds_merge_insert(
+                    self._ds.uri, self._on, False, False, self._delete_by_source, self._delete_condition,
+                    self._fill_missing_columns(pa.RecordBatchReader.from_batches(keys.schema, keys.to_batches()),
+                                               target, read_old=False),
+                    "", "delete")
+            self._ds._refresh_latest()
+            return {k: int(v) for k, v in stats.items()}
+        _check_append_schema(target, reader.schema, allow_subset=True)
+        if self._write_mode == "rewrite_columns":
+            if len(reader.schema.names) >= len(target.names) or self._insert_all:
+                raise OSError(
+                    "Invalid user input: MergeInsertWriteMode::RewriteColumns cannot express this merge insert: "
+                    + ("the source covers every dataset column, so there is nothing to skip; "
+                       if len(reader.schema.names) >= len(target.names) else "")
+                    + ("inserting unmatched source rows adds rows, which patching cannot do. " if self._insert_all
+                       else "")
+                    + "Use MergeInsertWriteMode::Auto or RewriteRows instead."
+                )
+        if len(reader.schema.names) < len(target.names):
+            reader = self._fill_missing_columns(reader, target)
         conformed = pa.RecordBatchReader.from_batches(target, (_conform(b, target) for b in reader))
         with native():
             stats, _ = _nanolance._ds_merge_insert(self._ds.uri, self._on, self._update_all, self._insert_all,
                                                    self._delete_by_source, self._delete_condition, conformed,
-                                                   self._update_condition)
+                                                   self._update_condition, self._when_matched)
         self._ds._refresh_latest()
         return {k: int(v) for k, v in stats.items()}
+
+
+    def _fill_missing_columns(self, reader: pa.RecordBatchReader, target: pa.Schema,
+                              read_old: bool = True) -> pa.RecordBatchReader:
+        """A source with part of the dataset's columns, made whole: a matched row keeps the values
+        it has in the columns the source lacks, and an inserted row gets nulls there (as Lance's
+        merge of part of the schema does)."""
+        source = reader.read_all()
+        for k in self._on:
+            if k not in source.column_names:
+                raise ValueError(f"the source has no key column '{k}'")
+        missing = [f.name for f in target if f.name not in source.column_names]
+        # Each source row's matching dataset row (its position in a scan), by the keys. Null keys
+        # match nothing.
+        keys = self._ds.to_table(columns=self._on)
+        left = pa.table({**{f"k{i}": source.column(k) for i, k in enumerate(self._on)},
+                         "__source": pa.array(range(source.num_rows), pa.int64())})
+        right = pa.table({**{f"k{i}": keys.column(k) for i, k in enumerate(self._on)},
+                          "__target": pa.array(range(keys.num_rows), pa.int64())})
+        names = [f"k{i}" for i in range(len(self._on))]
+        joined = left.join(right, keys=names, join_type="left outer").sort_by("__source")
+        if joined.num_rows != source.num_rows:
+            raise ValueError("merge insert: a source row matches more than one row of the dataset")
+        at = joined.column("__target")
+        matched = at.drop_null()
+        if len(matched) and read_old:
+            old = self._ds.take(matched.to_pylist(), columns=missing)
+        else:
+            old = pa.table({n: pa.array([], target.field(n).type) for n in missing})
+        # Row i of `old` belongs to the i-th matched source row; the others take null.
+        import pyarrow.compute as pc
+        valid = pc.is_valid(at)
+        position = pc.subtract(pc.cumulative_sum(pc.cast(valid, pa.int64())), 1)
+        pick = pc.if_else(valid, position, pa.scalar(None, pa.int64()))
+        inserted = (self._insert_all and len(matched) < source.num_rows)
+        if inserted:
+            for n in missing:
+                if not target.field(n).nullable:
+                    raise OSError(
+                        "Append with different schema: fields did not match, "
+                        f"missing=[{n}], unexpected=[]"
+                    )
+        columns = {}
+        for f in target:
+            if f.name in source.column_names:
+                columns[f.name] = source.column(f.name)
+            elif read_old:
+                columns[f.name] = old.column(f.name).take(pick)
+            else:
+                columns[f.name] = pa.nulls(source.num_rows, f.type)
+        whole = pa.table(columns)
+        return pa.RecordBatchReader.from_batches(whole.schema, whole.to_batches())
 
 
 class DatasetOptimizer:
@@ -1483,11 +1593,17 @@ def write_dataset(
     target = None
     if append:
         target = LanceDataset(path).schema
-        _check_append_schema(target, reader.schema)
+        _check_append_schema(target, reader.schema, allow_subset=True)
     options = _nanolance.WriteOptions()
     with native():
         writer = _nanolance._StagedWriter(path, options, append, int(max_rows_per_file or 0),
                                           int(max_bytes_per_file or 0) if max_bytes_per_file < 2**62 else 0)
+    if target is not None and len(reader.schema.names) < len(target.names):
+        # Part of the schema: the new files hold those columns alone, as Lance writes them, and the
+        # others read as null.
+        target = pa.schema([f for f in target if f.name in reader.schema.names], metadata=target.metadata)
+        with native():
+            writer.project(target.names)
     wrote = False
     limit = int(max_rows_per_file or 0)
     in_file = 0
@@ -1518,12 +1634,15 @@ def write_dataset(
     return LanceDataset(path)
 
 
-def _check_append_schema(target: pa.Schema, given: pa.Schema) -> None:
-    missing = [n for n in target.names if n not in given.names]
+def _check_append_schema(target: pa.Schema, given: pa.Schema, allow_subset: bool = False) -> None:
+    """Lance's check: no column the dataset lacks, and (with `allow_subset`) only nullable columns
+    left out."""
+    missing = [f.name for f in target if f.name not in given.names and (not allow_subset or not f.nullable)]
     unexpected = [n for n in given.names if n not in target.names]
     if missing or unexpected:
         raise OSError(
-            f"Append with different schema: fields did not match, missing={missing}, unexpected={unexpected}"
+            "Append with different schema: fields did not match, "
+            f"missing=[{', '.join(missing)}], unexpected=[{', '.join(unexpected)}]"
         )
 
 

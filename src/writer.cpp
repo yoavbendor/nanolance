@@ -1361,6 +1361,42 @@ bool writer_set_field_id_base(NanoLanceWriter* writer, std::int32_t first_id, st
     return true;
 }
 
+bool writer_project_append(NanoLanceWriter* writer, const std::vector<std::string>& keep, std::string& error) {
+    auto* state = state_from(writer);
+    if (state == nullptr || !state->append_only_commits || !state->has_schema || state->pending_batches != 0U ||
+        !state->staged.empty()) {
+        error = "only a new append writer can write part of the schema";
+        return false;
+    }
+    // A field is kept when its top-level ancestor is; parents come before their children.
+    std::map<std::int32_t, bool> kept;
+    LanceSchemaMapping projected;
+    for (const auto& f : state->schema_mapping.fields) {
+        const bool keep_it = f.parent_id < 0 ? std::find(keep.begin(), keep.end(), f.name) != keep.end()
+                                             : kept[f.parent_id];
+        kept[f.id] = keep_it;
+        if (keep_it) {
+            projected.fields.push_back(f);
+        }
+    }
+    for (const auto& name : keep) {
+        const bool found = std::any_of(projected.fields.begin(), projected.fields.end(), [&](const LanceField& f) {
+            return f.parent_id < 0 && f.name == name;
+        });
+        if (!found) {
+            error = "no column '" + name + "' in the dataset";
+            return false;
+        }
+    }
+    renumber_columns_for_one_file(projected);
+    state->schema_mapping = std::move(projected);
+    state->blob_field = find_blob_v2_parent(state->schema_mapping);
+    const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
+    state->column_values.clear();
+    state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
+    return true;
+}
+
 bool writer_take_staged(NanoLanceWriter* writer, std::vector<NewFragment>& out, LanceSchemaMapping& mapping,
                         std::string& error, bool keep_empty) {
     auto* state = state_from(writer);

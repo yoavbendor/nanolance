@@ -25,6 +25,8 @@ def translate(message: str) -> Exception:
         return OSError(text)
     if "append" in lower and "schema" in lower:
         return OSError(text)
+    if "merge insert failed" in lower:
+        return OSError(text)
     if "not found" in lower or "no manifest" in lower:
         return ValueError(text)
     if "not supported" in lower or "unsupported" in lower:

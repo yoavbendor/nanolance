@@ -1513,9 +1513,54 @@ std::vector<const LanceField*> fields_missing_from(const PlannedFile& planned, c
     return missing;
 }
 
-/// `rows` nulls of `field`'s type.
-bool null_column_values(const LanceField& field, std::uint64_t rows, ColumnValues& out, std::string& error) {
+/// `rows` nulls of `field`'s type. A field under structs or lists whose whole top-level column the
+/// fragment lacks (an append of part of the schema, a column added later) reads as Lance reads it:
+/// the outermost ancestor null in every row, and the levels below it empty or null.
+bool null_column_values(const LanceField& field, const LanceSchemaMapping& mapping,
+                        const std::vector<const LanceField*>& missing, std::uint64_t rows, ColumnValues& out,
+                        std::string& error) {
     out = ColumnValues{};
+    // The ancestors, outermost first, and whether every leaf under the outermost is missing.
+    std::vector<const LanceField*> ancestors;
+    for (std::int32_t id = field.parent_id; id >= 0;) {
+        const auto it = std::find_if(mapping.fields.begin(), mapping.fields.end(),
+                                     [&](const LanceField& f) { return f.id == id; });
+        if (it == mapping.fields.end()) {
+            break;
+        }
+        ancestors.insert(ancestors.begin(), &*it);
+        id = it->parent_id;
+    }
+    if (!ancestors.empty()) {
+        std::unordered_set<std::int32_t> under{ancestors.front()->id};
+        bool whole = true;
+        for (const auto& f : mapping.fields) {
+            if (under.count(f.parent_id) == 0U) {
+                continue;
+            }
+            under.insert(f.id);
+            if (f.column_index >= 0 &&
+                std::find(missing.begin(), missing.end(), &f) == missing.end()) {
+                whole = false;  // a sibling has data: the struct stands, this field alone is null
+            }
+        }
+        if (whole) {
+            std::uint64_t length = rows;
+            for (const auto* a : ancestors) {
+                ColumnValues::NestedLayer layer;
+                layer.is_list = a->logical_type != "struct";
+                layer.length = length;
+                layer.validity.assign(static_cast<std::size_t>((length + 7U) / 8U), 0U);
+                layer.null_count = length;
+                if (layer.is_list) {
+                    layer.offsets.assign(static_cast<std::size_t>(length + 1U), 0);
+                    length = 0;  // a null list holds no items
+                }
+                out.layers.push_back(std::move(layer));
+            }
+            rows = length;
+        }
+    }
     out.rows = rows;
     out.validity.assign(static_cast<std::size_t>((rows + 7U) / 8U), 0U);
     out.null_count = rows;
@@ -1702,7 +1747,7 @@ bool filter_decoded_rows(const FilterSpec& filter, const LanceSchemaMapping& map
         }
     }
     for (const auto* field : missing) {
-        if (!null_column_values(*field, out_rows, by_field[field->id], why)) {
+        if (!null_column_values(*field, mapping, missing, out_rows, by_field[field->id], why)) {
             return false;
         }
     }
@@ -1998,7 +2043,7 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
             }
         }
         for (const auto* field : missing) {
-            if (!null_column_values(*field, take, by_field[field->id], why)) {
+            if (!null_column_values(*field, mapping, missing, take, by_field[field->id], why)) {
                 return;
             }
         }
@@ -2250,7 +2295,7 @@ bool decode_data_file_rows(const std::filesystem::path& dataset_path, const Plan
     }
     missing = fields_missing_from(planned, mapping, allowed_field_ids, columns);
     for (const auto* field : missing) {
-        if (!null_column_values(*field, physical.size(), decoded_by_field_id[field->id], error)) {
+        if (!null_column_values(*field, mapping, missing, physical.size(), decoded_by_field_id[field->id], error)) {
             return false;
         }
     }

@@ -2884,3 +2884,26 @@ without degrading current function or speed.
   phrase check sits outside the plain match's loops).
 - **Not yet**: fuzzy matching; full-text ties under a limit can keep other rows than Lance's
   block-max WAND keeps (`docs/ROADMAP.md`).
+
+## Writes with part of the schema
+
+Asked: work through the Tier 1 list of `docs/ROADMAP.md` (what pylance users hit most), function
+first, without degrading function or speed.
+
+- **Append some of the columns** (`src/writer.cpp` `writer_project_append`): the new files hold the
+  given columns alone, with the dataset's field ids, as pylance writes them; leaving out a
+  non-nullable column, or giving one the dataset lacks, is pylance's error, word for word.
+- **Reading columns a fragment lacks** (`src/lance_table_reader.cpp`): a struct or list column
+  whose fragment has no data reads as a null value, as in Lance (it read as a struct of nulls,
+  and a missing list column could not be read at all).
+- **`merge_insert` with part of the columns**: matched rows keep their values in the other
+  columns, inserted rows get nulls there; `when_matched_delete`, `when_matched_fail`,
+  `write_mode`, the schema's unenforced primary key as default `on`, and pylance's error for a
+  merge that changes nothing.
+- **Verified**: `tests/test_partial_schema.py` (every case run on nanolance and pylance, read back
+  by both: structs, nested structs, lists, lists of structs, fixed-size lists, deletions, multi-key
+  merges); pylance's suite 271 (259 before); lance-c's 106 of 106; ctest; the Python suite.
+  Full-schema appends and merges take the same path as before.
+- **Found**: pylance retries a commit that lost a race to a compatible one; nanolance refuses it,
+  so `test_compact_with_write` fails about 1 run in 16, before this change too (now in the
+  roadmap's Tier 1). nanolance casts an append's column types where pylance refuses them.
