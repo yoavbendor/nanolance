@@ -8,6 +8,7 @@
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/version.hpp"
 #include "nanolance/dataset_refs.hpp"
+#include "transaction_file.hpp"
 #include <sstream>
 #include <iomanip>
 #include "nanolance/schema_mapper.hpp"
@@ -174,6 +175,23 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     if (!check_data_file_versions(written, error)) {
         return false;
     }
+    // The transaction first, as Lance writes it: the manifest names it, and Lance reads it to check
+    // a concurrent commit of its own against this one.
+    std::string transaction;
+    if (!write_transaction_file(dataset_path, written, transaction, error)) {
+        return false;
+    }
+    written.transaction_file = transaction;
+    struct DropUnlessCommitted {
+        const std::filesystem::path& path;
+        const std::string& name;
+        bool committed = false;
+        ~DropUnlessCommitted() {
+            if (!committed) {
+                remove_transaction_file(path, name);
+            }
+        }
+    } drop_transaction{dataset_path, transaction};
     written.has_index_section = !manifest.indices.empty();
     std::uint64_t manifest_position = 4;
     if (written.has_index_section) {
@@ -221,6 +239,7 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     // without hard links fall back to rename.
     std::filesystem::create_hard_link(temp_path, final_path, ec);
     if (!ec) {
+        drop_transaction.committed = true;
         std::filesystem::remove(temp_path, ec);
         run_auto_cleanup(dataset_path, manifest.version, manifest.config);
         return true;
@@ -236,6 +255,7 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
         error = "failed to atomically publish manifest: " + ec.message();
         return false;
     }
+    drop_transaction.committed = true;
     run_auto_cleanup(dataset_path, manifest.version, manifest.config);
     return true;
 }
@@ -395,6 +415,8 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
         manifest.reader_feature_flags = prior.reader_feature_flags;
         manifest.writer_feature_flags = prior.writer_feature_flags;
         manifest.fragments = prior.fragments;
+        manifest.operation = pb::Manifest::Operation::Append;
+        manifest.first_new_fragment = prior.fragments.size();
         // An append keeps every index as it is; the new fragments are simply not covered.
         manifest.indices = prior.indices;
         manifest.index_section_error = prior.index_section_error;
@@ -418,6 +440,7 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
     }
     if (mode == CommitMode::Overwrite || mode == CommitMode::Create) {
         next_id = exists && prior.has_max_fragment_id ? next_id : 0U;
+        manifest.operation = pb::Manifest::Operation::Overwrite;
     }
     for (const auto& fragment : fragments) {
         if (next_id > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {

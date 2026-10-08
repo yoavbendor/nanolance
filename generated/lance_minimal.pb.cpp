@@ -527,6 +527,7 @@ bool decode_manifest(const std::vector<std::uint8_t>& bytes, Manifest& manifest)
 }
 
 std::vector<std::uint8_t> encode_data_fragment(const DataFragment& fragment) { return encode(to_wire(fragment)); }
+std::vector<std::uint8_t> encode_field(const Field& field) { return encode(to_wire(field)); }
 
 bool decode_data_fragment(const std::vector<std::uint8_t>& bytes, DataFragment& fragment) {
     wire::DataFragment w;

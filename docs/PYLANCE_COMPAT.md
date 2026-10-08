@@ -269,7 +269,7 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **311**, every one of which pylance also passes (305 before `order_by`, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
+| nanolance.lance | **312**, every one of which pylance also passes (311 before transaction files, 305 before `order_by`, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
 
 By test file, where nanolance passes any:
 
@@ -332,6 +332,12 @@ The runs found these bugs in nanolance's core. All are fixed and pinned in
   one could publish the other's manifest and still report success. A change now commits as the
   version after the one it read, the publish refuses to replace an existing version, and the temp
   name is each writer's own (`test_concurrent_commits_lose_nothing`).
+- **A pylance commit failed outright after a nanolance commit.** nanolance wrote no transaction
+  files; pylance reads the transaction of every version committed since its read version to
+  decide whether its change still applies, and a version without one is a hard error ("Dataset
+  version N does not have a transaction file"). Every nanolance commit now writes Lance's
+  `_transactions/{read_version}-{uuid}.txn`, describing the change as pylance would
+  (`test_transactions.py`).
 - **Writers in different processes could overwrite each other's data files.** A data file was
   named `fragment-<n>.lance`, `n` one more than the highest number already in `data/`, so two
   processes writing at once took the same name and the second file replaced the first -- also

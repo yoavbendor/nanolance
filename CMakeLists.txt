@@ -319,6 +319,7 @@ add_library(nanolance STATIC
     src/manifest_writer.cpp
     src/dataset.cpp
     src/dataset_refs.cpp
+    src/transaction_file.cpp
     src/expr.cpp
     src/arrow_slice.cpp
     src/dataset_ops.cpp

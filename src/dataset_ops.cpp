@@ -683,6 +683,7 @@ bool update_once(const std::filesystem::path& dataset_path, const std::string* p
     if (opened) {
         add_fragments(manifest, staged.mapping(), staged.files());
     }
+    manifest.operation = pb::Manifest::Operation::Update;  // its transaction: Lance's Update
     return commit(dataset_path, std::move(manifest), new_version, error);
 }
 
@@ -1065,6 +1066,7 @@ bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeIns
     if (opened) {
         add_fragments(manifest, staged.mapping(), staged.files());
     }
+    manifest.operation = pb::Manifest::Operation::Update;  // its transaction: Lance's Update
     return commit(dataset_path, std::move(manifest), new_version, error);
 }
 
@@ -1613,6 +1615,7 @@ bool compact_once(const std::filesystem::path& dataset_path, const CompactionOpt
         }
     }
     drop_fragments_from_indices(manifest.indices, rewritten_ids);
+    manifest.operation = pb::Manifest::Operation::Rewrite;
     if (!commit(dataset_path, std::move(manifest), new_version, error, false)) {
         return false;
     }

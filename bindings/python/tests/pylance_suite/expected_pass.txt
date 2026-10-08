@@ -47,6 +47,7 @@ tests/test_dataset.py::test_cleanup_old_versions
 tests/test_dataset.py::test_cleanup_specific_versions
 tests/test_dataset.py::test_cleanup_with_older_than_and_retain_versions
 tests/test_dataset.py::test_cleanup_with_rate_limit
+tests/test_dataset.py::test_cleanup_with_retain_versions
 tests/test_dataset.py::test_config_update_auto_cleanup
 tests/test_dataset.py::test_config_updates
 tests/test_dataset.py::test_count_rows

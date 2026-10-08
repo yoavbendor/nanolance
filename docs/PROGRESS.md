@@ -2989,3 +2989,25 @@ first, without degrading function or speed.
 - **Verified**: `tests/test_order_by.py` (12 random specs over int / float with NaN and ±0 /
   string / bool / timestamp keys with nulls, filters, offset and limit, projections without the
   sort columns; the forms; fragments) equal to pylance's results; pylance's suite 311 (305 before).
+
+## Transaction files
+
+- **The bug**: pylance, committing from a read version older than a version nanolance committed,
+  failed with Lance's internal error "Dataset version N does not have a transaction file" -- any
+  pylance writer sharing a dataset with a nanolance writer could hit it.
+- **The fix** (`src/transaction_file.cpp`): every commit (`publish_manifest`) writes
+  `_transactions/{read_version}-{uuid}.txn`, a lance.table.Transaction, before the manifest that
+  names it (field 12), and removes it when the commit does not land. The operation is read off the
+  change from the version before (fragments added / deletion files changed / fragments replaced,
+  schema, indices, config), with the commit's own word where the change cannot say it: append,
+  overwrite, restore, compaction (Rewrite), update and merge_insert (Update, as Lance records them
+  even when every row was an insert).
+- **Speed**: the append and overwrite paths describe themselves, so no manifest is re-read; the
+  remaining cost is the file itself, about 0.2 ms a commit on a 1,000-row append (Lance writes the
+  same file).
+- **Verified**: `tests/test_transactions.py`: pylance decodes every kind of nanolance commit as the
+  operation it records itself; pylance commits (insert, delete) from a stale version over each kind
+  of nanolance commit land with the right rows, or conflict exactly as two pylance writers would
+  (over an overwrite; an append over a schema change); one transaction per version after racing
+  writers. pylance's suite 312 (`test_cleanup_with_retain_versions` now passes); ctest, lance-c
+  106/106, the Python suite.

@@ -334,6 +334,8 @@ bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t ve
         manifest.max_fragment_id = std::max(manifest.max_fragment_id, latest.max_fragment_id);
     }
     manifest.version = latest_version;  // committed on top of the latest, which it replaces
+    manifest.operation = pb::Manifest::Operation::Restore;
+    manifest.restored_version = version;
     return commit_next_version(dataset_path, std::move(manifest), new_version, error);
 }
 

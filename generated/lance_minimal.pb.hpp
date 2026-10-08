@@ -149,6 +149,14 @@ struct Manifest {
     /// file this was read from (version_aux_data, index_section, transaction_section) are not kept:
     /// they would point at the wrong bytes of a new file.
     std::vector<std::uint8_t> unknown;
+
+    /// Not on the wire: what a commit of this manifest does, for its transaction file, when the change
+    /// from the version before does not say it alone (an overwrite or a restore replaces every
+    /// fragment, as a compaction of all of them does). `Derive`: read it off the change.
+    enum class Operation { Derive, Append, Overwrite, Restore, Rewrite, Update };
+    Operation operation = Operation::Derive;
+    std::uint64_t restored_version = 0;  // Restore: the version restored
+    std::size_t first_new_fragment = 0;  // Append: fragments from here on are the new ones
 };
 
 /// Reader feature flags, as Lance defines them (Manifest.reader_feature_flags).
@@ -194,6 +202,7 @@ std::vector<std::uint8_t> encode_file_descriptor(const FileDescriptor& descripto
 bool decode_file_descriptor(const std::vector<std::uint8_t>& bytes, FileDescriptor& descriptor);
 
 std::vector<std::uint8_t> encode_data_fragment(const DataFragment& fragment);
+std::vector<std::uint8_t> encode_field(const Field& field);
 bool decode_data_fragment(const std::vector<std::uint8_t>& bytes, DataFragment& fragment);
 
 std::vector<std::uint8_t> encode_data_file(const DataFile& file);
