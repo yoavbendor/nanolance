@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <random>
 #include <cstdio>
 
 #include "nanolance/read_safety.hpp"
@@ -720,10 +721,14 @@ bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_
         error = "failed to create _deletions: " + ec.message();
         return false;
     }
+    // Random as well as clock-based: writers in other processes name files in the same directory.
     static std::atomic<std::uint64_t> counter{0};
+    // (Drawn from the entropy source each time: a seeded generator would be shared by forked processes.)
+    std::random_device device;
+    const std::uint64_t random = (static_cast<std::uint64_t>(device()) << 32U) ^ device();
     const std::uint64_t id =
         (static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) * 0x9E3779B97F4A7C15ULL) ^
-        (counter.fetch_add(1) + 1U) ^ (static_cast<std::uint64_t>(fragment_id) << 40U);
+        (counter.fetch_add(1) + 1U) ^ (static_cast<std::uint64_t>(fragment_id) << 40U) ^ random;
     const auto name = std::to_string(fragment_id) + "-" + std::to_string(read_version) + "-" +
                       std::to_string(id & 0x7FFFFFFFFFFFFFFFULL) + ".arrow";
     const auto path = dataset_path / "_deletions" / name;

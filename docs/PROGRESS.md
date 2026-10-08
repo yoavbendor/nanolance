@@ -2907,3 +2907,22 @@ first, without degrading function or speed.
 - **Found**: pylance retries a commit that lost a race to a compatible one; nanolance refuses it,
   so `test_compact_with_write` fails about 1 run in 16, before this change too (now in the
   roadmap's Tier 1). nanolance casts an append's column types where pylance refuses them.
+
+## Concurrent writers
+
+- **Retries, as Lance's** (`src/dataset.cpp`, `src/manifest_writer.cpp`, `src/dataset_ops.cpp`,
+  `src/index_optimize.cpp`): a commit that loses its version is no longer refused when it still
+  applies -- an append or overwrite is built again on the newer version; a change made from an
+  older version is rebased when the other writers only added fragments (its own new fragments
+  renumbered after theirs, with the index coverage that names them); a delete, update,
+  merge_insert, compaction or index optimization whose fragments another writer rewrote runs
+  again on the latest version. Up to 20 tries with a short jittered pause, Lance's default.
+- **Fixed: writers in different processes overwrote each other's data files.** Files were named
+  from a counter over `data/`; two processes took the same name, and the later file replaced the
+  earlier one, committed or not. Names are now 128 random bits, drawn from the entropy source on
+  every call (a seeded generator is copied into forked processes, which then all draw the same
+  names); deletion file ids take random bits too. This also drops a directory listing per file.
+- **Verified**: `tests/test_concurrent_writers.py` (processes and threads: appends racing a
+  compaction, deletes, an update and a merge; every row once, every change landed, pylance reads
+  what nanolance reads, the index still answers); pylance's `test_compact_with_write` 16 of 16 in
+  parallel (15 of 16 before); pylance's suite 271, lance-c's 106 of 106, ctest, the Python suite.

@@ -21,7 +21,7 @@ plain append / update / scan comes before a whole subsystem.
 | tier | gap | failing tests |
 |---|---|---|
 | 1 | ~~Writes with part of the schema~~ -- **done (2026-10-08)**: appends of some columns (files hold only those, as Lance's do), `merge_insert` with part of the columns, `when_matched_delete` / `fail`, the primary key as default `on`; 12 more of pylance's tests pass. Left: `write_mode("rewrite_columns")` writes whole rows (same results, other layout) | ~10 |
-| 1 | Commit retries: Lance rebases a commit that lost a race to a compatible one (append and compaction, two appends) and retries; nanolance refuses it ("commit conflict"), so concurrent writers fail now and then (`test_compact_with_write` fails about 1 run in 16) | ~3 |
+| 1 | ~~Commit retries~~ -- **done (2026-10-08)**: appends and overwrites rebuilt on the newer version, other changes rebased when the other writers only added fragments, delete / update / merge / compaction / index optimization re-run after a real conflict; found and fixed on the way: concurrent writers could overwrite each other's data files (names from a counter). `test_compact_with_write` passes 16 runs in 16 (15 before) | ~3 |
 | 1 | System columns: `_rowid` in filters, `_rowoffset`, `_row_created_at_version`, `_row_last_updated_at_version`, `_distance` where pylance puts it, default scan options | ~10 |
 | 1 | Nested field paths: `struct.x` projection, scalar and full-text indexes on nested fields, back-quoted names | ~7 |
 | 1 | Version housekeeping: `cleanup_old_versions`, auto cleanup, `drop`, `tags` / version refs | ~20 |

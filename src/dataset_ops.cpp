@@ -28,6 +28,9 @@
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <chrono>
+#include <random>
+#include <thread>
 
 namespace nano_lance {
 namespace {
@@ -475,8 +478,83 @@ pb::Field* find_field(pb::Manifest& manifest, const std::string& path) {
 
 // ── delete ──────────────────────────────────────────────────────────────────────────────────────
 
+
+// One attempt of each, defined below.
+bool delete_once(const std::filesystem::path& dataset_path, const std::string& predicate, std::uint64_t& deleted,
+                 std::uint64_t& new_version, std::string& error);
+bool update_once(const std::filesystem::path& dataset_path, const std::string* predicate,
+                 const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
+                 std::uint64_t& new_version, std::string& error);
+bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeInsertSpec& spec,
+                       ArrowArrayStream& source, MergeInsertStats& stats, std::uint64_t& new_version,
+                       std::string& error);
+
 bool dataset_delete(const std::filesystem::path& dataset_path, const std::string& predicate, std::uint64_t& deleted,
                     std::uint64_t& new_version, std::string& error) {
+    return retry_on_conflict([&] { return delete_once(dataset_path, predicate, deleted, new_version, error); }, error);
+}
+
+bool dataset_update(const std::filesystem::path& dataset_path, const std::string* predicate,
+                    const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
+                    std::uint64_t& new_version, std::string& error) {
+    return retry_on_conflict(
+        [&] { return update_once(dataset_path, predicate, assignments, updated, new_version, error); }, error);
+}
+
+bool dataset_merge_insert(const std::filesystem::path& dataset_path, const MergeInsertSpec& spec,
+                          ArrowArrayStream& source, MergeInsertStats& stats, std::uint64_t& new_version,
+                          std::string& error) {
+    // The source is read once and replayed to each attempt.
+    struct Release {
+        ArrowArrayStream* s;
+        ~Release() {
+            if (s->release != nullptr) {
+                s->release(s);
+            }
+        }
+    } release_source{&source};
+    OwnedSchema schema;
+    if (source.get_schema(&source, &schema.s) != 0) {
+        error = "failed to read the source's schema";
+        return false;
+    }
+    std::vector<std::shared_ptr<SharedBatch>> batches;
+    for (;;) {
+        ArrowArray b{};
+        if (source.get_next(&source, &b) != 0) {
+            const char* why = source.get_last_error != nullptr ? source.get_last_error(&source) : nullptr;
+            error = std::string("reading the source failed") + (why != nullptr ? std::string(": ") + why : "");
+            return false;
+        }
+        if (b.release == nullptr) {
+            break;
+        }
+        batches.push_back(std::make_shared<SharedBatch>(std::move(b)));
+    }
+    return retry_on_conflict(
+        [&] {
+            ArrowSchema copy{};
+            ArrowArrayStream replay{};
+            if (ArrowSchemaDeepCopy(&schema.s, &copy) != NANOARROW_OK ||
+                ArrowBasicArrayStreamInit(&replay, &copy, static_cast<int64_t>(batches.size())) != NANOARROW_OK) {
+                if (copy.release != nullptr) {
+                    copy.release(&copy);
+                }
+                error = "out of memory";
+                return false;
+            }
+            for (std::size_t i = 0; i < batches.size(); ++i) {
+                ArrowArray view = slice_batch(batches[i], 0, batches[i]->array.length);
+                ArrowBasicArrayStreamSetArray(&replay, static_cast<int64_t>(i), &view);
+            }
+            const bool ok = merge_insert_once(dataset_path, spec, replay, stats, new_version, error);
+            return ok;
+        },
+        error);
+}
+
+bool delete_once(const std::filesystem::path& dataset_path, const std::string& predicate, std::uint64_t& deleted,
+                 std::uint64_t& new_version, std::string& error) {
     error.clear();
     deleted = 0;
     if (predicate.empty()) {
@@ -498,9 +576,9 @@ bool dataset_delete(const std::filesystem::path& dataset_path, const std::string
 
 // ── update ──────────────────────────────────────────────────────────────────────────────────────
 
-bool dataset_update(const std::filesystem::path& dataset_path, const std::string* predicate,
-                    const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
-                    std::uint64_t& new_version, std::string& error) {
+bool update_once(const std::filesystem::path& dataset_path, const std::string* predicate,
+                 const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
+                 std::uint64_t& new_version, std::string& error) {
     error.clear();
     updated = 0;
     if (assignments.empty()) {
@@ -754,9 +832,9 @@ bool update_if_passes(const std::filesystem::path& dataset_path, std::uint64_t v
 
 }  // namespace
 
-bool dataset_merge_insert(const std::filesystem::path& dataset_path, const MergeInsertSpec& spec,
-                          ArrowArrayStream& source, MergeInsertStats& stats, std::uint64_t& new_version,
-                          std::string& error) {
+bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeInsertSpec& spec,
+                       ArrowArrayStream& source, MergeInsertStats& stats, std::uint64_t& new_version,
+                       std::string& error) {
     struct Release {
         ArrowArrayStream* s;
         ~Release() {
@@ -1398,8 +1476,18 @@ bool dataset_alter_columns(const std::filesystem::path& dataset_path, const std:
 
 // ── compaction ──────────────────────────────────────────────────────────────────────────────────
 
+bool compact_once(const std::filesystem::path& dataset_path, const CompactionOptions& options,
+                  CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error);
+
 bool dataset_compact_files(const std::filesystem::path& dataset_path, const CompactionOptions& options,
                            CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error) {
+    // Planned again from the latest version when a delete or update rewrote a fragment meanwhile.
+    return retry_on_conflict([&] { return compact_once(dataset_path, options, metrics, new_version, error); },
+                             error);
+}
+
+bool compact_once(const std::filesystem::path& dataset_path, const CompactionOptions& options,
+                  CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error) {
     error.clear();
     metrics = {};
     pb::Manifest manifest;

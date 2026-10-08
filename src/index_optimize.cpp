@@ -329,8 +329,16 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
 
 }  // namespace
 
+bool optimize_indices_once(const std::filesystem::path& dataset_path, const OptimizeIndicesOptions& options,
+                           OptimizeIndicesResult& result, std::string& error);
+
 bool dataset_optimize_indices(const std::filesystem::path& dataset_path, const OptimizeIndicesOptions& options,
                               OptimizeIndicesResult& result, std::string& error) {
+    return retry_on_conflict([&] { return optimize_indices_once(dataset_path, options, result, error); }, error);
+}
+
+bool optimize_indices_once(const std::filesystem::path& dataset_path, const OptimizeIndicesOptions& options,
+                           OptimizeIndicesResult& result, std::string& error) {
     error.clear();
     result = OptimizeIndicesResult{};
     pb::Manifest manifest;

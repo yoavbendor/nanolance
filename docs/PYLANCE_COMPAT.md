@@ -229,8 +229,10 @@ them is silently ignored:
   JSON, array functions other than `array_has_any`, `array_has_all` and `array_contains` /
   `array_has`). A function the filter dialect lacks is refused by name.
 - The transaction API (`LanceOperation`, `commit`, `write_fragments`), `LanceFragment.merge_columns`
-  / `update_columns`, `cleanup_old_versions`. Conflicting writers are refused rather than retried:
-  a change built on a version another writer has since replaced fails with "commit conflict".
+  / `update_columns`, `cleanup_old_versions`. (Racing writers are retried as Lance retries them:
+  an append or overwrite is built again on the newer version, a change is rebased when the other
+  writers only added fragments, and a delete, update, merge, compaction or index optimization whose
+  fragments another writer rewrote runs again on the latest version, up to Lance's 20 tries.)
 - Fuzzy full-text queries and the full-text features listed under "Full-text indexes",
   vector indexes other than IVF_FLAT and IVF_PQ, and scalar indexes other than BTree, Bitmap,
   LabelList and INVERTED. An index pylance built is kept, though: see "Indexes" below.
@@ -330,6 +332,12 @@ The runs found these bugs in nanolance's core. All are fixed and pinned in
   one could publish the other's manifest and still report success. A change now commits as the
   version after the one it read, the publish refuses to replace an existing version, and the temp
   name is each writer's own (`test_concurrent_commits_lose_nothing`).
+- **Writers in different processes could overwrite each other's data files.** A data file was
+  named `fragment-<n>.lance`, `n` one more than the highest number already in `data/`, so two
+  processes writing at once took the same name and the second file replaced the first -- also
+  one already committed. Data files are now named at random (128 bits from the system's entropy
+  source on every call, as a seeded generator would be copied into forked processes), as Lance
+  names them by UUID; deletion file ids take random bits too (`test_concurrent_writers.py`).
 
 - **Reading format 2.1 was refused outright**, and a fixed-size-binary constant wider than 32 bytes
   in a pylance-written 2.2 dataset was refused. The file footer holds the major version and then

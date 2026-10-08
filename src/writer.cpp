@@ -18,6 +18,8 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <random>
+#include <chrono>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -543,40 +545,23 @@ std::size_t count_non_blob_physical_columns(const nano_lance::LanceSchemaMapping
     return count;
 }
 
-/// Next numeric suffix for `data/fragment-<n>.lance` (0 if `data/` is missing or has no matching files).
-std::uint64_t next_fragment_numeric_suffix(const std::filesystem::path& dataset_path) {
-    const auto data_dir = dataset_path / "data";
-    std::error_code ec;
-    if (!std::filesystem::exists(data_dir, ec)) {
-        return 0;
-    }
-    std::uint64_t max_seen = 0;
-    bool found = false;
-    for (const auto& entry : std::filesystem::directory_iterator(data_dir, ec)) {
-        if (ec || !entry.is_regular_file()) {
-            continue;
-        }
-        const auto name = entry.path().filename().string();
-        constexpr const char kPrefix[] = "fragment-";
-        constexpr std::size_t kPrefixLen = sizeof(kPrefix) - 1U;
-        if (name.size() <= kPrefixLen + 6U) {
-            continue;
-        }
-        if (name.rfind(".lance") != name.size() - 6U) {
-            continue;
-        }
-        if (name.compare(0, kPrefixLen, kPrefix) != 0) {
-            continue;
-        }
-        const auto mid = name.substr(kPrefixLen, name.size() - 6U - kPrefixLen);
-        try {
-            const auto n = static_cast<std::uint64_t>(std::stoull(mid));
-            max_seen = std::max(max_seen, n);
-            found = true;
-        } catch (...) {
+/// A new data file's name: `fragment-<32 hex digits>.lance`, random, as Lance names its files by a
+/// UUID. Writers in other processes add files to the same `data/` at the same time, so a name
+/// derived from what is already there (a counter) could be taken twice -- and the second file would
+/// overwrite one the first writer has committed.
+/// The bits come from the system's entropy source on every call: a seeded generator would be
+/// copied into each process a writer forks, and those would then all draw the same names.
+std::string new_data_file_name() {
+    std::random_device device;
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string name = "fragment-";
+    for (int word = 0; word < 4; ++word) {
+        auto bits = static_cast<std::uint32_t>(device());
+        for (int k = 0; k < 8; ++k, bits >>= 4U) {
+            name += kHex[bits & 0xFU];
         }
     }
-    return found ? max_seen + 1U : 0U;
+    return name + ".lance";
 }
 
 }  // namespace
@@ -1193,8 +1178,7 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     nano_lance::DataFileResult data_file;
-    const auto data_file_name =
-        "fragment-" + std::to_string(next_fragment_numeric_suffix(state->dataset_path)) + ".lance";
+    const auto data_file_name = new_data_file_name();
     if (!nano_lance::write_lance_data_file(state->dataset_path,
                                            data_file_name,
                                            disk_schema,

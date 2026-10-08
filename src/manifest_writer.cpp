@@ -18,6 +18,7 @@
 #include <fstream>
 #include <limits>
 #include <random>
+#include <thread>
 #include <utility>
 
 namespace nano_lance {
@@ -289,9 +290,38 @@ const char* nanolance_writer_version() {
     return nanolance::library_version();
 }
 
+namespace {
+
+bool commit_dataset_version_once(const std::filesystem::path& dataset_path, const LanceSchemaMapping& mapping,
+                                 const std::vector<NewFragment>& fragments, CommitMode mode, std::uint64_t& version,
+                                 std::string& error, const CommitExtras& extras);
+
+}  // namespace
+
 bool commit_dataset_version(const std::filesystem::path& dataset_path, const LanceSchemaMapping& mapping,
                             const std::vector<NewFragment>& fragments, CommitMode mode, std::uint64_t& version,
                             std::string& error, const CommitExtras& extras) {
+    // An append reads nothing of the dataset but its schema, and an overwrite nothing at all, so
+    // when another writer commits first either still applies after it: built again on the newer
+    // version and retried, as Lance retries compatible transactions.
+    for (int attempt = 0;; ++attempt) {
+        if (commit_dataset_version_once(dataset_path, mapping, fragments, mode, version, error, extras)) {
+            return true;
+        }
+        if (mode == CommitMode::Create || error.rfind("commit conflict", 0) != 0 || attempt + 1 >= 20) {
+            return false;
+        }
+        thread_local std::mt19937 rng{std::random_device{}()};
+        const int ceiling = std::min(50, 1 << std::min(attempt, 5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::uniform_int_distribution<int>(1, ceiling)(rng)));
+    }
+}
+
+namespace {
+
+bool commit_dataset_version_once(const std::filesystem::path& dataset_path, const LanceSchemaMapping& mapping,
+                                 const std::vector<NewFragment>& fragments, CommitMode mode, std::uint64_t& version,
+                                 std::string& error, const CommitExtras& extras) {
     error.clear();
     const auto versions_dir = dataset_path / "_versions";
     std::error_code ec;
@@ -419,6 +449,8 @@ bool commit_dataset_version(const std::filesystem::path& dataset_path, const Lan
     }
     return publish_manifest(dataset_path, manifest, error);
 }
+
+}  // namespace
 
 bool write_dataset_manifest(const std::filesystem::path& dataset_path,
                             const LanceSchemaMapping& mapping,

@@ -11,6 +11,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
+#include <random>
+#include <set>
+#include <thread>
 
 namespace nano_lance {
 namespace {
@@ -36,6 +40,132 @@ bool load(const std::filesystem::path& dataset_path, bool has_version, std::uint
     return load_latest_manifest(dataset_path, manifest, latest, error);
 }
 
+bool same_file(const pb::DataFile& a, const pb::DataFile& b) {
+    return a.path == b.path && a.fields == b.fields && a.column_indices == b.column_indices;
+}
+
+bool same_fragment(const pb::DataFragment& a, const pb::DataFragment& b) {
+    if (a.id != b.id || a.physical_rows != b.physical_rows || a.files.size() != b.files.size() ||
+        a.deletion_file.present != b.deletion_file.present ||
+        (a.deletion_file.present && (a.deletion_file.id != b.deletion_file.id ||
+                                     a.deletion_file.read_version != b.deletion_file.read_version))) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.files.size(); ++i) {
+        if (!same_file(a.files[i], b.files[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool same_fields(const std::vector<pb::Field>& a, const std::vector<pb::Field>& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].id != b[i].id || a[i].parent_id != b[i].parent_id || a[i].name != b[i].name ||
+            a[i].logical_type != b[i].logical_type || a[i].nullable != b[i].nullable) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::set<std::array<std::uint8_t, 16>> index_uuids(const pb::Manifest& m) {
+    std::set<std::array<std::uint8_t, 16>> out;
+    for (const auto& i : m.indices) {
+        out.insert(i.uuid);
+    }
+    return out;
+}
+
+/// Rebase `ours` -- a change made from `base` -- onto `latest`, which other writers committed in the
+/// meantime, as Lance's conflict resolution does for compatible transactions: when they only added
+/// fragments (every fragment of `base` unchanged, the same schema, indices and config), the change
+/// reads as made after theirs. Their new fragments join ours, and fragments ours added are numbered
+/// after theirs (with the indices that cover them). False: a real conflict.
+bool rebase(const pb::Manifest& base, const pb::Manifest& latest, pb::Manifest& ours) {
+    if (!same_fields(base.fields, latest.fields) || index_uuids(base) != index_uuids(latest) ||
+        base.config != latest.config || base.table_metadata != latest.table_metadata ||
+        base.schema_metadata != latest.schema_metadata ||
+        base.reader_feature_flags != latest.reader_feature_flags) {
+        return false;
+    }
+    std::map<std::uint64_t, const pb::DataFragment*> theirs;
+    for (const auto& f : latest.fragments) {
+        theirs[f.id] = &f;
+    }
+    std::set<std::uint64_t> in_base;
+    for (const auto& f : base.fragments) {
+        const auto it = theirs.find(f.id);
+        if (it == theirs.end() || !same_fragment(f, *it->second)) {
+            return false;  // they changed or removed a fragment this change was made from
+        }
+        in_base.insert(f.id);
+    }
+    std::uint64_t next = latest.has_max_fragment_id ? latest.max_fragment_id + 1ULL : 0ULL;
+    for (const auto& f : latest.fragments) {
+        next = std::max(next, f.id + 1U);
+    }
+    // Fragments this change added: numbered after every fragment the dataset has had.
+    std::map<std::uint32_t, std::uint32_t> renumber;
+    for (auto& f : ours.fragments) {
+        if (in_base.count(f.id) == 0U) {
+            renumber[static_cast<std::uint32_t>(f.id)] = static_cast<std::uint32_t>(next);
+            f.id = next++;
+        }
+    }
+    for (auto& index : ours.indices) {
+        bool changed = false;
+        for (auto& id : index.fragment_ids) {
+            const auto it = renumber.find(id);
+            if (it != renumber.end()) {
+                id = it->second;
+                changed = true;
+            }
+        }
+        if (changed) {
+            std::sort(index.fragment_ids.begin(), index.fragment_ids.end());
+            index.fragment_bitmap_changed = true;
+        }
+    }
+    for (const auto& f : latest.fragments) {
+        if (in_base.count(f.id) == 0U) {
+            ours.fragments.push_back(f);  // theirs
+        }
+    }
+    std::stable_sort(ours.fragments.begin(), ours.fragments.end(),
+                     [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
+    std::uint64_t max_id = latest.has_max_fragment_id ? latest.max_fragment_id : 0U;
+    for (const auto& f : ours.fragments) {
+        max_id = std::max(max_id, f.id);
+    }
+    ours.has_max_fragment_id = ours.has_max_fragment_id || latest.has_max_fragment_id || !ours.fragments.empty();
+    ours.max_fragment_id = static_cast<std::uint32_t>(max_id);
+    ours.next_row_id = std::max(ours.next_row_id, latest.next_row_id);
+    if (std::any_of(ours.fragments.begin(), ours.fragments.end(),
+                    [](const pb::DataFragment& f) { return f.deletion_file.present; })) {
+        ours.reader_feature_flags |= pb::kFlagDeletionFiles;
+        ours.writer_feature_flags |= pb::kFlagDeletionFiles;
+    }
+    ours.version = latest.version;
+    return true;
+}
+
+bool is_conflict(const std::string& error) {
+    return error.rfind("commit conflict", 0) == 0;
+}
+
+/// A short, growing, jittered pause between attempts, so racing writers spread out.
+void back_off(int attempt) {
+    thread_local std::mt19937 rng{std::random_device{}()};
+    const int ceiling = std::min(50, 1 << std::min(attempt, 5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::uniform_int_distribution<int>(1, ceiling)(rng)));
+}
+
+constexpr int kCommitAttempts = 20;  // Lance's default conflict_retries
+
 }  // namespace
 
 /// Publish `manifest` as the version after the one it was read at, stamped now and by nanolance.
@@ -60,7 +190,42 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
     manifest.transaction_file.clear();
     manifest.tag.clear();
     new_version = manifest.version;
-    return publish_manifest(dataset_path, manifest, error);
+    if (publish_manifest(dataset_path, manifest, error)) {
+        return true;
+    }
+    if (!is_conflict(error)) {
+        return false;
+    }
+    // Another writer took the version. Made from `base`, the change may still apply after theirs.
+    const std::string first_error = error;
+    pb::Manifest base;
+    if (!load_manifest_version(dataset_path, read_version, base, error)) {
+        error = first_error;
+        return false;
+    }
+    for (int attempt = 0; attempt < kCommitAttempts; ++attempt) {
+        pb::Manifest latest;
+        std::uint64_t latest_version = 0;
+        error.clear();
+        if (!load_latest_manifest(dataset_path, latest, latest_version, error)) {
+            return false;
+        }
+        pb::Manifest rebased = manifest;
+        if (!rebase(base, latest, rebased)) {
+            error = first_error;
+            return false;
+        }
+        rebased.version = latest_version + 1U;
+        new_version = rebased.version;
+        if (publish_manifest(dataset_path, rebased, error)) {
+            return true;
+        }
+        if (!is_conflict(error)) {
+            return false;
+        }
+        back_off(attempt);
+    }
+    return false;
 }
 
 bool dataset_latest_version(const std::filesystem::path& dataset_path, std::uint64_t& out, std::string& error) {
