@@ -10,6 +10,40 @@ two items the backlog called large are small.
 
 ---
 
+## Priority: competing with pylance directly (2026-10-08)
+
+This order supersedes the "Suggested order" lines further down. The evidence is pylance 12's own
+suite, run against nanolance.lance with every failure grouped by its cause: nanolance passes 259;
+869 tests fail or error, of which pylance itself passes all but about 14. The counts are a proxy
+for how often a user hits a gap, so the order also weighs how ordinary the workflow is: a gap in
+plain append / update / scan comes before a whole subsystem.
+
+| tier | gap | failing tests |
+|---|---|---|
+| 1 | Writes with part of the schema: append filling missing columns with nulls; `merge_insert` that updates only the source's columns; `merge_insert` defaulting to the primary key | ~10 |
+| 1 | System columns: `_rowid` in filters, `_rowoffset`, `_row_created_at_version`, `_row_last_updated_at_version`, `_distance` where pylance puts it, default scan options | ~10 |
+| 1 | Nested field paths: `struct.x` projection, scalar and full-text indexes on nested fields, back-quoted names | ~7 |
+| 1 | Version housekeeping: `cleanup_old_versions`, auto cleanup, `drop`, `tags` / version refs | ~20 |
+| 1 | Compaction parity: `max_bytes`, source budgets, excluded fragments, index remapping instead of re-covering, `defer_index_remap` | ~10 |
+| 1 | Filter functions: JSON (`json_get*`, `json_extract`, ...), `::` casts, `arrow_cast`, `regexp_match`, datetime casts | ~40 |
+| 1 | Small APIs: `stats`, `lance_schema`, `update_field_metadata`, `read_transaction` / `get_transactions`, `LANCE_DEFAULT_BATCH_SIZE` | ~25 |
+| 1 | Writer tail: empty structs, null elements inside fixed-size lists, zero-dimension fixed-size lists, Arrow dictionary arrays, enums | ~10 |
+| 2 | Distributed index builds from Python: `fragment_ids`, `index_uuid`, `create_index_uncommitted`, `merge_index_metadata`, `IndicesBuilder` (the core exists since lance-c's index segments) | ~55 |
+| 2 | Transactions and fragment-level writes, what Ray / Daft / Spark writers use: `LanceFragment.create`, `write_fragments`, `LanceOperation.*`, `LanceDataset.commit` / `commit_batch`, `merge_columns` / `update_columns`, fragment deletes, `add_columns` with UDFs | ~110 |
+| 2 | Namespaces (`DirectoryNamespace`, what LanceDB's catalog uses): mostly one fixture, so one feature unblocks many tests | ~130 |
+| 2 | Stable row ids | ~57 |
+| 3 | Search breadth: fuzzy full-text, ZONEMAP / NGRAM / BLOOMFILTER, more tokenizers (icu, jieba, lindera), full-text on list columns, Hamming and binary vectors, IVF_SQ / IVF_HNSW_PQ / IVF_HNSW_FLAT, Lance's tie order under a limit | ~60 |
+| 4 | Niche: `mem_wal`, writing data storage versions other than 2.2, multiple base paths, samplers, debug / logging / otel hooks, bfloat16 and image extension arrays, `lance.util.KMeans` | ~120 |
+
+Order of work: tier 1 top to bottom (each item is days, not weeks, and removes an error from an
+everyday workflow); then distributed index builds (cheap for its count: the work is exposing what
+lance-c already has); then transactions and fragment-level writes; then namespaces and stable row
+ids. Tier 3 items move up only when a user asks for one. Every item keeps the standing rules: same
+answers as pylance (checked against it), no speed regression, pylance's errors where nanolance
+still refuses.
+
+---
+
 ## Found on published datasets (2026-09-28)
 
 `tools/real_lance_check.py` read 24 tables from Lance datasets on the Hugging Face Hub
@@ -345,8 +379,8 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
    `lance.indices.IndicesBuilder`, progress callbacks, index file format v3 (256-document posting
    blocks).
 
-Suggested order: fuzzy matching from (4) next, then ZONEMAP from (5) (IVF_HNSW_SQ from (2) and
-phrase queries from (4) are done).
+Suggested order: see "Priority: competing with pylance directly" at the top (IVF_HNSW_SQ from (2)
+and phrase queries from (4) are done).
 
 ## lance-c: what is left of the C API (2026-10-07)
 
