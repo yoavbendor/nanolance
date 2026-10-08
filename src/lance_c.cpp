@@ -93,6 +93,8 @@ struct SearchSettings {
     std::optional<uint32_t> minimum_nprobes;
     std::optional<uint32_t> maximum_nprobes;
     std::optional<uint32_t> refine_factor;
+    std::optional<uint32_t> ef;
+    int32_t query_parallelism = 0;
     std::optional<nano_lance::VectorMetric> metric;
     bool use_index = true;
     bool prefilter = false;
@@ -711,6 +713,8 @@ bool open_search(const LanceScanner& scanner, ArrowArrayStream& out) {
         q.minimum_nprobes = search.minimum_nprobes.value_or(1U);
         q.maximum_nprobes = search.maximum_nprobes;
         q.refine_factor = search.refine_factor;
+        q.ef = search.ef;
+        q.query_parallelism = search.query_parallelism;
         q.metric = search.metric;
         q.use_index = search.use_index;
         if (!scanner.filter.empty()) {
@@ -2528,7 +2532,7 @@ int32_t lance_dataset_create_vector_index(LanceDataset* dataset, const char* col
     case LANCE_INDEX_IVF_FLAT: options.type = "IVF_FLAT"; break;
     case LANCE_INDEX_IVF_PQ: options.type = "IVF_PQ"; break;
     case LANCE_INDEX_IVF_SQ: NL_UNSUPPORTED_INT("IVF_SQ indexes");
-    case LANCE_INDEX_IVF_HNSW_SQ: NL_UNSUPPORTED_INT("IVF_HNSW_SQ indexes");
+    case LANCE_INDEX_IVF_HNSW_SQ: options.type = "IVF_HNSW_SQ"; break;
     case LANCE_INDEX_IVF_HNSW_PQ: NL_UNSUPPORTED_INT("IVF_HNSW_PQ indexes");
     case LANCE_INDEX_IVF_HNSW_FLAT: NL_UNSUPPORTED_INT("IVF_HNSW_FLAT indexes");
     default:
@@ -2559,6 +2563,20 @@ int32_t lance_dataset_create_vector_index(LanceDataset* dataset, const char* col
         if (options.num_bits != 4U && options.num_bits != 8U) {
             invalid("num_bits must be 4 or 8 for Lance PQ indexes, got " + std::to_string(options.num_bits));
             return -1;
+        }
+    }
+    if (options.type == "IVF_HNSW_SQ") {
+        if (params->hnsw_m == 0U) {
+            invalid("hnsw_m is required for this index type and must be > 0");
+            return -1;
+        }
+        if (params->num_bits != 0U && params->num_bits != 8U) {
+            invalid("num_bits must be 0 or 8 for Lance SQ indexes, got " + std::to_string(params->num_bits));
+            return -1;
+        }
+        options.hnsw_m = params->hnsw_m;
+        if (params->hnsw_ef_construction != 0U) {
+            options.hnsw_ef_construction = params->hnsw_ef_construction;
         }
     }
     if (params->max_iterations != 0U) {
@@ -2863,8 +2881,8 @@ int32_t lance_scanner_set_maximum_nprobes(LanceScanner* scanner, uint32_t maximu
         return true;
     });
 }
-// The approximation mode and the HNSW beam width change only HNSW and binary-quantized searches in
-// Lance; for the IVF_FLAT / IVF_PQ indexes nanolance searches they change nothing, as in Lance.
+// The approximation mode changes only binary-quantized searches in Lance; for the indexes nanolance
+// searches it changes nothing, as in Lance.
 int32_t lance_scanner_set_approx_mode(LanceScanner* scanner, LanceApproxMode approx_mode) {
     return before_scan(scanner, [&] {
         const auto mode = static_cast<int32_t>(approx_mode);
@@ -2874,8 +2892,12 @@ int32_t lance_scanner_set_approx_mode(LanceScanner* scanner, LanceApproxMode app
 }
 int32_t lance_scanner_set_query_parallelism(LanceScanner* scanner, int32_t query_parallelism) {
     return before_scan(scanner, [&] {
-        return query_parallelism >= -1 ||
-               invalid("query_parallelism must be -1, 0 or positive, got " + std::to_string(query_parallelism));
+        if (query_parallelism < -1) {
+            return invalid("query_parallelism must be -1, 0, or greater than 0, got " +
+                           std::to_string(query_parallelism));
+        }
+        scanner->search.query_parallelism = query_parallelism;
+        return true;
     });
 }
 int32_t lance_scanner_set_refine_factor(LanceScanner* scanner, uint32_t f) {
@@ -2884,8 +2906,11 @@ int32_t lance_scanner_set_refine_factor(LanceScanner* scanner, uint32_t f) {
         return true;
     });
 }
-int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t) {
-    return before_scan(scanner, [] { return true; });
+int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e) {
+    return before_scan(scanner, [&] {
+        scanner->search.ef = e;
+        return true;
+    });
 }
 int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric) {
     return before_scan(scanner, [&] {

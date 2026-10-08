@@ -65,12 +65,12 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                      std::string& error);
 
 struct VectorIndexOptions {
-    std::string type;  // "IVF_FLAT" or "IVF_PQ"
+    std::string type;  // "IVF_FLAT", "IVF_PQ" or "IVF_HNSW_SQ"
     std::string name;  // empty: <column>_idx
     VectorMetric metric = VectorMetric::L2;
     bool replace = false;
     /// Partitions: as given, else rows / target_partition_size (Lance's 4096 for IVF_FLAT, 8192 for
-    /// IVF_PQ), at least 1 and at most 4096.
+    /// IVF_PQ, 1 << 20 for IVF_HNSW_SQ), at least 1 and at most 4096.
     std::optional<std::uint32_t> num_partitions;
     std::optional<std::uint32_t> target_partition_size;
     std::uint32_t num_sub_vectors = 0;  // IVF_PQ: required; must divide the dimension
@@ -78,9 +78,13 @@ struct VectorIndexOptions {
     std::uint32_t max_iters = 50;       // k-means iterations (IVF and PQ), as Lance's defaults
     std::uint32_t sample_rate = 256;    // k-means trains on sample_rate * k vectors at most
     std::optional<std::uint64_t> seed;  // the random sample and initial centroids
+    // IVF_HNSW_SQ: each partition's graph (Lance's HnswBuildParams and defaults).
+    std::uint32_t hnsw_m = 20;                 // edges per node (2 * m on level 0); at least 4
+    std::uint32_t hnsw_ef_construction = 150;  // the beam while inserting; at least m
+    std::uint32_t hnsw_max_level = 7;          // levels, 1 to 16
 };
 
-/// Build an IVF_FLAT / IVF_PQ index on `column` (a fixed-size list of float32) in Lance's format --
+/// Build an IVF_FLAT / IVF_PQ / IVF_HNSW_SQ index on `column` (a fixed-size list of float32) in Lance's format --
 /// one pylance and LanceDB search as their own -- and commit it as the next version. Null vectors
 /// and vectors with NaN or infinite values are left out, as Lance leaves them out.
 bool dataset_create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,

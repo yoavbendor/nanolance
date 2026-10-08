@@ -511,6 +511,9 @@ struct IvfIndex {
     std::vector<std::uint64_t> graph_offsets;
     std::vector<std::uint64_t> graph_lengths;
     std::vector<HnswMeta> hnsw_meta;
+    std::uint32_t hnsw_m = 20;  // the graphs' build parameters
+    std::uint32_t hnsw_ef_construction = 150;
+    std::uint32_t hnsw_max_level = 7;
     std::vector<float> codebook_t;  // the same as [m][dim / m][2^nbits]: a table row is one sweep
 
     mutable std::mutex mutex;
@@ -826,6 +829,16 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
             }
             if (m.level_offsets.empty()) {
                 m.level_offsets.push_back(0);
+            }
+            if (const auto* params = meta.get("params"); params != nullptr && index->hnsw_meta.empty()) {
+                const auto param = [&](const char* key, std::uint32_t& out) {
+                    if (const auto* x = params->get(key); x != nullptr && x->n >= 1.0) {
+                        out = static_cast<std::uint32_t>(x->n);
+                    }
+                };
+                param("m", index->hnsw_m);
+                param("ef_construction", index->hnsw_ef_construction);
+                param("max_level", index->hnsw_max_level);
             }
             index->hnsw_meta.push_back(std::move(m));
         }
@@ -1260,10 +1273,15 @@ struct SqDistance {
             }
             return 1.0F - (lower * query_sum + value_scale * acc);
         }
+        // Summed in 32-bit chunks (255^2 * 65536 < 2^32), which compilers vectorize.
         std::uint64_t sum = 0;
-        for (std::size_t j = 0; j < dim; ++j) {
-            const int d = static_cast<int>(c[j]) - static_cast<int>(query_code[j]);
-            sum += static_cast<std::uint64_t>(d * d);
+        for (std::size_t at = 0; at < dim; at += 65536U) {
+            std::uint32_t part = 0;
+            for (std::size_t j = at; j < std::min<std::size_t>(dim, at + 65536U); ++j) {
+                const int d = static_cast<int>(c[j]) - static_cast<int>(query_code[j]);
+                part += static_cast<std::uint32_t>(d * d);
+            }
+            sum += part;
         }
         return static_cast<float>(sum) * scale;
     }
@@ -1787,6 +1805,11 @@ bool index_build::load_vector_model(const std::filesystem::path& dir, VectorMode
     out.m = index->pq ? index->m : 0U;
     out.codebook = index->pq ? index->codebook : std::vector<float>{};
     out.lengths = index->lengths;
+    out.sq_start = index->sq_start;
+    out.sq_end = index->sq_end;
+    out.hnsw_m = index->hnsw_m;
+    out.hnsw_ef_construction = index->hnsw_ef_construction;
+    out.hnsw_max_level = index->hnsw_max_level;
     return true;
 }
 

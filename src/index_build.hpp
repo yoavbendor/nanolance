@@ -22,7 +22,7 @@ namespace nano_lance::index_build {
 
 /// A trained IVF (and PQ) model, as an index's files hold it.
 struct VectorModel {
-    std::string type;  // "IVF_FLAT" / "IVF_PQ"
+    std::string type;  // "IVF_FLAT" / "IVF_PQ" / "IVF_HNSW_SQ"
     VectorMetric metric = VectorMetric::L2;
     std::size_t dim = 0;
     std::size_t partitions = 0;
@@ -31,6 +31,11 @@ struct VectorModel {
     std::size_t m = 0;             // PQ sub-vectors
     std::vector<float> codebook;   // [m][2^nbits][dim / m]
     std::vector<std::uint64_t> lengths;  // rows per partition
+    double sq_start = 0;  // IVF_HNSW_SQ: the SQ bounds and the graph parameters
+    double sq_end = 0;
+    std::uint32_t hnsw_m = 20;
+    std::uint32_t hnsw_ef_construction = 150;
+    std::uint32_t hnsw_max_level = 7;
 };
 
 /// The model of the vector index segment in `dir` (an _indices/<uuid> directory).

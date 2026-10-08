@@ -96,8 +96,8 @@ Those a dataset already has are kept, as below.
 
 `to_table(nearest={...})` (and `scanner(nearest=...)`, `ScannerBuilder.nearest`) searches a vector
 column -- a fixed-size list of floats -- as pylance does, and `create_index(column, "IVF_FLAT" |
-"IVF_PQ", metric=..., num_partitions=..., num_sub_vectors=..., num_bits=...)` builds Lance's index for
-it. The format and the search, step for step, are in `docs/VECTOR_INDEX.md`.
+"IVF_PQ" | "IVF_HNSW_SQ", metric=..., num_partitions=..., num_sub_vectors=..., num_bits=..., m=...,
+ef_construction=..., max_level=...)` builds Lance's index for it. The format and the search, step for step, are in `docs/VECTOR_INDEX.md`.
 
 - **Searching** (`src/vector_search.cpp`) an IVF_FLAT or IVF_PQ index -- built by pylance or by
   nanolance -- gives pylance's answer: the same rows, in the same order, with the same `_distance`,
@@ -120,8 +120,16 @@ it. The format and the search, step for step, are in `docs/VECTOR_INDEX.md`.
 pylance (IVF_PQ k=10 2.9 ms vs 7.6 ms; IVF_FLAT 1.5 ms vs 5.3 ms), building 1.3x faster (IVF_PQ
 12.7 s vs 16.4 s), at the same recall.
 
-Not supported: IVF_HNSW_*, IVF_SQ and IVF_RQ indexes (a search falls back to an exact one, its plan
-says why), batch and multivector queries, binary (Hamming) vectors, building on float16 / float64
+**IVF_HNSW_SQ** (`test_hnsw.py`): pylance's indexes are searched with pylance's answers -- rows,
+order and distances for L2 and cosine, with and without deletions, for k, `nprobes`, `refine_factor`,
+`ef`, `distance_range` and filters before and after the search; for dot the same, except filtered
+searches, where pylance's parallel partition search can itself answer differently from run to run.
+Indexes nanolance builds (graphs built as Lance builds them, its node levels and entry points
+exactly) are searched by pylance with nanolance's answers, at the recall of pylance's own, and
+`optimize_indices` maintains them.
+
+Not supported: IVF_HNSW_PQ, IVF_HNSW_FLAT, IVF_SQ and IVF_RQ indexes (a search falls back to an exact
+one, its plan says why), batch and multivector queries, binary (Hamming) vectors, building on float16 / float64
 vectors, `lance.indices.IndicesBuilder`, and a vector index on a dataset with stable row ids.
 
 ### Full-text indexes: built and searched
@@ -181,7 +189,7 @@ pylance's does (`lance/src/index/append.rs`), for the index kinds nanolance buil
   and encoded with them, then the partitions rebalanced as Lance 12 rebalances them (split those over
   four times the target size, join those under a quarter of it), even when nothing is new;
 - every index optimized is committed in one version; an index with nothing to do is left alone; an
-  index of a kind nanolance cannot build (IVF_HNSW_*, NGRAM, ZONEMAP, ...) fails the call, so name
+  index of a kind nanolance cannot build (IVF_HNSW_PQ, NGRAM, ZONEMAP, ...) fails the call, so name
   the others in `index_names`.
 
 `test_index_optimize.py` optimizes copies of the same dataset with pylance and with nanolance and

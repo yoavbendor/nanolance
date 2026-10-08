@@ -1096,7 +1096,9 @@ NB_MODULE(_nanolance, m) {
                                         bool replace, std::optional<std::uint32_t> num_partitions,
                                         std::optional<std::uint32_t> target_partition_size,
                                         std::uint32_t num_sub_vectors, std::uint32_t num_bits, std::uint32_t max_iters,
-                                        std::uint32_t sample_rate, std::optional<std::uint64_t> seed) {
+                                        std::uint32_t sample_rate, std::optional<std::uint64_t> seed,
+                                        std::uint32_t hnsw_m, std::uint32_t ef_construction,
+                                        std::uint32_t max_level) {
         nano_lance::VectorIndexOptions o;
         o.type = type;
         o.name = name;
@@ -1111,6 +1113,9 @@ NB_MODULE(_nanolance, m) {
         o.max_iters = max_iters;
         o.sample_rate = sample_rate;
         o.seed = seed;
+        o.hnsw_m = hnsw_m;
+        o.hnsw_ef_construction = ef_construction;
+        o.hnsw_max_level = max_level;
         std::uint64_t version = 0;
         run_op([&](std::string& e) { return nano_lance::dataset_create_vector_index(path, column, o, version, e); });
         return version;

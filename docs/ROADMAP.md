@@ -316,11 +316,13 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
    selection, `num_indices_to_merge`, `retrain`; a vector index keeps its model and is rebalanced as
    Lance 12 rebalances it), and compaction gives its rewritten rows back to the indexes
    (`include/nanolance/index_optimize.hpp`, `tests/test_index_optimize.py`).
-2. **HNSW and quantized vector indexes**: IVF_HNSW_SQ (what many LanceDB users pick for low
-   latency), IVF_HNSW_PQ, IVF_SQ, IVF_RQ. nanolance cannot build them; on a dataset that has one it
-   answers correctly but by exact search, which does not scale. Related search gaps: batch query
-   vectors, multivector (ColBERT-style) search, Hamming distance, building on float16 / float64
-   vectors.
+2. **HNSW and quantized vector indexes**: ~~IVF_HNSW_SQ~~ -- **done (2026-10-08)**: searched with
+   pylance's answers, built so pylance uses it, kept up by `optimize_indices`, in lance-c too
+   (`docs/VECTOR_INDEX.md`, `tests/test_hnsw.py`). Left: IVF_HNSW_PQ, IVF_HNSW_FLAT, IVF_SQ, IVF_RQ
+   -- on a dataset that has one nanolance answers correctly but by exact search, which does not
+   scale. Related search gaps: batch query vectors, multivector (ColBERT-style) search, Hamming
+   distance, building on float16 / float64 vectors, `stats.index_stats` (which most of pylance's
+   own HNSW tests read).
 3. **Stable row ids.** Optional in pylance, but some workflows depend on it. nanolance refuses to
    build or use any index on such a dataset.
 4. **Full-text search beyond LanceDB's defaults:**
@@ -343,7 +345,7 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
    `lance.indices.IndicesBuilder`, progress callbacks, index file format v3 (256-document posting
    blocks).
 
-Suggested order: IVF_HNSW_SQ from (2) next; then phrase queries from (4).
+Suggested order: phrase queries from (4) next (IVF_HNSW_SQ from (2) is done).
 
 ## lance-c: what is left of the C API (2026-10-07)
 
@@ -358,7 +360,8 @@ still calls vector and full-text indexes out of scope; it should be updated alon
    search with every setter, INVERTED in `create_scalar_index`, `full_text_search` and prepared Match
    contexts with both coverage modes (`tests/test_lance_c_search.cpp`).
 2. **Wait on core features from the index gaps list:**
-   - `lance_scanner_set_ef`: HNSW indexes.
+   - ~~`lance_scanner_set_ef`: HNSW indexes~~ -- done with IVF_HNSW_SQ (and
+     `set_query_parallelism`, which Lance's HNSW search uses).
    - `lance_scanner_nearest_multivector`: multivector search.
    - `lance_dataset_prepare_fts_phrase_query`: positions in INVERTED indexes.
 3. **Index segments**, 23 functions: build an index in pieces, possibly on other machines, and

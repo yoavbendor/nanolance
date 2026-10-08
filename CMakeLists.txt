@@ -297,6 +297,7 @@ add_library(nanolance STATIC
     src/index_files.cpp
     src/vector_search.cpp
     src/vector_index_build.cpp
+    src/hnsw_build.cpp
     src/fts_tokenizer.cpp
     src/fts_fst.cpp
     src/fts_posting.cpp

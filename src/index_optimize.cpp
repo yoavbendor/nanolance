@@ -120,7 +120,7 @@ std::size_t target_partition_size(const pb::IndexMetadata& index, const std::str
             break;
         }
     }
-    return type == "IVF_FLAT" ? 4096U : 8192U;
+    return type == "IVF_FLAT" ? 4096U : (type.rfind("IVF_HNSW", 0) == 0 ? std::size_t{1} << 20U : 8192U);
 }
 
 /// Whether Lance's optimize would rebalance these partitions with nothing new to fold in: one over
@@ -300,6 +300,9 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
         o.num_partitions = static_cast<std::uint32_t>(model.partitions);
         o.num_sub_vectors = static_cast<std::uint32_t>(model.m);
         o.num_bits = model.nbits;
+        o.hnsw_m = model.hnsw_m;
+        o.hnsw_ef_construction = model.hnsw_ef_construction;
+        o.hnsw_max_level = model.hnsw_max_level;
         if (!retrain) {
             where.model = &model;
             where.rebalance_target = target_size;

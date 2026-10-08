@@ -188,11 +188,14 @@ void test_nearest(const std::string& uri, const char* index_name) {
             core.minimum_nprobes = 2;
             core.maximum_nprobes = 2;
             core.refine_factor = seed % 2 == 0 ? std::optional<uint32_t>{} : std::optional<uint32_t>{3};
+            if (seed % 3 == 0) core.ef = 60;  // the HNSW beam (no effect on IVF_FLAT / IVF_PQ)
+            if (seed % 3 == 1) core.query_parallelism = 1;
             if (with_filter) core.filter = "id % 3 = 1";
             core.prefilter = with_filter && seed % 4 < 2;
             nano_lance::NearestResult want;
             std::string error;
-            check(nano_lance::dataset_nearest(uri, core, want, error), "core nearest: " + error);
+            const bool found = nano_lance::dataset_nearest(uri, core, want, error);
+            check(found, "core nearest: " + error);
 
             LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
             const char* cols[] = {"id", nullptr};
@@ -200,6 +203,8 @@ void test_nearest(const std::string& uri, const char* index_name) {
             check(lance_scanner_nearest(sc, "vec", q.data(), q.size(), LANCE_DTYPE_FLOAT32, 15) == 0, "nearest");
             check(lance_scanner_set_nprobes(sc, 2) == 0, "nprobes");
             if (core.refine_factor) check(lance_scanner_set_refine_factor(sc, 3) == 0, "refine");
+            if (core.ef) check(lance_scanner_set_ef(sc, 60) == 0, "ef");
+            if (core.query_parallelism == 1) check(lance_scanner_set_query_parallelism(sc, 1) == 0, "parallelism");
             check(lance_scanner_set_prefilter(sc, core.prefilter) == 0, "prefilter");
             check(lance_scanner_with_row_id(sc, true) == 0, "with_row_id");
             const auto got = collect(sc, "_distance");
@@ -312,6 +317,8 @@ void test_errors(const std::string& uri) {
     check(lance_scanner_set_approx_mode(sc, LANCE_APPROX_MODE_ACCURATE) == 0 && lance_scanner_set_ef(sc, 64) == 0 &&
               lance_scanner_set_query_parallelism(sc, 2) == 0,
           "settings without an effect on IVF");
+    check(lance_scanner_set_query_parallelism(sc, -2) != 0 && lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+          "query_parallelism -2");
     check(lance_scanner_nearest_multivector(sc, "vec", q.data(), kDim, 1, LANCE_DTYPE_FLOAT32, 1) != 0,
           "multivector");
     lance_scanner_close(sc);
@@ -333,8 +340,22 @@ void test_errors(const std::string& uri) {
     p.index_type = LANCE_INDEX_IVF_HNSW_SQ;
     p.num_partitions = 2;
     check(lance_dataset_create_vector_index(ds, "vec", "h", &p, true) != 0 &&
+              lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT && last_error().find("hnsw_m") != std::string::npos,
+          "IVF_HNSW_SQ without hnsw_m");
+    p.hnsw_m = 8;
+    p.num_bits = 4;
+    check(lance_dataset_create_vector_index(ds, "vec", "h", &p, true) != 0 &&
+              lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+          "4-bit SQ");
+    p.num_bits = 0;
+    p.hnsw_ef_construction = 4;
+    check(lance_dataset_create_vector_index(ds, "vec", "h", &p, true) != 0 &&
+              last_error().find("ef_construction") != std::string::npos,
+          "ef_construction under m");
+    p.index_type = LANCE_INDEX_IVF_HNSW_PQ;
+    check(lance_dataset_create_vector_index(ds, "vec", "h", &p, true) != 0 &&
               lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED,
-          "IVF_HNSW_SQ");
+          "IVF_HNSW_PQ");
     p.index_type = LANCE_INDEX_IVF_PQ;
     check(lance_dataset_create_vector_index(ds, "vec", "h", &p, true) != 0 &&
               lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
@@ -468,8 +489,9 @@ int main(int argc, char** argv) {
         argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::temp_directory_path() / "nl_lance_c_search";
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
-    for (const auto type : {LANCE_INDEX_IVF_FLAT, LANCE_INDEX_IVF_PQ}) {
-        const std::string uri = (dir / (type == LANCE_INDEX_IVF_FLAT ? "flat.lance" : "pq.lance")).string();
+    for (const auto type : {LANCE_INDEX_IVF_FLAT, LANCE_INDEX_IVF_PQ, LANCE_INDEX_IVF_HNSW_SQ}) {
+        const char* kind = type == LANCE_INDEX_IVF_FLAT ? "IVF_FLAT" : (type == LANCE_INDEX_IVF_PQ ? "IVF_PQ" : "IVF_HNSW_SQ");
+        const std::string uri = (dir / (std::string(kind) + ".lance")).string();
         check(write(uri, 0, 1000, LANCE_WRITE_CREATE) && write(uri, 1000, 1000, LANCE_WRITE_APPEND),
               "write: " + last_error());
         LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
@@ -478,13 +500,14 @@ int main(int argc, char** argv) {
         p.metric = LANCE_METRIC_L2;
         p.num_partitions = 4;
         p.num_sub_vectors = 4;
+        p.hnsw_m = 8;
         check(lance_dataset_create_vector_index(ds, "vec", nullptr, &p, false) == 0, "create vector index: " + last_error());
         check(lance_dataset_index_count(ds) == 1, "the index is listed");
         check(lance_dataset_create_scalar_index(ds, "text", "text_fts", LANCE_SCALAR_INVERTED,
                                                 R"({"base_tokenizer":"simple","language":"English"})", false) == 0,
               "create INVERTED: " + last_error());
         lance_dataset_close(ds);
-        test_nearest(uri, type == LANCE_INDEX_IVF_FLAT ? "IVF_FLAT" : "IVF_PQ");
+        test_nearest(uri, kind);
         if (type == LANCE_INDEX_IVF_FLAT) {
             test_fts(uri);
             test_errors(uri);

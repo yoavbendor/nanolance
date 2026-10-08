@@ -19,6 +19,7 @@
 #include "index_build.hpp"
 #include "nanolance/vector_search.hpp"
 
+#include "hnsw_build.hpp"
 #include "index_files.hpp"
 
 #include "nanolance/dataset_commit.hpp"
@@ -32,6 +33,7 @@
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -56,6 +58,11 @@ using index_files::struct_batch;
 using index_files::write_file;
 
 constexpr std::size_t kMaxPartitions = 4096;  // Lance's recommended_num_partitions cap
+
+/// Lance's IndexType::target_partition_size.
+std::size_t default_partition_size(const std::string& type) {
+    return type == "IVF_FLAT" ? 4096U : (type == "IVF_HNSW_SQ" ? std::size_t{1} << 20U : 8192U);
+}
 constexpr std::size_t kHierarchyFanOut = 16;  // Lance's hierarchical_k
 constexpr double kTolerance = 1e-4;           // Lance's KMeansParams::tolerance
 
@@ -405,6 +412,48 @@ bool fsl_array(ArrowType item, std::size_t width, const void* values, std::int64
     return ArrowArrayFinishBuildingDefault(&out, nullptr) == NANOARROW_OK;
 }
 
+bool list_schema(const char* name, ArrowType item, ArrowSchema& out) {
+    ArrowSchemaInit(&out);
+    if (ArrowSchemaSetType(&out, NANOARROW_TYPE_LIST) != NANOARROW_OK ||
+        ArrowSchemaSetType(out.children[0], item) != NANOARROW_OK ||
+        ArrowSchemaSetName(out.children[0], "item") != NANOARROW_OK || ArrowSchemaSetName(&out, name) != NANOARROW_OK) {
+        return false;
+    }
+    out.flags = ARROW_FLAG_NULLABLE;
+    return true;
+}
+
+/// A list array: list i is values[offsets[i], offsets[i + 1]) of `item` (`width` bytes each).
+bool list_array(ArrowType item, std::size_t width, const std::vector<std::int32_t>& offsets, const void* values,
+                ArrowArray& out) {
+    const std::int64_t count = offsets.back();
+    if (ArrowArrayInitFromType(&out, NANOARROW_TYPE_LIST) != NANOARROW_OK ||
+        ArrowArrayAllocateChildren(&out, 1) != NANOARROW_OK ||
+        ArrowArrayInitFromType(out.children[0], item) != NANOARROW_OK ||
+        ArrowBufferAppend(ArrowArrayBuffer(&out, 1), offsets.data(),
+                          static_cast<std::int64_t>(offsets.size() * sizeof(std::int32_t))) != NANOARROW_OK ||
+        ArrowBufferAppend(ArrowArrayBuffer(out.children[0], 1), values,
+                          count * static_cast<std::int64_t>(width)) != NANOARROW_OK) {
+        return false;
+    }
+    out.children[0]->length = count;
+    out.children[0]->null_count = 0;
+    out.length = static_cast<std::int64_t>(offsets.size()) - 1;
+    out.null_count = 0;
+    return ArrowArrayFinishBuildingDefault(&out, nullptr) == NANOARROW_OK;
+}
+
+/// A double as serde_json writes it: the shortest round-trip form, with ".0" when integral.
+std::string json_double(double x) {
+    char buf[64];
+    const auto r = std::to_chars(buf, buf + sizeof(buf), x);
+    std::string s(buf, r.ptr);
+    if (s.find_first_of(".eEn") == std::string::npos) {
+        s += ".0";
+    }
+    return s;
+}
+
 std::string json_string(const std::string& s) {
     std::string out = "\"";
     for (const char c : s) {
@@ -674,11 +723,32 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         options.num_bits = model->nbits;
         options.num_sub_vectors = static_cast<std::uint32_t>(model->m);
         options.num_partitions = static_cast<std::uint32_t>(model->partitions);
+        options.hnsw_m = model->hnsw_m;
+        options.hnsw_ef_construction = model->hnsw_ef_construction;
+        options.hnsw_max_level = model->hnsw_max_level;
     }
     const bool pq = options.type == "IVF_PQ";
-    if (!pq && options.type != "IVF_FLAT") {
-        error = "vector index type '" + options.type + "' is not supported (IVF_FLAT and IVF_PQ are)";
+    const bool hnsw = options.type == "IVF_HNSW_SQ";
+    if (!pq && !hnsw && options.type != "IVF_FLAT") {
+        error = "vector index type '" + options.type + "' is not supported (IVF_FLAT, IVF_PQ and IVF_HNSW_SQ are)";
         return false;
+    }
+    if (hnsw) {
+        // lance-index HnswBuildParams::validate.
+        if (options.hnsw_max_level == 0U || options.hnsw_max_level > 65535U) {
+            error = "HnswBuildParams::max_level must be greater than 0, got " + std::to_string(options.hnsw_max_level);
+            return false;
+        }
+        if (options.hnsw_m < 4U) {
+            error = "HnswBuildParams::m must be at least 4 to avoid severely fragmented graphs, got " +
+                    std::to_string(options.hnsw_m);
+            return false;
+        }
+        if (options.hnsw_ef_construction < options.hnsw_m) {
+            error = "HnswBuildParams::ef_construction must be at least m (" + std::to_string(options.hnsw_m) +
+                    "), got " + std::to_string(options.hnsw_ef_construction);
+            return false;
+        }
     }
     if (pq && options.num_bits != 8U && options.num_bits != 4U) {
         error = "ProductQuantization: num_bits " + std::to_string(options.num_bits) + " not supported";
@@ -832,7 +902,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     if (options.num_partitions) {
         partitions = *options.num_partitions;
     } else {
-        const std::size_t target = options.target_partition_size.value_or(pq ? 8192U : 4096U);
+        const std::size_t target = options.target_partition_size.value_or(default_partition_size(options.type));
         partitions = std::clamp<std::size_t>(data.n / std::max<std::size_t>(target, 1U), 1U, kMaxPartitions);
     }
     if (partitions == 0U) {
@@ -972,6 +1042,56 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         }
     }
 
+    // SQ: the bounds of a sample's values (or the model's), every row's 8-bit codes (Lance's
+    // scale_to_u8), and each partition's HNSW graph over them.
+    double sq_start = 0;
+    double sq_end = 0;
+    std::vector<std::uint8_t> sq;  // [row][dim], rows in `order`
+    std::vector<hnsw_build::Graph> graphs;
+    if (hnsw) {
+        if (model != nullptr) {
+            sq_start = model->sq_start;
+            sq_end = model->sq_end;
+        } else {
+            sq_start = std::numeric_limits<double>::max();
+            sq_end = std::numeric_limits<double>::lowest();
+            for (const auto r : sample_indices(data.n, std::size_t{options.sample_rate} * 256U, rng)) {
+                const float* x = data.row(r);
+                for (std::size_t j = 0; j < dim; ++j) {
+                    sq_start = std::min(sq_start, static_cast<double>(x[j]));
+                    sq_end = std::max(sq_end, static_cast<double>(x[j]));
+                }
+            }
+        }
+        sq.resize(data.n * dim);
+        const double range = sq_end - sq_start;
+        parallel::for_each((data.n + 4095U) / 4096U, [&](std::size_t block) {
+            for (std::size_t i = block * 4096U; i < std::min(data.n, (block + 1U) * 4096U); ++i) {
+                const float* x = data.row(order[i]);
+                std::uint8_t* out = sq.data() + i * dim;
+                for (std::size_t j = 0; j < dim; ++j) {
+                    const double s = range == 0.0 ? 0.0 : (static_cast<double>(x[j]) - sq_start) * 255.0 / range;
+                    out[j] = !(s > 0.0) ? 0 : (s >= 255.0 ? 255 : static_cast<std::uint8_t>(s));
+                }
+            }
+        });
+        hnsw_build::Params params;
+        params.m = options.hnsw_m;
+        params.ef_construction = options.hnsw_ef_construction;
+        params.max_level = static_cast<std::uint16_t>(options.hnsw_max_level);
+        graphs.resize(partitions);
+        for (std::size_t p = 0; p < partitions; ++p) {
+            hnsw_build::Codes codes;
+            codes.data = sq.data() + offsets[p] * dim;
+            codes.n = lengths[p];
+            codes.dim = dim;
+            codes.dot = dot_metric;
+            codes.start = sq_start;
+            codes.end = sq_end;
+            graphs[p] = hnsw_build::build(codes, params);
+        }
+    }
+
     // The files.
     const auto uuid = new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
@@ -993,25 +1113,29 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         std::vector<ArrowSchema> children(2);
         OwnedSchema schema;
         if (!scalar_schema("_rowid", NANOARROW_TYPE_UINT64, true, children[0]) ||
-            !(pq ? fsl_schema("__pq_code", NANOARROW_TYPE_UINT8, static_cast<std::int64_t>(code_bytes), true, children[1])
-                 : fsl_schema("flat", NANOARROW_TYPE_FLOAT, static_cast<std::int64_t>(dim), false, children[1])) ||
+            !(pq     ? fsl_schema("__pq_code", NANOARROW_TYPE_UINT8, static_cast<std::int64_t>(code_bytes), true,
+                                  children[1])
+              : hnsw ? fsl_schema("__sq_code", NANOARROW_TYPE_UINT8, static_cast<std::int64_t>(dim), true, children[1])
+                     : fsl_schema("flat", NANOARROW_TYPE_FLOAT, static_cast<std::int64_t>(dim), false, children[1])) ||
             !table_schema(children, schema.s)) {
             return fail("out of memory");
         }
         OwnedArray rowid;
         OwnedArray values;
         std::vector<float> flat;
-        if (!pq) {
+        if (!pq && !hnsw) {
             flat.resize(data.n * dim);
             for (std::size_t i = 0; i < data.n; ++i) {
                 std::memcpy(flat.data() + i * dim, data.row(order[i]), dim * sizeof(float));
             }
         }
         if (!u64_array(sorted_ids, rowid.a) ||
-            !(pq ? fsl_array(NANOARROW_TYPE_UINT8, 1, codes.data(), static_cast<std::int64_t>(data.n),
-                             static_cast<std::int64_t>(code_bytes), values.a)
-                 : fsl_array(NANOARROW_TYPE_FLOAT, 4, flat.data(), static_cast<std::int64_t>(data.n),
-                             static_cast<std::int64_t>(dim), values.a))) {
+            !(pq     ? fsl_array(NANOARROW_TYPE_UINT8, 1, codes.data(), static_cast<std::int64_t>(data.n),
+                                 static_cast<std::int64_t>(code_bytes), values.a)
+              : hnsw ? fsl_array(NANOARROW_TYPE_UINT8, 1, sq.data(), static_cast<std::int64_t>(data.n),
+                                 static_cast<std::int64_t>(dim), values.a)
+                     : fsl_array(NANOARROW_TYPE_FLOAT, 4, flat.data(), static_cast<std::int64_t>(data.n),
+                                 static_cast<std::int64_t>(dim), values.a))) {
             return fail("out of memory");
         }
         OwnedArray batch;
@@ -1026,6 +1150,9 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             storage = "{\"codebook_position\":2,\"nbits\":" + std::to_string(options.num_bits) +
                       ",\"num_sub_vectors\":" + std::to_string(m) + ",\"dimension\":" + std::to_string(dim) +
                       ",\"codebook_tensor\":[],\"transposed\":true}";
+        } else if (hnsw) {
+            storage = "{\"dim\":" + std::to_string(dim) + ",\"num_bits\":8,\"bounds\":{\"start\":" +
+                      json_double(sq_start) + ",\"end\":" + json_double(sq_end) + "}}";
         } else {
             storage = "{\"dim\":" + std::to_string(dim) + "}";
         }
@@ -1038,7 +1165,77 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             return fail(error);
         }
     }
-    {
+    if (hnsw) {
+        // index.idx: the graphs, partition after partition, each level after level (a row per node
+        // on the level: its id, neighbours and their distances); the centroids.
+        std::vector<std::uint32_t> vector_ids;
+        std::vector<std::int32_t> list_offsets{0};
+        std::vector<std::uint32_t> neighbor_ids;
+        std::vector<float> neighbor_dists;
+        std::vector<std::uint64_t> graph_offsets(partitions, 0);
+        std::vector<std::uint64_t> graph_lengths(partitions, 0);
+        std::string hnsw_list = "[";
+        for (std::size_t p = 0; p < partitions; ++p) {
+            const auto& g = graphs[p];
+            graph_offsets[p] = vector_ids.size();
+            std::string level_offsets = "[0";
+            std::uint64_t at = 0;
+            for (std::size_t level = 0; level < g.level_count.size(); ++level) {
+                for (std::size_t i = 0; i < g.nodes.size(); ++i) {
+                    if (level >= g.nodes[i].size()) {
+                        continue;
+                    }
+                    vector_ids.push_back(static_cast<std::uint32_t>(i));
+                    for (const auto& e : g.nodes[i][level]) {
+                        neighbor_ids.push_back(e.id);
+                        neighbor_dists.push_back(e.dist);
+                    }
+                    if (neighbor_ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+                        return fail("vector index: an HNSW graph with more than 2^31 edges");
+                    }
+                    list_offsets.push_back(static_cast<std::int32_t>(neighbor_ids.size()));
+                }
+                at += g.level_count[level];
+                level_offsets += "," + std::to_string(at);
+            }
+            graph_lengths[p] = vector_ids.size() - graph_offsets[p];
+            const std::string meta = "{\"entry_point\":" + std::to_string(g.entry_point) +
+                                     ",\"params\":{\"max_level\":" + std::to_string(options.hnsw_max_level) +
+                                     ",\"m\":" + std::to_string(options.hnsw_m) +
+                                     ",\"ef_construction\":" + std::to_string(options.hnsw_ef_construction) +
+                                     ",\"prefetch_distance\":2},\"level_offsets\":" + level_offsets + "]}";
+            hnsw_list += (p == 0U ? "" : ",") + json_string(meta);
+        }
+        hnsw_list += "]";
+        std::vector<ArrowSchema> children(3);
+        OwnedSchema schema;
+        OwnedArray ids_array;
+        OwnedArray neighbors_array;
+        OwnedArray dists_array;
+        OwnedArray batch;
+        std::string ignored;
+        if (!scalar_schema("__vector_id", NANOARROW_TYPE_UINT32, true, children[0]) ||
+            !list_schema("__neighbors", NANOARROW_TYPE_UINT32, children[1]) ||
+            !list_schema("_distance", NANOARROW_TYPE_FLOAT, children[2]) || !table_schema(children, schema.s) ||
+            !index_files::uint_array(NANOARROW_TYPE_UINT32, vector_ids.data(),
+                                     static_cast<std::int64_t>(vector_ids.size()), 4, ids_array.a, ignored) ||
+            !list_array(NANOARROW_TYPE_UINT32, 4, list_offsets, neighbor_ids.data(), neighbors_array.a) ||
+            !list_array(NANOARROW_TYPE_FLOAT, 4, list_offsets, neighbor_dists.data(), dists_array.a) ||
+            !struct_batch({&ids_array.a, &neighbors_array.a, &dists_array.a},
+                          static_cast<std::int64_t>(vector_ids.size()), batch.a, error)) {
+            return fail(error.empty() ? "out of memory" : error);
+        }
+        LanceFileExtras extras;
+        extras.schema_metadata["lance:hnsw"] = bytes_of(hnsw_list);
+        extras.schema_metadata["lance:index"] =
+            bytes_of("{\"type\":\"IVF_HNSW_SQ\",\"distance_type\":\"" + metric_name + "\"}");
+        extras.schema_metadata["lance:ivf"] = bytes_of("1");
+        const auto tensor = tensor_message({partitions, dim}, centroids);
+        extras.global_buffers.push_back(ivf_message(graph_offsets, graph_lengths, &tensor, &loss));
+        if (!write_file(dir, "index.idx", schema.s, batch.a, extras, files, error)) {
+            return fail(error);
+        }
+    } else {
         // index.idx: no rows; the centroids.
         std::vector<ArrowSchema> children(1);
         OwnedSchema schema;
@@ -1074,7 +1271,17 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     }
     if (!options.num_partitions) {
         put_key(details, 2, 0);
-        put_varint(details, options.target_partition_size.value_or(pq ? 8192U : 4096U));
+        put_varint(details, options.target_partition_size.value_or(default_partition_size(options.type)));
+    }
+    if (hnsw) {
+        std::vector<std::uint8_t> hnsw_details;  // HnswParameters { max_connections, construction_ef, max_level }
+        put_key(hnsw_details, 1, 0);
+        put_varint(hnsw_details, options.hnsw_m);
+        put_key(hnsw_details, 2, 0);
+        put_varint(hnsw_details, options.hnsw_ef_construction);
+        put_key(hnsw_details, 3, 0);
+        put_varint(hnsw_details, options.hnsw_max_level);
+        put_bytes(details, 3, hnsw_details.data(), hnsw_details.size());
     }
     if (pq) {
         std::vector<std::uint8_t> pq_details;
@@ -1083,6 +1290,11 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         put_key(pq_details, 2, 0);
         put_varint(pq_details, m);
         put_bytes(details, 4, pq_details.data(), pq_details.size());
+    } else if (hnsw) {
+        std::vector<std::uint8_t> sq_details;  // ScalarQuantization { num_bits }
+        put_key(sq_details, 1, 0);
+        put_varint(sq_details, 8U);
+        put_bytes(details, 5, sq_details.data(), sq_details.size());
     } else {
         put_bytes(details, 8, nullptr, 0);
     }
@@ -1092,12 +1304,18 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         put_bytes(entry, 2, value.data(), value.size());
         put_bytes(details, 9, entry.data(), entry.size());
     };
+    if (hnsw) {
+        hint("lance.hnsw.prefetch_distance", "2");
+    }
     hint("lance.ivf.max_iters", std::to_string(options.max_iters));
     hint("lance.ivf.sample_rate", std::to_string(options.sample_rate));
     if (pq) {
         hint("lance.pq.max_iters", std::to_string(options.max_iters));
         hint("lance.pq.sample_rate", std::to_string(options.sample_rate));
         hint("lance.pq.kmeans_redos", "1");
+    }
+    if (hnsw) {
+        hint("lance.sq.sample_rate", std::to_string(options.sample_rate));
     }
 
     std::vector<std::uint32_t> fragment_ids;

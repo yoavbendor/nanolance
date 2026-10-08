@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vector indexes: nanolance against Rust Lance (pylance), building IVF_FLAT / IVF_PQ and searching.
+"""Vector indexes: nanolance against Rust Lance (pylance), building IVF_FLAT / IVF_PQ / IVF_HNSW_SQ and searching.
 
     python tools/bench_vector_index.py [--rows 200000] [--dim 128] [--runs 5] [--work DIR]
                                        # writes bench/results/vector_index.json
@@ -62,7 +62,7 @@ def main() -> None:
             pa.array(v.ravel()), args.dim)}), str(base))
 
     results = {}
-    for kind, kw in (("IVF_FLAT", {}), ("IVF_PQ", {"num_sub_vectors": args.dim // 8})):
+    for kind, kw in (("IVF_FLAT", {}), ("IVF_PQ", {"num_sub_vectors": args.dim // 8}), ("IVF_HNSW_SQ", {})):
         rec = {"build_s": {}, "recall@10": {}, "search_ms": {}}
         paths = {}
         for who, mod in (("pylance", lance), ("nanolance", nl)):

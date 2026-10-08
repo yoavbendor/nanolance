@@ -619,8 +619,8 @@ class LanceDataset:
                      precomputed_partition_dataset=None, storage_options=None, filter_nan: bool = True,
                      train: bool = True, fragment_ids=None, index_uuid=None, *,
                      target_partition_size: Optional[int] = None, **kwargs) -> "LanceDataset":
-        """Build an index on `column`, in Lance's format. IVF_FLAT and IVF_PQ vector indexes (pylance
-        and LanceDB search them as their own); scalar index types go to create_scalar_index."""
+        """Build an index on `column`, in Lance's format. IVF_FLAT, IVF_PQ and IVF_HNSW_SQ vector indexes
+        (pylance and LanceDB search them as their own); scalar index types go to create_scalar_index."""
         kind = str(index_type).upper()
         if isinstance(column, (list, tuple)):
             if len(column) != 1:
@@ -630,8 +630,8 @@ class LanceDataset:
             return self.create_scalar_index(column, kind, name, replace=replace, **kwargs)
         if kind not in self._VECTOR_INDEX_TYPES:
             raise NotImplementedError(f"Only {self._VECTOR_INDEX_TYPES} index types supported. Got {index_type}")
-        if kind not in ("IVF_FLAT", "IVF_PQ"):
-            raise unsupported(f"{kind} indexes (IVF_FLAT and IVF_PQ are supported)")
+        if kind not in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"):
+            raise unsupported(f"{kind} indexes (IVF_FLAT, IVF_PQ and IVF_HNSW_SQ are supported)")
         for option, value in (("ivf_centroids", ivf_centroids), ("pq_codebook", pq_codebook),
                               ("ivf_centroids_file", ivf_centroids_file), ("accelerator", accelerator),
                               ("precomputed_partition_dataset", precomputed_partition_dataset),
@@ -646,6 +646,9 @@ class LanceDataset:
         max_iters = int(kwargs.pop("max_iters", 50))
         sample_rate = int(kwargs.pop("sample_rate", 256))
         seed = kwargs.pop("seed", None)
+        hnsw_m = int(kwargs.pop("m", 20))
+        ef_construction = int(kwargs.pop("ef_construction", 150))
+        max_level = int(kwargs.pop("max_level", 7))
         for ignored in ("one_pass_ivfpq", "skip_transpose", "streaming_sample_rate", "streaming_coreset_rate",
                         "streaming_refine_passes", "progress", "kmeans_redos"):
             kwargs.pop(ignored, None)
@@ -663,7 +666,7 @@ class LanceDataset:
                 None if num_partitions is None else int(num_partitions),
                 None if target_partition_size is None else int(target_partition_size),
                 0 if num_sub_vectors is None else int(num_sub_vectors), num_bits, max_iters, sample_rate,
-                None if seed is None else int(seed))
+                None if seed is None else int(seed), hnsw_m, ef_construction, max_level)
         self._refresh_latest()
         return self
 
