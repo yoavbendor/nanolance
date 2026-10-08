@@ -2942,3 +2942,12 @@ first, without degrading function or speed.
 - **Verified**: `tests/test_system_columns.py` against pylance (takes, projections, filters with
   limit/offset, distance placement); pylance's suite 283 (271 before); ctest, lance-c 106 of 106,
   the Python suite. Plain scans take the same path as before.
+
+## Nested field paths
+
+- A projection of `s.x`, `MetaData.deep.z` or `` `meta-data`.`user-id` `` reads the top-level
+  column and returns the field under the name as written (pylance's names); `create_scalar_index`
+  resolves a path as Lance does (exact name, else the one case-insensitive match; back-quoted
+  segments) and stores the schema's own names (`MetaData.userId_idx`).
+- **Verified**: `tests/test_nested_paths.py` against pylance; pylance's suite 286 (283 before).
+- **Not yet**: INVERTED indexes on nested fields; SQL expressions in projections; `order_by`.

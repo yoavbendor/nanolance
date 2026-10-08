@@ -88,6 +88,49 @@ def _normalize_columns(columns) -> Optional[List[str]]:
     return [str(c) for c in columns]
 
 
+def _path_parts(text: str) -> List[str]:
+    """A field path's segments: `a.b`, with back-quoted segments for names with other characters
+    (`` `meta-data`.`user-id` ``)."""
+    parts, current, quoted, i = [], "", False, 0
+    while i < len(text):
+        c = text[i]
+        if c == "`":
+            if quoted and i + 1 < len(text) and text[i + 1] == "`":
+                current += "`"  # a doubled backtick inside a quoted name
+                i += 2
+                continue
+            quoted = not quoted
+        elif c == "." and not quoted:
+            parts.append(current)
+            current = ""
+        else:
+            current += c
+        i += 1
+    parts.append(current)
+    return parts
+
+
+def _resolve_path(schema: pa.Schema, text: str) -> Optional[List[str]]:
+    """The fields a column path names, as Lance resolves it: a top-level name as written first, then
+    each segment by its exact name, else by its only case-insensitive match. None: no such field."""
+    if text in schema.names:
+        return [text]
+    fields = list(schema)
+    out = []
+    for i, part in enumerate(_path_parts(text)):
+        if i > 0:
+            if not pa.types.is_struct(node.type):
+                return None
+            fields = [node.type.field(k) for k in range(node.type.num_fields)]
+        exact = [f for f in fields if f.name == part]
+        loose = [f for f in fields if f.name.lower() == part.lower()]
+        node = exact[0] if exact else (loose[0] if len(loose) == 1 else None)
+        if node is None:
+            return None
+        out.append(node.name)
+    return out
+
+
 def _rename(table: pa.Table, columns) -> pa.Table:
     if isinstance(columns, dict):
         names = list(columns.keys()) + [n for n in table.column_names if n in ("_rowid", "_rowaddr")]
@@ -602,6 +645,10 @@ class LanceDataset:
                             replace: bool = True, **kwargs) -> "LanceDataset":
         """Build a BTREE, BITMAP, LABEL_LIST or INVERTED (full-text) index on `column`, in Lance's own
         format: pylance and LanceDB use it as one they built. Commits a new version."""
+        if isinstance(column, str):
+            path = _resolve_path(self._data_schema, column)
+            if path is not None:
+                column = ".".join(path)  # the schema's own names, as Lance stores them
         if str(index_type).upper() in ("INVERTED", "FTS"):
             return self._create_inverted_index(column, name, replace, kwargs)
         if kwargs:
@@ -1287,6 +1334,24 @@ class LanceScanner:
             if self._order is None:
                 self._order = list(self._names)
             self._names = [n for n in self._names if n != "_score"]
+        # A nested field (`s.x`, `` `meta-data`.`id` ``) or a differently cased name: its top-level
+        # column is read, and the field comes back under the name as given.
+        self._nested = {}
+        if self._names is not None:
+            requested = list(self._order if self._order is not None else self._names)
+            schema = ds._data_schema
+            read = []
+            for n in self._names:
+                path = None if n in schema.names else _resolve_path(schema, n)
+                if path is not None:
+                    self._nested[n] = path
+                    n = path[0]
+                if n not in read:
+                    read.append(n)
+            if self._nested:
+                self._names = read
+                if self._order is None:
+                    self._order = requested
         self._limit = None if limit is None else int(limit)
         self._offset = 0 if offset is None else int(offset)
         self._batch_size = batch_size
@@ -1333,6 +1398,16 @@ class LanceScanner:
             table = table.append_column("_rowoffset", pa.array(range(first, first + table.num_rows), pa.uint64()))
         for column in self._row_versions:
             table = table.append_column(column, self._ds._row_versions(table.num_rows))
+        for name, path in self._nested.items():
+            import pyarrow.compute as pc
+
+            column = table.column(path[0])
+            for part in path[1:]:
+                column = pc.struct_field(column, part)
+            table = table.append_column(name, column)
+        if self._order is not None and self._nested:
+            extra = [c for c in ("_rowid", "_rowaddr") if c in table.column_names and c not in self._order]
+            return table.select(self._order + extra)
         if self._order is not None:
             return table.select(self._order)
         if self._names is not None:

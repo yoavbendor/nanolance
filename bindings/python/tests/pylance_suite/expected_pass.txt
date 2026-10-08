@@ -23,6 +23,8 @@ tests/test_column_names.py::TestNestedFieldColumnNames::test_create_table_with_n
 tests/test_column_names.py::TestNestedFieldColumnNames::test_create_table_with_nested_special_chars
 tests/test_column_names.py::TestNestedFieldColumnNames::test_filter_with_nested_mixed_case
 tests/test_column_names.py::TestNestedFieldColumnNames::test_filter_with_nested_special_chars
+tests/test_column_names.py::TestNestedFieldColumnNames::test_scalar_index_on_top_level_special_chars
+tests/test_column_names.py::TestNestedFieldColumnNames::test_scalar_index_with_lowercased_nested_path
 tests/test_column_names.py::TestSpecialCharacterColumnNames::test_alter_column_with_special_chars
 tests/test_column_names.py::TestSpecialCharacterColumnNames::test_create_table_with_special_chars
 tests/test_column_names.py::TestSpecialCharacterColumnNames::test_drop_column_with_special_chars
@@ -92,6 +94,7 @@ tests/test_dataset.py::test_merge_insert_vector_column
 tests/test_dataset.py::test_merge_insert_when_matched_delete
 tests/test_dataset.py::test_merge_insert_when_matched_fail
 tests/test_dataset.py::test_metadata_apis_return_post_image
+tests/test_dataset.py::test_nested_projection
 tests/test_dataset.py::test_null_reader_with_deletes
 tests/test_dataset.py::test_pickle
 tests/test_dataset.py::test_polar_scan
