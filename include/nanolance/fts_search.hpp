@@ -91,8 +91,8 @@ struct InvertedIndexOptions {
     std::string name;  // empty: <column>_idx
     /// An index of the same name is replaced; without `replace`, that is an error.
     bool replace = true;
-    /// The analyzer: Lance's and LanceDB's defaults unless set. Positions (`with_position`) are not
-    /// supported.
+    /// The analyzer: Lance's and LanceDB's defaults unless set. `with_position` stores every token's
+    /// positions (Lance's shared-stream layout), which phrase queries need.
     fts::AnalyzerParams params;
 };
 

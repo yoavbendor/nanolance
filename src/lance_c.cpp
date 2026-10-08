@@ -622,7 +622,7 @@ LanceFtsQueryContext* prepare_fts(const LanceDataset* dataset, const char* colum
         return nullptr;
     }
     if (phrase) {
-        // Phrase queries need positions; nanolance neither builds nor searches them.
+        // Phrase queries need positions.
         nano_lance::fts::AnalyzerParams params;
         if (nano_lance::index_build::load_inverted_params(dataset->path / "_indices" / uuid, params, error) &&
             !params.with_position) {
@@ -631,8 +631,6 @@ LanceFtsQueryContext* prepare_fts(const LanceDataset* dataset, const char* colum
                     "enabled");
             return nullptr;
         }
-        not_supported("phrase queries");
-        return nullptr;
     }
     auto data = std::make_shared<FtsContextData>();
     data->origin = dataset;

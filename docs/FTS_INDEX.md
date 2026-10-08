@@ -142,15 +142,37 @@ BM25 with `K1 = 1.2` and `B = 0.75`, in f32, in Lance's operation order:
 | `MultiMatchQuery(text, columns, boosts)` | any column matching | the best column's (boosted) score |
 | `BoostQuery(positive, negative, negative_boost)` | the positive query's | `positive - negative_boost * negative` where both match |
 | `BooleanQuery(MUST / SHOULD / MUST_NOT)` | every MUST (else any SHOULD), no MUST_NOT | the MUST and matching SHOULD scores summed |
+| `PhraseQuery(text, column, slop)`, or a string in double quotes | rows with the terms in order, at most `slop` apart | the sum over the terms |
 
-Not supported: `fuzziness` other than 0, and `PhraseQuery`. A phrase query needs positions;
-without them, nanolance gives pylance's error.
+Not supported: `fuzziness` other than 0.
+
+A phrase query needs an index built with positions (`with_position=True`); without them nanolance
+gives pylance's error. As in Lance, query positions count from the first term kept (a stop word
+leaves a gap). With slop 0 every term must sit at its place relative to a common start; with slop,
+the terms in query order may each stand up to `slop` past the one before (Lance's `wand.rs`
+`check_positions`). Rows the index does not cover use Lance's flat check (`flat_search.rs`
+`phrase_matches_positions`). A quoted string over several indexed columns is pylance's error: the
+column must be given.
+
+#### Positions on disk
+
+Index format 2 with positions adds two columns to `part_<n>_invert.lance`, one row per token:
+`_compressed_position` (large_binary) and `_position_block_offset` (list<uint32>), the byte
+offset of each 128-document posting block in the stream. The metadata names the layout
+(`positions_layout` = `shared_stream_v2`) and codec (`positions_codec`). For a block, each
+document's positions are deltas (the first one absolute), concatenated over the block's documents.
+With `packed_delta_v1` they go in groups of 128 (`[bit width][BitPacker4x bits]`, as posting
+blocks are) and the tail as varints; `varint_doc_delta_v2` is varints only. nanolance reads both
+and writes `packed_delta_v1`, as Lance 12 does. Other layouts (older per-document positions) are
+refused for phrases only; plain matches still work.
 
 ### How nanolance searches (`src/fts_search.cpp`)
 
 - An index's token map, document lengths and decoded posting lists are cached. The cache is keyed
   by the files' size and modification time.
 - A match scores every posting into a dense per-document array, then reads it back in row order.
+- A phrase is a match with every term required. Before the rows are read back, each candidate's
+  positions are checked; a term's positions are decoded once and cached with its posting list.
 - When only the best `limit` rows of a match matter, it keeps a heap of them. For one word, it
   walks the posting list's runs of 128 in the order of their best document weight, and stops at
   the first run that cannot beat the rows kept. That bound is exact in f32, because rounding is
@@ -176,5 +198,7 @@ out of order. Integer columns are bit-packed as Lance's are, and carry a `nanola
 in their field metadata. pylance and LanceDB list and search the index as their own, and pylance's
 `optimize_indices` merges new rows into it.
 
-Not built: indexes with positions (`with_position=True`), posting blocks of 256 (index format
-v3), and the tokenizers listed above.
+With `with_position=True` the index also stores positions, as Lance 12 writes them
+(`packed_delta_v1`), with the same contents as pylance's build; pylance's phrase queries use it.
+
+Not built: posting blocks of 256 (index format v3), and the tokenizers listed above.

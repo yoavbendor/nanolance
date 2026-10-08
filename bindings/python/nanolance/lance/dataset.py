@@ -834,6 +834,9 @@ def _fts_query_json(query) -> str:
     import json
 
     if isinstance(query, str):
+        if len(query) >= 2 and query[0] == '"' and query[-1] == '"':
+            # pylance: a string in double quotes is an exact phrase on the indexed column.
+            return json.dumps({"match_phrase": {"column": None, "terms": query[1:-1], "slop": 0}})
         return json.dumps(query)
     if isinstance(query, dict):
         if "query" in query:

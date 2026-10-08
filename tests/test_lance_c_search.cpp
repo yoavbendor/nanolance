@@ -783,6 +783,62 @@ void test_segments(const std::filesystem::path& dir) {
     lance_dataset_close(ds);
 }
 
+// ── phrase queries: an INVERTED index with positions, built and searched through lance-c ────────
+
+void test_phrase(const std::filesystem::path& dir) {
+    const std::string uri = (dir / "phrase.lance").string();
+    check(write(uri, 0, 1000, LANCE_WRITE_CREATE) && write(uri, 1000, 1000, LANCE_WRITE_APPEND), "write");
+    LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+    check(lance_dataset_create_scalar_index(ds, "text", "text_pos", LANCE_SCALAR_INVERTED,
+                                            R"({"base_tokenizer":"simple","with_position":true})", false) == 0,
+          "INVERTED with positions: " + last_error());
+    for (const char* phrase : {"plum fig", "apple apple", "kiwi lime date"}) {
+        for (const int32_t slop : {0, 1, 3}) {
+            nano_lance::FtsSearchRequest r;
+            r.query.kind = nano_lance::FtsQuery::Kind::Phrase;
+            r.query.text = phrase;
+            r.query.columns = {"text"};
+            r.query.slop = static_cast<uint32_t>(slop);
+            nano_lance::FtsSearchResult want;
+            std::string error;
+            check(nano_lance::dataset_full_text_search(uri, r, want, error), "core phrase: " + error);
+            LanceFtsQueryContext* ctx =
+                lance_dataset_prepare_fts_phrase_query(ds, "text", phrase, slop, LANCE_FTS_COVERAGE_STRICT);
+            check(ctx != nullptr, "prepare phrase: " + last_error());
+            LanceScanner* sc = lance_scanner_new(ds, nullptr, nullptr);
+            lance_scanner_with_row_id(sc, true);
+            lance_scanner_set_fts_query_context(sc, ctx);
+            const auto got = collect(sc, "_score");
+            lance_scanner_close(sc);
+            lance_fts_query_context_close(ctx);
+            const std::string what = std::string("phrase '") + phrase + "' slop " + std::to_string(slop);
+            check(got.ok && got.row_ids == want.row_ids && got.values == want.scores, what + ": " + got.error);
+            check(slop != 0 || std::string(phrase) != "plum fig" || !want.row_ids.empty(), what + " finds rows");
+        }
+    }
+    // Exact phrases are a subset of slop 3's.
+    const auto rows = [&](int32_t slop) {
+        LanceFtsQueryContext* ctx =
+            lance_dataset_prepare_fts_phrase_query(ds, "text", "plum fig", slop, LANCE_FTS_COVERAGE_STRICT);
+        LanceScanner* sc = lance_scanner_new(ds, nullptr, nullptr);
+        lance_scanner_with_row_id(sc, true);
+        lance_scanner_set_fts_query_context(sc, ctx);
+        auto r = collect(sc, "_score");
+        lance_scanner_close(sc);
+        lance_fts_query_context_close(ctx);
+        std::sort(r.row_ids.begin(), r.row_ids.end());
+        return r.row_ids;
+    };
+    const auto exact = rows(0);
+    const auto loose = rows(3);
+    check(exact.size() < loose.size() && std::includes(loose.begin(), loose.end(), exact.begin(), exact.end()),
+          "slop widens the phrase");
+    check(lance_dataset_prepare_fts_phrase_query(ds, "text", "plum fig", -1, LANCE_FTS_COVERAGE_STRICT) == nullptr &&
+              lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+          "negative slop");
+    lance_dataset_close(ds);
+}
+
 int main(int argc, char** argv) {
     const std::filesystem::path dir =
         argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::temp_directory_path() / "nl_lance_c_search";
@@ -814,6 +870,7 @@ int main(int argc, char** argv) {
         }
     }
     test_segments(dir);
+    test_phrase(dir);
     test_include_deleted_rows((dir / "deleted.lance").string());
     test_update_if((dir / "upsert.lance").string());
     if (std::getenv("NANOLANCE_KEEP_TEST_DATA") == nullptr) {

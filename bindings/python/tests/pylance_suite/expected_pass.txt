@@ -222,8 +222,10 @@ tests/test_scalar_index.py::test_create_text_inverted_index_defaults_to_v2_witho
 tests/test_scalar_index.py::test_describe_indices_vector_and_scalar
 tests/test_scalar_index.py::test_filter_with_fts_index
 tests/test_scalar_index.py::test_fts_all_deleted
+tests/test_scalar_index.py::test_fts_boost_query
 tests/test_scalar_index.py::test_fts_deleted_rows
 tests/test_scalar_index.py::test_fts_flat_fallback_matches_wand
+tests/test_scalar_index.py::test_fts_fts[simple]
 tests/test_scalar_index.py::test_fts_stop_words_respect_language_for_simple_tokenizer
 tests/test_scalar_index.py::test_fts_with_other_str_scalar_index
 tests/test_scalar_index.py::test_fts_with_postfilter

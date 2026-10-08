@@ -2862,3 +2862,25 @@ Asked: continue lance-c compatibility, function before speed, without degrading 
 - **Not yet**: BTREE / BITMAP / LABEL_LIST parameters, search with `set_fragment_ids`, IVF_SQ /
   IVF_HNSW_PQ / IVF_HNSW_FLAT, Hamming, multivector, phrase and fuzzy full-text, Substrait, object
   stores. Full-text ties come back in another order than pylance's.
+
+## Phrase queries: positions in INVERTED indexes
+
+Asked: continue toward feature completeness and performance parity; new features function first,
+without degrading current function or speed.
+
+- **Read** (`src/fts_search.cpp`): Lance 12's positions (`shared_stream_v2`, `packed_delta_v1` and
+  `varint_doc_delta_v2`), decoded per token on first use and cached. Other layouts are refused for
+  phrases only.
+- **Search**: `PhraseQuery` with slop, and a string in double quotes, as Lance does them (exact and
+  slop checks from `wand.rs`, the flat check for unindexed rows from `flat_search.rs`, query
+  positions counted from the first term kept); pylance's errors for a missing column or an index
+  without positions. lance-c's `lance_dataset_prepare_fts_phrase_query` works.
+- **Build** (`src/fts_index_build.cpp`): `with_position=True` writes positions as Lance 12 does,
+  with the same contents as pylance's build; pylance's phrase queries and `optimize_indices` use it.
+- **Verified**: 1,050 random phrases (pylance-built and nanolance-built indexes, unindexed and
+  deleted rows, limits) give pylance's rows and scores; `test_fts_phrase.py`; the lance-c phrase
+  test under ASan/UBSan; pylance's suite 259 (257 before), lance-c's 106 of 106, ctest, the Python
+  suite. Speed: FTS builds and match searches as before (search instructions 0.1% fewer; the
+  phrase check sits outside the plain match's loops).
+- **Not yet**: fuzzy matching; full-text ties under a limit can keep other rows than Lance's
+  block-max WAND keeps (`docs/ROADMAP.md`).

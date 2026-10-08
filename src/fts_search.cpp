@@ -269,6 +269,13 @@ struct Posting {
     std::shared_ptr<const BlockBounds> block_bounds(const float* norm, std::uint32_t key) const;
 };
 
+/// One posting list's positions (an index built with_position): posting entry k's are
+/// values[start[k] .. start[k + 1]), ascending.
+struct Positions {
+    std::vector<std::uint32_t> values;
+    std::vector<std::uint32_t> start;
+};
+
 struct Partition {
     std::filesystem::path invert;
     std::vector<std::uint8_t> fst_bytes;
@@ -300,13 +307,158 @@ struct Partition {
     /// The posting lists of `ids` (token ids), loaded on first use.
     bool load(const std::vector<std::uint32_t>& ids, fts::TailCodec codec,
               std::vector<std::shared_ptr<const Posting>>& out, std::string& error) const;
+
+    /// The positions of token `id`, whose posting list is `posting`, loaded on first use.
+    mutable std::unordered_map<std::uint32_t, std::shared_ptr<const Positions>> positions;
+    bool load_positions(std::uint32_t id, const Posting& posting, bool packed, std::shared_ptr<const Positions>& out,
+                        std::string& error) const;
 };
 
 struct InvertedIndex {
     fts::Analyzer analyzer;
     fts::TailCodec codec = fts::TailCodec::VarintDelta;
+    bool with_positions = false;   // shared-stream positions (Lance's positions_layout shared_stream_v2)
+    bool packed_positions = true;  // positions_codec packed_delta_v1, else varint_doc_delta_v2
+    std::string positions_error;   // with positions nanolance cannot read: why (matches still work)
     std::vector<std::shared_ptr<const Partition>> partitions;
 };
+
+/// A u32 varint of `src` at `at`.
+bool read_varint(const std::uint8_t* src, std::size_t size, std::size_t& at, std::uint32_t& out) {
+    out = 0;
+    for (std::uint32_t shift = 0; at < size; shift += 7U) {
+        const std::uint8_t b = src[at++];
+        if (shift >= 35U) {
+            return false;
+        }
+        out |= static_cast<std::uint32_t>(b & 0x7FU) << shift;
+        if ((b & 0x80U) == 0U) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// One posting block's position stream (lance-index encoding.rs): every document's positions as
+/// deltas, the first absolute. PackedDelta: groups of 128 deltas bit-packed (BitPacker4x, a bit
+/// width byte first), the rest varints; VarintDocDelta: all varints.
+bool decode_position_block(const std::uint8_t* src, std::size_t size, const std::uint32_t* freqs, std::size_t docs,
+                           bool packed, std::vector<std::uint32_t>& out) {
+    std::size_t total = 0;
+    for (std::size_t d = 0; d < docs; ++d) {
+        total += freqs[d];
+    }
+    std::vector<std::uint32_t> deltas;
+    deltas.reserve(total);
+    std::size_t at = 0;
+    if (packed) {
+        std::uint32_t group[fts::kPostingBlock];
+        for (std::size_t g = 0; g < total / fts::kPostingBlock; ++g) {
+            if (at >= size || src[at] > 32U) {
+                return false;
+            }
+            const std::uint8_t bits = src[at++];
+            const std::size_t bytes = static_cast<std::size_t>(bits) * fts::kPostingBlock / 8U;
+            if (bytes > size - at) {
+                return false;
+            }
+            fts::bitpack4x_unpack(src + at, bits, group);
+            at += bytes;
+            deltas.insert(deltas.end(), group, group + fts::kPostingBlock);
+        }
+    }
+    while (deltas.size() < total) {
+        std::uint32_t v = 0;
+        if (!read_varint(src, size, at, v)) {
+            return false;
+        }
+        deltas.push_back(v);
+    }
+    if (at != size) {
+        return false;
+    }
+    std::size_t k = 0;
+    for (std::size_t d = 0; d < docs; ++d) {
+        std::uint32_t previous = 0;
+        for (std::uint32_t i = 0; i < freqs[d]; ++i, ++k) {
+            previous = i == 0U ? deltas[k] : previous + deltas[k];
+            out.push_back(previous);
+        }
+    }
+    return true;
+}
+
+bool Partition::load_positions(std::uint32_t id, const Posting& posting, bool packed,
+                               std::shared_ptr<const Positions>& out, std::string& error) const {
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = positions.find(id);
+        if (it != positions.end()) {
+            out = it->second;
+            return true;
+        }
+    }
+    FileTable table;
+    const std::vector<std::string> columns = {"_compressed_position", "_position_block_offset"};
+    if (!index_files::take_table(invert, &columns, {id}, table, error)) {
+        error = invert.filename().string() + ": " + error;
+        return false;
+    }
+    auto result = std::make_shared<Positions>();
+    bool ok = false;
+    for (const auto& batch : table.batches) {
+        if (batch.length == 0) {
+            continue;
+        }
+        ArrowArrayView view{};
+        ArrowError e{};
+        if (ArrowArrayViewInitFromSchema(&view, &table.schema, &e) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&view, &batch, &e) != NANOARROW_OK || view.n_children < 2 ||
+            view.children[1]->n_children != 1) {
+            ArrowArrayViewReset(&view);
+            break;
+        }
+        const std::int64_t row = view.offset;
+        const ArrowBufferView stream = ArrowArrayViewGetBytesUnsafe(view.children[0], row);
+        const ArrowArrayView* offsets = view.children[1];
+        const std::int64_t first = ArrowArrayViewListChildOffset(offsets, row);
+        const std::int64_t last = ArrowArrayViewListChildOffset(offsets, row + 1);
+        const std::size_t blocks = (posting.docs.size() + fts::kPostingBlock - 1U) / fts::kPostingBlock;
+        const auto size = static_cast<std::size_t>(stream.size_bytes);
+        ok = static_cast<std::size_t>(last - first) == blocks;
+        result->values.reserve(posting.docs.size());
+        for (std::size_t b = 0; ok && b < blocks; ++b) {
+            const auto begin = static_cast<std::size_t>(ArrowArrayViewGetUIntUnsafe(offsets->children[0], first + static_cast<std::int64_t>(b)));
+            const auto end = b + 1U < blocks
+                                 ? static_cast<std::size_t>(ArrowArrayViewGetUIntUnsafe(
+                                       offsets->children[0], first + static_cast<std::int64_t>(b) + 1))
+                                 : size;
+            const std::size_t d0 = b * fts::kPostingBlock;
+            const std::size_t nd = std::min(fts::kPostingBlock, posting.docs.size() - d0);
+            ok = begin <= end && end <= size &&
+                 decode_position_block(stream.data.as_uint8 + begin, end - begin, posting.freqs.data() + d0, nd,
+                                       packed, result->values);
+        }
+        ArrowArrayViewReset(&view);
+        break;
+    }
+    if (!ok) {
+        error = invert.filename().string() + ": malformed positions of token " + std::to_string(id);
+        return false;
+    }
+    result->start.resize(posting.docs.size() + 1U, 0U);
+    for (std::size_t k = 0; k < posting.docs.size(); ++k) {
+        result->start[k + 1U] = result->start[k] + posting.freqs[k];
+    }
+    if (result->start.back() != result->values.size()) {
+        error = invert.filename().string() + ": positions of token " + std::to_string(id) +
+                " do not match its frequencies";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    out = positions.emplace(id, std::move(result)).first->second;
+    return true;
+}
 
 bool Partition::load(const std::vector<std::uint32_t>& ids, fts::TailCodec codec,
                      std::vector<std::shared_ptr<const Posting>>& out, std::string& error) const {
@@ -585,6 +737,21 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
     if (found && !fts::parse_params(params_text, params, error)) {
         return false;
     }
+    bool found_codec = false;
+    if (params.with_position) {
+        const std::string layout = metadata_value(meta, "positions_layout", found, error);
+        const std::string codec = metadata_value(meta, "positions_codec", found_codec, error);
+        if (!found || layout != "shared_stream_v2") {
+            index->positions_error = "INVERTED index positions in layout '" +
+                                     (found ? layout : std::string("legacy per-document")) +
+                                     "' are not supported by nanolance (shared_stream_v2 is)";
+        } else if (found_codec && codec != "packed_delta_v1" && codec != "varint_doc_delta_v2") {
+            index->positions_error = "INVERTED index positions codec '" + codec + "' is not supported by nanolance";
+        } else {
+            index->with_positions = true;
+            index->packed_positions = found_codec && codec == "packed_delta_v1";
+        }
+    }
     if (!index->analyzer.init(params, error)) {
         return false;
     }
@@ -717,6 +884,7 @@ int child_index(const ArrowSchema& schema, const std::string& name) {
 struct FlatDocs {
     std::vector<std::uint64_t> addrs;
     std::vector<std::vector<std::string>> tokens;  // only documents with tokens
+    std::vector<std::vector<std::uint32_t>> positions;  // each token's position
     std::uint64_t total_tokens = 0;
 };
 
@@ -751,8 +919,152 @@ struct Search {
 
     bool scan_flat(ColumnIndex& c, std::string& error);
     bool match(const FtsQuery& q, const std::string& column, float boost, Hits& out, std::string& error);
+    /// A phrase query in progress (match() with every term required, and their positions checked).
+    bool phrase_ = false;
+    std::uint32_t slop_ = 0;
+    /// A partition's scored documents with `need` marks, in row order, into `sink`; the buffers
+    /// left zeroed.
+    [[gnu::noinline]] void emit(const Partition& part, std::uint32_t need, HitSink& sink);
+    /// A phrase over a partition: unmark the documents holding every term but not as the phrase
+    /// does, so the plain match's emit loop drops them.
+    [[gnu::noinline]] bool drop_non_phrases(const Partition& part,
+                                            const std::vector<std::shared_ptr<const Posting>>& postings,
+                                            const std::vector<std::string>& distinct,
+                                            const std::vector<std::size_t>& order,
+                                            const std::vector<std::int32_t>& query_positions, bool packed,
+                                            std::uint32_t need, std::string& error);
     bool run(const FtsQuery& q, Hits& out, std::string& error);
 };
+
+/// One query term's positions in a document, and the term's place in the query.
+struct PositionCursor {
+    const std::uint32_t* values = nullptr;
+    std::size_t n = 0;
+    std::int32_t query_position = 0;
+    std::size_t i = 0;
+    std::optional<std::int32_t> relative() const {
+        return i < n ? std::optional<std::int32_t>(static_cast<std::int32_t>(values[i]) - query_position) : std::nullopt;
+    }
+    void advance_to_relative(std::int32_t least) {
+        if (i >= n) {
+            return;
+        }
+        const auto target = static_cast<std::uint32_t>(std::max(least + query_position, 0));
+        i = static_cast<std::size_t>(std::lower_bound(values + i, values + n, target) - values);
+    }
+};
+
+/// Whether the terms stand as the phrase does, within `slop` (lance-index wand.rs check_positions:
+/// exact -- some base puts every term at base + its query position -- or, with slop, the terms in
+/// query order each at most `slop` past the one before, moving every cursor up to the furthest
+/// position a pair needs until all pairs fit).
+bool phrase_matches(std::vector<PositionCursor> cursors, std::int32_t slop) {
+    if (cursors.empty()) {
+        return false;
+    }
+    if (slop == 0) {
+        std::size_t lead = 0;
+        for (std::size_t k = 1; k < cursors.size(); ++k) {
+            if (cursors[k].n < cursors[lead].n) {
+                lead = k;
+            }
+        }
+        const auto& a = cursors[lead];
+        for (std::size_t j = 0; j < a.n; ++j) {
+            if (a.values[j] < static_cast<std::uint32_t>(a.query_position)) {
+                continue;
+            }
+            const std::uint32_t base = a.values[j] - static_cast<std::uint32_t>(a.query_position);
+            bool all = true;
+            for (std::size_t k = 0; all && k < cursors.size(); ++k) {
+                const auto& c = cursors[k];
+                all = std::binary_search(c.values, c.values + c.n, base + static_cast<std::uint32_t>(c.query_position));
+            }
+            if (all) {
+                return true;
+            }
+        }
+        return false;
+    }
+    std::sort(cursors.begin(), cursors.end(),
+              [](const PositionCursor& x, const PositionCursor& y) { return x.query_position < y.query_position; });
+    for (;;) {
+        std::optional<std::int32_t> furthest;
+        bool all_same = true;
+        for (std::size_t k = 0; k + 1U < cursors.size(); ++k) {
+            const auto last = cursors[k].relative();
+            const auto next = cursors[k + 1U].relative();
+            if (!last || !next) {
+                return false;
+            }
+            const std::int32_t move_to = *last > *next ? *last : std::max(*last + 1, *next - slop);
+            furthest = std::max(furthest.value_or(move_to), move_to);
+            if (!(*last <= *next && *next <= *last + slop)) {
+                all_same = false;
+                break;
+            }
+        }
+        if (all_same) {
+            return true;
+        }
+        for (auto& c : cursors) {
+            c.advance_to_relative(*furthest);
+        }
+    }
+}
+
+/// The same for a document outside the index, as Lance's flat search decides it
+/// (flat_search.rs phrase_matches_positions): the first term's positions are the candidates, and
+/// each next term keeps its positions within [candidate + gap, candidate + gap + slop] of one.
+bool flat_phrase_matches(const std::vector<std::int32_t>& query_positions,
+                         const std::vector<const std::vector<std::uint32_t>*>& positions, std::uint32_t slop) {
+    if (positions.empty() || positions.front()->empty()) {
+        return false;
+    }
+    std::vector<std::uint64_t> candidates(positions.front()->begin(), positions.front()->end());
+    std::vector<std::uint64_t> next;
+    for (std::size_t i = 1; i < positions.size(); ++i) {
+        if (query_positions[i] < query_positions[i - 1U]) {
+            return false;
+        }
+        const auto gap = static_cast<std::uint64_t>(query_positions[i] - query_positions[i - 1U]);
+        next.clear();
+        for (const std::uint32_t p : *positions[i]) {
+            const bool fits = std::any_of(candidates.begin(), candidates.end(), [&](std::uint64_t c) {
+                return c + gap <= p && p <= c + gap + slop;
+            });
+            if (fits) {
+                next.push_back(p);
+            }
+        }
+        if (next.empty()) {
+            return false;
+        }
+        candidates.swap(next);
+    }
+    return true;
+}
+
+/// The same over an unindexed document's tokens, at their positions.
+[[gnu::noinline]] bool flat_phrase_matches(const std::vector<std::string>& tokens,
+                                           const std::vector<std::uint32_t>& token_positions,
+                                           const std::vector<std::string>& distinct,
+                                           const std::vector<std::size_t>& order,
+                                           const std::vector<std::int32_t>& query_positions, std::uint32_t slop) {
+    std::vector<std::vector<std::uint32_t>> at(distinct.size());
+    for (std::size_t j = 0; j < tokens.size(); ++j) {
+        for (std::size_t t = 0; t < distinct.size(); ++t) {
+            if (tokens[j] == distinct[t]) {
+                at[t].push_back(token_positions[j]);
+            }
+        }
+    }
+    std::vector<const std::vector<std::uint32_t>*> by_query;
+    for (const std::size_t t : order) {
+        by_query.push_back(&at[t]);
+    }
+    return flat_phrase_matches(query_positions, by_query, slop);
+}
 
 bool Search::scan_flat(ColumnIndex& c, std::string& error) {
     if (c.flat_loaded) {
@@ -819,10 +1131,14 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
                 }
                 c.flat.addrs.push_back(ArrowArrayViewGetUIntUnsafe(view.children[ac], row));
                 std::vector<std::string> words;
+                std::vector<std::uint32_t> at;
                 words.reserve(tokens.size());
+                at.reserve(tokens.size());
                 for (auto& t : tokens) {
                     words.push_back(std::move(t.text));
+                    at.push_back(t.position);
                 }
+                c.flat.positions.push_back(std::move(at));
                 c.flat.total_tokens += words.size();
                 c.flat.tokens.push_back(std::move(words));
             }
@@ -894,6 +1210,16 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         }
     }
     const std::size_t nt = distinct.size();
+    // A phrase: each query term's place, counted from the first term kept (Lance's
+    // collect_query_tokens), and every distinct term required.
+    std::vector<std::int32_t> query_positions;
+    if (phrase_) {
+        for (const auto& t : query_tokens) {
+            query_positions.push_back(static_cast<std::int32_t>(t.position - query_tokens.front().position));
+        }
+    }
+    const bool and_terms = q.and_operator || phrase_;
+    const bool check_phrase = phrase_ && order.size() > 1U;  // positions to check
     // Posting lists by partition, and each token's document count.
     const auto& parts = c.index->partitions;
     std::vector<std::vector<std::shared_ptr<const Posting>>> postings(parts.size());
@@ -950,7 +1276,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
     // partition and read back in document (row) order.
     for (std::size_t p = 0; p < parts.size(); ++p) {
         const Partition& part = *parts[p];
-        if (q.and_operator) {
+        if (and_terms) {
             bool all = true;
             for (std::size_t t = 0; t < nt; ++t) {
                 all = all && postings[p][t] != nullptr;
@@ -962,7 +1288,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         const std::size_t n = part.row_ids.size();
         const auto norms = part.length_norms(avg);
         const float* norm = norms->data();
-        if (nt == 1U && sink.limited()) {
+        if (nt == 1U && sink.limited() && !check_phrase) {
             // One word, the best rows only: its runs best first, until no run can beat the rows
             // kept. (A word repeated in the query scores its weight that many times over, which
             // keeps the order.)
@@ -1020,7 +1346,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             }
         }
         std::uint32_t need = 1U;
-        if (q.and_operator) {
+        if (and_terms) {
             // Count each distinct token's documents (above the "touched" bit).
             for (std::size_t t = 0; t < nt; ++t) {
                 for (const std::uint32_t d : postings[p][t]->docs) {
@@ -1029,30 +1355,12 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             }
             need = 1U + 2U * static_cast<std::uint32_t>(nt);
         }
-        const auto emit = [&](std::uint32_t d) {
-            if (seen_[d] == need) {
-                const std::uint64_t row = part.row_ids[d];
-                if (mask.allows(row)) {
-                    sink.add(row, scores_[d]);
-                }
-            }
-            scores_[d] = 0.0F;
-            seen_[d] = 0U;
-        };
-        if (part.rows_sorted && touched_.size() * 8U > n) {
-            for (std::uint32_t d = 0; d < n; ++d) {
-                if (seen_[d] != 0U) {
-                    emit(d);
-                }
-            }
-        } else {
-            if (part.rows_sorted) {
-                std::sort(touched_.begin(), touched_.end());
-            }
-            for (const std::uint32_t d : touched_) {
-                emit(d);
-            }
+        if (check_phrase &&
+            !drop_non_phrases(part, postings[p], distinct, order, query_positions, c.index->packed_positions, need,
+                              error)) {
+            return false;
         }
+        emit(part, need, sink);
     }
     // Documents outside the index: their scores from the index's statistics and theirs.
     if (!scan_flat(c, error)) {
@@ -1084,7 +1392,12 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             for (std::size_t t = 0; t < nt; ++t) {
                 found += counts[d][t] != 0U ? 1U : 0U;
             }
-            if (found == 0U || (q.and_operator && found != nt)) {
+            if (found == 0U || (and_terms && found != nt)) {
+                continue;
+            }
+            if (check_phrase &&
+                !flat_phrase_matches(c.flat.tokens[d], c.flat.positions[d], distinct, order, query_positions,
+                                     slop_)) {
                 continue;
             }
             float s = 0.0F;
@@ -1104,6 +1417,69 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
     }
     sort_hits(hits);
     out = std::move(hits);
+    return true;
+}
+
+void Search::emit(const Partition& part, std::uint32_t need, HitSink& sink) {
+    const auto one = [&](std::uint32_t d) {
+        if (seen_[d] == need) {
+            const std::uint64_t row = part.row_ids[d];
+            if (mask.allows(row)) {
+                sink.add(row, scores_[d]);
+            }
+        }
+        scores_[d] = 0.0F;
+        seen_[d] = 0U;
+    };
+    const std::size_t n = part.row_ids.size();
+    if (part.rows_sorted && touched_.size() * 8U > n) {
+        for (std::uint32_t d = 0; d < n; ++d) {
+            if (seen_[d] != 0U) {
+                one(d);
+            }
+        }
+    } else {
+        if (part.rows_sorted) {
+            std::sort(touched_.begin(), touched_.end());
+        }
+        for (const std::uint32_t d : touched_) {
+            one(d);
+        }
+    }
+}
+
+bool Search::drop_non_phrases(const Partition& part, const std::vector<std::shared_ptr<const Posting>>& postings,
+                              const std::vector<std::string>& distinct, const std::vector<std::size_t>& order,
+                              const std::vector<std::int32_t>& query_positions, bool packed, std::uint32_t need,
+                              std::string& error) {
+    // The distinct terms' positions.
+    std::vector<std::shared_ptr<const Positions>> positions(distinct.size());
+    for (std::size_t t = 0; t < distinct.size(); ++t) {
+        const auto id = part.token_id(distinct[t]);
+        if (!id || !part.load_positions(*id, *postings[t], packed, positions[t], error)) {
+            if (error.empty()) {
+                error = "positions of a phrase term are missing";
+            }
+            return false;
+        }
+    }
+    std::vector<PositionCursor> cursors(order.size());
+    for (const std::uint32_t d : touched_) {
+        if (seen_[d] != need) {
+            continue;
+        }
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            const std::size_t t = order[i];
+            const auto& docs = postings[t]->docs;
+            const auto k = static_cast<std::size_t>(std::lower_bound(docs.begin(), docs.end(), d) - docs.begin());
+            const auto& pos = *positions[t];
+            cursors[i] = PositionCursor{pos.values.data() + pos.start[k], pos.start[k + 1U] - pos.start[k],
+                                        query_positions[i], 0};
+        }
+        if (!phrase_matches(cursors, static_cast<std::int32_t>(slop_))) {
+            seen_[d] = 1U;  // touched, not kept
+        }
+    }
     return true;
 }
 
@@ -1157,18 +1533,42 @@ bool Search::run(const FtsQuery& q, Hits& out, std::string& error) {
             return true;
         }
         case FtsQuery::Kind::Phrase: {
+            if (q.columns.empty()) {
+                // No column: the one column with an index (Lance's fill_fts_query_column).
+                if (columns.size() != 1U) {
+                    error = columns.empty() ? "Cannot perform full text search unless an INVERTED index has been "
+                                              "created on at least one column"
+                                            : "the column must be specified in the query";
+                    return false;
+                }
+                FtsQuery filled = q;
+                filled.columns = {columns.begin()->first};
+                return run(filled, out, error);
+            }
             if (q.columns.size() != 1U) {
                 error = "a phrase query needs one column";
                 return false;
             }
             const auto it = columns.find(q.columns[0]);
-            if (it != columns.end() && !it->second.index->analyzer.params().with_position) {
+            if (it == columns.end() || !it->second.index->analyzer.params().with_position) {
                 error = "position is not found but required for phrase queries, try recreating the index with "
                         "position";
-            } else {
-                error = "phrase queries are not supported by nanolance";
+                return false;
             }
-            return false;
+            if (!it->second.index->with_positions) {
+                error = it->second.index->positions_error;
+                return false;
+            }
+            // Every term, at its place in the phrase (within the slop), scored as their match.
+            FtsQuery terms = q;
+            terms.kind = FtsQuery::Kind::Match;
+            terms.and_operator = true;
+            terms.fuzziness = 0;
+            phrase_ = true;
+            slop_ = q.slop;
+            const bool ok = match(terms, q.columns[0], 1.0F, out, error);
+            phrase_ = false;
+            return ok;
         }
         case FtsQuery::Kind::Boost: {
             Hits neg;

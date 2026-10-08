@@ -61,9 +61,9 @@ URIs: local paths, `file://`, and `memory://` (a directory private to the proces
 - Vector indexes other than IVF_FLAT, IVF_PQ and IVF_HNSW_SQ (IVF_SQ, IVF_HNSW_PQ, IVF_HNSW_FLAT), the
   Hamming metric, and
   multi-vector search (`lance_scanner_nearest_multivector`).
-- Fuzzy full-text matching (`max_fuzzy_distance > 0`) and phrase queries
-  (`lance_dataset_prepare_fts_phrase_query`): nanolance's INVERTED indexes store no positions, and it
-  does not search an index that does. An index without positions gets lance-c's own error.
+- Fuzzy full-text matching (`max_fuzzy_distance > 0`). Phrase queries
+  (`lance_dataset_prepare_fts_phrase_query`) work on indexes with positions (`params_json`
+  `{"with_position": true}`); an index without them gets lance-c's own error.
 - Parameters for BTREE, BITMAP and LABEL_LIST indexes (`params_json`).
 - Nearest or full-text search combined with `set_fragment_ids`.
 - Substrait filters, object stores, writing Lance's inline, packed and dedicated blob layouts

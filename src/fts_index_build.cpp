@@ -232,6 +232,9 @@ struct Built {
     std::unordered_map<std::string, std::uint32_t> ids;
     std::vector<std::vector<std::uint32_t>> docs;   // by token id
     std::vector<std::vector<std::uint32_t>> freqs;  // by token id
+    /// with_position: by token id, every posting's positions in order (freqs[t][k] for posting k).
+    bool with_positions = false;
+    std::vector<std::vector<std::uint32_t>> positions;
 };
 
 /// The documents of `batches` (column 0 text, column 1 row address), added in order.
@@ -261,7 +264,7 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
                 }
             }
         });
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> counts;  // token id, frequency
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> counts;  // token id, position
         for (std::size_t r = 0; r < rows; ++r) {
             if (tokens[r].empty()) {
                 continue;
@@ -282,8 +285,11 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
                     b.tokens.push_back(std::move(t.text));
                     b.docs.emplace_back();
                     b.freqs.emplace_back();
+                    if (b.with_positions) {
+                        b.positions.emplace_back();
+                    }
                 }
-                counts.emplace_back(it->second, 1U);
+                counts.emplace_back(it->second, b.with_positions ? t.position : 0U);
             }
             std::sort(counts.begin(), counts.end());
             for (std::size_t i = 0; i < counts.size();) {
@@ -293,6 +299,12 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
                 }
                 b.docs[counts[i].first].push_back(doc);
                 b.freqs[counts[i].first].push_back(static_cast<std::uint32_t>(j - i));
+                if (b.with_positions) {
+                    auto& p = b.positions[counts[i].first];
+                    for (std::size_t k = i; k < j; ++k) {
+                        p.push_back(counts[k].second);
+                    }
+                }
                 i = j;
             }
         }
@@ -360,17 +372,61 @@ bool write_docs(const std::filesystem::path& dir, const Built& b, std::vector<Wr
 
 /// The posting lists, by token id: blocks of 128 with Lance's block scores, the best of them, the
 /// length and the impact skip data (an entry per block, then one per 32 blocks).
+/// One posting block's positions as Lance's PackedDelta stream (encoding.rs): each document's
+/// positions as deltas (the first absolute), 128 at a time bit-packed after a bit-width byte, the
+/// rest as varints.
+void encode_position_block(const std::uint32_t* positions, const std::uint32_t* freqs, std::size_t docs,
+                           std::vector<std::uint8_t>& out) {
+    std::uint32_t pending[fts::kPostingBlock];
+    std::size_t count = 0;
+    std::uint8_t packed[fts::kPostingBlock * 4];
+    const auto push = [&](std::uint32_t delta) {
+        pending[count++] = delta;
+        if (count == fts::kPostingBlock) {
+            std::uint32_t any = 0;
+            for (const auto v : pending) {
+                any |= v;
+            }
+            const auto bits = static_cast<std::uint8_t>(any == 0U ? 0 : 32 - __builtin_clz(any));
+            fts::bitpack4x_pack(pending, bits, packed);
+            out.push_back(bits);
+            out.insert(out.end(), packed, packed + static_cast<std::size_t>(bits) * fts::kPostingBlock / 8U);
+            count = 0;
+        }
+    };
+    std::size_t at = 0;
+    for (std::size_t d = 0; d < docs; ++d) {
+        for (std::uint32_t i = 0; i < freqs[d]; ++i, ++at) {
+            push(i == 0U ? positions[at] : positions[at] - positions[at - 1U]);
+        }
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        fts::put_varint(out, pending[i]);
+    }
+}
+
 bool write_postings(const std::filesystem::path& dir, const Built& b, std::vector<WrittenFile>& files,
                     std::string& error) {
     OwnedSchema schema;
     OwnedArray batch;
-    if (!struct_schema(schema.s, 4) || !list_field(schema.s.children[0], "_posting") ||
+    const bool with_positions = b.with_positions;
+    if (!struct_schema(schema.s, with_positions ? 6 : 4) || !list_field(schema.s.children[0], "_posting") ||
         !field(schema.s.children[1], "_max_score", NANOARROW_TYPE_FLOAT, false) ||
         !field(schema.s.children[2], "_length", NANOARROW_TYPE_UINT32, false) ||
-        !list_field(schema.s.children[3], "_impacts") || !start(schema.s, batch.a)) {
+        !list_field(schema.s.children[3], "_impacts") ||
+        (with_positions &&
+         (!field(schema.s.children[4], "_compressed_position", NANOARROW_TYPE_LARGE_BINARY, false) ||
+          ArrowSchemaInitFromType(schema.s.children[5], NANOARROW_TYPE_LIST) != NANOARROW_OK ||
+          ArrowSchemaSetName(schema.s.children[5], "_position_block_offset") != NANOARROW_OK ||
+          ArrowSchemaSetType(schema.s.children[5]->children[0], NANOARROW_TYPE_UINT32) != NANOARROW_OK)) ||
+        !start(schema.s, batch.a)) {
         error = "out of memory";
         return false;
     }
+    if (with_positions) {
+        schema.s.children[5]->flags &= ~ARROW_FLAG_NULLABLE;
+    }
+    std::vector<std::uint8_t> stream;
     const std::size_t n_docs = b.row_ids.size();
     const float avgdl = static_cast<float>(b.total_tokens) / static_cast<float>(n_docs);
     std::vector<std::uint8_t> block;
@@ -427,6 +483,22 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
              ArrowArrayAppendDouble(batch.a.children[1], max_score) == NANOARROW_OK &&
              ArrowArrayAppendUInt(batch.a.children[2], length) == NANOARROW_OK &&
              ArrowArrayFinishElement(impact_list) == NANOARROW_OK;
+        if (ok && with_positions) {
+            // Every block's positions, one stream after another, and where each starts.
+            stream.clear();
+            ArrowArray* offsets = batch.a.children[5];
+            std::size_t first = 0;
+            for (std::size_t at = 0; ok && at < length; at += fts::kPostingBlock) {
+                const std::size_t n = std::min(fts::kPostingBlock, length - at);
+                ok = ArrowArrayAppendUInt(offsets->children[0], stream.size()) == NANOARROW_OK;
+                encode_position_block(b.positions[t].data() + first, freqs.data() + at, n, stream);
+                for (std::size_t i = at; i < at + n; ++i) {
+                    first += freqs[i];
+                }
+            }
+            ok = ok && append_bytes(batch.a.children[4], stream.data(), stream.size()) &&
+                 ArrowArrayFinishElement(offsets) == NANOARROW_OK;
+        }
     }
     if (!ok || !finish(batch.a, static_cast<std::int64_t>(b.tokens.size()), error)) {
         if (error.empty()) {
@@ -439,6 +511,10 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
     extras.schema_metadata["format_version"] = index_files::bytes_of("2");
     extras.schema_metadata["posting_block_size"] = index_files::bytes_of("128");
     extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of("varint_delta_v1");
+    if (with_positions) {
+        extras.schema_metadata["positions_layout"] = index_files::bytes_of("shared_stream_v2");
+        extras.schema_metadata["positions_codec"] = index_files::bytes_of("packed_delta_v1");
+    }
     return index_files::write_file(dir, "part_0_invert.lance", schema.s, batch.a, extras, files, error);
 }
 
@@ -464,6 +540,10 @@ bool write_metadata(const std::filesystem::path& dir, const fts::AnalyzerParams&
     extras.schema_metadata["format_version"] = index_files::bytes_of("2");
     extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of("varint_delta_v1");
     extras.schema_metadata["posting_block_size"] = index_files::bytes_of("128");
+    if (params.with_position) {
+        extras.schema_metadata["positions_layout"] = index_files::bytes_of("shared_stream_v2");
+        extras.schema_metadata["positions_codec"] = index_files::bytes_of("packed_delta_v1");
+    }
     return index_files::write_file(dir, "metadata.lance", schema.s, batch.a, extras, files, error);
 }
 
@@ -476,10 +556,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
                            std::uint64_t& new_version, std::string& error) {
     error.clear();
     fts::AnalyzerParams params = options.params;
-    if (params.with_position) {
-        error = "INVERTED indexes with positions (with_position=True) are not supported by nanolance";
-        return false;
-    }
+
     if (params.block_size != 128U) {
         error = "INVERTED index posting blocks of " + std::to_string(params.block_size) +
                 " documents are not supported (128 are)";
@@ -538,6 +615,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
         return true;
     };
     Built built;
+    built.with_positions = params.with_position;
     const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
     if (progress != nullptr) {
         (*progress)(0, "tokenize_docs", 0, "rows", 0);

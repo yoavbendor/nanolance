@@ -326,8 +326,8 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
 3. **Stable row ids.** Optional in pylance, but some workflows depend on it. nanolance refuses to
    build or use any index on such a dataset.
 4. **Full-text search beyond LanceDB's defaults:**
-   - positions (`with_position=True`) and phrase queries: the largest group of pylance's
-     full-text tests that still fail;
+   - ~~positions (`with_position=True`) and phrase queries~~ -- **done (2026-10-08)**: read,
+     searched (slop included) and built as Lance 12 does, in pylance and lance-c;
    - fuzzy matching (`fuzziness`);
    - other languages and their tokenizers: icu, jieba (Chinese), lindera (Japanese);
    - the ngram tokenizer and the NGRAM index, which serve `LIKE '%x%'` and `contains` filters;
@@ -345,7 +345,8 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
    `lance.indices.IndicesBuilder`, progress callbacks, index file format v3 (256-document posting
    blocks).
 
-Suggested order: phrase queries from (4) next (IVF_HNSW_SQ from (2) is done).
+Suggested order: fuzzy matching from (4) next, then ZONEMAP from (5) (IVF_HNSW_SQ from (2) and
+phrase queries from (4) are done).
 
 ## lance-c: what is left of the C API (2026-10-07)
 
@@ -363,7 +364,7 @@ still calls vector and full-text indexes out of scope; it should be updated alon
    - ~~`lance_scanner_set_ef`: HNSW indexes~~ -- done with IVF_HNSW_SQ (and
      `set_query_parallelism`, which Lance's HNSW search uses).
    - `lance_scanner_nearest_multivector`: multivector search.
-   - `lance_dataset_prepare_fts_phrase_query`: positions in INVERTED indexes.
+   - ~~`lance_dataset_prepare_fts_phrase_query`: positions in INVERTED indexes~~ -- done.
 3. ~~**Index segments**~~ -- **done (2026-10-08)**: builders, model training, metadata, commit with
    Lance's replacement rules, listing, and searches restricted to segments (vector, full-text with
    the whole index's scores, scoped scalar scans); pylance uses the indexes committed this way
@@ -396,8 +397,12 @@ What is left: the features item 2 waits on, the rest of item 4, and the options 
 or full-text search with `set_fragment_ids`, IVF_SQ / IVF_HNSW_PQ / IVF_HNSW_FLAT, Hamming).
 
 Found along the way (not lance-c's): full-text results with exactly equal scores come back in
-another order than pylance's (the rows and scores agree; pylance's order is stable). Matters only
-when a limit cuts through a tie.
+another order than pylance's, and when a limit cuts through such a tie the two keep different rows
+(short documents tie often; the scores of the rows kept agree). nanolance breaks ties by row id;
+Lance 12's block-max WAND (`lance-index/src/scalar/inverted/wand.rs`, ~10,500 lines) keeps
+whichever tied rows its traversal admits first -- it visits posting blocks in impact order and only
+replaces a top-k entry on a strictly higher score -- so matching it means emulating that traversal
+per query shape. Not done yet.
 
 ---
 

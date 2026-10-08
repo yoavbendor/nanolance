@@ -203,8 +203,6 @@ def test_create_index_fts_alias_and_replace(tmp_path):
 def test_build_rejects_what_it_cannot_write(tmp_path):
     path = str(tmp_path / "a.lance")
     nl.write_dataset(_table(100), path)
-    with pytest.raises(NotImplementedError):
-        nl.dataset(path).create_scalar_index("text", "INVERTED", with_position=True)
     with pytest.raises(Exception, match="string column"):
         nl.dataset(path).create_scalar_index("id", "INVERTED")
     with pytest.raises(Exception):

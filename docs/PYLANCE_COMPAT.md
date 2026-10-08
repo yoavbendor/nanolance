@@ -159,6 +159,10 @@ with LanceDB's default analyzer or the settings given. `lance.query` has pylance
   Two things can differ: the partition number, and document order when Lance's workers take
   fragments out of order. pylance and LanceDB search such an index as their own, and pylance's
   `optimize_indices` merges new rows into it.
+- **Phrase queries** (`PhraseQuery`, with `slop`, or a string in double quotes) on indexes with
+  positions (`with_position=True`), built by pylance or by nanolance, give pylance's rows and
+  scores, unindexed and deleted rows included (`test_fts_phrase.py`, and 1,050 random phrases
+  checked against pylance).
 
 `test_fts.py` checks all of it against pylance. Speed, 500,000 documents, 4 cores
 (`docs/BENCHMARKS.md`, "Full-text (INVERTED) indexes"):
@@ -168,7 +172,6 @@ with LanceDB's default analyzer or the settings given. `lance.query` has pylance
 
 Not supported:
 - fuzzy matching (`fuzziness` other than 0);
-- positions (`with_position=True`), and so phrase queries;
 - tokenizers other than simple, whitespace and raw (icu, ngram, code, jieba, lindera), and
   languages other than English;
 - full-text search over list columns;
@@ -228,7 +231,7 @@ them is silently ignored:
 - The transaction API (`LanceOperation`, `commit`, `write_fragments`), `LanceFragment.merge_columns`
   / `update_columns`, `cleanup_old_versions`. Conflicting writers are refused rather than retried:
   a change built on a version another writer has since replaced fails with "commit conflict".
-- Fuzzy and phrase full-text queries and the full-text features listed under "Full-text indexes",
+- Fuzzy full-text queries and the full-text features listed under "Full-text indexes",
   vector indexes other than IVF_FLAT and IVF_PQ, and scalar indexes other than BTree, Bitmap,
   LabelList and INVERTED. An index pylance built is kept, though: see "Indexes" below.
 - Tags and branches, stable row ids, multiple base paths, shallow and deep clones.
@@ -287,7 +290,7 @@ By test file, where nanolance passes any:
 
 The main reasons tests fail today:
 
-- Most need full-text features nanolance lacks (positions and phrase queries, fuzzy matching, other
+- Most need full-text features nanolance lacks (fuzzy matching, other
   tokenizers, list columns, distributed builds), scalar indexes other than BTree / Bitmap /
   LabelList / INVERTED or their build options (about 145 in `test_scalar_index.py`), vector index kinds other than
   IVF_FLAT / IVF_PQ or `lance.indices.IndicesBuilder` (about 30), namespaces (about 130), object
