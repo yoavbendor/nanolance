@@ -41,7 +41,8 @@ compared, results are checked against pylance on the same files, in both directi
 | Metadata | `schema` (with its schema metadata), `data_storage_version`, `config` / `update_config` / `delete_config_keys`, `metadata` / `update_metadata`, `schema_metadata` / `update_schema_metadata` / `replace_schema_metadata` |
 | Fragments | `get_fragments`, `get_fragment`; `LanceFragment`: `fragment_id`, `metadata` (`FragmentMetadata`, `DataFile`, `DeletionFile`), `count_rows`, `physical_rows`, `num_deletions`, `to_table`, `to_batches`, `scanner`, `head`, `take` |
 | Filters | `filter=` on `to_table`, `to_batches`, `scanner`, `count_rows` and fragments: an SQL string or a pyarrow compute expression. Comparisons, `AND` / `OR` / `NOT` with SQL's three-valued logic, `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE` / `ILIKE`, arithmetic, `CAST`, `DATE` / `TIMESTAMP` literals, struct fields (`s.a`), and the functions `lower`, `upper`, `length`, `abs`, `coalesce`, `starts_with`, `ends_with`, `contains`. With a filter, `offset` and `limit` count the rows that pass, as in pylance. |
-| Changes | `delete`, `update` (SQL values), `merge_insert` (`when_matched_update_all` with a condition, `when_not_matched_insert_all`, `when_not_matched_by_source_delete`, `execute`), `add_columns` (SQL expressions, a `pa.field` / schema of null columns, or a reader), `drop_columns`, `alter_columns` (rename, nullability, data type), `optimize.compact_files`. Each is one version, and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column. |
+| Changes | `delete`, `update` (SQL values), `merge_insert` (`when_matched_update_all`, with or without a condition over `source.*` / `target.*`, `when_not_matched_insert_all`, `when_not_matched_by_source_delete`, `execute`), `add_columns` (SQL expressions, a `pa.field` / schema of null columns, or a reader), `drop_columns`, `alter_columns` (rename, nullability, data type), `optimize.compact_files`, `optimize.optimize_indices`. Each is one version (compaction of indexed
+fragments two: see "Keeping indexes up to date"), and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column. |
 | Blobs | Blob v2 columns, every storage kind pylance writes (inline, packed, dedicated, external, empty, null): `to_table` returns their descriptions, as pylance does, and `blob_handling="all_binary"` their bytes. `take_blobs` (by `ids`, `addresses` or `indices`) returns `lance.BlobFile` handles (`read`, `readall`, `readinto`, `seek`, `tell`, `size`, `read_range`, `read_ranges`), and `read_blobs` the bytes. A handle reads only the bytes asked for, where they are. |
 | Files | `lance.file`: `LanceFileReader` (`read_all`, `read_range`, `take_rows`, `num_rows`, `metadata`, `file_statistics`, `read_global_buffer`), `LanceFileWriter`, `LanceFileSession` (local), `stable_version` |
 
@@ -166,6 +167,28 @@ Not supported:
 - 256-document posting blocks (index format v3);
 - an INVERTED index on a dataset with stable row ids.
 
+### Keeping indexes up to date
+
+`optimize.optimize_indices(num_indices_to_merge=None, index_names=None, retrain=False)` does what
+pylance's does (`lance/src/index/append.rs`), for the index kinds nanolance builds:
+
+- the last `num_indices_to_merge` segments of each index (1 by default) are replaced by one covering
+  their fragments that still exist and every fragment no segment covers; 0 adds a segment over the
+  uncovered fragments alone; `retrain` trains a vector index's model anew over every fragment;
+- the new segment keeps the replaced segment's parameters: a scalar index's type; an INVERTED index's
+  analyzer and its documents (deleted rows too, which Lance keeps counting until a rebuild, so the
+  scores stay pylance's, bit for bit); a vector index's centroids and PQ codebook, new rows assigned
+  and encoded with them, then the partitions rebalanced as Lance 12 rebalances them (split those over
+  four times the target size, join those under a quarter of it), even when nothing is new;
+- every index optimized is committed in one version; an index with nothing to do is left alone; an
+  index of a kind nanolance cannot build (IVF_HNSW_*, NGRAM, ZONEMAP, ...) fails the call, so name
+  the others in `index_names`.
+
+`test_index_optimize.py` optimizes copies of the same dataset with pylance and with nanolance and
+checks, with pylance: the same segments and coverage, no unindexed rows, the same filter rows,
+bit-identical full-text scores, the same vector distances and partition counts. Compaction uses the
+same machinery to give its rewritten rows back to the indexes.
+
 ### Indexes nanolance keeps
 
 Every commit nanolance makes
@@ -177,7 +200,7 @@ lance-table's `index_maintenance.rs`), so pylance goes on using them:
 |---|---|
 | append, delete, update, `merge_insert`, add columns, rename | kept as it is: new fragments are not covered (pylance scans them, and `optimize_indices` adds them), deleted rows are masked |
 | drop a column, change its type | an index on that column is dropped |
-| compaction | the fragments it rewrites leave every index's coverage (the index points at their rows' old places) |
+| compaction | the fragments it rewrites leave every index's coverage (the index points at their rows' old places); then, in a second version, the indexes nanolance can rebuild take them back (`compact_files(reindex=False)` leaves them out) |
 | overwrite | every index is dropped |
 | restore | that version's indices come back |
 
@@ -233,14 +256,14 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **254**, every one of which pylance also passes (241 before full-text search, 216 before vector search, 189 before scalar indexes) |
+| nanolance.lance | **257**, every one of which pylance also passes (254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
 
 By test file, where nanolance passes any:
 
 | file | pylance | nanolance |
 |---|---|---|
-| test_dataset.py | 250 | 86 |
-| test_scalar_index.py | 189 | 44 |
+| test_dataset.py | 250 | 87 |
+| test_scalar_index.py | 189 | 46 |
 | test_file.py | 40 | 27 |
 | test_map_type.py | 19 | 17 |
 | test_column_names.py | 27 | 17 |

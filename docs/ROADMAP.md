@@ -312,15 +312,10 @@ nanolance builds and searches Lance's BTree, Bitmap, LabelList, IVF_FLAT, IVF_PQ
 indexes, and pylance and LanceDB use them as their own (`docs/PYLANCE_COMPAT.md`, "Indexes"). What
 pylance users rely on that nanolance does not do yet, roughly in order of how often they hit it:
 
-1. **Keeping an index up to date** (`optimize_indices`, LanceDB's `table.optimize()`). Real users
-   run it after nearly every batch of appends; nanolance raises "not supported".
-   - Rows nanolance appends stay out of every index. Searches stay correct (uncovered fragments
-     are searched directly) but slow down as unindexed data grows.
-   - Compaction is worse. pylance remaps its indexes to the moved rows; nanolance drops the
-     rewritten fragments from every index's coverage, so an index loses ground after each
-     compaction until pylance or a rebuild fixes it.
-   - Needed: Lance's append path (fold new fragments into an index as a new segment or a merge)
-     and remapping row addresses after compaction.
+1. ~~**Keeping an index up to date**~~ -- **done (2026-10-08)**: `optimize_indices` (Lance's segment
+   selection, `num_indices_to_merge`, `retrain`; a vector index keeps its model and is rebalanced as
+   Lance 12 rebalances it), and compaction gives its rewritten rows back to the indexes
+   (`include/nanolance/index_optimize.hpp`, `tests/test_index_optimize.py`).
 2. **HNSW and quantized vector indexes**: IVF_HNSW_SQ (what many LanceDB users pick for low
    latency), IVF_HNSW_PQ, IVF_SQ, IVF_RQ. nanolance cannot build them; on a dataset that has one it
    answers correctly but by exact search, which does not scale. Related search gaps: batch query
@@ -348,29 +343,20 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
    `lance.indices.IndicesBuilder`, progress callbacks, index file format v3 (256-document posting
    blocks).
 
-Suggested order: (1) first, since without it every index degrades as soon as nanolance writes to
-the dataset; then IVF_HNSW_SQ from (2); then phrase queries from (4).
+Suggested order: IVF_HNSW_SQ from (2) next; then phrase queries from (4).
 
 ## lance-c: what is left of the C API (2026-10-07)
 
-`liblance_c` defines all 127 functions of lance-c's header (`compat/lance-c/UPSTREAM`), but 39 of
-them only return `LANCE_ERR_NOT_SUPPORTED`, and 5 more cover part of what lance-c does. All 39 are
+`liblance_c` defines all 127 functions of lance-c's header (`compat/lance-c/UPSTREAM`). When this
+section was written 39 of them only returned `LANCE_ERR_NOT_SUPPORTED`; 20 still do (2026-10-08),
+all of them the index-segment API. All 39 are
 vector search, full-text search or index segments. Much of what they need now exists in nanolance's
 core (Phases 2 and 3 above) and only has to be wired into `src/lance_c.cpp`. `docs/LANCE_C_COMPAT.md`
 still calls vector and full-text indexes out of scope; it should be updated along with this work.
 
-1. **Wire what the core already does** (most value for the effort):
-   - Vector search, 9 functions: `lance_dataset_create_vector_index` (IVF_FLAT and IVF_PQ; the other
-     `LANCE_INDEX_*` kinds stay refused until item 2 of the index gaps), `lance_scanner_nearest`,
-     `set_nprobes`, `set_minimum_nprobes`, `set_maximum_nprobes`, `set_refine_factor`, `set_metric`,
-     `set_approx_mode` and `set_query_parallelism`.
-   - `lance_scanner_set_use_index` and `lance_scanner_set_prefilter` are accepted today but change
-     nothing; they must take effect once `nearest` works.
-   - Full-text search, 4 functions: `lance_dataset_prepare_fts_query`,
-     `lance_dataset_prepare_fts_match_query`, `lance_scanner_full_text_search` and
-     `lance_scanner_set_fts_query_context`.
-   - `lance_dataset_create_scalar_index`: accept `LANCE_SCALAR_INVERTED`, and `params_json` (the
-     analyzer settings for INVERTED, and the options the other types take). Both are refused today.
+1. ~~**Wire what the core already does**~~ -- **done (2026-10-08)**: vector index creation and
+   search with every setter, INVERTED in `create_scalar_index`, `full_text_search` and prepared Match
+   contexts with both coverage modes (`tests/test_lance_c_search.cpp`).
 2. **Wait on core features from the index gaps list:**
    - `lance_scanner_set_ef`: HNSW indexes.
    - `lance_scanner_nearest_multivector`: multivector search.
@@ -391,9 +377,7 @@ still calls vector and full-text indexes out of scope; it should be updated alon
    - Search with chosen segments: `lance_scanner_set_index_segments`,
      `lance_scanner_set_scalar_index_segment`, `lance_scanner_set_fts_index_segments`.
 4. **Finish the partial ones:**
-   - `lance_dataset_merge_insert`: `LANCE_MERGE_WHEN_MATCHED_UPDATE_IF` (a condition comparing
-     source and target rows).
-   - `lance_scanner_set_include_deleted_rows(true)`: deleted rows come back with a NULL `_rowid`.
+   - ~~`UPDATE_IF` and `include_deleted_rows`~~ -- done (2026-10-08).
    - `lance_dataset_take_rows` on a dataset with stable row ids (with item 3 of the index gaps).
    - `lance_scanner_set_substrait_filter`: Substrait filters.
    - Object-store URIs (`s3://` and others) in `lance_dataset_open` and the writes; `storage_opts`
@@ -401,8 +385,8 @@ still calls vector and full-text indexes out of scope; it should be updated alon
    - Writes in Lance's inline, packed and dedicated blob layouts (nanolance writes external blobs
      and reads every layout).
 
-Suggested order: item 1 (it makes vector and full-text search usable from C at once, with tests
-that already exist upstream), then item 4's `UPDATE_IF` and `include_deleted_rows`, then item 3.
+What is left: item 3 (index segments, 20 functions), the features item 2 waits on, and the rest of
+item 4.
 
 ---
 

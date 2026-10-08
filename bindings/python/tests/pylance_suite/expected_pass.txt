@@ -68,6 +68,7 @@ tests/test_dataset.py::test_input_data[Schema-list_iterator]
 tests/test_dataset.py::test_late_materialization_batch_size
 tests/test_dataset.py::test_list_from_parquet
 tests/test_dataset.py::test_load_scanner_from_fragments
+tests/test_dataset.py::test_merge_insert_conditional_upsert_example
 tests/test_dataset.py::test_merge_insert_empty_index
 tests/test_dataset.py::test_merge_insert_input_kinds[False]
 tests/test_dataset.py::test_merge_insert_input_kinds[True]
@@ -240,6 +241,8 @@ tests/test_scalar_index.py::test_large_string_scalar_index[BITMAP]
 tests/test_scalar_index.py::test_large_string_scalar_index[BTREE]
 tests/test_scalar_index.py::test_multi_index_create
 tests/test_scalar_index.py::test_nan_handling
+tests/test_scalar_index.py::test_nested_field_bitmap_index
+tests/test_scalar_index.py::test_nested_field_btree_index
 tests/test_scalar_index.py::test_null_handling
 tests/test_scalar_index.py::test_rowid_order
 tests/test_scalar_index.py::test_temporal_index

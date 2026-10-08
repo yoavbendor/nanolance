@@ -2767,3 +2767,42 @@ about pylance's speed.
   - stable row ids;
   - a multi-word top-k that skips postings (WAND / MaxScore). Multi-word searches still score
     every posting, and are already about 2x faster than pylance.
+
+## Keeping indexes up to date, and the rest of lance-c's search API
+
+Asked: the next index phase from the roadmap (indexes kept up to date after appends and compaction)
+and the planned lance-c work (wire vector and full-text search into the C API; UPDATE_IF and
+include_deleted_rows).
+
+- **optimize_indices** (`src/index_optimize.cpp`, `include/nanolance/index_optimize.hpp`), as Lance's
+  `lance/src/index/append.rs` does it:
+  - segment selection by `num_indices_to_merge` (default 1; 0 adds a delta segment) and `retrain`;
+  - one new segment per index, over the replaced segments' live fragments and every uncovered one,
+    with their parameters: a scalar index's type, an INVERTED index's analyzer and documents (deleted
+    rows kept, as Lance keeps them, so BM25 statistics -- and scores -- stay pylance's), a vector
+    index's centroids and codebook;
+  - Lance 12's partition rebalance for vector indexes: split partitions over 4x the target size by
+    seeded k-means, keeping only centroids that win rows; join those under a quarter of it into the
+    nearest of their 64 nearest survivors with room; also with nothing new to fold in.
+  - The builders were split into "write a segment over these fragments" and a commit
+    (`src/index_build.hpp`), so creating and optimizing share one path.
+- **Compaction** folds its rewritten fragments back into the indexes that covered them (a second
+  version; `CompactionOptions::reindex`, Python `compact_files(reindex=False)`).
+- **lance-c** (`src/lance_c.cpp`): vector index creation and `nearest` with every setter; INVERTED
+  in `create_scalar_index` (`params_json`); `full_text_search` and prepared Match contexts with
+  STRICT / INDEX_ONLY coverage; `include_deleted_rows` (deleted rows with a NULL `_rowid`);
+  `use_scalar_index`; merge insert `UPDATE_IF`, also in the core and in Python
+  (`when_matched_update_all(condition=...)`), evaluated over `source.*` / `target.*` on zero-copy
+  slices of runs of matched rows. Stubs: 39 -> 20, all index segments.
+- **Verified**:
+  - `test_index_optimize.py` optimizes copies with pylance and with nanolance (indexes built by
+    either) and compares with pylance: segments, coverage, filter rows, full-text scores bit for bit,
+    vector distances and partition counts.
+  - `test_pylance_compat.py`: conditional upserts give pylance's rows.
+  - `tests/test_lance_c_search.cpp` drives the C API end to end against nanolance's own search; clean
+    under ASan, UBSan and LeakSanitizer.
+  - lance-c's suite stays at 90 of 106 (the rest need index segments).
+  - 257 of pylance's own tests pass (254 before).
+- **Not yet**: index segments in lance-c (20 functions), HNSW / SQ vector indexes, phrase and fuzzy
+  full-text queries, and compaction that remaps indexes in place in the same version (nanolance
+  rebuilds the affected segments in the next one).
