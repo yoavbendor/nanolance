@@ -1,10 +1,10 @@
 {
  "environment": {
   "pylance": "12.0.0",
-  "nanolance_commit": "d0d94bd with uncommitted changes",
+  "nanolance_commit": "95a78b7",
   "cores": 4,
   "machine": "x86_64",
-  "date": "2026-10-04 14:56 UTC"
+  "date": "2026-10-08 08:35 UTC"
  },
  "rows": 200000,
  "dim": 128,
@@ -13,8 +13,8 @@
  "indexes": {
   "IVF_FLAT": {
    "build_s": {
-    "pylance": 3.763473066000188,
-    "nanolance": 2.9682573969998884
+    "pylance": 10.35483563599999,
+    "nanolance": 5.140039301999991
    },
    "recall@10": {
     "pylance": 1.0,
@@ -22,48 +22,76 @@
    },
    "search_ms": {
     "k=10": {
-     "pylance": 5.2825409199977,
-     "nanolance": 1.4749028799997177
+     "pylance": 4.113365200000203,
+     "nanolance": 1.1646793799997113
     },
     "k=100": {
-     "pylance": 7.267673919996014,
-     "nanolance": 2.2907655200015142
+     "pylance": 5.306253640000023,
+     "nanolance": 1.5791869599996744
     },
     "k=10, nprobes=32": {
-     "pylance": 8.23892321999665,
-     "nanolance": 2.2348339800009853
+     "pylance": 5.452573420000135,
+     "nanolance": 1.719582239999795
     },
     "k=10, refine_factor=4": {
-     "pylance": 21.040389360005065,
-     "nanolance": 5.973786900003688
+     "pylance": 17.814937580000105,
+     "nanolance": 4.929923500000086
     }
    }
   },
   "IVF_PQ": {
    "build_s": {
-    "pylance": 16.408171954999943,
-    "nanolance": 12.74772751699993
+    "pylance": 20.658924976999998,
+    "nanolance": 16.939356384000007
    },
    "recall@10": {
-    "pylance": 0.33199999999999996,
-    "nanolance": 0.29400000000000004
+    "pylance": 0.284,
+    "nanolance": 0.314
    },
    "search_ms": {
     "k=10": {
-     "pylance": 7.600038119999226,
-     "nanolance": 2.949516139997286
+     "pylance": 8.183456279999746,
+     "nanolance": 3.6670009799996706
     },
     "k=100": {
-     "pylance": 8.405856140007018,
-     "nanolance": 3.590359259997058
+     "pylance": 8.60556669999994,
+     "nanolance": 3.898315999999795
     },
     "k=10, nprobes=32": {
-     "pylance": 4.375143819997902,
-     "nanolance": 1.4016373800041038
+     "pylance": 3.903245399999946,
+     "nanolance": 1.5429950599997255
     },
     "k=10, refine_factor=4": {
-     "pylance": 10.197114160000638,
-     "nanolance": 3.4561214200039103
+     "pylance": 9.578812320000338,
+     "nanolance": 3.6652816999998095
+    }
+   }
+  },
+  "IVF_HNSW_SQ": {
+   "build_s": {
+    "pylance": 13.498518942000004,
+    "nanolance": 11.087681941
+   },
+   "recall@10": {
+    "pylance": 0.9620000000000001,
+    "nanolance": 0.96
+   },
+   "search_ms": {
+    "k=10": {
+     "pylance": 17.9633576599997,
+     "nanolance": 2.7811571399996637
+    },
+    "k=100": {
+     "pylance": 37.682557099999485,
+     "nanolance": 8.625495920000503
+    },
+    "k=10, nprobes=32": {
+     "pylance": 4.955864639999845,
+     "nanolance": 1.2471516400000837
+    },
+    "k=10, refine_factor=4": {
+     "pylance": 25.780396540000083,
+     "nanolance": 4.211866659999259
     }
    }
   }

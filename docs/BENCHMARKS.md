@@ -290,23 +290,28 @@ _From `bench/results/scalar_index.json`, produced by `tools/bench_scalar_index.p
 
 ## Vector indexes
 
-_From `bench/results/vector_index.json`, produced by `tools/bench_vector_index.py` (generated data)._ 200,000 vectors of 128 float32s around 1,000 centres, 256 partitions (IVF_PQ: 16 sub-vectors of 8 bits). Each engine builds the index on its own copy and searches the one it built; on pylance's index nanolance returns pylance's rows, order and distances. Recall@10 against an exact search, default probing. Search: ms a query, median of 5 passes over 50 queries, warm. nanolance `d0d94bd with uncommitted changes`, pylance 12.0.0, 4 cores, 2026-10-04 14:56 UTC.
+_From `bench/results/vector_index.json`, produced by `tools/bench_vector_index.py` (generated data)._ 200,000 vectors of 128 float32s around 1,000 centres, 256 partitions (IVF_PQ: 16 sub-vectors of 8 bits). Each engine builds the index on its own copy and searches the one it built; on pylance's index nanolance returns pylance's rows, order and distances. Recall@10 against an exact search, default probing. Search: ms a query, median of 5 passes over 50 queries, warm. nanolance `95a78b7`, pylance 12.0.0, 4 cores, 2026-10-08 08:35 UTC.
 
 | index | build, pylance | build, nanolance | recall@10, pylance's index | recall@10, nanolance's |
 |---|---:|---:|---:|---:|
-| IVF_FLAT | 3.76 s | 2.97 s | 1.000 | 1.000 |
-| IVF_PQ | 16.41 s | 12.75 s | 0.332 | 0.294 |
+| IVF_FLAT | 10.35 s | 5.14 s | 1.000 | 1.000 |
+| IVF_PQ | 20.66 s | 16.94 s | 0.284 | 0.314 |
+| IVF_HNSW_SQ | 13.50 s | 11.09 s | 0.962 | 0.960 |
 
 | index | search | pylance | nanolance |
 |---|---|---:|---:|
-| IVF_FLAT | k=10 | 5.28 | 1.47 |
-| IVF_FLAT | k=100 | 7.27 | 2.29 |
-| IVF_FLAT | k=10, nprobes=32 | 8.24 | 2.23 |
-| IVF_FLAT | k=10, refine_factor=4 | 21.04 | 5.97 |
-| IVF_PQ | k=10 | 7.60 | 2.95 |
-| IVF_PQ | k=100 | 8.41 | 3.59 |
-| IVF_PQ | k=10, nprobes=32 | 4.38 | 1.40 |
-| IVF_PQ | k=10, refine_factor=4 | 10.20 | 3.46 |
+| IVF_FLAT | k=10 | 4.11 | 1.16 |
+| IVF_FLAT | k=100 | 5.31 | 1.58 |
+| IVF_FLAT | k=10, nprobes=32 | 5.45 | 1.72 |
+| IVF_FLAT | k=10, refine_factor=4 | 17.81 | 4.93 |
+| IVF_PQ | k=10 | 8.18 | 3.67 |
+| IVF_PQ | k=100 | 8.61 | 3.90 |
+| IVF_PQ | k=10, nprobes=32 | 3.90 | 1.54 |
+| IVF_PQ | k=10, refine_factor=4 | 9.58 | 3.67 |
+| IVF_HNSW_SQ | k=10 | 17.96 | 2.78 |
+| IVF_HNSW_SQ | k=100 | 37.68 | 8.63 |
+| IVF_HNSW_SQ | k=10, nprobes=32 | 4.96 | 1.25 |
+| IVF_HNSW_SQ | k=10, refine_factor=4 | 25.78 | 4.21 |
 
 ## Full-text (INVERTED) indexes
 

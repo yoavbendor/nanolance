@@ -2806,3 +2806,30 @@ include_deleted_rows).
 - **Not yet**: index segments in lance-c (20 functions), HNSW / SQ vector indexes, phrase and fuzzy
   full-text queries, and compaction that remaps indexes in place in the same version (nanolance
   rebuilds the affected segments in the next one).
+
+## IVF_HNSW_SQ: searched and built
+
+Asked: IVF_HNSW_SQ, the next index gap on the roadmap -- its format, search and build.
+
+- **Search** (`src/vector_search.cpp`): Lance's HNSW graphs (`index.idx`) and 8-bit SQ codes
+  (`auxiliary.idx`), searched with Lance's greedy descent, level-0 beam (`ef`), prefilter rules
+  (plain / exact under 10% passing / filtered beam) and `distance_range`, ties ranked as Rust's
+  `BinaryHeap` ranks them; partitions past the first probes searched `query_parallelism` at a time as
+  Lance does. Also 0-bit bit-packed definition levels (no level buffer), which pylance writes for the
+  neighbour lists.
+- **Build** (`src/hnsw_build.cpp`, `src/vector_index_build.cpp`): `create_index(..., "IVF_HNSW_SQ",
+  m=, ef_construction=, max_level=)`; SQ bounds from a sample; each partition's graph after
+  lance-index's `HnswBuilder` -- Lance's fixed-seed node levels and entry points exactly (rand 0.9
+  `SmallRng`, seed 42), beam insertion, Algorithm 4 neighbour selection, reciprocal pruning, repair of
+  unreachable nodes, nodes inserted in parallel. `optimize_indices` keeps such indexes up.
+- **lance-c**: `LANCE_INDEX_IVF_HNSW_SQ` in `create_vector_index`; `set_ef` and
+  `set_query_parallelism` now reach the search.
+- **Verified**: `test_hnsw.py` against pylance -- pylance's indexes searched with pylance's rows,
+  order and distances (L2, cosine; dot unfiltered), and nanolance's indexes searched by pylance with
+  nanolance's answers at the recall of pylance's own; the lance-c test builds and searches one; ctest,
+  the Python suite, pylance's suite (257) and lance-c's (90 of 106) all pass as before.
+- **Speed** (`docs/BENCHMARKS.md`, "Vector indexes"; 200,000 x 128, 256 partitions, 4 cores):
+  search 3.9-6.5x faster than pylance (k=10 2.8 ms vs 18.0 ms), build 1.2-1.4x faster, recall@10
+  0.960 vs 0.962. The HNSW branch is kept out of line: inlined, it slowed IVF_PQ search by 40%.
+- **Not yet**: IVF_HNSW_PQ, IVF_HNSW_FLAT, IVF_SQ, IVF_RQ; `stats.index_stats`, which most of
+  pylance's own HNSW tests read.
