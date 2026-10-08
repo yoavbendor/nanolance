@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -71,6 +72,10 @@ struct FtsSearchRequest {
     bool prefilter = false;
     /// Search only the fragments the index covers.
     bool fast_search = false;
+    /// When set, search only these segments (by UUID) of the columns' indexes -- one worker's share
+    /// of a distributed search -- scoring with the statistics of all their segments, so the scores
+    /// are the ones a search of every segment gives. Fragments outside the segments are not searched.
+    std::vector<std::array<std::uint8_t, 16>> segments;
 };
 
 struct FtsSearchResult {

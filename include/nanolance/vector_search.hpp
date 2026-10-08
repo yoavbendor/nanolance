@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -53,6 +54,11 @@ struct NearestQuery {
     bool prefilter = false;
     /// Search only the fragments the index covers.
     bool fast_search = false;
+    /// When set, search these segments (by UUID) of the column's index and nothing else -- no exact
+    /// search of the fragments they do not cover (Lance's with_index_segments, which a distributed
+    /// query fans out over). They must exist and belong to one index on the column; a `metric` other
+    /// than theirs is an error. Ignored with use_index=false.
+    std::vector<std::array<std::uint8_t, 16>> segments;
 };
 
 struct NearestResult {

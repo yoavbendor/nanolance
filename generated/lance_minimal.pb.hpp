@@ -101,6 +101,11 @@ IndexMetadata make_index_metadata(const std::array<std::uint8_t, 16>& uuid, cons
                                   const std::vector<IndexMetadata::File>& files,
                                   const std::vector<std::uint8_t>& details_value = {});
 
+/// One IndexMetadata message: read (`raw` keeps the bytes), and written (`raw` itself unless the
+/// writer changed the coverage).
+bool decode_index_message(const std::uint8_t* data, std::size_t size, IndexMetadata& index, std::string& error);
+std::vector<std::uint8_t> encode_index_message(const IndexMetadata& index);
+
 /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", the directory name of an index under _indices/.
 std::string uuid_string(const std::array<std::uint8_t, 16>& uuid);
 

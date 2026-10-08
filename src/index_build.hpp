@@ -13,8 +13,10 @@
 #include "nanolance/scalar_index.hpp"
 #include "nanolance/vector_search.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -36,7 +38,30 @@ struct VectorModel {
     std::uint32_t hnsw_m = 20;
     std::uint32_t hnsw_ef_construction = 150;
     std::uint32_t hnsw_max_level = 7;
+    /// Which parts the model carries. A model read from an index has them all; one handed in from
+    /// outside (lance-c's precomputed models) may carry the IVF centroids alone, and the rest is
+    /// trained as for a new index.
+    bool has_codebook = true;
+    bool has_sq = true;
 };
+
+/// A build's progress, as Lance reports it (lance-c's LanceIndexBuildProgressCallback): `event` 0
+/// starts `stage` (`total` units of `unit`, 0 / "" unknown), 1 reports `completed` units, 2 ends it.
+using Progress = std::function<void(int event, const char* stage, std::uint64_t total, const char* unit,
+                                    std::uint64_t completed)>;
+
+/// Report a stage around `work` when `progress` is set.
+template <typename F>
+bool stage(const Progress* progress, const char* name, std::uint64_t total, const char* unit, F&& work) {
+    if (progress != nullptr) {
+        (*progress)(0, name, total, unit, 0);
+    }
+    const bool ok = work();
+    if (ok && progress != nullptr) {
+        (*progress)(2, name, 0, "", 0);
+    }
+    return ok;
+}
 
 /// The model of the vector index segment in `dir` (an _indices/<uuid> directory).
 bool load_vector_model(const std::filesystem::path& dir, VectorModel& out, std::string& error);
@@ -67,6 +92,13 @@ struct SegmentTarget {
     std::size_t rebalance_target = 0;
     /// A vector index: these details (VectorIndexDetails) instead of the options' own.
     const std::vector<std::uint8_t>* details = nullptr;
+    /// The segment's UUID (its directory under _indices/); a new random one when null.
+    const std::array<std::uint8_t, 16>* uuid = nullptr;
+    /// Where the build reports its stages; nothing when null.
+    const Progress* progress = nullptr;
+    /// A vector index: train the model only -- the IVF centroids, and for IVF_PQ the codebook --
+    /// into this, and write nothing.
+    VectorModel* trained = nullptr;
 };
 
 bool build_scalar_segment(const std::filesystem::path& dataset_path, const std::string& column,

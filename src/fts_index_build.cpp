@@ -538,6 +538,10 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
         return true;
     };
     Built built;
+    const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
+    if (progress != nullptr) {
+        (*progress)(0, "tokenize_docs", 0, "rows", 0);
+    }
     if (target != nullptr && target->rows != nullptr && !target->rows->empty()) {
         // An old segment's documents first, deleted or not.
         OwnedSchema taken;
@@ -558,8 +562,12 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
         }
     }
 
+    if (progress != nullptr) {
+        (*progress)(2, "tokenize_docs", 0, "", 0);
+    }
+
     // The files.
-    const auto uuid = index_files::new_uuid();
+    const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : index_files::new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -568,8 +576,10 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
         return false;
     }
     std::vector<WrittenFile> files;
-    if (!write_postings(dir, built, files, error) || !write_tokens(dir, built, files, error) ||
-        !write_docs(dir, built, files, error) || !write_metadata(dir, params, files, error)) {
+    if (!index_build::stage(progress, "write_metadata", 4, "files", [&] {
+            return write_postings(dir, built, files, error) && write_tokens(dir, built, files, error) &&
+                   write_docs(dir, built, files, error) && write_metadata(dir, params, files, error);
+        })) {
         std::filesystem::remove_all(dir, ec);
         return false;
     }

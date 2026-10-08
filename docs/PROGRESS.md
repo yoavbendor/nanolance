@@ -2833,3 +2833,32 @@ Asked: IVF_HNSW_SQ, the next index gap on the roadmap -- its format, search and 
   0.960 vs 0.962. The HNSW branch is kept out of line: inlined, it slowed IVF_PQ search by 40%.
 - **Not yet**: IVF_HNSW_PQ, IVF_HNSW_FLAT, IVF_SQ, IVF_RQ; `stats.index_stats`, which most of
   pylance's own HNSW tests read.
+
+## lance-c: index segments
+
+Asked: continue lance-c compatibility, function before speed, without degrading function or speed.
+
+- **Index segments** (`src/lance_c.cpp`, `src/index_segments.cpp`, `include/nanolance/index_segments.hpp`),
+  the last 20 functions that only returned `LANCE_ERR_NOT_SUPPORTED`:
+  - builders over chosen fragments with an assigned UUID, for BTREE / BITMAP / LABEL_LIST /
+    INVERTED and IVF_FLAT / IVF_PQ / IVF_HNSW_SQ, with progress callbacks, Lance's default names
+    and its name and UUID rules;
+  - IVF and PQ model training exported as Arrow with lance-c's provenance metadata, and models
+    injected into builds (AUTO / LOCAL_TRAIN / PRECOMPUTED); the core's builders gained a fixed
+    UUID, progress stages, a train-only mode and partial models (`src/index_build.hpp`);
+  - segment metadata parsing and accessors; commit as Lance's `commit_existing_index_segments`
+    (validation, stale-coverage pruning, coverage-driven replacement, vector compatibility);
+    listing;
+  - searches restricted to segments: nearest (`NearestQuery::segments`), prepared full-text over
+    some segments scored with all of them (`FtsSearchRequest::segments`), scoped scalar scans.
+- **Fixed**: a prepared full-text context took only one segment of a multi-segment index when
+  another index was listed first; `tools/lance_c_suite.py` now gives each test binary fresh
+  fixtures, as upstream does.
+- **Verified**: lance-c's suite 106 of 106 (90 before); `tests/test_lance_c_search.cpp` checks
+  that per-segment searches merged equal the whole search, the commit rules, scoped scans and
+  per-segment FTS scores; pylance lists, searches and uses the indexes committed this way; ctest,
+  the Python suite and pylance's suite (257) unchanged. Speed: index builds and vector,
+  full-text and filtered searches as before (FTS search instruction count within 0.2%).
+- **Not yet**: BTREE / BITMAP / LABEL_LIST parameters, search with `set_fragment_ids`, IVF_SQ /
+  IVF_HNSW_PQ / IVF_HNSW_FLAT, Hamming, multivector, phrase and fuzzy full-text, Substrait, object
+  stores. Full-text ties come back in another order than pylance's.

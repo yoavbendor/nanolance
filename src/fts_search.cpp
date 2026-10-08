@@ -723,6 +723,8 @@ struct FlatDocs {
 struct ColumnIndex {
     std::string name;
     std::shared_ptr<const InvertedIndex> index;
+    /// A search of some segments only: all of them, for the token document counts.
+    std::shared_ptr<const InvertedIndex> stats;
     std::set<std::uint32_t> covered;
     std::uint64_t num_docs = 0;
     std::uint64_t total_tokens = 0;
@@ -758,7 +760,7 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
     }
     c.flat_loaded = true;
     std::vector<std::uint64_t> frags;
-    if (!request->fast_search) {
+    if (!request->fast_search && request->segments.empty()) {
         for (const auto& f : manifest.fragments) {
             if (c.covered.count(static_cast<std::uint32_t>(f.id)) == 0U) {
                 frags.push_back(f.id);
@@ -913,6 +915,27 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         for (std::size_t k = 0; k < ids.size(); ++k) {
             postings[p][which[k]] = loaded[k];
             token_docs[which[k]] += loaded[k]->docs.size();
+        }
+    }
+    if (c.stats != nullptr) {
+        // Some segments only: the document counts are all segments'.
+        std::fill(token_docs.begin(), token_docs.end(), 0U);
+        for (const auto& part : c.stats->partitions) {
+            std::vector<std::uint32_t> ids;
+            std::vector<std::size_t> which;
+            for (std::size_t t = 0; t < nt; ++t) {
+                if (const auto id = part->token_id(distinct[t])) {
+                    ids.push_back(*id);
+                    which.push_back(t);
+                }
+            }
+            std::vector<std::shared_ptr<const Posting>> loaded;
+            if (!part->load(ids, c.stats->codec, loaded, error)) {
+                return false;
+            }
+            for (std::size_t k = 0; k < ids.size(); ++k) {
+                token_docs[which[k]] += loaded[k]->docs.size();
+            }
         }
     }
     const float avg = static_cast<float>(c.total_tokens) / static_cast<float>(c.num_docs);
@@ -1392,17 +1415,45 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
         error = "full-text search over a dataset with stable row ids is not supported by nanolance";
         return false;
     }
+    const std::set<std::array<std::uint8_t, 16>> chosen(request.segments.begin(), request.segments.end());
+    for (const auto& uuid : chosen) {
+        bool known = false;
+        for (const auto& [column, segs] : segments) {
+            for (const auto* seg : segs) {
+                known = known || seg->uuid == uuid;
+            }
+        }
+        if (!known) {
+            error = "FTS segment UUID " + pb::uuid_string(uuid) + " is not present in the attached query context for "
+                    "dataset version " + std::to_string(version);
+            return false;
+        }
+    }
     for (const auto& [column, segs] : segments) {
         ColumnIndex c;
         c.name = column;
         std::shared_ptr<InvertedIndex> merged;
+        std::shared_ptr<InvertedIndex> picked;  // the chosen segments, when some are
         for (const auto* seg : segs) {
             std::shared_ptr<const InvertedIndex> index;
             if (!load_inverted(dataset_path / "_indices" / pb::uuid_string(seg->uuid), index, error)) {
                 error = "index " + seg->name + ": " + error;
                 return false;
             }
-            c.covered.insert(seg->fragment_ids.begin(), seg->fragment_ids.end());
+            if (!chosen.empty()) {
+                if (picked == nullptr) {
+                    picked = std::make_shared<InvertedIndex>();
+                    picked->analyzer = index->analyzer;
+                    picked->codec = index->codec;
+                }
+                if (chosen.count(seg->uuid) != 0U) {
+                    c.covered.insert(seg->fragment_ids.begin(), seg->fragment_ids.end());
+                    picked->partitions.insert(picked->partitions.end(), index->partitions.begin(),
+                                              index->partitions.end());
+                }
+            } else {
+                c.covered.insert(seg->fragment_ids.begin(), seg->fragment_ids.end());
+            }
             for (const auto& p : index->partitions) {
                 c.num_docs += p->row_ids.size();
                 c.total_tokens += p->total_tokens;
@@ -1425,6 +1476,10 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
         }
         if (merged != nullptr) {
             c.index = merged;
+        }
+        if (picked != nullptr) {
+            c.stats = c.index;
+            c.index = picked;
         }
         out.plan.push_back("MatchQuery: column=" + column + ", index=" + index_names[column] + " (" +
                            std::to_string(c.index->partitions.size()) + " partitions, " + std::to_string(c.num_docs) +

@@ -15,7 +15,10 @@
 #include "nanolance/fts_search.hpp"
 #include "nanolance/vector_search.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <map>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -484,6 +487,302 @@ void test_update_if(const std::string& uri) {
 
 }  // namespace
 
+// ── index segments: built apart, committed together, searched apart ──────────────────────────────
+
+/// One uncommitted segment of `params` (or a scalar `scalar_type`) over `fragment`.
+std::vector<uint8_t> build_segment(LanceDataset* ds, const char* column, const char* name, uint32_t fragment,
+                                   const LanceVectorIndexSegmentParams* params, int32_t scalar_type,
+                                   LanceIndexSegmentBuildOptions options = {}) {
+    options.fragment_ids = &fragment;
+    options.fragment_count = 1;
+    LanceIndexSegmentBuilder* b = params != nullptr
+                                      ? lance_index_segment_builder_new_vector(ds, column, name, params, &options)
+                                      : lance_index_segment_builder_new_scalar(ds, column, name, scalar_type, nullptr,
+                                                                               &options);
+    check(b != nullptr, std::string("segment builder: ") + last_error());
+    uint8_t* bytes = nullptr;
+    size_t len = 0;
+    check(b != nullptr && lance_index_segment_builder_execute_uncommitted(b, &bytes, &len) == 0,
+          "segment build: " + last_error());
+    std::vector<uint8_t> out(bytes, bytes + len);
+    lance_free_bytes(bytes);
+    lance_index_segment_builder_free(b);
+    return out;
+}
+
+int32_t commit(LanceDataset* ds, const char* name, const char* column, const std::vector<std::vector<uint8_t>>& segs) {
+    std::vector<const uint8_t*> ptrs;
+    std::vector<size_t> lens;
+    for (const auto& s : segs) {
+        ptrs.push_back(s.data());
+        lens.push_back(s.size());
+    }
+    return lance_dataset_commit_index_segments(ds, name, column, ptrs.data(), lens.data(), segs.size());
+}
+
+std::array<uint8_t, 16> uuid_of(const std::vector<uint8_t>& seg) {
+    LanceIndexSegmentMetadata* md = nullptr;
+    std::array<uint8_t, 16> out{};
+    if (lance_index_segment_metadata_parse(seg.data(), seg.size(), &md) == 0) {
+        lance_index_segment_metadata_uuid(md, out.data());
+    }
+    lance_index_segment_metadata_free(md);
+    return out;
+}
+
+Result nearest_in(const std::string& uri, const std::vector<float>& q, uint32_t k, const uint8_t* segs, size_t n) {
+    LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+    const char* cols[] = {"id", nullptr};
+    LanceScanner* sc = lance_scanner_new(ds, cols, nullptr);
+    lance_scanner_nearest(sc, "vec", q.data(), q.size(), LANCE_DTYPE_FLOAT32, k);
+    lance_scanner_set_nprobes(sc, 4);
+    if (n > 0U) {
+        check(lance_scanner_set_index_segments(sc, segs, n) == 0, "set_index_segments");
+    }
+    auto r = collect(sc, "_distance");
+    lance_scanner_close(sc);
+    lance_dataset_close(ds);
+    return r;
+}
+
+void test_segments(const std::filesystem::path& dir) {
+    const std::string uri = (dir / "segments.lance").string();
+    check(write(uri, 0, 1000, LANCE_WRITE_CREATE) && write(uri, 1000, 1000, LANCE_WRITE_APPEND), "write");
+    LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+    uint64_t frags[2] = {0, 0};
+    lance_dataset_fragment_ids(ds, frags);
+
+    // Vector: one IVF_PQ model trained once, a segment per fragment built with it (two "workers").
+    ArrowArray centroids{};
+    ArrowSchema centroids_schema{};
+    ArrowArray codebook{};
+    ArrowSchema codebook_schema{};
+    check(lance_index_train_ivf_model(ds, "vec", 4, LANCE_METRIC_L2, nullptr, 0, &centroids, &centroids_schema) == 0,
+          "train IVF: " + last_error());
+    check(centroids.length == 4 && std::string(centroids_schema.format) == "+w:8", "4 centroids of 8");
+    check(lance_index_train_pq_model(ds, "vec", 4, 8, LANCE_METRIC_L2, nullptr, 0, &centroids, &centroids_schema,
+                                     &codebook, &codebook_schema) == 0,
+          "train PQ: " + last_error());
+    check(codebook.length == 4 * 256 && std::string(codebook_schema.format) == "+w:2", "a codebook of 4 x 256 x 2");
+    // A codebook with centroids of another training is refused.
+    ArrowArray other{};
+    ArrowSchema other_schema{};
+    lance_index_train_ivf_model(ds, "vec", 4, LANCE_METRIC_L2, nullptr, 0, &other, &other_schema);
+    LanceVectorIndexSegmentParams pq = {LANCE_INDEX_IVF_PQ, LANCE_METRIC_L2, 4, 4, 8, 10, 0, 0, 0};
+    {
+        LanceIndexSegmentBuildOptions o{};
+        o.ivf_centroids = &other;
+        o.ivf_centroids_schema = &other_schema;
+        o.pq_codebook = &codebook;
+        o.pq_codebook_schema = &codebook_schema;
+        check(lance_index_segment_builder_new_vector(ds, "vec", "pq", &pq, &o) == nullptr &&
+                  last_error().find("not trained with the supplied ivf_centroids") != std::string::npos,
+              "mismatched models");
+    }
+    std::vector<std::vector<uint8_t>> pq_segs;
+    for (const auto f : frags) {
+        LanceIndexSegmentBuildOptions o{};
+        o.ivf_centroids = &centroids;
+        o.ivf_centroids_schema = &centroids_schema;
+        o.pq_codebook = &codebook;
+        o.pq_codebook_schema = &codebook_schema;
+        o.mode = LANCE_INDEX_SEGMENT_BUILD_PRECOMPUTED;
+        pq_segs.push_back(build_segment(ds, "vec", "pq", static_cast<uint32_t>(f), &pq, 0, o));
+    }
+    for (auto* a : {&centroids, &codebook, &other}) a->release(a);
+    for (auto* s : {&centroids_schema, &codebook_schema, &other_schema}) s->release(s);
+    check(commit(ds, "pq", "vec", pq_segs) == 0, "commit IVF_PQ segments: " + last_error());
+    check(lance_dataset_index_segment_count(ds, "pq") == 2, "two IVF_PQ segments");
+    lance_dataset_close(ds);
+    // Both segments share the model, so they are one index: searched together, the core's answer.
+    const auto q = query_vector(5);
+    nano_lance::NearestQuery core;
+    core.column = "vec";
+    core.key = q;
+    core.k = 10;
+    core.minimum_nprobes = core.maximum_nprobes.emplace(4);
+    nano_lance::NearestResult want;
+    std::string error;
+    check(nano_lance::dataset_nearest(uri, core, want, error), "core nearest: " + error);
+    const auto all = nearest_in(uri, q, 10, nullptr, 0);
+    check(all.ok && all.values == want.distances, "IVF_PQ segments searched together");
+
+    // A worker per segment: each searches its own, the union's best 10 are the whole search's.
+    std::vector<std::pair<float, int64_t>> merged;
+    for (const auto& seg : pq_segs) {
+        const auto u = uuid_of(seg);
+        const auto part = nearest_in(uri, q, 10, u.data(), 1);
+        check(part.ok, "segment search: " + part.error);
+        for (std::size_t i = 0; i < part.ids.size(); ++i) {
+            check(part.ids[i] < 1000 == (&seg == &pq_segs[0]), "a segment returns only its own fragment's rows");
+            merged.emplace_back(part.values[i], part.ids[i]);
+        }
+    }
+    std::sort(merged.begin(), merged.end());
+    merged.resize(std::min<std::size_t>(merged.size(), 10));
+    std::vector<int64_t> merged_ids;
+    for (const auto& m : merged) merged_ids.push_back(m.second);
+    check(merged_ids == all.ids, "the segments' searches merged give the whole search");
+    {
+        const uint8_t unknown[16] = {1, 2, 3};
+        const auto bad = nearest_in(uri, q, 10, unknown, 1);
+        check(!bad.ok && bad.error.find("unknown index segments") != std::string::npos, "an unknown segment");
+        LanceDataset* d = lance_dataset_open(uri.c_str(), nullptr, 0);
+        LanceScanner* sc = lance_scanner_new(d, nullptr, nullptr);
+        const auto u = uuid_of(pq_segs[0]);
+        lance_scanner_set_index_segments(sc, u.data(), 1);
+        ArrowArrayStream stream{};
+        check(lance_scanner_to_arrow_stream(sc, &stream) != 0 && lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+              "index segments without nearest");
+        lance_scanner_close(sc);
+        lance_dataset_close(d);
+    }
+
+    // Replacement by coverage: a segment over fragment 0 alone is kept beside one over fragment 1,
+    // a segment over both replaces both, one over fragment 0 alone then would orphan fragment 1.
+    ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+    LanceVectorIndexSegmentParams flat = {LANCE_INDEX_IVF_FLAT, LANCE_METRIC_L2, 2, 0, 0, 5, 0, 0, 0};
+    check(commit(ds, "flat", "vec", {build_segment(ds, "vec", "flat", static_cast<uint32_t>(frags[0]), &flat, 0)}) == 0,
+          "commit flat over fragment 0: " + last_error());
+    // Building under a name that an index already holds is refused, as in Lance.
+    {
+        uint32_t f = static_cast<uint32_t>(frags[1]);
+        LanceIndexSegmentBuildOptions o{};
+        o.fragment_ids = &f;
+        o.fragment_count = 1;
+        LanceIndexSegmentBuilder* b = lance_index_segment_builder_new_vector(ds, "vec", "flat", &flat, &o);
+        uint8_t* bytes = nullptr;
+        size_t len = 0;
+        check(b != nullptr && lance_index_segment_builder_execute_uncommitted(b, &bytes, &len) != 0 &&
+                  lance_last_error_code() == LANCE_ERR_INDEX,
+              "a segment under a taken name");
+        lance_index_segment_builder_free(b);
+    }
+    const auto second = build_segment(ds, "vec", "flat_b", static_cast<uint32_t>(frags[1]), &flat, 0);
+    const uint64_t before = lance_dataset_version(ds);
+    check(commit(ds, "flat", "vec", {second}) == 0 && lance_dataset_index_segment_count(ds, "flat") == 2,
+          "a disjoint segment is added: " + last_error());
+    check(lance_dataset_version(ds) == before + 1, "one version per commit");
+    LanceDataset* old = lance_dataset_open(uri.c_str(), nullptr, 0);
+    lance_dataset_close(ds);
+    ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+    LanceIndexSegmentBuildOptions both{};
+    both.mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+    LanceIndexSegmentBuilder* b = lance_index_segment_builder_new_vector(ds, "vec", "flat_all", &flat, &both);
+    uint8_t* bytes = nullptr;
+    size_t len = 0;
+    check(b != nullptr && lance_index_segment_builder_execute_uncommitted(b, &bytes, &len) == 0, "segment over all");
+    std::vector<uint8_t> whole(bytes, bytes + len);
+    lance_free_bytes(bytes);
+    lance_index_segment_builder_free(b);
+    check(commit(ds, "flat", "vec", {whole}) == 0 && lance_dataset_index_segment_count(ds, "flat") == 1,
+          "a covering segment replaces both: " + last_error());
+    const auto part0 = build_segment(old, "vec", "flat_c", static_cast<uint32_t>(frags[0]), &flat, 0);
+    check(commit(ds, "flat", "vec", {part0}) != 0 && last_error().find("orphan") != std::string::npos &&
+              lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
+          "partial overlap orphans fragments");
+    check(commit(ds, "flat", "vec", {pq_segs[0]}) != 0, "an IVF_PQ segment over part of an IVF_FLAT index");
+    check(commit(ds, "flat", "id", {whole}) != 0, "a segment of another column");
+    check(commit(ds, "nope", "missing", {whole}) != 0 && lance_last_error_code() == LANCE_ERR_INDEX,
+          "a missing column");
+    lance_dataset_close(old);
+
+    // Scalar: a BITMAP segment per fragment; a worker's scoped scan returns its fragment's rows.
+    std::vector<std::vector<uint8_t>> bitmap;
+    for (const auto f : frags) {
+        bitmap.push_back(build_segment(ds, "id", "id_bitmap", static_cast<uint32_t>(f), nullptr, LANCE_SCALAR_BITMAP));
+    }
+    check(commit(ds, "id_bitmap", "id", bitmap) == 0, "commit bitmap segments: " + last_error());
+    check(commit(ds, "id_bitmap", "id",
+                 {build_segment(ds, "id", "id_btree", static_cast<uint32_t>(frags[0]), nullptr, LANCE_SCALAR_BTREE)}) != 0 &&
+              last_error().find("cannot change index") != std::string::npos,
+          "a type change must cover every fragment");
+    {
+        uint32_t f = static_cast<uint32_t>(frags[0]);
+        const uint8_t uuid[16] = {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x4d, 0xef, 0x80, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde};
+        LanceIndexSegmentBuildOptions o{};
+        o.fragment_ids = &f;
+        o.fragment_count = 1;
+        o.index_uuid = uuid;
+        LanceIndexSegmentBuilder* bt = lance_index_segment_builder_new_scalar(ds, "id", "bt", LANCE_SCALAR_BTREE, nullptr, &o);
+        uint8_t* out = nullptr;
+        size_t n = 0;
+        check(bt != nullptr && lance_index_segment_builder_execute_uncommitted(bt, &out, &n) != 0 &&
+                  last_error().find("index_uuid is no longer accepted for BTree") != std::string::npos,
+              "a BTree segment with an assigned UUID");
+        lance_index_segment_builder_free(bt);
+    }
+    for (std::size_t i = 0; i < 2; ++i) {
+        const auto u = uuid_of(bitmap[i]);
+        const uint64_t f = frags[i];
+        const char* cols[] = {"id", nullptr};
+        LanceScanner* sc = lance_scanner_new(ds, cols, "id % 7 = 3");
+        lance_scanner_set_fragment_ids(sc, &f, 1);
+        check(lance_scanner_set_scalar_index_segment(sc, u.data()) == 0, "set_scalar_index_segment");
+        const auto got = collect(sc, "");
+        lance_scanner_close(sc);
+        std::vector<int64_t> want_ids;
+        for (int64_t id = static_cast<int64_t>(i) * 1000; id < static_cast<int64_t>(i + 1) * 1000; ++id) {
+            if (id % 7 == 3) want_ids.push_back(id);
+        }
+        check(got.ok && got.ids == want_ids, "a scoped scan of fragment " + std::to_string(i) + ": " + got.error);
+    }
+    {
+        const auto u = uuid_of(bitmap[0]);
+        LanceScanner* sc = lance_scanner_new(ds, nullptr, "id = 3");
+        lance_scanner_set_scalar_index_segment(sc, u.data());
+        ArrowArrayStream stream{};
+        check(lance_scanner_to_arrow_stream(sc, &stream) != 0 &&
+                  last_error().find("explicit nonempty fragment_ids") != std::string::npos,
+              "a scoped scan needs fragment_ids");
+        lance_scanner_close(sc);
+    }
+
+    // Full text: an INVERTED segment per fragment; each worker's scores are the whole search's.
+    std::vector<std::vector<uint8_t>> inverted;
+    for (const auto f : frags) {
+        inverted.push_back(build_segment(ds, "text", "text_fts", static_cast<uint32_t>(f), nullptr, LANCE_SCALAR_INVERTED));
+    }
+    check(commit(ds, "text_fts", "text", inverted) == 0, "commit INVERTED segments: " + last_error());
+    LanceFtsQueryContext* ctx = lance_dataset_prepare_fts_match_query(ds, "text", "plum fig", 0, 0,
+                                                                      LANCE_FTS_COVERAGE_STRICT);
+    check(ctx != nullptr, "prepare: " + last_error());
+    const auto fts = [&](const uint8_t* segs, size_t n) {
+        const char* cols[] = {"id", nullptr};
+        LanceScanner* sc = lance_scanner_new(ds, cols, nullptr);
+        lance_scanner_set_fts_query_context(sc, ctx);
+        if (n > 0U) check(lance_scanner_set_fts_index_segments(sc, segs, n) == 0, "set_fts_index_segments");
+        auto r = collect(sc, "_score");
+        lance_scanner_close(sc);
+        return r;
+    };
+    const auto everything = fts(nullptr, 0);
+    check(everything.ok && !everything.ids.empty(), "the full-text search: " + everything.error);
+    std::map<int64_t, float> score_of;
+    for (std::size_t i = 0; i < everything.ids.size(); ++i) score_of[everything.ids[i]] = everything.values[i];
+    std::size_t seen = 0;
+    for (std::size_t s = 0; s < 2; ++s) {
+        const auto u = uuid_of(inverted[s]);
+        const auto part = fts(u.data(), 1);
+        check(part.ok, "segment FTS: " + part.error);
+        for (std::size_t i = 0; i < part.ids.size(); ++i) {
+            check((part.ids[i] < 1000) == (s == 0), "an FTS segment returns its own rows");
+            check(score_of.count(part.ids[i]) == 1U && score_of[part.ids[i]] == part.values[i],
+                  "a segment's score is the whole search's");
+        }
+        seen += part.ids.size();
+    }
+    check(seen == everything.ids.size(), "the segments' rows are the whole search's");
+    {
+        const uint8_t twice[32] = {};
+        LanceScanner* sc = lance_scanner_new(ds, nullptr, nullptr);
+        check(lance_scanner_set_fts_index_segments(sc, twice, 2) != 0, "duplicate FTS segment UUIDs");
+        lance_scanner_close(sc);
+    }
+    lance_fts_query_context_close(ctx);
+    lance_dataset_close(ds);
+}
+
 int main(int argc, char** argv) {
     const std::filesystem::path dir =
         argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::temp_directory_path() / "nl_lance_c_search";
@@ -514,9 +813,12 @@ int main(int argc, char** argv) {
             test_coverage(uri);
         }
     }
+    test_segments(dir);
     test_include_deleted_rows((dir / "deleted.lance").string());
     test_update_if((dir / "upsert.lance").string());
-    std::filesystem::remove_all(dir);
+    if (std::getenv("NANOLANCE_KEEP_TEST_DATA") == nullptr) {
+        std::filesystem::remove_all(dir);
+    }
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

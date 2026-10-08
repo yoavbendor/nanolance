@@ -769,9 +769,11 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     request.columns = &columns;
     request.with_row_address = true;
     request.fragment_ids = target != nullptr ? target->fragments : nullptr;
+    const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
     OwnedSchema scanned;
     OwnedBatches batches;
-    if (!lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error)) {
+    if (!index_build::stage(progress, "load_data", 0, "rows",
+                            [&] { return lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error); })) {
         return false;
     }
     const ArrowSchema* col_type = scanned.s.children[0];
@@ -880,7 +882,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     Sorted sorted;
     sort_items(items, kind, type != ScalarIndexType::BTree, sorted);
 
-    const auto uuid = new_uuid();
+    const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -892,6 +894,12 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     std::string details;
     std::uint32_t index_version = 0;
     bool written = false;
+    const char* write_stage = type == ScalarIndexType::BTree    ? "write_lookup_file"
+                              : type == ScalarIndexType::Bitmap ? "write_bitmap_index"
+                                                                : "write_label_list_index";
+    if (progress != nullptr) {
+        (*progress)(0, write_stage, 1, "files", 0);
+    }
     switch (type) {
     case ScalarIndexType::BTree:
         written = write_btree(dir, *key_type, items, sorted, files, error);
@@ -912,6 +920,9 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     if (!written) {
         std::filesystem::remove_all(dir, ec);
         return false;
+    }
+    if (progress != nullptr) {
+        (*progress)(2, write_stage, 0, "", 0);
     }
 
     std::vector<std::uint32_t> fragment_ids;

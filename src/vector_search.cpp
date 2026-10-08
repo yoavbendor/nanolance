@@ -1952,6 +1952,39 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             }
         }
     }
+    const bool chosen = q.use_index && !q.segments.empty();
+    if (chosen) {
+        // The segments asked for, in manifest order (Lance's with_index_segments).
+        const std::set<std::array<std::uint8_t, 16>> wanted(q.segments.begin(), q.segments.end());
+        segments.clear();
+        for (const auto& index : manifest.indices) {
+            if (wanted.count(index.uuid) != 0U) {
+                segments.push_back(&index);
+            }
+        }
+        if (segments.size() != wanted.size()) {
+            std::string missing;
+            for (const auto& uuid : wanted) {
+                if (std::none_of(segments.begin(), segments.end(),
+                                 [&](const pb::IndexMetadata* s) { return s->uuid == uuid; })) {
+                    missing += (missing.empty() ? "\"" : ", \"") + pb::uuid_string(uuid) + "\"";
+                }
+            }
+            error = "with_index_segments referenced unknown index segments: [" + missing + "]";
+            return false;
+        }
+        if (std::any_of(segments.begin(), segments.end(),
+                        [&](const pb::IndexMetadata* s) { return s->fields.empty() || s->fields.front() != fid; })) {
+            error = "with_index_segments contained a segment that does not belong to vector column '" + q.column + "'";
+            return false;
+        }
+        index_name = segments.front()->name;
+        if (std::any_of(segments.begin(), segments.end(),
+                        [&](const pb::IndexMetadata* s) { return s->name != index_name; })) {
+            error = "with_index_segments must reference segments from a single logical index";
+            return false;
+        }
+    }
     std::vector<std::shared_ptr<const IvfIndex>> loaded;
     std::string not_used;  // why the index was not used
     if (!q.use_index) {
@@ -1969,12 +2002,21 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             if (!load_ivf(dataset_path / "_indices" / pb::uuid_string(s->uuid), index, why)) {
                 not_used = why;
             } else if (q.metric && *q.metric != index->metric) {
+                if (chosen) {
+                    error = std::string("with_index_segments requested metric ") + vector_metric_name(*q.metric) +
+                            " but the selected index segments use " + vector_metric_name(index->metric);
+                    return false;
+                }
                 not_used = std::string("the index's metric is ") + vector_metric_name(index->metric);
             } else {
                 loaded.push_back(index);
             }
         }
         if (!not_used.empty()) {
+            if (chosen) {
+                error = "with_index_segments: the selected index segments cannot be searched: " + not_used;
+                return false;
+            }
             loaded.clear();
         }
     }
@@ -2047,7 +2089,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         }
         keep_best(ann, kk);
         std::vector<std::uint64_t> unindexed;
-        if (!q.fast_search) {
+        if (!q.fast_search && !chosen) {
             for (const auto& f : manifest.fragments) {
                 if (covered.count(static_cast<std::uint32_t>(f.id)) == 0U) {
                     unindexed.push_back(f.id);

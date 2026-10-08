@@ -350,8 +350,8 @@ Suggested order: phrase queries from (4) next (IVF_HNSW_SQ from (2) is done).
 ## lance-c: what is left of the C API (2026-10-07)
 
 `liblance_c` defines all 127 functions of lance-c's header (`compat/lance-c/UPSTREAM`). When this
-section was written 39 of them only returned `LANCE_ERR_NOT_SUPPORTED`; 20 still do (2026-10-08),
-all of them the index-segment API. All 39 are
+section was written 39 of them only returned `LANCE_ERR_NOT_SUPPORTED`; none does now (2026-10-08):
+the last 20, the index-segment API, are done, and lance-c's own suite passes 106 of 106. All 39 were
 vector search, full-text search or index segments. Much of what they need now exists in nanolance's
 core (Phases 2 and 3 above) and only has to be wired into `src/lance_c.cpp`. `docs/LANCE_C_COMPAT.md`
 still calls vector and full-text indexes out of scope; it should be updated along with this work.
@@ -364,7 +364,10 @@ still calls vector and full-text indexes out of scope; it should be updated alon
      `set_query_parallelism`, which Lance's HNSW search uses).
    - `lance_scanner_nearest_multivector`: multivector search.
    - `lance_dataset_prepare_fts_phrase_query`: positions in INVERTED indexes.
-3. **Index segments**, 23 functions: build an index in pieces, possibly on other machines, and
+3. ~~**Index segments**~~ -- **done (2026-10-08)**: builders, model training, metadata, commit with
+   Lance's replacement rules, listing, and searches restricted to segments (vector, full-text with
+   the whole index's scores, scoped scalar scans); pylance uses the indexes committed this way
+   (`docs/LANCE_C_COMPAT.md`). What it was: build an index in pieces, possibly on other machines, and
    commit the pieces. This is the one large new subsystem; it shares its core with distributed
    builds (item 6 of the index gaps). The four lance-c tests nanolance fails today all need it
    (`index_segment_builder`, `index_segment_builder_progress`,
@@ -388,8 +391,13 @@ still calls vector and full-text indexes out of scope; it should be updated alon
    - Writes in Lance's inline, packed and dedicated blob layouts (nanolance writes external blobs
      and reads every layout).
 
-What is left: item 3 (index segments, 20 functions), the features item 2 waits on, and the rest of
-item 4.
+What is left: the features item 2 waits on, the rest of item 4, and the options and index kinds
+`docs/LANCE_C_COMPAT.md` lists as not implemented (BTREE / BITMAP / LABEL_LIST parameters, nearest
+or full-text search with `set_fragment_ids`, IVF_SQ / IVF_HNSW_PQ / IVF_HNSW_FLAT, Hamming).
+
+Found along the way (not lance-c's): full-text results with exactly equal scores come back in
+another order than pylance's (the rows and scores agree; pylance's order is stable). Matters only
+when a limit cuts through a tie.
 
 ---
 

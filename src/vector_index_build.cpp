@@ -822,7 +822,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     }
     if (model != nullptr &&
         (model->dim != dim || model->centroids.size() != model->partitions * dim ||
-         (pq && model->codebook.size() != (std::size_t{1} << model->nbits) * dim))) {
+         (pq && model->has_codebook && model->codebook.size() != (std::size_t{1} << model->nbits) * dim))) {
         error = "vector index on " + column + ": its model does not match the column's dimension " +
                 std::to_string(dim);
         return false;
@@ -915,7 +915,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         return false;
     }
     const std::size_t nc = std::size_t{1} << options.num_bits;
-    if (model == nullptr && pq && data.n < nc) {
+    if ((model == nullptr || !model->has_codebook) && pq && data.n < nc) {
         error = "Not enough rows to train PQ. Requires " + std::to_string(nc) + " rows but only " +
                 std::to_string(data.n) + " available";
         return false;
@@ -926,19 +926,43 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
 
     // IVF: train on a sample, then every vector to its nearest centroid.
     const bool dot_metric = options.metric == VectorMetric::Dot;
+    const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
+    index_build::VectorModel* trained = target != nullptr ? target->trained : nullptr;
     double loss = 0;
     std::vector<float> centroids;
-    if (model != nullptr) {
-        centroids = model->centroids;
-    } else {
-        const auto train = gather(data, sample_indices(data.n, std::size_t{options.sample_rate} * partitions, rng));
-        centroids = kmeans(train, partitions, dot_metric, options.max_iters, rng, loss);
+    index_build::stage(progress, "train_ivf", options.max_iters, "iterations", [&] {
+        if (model != nullptr) {
+            centroids = model->centroids;
+        } else {
+            const auto train =
+                gather(data, sample_indices(data.n, std::size_t{options.sample_rate} * partitions, rng));
+            centroids = kmeans(train, partitions, dot_metric, options.max_iters, rng, loss);
+        }
+        return true;
+    });
+    if (trained != nullptr) {
+        trained->type = options.type;
+        trained->metric = options.metric;
+        trained->dim = dim;
+        trained->partitions = partitions;
+        trained->centroids = centroids;
+        trained->nbits = options.num_bits;
+        trained->m = pq ? options.num_sub_vectors : 0U;
+        trained->has_codebook = false;
+        trained->has_sq = false;
+        if (!pq) {
+            return true;
+        }
     }
     std::vector<std::uint32_t> label;
-    assign(data, centroids, partitions, dot_metric, label, nullptr);
-    if (model != nullptr && target->rebalance_target != 0U) {
-        adjust_partitions(data, centroids, partitions, label, target->rebalance_target, dot_metric, options.max_iters);
-    }
+    index_build::stage(progress, "shuffle", data.n, "rows", [&] {
+        assign(data, centroids, partitions, dot_metric, label, nullptr);
+        if (model != nullptr && target->rebalance_target != 0U) {
+            adjust_partitions(data, centroids, partitions, label, target->rebalance_target, dot_metric,
+                              options.max_iters);
+        }
+        return true;
+    });
     std::vector<std::uint64_t> lengths(partitions, 0);
     for (const auto l : label) {
         ++lengths[l];
@@ -974,7 +998,10 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             }
         };
         codebook.resize(m * nc * w);
-        if (model != nullptr) {
+        if (progress != nullptr) {
+            (*progress)(0, "train_quantizer", 0, "", 0);
+        }
+        if (model != nullptr && model->has_codebook) {
             codebook = model->codebook;
         } else {
         const auto picked = sample_indices(data.n, std::size_t{options.sample_rate} * nc, rng);
@@ -1004,6 +1031,17 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             const auto c = kmeans_flat(subs[s], nc, false, options.max_iters, sub_rng, sub_loss);
             std::copy(c.begin(), c.end(), codebook.begin() + static_cast<std::ptrdiff_t>(s * nc * w));
         });
+        }
+        if (progress != nullptr) {
+            (*progress)(2, "train_quantizer", 0, "", 0);
+        }
+        if (trained != nullptr) {
+            trained->codebook = codebook;
+            trained->has_codebook = true;
+            return true;
+        }
+        if (progress != nullptr) {
+            (*progress)(0, "merge_partitions", partitions, "partitions", 0);
         }
         // Codes: each sub-vector's nearest codebook entry by L2, whatever the metric.
         std::vector<std::uint8_t> row_codes(data.n * m);  // [row][m], rows in `order`
@@ -1049,7 +1087,10 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     std::vector<std::uint8_t> sq;  // [row][dim], rows in `order`
     std::vector<hnsw_build::Graph> graphs;
     if (hnsw) {
-        if (model != nullptr) {
+        if (progress != nullptr) {
+            (*progress)(0, "train_quantizer", 0, "", 0);
+        }
+        if (model != nullptr && model->has_sq) {
             sq_start = model->sq_start;
             sq_end = model->sq_end;
         } else {
@@ -1062,6 +1103,10 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                     sq_end = std::max(sq_end, static_cast<double>(x[j]));
                 }
             }
+        }
+        if (progress != nullptr) {
+            (*progress)(2, "train_quantizer", 0, "", 0);
+            (*progress)(0, "merge_partitions", partitions, "partitions", 0);
         }
         sq.resize(data.n * dim);
         const double range = sq_end - sq_start;
@@ -1089,11 +1134,19 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             codes.start = sq_start;
             codes.end = sq_end;
             graphs[p] = hnsw_build::build(codes, params);
+            if (progress != nullptr) {
+                (*progress)(1, "merge_partitions", 0, "", p + 1U);
+            }
         }
+    }
+    if (!pq && !hnsw && progress != nullptr) {
+        (*progress)(0, "train_quantizer", 0, "", 0);
+        (*progress)(2, "train_quantizer", 0, "", 0);
+        (*progress)(0, "merge_partitions", partitions, "partitions", 0);
     }
 
     // The files.
-    const auto uuid = new_uuid();
+    const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -1338,6 +1391,9 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                          .count();
     if (target != nullptr && target->details != nullptr) {
         details = *target->details;
+    }
+    if (progress != nullptr) {
+        (*progress)(2, "merge_partitions", 0, "", 0);
     }
     auto entry = pb::make_index_metadata(uuid, {field->id}, name, version, fragment_ids,
                                          "/lance.index.pb.VectorIndexDetails", 1, static_cast<std::uint64_t>(now),

@@ -376,6 +376,14 @@ std::string uuid_string(const std::array<std::uint8_t, 16>& uuid) {
     return s;
 }
 
+bool decode_index_message(const std::uint8_t* data, std::size_t size, IndexMetadata& index, std::string& error) {
+    return decode_index_metadata(data, size, index, error);
+}
+
+std::vector<std::uint8_t> encode_index_message(const IndexMetadata& index) {
+    return encode_index_metadata(index);
+}
+
 bool decode_index_section(const std::vector<std::uint8_t>& bytes, std::vector<IndexMetadata>& out,
                           std::string& error) {
     out.clear();
