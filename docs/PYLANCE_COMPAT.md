@@ -38,10 +38,12 @@ compared, results are checked against pylance on the same files, in both directi
 | Write | `lance.write_dataset(data, uri, schema=, mode="create" / "append" / "overwrite", max_rows_per_file=, max_bytes_per_file=)`. Takes a table, batches, a reader, pandas, polars, dicts, lists of dicts or pydantic models, another dataset. One version per call, as in pylance. `LanceDataset.insert`, `LanceDataset.from_pydantic_model`. An append may leave out nullable columns: as in Lance, its files hold only the columns given, and the others read as null (a struct or list column as a null value). Unlike pylance, an append whose column types differ from the dataset's is cast rather than refused. |
 | Read | `to_table`, `to_batches`, `scanner` (+ `ScannerBuilder`), `head`, `slice`, `take`, `_take_rows` / `take_rows`, `sample`, `count_rows`, `to_pandas`. `columns=` as a list or a `{alias: column}` rename (a nested field `s.x` or `` `meta-data`.`id` `` comes back under the name as written), `limit`, `offset`, `batch_size`, `fragments=`, `with_row_id`, `with_row_address`, `order_by` (column names or `ColumnOrdering`, exact names, per-key direction and null placement; floats in IEEE total order as Lance sorts them; after the filter, before offset and limit; the result is sorted in memory), `batch_size_bytes`, `LANCE_DEFAULT_BATCH_SIZE`, `disable_scoring_autoprojection`, `default_scan_options` (the dataset's schema shows the row id columns they add), and the system columns `_rowid`, `_rowaddr`, `_rowoffset`, `_row_created_at_version`, `_row_last_updated_at_version` in a projection or a `take`, and in a filter (`_rowid` / `_rowaddr`, evaluated over the scanned rows before limit and offset; not combined with vector or full-text search). Without stable row ids both version columns read 1, as in Lance. |
 | Versions | `version`, `latest_version`, `versions()` (with pylance's summary metadata), `version_refs()`, `checkout_version` (a number or a tag), `checkout_latest`, `restore`; `tags` (`list`, `list_ordered`, `get_version`, `create`, `update`, `delete`, `replace_metadata`, in Lance's `_refs/tags` files, so pylance and nanolance see each other's); `cleanup_old_versions` / `explain_cleanup_old_versions` with all of pylance's options, by Lance's rules (the read version, newer and tagged versions kept; files no version names kept until 7 days old; only files no newer than the earliest version kept are listed); automatic cleanup from `lance.auto_cleanup.*` after every commit (`auto_cleanup_options`, `optimize.enable_auto_cleanup` / `disable_auto_cleanup`); `LanceDataset.drop` (refused unless the path holds a readable manifest). Branches are not supported. |
-| Metadata | `schema` (with its schema metadata), `data_storage_version`, `config` / `update_config` / `delete_config_keys`, `metadata` / `update_metadata`, `schema_metadata` / `update_schema_metadata` / `replace_schema_metadata` |
+| Metadata | `schema` (with its schema metadata), `lance_schema` (`lance.schema.LanceSchema` / `LanceField`: ids, parents, field metadata, keys, `field` / `field_case_insensitive`, `from_pyarrow`, pickling), `data_storage_version`, `config` / `update_config` / `delete_config_keys`, `metadata` / `update_metadata`, `schema_metadata` / `update_schema_metadata` / `replace_schema_metadata`, `update_field_metadata` (by path; set, remove, replace) |
+| Statistics | `stats.dataset_stats`, `stats.data_stats` (bytes on disk per field, as Lance sums them), `stats.index_stats` / `index_statistics` (the same numbers as pylance's for BTree, Bitmap, LabelList, INVERTED, IVF_FLAT, IVF_PQ and IVF_HNSW_SQ, on either library's index), `validate` |
+| Transactions | `read_transaction`, `get_transactions` (as `Transaction` / `LanceOperation.*`, from the `_transactions/*.txn` file every commit writes; pylance and nanolance read either library's the same way), `transaction_properties=` and `commit_message=` on writes. Committing a hand-built transaction is not implemented. |
 | Fragments | `get_fragments`, `get_fragment`; `LanceFragment`: `fragment_id`, `metadata` (`FragmentMetadata`, `DataFile`, `DeletionFile`), `count_rows`, `physical_rows`, `num_deletions`, `to_table`, `to_batches`, `scanner`, `head`, `take` |
 | Filters | `filter=` on `to_table`, `to_batches`, `scanner`, `count_rows` and fragments: an SQL string or a pyarrow compute expression. Comparisons, `AND` / `OR` / `NOT` with SQL's three-valued logic, `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE` / `ILIKE`, arithmetic, `CAST`, `DATE` / `TIMESTAMP` literals, struct fields (`s.a`), and the functions `lower`, `upper`, `length`, `abs`, `coalesce`, `starts_with`, `ends_with`, `contains`. With a filter, `offset` and `limit` count the rows that pass, as in pylance. |
-| Changes | `delete`, `update` (SQL values), `merge_insert` (`when_matched_update_all`, with or without a condition over `source.*` / `target.*`, `when_matched_delete`, `when_matched_fail`, `when_not_matched_insert_all`, `when_not_matched_by_source_delete`, `write_mode`, `execute`; `on` defaults to the schema's unenforced primary key; a source with part of the columns keeps the matched rows' other values and gives inserted rows nulls there, written as whole rows in every `write_mode`), `add_columns` (SQL expressions, a `pa.field` / schema of null columns, or a reader), `drop_columns`, `alter_columns` (rename, nullability, data type), `optimize.compact_files`, `optimize.optimize_indices`. Each is one version (compaction of indexed
+| Changes | `delete`, `update` (SQL values), `merge_insert` (`when_matched_update_all`, with or without a condition over `source.*` / `target.*`, `when_matched_delete`, `when_matched_fail`, `when_not_matched_insert_all`, `when_not_matched_by_source_delete`, `write_mode`, `execute`; `on` defaults to the schema's unenforced primary key; a source with part of the columns keeps the matched rows' other values and gives inserted rows nulls there, written as whole rows in every `write_mode`), `add_columns` (SQL expressions, a `pa.field` / schema of null columns, or a reader), `merge` (new columns joined on a key; not yet into a dataset with deleted rows), `drop_columns`, `alter_columns` (rename, nullability, data type), `optimize.compact_files`, `optimize.optimize_indices`. Each is one version (compaction of indexed
 fragments two: see "Keeping indexes up to date"), and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column. |
 | Blobs | Blob v2 columns, every storage kind pylance writes (inline, packed, dedicated, external, empty, null): `to_table` returns their descriptions, as pylance does, and `blob_handling="all_binary"` their bytes. `take_blobs` (by `ids`, `addresses` or `indices`) returns `lance.BlobFile` handles (`read`, `readall`, `readinto`, `seek`, `tell`, `size`, `read_range`, `read_ranges`), and `read_blobs` the bytes. A handle reads only the bytes asked for, where they are. |
 | Files | `lance.file`: `LanceFileReader` (`read_all`, `read_range`, `take_rows`, `num_rows`, `metadata`, `file_statistics`, `read_global_buffer`), `LanceFileWriter`, `LanceFileSession` (local), `stable_version` |
@@ -225,10 +227,11 @@ readable, but nanolance refuses to commit to it rather than drop its indices.
 These raise `NotImplementedError` (`nanolance.lance.NotSupportedError`) naming the feature. None of
 them is silently ignored:
 
-- Substrait filters, and SQL functions beyond the list above (regular expressions,
-  JSON, array functions other than `array_has_any`, `array_has_all` and `array_contains` /
-  `array_has`). A function the filter dialect lacks is refused by name.
-- The transaction API (`LanceOperation`, `commit`, `write_fragments`), `LanceFragment.merge_columns`
+- Substrait filters, `LanceDataset.sql`, and SQL functions beyond those listed (the filter dialect
+  now has the `json_*` functions, `regexp_match` / `regexp_like`, `::` / `arrow_cast` casts and
+  `array_has_any` / `array_has_all` / `array_contains`). A function it lacks is refused by name.
+- Committing transactions (`LanceDataset.commit`, `commit_batch`, `write_fragments`,
+  `LanceFragment.create`; `LanceOperation` exists for reading them), `LanceFragment.merge_columns`
   / `update_columns`. (Racing writers are retried as Lance retries them:
   an append or overwrite is built again on the newer version, a change is rebased when the other
   writers only added fragments, and a delete, update, merge, compaction or index optimization whose
@@ -236,7 +239,7 @@ them is silently ignored:
 - Fuzzy full-text queries and the full-text features listed under "Full-text indexes",
   vector indexes other than IVF_FLAT and IVF_PQ, and scalar indexes other than BTree, Bitmap,
   LabelList and INVERTED. An index pylance built is kept, though: see "Indexes" below.
-- Tags and branches, stable row ids, multiple base paths, shallow and deep clones.
+- Branches, stable row ids, multiple base paths, shallow and deep clones.
 - Writing Lance's inline, packed and dedicated blob layouts (`lance.blob_field`, `lance.blob_array`):
   nanolance writes external blobs, and reads every kind.
 - Object stores and namespaces (`s3://`, `gs://`, REST and directory namespaces).
@@ -269,26 +272,29 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **336**, every one of which pylance also passes (316 before JSON columns and filter functions, 312 before compaction planning, 311 before transaction files, 305 before `order_by`, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
+| nanolance.lance | **383**, every one of which pylance also passes (336 before the small dataset APIs, 316 before JSON columns and filter functions, 312 before compaction planning, 311 before transaction files, 305 before `order_by`, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
 
 By test file, where nanolance passes any:
 
 | file | pylance | nanolance |
 |---|---|---|
-| test_dataset.py | 250 | 87 |
-| test_scalar_index.py | 189 | 46 |
+| test_dataset.py | 250 | 142 |
+| test_scalar_index.py | 189 | 50 |
 | test_file.py | 40 | 27 |
+| test_column_names.py | 27 | 27 |
+| test_filter.py | 26 | 24 |
+| test_vector_index.py | 97 | 23 |
 | test_map_type.py | 19 | 17 |
-| test_column_names.py | 27 | 17 |
 | test_lance.py | 23 | 11 |
+| test_json.py | 18 | 10 |
+| test_fragment.py | 85 | 10 |
 | test_coerce_query_vector.py | 10 | 10 |
-| test_filter.py | 26 | 9 |
-| test_fragment.py | 85 | 9 |
-| test_json.py | 18 | 5 |
+| test_optimize.py | 22 | 6 |
+| test_schema.py | 4 | 4 |
+| test_schema_evolution.py | 23 | 4 |
 | test_pydantic.py | 12 | 4 |
-| test_schema_evolution.py | 23 | 3 |
 | test_vector.py | 9 | 3 |
-| others | | 9 |
+| others | | 11 |
 
 The main reasons tests fail today:
 

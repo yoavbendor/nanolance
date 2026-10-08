@@ -158,6 +158,9 @@ struct Manifest {
     std::uint64_t restored_version = 0;  // Restore: the version restored
     std::size_t first_new_fragment = 0;  // Append: fragments from here on are the new ones
     std::uint32_t reserved_fragments = 0;  // Reserve: fragment ids reserved (max_fragment_id raised by it)
+    /// Not on the wire: the commit's transaction properties (its message among them), for its
+    /// transaction file.
+    std::map<std::string, std::string> transaction_properties;
 };
 
 /// Reader feature flags, as Lance defines them (Manifest.reader_feature_flags).

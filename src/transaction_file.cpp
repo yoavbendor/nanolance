@@ -14,6 +14,7 @@
 #include "nanolance/manifest_reader.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -98,6 +99,72 @@ Bytes update_map(const std::map<std::string, std::string>& before, const std::ma
     return out;
 }
 
+/// Lance's Project.preserves_nullability is false when a field became non-nullable.
+bool project_tightens_nullability(const pb::Manifest& before, const pb::Manifest& after) {
+    std::map<std::int32_t, bool> nullable;
+    for (const auto& f : before.fields) {
+        nullable[f.id] = f.nullable;
+    }
+    for (const auto& f : after.fields) {
+        const auto it = nullable.find(f.id);
+        if (it != nullable.end() && it->second && !f.nullable) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Lance's merge_introduces_required_field (Merge.preserves_nullability is its negation): a new
+/// field that is not nullable at the first new node of its path, or any new node under a
+/// non-nullable top-level column.
+bool merge_introduces_required_field(const pb::Manifest& before, const pb::Manifest& after) {
+    const auto children = [](const pb::Manifest& m, std::int32_t parent) {
+        std::vector<const pb::Field*> out;
+        for (const auto& f : m.fields) {
+            if (f.parent_id == parent) {
+                out.push_back(&f);
+            }
+        }
+        return out;
+    };
+    // (any new node, any first-new node non-nullable) below old_parent / new_parent.
+    std::function<std::pair<bool, bool>(std::int32_t, std::int32_t)> subtree = [&](std::int32_t old_parent,
+                                                                                    std::int32_t new_parent) {
+        bool any_new = false;
+        bool any_required = false;
+        const auto old_children = children(before, old_parent);
+        for (const auto* field : children(after, new_parent)) {
+            const auto it = std::find_if(old_children.begin(), old_children.end(),
+                                         [&](const pb::Field* o) { return o->name == field->name; });
+            if (it != old_children.end()) {
+                const auto [n, r] = subtree((*it)->id, field->id);
+                any_new = any_new || n;
+                any_required = any_required || r;
+            } else {
+                any_new = true;
+                any_required = any_required || !field->nullable;
+            }
+        }
+        return std::make_pair(any_new, any_required);
+    };
+    const auto old_top = children(before, -1);
+    for (const auto* field : children(after, -1)) {
+        const auto it = std::find_if(old_top.begin(), old_top.end(),
+                                     [&](const pb::Field* o) { return o->name == field->name; });
+        if (it == old_top.end()) {
+            if (!field->nullable) {
+                return true;
+            }
+            continue;
+        }
+        const auto [any_new, any_required] = subtree((*it)->id, field->id);
+        if (any_required || (any_new && !field->nullable)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::map<std::string, std::string> as_strings(const std::map<std::string, std::vector<std::uint8_t>>& m) {
     std::map<std::string, std::string> out;
     for (const auto& [k, v] : m) {
@@ -159,14 +226,14 @@ std::pair<std::uint32_t, Bytes> operation(const pb::Manifest* parent, const pb::
         }
         return {kAppend, op};
     }
-    if (parent == nullptr || next.operation == pb::Manifest::Operation::Overwrite) {
-        // (Without the version before, every config value is an upsert: the same table config.)
-        return {kOverwrite, overwrite(next, parent != nullptr ? parent->config : std::map<std::string, std::string>{})};
-    }
     if (next.operation == pb::Manifest::Operation::Restore) {
         Bytes op;
         put_uint(op, 1, next.restored_version);
         return {kRestore, op};
+    }
+    if (parent == nullptr || next.operation == pb::Manifest::Operation::Overwrite) {
+        // (Without the version before, every config value is an upsert: the same table config.)
+        return {kOverwrite, overwrite(next, parent != nullptr ? parent->config : std::map<std::string, std::string>{})};
     }
     std::map<std::uint64_t, Bytes> before;
     for (const auto& f : parent->fragments) {
@@ -217,7 +284,36 @@ std::pair<std::uint32_t, Bytes> operation(const pb::Manifest* parent, const pb::
     Bytes after_schema;
     put_schema(before_schema, 1, *parent);
     put_schema(after_schema, 1, next);
-    const bool schema_changed = before_schema != after_schema;
+    bool schema_changed = before_schema != after_schema;
+    // Only field metadata changed (Lance's update_field_metadata): an UpdateConfig of it.
+    Bytes field_metadata;
+    if (schema_changed && parent->fields.size() == next.fields.size() && parent->fragments.size() == next.fragments.size()) {
+        bool only_metadata = parent->schema_metadata == next.schema_metadata;
+        for (std::size_t i = 0; only_metadata && i < next.fields.size(); ++i) {
+            pb::Field a = parent->fields[i];
+            pb::Field b = next.fields[i];
+            const auto changes = update_map(as_strings(a.metadata), as_strings(b.metadata));
+            a.metadata.clear();
+            b.metadata.clear();
+            only_metadata = pb::encode_field(a) == pb::encode_field(b);
+            if (only_metadata && !changes.empty()) {
+                Bytes entry;
+                put_uint(entry, 1, static_cast<std::uint32_t>(next.fields[i].id));
+                put_bytes(entry, 2, changes);
+                put_bytes(field_metadata, 9, entry);
+            }
+        }
+        if (only_metadata) {
+            for (std::size_t i = 0; only_metadata && i < next.fragments.size(); ++i) {
+                only_metadata = fragment_bytes(parent->fragments[i]) == fragment_bytes(next.fragments[i]);
+            }
+        }
+        if (only_metadata) {
+            schema_changed = false;
+        } else {
+            field_metadata.clear();
+        }
+    }
 
     if (next.operation == pb::Manifest::Operation::Rewrite) {
         // One group: the fragments replaced and those replacing them (Lance conflicts a concurrent
@@ -242,7 +338,8 @@ std::pair<std::uint32_t, Bytes> operation(const pb::Manifest* parent, const pb::
     if (schema_changed) {
         Bytes op;
         if (added.empty() && removed.empty() && !files_changed) {
-            put_schema(op, 1, next);  // a drop or a rename: Project
+            put_schema(op, 1, next);  // a drop, a rename, a nullability change: Project
+            put_uint(op, 2, project_tightens_nullability(*parent, next) ? 0U : 1U);
             return {kProject, op};
         }
         for (const auto& f : next.fragments) {
@@ -250,6 +347,7 @@ std::pair<std::uint32_t, Bytes> operation(const pb::Manifest* parent, const pb::
         }
         put_schema(op, 2, next);
         put_schema_metadata(op, 3, next);
+        put_uint(op, 4, merge_introduces_required_field(*parent, next) ? 0U : 1U);
         return {kMerge, op};
     }
     const bool update = next.operation == pb::Manifest::Operation::Update;  // update, merge_insert
@@ -346,6 +444,7 @@ std::pair<std::uint32_t, Bytes> operation(const pb::Manifest* parent, const pb::
     if (!schema.empty()) {
         put_bytes(op, 8, schema);
     }
+    op.insert(op.end(), field_metadata.begin(), field_metadata.end());
     return {kUpdateConfig, op};
 }
 
@@ -372,6 +471,12 @@ bool write_transaction_file(const std::filesystem::path& dataset_path, const pb:
     Bytes tx;
     put_uint(tx, 1, read_version);
     put_string(tx, 2, uuid);
+    for (const auto& [key, value] : next.transaction_properties) {
+        Bytes entry;
+        put_string(entry, 1, key);
+        put_string(entry, 2, value);
+        put_bytes(tx, 4, entry);
+    }
     const auto [field, op] = operation(has_parent ? &parent : nullptr, next);
     put_bytes(tx, field, op);
 

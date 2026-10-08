@@ -112,7 +112,7 @@ class LanceFileReader:
         self._path = _local(path)
         self._columns = None if columns is None else [str(c) for c in columns]
         with native():
-            self._rows, _, schema, self._pages = _nanolance._file_info(self._path)
+            self._rows, _, schema, self._pages, _ = _nanolance._file_info(self._path)
         self._schema = pa.schema(schema)
 
     def _results(self, table: pa.Table, batch_size: int) -> ReaderResults:

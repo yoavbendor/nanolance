@@ -2984,7 +2984,21 @@ bool lance_file_info(const std::filesystem::path& file_path, LanceFileInfo& info
     error.clear();
     ArrowSchemaInit(&out_schema);
     ReadPlan plan;
-    return open_file_plan(file_path, LanceScanRequest{}, plan, out_schema, error, &info);
+    if (!open_file_plan(file_path, LanceScanRequest{}, plan, out_schema, error, &info)) {
+        return false;
+    }
+    pb::FileDescriptor descriptor;
+    LanceDataFileFooterLayout layout{};
+    if (!read_lance_data_file_footer_and_descriptor(file_path, descriptor, layout, error)) {
+        if (out_schema.release != nullptr) {
+            out_schema.release(&out_schema);
+        }
+        return false;
+    }
+    for (const auto& [key, value] : descriptor.schema_metadata) {
+        info.schema_metadata[key] = std::string(value.begin(), value.end());
+    }
+    return true;
 }
 
 namespace {

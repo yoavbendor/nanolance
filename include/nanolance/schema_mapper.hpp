@@ -105,10 +105,14 @@ inline bool lance_logical_type_is_bitpackable_integer(const std::string& logical
 inline constexpr std::size_t kMaxInlineConstantBytes = 32U;
 
 /// Lance `file.Field.encoding`: 1 = fixed-width, 2 = variable-width, 0 = none -- which is what
-/// pylance writes for a null-typed field, since it has no values to encode.
+/// pylance writes for a null-typed field, since it has no values to encode, and for a struct, whose
+/// values are its children's; 3 = dictionary.
 inline std::int32_t lance_on_disk_field_encoding(const std::string& logical_type) {
-    if (logical_type == "null") {
+    if (logical_type == "null" || logical_type == "struct") {
         return 0;
+    }
+    if (logical_type.rfind("dict:", 0) == 0) {
+        return 3;
     }
     return lance_field_is_variable_width(logical_type) ? 2 : 1;
 }

@@ -3060,3 +3060,30 @@ first, without degrading function or speed.
 - **Verified**: `tests/test_json_columns.py` (bytes and text both ways, appends across libraries,
   compaction, 15 JSON filters and 8 other functions equal to pylance's results); pylance's suite 336
   (316 before); ctest, lance-c 106/106, the Python suite.
+
+## Small dataset APIs
+
+- **`stats`**: `dataset_stats` (deleted rows, fragments, small files), `data_stats` (bytes on disk
+  per field: the page buffers of each field's columns, summed over the data files, as Lance sums
+  them -- `dataset_data_stats`), `index_stats` / `index_statistics` (coverage from the manifest,
+  per-segment details from the index files: BTree min / max / pages, bitmap counts, the inverted
+  index's params, tokens and documents, and for IVF_FLAT / IVF_PQ / IVF_HNSW_SQ the model --
+  partitions, centroids, k-means loss, the sub-index metadata -- read by
+  `read_vector_index_model`). Equal to pylance's on pylance's indexes and on nanolance's.
+- **`lance_schema`** and `lance.schema.LanceSchema` / `LanceField` (ids, parents, metadata, the
+  primary and clustering keys, lookups by path, `from_pyarrow`, pickling, pylance's repr), and
+  **`update_field_metadata`** (set, remove, replace; recorded as an UpdateConfig of field metadata).
+- **Transactions**: `read_transaction` / `get_transactions` decode `_transactions/*.txn` into
+  `LanceOperation.*` (Append, Delete, Overwrite, CreateIndex, Rewrite, Merge, Restore, Update,
+  Project, UpdateConfig, DataReplacement; ReserveFragments shows as a bare `BaseOperation`, as in
+  pylance) and `Transaction`; writes record `transaction_properties` and `commit_message`.
+  nanolance and pylance read every transaction of either library's history the same way.
+- **`merge`** (a hash join on a key column, the right key not added, unmatched rows null) and
+  **`validate`** (Lance's manifest and file checks).
+- **Fixed on the way**: a restore's transaction was recorded as an Overwrite; struct fields were
+  written with a "plain" encoding (pylance writes none, and "dictionary" for dictionary fields);
+  Merge and Project transactions now carry `preserves_nullability` as Lance computes it; the
+  standalone file reader keeps the file schema's metadata.
+- **Verified**: `tests/test_small_apis.py`; pylance's suite 383 (336 before, 23 of them from
+  `test_vector_index.py`, which now loads); ctest 60/60, lance-c 106/106, the Python suite.
+

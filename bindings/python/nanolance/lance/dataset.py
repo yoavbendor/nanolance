@@ -22,6 +22,7 @@ import pyarrow as pa
 
 from nanolance import _nanolance
 from nanolance.lance._errors import native, unsupported
+from nanolance.lance._transactions import Index, LanceOperation, Transaction
 
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 
@@ -680,6 +681,40 @@ class LanceDataset:
                 _nanolance._ds_add_columns_stream(self._uri, reader)
         self._refresh_latest()
 
+    def merge(self, data_obj, left_on: str, right_on: Optional[str] = None, schema=None) -> None:
+        """Add the columns of ``data_obj`` (a table, reader, dataset ...), matched to this dataset's
+        rows on ``left_on`` = ``right_on`` (Lance's hash join: rows without a match get nulls; the
+        right key column itself is not added)."""
+        right_on = left_on if right_on is None else right_on
+        if left_on not in self._data_schema.names and _resolve_path(self._data_schema, left_on) is None:
+            raise OSError(f"Invalid user input: Column {left_on} does not exist in the left side dataset")
+        if isinstance(data_obj, LanceDataset):
+            right = data_obj.to_table()
+        else:
+            right = _coerce_reader(data_obj, schema).read_all()
+        if right_on not in right.schema.names:
+            raise OSError(f"Invalid user input: Column {right_on} does not exist in the right side dataset")
+        for name in right.schema.names:
+            if name != right_on and (name in self._data_schema.names):
+                raise OSError(f"Invalid user input: Column {name} exists in both sides of the dataset")
+        if right.num_rows == 0:
+            raise OSError("Invalid user input: HashJoiner: No data")
+        if any(f["deleted_rows"] for f in self._info["fragments"]):
+            raise unsupported("merge into a dataset with deleted rows")
+        keys = self.to_table(columns=[left_on]).column(0)
+        index: Dict[Any, int] = {}
+        for row, key in enumerate(right.column(right_on).to_pylist()):
+            if key is not None:
+                index[key] = row  # a repeated key: its last row
+        take = pa.array([index.get(k) for k in keys.to_pylist()], pa.int64())
+        added = right.drop_columns([right_on]).take(take)
+        fields = [f.with_nullable(True) if added.column(f.name).null_count else f for f in added.schema]
+        added = pa.table(added.columns, schema=pa.schema(fields, metadata=added.schema.metadata))
+        with native():
+            _nanolance._ds_add_columns_stream(self._uri, pa.RecordBatchReader.from_batches(
+                added.schema, added.to_batches()))
+        self._refresh_latest()
+
     def drop_columns(self, columns: List[str]) -> None:
         if isinstance(columns, str):
             columns = [columns]
@@ -851,14 +886,155 @@ class LanceDataset:
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)
 
+    def read_transaction(self, version: int) -> Optional["Transaction"]:
+        """The transaction that made ``version``, from the file its manifest names; None without one."""
+        from nanolance.lance._transactions import decode_transaction
+
+        with native():
+            info = _nanolance._ds_info(self._uri, int(version))
+        name = info.get("transaction_file") or ""
+        if not name:
+            return None
+        try:
+            with open(os.path.join(self._uri, "_transactions", name), "rb") as handle:
+                data = handle.read()
+        except FileNotFoundError:
+            return None
+        return decode_transaction(data)
+
+    def validate(self) -> None:
+        """Check the manifest against itself and the files, as Lance's validate does: fragment ids
+        unique and ascending, no field in two files of a fragment, every data file as long as its
+        fragment, index segments unique and not overlapping."""
+        path = self._uri
+        fragments = self._info["fragments"]
+        ids = [f["id"] for f in fragments]
+        for i in sorted(set(ids)):
+            if ids.count(i) > 1:
+                raise OSError(f"LanceError(IO): Duplicate fragment id {i} found in dataset {path!r}")
+        for prev, cur in zip(ids, ids[1:]):
+            if cur < prev:
+                raise OSError("LanceError(IO): Fragment ids are not sorted in increasing fragment-id order. "
+                              f"Found {cur} after {prev} in dataset {path!r}")
+        for f in fragments:
+            seen = set()
+            lengths = []
+            for file in f["files"]:
+                for field_id in file["fields"]:
+                    if field_id == -2:
+                        continue  # a tombstone
+                    if field_id in seen:
+                        raise OSError(f"LanceError(IO): Field id {field_id} is duplicated in fragment {f['id']}")
+                    seen.add(field_id)
+                with native():
+                    lengths.append(int(_nanolance._file_info(os.path.join(path, "data", file["path"]))[0]))
+            for file, n in zip(f["files"], lengths):
+                if n != lengths[0]:
+                    raise OSError(f"LanceError(IO): data file has incorrect length. Expected: {lengths[0]} "
+                                  f"Got: {n}")
+            if lengths and lengths[0] != f["physical_rows"]:
+                raise OSError("LanceError(IO): Fragment metadata has incorrect physical_rows. "
+                              f"Actual: {lengths[0]} Metadata: {f['physical_rows']}")
+        with native():
+            indices = _nanolance._ds_list_indices(self._uri, self._version)
+        uuids = [i["uuid"] for i in indices]
+        for u in sorted(set(uuids)):
+            if uuids.count(u) > 1:
+                raise OSError(f"LanceError(IO): Duplicate index id {u} found in dataset {path!r}")
+        by_name: Dict[str, List[set]] = {}
+        for i in indices:
+            by_name.setdefault(i["name"], []).append(set(i["fragment_ids"]))
+        bad = []
+        for name, covers in by_name.items():
+            overlap = set()
+            for a in range(len(covers)):
+                for b in range(a + 1, len(covers)):
+                    overlap |= covers[a] & covers[b]
+            if overlap:
+                bad.append((name, sorted(overlap)))
+        if bad:
+            message = "Overlapping fragments detected in dataset."
+            for name, frags in bad:
+                message += f"\nIndex {name!r} has overlapping fragments: {frags}"
+            raise OSError(f"LanceError(IO): {message}")
+
+    def get_transactions(self, recent_transactions: int = 10) -> List[Optional["Transaction"]]:
+        """The transactions of this version and those before it, newest first (None where a version
+        has no transaction file)."""
+        out = []
+        version = self._version
+        while version >= 1 and len(out) < int(recent_transactions):
+            try:
+                out.append(self.read_transaction(version))
+            except OSError:
+                break  # cleaned up
+            version -= 1
+        return out
+
+    @property
+    def lance_schema(self) -> "LanceSchema":
+        """The schema as Lance holds it: field ids, parents, logical types, metadata."""
+        from nanolance.lance.schema import LanceSchema
+
+        with native():
+            fields = _nanolance._ds_fields(self._uri, self._version)
+        metadata = {k.decode(): v.decode(errors="replace") for k, v in self._info["schema_metadata"].items()}
+        return LanceSchema(fields, metadata, self.schema)
+
+    def update_field_metadata(self, field_updates: Dict[str, Dict[str, Optional[str]]], *,
+                              replace: bool = False) -> None:
+        """Set (a value) or remove (None) metadata keys of fields named by path; with ``replace``, a
+        field's metadata becomes exactly the keys given a value."""
+        if not isinstance(field_updates, dict):
+            raise TypeError(f"argument 'field_updates': '{type(field_updates).__name__}' object cannot be "
+                            "converted to 'PyDict'")
+        schema = self.lance_schema
+        by_id = {}
+        for path, values in field_updates.items():
+            if not isinstance(path, str):
+                raise TypeError(f"argument 'field_updates': '{type(path).__name__}' object is not an "
+                                "instance of 'str'")
+            entries = []
+            for k, v in dict(values).items():
+                for x in (k,) if v is None else (k, v):
+                    if not isinstance(x, str):
+                        raise TypeError(f"argument 'field_updates': '{type(x).__name__}' object is not an "
+                                        "instance of 'str'")
+                entries.append((k, v))
+            field = schema.field(path)
+            if field is None:
+                names = []
+
+                def walk(fields, prefix):
+                    for f in fields:
+                        names.append(prefix + f.name())
+                        walk(f.children(), prefix + f.name() + ".")
+
+                walk(schema.fields(), "")
+                raise OSError(f"Field '{path}' not found.\nAvailable fields: {names}")
+            by_id[field.id()] = entries
+        with native():
+            _nanolance._ds_update_field_metadata(self._uri, by_id, bool(replace))
+        self._refresh_latest()
+
+    @property
+    def stats(self) -> "LanceStats":
+        return LanceStats(self)
+
+    def index_statistics(self, index_name: str) -> str:
+        """The statistics of an index as Lance reports them (a JSON string; stats.index_stats parses it)."""
+        import json
+
+        return json.dumps(_index_statistics(self, index_name))
+
     # ── not supported ─────────────────────────────────────────────────────────────────────────────
 
     def __getattr__(self, name: str):
         known = {
             "create_index",
-            "index_statistics", "merge", "branches", "create_branch", "sql",
-            "shallow_clone", "deep_clone", "commit", "commit_batch", "session", "stats", "join", "delta",
-            "prewarm_index", "lance_schema", "validate",
+            "branches", "create_branch", "sql",
+            "shallow_clone", "deep_clone", "commit", "commit_batch", "session", "join", "delta",
+            "prewarm_index",
         }
         if name in known:
             raise unsupported(f"LanceDataset.{name}")
@@ -1559,6 +1735,183 @@ class IndexSegmentDescription:
         return f"IndexSegmentDescription(uuid={self.uuid!r}, fragment_ids={sorted(self.fragment_ids)})"
 
 
+@dataclasses.dataclass
+class FieldStatistics:
+    """Statistics about a field in the dataset"""
+
+    id: int  #: id of the field
+    bytes_on_disk: int  #: (possibly compressed) bytes on disk used to store the field
+
+
+@dataclasses.dataclass
+class DataStatistics:
+    """Statistics about the data in the dataset"""
+
+    fields: List[FieldStatistics]  #: Statistics about the fields in the dataset
+
+
+class DatasetStats(TypedDict):
+    num_deleted_rows: int
+    num_fragments: int
+    num_small_files: int
+
+
+class LanceStats:
+    """Statistics about a LanceDataset."""
+
+    def __init__(self, dataset: "LanceDataset"):
+        self._ds = dataset
+
+    def dataset_stats(self, max_rows_per_group: int = 1024) -> DatasetStats:
+        fragments = self._ds._info["fragments"]
+        return {
+            "num_deleted_rows": sum(f["deleted_rows"] for f in fragments),
+            "num_fragments": len(fragments),
+            "num_small_files": sum(1 for f in fragments if f["physical_rows"] < max_rows_per_group),
+        }
+
+    def index_stats(self, index_name: str) -> Dict[str, Any]:
+        return _index_statistics(self._ds, index_name)
+
+    def data_stats(self) -> DataStatistics:
+        with native():
+            stats = _nanolance._ds_data_stats(self._ds._uri, self._ds._version)
+        return DataStatistics(fields=[FieldStatistics(id=i, bytes_on_disk=b) for i, b in stats])
+
+
+def _index_statistics(ds: "LanceDataset", index_name: str) -> Dict[str, Any]:
+    """Lance's index_statistics: per-segment details from the index files, coverage from the manifest."""
+    with native():
+        segments = [i for i in _nanolance._ds_list_indices(ds._uri, ds._version) if i["name"] == index_name]
+    if not segments:
+        raise KeyError(f'Index "{index_name}" not found')
+    details = [_segment_statistics(ds, s) for s in segments]
+    kind = details[0].get("index_type") if details and isinstance(details[0].get("index_type"), str) else None
+    if kind is None:
+        kind = segments[0]["type"] if segments[0]["type_url"] else "N/A"
+    live = {f["id"]: f["physical_rows"] - f["deleted_rows"] for f in ds._info["fragments"]}
+    per_delta = [sum(live[i] for i in s["fragment_ids"] if i in live) for s in segments]
+    covered = [i for s in segments for i in s["fragment_ids"] if i in live]
+    indexed_rows = sum(per_delta)
+    created = [s["created_at"] for s in segments if s["created_at"]]
+    return {
+        "index_type": kind,
+        "name": index_name,
+        "num_indices": len(segments),
+        "num_segments": len(segments),
+        "indices": details,
+        "segments": [dict(d) for d in details],
+        "num_indexed_fragments": len(set(covered)),
+        "num_indexed_rows": indexed_rows,
+        "num_unindexed_fragments": len(live) - len(set(covered)),
+        "num_unindexed_rows": sum(live.values()) - indexed_rows,
+        "num_indexed_rows_per_delta": per_delta,
+        "updated_at_timestamp_ms": max(created) if created else None,
+    }
+
+
+def _scalar_display(value) -> Optional[str]:
+    """A value as DataFusion's ScalarValue displays it (what a BTree's statistics print)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (float, np.floating)):
+        if np.isnan(value):
+            return "NaN"
+        if np.isinf(value):
+            return "inf" if value > 0 else "-inf"
+        return np.format_float_positional(value, trim="-")
+    if isinstance(value, bytes):
+        return value.hex()
+    return str(value)
+
+
+def _segment_statistics(ds: "LanceDataset", segment: dict) -> Dict[str, Any]:
+    """One index segment's own statistics, as Lance's index of that type reports them."""
+    import json
+
+    directory = os.path.join(ds._uri, "_indices", segment["uuid"])
+    kind = segment["type"]
+
+    def metadata(name: str) -> Dict[bytes, bytes]:
+        with native():
+            return _nanolance._file_info(os.path.join(directory, name))[4]
+
+    def rows(name: str) -> int:
+        with native():
+            return int(_nanolance._file_info(os.path.join(directory, name))[0])
+
+    try:
+        if kind in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ", "IVF_SQ", "IVF_HNSW_PQ", "IVF_HNSW_FLAT"):
+            return _vector_statistics(ds, segment, directory)
+        if kind == "BTree":
+            table = pa.table(_nanolance._file_read(os.path.join(directory, "page_lookup.lance"), None, 0, -1))
+            mins, maxs = table.column(0).to_pylist(), table.column(1).to_pylist()
+            start = next((k for k, v in enumerate(mins) if v is not None), len(mins))
+            if pa.types.is_floating(table.schema.field(0).type):
+                np_type = table.schema.field(0).type.to_pandas_dtype()
+                mins = [None if v is None else np_type(v) for v in mins]
+                maxs = [None if v is None else np_type(v) for v in maxs]
+            return {"min": _scalar_display(mins[start]) if start < len(mins) else None,
+                    "max": _scalar_display(maxs[-1]) if start < len(mins) else None,
+                    "num_pages": len(mins)}
+        if kind in ("Bitmap", "LabelList"):
+            stats = metadata("bitmap_page_lookup.lance").get(b"lance:index_stats")
+            if stats is not None:
+                return json.loads(stats)
+            return {"num_bitmaps": rows("bitmap_page_lookup.lance")}
+        if kind == "Inverted":
+            meta = metadata("metadata.lance")
+            params = json.loads(meta.get(b"params", b"{}"))
+            parts = json.loads(meta.get(b"partitions", b"[]"))
+            return {"params": params,
+                    "num_tokens": sum(rows(f"part_{p}_invert.lance") for p in parts),
+                    "num_docs": sum(rows(f"part_{p}_docs.lance") for p in parts)}
+        if kind == "NGram":
+            return {"num_ngrams": rows("ngram_postings.lance")}
+    except (OSError, ValueError, KeyError):
+        pass
+    return {}
+
+
+def _vector_statistics(ds: "LanceDataset", segment: dict, directory: str) -> Dict[str, Any]:
+    import json
+
+    with native():
+        model = _nanolance._vector_index_model(directory)
+    index_meta = json.loads(model["index_metadata"] or "{}")
+    kind = index_meta.get("type", segment["type"])
+    metric = index_meta.get("distance_type", "l2")
+    sub: Dict[str, Any] = {}
+    if model["sub_index_metadata"]:
+        for item in json.loads(model["sub_index_metadata"]):
+            if item:
+                sub.update(json.loads(item))
+                break
+    for item in json.loads(model["storage_metadata"] or "[]"):
+        sub.update(json.loads(item) if isinstance(item, str) else item)
+        break
+    sub_kind = kind.split("_")[-1]
+    sub["index_type"] = "HNSW" if "HNSW" in kind else ("FLAT" if sub_kind == "FLAT" else sub_kind)
+    sub["metric_type"] = "l2" if sub_kind == "PQ" and metric == "cosine" else metric
+    for key in ("codebook_position", "codebook", "codebook_tensor"):
+        sub.pop(key, None)
+    include = os.environ.get("LANCE_INCLUDE_VECTOR_CENTROIDS", "true").strip().lower()
+    return {
+        "index_type": kind,
+        "uuid": segment["uuid"],
+        "uri": os.path.join(directory, "index.idx"),
+        "metric_type": metric,
+        "num_partitions": len(model["partition_sizes"]),
+        "sub_index": sub,
+        "partitions": [{"size": int(n)} for n in model["partition_sizes"]],
+        "centroids": None if include in ("0", "false", "no", "off") else model["centroids"],
+        "loss": model["loss"],
+        "index_file_version": "V3",
+    }
+
+
 class IndexDescription:
     """An index of a dataset, its segments together. Mirrors ``lance.indices.IndexDescription``."""
 
@@ -2193,6 +2546,12 @@ def write_dataset(
             writer.set_initial_config("lance.auto_cleanup.interval", str(int(auto_cleanup_options["interval"])))
             writer.set_initial_config("lance.auto_cleanup.older_than",
                                       _format_duration(int(auto_cleanup_options["older_than_seconds"])))
+    properties = dict(transaction_properties or {})
+    if commit_message is not None:
+        properties[LANCE_COMMIT_MESSAGE_KEY] = str(commit_message)
+    for key, value in properties.items():
+        with native():
+            writer.set_transaction_property(str(key), str(value))
     if target is not None and len(reader.schema.names) < len(target.names):
         # Part of the schema: the new files hold those columns alone, as Lance writes them, and the
         # others read as null.

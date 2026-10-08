@@ -103,6 +103,21 @@ std::string vector_index_type(const std::vector<std::uint8_t>& details);
 /// The same, falling back to what the index's files say (`dir`: _indices/<uuid>).
 std::string vector_index_type(const std::filesystem::path& dir, const std::vector<std::uint8_t>& details);
 
+/// A vector index's model, as its files (`dir`: _indices/<uuid>) hold it: what Lance reports as the
+/// index's statistics is made of these.
+struct VectorIndexModel {
+    std::string index_metadata;      // index.idx `lance:index` (JSON: type, distance_type)
+    std::string sub_index_metadata;  // index.idx `lance:hnsw` (JSON list, one per partition), if any
+    std::string storage_metadata;    // auxiliary.idx `storage_metadata` (JSON list)
+    std::vector<float> centroids;    // partitions * dim
+    std::size_t partitions = 0;
+    std::size_t dim = 0;
+    std::vector<std::uint64_t> partition_sizes;
+    bool has_loss = false;
+    double loss = 0;
+};
+bool read_vector_index_model(const std::filesystem::path& dir, VectorIndexModel& out, std::string& error);
+
 /// Whether an index's details type is a vector index's (Lance has used more than one package name).
 bool is_vector_index_url(const std::string& url);
 

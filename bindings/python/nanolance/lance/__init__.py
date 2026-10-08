@@ -41,6 +41,7 @@ from nanolance.lance.dataset import (
 )
 from nanolance.lance.blob import BlobFile, blob_array, blob_field
 from nanolance.lance.fragment import DataFile, DeletionFile, FragmentMetadata, LanceFragment
+from nanolance.lance._transactions import LanceOperation, Transaction
 
 #: The pylance release whose API (and test suite) this module tracks.
 PYLANCE_API_VERSION = "12.0.0"
@@ -53,9 +54,11 @@ __all__ = [
     "FragmentMetadata",
     "LanceDataset",
     "LanceFragment",
+    "LanceOperation",
     "LanceScanner",
     "NotSupportedError",
     "ScannerBuilder",
+    "Transaction",
     "__version__",
     "blob_array",
     "blob_field",

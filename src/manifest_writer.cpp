@@ -271,6 +271,7 @@ pb::Field manifest_field(const LanceField& mapped_field) {
     field.id = mapped_field.id;
     field.parent_id = mapped_field.parent_id;
     field.type = 2;
+    field.encoding = lance_on_disk_field_encoding(mapped_field.logical_type);
     field.nullable = mapped_field.nullable;
     for (const auto& kv : mapped_field.metadata) {
         // Per-file encoding choices live in each data file's own schema; the dataset's is logical.
@@ -400,6 +401,7 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
     for (const auto& kv : extras.table_metadata) {
         manifest.table_metadata[kv.first] = kv.second;
     }
+    manifest.transaction_properties = extras.transaction_properties;
     if (!exists) {
         for (const auto& kv : extras.initial_config) {
             manifest.config[kv.first] = kv.second;

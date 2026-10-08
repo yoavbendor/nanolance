@@ -5,7 +5,9 @@
 #include "nanolance/dataset_commit.hpp"
 
 #include "nanolance/manifest_reader.hpp"
+#include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_writer.hpp"
+#include "nanolance/path_safety.hpp"
 
 #include "lance_minimal.pb.hpp"
 
@@ -28,6 +30,7 @@ DatasetVersionInfo version_info(const pb::Manifest& manifest) {
     info.tag = manifest.tag;
     info.writer_library = manifest.writer_library;
     info.writer_version = manifest.writer_version;
+    info.transaction_file = manifest.transaction_file;
     return info;
 }
 
@@ -392,6 +395,124 @@ bool dataset_update_schema_metadata(const std::filesystem::path& dataset_path,
         manifest.schema_metadata[kv.first] = std::vector<std::uint8_t>(kv.second.begin(), kv.second.end());
     }
     return commit_next_version(dataset_path, std::move(manifest), new_version, error);
+}
+
+bool dataset_fields(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
+                    std::vector<DatasetField>& out, std::string& error) {
+    out.clear();
+    pb::Manifest manifest;
+    if (!load(dataset_path, has_version, version, manifest, error)) {
+        return false;
+    }
+    for (const auto& field : manifest.fields) {
+        DatasetField f;
+        f.id = field.id;
+        f.parent_id = field.parent_id;
+        f.name = field.name;
+        f.logical_type = field.logical_type;
+        f.nullable = field.nullable;
+        f.encoding = field.encoding;
+        for (const auto& [k, v] : field.metadata) {
+            f.metadata[k] = std::string(v.begin(), v.end());
+        }
+        out.push_back(std::move(f));
+    }
+    return true;
+}
+
+bool dataset_update_field_metadata(const std::filesystem::path& dataset_path,
+                                   const std::map<std::int32_t, FieldMetadataUpdate>& updates,
+                                   std::uint64_t& new_version, std::string& error) {
+    pb::Manifest manifest;
+    std::uint64_t latest = 0;
+    if (!load_latest_manifest(dataset_path, manifest, latest, error)) {
+        return false;
+    }
+    for (const auto& [id, update] : updates) {
+        const auto field = std::find_if(manifest.fields.begin(), manifest.fields.end(),
+                                        [id = id](const pb::Field& f) { return f.id == id; });
+        if (field == manifest.fields.end()) {
+            error = "Field with id " + std::to_string(id) + " not found";
+            return false;
+        }
+        if (update.replace) {
+            field->metadata.clear();
+        }
+        for (const auto& [key, value] : update.entries) {
+            if (value) {
+                field->metadata[key] = std::vector<std::uint8_t>(value->begin(), value->end());
+            } else if (!update.replace) {
+                field->metadata.erase(key);
+            }
+        }
+    }
+    return commit_next_version(dataset_path, std::move(manifest), new_version, error);
+}
+
+bool dataset_data_stats(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
+                        std::vector<std::pair<std::int32_t, std::uint64_t>>& out, std::string& error) {
+    out.clear();
+    pb::Manifest manifest;
+    if (!load(dataset_path, has_version, version, manifest, error)) {
+        return false;
+    }
+    std::map<std::int32_t, std::uint64_t> bytes;
+    for (const auto& field : manifest.fields) {
+        bytes[field.id] = 0;
+        out.emplace_back(field.id, 0);
+    }
+    for (const auto& fragment : manifest.fragments) {
+        for (const auto& file : fragment.files) {
+            // Lance opens the files that hold a field of the schema.
+            std::map<std::uint32_t, std::int32_t> column_field;
+            bool in_schema = false;
+            for (std::size_t i = 0; i < file.fields.size(); ++i) {
+                in_schema = in_schema || bytes.count(file.fields[i]) != 0U;
+                const std::int32_t column = i < file.column_indices.size() ? file.column_indices[i]
+                                            : file.column_indices.empty() ? static_cast<std::int32_t>(i) : -1;
+                if (column >= 0) {
+                    column_field[static_cast<std::uint32_t>(column)] = file.fields[i];
+                }
+            }
+            if (!in_schema || file.file_major_version < 2U) {
+                continue;  // Lance keeps no statistics for legacy (v1) files
+            }
+            const auto jailed = safe_join_under(dataset_path / "data", file.path);
+            if (!jailed) {
+                error = "data file path escapes the dataset: " + file.path;
+                return false;
+            }
+            LanceFileInfo info;
+            ArrowSchema schema{};
+            if (!lance_file_info(*jailed, info, schema, error)) {
+                return false;
+            }
+            if (schema.release != nullptr) {
+                schema.release(&schema);
+            }
+            std::int32_t current = 0;
+            for (std::size_t c = 0; c < info.pages.size(); ++c) {
+                const auto it = column_field.find(static_cast<std::uint32_t>(c));
+                if (it != column_field.end()) {
+                    current = it->second;
+                }
+                std::uint64_t size = 0;
+                for (const auto& page : info.pages[c]) {
+                    for (const auto& buffer : page.buffers) {
+                        size += buffer.second;
+                    }
+                }
+                const auto b = bytes.find(current);
+                if (b != bytes.end()) {
+                    b->second += size;
+                }
+            }
+        }
+    }
+    for (auto& entry : out) {
+        entry.second = bytes[entry.first];
+    }
+    return true;
 }
 
 }  // namespace nano_lance

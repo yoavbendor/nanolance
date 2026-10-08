@@ -36,6 +36,8 @@ struct CommitExtras {
     std::map<std::string, std::string> table_metadata;
     /// Upserted into the table config, when the commit creates the dataset (not on later commits).
     std::map<std::string, std::string> initial_config;
+    /// Recorded in the commit's transaction file.
+    std::map<std::string, std::string> transaction_properties;
 };
 
 /// Publish one new version holding `fragments` (possibly none), numbered after the latest one. Table

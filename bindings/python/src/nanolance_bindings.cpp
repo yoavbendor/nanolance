@@ -17,6 +17,7 @@
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
 #include <nanolance/scalar_index.hpp>
+#include <nanolance/schema_mapper.hpp>
 #include <nanolance/vector_search.hpp>
 #include <nanolance/writer_internal.hpp>
 
@@ -483,6 +484,7 @@ nb::dict version_dict(const nano_lance::DatasetVersionInfo& v) {
     d["tag"] = v.tag;
     d["writer_library"] = v.writer_library;
     d["writer_version"] = v.writer_version;
+    d["transaction_file"] = v.transaction_file;
     return d;
 }
 
@@ -609,7 +611,11 @@ nb::tuple file_info(const std::filesystem::path& path) {
         }
         columns.append(column);
     }
-    return nb::make_tuple(info.num_rows, info.num_columns, ExportedSchema::adopt(std::move(schema)), columns);
+    nb::dict metadata;
+    for (const auto& [key, value] : info.schema_metadata) {
+        metadata[nb::bytes(key.data(), key.size())] = nb::bytes(value.data(), value.size());
+    }
+    return nb::make_tuple(info.num_rows, info.num_columns, ExportedSchema::adopt(std::move(schema)), columns, metadata);
 }
 
 /// A writer that stages fragments and publishes them as one version at finish() -- a Lance write.
@@ -674,6 +680,11 @@ public:
         }
     }
 
+    void set_transaction_property(const std::string& key, const std::string& value) {
+        if (nano_lance_writer_set_transaction_property(&writer_, key.c_str(), value.c_str()) != 0) {
+            throw std::runtime_error("failed to set a transaction property");
+        }
+    }
     void set_initial_config(const std::string& key, const std::string& value) {
         if (nano_lance_writer_set_initial_config(&writer_, key.c_str(), value.c_str()) != 0) {
             throw std::runtime_error("failed to set the dataset config");
@@ -1041,6 +1052,7 @@ NB_MODULE(_nanolance, m) {
         .def("write_batch", &StagedWriter::write_batch)
         .def("project", &StagedWriter::project)
         .def("set_initial_config", &StagedWriter::set_initial_config)
+        .def("set_transaction_property", &StagedWriter::set_transaction_property)
         .def("finish", &StagedWriter::finish, nb::arg("mode"), nb::arg("keep_empty") = false);
     m.attr("COMMIT_CREATE") = static_cast<int>(NANO_LANCE_COMMIT_CREATE);
     m.attr("COMMIT_APPEND") = static_cast<int>(NANO_LANCE_COMMIT_APPEND);
@@ -1231,6 +1243,86 @@ NB_MODULE(_nanolance, m) {
             out.append(d);
         }
         return out;
+    });
+    m.def("_ds_fields", [](const std::filesystem::path& path, std::optional<std::uint64_t> version) {
+        std::vector<nano_lance::DatasetField> fields;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_fields(path, version.has_value(), version.value_or(0), fields, e);
+        });
+        nb::list out;
+        for (const auto& f : fields) {
+            nb::dict d;
+            d["id"] = f.id;
+            d["parent_id"] = f.parent_id;
+            d["name"] = f.name;
+            d["logical_type"] = f.logical_type;
+            d["nullable"] = f.nullable;
+            d["encoding"] = f.encoding;
+            d["metadata"] = f.metadata;
+            out.append(d);
+        }
+        return out;
+    });
+    m.def("_ds_update_field_metadata",
+          [](const std::filesystem::path& path,
+             const std::map<std::int32_t, std::vector<std::pair<std::string, std::optional<std::string>>>>& updates,
+             bool replace) {
+              std::map<std::int32_t, nano_lance::FieldMetadataUpdate> by_id;
+              for (const auto& [id, entries] : updates) {
+                  by_id[id] = nano_lance::FieldMetadataUpdate{entries, replace};
+              }
+              std::uint64_t version = 0;
+              run_op([&](std::string& e) { return nano_lance::dataset_update_field_metadata(path, by_id, version, e); });
+              return version;
+          });
+    m.def("_lance_fields_from_arrow", [](nb::handle schema) {
+        SchemaHolder holder;
+        schema_of(schema, holder);
+        nano_lance::LanceSchemaMapping mapping;
+        std::string error;
+        if (!nano_lance::map_arrow_schema(holder.schema, mapping, error)) {
+            throw nb::value_error(error.c_str());
+        }
+        nb::list out;
+        for (const auto& f : mapping.fields) {
+            nb::dict d;
+            d["id"] = f.id;
+            d["parent_id"] = f.parent_id;
+            d["name"] = f.name;
+            d["logical_type"] = nano_lance::lance_on_disk_logical_type(f.logical_type);
+            d["nullable"] = f.nullable;
+            d["encoding"] = nano_lance::lance_on_disk_field_encoding(f.logical_type);
+            d["metadata"] = f.metadata;
+            out.append(d);
+        }
+        return out;
+    });
+    m.def("_ds_data_stats", [](const std::filesystem::path& path, std::optional<std::uint64_t> version) {
+        std::vector<std::pair<std::int32_t, std::uint64_t>> stats;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_data_stats(path, version.has_value(), version.value_or(0), stats, e);
+        });
+        return stats;
+    });
+    m.def("_vector_index_model", [](const std::filesystem::path& dir) {
+        nano_lance::VectorIndexModel model;
+        run_op([&](std::string& e) { return nano_lance::read_vector_index_model(dir, model, e); });
+        nb::dict d;
+        d["index_metadata"] = model.index_metadata;
+        d["sub_index_metadata"] = model.sub_index_metadata;
+        d["storage_metadata"] = model.storage_metadata;
+        nb::list centroids;
+        for (std::size_t p = 0; p < model.partitions && model.dim != 0U; ++p) {
+            nb::list row;
+            for (std::size_t j = 0; j < model.dim && p * model.dim + j < model.centroids.size(); ++j) {
+                row.append(static_cast<double>(model.centroids[p * model.dim + j]));
+            }
+            centroids.append(row);
+        }
+        d["centroids"] = centroids;
+        d["partition_sizes"] = model.partition_sizes;
+        d["loss"] = model.has_loss ? nb::cast(model.loss) : nb::none();
+        return d;
     });
     m.def("_ds_explain_filter", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
                                    const std::string& filter) {

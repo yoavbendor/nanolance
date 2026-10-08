@@ -68,6 +68,8 @@ struct WriterState {
     std::map<std::string, std::vector<std::uint8_t>> schema_metadata;
     /// Table config recorded when the commit creates the dataset (nano_lance_writer_set_initial_config).
     std::map<std::string, std::string> initial_config;
+    /// Recorded in the finishing commit's transaction file (nano_lance_writer_set_transaction_property).
+    std::map<std::string, std::string> transaction_properties;
     /// Field ids of the schema taken from the first batch start here (writer_set_field_id_base): new
     /// columns for an existing dataset, numbered after its fields.
     std::int32_t field_id_base = 0;
@@ -1264,6 +1266,7 @@ int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* versio
     nano_lance::CommitExtras extras;
     extras.schema_metadata = commit_mode == nano_lance::CommitMode::Append ? nullptr : &state->schema_metadata;
     extras.initial_config = state->initial_config;
+    extras.transaction_properties = state->transaction_properties;
     std::filesystem::create_directories(state->dataset_path / "data", ec);
     if (!nano_lance::commit_dataset_version(state->dataset_path, mapping, state->staged, commit_mode, version, error,
                                             extras)) {
@@ -1286,6 +1289,19 @@ int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* ke
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "config key and value are required");
     }
     state->initial_config[key] = value;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_transaction_property(NanoLanceWriter* writer, const char* key, const char* value) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (key == nullptr || value == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "property key and value are required");
+    }
+    state->transaction_properties[key] = value;
     clear_error(writer);
     return NANO_LANCE_OK;
 }

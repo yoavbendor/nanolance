@@ -6,7 +6,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 /// What a dataset's manifests say about it -- versions, fragments, configuration -- for the APIs that
@@ -39,6 +41,7 @@ struct DatasetVersionInfo {
     std::string tag;
     std::string writer_library;
     std::string writer_version;
+    std::string transaction_file;  // relative to <dataset>/_transactions; empty when none was written
 };
 
 /// One version of a dataset, as its manifest describes it.
@@ -94,5 +97,37 @@ bool dataset_update_table_metadata(const std::filesystem::path& dataset_path,
 bool dataset_update_schema_metadata(const std::filesystem::path& dataset_path,
                                     const std::map<std::string, std::string>& values, bool replace,
                                     std::uint64_t& new_version, std::string& error);
+
+/// A field of a dataset's schema, as its manifest holds it (pre-order; a child names its parent).
+struct DatasetField {
+    std::int32_t id = 0;
+    std::int32_t parent_id = -1;
+    std::string name;
+    std::string logical_type;
+    bool nullable = true;
+    std::int32_t encoding = 0;  // Lance's Encoding: 0 none, 1 plain, 2 var-binary, 3 dictionary, 4 RLE
+    std::map<std::string, std::string> metadata;
+};
+
+bool dataset_fields(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
+                    std::vector<DatasetField>& out, std::string& error);
+
+/// One field's metadata change: set (a value) or remove (none) keys, or replace the whole map
+/// with the keys given a value (Lance's UpdateMap).
+struct FieldMetadataUpdate {
+    std::vector<std::pair<std::string, std::optional<std::string>>> entries;
+    bool replace = false;
+};
+
+/// Apply `updates` (by field id) in a new version. A field id the schema lacks is an error.
+bool dataset_update_field_metadata(const std::filesystem::path& dataset_path,
+                                   const std::map<std::int32_t, FieldMetadataUpdate>& updates,
+                                   std::uint64_t& new_version, std::string& error);
+
+/// Bytes on disk per field of `version`'s schema, in schema (pre-order) order: the sizes of the pages
+/// of each field's columns, summed over the data files (Lance's data_stats; a column a file does not
+/// map to a field counts for the field before it).
+bool dataset_data_stats(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
+                        std::vector<std::pair<std::int32_t, std::uint64_t>>& out, std::string& error);
 
 }  // namespace nano_lance

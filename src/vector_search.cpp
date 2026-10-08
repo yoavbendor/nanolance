@@ -221,6 +221,8 @@ struct IvfModel {
     std::size_t dim = 0;
     std::vector<std::uint64_t> offsets;
     std::vector<std::uint64_t> lengths;
+    bool has_loss = false;
+    double loss = 0;  // field 5: the k-means loss
 };
 
 bool decode_ivf(const std::vector<std::uint8_t>& message, IvfModel& out, std::string& error) {
@@ -254,6 +256,9 @@ bool decode_ivf(const std::vector<std::uint8_t>& message, IvfModel& out, std::st
                 error = "malformed IVF lengths";
                 return false;
             }
+        } else if (f.number == 5 && f.wire == 1) {
+            std::memcpy(&out.loss, f.data, 8U);
+            out.has_loss = true;
         } else if (f.number == 4 && f.wire == 2) {
             std::vector<std::uint64_t> shape;
             if (!decode_tensor(f.data, f.size, shape, out.centroids, error)) {
@@ -2125,6 +2130,53 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         out.distances.push_back(h.d);
     }
     (void)version;
+    return true;
+}
+
+bool read_vector_index_model(const std::filesystem::path& dir, VectorIndexModel& out, std::string& error) {
+    out = VectorIndexModel{};
+    const auto index_path = dir / "index.idx";
+    const auto aux_path = dir / "auxiliary.idx";
+    std::string value;
+    bool found = false;
+    LanceDataFileFooterLayout layout{};
+    if (!schema_metadata(index_path, "lance:index", out.index_metadata, found, layout, error) ||
+        !schema_metadata(index_path, "lance:hnsw", out.sub_index_metadata, found, layout, error) ||
+        !schema_metadata(index_path, "lance:ivf", value, found, layout, error)) {
+        return false;
+    }
+    std::vector<std::uint8_t> buffer;
+    IvfModel model;
+    if (!found || !read_lance_file_global_buffer(index_path, layout,
+                                                 static_cast<std::uint32_t>(std::strtoul(value.c_str(), nullptr, 10)),
+                                                 buffer, error) ||
+        !decode_ivf(buffer, model, error)) {
+        if (error.empty()) {
+            error = "vector index: index.idx has no IVF model";
+        }
+        return false;
+    }
+    LanceDataFileFooterLayout aux_layout{};
+    if (!schema_metadata(aux_path, "storage_metadata", out.storage_metadata, found, aux_layout, error) ||
+        !schema_metadata(aux_path, "lance:ivf", value, found, aux_layout, error)) {
+        return false;
+    }
+    IvfModel parts;
+    if (!found || !read_lance_file_global_buffer(aux_path, aux_layout,
+                                                 static_cast<std::uint32_t>(std::strtoul(value.c_str(), nullptr, 10)),
+                                                 buffer, error) ||
+        !decode_ivf(buffer, parts, error)) {
+        if (error.empty()) {
+            error = "vector index: auxiliary.idx has no partitions";
+        }
+        return false;
+    }
+    out.centroids = std::move(model.centroids);
+    out.partitions = model.partitions;
+    out.dim = model.dim;
+    out.has_loss = model.has_loss;
+    out.loss = model.loss;
+    out.partition_sizes = std::move(parts.lengths);
     return true;
 }
 

@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -108,6 +109,7 @@ struct LanceFileInfo {
         std::string encoding;  // the page layout, described
     };
     std::vector<std::vector<Page>> pages;
+    std::map<std::string, std::string> schema_metadata;  // the file schema's own metadata
 };
 
 /// Read a standalone data file, as `request` asks (its columns and range; the version, fragment and
