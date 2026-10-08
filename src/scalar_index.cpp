@@ -6,6 +6,7 @@
 // its lists' elements -- sorted nulls first, then ascending, ties by row address, and written in
 // Lance's index files; the index is committed in the manifest's index section as Lance commits one.
 
+#include "index_build.hpp"
 #include "nanolance/scalar_index.hpp"
 #include "nanolance/vector_search.hpp"
 
@@ -727,15 +728,21 @@ bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type) {
     return true;
 }
 
-bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, const std::string& column,
-                                 ScalarIndexType type, const ScalarIndexOptions& options,
-                                 std::uint64_t& new_version, std::string& error) {
+namespace {
+
+bool create_scalar_index(const std::filesystem::path& dataset_path, const std::string& column, ScalarIndexType type,
+                         const ScalarIndexOptions& options, const index_build::SegmentTarget* target,
+                         std::uint64_t& new_version, std::string& error) {
     error.clear();
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    if (target != nullptr && target->manifest != nullptr) {
+        manifest = *target->manifest;
+        version = target->version;
+    } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
         return false;
     }
+    const bool commit = target == nullptr || target->out == nullptr;
     if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
         error = "a scalar index on a dataset with stable row ids is not supported";
         return false;
@@ -749,7 +756,7 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
     const std::string name = options.name.empty() ? column + "_idx" : options.name;
     const auto existing = std::find_if(manifest.indices.begin(), manifest.indices.end(),
                                        [&](const pb::IndexMetadata& i) { return i.name == name; });
-    if (existing != manifest.indices.end() && !options.replace) {
+    if (commit && existing != manifest.indices.end() && !options.replace) {
         error = "index '" + name + "' already exists";
         return false;
     }
@@ -761,6 +768,7 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
     const std::vector<std::string> columns = {parts.front()};
     request.columns = &columns;
     request.with_row_address = true;
+    request.fragment_ids = target != nullptr ? target->fragments : nullptr;
     OwnedSchema scanned;
     OwnedBatches batches;
     if (!lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error)) {
@@ -907,8 +915,14 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
     }
 
     std::vector<std::uint32_t> fragment_ids;
-    for (const auto& f : manifest.fragments) {
-        fragment_ids.push_back(static_cast<std::uint32_t>(f.id));
+    if (target != nullptr && (target->coverage != nullptr || target->fragments != nullptr)) {
+        for (const auto id : target->coverage != nullptr ? *target->coverage : *target->fragments) {
+            fragment_ids.push_back(static_cast<std::uint32_t>(id));
+        }
+    } else {
+        for (const auto& f : manifest.fragments) {
+            fragment_ids.push_back(static_cast<std::uint32_t>(f.id));
+        }
     }
     std::sort(fragment_ids.begin(), fragment_ids.end());
     std::vector<pb::IndexMetadata::File> index_files;
@@ -918,19 +932,39 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
+    auto entry = pb::make_index_metadata(uuid, {field->id}, name, version, fragment_ids, details,
+                                                       index_version, static_cast<std::uint64_t>(now), index_files);
+    if (!commit) {
+        *target->out = std::move(entry);
+        return true;
+    }
     if (existing != manifest.indices.end()) {
         // Every segment of the replaced index goes.
         manifest.indices.erase(std::remove_if(manifest.indices.begin(), manifest.indices.end(),
                                               [&](const pb::IndexMetadata& i) { return i.name == name; }),
                                manifest.indices.end());
     }
-    manifest.indices.push_back(pb::make_index_metadata(uuid, {field->id}, name, version, fragment_ids, details,
-                                                       index_version, static_cast<std::uint64_t>(now), index_files));
+    manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
         std::filesystem::remove_all(dir, ec);
         return false;
     }
     return true;
+}
+
+}  // namespace
+
+bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, const std::string& column,
+                                 ScalarIndexType type, const ScalarIndexOptions& options,
+                                 std::uint64_t& new_version, std::string& error) {
+    return create_scalar_index(dataset_path, column, type, options, nullptr, new_version, error);
+}
+
+bool index_build::build_scalar_segment(const std::filesystem::path& dataset_path, const std::string& column,
+                                       ScalarIndexType type, const ScalarIndexOptions& options,
+                                       const SegmentTarget& target, std::string& error) {
+    std::uint64_t unused = 0;
+    return create_scalar_index(dataset_path, column, type, options, &target, unused, error);
 }
 
 bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,

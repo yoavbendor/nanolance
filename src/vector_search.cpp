@@ -15,6 +15,7 @@
 
 #include "nanolance/vector_search.hpp"
 
+#include "index_build.hpp"
 #include "index_files.hpp"
 
 #include "nanolance/data_file_reader.hpp"
@@ -1203,6 +1204,23 @@ std::int32_t field_id(const pb::Manifest& manifest, const std::string& path) {
 }
 
 }  // namespace
+
+bool index_build::load_vector_model(const std::filesystem::path& dir, VectorModel& out, std::string& error) {
+    std::shared_ptr<const IvfIndex> index;
+    if (!load_ivf(dir, index, error)) {
+        return false;
+    }
+    out.type = index->type;
+    out.metric = index->metric;
+    out.dim = index->dim;
+    out.partitions = index->partitions;
+    out.centroids = index->centroids;
+    out.nbits = index->nbits;
+    out.m = index->pq ? index->m : 0U;
+    out.codebook = index->pq ? index->codebook : std::vector<float>{};
+    out.lengths = index->lengths;
+    return true;
+}
 
 bool is_vector_index_url(const std::string& url) {
     const std::string suffix = "VectorIndexDetails";  // /lance.index.pb.VectorIndexDetails, /lance.table....

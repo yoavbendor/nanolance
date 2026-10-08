@@ -6,6 +6,7 @@
 // appearance, and the four files and manifest entry written as Lance's InvertedIndexBuilder writes
 // them, one partition holding every document.
 
+#include "index_build.hpp"
 #include "nanolance/fts_search.hpp"
 
 #include "fts_fst.hpp"
@@ -468,9 +469,11 @@ bool write_metadata(const std::filesystem::path& dir, const fts::AnalyzerParams&
 
 }  // namespace
 
-bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, const std::string& column,
-                                   const InvertedIndexOptions& options, std::uint64_t& new_version,
-                                   std::string& error) {
+namespace {
+
+bool create_inverted_index(const std::filesystem::path& dataset_path, const std::string& column,
+                           const InvertedIndexOptions& options, const index_build::SegmentTarget* target,
+                           std::uint64_t& new_version, std::string& error) {
     error.clear();
     fts::AnalyzerParams params = options.params;
     if (params.with_position) {
@@ -488,9 +491,13 @@ bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, co
     }
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    if (target != nullptr && target->manifest != nullptr) {
+        manifest = *target->manifest;
+        version = target->version;
+    } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
         return false;
     }
+    const bool commit = target == nullptr || target->out == nullptr;
     if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
         error = "an INVERTED index on a dataset with stable row ids is not supported";
         return false;
@@ -508,7 +515,7 @@ bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, co
     const std::string name = options.name.empty() ? column + "_idx" : options.name;
     const auto existing = std::find_if(manifest.indices.begin(), manifest.indices.end(),
                                        [&](const pb::IndexMetadata& i) { return i.name == name; });
-    if (existing != manifest.indices.end() && !options.replace) {
+    if (commit && existing != manifest.indices.end() && !options.replace) {
         error = "Index name '" + name + "' already exists, please specify a different name or use replace=True";
         return false;
     }
@@ -520,20 +527,35 @@ bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, co
     const std::vector<std::string> columns = {column};
     request.columns = &columns;
     request.with_row_address = true;
-    OwnedSchema scanned;
-    index_files::OwnedBatches batches;
-    if (!lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error)) {
-        return false;
-    }
-    const char* format = scanned.s.n_children == 2 ? scanned.s.children[0]->format : nullptr;
-    if (format == nullptr || (std::strcmp(format, "u") != 0 && std::strcmp(format, "U") != 0 &&
-                              std::strcmp(format, "vu") != 0)) {
-        error = "an INVERTED index needs a string column; " + column + " is not one";
-        return false;
-    }
+    request.fragment_ids = target != nullptr ? target->fragments : nullptr;
+    const auto is_text = [&](const ArrowSchema& schema) {
+        const char* format = schema.n_children == 2 ? schema.children[0]->format : nullptr;
+        if (format == nullptr || (std::strcmp(format, "u") != 0 && std::strcmp(format, "U") != 0 &&
+                                  std::strcmp(format, "vu") != 0)) {
+            error = "an INVERTED index needs a string column; " + column + " is not one";
+            return false;
+        }
+        return true;
+    };
     Built built;
-    if (!add_documents(scanned.s, batches.v, analyzer, built, error)) {
-        return false;
+    if (target != nullptr && target->rows != nullptr && !target->rows->empty()) {
+        // An old segment's documents first, deleted or not.
+        OwnedSchema taken;
+        index_files::OwnedBatches rows;
+        LanceScanRequest by_address = request;
+        by_address.fragment_ids = nullptr;
+        if (!lance_dataset_take_rows(dataset_path, by_address, *target->rows, taken.s, rows.v, error) ||
+            !is_text(taken.s) || !add_documents(taken.s, rows.v, analyzer, built, error)) {
+            return false;
+        }
+    }
+    if (request.fragment_ids == nullptr || !request.fragment_ids->empty()) {
+        OwnedSchema scanned;
+        index_files::OwnedBatches batches;
+        if (!lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error) || !is_text(scanned.s) ||
+            !add_documents(scanned.s, batches.v, analyzer, built, error)) {
+            return false;
+        }
     }
 
     // The files.
@@ -554,8 +576,14 @@ bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, co
 
     // The manifest entry.
     std::vector<std::uint32_t> fragment_ids;
-    for (const auto& frag : manifest.fragments) {
-        fragment_ids.push_back(static_cast<std::uint32_t>(frag.id));
+    if (target != nullptr && (target->coverage != nullptr || target->fragments != nullptr)) {
+        for (const auto id : target->coverage != nullptr ? *target->coverage : *target->fragments) {
+            fragment_ids.push_back(static_cast<std::uint32_t>(id));
+        }
+    } else {
+        for (const auto& frag : manifest.fragments) {
+            fragment_ids.push_back(static_cast<std::uint32_t>(frag.id));
+        }
     }
     std::sort(fragment_ids.begin(), fragment_ids.end());
     std::vector<pb::IndexMetadata::File> index_files_list;
@@ -565,20 +593,40 @@ bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, co
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
+    auto entry = pb::make_index_metadata(uuid, {f->id}, name, version, fragment_ids,
+                                                       "/lance.table.InvertedIndexDetails", 2,
+                                                       static_cast<std::uint64_t>(now), index_files_list,
+                                                       index_details(params));
+    if (!commit) {
+        *target->out = std::move(entry);
+        return true;
+    }
     if (existing != manifest.indices.end()) {
         manifest.indices.erase(std::remove_if(manifest.indices.begin(), manifest.indices.end(),
                                               [&](const pb::IndexMetadata& i) { return i.name == name; }),
                                manifest.indices.end());
     }
-    manifest.indices.push_back(pb::make_index_metadata(uuid, {f->id}, name, version, fragment_ids,
-                                                       "/lance.table.InvertedIndexDetails", 2,
-                                                       static_cast<std::uint64_t>(now), index_files_list,
-                                                       index_details(params)));
+    manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
         std::filesystem::remove_all(dir, ec);
         return false;
     }
     return true;
+}
+
+}  // namespace
+
+bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, const std::string& column,
+                                   const InvertedIndexOptions& options, std::uint64_t& new_version,
+                                   std::string& error) {
+    return create_inverted_index(dataset_path, column, options, nullptr, new_version, error);
+}
+
+bool index_build::build_inverted_segment(const std::filesystem::path& dataset_path, const std::string& column,
+                                         const InvertedIndexOptions& options, const SegmentTarget& target,
+                                         std::string& error) {
+    std::uint64_t unused = 0;
+    return create_inverted_index(dataset_path, column, options, &target, unused, error);
 }
 
 }  // namespace nano_lance

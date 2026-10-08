@@ -1,11 +1,11 @@
 """A dataset's indices survive the commits nanolance makes.
 
-nanolance builds only scalar indices (test_scalar_index.py), but it writes to datasets pylance indexed
-with any kind: append, delete, update,
+nanolance writes to datasets pylance indexed with any kind: append, delete, update,
 merge_insert, column changes, compaction. Each commit used to drop the manifest's index section, so
 pylance saw no indices afterwards and every indexed query became a full scan. nanolance now carries
 them on by Lance's own rules (src/index_maintenance.cpp): an index keeps the fragments it covers, a
-fragment whose rows it no longer describes leaves its coverage, and an index on a dropped column goes.
+fragment whose rows it no longer describes leaves its coverage (compaction then gives the rewritten
+rows back to the indexes nanolance can rebuild), and an index on a dropped column goes.
 
 Each test indexes a dataset with pylance (BTree, Bitmap, full-text and IVF_PQ), changes it with
 nanolance, and checks with pylance: which indices exist, which fragments they cover, that every
@@ -127,11 +127,22 @@ def test_column_changes(lance, ds_path):
     _check_queries(lance, ds_path)
 
 
-def test_compaction_narrows_coverage(lance, ds_path):
+def test_compaction_reindexes_the_rewritten_rows(lance, ds_path):
     nl.dataset(ds_path).delete("id >= 1000 AND id < 1300")
     nl.dataset(ds_path).optimize.compact_files(target_rows_per_fragment=500, materialize_deletions_threshold=0.1)
     ds = lance.dataset(ds_path)
     assert sorted(f.fragment_id for f in ds.get_fragments()) == [0, 2, 3]  # 1 rewritten as 3, in id order
+    # Each index takes fragment 3 back in (test_index_optimize.py covers how).
+    assert _coverage(lance, ds_path) == {name: [0, 2, 3] for name in ALL}
+    _check_queries(lance, ds_path)
+
+
+def test_compaction_without_reindex_narrows_coverage(lance, ds_path):
+    nl.dataset(ds_path).delete("id >= 1000 AND id < 1300")
+    nl.dataset(ds_path).optimize.compact_files(target_rows_per_fragment=500, materialize_deletions_threshold=0.1,
+                                               reindex=False)
+    ds = lance.dataset(ds_path)
+    assert sorted(f.fragment_id for f in ds.get_fragments()) == [0, 2, 3]
     assert _coverage(lance, ds_path) == {name: [0, 2] for name in ALL}
     _check_queries(lance, ds_path)
 

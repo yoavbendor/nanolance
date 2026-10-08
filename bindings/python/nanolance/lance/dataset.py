@@ -1012,19 +1012,36 @@ class DatasetOptimizer:
     def compact_files(self, *, target_rows_per_fragment: Optional[int] = None, max_rows_per_group=None,
                       max_bytes_per_file=None, materialize_deletions: Optional[bool] = None,
                       materialize_deletions_threshold: Optional[float] = None, num_threads=None, batch_size=None,
-                      **kwargs):
+                      reindex: bool = True, **kwargs):
+        """Rewrite small fragments (and those with many deleted rows) into fewer, larger ones. The
+        indexes that covered the rewritten rows take them back, as Lance's compaction remaps its
+        indexes (a second version; nanolance's `reindex=False` leaves them covering fewer fragments)."""
         from nanolance.lance.optimize import CompactionMetrics
 
         with native():
             metrics, _ = _nanolance._ds_compact_files(
                 self._ds.uri, int(target_rows_per_fragment or 1024 * 1024),
                 True if materialize_deletions is None else bool(materialize_deletions),
-                0.1 if materialize_deletions_threshold is None else float(materialize_deletions_threshold))
+                0.1 if materialize_deletions_threshold is None else float(materialize_deletions_threshold),
+                bool(reindex))
         self._ds._refresh_latest()
-        return CompactionMetrics(**{k: int(v) for k, v in metrics.items()})
+        return CompactionMetrics(**{k: int(v) for k, v in metrics.items() if not k.startswith("indexes_")})
 
-    def optimize_indices(self, **kwargs):
-        raise unsupported("indexes")
+    def optimize_indices(self, *, num_indices_to_merge: Optional[int] = None, index_names=None, retrain: bool = False,
+                         **kwargs):
+        """Fold rows the indexes do not cover yet into them, as pylance's optimize_indices does: the last
+        `num_indices_to_merge` (default 1) segments of each index are replaced by one covering their
+        fragments and every uncovered one (0: a new segment over the uncovered fragments alone), with
+        the index's parameters -- a vector index keeps its trained model unless `retrain`."""
+        unknown = sorted(set(kwargs) - {"num_threads"})
+        if unknown:
+            raise unsupported(f"optimize_indices options {unknown}")
+        names = [index_names] if isinstance(index_names, str) else list(index_names or [])
+        with native():
+            _nanolance._ds_optimize_indices(self._ds.uri, names,
+                                            None if num_indices_to_merge is None else int(num_indices_to_merge),
+                                            bool(retrain))
+        self._ds._refresh_latest()
 
 
 class IndexSegmentDescription:

@@ -6,6 +6,7 @@
 // latest manifest with the changed fragments and schema.
 
 #include "nanolance/dataset_ops.hpp"
+#include "nanolance/index_optimize.hpp"
 
 #include "nanolance/arrow_slice.hpp"
 #include "nanolance/dataset_commit.hpp"
@@ -1336,8 +1337,45 @@ bool dataset_compact_files(const std::filesystem::path& dataset_path, const Comp
     }
     // An index keeps covering the fragments the compaction left alone. Those it rewrote leave its
     // coverage -- it points at their rows' old addresses -- and Lance scans them instead.
+    std::vector<std::string> affected;
+    for (const auto& index : manifest.indices) {
+        const bool touched = std::any_of(index.fragment_ids.begin(), index.fragment_ids.end(), [&](std::uint32_t id) {
+            return std::find(rewritten_ids.begin(), rewritten_ids.end(), id) != rewritten_ids.end();
+        });
+        if (touched && !is_system_index(index) &&
+            std::find(affected.begin(), affected.end(), index.name) == affected.end()) {
+            affected.push_back(index.name);
+        }
+    }
     drop_fragments_from_indices(manifest.indices, rewritten_ids);
-    return commit(dataset_path, std::move(manifest), new_version, error, false);
+    if (!commit(dataset_path, std::move(manifest), new_version, error, false)) {
+        return false;
+    }
+    if (!options.reindex || affected.empty()) {
+        return true;
+    }
+    // The indexes take the compacted fragments back in: all together, or one by one when one of them
+    // cannot be rebuilt (its coverage then stays narrower; the rows are scanned, never lost).
+    OptimizeIndicesOptions reindex;
+    reindex.index_names = affected;
+    OptimizeIndicesResult done;
+    std::string why;
+    if (dataset_optimize_indices(dataset_path, reindex, done, why)) {
+        metrics.indexes_reindexed = done.optimized;
+        new_version = done.version;
+        return true;
+    }
+    for (const auto& name : affected) {
+        reindex.index_names = {name};
+        if (dataset_optimize_indices(dataset_path, reindex, done, why)) {
+            metrics.indexes_reindexed.insert(metrics.indexes_reindexed.end(), done.optimized.begin(),
+                                             done.optimized.end());
+            new_version = done.version;
+        } else {
+            metrics.indexes_not_reindexed.push_back(name);
+        }
+    }
+    return true;
 }
 
 }  // namespace nano_lance

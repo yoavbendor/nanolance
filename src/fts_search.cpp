@@ -6,6 +6,7 @@
 #include "fts_fst.hpp"
 #include "fts_json.hpp"
 #include "fts_posting.hpp"
+#include "index_build.hpp"
 #include "index_files.hpp"
 #include "nanolance/expr.hpp"
 #include "nanolance/fts_tokenizer.hpp"
@@ -1494,6 +1495,61 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
         out.scores.push_back(h.second);
     }
     (void)version;
+    return true;
+}
+
+bool index_build::load_inverted_params(const std::filesystem::path& dir, fts::AnalyzerParams& out,
+                                       std::string& error) {
+    bool found = false;
+    const std::string text = metadata_value(dir / "metadata.lance", "params", found, error);
+    if (!error.empty()) {
+        return false;
+    }
+    out = fts::AnalyzerParams{};
+    return !found || fts::parse_params(text, out, error);
+}
+
+bool index_build::load_inverted_rows(const std::filesystem::path& dir, std::vector<std::uint64_t>& out,
+                                     std::string& error) {
+    out.clear();
+    bool found = false;
+    const std::string text = metadata_value(dir / "metadata.lance", "partitions", found, error);
+    fts::json::Value parts;
+    if (!error.empty()) {
+        return false;
+    }
+    if (!found || !fts::json::parse(text, parts) || parts.kind != fts::json::Value::Array) {
+        error = "INVERTED index metadata lists no partitions";
+        return false;
+    }
+    for (const auto& p : parts.items) {
+        if (p.kind != fts::json::Value::Number || p.n < 0) {
+            error = "INVERTED index metadata: malformed partition list";
+            return false;
+        }
+        FileTable table;
+        const std::vector<std::string> columns = {"_rowid"};
+        const auto file = dir / ("part_" + std::to_string(static_cast<std::uint64_t>(p.n)) + "_docs.lance");
+        if (!index_files::read_table(file, &columns, LanceRowRange{}, table, error)) {
+            return false;
+        }
+        for (const auto& batch : table.batches) {
+            ArrowArrayView view{};
+            ArrowError e{};
+            if (ArrowArrayViewInitFromSchema(&view, &table.schema, &e) != NANOARROW_OK ||
+                ArrowArrayViewSetArray(&view, &batch, &e) != NANOARROW_OK || view.n_children < 1) {
+                ArrowArrayViewReset(&view);
+                error = file.filename().string() + ": unexpected columns";
+                return false;
+            }
+            for (std::int64_t r = 0; r < batch.length; ++r) {
+                out.push_back(ArrowArrayViewGetUIntUnsafe(view.children[0], view.offset + r));
+            }
+            ArrowArrayViewReset(&view);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
     return true;
 }
 

@@ -9,6 +9,7 @@
 #include <nanolance/dataset.hpp>
 #include <nanolance/dataset_ops.hpp>
 #include <nanolance/fts_search.hpp>
+#include <nanolance/index_optimize.hpp>
 #include <nanolance/lance_table_reader.hpp>
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
@@ -1139,8 +1140,9 @@ NB_MODULE(_nanolance, m) {
         return version;
     });
     m.def("_ds_compact_files", [](const std::filesystem::path& path, std::uint64_t target_rows,
-                                  bool materialize_deletions, double threshold) {
+                                  bool materialize_deletions, double threshold, bool reindex) {
         nano_lance::CompactionOptions options;
+        options.reindex = reindex;
         options.target_rows_per_fragment = target_rows;
         options.materialize_deletions = materialize_deletions;
         options.materialize_deletions_threshold = threshold;
@@ -1152,7 +1154,19 @@ NB_MODULE(_nanolance, m) {
         d["fragments_added"] = metrics.fragments_added;
         d["files_removed"] = metrics.files_removed;
         d["files_added"] = metrics.files_added;
+        d["indexes_reindexed"] = metrics.indexes_reindexed;
+        d["indexes_not_reindexed"] = metrics.indexes_not_reindexed;
         return nb::make_tuple(d, version);
+    });
+    m.def("_ds_optimize_indices", [](const std::filesystem::path& path, const std::vector<std::string>& names,
+                                     std::optional<std::uint32_t> num_indices_to_merge, bool retrain) {
+        nano_lance::OptimizeIndicesOptions options;
+        options.index_names = names;
+        options.num_indices_to_merge = num_indices_to_merge;
+        options.retrain = retrain;
+        nano_lance::OptimizeIndicesResult result;
+        run_op([&](std::string& e) { return nano_lance::dataset_optimize_indices(path, options, result, e); });
+        return nb::make_tuple(result.optimized, result.committed, result.version);
     });
     m.def("open_stream", &read_table_stream, nb::arg("path"), nb::arg("columns") = nb::none(),
           nb::arg("offset") = 0, nb::arg("length") = -1,

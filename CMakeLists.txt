@@ -302,6 +302,7 @@ add_library(nanolance STATIC
     src/fts_posting.cpp
     src/fts_search.cpp
     src/fts_index_build.cpp
+    src/index_optimize.cpp
     src/data_file_reader.cpp
     src/deletion_vector.cpp
     src/data_file_writer.cpp

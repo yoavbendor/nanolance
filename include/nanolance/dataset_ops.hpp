@@ -83,6 +83,10 @@ struct CompactionOptions {
     std::uint64_t target_rows_per_fragment = 1024ULL * 1024ULL;
     bool materialize_deletions = true;
     double materialize_deletions_threshold = 0.1;  // fraction of a fragment's rows deleted
+    /// Fold the rewritten rows back into the indexes that covered them (index_optimize.hpp), as
+    /// Lance's compaction remaps its indexes: committed as a second version. Without it, an index
+    /// stops covering the fragments compaction rewrote, and those rows are scanned.
+    bool reindex = true;
 };
 
 struct CompactionMetrics {
@@ -90,6 +94,10 @@ struct CompactionMetrics {
     std::uint64_t fragments_added = 0;
     std::uint64_t files_removed = 0;
     std::uint64_t files_added = 0;
+    /// With `reindex`: the indexes given back their compacted rows, and those that could not be (an
+    /// index of a kind nanolance cannot build), which cover fewer fragments from now on.
+    std::vector<std::string> indexes_reindexed;
+    std::vector<std::string> indexes_not_reindexed;
 };
 
 /// Rewrite small fragments (and fragments with many deleted rows) into fewer, larger ones. Commits

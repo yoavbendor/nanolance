@@ -16,6 +16,7 @@
 // values left out, as Lance's filter_nan leaves them), and the index is committed in the
 // manifest's index section as Lance commits one.
 
+#include "index_build.hpp"
 #include "nanolance/vector_search.hpp"
 
 #include "index_files.hpp"
@@ -37,6 +38,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <set>
 #include <system_error>
 #include <unordered_set>
 
@@ -416,9 +418,263 @@ std::string json_string(const std::string& s) {
 
 }  // namespace
 
-bool dataset_create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,
-                                 const VectorIndexOptions& options, std::uint64_t& new_version, std::string& error) {
+namespace {
+
+constexpr std::size_t kMaxPartitionSizeFactor = 4;    // lance-index MAX_PARTITION_SIZE_FACTOR
+constexpr std::size_t kMinPartitionSizePercent = 25;  // lance-index MIN_PARTITION_SIZE_PERCENT
+constexpr std::size_t kReassignRange = 64;            // lance REASSIGN_RANGE
+constexpr std::size_t kSplitSampleRate = 256;         // lance SPLIT_SAMPLE_RATE
+constexpr std::size_t kMaxSplitWays = 1024;           // lance MAX_SPLIT_WAYS
+
+float distance(const float* a, const float* b, std::size_t d, bool dot) {
+    float s = 0;
+    if (dot) {
+        for (std::size_t j = 0; j < d; ++j) {
+            s += a[j] * b[j];
+        }
+        return -s;
+    }
+    for (std::size_t j = 0; j < d; ++j) {
+        const float t = a[j] - b[j];
+        s += t * t;
+    }
+    return s;
+}
+
+/// The `count` centroids nearest to `c` (by `dot` or L2), `skip` and `removed` left out.
+std::vector<std::uint32_t> nearest_centroids(const std::vector<float>& centroids, std::size_t k, std::size_t d,
+                                             const float* c, std::size_t skip, const std::vector<bool>& removed,
+                                             std::size_t count, bool dot) {
+    std::vector<std::pair<float, std::uint32_t>> all;
+    for (std::size_t p = 0; p < k; ++p) {
+        if (p != skip && !removed[p]) {
+            all.emplace_back(distance(c, centroids.data() + p * d, d, dot), static_cast<std::uint32_t>(p));
+        }
+    }
+    const std::size_t n = std::min(count, all.size());
+    std::partial_sort(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(n), all.end());
+    std::vector<std::uint32_t> out;
+    for (std::size_t i = 0; i < n; ++i) {
+        out.push_back(all[i].second);
+    }
+    return out;
+}
+
+/// Lance 12's partition adjustment when it merges rows into an IVF index (lance/src/index/vector/
+/// builder.rs, plan_partition_adjustment): every partition over 4x the target is split straight to
+/// the target size, by k-means on a sample of its rows; when none is, partitions under a quarter of
+/// the target are joined away, smallest first, as long as the survivors have room below the split
+/// threshold for every joined row, each row going to the nearest of the 64 survivors nearest its old
+/// centroid that has room. Updates `centroids`, `k` and `label`.
+void adjust_partitions(const Rows& data, std::vector<float>& centroids, std::size_t& k,
+                       std::vector<std::uint32_t>& label, std::size_t target, bool dot,
+                       std::uint32_t max_iters) {
+    const std::size_t d = data.d;
+    const std::size_t split_threshold = kMaxPartitionSizeFactor * target;
+    const std::size_t join_threshold = kMinPartitionSizePercent * target / 100U;
+    std::vector<std::size_t> sizes(k, 0);
+    for (const auto l : label) {
+        ++sizes[l];
+    }
+    std::vector<std::vector<std::size_t>> members(k);
+    for (std::size_t r = 0; r < data.n; ++r) {
+        members[label[r]].push_back(r);
+    }
+    std::vector<std::pair<std::size_t, std::size_t>> splits;  // partition, ways
+    for (std::size_t p = 0; p < k; ++p) {
+        if (sizes[p] > split_threshold) {
+            splits.emplace_back(p, std::clamp<std::size_t>((sizes[p] + target - 1U) / target, 2U, kMaxSplitWays));
+        }
+    }
+    const std::vector<bool> none(k, false);
+    if (!splits.empty()) {
+        const std::vector<float> old = centroids;
+        std::set<std::size_t> affected;
+        bool split_any = false;
+        for (const auto& [p, ways_wanted] : splits) {
+            // A seeded sample of the partition's rows (seeded per partition, as Lance seeds its split).
+            std::mt19937_64 rng(p);
+            const auto picked = sample_indices(members[p].size(), kSplitSampleRate * ways_wanted, rng);
+            Rows sample;
+            sample.d = d;
+            for (const auto i : picked) {
+                const float* v = data.row(members[p][i]);
+                sample.v.insert(sample.v.end(), v, v + d);
+            }
+            sample.n = picked.size();
+            const std::size_t ways = std::min(ways_wanted, sample.n);
+            if (ways < 2U) {
+                continue;
+            }
+            double loss = 0;
+            const auto trained = kmeans(sample, ways, dot, max_iters, rng, loss);
+            // Keep the centroids that win a sampled row from the old centroids around the partition.
+            const auto neighbors = nearest_centroids(old, k, d, old.data() + p * d, p, none, kReassignRange, dot);
+            std::vector<bool> wins(ways, false);
+            for (std::size_t i = 0; i < sample.n; ++i) {
+                const float* v = sample.v.data() + i * d;
+                std::size_t best = 0;
+                float best_d = std::numeric_limits<float>::infinity();
+                for (std::size_t c = 0; c < ways; ++c) {
+                    const float dd = distance(v, trained.data() + c * d, d, dot);
+                    if (dd < best_d) {
+                        best_d = dd;
+                        best = c;
+                    }
+                }
+                float old_d = std::numeric_limits<float>::infinity();
+                for (const auto q : neighbors) {
+                    old_d = std::min(old_d, distance(v, old.data() + std::size_t{q} * d, d, dot));
+                }
+                if (best_d < old_d) {
+                    wins[best] = true;
+                }
+            }
+            std::vector<std::size_t> kept;
+            for (std::size_t c = 0; c < ways; ++c) {
+                if (wins[c]) {
+                    kept.push_back(c);
+                }
+            }
+            if (kept.size() < 2U) {
+                continue;  // too alike to split
+            }
+            split_any = true;
+            std::copy_n(trained.data() + kept[0] * d, d, centroids.data() + p * d);
+            affected.insert(p);
+            for (std::size_t i = 1; i < kept.size(); ++i) {
+                centroids.insert(centroids.end(), trained.data() + kept[i] * d, trained.data() + (kept[i] + 1U) * d);
+                affected.insert(centroids.size() / d - 1U);
+            }
+            for (const auto q : neighbors) {
+                affected.insert(q);
+            }
+        }
+        if (!split_any) {
+            return;
+        }
+        // The rows of every affected partition go to their nearest centroid of the new set.
+        k = centroids.size() / d;
+        for (std::size_t r = 0; r < data.n; ++r) {
+            if (affected.count(label[r]) == 0U) {
+                continue;
+            }
+            const float* v = data.row(r);
+            std::uint32_t best = label[r];
+            float best_d = std::numeric_limits<float>::infinity();
+            for (std::size_t c = 0; c < k; ++c) {
+                const float dd = distance(v, centroids.data() + c * d, d, dot);
+                if (dd < best_d) {
+                    best_d = dd;
+                    best = static_cast<std::uint32_t>(c);
+                }
+            }
+            label[r] = best;
+        }
+        return;
+    }
+    if (k < 2U) {
+        return;
+    }
+    std::size_t total = 0;
+    for (const auto n : sizes) {
+        total += n;
+    }
+    const std::size_t keep_at_least = std::max<std::size_t>((total + split_threshold - 1U) / split_threshold, 1U);
+    const std::size_t max_joins = k > keep_at_least ? k - keep_at_least : 0U;
+    std::vector<std::pair<std::size_t, std::size_t>> candidates;  // size, partition
+    for (std::size_t p = 0; p < k; ++p) {
+        if (sizes[p] < join_threshold) {
+            candidates.emplace_back(sizes[p], p);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end());
+    if (candidates.size() > max_joins) {
+        candidates.resize(max_joins);
+    }
+    if (candidates.empty()) {
+        return;
+    }
+    std::vector<std::size_t> joins;
+    std::vector<bool> removed(k, false);
+    for (const auto& c : candidates) {
+        joins.push_back(c.second);
+        removed[c.second] = true;
+    }
+    std::sort(joins.begin(), joins.end());
+    std::vector<std::size_t> room(k, 0);
+    for (std::size_t p = 0; p < k; ++p) {
+        room[p] = removed[p] ? 0U : split_threshold - std::min(split_threshold, sizes[p]);
+    }
+    for (const auto p : joins) {
+        const auto window = nearest_centroids(centroids, k, d, centroids.data() + p * d, p, removed, kReassignRange, dot);
+        for (const auto r : members[p]) {
+            const float* v = data.row(r);
+            const auto nearest_of = [&](const std::vector<std::uint32_t>& ids, bool need_room) {
+                std::int64_t best = -1;
+                float best_d = std::numeric_limits<float>::infinity();
+                for (const auto q : ids) {
+                    if (need_room && room[q] == 0U) {
+                        continue;
+                    }
+                    const float dd = distance(v, centroids.data() + std::size_t{q} * d, d, dot);
+                    if (dd < best_d) {
+                        best_d = dd;
+                        best = q;
+                    }
+                }
+                return best;
+            };
+            std::int64_t dest = nearest_of(window, true);
+            if (dest < 0) {
+                std::vector<std::uint32_t> anywhere;
+                for (std::size_t q = 0; q < k; ++q) {
+                    if (!removed[q]) {
+                        anywhere.push_back(static_cast<std::uint32_t>(q));
+                    }
+                }
+                dest = nearest_of(anywhere, true);
+                if (dest < 0) {
+                    dest = nearest_of(window, false);
+                }
+            }
+            label[r] = static_cast<std::uint32_t>(dest);
+            if (room[static_cast<std::size_t>(dest)] > 0U) {
+                --room[static_cast<std::size_t>(dest)];
+            }
+        }
+    }
+    // The survivors, renumbered in order.
+    std::vector<std::uint32_t> renumber(k, 0);
+    std::vector<float> kept;
+    std::uint32_t next = 0;
+    for (std::size_t p = 0; p < k; ++p) {
+        if (!removed[p]) {
+            renumber[p] = next++;
+            kept.insert(kept.end(), centroids.data() + p * d, centroids.data() + (p + 1U) * d);
+        }
+    }
+    for (auto& l : label) {
+        l = renumber[l];
+    }
+    centroids = std::move(kept);
+    k = next;
+}
+
+bool create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,
+                         const VectorIndexOptions& given, const index_build::SegmentTarget* target,
+                         std::uint64_t& new_version, std::string& error) {
     error.clear();
+    const index_build::VectorModel* model = target != nullptr ? target->model : nullptr;
+    VectorIndexOptions options = given;
+    if (model != nullptr) {
+        // An existing segment's model: its type, metric and PQ settings, its partitions.
+        options.type = model->type;
+        options.metric = model->metric;
+        options.num_bits = model->nbits;
+        options.num_sub_vectors = static_cast<std::uint32_t>(model->m);
+        options.num_partitions = static_cast<std::uint32_t>(model->partitions);
+    }
     const bool pq = options.type == "IVF_PQ";
     if (!pq && options.type != "IVF_FLAT") {
         error = "vector index type '" + options.type + "' is not supported (IVF_FLAT and IVF_PQ are)";
@@ -430,9 +686,13 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
     }
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    if (target != nullptr && target->manifest != nullptr) {
+        manifest = *target->manifest;
+        version = target->version;
+    } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
         return false;
     }
+    const bool commit = target == nullptr || target->out == nullptr;
     if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
         error = "a vector index on a dataset with stable row ids is not supported";
         return false;
@@ -446,7 +706,7 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
     const std::string name = options.name.empty() ? column + "_idx" : options.name;
     const auto existing = std::find_if(manifest.indices.begin(), manifest.indices.end(),
                                        [&](const pb::IndexMetadata& i) { return i.name == name; });
-    if (existing != manifest.indices.end() && !options.replace) {
+    if (commit && existing != manifest.indices.end() && !options.replace) {
         error = "Index name '" + name + "' already exists, please specify a different name or use replace=True";
         return false;
     }
@@ -458,6 +718,7 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
     const std::vector<std::string> columns = {parts.front()};
     request.columns = &columns;
     request.with_row_address = true;
+    request.fragment_ids = target != nullptr ? target->fragments : nullptr;
     OwnedSchema scanned;
     OwnedBatches batches;
     if (!lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error)) {
@@ -487,6 +748,13 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
     const std::size_t dim = static_cast<std::size_t>(std::strtoull(format.c_str() + 3, nullptr, 10));
     if (dim == 0U) {
         error = "Vector column " + column + " has dimension 0";
+        return false;
+    }
+    if (model != nullptr &&
+        (model->dim != dim || model->centroids.size() != model->partitions * dim ||
+         (pq && model->codebook.size() != (std::size_t{1} << model->nbits) * dim))) {
+        error = "vector index on " + column + ": its model does not match the column's dimension " +
+                std::to_string(dim);
         return false;
     }
     if (pq && (options.num_sub_vectors == 0U)) {
@@ -571,13 +839,13 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
         error = "num_partitions must be at least 1";
         return false;
     }
-    if (partitions > data.n) {
+    if (model == nullptr && partitions > data.n) {
         error = "KMeans cannot train " + std::to_string(partitions) + " centroids with " + std::to_string(data.n) +
                 " vectors; choose a smaller K (< " + std::to_string(data.n) + ")";
         return false;
     }
     const std::size_t nc = std::size_t{1} << options.num_bits;
-    if (pq && data.n < nc) {
+    if (model == nullptr && pq && data.n < nc) {
         error = "Not enough rows to train PQ. Requires " + std::to_string(nc) + " rows but only " +
                 std::to_string(data.n) + " available";
         return false;
@@ -589,10 +857,18 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
     // IVF: train on a sample, then every vector to its nearest centroid.
     const bool dot_metric = options.metric == VectorMetric::Dot;
     double loss = 0;
-    const auto train = gather(data, sample_indices(data.n, std::size_t{options.sample_rate} * partitions, rng));
-    const auto centroids = kmeans(train, partitions, dot_metric, options.max_iters, rng, loss);
+    std::vector<float> centroids;
+    if (model != nullptr) {
+        centroids = model->centroids;
+    } else {
+        const auto train = gather(data, sample_indices(data.n, std::size_t{options.sample_rate} * partitions, rng));
+        centroids = kmeans(train, partitions, dot_metric, options.max_iters, rng, loss);
+    }
     std::vector<std::uint32_t> label;
     assign(data, centroids, partitions, dot_metric, label, nullptr);
+    if (model != nullptr && target->rebalance_target != 0U) {
+        adjust_partitions(data, centroids, partitions, label, target->rebalance_target, dot_metric, options.max_iters);
+    }
     std::vector<std::uint64_t> lengths(partitions, 0);
     for (const auto l : label) {
         ++lengths[l];
@@ -627,9 +903,12 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
                 out[j] = dot_metric ? v[j] : v[j] - c[j];
             }
         };
+        codebook.resize(m * nc * w);
+        if (model != nullptr) {
+            codebook = model->codebook;
+        } else {
         const auto picked = sample_indices(data.n, std::size_t{options.sample_rate} * nc, rng);
         std::vector<float> res(dim);
-        codebook.resize(m * nc * w);
         std::vector<Rows> subs(m);
         for (std::size_t s = 0; s < m; ++s) {
             subs[s].d = w;
@@ -655,6 +934,7 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
             const auto c = kmeans_flat(subs[s], nc, false, options.max_iters, sub_rng, sub_loss);
             std::copy(c.begin(), c.end(), codebook.begin() + static_cast<std::ptrdiff_t>(s * nc * w));
         });
+        }
         // Codes: each sub-vector's nearest codebook entry by L2, whatever the metric.
         std::vector<std::uint8_t> row_codes(data.n * m);  // [row][m], rows in `order`
         parallel::for_each(m, [&](std::size_t s) {
@@ -821,8 +1101,14 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
     }
 
     std::vector<std::uint32_t> fragment_ids;
-    for (const auto& f : manifest.fragments) {
-        fragment_ids.push_back(static_cast<std::uint32_t>(f.id));
+    if (target != nullptr && (target->coverage != nullptr || target->fragments != nullptr)) {
+        for (const auto id : target->coverage != nullptr ? *target->coverage : *target->fragments) {
+            fragment_ids.push_back(static_cast<std::uint32_t>(id));
+        }
+    } else {
+        for (const auto& f : manifest.fragments) {
+            fragment_ids.push_back(static_cast<std::uint32_t>(f.id));
+        }
     }
     std::sort(fragment_ids.begin(), fragment_ids.end());
     std::vector<pb::IndexMetadata::File> index_files;
@@ -832,19 +1118,41 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
+    if (target != nullptr && target->details != nullptr) {
+        details = *target->details;
+    }
+    auto entry = pb::make_index_metadata(uuid, {field->id}, name, version, fragment_ids,
+                                         "/lance.index.pb.VectorIndexDetails", 1, static_cast<std::uint64_t>(now),
+                                         index_files, details);
+    if (!commit) {
+        *target->out = std::move(entry);
+        return true;
+    }
     if (existing != manifest.indices.end()) {
         manifest.indices.erase(std::remove_if(manifest.indices.begin(), manifest.indices.end(),
                                               [&](const pb::IndexMetadata& i) { return i.name == name; }),
                                manifest.indices.end());
     }
-    manifest.indices.push_back(pb::make_index_metadata(uuid, {field->id}, name, version, fragment_ids,
-                                                       "/lance.index.pb.VectorIndexDetails", 1,
-                                                       static_cast<std::uint64_t>(now), index_files, details));
+    manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
         std::filesystem::remove_all(dir, ec);
         return false;
     }
     return true;
+}
+
+}  // namespace
+
+bool dataset_create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,
+                                 const VectorIndexOptions& options, std::uint64_t& new_version, std::string& error) {
+    return create_vector_index(dataset_path, column, options, nullptr, new_version, error);
+}
+
+bool index_build::build_vector_segment(const std::filesystem::path& dataset_path, const std::string& column,
+                                       const VectorIndexOptions& options, const SegmentTarget& target,
+                                       std::string& error) {
+    std::uint64_t unused = 0;
+    return create_vector_index(dataset_path, column, options, &target, unused, error);
 }
 
 }  // namespace nano_lance

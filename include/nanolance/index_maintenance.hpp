@@ -8,9 +8,9 @@
 #include <cstdint>
 #include <vector>
 
-/// Keeping a dataset's indices across the commits nanolance makes. nanolance builds only scalar
-/// indices (scalar_index.hpp), but a dataset pylance indexed must keep all its indices when nanolance appends to it, deletes from it or
-/// changes its columns -- dropping them silently turns every indexed query into a full scan.
+/// Keeping a dataset's indices across the commits nanolance makes. A dataset pylance indexed must keep
+/// all its indices -- whatever their kind -- when nanolance appends to it, deletes from it or changes
+/// its columns: dropping them silently turns every indexed query into a full scan.
 ///
 /// An index claims a set of fields and of fragments (its fragment bitmap). These are Lance's own
 /// rules for keeping that claim honest (lance-table's transaction/index_maintenance.rs), for the
@@ -21,7 +21,8 @@
 ///   add columns                            kept (no indexed field's data changes)
 ///   drop / retype a column                 an index on a field that is gone is dropped
 ///   compaction                             the rewritten fragments leave every index's coverage
-///                                          (their rows moved; the index points at the old ones)
+///                                          (their rows moved; the index points at the old ones);
+///                                          compaction then folds them back in (index_optimize.hpp)
 ///   overwrite                              every index is dropped
 ///
 /// Lance scans whatever an index does not cover, so a narrower claim costs speed, never rows.
