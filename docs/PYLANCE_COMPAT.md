@@ -36,7 +36,7 @@ compared, results are checked against pylance on the same files, in both directi
 |---|---|
 | Open | `lance.dataset(uri, version=, asof=)`, `LanceDataset(...)`, `local paths`, `file://`, `memory://` |
 | Write | `lance.write_dataset(data, uri, schema=, mode="create" / "append" / "overwrite", max_rows_per_file=, max_bytes_per_file=)`. Takes a table, batches, a reader, pandas, polars, dicts, lists of dicts or pydantic models, another dataset. One version per call, as in pylance. `LanceDataset.insert`, `LanceDataset.from_pydantic_model`. An append may leave out nullable columns: as in Lance, its files hold only the columns given, and the others read as null (a struct or list column as a null value). Unlike pylance, an append whose column types differ from the dataset's is cast rather than refused. |
-| Read | `to_table`, `to_batches`, `scanner` (+ `ScannerBuilder`), `head`, `slice`, `take`, `_take_rows` / `take_rows`, `sample`, `count_rows`, `to_pandas`. `columns=` as a list or a `{alias: column}` rename, `limit`, `offset`, `batch_size`, `fragments=`, `with_row_id`, `with_row_address`, and the system columns `_rowid`, `_rowaddr`, `_rowoffset` in a projection. |
+| Read | `to_table`, `to_batches`, `scanner` (+ `ScannerBuilder`), `head`, `slice`, `take`, `_take_rows` / `take_rows`, `sample`, `count_rows`, `to_pandas`. `columns=` as a list or a `{alias: column}` rename, `limit`, `offset`, `batch_size`, `fragments=`, `with_row_id`, `with_row_address`, `batch_size_bytes`, `LANCE_DEFAULT_BATCH_SIZE`, `disable_scoring_autoprojection`, `default_scan_options` (the dataset's schema shows the row id columns they add), and the system columns `_rowid`, `_rowaddr`, `_rowoffset`, `_row_created_at_version`, `_row_last_updated_at_version` in a projection or a `take`, and in a filter (`_rowid` / `_rowaddr`, evaluated over the scanned rows before limit and offset; not combined with vector or full-text search). Without stable row ids both version columns read 1, as in Lance. |
 | Versions | `version`, `latest_version`, `versions()` (with pylance's summary metadata), `checkout_version`, `checkout_latest`, `restore` |
 | Metadata | `schema` (with its schema metadata), `data_storage_version`, `config` / `update_config` / `delete_config_keys`, `metadata` / `update_metadata`, `schema_metadata` / `update_schema_metadata` / `replace_schema_metadata` |
 | Fragments | `get_fragments`, `get_fragment`; `LanceFragment`: `fragment_id`, `metadata` (`FragmentMetadata`, `DataFile`, `DeletionFile`), `count_rows`, `physical_rows`, `num_deletions`, `to_table`, `to_batches`, `scanner`, `head`, `take` |
@@ -269,7 +269,7 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **271**, every one of which pylance also passes (259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
+| nanolance.lance | **283**, every one of which pylance also passes (271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
 
 By test file, where nanolance passes any:
 

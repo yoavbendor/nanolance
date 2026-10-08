@@ -8,6 +8,7 @@
 #include <nanolance/blob_v2_external.hpp>
 #include <nanolance/dataset.hpp>
 #include <nanolance/dataset_ops.hpp>
+#include <nanolance/expr.hpp>
 #include <nanolance/fts_search.hpp>
 #include <nanolance/index_optimize.hpp>
 #include <nanolance/lance_table_reader.hpp>
@@ -940,6 +941,19 @@ NB_MODULE(_nanolance, m) {
         });
         return nb::make_tuple(updated, version);
     }, nb::arg("path"), nb::arg("where").none(), nb::arg("assignments"));
+    // A SQL filter evaluated over one record batch, as the scan evaluates it: one byte per row, 1
+    // where it holds. For filters the scan cannot push down (on _rowid / _rowaddr).
+    m.def("_filter_mask", [](nb::handle batch, const std::string& sql) {
+        auto imported = nanolance_py::arrow_capsule::import_batch(batch);
+        nano_lance::expr::Expression expression;
+        std::string error;
+        std::vector<std::uint8_t> keep;
+        if (!nano_lance::expr::Expression::parse(sql, expression, error) ||
+            !expression.bind(*imported.first, error) || !expression.filter(*imported.second, keep, error)) {
+            throw std::invalid_argument(error);
+        }
+        return nb::bytes(reinterpret_cast<const char*>(keep.data()), keep.size());
+    });
     m.def("_ds_merge_insert", [](const std::filesystem::path& path, const std::vector<std::string>& on,
                                  bool update_all, bool insert_all, bool delete_by_source,
                                  const std::string& delete_condition, nb::handle data,

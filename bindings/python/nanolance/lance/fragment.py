@@ -122,7 +122,7 @@ class LanceFragment:
 
     @property
     def schema(self) -> pa.Schema:
-        return self._ds.schema
+        return self._ds._data_schema
 
     def data_files(self) -> List[DataFile]:
         return self.metadata.files

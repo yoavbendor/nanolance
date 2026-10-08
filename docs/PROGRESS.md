@@ -2926,3 +2926,19 @@ first, without degrading function or speed.
   compaction, deletes, an update and a merge; every row once, every change landed, pylance reads
   what nanolance reads, the index still answers); pylance's `test_compact_with_write` 16 of 16 in
   parallel (15 of 16 before); pylance's suite 271, lance-c's 106 of 106, ctest, the Python suite.
+
+## System columns
+
+- `_rowoffset`, `_row_created_at_version` and `_row_last_updated_at_version` in takes and scans,
+  where the projection names them (the version columns read 1 without stable row ids, as Lance's
+  do; refused with them); `_rowoffset` of a take is non-nullable, as pylance's.
+- Filters on `_rowid` / `_rowaddr`: the scan returns every row with its address, the filter is
+  evaluated by the core's own expression engine (new `_filter_mask` binding), then offset and
+  limit; `count_rows` too.
+- `_distance` (and `_score`) after the named columns, or left out with
+  `disable_scoring_autoprojection`; a dataset opened with `default_scan_options` shows `_rowid` /
+  `_rowaddr` in its schema (internal paths use the data schema); `batch_size_bytes` and
+  `LANCE_DEFAULT_BATCH_SIZE`; pylance's limit/offset error wording.
+- **Verified**: `tests/test_system_columns.py` against pylance (takes, projections, filters with
+  limit/offset, distance placement); pylance's suite 283 (271 before); ctest, lance-c 106 of 106,
+  the Python suite. Plain scans take the same path as before.

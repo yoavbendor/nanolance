@@ -33,6 +33,7 @@ tests/test_dataset.py::test_access_config
 tests/test_dataset.py::test_add_null_columns
 tests/test_dataset.py::test_asof_checkout
 tests/test_dataset.py::test_auto_cleanup_invalid
+tests/test_dataset.py::test_batch_size_bytes_chopping_fallback
 tests/test_dataset.py::test_checkout
 tests/test_dataset.py::test_config_updates
 tests/test_dataset.py::test_count_rows
@@ -45,10 +46,13 @@ tests/test_dataset.py::test_dataset_append
 tests/test_dataset.py::test_dataset_from_record_batch_iterable
 tests/test_dataset.py::test_dataset_overwrite
 tests/test_dataset.py::test_dataset_restore
+tests/test_dataset.py::test_dataset_schema
+tests/test_dataset.py::test_default_scan_options
 tests/test_dataset.py::test_default_scan_options_nearest
 tests/test_dataset.py::test_default_v2_manifest_paths
 tests/test_dataset.py::test_delete_data
 tests/test_dataset.py::test_filter
+tests/test_dataset.py::test_filter_meta_columns
 tests/test_dataset.py::test_flat_vector_search_with_delete
 tests/test_dataset.py::test_from_pydantic_model
 tests/test_dataset.py::test_from_pydantic_model_rejects_invalid_item[dict]
@@ -67,6 +71,7 @@ tests/test_dataset.py::test_input_data[NoneType-list]
 tests/test_dataset.py::test_input_data[Schema-list]
 tests/test_dataset.py::test_input_data[Schema-list_iterator]
 tests/test_dataset.py::test_late_materialization_batch_size
+tests/test_dataset.py::test_limit_offset[stable]
 tests/test_dataset.py::test_list_from_parquet
 tests/test_dataset.py::test_load_scanner_from_fragments
 tests/test_dataset.py::test_merge_insert
@@ -98,9 +103,11 @@ tests/test_dataset.py::test_sample
 tests/test_dataset.py::test_scan_count_rows
 tests/test_dataset.py::test_scan_no_columns
 tests/test_dataset.py::test_scan_prefilter
+tests/test_dataset.py::test_scan_with_batch_size
 tests/test_dataset.py::test_scan_with_row_ids
 tests/test_dataset.py::test_scanner_schemas
 tests/test_dataset.py::test_schema_metadata_updates
+tests/test_dataset.py::test_scoring_columns
 tests/test_dataset.py::test_system_columns
 tests/test_dataset.py::test_table_metadata_updates
 tests/test_dataset.py::test_take
@@ -109,8 +116,12 @@ tests/test_dataset.py::test_take_duplicate_index[indices1]
 tests/test_dataset.py::test_take_duplicate_index[indices2]
 tests/test_dataset.py::test_take_duplicate_index[indices3]
 tests/test_dataset.py::test_take_rowid_rowaddr
+tests/test_dataset.py::test_take_system_columns_column_ordering
+tests/test_dataset.py::test_take_system_columns_values[_row_created_at_version]
+tests/test_dataset.py::test_take_system_columns_values[_row_last_updated_at_version]
 tests/test_dataset.py::test_take_system_columns_values[_rowaddr]
 tests/test_dataset.py::test_take_system_columns_values[_rowid]
+tests/test_dataset.py::test_take_system_columns_values[_rowoffset]
 tests/test_dataset.py::test_take_with_columns
 tests/test_dataset.py::test_take_with_json_column
 tests/test_dataset.py::test_tensor_type
@@ -165,6 +176,7 @@ tests/test_filter.py::test_pyarrow_predicate_with_default_row_id
 tests/test_filter.py::test_struct_field_order
 tests/test_fork.py::test_table_roundtrip
 tests/test_fragment.py::test_fragment_count_rows
+tests/test_fragment.py::test_fragment_scanner_batch_size_bytes
 tests/test_fragment.py::test_fragment_scanner_io_buffer_size_forwarded
 tests/test_fragment.py::test_fragment_scanner_matches_dataset_scanner[False]
 tests/test_fragment.py::test_fragment_scanner_matches_dataset_scanner[None]

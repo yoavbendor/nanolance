@@ -173,6 +173,16 @@ class LanceDataset:
 
     @property
     def schema(self) -> pa.Schema:
+        """The dataset's schema, with the row id columns its default scan options add (as Lance's)."""
+        schema = self._data_schema
+        for option, name in (("with_row_id", "_rowid"), ("with_row_address", "_rowaddr")):
+            if self._default_scan_options.get(option):
+                schema = schema.append(pa.field(name, pa.uint64()))
+        return schema
+
+    @property
+    def _data_schema(self) -> pa.Schema:
+        """The schema of the data alone."""
         if self._schema_cache is None:
             with native():
                 schema = pa.schema(_nanolance._ds_schema(self._uri, self._version))
@@ -184,7 +194,7 @@ class LanceDataset:
 
     @property
     def max_field_id(self) -> int:
-        return max(len(self.schema.names) - 1, 0)
+        return max(len(self._data_schema.names) - 1, 0)
 
     @property
     def partition_expression(self):
@@ -358,6 +368,7 @@ class LanceDataset:
             with_row_address=with_row_address, include_deleted_rows=include_deleted_rows, order_by=order_by,
             substrait_filter=substrait_filter, scan_stats_callback=scan_stats_callback, blob_handling=blob_handling,
             use_scalar_index=use_scalar_index, prefilter=prefilter, fast_search=fast_search,
+            disable_scoring_autoprojection=disable_scoring_autoprojection, batch_size_bytes=batch_size_bytes,
         )
         options.update({k: v for k, v in given.items() if v is not None})
         return LanceScanner(self, **options)
@@ -381,6 +392,7 @@ class LanceDataset:
                    strict_batch_size=None, order_by=None, **kwargs) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
+            batch_size_bytes=batch_size_bytes,
             full_text_query=full_text_query, with_row_id=with_row_id, with_row_address=with_row_address,
             order_by=order_by, use_scalar_index=use_scalar_index, prefilter=prefilter, **kwargs,
         ).to_batches()
@@ -422,25 +434,42 @@ class LanceDataset:
               blob_handling=None):
         blob_handling = _nanolance.BLOB_DESCRIPTIONS if blob_handling is None else blob_handling
         order = None
-        if names is not None and any(n in ("_rowid", "_rowaddr") for n in names):
+        derived = []  # system columns computed here rather than read
+        if names is not None and any(n in _SYSTEM_COLUMNS for n in names):
             order = list(names)
             with_row_id = with_row_id or "_rowid" in names
             with_row_address = with_row_address or "_rowaddr" in names
-            names = [n for n in names if n not in ("_rowid", "_rowaddr")]
+            derived = [n for n in names if n in ("_rowoffset",) + _VERSION_COLUMNS]
+            if "_rowoffset" in derived and addresses:
+                raise unsupported("_rowoffset when taking rows by id or address")
+            names = [n for n in names if n not in _SYSTEM_COLUMNS]
             if not names and not (with_row_id or with_row_address):
-                names = None
+                names, with_row_address = [], True  # something to count the rows by
         distinct = sorted(set(wanted))
         with native():
             table = pa.table(_nanolance._ds_take(self._uri, self._version, distinct, names, with_row_id,
                                                  with_row_address, addresses, blob_handling))
+        if wanted != distinct:
+            position = {row: k for k, row in enumerate(distinct)}
+            table = table.take(pa.array([position[i] for i in wanted], pa.int64()))
+        for column in derived:
+            if column == "_rowoffset":
+                table = table.append_column(pa.field(column, pa.uint64(), nullable=False),
+                                            pa.array(wanted, pa.uint64()))
+            else:
+                table = table.append_column(column, self._row_versions(table.num_rows))
         if order is not None:
-            table = table.select(order)
-        elif names is not None:
+            return table.select(order)
+        if names is not None:
             table = table.select(names + [c for c in ("_rowid", "_rowaddr") if c in table.column_names])
-        if wanted == distinct:
-            return table
-        position = {row: k for k, row in enumerate(distinct)}
-        return table.take(pa.array([position[i] for i in wanted], pa.int64()))
+        return table
+
+    def _row_versions(self, rows: int) -> pa.Array:
+        """`_row_created_at_version` / `_row_last_updated_at_version`: Lance keeps them per row only
+        with stable row ids; without, every row reads as version 1, as in Lance."""
+        if self.has_stable_row_ids:
+            raise unsupported("row version columns of a dataset with stable row ids")
+        return pa.array([1] * rows, pa.uint64())
 
     # ── blobs ───────────────────────────────────────────────────────────────────────────────────────
 
@@ -456,7 +485,7 @@ class LanceDataset:
             for i in wanted:
                 if i < 0 or i >= n:
                     raise IndexError(f"index {i} is out of bounds for a dataset of {n} rows")
-        field = self.schema.field(blob_column) if blob_column in self.schema.names else None
+        field = self._data_schema.field(blob_column) if blob_column in self._data_schema.names else None
         if field is None:
             raise ValueError(f"column {blob_column!r} does not exist")
         table = self._take(wanted, [blob_column], addresses=kind != "indices",
@@ -654,7 +683,7 @@ class LanceDataset:
             kwargs.pop(ignored, None)
         if kwargs:
             raise unsupported(f"create_index options {sorted(kwargs)}")
-        field = next((f for f in self.schema if f.name == str(column)), None)
+        field = next((f for f in self._data_schema if f.name == str(column)), None)
         if field is not None:
             storage = getattr(field.type, "storage_type", field.type)
             if not pa.types.is_fixed_size_list(storage):
@@ -767,7 +796,21 @@ def _index_list(indices) -> List[int]:
     return [int(i) for i in indices]
 
 
-_SYSTEM_COLUMNS = ("_rowid", "_rowaddr", "_rowoffset", "_distance")
+_VERSION_COLUMNS = ("_row_created_at_version", "_row_last_updated_at_version")
+_SYSTEM_COLUMNS = ("_rowid", "_rowaddr", "_rowoffset", "_distance") + _VERSION_COLUMNS
+_ROW_ID_REFERENCE = None
+
+
+def _references_row_ids(sql: Optional[str]) -> bool:
+    """Whether a filter reads `_rowid` or `_rowaddr` (which the scan cannot push down)."""
+    global _ROW_ID_REFERENCE
+    if sql is None:
+        return False
+    if _ROW_ID_REFERENCE is None:
+        import re
+
+        _ROW_ID_REFERENCE = re.compile(r"(?<![A-Za-z0-9_])_row(id|addr)(?![A-Za-z0-9_])")
+    return _ROW_ID_REFERENCE.search(sql) is not None
 
 
 @contextlib.contextmanager
@@ -868,7 +911,7 @@ def _nearest_query(ds, nearest) -> dict:
         if i > 0 and not pa.types.is_struct(node.type):
             node = None
             break
-        node = {f.name.lower(): f for f in (ds.schema if i == 0 else node.type)}.get(part.lower())
+        node = {f.name.lower(): f for f in (ds._data_schema if i == 0 else node.type)}.get(part.lower())
         if node is None:
             break
     if node is None:
@@ -967,7 +1010,7 @@ class MergeInsertBuilder:
     def __init__(self, dataset: LanceDataset, on):
         if on is None:
             # The schema's (unenforced) primary key, as Lance does it.
-            on = [f.name for f in dataset.schema
+            on = [f.name for f in dataset._data_schema
                   if (f.metadata or {}).get(b"lance-schema:unenforced-primary-key", b"").lower() == b"true"]
             if not on:
                 raise ValueError(
@@ -1032,7 +1075,7 @@ class MergeInsertBuilder:
 
     def execute(self, data_obj, *, schema: Optional[pa.Schema] = None) -> Dict[str, int]:
         reader = _coerce_reader(data_obj, schema)
-        target = self._ds.schema
+        target = self._ds._data_schema
         if not (self._update_all or self._insert_all or self._delete_by_source or self._when_matched):
             raise ValueError("Invalid user input: The merge insert job is not configured to change the data in any way")
         if self._when_matched == "delete" and not self._insert_all:
@@ -1193,7 +1236,12 @@ class LanceScanner:
     def __init__(self, ds: LanceDataset, columns=None, filter=None, limit=None, offset=None, nearest=None,
                  batch_size=None, fragments=None, full_text_query=None, with_row_id=False, with_row_address=False,
                  include_deleted_rows=None, order_by=None, substrait_filter=None, scan_stats_callback=None,
-                 blob_handling=None, use_scalar_index=None, prefilter=None, fast_search=None, **ignored):
+                 blob_handling=None, use_scalar_index=None, prefilter=None, fast_search=None,
+                 disable_scoring_autoprojection=None, batch_size_bytes=None, **ignored):
+        self._batch_size_bytes = None if batch_size_bytes is None else int(batch_size_bytes)
+        # With a projection, `_distance` / `_score` come back only where named (Lance's
+        # disable_scoring_autoprojection); otherwise after the named columns.
+        self._no_score_autoprojection = bool(disable_scoring_autoprojection) and columns is not None
         self._nearest = None if nearest is None else _nearest_query(ds, nearest)
         self._prefilter = bool(prefilter)
         self._fast_search = bool(fast_search)
@@ -1207,11 +1255,18 @@ class LanceScanner:
         if order_by:
             raise unsupported("order_by")
         self._filter = _filter_sql(filter)
+        # A filter on _rowid / _rowaddr is evaluated here, over the rows the scan returns with their
+        # addresses, before limit and offset (the scan cannot push it down).
+        self._post_filter = None
+        if _references_row_ids(self._filter):
+            if self._nearest is not None or self._fts is not None:
+                raise unsupported("a filter on _rowid or _rowaddr with a vector or full-text search")
+            self._post_filter, self._filter = self._filter, None
         self._blob_handling = _blob_mode(blob_handling)
-        if limit is not None and int(limit) < 0:
-            raise ValueError("limit must be non-negative")
         if offset is not None and int(offset) < 0:
-            raise ValueError("offset must be non-negative")
+            raise ValueError("Offset must be non-negative")
+        if limit is not None and int(limit) < 0:
+            raise ValueError("Limit must be non-negative")
         self._ds = ds
         self._columns = columns
         self._names = _normalize_columns(columns)
@@ -1223,6 +1278,7 @@ class LanceScanner:
             with_row_id = with_row_id or "_rowid" in self._names
             with_row_address = with_row_address or "_rowaddr" in self._names
             self._row_offset = "_rowoffset" in self._names
+            self._row_versions = [n for n in self._names if n in _VERSION_COLUMNS]
             self._names = [n for n in self._names if n not in _SYSTEM_COLUMNS]
             if not self._names and not (with_row_id or with_row_address):
                 with_row_address = True  # something to count rows by; not returned
@@ -1260,6 +1316,7 @@ class LanceScanner:
                                        self._blob_handling, self._use_scalar_index)
 
     _drop_rowaddr = False
+    _row_versions: List[str] = []
 
     def _shape(self, table: pa.Table) -> pa.Table:
         if self._drop_rowaddr:
@@ -1274,6 +1331,8 @@ class LanceScanner:
                     at += int(f["physical_rows"]) - int(f["deleted_rows"])
                 first += starts[self._fragment_ids[0]] if len(self._fragment_ids) == 1 else 0
             table = table.append_column("_rowoffset", pa.array(range(first, first + table.num_rows), pa.uint64()))
+        for column in self._row_versions:
+            table = table.append_column(column, self._ds._row_versions(table.num_rows))
         if self._order is not None:
             return table.select(self._order)
         if self._names is not None:
@@ -1289,7 +1348,45 @@ class LanceScanner:
             return self._nearest_table()
         if self._fts is not None:
             return self._fts_table()
+        if self._post_filter is not None:
+            return self._shape(self._row_id_filtered())
         return self._shape(pa.table(self._read(stream=False)))
+
+    def _row_id_filtered(self) -> pa.Table:
+        """The scan with a filter on _rowid / _rowaddr: every row with its address (and the columns
+        the filter reads), the filter evaluated by the scan's own expression engine, then offset and
+        limit."""
+        import re
+
+        sql = self._post_filter
+        if self._ds.has_stable_row_ids:
+            raise unsupported("a filter on _rowid or _rowaddr over a dataset with stable row ids")
+        names = self._names
+        extra = []
+        if names is not None:
+            extra = [n for n in self._ds._data_schema.names
+                     if n not in names and re.search(r"(?<![A-Za-z0-9_])" + re.escape(n) + r"(?![A-Za-z0-9_])", sql)]
+            if not names and not (self._with_row_id or self._with_row_address):
+                self._drop_rowaddr = True
+        with native():
+            table = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version,
+                                                 None if names is None else names + extra, self._fragment_ids, 0, -1,
+                                                 False, True, False, None, self._blob_handling,
+                                                 self._use_scalar_index))
+        address = table.column("_rowaddr")
+        probe = table.append_column("_rowid", address)  # without stable row ids, a row's id is its address
+        masks = []
+        for batch in probe.combine_chunks().to_batches():
+            with native():
+                masks.append(np.frombuffer(_nanolance._filter_mask(batch, sql), dtype=np.uint8).astype(bool))
+        mask = np.concatenate(masks) if masks else np.zeros(0, dtype=bool)
+        table = table.filter(pa.array(mask, pa.bool_()))
+        if self._offset or self._limit is not None:
+            table = table.slice(self._offset, self._limit)
+        if self._with_row_id:
+            table = table.append_column("_rowid", table.column("_rowaddr"))
+        drop = extra + ([] if self._with_row_address else ["_rowaddr"])
+        return table.drop_columns([c for c in drop if c in table.column_names])
 
     def _search(self):
         n = self._nearest
@@ -1315,7 +1412,14 @@ class LanceScanner:
         if self._offset or self._limit is not None:
             out = out.slice(self._offset, self._limit)
         if self._order is not None:
-            out = out.select([c for c in self._order if c in out.column_names])
+            # Named columns where named; `_distance`, when not named, after them (as Lance).
+            order = [c for c in self._order if c in out.column_names]
+            if "_distance" not in order and not self._no_score_autoprojection:
+                order.append("_distance")
+            order += [c for c in system if c not in order]
+            out = out.select(order)
+        elif self._no_score_autoprojection:
+            out = out.drop_columns(["_distance"])
         meta = self._ds._info["schema_metadata"]
         if meta and out.schema.metadata != meta:
             out = out.replace_schema_metadata(meta)
@@ -1344,10 +1448,12 @@ class LanceScanner:
             out = out.slice(self._offset)
         if self._order is not None:
             order = [c for c in self._order if c in out.column_names]
-            if "_score" not in order:
+            if "_score" not in order and not self._no_score_autoprojection:
                 order.append("_score")
             order += [c for c in system if c not in order]
             out = out.select(order)
+        elif self._no_score_autoprojection:
+            out = out.drop_columns(["_score"])
         meta = self._ds._info["schema_metadata"]
         if meta and out.schema.metadata != meta:
             out = out.replace_schema_metadata(meta)
@@ -1358,8 +1464,12 @@ class LanceScanner:
         return pa.RecordBatchReader.from_batches(table.schema, self._rebatch(table))
 
     def _rebatch(self, table: pa.Table) -> Iterator[pa.RecordBatch]:
-        if self._batch_size:
-            return iter(table.to_batches(max_chunksize=int(self._batch_size)))
+        size = self._batch_size or os.environ.get("LANCE_DEFAULT_BATCH_SIZE")
+        if not size and self._batch_size_bytes and table.num_rows:
+            # About that many bytes a batch, by the rows' average in-memory size.
+            size = max(1, self._batch_size_bytes * table.num_rows // max(table.nbytes, 1))
+        if size:
+            return iter(table.to_batches(max_chunksize=int(size)))
         return iter(table.to_batches())
 
     def to_batches(self) -> Iterator[pa.RecordBatch]:
@@ -1370,7 +1480,8 @@ class LanceScanner:
             return len(self._fts_search()[0][self._offset:])
         if self._names is None and not (self._with_row_id or self._with_row_address):
             # Count by reading only what the filter needs (a row address column when it needs nothing).
-            counter = LanceScanner(self._ds, columns=[], filter=self._filter, limit=self._limit, offset=self._offset,
+            counter = LanceScanner(self._ds, columns=[], filter=self._post_filter or self._filter, limit=self._limit,
+                                   offset=self._offset,
                                    fragments=self._fragment_ids, with_row_address=True,
                                    use_scalar_index=self._use_scalar_index)
             return counter.to_table().num_rows
@@ -1382,7 +1493,7 @@ class LanceScanner:
 
     @property
     def dataset_schema(self) -> pa.Schema:
-        return self._ds.schema
+        return self._ds._data_schema
 
     def explain_plan(self, verbose: bool = False) -> str:
         lines = [f"nanolance scan of {self._ds.uri} v{self._ds.version}"]
