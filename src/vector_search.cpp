@@ -16,6 +16,7 @@
 #include "nanolance/vector_search.hpp"
 
 #include "index_build.hpp"
+#include "fts_json.hpp"
 #include "index_files.hpp"
 
 #include "nanolance/data_file_reader.hpp"
@@ -38,6 +39,10 @@
 #include <mutex>
 #include <numeric>
 #include <set>
+#include <cstdlib>
+#include <functional>
+#include <optional>
+#include <thread>
 #include <unordered_map>
 
 namespace nano_lance {
@@ -447,7 +452,40 @@ bool in_range(float d, const NearestQuery& q) {
 struct Partition {
     std::vector<std::uint64_t> ids;
     std::vector<float> vectors;       // IVF_FLAT: n * dim
-    std::vector<std::uint8_t> codes;  // IVF_PQ: [code bytes][n]
+    std::vector<std::uint8_t> codes;  // IVF_PQ: [code bytes][n]; IVF_HNSW_SQ: [n][dim]
+    // IVF_HNSW_SQ: the partition's graph. Level 0 holds every node (row == node id); an upper level
+    // only the nodes on it.
+    std::vector<std::uint32_t> level0_offsets;  // n + 1
+    std::vector<std::uint32_t> level0;
+    std::vector<std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>> upper;  // levels 1..
+    std::uint32_t entry_point = 0;
+    std::size_t max_level = 0;  // levels holding nodes (Lance's max_level())
+
+    const std::uint32_t* neighbors(std::size_t level, std::uint32_t node, std::size_t& count) const {
+        count = 0;
+        if (level == 0) {
+            if (node + 1U >= level0_offsets.size()) {
+                return nullptr;
+            }
+            count = level0_offsets[node + 1U] - level0_offsets[node];
+            return level0.data() + level0_offsets[node];
+        }
+        if (level - 1U >= upper.size()) {
+            return nullptr;
+        }
+        const auto it = upper[level - 1U].find(node);
+        if (it == upper[level - 1U].end()) {
+            return nullptr;
+        }
+        count = it->second.size();
+        return it->second.data();
+    }
+};
+
+/// One partition's HNSW graph metadata (index.idx's `lance:hnsw` entry).
+struct HnswMeta {
+    std::uint32_t entry_point = 0;
+    std::vector<std::uint64_t> level_offsets;
 };
 
 struct IvfIndex {
@@ -465,13 +503,130 @@ struct IvfIndex {
     std::size_t code_bytes = 0;   // m, or m / 2 with 4 bits
     bool transposed = true;
     std::vector<float> codebook;    // [m][2^nbits][dim / m]
+    // IVF_HNSW_SQ: 8-bit scalar quantization over [sq_start, sq_end], and the graphs in index.idx.
+    bool hnsw = false;
+    double sq_start = 0;
+    double sq_end = 0;
+    std::filesystem::path graph;
+    std::vector<std::uint64_t> graph_offsets;
+    std::vector<std::uint64_t> graph_lengths;
+    std::vector<HnswMeta> hnsw_meta;
     std::vector<float> codebook_t;  // the same as [m][dim / m][2^nbits]: a table row is one sweep
 
     mutable std::mutex mutex;
     mutable std::unordered_map<std::size_t, std::shared_ptr<const Partition>> loaded;
 
     bool partition(std::size_t p, std::shared_ptr<const Partition>& out, std::string& error) const;
+    bool load_hnsw_partition(std::size_t p, const FileTable& table, int id_col, int code_col, Partition& part,
+                             std::string& error) const;
 };
+
+bool IvfIndex::load_hnsw_partition(std::size_t p, const FileTable& table, int id_col, int code_col, Partition& part,
+                                   std::string& error) const {
+    for (const auto& batch : table.batches) {
+        BatchView b(table.schema, batch, error);
+        if (!b.ok) {
+            return false;
+        }
+        const ArrowArrayView* list = b.view.children[code_col];
+        const ArrowArrayView* bytes = list->children[0];
+        const ArrowArrayView* ids = b.view.children[id_col];
+        for (std::int64_t r = 0; r < batch.length; ++r) {
+            const std::int64_t row = b.view.offset + r;
+            part.ids.push_back(ArrowArrayViewGetUIntUnsafe(ids, row));
+            const std::int64_t first = (list->offset + row) * static_cast<std::int64_t>(dim);
+            const auto* src = bytes->buffer_views[1].data.as_uint8 + bytes->offset + first;
+            part.codes.insert(part.codes.end(), src, src + dim);
+        }
+    }
+    const std::size_t n = part.ids.size();
+    // The graph: index.idx rows of this partition, level by level.
+    const HnswMeta& meta = hnsw_meta[p];
+    const std::uint64_t rows = graph_lengths[p];
+    if (meta.level_offsets.back() != rows) {
+        error = "vector index: HNSW partition " + std::to_string(p) + " has " + std::to_string(rows) +
+                " graph rows, its levels " + std::to_string(meta.level_offsets.back());
+        return false;
+    }
+    std::vector<std::uint32_t> node_ids;
+    std::vector<std::uint32_t> offsets{0};
+    std::vector<std::uint32_t> values;
+    if (rows != 0U) {
+        const std::vector<std::string> columns = {"__vector_id", "__neighbors"};
+        FileTable g;
+        if (!read_table(graph, &columns, LanceRowRange{graph_offsets[p], rows}, g, error)) {
+            return false;
+        }
+        const int vid = child_index(g.schema, "__vector_id");
+        const int nb = child_index(g.schema, "__neighbors");
+        if (vid < 0 || nb < 0) {
+            error = "vector index: index.idx has no __vector_id / __neighbors column";
+            return false;
+        }
+        for (const auto& batch : g.batches) {
+            BatchView b(g.schema, batch, error);
+            if (!b.ok) {
+                return false;
+            }
+            const ArrowArrayView* lists = b.view.children[nb];
+            for (std::int64_t r = 0; r < batch.length; ++r) {
+                const std::int64_t row = b.view.offset + r;
+                node_ids.push_back(static_cast<std::uint32_t>(ArrowArrayViewGetUIntUnsafe(b.view.children[vid], row)));
+                const auto begin = ArrowArrayViewListChildOffset(lists, row);
+                const auto end = ArrowArrayViewListChildOffset(lists, row + 1);
+                for (auto e = begin; e < end; ++e) {
+                    const auto v = static_cast<std::uint32_t>(ArrowArrayViewGetUIntUnsafe(lists->children[0], e));
+                    if (v < n) {  // an edge out of the graph is dropped, as Lance drops it
+                        values.push_back(v);
+                    }
+                }
+                offsets.push_back(static_cast<std::uint32_t>(values.size()));
+            }
+        }
+    }
+    const std::size_t levels = meta.level_offsets.size() - 1U;
+    std::size_t max_level = 0;
+    for (std::size_t l = 0; l < levels; ++l) {
+        const auto from = meta.level_offsets[l];
+        const auto to = meta.level_offsets[l + 1U];
+        if (to > from) {
+            max_level = l + 1U;
+        }
+        if (l == 0) {
+            if (to - from != n) {
+                error = "vector index: HNSW level 0 of partition " + std::to_string(p) + " has " +
+                        std::to_string(to - from) + " nodes, the partition " + std::to_string(n) + " rows";
+                return false;
+            }
+            for (std::uint64_t r = from; r < to; ++r) {
+                if (node_ids[r] != r - from) {
+                    error = "vector index: HNSW level-0 __vector_id must equal the row index";
+                    return false;
+                }
+            }
+            part.level0_offsets.assign(offsets.begin() + static_cast<std::ptrdiff_t>(from),
+                                       offsets.begin() + static_cast<std::ptrdiff_t>(to + 1U));
+            const std::uint32_t base = part.level0_offsets.front();
+            for (auto& o : part.level0_offsets) {
+                o -= base;
+            }
+            part.level0.assign(values.begin() + offsets[from], values.begin() + offsets[to]);
+        } else {
+            std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> level;
+            for (std::uint64_t r = from; r < to; ++r) {
+                level[node_ids[r]] = std::vector<std::uint32_t>(values.begin() + offsets[r], values.begin() + offsets[r + 1U]);
+            }
+            part.upper.push_back(std::move(level));
+        }
+    }
+    part.max_level = max_level;
+    part.entry_point = meta.entry_point;
+    if (n != 0U && part.entry_point >= n) {
+        error = "vector index: HNSW entry point out of range";
+        return false;
+    }
+    return true;
+}
 
 bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, std::string& error) const {
     {
@@ -485,7 +640,7 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
     auto part = std::make_shared<Partition>();
     const std::uint64_t n = lengths[p];
     if (n != 0U) {
-        const std::vector<std::string> columns = {"_rowid", pq ? "__pq_code" : "flat"};
+        const std::vector<std::string> columns = {"_rowid", pq ? "__pq_code" : (hnsw ? "__sq_code" : "flat")};
         FileTable table;
         if (!read_table(aux, &columns, LanceRowRange{offsets[p], n}, table, error)) {
             return false;
@@ -496,7 +651,11 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
             error = "vector index: auxiliary.idx has no _rowid / " + columns[1] + " column";
             return false;
         }
-        if (!pq) {
+        if (hnsw) {
+            if (!load_hnsw_partition(p, table, id_col, value_col, *part, error)) {
+                return false;
+            }
+        } else if (!pq) {
             VectorRows rows;
             rows.dim = dim;
             if (!collect_vectors(table.schema, table.batches, value_col, id_col, rows, error)) {
@@ -566,11 +725,12 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
         return false;
     }
     index->type = found ? json_value(value, "type") : std::string{};
-    if (index->type != "IVF_FLAT" && index->type != "IVF_PQ") {
+    if (index->type != "IVF_FLAT" && index->type != "IVF_PQ" && index->type != "IVF_HNSW_SQ") {
         error = "vector index type '" + index->type + "' is not supported";
         return false;
     }
     index->pq = index->type == "IVF_PQ";
+    index->hnsw = index->type == "IVF_HNSW_SQ";
     if (!parse_vector_metric(json_value(value, "distance_type"), index->metric)) {
         error = "vector index: unknown distance type '" + json_value(value, "distance_type") + "'";
         return false;
@@ -618,6 +778,58 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
         error = "vector index: " + std::to_string(index->partitions) + " partitions of dimension " +
                 std::to_string(index->dim) + " do not match its centroids and partition table";
         return false;
+    }
+    if (index->hnsw) {
+        // {"dim", "num_bits": 8, "bounds": {"start", "end"}}, and per partition {"entry_point",
+        // "params", "level_offsets"}; the graph rows of each partition from index.idx's IVF table.
+        fts::json::Value sq_list;
+        fts::json::Value sq;
+        if (!fts::json::parse(storage, sq_list) || sq_list.kind != fts::json::Value::Array || sq_list.items.empty() ||
+            sq_list.items[0].kind != fts::json::Value::String || !fts::json::parse(sq_list.items[0].s, sq) ||
+            sq.get("bounds") == nullptr || sq.get("bounds")->get("start") == nullptr ||
+            sq.get("bounds")->get("end") == nullptr) {
+            error = "vector index: IVF_HNSW_SQ storage metadata has no bounds";
+            return false;
+        }
+        const auto* bits = sq.get("num_bits");
+        if (bits != nullptr && bits->n != 8.0) {
+            error = "vector index: SQ with " + std::to_string(static_cast<int>(bits->n)) + " bits is not supported";
+            return false;
+        }
+        index->sq_start = sq.get("bounds")->get("start")->n;
+        index->sq_end = sq.get("bounds")->get("end")->n;
+        index->graph = index_path;
+        index->graph_offsets = model.offsets;
+        index->graph_lengths = model.lengths;
+        std::string hnsw_text;
+        if (!schema_metadata(index_path, "lance:hnsw", hnsw_text, found, layout, error)) {
+            return false;
+        }
+        fts::json::Value list;
+        if (!found || !fts::json::parse(hnsw_text, list) || list.kind != fts::json::Value::Array ||
+            list.items.size() != index->partitions || index->graph_offsets.size() != index->partitions ||
+            index->graph_lengths.size() != index->partitions) {
+            error = "vector index: IVF_HNSW_SQ index.idx has no graph for every partition";
+            return false;
+        }
+        for (const auto& item : list.items) {
+            fts::json::Value meta;
+            if (item.kind != fts::json::Value::String || !fts::json::parse(item.s, meta) ||
+                meta.get("level_offsets") == nullptr || meta.get("entry_point") == nullptr) {
+                error = "vector index: malformed HNSW metadata";
+                return false;
+            }
+            HnswMeta m;
+            m.entry_point = static_cast<std::uint32_t>(meta.get("entry_point")->n);
+            for (const auto& o : meta.get("level_offsets")->items) {
+                m.level_offsets.push_back(static_cast<std::uint64_t>(o.n));
+            }
+            if (m.level_offsets.empty()) {
+                m.level_offsets.push_back(0);
+            }
+            index->hnsw_meta.push_back(std::move(m));
+        }
+        index->code_bytes = index->dim;
     }
     if (index->pq) {
         index->nbits = static_cast<std::uint32_t>(std::strtoul(json_value(storage, "nbits").c_str(), nullptr, 10));
@@ -674,7 +886,7 @@ void probe_counts(const IvfIndex& index, const NearestQuery& q, bool f32_column,
     }
     const float nearest = sorted.empty() ? 0.0F : sorted.front();
     const bool finite_key = std::all_of(q.key.begin(), q.key.end(), [](float x) { return std::isfinite(x); });
-    const bool adaptive = !q.maximum_nprobes && f32_column && finite_key && !index.pq &&
+    const bool adaptive = !q.maximum_nprobes && f32_column && finite_key && index.type == "IVF_FLAT" &&
                           (index.metric == VectorMetric::L2 || index.metric == VectorMetric::Cosine) && q.k <= 100U &&
                           !(q.refine_factor && *q.refine_factor > 1U);
     const int bucket = q.k <= 1U ? 0 : (q.k <= 10U ? 1 : 2);
@@ -887,6 +1099,302 @@ void pq_distances(const IvfIndex& index, const std::vector<float>& table, const 
     }
 }
 
+// ── IVF_HNSW_SQ ───────────────────────────────────────────────────────────────────────────────
+
+/// Rust's std::collections::BinaryHeap (a max-heap) over `T`, compared by `less` alone: pushes,
+/// pops and the final sort move elements exactly as Rust's do, so equal distances come out in
+/// Lance's order.
+template <typename T, typename Less>
+class RustHeap {
+public:
+    explicit RustHeap(Less less) : less_(less) {}
+    std::size_t size() const { return d_.size(); }
+    bool empty() const { return d_.empty(); }
+    const T& peek() const { return d_.front(); }
+    void push(T x) {
+        d_.push_back(std::move(x));
+        sift_up(0, d_.size() - 1U);
+    }
+    T pop() {
+        T item = std::move(d_.back());
+        d_.pop_back();
+        if (!d_.empty()) {
+            std::swap(item, d_.front());
+            sift_down_to_bottom(0);
+        }
+        return item;
+    }
+    /// Ascending, as into_sorted_vec.
+    std::vector<T> into_sorted() && {
+        std::size_t end = d_.size();
+        while (end > 1U) {
+            --end;
+            std::swap(d_[0], d_[end]);
+            sift_down_range(0, end);
+        }
+        return std::move(d_);
+    }
+
+private:
+    bool le(const T& a, const T& b) const { return !less_(b, a); }
+    std::size_t sift_up(std::size_t start, std::size_t pos) {
+        T el = std::move(d_[pos]);
+        while (pos > start) {
+            const std::size_t parent = (pos - 1U) / 2U;
+            if (le(el, d_[parent])) {
+                break;
+            }
+            d_[pos] = std::move(d_[parent]);
+            pos = parent;
+        }
+        d_[pos] = std::move(el);
+        return pos;
+    }
+    void sift_down_range(std::size_t pos, std::size_t end) {
+        T el = std::move(d_[pos]);
+        std::size_t child = 2U * pos + 1U;
+        while (end >= 2U && child <= end - 2U) {
+            if (le(d_[child], d_[child + 1U])) {
+                ++child;
+            }
+            if (!less_(el, d_[child])) {  // el >= child
+                d_[pos] = std::move(el);
+                return;
+            }
+            d_[pos] = std::move(d_[child]);
+            pos = child;
+            child = 2U * pos + 1U;
+        }
+        if (child + 1U == end && less_(el, d_[child])) {
+            d_[pos] = std::move(d_[child]);
+            pos = child;
+        }
+        d_[pos] = std::move(el);
+    }
+    void sift_down_to_bottom(std::size_t pos) {
+        const std::size_t end = d_.size();
+        const std::size_t start = pos;
+        T el = std::move(d_[pos]);
+        std::size_t child = 2U * pos + 1U;
+        while (end >= 2U && child <= end - 2U) {
+            if (le(d_[child], d_[child + 1U])) {
+                ++child;
+            }
+            d_[pos] = std::move(d_[child]);
+            pos = child;
+            child = 2U * pos + 1U;
+        }
+        if (child + 1U == end) {
+            d_[pos] = std::move(d_[child]);
+            pos = child;
+        }
+        d_[pos] = std::move(el);
+        sift_up(start, pos);
+    }
+
+    std::vector<T> d_;
+    Less less_;
+};
+
+struct HnswNode {
+    float dist;
+    std::uint32_t id;
+};
+
+/// OrderedFloat's total order (NaN greatest).
+bool dist_less(float a, float b) {
+    const bool an = std::isnan(a);
+    const bool bn = std::isnan(b);
+    if (an || bn) {
+        return !an && bn;
+    }
+    return a < b;
+}
+
+/// The SQ codes of `v` over [start, end] (lance-index scale_to_u8): (v - start) * 255 / range in f64,
+/// cast to u8 with Rust's saturation (NaN to 0).
+void sq_codes(const float* v, std::size_t dim, double start, double end, std::uint8_t* out) {
+    if (start == end) {
+        std::fill(out, out + dim, std::uint8_t{0});
+        return;
+    }
+    const double range = end - start;
+    for (std::size_t j = 0; j < dim; ++j) {
+        const double x = (static_cast<double>(v[j]) - start) * 255.0 / range;
+        out[j] = std::isnan(x) || x <= 0.0 ? 0 : (x >= 255.0 ? 255 : static_cast<std::uint8_t>(x));
+    }
+}
+
+/// Distances to one partition's SQ codes, as Lance's SQDistCalculator computes them.
+struct SqDistance {
+    const IvfIndex* index = nullptr;
+    const Partition* part = nullptr;
+    std::vector<std::uint8_t> query_code;  // L2 / cosine
+    std::vector<float> query;              // dot
+    float query_sum = 0;
+    float scale = 0;
+    float lower = 0;
+    float value_scale = 0;
+
+    SqDistance(const IvfIndex& idx, const Partition& p, const std::vector<float>& key) : index(&idx), part(&p) {
+        value_scale = static_cast<float>(idx.sq_end - idx.sq_start) / 255.0F;
+        scale = value_scale * value_scale;
+        lower = static_cast<float>(idx.sq_start);
+        if (idx.metric == VectorMetric::Dot) {
+            query = key;
+            for (const float x : key) {
+                query_sum += x;
+            }
+        } else {
+            query_code.resize(idx.dim);
+            sq_codes(key.data(), idx.dim, idx.sq_start, idx.sq_end, query_code.data());
+        }
+    }
+    float operator()(std::uint32_t id) const {
+        const std::size_t dim = index->dim;
+        const std::uint8_t* c = part->codes.data() + static_cast<std::size_t>(id) * dim;
+        if (index->metric == VectorMetric::Dot) {
+            float acc = 0;
+            for (std::size_t j = 0; j < dim; ++j) {
+                acc += static_cast<float>(c[j]) * query[j];
+            }
+            return 1.0F - (lower * query_sum + value_scale * acc);
+        }
+        std::uint64_t sum = 0;
+        for (std::size_t j = 0; j < dim; ++j) {
+            const int d = static_cast<int>(c[j]) - static_cast<int>(query_code[j]);
+            sum += static_cast<std::uint64_t>(d * d);
+        }
+        return static_cast<float>(sum) * scale;
+    }
+};
+
+/// One partition's HNSW search (lance-index HNSW::search): greedy descent to level 1, a beam of
+/// `ef` at level 0, the best `k`. `accept` filters results (a prefilter, a distance range); null
+/// accepts all.
+std::vector<HnswNode> hnsw_search(const Partition& part, const SqDistance& dist, std::size_t k, std::size_t ef,
+                                  const std::function<bool(std::uint32_t, float)>* accept) {
+    const std::size_t n = part.ids.size();
+    if (n == 0U) {
+        return {};
+    }
+    HnswNode ep{dist(part.entry_point), part.entry_point};
+    for (std::size_t level = part.max_level; level-- > 1U;) {
+        std::uint32_t current = ep.id;
+        float closest = ep.dist;
+        for (;;) {
+            std::optional<std::uint32_t> next;
+            std::size_t count = 0;
+            const std::uint32_t* nb = part.neighbors(level, current, count);
+            for (std::size_t i = 0; i < count; ++i) {
+                const float d = dist(nb[i]);
+                if (dist_less(d, closest)) {
+                    closest = d;
+                    next = nb[i];
+                }
+            }
+            if (!next) {
+                break;
+            }
+            current = *next;
+        }
+        ep = HnswNode{closest, current};
+    }
+    const auto by_dist = [](const HnswNode& a, const HnswNode& b) { return dist_less(a.dist, b.dist); };
+    const auto reverse = [](const HnswNode& a, const HnswNode& b) { return dist_less(b.dist, a.dist); };
+    RustHeap<HnswNode, decltype(reverse)> candidates(reverse);
+    RustHeap<HnswNode, decltype(by_dist)> results(by_dist);
+    std::vector<std::uint8_t> visited(n, 0U);
+    visited[ep.id] = 1U;
+    candidates.push(ep);
+    if (accept == nullptr || (*accept)(ep.id, ep.dist)) {
+        results.push(ep);
+    }
+    while (!candidates.empty()) {
+        const HnswNode current = candidates.pop();
+        const float furthest = results.empty() ? std::numeric_limits<float>::infinity() : results.peek().dist;
+        if (dist_less(furthest, current.dist) && results.size() == ef) {
+            break;
+        }
+        std::size_t count = 0;
+        const std::uint32_t* nb = part.neighbors(0, current.id, count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::uint32_t id = nb[i];
+            if (visited[id] != 0U) {
+                continue;
+            }
+            visited[id] = 1U;
+            const float d = dist(id);
+            const float far = results.empty() ? std::numeric_limits<float>::infinity() : results.peek().dist;
+            if (!dist_less(far, d) || results.size() < ef) {
+                if (accept == nullptr || (*accept)(id, d)) {
+                    if (results.size() < ef) {
+                        results.push(HnswNode{d, id});
+                    } else if (dist_less(d, results.peek().dist)) {
+                        results.pop();
+                        results.push(HnswNode{d, id});
+                    }
+                }
+                candidates.push(HnswNode{d, id});
+            }
+        }
+    }
+    auto sorted = std::move(results).into_sorted();
+    if (sorted.size() > k) {
+        sorted.resize(k);
+    }
+    return sorted;
+}
+
+/// A partition's prefiltered search when few rows pass (under 10%): every passing row, exactly.
+std::vector<HnswNode> hnsw_flat(const Partition& part, const SqDistance& dist, std::size_t k,
+                                const std::vector<std::uint32_t>& passing, const NearestQuery& q) {
+    const auto by_dist = [](const HnswNode& a, const HnswNode& b) { return dist_less(a.dist, b.dist); };
+    RustHeap<HnswNode, decltype(by_dist)> heap(by_dist);
+    for (const auto id : passing) {
+        const float d = dist(id);
+        if (!in_range(d, q)) {
+            continue;
+        }
+        if (heap.size() < k) {
+            heap.push(HnswNode{d, id});
+        } else if (dist_less(d, heap.peek().dist)) {
+            heap.pop();
+            heap.push(HnswNode{d, id});
+        }
+    }
+    (void)part;
+    return std::move(heap).into_sorted();
+}
+
+/// Lance's query parallelism for an index without a global top-k heap (HNSW): its compute pool --
+/// the cores less LANCE_IO_CORE_RESERVATION (2), or LANCE_CPU_THREADS -- bounded by DataFusion's
+/// target partitions (the cores), and by the query's own setting.
+std::size_t late_parallelism(const NearestQuery& q) {
+    const auto cores = static_cast<std::size_t>(std::max(1U, std::thread::hardware_concurrency()));
+    const auto env = [](const char* name, std::size_t fallback) {
+        const char* raw = std::getenv(name);
+        if (raw == nullptr || *raw == '\0') {
+            return fallback;
+        }
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(raw, &end, 10);
+        return end != nullptr && *end == '\0' ? static_cast<std::size_t>(v) : fallback;
+    };
+    std::size_t compute = 0;
+    if (std::getenv("LANCE_CPU_THREADS") != nullptr) {
+        compute = std::max<std::size_t>(env("LANCE_CPU_THREADS", 1), 1);
+    } else {
+        const std::size_t reserved = env("LANCE_IO_CORE_RESERVATION", 2);
+        compute = cores <= reserved ? 1U : cores - reserved;
+    }
+    const std::size_t pool = std::max<std::size_t>(std::min(compute, cores), 1);
+    if (q.query_parallelism == -1 || q.query_parallelism == 0) {
+        return pool;
+    }
+    return q.query_parallelism > 0 ? std::clamp<std::size_t>(static_cast<std::size_t>(q.query_parallelism), 1, pool) : 1U;
+}
+
 /// The best `kk` candidates of one index segment.
 bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_column, const RowMask& mask,
                     std::size_t kk, std::vector<Candidate>& out, std::string& plan, std::string& error) {
@@ -936,6 +1444,54 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         }
         const std::size_t n = part->ids.size();
         std::vector<float> d;
+        if (index.hnsw) {
+            // Lance's HNSW::search: the rows that may come back (the prefilter: deletions, a filter);
+            // all of them -- a plain search; under 10% -- every one of them, exactly; otherwise the
+            // graph search, keeping only those.
+            std::vector<std::uint32_t> passing;
+            for (std::size_t r = 0; r < n; ++r) {
+                if (mask.allows(part->ids[r])) {
+                    passing.push_back(static_cast<std::uint32_t>(r));
+                }
+            }
+            const SqDistance dist(index, *part, key);
+            const std::size_t ef = q.ef.value_or(kk + kk / 2U);
+            if (ef < kk) {
+                why = "ef must be greater than or equal to k";
+                return false;
+            }
+            std::vector<HnswNode> found;
+            const bool ranged = q.lower_bound || q.upper_bound;
+            if (passing.size() == n) {
+                if (ranged) {
+                    const std::function<bool(std::uint32_t, float)> range = [&](std::uint32_t, float x) {
+                        return in_range(x, q);
+                    };
+                    found = hnsw_search(*part, dist, kk, ef, &range);
+                } else {
+                    found = hnsw_search(*part, dist, kk, ef, nullptr);
+                }
+            } else if (passing.size() < n * 10U / 100U) {
+                found = hnsw_flat(*part, dist, kk, passing, q);
+            } else {
+                std::vector<std::uint8_t> ok(n, 0U);
+                for (const auto r : passing) {
+                    ok[r] = 1U;
+                }
+                const std::function<bool(std::uint32_t, float)> allowed = [&](std::uint32_t id, float x) {
+                    return ok[id] != 0U && in_range(x, q);
+                };
+                found = hnsw_search(*part, dist, kk, ef, &allowed);
+            }
+            std::set<std::uint64_t> seen;
+            for (const auto& f : found) {
+                const std::uint64_t id = part->ids[f.id];
+                if (seen.insert(id).second) {
+                    local.push_back(Candidate{f.dist, id});
+                }
+            }
+            return true;
+        }
         if (index.pq) {
             std::vector<float> own;
             if (index.metric != VectorMetric::Dot) {
@@ -975,15 +1531,27 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         found += early[i].size();
         out.insert(out.end(), early[i].begin(), early[i].end());
     }
-    // Then one at a time while fewer than k rows were found.
+    // Then, while fewer than k rows were found, more partitions in order: one at a time (Lance's
+    // global top-k path, IVF_FLAT / IVF_PQ), or for HNSW `query_parallelism` in flight -- Lance pulls
+    // that many before the first finishes, and one more each time a finished one leaves it short.
     std::size_t searched = early.size();
-    for (; searched < most && found < max_results; ++searched) {
-        std::vector<Candidate> local;
-        if (!score(order[searched], local, error)) {
-            return false;
+    // Fewer rows pass the prefilter than k: Lance searches no further (the rest come back below).
+    const bool few = mask.has_count && mask.count <= q.k && found < mask.count;
+    if (!few && found < max_results && searched < most) {
+        const std::size_t remaining = most - searched;
+        std::size_t pulled = index.hnsw ? std::min(remaining, late_parallelism(q)) : 1U;
+        for (std::size_t done = 0; done < pulled; ++done) {
+            std::vector<Candidate> local;
+            if (!score(order[searched + done], local, error)) {
+                return false;
+            }
+            found += local.size();
+            out.insert(out.end(), local.begin(), local.end());
+            if (found < max_results && pulled < remaining) {
+                ++pulled;
+            }
         }
-        found += local.size();
-        out.insert(out.end(), local.begin(), local.end());
+        searched += pulled;
     }
     // Fewer rows pass the prefilter than k, and the search did not reach them all: Lance returns
     // the rest too, at an infinite distance.

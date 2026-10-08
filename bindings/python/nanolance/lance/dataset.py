@@ -915,6 +915,7 @@ def _nearest_query(ds, nearest) -> dict:
         "use_index": nearest.get("use_index", True) is not False,
         "lower_bound": None if lower is None else float(lower),
         "upper_bound": None if upper is None else float(upper),
+        "ef": None if ef is None else int(ef),
     }
 
 
@@ -1180,7 +1181,7 @@ class LanceScanner:
             return _nanolance._ds_nearest(
                 self._ds.uri, self._ds.version, n["column"], n["q"], n["k"], n["minimum_nprobes"],
                 n["maximum_nprobes"], n["refine_factor"], n["metric"], n["use_index"], n["lower_bound"],
-                n["upper_bound"], self._filter, self._prefilter, self._fast_search)
+                n["upper_bound"], self._filter, self._prefilter, self._fast_search, n.get("ef"))
 
     def _nearest_table(self) -> pa.Table:
         """The k nearest rows: the columns asked for, then ``_distance`` (then the row id columns)."""

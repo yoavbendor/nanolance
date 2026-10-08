@@ -1131,8 +1131,23 @@ bool append_levels_to_validity(const std::uint16_t* levels, std::uint32_t count,
 /// Decode one chunk's `count` repetition or definition levels (Lance levels are u16) into `levels`.
 /// Handles every spelling Lance uses for them: Rle, InlineBitpacking(16), Bitpacked{16, Flat(bits)},
 /// and raw Flat(16).
+/// Levels bit-packed at 0 bits: every level is 0 and the buffer is empty (pylance writes these for
+/// a chunk with no nulls, e.g. an HNSW index's neighbour lists).
+bool zero_width_levels(const page_layout::Compressive& encoding) {
+    return encoding.kind == page_layout::CompressiveKind::kBitpacked && encoding.values != nullptr &&
+           encoding.values->kind == page_layout::CompressiveKind::kFlat && encoding.values->bits_per_value == 0U;
+}
+
 [[nodiscard]] bool decode_levels(const std::vector<std::uint8_t>& bytes, const page_layout::Compressive& encoding,
                                  std::uint32_t count, std::uint16_t* levels, std::string& error) {
+    if (zero_width_levels(encoding)) {
+        if (!bytes.empty()) {
+            error = "0-bit levels carry " + std::to_string(bytes.size()) + " bytes";
+            return false;
+        }
+        std::fill(levels, levels + count, std::uint16_t{0});
+        return true;
+    }
     if (encoding.kind == page_layout::CompressiveKind::kRle) {
         return decode_rle_definition_levels(bytes, encoding, count, levels, error);
     }
@@ -2078,7 +2093,7 @@ bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& 
     }
     std::uint64_t covered = 0;
     for (const auto& chunk : chunks) {
-        if (chunk.repdef.empty()) {
+        if (chunk.repdef.empty() && !zero_width_levels(*plan.repdef)) {
             error = "column declares definition levels but a chunk carries none";
             return false;
         }
@@ -3349,7 +3364,7 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 return false;
             }
             if (nullable) {
-                if (chunk.repdef.empty()) {
+                if (chunk.repdef.empty() && !zero_width_levels(*plan->repdef)) {
                     error = "column declares definition levels but a chunk carries none";
                     return false;
                 }
@@ -3643,8 +3658,12 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
                 if (n == 0U) {
                     continue;
                 }
-                if ((has_rep && chunk.rep.empty()) || (chunk_shape.has_definition && chunk.repdef.empty())) {
-                    error = where + "a chunk declares levels but carries no level buffer";
+                if ((has_rep && chunk.rep.empty() && !zero_width_levels(*mb.rep_compression)) ||
+                    (chunk_shape.has_definition && chunk.repdef.empty() && !zero_width_levels(*mb.repdef_compression))) {
+                    error = where + "a chunk declares " + std::to_string(n) + " levels but carries no " +
+                            (has_rep && chunk.rep.empty() ? "repetition (" + page_layout::describe_encoding(*mb.rep_compression)
+                                                          : "definition (" + page_layout::describe_encoding(*mb.repdef_compression)) +
+                            ") level buffer";
                     return false;
                 }
                 if (has_rep) {

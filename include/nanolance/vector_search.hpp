@@ -33,6 +33,13 @@ struct NearestQuery {
     std::optional<std::uint32_t> maximum_nprobes;
     /// Re-score the best `k * refine_factor` index candidates exactly and return the best k.
     std::optional<std::uint32_t> refine_factor;
+    /// HNSW: the search beam's width; unset: 1.5 times the candidates kept (Lance's default).
+    std::optional<std::uint32_t> ef;
+    /// Partitions searched side by side once the first ones gave fewer than k rows (Lance's
+    /// query_parallelism): -1 every compute core, 0 Lance's choice for the index, n at most n. For
+    /// an HNSW index this decides how many partitions are searched (Lance searches them in batches),
+    /// so it is reproduced; elsewhere it changes nothing.
+    std::int32_t query_parallelism = 0;
     /// The distance; unset: the index's (L2 without one). A metric other than the index's searches
     /// exactly, as Lance does.
     std::optional<VectorMetric> metric;

@@ -1044,8 +1044,10 @@ NB_MODULE(_nanolance, m) {
                             std::uint32_t minimum_nprobes, std::optional<std::uint32_t> maximum_nprobes,
                             std::optional<std::uint32_t> refine_factor, std::optional<std::string> metric,
                             bool use_index, std::optional<float> lower_bound, std::optional<float> upper_bound,
-                            std::optional<std::string> filter, bool prefilter, bool fast_search) {
+                            std::optional<std::string> filter, bool prefilter, bool fast_search,
+                            std::optional<std::uint32_t> ef) {
         nano_lance::NearestQuery q;
+        q.ef = ef;
         q.has_version = version.has_value();
         q.version = version.value_or(0);
         q.column = column;
