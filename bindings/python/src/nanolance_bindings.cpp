@@ -8,6 +8,7 @@
 #include <nanolance/blob_v2_external.hpp>
 #include <nanolance/dataset.hpp>
 #include <nanolance/dataset_ops.hpp>
+#include <nanolance/dataset_refs.hpp>
 #include <nanolance/expr.hpp>
 #include <nanolance/fts_search.hpp>
 #include <nanolance/index_optimize.hpp>
@@ -672,6 +673,12 @@ public:
         }
     }
 
+    void set_initial_config(const std::string& key, const std::string& value) {
+        if (nano_lance_writer_set_initial_config(&writer_, key.c_str(), value.c_str()) != 0) {
+            throw std::runtime_error("failed to set the dataset config");
+        }
+    }
+
     std::uint64_t finish(int mode, bool keep_empty) {
         std::uint64_t version = 0;
         int rc = NANO_LANCE_OK;
@@ -889,6 +896,116 @@ NB_MODULE(_nanolance, m) {
         }
         return v;
     });
+    // Tags, cleanup and drop (dataset_refs.hpp).
+    m.def("_ds_tags", [](const std::filesystem::path& path) {
+        std::vector<nano_lance::TagInfo> tags;
+        std::string error;
+        if (!nano_lance::list_tags(path, tags, error)) {
+            throw_dataset(error);
+        }
+        nb::list out;
+        for (const auto& t : tags) {
+            nb::dict d;
+            d["name"] = t.name;
+            d["branch"] = t.branch ? nb::object(nb::str(t.branch->c_str())) : nb::none();
+            d["version"] = t.version;
+            d["created_at"] = t.created_at;
+            d["updated_at"] = t.updated_at;
+            d["manifest_size"] = t.manifest_size;
+            d["metadata"] = t.metadata;
+            out.append(d);
+        }
+        return out;
+    });
+    m.def("_ds_create_tag", [](const std::filesystem::path& path, const std::string& name, std::uint64_t version) {
+        std::string error;
+        if (!nano_lance::create_tag(path, name, version, error)) {
+            throw_dataset(error);
+        }
+    });
+    m.def("_ds_update_tag", [](const std::filesystem::path& path, const std::string& name, std::uint64_t version) {
+        std::string error;
+        if (!nano_lance::update_tag(path, name, version, error)) {
+            throw_dataset(error);
+        }
+    });
+    m.def("_ds_delete_tag", [](const std::filesystem::path& path, const std::string& name) {
+        std::string error;
+        if (!nano_lance::delete_tag(path, name, error)) {
+            throw_dataset(error);
+        }
+    });
+    m.def("_ds_replace_tag_metadata", [](const std::filesystem::path& path, const std::string& name,
+                                         const std::map<std::string, std::string>& metadata) {
+        std::string error;
+        if (!nano_lance::replace_tag_metadata(path, name, metadata, error)) {
+            throw_dataset(error);
+        }
+    });
+    m.def(
+        "_ds_cleanup",
+        [](const std::filesystem::path& path, std::uint64_t read_version, std::optional<std::int64_t> older_than_ns,
+           std::optional<std::uint64_t> retain_versions, bool delete_unverified, bool error_if_tagged,
+           std::optional<std::uint64_t> delete_rate_limit, std::optional<std::vector<std::uint64_t>> versions,
+           bool execute, std::size_t max_candidates) {
+            nano_lance::CleanupPolicy policy;
+            nano_lance::CleanupResult result;
+            std::string error;
+            bool ok = true;
+            {
+                nb::gil_scoped_release release;
+                if (older_than_ns) {
+                    policy.before_timestamp_ns =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        *older_than_ns;
+                }
+                if (versions) {
+                    policy.versions.emplace(versions->begin(), versions->end());
+                }
+                policy.delete_unverified = delete_unverified;
+                policy.error_if_tagged_old_versions = error_if_tagged;
+                policy.delete_rate_limit = delete_rate_limit;
+                ok = (!retain_versions || nano_lance::cleanup_retain_versions(path, *retain_versions, policy, error)) &&
+                     nano_lance::cleanup_old_versions(path, read_version, policy, execute, max_candidates, result,
+                                                      error);
+            }
+            if (!ok) {
+                throw_dataset(error);
+            }
+            nb::dict stats;
+            stats["bytes_removed"] = result.stats.bytes_removed;
+            stats["old_versions"] = result.stats.old_versions;
+            stats["data_files_removed"] = result.stats.data_files_removed;
+            stats["transaction_files_removed"] = result.stats.transaction_files_removed;
+            stats["index_files_removed"] = result.stats.index_files_removed;
+            stats["deletion_files_removed"] = result.stats.deletion_files_removed;
+            nb::list files;
+            for (const auto& f : result.candidates) {
+                nb::dict d;
+                d["path"] = f.path;
+                d["kind"] = f.kind;
+                d["unverified"] = f.unverified;
+                d["size_bytes"] = f.size_bytes;
+                files.append(d);
+            }
+            return nb::make_tuple(result.read_version, stats, files, result.candidates_truncated);
+        },
+        nb::arg("path"), nb::arg("read_version"), nb::arg("older_than_ns").none(), nb::arg("retain_versions").none(),
+        nb::arg("delete_unverified"), nb::arg("error_if_tagged"), nb::arg("delete_rate_limit").none(),
+        nb::arg("versions").none(), nb::arg("execute"), nb::arg("max_candidates"));
+    m.def("_ds_drop", [](const std::filesystem::path& path, bool ignore_not_found) {
+        std::string error;
+        bool ok = false;
+        {
+            nb::gil_scoped_release release;
+            ok = nano_lance::drop_dataset(path, ignore_not_found, error);
+        }
+        if (!ok) {
+            throw_dataset(error);
+        }
+    });
     m.def("_ds_restore", [](const std::filesystem::path& path, std::uint64_t version) {
         return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
             return nano_lance::dataset_restore(path, version, v, e);
@@ -922,6 +1039,7 @@ NB_MODULE(_nanolance, m) {
              nb::arg("max_bytes_per_file"))
         .def("write_batch", &StagedWriter::write_batch)
         .def("project", &StagedWriter::project)
+        .def("set_initial_config", &StagedWriter::set_initial_config)
         .def("finish", &StagedWriter::finish, nb::arg("mode"), nb::arg("keep_empty") = false);
     m.attr("COMMIT_CREATE") = static_cast<int>(NANO_LANCE_COMMIT_CREATE);
     m.attr("COMMIT_APPEND") = static_cast<int>(NANO_LANCE_COMMIT_APPEND);

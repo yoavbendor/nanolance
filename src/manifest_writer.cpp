@@ -7,6 +7,7 @@
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/version.hpp"
+#include "nanolance/dataset_refs.hpp"
 #include <sstream>
 #include <iomanip>
 #include "nanolance/schema_mapper.hpp"
@@ -221,6 +222,7 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     std::filesystem::create_hard_link(temp_path, final_path, ec);
     if (!ec) {
         std::filesystem::remove(temp_path, ec);
+        run_auto_cleanup(dataset_path, manifest.version, manifest.config);
         return true;
     }
     if (std::filesystem::exists(final_path)) {
@@ -234,6 +236,7 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
         error = "failed to atomically publish manifest: " + ec.message();
         return false;
     }
+    run_auto_cleanup(dataset_path, manifest.version, manifest.config);
     return true;
 }
 
@@ -465,3 +468,4 @@ bool write_dataset_manifest(const std::filesystem::path& dataset_path,
 }
 
 }  // namespace nano_lance
+

@@ -34,9 +34,17 @@ tests/test_compat_version_snapshot.py::test_workers_share_the_controller_version
 tests/test_dataset.py::test_access_config
 tests/test_dataset.py::test_add_null_columns
 tests/test_dataset.py::test_asof_checkout
+tests/test_dataset.py::test_auto_cleanup
 tests/test_dataset.py::test_auto_cleanup_invalid
 tests/test_dataset.py::test_batch_size_bytes_chopping_fallback
 tests/test_dataset.py::test_checkout
+tests/test_dataset.py::test_cleanup_around_tagged_old_versions
+tests/test_dataset.py::test_cleanup_error_when_tagged_old_versions
+tests/test_dataset.py::test_cleanup_old_versions
+tests/test_dataset.py::test_cleanup_specific_versions
+tests/test_dataset.py::test_cleanup_with_older_than_and_retain_versions
+tests/test_dataset.py::test_cleanup_with_rate_limit
+tests/test_dataset.py::test_config_update_auto_cleanup
 tests/test_dataset.py::test_config_updates
 tests/test_dataset.py::test_count_rows
 tests/test_dataset.py::test_count_rows_via_scanner
@@ -45,6 +53,13 @@ tests/test_dataset.py::test_create_table_from_pylist
 tests/test_dataset.py::test_create_update_empty_dataset[False]
 tests/test_dataset.py::test_create_update_empty_dataset[True]
 tests/test_dataset.py::test_dataset_append
+tests/test_dataset.py::test_dataset_drop
+tests/test_dataset.py::test_dataset_drop_allows_create_over_uncommitted_leftovers
+tests/test_dataset.py::test_dataset_drop_allows_dataset_with_unmanaged_files
+tests/test_dataset.py::test_dataset_drop_rejects_non_dataset_directory
+tests/test_dataset.py::test_dataset_drop_rejects_paths_without_readable_manifest[entries0]
+tests/test_dataset.py::test_dataset_drop_rejects_paths_without_readable_manifest[entries1]
+tests/test_dataset.py::test_dataset_drop_rejects_paths_without_readable_manifest[entries2]
 tests/test_dataset.py::test_dataset_from_record_batch_iterable
 tests/test_dataset.py::test_dataset_overwrite
 tests/test_dataset.py::test_dataset_restore
@@ -53,6 +68,8 @@ tests/test_dataset.py::test_default_scan_options
 tests/test_dataset.py::test_default_scan_options_nearest
 tests/test_dataset.py::test_default_v2_manifest_paths
 tests/test_dataset.py::test_delete_data
+tests/test_dataset.py::test_enable_disable_auto_cleanup
+tests/test_dataset.py::test_explain_cleanup_old_versions
 tests/test_dataset.py::test_filter
 tests/test_dataset.py::test_filter_meta_columns
 tests/test_dataset.py::test_flat_vector_search_with_delete
@@ -113,6 +130,7 @@ tests/test_dataset.py::test_schema_metadata_updates
 tests/test_dataset.py::test_scoring_columns
 tests/test_dataset.py::test_system_columns
 tests/test_dataset.py::test_table_metadata_updates
+tests/test_dataset.py::test_tag_order
 tests/test_dataset.py::test_take
 tests/test_dataset.py::test_take_duplicate_index[indices0]
 tests/test_dataset.py::test_take_duplicate_index[indices1]
@@ -137,6 +155,7 @@ tests/test_dataset.py::test_update_with_retry_parameters
 tests/test_dataset.py::test_use_scalar_index
 tests/test_dataset.py::test_v2_manifest_paths
 tests/test_dataset.py::test_version_id
+tests/test_dataset.py::test_versions
 tests/test_dataset.py::test_with_row_offset
 tests/test_dataset.py::test_write_dataset_pydantic_list_rejects_invalid_item[dict]
 tests/test_dataset.py::test_write_dataset_pydantic_list_rejects_invalid_item[different_model]

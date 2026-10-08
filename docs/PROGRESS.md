@@ -2951,3 +2951,28 @@ first, without degrading function or speed.
   segments) and stores the schema's own names (`MetaData.userId_idx`).
 - **Verified**: `tests/test_nested_paths.py` against pylance; pylance's suite 286 (283 before).
 - **Not yet**: INVERTED indexes on nested fields; SQL expressions in projections; `order_by`.
+
+## Version housekeeping
+
+- **Tags** (`src/dataset_refs.cpp`): `_refs/tags/<name>.json` in Lance's format (camelCase,
+  RFC 3339 times, manifest size, metadata), Lance's name rules and messages; created without
+  replacing (hard link, as `put_if_absent`). pylance reads nanolance's tags and the reverse;
+  `checkout_version("tag")`, `lance.dataset(uri, "tag")`.
+- **Cleanup**, Lance 12's rules: the read version, every newer and every tagged one kept (or an
+  error naming the tags); a removed version's files removed, files no version names only when 7
+  days old (or `delete_unverified`); only files no newer than the earliest kept version are listed,
+  unless a removed version is newer than a kept one; index directories by UUID; Blob v2 sidecars
+  with their data file; `retain_versions`, `versions`, `older_than`, `delete_rate_limit`; explain
+  with candidate files. Old manifests are removed before the files, so a cleanup cut short never
+  leaves a version whose files are gone.
+- **Auto cleanup**: every commit (`publish_manifest`) runs what the new version's
+  `lance.auto_cleanup.*` config asks for, as of the version before, errors ignored, as Lance's
+  hook. `auto_cleanup_options` goes into the first version's config. lance-c's create defaults
+  (every 20 versions, older than 14 days), already recorded, now take effect, as in Lance.
+- **Drop**: refused unless the path holds a manifest that reads (or a namespace marker).
+- **Verified**: `tests/test_version_housekeeping.py`: nanolance's and pylance's explain on copies of
+  the same dataset (nanolance- and pylance-written; overwrites, deletes, an update, an index,
+  compaction, a stray file; five policies) pick the same files, kinds and stats; after the
+  cleanup pylance and nanolance read every version left as before. Tags both ways; auto cleanup
+  matches pylance's version for version. pylance's suite 305 (286 before); ctest, lance-c 106/106,
+  the Python suite.

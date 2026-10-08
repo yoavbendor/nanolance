@@ -1275,8 +1275,8 @@ int32_t write_impl(const WriteRequest& req) {
     } close_writer{&writer};
     nano_lance_writer_set_ignore_nullability(&writer, true);
     if (req.commit) {
-        // What lance-c records on create: every 20 versions, versions older than 14 days may be
-        // reclaimed. nanolance reclaims nothing itself; Lance honors it when it next commits.
+        // What lance-c records on create: every 20 versions, versions older than 14 days are
+        // reclaimed (run_auto_cleanup after each commit, as Lance's auto cleanup hook).
         nano_lance_writer_set_initial_config(&writer, "lance.auto_cleanup.interval", "20");
         nano_lance_writer_set_initial_config(&writer, "lance.auto_cleanup.older_than", "14days");
     }

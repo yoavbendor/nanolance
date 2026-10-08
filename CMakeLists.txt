@@ -318,6 +318,7 @@ add_library(nanolance STATIC
     src/nano_lance_table_reader_c.cpp
     src/manifest_writer.cpp
     src/dataset.cpp
+    src/dataset_refs.cpp
     src/expr.cpp
     src/arrow_slice.cpp
     src/dataset_ops.cpp

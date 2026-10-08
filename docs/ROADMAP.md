@@ -25,7 +25,8 @@ plain append / update / scan comes before a whole subsystem.
 | 1 | ~~System columns~~ -- **done (2026-10-08)**: `_rowid` / `_rowaddr` in filters, `_rowoffset` and the row version columns in takes and scans, `_distance` / `_score` placement and `disable_scoring_autoprojection`, `default_scan_options` in the schema, `batch_size_bytes`, `LANCE_DEFAULT_BATCH_SIZE`; 12 more of pylance's tests. Left: a `_rowid` filter with vector or full-text search, or on a delete / update | ~10 |
 | 1 | ~~Nested field paths~~ -- **done (2026-10-08)**: `s.x` and back-quoted projections, scalar indexes on paths resolved as Lance resolves them (exact, else the one case-insensitive match). Left: an INVERTED index on a nested field (build and search), SQL expressions in a projection (`list_struct[1]['x']`) | ~7 |
 | 1 | `order_by` in scans (`ColumnOrdering`), found failing several column-name tests | ~5 |
-| 1 | Version housekeeping: `cleanup_old_versions`, auto cleanup, `drop`, `tags` / version refs | ~20 |
+| 1 | ~~Version housekeeping~~ -- **done (2026-10-08)**: tags, `cleanup_old_versions` / explain, auto cleanup on commit, `drop`, `version_refs`; 19 more of pylance's tests, and nanolance's cleanup picks the same files as pylance's on the same dataset. Left: branches (`create_branch`, tags on branches) | ~20 |
+| 1 | Write `_transactions/*.txn` files: Lance writes one per commit (pylance's conflict check reads them; cleanup counts them, so `test_cleanup_with_retain_versions` sees 0 for nanolance commits) | ~3 |
 | 1 | Compaction parity: `max_bytes`, source budgets, excluded fragments, index remapping instead of re-covering, `defer_index_remap` | ~10 |
 | 1 | Filter functions: JSON (`json_get*`, `json_extract`, ...), `::` casts, `arrow_cast`, `regexp_match`, datetime casts | ~40 |
 | 1 | Small APIs: `stats`, `lance_schema`, `update_field_metadata`, `read_transaction` / `get_transactions`, `LANCE_DEFAULT_BATCH_SIZE` | ~25 |

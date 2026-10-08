@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypedDict, Union
 
@@ -158,9 +158,9 @@ class LanceDataset:
         session=None,
         **kwargs,
     ):
-        if isinstance(version, str):
-            raise unsupported("tags (version given as a string)")
         self._uri = _path_of(uri)
+        if isinstance(version, str):
+            version = _tag_version(self._uri, version, ValueError)
         self._default_scan_options = dict(default_scan_options or {})
         with native():
             info = _nanolance._ds_info(self._uri, version)
@@ -277,7 +277,69 @@ class LanceDataset:
             )
         return out
 
+    def version_refs(self) -> List[Dict[str, int]]:
+        """Every version, oldest first, as ``{"version": n}`` (main branch only)."""
+        with native():
+            return [{"version": int(v["version"])} for v in _nanolance._ds_versions(self._uri)]
+
+    @property
+    def tags(self) -> "Tags":
+        return Tags(self)
+
+    def cleanup_old_versions(self, older_than: Optional[timedelta] = None, retain_versions: Optional[int] = None, *,
+                             delete_unverified: bool = False, error_if_tagged_old_versions: bool = True,
+                             delete_rate_limit: Optional[int] = None,
+                             versions: Optional[List[int]] = None) -> "CleanupStats":
+        """Remove old versions and the files only they use, as Lance's cleanup removes them: the
+        version this dataset is at, newer ones and tagged ones are kept; files no version references
+        are removed only once 7 days old (unless ``delete_unverified``). ``older_than`` defaults to
+        two weeks when nothing else selects versions."""
+        _, stats, _, _ = self._cleanup(older_than, retain_versions, delete_unverified, error_if_tagged_old_versions,
+                                       delete_rate_limit, versions, True, 0)
+        return stats
+
+    def explain_cleanup_old_versions(self, older_than: Optional[timedelta] = None,
+                                     retain_versions: Optional[int] = None, *, delete_unverified: bool = False,
+                                     error_if_tagged_old_versions: bool = True,
+                                     delete_rate_limit: Optional[int] = None, versions: Optional[List[int]] = None,
+                                     include_files: bool = False, max_files: int = 1000) -> "CleanupExplanation":
+        """What ``cleanup_old_versions`` would remove, removing nothing."""
+        if max_files <= 0:
+            raise ValueError("max_files must be positive")
+        read_version, stats, files, truncated = self._cleanup(
+            older_than, retain_versions, delete_unverified, error_if_tagged_old_versions, delete_rate_limit,
+            versions, False, int(max_files) if include_files else 0)
+        return CleanupExplanation(read_version, stats, [CleanupCandidateFile(**f) for f in files], truncated,
+                                  int(max_files) if include_files else 0)
+
+    def _cleanup(self, older_than, retain_versions, delete_unverified, error_if_tagged, delete_rate_limit, versions,
+                 execute, max_files):
+        if older_than is None and retain_versions is None and versions is None:
+            older_than = timedelta(days=14)
+        older_than_ns = None
+        if older_than is not None:
+            older_than_ns = (older_than.days * 86400 + older_than.seconds) * 10**9 + older_than.microseconds * 1000
+        if retain_versions is not None and int(retain_versions) <= 0:
+            raise OSError(f"Invalid user input: retain_versions must be greater than 0, got {int(retain_versions)}")
+        with _ref_errors():
+            read_version, stats, files, truncated = _nanolance._ds_cleanup(
+                self._uri, self._version, older_than_ns, None if retain_versions is None else int(retain_versions),
+                bool(delete_unverified), bool(error_if_tagged),
+                None if delete_rate_limit is None else int(delete_rate_limit),
+                None if versions is None else [int(v) for v in versions], bool(execute), int(max_files))
+        return int(read_version), CleanupStats(**stats), files, bool(truncated)
+
+    @staticmethod
+    def drop(base_uri, storage_options: Optional[Dict[str, str]] = None,
+             ignore_not_found: Optional[bool] = None) -> None:
+        """Delete the dataset and everything under ``base_uri``. Refused (ValueError) unless the path
+        holds a manifest that reads, as Lance refuses, so a parent directory given by mistake survives."""
+        with _ref_errors():
+            _nanolance._ds_drop(_path_of(base_uri), bool(ignore_not_found))
+
     def checkout_version(self, version) -> "LanceDataset":
+        if isinstance(version, str):
+            version = _tag_version(self._uri, version, OSError)
         if isinstance(version, tuple):
             branch, number = version
             if branch not in (None, "main"):
@@ -792,13 +854,168 @@ class LanceDataset:
     def __getattr__(self, name: str):
         known = {
             "create_index",
-            "index_statistics", "cleanup_old_versions", "merge", "tags", "branches", "create_branch", "sql",
+            "index_statistics", "merge", "branches", "create_branch", "sql",
             "shallow_clone", "deep_clone", "commit", "commit_batch", "session", "stats", "join", "delta",
             "prewarm_index", "lance_schema", "validate",
         }
         if name in known:
             raise unsupported(f"LanceDataset.{name}")
         raise AttributeError(name)
+
+
+def _format_duration(seconds: int) -> str:
+    """Seconds as humantime's format_duration writes them ("14days", "1h 30m", "1s")."""
+    if seconds <= 0:
+        return "0s"
+    parts = []
+    for size, one, many in ((31557600, "year", "years"), (2630016, "month", "months"), (86400, "day", "days"),
+                            (3600, "h", "h"), (60, "m", "m"), (1, "s", "s")):
+        n, seconds = divmod(seconds, size)
+        if n:
+            parts.append(f"{n}{one if n == 1 else many}")
+    return " ".join(parts)
+
+
+def _parse_rfc3339(text: str) -> Optional[datetime]:
+    """A tag's time ("2026-10-08T16:00:17.502516072Z"), to the microsecond, in UTC."""
+    if not text:
+        return None
+    import re
+    from datetime import timezone
+
+    m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$", text)
+    if m is None:
+        return None
+    fraction = (m.group(2) or "")[:6].ljust(6, "0")
+    out = datetime.fromisoformat(f"{m.group(1)}.{fraction}" + ("+00:00" if m.group(3) == "Z" else m.group(3)))
+    return out.astimezone(timezone.utc)
+
+
+@contextlib.contextmanager
+def _ref_errors():
+    """Tag, cleanup and drop errors raised as pylance raises them."""
+    try:
+        yield
+    except RuntimeError as exc:
+        text = str(exc)
+        if text.startswith(("Ref ", "Version not found", "Invalid user input: Refusing to drop")):
+            raise ValueError(text) from None
+        if text.startswith(("Cleanup error", "Invalid user input", "Dataset at path")):
+            raise OSError(text) from None
+        from nanolance.lance._errors import translate
+
+        raise translate(text) from None
+
+
+def _tag_reference(ds: "LanceDataset", reference) -> int:
+    """A tag's target as pylance takes it: a version, another tag's name, ``(branch, version)`` on the
+    main branch (``None`` for the latest), or ``None`` for the latest; 0 means the latest."""
+    if reference is None:
+        return 0
+    if isinstance(reference, str):
+        return _tag_version(ds.uri, reference, ValueError)
+    if isinstance(reference, tuple):
+        branch, number = reference
+        if branch not in (None, "main"):
+            raise unsupported("branches")
+        return 0 if number is None else int(number)
+    return int(reference)
+
+
+def _tag_version(uri: str, name: str, error_type) -> int:
+    for tag in _nanolance._ds_tags(uri):
+        if tag["name"] == name:
+            if tag["branch"] is not None:
+                raise unsupported("branches")
+            return int(tag["version"])
+    raise error_type(f"Ref not found error: tag {name} does not exist")
+
+
+class Tags:
+    """Mirrors ``lance.dataset.Tags``: names for versions, kept by cleanup (``_refs/tags``, Lance's
+    format: pylance sees nanolance's tags and nanolance pylance's)."""
+
+    def __init__(self, dataset: "LanceDataset"):
+        self._ds = dataset
+
+    def _all(self):
+        with _ref_errors():
+            raw = _nanolance._ds_tags(self._ds.uri)
+        return [(t["name"], {"branch": t["branch"], "version": int(t["version"]),
+                             "created_at": _parse_rfc3339(t["created_at"]),
+                             "updated_at": _parse_rfc3339(t["updated_at"]),
+                             "manifest_size": int(t["manifest_size"]), "metadata": dict(t["metadata"])})
+                for t in raw]
+
+    def list(self) -> Dict[str, Dict[str, Any]]:
+        return dict(self._all())
+
+    def list_ordered(self, order: Optional[str] = None) -> List[Tuple[str, Dict[str, Any]]]:
+        """By version, newest first (``order="desc"``, the default) or oldest first; then by name."""
+        if order not in (None, "asc", "desc"):
+            raise ValueError(f"Invalid order: {order}; expected 'asc' or 'desc'")
+        tags = self._all()
+        tags.sort(key=lambda t: t[0])
+        tags.sort(key=lambda t: t[1]["version"], reverse=order != "asc")
+        return tags
+
+    def get_version(self, tag: str) -> int:
+        return _tag_version(self._ds.uri, tag, ValueError)
+
+    def create(self, tag: str, reference=None) -> None:
+        version = _tag_reference(self._ds, reference)
+        with _ref_errors():
+            _nanolance._ds_create_tag(self._ds.uri, str(tag), version)
+
+    def delete(self, tag: str) -> None:
+        with _ref_errors():
+            _nanolance._ds_delete_tag(self._ds.uri, str(tag))
+
+    def update(self, tag: str, reference=None) -> None:
+        version = _tag_reference(self._ds, reference)
+        with _ref_errors():
+            _nanolance._ds_update_tag(self._ds.uri, str(tag), version)
+
+    def replace_metadata(self, tag: str, metadata: Dict[str, str]) -> None:
+        with _ref_errors():
+            _nanolance._ds_replace_tag_metadata(self._ds.uri, str(tag), {str(k): str(v) for k, v in metadata.items()})
+
+
+class CleanupStats:
+    """Mirrors ``lance.dataset.CleanupStats``: what a cleanup removed."""
+
+    def __init__(self, bytes_removed=0, old_versions=0, data_files_removed=0, transaction_files_removed=0,
+                 index_files_removed=0, deletion_files_removed=0):
+        self.bytes_removed = int(bytes_removed)
+        self.old_versions = int(old_versions)
+        self.data_files_removed = int(data_files_removed)
+        self.transaction_files_removed = int(transaction_files_removed)
+        self.index_files_removed = int(index_files_removed)
+        self.deletion_files_removed = int(deletion_files_removed)
+
+    def __repr__(self) -> str:
+        return "CleanupStats(" + ", ".join(f"{k}={v}" for k, v in vars(self).items()) + ")"
+
+
+class CleanupCandidateFile:
+    def __init__(self, path, kind, unverified, size_bytes):
+        self.path, self.kind, self.unverified, self.size_bytes = str(path), str(kind), bool(unverified), int(size_bytes)
+
+    def __repr__(self) -> str:
+        return f"CleanupCandidateFile(path={self.path!r}, kind={self.kind!r}, size_bytes={self.size_bytes})"
+
+
+class CleanupExplanation:
+    """Mirrors ``lance.dataset.CleanupExplanation``."""
+
+    def __init__(self, read_version, stats, candidate_files, candidate_files_truncated, candidate_file_limit):
+        self.read_version = read_version
+        self.stats = stats
+        self.candidate_files = candidate_files
+        self.candidate_files_truncated = candidate_files_truncated
+        self.candidate_file_limit = candidate_file_limit
+        self.referenced_branches = []
+        self.warnings = []
 
 
 def _blob_mode(blob_handling) -> int:
@@ -1236,6 +1453,17 @@ class DatasetOptimizer:
                 bool(reindex))
         self._ds._refresh_latest()
         return CompactionMetrics(**{k: int(v) for k, v in metrics.items() if not k.startswith("indexes_")})
+
+    def enable_auto_cleanup(self, auto_cleanup_config, **kwargs) -> None:
+        """Clean up old versions after commits, as ``lance.auto_cleanup.*`` in the config asks: every
+        ``interval`` versions, the versions older than ``older_than_seconds``."""
+        self._ds.update_config({
+            "lance.auto_cleanup.interval": str(auto_cleanup_config["interval"]),
+            "lance.auto_cleanup.older_than": f"{auto_cleanup_config['older_than_seconds']}s",
+        })
+
+    def disable_auto_cleanup(self, **kwargs) -> None:
+        self._ds.delete_config_keys(["lance.auto_cleanup.interval", "lance.auto_cleanup.older_than"])
 
     def optimize_indices(self, *, num_indices_to_merge: Optional[int] = None, index_names=None, retrain: bool = False,
                          **kwargs):
@@ -1784,6 +2012,12 @@ def write_dataset(
     with native():
         writer = _nanolance._StagedWriter(path, options, append, int(max_rows_per_file or 0),
                                           int(max_bytes_per_file or 0) if max_bytes_per_file < 2**62 else 0)
+    if auto_cleanup_options is not None and not exists:
+        # Recorded in the first version's config, as Lance records it when it creates a dataset.
+        with native():
+            writer.set_initial_config("lance.auto_cleanup.interval", str(int(auto_cleanup_options["interval"])))
+            writer.set_initial_config("lance.auto_cleanup.older_than",
+                                      _format_duration(int(auto_cleanup_options["older_than_seconds"])))
     if target is not None and len(reader.schema.names) < len(target.names):
         # Part of the schema: the new files hold those columns alone, as Lance writes them, and the
         # others read as null.

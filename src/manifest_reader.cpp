@@ -222,6 +222,12 @@ bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint6
             return false;
         }
     }
+    return load_manifest_file(manifest_path, out, error);
+}
+
+bool load_manifest_file(const std::filesystem::path& manifest_path, pb::Manifest& out, std::string& error) {
+    error.clear();
+    out = pb::Manifest{};
     std::vector<std::uint8_t> body;
     if (!read_manifest_file(manifest_path, body, error)) {
         return false;
