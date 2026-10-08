@@ -3011,3 +3011,25 @@ first, without degrading function or speed.
   (over an overwrite; an append over a schema change); one transaction per version after racing
   writers. pylance's suite 312 (`test_cleanup_with_retain_versions` now passes); ctest, lance-c
   106/106, the Python suite.
+
+## Compaction parity
+
+- **Planner, as Lance's** (`compact_once`): a fragment is a candidate when more of it is deleted
+  than the threshold (rewritten even alone) or it has fewer *physical* rows than the target (only
+  with neighbours); runs of candidates end at an excluded fragment, a non-candidate, or a change of
+  index coverage (an indexed fragment never joins an unindexed one); a lone neighbours-only
+  fragment is dropped; runs split where a piece has reached the target and the rest can too.
+  Before: live rows, no index boundary, and bins cut before the target, so nanolance compacted
+  differently from pylance on the same dataset.
+- **Options**: `max_source_fragments` / `max_source_rows` / `max_source_bytes` (whole tasks in
+  order; a budget of 0 refused, as Lance), `excluded_fragment_ids`, `max_bytes_per_file` with
+  `batch_size` (rows fed that many at a time, a data file cut whenever the buffered bytes reach
+  the limit), a threshold of 1.0 turning materialization off.
+- **Commits, as Lance's**: a ReserveFragments version first, then the Rewrite made on top of it
+  with the reserved ids (a fragment changed in between is a conflict, and the compaction is planned
+  again); the reserve rebases above other writers' ids.
+- **Verified**: `tests/test_compaction_plan.py`: 16 random datasets (sizes, deletions, an index,
+  exclusions, budgets) compacted by nanolance and pylance leave the same fragments (new ids and row
+  counts as sets: Lance numbers them in task completion order), the same rows, versions and
+  transaction kinds. pylance's suite 316 (312 before). Compaction speed unchanged (200 fragments).
+- **Not yet**: index remapping inside the Rewrite (see the roadmap).

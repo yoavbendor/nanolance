@@ -23,6 +23,8 @@ def translate(message: str) -> Exception:
     lower = text.lower()
     if "already exists" in lower:
         return OSError(text)
+    if text.startswith("Invalid user input: CompactionOptions::"):
+        return OSError(text)
     if "append" in lower and "schema" in lower:
         return OSError(text)
     if "merge insert failed" in lower:

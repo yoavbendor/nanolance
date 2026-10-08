@@ -126,7 +126,8 @@ std::string random_uuid() {
 // ── the operation, from the change ─────────────────────────────────────────────────────────────────
 
 constexpr std::uint32_t kAppend = 100, kDelete = 101, kOverwrite = 102, kCreateIndex = 103, kRewrite = 104,
-                        kMerge = 105, kRestore = 106, kUpdate = 108, kProject = 109, kUpdateConfig = 110;
+                        kMerge = 105, kRestore = 106, kReserveFragments = 107, kUpdate = 108, kProject = 109,
+                        kUpdateConfig = 110;
 
 Bytes overwrite(const pb::Manifest& next, const std::map<std::string, std::string>& prior_config) {
     Bytes op;
@@ -146,6 +147,11 @@ Bytes overwrite(const pb::Manifest& next, const std::map<std::string, std::strin
 
 /// The operation's field number and message.
 std::pair<std::uint32_t, Bytes> operation(const pb::Manifest* parent, const pb::Manifest& next) {
+    if (next.operation == pb::Manifest::Operation::Reserve) {
+        Bytes op;
+        put_uint(op, 1, next.reserved_fragments);
+        return {kReserveFragments, op};
+    }
     if (next.operation == pb::Manifest::Operation::Append) {
         Bytes op;
         for (std::size_t i = next.first_new_fragment; i < next.fragments.size(); ++i) {
@@ -353,7 +359,7 @@ bool write_transaction_file(const std::filesystem::path& dataset_path, const pb:
     // An append, an overwrite and a restore say what they do; the rest is read off the change.
     using Op = pb::Manifest::Operation;
     const bool needs_parent = next.operation != Op::Append && next.operation != Op::Overwrite &&
-                              next.operation != Op::Restore;
+                              next.operation != Op::Restore && next.operation != Op::Reserve;
     if (read_version > 0U && needs_parent) {
         std::string load_error;
         has_parent = load_manifest_version(dataset_path, read_version, parent, load_error);

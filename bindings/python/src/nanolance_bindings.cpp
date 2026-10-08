@@ -1297,9 +1297,20 @@ NB_MODULE(_nanolance, m) {
         return version;
     });
     m.def("_ds_compact_files", [](const std::filesystem::path& path, std::uint64_t target_rows,
-                                  bool materialize_deletions, double threshold, bool reindex) {
+                                  bool materialize_deletions, double threshold, bool reindex,
+                                  std::optional<std::uint64_t> max_source_fragments,
+                                  std::optional<std::uint64_t> max_source_rows,
+                                  std::optional<std::uint64_t> max_source_bytes,
+                                  const std::vector<std::uint64_t>& excluded_fragment_ids,
+                                  std::uint64_t max_bytes_per_file, std::uint64_t batch_size) {
         nano_lance::CompactionOptions options;
         options.reindex = reindex;
+        options.max_source_fragments = max_source_fragments;
+        options.max_source_rows = max_source_rows;
+        options.max_source_bytes = max_source_bytes;
+        options.excluded_fragment_ids = excluded_fragment_ids;
+        options.max_bytes_per_file = max_bytes_per_file;
+        options.batch_size = batch_size;
         options.target_rows_per_fragment = target_rows;
         options.materialize_deletions = materialize_deletions;
         options.materialize_deletions_threshold = threshold;

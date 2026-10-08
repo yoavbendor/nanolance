@@ -1489,7 +1489,9 @@ class DatasetOptimizer:
     def compact_files(self, *, target_rows_per_fragment: Optional[int] = None, max_rows_per_group=None,
                       max_bytes_per_file=None, materialize_deletions: Optional[bool] = None,
                       materialize_deletions_threshold: Optional[float] = None, num_threads=None, batch_size=None,
-                      reindex: bool = True, **kwargs):
+                      reindex: bool = True, max_source_fragments: Optional[int] = None,
+                      max_source_rows: Optional[int] = None, max_source_bytes: Optional[int] = None,
+                      excluded_fragment_ids=None, **kwargs):
         """Rewrite small fragments (and those with many deleted rows) into fewer, larger ones. The
         indexes that covered the rewritten rows take them back, as Lance's compaction remaps its
         indexes (a second version; nanolance's `reindex=False` leaves them covering fewer fragments)."""
@@ -1500,7 +1502,10 @@ class DatasetOptimizer:
                 self._ds.uri, int(target_rows_per_fragment or 1024 * 1024),
                 True if materialize_deletions is None else bool(materialize_deletions),
                 0.1 if materialize_deletions_threshold is None else float(materialize_deletions_threshold),
-                bool(reindex))
+                bool(reindex), *(None if v is None else int(v)
+                                 for v in (max_source_fragments, max_source_rows, max_source_bytes)),
+                sorted({int(i) for i in (excluded_fragment_ids or [])}), int(max_bytes_per_file or 0),
+                int(batch_size or 0))
         self._ds._refresh_latest()
         return CompactionMetrics(**{k: int(v) for k, v in metrics.items() if not k.startswith("indexes_")})
 

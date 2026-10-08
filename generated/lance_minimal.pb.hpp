@@ -153,10 +153,11 @@ struct Manifest {
     /// Not on the wire: what a commit of this manifest does, for its transaction file, when the change
     /// from the version before does not say it alone (an overwrite or a restore replaces every
     /// fragment, as a compaction of all of them does). `Derive`: read it off the change.
-    enum class Operation { Derive, Append, Overwrite, Restore, Rewrite, Update };
+    enum class Operation { Derive, Append, Overwrite, Restore, Rewrite, Update, Reserve };
     Operation operation = Operation::Derive;
     std::uint64_t restored_version = 0;  // Restore: the version restored
     std::size_t first_new_fragment = 0;  // Append: fragments from here on are the new ones
+    std::uint32_t reserved_fragments = 0;  // Reserve: fragment ids reserved (max_fragment_id raised by it)
 };
 
 /// Reader feature flags, as Lance defines them (Manifest.reader_feature_flags).

@@ -91,6 +91,18 @@ struct CompactionOptions {
     /// Lance's compaction remaps its indexes: committed as a second version. Without it, an index
     /// stops covering the fragments compaction rewrote, and those rows are scanned.
     bool reindex = true;
+    /// Lance's source budgets: plan whole tasks, in order, while their source fragments, live rows
+    /// and data-file bytes stay within every one set. A first task over budget plans nothing; a
+    /// budget of 0 is refused.
+    std::optional<std::uint64_t> max_source_fragments;
+    std::optional<std::uint64_t> max_source_rows;
+    std::optional<std::uint64_t> max_source_bytes;
+    /// Fragments left as they are; each one also ends the run of candidates around it.
+    std::vector<std::uint64_t> excluded_fragment_ids;
+    /// A new data file ends once it holds about this many bytes (0: no limit); rows go to the writer
+    /// `batch_size` at a time (0: Lance's scanner default, 8192), so a small limit cuts often.
+    std::uint64_t max_bytes_per_file = 0;
+    std::uint64_t batch_size = 0;
 };
 
 struct CompactionMetrics {

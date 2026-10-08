@@ -245,7 +245,11 @@ tests/test_map_type.py::test_nested_map_in_struct
 tests/test_map_type.py::test_query_map_column
 tests/test_map_type.py::test_simple_map_write_read
 tests/test_memory_leaks.py::TestMemoryLeaks::test_index_statistics_no_leak
+tests/test_optimize.py::test_compact_files_max_source_fragments
+tests/test_optimize.py::test_compact_files_source_budgets
 tests/test_optimize.py::test_compact_with_write
+tests/test_optimize.py::test_dataset_optimize
+tests/test_optimize.py::test_dataset_optimize_excluded_fragment_ids
 tests/test_order_by.py::test_all_order_by_support_functions
 tests/test_order_by.py::test_one_column_order_by
 tests/test_order_by.py::test_two_column_order_by

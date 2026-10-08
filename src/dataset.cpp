@@ -141,6 +141,10 @@ bool rebase(const pb::Manifest& base, const pb::Manifest& latest, pb::Manifest& 
     for (const auto& f : ours.fragments) {
         max_id = std::max(max_id, f.id);
     }
+    if (ours.operation == pb::Manifest::Operation::Reserve && ours.reserved_fragments > 0U) {
+        // Reserved again, after every id the other writers used (Lance's ReserveFragments rebase).
+        max_id = std::max(max_id, next + ours.reserved_fragments - 1U);
+    }
     ours.has_max_fragment_id = ours.has_max_fragment_id || latest.has_max_fragment_id || !ours.fragments.empty();
     ours.max_fragment_id = static_cast<std::uint32_t>(max_id);
     ours.next_row_id = std::max(ours.next_row_id, latest.next_row_id);

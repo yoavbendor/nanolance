@@ -244,6 +244,13 @@ public:
 
     bool finish(std::string& error) { return cut(error); }
 
+    /// End a data file whenever the rows buffered reach `bytes` (0: never).
+    void set_max_bytes(std::uint64_t bytes) {
+        if (bytes > 0U) {
+            nano_lance_writer_set_max_pending_bytes(&writer_, bytes);
+        }
+    }
+
     std::vector<NewFragment>& files() { return files_; }
     const LanceSchemaMapping& mapping() const { return mapping_; }
 
@@ -1501,51 +1508,134 @@ bool compact_once(const std::filesystem::path& dataset_path, const CompactionOpt
         return false;
     }
     new_version = version;
+    for (const auto& [name, value] :
+         {std::pair<const char*, std::optional<std::uint64_t>>{"max_source_fragments", options.max_source_fragments},
+          {"max_source_rows", options.max_source_rows},
+          {"max_source_bytes", options.max_source_bytes}}) {
+        if (value && *value == 0U) {
+            error = std::string("Invalid user input: CompactionOptions::") + name +
+                    " must be greater than 0 (use None for no limit)";
+            return false;
+        }
+    }
+    const pb::Manifest original = manifest;
+    // A threshold of 100% is no materializing at all (Lance's CompactionOptions::validate).
+    const bool materialize = options.materialize_deletions && options.materialize_deletions_threshold < 1.0;
+    const std::set<std::uint64_t> excluded(options.excluded_fragment_ids.begin(), options.excluded_fragment_ids.end());
     const auto target = std::max<std::uint64_t>(options.target_rows_per_fragment, 1U);
     auto rows_of = [](const pb::DataFragment& f) {
         return f.physical_rows - (f.deletion_file.present ? f.deletion_file.num_deleted_rows : 0U);
     };
-    auto candidate = [&](const pb::DataFragment& f) {
-        if (rows_of(f) < target) {
-            return true;
-        }
-        return options.materialize_deletions && f.deletion_file.present && f.physical_rows != 0U &&
-               static_cast<double>(f.deletion_file.num_deleted_rows) / static_cast<double>(f.physical_rows) >
-                   options.materialize_deletions_threshold;
+    // Lance's candidacy: a fragment with more of its rows deleted than the threshold is rewritten even
+    // alone; one with fewer physical rows than the target, only together with neighbours.
+    auto itself = [&](const pb::DataFragment& f) {
+        return materialize && f.deletion_file.present && f.physical_rows != 0U &&
+               static_cast<float>(f.deletion_file.num_deleted_rows) / static_cast<float>(f.physical_rows) >
+                   static_cast<float>(options.materialize_deletions_threshold);
     };
-    // Runs of adjacent candidates, cut into bins of about `target` rows.
-    std::vector<std::vector<std::size_t>> bins;
-    std::vector<std::size_t> bin;
-    std::uint64_t bin_rows = 0;
-    auto close_bin = [&] {
-        if (bin.size() > 1U || (bin.size() == 1U && manifest.fragments[bin.front()].deletion_file.present &&
-                                options.materialize_deletions)) {
-            bins.push_back(bin);
+    auto candidate = [&](const pb::DataFragment& f) { return itself(f) || f.physical_rows < target; };
+    // The indexes covering a fragment: Lance never puts fragments covered by different ones in one bin
+    // (an indexed fragment with an unindexed one).
+    auto covering = [&](const pb::DataFragment& f) {
+        std::vector<std::size_t> out;
+        for (std::size_t k = 0; k < manifest.indices.size(); ++k) {
+            const auto& ids = manifest.indices[k].fragment_ids;
+            if (std::binary_search(ids.begin(), ids.end(), static_cast<std::uint32_t>(f.id))) {
+                out.push_back(k);
+            }
         }
-        bin.clear();
-        bin_rows = 0;
+        return out;
+    };
+    // Lance's planner: runs of adjacent candidates with the same index coverage (an excluded
+    // fragment, or one that is no candidate, ends a run); a run of one fragment that only wants
+    // neighbours is dropped; the rest are split where a piece has reached the target and what is
+    // left can reach it too (split_for_size), so a task may hold more than the target, never less
+    // when it can be avoided.
+    std::vector<std::vector<std::size_t>> runs;
+    std::vector<std::size_t> run;
+    std::vector<std::size_t> run_indices;
+    auto close_run = [&] {
+        if (run.size() > 1U || (run.size() == 1U && itself(manifest.fragments[run.front()]))) {
+            runs.push_back(run);
+        }
+        run.clear();
     };
     for (std::size_t i = 0; i < manifest.fragments.size(); ++i) {
         const auto& f = manifest.fragments[i];
-        if (!candidate(f)) {
-            close_bin();
+        if (excluded.count(f.id) != 0U || !candidate(f)) {
+            close_run();
             continue;
         }
-        if (!bin.empty() && bin_rows + rows_of(f) > target) {
-            close_bin();
+        auto indices = covering(f);
+        if (!run.empty() && indices != run_indices) {
+            close_run();
         }
-        bin.push_back(i);
-        bin_rows += rows_of(f);
+        run_indices = std::move(indices);
+        run.push_back(i);
     }
-    close_bin();
+    close_run();
+    std::vector<std::vector<std::size_t>> bins;
+    for (const auto& r : runs) {
+        std::uint64_t remaining = 0;
+        for (const auto m : r) {
+            remaining += rows_of(manifest.fragments[m]);
+        }
+        std::vector<std::size_t> piece;
+        std::uint64_t piece_rows = 0;
+        for (const auto m : r) {
+            const auto rows = rows_of(manifest.fragments[m]);
+            piece.push_back(m);
+            piece_rows += rows;
+            remaining -= rows;
+            if (piece_rows >= target && remaining > 0U && remaining >= target) {
+                bins.push_back(std::move(piece));
+                piece.clear();
+                piece_rows = 0;
+            }
+        }
+        if (!piece.empty()) {
+            bins.push_back(std::move(piece));
+        }
+    }
+    // Lance's source budgets: whole tasks, in order, until the next one would exceed any of them.
+    if (options.max_source_fragments || options.max_source_rows || options.max_source_bytes) {
+        std::set<std::int32_t> schema_ids;
+        for (const auto& field : manifest.fields) {
+            schema_ids.insert(field.id);
+        }
+        std::uint64_t fragments = 0;
+        std::uint64_t rows = 0;
+        std::uint64_t bytes = 0;
+        std::size_t keep = 0;
+        for (; keep < bins.size(); ++keep) {
+            for (const auto m : bins[keep]) {
+                const auto& f = manifest.fragments[m];
+                ++fragments;
+                rows += rows_of(f);
+                for (const auto& file : f.files) {
+                    // A file of dropped columns only is not read, so not counted.
+                    if (std::any_of(file.fields.begin(), file.fields.end(),
+                                    [&](std::int32_t id) { return schema_ids.count(id) != 0U; })) {
+                        bytes += file.file_size_bytes;
+                    }
+                }
+            }
+            if ((options.max_source_fragments && fragments > *options.max_source_fragments) ||
+                (options.max_source_rows && rows > *options.max_source_rows) ||
+                (options.max_source_bytes && bytes > *options.max_source_bytes)) {
+                break;
+            }
+        }
+        bins.resize(keep);
+    }
     if (bins.empty()) {
         return true;
     }
-    std::vector<pb::DataFragment> rebuilt;
+    std::vector<pb::DataFragment> created;  // ids assigned once reserved
     std::vector<std::uint64_t> rewritten_ids;
     std::size_t next_bin = 0;
-    auto id = next_fragment_id(manifest);
-    std::vector<pb::DataFragment> old = manifest.fragments;
+    const std::vector<pb::DataFragment> old = manifest.fragments;
+    const std::int64_t batch_rows = static_cast<std::int64_t>(options.batch_size != 0U ? options.batch_size : 8192U);
     for (std::size_t i = 0; i < old.size();) {
         if (next_bin < bins.size() && bins[next_bin].front() == i) {
             const auto& members = bins[next_bin];
@@ -1570,9 +1660,28 @@ bool compact_once(const std::filesystem::path& dataset_path, const CompactionOpt
             if (!staged.open(dataset_path, true, 0, error)) {
                 return false;
             }
+            staged.set_max_bytes(options.max_bytes_per_file);
             for (auto& b : batches.v) {
-                if (b.length != 0 && !staged.write(b, schema.s, error)) {
-                    return false;
+                if (b.length == 0) {
+                    continue;
+                }
+                if (options.max_bytes_per_file == 0U || b.length <= batch_rows) {
+                    if (!staged.write(b, schema.s, error)) {
+                        return false;
+                    }
+                    continue;
+                }
+                // `batch_size` rows at a time, so the byte limit can cut between them.
+                auto shared = std::make_shared<SharedBatch>(std::move(b));
+                for (std::int64_t at = 0; at < shared->array.length; at += batch_rows) {
+                    ArrowArray piece = slice_batch(shared, at, std::min(batch_rows, shared->array.length - at));
+                    const bool ok = staged.write(piece, schema.s, error);
+                    if (piece.release != nullptr) {
+                        piece.release(&piece);
+                    }
+                    if (!ok) {
+                        return false;
+                    }
                 }
             }
             if (!staged.finish(error)) {
@@ -1582,20 +1691,52 @@ bool compact_once(const std::filesystem::path& dataset_path, const CompactionOpt
                 if (f.rows == 0U) {
                     continue;
                 }
-                rebuilt.push_back(make_data_fragment(staged.mapping(), f, id));
-                note_fragment_id(manifest, id);
-                ++id;
+                created.push_back(make_data_fragment(staged.mapping(), f, 0));
                 ++metrics.fragments_added;
                 ++metrics.files_added;
             }
             i = members.back() + 1U;
             ++next_bin;
         } else {
-            rebuilt.push_back(old[i]);
             ++i;
         }
     }
-    manifest.fragments = std::move(rebuilt);
+
+    // As Lance commits a compaction: first a version reserving the new fragments' ids, then the
+    // rewrite, made on top of the reserving version. A fragment it rewrote that a writer changed in
+    // between makes it a conflict, and it is planned again.
+    pb::Manifest reserve = original;
+    reserve.operation = pb::Manifest::Operation::Reserve;
+    reserve.reserved_fragments = static_cast<std::uint32_t>(created.size());
+    if (!created.empty()) {
+        note_fragment_id(reserve, next_fragment_id(original) + created.size() - 1U);
+    }
+    std::uint64_t reserved_version = 0;
+    if (!commit_next_version(dataset_path, std::move(reserve), reserved_version, error)) {
+        return false;
+    }
+    new_version = reserved_version;
+    if (!load_manifest_version(dataset_path, reserved_version, manifest, error)) {
+        return false;
+    }
+    for (const auto rewritten : rewritten_ids) {
+        const auto now = std::find_if(manifest.fragments.begin(), manifest.fragments.end(),
+                                      [&](const pb::DataFragment& f) { return f.id == rewritten; });
+        const auto then = std::find_if(original.fragments.begin(), original.fragments.end(),
+                                       [&](const pb::DataFragment& f) { return f.id == rewritten; });
+        if (now == manifest.fragments.end() || pb::encode_data_fragment(*now) != pb::encode_data_fragment(*then)) {
+            error = "commit conflict: fragment " + std::to_string(rewritten) + " changed during the compaction";
+            return false;
+        }
+    }
+    std::uint64_t id = manifest.max_fragment_id + 1U - created.size();
+    std::erase_if(manifest.fragments, [&](const pb::DataFragment& f) {
+        return std::find(rewritten_ids.begin(), rewritten_ids.end(), f.id) != rewritten_ids.end();
+    });
+    for (auto& f : created) {
+        f.id = id++;
+        manifest.fragments.push_back(std::move(f));
+    }
     const bool deletions = std::any_of(manifest.fragments.begin(), manifest.fragments.end(),
                                        [](const pb::DataFragment& f) { return f.deletion_file.present; });
     if (!deletions) {
