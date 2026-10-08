@@ -1413,6 +1413,59 @@ std::size_t late_parallelism(const NearestQuery& q) {
     return q.query_parallelism > 0 ? std::clamp<std::size_t>(static_cast<std::size_t>(q.query_parallelism), 1, pool) : 1U;
 }
 
+/// One IVF_HNSW_SQ partition's best `kk` rows (Lance's HNSW::search): the rows that may come back
+/// (the prefilter: deletions, a filter); all of them -- a plain search; under 10% -- every one of
+/// them, exactly; otherwise the graph search, keeping only those. Out of line, so the IVF_FLAT /
+/// IVF_PQ path around it compiles as before.
+[[gnu::noinline]] bool hnsw_partition(const IvfIndex& index, const Partition& part, const NearestQuery& q,
+                                      const RowMask& mask, const std::vector<float>& key, std::size_t kk,
+                                      std::vector<Candidate>& local, std::string& why) {
+    const std::size_t n = part.ids.size();
+    std::vector<std::uint32_t> passing;
+    for (std::size_t r = 0; r < n; ++r) {
+        if (mask.allows(part.ids[r])) {
+            passing.push_back(static_cast<std::uint32_t>(r));
+        }
+    }
+    const SqDistance dist(index, part, key);
+    const std::size_t ef = q.ef.value_or(kk + kk / 2U);
+    if (ef < kk) {
+        why = "ef must be greater than or equal to k";
+        return false;
+    }
+    std::vector<HnswNode> found;
+    const bool ranged = q.lower_bound || q.upper_bound;
+    if (passing.size() == n) {
+        if (ranged) {
+            const std::function<bool(std::uint32_t, float)> range = [&](std::uint32_t, float x) {
+                return in_range(x, q);
+            };
+            found = hnsw_search(part, dist, kk, ef, &range);
+        } else {
+            found = hnsw_search(part, dist, kk, ef, nullptr);
+        }
+    } else if (passing.size() < n * 10U / 100U) {
+        found = hnsw_flat(part, dist, kk, passing, q);
+    } else {
+        std::vector<std::uint8_t> ok(n, 0U);
+        for (const auto r : passing) {
+            ok[r] = 1U;
+        }
+        const std::function<bool(std::uint32_t, float)> allowed = [&](std::uint32_t id, float x) {
+            return ok[id] != 0U && in_range(x, q);
+        };
+        found = hnsw_search(part, dist, kk, ef, &allowed);
+    }
+    std::set<std::uint64_t> seen;
+    for (const auto& f : found) {
+        const std::uint64_t id = part.ids[f.id];
+        if (seen.insert(id).second) {
+            local.push_back(Candidate{f.dist, id});
+        }
+    }
+    return true;
+}
+
 /// The best `kk` candidates of one index segment.
 bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_column, const RowMask& mask,
                     std::size_t kk, std::vector<Candidate>& out, std::string& plan, std::string& error) {
@@ -1463,52 +1516,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         const std::size_t n = part->ids.size();
         std::vector<float> d;
         if (index.hnsw) {
-            // Lance's HNSW::search: the rows that may come back (the prefilter: deletions, a filter);
-            // all of them -- a plain search; under 10% -- every one of them, exactly; otherwise the
-            // graph search, keeping only those.
-            std::vector<std::uint32_t> passing;
-            for (std::size_t r = 0; r < n; ++r) {
-                if (mask.allows(part->ids[r])) {
-                    passing.push_back(static_cast<std::uint32_t>(r));
-                }
-            }
-            const SqDistance dist(index, *part, key);
-            const std::size_t ef = q.ef.value_or(kk + kk / 2U);
-            if (ef < kk) {
-                why = "ef must be greater than or equal to k";
-                return false;
-            }
-            std::vector<HnswNode> found;
-            const bool ranged = q.lower_bound || q.upper_bound;
-            if (passing.size() == n) {
-                if (ranged) {
-                    const std::function<bool(std::uint32_t, float)> range = [&](std::uint32_t, float x) {
-                        return in_range(x, q);
-                    };
-                    found = hnsw_search(*part, dist, kk, ef, &range);
-                } else {
-                    found = hnsw_search(*part, dist, kk, ef, nullptr);
-                }
-            } else if (passing.size() < n * 10U / 100U) {
-                found = hnsw_flat(*part, dist, kk, passing, q);
-            } else {
-                std::vector<std::uint8_t> ok(n, 0U);
-                for (const auto r : passing) {
-                    ok[r] = 1U;
-                }
-                const std::function<bool(std::uint32_t, float)> allowed = [&](std::uint32_t id, float x) {
-                    return ok[id] != 0U && in_range(x, q);
-                };
-                found = hnsw_search(*part, dist, kk, ef, &allowed);
-            }
-            std::set<std::uint64_t> seen;
-            for (const auto& f : found) {
-                const std::uint64_t id = part->ids[f.id];
-                if (seen.insert(id).second) {
-                    local.push_back(Candidate{f.dist, id});
-                }
-            }
-            return true;
+            return hnsw_partition(index, *part, q, mask, key, kk, local, why);
         }
         if (index.pq) {
             std::vector<float> own;
