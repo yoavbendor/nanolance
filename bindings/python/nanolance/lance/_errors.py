@@ -21,6 +21,16 @@ def unsupported(what: str) -> NotSupportedError:
 def translate(message: str) -> Exception:
     text = str(message)
     lower = text.lower()
+    # Filter errors, as pylance words them (DataFusion's planner behind "Invalid user input").
+    import re
+
+    missing = re.match(r"filter column '(.*)' not found in schema", text)
+    if missing:
+        return ValueError(f"Invalid user input: Schema error: No field named {missing.group(1)}.")
+    if text.startswith("a filter must be a boolean expression"):
+        return ValueError(f"Invalid user input: the filter does not return a boolean ({text})")
+    if text.startswith(("invalid filter", "cannot compare", "cannot CAST")):
+        return ValueError(f"Invalid user input: {text}")
     if "already exists" in lower:
         return OSError(text)
     if text.startswith("Invalid user input: CompactionOptions::"):

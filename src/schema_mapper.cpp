@@ -378,6 +378,10 @@ bool map_field(const ArrowSchema& field,
     }
     std::string extension_name;
     read_metadata_key(field, kArrowExtensionNameKey, extension_name);
+    // JSONB (the lance.json extension over large_binary) is Lance's logical type "json".
+    if (parsed.logical_type == "large_binary" && extension_name == "lance.json") {
+        parsed.logical_type = "json";
+    }
 
     const bool is_list = lance_logical_type_is_list(parsed.logical_type);
     if (is_list && (field.n_children != 1 || field.children == nullptr || field.children[0] == nullptr)) {
@@ -690,8 +694,8 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
         arrow_format = "z";
         return true;
     }
-    if (logical_type == "large_binary") {
-        arrow_format = "Z";
+    if (logical_type == "large_binary" || logical_type == "json") {
+        arrow_format = "Z";  // json: JSONB, marked lance.json in the field's metadata
         return true;
     }
     if (logical_type == "struct") {

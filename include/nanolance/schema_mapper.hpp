@@ -38,8 +38,10 @@ struct LanceSchemaMapping {
 /// An Arrow extension type Lance itself defines (lance.blob.v2, ...), which nanolance lays out on its
 /// own terms. Any other extension type (arrow.fixed_shape_tensor, arrow.uuid, a user's) is stored as
 /// its storage type, with the extension recorded in the field's metadata.
+/// A Lance extension whose field is a logical shell over other fields (a blob struct). lance.json is
+/// not one: it is an ordinary large-binary column holding JSONB.
 inline bool lance_extension_is_lance_owned(const std::string& extension_name) {
-    return extension_name.rfind("lance.", 0) == 0;
+    return extension_name.rfind("lance.", 0) == 0 && extension_name != "lance.json";
 }
 
 inline bool lance_field_is_physical(const LanceField& field) {
@@ -57,16 +59,18 @@ inline bool lance_logical_type_is_large_list(const std::string& logical_type) {
     return logical_type.rfind("large_list", 0) == 0;
 }
 
+/// Lance's "json" is JSONB in a large-binary column (jsonb.hpp).
 inline bool lance_field_is_variable_width(const std::string& logical_type) {
     return logical_type == "utf8" || logical_type == "large_utf8" || logical_type == "string" ||
-           logical_type == "large_string" || logical_type == "binary" || logical_type == "large_binary";
+           logical_type == "large_string" || logical_type == "binary" || logical_type == "large_binary" ||
+           logical_type == "json";
 }
 
 /// Does this logical type use 64-bit (rather than 32-bit) offsets? Accepts both the in-memory names
 /// (`large_utf8`) and the on-disk ones (`large_string`), since the same predicate runs on both sides.
 inline bool lance_logical_type_has_large_offsets(const std::string& logical_type) {
     return logical_type == "large_utf8" || logical_type == "large_string" ||
-           logical_type == "large_binary";
+           logical_type == "large_binary" || logical_type == "json";
 }
 
 /// Temporal types backed by a 32-bit integer on the wire (`date32:day`, `time32:s`, `time32:ms`).

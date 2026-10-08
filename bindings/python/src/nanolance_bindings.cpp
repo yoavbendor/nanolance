@@ -10,6 +10,7 @@
 #include <nanolance/dataset_ops.hpp>
 #include <nanolance/dataset_refs.hpp>
 #include <nanolance/expr.hpp>
+#include <nanolance/jsonb.hpp>
 #include <nanolance/fts_search.hpp>
 #include <nanolance/index_optimize.hpp>
 #include <nanolance/lance_table_reader.hpp>
@@ -1059,6 +1060,59 @@ NB_MODULE(_nanolance, m) {
         });
         return nb::make_tuple(updated, version);
     }, nb::arg("path"), nb::arg("where").none(), nb::arg("assignments"));
+    // JSON columns: arrow.json text <-> Lance's JSONB (jsonb.hpp), a whole array at a time. Each
+    // returns (schema capsule, array capsule): large_binary for _json_encode, utf8 for _json_decode.
+    auto convert_json = [](nb::handle array, bool encode) {
+        auto imported = nanolance_py::arrow_capsule::import_batch(array);
+        ArrowArrayView view;
+        ArrowError err;
+        if (ArrowArrayViewInitFromSchema(&view, imported.first.get(), &err) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&view, imported.second.get(), &err) != NANOARROW_OK) {
+            ArrowArrayViewReset(&view);
+            throw std::invalid_argument(std::string("JSON conversion: ") + err.message);
+        }
+        auto* schema = static_cast<ArrowSchema*>(std::malloc(sizeof(ArrowSchema)));
+        auto* out = static_cast<ArrowArray*>(std::malloc(sizeof(ArrowArray)));
+        ArrowSchemaInit(schema);
+        nanolance_py::arrow_capsule::nanoarrow_check(
+            "ArrowSchemaSetType", ArrowSchemaSetType(schema, encode ? NANOARROW_TYPE_LARGE_BINARY : NANOARROW_TYPE_STRING));
+        nanolance_py::arrow_capsule::nanoarrow_check(
+            "ArrowArrayInitFromSchema", ArrowArrayInitFromSchema(out, schema, nullptr));
+        nanolance_py::arrow_capsule::nanoarrow_check("ArrowArrayStartAppending", ArrowArrayStartAppending(out));
+        std::string converted;
+        std::string error;
+        const auto length = imported.second->length;
+        for (std::int64_t i = 0; i < length; ++i) {
+            if (ArrowArrayViewIsNull(&view, i)) {
+                nanolance_py::arrow_capsule::nanoarrow_check("ArrowArrayAppendNull", ArrowArrayAppendNull(out, 1));
+                continue;
+            }
+            const auto value = ArrowArrayViewGetBytesUnsafe(&view, i);
+            const std::string_view text(value.data.as_char, static_cast<std::size_t>(value.size_bytes));
+            const bool ok = encode ? nano_lance::jsonb::encode(text, converted, error)
+                                   : nano_lance::jsonb::to_text(text, converted, error);
+            if (!ok) {
+                ArrowArrayViewReset(&view);
+                ArrowArrayRelease(out);
+                ArrowSchemaRelease(schema);
+                std::free(out);
+                std::free(schema);
+                throw std::invalid_argument(encode ? "Failed to encode JSON: " + error : "Failed to decode JSONB: " + error);
+            }
+            ArrowBufferView bytes;
+            bytes.data.as_char = converted.data();
+            bytes.size_bytes = static_cast<std::int64_t>(converted.size());
+            nanolance_py::arrow_capsule::nanoarrow_check("ArrowArrayAppendBytes", ArrowArrayAppendBytes(out, bytes));
+        }
+        ArrowArrayViewReset(&view);
+        nanolance_py::arrow_capsule::nanoarrow_check("ArrowArrayFinishBuildingDefault",
+                                                     ArrowArrayFinishBuildingDefault(out, nullptr));
+        return nb::make_tuple(nanolance_py::arrow_capsule::detail::make_schema_capsule(schema),
+                              nanolance_py::arrow_capsule::detail::make_array_capsule(out));
+    };
+    m.def("_json_encode", [convert_json](nb::handle array) { return convert_json(array, true); });
+    m.def("_json_decode", [convert_json](nb::handle array) { return convert_json(array, false); });
+
     // A SQL filter evaluated over one record batch, as the scan evaluates it: one byte per row, 1
     // where it holds. For filters the scan cannot push down (on _rowid / _rowaddr).
     m.def("_filter_mask", [](nb::handle batch, const std::string& sql) {

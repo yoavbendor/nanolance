@@ -3033,3 +3033,30 @@ first, without degrading function or speed.
   counts as sets: Lance numbers them in task completion order), the same rows, versions and
   transaction kinds. pylance's suite 316 (312 before). Compaction speed unchanged (200 fragments).
 - **Not yet**: index remapping inside the Rewrite (see the roadmap).
+
+## JSON columns and filter functions
+
+- **The gap**: JSON columns did not interoperate at all. pylance stores `pa.json_()` as JSONB
+  (Databend's binary JSON, the `jsonb` crate) under logical type "json"; nanolance refused those
+  datasets and wrote its own as text, which pylance refused.
+- **JSONB** (`src/jsonb.cpp`): the crate's lenient parser (single quotes, unquoted keys, NaN /
+  Infinity, hex, `+1`, `.5`, `123.` as an integer; duplicate keys and trailing commas refused),
+  its encoder (sorted keys, u64 / i64 / f64 number types, smallest integer width), its printer
+  (compact; floats positional for exponents -5..15 with ".0" when integral, else `1e+20`; NaN and
+  infinities as null; `\b \f \n \r \t \u00XX` escapes), and JSONPath selection. Checked against
+  pylance on 3,000 random documents: the same bytes written, the same text read.
+- **Columns**: an `arrow.json` column is encoded on the way in (every write path goes through
+  `_coerce_reader`) and stored as logical type "json" (a large-binary column marked `lance.json`);
+  reads return `arrow.json` text, filters and compaction see the JSONB.
+- **Functions**: `json_get` (key, or index of an array), `json_get_string / int / float / bool`
+  (the crate's conversions; an impossible one fails the query, as in Lance), `json_extract`,
+  `json_exists`, `json_array_contains`, `json_array_length`; `::` casts, `arrow_cast` to scalar
+  types, `regexp_match` / `regexp_like`, `current_date()` / `now()`, `ARRAY[...]`, `0x..` binary
+  literals, pyarrow's `add_checked` & co. and its timestamp / date literals; filter errors worded
+  as pylance's ("Invalid user input: ...", "No field named ..."). Fixed on the way: an error about a
+  non-ASCII character cut it in half, and Python could not decode the message.
+- **Speed**: the new functions are dispatched by a family set at parse time; filters using the
+  existing functions run as before (2M rows, `lower(s) = ...` and `starts_with(...)`).
+- **Verified**: `tests/test_json_columns.py` (bytes and text both ways, appends across libraries,
+  compaction, 15 JSON filters and 8 other functions equal to pylance's results); pylance's suite 336
+  (316 before); ctest, lance-c 106/106, the Python suite.

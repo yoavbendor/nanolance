@@ -320,6 +320,7 @@ add_library(nanolance STATIC
     src/dataset.cpp
     src/dataset_refs.cpp
     src/transaction_file.cpp
+    src/jsonb.cpp
     src/expr.cpp
     src/arrow_slice.cpp
     src/dataset_ops.cpp

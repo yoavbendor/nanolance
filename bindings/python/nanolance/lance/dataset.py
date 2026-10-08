@@ -218,7 +218,7 @@ class LanceDataset:
     @property
     def schema(self) -> pa.Schema:
         """The dataset's schema, with the row id columns its default scan options add (as Lance's)."""
-        schema = self._data_schema
+        schema = _json_out_schema(self._data_schema)
         for option, name in (("with_row_id", "_rowid"), ("with_row_address", "_rowaddr")):
             if self._default_scan_options.get(option):
                 schema = schema.append(pa.field(name, pa.uint64()))
@@ -526,12 +526,13 @@ class LanceDataset:
         for i in wanted:
             if i < 0 or i >= n:
                 raise IndexError(f"index {i} is out of bounds for a dataset of {n} rows")
-        return _rename(self._take(wanted, names, addresses=False), columns)
+        return _json_out(_rename(self._take(wanted, names, addresses=False), columns))
 
     def _take_rows(self, row_ids, columns=None, **kwargs) -> pa.Table:
         if self.has_stable_row_ids:
             raise unsupported("taking rows of a dataset with stable row ids")
-        return _rename(self._take(_index_list(row_ids), _normalize_columns(columns), addresses=True), columns)
+        return _json_out(_rename(self._take(_index_list(row_ids), _normalize_columns(columns), addresses=True),
+                                 columns))
 
     def take_rows(self, row_ids, columns=None, **kwargs) -> pa.Table:
         return self._take_rows(row_ids, columns, **kwargs)
@@ -1313,6 +1314,17 @@ def _expression_sql(expr) -> str:
 
     text = re.sub(r'is_in\(([^,]+), \{value_set=([^}]*?\])[^}]*\}\)', value_set, text)
     text = re.sub(r", \{[^}]*\}\)", ")", text)  # function options: is_null(a, {nan_is_null=false})
+
+    # pyarrow prints temporal scalars bare: a timestamp as "2021-01-01 02:00:00.000[Z]" (a zoned one
+    # in UTC, how the column holds it too), a date as "2021-01-01". Outside string literals, they
+    # become SQL's TIMESTAMP and DATE literals.
+    def temporal(segment):
+        segment = re.sub(r"(?<![\w'])(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)Z?(?![\w'])",
+                         lambda m: f"TIMESTAMP '{m.group(1)}'", segment)
+        return re.sub(r"(?<![\w'-])(\d{4}-\d{2}-\d{2})(?![\w:'-]| \d)", lambda m: f"DATE '{m.group(1)}'", segment)
+
+    parts = re.split(r'("(?:[^"\\]|\\.)*")', text)
+    text = "".join(part if i % 2 else temporal(part) for i, part in enumerate(parts))
     # pyarrow quotes strings with double quotes; SQL uses single.
     text = re.sub(r'"((?:[^"\\]|\\.)*)"', lambda m: "'" + m.group(1).replace("'", "''") + "'", text)
     return text
@@ -1734,6 +1746,9 @@ class LanceScanner:
         return table.drop_columns(list(dict.fromkeys(extra))) if extra else table
 
     def to_table(self) -> pa.Table:
+        return _json_out(self._to_table())
+
+    def _to_table(self) -> pa.Table:
         if self._order_by:
             return self._sorted_table()
         if self._nearest is not None:
@@ -1885,7 +1900,7 @@ class LanceScanner:
 
     @property
     def dataset_schema(self) -> pa.Schema:
-        return self._ds._data_schema
+        return self._ds.schema
 
     def explain_plan(self, verbose: bool = False) -> str:
         lines = [f"nanolance scan of {self._ds.uri} v{self._ds.version}"]
@@ -1973,7 +1988,78 @@ class ScannerBuilder:
 # ── writes ────────────────────────────────────────────────────────────────────────────────────────
 
 
+# ── JSON columns ───────────────────────────────────────────────────────────────────────────────────
+# Lance stores JSON as JSONB in a large_binary column marked lance.json and reads it back as
+# arrow.json text (pa.json_()); nanolance does the same, converting at the edges (jsonb.hpp).
+
+_LANCE_JSON = {b"ARROW:extension:name": b"lance.json", b"ARROW:extension:metadata": b""}
+
+
+def _is_arrow_json(field: pa.Field) -> bool:
+    t = field.type
+    return isinstance(t, pa.BaseExtensionType) and t.extension_name == "arrow.json"
+
+
+def _is_lance_json(field: pa.Field) -> bool:
+    return pa.types.is_large_binary(field.type) and (field.metadata or {}).get(b"ARROW:extension:name") == b"lance.json"
+
+
+def _json_in_schema(schema: pa.Schema) -> pa.Schema:
+    return pa.schema([pa.field(f.name, pa.large_binary(), f.nullable, {**(f.metadata or {}), **_LANCE_JSON})
+                      if _is_arrow_json(f) else f for f in schema], metadata=schema.metadata)
+
+
+def _json_in(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """arrow.json text columns as JSONB (Lance's errors for text that is not JSON)."""
+    columns = []
+    for field, column in zip(batch.schema, batch.columns):
+        if _is_arrow_json(field):
+            try:
+                column = pa.Array._import_from_c_capsule(*_nanolance._json_encode(column.storage))
+            except ValueError as exc:
+                raise OSError(f"LanceError(Arrow): Invalid argument error: {exc}") from None
+        columns.append(column)
+    return pa.RecordBatch.from_arrays(columns, schema=_json_in_schema(batch.schema))
+
+
+def _json_out_field(field: pa.Field) -> pa.Field:
+    meta = {k: v for k, v in (field.metadata or {}).items()
+            if k not in (b"ARROW:extension:name", b"ARROW:extension:metadata")}
+    return pa.field(field.name, pa.json_(pa.utf8()), field.nullable, meta or None)
+
+
+def _json_out_schema(schema: pa.Schema) -> pa.Schema:
+    if not any(_is_lance_json(f) for f in schema):
+        return schema
+    return pa.schema([_json_out_field(f) if _is_lance_json(f) else f for f in schema], metadata=schema.metadata)
+
+
+def _json_out(table: pa.Table) -> pa.Table:
+    """lance.json JSONB columns as arrow.json text, as pylance returns them."""
+    if not any(_is_lance_json(f) for f in table.schema):
+        return table
+    columns = []
+    for field, column in zip(table.schema, table.columns):
+        if _is_lance_json(field):
+            chunks = [pa.ExtensionArray.from_storage(
+                pa.json_(pa.utf8()), pa.Array._import_from_c_capsule(*_nanolance._json_decode(c)))
+                for c in column.chunks]
+            column = pa.chunked_array(chunks, type=pa.json_(pa.utf8()))
+        columns.append(column)
+    return pa.Table.from_arrays(columns, schema=_json_out_schema(table.schema))
+
+
 def _coerce_reader(data_obj: ReaderLike, schema: Optional[pa.Schema] = None) -> pa.RecordBatchReader:
+    """Any of the inputs pylance's write_dataset takes, as a RecordBatchReader, with JSON columns
+    (arrow.json) as the JSONB Lance stores (lance.json)."""
+    reader = _coerce_reader_raw(data_obj, schema)
+    if not any(_is_arrow_json(f) for f in reader.schema):
+        return reader
+    target = _json_in_schema(reader.schema)
+    return pa.RecordBatchReader.from_batches(target, (_json_in(b) for b in reader))
+
+
+def _coerce_reader_raw(data_obj: ReaderLike, schema: Optional[pa.Schema] = None) -> pa.RecordBatchReader:
     """Any of the inputs pylance's write_dataset takes, as a RecordBatchReader.
 
     Follows pylance's ``lance.types._coerce_reader`` (Apache-2.0, The Lance Authors).
@@ -2095,7 +2181,7 @@ def write_dataset(
     append = mode == "append" and exists
     target = None
     if append:
-        target = LanceDataset(path).schema
+        target = LanceDataset(path)._data_schema
         _check_append_schema(target, reader.schema, allow_subset=True)
     options = _nanolance.WriteOptions()
     with native():
