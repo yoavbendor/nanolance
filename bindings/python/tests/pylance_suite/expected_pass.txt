@@ -13,12 +13,14 @@ tests/test_coerce_query_vector.py::TestCoerceQueryVectorValidTypes::test_pa_int_
 tests/test_coerce_query_vector.py::TestCoerceQueryVectorValidTypes::test_tuple_of_floats
 tests/test_column_names.py::TestCaseOnlyDifferentColumnNames::test_create_table_preserves_all_cases
 tests/test_column_names.py::TestCaseOnlyDifferentColumnNames::test_filter_resolves_exact_case_match
+tests/test_column_names.py::TestCaseOnlyDifferentColumnNames::test_order_by_each_case_variant
 tests/test_column_names.py::TestCaseOnlyDifferentColumnNames::test_scalar_index_on_each_case_variant
 tests/test_column_names.py::TestMixedCaseColumnNames::test_alter_column_with_mixed_case
 tests/test_column_names.py::TestMixedCaseColumnNames::test_create_table_with_mixed_case
 tests/test_column_names.py::TestMixedCaseColumnNames::test_drop_column_with_mixed_case
 tests/test_column_names.py::TestMixedCaseColumnNames::test_filter_with_mixed_case
 tests/test_column_names.py::TestMixedCaseColumnNames::test_merge_insert_with_mixed_case_key
+tests/test_column_names.py::TestMixedCaseColumnNames::test_order_by_with_mixed_case
 tests/test_column_names.py::TestNestedFieldColumnNames::test_create_table_with_nested_mixed_case
 tests/test_column_names.py::TestNestedFieldColumnNames::test_create_table_with_nested_special_chars
 tests/test_column_names.py::TestNestedFieldColumnNames::test_filter_with_nested_mixed_case
@@ -30,6 +32,7 @@ tests/test_column_names.py::TestSpecialCharacterColumnNames::test_create_table_w
 tests/test_column_names.py::TestSpecialCharacterColumnNames::test_drop_column_with_special_chars
 tests/test_column_names.py::TestSpecialCharacterColumnNames::test_filter_with_special_chars_using_backticks
 tests/test_column_names.py::TestSpecialCharacterColumnNames::test_merge_insert_with_special_char_key
+tests/test_column_names.py::TestSpecialCharacterColumnNames::test_order_by_with_special_chars
 tests/test_compat_version_snapshot.py::test_workers_share_the_controller_version_snapshot
 tests/test_dataset.py::test_access_config
 tests/test_dataset.py::test_add_null_columns
@@ -242,6 +245,9 @@ tests/test_map_type.py::test_query_map_column
 tests/test_map_type.py::test_simple_map_write_read
 tests/test_memory_leaks.py::TestMemoryLeaks::test_index_statistics_no_leak
 tests/test_optimize.py::test_compact_with_write
+tests/test_order_by.py::test_all_order_by_support_functions
+tests/test_order_by.py::test_one_column_order_by
+tests/test_order_by.py::test_two_column_order_by
 tests/test_pydantic.py::test_naive_datetime_field
 tests/test_pydantic.py::test_nested_model_becomes_struct
 tests/test_pydantic.py::test_optional_field_is_nullable

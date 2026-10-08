@@ -2976,3 +2976,16 @@ first, without degrading function or speed.
   cleanup pylance and nanolance read every version left as before. Tags both ways; auto cleanup
   matches pylance's version for version. pylance's suite 305 (286 before); ctest, lance-c 106/106,
   the Python suite.
+
+## order_by
+
+- `order_by` in `to_table` / `to_batches` / `scanner` and on fragments: column names or
+  `ColumnOrdering(column, ascending, nulls_first)`, names exact (as Lance). The filtered rows are
+  read without offset and limit (plus sort columns not projected), sorted by stable passes from
+  the last key to the first (each key its own direction and null placement), then sliced.
+- Floats sort in IEEE total order (`-NaN < -inf < ... < -0.0 < 0.0 < ... < inf < NaN`, nulls
+  apart), as Lance's sort does; Arrow's own sort ranks NaN with the nulls and -0.0 equal to 0.0, so
+  float keys are sorted by their total-order integer image.
+- **Verified**: `tests/test_order_by.py` (12 random specs over int / float with NaN and ±0 /
+  string / bool / timestamp keys with nulls, filters, offset and limit, projections without the
+  sort columns; the forms; fragments) equal to pylance's results; pylance's suite 311 (305 before).

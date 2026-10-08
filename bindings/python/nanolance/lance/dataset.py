@@ -11,6 +11,7 @@ nothing is silently ignored when ignoring it would change a result.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1018,6 +1019,55 @@ class CleanupExplanation:
         self.warnings = []
 
 
+@dataclasses.dataclass
+class ColumnOrdering:
+    """Mirrors ``lance.dataset.ColumnOrdering``: one sort key of ``order_by``."""
+
+    column_name: str
+    ascending: bool = True
+    nulls_first: bool = False
+
+
+def _total_order_key(column):
+    """Floats as integers that sort in IEEE total order (Rust's total_cmp, which the sort in Lance
+    uses: -NaN < -inf < ... < -0.0 < 0.0 < ... < inf < NaN), nulls kept; other columns unchanged.
+    Arrow's own sort ranks NaN with the nulls and -0.0 equal to 0.0."""
+    if isinstance(column, pa.ChunkedArray):
+        column = column.combine_chunks()
+    widths = {pa.float64(): (np.int64, 63), pa.float32(): (np.int32, 31), pa.float16(): (np.int16, 15)}
+    if column.type not in widths:
+        return column
+    int_type, sign = widths[column.type]
+    bits = np.frombuffer(column.buffers()[1], dtype=int_type, count=len(column) + column.offset)[column.offset:]
+    unsigned = np.dtype(int_type).str.replace("i", "u")
+    flip = ((bits >> sign).view(unsigned) >> 1).view(int_type)
+    keys = bits ^ flip
+    return pa.array(keys, mask=column.is_null().to_numpy(zero_copy_only=False) if column.null_count else None)
+
+
+def _orderings(ds: "LanceDataset", order_by) -> List[ColumnOrdering]:
+    """``order_by`` (column names or ColumnOrdering): each a top-level column, named exactly (Lance
+    resolves sort columns by exact name)."""
+    if not order_by:
+        return []
+    if isinstance(order_by, (str, ColumnOrdering)):
+        order_by = [order_by]
+    out = []
+    for o in order_by:
+        if isinstance(o, str):
+            o = ColumnOrdering(o)
+        elif not isinstance(o, ColumnOrdering) and hasattr(o, "column_name"):
+            o = ColumnOrdering(o.column_name, bool(getattr(o, "ascending", True)), bool(getattr(o, "nulls_first", False)))
+        elif not isinstance(o, ColumnOrdering):
+            raise TypeError(f"order_by takes column names or ColumnOrdering, got {type(o).__name__}")
+        if o.column_name not in ds._data_schema.names:
+            if "." in o.column_name and _resolve_path(ds._data_schema, o.column_name) is not None:
+                raise unsupported("order_by on a nested field")
+            raise ValueError(f"Invalid user input: Column {o.column_name} not found")
+        out.append(ColumnOrdering(o.column_name, bool(o.ascending), bool(o.nulls_first)))
+    return out
+
+
 def _blob_mode(blob_handling) -> int:
     """pylance's blob_handling names, as nanolance's reader modes. The default, as in pylance: a blob
     column comes back as its description."""
@@ -1513,6 +1563,17 @@ class LanceScanner:
                  include_deleted_rows=None, order_by=None, substrait_filter=None, scan_stats_callback=None,
                  blob_handling=None, use_scalar_index=None, prefilter=None, fast_search=None,
                  disable_scoring_autoprojection=None, batch_size_bytes=None, **ignored):
+        # order_by: the scan without limit and offset (and with the sort columns), sorted, then sliced.
+        self._order_by = _orderings(ds, order_by)
+        if self._order_by:
+            if nearest is not None or full_text_query is not None:
+                raise unsupported("order_by with a vector or full-text search")
+            if isinstance(columns, dict):
+                raise unsupported("order_by with a {alias: column} projection")
+            self._unsorted = dict(
+                columns=columns, filter=filter, fragments=fragments, with_row_id=with_row_id,
+                with_row_address=with_row_address, blob_handling=blob_handling, use_scalar_index=use_scalar_index,
+                substrait_filter=substrait_filter, include_deleted_rows=include_deleted_rows)
         self._batch_size_bytes = None if batch_size_bytes is None else int(batch_size_bytes)
         # With a projection, `_distance` / `_score` come back only where named (Lance's
         # disable_scoring_autoprojection); otherwise after the named columns.
@@ -1527,8 +1588,6 @@ class LanceScanner:
             raise unsupported("substrait filters")
         if include_deleted_rows:
             raise unsupported("include_deleted_rows")
-        if order_by:
-            raise unsupported("order_by")
         self._filter = _filter_sql(filter)
         # A filter on _rowid / _rowaddr is evaluated here, over the rows the scan returns with their
         # addresses, before limit and offset (the scan cannot push it down).
@@ -1646,7 +1705,32 @@ class LanceScanner:
             table = table.replace_schema_metadata(meta)
         return table
 
+    def _sorted_table(self) -> pa.Table:
+        """Every row the filter passes, sorted by the orderings (each key with its own direction and
+        null placement, as DataFusion's sort in Lance), then offset and limit."""
+        import pyarrow.compute as pc
+
+        args = dict(self._unsorted)
+        names = None if args["columns"] is None else _normalize_columns(args["columns"])
+        extra = []
+        if names is not None:
+            extra = [o.column_name for o in self._order_by if o.column_name not in names]
+            args["columns"] = names + [c for c in dict.fromkeys(extra)]
+        table = LanceScanner(self._ds, **args).to_table()
+        order = pa.array(range(table.num_rows), pa.int64())
+        for o in reversed(self._order_by):  # stable passes, least significant key first
+            column = _total_order_key(table.column(o.column_name).take(order))
+            keys = pc.array_sort_indices(column, order="ascending" if o.ascending else "descending",
+                                         null_placement="at_start" if o.nulls_first else "at_end")
+            order = order.take(keys)
+        table = table.take(order)
+        if self._offset or self._limit is not None:
+            table = table.slice(self._offset, self._limit)
+        return table.drop_columns(list(dict.fromkeys(extra))) if extra else table
+
     def to_table(self) -> pa.Table:
+        if self._order_by:
+            return self._sorted_table()
         if self._nearest is not None:
             return self._nearest_table()
         if self._fts is not None:
