@@ -272,15 +272,15 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **383**, every one of which pylance also passes (336 before the small dataset APIs, 316 before JSON columns and filter functions, 312 before compaction planning, 311 before transaction files, 305 before `order_by`, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
+| nanolance.lance | **393**, every one of which pylance also passes (383 before the writer tail, 336 before the small dataset APIs, 316 before JSON columns and filter functions, 312 before compaction planning, 311 before transaction files, 305 before `order_by`, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
 
 By test file, where nanolance passes any:
 
 | file | pylance | nanolance |
 |---|---|---|
-| test_dataset.py | 250 | 142 |
+| test_dataset.py | 250 | 146 |
 | test_scalar_index.py | 189 | 50 |
-| test_file.py | 40 | 27 |
+| test_file.py | 40 | 31 |
 | test_column_names.py | 27 | 27 |
 | test_filter.py | 26 | 24 |
 | test_vector_index.py | 97 | 23 |
@@ -292,7 +292,7 @@ By test file, where nanolance passes any:
 | test_optimize.py | 22 | 6 |
 | test_schema.py | 4 | 4 |
 | test_schema_evolution.py | 23 | 4 |
-| test_pydantic.py | 12 | 4 |
+| test_pydantic.py | 12 | 6 |
 | test_vector.py | 9 | 3 |
 | others | | 11 |
 
@@ -305,8 +305,9 @@ The main reasons tests fail today:
   stores or the `mem_wal`.
 - About 90 need the transaction API, fragment-level writes, stable row ids or multiple base paths.
 - About 25 need filter functions nanolance lacks, or a data storage version other than 2.2.
-- A tail of writer gaps in nanolance itself: Arrow dictionary arrays, empty structs, a nullable
-  fixed-size list of nullable values, bfloat16. Each is a real gap, listed by the run.
+- A tail of writer gaps in nanolance itself: dictionary columns inside structs or lists, null
+  elements of a fixed-size list under a list or struct, bfloat16. Each is a real gap, listed by
+  the run.
 
 ## Bugs the suite found in nanolance itself
 

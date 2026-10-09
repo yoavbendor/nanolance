@@ -31,6 +31,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <deque>
 #include <vector>
 
 namespace nano_lance {
@@ -418,6 +419,39 @@ std::uint64_t stream_miniblock_payload_with_repdef(std::ostream& out, const std:
         out.write(zeros.data(), static_cast<std::streamsize>(pad));
     }
     return written + pad;
+}
+
+/// A mini-block chunk as Lance serializes one in general: [levels][def size][each buffer's size, u32],
+/// padded to 8; the definition levels, padded; each buffer, padded. `def` empty: no levels.
+std::uint64_t stream_miniblock_chunk(std::ostream& out, std::size_t value_count, const std::vector<std::uint8_t>& def,
+                                     const std::vector<std::pair<const std::uint8_t*, std::size_t>>& buffers) {
+    static constexpr std::array<char, 8> fill{static_cast<char>(0xFE), static_cast<char>(0xFE), static_cast<char>(0xFE),
+                                              static_cast<char>(0xFE), static_cast<char>(0xFE), static_cast<char>(0xFE),
+                                              static_cast<char>(0xFE), static_cast<char>(0xFE)};
+    std::vector<std::uint8_t> header;
+    append_le16(header, static_cast<std::uint16_t>(def.empty() ? 0U : value_count));
+    if (!def.empty()) {
+        append_le16(header, static_cast<std::uint16_t>(def.size()));
+    }
+    for (const auto& b : buffers) {  // u32: the pages say has_large_chunk
+        append_le32(header, static_cast<std::uint32_t>(b.second));
+    }
+    std::uint64_t written = 0;
+    const auto put = [&](const std::uint8_t* data, std::size_t size) {
+        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+        written += size;
+        const auto pad = (8U - (written % 8U)) % 8U;
+        out.write(fill.data(), static_cast<std::streamsize>(pad));
+        written += pad;
+    };
+    put(header.data(), header.size());
+    if (!def.empty()) {
+        put(def.data(), def.size());
+    }
+    for (const auto& b : buffers) {
+        put(b.first, b.second);
+    }
+    return written;
 }
 
 std::uint64_t stream_flat_miniblock_payload(std::ostream& out, const std::uint8_t* data,
@@ -2119,8 +2153,10 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             return true;
         }
 
-        // Arrow's null type: every row is null and there is no value to store at all.
-        if (field.logical_type == "null") {
+        // Arrow's null type: every row is null and there is no value to store at all. An empty struct
+        // (a physical "struct" column) is written the same way, as Lance writes it: the page says
+        // nothing a reader needs, the type says every row is a valid empty struct.
+        if (field.logical_type == "null" || field.logical_type == "struct") {
             pb::ColumnMetadata column;
             column.encoding = column_encoding_bytes();
             pb::ColumnPage page;
@@ -2128,6 +2164,170 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             page.priority = 0;
             page.encoding = all_null_constant_layout_message();
             column.pages.push_back(std::move(page));
+            columns.push_back(std::move(column));
+            return true;
+        }
+
+        // An Arrow dictionary column: Lance's dictionary page -- the indices, at the index type's
+        // width, in mini-block chunks, and the dictionary it was given (unused entries and order
+        // kept) as the page's third buffer.
+        if (!field.dictionary_index_format.empty()) {
+            const bool variable = values.kind == ColumnValues::Kind::VariableWidth;
+            const bool large = values.variable.large;
+            const auto& format = field.dictionary_index_format;
+            const std::size_t iw = format == "c" || format == "C" ? 1U : format == "s" || format == "S" ? 2U
+                                   : format == "i" || format == "I"                                  ? 4U
+                                                                                                     : 8U;
+            const std::size_t width = variable ? 0U : lance_logical_type_value_bytes(field.logical_type);
+            const auto value_at = [&](std::uint64_t r) -> std::string_view {
+                if (!variable) {
+                    return {reinterpret_cast<const char*>(values.fixed_data() + r * width), width};
+                }
+                std::uint64_t s = 0;
+                std::uint64_t e = 0;
+                if (large) {
+                    std::memcpy(&s, values.variable.offsets.data() + r * 8U, 8U);
+                    std::memcpy(&e, values.variable.offsets.data() + (r + 1U) * 8U, 8U);
+                } else {
+                    std::uint32_t s32 = 0;
+                    std::uint32_t e32 = 0;
+                    std::memcpy(&s32, values.variable.offsets.data() + r * 4U, 4U);
+                    std::memcpy(&e32, values.variable.offsets.data() + (r + 1U) * 4U, 4U);
+                    s = s32;
+                    e = e32;
+                }
+                return {reinterpret_cast<const char*>(values.variable.data.data() + s), static_cast<std::size_t>(e - s)};
+            };
+            std::vector<std::string> entries;
+            if (values.dictionary != nullptr) {
+                entries = *values.dictionary;
+            }
+            std::unordered_map<std::string_view, std::uint64_t> lookup;
+            for (std::size_t k = 0; k < entries.size(); ++k) {
+                lookup.emplace(std::string_view(entries[k]), k);
+            }
+            std::deque<std::string> extra;  // values the dictionary lacks (none, from an Arrow dictionary)
+            std::vector<std::uint8_t> indices(static_cast<std::size_t>(rows) * iw, 0U);
+            for (std::uint64_t r = 0; r < rows; ++r) {
+                if (!values.validity.empty() && ((values.validity[r >> 3U] >> (r & 7U)) & 1U) == 0U) {
+                    continue;
+                }
+                const auto v = value_at(r);
+                auto it = lookup.find(v);
+                if (it == lookup.end()) {
+                    extra.emplace_back(v);
+                    it = lookup.emplace(std::string_view(extra.back()), entries.size() + extra.size() - 1U).first;
+                }
+                std::memcpy(indices.data() + r * iw, &it->second, iw);
+            }
+            // (A deque: `lookup` holds views into its strings, which must not move.)
+            for (auto& e : extra) {
+                entries.push_back(e);
+            }
+            std::vector<std::uint8_t> dict_block;
+            std::vector<std::uint8_t> dict_encoding;
+            if (variable) {
+                std::vector<std::string_view> views(entries.begin(), entries.end());
+                dict_block = build_dict_variable_block(views, large);
+                dict_encoding = descriptor::variable(descriptor::flat(offset_bits_token(large)));
+            } else {
+                for (const auto& e : entries) {
+                    dict_block.insert(dict_block.end(), e.begin(), e.end());
+                }
+                dict_encoding = descriptor::flat(static_cast<std::uint32_t>(width * 8U));
+            }
+            const auto by_bytes = max_values_per_uncompressed_chunk(iw);
+            const auto multi = multichunk_values(column_has_nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
+            const auto max_chunk = multi != 0U ? multi : std::size_t{1};
+            pb::ColumnMetadata column;
+            column.encoding = column_encoding_bytes();
+            MiniblockPageWriter page_writer(out);
+            for (std::size_t off = 0; off < rows;) {
+                const auto count = std::min<std::size_t>(max_chunk, rows - off);
+                const auto def = column_has_nulls ? pack_definition_levels(values.validity, off, count)
+                                                  : std::vector<std::uint8_t>{};
+                page_writer.begin_chunk();
+                const auto footprint = stream_miniblock_chunk(out, count, def, {{indices.data() + off * iw, count * iw}});
+                page_writer.end_chunk(footprint, count);
+                off += count;
+            }
+            pb::ColumnPage page;
+            if (rows > 0U) {
+                page_writer.finish(page);
+            } else {
+                page.length = 0;
+            }
+            align64(out);
+            page.buffer_offsets.push_back(pos(out));
+            page.buffer_sizes.push_back(dict_block.size());
+            out.write(reinterpret_cast<const char*>(dict_block.data()), static_cast<std::streamsize>(dict_block.size()));
+            descriptor::MiniBlock m;
+            m.value_compression = descriptor::flat(static_cast<std::uint32_t>(iw * 8U));
+            m.dictionary = dict_encoding;
+            m.num_dictionary_items = entries.size();
+            if (column_has_nulls) {
+                m.def_compression = repdef_encoding_bytes();
+            }
+            mini_block_tail(m, rows, 1U, column_has_nulls);
+            page.encoding = descriptor::page_encoding(m);
+            column.pages.push_back(std::move(page));
+            columns.push_back(std::move(column));
+            return true;
+        }
+
+        // A fixed_size_list with null elements inside valid rows: Lance's mini-block chunks of two
+        // buffers, the elements' validity bits then the values, under FixedSizeList{has_validity}.
+        if (!values.item_validity.empty()) {
+            std::string element;
+            std::uint64_t items = 0;
+            if (!lance_fixed_size_list_parts(field.logical_type, element, items) || items == 0U) {
+                error = "element validity on a column that is not a fixed_size_list: " + field.name;
+                return false;
+            }
+            const auto element_bytes = lance_logical_type_value_bytes(element);
+            const auto row_bytes = element_bytes * items;
+            const auto total = values.fixed_size() / row_bytes;
+            const auto by_bytes = max_values_per_uncompressed_chunk(row_bytes + (items + 7U) / 8U + 1U);
+            const auto multi = multichunk_values(column_has_nulls ? std::min<std::size_t>(1024U, by_bytes) : by_bytes);
+            const auto max_chunk_rows = multi != 0U ? multi : std::size_t{1};
+            pb::ColumnMetadata column;
+            column.encoding = column_encoding_bytes();
+            MiniblockPageWriter page_writer(out);
+            std::vector<std::uint8_t> bits;
+            for (std::size_t off = 0; off < total;) {
+                const auto count = std::min(max_chunk_rows, total - off);
+                const auto first = static_cast<std::uint64_t>(off) * items;
+                const auto n = static_cast<std::uint64_t>(count) * items;
+                bits.assign(static_cast<std::size_t>((n + 7U) / 8U), 0U);
+                for (std::uint64_t k = 0; k < n; ++k) {
+                    const auto at = first + k;
+                    if ((values.item_validity[at >> 3U] >> (at & 7U)) & 1U) {
+                        bits[k >> 3U] |= static_cast<std::uint8_t>(1U << (k & 7U));
+                    }
+                }
+                const auto def = column_has_nulls ? pack_definition_levels(values.validity, off, count)
+                                                  : std::vector<std::uint8_t>{};
+                page_writer.begin_chunk();
+                const auto footprint = stream_miniblock_chunk(
+                    out, count, def, {{bits.data(), bits.size()}, {values.fixed_data() + off * row_bytes, count * row_bytes}});
+                page_writer.end_chunk(footprint, count);
+                off += count;
+                if (off < total && multi != 0U && page_writer.payload_bytes() < kTargetMiniblockPageBytes) {
+                    continue;
+                }
+                pb::ColumnPage page;
+                const auto page_rows = page_writer.rows();
+                page_writer.finish(page);
+                descriptor::MiniBlock m;
+                m.value_compression =
+                    descriptor::fixed_size_list(items, descriptor::flat(static_cast<std::uint32_t>(element_bytes * 8U)), true);
+                if (column_has_nulls) {
+                    m.def_compression = repdef_encoding_bytes();
+                }
+                mini_block_tail(m, page_rows, 2U, column_has_nulls);
+                page.encoding = descriptor::page_encoding(m);
+                column.pages.push_back(std::move(page));
+            }
             columns.push_back(std::move(column));
             return true;
         }
@@ -2800,12 +3000,12 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
     for (const auto& mapped_field : mapping.fields) {
         pb::Field field;
         field.name = mapped_field.name;
-        field.logical_type = lance_on_disk_logical_type(mapped_field.logical_type);
+        field.logical_type = lance_field_disk_logical_type(mapped_field);
         field.id = mapped_field.id;
         field.parent_id = mapped_field.parent_id;
         field.type = 2;
         field.nullable = mapped_field.nullable;
-        field.encoding = lance_on_disk_field_encoding(mapped_field.logical_type);
+        field.encoding = mapped_field.dictionary_index_format.empty() ? lance_on_disk_field_encoding(mapped_field.logical_type) : 3;
         for (const auto& kv : mapped_field.metadata) {
             field.metadata[kv.first] = std::vector<std::uint8_t>(kv.second.begin(), kv.second.end());
         }

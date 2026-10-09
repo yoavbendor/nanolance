@@ -267,11 +267,11 @@ namespace {
 pb::Field manifest_field(const LanceField& mapped_field) {
     pb::Field field;
     field.name = mapped_field.name;
-    field.logical_type = lance_on_disk_logical_type(mapped_field.logical_type);
+    field.logical_type = lance_field_disk_logical_type(mapped_field);
     field.id = mapped_field.id;
     field.parent_id = mapped_field.parent_id;
     field.type = 2;
-    field.encoding = lance_on_disk_field_encoding(mapped_field.logical_type);
+    field.encoding = mapped_field.dictionary_index_format.empty() ? lance_on_disk_field_encoding(mapped_field.logical_type) : 3;
     field.nullable = mapped_field.nullable;
     for (const auto& kv : mapped_field.metadata) {
         // Per-file encoding choices live in each data file's own schema; the dataset's is logical.

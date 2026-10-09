@@ -31,6 +31,10 @@ def translate(message: str) -> Exception:
         return ValueError(f"Invalid user input: the filter does not return a boolean ({text})")
     if text.startswith(("invalid filter", "cannot compare", "cannot CAST")):
         return ValueError(f"Invalid user input: {text}")
+    if "Empty structs with rep/def information" in text:
+        return OSError("Invalid user input: " + text.split("write failed: ", 1)[-1])
+    if "dimension must be a positive integer" in text:
+        return OSError(text)
     if "already exists" in lower:
         return OSError(text)
     if text.startswith("Invalid user input: CompactionOptions::"):

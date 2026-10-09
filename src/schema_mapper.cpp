@@ -306,7 +306,12 @@ ParsedFormat parse_fixed_size_list(const ArrowSchema& field) {
         }
         items = items * 10U + static_cast<std::uint64_t>(*c - '0');
     }
-    if (items == 0U || field.n_children != 1 || field.children == nullptr || field.children[0] == nullptr) {
+    if (items == 0U) {  // Lance's words
+        out.rejection = std::string("LanceError(Schema): Field \"") + (field.name == nullptr ? "" : field.name) +
+                        "\" contains a FixedSizeList with dimension 0; dimension must be a positive integer";
+        return out;
+    }
+    if (field.n_children != 1 || field.children == nullptr || field.children[0] == nullptr) {
         out.rejection = "a fixed_size_list needs one child and a non-zero size";
         return out;
     }
@@ -394,7 +399,10 @@ bool map_field(const ArrowSchema& field,
         std::strcmp(field.children[0]->format, "+s") == 0) {
         parsed.logical_type += ".struct";
     }
-    const bool is_struct = parsed.logical_type == "struct" || is_list;
+    // A struct with no fields at all is a column of its own, as in Lance: one constant page, the
+    // struct valid in every row.
+    const bool empty_struct = parsed.logical_type == "struct" && field.n_children == 0;
+    const bool is_struct = (parsed.logical_type == "struct" && !empty_struct) || is_list;
     const bool is_dictionary = field.dictionary != nullptr;
 
     LanceField out;
@@ -412,22 +420,44 @@ bool map_field(const ArrowSchema& field,
     out.extension_name = extension_name;
     copy_metadata(field, out.metadata);
 
-    // An Arrow dictionary column used to be written as a bare index column with the dictionary
-    // VALUES stored nowhere at all: pa.array(["a","b","a"]).dictionary_encode() became an int32
-    // column reading back [0, 1, 0], with no record of what 0 and 1 meant. Nothing downstream could
-    // detect the loss -- the file is a perfectly valid int32 column to every reader. Refuse it.
-    //
-    // The remedy costs nothing on disk: nanolance already dictionary-encodes low-cardinality string
-    // columns on its own (structural dict / dict+RLE, on by default), so casting to plain utf8 gives
-    // the same file size without the Arrow-level dictionary.
+    // An Arrow dictionary column was once written as a bare index column with its dictionary VALUES
+    // stored nowhere (pa.array(["a","b","a"]).dictionary_encode() read back as [0, 1, 0]), then
+    // refused; it is now stored the way Lance stores one. Shapes Lance's form cannot hold here are
+    // still refused by name.
     if (is_dictionary) {
+        // An Arrow dictionary column: stored as Lance stores one ("dict:<value>:<index>:<ordered>",
+        // dictionary pages), and handled everywhere else as its values.
+        const ArrowSchema& values = *field.dictionary;
+        auto value_type = parse_format(values.format == nullptr ? "" : values.format);
+        const std::string index_format = format;
+        if (parent_id >= 0) {
+            error = "dictionary-encoded column '" + out.name +
+                    "' inside a struct or list is not supported yet; cast it to its value type first";
+            return false;
+        }
+        if (value_type.supported && !lance_logical_type_is_list(value_type.logical_type) &&
+            value_type.logical_type != "struct" && value_type.logical_type != "null" &&
+            value_type.logical_type != "bool" && value_type.logical_type.rfind("fixed_size_list", 0) != 0 &&
+            values.dictionary == nullptr &&
+            !lance_integer_name_of_format(index_format).empty() &&
+            (value_type.logical_type == "utf8" || value_type.logical_type == "large_utf8" ||
+             value_type.logical_type == "binary" || value_type.logical_type == "large_binary" ||
+             lance_logical_type_value_bytes(value_type.logical_type) != 0U)) {
+            out.logical_type = value_type.logical_type;
+            out.arrow_format = values.format;
+            out.dictionary_index_format = index_format;
+            out.dictionary_ordered = (field.flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0;
+            out.column_index = next_column++;
+            mapping.fields.push_back(out);
+            return true;
+        }
         error = "dictionary-encoded column '";
         error += out.name;
         error +=
-            "' is not supported: nanolance would store only the integer indices and discard the "
-            "dictionary values. Cast it to its value type first (pyarrow: "
-            "col.cast(pa.string()), or table.cast(...)); nanolance dictionary-encodes "
-            "low-cardinality string columns on disk by itself, so the file stays the same size.";
+            "' is not supported: its index type must be an integer and its values a string, binary "
+            "or fixed-width type (not a nested type or another dictionary). Cast it to its value "
+            "type first (pyarrow: col.cast(...)); nanolance dictionary-encodes low-cardinality "
+            "columns on disk by itself.";
         return false;
     }
 
@@ -476,10 +506,19 @@ bool mappings_field_equal(const LanceField& lhs, const LanceField& rhs) {
            lhs.nullable == rhs.nullable && lhs.extension_name == rhs.extension_name &&
            metadata_equal_ignoring_encoding(lhs.metadata, rhs.metadata) &&
            lhs.is_dictionary_index == rhs.is_dictionary_index &&
-           lhs.dictionary_value_logical_type == rhs.dictionary_value_logical_type;
+           lhs.dictionary_value_logical_type == rhs.dictionary_value_logical_type &&
+           lhs.dictionary_index_format == rhs.dictionary_index_format && lhs.dictionary_ordered == rhs.dictionary_ordered;
 }
 
 }  // namespace
+
+bool lance_field_is_empty_struct(const LanceField& field, const LanceSchemaMapping& mapping) {
+    if (field.logical_type != "struct" || !field.extension_name.empty()) {
+        return false;
+    }
+    return std::none_of(mapping.fields.begin(), mapping.fields.end(),
+                        [&](const LanceField& f) { return f.parent_id == field.id; });
+}
 
 std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& mapping) {
     std::vector<const LanceField*> out;
@@ -535,6 +574,7 @@ bool schema_mappings_equivalent(const LanceSchemaMapping& left, const LanceSchem
             l.nullable != r.nullable || l.extension_name != r.extension_name ||
             !metadata_equal_ignoring_encoding(l.metadata, r.metadata) || l.is_dictionary_index != r.is_dictionary_index ||
             l.dictionary_value_logical_type != r.dictionary_value_logical_type ||
+            l.dictionary_index_format != r.dictionary_index_format ||
             (l.column_index >= 0) != (r.column_index >= 0) ||
             position(left, l.parent_id) != position(right, r.parent_id)) {
             return false;
@@ -586,7 +626,8 @@ std::string describe_schema_mapping_mismatch(const LanceSchemaMapping& expected,
         if (e.name != a.name) {
             reason = "field name/order";
         } else if (e.logical_type != a.logical_type || e.arrow_format != a.arrow_format ||
-                   e.dictionary_value_logical_type != a.dictionary_value_logical_type) {
+                   e.dictionary_value_logical_type != a.dictionary_value_logical_type ||
+                   e.dictionary_index_format != a.dictionary_index_format) {
             reason = "type";
         } else if (e.nullable != a.nullable) {
             reason = "nullability";
@@ -931,6 +972,28 @@ bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchem
         LanceField lf;
         lf.name = pf.name;
         lf.logical_type = disk_logical_type_to_internal(pf.logical_type);
+        if (lf.logical_type.rfind("dict:", 0) == 0) {
+            // dict:<value type>:<index type>:<ordered>; the value type may hold colons of its own.
+            const auto last = lf.logical_type.rfind(':');
+            const auto index_at = last == std::string::npos ? std::string::npos : lf.logical_type.rfind(':', last - 1U);
+            const std::string index = index_at == std::string::npos || index_at < 5U
+                                          ? std::string{}
+                                          : lf.logical_type.substr(index_at + 1U, last - index_at - 1U);
+            static const std::pair<const char*, const char*> kIndex[] = {
+                {"int8", "c"}, {"uint8", "C"}, {"int16", "s"}, {"uint16", "S"},
+                {"int32", "i"}, {"uint32", "I"}, {"int64", "l"}, {"uint64", "L"}};
+            for (const auto& [name, format] : kIndex) {
+                if (index == name) {
+                    lf.dictionary_index_format = format;
+                }
+            }
+            if (lf.dictionary_index_format.empty()) {
+                error = "unsupported dictionary logical type: " + pf.logical_type;
+                return false;
+            }
+            lf.dictionary_ordered = lf.logical_type.substr(last + 1U) == "true";
+            lf.logical_type = disk_logical_type_to_internal(lf.logical_type.substr(5U, index_at - 5U));
+        }
         if (!infer_arrow_format_from_internal(lf.logical_type, lf.arrow_format, error)) {
             return false;
         }
@@ -986,8 +1049,8 @@ bool lance_schema_mapping_from_manifest(const pb::Manifest& manifest, LanceSchem
             return false;
         };
         for (auto& f : out.fields) {
-            if (f.column_index < 0 && parents.count(f.id) == 0U && f.logical_type != "struct" &&
-                !inside_lance_extension(f)) {
+            if (f.column_index < 0 && parents.count(f.id) == 0U &&
+                (f.logical_type != "struct" || f.extension_name.empty()) && !inside_lance_extension(f)) {
                 f.column_index = next++;
             }
         }

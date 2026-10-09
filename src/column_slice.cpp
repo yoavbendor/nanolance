@@ -570,6 +570,7 @@ bool cut_layers(const std::vector<ColumnValues::NestedLayer>& layers, const std:
 bool gather_leaf_runs(const ColumnValues& src, const RowRuns& runs, std::uint64_t total, std::size_t value_bytes,
                       ColumnValues& out, std::string& error) {
     out = ColumnValues{};
+    out.dictionary = src.dictionary;
     out.kind = src.kind;
     out.variable.large = src.variable.large;
     out.items_per_row = src.items_per_row;

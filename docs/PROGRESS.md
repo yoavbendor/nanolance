@@ -3087,3 +3087,24 @@ first, without degrading function or speed.
 - **Verified**: `tests/test_small_apis.py`; pylance's suite 383 (336 before, 23 of them from
   `test_vector_index.py`, which now loads); ctest 60/60, lance-c 106/106, the Python suite.
 
+## Writer tail
+
+- **Arrow dictionary columns**: written as Lance writes them -- logical type
+  `dict:<value>:<index>:<ordered>`, dictionary pages of the indices at the index type's width with
+  the dictionary the batches carried (unused entries and order kept) -- and read back as dictionary
+  columns, with the stored dictionary, from either library's files. Inside nanolance a dictionary
+  field is its VALUES (`LanceField::dictionary_index_format` beside the value type), so decoding,
+  filters, takes and the encoders work unchanged; only the Arrow form at the edges differs. The
+  decoder reads 8/16/32/64-bit indices flat, bit-packed or in runs (pylance writes all of them).
+- **Empty structs**: a column of their own, one constant page (byte for byte what pylance writes);
+  a nullable one, or one in a list, is refused with Lance's error.
+- **Null elements in fixed-size lists**: `FixedSizeList{has_validity}` mini-block chunks of two
+  buffers (element bits, then values), as pylance writes them; both libraries read either's.
+  Under a list or a struct they stay refused: accepting them at the top level would otherwise have
+  let a nested one through as 0.0.
+- **Also**: Lance's error for a zero-dimension fixed-size list, pydantic enums (a string enum is a
+  dictionary column), `truncate_table`.
+- **Speed**: unchanged (2M rows: write 0.128 s / 0.130 before, scan 0.021 s, filter 0.039 s).
+- **Verified**: `tests/test_writer_tail.py` (every shape written by both libraries and read by
+  both); pylance's suite 393 (383 before); ctest 60/60, lance-c 106/106, the Python suite.
+

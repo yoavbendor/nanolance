@@ -34,6 +34,7 @@
 #include <utility>
 #include <cstdlib>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 
 #if defined(__linux__)
@@ -1321,6 +1322,9 @@ struct ColumnEncodingPlan {
     /// kDict: the indices are `Flat(N)` -- N-bit integers end to end -- rather than FastLanes packed.
     /// Format 2.2 writes them so for a small page of 64-bit values (Flat(32) indices). Zero: packed.
     std::uint32_t dict_flat_index_bits = 0;
+    /// kDict with packed indices: their unpacked width (an Arrow dictionary's index type: 8, 16, 32
+    /// or 64 bits). kDictRle: the width of each run's index. 32 unless the descriptor says otherwise.
+    std::uint32_t dict_index_bits = 32;
     bool dict_inline_bitpacked = false;
     bool dict_out_of_line_bitpacked = false;
     /// kVariable: the offset width the descriptor declares for the value block, in bits. Only the
@@ -1929,9 +1933,18 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
     switch (inner->kind) {
         case page_layout::CompressiveKind::kRle:
             out.kind = has_dictionary ? ColumnEncodingKind::kDictRle : ColumnEncodingKind::kRle;
+            if (has_dictionary && inner->values != nullptr && inner->values->kind == page_layout::CompressiveKind::kFlat &&
+                (inner->values->bits_per_value == 8U || inner->values->bits_per_value == 16U ||
+                 inner->values->bits_per_value == 32U || inner->values->bits_per_value == 64U)) {
+                out.dict_index_bits = inner->values->bits_per_value;
+            }
             return true;
         case page_layout::CompressiveKind::kInlineBitpacking:
             out.kind = has_dictionary ? ColumnEncodingKind::kDict : ColumnEncodingKind::kBitpack;
+            if (has_dictionary && (inner->bits_per_value == 8U || inner->bits_per_value == 16U ||
+                                   inner->bits_per_value == 32U || inner->bits_per_value == 64U)) {
+                out.dict_index_bits = inner->bits_per_value;
+            }
             return true;
         case page_layout::CompressiveKind::kVariable:
             out.kind = ColumnEncodingKind::kVariable;
@@ -1941,7 +1954,8 @@ bool classify_from_descriptor(const pb::ColumnMetadata& column_metadata, ColumnE
             if (has_dictionary) {
                 // Dictionary indices stored flat. Read as values they were the wrong width (or,
                 // when it happened to match, the indices themselves).
-                if (inner->bits_per_value != 8U && inner->bits_per_value != 16U && inner->bits_per_value != 32U) {
+                if (inner->bits_per_value != 8U && inner->bits_per_value != 16U && inner->bits_per_value != 32U &&
+                    inner->bits_per_value != 64U) {
                     out.kind = ColumnEncodingKind::kUnsupported;
                     out.unsupported_reason = "dictionary indices of " + std::to_string(inner->bits_per_value) +
                                              " bits in " + page_layout::describe(layout);
@@ -2569,17 +2583,23 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     error = "dict-rle chunk is missing its run-lengths buffer";
                     return false;
                 }
-                const auto& values = chunk.values;    // one u32 dictionary index per run
+                const auto& values = chunk.values;    // one dictionary index per run (u32 unless declared)
                 const auto& lengths = chunk.extra_buffers[0];  // one u8 run length per run
-                if (values.size() % 4U != 0U || values.size() / 4U != lengths.size()) {
+                const std::size_t iw = encoding_plan.dict_index_bits / 8U;
+                if (values.size() % iw != 0U || values.size() / iw != lengths.size()) {
                     error = "dict-rle run count mismatch between indices and lengths";
                     return false;
                 }
                 const std::size_t num_runs = lengths.size();
                 reserve_more(runs, num_runs);
                 for (std::size_t r = 0; r < num_runs; ++r) {
-                    std::uint32_t index = 0;
-                    std::memcpy(&index, values.data() + r * 4U, 4U);
+                    std::uint64_t wide = 0;
+                    std::memcpy(&wide, values.data() + r * iw, iw);  // little-endian
+                    if (wide > std::numeric_limits<std::uint32_t>::max()) {
+                        error = "dict-rle index out of range";
+                        return false;
+                    }
+                    const auto index = static_cast<std::uint32_t>(wide);
                     if (index >= dict.count) {
                         error = "dict-rle index out of range";
                         return false;
@@ -2725,9 +2745,34 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                     const auto base = indices_bytes.size();
                     indices_bytes.resize(base + static_cast<std::size_t>(count) * 4U);
                     for (std::uint64_t i = 0; i < count; ++i) {
-                        std::uint32_t index = 0;
-                        std::memcpy(&index, chunk.values.data() + i * flat_width, flat_width);  // little-endian
+                        std::uint64_t wide = 0;
+                        std::memcpy(&wide, chunk.values.data() + i * flat_width, flat_width);  // little-endian
+                        if (wide > std::numeric_limits<std::uint32_t>::max()) {
+                            error = "dict index out of range";
+                            return false;
+                        }
+                        const auto index = static_cast<std::uint32_t>(wide);
                         std::memcpy(indices_bytes.data() + base + i * 4U, &index, 4U);
+                    }
+                } else if (encoding_plan.dict_index_bits != 32U) {
+                    // Packed indices of an Arrow dictionary's own index width: unpacked at that width,
+                    // then widened to the u32 the expansion below reads.
+                    const std::size_t iw = encoding_plan.dict_index_bits / 8U;
+                    std::vector<std::uint8_t> narrow;
+                    if (!unpack_bitpacked_page_dispatch(chunk.values, count, iw, narrow, error)) {
+                        return false;
+                    }
+                    const auto base = indices_bytes.size();
+                    indices_bytes.resize(base + static_cast<std::size_t>(count) * 4U);
+                    for (std::uint64_t i = 0; i < count; ++i) {
+                        std::uint64_t index = 0;
+                        std::memcpy(&index, narrow.data() + i * iw, iw);
+                        if (index > std::numeric_limits<std::uint32_t>::max()) {
+                            error = "dict index out of range";
+                            return false;
+                        }
+                        const auto index32 = static_cast<std::uint32_t>(index);
+                        std::memcpy(indices_bytes.data() + base + i * 4U, &index32, 4U);
                     }
                 } else if (!unpack_bitpacked_page_dispatch(chunk.values, count, 4U, indices_bytes, error)) {
                     return false;
@@ -4774,12 +4819,64 @@ bool take_flat_miniblock_chunks(const std::filesystem::path& path, const pb::Fie
     return true;
 }
 
+/// An Arrow dictionary column ("dict:<value>:<index>:<ordered>") decodes as its values: the field
+/// with the value type, for every decoder below.
+const pb::Field& dictionary_value_field(const pb::Field& field, pb::Field& scratch) {
+    if (field.logical_type.rfind("dict:", 0) != 0) {
+        return field;
+    }
+    const auto last = field.logical_type.rfind(':');
+    const auto index_at = last == std::string::npos || last < 6U ? std::string::npos : field.logical_type.rfind(':', last - 1U);
+    if (index_at == std::string::npos || index_at < 5U) {
+        return field;
+    }
+    scratch = field;
+    scratch.logical_type = field.logical_type.substr(5U, index_at - 5U);
+    return scratch;
+}
+
+
 }  // namespace
 
-bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+bool lance_column_dictionary_entries(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field_in,
+                                     const pb::ColumnMetadata& column_metadata, std::vector<std::string>& out,
+                                     std::string& error) {
+    pb::Field value_field_scratch;
+    const pb::Field& on_disk_field = dictionary_value_field(on_disk_field_in, value_field_scratch);
+    out.clear();
+    std::unordered_set<std::string> seen;
+    std::vector<std::uint8_t> stored;
+    for (const auto& page : column_metadata.pages) {
+        pb::ColumnMetadata one_page;
+        one_page.pages.push_back(page);
+        ColumnEncodingPlan plan;
+        if (!classify_from_descriptor(one_page, plan) ||
+            (plan.kind != ColumnEncodingKind::kDict && plan.kind != ColumnEncodingKind::kDictRle) ||
+            page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
+            continue;
+        }
+        DictionaryBlock dict;
+        if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], stored, error) ||
+            !decode_dictionary_block(plan, on_disk_field.logical_type, stored, dict, error)) {
+            return false;
+        }
+        for (std::size_t i = 0; i < dict.count; ++i) {
+            std::string entry(reinterpret_cast<const char*>(dict.entry(i)), dict.entry_size(i));
+            if (seen.insert(entry).second) {
+                out.push_back(std::move(entry));
+            }
+        }
+    }
+    return true;
+}
+
+
+static bool decode_lance_physical_column_rows_impl(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field_in,
                                        const pb::ColumnMetadata& column_metadata,
                                        const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
                                        ColumnValues& out, std::string& error) {
+    pb::Field value_field_scratch;
+    const pb::Field& on_disk_field = dictionary_value_field(on_disk_field_in, value_field_scratch);
     if (v20::is_v20_column(column_metadata)) {
         return v20::decode_column_rows(data_file_path, on_disk_field, column_metadata, nullptr, rows, value_bytes,
                                        out, error);
@@ -5197,8 +5294,10 @@ bool decompress_general_buffer(const std::string& scheme, const std::uint8_t* da
     return true;
 }
 
-bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+static bool decode_lance_physical_column_impl(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field_in,
                                   const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
+    pb::Field value_field_scratch;
+    const pb::Field& on_disk_field = dictionary_value_field(on_disk_field_in, value_field_scratch);
     if (v20::is_v20_column(column_metadata)) {
         return v20::decode_column(data_file_path, on_disk_field, column_metadata, nullptr, out, error);
     }
@@ -5279,10 +5378,12 @@ bool lance_page_row_addressable(const pb::ColumnPage& page) {
     return mb.repetition_index_depth != 0U && page.buffer_offsets.size() > rep_at;
 }
 
-bool decode_lance_physical_column_range(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+static bool decode_lance_physical_column_range_impl(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field_in,
                                         const pb::ColumnMetadata& column_metadata, std::uint64_t first,
                                         std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
                                         std::string& error) {
+    pb::Field value_field_scratch;
+    const pb::Field& on_disk_field = dictionary_value_field(on_disk_field_in, value_field_scratch);
     if (v20::is_v20_column(column_metadata)) {
         return v20::decode_column_range(data_file_path, on_disk_field, column_metadata, nullptr, first, count,
                                         value_bytes, out, error);
@@ -5386,6 +5487,51 @@ bool decode_lance_physical_column_range(const std::filesystem::path& data_file_p
         return true;
     }
     return slice_column_values(out, first - subset_first, count, subset_rows, value_bytes, error);
+}
+
+
+namespace {
+
+/// An Arrow dictionary column keeps its stored dictionary next to its values (ColumnValues::dictionary).
+bool attach_dictionary(const std::filesystem::path& path, const pb::Field& field, const pb::ColumnMetadata& column,
+                       ColumnValues& out, std::string& error) {
+    if (field.logical_type.rfind("dict:", 0) != 0) {
+        return true;
+    }
+    auto entries = std::make_shared<std::vector<std::string>>();
+    if (!lance_column_dictionary_entries(path, field, column, *entries, error)) {
+        return false;
+    }
+    if (!entries->empty()) {
+        out.dictionary = std::move(entries);
+    }
+    return true;
+}
+
+}  // namespace
+
+bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                                       const pb::ColumnMetadata& column_metadata,
+                                       const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
+                                       ColumnValues& out, std::string& error) {
+    return decode_lance_physical_column_rows_impl(data_file_path, on_disk_field, column_metadata, rows, value_bytes,
+                                                  out, error) &&
+           attach_dictionary(data_file_path, on_disk_field, column_metadata, out, error);
+}
+
+bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                                  const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
+    return decode_lance_physical_column_impl(data_file_path, on_disk_field, column_metadata, out, error) &&
+           attach_dictionary(data_file_path, on_disk_field, column_metadata, out, error);
+}
+
+bool decode_lance_physical_column_range(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                                        const pb::ColumnMetadata& column_metadata, std::uint64_t first,
+                                        std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
+                                        std::string& error) {
+    return decode_lance_physical_column_range_impl(data_file_path, on_disk_field, column_metadata, first, count,
+                                                   value_bytes, out, error) &&
+           attach_dictionary(data_file_path, on_disk_field, column_metadata, out, error);
 }
 
 }  // namespace nano_lance

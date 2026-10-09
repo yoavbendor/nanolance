@@ -150,19 +150,36 @@ void test_dictionary_schema() {
     dictionary_values.flags = 0;
     uri_index.dictionary = &dictionary_values;
 
-    // An Arrow dictionary column is refused. It used to map to a bare index column: LanceField
-    // recorded is_dictionary_index / dictionary_value_logical_type, but those are read ONLY by the
-    // schema-equality comparison -- no writer path ever stored the dictionary VALUES, so
-    // pa.array(["a","b","a"]).dictionary_encode() became an int32 column reading back [0, 1, 0] with
-    // no record of what the indices meant.
+    // An Arrow dictionary column is stored as Lance stores one: its VALUES' type (so it decodes,
+    // filters and encodes as its values) with the index type alongside, and "dict:<value>:<index>:
+    // <ordered>" on disk. (It used to map to a bare index column whose dictionary values were stored
+    // nowhere; then it was refused.)
     nano_lance::LanceSchemaMapping mapping;
     std::string error;
-    require(!nano_lance::map_arrow_schema(uri_index, mapping, error),
-            "dictionary-encoded column should be refused");
+    require(nano_lance::map_arrow_schema(uri_index, mapping, error), error);
+    require(mapping.fields.size() == 1U && mapping.fields[0].logical_type == "utf8" &&
+                mapping.fields[0].arrow_format == "u" && mapping.fields[0].dictionary_index_format == "i" &&
+                mapping.fields[0].column_index == 0,
+            "dictionary column should map to its values with an int32 index");
+    require(nano_lance::lance_field_disk_logical_type(mapping.fields[0]) == "dict:string:int32:false",
+            "dictionary column's Lance logical type");
+
+    // A dictionary of dictionaries, or of a nested type, is still refused, by name.
+    ArrowSchema inner_values{};
+    inner_values.format = "u";
+    inner_values.name = "v";
+    ArrowSchema inner{};
+    inner.format = "i";
+    inner.name = "inner";
+    inner.dictionary = &inner_values;
+    ArrowSchema outer{};
+    outer.format = "i";
+    outer.name = "outer";
+    outer.dictionary = &inner;
+    nano_lance::LanceSchemaMapping refused;
+    require(!nano_lance::map_arrow_schema(outer, refused, error), "a dictionary of dictionaries should be refused");
     require(error.find("dictionary") != std::string::npos,
             "dictionary rejection should say what was refused, got: " + error);
-    require(error.find("cast") != std::string::npos,
-            "dictionary rejection should suggest casting, got: " + error);
 }
 
 void test_extension_struct() {

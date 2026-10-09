@@ -29,6 +29,11 @@ struct LanceField {
     std::map<std::string, std::string> metadata;
     bool is_dictionary_index = false;
     std::string dictionary_value_logical_type;
+    /// An Arrow dictionary column (Lance's "dict:<value>:<index>:<ordered>"): the index type's Arrow
+    /// format ("c", "i", ...). Empty otherwise. `logical_type` / `arrow_format` are the VALUES' type,
+    /// so the column decodes, filters and encodes as its values; only the Arrow form differs.
+    std::string dictionary_index_format;
+    bool dictionary_ordered = false;
 };
 
 struct LanceSchemaMapping {
@@ -210,6 +215,36 @@ inline std::size_t lance_logical_type_value_bytes(const std::string& logical_typ
 /// file -- stock Lance rejected it outright ("expected 32-bit offsets but got 64-bit offsets") and
 /// nanolance's own reader failed with "terminal offset out of range". Lance's on-disk name is
 /// "large_string", which is what pylance writes for a pa.large_string() column.
+inline std::string lance_on_disk_logical_type(const std::string& logical_type);
+
+/// Lance's name for an integer type given its Arrow format ("i" -> "int32"); empty if not one.
+inline std::string lance_integer_name_of_format(const std::string& format) {
+    if (format.size() != 1U) {
+        return {};
+    }
+    switch (format[0]) {
+        case 'c': return "int8";
+        case 'C': return "uint8";
+        case 's': return "int16";
+        case 'S': return "uint16";
+        case 'i': return "int32";
+        case 'I': return "uint32";
+        case 'l': return "int64";
+        case 'L': return "uint64";
+        default: return {};
+    }
+}
+
+/// The logical type a field is stored under in a manifest or a data file's schema.
+inline std::string lance_field_disk_logical_type(const LanceField& field) {
+    if (!field.dictionary_index_format.empty()) {
+        return "dict:" + lance_on_disk_logical_type(field.logical_type) + ":" +
+               lance_integer_name_of_format(field.dictionary_index_format) + ":" +
+               (field.dictionary_ordered ? "true" : "false");
+    }
+    return lance_on_disk_logical_type(field.logical_type);
+}
+
 inline std::string lance_on_disk_logical_type(const std::string& logical_type) {
     if (logical_type == "utf8") {
         return "string";
@@ -221,6 +256,9 @@ inline std::string lance_on_disk_logical_type(const std::string& logical_type) {
 }
 
 std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& mapping);
+
+/// A struct with no fields: a column of its own (one constant page), every row a valid empty struct.
+bool lance_field_is_empty_struct(const LanceField& field, const LanceSchemaMapping& mapping);
 
 /// \p ignore_nullability is accepted and ignored; it is kept so existing callers still compile.
 /// Nullable-flagged fields are always accepted now -- pyarrow marks essentially every field nullable,

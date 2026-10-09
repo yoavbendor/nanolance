@@ -10,6 +10,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string_view>
+#include <limits>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -336,8 +339,8 @@ bool append_fixed_width(const ArrowArray& array,
 /// A fixed_size_list's rows are its child's elements, N per row: row r of a list at offset `o` is
 /// child elements [(o + r) * N, (o + r + 1) * N), further shifted by the child's own offset. Copied as
 /// one run -- that byte layout is exactly what Lance stores. Row-level nulls were taken by
-/// append_validity from the list's own bitmap; a null ELEMENT inside a row is refused, because
-/// writing it needs FixedSizeList.has_validity, which this writer does not emit.
+/// append_validity from the list's own bitmap; a null ELEMENT inside a valid row is recorded in
+/// `item_validity`, which the writer stores as FixedSizeList.has_validity.
 bool append_fixed_size_list(const ArrowArray& array, const LanceField& field, const std::string& element,
                             std::uint64_t items, ColumnValues& out, std::string& error) {
     const ArrowArray* child = array.n_children == 1 && array.children != nullptr ? array.children[0] : nullptr;
@@ -348,23 +351,43 @@ bool append_fixed_size_list(const ArrowArray& array, const LanceField& field, co
     const std::size_t element_bytes = lance_logical_type_value_bytes(element);
     const auto first = static_cast<std::uint64_t>(child->offset) + static_cast<std::uint64_t>(array.offset) * items;
     const auto count = static_cast<std::uint64_t>(array.length) * items;
+    const std::uint64_t held = element_bytes == 0U ? 0U : out.fixed.size() / element_bytes;  // elements so far
     if (child->null_count != 0 && child->buffers[0] != nullptr) {
-        // Only elements of VALID rows count. pyarrow marks every element of a null row null as well
-        // (pa.array([None, [1, 2]], pa.list_(t, 2)) does), and those are masked by the row anyway --
-        // refusing them refused every ordinary nullable vector column.
+        // A null element of a VALID row is kept as Lance keeps it: element validity next to the
+        // values. pyarrow marks every element of a null row null as well (pa.array([None, [1, 2]],
+        // pa.list_(t, 2)) does); those are masked by the row, so they alone need no element bits.
         const auto* bits = static_cast<const std::uint8_t*>(child->buffers[0]);
         const auto* rows = static_cast<const std::uint8_t*>(array.buffers != nullptr ? array.buffers[0] : nullptr);
-        for (std::uint64_t k = first; k < first + count; ++k) {
+        bool inner_nulls = !out.item_validity.empty();
+        for (std::uint64_t k = first; k < first + count && !inner_nulls; ++k) {
             const auto row = static_cast<std::uint64_t>(array.offset) + (k - first) / items;
             if (rows != nullptr && ((rows[row >> 3U] >> (row & 7U)) & 1U) == 0U) {
                 continue;
             }
-            if (((bits[k >> 3U] >> (k & 7U)) & 1U) == 0U) {
-                error = "fixed_size_list column '" + field.name +
-                        "' has a null element inside a row; whole-row nulls are supported, null elements "
-                        "are not yet";
-                return false;
+            inner_nulls = ((bits[k >> 3U] >> (k & 7U)) & 1U) == 0U;
+        }
+        if (inner_nulls && out.item_validity.empty()) {
+            out.item_validity.assign(static_cast<std::size_t>((held + 7U) / 8U), 0xFFU);  // the elements so far: valid
+        }
+        if (inner_nulls) {
+            out.items_per_row = items;
+            out.item_validity.resize(static_cast<std::size_t>((held + count + 7U) / 8U), 0U);
+            for (std::uint64_t k = 0; k < count; ++k) {
+                const auto at = held + k;
+                const auto src = first + k;
+                if ((bits[src >> 3U] >> (src & 7U)) & 1U) {
+                    out.item_validity[at >> 3U] |= static_cast<std::uint8_t>(1U << (at & 7U));
+                } else {
+                    out.item_validity[at >> 3U] &= static_cast<std::uint8_t>(~(1U << (at & 7U)));
+                    ++out.item_null_count;
+                }
             }
+        }
+    } else if (!out.item_validity.empty()) {
+        out.item_validity.resize(static_cast<std::size_t>((held + count + 7U) / 8U), 0U);
+        for (std::uint64_t k = 0; k < count; ++k) {
+            const auto at = held + k;
+            out.item_validity[at >> 3U] |= static_cast<std::uint8_t>(1U << (at & 7U));
         }
     }
     out.kind = ColumnValues::Kind::FixedWidth;
@@ -599,6 +622,122 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
 /// nulls and every list's offsets are recorded per layer. (Whether the pages are written nested is
 /// decided later, per fragment: see ColumnValues::needs_nested_pages.) A leaf under an extension type
 /// -- lance.blob.v2 -- keeps its own path.
+/// An Arrow dictionary column, appended as its VALUES (the column then encodes like any other), with
+/// the dictionary itself recorded so the page is written with it: entries not seen before are added
+/// in order, so a dictionary unused in part, or shared by every batch, is stored as it was given.
+bool append_dictionary_values(const ArrowArray& array, const LanceField& field, ColumnValues& out,
+                              std::string& error) {
+    const ArrowArray* dict = array.dictionary;
+    const std::string& format = field.dictionary_index_format;
+    const std::size_t iw = format == "c" || format == "C" ? 1U : format == "s" || format == "S" ? 2U
+                           : format == "i" || format == "I"                                  ? 4U
+                                                                                             : 8U;
+    const bool is_signed = format == "c" || format == "s" || format == "i" || format == "l";
+    if (dict == nullptr || array.n_buffers < 2 || array.buffers == nullptr || array.buffers[1] == nullptr) {
+        error = "dictionary column '" + field.name + "' has no dictionary or no indices";
+        return false;
+    }
+    const bool variable = lance_field_is_variable_width(field.logical_type);
+    const bool large = lance_logical_type_has_large_offsets(field.logical_type);
+    const std::size_t width = variable ? 0U : lance_logical_type_value_bytes(field.logical_type);
+    if (dict->n_buffers < (variable ? 3 : 2) || dict->buffers == nullptr || dict->buffers[1] == nullptr ||
+        (variable && dict->buffers[2] == nullptr && dict->length > 0)) {
+        error = "dictionary of column '" + field.name + "' is missing its buffers";
+        return false;
+    }
+    // The dictionary's entries.
+    const auto entry = [&](std::int64_t k) -> std::string_view {
+        const auto at = static_cast<std::size_t>(k + dict->offset);
+        if (!variable) {
+            return {static_cast<const char*>(dict->buffers[1]) + at * width, width};
+        }
+        std::int64_t s = 0;
+        std::int64_t e = 0;
+        if (large) {
+            std::memcpy(&s, static_cast<const std::uint8_t*>(dict->buffers[1]) + at * 8U, 8U);
+            std::memcpy(&e, static_cast<const std::uint8_t*>(dict->buffers[1]) + (at + 1U) * 8U, 8U);
+        } else {
+            std::int32_t s32 = 0;
+            std::int32_t e32 = 0;
+            std::memcpy(&s32, static_cast<const std::uint8_t*>(dict->buffers[1]) + at * 4U, 4U);
+            std::memcpy(&e32, static_cast<const std::uint8_t*>(dict->buffers[1]) + (at + 1U) * 4U, 4U);
+            s = s32;
+            e = e32;
+        }
+        return {static_cast<const char*>(dict->buffers[2]) + s, static_cast<std::size_t>(e - s)};
+    };
+    auto recorded = out.dictionary != nullptr ? std::make_shared<std::vector<std::string>>(*out.dictionary)
+                                              : std::make_shared<std::vector<std::string>>();
+    std::unordered_set<std::string_view> have(recorded->begin(), recorded->end());
+    std::vector<std::string> added;
+    for (std::int64_t k = 0; k < dict->length; ++k) {
+        const auto v = entry(k);
+        if (have.count(v) == 0U) {
+            added.emplace_back(v);
+        }
+    }
+    for (auto& v : added) {
+        if (std::find(recorded->begin(), recorded->end(), v) == recorded->end()) {
+            recorded->push_back(std::move(v));
+        }
+    }
+    out.dictionary = recorded;
+    // The values, gathered row by row (a null row gets an empty / zero value under its null bit).
+    const auto* indices = static_cast<const std::uint8_t*>(array.buffers[1]);
+    const auto index_at = [&](std::int64_t r, std::int64_t& index) {
+        std::uint64_t raw = 0;
+        std::memcpy(&raw, indices + static_cast<std::size_t>(r + array.offset) * iw, iw);
+        if (is_signed && iw < 8U && ((raw >> (iw * 8U - 1U)) & 1U) != 0U) {
+            raw |= ~((std::uint64_t{1} << (iw * 8U)) - 1U);
+        }
+        index = static_cast<std::int64_t>(raw);
+        return index >= 0 && index < dict->length;
+    };
+    std::vector<std::uint8_t> fixed;
+    std::vector<std::uint8_t> offsets;
+    std::vector<std::uint8_t> data;
+    if (variable) {
+        offsets.resize(static_cast<std::size_t>(array.length + 1) * (large ? 8U : 4U), 0U);
+    } else {
+        fixed.resize(static_cast<std::size_t>(array.length) * width, 0U);
+    }
+    std::uint64_t at = 0;
+    for (std::int64_t r = 0; r < array.length; ++r) {
+        std::int64_t index = 0;
+        const bool valid = array.null_count == 0 || array.buffers[0] == nullptr || !row_is_null(array, r);
+        if (valid && !index_at(r, index)) {
+            error = "dictionary column '" + field.name + "' has an index outside its dictionary";
+            return false;
+        }
+        const auto v = valid ? entry(index) : std::string_view{};
+        if (variable) {
+            data.insert(data.end(), v.begin(), v.end());
+            at += v.size();
+            if (large) {
+                std::memcpy(offsets.data() + static_cast<std::size_t>(r + 1) * 8U, &at, 8U);
+            } else {
+                if (at > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+                    error = "dictionary column '" + field.name + "' expands past 2 GiB in one batch";
+                    return false;
+                }
+                const auto at32 = static_cast<std::int32_t>(at);
+                std::memcpy(offsets.data() + static_cast<std::size_t>(r + 1) * 4U, &at32, 4U);
+            }
+        } else if (valid) {
+            std::memcpy(fixed.data() + static_cast<std::size_t>(r) * width, v.data(), width);
+        }
+    }
+    ArrowArray view{};
+    view.length = array.length;
+    view.offset = 0;
+    view.null_count = 0;
+    const void* buffers[3] = {nullptr, variable ? static_cast<const void*>(offsets.data()) : fixed.data(),
+                              data.empty() ? static_cast<const void*>(offsets.data()) : data.data()};
+    view.n_buffers = variable ? 3 : 2;
+    view.buffers = buffers;
+    return variable ? append_variable_width(view, field, out, error) : append_fixed_width(view, field, out, error);
+}
+
 bool is_nested_leaf(const LanceSchemaMapping& mapping, const LanceField& field) {
     bool any = false;
     for (const LanceField* f = field.parent_id < 0 ? nullptr : find_field_by_id(mapping, field.parent_id); f != nullptr;
@@ -609,6 +748,23 @@ bool is_nested_leaf(const LanceSchemaMapping& mapping, const LanceField& field) 
         any = true;
     }
     return any;
+}
+
+/// The nulls of `array` (counted from its validity bitmap when the producer left the count unknown).
+std::int64_t null_count_of(const ArrowArray& array) {
+    if (array.null_count >= 0) {
+        return array.null_count;
+    }
+    if (array.n_buffers == 0 || array.buffers == nullptr || array.buffers[0] == nullptr) {
+        return 0;
+    }
+    const auto* bits = static_cast<const std::uint8_t*>(array.buffers[0]);
+    std::int64_t nulls = 0;
+    for (std::int64_t r = 0; r < array.length; ++r) {
+        const auto at = r + array.offset;
+        nulls += ((bits[at / 8] >> (at % 8)) & 1U) == 0U ? 1 : 0;
+    }
+    return nulls;
 }
 
 }  // namespace
@@ -652,6 +808,35 @@ bool append_batch_column_values(const ArrowArray& batch,
         const auto& field = *selected[i];
         // A leaf under a list is not row-aligned with the batch (a list's child has as many entries
         // as its lists have items), so it is reached by walking down from its top-level column.
+        if (field.logical_type == "struct") {
+            // An empty struct, at the top or under structs: one constant page, as Lance writes it,
+            // which says the struct is valid in every row -- so neither it nor a struct above it
+            // may be null, and it may not sit in a list (Lance refuses those too).
+            bool refused = false;
+            for (const LanceField* f = &field; f != nullptr && !refused;
+                 f = f->parent_id >= 0 ? find_field_by_id(mapping, f->parent_id) : nullptr) {
+                ArrowArray node{};
+                refused = lance_logical_type_is_list(f->logical_type) || !resolve_field_array(batch, mapping, *f, node) ||
+                          null_count_of(node) > 0;
+            }
+            if (refused) {
+                error = "Empty structs with rep/def information are not yet supported.  The field " + field.name +
+                        " is an empty struct that either has nulls or is in a list.";
+                return false;
+            }
+            const LanceField* top = &field;
+            while (top->parent_id >= 0) {
+                top = find_field_by_id(mapping, top->parent_id);
+            }
+            ArrowArray top_view{};
+            if (!resolve_field_array(batch, mapping, *top, top_view)) {
+                error = "missing ArrowArray for mapped field " + top->name;
+                return false;
+            }
+            columns[i].kind = ColumnValues::Kind::FixedWidth;
+            columns[i].rows += static_cast<std::uint64_t>(top_view.length);
+            continue;
+        }
         if (is_nested_leaf(mapping, field)) {
             const LanceField* top = &field;
             while (top->parent_id >= 0) {
@@ -663,6 +848,14 @@ bool append_batch_column_values(const ArrowArray& batch,
                 return false;
             }
             if (!append_nested(batch, mapping, field, columns[i], error)) {
+                return false;
+            }
+            if (!columns[i].item_validity.empty()) {
+                // Element validity is written for a top-level fixed_size_list only; under a list or a
+                // struct the nested page writer has no place for it.
+                error = "fixed_size_list column '" + field.name +
+                        "' has a null element inside a row under a list or struct; whole-row nulls are "
+                        "supported there, null elements are not yet";
                 return false;
             }
             columns[i].rows += static_cast<std::uint64_t>(top_view.length);
@@ -701,7 +894,11 @@ bool append_batch_column_values(const ArrowArray& batch,
         }
         std::string fsl_element;
         std::uint64_t fsl_items = 0;
-        if (lance_fixed_size_list_parts(field.logical_type, fsl_element, fsl_items)) {
+        if (!field.dictionary_index_format.empty()) {
+            if (!append_dictionary_values(*array, field, columns[i], error)) {
+                return false;
+            }
+        } else if (lance_fixed_size_list_parts(field.logical_type, fsl_element, fsl_items)) {
             if (!append_fixed_size_list(*array, field, fsl_element, fsl_items, columns[i], error)) {
                 return false;
             }

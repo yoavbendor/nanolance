@@ -80,6 +80,8 @@ tests/test_dataset.py::test_default_scan_options
 tests/test_dataset.py::test_default_scan_options_nearest
 tests/test_dataset.py::test_default_v2_manifest_paths
 tests/test_dataset.py::test_delete_data
+tests/test_dataset.py::test_dictionaries
+tests/test_dataset.py::test_empty_structs
 tests/test_dataset.py::test_enable_disable_auto_cleanup
 tests/test_dataset.py::test_explain_cleanup_old_versions
 tests/test_dataset.py::test_field_metadata_multiple_fields
@@ -169,6 +171,7 @@ tests/test_dataset.py::test_take_with_json_column
 tests/test_dataset.py::test_tensor_type
 tests/test_dataset.py::test_tilde_paths
 tests/test_dataset.py::test_to_batches
+tests/test_dataset.py::test_truncate_table
 tests/test_dataset.py::test_update_dataset
 tests/test_dataset.py::test_update_dataset_all_types
 tests/test_dataset.py::test_update_with_binary_field
@@ -181,8 +184,12 @@ tests/test_dataset.py::test_with_row_offset
 tests/test_dataset.py::test_write_dataset_pydantic_list_rejects_invalid_item[dict]
 tests/test_dataset.py::test_write_dataset_pydantic_list_rejects_invalid_item[different_model]
 tests/test_dataset.py::test_write_dataset_pydantic_optional_field_typed_correctly_when_all_none
+tests/test_dataset.py::test_write_zero_dimension_fixed_size_list[stable]
 tests/test_file.py::test_aborted_write
 tests/test_file.py::test_batch_sizes
+tests/test_file.py::test_dictionary
+tests/test_file.py::test_different_types
+tests/test_file.py::test_empty_structs
 tests/test_file.py::test_field_meta
 tests/test_file.py::test_file_read_projection
 tests/test_file.py::test_file_writer
@@ -206,6 +213,7 @@ tests/test_file.py::test_size_bytes[3]
 tests/test_file.py::test_size_bytes_with_session
 tests/test_file.py::test_struct_null_regression
 tests/test_file.py::test_take
+tests/test_file.py::test_with_nulls
 tests/test_file.py::test_write_no_schema
 tests/test_file.py::test_write_read_with_session
 tests/test_filter.py::test_compound
@@ -291,10 +299,12 @@ tests/test_optimize.py::test_dataset_optimize_excluded_fragment_ids
 tests/test_order_by.py::test_all_order_by_support_functions
 tests/test_order_by.py::test_one_column_order_by
 tests/test_order_by.py::test_two_column_order_by
+tests/test_pydantic.py::test_int_enum_uses_native_type
 tests/test_pydantic.py::test_naive_datetime_field
 tests/test_pydantic.py::test_nested_model_becomes_struct
 tests/test_pydantic.py::test_optional_field_is_nullable
 tests/test_pydantic.py::test_scalar_and_optional_and_list_unchanged
+tests/test_pydantic.py::test_string_enum_is_dictionary_encoded
 tests/test_row_addr_prefilter.py::test_no_mask_reads_everything
 tests/test_scalar_index.py::test_all_null_chunk
 tests/test_scalar_index.py::test_backward_compatibility_no_fragment_ids

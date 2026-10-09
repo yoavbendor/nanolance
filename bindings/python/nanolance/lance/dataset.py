@@ -681,6 +681,10 @@ class LanceDataset:
                 _nanolance._ds_add_columns_stream(self._uri, reader)
         self._refresh_latest()
 
+    def truncate_table(self) -> None:
+        """Delete every row, keeping the schema: a new version (Lance's delete("true"))."""
+        self.delete("true")
+
     def merge(self, data_obj, left_on: str, right_on: Optional[str] = None, schema=None) -> None:
         """Add the columns of ``data_obj`` (a table, reader, dataset ...), matched to this dataset's
         rows on ``left_on`` = ``right_on`` (Lance's hash join: rows without a match get nulls; the

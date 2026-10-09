@@ -139,10 +139,11 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
             }
         }
         if (children.empty()) {
-            error = "struct field has no children in mapping";
-            return false;
-        }
-        if (ArrowSchemaAllocateChildren(&schema, static_cast<int64_t>(children.size())) != NANOARROW_OK) {
+            if (ArrowSchemaSetTypeStruct(&schema, 0) != NANOARROW_OK) {
+                error = "failed to set struct type";
+                return false;
+            }
+        } else if (ArrowSchemaAllocateChildren(&schema, static_cast<int64_t>(children.size())) != NANOARROW_OK) {
             error = "failed to allocate struct children";
             return false;
         }
@@ -207,6 +208,21 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
                 error = "failed to build the fixed_size_list schema for " + field.name;
             }
             return false;
+        }
+    } else if (!field.dictionary_index_format.empty()) {
+        // An Arrow dictionary column: the indices' type, with the values' as its dictionary.
+        if (ArrowSchemaSetFormat(&schema, field.dictionary_index_format.c_str()) != NANOARROW_OK ||
+            ArrowSchemaAllocateDictionary(&schema) != NANOARROW_OK) {
+            error = "failed to build the dictionary schema for " + field.name;
+            return false;
+        }
+        ArrowSchemaInit(schema.dictionary);
+        if (ArrowSchemaSetFormat(schema.dictionary, field.arrow_format.c_str()) != NANOARROW_OK) {
+            error = "failed to set the dictionary value type of " + field.name;
+            return false;
+        }
+        if (field.dictionary_ordered) {
+            schema.flags |= ARROW_FLAG_DICTIONARY_ORDERED;
         }
     } else {
         if (ArrowSchemaSetFormat(&schema, field.arrow_format.c_str()) != NANOARROW_OK) {
@@ -646,7 +662,7 @@ bool append_fixed_fast(ArrowArray& array, const std::uint8_t* data, FixedFmt fmt
 
 // One column's decode plan, resolved once before the row loop (no per-row metadata/string work).
 struct ColumnPlan {
-    enum class Kind { Skip, Blob, Variable, Fixed, FixedSizeList } kind = Kind::Skip;
+    enum class Kind { Skip, Blob, Variable, Fixed, FixedSizeList, Dictionary } kind = Kind::Skip;
     ArrowArray* array = nullptr;
     const LanceField* field = nullptr;      // Blob path needs the full field
     ColumnValues* values = nullptr;
@@ -851,6 +867,140 @@ bool fill_variable_child(ArrowArray* child, VariableWidthColumnValues& v, std::i
     return true;
 }
 
+/// An Arrow dictionary column from its decoded values: indices into the dictionary it was stored
+/// with (unused entries and their order kept), or -- when a value is not in it, which only a
+/// dictionary lost on the way could cause -- into the values in order of first appearance.
+bool fill_dictionary_column(ColumnPlan& plan, std::int64_t rows, std::string& error) {
+    ColumnValues& values = *plan.values;
+    const bool variable = values.kind == ColumnValues::Kind::VariableWidth;
+    const bool large = values.variable.large;
+    const auto value_at = [&](std::int64_t r) -> std::string_view {
+        if (!variable) {
+            return {reinterpret_cast<const char*>(values.fixed.data() + static_cast<std::size_t>(r) * plan.width),
+                    plan.width};
+        }
+        std::uint64_t s = 0;
+        std::uint64_t e = 0;
+        if (large) {
+            std::memcpy(&s, values.variable.offsets.data() + static_cast<std::size_t>(r) * 8U, 8U);
+            std::memcpy(&e, values.variable.offsets.data() + static_cast<std::size_t>(r + 1) * 8U, 8U);
+        } else {
+            std::uint32_t s32 = 0;
+            std::uint32_t e32 = 0;
+            std::memcpy(&s32, values.variable.offsets.data() + static_cast<std::size_t>(r) * 4U, 4U);
+            std::memcpy(&e32, values.variable.offsets.data() + static_cast<std::size_t>(r + 1) * 4U, 4U);
+            s = s32;
+            e = e32;
+        }
+        return {reinterpret_cast<const char*>(values.variable.data.data() + s), static_cast<std::size_t>(e - s)};
+    };
+    const auto valid = [&](std::int64_t r) {
+        return values.validity.empty() ||
+               ((values.validity[static_cast<std::size_t>(r) >> 3U] >> (static_cast<std::size_t>(r) & 7U)) & 1U) != 0U;
+    };
+    if (variable ? values.variable.offsets.size() < static_cast<std::size_t>(rows + 1) * (large ? 8U : 4U)
+                 : values.fixed.size() < static_cast<std::size_t>(rows) * plan.width) {
+        error = "dictionary column '" + plan.field->name + "' decoded fewer values than it has rows";
+        return false;
+    }
+    std::vector<std::string> entries;
+    std::unordered_map<std::string_view, std::uint64_t> lookup;
+    std::vector<std::uint64_t> index(static_cast<std::size_t>(rows), 0U);
+    bool stored = values.dictionary != nullptr;
+    if (stored) {
+        entries = *values.dictionary;
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            lookup.emplace(std::string_view(entries[i]), i);
+        }
+        for (std::int64_t r = 0; r < rows && stored; ++r) {
+            if (!valid(r)) {
+                continue;
+            }
+            const auto it = lookup.find(value_at(r));
+            stored = it != lookup.end();
+            if (stored) {
+                index[static_cast<std::size_t>(r)] = it->second;
+            }
+        }
+    }
+    if (!stored) {
+        entries.clear();
+        lookup.clear();
+        entries.reserve(64);
+        std::vector<std::string_view> order;
+        for (std::int64_t r = 0; r < rows; ++r) {
+            if (!valid(r)) {
+                continue;
+            }
+            const auto v = value_at(r);
+            const auto [it, inserted] = lookup.emplace(v, order.size());
+            if (inserted) {
+                order.push_back(v);
+            }
+            index[static_cast<std::size_t>(r)] = it->second;
+        }
+        for (const auto& v : order) {
+            entries.emplace_back(v);
+        }
+    }
+    // The indices, at the index type's width.
+    const std::string& format = plan.field->dictionary_index_format;
+    const std::size_t width = format == "c" || format == "C" ? 1U : format == "s" || format == "S" ? 2U
+                              : format == "i" || format == "I"                                  ? 4U
+                                                                                                : 8U;
+    const bool is_signed = format == "c" || format == "s" || format == "i" || format == "l";
+    const std::uint64_t limit = width == 8U ? (is_signed ? std::uint64_t{INT64_MAX} : UINT64_MAX)
+                                            : (std::uint64_t{1} << (width * 8U - (is_signed ? 1U : 0U))) - 1U;
+    if (!entries.empty() && entries.size() - 1U > limit) {
+        error = "dictionary column '" + plan.field->name + "' has more entries than its index type can address";
+        return false;
+    }
+    std::vector<std::uint8_t> indices(static_cast<std::size_t>(rows) * width);
+    for (std::size_t r = 0; r < index.size(); ++r) {
+        std::memcpy(indices.data() + r * width, &index[r], width);  // little-endian
+    }
+    if (!fill_validity(plan.array, values, rows, error) ||
+        !adopt_into_buffer(std::move(indices), ArrowArrayBuffer(plan.array, 1), error)) {
+        return false;
+    }
+    plan.array->length = rows;
+    ArrowArray* dict = plan.array->dictionary;
+    if (dict == nullptr) {
+        error = "dictionary column '" + plan.field->name + "' has no dictionary array";
+        return false;
+    }
+    const auto n = static_cast<std::int64_t>(entries.size());
+    dict->null_count = 0;
+    if (variable) {
+        std::vector<std::uint8_t> offsets(static_cast<std::size_t>(n + 1) * (large ? 8U : 4U));
+        std::vector<std::uint8_t> data;
+        std::uint64_t at = 0;
+        for (std::int64_t i = 0; i <= n; ++i) {
+            if (large) {
+                std::memcpy(offsets.data() + static_cast<std::size_t>(i) * 8U, &at, 8U);
+            } else {
+                const auto at32 = static_cast<std::uint32_t>(at);
+                std::memcpy(offsets.data() + static_cast<std::size_t>(i) * 4U, &at32, 4U);
+            }
+            if (i < n) {
+                const auto& e = entries[static_cast<std::size_t>(i)];
+                data.insert(data.end(), e.begin(), e.end());
+                at += e.size();
+            }
+        }
+        VariableWidthColumnValues v;
+        v.offsets = std::move(offsets);
+        v.data = std::move(data);
+        return fill_variable_child(dict, v, n, error);
+    }
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(entries.size() * plan.width);
+    for (const auto& e : entries) {
+        bytes.insert(bytes.end(), e.begin(), e.end());
+    }
+    return fill_fixed_child(dict, std::move(bytes), n, plan.fmt, error);
+}
+
 bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaMapping& mapping,
                              std::unordered_map<std::int32_t, ColumnValues>& decoded_by_field_id,
                              const std::int64_t length, ArrowArray& batch, std::string& error) {
@@ -929,6 +1079,15 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             return self(self, node_schema->children[0], node_array->children[0], field->id, std::move(path));
         }
 
+        if (is_struct && node_schema->n_children == 0) {  // an empty struct: valid in every row
+            if (std::any_of(path.begin(), path.end(),
+                            [](const ColumnPlan::Node& n) { return n.kind != ColumnPlan::Node::Kind::Struct; })) {
+                collect_error = "column '" + field->name + "': an empty struct in a list is not read yet";
+                return false;
+            }
+            struct_nodes.push_back(node_array);
+            return true;
+        }
         if (is_struct) {
             const bool under_list = std::any_of(path.begin(), path.end(), [](const ColumnPlan::Node& n) {
                 return n.kind != ColumnPlan::Node::Kind::Struct;
@@ -979,6 +1138,10 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                               : node_schema->n_children == 6  ? BlobHandling::Locations
                               : node_schema->n_children == 5  ? BlobHandling::Descriptions
                                                               : BlobHandling::Ingest;
+        } else if (!field->dictionary_index_format.empty()) {
+            plan.kind = ColumnPlan::Kind::Dictionary;  // the values, given back as indices
+            plan.width = lance_logical_type_value_bytes(field->logical_type);
+            plan.fmt = fixed_fmt_code(field->arrow_format);
         } else if (is_fsl) {
             // One physical column of N-element rows. The decoded bytes ARE the child's values buffer:
             // N elements per row, back to back.
@@ -1012,7 +1175,7 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     bool bulk_ok = true;
     for (const auto& plan : plans) {
         if (plan.kind != ColumnPlan::Kind::Fixed && plan.kind != ColumnPlan::Kind::Variable &&
-            plan.kind != ColumnPlan::Kind::FixedSizeList) {
+            plan.kind != ColumnPlan::Kind::FixedSizeList && plan.kind != ColumnPlan::Kind::Dictionary) {
             bulk_ok = false;
             break;
         }
@@ -1067,6 +1230,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                                                 static_cast<std::int64_t>(child_length), plan.fmt, error);
                     plan.array->length = leaf_length;
                 }
+            } else if (ok && plan.kind == ColumnPlan::Kind::Dictionary) {
+                ok = fill_dictionary_column(plan, leaf_length, error);
             } else if (ok) {
                 ok = plan.kind == ColumnPlan::Kind::Fixed
                          ? fill_fixed_child(plan.array, std::move(plan.values->fixed), leaf_length, plan.fmt, error)
@@ -1884,6 +2049,7 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
                 continue;
             }
             if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
+            if (lance_field_is_empty_struct(*find_mapping_field(mapping, field_id), mapping)) continue;  // nothing to decode
 
             const auto column_index = data_file.column_indices[i];
             if (column_index < 0 || static_cast<std::size_t>(column_index) >= open.columns.size()) {
@@ -2249,6 +2415,7 @@ bool decode_data_file_rows(const std::filesystem::path& dataset_path, const Plan
                 continue;
             }
             if (allowed_field_ids && !allowed_field_ids->count(field_id)) continue;
+            if (lance_field_is_empty_struct(*find_mapping_field(mapping, field_id), mapping)) continue;  // nothing to decode
             const auto column_index = data_file.column_indices[i];
             if (column_index < 0 || static_cast<std::size_t>(column_index) >= column_metadatas.size()) {
                 error = "data file column index out of range";

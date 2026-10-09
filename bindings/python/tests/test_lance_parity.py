@@ -150,19 +150,17 @@ def test_struct_child_name_shadowing_a_top_level_column(tmp_path):
     assert pa.table(nanolance.read_table(path)).to_pydict() == table.to_pydict()
 
 
-def test_dictionary_column_is_refused(tmp_path):
-    """Writing an Arrow dictionary column stored only the indices and discarded the values."""
+def test_dictionary_column_round_trips(tmp_path):
+    """An Arrow dictionary column used to keep only its indices (and was then refused); it is now
+    stored as Lance stores one -- dictionary pages under "dict:<value>:<index>" -- and read back as
+    a dictionary column, by nanolance and by pylance."""
     table = pa.table({"d": pa.array(["a", "b", "a"]).dictionary_encode()})
-    with pytest.raises(RuntimeError) as excinfo:
-        nanolance.write_table(table, tmp_path / "dict.lance")
-    assert "dictionary" in str(excinfo.value)
-    assert "cast" in str(excinfo.value)
-    # The suggested remedy works, and costs nothing on disk (nanolance dictionary-encodes
-    # low-cardinality string columns by itself).
-    plain = table.cast(pa.schema([pa.field("d", pa.string())]))
-    path = tmp_path / "plain.lance"
-    nanolance.write_table(plain, path)
-    assert pa.table(nanolance.read_table(path)).to_pydict() == plain.to_pydict()
+    path = tmp_path / "dict.lance"
+    nanolance.write_table(table, path)
+    back = pa.table(nanolance.read_table(path))
+    assert back.equals(table)
+    lance_mod = require_pylance()
+    assert lance_mod.dataset(str(path)).to_table().equals(table)
 
 
 # large_utf8 / large_binary through every page nanolance can write for a string column (roadmap E4).
