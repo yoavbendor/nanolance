@@ -685,6 +685,11 @@ public:
             throw std::runtime_error("failed to set a transaction property");
         }
     }
+    void set_blob_pack_file_size(std::uint64_t bytes) {
+        if (nano_lance_writer_set_blob_pack_file_size(&writer_, bytes) != 0) {
+            throw std::runtime_error("failed to set the blob pack file size");
+        }
+    }
     void set_initial_config(const std::string& key, const std::string& value) {
         if (nano_lance_writer_set_initial_config(&writer_, key.c_str(), value.c_str()) != 0) {
             throw std::runtime_error("failed to set the dataset config");
@@ -892,6 +897,19 @@ NB_MODULE(_nanolance, m) {
         return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     }, nb::arg("file"), nb::arg("external"), nb::arg("position"), nb::arg("size"), nb::arg("offset"),
        nb::arg("length"));
+    m.def("_external_blob_size", [](const std::string& uri) {
+        std::uint64_t size = 0;
+        char message[512] = {0};
+        int rc = 0;
+        {
+            nb::gil_scoped_release release;
+            rc = nano_lance_external_blob_size(uri.c_str(), &size, message, sizeof(message));
+        }
+        if (rc != NANO_LANCE_READER_OK) {
+            throw_dataset(std::string("cannot size external blob ") + uri + ": " + message);
+        }
+        return size;
+    }, nb::arg("uri"));
     // BlobHandling, in the order of the C++ enum.
     m.attr("BLOB_INGEST") = 0;
     m.attr("BLOB_DESCRIPTIONS") = 1;
@@ -1053,6 +1071,7 @@ NB_MODULE(_nanolance, m) {
         .def("project", &StagedWriter::project)
         .def("set_initial_config", &StagedWriter::set_initial_config)
         .def("set_transaction_property", &StagedWriter::set_transaction_property)
+        .def("set_blob_pack_file_size", &StagedWriter::set_blob_pack_file_size)
         .def("finish", &StagedWriter::finish, nb::arg("mode"), nb::arg("keep_empty") = false);
     m.attr("COMMIT_CREATE") = static_cast<int>(NANO_LANCE_COMMIT_CREATE);
     m.attr("COMMIT_APPEND") = static_cast<int>(NANO_LANCE_COMMIT_APPEND);

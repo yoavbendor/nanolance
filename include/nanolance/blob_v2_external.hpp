@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -69,6 +71,11 @@ bool preprocess_blob_v2_external_row(const ArrowArray& data,
 /// Pack one external descriptor into the Lance 2.2 blob v2 per-row record bytes.
 std::vector<std::uint8_t> blob_v2_pack_descriptor_row(const BlobV2ExternalDescriptor& descriptor);
 
+/// One row of a legacy (v1) blob column -- (position, size) of bytes in `out.blob_v2.data_file` --
+/// appended as a descriptor row of kind inline, so every blob read shape serves it. `null` marks
+/// the row null (format 2.1's reading of a non-zero position with no size).
+void blob_append_legacy_row(ColumnValues& out, std::uint64_t position, std::uint64_t size, bool null);
+
 /// Unpack one per-row record (inverse of `blob_v2_pack_descriptor_row`) for tests.
 bool blob_v2_unpack_descriptor_row(const std::vector<std::uint8_t>& row_bytes,
                                      BlobV2ExternalDescriptor& out,
@@ -117,6 +124,53 @@ constexpr std::uint8_t kBlobKindInline = 0;     // in the data file, at `positio
 constexpr std::uint8_t kBlobKindPacked = 1;     // in a sidecar file shared with other blobs, at `position`
 constexpr std::uint8_t kBlobKindDedicated = 2;  // a sidecar file of its own
 constexpr std::uint8_t kBlobKindExternal = 3;   // at `blob_uri`, `position`
+/// Writer-side only, never on disk: a blob given as bytes, placed (inline, packed or dedicated) when
+/// its data file is written. The row's trailing bytes -- a URI's place -- are the blob itself.
+constexpr std::uint8_t kBlobKindPendingData = 0xFF;
+
+/// Lance's storage thresholds for a Blob v2 field, from its field metadata
+/// (`lance-encoding:blob-{inline,dedicated,pack-file}-size-threshold`): a blob of more than `inline_max`
+/// bytes goes to a packed sidecar, of more than `dedicated_above` to a sidecar of its own, and a
+/// packed sidecar holds at most `pack_file_max` bytes.
+struct BlobV2Thresholds {
+    std::uint64_t inline_max = 64U * 1024U;
+    std::uint64_t dedicated_above = 4U * 1024U * 1024U;
+    std::uint64_t pack_file_max = 1024U * 1024U * 1024U;
+};
+
+/// The field's thresholds, refused as Lance refuses them (not a number; zero where zero is not allowed).
+bool blob_v2_thresholds(const LanceField& field, BlobV2Thresholds& out, std::string& error);
+
+/// Whether `values` holds a blob given as bytes, still to be placed.
+bool blob_v2_has_pending(const ColumnValues& values);
+
+/// Places a data file's pending blobs, as Lance's blob preprocessor does: each inline blob's bytes are
+/// written to `out` (the data file, before any column) at a 64-byte boundary, and packed and dedicated
+/// ones to sidecar files beside it, ids counting from 1 per data file. One per data file.
+class BlobV2Placer {
+public:
+    BlobV2Placer(std::filesystem::path data_file, std::uint64_t pack_file_override)
+        : data_file_(std::move(data_file)), pack_override_(pack_file_override) {}
+    /// `values` with every pending row replaced by its stored descriptor.
+    bool place(const ColumnValues& values, const BlobV2Thresholds& thresholds, std::ostream& out,
+               ColumnValues& placed, std::string& error);
+    /// Closes the open packed sidecar, if any.
+    bool finish(std::string& error);
+
+private:
+    bool write_sidecar(std::uint32_t id, const std::uint8_t* data, std::uint64_t n, std::string& error);
+    std::filesystem::path data_file_;
+    std::uint64_t pack_override_ = 0;
+    std::uint32_t next_id_ = 1;
+    std::uint32_t pack_id_ = 0;  // 0: no pack open
+    std::uint64_t pack_size_ = 0;
+    std::uint64_t pack_max_ = 0;
+    std::ofstream pack_;
+};
+
+/// A Blob v2 descriptor page's PageLayout (the inner ColumnEncoding message): Lance's FullZip of
+/// variable-width packed descriptors, with a definition level per row when the page has nulls.
+std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(std::uint64_t rows, bool nullable);
 
 /// Where a blob's bytes are: a local file or an external URI, and the range within it.
 struct BlobV2Location {
@@ -140,5 +194,8 @@ bool blob_v2_read(const BlobV2Location& location, std::uint64_t offset, std::uin
 
 /// Find top-level `lance.blob.v2` extension struct in a mapped schema, if present.
 const LanceField* find_blob_v2_parent(const LanceSchemaMapping& mapping);
+
+/// The ids of every top-level `lance.blob.v2` struct, in schema order.
+std::vector<std::int32_t> blob_v2_parent_ids(const LanceSchemaMapping& mapping);
 
 }  // namespace nano_lance

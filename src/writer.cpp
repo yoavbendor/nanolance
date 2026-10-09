@@ -34,8 +34,11 @@ struct WriterState {
     std::uint64_t pending_rows = 0;
     nano_lance::LanceSchemaMapping schema_mapping;
     std::vector<nano_lance::ColumnValues> column_values;
-    nano_lance::ColumnValues blob_column_values;
-    const nano_lance::LanceField* blob_field = nullptr;
+    /// The top-level lance.blob.v2 columns (their field ids, in schema order) and their rows.
+    std::vector<std::int32_t> blob_ids;
+    std::vector<nano_lance::ColumnValues> blob_column_values;
+    /// write_dataset's blob_pack_file_size_threshold: over each blob field's own (0: the field's).
+    std::uint64_t blob_pack_file_size = 0;
     bool ignore_nullability = false;
     bool blob_uri_dictionary = false;
     bool compression = false;
@@ -94,7 +97,10 @@ std::uint64_t pending_bytes(const WriterState& state) {
         }
         return n;
     };
-    std::uint64_t total = column_bytes(state.blob_column_values);
+    std::uint64_t total = 0;
+    for (const auto& cv : state.blob_column_values) {
+        total += column_bytes(cv);
+    }
     for (const auto& cv : state.column_values) {
         total += column_bytes(cv);
     }
@@ -532,19 +538,22 @@ const WriterState* state_from(const NanoLanceWriter* writer) {
     return static_cast<const WriterState*>(writer->private_data);
 }
 
-std::size_t count_non_blob_physical_columns(const nano_lance::LanceSchemaMapping& mapping,
-                                            std::int32_t blob_parent_id) {
+std::size_t count_non_blob_physical_columns(const nano_lance::LanceSchemaMapping& mapping) {
     std::size_t count = 0;
     for (const auto& field : mapping.fields) {
-        if (!nano_lance::lance_field_is_physical(field)) {
-            continue;
+        if (nano_lance::lance_field_is_physical(field) && !nano_lance::lance_field_is_blob_v2_part(mapping, field)) {
+            ++count;
         }
-        if (blob_parent_id >= 0 && field.parent_id == blob_parent_id) {
-            continue;
-        }
-        ++count;
     }
     return count;
+}
+
+/// Empty row buffers for the writer's schema: one per column, one per blob column.
+void reset_column_values(WriterState& state) {
+    state.blob_ids = nano_lance::blob_v2_parent_ids(state.schema_mapping);
+    state.blob_column_values.assign(state.blob_ids.size(), nano_lance::ColumnValues{});
+    state.column_values.clear();
+    state.column_values.resize(count_non_blob_physical_columns(state.schema_mapping));
 }
 
 /// A new data file's name: `fragment-<32 hex digits>.lance`, random, as Lance names its files by a
@@ -655,9 +664,7 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
         // The new fragment is one file with every column, whatever files the latest fragment has.
         nano_lance::renumber_columns_for_one_file(state->schema_mapping);
 
-        state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
-        const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
-        state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
+        reset_column_values(*state);
         state->has_schema = true;
     }
 
@@ -823,7 +830,6 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
         return set_error(writer, NANO_LANCE_UNSUPPORTED, error);
     }
 
-    const auto* batch_blob_field = nano_lance::find_blob_v2_parent(batch_mapping);
     if (!state->has_schema) {
         ArrowMetadataReader reader;
         if (schema->metadata != nullptr && ArrowMetadataReaderInit(&reader, schema->metadata) == NANOARROW_OK) {
@@ -846,9 +852,7 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
                 }
             }
         }
-        state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
-        const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
-        state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
+        reset_column_values(*state);
         state->has_schema = true;
     } else if (!nano_lance::schema_mappings_equivalent(state->schema_mapping, batch_mapping)) {
         // `state->schema_mapping` is the ingest-shape mapping captured on the first batch; compare the
@@ -861,26 +865,28 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
                                                                           batch_mapping));
     }
 
-    const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
     if (!nano_lance::append_batch_column_values(*batch,
                                                 state->schema_mapping,
                                                 state->column_values,
                                                 error,
-                                                blob_parent_id,
+                                                !state->blob_ids.empty(),
                                                 state->borrow_buffers)) {
         return set_error(writer, NANO_LANCE_UNSUPPORTED, error);
     }
-    if (state->blob_field != nullptr) {
-        if (!nano_lance::append_blob_v2_batch_column_values(*batch,
-                                                            state->schema_mapping,
-                                                            *state->blob_field,
-                                                            state->blob_uri_dictionary,
-                                                            state->blob_column_values,
-                                                            error)) {
-            return set_error(writer, NANO_LANCE_UNSUPPORTED, error);
+    for (std::size_t b = 0; b < state->blob_ids.size(); ++b) {
+        const nano_lance::LanceField* blob_field = nullptr;
+        for (const auto& f : state->schema_mapping.fields) {
+            blob_field = f.id == state->blob_ids[b] ? &f : blob_field;
         }
-    } else if (batch_blob_field != nullptr) {
-        return set_error(writer, NANO_LANCE_UNSUPPORTED, "schema gained lance.blob.v2 mid-write (not supported)");
+        if (blob_field == nullptr ||
+            !nano_lance::append_blob_v2_batch_column_values(*batch,
+                                                            state->schema_mapping,
+                                                            *blob_field,
+                                                            state->blob_uri_dictionary,
+                                                            state->blob_column_values[b],
+                                                            error)) {
+            return set_error(writer, NANO_LANCE_UNSUPPORTED, error.empty() ? "blob column not found" : error);
+        }
     }
 
     ++state->pending_batches;
@@ -957,20 +963,21 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     nano_lance::LanceSchemaMapping disk_schema = state->schema_mapping;
-    if (state->blob_field != nullptr) {
+    if (!state->blob_ids.empty()) {
         if (!nano_lance::finalize_blob_v2_schema_for_write(disk_schema, writer_error)) {
             return set_error(writer, NANO_LANCE_UNSUPPORTED, writer_error);
         }
-        // Persist the URI dictionary on the blob parent field so the reader can resolve each row's
-        // URI by index. Stored in manifest/field metadata; only present in dictionary mode.
-        if (state->blob_uri_dictionary && !state->blob_column_values.blob_v2.uri_dictionary.empty()) {
-            const auto serialized =
-                nano_lance::blob_v2_serialize_uri_dictionary(state->blob_column_values.blob_v2.uri_dictionary);
+        // Persist each URI dictionary on its blob field so the reader can resolve each row's URI by
+        // index. Stored in manifest/field metadata; only present in dictionary mode.
+        for (std::size_t b = 0; state->blob_uri_dictionary && b < state->blob_ids.size(); ++b) {
+            const auto& dictionary = state->blob_column_values[b].blob_v2.uri_dictionary;
+            if (dictionary.empty()) {
+                continue;
+            }
             for (auto& field : disk_schema.fields) {
-                if (field.extension_name == nano_lance::kBlobV2ExtensionName && field.logical_type == "struct" &&
-                    field.parent_id == -1) {
-                    field.metadata[nano_lance::kBlobV2UriDictMetadataKey] = serialized;
-                    break;
+                if (field.id == state->blob_ids[b]) {
+                    field.metadata[nano_lance::kBlobV2UriDictMetadataKey] =
+                        nano_lance::blob_v2_serialize_uri_dictionary(dictionary);
                 }
             }
         }
@@ -1037,13 +1044,15 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     std::vector<nano_lance::ColumnValues> commit_columns;
-    if (state->blob_field != nullptr) {
+    if (!state->blob_ids.empty()) {
         const auto physical = nano_lance::lance_physical_fields(disk_schema);
         commit_columns.reserve(physical.size());
         std::size_t non_blob_index = 0;
         for (const auto* field : physical) {
-            if (field->extension_name == nano_lance::kBlobV2ExtensionName) {
-                commit_columns.push_back(state->blob_column_values);
+            const auto blob = std::find(state->blob_ids.begin(), state->blob_ids.end(), field->id);
+            if (blob != state->blob_ids.end()) {
+                commit_columns.push_back(
+                    std::move(state->blob_column_values[static_cast<std::size_t>(blob - state->blob_ids.begin())]));
                 continue;
             }
             if (non_blob_index >= state->column_values.size()) {
@@ -1181,6 +1190,8 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
 
     nano_lance::DataFileResult data_file;
     const auto data_file_name = new_data_file_name();
+    nano_lance::LanceFileExtras file_extras;
+    file_extras.blob_pack_file_size = state->blob_pack_file_size;
     if (!nano_lance::write_lance_data_file(state->dataset_path,
                                            data_file_name,
                                            disk_schema,
@@ -1192,7 +1203,7 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
                                            writer_error,
                                            // A memory budget means resident bytes matter more
                                            // than speed: stream each column to the file.
-                                           state->max_pending_bytes == 0U)) {
+                                           state->max_pending_bytes == 0U, &file_extras)) {
         return set_error(writer, NANO_LANCE_IO_ERROR, writer_error);
     }
 
@@ -1214,13 +1225,7 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
     state->pending_batches = 0;
     state->pending_rows = 0;
-    state->column_values.clear();
-    state->blob_column_values = nano_lance::ColumnValues{};
-    state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
-    {
-        const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
-        state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
-    }
+    reset_column_values(*state);
     clear_error(writer);
     return NANO_LANCE_OK;
 }
@@ -1289,6 +1294,16 @@ int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* ke
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "config key and value are required");
     }
     state->initial_config[key] = value;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_blob_pack_file_size(NanoLanceWriter* writer, uint64_t bytes) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    state->blob_pack_file_size = bytes;
     clear_error(writer);
     return NANO_LANCE_OK;
 }
@@ -1390,10 +1405,7 @@ bool writer_project_append(NanoLanceWriter* writer, const std::vector<std::strin
     }
     renumber_columns_for_one_file(projected);
     state->schema_mapping = std::move(projected);
-    state->blob_field = find_blob_v2_parent(state->schema_mapping);
-    const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
-    state->column_values.clear();
-    state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
+    reset_column_values(*state);
     return true;
 }
 

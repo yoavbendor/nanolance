@@ -84,6 +84,12 @@ void nano_lance_dataset_metadata_free(NanoLanceDatasetMetadata* metadata);
 int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t size, uint8_t* out_buf, size_t out_cap,
                                    size_t* bytes_read, char* error_message, size_t error_message_capacity);
 
+/* The size in bytes of the object an external blob URI names (file:// or, when built with S3,
+   s3://), with the same path checks as nano_lance_fetch_external_blob. An external Blob v2 whose
+   recorded size is 0 spans its object from its position to the end, as in Lance. */
+int nano_lance_external_blob_size(const char* uri, uint64_t* out_size, char* error_message,
+                                  size_t error_message_capacity);
+
 /// Configure the optional on-disk LRU block cache used for `s3://` reads (no effect on `file://`). Call once
 /// before the first fetch. \p max_blocks is the LRU capacity (the reader clamps it to 2..500); <= 0 disables
 /// the cache. Each block is one 32 MiB read-ahead window persisted under \p cache_dir.

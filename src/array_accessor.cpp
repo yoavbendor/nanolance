@@ -779,20 +779,20 @@ bool append_batch_column_values(const ArrowArray& batch,
                                 const LanceSchemaMapping& mapping,
                                 std::vector<ColumnValues>& columns,
                                 std::string& error) {
-    return append_batch_column_values(batch, mapping, columns, error, -1);
+    return append_batch_column_values(batch, mapping, columns, error, false);
 }
 
 bool append_batch_column_values(const ArrowArray& batch,
                                 const LanceSchemaMapping& mapping,
                                 std::vector<ColumnValues>& columns,
                                 std::string& error,
-                                std::int32_t skip_blob_parent_id,
+                                bool skip_blob_children,
                                 bool borrow_fixed_buffers) {
     const auto physical = lance_physical_fields(mapping);
     std::vector<const LanceField*> selected;
     selected.reserve(physical.size());
     for (const auto* field : physical) {
-        if (skip_blob_parent_id >= 0 && field->parent_id == skip_blob_parent_id) {
+        if (skip_blob_children && lance_field_is_blob_v2_part(mapping, *field)) {
             continue;
         }
         selected.push_back(field);

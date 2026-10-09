@@ -45,7 +45,7 @@ compared, results are checked against pylance on the same files, in both directi
 | Filters | `filter=` on `to_table`, `to_batches`, `scanner`, `count_rows` and fragments: an SQL string or a pyarrow compute expression. Comparisons, `AND` / `OR` / `NOT` with SQL's three-valued logic, `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE` / `ILIKE`, arithmetic, `CAST`, `DATE` / `TIMESTAMP` literals, struct fields (`s.a`), and the functions `lower`, `upper`, `length`, `abs`, `coalesce`, `starts_with`, `ends_with`, `contains`. With a filter, `offset` and `limit` count the rows that pass, as in pylance. |
 | Changes | `delete`, `update` (SQL values), `merge_insert` (`when_matched_update_all`, with or without a condition over `source.*` / `target.*`, `when_matched_delete`, `when_matched_fail`, `when_not_matched_insert_all`, `when_not_matched_by_source_delete`, `write_mode`, `execute`; `on` defaults to the schema's unenforced primary key; a source with part of the columns keeps the matched rows' other values and gives inserted rows nulls there, written as whole rows in every `write_mode`), `add_columns` (SQL expressions, a `pa.field` / schema of null columns, or a reader), `merge` (new columns joined on a key; not yet into a dataset with deleted rows), `drop_columns`, `alter_columns` (rename, nullability, data type), `optimize.compact_files`, `optimize.optimize_indices`. Each is one version (compaction of indexed
 fragments two: see "Keeping indexes up to date"), and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column. |
-| Blobs | Blob v2 columns, every storage kind pylance writes (inline, packed, dedicated, external, empty, null): `to_table` returns their descriptions, as pylance does, and `blob_handling="all_binary"` their bytes. `take_blobs` (by `ids`, `addresses` or `indices`) returns `lance.BlobFile` handles (`read`, `readall`, `readinto`, `seek`, `tell`, `size`, `read_range`, `read_ranges`), and `read_blobs` the bytes. A handle reads only the bytes asked for, where they are. |
+| Blobs | Blob v2 columns, read and written, every storage kind: `lance.blob_field` (with `inline_size_threshold`, `dedicated_size_threshold`, `pack_file_size_threshold`), `lance.blob_array`, `Blob`, `BlobType`, `BlobArray`, `BlobColumn`. A blob given as bytes is stored as Lance stores it -- inline in the data file, in a shared packed sidecar or a dedicated sidecar by size, with the same descriptors, blob ids and sidecar files -- and a URI as an external reference (`allow_external_blob_outside_bases=True`, as pylance requires; `external_blob_mode="ingest"` copies the bytes in; `blob_pack_file_size_threshold`). Nulls, empties, whole-object externals, several blob columns, appends (either logical shape; a threshold that differs from the dataset's is refused), delete / update / merge_insert / compaction. The write-side checks and their errors are pylance's. Reading: `to_table` returns descriptions, `blob_handling="all_binary"` the bytes; `take_blobs` returns `lance.BlobFile` handles (`read`, `readall`, `readinto`, `seek`, `tell`, `size`, `read_range`, `read_ranges`), `read_blobs` the bytes, `read_blob_ranges` byte ranges per row, and `to_pandas(blob_mode="lazy" / "bytes" / "descriptions")` handles, bytes or descriptions. Legacy (v1) blob columns of formats 2.0 and 2.1 read the same ways; writing one is refused for 2.2, as Lance refuses it. |
 | Files | `lance.file`: `LanceFileReader` (`read_all`, `read_range`, `take_rows`, `num_rows`, `metadata`, `file_statistics`, `read_global_buffer`), `LanceFileWriter`, `LanceFileSession` (local), `stable_version` |
 
 Datasets and files are written in format 2.2, which is pylance 12's default. A request to write
@@ -222,6 +222,29 @@ full-text and IVF_PQ indexes with pylance, changes the dataset with nanolance, a
 indexed query against a plain scan. A dataset whose index section nanolance cannot read stays
 readable, but nanolance refuses to commit to it rather than drop its indices.
 
+## DuckDB, Polars, pandas and LanceDB
+
+A `nanolance.lance` dataset is a `pyarrow.dataset.Dataset` (its scanner a `pyarrow.dataset.Scanner`,
+its fragments `pyarrow.dataset.Fragment`s), as pylance's is, so the engines that read pylance
+datasets read nanolance's the same way, with projections and filters pushed into the scan:
+
+```python
+ds = nanolance.lance.dataset("data.lance")
+duckdb.sql("SELECT s, count(*) FROM ds WHERE id > 500 GROUP BY s")   # replacement scan
+duckdb.from_arrow(ds)                                               # a relation
+ds.to_polars()                         # a Polars LazyFrame, as LanceDB's Table.to_polars()
+polars.scan_pyarrow_dataset(ds)        # the same
+ds.to_pandas()                         # as pylance's (blob columns per blob_mode)
+```
+
+Other Lance implementations read the files nanolance writes: DuckDB's `lance` community extension
+(scans, filters, `lance_vector_search` and `lance_fts` over the IVF_PQ and INVERTED indexes
+nanolance built) and LanceDB (`open_table` on a nanolance dataset: `to_arrow`, `to_polars`,
+`to_pandas`, vector and full-text `search`, `where`; nanolance reads and appends to LanceDB's own
+tables, and LanceDB to nanolance's). `tests/test_interop.py` checks each against pylance and against
+the engine over the same table in memory; `tools/interop_suite.py` runs it in environments with the
+DuckDB extension (built for DuckDB 1.5.0, not 1.5.5) and LanceDB installed.
+
 ## What is not implemented
 
 These raise `NotImplementedError` (`nanolance.lance.NotSupportedError`) naming the feature. None of
@@ -240,8 +263,10 @@ them is silently ignored:
   vector indexes other than IVF_FLAT and IVF_PQ, and scalar indexes other than BTree, Bitmap,
   LabelList and INVERTED. An index pylance built is kept, though: see "Indexes" below.
 - Branches, stable row ids, multiple base paths, shallow and deep clones.
-- Writing Lance's inline, packed and dedicated blob layouts (`lance.blob_field`, `lance.blob_array`):
-  nanolance writes external blobs, and reads every kind.
+- Blob columns inside a struct or a list (refused on write, not read), external blobs under
+  registered base paths, and the prepared-layout blob writers (`PackedBlobWriter`,
+  `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`); blob data through `add_columns` or
+  `write_fragments`.
 - Object stores and namespaces (`s3://`, `gs://`, REST and directory namespaces).
 - torch and Hugging Face integration, UDFs, blob-file APIs, the memtable write-ahead log
   (`mem_wal`).

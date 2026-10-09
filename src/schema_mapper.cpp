@@ -383,6 +383,22 @@ bool map_field(const ArrowSchema& field,
     }
     std::string extension_name;
     read_metadata_key(field, kArrowExtensionNameKey, extension_name);
+    // A legacy blob column (Lance's "lance-encoding:blob" marker without the Blob v2 extension) is
+    // refused for format 2.2, as Lance refuses it: written anyway, Lance reads the file as a blob
+    // column whose layout it is not, and fails.
+    if (std::string legacy; extension_name != "lance.blob.v2" && read_metadata_key(field, "lance-encoding:blob", legacy)) {
+        error = std::string("Legacy blob columns (field metadata key \"lance-encoding:blob\") are not supported for "
+                            "file version >= 2.2. Found legacy blob field: ") +
+                (field.name == nullptr ? "" : field.name) +
+                ". Use the blob v2 extension type (ARROW:extension:name = \"lance.blob.v2\") and the new blob "
+                "APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder).";
+        return false;
+    }
+    if (extension_name == "lance.blob.v2" && parent_id != -1) {
+        error = std::string("lance.blob.v2 column '") + (field.name == nullptr ? "" : field.name) +
+                "' inside a struct or list is not supported yet (a top-level blob column is)";
+        return false;
+    }
     // JSONB (the lance.json extension over large_binary) is Lance's logical type "json".
     if (parsed.logical_type == "large_binary" && extension_name == "lance.json") {
         parsed.logical_type = "json";
@@ -570,12 +586,16 @@ bool schema_mappings_equivalent(const LanceSchemaMapping& left, const LanceSchem
     for (std::size_t i = 0; i < left.fields.size(); ++i) {
         const auto& l = left.fields[i];
         const auto& r = right.fields[i];
+        // A blob field's parts: which of them is the column, and whether its children are nullable,
+        // is how a dataset stores it, not what a batch must match.
+        const bool blob_part = lance_field_is_blob_v2_part(left, l) && lance_field_is_blob_v2_part(right, r);
+        const bool blob_child = blob_part && lance_field_in_blob_v2(left, l);
         if (l.name != r.name || l.logical_type != r.logical_type || l.arrow_format != r.arrow_format ||
-            l.nullable != r.nullable || l.extension_name != r.extension_name ||
+            (l.nullable != r.nullable && !blob_child) || l.extension_name != r.extension_name ||
             !metadata_equal_ignoring_encoding(l.metadata, r.metadata) || l.is_dictionary_index != r.is_dictionary_index ||
             l.dictionary_value_logical_type != r.dictionary_value_logical_type ||
             l.dictionary_index_format != r.dictionary_index_format ||
-            (l.column_index >= 0) != (r.column_index >= 0) ||
+            ((l.column_index >= 0) != (r.column_index >= 0) && !blob_part) ||
             position(left, l.parent_id) != position(right, r.parent_id)) {
             return false;
         }
@@ -915,7 +935,7 @@ bool dematerialize_blob_v2_for_arrow_append(LanceSchemaMapping& mapping, std::st
                 c.id = fid;
                 c.parent_id = blob_parent.id;
                 c.column_index = -1;
-                c.nullable = false;
+                c.nullable = true;  // Lance's logical children: data or uri, a range or none
                 c.extension_name.clear();
                 rebuilt.push_back(std::move(c));
             };

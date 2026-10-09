@@ -31,6 +31,13 @@ def translate(message: str) -> Exception:
         return ValueError(f"Invalid user input: the filter does not return a boolean ({text})")
     if text.startswith(("invalid filter", "cannot compare", "cannot CAST")):
         return ValueError(f"Invalid user input: {text}")
+    if "Legacy blob columns" in text:
+        return OSError("Invalid user input: " + text[text.index("Legacy blob columns"):])
+    for marker in ("Blob v2 field '", "Invalid blob threshold metadata"):
+        if marker in text:
+            return OSError("Invalid user input: " + text[text.index(marker):])
+    if "is declared as non-nullable but contains null values" in text:
+        return OSError("LanceError(Arrow): Invalid argument error: " + text[text.index("Column '"):])
     if "Empty structs with rep/def information" in text:
         return OSError("Invalid user input: " + text.split("write failed: ", 1)[-1])
     if "dimension must be a positive integer" in text:

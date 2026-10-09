@@ -651,7 +651,6 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
     if (earliest_kept_ns && latest_removed_ns && *latest_removed_ns > *earliest_kept_ns) {
         cutoff_ns.reset();
     }
-    const auto listing_now = now_ns();
     std::vector<CleanupCandidate> files;
     for (const char* dir : {"_versions", "_transactions", "data", "_indices", "_deletions"}) {
         const bool all = std::string_view(dir) == "_indices" || !cutoff_ns;
@@ -671,7 +670,13 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
             file.size = static_cast<std::uint64_t>(it->file_size(entry_ec));
             const auto modified = it->last_write_time(entry_ec);
             const auto age = std::chrono::duration_cast<std::chrono::nanoseconds>(file_now - modified).count();
-            if (!all && listing_now - age > *cutoff_ns) {
+            // The modification time itself, on the clock commit times are on (not now minus an age:
+            // two clocks read at different moments put a file written just after the earliest kept
+            // version before it whenever the walk is slow).
+            const auto modified_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         fs::file_time_type::clock::to_sys(modified).time_since_epoch())
+                                         .count();
+            if (!all && modified_ns > *cutoff_ns) {
                 continue;  // modified after the earliest kept version
             }
             file.maybe_in_progress = !policy.delete_unverified && age < kUnverifiedThresholdNs;

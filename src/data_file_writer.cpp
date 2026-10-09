@@ -2080,11 +2080,45 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         return false;
     }
 
+    // Lance's blob preprocessing, now that the file's name is known: blobs given as bytes are placed --
+    // inline ones here at the head of the file, before any column (their descriptors hold absolute
+    // positions, which a column buffered on its own thread could not), packed and dedicated ones in
+    // sidecar files beside it.
+    std::vector<const ColumnValues*> column_source(physical_fields.size());
+    std::vector<ColumnValues> placed_blobs;
+    {
+        BlobV2Placer placer(full_path, extras != nullptr ? extras->blob_pack_file_size : 0U);
+        std::size_t blob_columns = 0;
+        for (const auto& v : column_values) {
+            blob_columns += v.kind == ColumnValues::Kind::BlobV2External ? 1U : 0U;
+        }
+        placed_blobs.reserve(blob_columns);
+        for (std::size_t i = 0; i < physical_fields.size(); ++i) {
+            column_source[i] = &column_values[i];
+            if (column_values[i].kind != ColumnValues::Kind::BlobV2External ||
+                !blob_v2_has_pending(column_values[i])) {
+                continue;  // external references (or nulls) only: stored as they are
+            }
+            BlobV2Thresholds thresholds;
+            if (!blob_v2_thresholds(*physical_fields[i], thresholds, error)) {
+                return false;
+            }
+            placed_blobs.emplace_back();
+            if (!placer.place(column_values[i], thresholds, out, placed_blobs.back(), error)) {
+                return false;
+            }
+            column_source[i] = &placed_blobs.back();
+        }
+        if (!placer.finish(error)) {
+            return false;
+        }
+    }
+
     // One column's pages, written to `out` (the file, or with several threads a buffer of its own).
     const auto encode_column = [&](std::size_t field_index, std::ostream& out,
                                    std::vector<pb::ColumnMetadata>& columns, std::string& error) -> bool {
         const auto& field = *physical_fields[field_index];
-        const auto& values = column_values[field_index];
+        const auto& values = *column_source[field_index];
 
         // Nulls are encodable only on the paths that have been taught the definition-level layer.
         // Everything else must refuse rather than drop them: ingest no longer rejects a null batch,
@@ -2093,11 +2127,6 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         // area is here to prevent.
         const bool column_has_nulls = values.null_count != 0U;
         if (column_has_nulls) {
-            if (values.kind == ColumnValues::Kind::BlobV2External) {
-                error = "column '" + field.name +
-                        "' is a lance.blob.v2 external reference and cannot carry nulls yet";
-                return false;
-            }
             if (values.validity.empty()) {
                 error = "column '" + field.name + "' reports " + std::to_string(values.null_count) +
                         " nulls but carries no validity bitmap";
@@ -2112,18 +2141,33 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
                 error += field.name;
                 return false;
             }
-            if (blob.packed_payload.empty() && rows != 0U) {
-                error = "blob v2 packed payload is empty for ";
-                error += field.name;
-                return false;
+            // With nulls, each row starts with its definition level (1: null), a null row being that
+            // byte alone -- Lance's FullZip with one definition layer.
+            const bool nullable = column_has_nulls;
+            std::vector<std::uint8_t> with_levels;
+            std::vector<std::uint32_t> level_sizes;
+            if (nullable) {
+                with_levels.reserve(blob.packed_payload.size() + blob.row_packed_sizes.size());
+                level_sizes.reserve(blob.row_packed_sizes.size());
+                std::size_t at = 0;
+                for (std::size_t r = 0; r < blob.row_packed_sizes.size(); ++r) {
+                    const bool valid = validity_bit(values.validity, r);
+                    const auto n = blob.row_packed_sizes[r];
+                    with_levels.push_back(valid ? 0U : 1U);
+                    if (valid) {
+                        with_levels.insert(with_levels.end(), blob.packed_payload.begin() + static_cast<std::ptrdiff_t>(at),
+                                           blob.packed_payload.begin() + static_cast<std::ptrdiff_t>(at + n));
+                    }
+                    at += n;
+                    level_sizes.push_back(valid ? n + 1U : 1U);
+                }
             }
-
-            const auto control = blob_v2_build_control_buffer(blob.row_packed_sizes);
+            const auto& payload = nullable ? with_levels : blob.packed_payload;
+            const auto control = blob_v2_build_control_buffer(nullable ? level_sizes : blob.row_packed_sizes);
 
             align64(out);
             const auto values_offset = pos(out);
-            out.write(reinterpret_cast<const char*>(blob.packed_payload.data()),
-                      static_cast<std::streamsize>(blob.packed_payload.size()));
+            out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
 
             align64(out);
             const auto control_offset = pos(out);
@@ -2134,11 +2178,11 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             pb::ColumnPage page;
             page.buffer_offsets.push_back(values_offset);
             page.buffer_offsets.push_back(control_offset);
-            page.buffer_sizes.push_back(blob.packed_payload.size());
+            page.buffer_sizes.push_back(payload.size());
             page.buffer_sizes.push_back(control.size());
             page.length = rows;
             page.priority = 0;
-            page.encoding = blob_v2_column_page_encoding();
+            page.encoding = blob_v2_descriptor_page_encoding(rows, nullable);
             column.pages.push_back(std::move(page));
             columns.push_back(std::move(column));
             return true;
@@ -2997,7 +3041,46 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
 
     pb::FileDescriptor descriptor;
     descriptor.length = rows;
+    // A Blob v2 field is stored as Lance stores it: the file's schema has the descriptor struct --
+    // marked packed and blob, its children (kind, position, size, blob_id, blob_uri) without ids of
+    // their own -- where the dataset's has the field's logical children.
+    const auto blob_ids = blob_v2_parent_ids(mapping);
+    const auto logical_blob = [&](std::int32_t id) {
+        return std::find(blob_ids.begin(), blob_ids.end(), id) != blob_ids.end() &&
+               std::none_of(mapping.fields.begin(), mapping.fields.end(),
+                            [&](const LanceField& f) { return f.parent_id == id && f.name == "kind"; });
+    };
     for (const auto& mapped_field : mapping.fields) {
+        if (mapped_field.parent_id >= 0 && logical_blob(mapped_field.parent_id)) {
+            continue;
+        }
+        if (logical_blob(mapped_field.id)) {
+            pb::Field parent;
+            parent.name = mapped_field.name;
+            parent.logical_type = "struct";
+            parent.id = mapped_field.id;
+            parent.parent_id = -1;
+            parent.type = 0;
+            parent.nullable = mapped_field.nullable;
+            parent.encoding = 0;
+            parent.metadata["lance-encoding:blob"] = {'t', 'r', 'u', 'e'};
+            parent.metadata["lance-encoding:packed"] = {'t', 'r', 'u', 'e'};
+            descriptor.fields.push_back(std::move(parent));
+            const std::pair<const char*, const char*> children[] = {
+                {"kind", "uint8"}, {"position", "uint64"}, {"size", "uint64"}, {"blob_id", "uint32"}, {"blob_uri", "string"}};
+            for (const auto& [name, type] : children) {
+                pb::Field child;
+                child.name = name;
+                child.logical_type = type;
+                child.id = -1;
+                child.parent_id = -1;
+                child.type = 0;
+                child.nullable = false;
+                child.encoding = lance_on_disk_field_encoding(type);
+                descriptor.fields.push_back(std::move(child));
+            }
+            continue;
+        }
         pb::Field field;
         field.name = mapped_field.name;
         field.logical_type = lance_field_disk_logical_type(mapped_field);

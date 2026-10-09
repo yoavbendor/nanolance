@@ -2049,6 +2049,180 @@ bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& 
 }
 
 
+// ── legacy (v1) blobs in format 2.1 ─────────────────────────────────────────────────────────────
+
+/// One protobuf field: its number, wire type, and a varint value or a length-delimited span.
+struct RawField {
+    std::uint32_t number = 0;
+    std::uint32_t wire = 0;
+    std::uint64_t varint = 0;
+    const std::uint8_t* data = nullptr;
+    std::size_t size = 0;
+};
+
+bool raw_varint(const std::uint8_t*& p, const std::uint8_t* end, std::uint64_t& v) {
+    v = 0;
+    for (unsigned shift = 0; shift < 64U && p < end; shift += 7U) {
+        const auto b = *p++;
+        v |= static_cast<std::uint64_t>(b & 0x7FU) << shift;
+        if ((b & 0x80U) == 0U) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The fields of a message, in order; false when it is not well formed.
+bool raw_fields(const std::uint8_t* p, std::size_t size, std::vector<RawField>& out) {
+    out.clear();
+    const auto* end = p + size;
+    while (p < end) {
+        std::uint64_t key = 0;
+        if (!raw_varint(p, end, key)) {
+            return false;
+        }
+        RawField f;
+        f.number = static_cast<std::uint32_t>(key >> 3U);
+        f.wire = static_cast<std::uint32_t>(key & 7U);
+        if (f.wire == 0U) {
+            if (!raw_varint(p, end, f.varint)) {
+                return false;
+            }
+        } else if (f.wire == 2U) {
+            std::uint64_t n = 0;
+            if (!raw_varint(p, end, n) || n > static_cast<std::uint64_t>(end - p)) {
+                return false;
+            }
+            f.data = p;
+            f.size = static_cast<std::size_t>(n);
+            p += n;
+        } else if (f.wire == 1U || f.wire == 5U) {
+            const std::size_t n = f.wire == 1U ? 8U : 4U;
+            if (static_cast<std::size_t>(end - p) < n) {
+                return false;
+            }
+            p += n;
+        } else {
+            return false;
+        }
+        out.push_back(f);
+    }
+    return true;
+}
+
+const RawField* raw_find(const std::vector<RawField>& fields, std::uint32_t number) {
+    const RawField* found = nullptr;
+    for (const auto& f : fields) {
+        if (f.number == number) {
+            found = &f;
+        }
+    }
+    return found;
+}
+
+/// A legacy blob page's inner layout: a mini-block of 16-byte (position, size) rows -- Flat(128), or
+/// PackedStruct{[64, 64], Flat(128)} -- with no repetition or definition levels. Anything else is
+/// refused by name.
+bool legacy_blob_inner_shape(const std::vector<std::uint8_t>& encoding, MiniBlockChunkShape& shape, std::string& why) {
+    std::vector<RawField> fields;
+    // Any { type_url = 1, value = 2 } -> PageLayout { blob_layout = 4 } -> BlobLayout { inner_layout = 1 }
+    // -> PageLayout { mini_block_layout = 1 }.
+    const RawField* f = nullptr;
+    if (!raw_fields(encoding.data(), encoding.size(), fields) || (f = raw_find(fields, 2)) == nullptr ||
+        !raw_fields(f->data, f->size, fields) || (f = raw_find(fields, 4)) == nullptr ||
+        !raw_fields(f->data, f->size, fields) || (f = raw_find(fields, 1)) == nullptr ||
+        !raw_fields(f->data, f->size, fields) || (f = raw_find(fields, 1)) == nullptr ||
+        !raw_fields(f->data, f->size, fields)) {
+        why = "a legacy blob page that is not a BlobLayout over a mini-block layout";
+        return false;
+    }
+    const std::vector<RawField> mini = fields;
+    if (raw_find(mini, 1) != nullptr || raw_find(mini, 2) != nullptr || raw_find(mini, 4) != nullptr) {
+        why = "a legacy blob page with levels or a dictionary";
+        return false;
+    }
+    const RawField* value = raw_find(mini, 3);
+    std::vector<RawField> compression;
+    bool ok = value != nullptr && raw_fields(value->data, value->size, compression);
+    if (ok) {
+        const RawField* packed = raw_find(compression, 12);
+        const RawField* flat = raw_find(compression, 1);
+        if (packed != nullptr) {
+            std::vector<RawField> inner;
+            ok = raw_fields(packed->data, packed->size, inner) && (value = raw_find(inner, 2)) != nullptr &&
+                 raw_fields(value->data, value->size, compression) && (flat = raw_find(compression, 1)) != nullptr;
+        }
+        std::vector<RawField> flat_fields;
+        const RawField* bits = nullptr;
+        ok = ok && flat != nullptr && raw_fields(flat->data, flat->size, flat_fields) &&
+             (bits = raw_find(flat_fields, 1)) != nullptr && bits->varint == 128U;
+    }
+    if (!ok) {
+        why = "a legacy blob page whose (position, size) values are not 2 x 64 bits";
+        return false;
+    }
+    const RawField* buffers = raw_find(mini, 7);
+    const RawField* large = raw_find(mini, 10);
+    shape = MiniBlockChunkShape{};
+    shape.has_repetition = false;
+    shape.has_definition = false;
+    shape.num_buffers = buffers != nullptr ? static_cast<std::uint32_t>(buffers->varint) : 1U;
+    shape.large_buffer_sizes = large != nullptr && large->varint != 0U;
+    if (shape.num_buffers != 1U) {
+        why = "a legacy blob page of " + std::to_string(shape.num_buffers) + " buffers per chunk";
+        return false;
+    }
+    return true;
+}
+
+/// A format 2.1 legacy blob column: every page's (position, size) rows, as descriptor rows of
+/// bytes in this data file. A non-zero position with no size is a null, as Lance reads it.
+bool decode_legacy_blob_column(const std::filesystem::path& path, const pb::Field& field,
+                               const pb::ColumnMetadata& column, ColumnValues& out, std::string& error) {
+    out = ColumnValues{};
+    out.kind = ColumnValues::Kind::BlobV2External;
+    out.blob_v2.data_file = path;
+    std::vector<std::uint8_t> control;
+    std::vector<std::uint8_t> payload;
+    std::vector<MiniBlockChunkView> chunks;
+    for (const auto& page : column.pages) {
+        if (page.length == 0U) {
+            continue;
+        }
+        MiniBlockChunkShape shape;
+        std::string why;
+        if (!legacy_blob_inner_shape(page.encoding, shape, why)) {
+            error = "column '" + field.name + "': " + why;
+            return false;
+        }
+        if (!read_page_buffers(path, page, false, control, payload, error) ||
+            !split_miniblock_payload(payload, shape, chunks, error)) {
+            return false;
+        }
+        std::uint64_t rows = 0;
+        for (const auto& chunk : chunks) {
+            if (chunk.values.size() % 16U != 0U) {
+                error = "column '" + field.name + "': a legacy blob chunk is not whole (position, size) rows";
+                return false;
+            }
+            for (std::size_t i = 0; i + 16U <= chunk.values.size(); i += 16U) {
+                std::uint64_t position = 0;
+                std::uint64_t size = 0;
+                std::memcpy(&position, chunk.values.data() + i, 8U);
+                std::memcpy(&size, chunk.values.data() + i + 8U, 8U);
+                blob_append_legacy_row(out, position, size, size == 0U && position != 0U);
+                ++rows;
+            }
+        }
+        if (rows != page.length) {
+            error = "column '" + field.name + "': a legacy blob page holds " + std::to_string(rows) +
+                    " rows but declares " + std::to_string(page.length);
+            return false;
+        }
+    }
+    return true;
+}
+
 /// For a list column's item pass: give each chunk its value count from the metadata words, in place
 /// of the level count or byte-size inference the flat paths use. A no-op for any other column.
 [[nodiscard]] bool apply_item_view(const ColumnEncodingPlan& plan, std::vector<MiniBlockChunkView>& chunks,
@@ -2253,6 +2427,9 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     // blob-v2 packed page uses FullZipLayout (PageLayout field 3), which the descriptor classifier
     // below does not model -- classifying first would refuse the library's headline feature.
     const bool blob_packed = field_metadata_is_true(on_disk_field, "lance-encoding:blob");
+    if (blob_packed && (on_disk_field.logical_type == "large_binary" || on_disk_field.logical_type == "binary")) {
+        return decode_legacy_blob_column(data_file_path, on_disk_field, column_metadata, out, error);
+    }
     if (blob_packed) {
         out.kind = ColumnValues::Kind::BlobV2External;
         out.blob_v2.data_file = data_file_path;

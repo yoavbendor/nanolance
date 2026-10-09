@@ -28,6 +28,8 @@ branch; commands to reproduce are in the plan or the commit messages. Test count
 | Roadmap C — lists, read side | **C0–C8 done**; only a list of `fixed_size_list` is still refused |
 | Lance metadata codec on nanom | **done** — one model in nanom, canonical proto3, deletion files now survive appends |
 | Roadmap D — lists, write side | **D1–D2 done**: lists, maps, lists of structs, null structs round-trip; pages compressed to within ~0.2% of pylance (FSST aside) |
+| Blobs, every kind (2026-10-09) | **done** — Blob v2 written inline / packed / dedicated / external as Lance writes them, legacy 2.0 / 2.1 blob columns read; `tests/test_blob_kinds.py` against pylance both ways |
+| DuckDB / Polars / LanceDB interop (2026-10-09) | **done** — pyarrow-dataset subclasses, `to_polars()`, DuckDB `lance` extension and LanceDB read nanolance's files and indexes; `tests/test_interop.py`, `tools/interop_suite.py` |
 
 Test suite: **54 ctest** (was 42) and **1395 pytest** (was 22), all passing -- and nothing skipped: the one
 ctest that used to report a green SKIP for a real interop failure now passes for real.

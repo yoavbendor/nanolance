@@ -257,6 +257,37 @@ inline std::string lance_on_disk_logical_type(const std::string& logical_type) {
 
 std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& mapping);
 
+/// A legacy (v1) blob column, as format 2.0 / 2.1 datasets hold one: large_binary marked with
+/// `lance-encoding:blob`, its values (position, size) descriptions of bytes stored in the data file.
+inline bool lance_field_is_legacy_blob(const LanceField& field) {
+    if (field.extension_name == "lance.blob.v2" ||
+        (field.logical_type != "large_binary" && field.logical_type != "binary")) {
+        return false;
+    }
+    const auto it = field.metadata.find("lance-encoding:blob");
+    return it != field.metadata.end() && it->second != "false" && it->second != "0";
+}
+
+/// A child of a top-level lance.blob.v2 struct (its write-side data/uri/position/size).
+inline bool lance_field_in_blob_v2(const LanceSchemaMapping& mapping, const LanceField& field) {
+    if (field.parent_id < 0) {
+        return false;
+    }
+    for (const auto& f : mapping.fields) {
+        if (f.id == field.parent_id) {
+            return f.parent_id == -1 && f.extension_name == "lance.blob.v2";
+        }
+    }
+    return false;
+}
+
+/// A top-level lance.blob.v2 struct or one of its children: written by the blob ingest, not as
+/// ordinary columns, whichever of them a mapping makes the column (the dataset's: the struct; a
+/// batch's: its children).
+inline bool lance_field_is_blob_v2_part(const LanceSchemaMapping& mapping, const LanceField& field) {
+    return (field.parent_id == -1 && field.extension_name == "lance.blob.v2") || lance_field_in_blob_v2(mapping, field);
+}
+
 /// A struct with no fields: a column of its own (one constant page), every row a valid empty struct.
 bool lance_field_is_empty_struct(const LanceField& field, const LanceSchemaMapping& mapping);
 

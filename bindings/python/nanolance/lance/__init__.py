@@ -39,7 +39,7 @@ from nanolance.lance.dataset import (
     dataset,
     write_dataset,
 )
-from nanolance.lance.blob import BlobFile, blob_array, blob_field
+from nanolance.lance.blob import Blob, BlobArray, BlobColumn, BlobFile, blob_array, blob_field
 from nanolance.lance.fragment import DataFile, DeletionFile, FragmentMetadata, LanceFragment
 from nanolance.lance._transactions import LanceOperation, Transaction
 
@@ -48,6 +48,9 @@ PYLANCE_API_VERSION = "12.0.0"
 __version__ = f"{PYLANCE_API_VERSION}+nanolance.{_nanolance_pkg.__version__}"
 
 __all__ = [
+    "Blob",
+    "BlobArray",
+    "BlobColumn",
     "BlobFile",
     "DataFile",
     "DeletionFile",

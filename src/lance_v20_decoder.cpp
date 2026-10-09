@@ -5,6 +5,7 @@
 // `array_encoding` module (the 2.0 decoders), which Lance keeps for reading these files.
 
 #include "nanolance/lance_v20_decoder.hpp"
+#include "nanolance/blob_v2_external.hpp"
 
 #include "nanolance/column_slice.hpp"
 #include "nanolance/data_file_reader.hpp"
@@ -1115,44 +1116,24 @@ bool is_blob_column(const pb::ColumnMetadata& column) {
     return nm::protobuf_decode(nm::from(**any.value), encoding) && encoding.blob->has_value();
 }
 
-/// A 2.0 blob column's page: (position, size) per row, the bytes elsewhere in the same data file. A
-/// null is (1, 0) and an empty value (0, 0), as Lance writes them.
-bool read_blob_values(const std::filesystem::path& path, Arr& a, const std::string& name, std::string& error) {
+/// A 2.0 blob page's rows as legacy blob descriptor rows (blob_append_legacy_row): the bytes stay in
+/// the data file until a read asks for them, and a description reads back as Lance's (position,
+/// size) -- a null among them as Lance writes it, (1, 0).
+bool append_blob_descriptions(const std::filesystem::path& path, const Arr& a, ColumnValues& out,
+                              const std::string& name, std::string& error) {
     if (a.shape != Arr::Shape::kFixed || a.packed != std::vector<std::uint32_t>{8U, 8U}) {
         error = "column '" + name + "': a format 2.0 blob page that is not (position, size) descriptions";
         return false;
     }
-    Arr out;
-    out.shape = Arr::Shape::kVariable;
-    out.n = a.n;
-    out.offsets.assign(1, 0U);
-    out.offsets.reserve(static_cast<std::size_t>(a.n) + 1U);
-    std::vector<std::uint8_t> value;
+    out.kind = ColumnValues::Kind::BlobV2External;
+    out.blob_v2.data_file = path;
     for (std::uint64_t i = 0; i < a.n; ++i) {
         std::uint64_t position = 0;
         std::uint64_t size = 0;
         std::memcpy(&position, a.bytes.data() + i * 16U, 8U);
         std::memcpy(&size, a.bytes.data() + i * 16U + 8U, 8U);
-        if (size == 0U && position == 1U) {
-            if (out.validity.empty()) {
-                out.validity.assign(static_cast<std::size_t>((a.n + 7U) / 8U), 0xFFU);
-            }
-            out.validity[static_cast<std::size_t>(i >> 3U)] &= static_cast<std::uint8_t>(~(1U << (i & 7U)));
-            ++out.nulls;
-        } else if (size != 0U) {
-            if (!read_lance_data_file_bytes(path, position, size, value, error)) {
-                error = "column '" + name + "' blob " + std::to_string(i) + ": " + error;
-                return false;
-            }
-            out.bytes.insert(out.bytes.end(), value.begin(), value.end());
-            if (out.bytes.size() > default_read_limits().max_uncompressed_bytes) {
-                error = "column '" + name + "' exceeds the decoded-size limit";
-                return false;
-            }
-        }
-        out.offsets.push_back(out.bytes.size());
+        blob_append_legacy_row(out, position, size, false);
     }
-    a = std::move(out);
     return true;
 }
 
@@ -1207,6 +1188,10 @@ bool decode_pages(const std::filesystem::path& path, const pb::Field& field, con
     }
     start_column(out, t);
     const bool blob = t.variable && is_blob_column(column);
+    if (blob) {
+        out.kind = ColumnValues::Kind::BlobV2External;
+        out.blob_v2.data_file = path;
+    }
     for (std::size_t p = p0; p < p1; ++p) {
         const auto& page = column.pages[p];
         if (page.length == 0U) {
@@ -1217,8 +1202,11 @@ bool decode_pages(const std::filesystem::path& path, const pb::Field& field, con
             error = "column '" + field.name + "' page " + std::to_string(p) + ": " + error;
             return false;
         }
-        if (blob && !read_blob_values(path, a, field.name, error)) {
-            return false;
+        if (blob) {
+            if (!append_blob_descriptions(path, a, out, field.name, error)) {
+                return false;
+            }
+            continue;
         }
         if (!select_packed_child(a, context, t, field.name, error) || !append_page(out, t, a, field.name, error)) {
             return false;
@@ -1356,8 +1344,8 @@ bool append_rows(const std::filesystem::path& path, const pb::Field& field, cons
         error = "column '" + field.name + "' page " + std::to_string(p) + ": " + error;
         return false;
     }
-    if (t.variable && is_blob_column(column) && !read_blob_values(path, a, field.name, error)) {
-        return false;
+    if (t.variable && is_blob_column(column)) {
+        return append_blob_descriptions(path, a, out, field.name, error);
     }
     return select_packed_child(a, context, t, field.name, error) && append_page(out, t, a, field.name, error);
 }

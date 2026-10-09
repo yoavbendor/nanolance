@@ -225,6 +225,52 @@ int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t 
     return NANO_LANCE_READER_OK;
 }
 
+int nano_lance_external_blob_size(const char* uri, uint64_t* out_size, char* error_message,
+                                  size_t error_message_capacity) {
+    if (uri == nullptr || uri[0] == '\0' || out_size == nullptr) {
+        set_error(error_message, error_message_capacity, "invalid argument");
+        return NANO_LANCE_READER_INVALID_ARGUMENT;
+    }
+    *out_size = 0U;
+    const std::string suri(uri);
+    if (suri.rfind("file://", 0) == 0) {
+        const std::string fpath = file_uri_to_path(suri);
+        std::string reject_reason;
+        if (!file_blob_path_allowed(fpath, reject_reason)) {
+            set_error(error_message, error_message_capacity, reject_reason);
+            return NANO_LANCE_READER_INVALID_ARGUMENT;
+        }
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(fpath, ec);
+        if (ec) {
+            set_error(error_message, error_message_capacity, "failed to stat file:// path");
+            return NANO_LANCE_READER_IO_ERROR;
+        }
+        *out_size = static_cast<uint64_t>(size);
+        return NANO_LANCE_READER_OK;
+    }
+#ifdef NANO_LANCE_READER_HAS_S3
+    if (suri.rfind("s3://", 0) == 0) {
+        auto stream = s3_factory().open(suri, kS3ReadAheadBytes);
+        if (!stream) {
+            set_error(error_message, error_message_capacity,
+                      s3_factory().error().empty() ? "failed to open s3:// stream" : s3_factory().error());
+            return NANO_LANCE_READER_IO_ERROR;
+        }
+        stream->seekg(0, std::ios::end);
+        const auto end = stream->tellg();
+        if (!*stream || end < 0) {
+            set_error(error_message, error_message_capacity, "failed to size s3:// object");
+            return NANO_LANCE_READER_IO_ERROR;
+        }
+        *out_size = static_cast<uint64_t>(end);
+        return NANO_LANCE_READER_OK;
+    }
+#endif
+    set_error(error_message, error_message_capacity, "unsupported URI scheme");
+    return NANO_LANCE_READER_IO_ERROR;
+}
+
 int nano_lance_block_cache_configure(const char* cache_dir, int max_blocks, char* error_message,
                                      size_t error_message_capacity) {
 #ifdef NANO_LANCE_HAS_BLOCK_CACHE

@@ -177,6 +177,10 @@ int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* ke
 /// Staged writers only: a property recorded in the finishing commit's transaction file (Lance's
 /// transaction_properties; "__lance_commit_message" holds a commit message).
 int nano_lance_writer_set_transaction_property(NanoLanceWriter* writer, const char* key, const char* value);
+/// The most bytes a packed Blob v2 sidecar file holds, over each blob field's own
+/// `lance-encoding:blob-pack-file-size-threshold` (Lance's blob_pack_file_size_threshold write
+/// parameter). 0 restores the fields' own.
+int nano_lance_writer_set_blob_pack_file_size(NanoLanceWriter* writer, uint64_t bytes);
 int nano_lance_writer_close(NanoLanceWriter* writer);
 
 const char* nano_lance_writer_last_error(const NanoLanceWriter* writer);

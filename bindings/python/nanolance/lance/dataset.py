@@ -13,12 +13,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance._errors import native, unsupported
@@ -140,7 +142,7 @@ def _rename(table: pa.Table, columns) -> pa.Table:
     return table
 
 
-class LanceDataset:
+class LanceDataset(pa.dataset.Dataset):
     """A Lance dataset at a version. Mirrors ``lance.LanceDataset``."""
 
     def __init__(
@@ -253,6 +255,9 @@ class LanceDataset:
 
     def __getstate__(self):
         return {"uri": self._uri, "version": self._version, "pinned": self._pinned}
+
+    def __reduce__(self):  # over pyarrow.dataset.Dataset's, which would pickle a native dataset
+        return (_restore_dataset, (self.__getstate__(),))
 
     def __setstate__(self, state):
         self.__init__(state["uri"], version=state["version"])
@@ -504,8 +509,20 @@ class LanceDataset:
             order_by=order_by, use_scalar_index=use_scalar_index, prefilter=prefilter, **kwargs,
         ).to_batches()
 
-    def to_pandas(self, columns=None, filter=None, limit=None, offset=None, **kwargs):
-        return self.to_table(columns=columns, filter=filter, limit=limit, offset=offset, **kwargs).to_pandas()
+    def to_pandas(self, columns=None, filter=None, limit=None, offset=None, nearest=None, batch_size=None,
+                  batch_readahead=None, fragment_readahead=None, scan_in_order=None, *, prefilter=None,
+                  with_row_id=None, with_row_address=None, use_stats=None, fast_search=None, full_text_query=None,
+                  io_buffer_size=None, late_materialization=None, blob_mode: str = "lazy", use_scalar_index=None,
+                  include_deleted_rows=None, order_by=None, disable_scoring_autoprojection=None, **kwargs):
+        """The scan as a pandas DataFrame (see :meth:`LanceScanner.to_pandas`); ``kwargs`` go to
+        ``pyarrow.Table.to_pandas``. Mirrors ``lance.LanceDataset.to_pandas``."""
+        return self.scanner(
+            columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest, batch_size=batch_size,
+            prefilter=prefilter, with_row_id=bool(with_row_id), with_row_address=bool(with_row_address),
+            fast_search=fast_search, full_text_query=full_text_query, use_scalar_index=use_scalar_index,
+            include_deleted_rows=include_deleted_rows, order_by=order_by,
+            disable_scoring_autoprojection=disable_scoring_autoprojection,
+        ).to_pandas(blob_mode=blob_mode, **kwargs)
 
     def head(self, num_rows: int, **kwargs) -> pa.Table:
         return self.to_table(limit=num_rows, **kwargs)
@@ -579,9 +596,44 @@ class LanceDataset:
             raise unsupported("row version columns of a dataset with stable row ids")
         return pa.array([1] * rows, pa.uint64())
 
+    def to_polars(self, batch_size: Optional[int] = None):
+        """The dataset as a Polars LazyFrame (as LanceDB's ``Table.to_polars``): a scan of this
+        pyarrow dataset, with Polars' projections and filters pushed down into it."""
+        import polars as pl
+
+        return pl.scan_pyarrow_dataset(self, batch_size=batch_size)
+
+    # ── pyarrow.dataset.Dataset ─────────────────────────────────────────────────────────────────
+    # A pyarrow Dataset, as pylance's is, so DuckDB's replacement scans, Polars' scan_pyarrow_dataset
+    # and pyarrow's own consumers take it (scanner / to_table / to_batches / count_rows / schema with
+    # projection and pyarrow-expression filters pushed down). The base class's other methods would act
+    # on a native pyarrow dataset there is none of: each is overridden.
+
+    @property
+    def partition_expression(self):
+        raise NotImplementedError("partitioning not yet supported")
+
+    def replace_schema(self, schema):
+        raise NotImplementedError(
+            "Cannot replace the schema of a dataset.  This method exists for backwards compatibility with "
+            "pyarrow.  Use replace_schema_metadata or replace_field_metadata to change the metadata")
+
+    def join(self, right_dataset, keys, right_keys=None, join_type="left outer", left_suffix=None,
+             right_suffix=None, coalesce_keys=True, use_threads=True):
+        raise NotImplementedError("Versioning not yet supported in Rust")
+
+    def join_asof(self, *args, **kwargs):
+        raise NotImplementedError("join_asof is not supported on a Lance dataset; use to_table() first")
+
+    def sort_by(self, *args, **kwargs):
+        raise NotImplementedError("sort_by is not supported on a Lance dataset; use to_table(order_by=...)")
+
+    def filter(self, *args, **kwargs):
+        raise NotImplementedError("filter is not supported on a Lance dataset; use scanner(filter=...)")
+
     # ── blobs ───────────────────────────────────────────────────────────────────────────────────────
 
-    def _blob_rows(self, blob_column: str, ids, addresses, indices):
+    def _blob_rows(self, blob_column: str, ids=None, addresses=None, indices=None):
         """The Locations read of `blob_column` for the selected rows, in selection order."""
         given = [(k, v) for k, v in (("ids", ids), ("addresses", addresses), ("indices", indices)) if v is not None]
         if len(given) != 1:
@@ -618,6 +670,34 @@ class LanceDataset:
         addrs, _ = self._blob_rows(blob_column, ids, addresses, indices)
         files = self.take_blobs(blob_column, ids=ids, addresses=addresses, indices=indices)
         return [(a, None if f is None else f.readall()) for a, f in zip(addrs, files)]
+
+    def read_blob_ranges(self, blob_column: str, requests, *, selector: str, io_buffer_size=None,
+                         preserve_order=None) -> List[Tuple[int, int, Optional[bytes]]]:
+        """One ``(request_index, row_address, bytes)`` per ``(row, offset, length)`` request -- a
+        blob-local byte range of the row ``selector`` names ("ids", "addresses" or "indices"); ``None``
+        for a null blob. Results follow the request order. Mirrors ``lance.LanceDataset.read_blob_ranges``."""
+        from .blob import BlobFile
+
+        if selector not in ("ids", "addresses", "indices"):
+            raise ValueError(f"selector must be one of 'ids', 'addresses', or 'indices', got \"{selector}\"")
+        requests = [(int(row), int(offset), int(length)) for row, offset, length in requests]
+        for i, (_, offset, length) in enumerate(requests):
+            if offset + length >= 2**64:
+                raise ValueError(f"Invalid user input: Blob range request {i} offset + length overflowed u64: "
+                                 f"offset={offset}, length={length}")
+        if not requests:
+            return []
+        addrs, rows = self._blob_rows(blob_column, **{selector: [row for row, _, _ in requests]})
+        out = []
+        for i, ((_, offset, length), addr, r) in enumerate(zip(requests, addrs, rows)):
+            if r is None:
+                out.append((i, addr, None))
+                continue
+            if offset + length > r["size"]:
+                raise ValueError(f"Invalid user input: Blob range end {offset + length} exceeds blob size {r['size']}")
+            blob = BlobFile(r["file"], r["kind"] == 3, 0 if r["kind"] == 2 else r["position"], r["size"])
+            out.append((i, addr, blob.read_range(offset, length) if length else b""))
+        return out
 
     def sample(self, num_rows: int, columns=None, randomize_order: bool = True, **kwargs) -> pa.Table:
         import random
@@ -1611,7 +1691,16 @@ class MergeInsertBuilder:
                 )
         if len(reader.schema.names) < len(target.names):
             reader = self._fill_missing_columns(reader, target)
-        conformed = pa.RecordBatchReader.from_batches(target, (_conform(b, target) for b in reader))
+        blob_columns = [i for i, f in enumerate(target) if _is_blob_v2(f)]
+
+        def checked(batch):  # a source's external blob URIs, refused as Lance refuses them
+            return _blob_batch(batch, blob_columns, "reference", False) if blob_columns else batch
+
+        if blob_columns:  # refused before the merge starts, not from inside its stream
+            batches = [checked(_conform(b, target)) for b in reader]
+            conformed = pa.RecordBatchReader.from_batches(target, iter(batches))
+        else:
+            conformed = pa.RecordBatchReader.from_batches(target, (_conform(b, target) for b in reader))
         with native():
             stats, _ = _nanolance._ds_merge_insert(self._ds.uri, self._on, self._update_all, self._insert_all,
                                                    self._delete_by_source, self._delete_condition, conformed,
@@ -1929,7 +2018,13 @@ class IndexDescription:
                 f"total_size_bytes={self.total_size_bytes})")
 
 
-class LanceScanner:
+def _restore_dataset(state) -> "LanceDataset":
+    ds = LanceDataset.__new__(LanceDataset)
+    ds.__setstate__(state)
+    return ds
+
+
+class LanceScanner(pa.dataset.Scanner):
     """A configured read. Mirrors ``lance.LanceScanner``."""
 
     def __init__(self, ds: LanceDataset, columns=None, filter=None, limit=None, offset=None, nearest=None,
@@ -1937,6 +2032,8 @@ class LanceScanner:
                  include_deleted_rows=None, order_by=None, substrait_filter=None, scan_stats_callback=None,
                  blob_handling=None, use_scalar_index=None, prefilter=None, fast_search=None,
                  disable_scoring_autoprojection=None, batch_size_bytes=None, **ignored):
+        self._args = {k: v for k, v in locals().items() if k not in ("self", "ds", "ignored", "__class__")}
+        self._args.update(ignored)
         # order_by: the scan without limit and offset (and with the sort columns), sorted, then sliced.
         self._order_by = _orderings(ds, order_by)
         if self._order_by:
@@ -2105,6 +2202,39 @@ class LanceScanner:
     def to_table(self) -> pa.Table:
         return _json_out(self._to_table())
 
+    def to_pandas(self, *, blob_mode: str = "lazy", **kwargs):
+        """The scan as a pandas DataFrame. Blob columns come back as ``blob_mode`` asks: "lazy", a
+        :class:`BlobFile` per row; "bytes", the bytes; "descriptions", as ``to_table`` gives them.
+        Mirrors ``lance.LanceScanner.to_pandas``."""
+        if blob_mode not in ("lazy", "bytes", "descriptions"):
+            raise ValueError("blob_mode must be one of: 'lazy', 'bytes', 'descriptions'")
+        table = self.to_table()
+        blobs = [f.name for f in table.schema if _is_blob_field(f)]
+        if not blobs or blob_mode == "descriptions":
+            return table.to_pandas(**kwargs)
+        if blob_mode == "bytes":
+            return LanceScanner(self._ds, **{**self._args, "blob_handling": "all_binary"}).to_table().to_pandas(**kwargs)
+        from .blob import BlobFile
+
+        requested = bool(self._args.get("with_row_address"))
+        table = LanceScanner(self._ds, **{**self._args, "with_row_address": True}).to_table()
+        addresses = table.column("_rowaddr").to_pylist()
+        files = {}
+        for name in blobs:
+            rows = self._ds._take(addresses, [name], addresses=True, with_row_address=False,
+                                  blob_handling=_nanolance.BLOB_LOCATIONS).column(name).to_pylist()
+            files[name] = [None if r is None else
+                           BlobFile(r["file"], r["kind"] == 3, 0 if r["kind"] == 2 else r["position"], r["size"])
+                           for r in rows]
+        drop = blobs + ([] if requested else ["_rowaddr"])
+        rest = table.drop_columns(drop)
+        import pandas as pd
+
+        frame = rest.to_pandas(**kwargs) if rest.num_columns else pd.DataFrame(index=range(table.num_rows))
+        for name in blobs:
+            frame.insert(table.schema.get_field_index(name), name, pd.Series(files[name], dtype=object))
+        return frame
+
     def _to_table(self) -> pa.Table:
         if self._order_by:
             return self._sorted_table()
@@ -2250,6 +2380,28 @@ class LanceScanner:
                                    use_scalar_index=self._use_scalar_index)
             return counter.to_table().num_rows
         return self.to_table().num_rows
+
+    # pyarrow.dataset.Scanner's other methods, overridden (see LanceDataset).
+    @staticmethod
+    def from_dataset(*args, **kwargs):
+        raise NotImplementedError("from dataset")
+
+    @staticmethod
+    def from_fragment(*args, **kwargs):
+        raise NotImplementedError("from fragment")
+
+    @staticmethod
+    def from_batches(*args, **kwargs):
+        raise NotImplementedError("from batches")
+
+    def scan_batches(self):
+        return list(self.to_reader())
+
+    def take(self, indices):
+        raise NotImplementedError("take")
+
+    def head(self, num_rows):
+        return self.to_table()[:num_rows]
 
     @property
     def projected_schema(self) -> pa.Schema:
@@ -2510,9 +2662,17 @@ def write_dataset(
     target_bases=None,
     namespace=None,
     table_id=None,
+    external_blob_mode: str = "reference",
+    allow_external_blob_outside_bases: bool = False,
+    blob_pack_file_size_threshold: Optional[int] = None,
     **kwargs,
 ) -> LanceDataset:
-    """Write data to a Lance dataset. Mirrors ``lance.write_dataset``: one new version per call."""
+    """Write data to a Lance dataset. Mirrors ``lance.write_dataset``: one new version per call.
+
+    Blob v2 columns (``blob_field`` / ``blob_array``) are stored as Lance stores them: bytes inline,
+    packed or dedicated by size, URIs as external references -- which, the dataset having no
+    registered external bases, takes ``allow_external_blob_outside_bases=True``. With
+    ``external_blob_mode="ingest"`` the bytes a URI names are copied into the dataset instead."""
     if uri is None:
         raise ValueError("uri is required")
     if mode not in _MODES:
@@ -2523,8 +2683,18 @@ def write_dataset(
         raise unsupported("stable row ids")
     if max_rows_per_file is not None and int(max_rows_per_file) <= 0:
         raise ValueError("max_rows_per_file must be greater than 0")
+    if external_blob_mode not in ("reference", "ingest"):
+        raise ValueError(f"Invalid user input: Invalid external blob mode: {external_blob_mode}")
+    if external_blob_mode == "ingest" and allow_external_blob_outside_bases:
+        raise OSError('Invalid user input: allow_external_blob_outside_bases only applies when '
+                      'external_blob_mode="reference"')
+    if blob_pack_file_size_threshold is not None:
+        from .blob import _validate_threshold
+
+        _validate_threshold("blob_pack_file_size_threshold", blob_pack_file_size_threshold, allow_zero=False)
     path = _path_of(uri)
     reader = _coerce_reader(data_obj, schema)
+    blob_columns = [i for i, f in enumerate(reader.schema) if _is_blob_v2(f)]
     exists = _exists(path)
     in_memory = not isinstance(uri, LanceDataset) and os.fspath(uri).startswith("memory://")
     if mode == "create" and exists and in_memory:
@@ -2540,6 +2710,7 @@ def write_dataset(
     if append:
         target = LanceDataset(path)._data_schema
         _check_append_schema(target, reader.schema, allow_subset=True)
+        _check_blob_thresholds(target, reader.schema)
     options = _nanolance.WriteOptions()
     with native():
         writer = _nanolance._StagedWriter(path, options, append, int(max_rows_per_file or 0),
@@ -2556,6 +2727,8 @@ def write_dataset(
     for key, value in properties.items():
         with native():
             writer.set_transaction_property(str(key), str(value))
+    if blob_pack_file_size_threshold is not None:
+        writer.set_blob_pack_file_size(int(blob_pack_file_size_threshold))
     if target is not None and len(reader.schema.names) < len(target.names):
         # Part of the schema: the new files hold those columns alone, as Lance writes them, and the
         # others read as null.
@@ -2566,6 +2739,8 @@ def write_dataset(
     limit = int(max_rows_per_file or 0)
     in_file = 0
     for batch in reader:
+        if blob_columns:
+            batch = _blob_batch(batch, blob_columns, external_blob_mode, allow_external_blob_outside_bases)
         if target is not None:
             batch = _conform(batch, target)
         if batch.num_rows == 0 and wrote:
@@ -2592,6 +2767,111 @@ def write_dataset(
     return LanceDataset(path)
 
 
+def _is_blob_field(field: pa.Field) -> bool:
+    """A blob column, as a scan returns it: a Blob v2 or a legacy blob column."""
+    metadata = field.metadata or {}
+    return metadata.get(b"lance-encoding:blob") == b"true" or _is_blob_v2(field)
+
+
+def _is_blob_v2(field: pa.Field) -> bool:
+    if getattr(field.type, "extension_name", None) == "lance.blob.v2":
+        return True
+    return (field.metadata or {}).get(b"ARROW:extension:name") == b"lance.blob.v2"
+
+
+_URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def _blob_batch(batch: pa.RecordBatch, columns, mode: str, allow_outside: bool) -> pa.RecordBatch:
+    """Lance's handling of a blob column's URIs before the write: in "reference" mode each must be
+    allowed outside the dataset (there are no registered bases) and be absolute; in "ingest" mode the
+    bytes each names are read and written as the blob's data."""
+    import pyarrow.compute as pc
+
+    arrays = list(batch.columns)
+    for i in columns:
+        column = arrays[i]
+        storage = column.storage if isinstance(column, pa.ExtensionArray) else column
+        names = [storage.type.field(k).name for k in range(storage.type.num_fields)]
+        if "uri" not in names or "data" not in names:
+            continue
+        children = dict(zip(names, storage.flatten()))  # sliced, and null where the row is
+        uri, data = children["uri"], children["data"]
+        external = pc.and_(uri.is_valid(), data.is_null())
+        if "size" in children and mode == "ingest":
+            # A row Lance refuses (an empty or half-given range) stays as it is, for the writer to refuse.
+            size, position = children["size"], children["position"]
+            whole = pc.and_(size.is_null(), position.is_null())
+            ranged = pc.and_(pc.and_(size.is_valid(), position.is_valid()), pc.greater(size, 0))
+            external = pc.and_(external, pc.or_(whole, pc.fill_null(ranged, False)))
+        if not pc.any(external).as_py():
+            continue
+        if mode == "reference":
+            if not allow_outside:
+                raise OSError(f"Invalid user input: External blob URI '{uri.filter(external)[0].as_py()}' is "
+                              "outside registered external bases (dataset root is not allowed). Set "
+                              "allow_external_blob_outside_bases=true to store it as absolute external URI.")
+            relative = pc.and_(external, pc.invert(pc.match_substring_regex(uri, _URI_SCHEME.pattern)))
+            if pc.any(relative).as_py():
+                raise OSError(f"Invalid user input: External URI '{uri.filter(relative)[0].as_py()}' is outside "
+                              "registered external bases and is not a valid absolute URI")
+            continue
+        uris = uri.to_pylist()
+        positions = children["position"].to_pylist() if "position" in children else [None] * len(uris)
+        sizes = children["size"].to_pylist() if "size" in children else [None] * len(uris)
+        values = data.to_pylist()
+        for r in pc.indices_nonzero(external).to_pylist():
+            with native():
+                if positions[r] is None:
+                    size = _nanolance._external_blob_size(uris[r])
+                    values[r] = _nanolance._blob_read(uris[r], True, 0, size, 0, size)
+                else:
+                    values[r] = _nanolance._blob_read(uris[r], True, positions[r], sizes[r], 0, sizes[r])
+            uris[r] = positions[r] = sizes[r] = None
+        rebuilt = {"data": pa.array(values, pa.large_binary()), "uri": pa.array(uris, pa.utf8()),
+                   "position": pa.array(positions, pa.uint64()), "size": pa.array(sizes, pa.uint64())}
+        struct = pa.StructArray.from_arrays([rebuilt[n] for n in names], fields=list(storage.type),
+                                            mask=storage.is_null())
+        arrays[i] = pa.ExtensionArray.from_storage(column.type, struct) if isinstance(column, pa.ExtensionArray) \
+            else struct
+    return pa.RecordBatch.from_arrays(arrays, schema=batch.schema)
+
+
+def _blob_reshape(column: pa.ExtensionArray, typ: pa.DataType) -> pa.Array:
+    """A blob column in another of Lance's logical shapes (struct<data, uri> and
+    struct<data, uri, position, size>): the children it lacks are null."""
+    storage = column.storage
+    target = typ.storage_type if isinstance(typ, pa.ExtensionType) else typ
+    have = dict(zip([storage.type.field(k).name for k in range(storage.type.num_fields)], storage.flatten()))
+    children = [have.get(f.name, pa.nulls(len(storage), f.type)) for f in target]
+    struct = pa.StructArray.from_arrays(children, fields=list(target), mask=storage.is_null())
+    return pa.ExtensionArray.from_storage(typ, struct) if isinstance(typ, pa.ExtensionType) else struct
+
+
+_BLOB_THRESHOLDS = ((b"lance-encoding:blob-inline-size-threshold", 64 * 1024),
+                    (b"lance-encoding:blob-dedicated-size-threshold", 4 * 1024 * 1024),
+                    (b"lance-encoding:blob-pack-file-size-threshold", 1024 * 1024 * 1024))
+
+
+def _check_blob_thresholds(target: pa.Schema, given: pa.Schema) -> None:
+    """Lance's check on an append: a blob threshold the new data sets must be the dataset's."""
+    for field in given:
+        if field.name not in target.names:
+            continue
+        existing = target.field(field.name)
+        if not (_is_blob_v2(field) or _is_blob_v2(existing)):
+            continue
+        for key, default in _BLOB_THRESHOLDS:
+            if key not in (field.metadata or {}):
+                continue
+            mine = field.metadata[key].decode()
+            theirs = (existing.metadata or {}).get(key, str(default).encode()).decode()
+            if int(mine) != int(theirs):
+                raise OSError(f"Invalid user input: Cannot append data with blob threshold metadata {key.decode()}="
+                              f"{int(mine)} for field '{field.name}'; the dataset schema has effective value "
+                              f"{int(theirs)}. Blob thresholds for existing columns are stored in the dataset schema.")
+
+
 def _check_append_schema(target: pa.Schema, given: pa.Schema, allow_subset: bool = False) -> None:
     """Lance's check: no column the dataset lacks, and (with `allow_subset`) only nullable columns
     left out."""
@@ -2611,6 +2891,8 @@ def _conform(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
     columns = [batch.column(batch.schema.get_field_index(f.name)) for f in target]
     out = []
     for col, field in zip(columns, target):
+        if col.type != field.type and _is_blob_v2(field) and isinstance(col, pa.ExtensionArray):
+            col = _blob_reshape(col, field.type)
         out.append(col if col.type == field.type else col.cast(field.type))
     return pa.RecordBatch.from_arrays(out, schema=target)
 

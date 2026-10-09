@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterator, List, Optional
 
 import pyarrow as pa
+import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance._errors import native, unsupported
@@ -70,7 +71,7 @@ class FragmentMetadata:
         }
 
 
-class LanceFragment:
+class LanceFragment(pa.dataset.Fragment):
     """One fragment of a dataset version. Mirrors ``lance.LanceFragment``."""
 
     def __init__(self, dataset: "LanceDataset", fragment_id: Optional[int], *, _info: Optional[dict] = None,
@@ -143,6 +144,13 @@ class LanceFragment:
         return self.scanner(columns=columns, filter=filter, limit=limit, offset=offset, with_row_id=with_row_id,
                             with_row_address=with_row_address, **kwargs).to_table()
 
+    def to_pandas(self, columns=None, filter=None, limit=None, offset=None, batch_size=None, with_row_id=False,
+                  with_row_address=False, blob_mode: str = "lazy", order_by=None, **kwargs):
+        """This fragment as a pandas DataFrame; ``kwargs`` go to ``pyarrow.Table.to_pandas``."""
+        return self.scanner(columns=columns, filter=filter, limit=limit, offset=offset, batch_size=batch_size,
+                            with_row_id=with_row_id, with_row_address=with_row_address,
+                            order_by=order_by).to_pandas(blob_mode=blob_mode, **kwargs)
+
     def to_batches(self, columns=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=False,
                    **kwargs) -> Iterator[pa.RecordBatch]:
         return self.scanner(columns=columns, batch_size=batch_size, filter=filter, limit=limit, offset=offset,
@@ -150,6 +158,15 @@ class LanceFragment:
 
     def head(self, num_rows: int) -> pa.Table:
         return self.to_table(limit=num_rows)
+
+    # pyarrow.dataset.Fragment's other members, overridden (see LanceDataset).
+    @property
+    def physical_schema(self) -> pa.Schema:
+        raise NotImplementedError("Not implemented yet for LanceFragment")
+
+    @property
+    def partition_expression(self):
+        raise NotImplementedError("Not implemented yet for LanceFragment")
 
     def take(self, indices, columns=None) -> pa.Table:
         addresses = [(self._id << 32) | int(i) for i in indices]
