@@ -286,6 +286,45 @@ tables, and LanceDB to nanolance's). `tests/test_interop.py` checks each against
 the engine over the same table in memory; `tools/interop_suite.py` runs it in environments with the
 DuckDB extension (built for DuckDB 1.5.0, not 1.5.5) and LanceDB installed.
 
+## Namespaces
+
+`lance.namespace.DirectoryNamespace`, `RestNamespace` and `RestAdapter`, and `lance.dataset` /
+`write_dataset` / `LanceDataset.commit` with `namespace_client` and `table_id`, are ports of Lance's
+(lance-namespace-impls 12: `dir.rs`, `dir/manifest.rs`, `rest.rs`, `rest_adapter.rs`), in Python over
+nanolance's datasets; `lance_namespace.connect("dir" | "rest", ...)` finds them.
+
+- **The catalog on disk is Lance's.** Root tables live at `<root>/<name>.lance`; with the manifest
+  enabled (the default) the `<root>/__manifest` Lance table records every namespace and table
+  (`object_id` -- the id joined by `$` --, `object_type`, `location`, `metadata` as JSON,
+  `base_objects`), and child tables get `<hash>_<object_id>` directories. Every change rewrites
+  that table as one fragment and commits it as an Overwrite at exactly the next version, so writers
+  in this process, other processes and pylance retry against what won (`commit_retries`). Either
+  library reads and writes the other's catalog; `tests/test_namespace.py` checks that both ways,
+  with both libraries writing one catalog at once.
+- **Operations**: namespaces (create, describe, list, exists, drop), tables (create with
+  Create / ExistOk / Overwrite, declare, describe with `check_declared` and
+  `load_detailed_metadata`, exists, list with pagination and `include_declared`, drop, register
+  with Lance's location checks, deregister, also without the manifest through `.lance-reserved` /
+  `.lance-deregistered` markers), versions (list, describe, create with Lance's version CAS,
+  batch delete), data (count rows, insert, merge insert, update, delete, query with filters,
+  projection, vector and full-text search, returned as Arrow IPC), indexes (create, create scalar,
+  list, stats, drop), tags, restore, schema metadata, table stats, query plans, add / alter / drop
+  columns, describe / alter transaction, ops metrics. Errors are lance_namespace's exceptions with
+  Lance's words: the test compares 21 failing calls against pylance's.
+- **Managed versioning** (`table_version_tracking_enabled`): `lance.dataset` resolves versions with
+  `list_table_versions` / `describe_table_version`, and every version nanolance commits through such
+  a dataset is published with `create_table_version`. nanolance has already written the manifest
+  itself (atomically), so the namespace sees the version published with the same bytes and takes
+  the call as an idempotent retry -- right for directory-backed catalogs; a namespace that keeps
+  versions somewhere else records them too, but cannot veto them.
+- **REST**: the client and the adapter speak the namespace REST spec as Lance's do (ids joined by the
+  delimiter and percent-encoded, Arrow IPC bodies, `ErrorResponse` with Lance's HTTP statuses, the
+  dynamic context provider's `headers.*`), so nanolance's client works against Lance's adapter and
+  Lance's client against nanolance's.
+- **Not yet**: table branches (nanolance has no branches), credential vending (local roots only),
+  `rename_table` (Lance's directory namespace refuses it too), materialized views, structured
+  full-text queries in `query_table`.
+
 ## What is not implemented
 
 These raise `NotImplementedError` (`nanolance.lance.NotSupportedError`) naming the feature. None of
@@ -307,7 +346,8 @@ them is silently ignored:
 - External blobs under registered base paths, and the prepared-layout blob writers (`PackedBlobWriter`,
   `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`); blob data through `add_columns` or
   `write_fragments`.
-- Object stores and namespaces (`s3://`, `gs://`, REST and directory namespaces).
+- Object stores (`s3://`, `gs://`); credential vending and the materialized-view, branch and rename
+  operations of namespaces.
 - torch and Hugging Face integration, blob-file APIs, the memtable write-ahead log
   (`mem_wal`).
 
@@ -337,32 +377,37 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **603**, every one of which pylance also passes (483 before distributed index builds, 393 before blobs, 383 before the writer tail, 336 before the small dataset APIs, 316 before JSON columns and filter functions, 312 before compaction planning, 311 before transaction files, 305 before `order_by`, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
+| nanolance.lance | **828**, every one of which pylance also passes (698 before namespaces, 603 before transactions and fragment-level writes, 483 before distributed index builds, 393 before blobs, 383 before the writer tail, 336 before the small dataset APIs, 316 before JSON columns and filter functions, 312 before compaction planning, 311 before transaction files, 305 before `order_by`, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
 
 By test file, where nanolance passes any:
 
 | file | pylance | nanolance |
 |---|---|---|
-| test_dataset.py | 250 | 146 |
-| test_blob.py | 214 | 87 |
-| test_scalar_index.py | 189 | 82 |
+| test_dataset.py | 250 | 176 |
+| test_namespace_dir.py | 101 | 97 |
+| test_blob.py | 214 | 93 |
+| test_scalar_index.py | 189 | 84 |
 | test_bitmap.py | 66 | 55 |
+| test_fragment.py | 85 | 36 |
+| test_vector_index.py | 97 | 34 |
+| test_namespace_rest.py | 33 | 33 |
 | test_file.py | 40 | 31 |
-| test_vector_index.py | 97 | 31 |
 | test_column_names.py | 27 | 27 |
 | test_filter.py | 26 | 25 |
 | test_indices.py | 27 | 23 |
+| test_schema_evolution.py | 23 | 20 |
 | test_map_type.py | 19 | 17 |
 | test_lance.py | 23 | 11 |
-| test_json.py | 18 | 10 |
-| test_fragment.py | 85 | 10 |
 | test_coerce_query_vector.py | 10 | 10 |
+| test_json.py | 18 | 10 |
 | test_optimize.py | 22 | 8 |
+| test_table_ops.py | 8 | 7 |
 | test_pydantic.py | 12 | 6 |
 | test_schema.py | 4 | 4 |
-| test_schema_evolution.py | 23 | 4 |
+| test_fragment_typing.py | 3 | 3 |
+| test_order_by.py | 3 | 3 |
 | test_vector.py | 9 | 3 |
-| others | | 14 |
+| others | | 12 |
 
 The main reasons tests fail today:
 
@@ -370,8 +415,8 @@ The main reasons tests fail today:
   tokenizers, list columns), scalar indexes other than BTree / Bitmap / LabelList / INVERTED or
   their build options (about 110 in `test_scalar_index.py`), vector index kinds other than
   IVF_FLAT / IVF_PQ / IVF_HNSW_SQ, indexes on float16 / float64 / binary / multivector columns
-  (about 60), namespaces (about 130), object stores or the `mem_wal`.
-- About 90 need the transaction API, fragment-level writes, stable row ids or multiple base paths.
+  (about 60), table branches, object stores or the `mem_wal`.
+- Many need stable row ids, multiple base paths or table branches.
 - About 25 need filter functions nanolance lacks, or a data storage version other than 2.2.
 - A tail of writer gaps in nanolance itself: dictionary columns inside structs or lists, null
   elements of a fixed-size list under a list or struct, bfloat16. Each is a real gap, listed by

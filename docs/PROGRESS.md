@@ -3194,3 +3194,35 @@ publishes them.
   operations committed, fragments written by one library commit in the other, conflicts come out
   as Lance decides them; pylance's suite 698 (603 before); ctest 60/60, lance-c 106/106, the Python
   suite 2161, interop green.
+
+
+## Namespaces
+
+- **DirectoryNamespace**, a port of Lance's `dir.rs` / `dir/manifest.rs` over nanolance's datasets
+  (`bindings/python/nanolance/lance/_namespace_dir.py`): the `__manifest` table with Lance's schema
+  (primary-key metadata on `object_id`, `base_objects` as `list<utf8>`), rewritten as one fragment
+  and committed as a strict Overwrite at the next version -- the put-if-not-exists Lance's rewrite
+  relies on, so a lost race re-reads and retries (or fails, for a create of an id the winner
+  created) as Lance's ConflictResolution decides. Root tables at `<name>.lance`, child tables at
+  `<hash>_<object_id>`, declared tables marked by `.lance-reserved`, directory listing and
+  migration mode, Lance's reader / writer feature-flag checks, the same JSON for properties.
+- **Data and table operations** through the namespace API (insert, merge insert, update, delete,
+  count, query as Arrow IPC, indexes, tags, versions with Lance's CAS, restore, stats, plans,
+  column changes, transactions with alteration sidecars), each raising lance_namespace's errors
+  in Lance's words.
+- **REST**: `_namespace_rest.py` -- the client of `rest.rs` and an `http.server` adapter of
+  `rest_adapter.rs`, table-driven from the spec's routes; either works against Lance's.
+- **Datasets through a namespace**: `lance.dataset(namespace_client=, table_id=)`, `write_dataset`
+  (declare_table for a create, describe_table for an append or overwrite), `LanceDataset.commit`;
+  with managed versioning, versions resolved through the namespace and every new version published
+  with `create_table_version` (a staged copy of the manifest nanolance already wrote, which the
+  directory namespace takes as an idempotent retry).
+- **Found on the way**: nothing in nanolance's datasets; one in the adapter -- an error from a
+  namespace other than nanolance's own reached clients with its Display prefix twice.
+- **Left**: table branches (4 of pylance's namespace tests), credential vending, materialized views,
+  structured full-text queries in `query_table`.
+- **Verified**: `tests/test_namespace.py` (9 tests: catalogs written by either library read the
+  same in both, both libraries writing one catalog -- also concurrently, from 8 threads --, the same
+  errors as pylance for 21 failing calls, REST each way, managed versioning across libraries);
+  pylance's suite 828 (698 before: `test_namespace_dir.py` 97, `test_namespace_rest.py` 33);
+  the Python suite 2170, interop green.

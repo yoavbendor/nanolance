@@ -189,8 +189,18 @@ class LanceDataset(pa.dataset.Dataset):
         return self._fragment_message_cache
 
     def _refresh_latest(self) -> None:
+        """Move to the latest version after a commit of this object's (reported to a namespace that
+        manages the table's versions)."""
+        before = self._version
         with native():
             self._set_info(_nanolance._ds_info(self._uri, None))
+        if getattr(self, "_ns_managed", False) and self._version > before:
+            _report_versions(self, before)
+
+    def _attach_namespace(self, namespace_client, table_id, managed: bool) -> None:
+        self._namespace_client = namespace_client
+        self._table_id = list(table_id) if table_id is not None else None
+        self._ns_managed = bool(managed)
 
     @classmethod
     def from_pydantic_model(cls, model, data, uri, **kwargs) -> "LanceDataset":
@@ -376,7 +386,8 @@ class LanceDataset(pa.dataset.Dataset):
         return LanceDataset(self._uri, version=version)
 
     def checkout_latest(self) -> "LanceDataset":
-        self._refresh_latest()
+        with native():
+            self._set_info(_nanolance._ds_info(self._uri, None))
         self._pinned = False
         return self
 
@@ -1453,8 +1464,6 @@ class LanceDataset(pa.dataset.Dataset):
                             f"got {type(operation)}")
         if (namespace_client is None) != (table_id is None):
             raise ValueError("Both 'namespace_client' and 'table_id' must be provided together.")
-        if namespace_client is not None:
-            raise unsupported("namespaces")
         if enable_stable_row_ids:
             raise unsupported("stable row ids")
         from nanolance.lance._transactions import encode_operation
@@ -1481,8 +1490,14 @@ class LanceDataset(pa.dataset.Dataset):
             return LanceDataset(path, version=int(version))
         if isinstance(operation, LanceOperation.CreateIndex):
             return LanceDataset._commit_create_index(path, operation)
+        before = LanceDataset(path).version if _exists(path) else 0
         version = _commit_hand_built(path, operation, read_version, properties, int(max_retries), timeout)
-        return LanceDataset(path, version=version)
+        ds = LanceDataset(path, version=version)
+        if namespace_client is not None:
+            ds._attach_namespace(namespace_client, table_id, namespace_client_managed_versioning)
+            if namespace_client_managed_versioning:
+                _report_versions(ds, before)
+        return ds
 
     @staticmethod
     def commit_batch(dest, transactions, commit_lock=None, storage_options=None, enable_v2_manifest_paths=None,
@@ -1546,6 +1561,42 @@ class LanceDataset(pa.dataset.Dataset):
         if name in known:
             raise unsupported(f"LanceDataset.{name}")
         raise AttributeError(name)
+
+
+def _field(obj, name: str):
+    """A field of a namespace response, a model or the dict some namespaces return."""
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+def _report_versions(ds: "LanceDataset", before: int) -> None:
+    """Publish versions ``before + 1 .. ds.version`` through the namespace that manages the table's
+    versions: create_table_version of a staged copy of each manifest. nanolance has already written
+    the manifest itself, atomically, so the namespace finds the version published with the same bytes
+    and takes it as an idempotent retry (a namespace that keeps versions elsewhere records it)."""
+    import uuid
+
+    from nanolance.lance._namespace_dir import _store_path
+    from lance_namespace import CreateTableVersionRequest
+
+    for version in range(int(before) + 1, ds.version + 1):
+        versions_dir = os.path.join(ds._uri, "_versions")
+        name = f"{(1 << 64) - 1 - version:020d}.manifest"
+        if not os.path.exists(os.path.join(versions_dir, name)):
+            name = f"{version}.manifest"
+        final = os.path.join(versions_dir, name)
+        if not os.path.exists(final):
+            continue
+        staging = f"{final}-{uuid.uuid4()}"
+        with open(final, "rb") as src, open(staging, "wb") as dst:
+            data = src.read()
+            dst.write(data)
+        try:
+            ds._namespace_client.create_table_version(CreateTableVersionRequest(
+                id=ds._table_id, version=version, manifest_path=_store_path(staging), manifest_size=len(data),
+                naming_scheme="V2" if len(name) == 29 else "V1"))
+        finally:
+            if os.path.exists(staging):
+                os.remove(staging)
 
 
 def _uses_v2_manifest_paths(path: str) -> bool:
@@ -3298,8 +3349,46 @@ def write_dataset(
     packed or dedicated by size, URIs as external references -- which, the dataset having no
     registered external bases, takes ``allow_external_blob_outside_bases=True``. With
     ``external_blob_mode="ingest"`` the bytes a URI names are copied into the dataset instead."""
-    if uri is None:
-        raise ValueError("uri is required")
+    namespace_client = kwargs.pop("namespace_client", None)
+    if namespace_client is None:
+        namespace_client = namespace
+    if uri is not None and (namespace_client is not None or table_id is not None):
+        raise ValueError("Cannot specify both 'uri' and 'namespace_client/table_id'. "
+                         "Please provide either 'uri' or both 'namespace_client' and 'table_id'.")
+    if uri is None and namespace_client is None and table_id is None:
+        raise ValueError("Must specify either 'uri' or both 'namespace_client' and 'table_id'.")
+    if (namespace_client is None) != (table_id is None):
+        raise ValueError("Both 'namespace_client' and 'table_id' must be provided together.")
+    managed = False
+    if namespace_client is not None:
+        from lance_namespace import DeclareTableRequest, DescribeTableRequest
+
+        if mode == "create":
+            response = namespace_client.declare_table(DeclareTableRequest(id=table_id, location=None))
+        elif mode in ("append", "overwrite"):
+            response = namespace_client.describe_table(DescribeTableRequest(id=table_id, version=None))
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+        uri = response.location
+        if not uri:
+            raise ValueError(f"Namespace did not return a table location in {mode} response")
+        managed = getattr(response, "managed_versioning", None) is True
+        before = LanceDataset(uri).version if _exists(_path_of(uri)) else 0
+        ds = write_dataset(data_obj, uri, schema, mode, max_rows_per_file=max_rows_per_file,
+                           max_rows_per_group=max_rows_per_group, max_bytes_per_file=max_bytes_per_file,
+                           commit_lock=commit_lock, progress=progress, storage_options=storage_options,
+                           data_storage_version=data_storage_version, use_legacy_format=use_legacy_format,
+                           enable_v2_manifest_paths=enable_v2_manifest_paths,
+                           enable_stable_row_ids=enable_stable_row_ids, auto_cleanup_options=auto_cleanup_options,
+                           commit_message=commit_message, transaction_properties=transaction_properties,
+                           initial_bases=initial_bases, target_bases=target_bases,
+                           external_blob_mode=external_blob_mode,
+                           allow_external_blob_outside_bases=allow_external_blob_outside_bases,
+                           blob_pack_file_size_threshold=blob_pack_file_size_threshold, **kwargs)
+        ds._attach_namespace(namespace_client, table_id, managed)
+        if managed:
+            _report_versions(ds, before)
+        return ds
     if mode not in _MODES:
         raise ValueError(f"Invalid mode: {mode}; expected one of create, append, overwrite")
     if data_storage_version not in (None, "stable", "2.2", "next") or use_legacy_format:
@@ -3573,7 +3662,7 @@ def _conform(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
 
 
 def dataset(
-    uri: Union[str, Path],
+    uri: Optional[Union[str, Path]] = None,
     version: Optional[Union[int, str]] = None,
     asof=None,
     block_size: Optional[int] = None,
@@ -3587,7 +3676,47 @@ def dataset(
     session=None,
     **kwargs,
 ) -> LanceDataset:
-    """Open a Lance dataset. Mirrors ``lance.dataset``."""
+    """Open a Lance dataset. Mirrors ``lance.dataset``: by ``uri``, or by ``namespace_client`` and
+    ``table_id`` (the location the namespace's describe_table gives; when the namespace manages the
+    table's versions, the version its list_table_versions / describe_table_version name)."""
+    namespace_client = kwargs.pop("namespace_client", None)
+    table_id = kwargs.pop("table_id", None)
+    kwargs.pop("base_store_params", None)
+    has_namespace = namespace_client is not None or table_id is not None
+    if uri is not None and has_namespace:
+        raise ValueError("Cannot specify both 'uri' and 'namespace_client/table_id'. "
+                         "Please provide either 'uri' or both 'namespace_client' and 'table_id'.")
+    if uri is None and not has_namespace:
+        raise ValueError("Must specify either 'uri' or both 'namespace_client' and 'table_id'.")
+    if has_namespace:
+        if namespace_client is None or table_id is None:
+            raise ValueError("Both 'namespace_client' and 'table_id' must be provided together.")
+        from lance_namespace import DescribeTableRequest, DescribeTableVersionRequest, ListTableVersionsRequest
+
+        response = namespace_client.describe_table(DescribeTableRequest(id=table_id, version=None))
+        uri = response.location
+        if not uri:
+            raise ValueError("Namespace did not return a table location")
+        managed = getattr(response, "managed_versioning", None) is True
+        if response.storage_options is not None:
+            storage_options = {**(storage_options or {}), **response.storage_options}
+        pinned = version is not None
+        if managed and isinstance(version, int):
+            described = namespace_client.describe_table_version(DescribeTableVersionRequest(id=table_id,
+                                                                                            version=version))
+            entry = _field(described, "version")
+            version = int(_field(entry, "version"))
+        elif managed and version is None and asof is None:
+            listed = namespace_client.list_table_versions(ListTableVersionsRequest(id=table_id, descending=True,
+                                                                                   limit=1))
+            versions = list(_field(listed, "versions") or [])
+            if versions:
+                version = int(_field(versions[0], "version"))
+        ds = dataset(uri, version=version, asof=asof, default_scan_options=default_scan_options,
+                     storage_options=storage_options)
+        ds._pinned = pinned or asof is not None
+        ds._attach_namespace(namespace_client, table_id, managed)
+        return ds
     if asof is not None:
         ds = LanceDataset(uri)
         ts = asof if isinstance(asof, datetime) else datetime.fromisoformat(str(asof))

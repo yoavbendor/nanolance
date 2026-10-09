@@ -52,7 +52,7 @@ class StubModule(types.ModuleType):
 PYLANCE_MODULES = {
     "_arrow", "_arrow.bf16", "_datagen", "_dataset", "_dataset.cache", "_dataset.sharded_batch_iterator",
     "arrow", "bitmap", "debug", "download", "hf", "indices",
-    "indices.builder", "indices.ivf", "indices.pq", "io", "lance", "log", "mem_wal", "namespace",
+    "indices.builder", "indices.ivf", "indices.pq", "io", "lance", "log", "mem_wal",
     "otel", "sampler", "schema", "torch", "torch.async_dataset", "torch.bench_utils", "torch.data",
     "torch.dist", "torch.distance", "torch.kmeans", "tracing", "types", "util", "vector",
 }
