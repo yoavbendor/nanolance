@@ -1602,6 +1602,11 @@ bool count_full_zip_levels(const std::vector<std::uint8_t>& data, const FullZipP
     return true;
 }
 
+/// Set while a nested Blob v2 column is decoded (decode_nested_blob_column): its descriptor pages
+/// store each row's packed descriptor struct (Lance's variable PackedStruct, CompressiveEncoding field
+/// 13) behind a length prefix, which is read as the row's bytes.
+thread_local bool g_blob_descriptor_values = false;
+
 /// Fills `out` from a FullZip layout, or explains why it cannot be read.
 bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t page_rows,
                           FullZipPageParams& out, std::string& why) {
@@ -1688,6 +1693,10 @@ bool full_zip_page_params(const page_layout::PageLayout& layout, std::uint64_t p
             }
             out.value_scheme = values->scheme;
             values = values->values.get();
+        }
+        if (g_blob_descriptor_values && values != nullptr && values->kind == page_layout::CompressiveKind::kUnknown &&
+            values->wire_field == 13U) {
+            return true;  // a blob descriptor: kind, position, size, blob_id, uri, read as its bytes
         }
         if (values == nullptr || values->kind != page_layout::CompressiveKind::kVariable) {
             why = "unsupported FullZip value compression";
@@ -5687,10 +5696,87 @@ bool attach_dictionary(const std::filesystem::path& path, const pb::Field& field
 
 }  // namespace
 
+namespace {
+
+/// A Blob v2 column inside a struct or a list (its pages carry the structs' definition levels, or a
+/// list's repetition): decoded as the nested variable-width column its pages are -- the layers built
+/// as for any nested column -- and each value turned back into its descriptor row
+/// ([u32 length][kind, position, size, blob_id, uri]). Returns false with `handled` unset when the
+/// column is not one.
+template <class Decode>
+bool decode_nested_blob_column(const std::filesystem::path& data_file_path, const pb::Field& field,
+                               const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
+                               bool& handled, Decode&& decode) {
+    handled = field.logical_type == "struct" && field_metadata_is_true(field, "lance-encoding:blob") &&
+              !v20::is_v20_column(column_metadata) && column_is_nested(column_metadata);
+    if (!handled) {
+        return false;
+    }
+    pb::Field as_bytes = field;
+    as_bytes.logical_type = "large_binary";
+    as_bytes.metadata.clear();
+    struct Guard {
+        Guard() { g_blob_descriptor_values = true; }
+        ~Guard() { g_blob_descriptor_values = false; }
+    } guard;
+    ColumnValues bytes;
+    if (!decode(as_bytes, bytes)) {
+        return false;
+    }
+    const auto items = bytes.variable.large ? bytes.variable.offsets.size() / 8U : bytes.variable.offsets.size() / 4U;
+    out = ColumnValues{};
+    out.kind = ColumnValues::Kind::BlobV2External;
+    out.blob_v2.data_file = data_file_path;
+    out.layers = std::move(bytes.layers);
+    out.validity = std::move(bytes.validity);
+    out.null_count = bytes.null_count;
+    out.rows = bytes.rows;
+    const auto offset_at = [&](std::size_t i) -> std::uint64_t {
+        if (bytes.variable.large) {
+            std::int64_t v = 0;
+            std::memcpy(&v, bytes.variable.offsets.data() + i * 8U, 8U);
+            return static_cast<std::uint64_t>(v);
+        }
+        std::int32_t v = 0;
+        std::memcpy(&v, bytes.variable.offsets.data() + i * 4U, 4U);
+        return static_cast<std::uint64_t>(v);
+    };
+    out.blob_v2.row_packed_sizes.reserve(items == 0U ? 0U : items - 1U);
+    out.blob_v2.packed_payload.reserve(bytes.variable.data.size() + 4U * items);
+    for (std::size_t i = 0; i + 1U < items; ++i) {
+        const auto begin = offset_at(i);
+        const auto end = offset_at(i + 1U);
+        const bool valid = out.validity.empty() || ((out.validity[i / 8U] >> (i % 8U)) & 1U) != 0U;
+        if (!valid || end == begin) {
+            out.blob_v2.row_packed_sizes.push_back(0U);  // null
+            continue;
+        }
+        const auto length = static_cast<std::uint32_t>(end - begin);
+        const auto* p = reinterpret_cast<const std::uint8_t*>(&length);
+        out.blob_v2.packed_payload.insert(out.blob_v2.packed_payload.end(), p, p + 4);
+        out.blob_v2.packed_payload.insert(out.blob_v2.packed_payload.end(),
+                                          bytes.variable.data.begin() + static_cast<std::ptrdiff_t>(begin),
+                                          bytes.variable.data.begin() + static_cast<std::ptrdiff_t>(end));
+        out.blob_v2.row_packed_sizes.push_back(length + 4U);
+    }
+    return true;
+}
+
+}  // namespace
+
 bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
                                        const pb::ColumnMetadata& column_metadata,
                                        const std::vector<std::uint64_t>& rows, std::size_t value_bytes,
                                        ColumnValues& out, std::string& error) {
+    bool blob = false;
+    const bool ok = decode_nested_blob_column(data_file_path, on_disk_field, column_metadata, out, error, blob,
+                                              [&](const pb::Field& f, ColumnValues& v) {
+                                                  return decode_lance_physical_column_rows_impl(
+                                                      data_file_path, f, column_metadata, rows, 0, v, error);
+                                              });
+    if (blob) {
+        return ok;
+    }
     return decode_lance_physical_column_rows_impl(data_file_path, on_disk_field, column_metadata, rows, value_bytes,
                                                   out, error) &&
            attach_dictionary(data_file_path, on_disk_field, column_metadata, out, error);
@@ -5698,6 +5784,15 @@ bool decode_lance_physical_column_rows(const std::filesystem::path& data_file_pa
 
 bool decode_lance_physical_column(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
                                   const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error) {
+    bool blob = false;
+    const bool ok = decode_nested_blob_column(data_file_path, on_disk_field, column_metadata, out, error, blob,
+                                              [&](const pb::Field& f, ColumnValues& v) {
+                                                  return decode_lance_physical_column_impl(data_file_path, f,
+                                                                                           column_metadata, v, error);
+                                              });
+    if (blob) {
+        return ok;
+    }
     return decode_lance_physical_column_impl(data_file_path, on_disk_field, column_metadata, out, error) &&
            attach_dictionary(data_file_path, on_disk_field, column_metadata, out, error);
 }
@@ -5706,6 +5801,15 @@ bool decode_lance_physical_column_range(const std::filesystem::path& data_file_p
                                         const pb::ColumnMetadata& column_metadata, std::uint64_t first,
                                         std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
                                         std::string& error) {
+    bool blob = false;
+    const bool ok = decode_nested_blob_column(data_file_path, on_disk_field, column_metadata, out, error, blob,
+                                              [&](const pb::Field& f, ColumnValues& v) {
+                                                  return decode_lance_physical_column_range_impl(
+                                                      data_file_path, f, column_metadata, first, count, 0, v, error);
+                                              });
+    if (blob) {
+        return ok;
+    }
     return decode_lance_physical_column_range_impl(data_file_path, on_disk_field, column_metadata, first, count,
                                                    value_bytes, out, error) &&
            attach_dictionary(data_file_path, on_disk_field, column_metadata, out, error);

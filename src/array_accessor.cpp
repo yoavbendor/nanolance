@@ -511,8 +511,9 @@ void append_bits(std::vector<std::uint8_t>& bits, std::uint64_t& nulls, std::uin
 /// Physical indices compose the Arrow way: a list's offsets are logical indices into its child (plus
 /// the child's own offset), and a struct's children are NOT sliced with it (child physical = child
 /// offset + the struct's physical index).
-bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, const LanceField& field,
-                   ColumnValues& out, std::string& error) {
+bool walk_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, const LanceField& field, ColumnValues& out,
+                 const ArrowArray*& leaf_node, std::int64_t& leaf_at, std::int64_t& leaf_count,
+                 std::vector<std::uint8_t>* ancestor_null, std::string& error) {
     std::vector<const LanceField*> path;
     for (const LanceField* f = &field; f != nullptr;
          f = f->parent_id < 0 ? nullptr : find_field_by_id(mapping, f->parent_id)) {
@@ -540,9 +541,25 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
     const ArrowArray* node = &top;
     std::int64_t at = top.offset;
     std::int64_t count = top.length;
+    // Per position of the current node: whether an ancestor (or the node itself) is null there.
+    std::vector<std::uint8_t> masked;
+    if (ancestor_null != nullptr) {
+        masked.assign(static_cast<std::size_t>(count), 0U);
+    }
+    const auto mask_own_nulls = [&](const ArrowArray& array) {
+        if (ancestor_null == nullptr || array.n_buffers == 0 || array.buffers == nullptr || array.buffers[0] == nullptr) {
+            return;
+        }
+        const auto* bits = static_cast<const std::uint8_t*>(array.buffers[0]);
+        for (std::int64_t i = 0; i < count; ++i) {
+            const auto p = at + i;
+            masked[static_cast<std::size_t>(i)] |= ((bits[p / 8] >> (p % 8)) & 1U) == 0U ? 1U : 0U;
+        }
+    };
     for (std::size_t k = 0; k + 1U < path.size(); ++k) {
         auto& layer = out.layers[k];
         append_bits(layer.validity, layer.null_count, layer.length, *node, at, count);
+        mask_own_nulls(*node);
         layer.length += static_cast<std::uint64_t>(count);
         if (layer.is_list) {
             if (node->n_buffers < 2 || node->buffers == nullptr || node->buffers[1] == nullptr ||
@@ -567,6 +584,15 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
             for (std::int64_t i = 1; i <= count; ++i) {
                 layer.offsets.push_back(base + offset_at(at + i) - first);
             }
+            if (ancestor_null != nullptr) {
+                std::vector<std::uint8_t> items(static_cast<std::size_t>(last - first), 0U);
+                for (std::int64_t i = 0; i < count; ++i) {
+                    for (auto j = offset_at(at + i); j < offset_at(at + i + 1); ++j) {
+                        items[static_cast<std::size_t>(j - first)] = masked[static_cast<std::size_t>(i)];
+                    }
+                }
+                masked = std::move(items);
+            }
             node = node->children[0];
             at = node->offset + first;
             count = last - first;
@@ -584,7 +610,23 @@ bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, c
             return false;
         }
     }
+    leaf_node = node;
+    leaf_at = at;
+    leaf_count = count;
+    if (ancestor_null != nullptr) {
+        *ancestor_null = std::move(masked);
+    }
+    return true;
+}
 
+bool append_nested(const ArrowArray& batch, const LanceSchemaMapping& mapping, const LanceField& field,
+                   ColumnValues& out, std::string& error) {
+    const ArrowArray* node = nullptr;
+    std::int64_t at = 0;
+    std::int64_t count = 0;
+    if (!walk_nested(batch, mapping, field, out, node, at, count, nullptr, error)) {
+        return false;
+    }
     std::string element;
     std::uint64_t items = 0;
     if (field.logical_type == "null" || lance_extension_is_lance_owned(field.extension_name)) {
@@ -768,6 +810,22 @@ std::int64_t null_count_of(const ArrowArray& array) {
 }
 
 }  // namespace
+
+bool nested_leaf_view(const ArrowArray& batch, const LanceSchemaMapping& mapping, const LanceField& field,
+                      ColumnValues& out, ArrowArray& leaf, std::vector<std::uint8_t>& ancestor_null,
+                      std::string& error) {
+    const ArrowArray* node = nullptr;
+    std::int64_t at = 0;
+    std::int64_t count = 0;
+    if (!walk_nested(batch, mapping, field, out, node, at, count, &ancestor_null, error)) {
+        return false;
+    }
+    leaf = *node;
+    leaf.offset = at;  // positions at .. at + count of the node's buffers
+    leaf.length = count;
+    leaf.release = nullptr;
+    return true;
+}
 
 bool resolve_field_array(const ArrowArray& batch, const LanceSchemaMapping& mapping,
                          const LanceField& field, ArrowArray& out) {

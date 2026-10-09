@@ -645,12 +645,18 @@ class LanceDataset(pa.dataset.Dataset):
             for i in wanted:
                 if i < 0 or i >= n:
                     raise IndexError(f"index {i} is out of bounds for a dataset of {n} rows")
-        field = self._data_schema.field(blob_column) if blob_column in self._data_schema.names else None
-        if field is None:
+        # A blob field inside structs is named by its path ("info.blob"): the top-level column is
+        # read, and the path walked down to it, a parent's nulls carried to the child.
+        parts = [blob_column] if blob_column in self._data_schema.names else _path_parts(blob_column)
+        if parts[0] not in self._data_schema.names:
             raise ValueError(f"column {blob_column!r} does not exist")
-        table = self._take(wanted, [blob_column], addresses=kind != "indices",
+        table = self._take(wanted, [parts[0]], addresses=kind != "indices",
                            with_row_address=True, blob_handling=_nanolance.BLOB_LOCATIONS)
-        column = table.column(blob_column)
+        column = table.column(parts[0]).combine_chunks()
+        for part in parts[1:]:
+            if not pa.types.is_struct(column.type) or column.type.get_field_index(part) < 0:
+                raise ValueError(f"column {blob_column!r} does not exist")
+            column = column.flatten()[column.type.get_field_index(part)]
         if not pa.types.is_struct(column.type) or column.type.get_field_index("file") < 0:
             raise ValueError(f"column {blob_column!r} is not a blob column")
         return table.column("_rowaddr").to_pylist(), column.to_pylist()
@@ -2837,10 +2843,36 @@ def _blob_batch(batch: pa.RecordBatch, columns, mode: str, allow_outside: bool) 
     return pa.RecordBatch.from_arrays(arrays, schema=batch.schema)
 
 
-def _blob_reshape(column: pa.ExtensionArray, typ: pa.DataType) -> pa.Array:
-    """A blob column in another of Lance's logical shapes (struct<data, uri> and
-    struct<data, uri, position, size>): the children it lacks are null."""
-    storage = column.storage
+def _holds_blob(typ: pa.DataType) -> bool:
+    if getattr(typ, "extension_name", None) == "lance.blob.v2":
+        return True
+    if pa.types.is_struct(typ):
+        return any(_holds_blob(f.type) for f in typ)
+    if pa.types.is_list(typ) or pa.types.is_large_list(typ):
+        return _holds_blob(typ.value_type)
+    return False
+
+
+def _retype(column: pa.Array, typ: pa.DataType) -> pa.Array:
+    """`column` as `typ` where a cast cannot make it so: a struct or list holding blob columns, whose
+    extension types pyarrow will not cast between (the same lance.blob.v2, another Python class)."""
+    if getattr(typ, "extension_name", None) == "lance.blob.v2":
+        return _blob_reshape(column, typ)
+    if pa.types.is_struct(typ):
+        children = column.flatten()  # sliced, a parent's nulls carried down
+        names = [column.type.field(k).name for k in range(column.type.num_fields)]
+        return pa.StructArray.from_arrays([_retype(children[names.index(f.name)], f.type) for f in typ],
+                                          fields=list(typ), mask=column.is_null())
+    if pa.types.is_list(typ) or pa.types.is_large_list(typ):
+        return type(column).from_arrays(column.offsets, _retype(column.values, typ.value_type), type=typ,
+                                        mask=column.is_null())
+    return column if column.type == typ else column.cast(typ)
+
+
+def _blob_reshape(column: pa.Array, typ: pa.DataType) -> pa.Array:
+    """A blob column (or its storage) as `typ`, in either of Lance's logical shapes (struct<data, uri>
+    and struct<data, uri, position, size>): the children it lacks are null."""
+    storage = column.storage if isinstance(column, pa.ExtensionArray) else column
     target = typ.storage_type if isinstance(typ, pa.ExtensionType) else typ
     have = dict(zip([storage.type.field(k).name for k in range(storage.type.num_fields)], storage.flatten()))
     children = [have.get(f.name, pa.nulls(len(storage), f.type)) for f in target]
@@ -2893,6 +2925,8 @@ def _conform(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
     for col, field in zip(columns, target):
         if col.type != field.type and _is_blob_v2(field) and isinstance(col, pa.ExtensionArray):
             col = _blob_reshape(col, field.type)
+        elif col.type != field.type and _holds_blob(field.type):
+            col = _retype(col, field.type)
         out.append(col if col.type == field.type else col.cast(field.type))
     return pa.RecordBatch.from_arrays(out, schema=target)
 

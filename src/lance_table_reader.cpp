@@ -208,7 +208,7 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
             error = "failed to build the list schema for " + field.name;
             return false;
         }
-        if (!init_schema_from_field(*child, mapping, *schema.children[0], error)) {
+        if (!init_schema_from_field(*child, mapping, *schema.children[0], error, blob)) {
             return false;
         }
         if (field.logical_type == "map") {
@@ -940,6 +940,22 @@ bool fill_variable_child(ArrowArray* child, VariableWidthColumnValues& v, std::i
     return true;
 }
 
+/// A blob leaf of `length` values (items, under a list), appended one by one into its child array --
+/// descriptions, locations or bytes, as the column's shape asks.
+bool fill_blob_column(ColumnPlan& plan, std::int64_t length, std::string& error) {
+    if (ArrowArrayStartAppending(plan.array) != NANOARROW_OK) {
+        error = "failed to start the blob column " + plan.field->name;
+        return false;
+    }
+    for (std::int64_t row = 0; row < length; ++row) {
+        if (!append_column_value_at_row(*plan.field, *plan.values, row, plan.dict, *plan.array, error,
+                                        plan.blob_shape)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// An Arrow dictionary column from its decoded values: indices into the dictionary it was stored
 /// with (unused entries and their order kept), or -- when a value is not in it, which only a
 /// dictionary lost on the way could cause -- into the values in order of first appearance.
@@ -1186,9 +1202,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
         plan.array = node_array;
         plan.field = field;
         plan.nodes = std::move(path);
-        if (plan.under_list() && (is_blob || field->column_index < 0)) {
-            collect_error = "column '" + field->name + "': a list of " +
-                            (is_blob ? std::string("blobs") : field->logical_type) + " is not read yet";
+        if (plan.under_list() && !is_blob && field->column_index < 0) {
+            collect_error = "column '" + field->name + "': a list of " + field->logical_type + " is not read yet";
             return false;
         }
         if (!is_blob && field->column_index < 0) {
@@ -1250,7 +1265,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
     bool bulk_ok = true;
     for (const auto& plan : plans) {
         if (plan.kind != ColumnPlan::Kind::Fixed && plan.kind != ColumnPlan::Kind::Variable &&
-            plan.kind != ColumnPlan::Kind::FixedSizeList && plan.kind != ColumnPlan::Kind::Dictionary) {
+            plan.kind != ColumnPlan::Kind::FixedSizeList && plan.kind != ColumnPlan::Kind::Dictionary &&
+            plan.kind != ColumnPlan::Kind::Blob) {
             bulk_ok = false;
             break;
         }
@@ -1272,6 +1288,15 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
                 error = "column '" + plan.field->name + "' sits under a list but decoded with no list layers";
                 ArrowArrayRelease(&batch);
                 return false;
+            }
+            if (plan.kind == ColumnPlan::Kind::Blob) {
+                // A blob leaf is built value by value (each is read or described where it is stored),
+                // into its own child alone; its nulls and length come from the appends.
+                if (!fill_blob_column(plan, leaf_length, error)) {
+                    ArrowArrayRelease(&batch);
+                    return false;
+                }
+                continue;
             }
             // Validity first: nanoarrow expects buffer 0 filled before the data buffers it sizes
             // against, and both fill_* helpers set child->length/null_count at the end.

@@ -394,11 +394,6 @@ bool map_field(const ArrowSchema& field,
                 "APIs (e.g. lance::blob::blob_field / lance::blob::BlobArrayBuilder).";
         return false;
     }
-    if (extension_name == "lance.blob.v2" && parent_id != -1) {
-        error = std::string("lance.blob.v2 column '") + (field.name == nullptr ? "" : field.name) +
-                "' inside a struct or list is not supported yet (a top-level blob column is)";
-        return false;
-    }
     // JSONB (the lance.json extension over large_binary) is Lance's logical type "json".
     if (parsed.logical_type == "large_binary" && extension_name == "lance.json") {
         parsed.logical_type = "json";

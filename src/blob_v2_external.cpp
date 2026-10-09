@@ -230,9 +230,18 @@ void record_validity(ColumnValues& out, std::size_t row, bool valid) {
 }  // namespace
 
 std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(const std::uint64_t rows, const bool nullable) {
+    return blob_v2_descriptor_page_encoding(0U, nullable ? 1U : 0U, rows, rows,
+                                            {static_cast<std::uint8_t>(nullable ? 3U : 1U)});
+}
+
+std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(const std::uint32_t bits_rep, const std::uint32_t bits_def,
+                                                           const std::uint64_t num_items,
+                                                           const std::uint64_t num_visible_items,
+                                                           const std::vector<std::uint8_t>& layers) {
     // As Lance writes it: Any{type_url, PageLayout{full_zip_layout = FullZipLayout{bits_def, bits_per_offset
     // = 32, num_items, num_visible_items, value = packed struct of (kind u8, position u64, size u64,
-    // blob_id u32, blob_uri variable), layers = [all-valid item | nullable item]}}}.
+    // blob_id u32, blob_uri variable), layers (innermost first)}}}; with rep / def bits when the
+    // blob is inside lists or nullable structs.
     static const std::uint8_t kValue[] = {
         0x6a, 0x36, 0x0a, 0x08, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x08, 0x10, 0x08, 0x0a, 0x08, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x40, 0x10,
         0x40, 0x0a, 0x08, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x40, 0x10, 0x40, 0x0a, 0x08, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20,
@@ -250,16 +259,21 @@ std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(const std::uint64_t r
         out.insert(out.end(), body.begin(), body.end());
     };
     std::vector<std::uint8_t> full_zip;
-    if (nullable) {
-        full_zip.insert(full_zip.end(), {0x10, 0x01});  // bits_def = 1
+    if (bits_rep != 0U) {
+        full_zip.push_back(0x08);
+        varint(full_zip, bits_rep);
     }
-    full_zip.insert(full_zip.end(), {0x20, 0x20});      // bits_per_offset = 32
+    if (bits_def != 0U) {
+        full_zip.push_back(0x10);
+        varint(full_zip, bits_def);
+    }
+    full_zip.insert(full_zip.end(), {0x20, 0x20});  // bits_per_offset = 32
     full_zip.push_back(0x28);
-    varint(full_zip, rows);  // num_items
+    varint(full_zip, num_items);
     full_zip.push_back(0x30);
-    varint(full_zip, rows);  // num_visible_items
+    varint(full_zip, num_visible_items);
     message(full_zip, 0x3a, std::vector<std::uint8_t>(std::begin(kValue), std::end(kValue)));
-    full_zip.insert(full_zip.end(), {0x42, 0x01, static_cast<std::uint8_t>(nullable ? 0x03 : 0x01)});
+    message(full_zip, 0x42, layers);
     std::vector<std::uint8_t> layout;
     message(layout, 0x1a, full_zip);
     static const std::string kTypeUrl = "/lance.encodings21.PageLayout";
@@ -348,6 +362,7 @@ bool BlobV2Placer::place(const ColumnValues& values, const BlobV2Thresholds& thr
     placed.kind = ColumnValues::Kind::BlobV2External;
     placed.validity = values.validity;
     placed.null_count = values.null_count;
+    placed.layers = values.layers;  // a blob inside structs or lists keeps them
     placed.blob_v2.uri_dictionary = values.blob_v2.uri_dictionary;
     placed.blob_v2.row_packed_sizes.reserve(values.blob_v2.row_packed_sizes.size());
     const auto pack_max = pack_override_ != 0U ? pack_override_ : thresholds.pack_file_max;
@@ -436,7 +451,7 @@ bool BlobV2Placer::finish(std::string& error) {
 std::vector<std::int32_t> blob_v2_parent_ids(const LanceSchemaMapping& mapping) {
     std::vector<std::int32_t> ids;
     for (const auto& field : mapping.fields) {
-        if (field.extension_name == kBlobV2ExtensionName && field.logical_type == "struct" && field.parent_id == -1) {
+        if (field.extension_name == kBlobV2ExtensionName && field.logical_type == "struct") {
             ids.push_back(field.id);
         }
     }
@@ -453,37 +468,20 @@ const LanceField* find_blob_v2_parent(const LanceSchemaMapping& mapping) {
 }
 
 std::vector<std::uint8_t> blob_v2_build_control_buffer(const std::vector<std::uint32_t>& row_packed_sizes) {
-    std::vector<std::uint8_t> out;
+    // Lance's FullZip repetition index: where each row starts and where the last ends (rows + 1
+    // offsets from 0), byte-packed at the narrowest of u8 / u16 / u32 / u64 that holds the largest --
+    // the reader derives the width from the buffer's size. (nanolance once wrote the u32 form as
+    // [0][1][u32 ends...]: pylance could scan such a page but not take rows from it.)
     std::uint64_t total = 0;
-    std::vector<std::uint64_t> prefixes;
-    prefixes.reserve(row_packed_sizes.size());
     for (const auto sz : row_packed_sizes) {
-        total += static_cast<std::uint64_t>(sz);
-        prefixes.push_back(total);
+        total += sz;
     }
-    // Blob control buffer encodings (cumulative row-end offsets):
-    //   narrow: [0][u8  cumulative offsets ...]            total < 256
-    //   wide16: [0][0][u16 cumulative offsets ...]         total <= 65535
-    //   wide32: [0][1][u32 cumulative offsets ...]         otherwise
-    // The wide forms carry a width discriminator in byte[1] (the reader already keyed off it). Writing
-    // a too-narrow width above wrapped the cumulative offsets and made them non-monotonic.
-    const bool narrow = total < 256U;
-    if (narrow) {
-        out.push_back(0U);
-        for (const auto p : prefixes) {
-            out.push_back(static_cast<std::uint8_t>(p));
-        }
-        return out;
-    }
-    const bool wide16 = total <= static_cast<std::uint64_t>(std::numeric_limits<std::uint16_t>::max());
-    out.push_back(0U);
-    out.push_back(wide16 ? 0U : 1U);
-    for (const auto p : prefixes) {
-        if (wide16) {
-            append_le16(out, static_cast<std::uint16_t>(p));
-        } else {
-            append_le32(out, static_cast<std::uint32_t>(p));
-        }
+    const std::size_t width = total <= 0xFFU ? 1U : total <= 0xFFFFU ? 2U : total <= 0xFFFFFFFFULL ? 4U : 8U;
+    std::vector<std::uint8_t> out((row_packed_sizes.size() + 1U) * width, 0U);
+    std::uint64_t at = 0;
+    for (std::size_t i = 0; i < row_packed_sizes.size(); ++i) {
+        at += row_packed_sizes[i];
+        std::memcpy(out.data() + (i + 1U) * width, &at, width);  // little-endian, low bytes first
     }
     return out;
 }
@@ -492,84 +490,49 @@ bool blob_v2_control_buffer_to_row_sizes(const std::vector<std::uint8_t>& contro
                                          std::vector<std::uint32_t>& row_packed_sizes, std::string& error) {
     row_packed_sizes.clear();
     error.clear();
-    if (num_rows > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+    if (num_rows > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) - 1U) {
         error = "blob row count overflow";
         return false;
     }
-    const auto n = static_cast<std::uint32_t>(num_rows);
-    if (control.empty()) {
-        error = "empty blob control buffer";
+    const auto entries = static_cast<std::size_t>(num_rows) + 1U;
+    std::size_t width = 0;
+    bool older = false;  // an older nanolance file: [0][1] and the rows' u32 ends
+    if (control.size() % entries == 0U) {
+        width = control.size() / entries;
+    } else if (num_rows != 0U && control.size() == 2U + 4U * static_cast<std::size_t>(num_rows) && control[0] == 0U &&
+               control[1] == 1U) {
+        width = 4U;
+        older = true;
+    }
+    if (width != 1U && width != 2U && width != 4U && width != 8U) {
+        error = "a blob page's row index is " + std::to_string(control.size()) + " bytes for " +
+                std::to_string(num_rows) + " rows";
         return false;
     }
-    if (control[0] != 0U) {
-        error = "invalid blob control buffer prefix";
+    const auto offset_at = [&](std::size_t i) -> std::uint64_t {
+        if (older && i == 0U) {
+            return 0U;
+        }
+        std::uint64_t v = 0;
+        std::memcpy(&v, control.data() + (older ? 2U + (i - 1U) * 4U : i * width), width);
+        return v;
+    };
+    if (offset_at(0) != 0U) {
+        error = "a blob page's row index does not start at 0";
         return false;
     }
-    if (n == 0U) {
-        if (control.size() != 1U) {
-            error = "invalid blob control buffer for zero rows";
+    row_packed_sizes.reserve(static_cast<std::size_t>(num_rows));
+    std::uint64_t prev = 0;
+    for (std::size_t i = 1; i < entries; ++i) {
+        const auto cum = offset_at(i);
+        if (cum < prev || cum - prev > std::numeric_limits<std::uint32_t>::max()) {
+            error = "a blob page's row index is not increasing";
             return false;
         }
-        return true;
+        row_packed_sizes.push_back(static_cast<std::uint32_t>(cum - prev));
+        prev = cum;
     }
-    const auto expect_narrow = static_cast<std::size_t>(1U) + static_cast<std::size_t>(n);
-    const auto expect_wide16 = static_cast<std::size_t>(2U) + 2U * static_cast<std::size_t>(n);
-    const auto expect_wide32 = static_cast<std::size_t>(2U) + 4U * static_cast<std::size_t>(n);
-    if (control.size() == expect_narrow) {
-        std::uint8_t prev = 0;
-        for (std::uint32_t i = 0; i < n; ++i) {
-            const auto cum = control[static_cast<std::size_t>(1U + i)];
-            if (cum < prev) {
-                error = "invalid narrow cumulative offsets in blob control buffer";
-                return false;
-            }
-            row_packed_sizes.push_back(static_cast<std::uint32_t>(static_cast<std::uint32_t>(cum) - prev));
-            prev = cum;
-        }
-        return true;
-    }
-    // Wide control buffers carry a width discriminator in byte[1]: 0 = u16 offsets, 1 = u32 offsets.
-    // expect_wide16 and expect_wide32 only collide when n == 0, which is handled above.
-    if (control.size() == expect_wide16) {
-        if (control[1] != 0U) {
-            error = "invalid wide blob control buffer header";
-            return false;
-        }
-        std::uint16_t prev = 0;
-        for (std::uint32_t i = 0; i < n; ++i) {
-            const auto base = static_cast<std::size_t>(2U + 2U * i);
-            std::uint16_t cum = 0;
-            std::memcpy(&cum, control.data() + base, sizeof(cum));
-            if (cum < prev) {
-                error = "invalid wide cumulative offsets in blob control buffer";
-                return false;
-            }
-            row_packed_sizes.push_back(static_cast<std::uint32_t>(cum - prev));
-            prev = cum;
-        }
-        return true;
-    }
-    if (control.size() == expect_wide32) {
-        if (control[1] != 1U) {
-            error = "invalid wide blob control buffer header";
-            return false;
-        }
-        std::uint32_t prev = 0;
-        for (std::uint32_t i = 0; i < n; ++i) {
-            const auto base = static_cast<std::size_t>(2U + 4U * i);
-            std::uint32_t cum = 0;
-            std::memcpy(&cum, control.data() + base, sizeof(cum));
-            if (cum < prev) {
-                error = "invalid wide cumulative offsets in blob control buffer";
-                return false;
-            }
-            row_packed_sizes.push_back(cum - prev);
-            prev = cum;
-        }
-        return true;
-    }
-    error = "blob control buffer size does not match row count (narrow/wide16/wide32)";
-    return false;
+    return true;
 }
 
 bool finalize_blob_v2_schema_for_write(LanceSchemaMapping& mapping, std::string& error) {
@@ -761,13 +724,6 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
                                         ColumnValues& out,
                                         std::string& error) {
     error.clear();
-    ArrowArray struct_array{};
-    if (!resolve_field_array(batch, mapping, blob_field, struct_array)) {
-        error = "missing Arrow struct array for blob field ";
-        error += blob_field.name;
-        return false;
-    }
-
     // Lance's logical shape: struct<data, uri> or struct<data, uri, position, size>.
     const auto* data_f = find_child(mapping, blob_field.id, "data");
     const auto* uri_f = find_child(mapping, blob_field.id, "uri");
@@ -778,17 +734,53 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
                 "' must be struct<data: large_binary, uri: utf8> or struct<data, uri, position: uint64, size: uint64>";
         return false;
     }
+    const bool ranged = pos_f != nullptr;
 
+    ArrowArray struct_array{};
     ArrowArray data_a{};
     ArrowArray uri_a{};
     ArrowArray pos_a{};
     ArrowArray size_a{};
-    const bool ranged = pos_f != nullptr;
-    if (!resolve_field_array(batch, mapping, *data_f, data_a) || !resolve_field_array(batch, mapping, *uri_f, uri_a) ||
-        (ranged && (!resolve_field_array(batch, mapping, *pos_f, pos_a) ||
-                    !resolve_field_array(batch, mapping, *size_f, size_a)))) {
-        error = "missing Arrow arrays for blob children";
-        return false;
+    std::vector<std::uint8_t> ancestor_null;  // nested: per item, whether a parent is null there
+    if (blob_field.parent_id < 0) {
+        if (!resolve_field_array(batch, mapping, blob_field, struct_array)) {
+            error = "missing Arrow struct array for blob field " + blob_field.name;
+            return false;
+        }
+        if (!resolve_field_array(batch, mapping, *data_f, data_a) || !resolve_field_array(batch, mapping, *uri_f, uri_a) ||
+            (ranged && (!resolve_field_array(batch, mapping, *pos_f, pos_a) ||
+                        !resolve_field_array(batch, mapping, *size_f, size_a)))) {
+            error = "missing Arrow arrays for blob children";
+            return false;
+        }
+    } else {
+        // Inside structs or lists: the items of the blob field, below the layers recorded for them.
+        if (!nested_leaf_view(batch, mapping, blob_field, out, struct_array, ancestor_null, error)) {
+            return false;
+        }
+        std::vector<const LanceField*> children;
+        for (const auto& f : mapping.fields) {
+            if (f.parent_id == blob_field.id) {
+                children.push_back(&f);
+            }
+        }
+        const auto child_view = [&](const LanceField* field, ArrowArray& view) {
+            const auto at = std::find(children.begin(), children.end(), field) - children.begin();
+            if (struct_array.children == nullptr || at >= struct_array.n_children ||
+                struct_array.children[at] == nullptr) {
+                return false;
+            }
+            view = *struct_array.children[at];
+            view.offset += struct_array.offset;
+            view.length = struct_array.length;
+            view.release = nullptr;
+            return true;
+        };
+        if (!child_view(data_f, data_a) || !child_view(uri_f, uri_a) ||
+            (ranged && (!child_view(pos_f, pos_a) || !child_view(size_f, size_a)))) {
+            error = "missing Arrow arrays for blob children";
+            return false;
+        }
     }
 
     out.kind = ColumnValues::Kind::BlobV2External;
@@ -800,8 +792,9 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
     };
     for (std::int64_t row = 0; row < rows; ++row) {
         const auto index = out.blob_v2.row_packed_sizes.size();
-        if (arrow_row_is_null(struct_array, row)) {
-            if (!blob_field.nullable) {
+        const bool parent_null = !ancestor_null.empty() && ancestor_null[static_cast<std::size_t>(row)] != 0U;
+        if (parent_null || arrow_row_is_null(struct_array, row)) {
+            if (!parent_null && !blob_field.nullable) {
                 error = "Column '" + blob_field.name + "' is declared as non-nullable but contains null values";
                 return false;
             }

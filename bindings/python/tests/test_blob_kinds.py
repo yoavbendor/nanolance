@@ -306,12 +306,129 @@ def test_legacy_blob_write_refused_as_pylance_refuses(tmp_path):
             lib.write_dataset(pa.table({"b": [b"x"]}, schema=schema), str(tmp_path / lib.__name__))
 
 
-def test_nested_blob_refused(tmp_path):
-    """A blob column inside a struct or list is refused (pylance writes them; nanolance does not yet)."""
+def _nested_table(lance, n=4000, seed=5):
+    """Blobs inside structs (with and without null structs, two deep), lists (null and empty lists)
+    and lists of structs, beside a vector: every shape nested blobs come in."""
+    rng = random.Random(seed)
+
+    def blob(i):
+        k = rng.random()
+        return None if k < 0.1 else bytes([i % 251]) * rng.choice([0, 3, 30, 200, 5000])
+
+    def field(name):
+        return lance.blob_field(name, inline_size_threshold=16, dedicated_size_threshold=1000)
+
+    types = {
+        "s": pa.struct([field("x"), pa.field("y", pa.int64())]),
+        "d": pa.struct([pa.field("deep", pa.struct([field("b")]))]),
+        "l": pa.list_(field("item")),
+        "ls": pa.list_(pa.field("item", pa.struct([field("x"), pa.field("k", pa.string())]))),
+    }
+    rows = [{"s": None if rng.random() < 0.1 else {"x": blob(i), "y": i},
+             "d": None if rng.random() < 0.05 else {"deep": None if rng.random() < 0.1 else {"b": blob(i)}},
+             "l": None if rng.random() < 0.1 else [blob(i + j) for j in range(rng.randint(0, 3))],
+             "ls": None if rng.random() < 0.1 else [None if rng.random() < 0.1 else {"x": blob(i), "k": f"k{j}"}
+                                                     for j in range(rng.randint(0, 2))]} for i in range(n)]
+
+    def storage(t):
+        if getattr(t, "extension_name", None) == "lance.blob.v2":
+            return t.storage_type
+        if pa.types.is_struct(t):
+            return pa.struct([pa.field(f.name, storage(f.type)) for f in t])
+        if pa.types.is_list(t):
+            return pa.list_(pa.field(t.value_field.name, storage(t.value_type)))
+        return t
+
+    def logical(v, t):
+        if v is None:
+            return None
+        if getattr(t, "extension_name", None) == "lance.blob.v2":
+            return {"data": v, "uri": None, "position": None, "size": None}
+        if pa.types.is_struct(t):
+            return {f.name: logical(v[f.name], f.type) for f in t}
+        if pa.types.is_list(t):
+            return [logical(x, t.value_type) for x in v]
+        return v
+
+    def extension(arr, t):
+        if getattr(t, "extension_name", None) == "lance.blob.v2":
+            return pa.ExtensionArray.from_storage(t, arr)
+        if pa.types.is_struct(t):
+            return pa.StructArray.from_arrays([extension(arr.field(k), t.field(k).type) for k in range(t.num_fields)],
+                                              fields=list(t), mask=arr.is_null())
+        if pa.types.is_list(t):
+            return pa.ListArray.from_arrays(arr.offsets, extension(arr.values, t.value_type),
+                                            type=pa.list_(t.value_field), mask=arr.is_null())
+        return arr
+
+    columns = {"id": pa.array(range(n), pa.int64())}
+    for name, t in types.items():
+        columns[name] = extension(pa.array([logical(r[name], t) for r in rows], storage(t)), t)
+    columns["v"] = pa.array([[float(i), 1.0] for i in range(n)], pa.list_(pa.float32(), 2))
+    schema = pa.schema([pa.field("id", pa.int64())] + [pa.field(k, t) for k, t in types.items()] +
+                       [pa.field("v", pa.list_(pa.float32(), 2))])
+    return pa.Table.from_arrays([columns[f.name] for f in schema], schema=schema)
+
+
+def test_nested_blobs_written_and_read_both_ways(tmp_path):
+    """Blobs inside structs and lists, written by either library -- as Lance pages them, with the
+    structs' definition and the lists' repetition levels -- and read by both, deletions included."""
     lance = require_pylance()
-    inner = lance.blob_array([b"a", b"b"])
-    nested = pa.table({"s": pa.StructArray.from_arrays([inner], fields=[lance.blob_field("x")])})
-    listed = pa.table({"l": pa.ListArray.from_arrays(pa.array([0, 1, 2]), inner)})
-    for table in (nested, listed):
-        with pytest.raises(NotImplementedError, match="inside a struct or list is not supported yet"):
-            nl.write_dataset(table, str(tmp_path / "x"))
+    table = _nested_table(lance)
+    for writer in (nl, lance):
+        path = str(tmp_path / writer.__name__)
+        writer.write_dataset(table, path, max_rows_per_file=1500)
+        writer.dataset(path).delete("id % 17 = 0")
+        for kwargs in ({}, {"blob_handling": "all_binary"}, {"filter": "id > 2000 and id < 2300"},
+                       {"columns": ["ls", "id"], "blob_handling": "all_binary"}):
+            assert nl.dataset(path).to_table(**kwargs).equals(lance.dataset(path).to_table(**kwargs)), \
+                (writer.__name__, kwargs)
+        rows = [0, 5, 100, 1600, 3999 - 3999 // 17 - 1]
+        assert nl.dataset(path).take(rows).equals(lance.dataset(path).to_table().take(rows))  # (pylance's own
+        # take of nested blobs panics)
+        for field_path in ("s.x", "d.deep.b"):
+            ours = [None if f is None else f.readall() for f in nl.dataset(path).take_blobs(field_path, indices=rows)]
+            theirs = [None if f is None else f.readall() for f in lance.dataset(path).take_blobs(field_path, indices=rows)]
+            assert ours == theirs, field_path
+        assert nl.dataset(path).read_blobs("s.x", indices=rows) == lance.dataset(path).read_blobs("s.x", indices=rows)
+    assert lance.dataset(str(tmp_path / "nanolance.lance")).lance_schema == lance.dataset(str(tmp_path / "lance")).lance_schema
+
+
+def test_nested_blob_datasets_rewritten(tmp_path):
+    lance = require_pylance()
+    table = _nested_table(lance, n=2500, seed=9)
+    for lib in (nl, lance):
+        path = str(tmp_path / lib.__name__)
+        lib.write_dataset(table, path, max_rows_per_file=1000)
+        lib.dataset(path).delete("id % 13 = 0")
+        lib.dataset(path).update({"id": "id + 0"}, where="id < 100")
+        lib.dataset(path).optimize.compact_files(target_rows_per_fragment=10000)
+        lib.write_dataset(table.slice(0, 50), path, mode="append")
+    tables = [r.dataset(str(tmp_path / w.__name__)).to_table(blob_handling="all_binary").sort_by("id")
+              for w in (nl, lance) for r in (nl, lance)]
+    assert all(t.equals(tables[0]) for t in tables)
+
+
+def test_blob_beside_vectors_lists_and_structs(tmp_path):
+    """A blob column in the same read as a fixed-size list, a list and a struct (it used to refuse)."""
+    lance = require_pylance()
+    table = pa.table({"vec": pa.FixedSizeListArray.from_arrays(pa.array([0.5] * 8, pa.float32()), 4),
+                      "img": lance.blob_array([b"a", None]), "tags": [["x"], []], "meta": [{"w": 1}, None]})
+    for writer in (nl, lance):
+        path = str(tmp_path / writer.__name__)
+        writer.write_dataset(table, path)
+        for kwargs in ({}, {"blob_handling": "all_binary"}, {"columns": ["vec", "img"]}):
+            assert nl.dataset(path).to_table(**kwargs).equals(lance.dataset(path).to_table(**kwargs))
+
+
+def test_large_blob_page_takes_in_pylance(tmp_path, external):
+    """A page of more than 64 KiB of blob descriptors: its row index is Lance's (rows + 1 offsets,
+    byte-packed), so pylance takes rows from it -- it panicked on nanolance's former u32 form."""
+    lance = require_pylance()
+    path = str(tmp_path / "d")
+    rows = 5000
+    nl.write_dataset(pa.table({"id": range(rows), "b": lance.blob_array([lance.blob.Blob.from_uri(external, 1, 5)] * rows)}),
+                     path, allow_external_blob_outside_bases=True)
+    assert [r["b"]["size"] for r in lance.dataset(path).take([3, 4000]).to_pylist()] == [5, 5]
+    nl.dataset(path).delete("id % 7 = 0")
+    assert lance.dataset(path).to_table().equals(nl.dataset(path).to_table())

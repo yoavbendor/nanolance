@@ -171,6 +171,11 @@ private:
 /// A Blob v2 descriptor page's PageLayout (the inner ColumnEncoding message): Lance's FullZip of
 /// variable-width packed descriptors, with a definition level per row when the page has nulls.
 std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(std::uint64_t rows, bool nullable);
+/// The same for a blob inside lists or structs: `bits_rep` / `bits_def` per control word,
+/// `num_items` levels of which `num_visible_items` own a value slot, the layers innermost first.
+std::vector<std::uint8_t> blob_v2_descriptor_page_encoding(std::uint32_t bits_rep, std::uint32_t bits_def,
+                                                           std::uint64_t num_items, std::uint64_t num_visible_items,
+                                                           const std::vector<std::uint8_t>& layers);
 
 /// Where a blob's bytes are: a local file or an external URI, and the range within it.
 struct BlobV2Location {
@@ -195,7 +200,7 @@ bool blob_v2_read(const BlobV2Location& location, std::uint64_t offset, std::uin
 /// Find top-level `lance.blob.v2` extension struct in a mapped schema, if present.
 const LanceField* find_blob_v2_parent(const LanceSchemaMapping& mapping);
 
-/// The ids of every top-level `lance.blob.v2` struct, in schema order.
+/// The ids of every `lance.blob.v2` struct -- at the top or inside structs and lists -- in schema order.
 std::vector<std::int32_t> blob_v2_parent_ids(const LanceSchemaMapping& mapping);
 
 }  // namespace nano_lance

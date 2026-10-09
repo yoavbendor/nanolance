@@ -2042,6 +2042,110 @@ bool write_full_zip_variable_column(std::ostream& out, const ColumnValues& value
     return true;
 }
 
+/// A Blob v2 column inside structs or lists, as Lance writes one: a FullZip page of the packed
+/// descriptors, each level's control word (`rep << bits_def | def`) followed -- for a valid item --
+/// by the item's descriptor (its u32 length, then kind..uri); a null item, and an empty or null list,
+/// is the control word alone. The second buffer gives each row's end, as for a flat blob page.
+bool write_nested_blob_column(std::ostream& out, const LanceField& field, const ColumnValues& values,
+                              std::uint64_t rows, pb::ColumnMetadata& column, std::string& error) {
+    std::vector<repdef::SerializeLayer> layers;
+    for (const auto& layer : values.layers) {
+        layers.push_back({layer.is_list, &layer.offsets, &layer.validity});
+    }
+    repdef::Serialized ser;
+    if (!repdef::serialize(layers, values.validity, 0, rows, ser, error)) {
+        error = "column '" + field.name + "': " + error;
+        return false;
+    }
+    // Control word widths, from the deepest level the layers can express (Lance's choice, not the
+    // deepest one these rows use).
+    std::uint32_t max_def = 0;
+    std::uint32_t max_rep = 0;
+    for (const auto layer : ser.layers) {
+        max_def += layer == repdef::kAllValidItem || layer == repdef::kAllValidList ? 0U
+                   : layer == repdef::kNullAndEmptyList                             ? 2U
+                                                                                     : 1U;
+        max_rep += repdef::is_list_layer(layer) ? 1U : 0U;
+    }
+    const auto bits_for = [](std::uint32_t v) {
+        std::uint32_t bits = 0;
+        while (v != 0U) {
+            ++bits;
+            v >>= 1U;
+        }
+        return bits;
+    };
+    const auto bits_def = ser.has_def ? bits_for(max_def) : 0U;
+    const auto bits_rep = ser.has_rep ? bits_for(max_rep) : 0U;
+    const auto total_bits = bits_def + bits_rep;
+    const std::size_t control_bytes = total_bits == 0U ? 0U : total_bits <= 8U ? 1U : total_bits <= 16U ? 2U : 4U;
+    const auto levels = ser.has_rep || ser.has_def ? std::max(ser.rep.size(), ser.def.size())
+                                                    : static_cast<std::size_t>(ser.items.size());
+
+    // Each item's descriptor row, by item index.
+    std::vector<std::size_t> starts(values.blob_v2.row_packed_sizes.size() + 1U, 0U);
+    for (std::size_t i = 0; i < values.blob_v2.row_packed_sizes.size(); ++i) {
+        starts[i + 1U] = starts[i] + values.blob_v2.row_packed_sizes[i];
+    }
+    std::vector<std::uint8_t> data;
+    data.reserve(values.blob_v2.packed_payload.size() + levels * control_bytes);
+    std::vector<std::uint32_t> row_sizes;
+    std::size_t row_start = 0;
+    std::size_t slot = 0;
+    for (std::size_t level = 0; level < levels; ++level) {
+        const std::uint32_t rep = ser.has_rep ? ser.rep[level] : 0U;
+        const std::uint32_t def = ser.has_def ? ser.def[level] : 0U;
+        if (level != 0U && (!ser.has_rep || rep == max_rep)) {
+            row_sizes.push_back(static_cast<std::uint32_t>(data.size() - row_start));  // a new row starts
+            row_start = data.size();
+        }
+        if (control_bytes != 0U) {
+            const std::uint32_t word = (rep << bits_def) | def;
+            const auto* p = reinterpret_cast<const std::uint8_t*>(&word);
+            data.insert(data.end(), p, p + control_bytes);  // little-endian
+        }
+        const bool has_slot = ser.is_slot.empty() || ser.is_slot[level] != 0U;
+        if (!has_slot) {
+            continue;  // an empty or null list
+        }
+        const auto item = static_cast<std::size_t>(ser.items[slot++]);
+        if (def != 0U) {
+            continue;  // a null item, or a null struct above it
+        }
+        if (item + 1U >= starts.size() || starts[item + 1U] == starts[item]) {
+            error = "column '" + field.name + "': a valid blob item has no descriptor";
+            return false;
+        }
+        data.insert(data.end(), values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(starts[item]),
+                    values.blob_v2.packed_payload.begin() + static_cast<std::ptrdiff_t>(starts[item + 1U]));
+    }
+    if (levels != 0U) {
+        row_sizes.push_back(static_cast<std::uint32_t>(data.size() - row_start));
+    }
+    if (row_sizes.size() != rows) {
+        error = "column '" + field.name + "': its levels make " + std::to_string(row_sizes.size()) + " rows, not " +
+                std::to_string(rows);
+        return false;
+    }
+    const auto control = blob_v2_build_control_buffer(row_sizes);
+    column.encoding = column_encoding_bytes();
+    pb::ColumnPage page;
+    align64(out);
+    page.buffer_offsets.push_back(pos(out));
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    page.buffer_sizes.push_back(data.size());
+    align64(out);
+    page.buffer_offsets.push_back(pos(out));
+    out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
+    page.buffer_sizes.push_back(control.size());
+    page.length = rows;
+    page.priority = 0;
+    page.encoding = blob_v2_descriptor_page_encoding(bits_rep, bits_def, levels, slot,
+                                                     std::vector<std::uint8_t>(ser.layers.begin(), ser.layers.end()));
+    column.pages.push_back(std::move(page));
+    return true;
+}
+
 bool write_lance_data_file(const std::filesystem::path& dataset_path,
                            const std::string& file_name,
                            const LanceSchemaMapping& mapping,
@@ -2134,6 +2238,14 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             }
         }
 
+        if (values.kind == ColumnValues::Kind::BlobV2External && !values.layers.empty()) {
+            pb::ColumnMetadata column;
+            if (!write_nested_blob_column(out, field, values, rows, column, error)) {
+                return false;
+            }
+            columns.push_back(std::move(column));
+            return true;
+        }
         if (values.kind == ColumnValues::Kind::BlobV2External) {
             const auto& blob = values.blob_v2;
             if (blob.row_packed_sizes.size() != static_cast<std::size_t>(rows)) {
@@ -3059,7 +3171,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             parent.name = mapped_field.name;
             parent.logical_type = "struct";
             parent.id = mapped_field.id;
-            parent.parent_id = -1;
+            parent.parent_id = mapped_field.parent_id;
             parent.type = 0;
             parent.nullable = mapped_field.nullable;
             parent.encoding = 0;
