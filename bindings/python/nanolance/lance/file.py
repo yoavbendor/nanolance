@@ -112,8 +112,10 @@ class LanceFileReader:
         self._path = _local(path)
         self._columns = None if columns is None else [str(c) for c in columns]
         with native():
-            self._rows, _, schema, self._pages, _ = _nanolance._file_info(self._path)
+            self._rows, _, schema, self._pages, metadata = _nanolance._file_info(self._path)
         self._schema = pa.schema(schema)
+        if metadata:
+            self._schema = self._schema.with_metadata(metadata)
 
     def _results(self, table: pa.Table, batch_size: int) -> ReaderResults:
         if self._columns is not None:
@@ -226,6 +228,8 @@ class LanceFileWriter:
         for b in batches:
             if self._schema is not None and not b.schema.equals(self._schema, check_metadata=False):
                 b = b.cast(self._schema)
+            if self._schema is not None and self._schema.metadata:
+                b = b.replace_schema_metadata(self._schema.metadata)  # the file's schema metadata
             self._open(b.schema)
             with native():
                 self._writer.write_batch(b)

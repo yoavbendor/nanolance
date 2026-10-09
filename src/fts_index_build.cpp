@@ -717,4 +717,8 @@ bool index_build::build_inverted_segment(const std::filesystem::path& dataset_pa
     return create_inverted_index(dataset_path, column, options, &target, unused, error);
 }
 
+std::vector<std::uint8_t> index_build::inverted_details(const fts::AnalyzerParams& params) {
+    return index_details(params);
+}
+
 }  // namespace nano_lance

@@ -24,7 +24,7 @@ import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance._errors import native, unsupported
-from nanolance.lance._transactions import Index, LanceOperation, Transaction
+from nanolance.lance._transactions import Index, IndexFile, LanceOperation, Transaction
 
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 
@@ -831,19 +831,34 @@ class LanceDataset(pa.dataset.Dataset):
     # ── indices ───────────────────────────────────────────────────────────────────────────────────
 
     def create_scalar_index(self, column: str, index_type: str, name: Optional[str] = None, *,
-                            replace: bool = True, **kwargs) -> "LanceDataset":
+                            replace: bool = True, train: bool = True, fragment_ids: Optional[List[int]] = None,
+                            index_uuid: Optional[str] = None, **kwargs) -> "LanceDataset":
         """Build a BTREE, BITMAP, LABEL_LIST or INVERTED (full-text) index on `column`, in Lance's own
-        format: pylance and LanceDB use it as one they built. Commits a new version."""
+        format: pylance and LanceDB use it as one they built. Commits a new version.
+
+        With `fragment_ids`, an INVERTED index is staged for those fragments under `index_uuid` and
+        not committed (Lance's legacy distributed build): ``merge_index_metadata`` builds it once every
+        part is staged. Other types build their segments with ``create_index_uncommitted``."""
         if isinstance(column, str):
             path = _resolve_path(self._data_schema, column)
             if path is not None:
                 column = ".".join(path)  # the schema's own names, as Lance stores them
-        if str(index_type).upper() in ("INVERTED", "FTS"):
+        kind = str(index_type).upper()
+        if kind == "FTS":
+            kind = "INVERTED"
+        if fragment_ids is not None and kind in ("BTREE", "BITMAP", "LABEL_LIST"):
+            raise ValueError(f"{kind} distributed indexing uses create_index_uncommitted(..., "
+                             f'index_type="{kind}", fragment_ids=...)')
+        uuid_bytes = _parse_index_uuid(index_uuid)
+        if kind == "INVERTED":
+            if fragment_ids is not None:
+                return self._stage_inverted_part(column, name, fragment_ids, uuid_bytes, kwargs)
             return self._create_inverted_index(column, name, replace, kwargs)
+        kwargs.pop("progress_callback", None)
         if kwargs:
             raise unsupported(f"create_scalar_index options {sorted(kwargs)}")
         with native():
-            _nanolance._ds_create_scalar_index(self._uri, str(column), str(index_type), name or "", bool(replace))
+            _nanolance._ds_create_scalar_index(self._uri, str(column), kind, name or "", bool(replace))
         self._refresh_latest()
         return self
 
@@ -851,7 +866,8 @@ class LanceDataset(pa.dataset.Dataset):
                          "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
                          "max_ngram_length", "prefix_only")
 
-    def _create_inverted_index(self, column, name, replace, kwargs) -> "LanceDataset":
+    def _inverted_params(self, kwargs) -> str:
+        """The analyzer settings among `kwargs` (taken out of it) as the native layer's JSON."""
         import json
 
         params = {}
@@ -860,19 +876,260 @@ class LanceDataset(pa.dataset.Dataset):
                 value = kwargs.pop(key)
                 if value is not None or key in ("max_token_length", "custom_stop_words"):
                     params[key] = value
-        for ignored in ("num_workers", "memory_limit", "progress", "train"):
+        for ignored in ("num_workers", "memory_limit", "progress", "train", "progress_callback",
+                        "document_granularity"):
             kwargs.pop(ignored, None)
         if kwargs:
             raise unsupported(f"INVERTED index options {sorted(kwargs)}")
+        return json.dumps(params)
+
+    def _create_inverted_index(self, column, name, replace, kwargs) -> "LanceDataset":
+        params = self._inverted_params(kwargs)
         if isinstance(column, (list, tuple)):
             if len(column) != 1:
                 raise unsupported("an index over more than one column")
             column = column[0]
         with _lance_errors():
-            _nanolance._ds_create_inverted_index(self._uri, str(column), name or "", bool(replace),
-                                                 json.dumps(params))
+            _nanolance._ds_create_inverted_index(self._uri, str(column), name or "", bool(replace), params)
         self._refresh_latest()
         return self
+
+    def _stage_inverted_part(self, column, name, fragment_ids, uuid_bytes, kwargs) -> "LanceDataset":
+        """One part of a legacy distributed INVERTED build: what to index, under
+        _indices/<index_uuid>/, for merge_index_metadata to build."""
+        import json
+        import uuid as uuid_module
+
+        params = self._inverted_params(kwargs)
+        fragments = sorted({int(f) for f in fragment_ids})
+        known = {f["id"] for f in self._info["fragments"]}
+        missing = [f for f in fragments if f not in known]
+        if missing:
+            raise ValueError(f"fragment_ids {missing} do not exist in dataset version {self._version}")
+        if self._field(str(column)) is None:
+            raise ValueError(f"column '{column}' does not exist")
+        segment = str(uuid_module.UUID(bytes=uuid_bytes)) if uuid_bytes else str(uuid_module.uuid4())
+        directory = os.path.join(self._uri, "_indices", segment)
+        os.makedirs(directory, exist_ok=True)
+        part = {"column": str(column), "name": name or "", "params": json.loads(params),
+                "dataset_version": self._version, "fragment_ids": fragments}
+        with open(os.path.join(directory, f"part_{fragments[0]}_nanolance.json"), "w") as handle:
+            json.dump(part, handle)
+        return self
+
+    def merge_index_metadata(self, index_uuid: str, index_type: str, batch_readhead: Optional[int] = None,
+                             progress_callback=None) -> None:
+        """Build the INVERTED index staged in parts under `index_uuid` (create_scalar_index with
+        fragment_ids), over the union of their fragments. Does not commit: commit it with
+        ``LanceDataset.commit(uri, LanceOperation.CreateIndex([...], []), read_version)``."""
+        import json
+
+        from nanolance.lance.indices import SupportedDistributedIndices
+        from nanolance.lance.progress import IndexProgress
+
+        t = str(index_type).upper()
+        valid = {member.name for member in SupportedDistributedIndices}
+        if t not in valid:
+            raise NotImplementedError(f"Only {', '.join(sorted(valid))} are supported, received {index_type}")
+        uuid_bytes = _parse_index_uuid(index_uuid)
+        if t == "BTREE":
+            raise ValueError("Invalid user input: BTree distributed indexing no longer supports merge_index_metadata; "
+                             "build segments, optionally merge groups with merge_existing_index_segments(...), "
+                             "and commit with commit_existing_index_segments(...)")
+        if t != "INVERTED":
+            raise ValueError("Invalid user input: Vector distributed indexing no longer supports "
+                             "merge_index_metadata; build segments, optionally merge groups with "
+                             "merge_existing_index_segments(...), and commit with "
+                             "commit_existing_index_segments(...)")
+
+        def report(event, stage, completed=None, total=None, unit=""):
+            if progress_callback is not None:
+                progress_callback(IndexProgress(event, stage, completed, total, unit))
+
+        directory = os.path.join(self._uri, "_indices", str(index_uuid))
+        names = sorted(n for n in (os.listdir(directory) if os.path.isdir(directory) else [])
+                       if n.startswith("part_") and n.endswith("_nanolance.json"))
+        if not names:
+            raise OSError(f"No partition metadata files found in index directory: {directory}")
+        report("start", "read_partition_metadata", 0, len(names), "partitions")
+        parts = []
+        for i, part_name in enumerate(names):
+            with open(os.path.join(directory, part_name)) as handle:
+                parts.append(json.load(handle))
+            report("progress", "read_partition_metadata", i + 1, len(names), "partitions")
+        report("complete", "read_partition_metadata", len(names), len(names), "partitions")
+        fragments = sorted({f for p in parts for f in p["fragment_ids"]})
+        first = parts[0]
+        report("start", "remap_partition_files", 0, len(fragments), "fragments")
+        with _lance_errors():
+            _nanolance._index_build_segment(self._uri, first["column"], "INVERTED", first["name"],
+                                            min(p["dataset_version"] for p in parts), fragments, uuid_bytes,
+                                            json.dumps(first["params"]), {}, None, None)
+        for part_name in names:  # built: the staged parts are done with (kept if the build failed)
+            os.remove(os.path.join(directory, part_name))
+        report("progress", "remap_partition_files", len(fragments), len(fragments), "fragments")
+        report("complete", "remap_partition_files", len(fragments), len(fragments), "fragments")
+        report("start", "write_merged_metadata", 0, 1, "files")
+        report("progress", "write_merged_metadata", 1, 1, "files")
+        report("complete", "write_merged_metadata", 1, 1, "files")
+        return None
+
+    # ── distributed index builds: segments ────────────────────────────────────────────────────────
+
+    def create_index_uncommitted(self, column, index_type, name: Optional[str] = None, metric: str = "L2",
+                                 replace: bool = False, num_partitions: Optional[int] = None, ivf_centroids=None,
+                                 pq_codebook=None, num_sub_vectors: Optional[int] = None, accelerator=None,
+                                 index_cache_size: Optional[int] = None,
+                                 shuffle_partition_batches: Optional[int] = None,
+                                 shuffle_partition_concurrency: Optional[int] = None, ivf_centroids_file=None,
+                                 precomputed_partition_dataset=None, storage_options=None, filter_nan: bool = True,
+                                 train: bool = True, fragment_ids: Optional[List[int]] = None,
+                                 index_uuid: Optional[str] = None, *,
+                                 target_partition_size: Optional[int] = None, **kwargs) -> Index:
+        """Build one segment of an index over `fragment_ids`, without committing it, and return its
+        metadata (Lance's distributed build): commit the segments of all workers with
+        ``commit_existing_index_segments``, after merging groups of them with
+        ``merge_existing_index_segments`` if wanted. BTREE, BITMAP, LABEL_LIST, INVERTED, IVF_FLAT,
+        IVF_PQ and IVF_HNSW_SQ. Vector segments that share `ivf_centroids` (and `pq_codebook`) share
+        one model and can be merged."""
+        kind = str(getattr(index_type, "index_type", index_type)).upper()
+        if kind == "FTS":
+            kind = "INVERTED"
+        if isinstance(column, (list, tuple)):
+            if len(column) != 1:
+                raise unsupported("an index over more than one column")
+            column = column[0]
+        if isinstance(column, str):
+            path = _resolve_path(self._data_schema, column)
+            if path is not None:
+                column = ".".join(path)
+        scalar = kind in ("BTREE", "BITMAP", "LABEL_LIST", "INVERTED")
+        if scalar and fragment_ids is None:
+            raise ValueError("create_index_uncommitted requires fragment_ids for distributed index build")
+        if not scalar and kind not in self._VECTOR_INDEX_TYPES:
+            raise unsupported(f"{kind} index segments")
+        if not scalar and kind not in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"):
+            raise unsupported(f"{kind} indexes (IVF_FLAT, IVF_PQ and IVF_HNSW_SQ are supported)")
+        for option, value in (("ivf_centroids_file", ivf_centroids_file), ("accelerator", accelerator),
+                              ("precomputed_partition_dataset", precomputed_partition_dataset)):
+            if value is not None:
+                raise unsupported(f"create_index_uncommitted option {option}")
+        uuid_bytes = _parse_index_uuid(index_uuid)
+        params, vector, centroids, codebook = "", {}, None, None
+        if kind == "INVERTED":
+            params = self._inverted_params(dict(kwargs))
+        elif scalar:
+            kwargs.pop("progress_callback", None)
+            if kwargs:
+                raise unsupported(f"create_index_uncommitted options {sorted(kwargs)}")
+        else:
+            dim = self._vector_dimension(str(column))
+            if kind == "IVF_PQ" and num_sub_vectors is None and pq_codebook is None:
+                raise ValueError("num_partitions and num_sub_vectors are required for IVF_PQ")
+            if ivf_centroids is not None:
+                centroids = _float32_matrix(ivf_centroids, dim)
+                if num_partitions is not None and int(num_partitions) != len(centroids):
+                    raise ValueError(f"ivf_centroids has {len(centroids)} centroids but num_partitions is "
+                                     f"{num_partitions}")
+                num_partitions = len(centroids)
+            if pq_codebook is not None:
+                if centroids is None:
+                    raise ValueError("pq_codebook requires ivf_centroids")
+                codebook = _float32_matrix(pq_codebook, dim)
+            vector = {"metric": str(metric).lower(), "num_partitions": num_partitions,
+                      "target_partition_size": target_partition_size, "num_sub_vectors": num_sub_vectors,
+                      "num_bits": kwargs.pop("num_bits", 8), "max_iters": kwargs.pop("max_iters", 50),
+                      "sample_rate": kwargs.pop("sample_rate", 256), "seed": kwargs.pop("seed", None),
+                      "m": kwargs.pop("m", 20), "ef_construction": kwargs.pop("ef_construction", 150),
+                      "max_level": kwargs.pop("max_level", 7)}
+            for ignored in ("one_pass_ivfpq", "skip_transpose", "streaming_sample_rate", "streaming_coreset_rate",
+                            "streaming_refine_passes", "progress", "progress_callback", "kmeans_redos"):
+                kwargs.pop(ignored, None)
+            if kwargs:
+                raise unsupported(f"create_index_uncommitted options {sorted(kwargs)}")
+        with _lance_errors():
+            message = _nanolance._index_build_segment(
+                self._uri, str(column), kind, name or "", self._version,
+                None if fragment_ids is None else [int(f) for f in fragment_ids], uuid_bytes, params, vector,
+                None if centroids is None else centroids.tobytes(), None if codebook is None else codebook.tobytes())
+        return _index_of(message)
+
+    def merge_existing_index_segments(self, segments: List[Index]) -> Index:
+        """Merge a group of uncommitted segments (create_index_uncommitted) into one, uncommitted:
+        a new segment over the union of their fragments. Vector segments must share their model."""
+        messages = [_segment_message(self, s) for s in segments]
+        with _lance_errors():
+            message = _nanolance._index_merge_segments(self._uri, messages)
+        return _index_of(message)
+
+    def commit_existing_index_segments(self, index_name: str, column: str, segments) -> "LanceDataset":
+        """Commit built segments as the logical index `index_name` on `column`, in one new version."""
+        messages = [_segment_message(self, s) for s in segments]
+        if isinstance(column, str):
+            path = _resolve_path(self._data_schema, column)
+            if path is not None:
+                column = ".".join(path)
+        with _lance_errors():
+            _nanolance._index_commit_segments(self._uri, str(index_name), str(column), messages)
+        self._refresh_latest()
+        return self
+
+    def get_ivf_model(self, index_name: str):
+        """The IVF model (centroids and distance type) of the vector index `index_name`, as an
+        ``IvfModel``; from its first segment."""
+        import json
+
+        from nanolance.lance.indices.ivf import IvfModel
+
+        segments = [i for i in self.list_indices() if i["name"] == index_name]
+        if not segments:
+            raise KeyError(f"Index {index_name} not found")
+        directory = os.path.join(self._uri, "_indices", segments[0]["uuid"])
+        with native():
+            model = _nanolance._vector_index_model(directory)
+        centroids = np.asarray(model["centroids"], dtype=np.float32)
+        if centroids.size == 0:
+            return None
+        metric = json.loads(model["index_metadata"] or "{}").get("distance_type", "l2")
+        return IvfModel(pa.FixedSizeListArray.from_arrays(pa.array(centroids.reshape(-1)), centroids.shape[1]),
+                        metric)
+
+    def _default_vector_index_for_column(self, column: str) -> str:
+        field = self._field(column)
+        ids = {f["id"]: f for f in _nanolance._ds_fields(self._uri, self._version)}
+        target = next((i for i, f in ids.items() if f["name"] == (field.name if field else None)), None)
+        for index in self.describe_indices():
+            if target in index.fields and str(index.index_type).startswith("IVF"):
+                return index.name
+        raise KeyError(f"No IVF index for column '{column}'")
+
+    def centroids(self, *, index_name: Optional[str] = None, column: Optional[str] = None):
+        """The IVF centroids of a vector index, by name or by its column."""
+        if index_name is None:
+            if column is None:
+                raise ValueError("Must provide 'index_name' or 'column'.")
+            index_name = self._default_vector_index_for_column(column)
+        ivf = self.get_ivf_model(index_name)
+        return None if ivf is None else ivf.centroids
+
+    def _vector_dimension(self, column: str) -> int:
+        field = self._field(column)
+        if field is None:
+            raise KeyError(f"{column} not found in schema")
+        storage = getattr(field.type, "storage_type", field.type)
+        if not pa.types.is_fixed_size_list(storage):
+            raise TypeError(f"Vector column {column} must be FixedSizeListArray 1-dimensional "
+                            f"FixedShapeTensorArray, got {field.type}")
+        return storage.list_size
+
+    def _field(self, column: str) -> Optional[pa.Field]:
+        path = _resolve_path(self._data_schema, column)
+        if path is None:
+            return None
+        field = self._data_schema.field(path[0])
+        for part in path[1:]:
+            field = field.type.field(part)
+        return field
 
     _VECTOR_INDEX_TYPES = ["IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ", "IVF_RQ"]
 
@@ -1117,13 +1374,42 @@ class LanceDataset(pa.dataset.Dataset):
 
         return json.dumps(_index_statistics(self, index_name))
 
+    @staticmethod
+    def commit(base_uri, operation, read_version: Optional[int] = None, commit_lock=None,
+               storage_options=None, enable_v2_manifest_paths=None, detached: bool = False, max_retries: int = 20,
+               **kwargs) -> "LanceDataset":
+        """Commit a hand-built operation. Of Lance's operations nanolance commits ``CreateIndex`` --
+        the last step of a distributed index build: its new segments become the index they name,
+        replacing the segments of that name they cover."""
+        uri = base_uri.uri if isinstance(base_uri, LanceDataset) else os.fspath(base_uri)
+        if not isinstance(operation, LanceOperation.CreateIndex):
+            raise unsupported(f"LanceDataset.commit of {type(operation).__name__}")
+        if detached:
+            raise unsupported("detached commits")
+        if operation.removed_indices:
+            raise unsupported("CreateIndex with removed_indices (the new segments replace those they cover)")
+        names = {index.name for index in operation.new_indices}
+        if len(names) != 1:
+            raise unsupported("CreateIndex of more than one index name")
+        ds = LanceDataset(uri)
+        fields = {f["id"]: f for f in _nanolance._ds_fields(ds._uri, ds._version)}
+        first = operation.new_indices[0]
+        field = fields.get(first.fields[0]) if first.fields else None
+        if field is None:
+            raise ValueError(f"CreateIndex: index {first.name} names no field of the dataset")
+        column = ""
+        while field is not None:
+            column = field["name"] + ("." + column if column else "")
+            field = fields.get(field["parent_id"])
+        return ds.commit_existing_index_segments(first.name, column, operation.new_indices)
+
     # ── not supported ─────────────────────────────────────────────────────────────────────────────
 
     def __getattr__(self, name: str):
         known = {
             "create_index",
             "branches", "create_branch", "sql",
-            "shallow_clone", "deep_clone", "commit", "commit_batch", "session", "join", "delta",
+            "shallow_clone", "deep_clone", "commit_batch", "session", "join", "delta",
             "prewarm_index",
         }
         if name in known:
@@ -1394,6 +1680,85 @@ def _references_row_ids(sql: Optional[str]) -> bool:
     return _ROW_ID_REFERENCE.search(sql) is not None
 
 
+def _parse_index_uuid(index_uuid) -> Optional[bytes]:
+    """A segment UUID's 16 bytes; None for none. A malformed one is a ValueError, as pylance's."""
+    import uuid as uuid_module
+
+    if index_uuid is None:
+        return None
+    try:
+        return uuid_module.UUID(str(index_uuid)).bytes
+    except ValueError as exc:
+        raise ValueError(f"Invalid UUID string for index_uuid: {exc}") from None
+
+
+def _float32_matrix(values, dim: int) -> np.ndarray:
+    """A model (FixedSizeListArray, fixed-shape tensor, or 2-D array) as float32 rows of `dim`."""
+    if isinstance(values, pa.ChunkedArray):
+        values = values.combine_chunks()
+    if isinstance(values, pa.ExtensionArray):
+        values = values.storage
+    if isinstance(values, pa.FixedSizeListArray):
+        if values.type.list_size != dim:
+            raise ValueError(f"the model's vectors have dimension {values.type.list_size}, the column {dim}")
+        values = values.flatten().to_numpy(zero_copy_only=False)
+    matrix = np.ascontiguousarray(np.asarray(values), dtype=np.float32)
+    if matrix.size % dim != 0 or (matrix.ndim == 2 and matrix.shape[1] != dim):
+        raise ValueError(f"the model's vectors do not have the column's dimension {dim}")
+    return matrix.reshape(-1, dim)
+
+
+def _index_of(message: bytes) -> Index:
+    """An IndexMetadata message as pylance's ``Index``."""
+    import uuid as uuid_module
+    from datetime import timezone
+
+    from nanolance.lance.bitmap import Bitmap
+
+    d = _nanolance._index_segment_decode(message)
+    created = datetime.fromtimestamp(d["created_at"] / 1000, tz=timezone.utc) if d["created_at"] else None
+    return Index(uuid=str(uuid_module.UUID(bytes=d["uuid"])), name=d["name"], fields=list(d["fields"]),
+                 dataset_version=d["dataset_version"], fragment_ids=Bitmap(d["fragment_ids"] or []),
+                 index_version=d["index_version"], created_at=created, base_id=None,
+                 files=[IndexFile(path, size) for path, size in d["files"]],
+                 index_details=(d["details_type_url"], d["details_value"]) if d["details_type_url"] else None,
+                 covering_fields=[])
+
+
+def _segment_message(ds: "LanceDataset", segment) -> bytes:
+    """An ``Index`` (or ``IndexSegment``) as an IndexMetadata message. Without index details they are
+    inferred from the segment's files, as Lance infers them."""
+    import uuid as uuid_module
+
+    message = getattr(segment, "_nl_message", b"")
+    if message:
+        return message
+    if not all(hasattr(segment, a) for a in ("uuid", "name", "fields", "dataset_version", "fragment_ids")):
+        raise TypeError(f"expected an Index from create_index_uncommitted, got {type(segment).__name__}")
+    uuid_bytes = uuid_module.UUID(str(segment.uuid)).bytes
+    details = getattr(segment, "index_details", None)
+    if details is None:
+        with native():
+            names = {f["id"]: f for f in _nanolance._ds_fields(ds._uri, ds._version)}
+        field = names.get(segment.fields[0]) if segment.fields else None
+        column = ""
+        while field is not None:
+            column = field["name"] + ("." + column if column else "")
+            field = names.get(field["parent_id"])
+        with native():
+            details = _nanolance._index_segment_details(ds._uri, column, uuid_bytes)
+    created = getattr(segment, "created_at", None)
+    return _nanolance._index_segment_encode({
+        "uuid": uuid_bytes, "name": str(segment.name), "fields": [int(f) for f in segment.fields],
+        "dataset_version": int(segment.dataset_version),
+        "fragment_ids": None if segment.fragment_ids is None else sorted(int(f) for f in segment.fragment_ids),
+        "index_version": int(getattr(segment, "index_version", 0)),
+        "created_at": int(created.timestamp() * 1000) if created is not None else 0,
+        "details_type_url": str(details[0]), "details_value": bytes(details[1]),
+        "files": [(f.path, int(f.size_bytes)) for f in (getattr(segment, "files", None) or [])],
+    })
+
+
 @contextlib.contextmanager
 def _lance_errors():
     """Errors raised as pylance raises them: its Rust core's (k-means, PQ training, a name taken)
@@ -1404,6 +1769,8 @@ def _lance_errors():
         text = str(exc)
         if text.startswith("dimension (") or "num_sub_vectors are required" in text:
             raise ValueError(text) from None
+        if "mismatch across shards" in text or "do not share a storage format" in text:
+            raise RuntimeError(f"LanceError(Index): {text}") from None
         if ("KMeans cannot train" in text or "Not enough rows to train PQ" in text or "already exists" in text
                 or "num_bits" in text):
             raise RuntimeError(text) from None

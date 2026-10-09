@@ -1192,6 +1192,7 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     const auto data_file_name = new_data_file_name();
     nano_lance::LanceFileExtras file_extras;
     file_extras.blob_pack_file_size = state->blob_pack_file_size;
+    file_extras.schema_metadata = state->schema_metadata;  // Lance writes it into every data file
     if (!nano_lance::write_lance_data_file(state->dataset_path,
                                            data_file_name,
                                            disk_schema,

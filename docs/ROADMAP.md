@@ -33,7 +33,7 @@ plain append / update / scan comes before a whole subsystem.
 | 1 | ~~Writer tail~~ -- **done (2026-10-09)**: Arrow dictionary columns (Lance's `dict:<value>:<index>:<ordered>` pages, every index width, string / binary / fixed-width values; read back with the dictionary they were written with, unused entries included, by either library), empty structs (one constant page, as Lance writes them; refused with Lance's error where Lance refuses), null elements inside fixed-size lists (`FixedSizeList.has_validity`), Lance's error for a zero-dimension fixed-size list, pydantic enums, `truncate_table`; 10 more of pylance's tests. Found on the way: a null element in a fixed-size list inside a list would have been written as 0.0 once top-level element nulls were accepted (now refused by name, as before). Left: dictionary columns inside structs or lists, element nulls under a list or struct | ~10 |
 | 1 | ~~Blobs, every kind~~ -- **done (2026-10-09)**: Blob v2 written as Lance writes it (inline / packed / dedicated by the field's thresholds, external references; the same descriptors, blob ids, sidecar files and Lance 12 logical schema), nulls, several blob columns, `blob_field` / `blob_array` / `Blob`, `external_blob_mode="ingest"`, `allow_external_blob_outside_bases`, `blob_pack_file_size_threshold`, pylance's write checks and errors, `read_blob_ranges`, `to_pandas(blob_mode=)`; whole-object external blobs (size 0) read; legacy v1 blob columns of formats 2.0 / 2.1 read in every shape, and their 2.2 write refused as Lance refuses it (nanolance used to write a dataset pylance could not read); 86 more of pylance's tests. Then (2026-10-09): blobs beside vectors / lists / structs (that read was refused outright), and inside structs, lists and lists of structs, read and written as Lance pages them; found on the way: nanolance's blob pages over 64 KiB of descriptors had a row index pylance could scan but not take rows from (a panic) -- now Lance's byte-packed offsets, older files still read. Left: prepared-layout writers (`PackedBlobWriter`, ...), blobs through `add_columns` / `write_fragments`, registered external bases | ~40 |
 | 1 | ~~DuckDB / Polars / LanceDB~~ -- **done (2026-10-09)**: datasets, scanners and fragments are `pyarrow.dataset` objects as pylance's are, so DuckDB replacement scans and `from_arrow`, Polars `scan_pyarrow_dataset` and `to_polars()` read them with pushdown; DuckDB's `lance` extension and LanceDB read nanolance's files and indexes, and nanolance reads and appends to LanceDB's (`tests/test_interop.py`, `tools/interop_suite.py`) | -- |
-| 2 | Distributed index builds from Python: `fragment_ids`, `index_uuid`, `create_index_uncommitted`, `merge_index_metadata`, `IndicesBuilder` (the core exists since lance-c's index segments) | ~55 |
+| 2 | ~~Distributed index builds from Python~~ -- **done (2026-10-09)**: `create_index_uncommitted` (BTree, Bitmap, LabelList, Inverted, IVF_FLAT, IVF_PQ, IVF_HNSW_SQ, with shared IVF / PQ models), `merge_existing_index_segments` (Lance's checks and errors: one keyed field, disjoint coverage, one model within 1e-5), `commit_existing_index_segments`, the legacy INVERTED flow (`create_scalar_index(fragment_ids=, index_uuid=)`, `merge_index_metadata` with its progress events, `LanceDataset.commit(CreateIndex)`), `lance.indices.IndicesBuilder` (`train_ivf` / `train_pq` / `prepare_global_ivf_pq` on float16 / 32 / 64 vectors, `transform_vectors`, `shuffle_transformed_vectors`, `load_shuffled_vectors`), `IvfModel` / `PqModel` files, `lance.bitmap.Bitmap`, `centroids()` / `get_ivf_model`; 120 more of pylance's tests. Found on the way: training a model on a dataset that already had an index of the default name failed ("already exists"), and data files dropped the schema metadata Lance writes into each. Left: merging is a rebuild over the union of fragments (the same index, not a physical merge of the segments' files), indexes over float16 / float64 columns, the index types of tier 3 | -- |
 | 2 | Transactions and fragment-level writes, what Ray / Daft / Spark writers use: `LanceFragment.create`, `write_fragments`, `LanceOperation.*`, `LanceDataset.commit` / `commit_batch`, `merge_columns` / `update_columns`, fragment deletes, `add_columns` with UDFs | ~110 |
 | 2 | Namespaces (`DirectoryNamespace`, what LanceDB's catalog uses): mostly one fixture, so one feature unblocks many tests | ~130 |
 | 2 | Stable row ids | ~57 |
@@ -41,8 +41,7 @@ plain append / update / scan comes before a whole subsystem.
 | 4 | Niche: `mem_wal`, writing data storage versions other than 2.2, multiple base paths, samplers, debug / logging / otel hooks, bfloat16 and image extension arrays, `lance.util.KMeans` | ~120 |
 
 Order of work: tier 1 top to bottom (each item is days, not weeks, and removes an error from an
-everyday workflow); then distributed index builds (cheap for its count: the work is exposing what
-lance-c already has); then transactions and fragment-level writes; then namespaces and stable row
+everyday workflow); then distributed index builds (done); then transactions and fragment-level writes; then namespaces and stable row
 ids. Tier 3 items move up only when a user asks for one. Every item keeps the standing rules: same
 answers as pylance (checked against it), no speed regression, pylance's errors where nanolance
 still refuses.
@@ -380,9 +379,9 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
      duration columns need `arrow_cast` in the filter engine; pylance's large-string index type
      test also fails (not yet diagnosed);
    - indexes on fields inside structs (`a.b`).
-6. **Less common:** distributed builds (`fragment_ids`, `index_uuid`, merging index metadata),
-   `lance.indices.IndicesBuilder`, progress callbacks, index file format v3 (256-document posting
-   blocks).
+6. **Less common:** ~~distributed builds (`fragment_ids`, `index_uuid`, merging index metadata),
+   `lance.indices.IndicesBuilder`~~ (done 2026-10-09, see the priority table), progress callbacks
+   of single-machine builds, index file format v3 (256-document posting blocks).
 
 Suggested order: see "Priority: competing with pylance directly" at the top (IVF_HNSW_SQ from (2)
 and phrase queries from (4) are done).

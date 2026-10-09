@@ -69,6 +69,9 @@ bool load_vector_model(const std::filesystem::path& dir, VectorModel& out, std::
 /// The analyzer settings of the INVERTED index segment in `dir`.
 bool load_inverted_params(const std::filesystem::path& dir, fts::AnalyzerParams& out, std::string& error);
 
+/// InvertedIndexDetails for these analyzer settings, as Lance 12 fills them in.
+std::vector<std::uint8_t> inverted_details(const fts::AnalyzerParams& params);
+
 /// The row addresses of the documents of the INVERTED index segment in `dir`.
 bool load_inverted_rows(const std::filesystem::path& dir, std::vector<std::uint64_t>& out, std::string& error);
 

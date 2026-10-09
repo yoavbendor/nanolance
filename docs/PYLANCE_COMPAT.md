@@ -131,8 +131,49 @@ exactly) are searched by pylance with nanolance's answers, at the recall of pyla
 `optimize_indices` maintains them.
 
 Not supported: IVF_HNSW_PQ, IVF_HNSW_FLAT, IVF_SQ and IVF_RQ indexes (a search falls back to an exact
-one, its plan says why), batch and multivector queries, binary (Hamming) vectors, building on float16 / float64
-vectors, `lance.indices.IndicesBuilder`, and a vector index on a dataset with stable row ids.
+one, its plan says why), batch and multivector queries, binary (Hamming) vectors, building an index on
+float16 / float64 vectors (training a model on them is supported, below), and a vector index on a
+dataset with stable row ids.
+
+### Distributed index builds
+
+As pylance 12 builds an index on many machines, and with the same results:
+
+- **`create_index_uncommitted(column, index_type, fragment_ids=..., ...)`** builds one segment over
+  those fragments under `_indices/<uuid>/` and returns its `Index` (uuid, fields, dataset version,
+  `fragment_ids` as a `lance.bitmap.Bitmap`, `files`, `index_details`) without committing it. BTREE,
+  BITMAP, LABEL_LIST, INVERTED (with the analyzer options), IVF_FLAT, IVF_PQ and IVF_HNSW_SQ.
+  Vector segments take a shared model, `ivf_centroids` (and for IVF_PQ `pq_codebook`), or train
+  their own. Lance's rules and errors: BTREE / LABEL_LIST take no `index_uuid`; scalar types need
+  `fragment_ids`; a malformed UUID is "Invalid UUID ...".
+- **`merge_existing_index_segments(segments)`** folds a group into one new segment (a new UUID, the
+  union of their fragments, the oldest of their versions), with Lance's checks: one keyed field,
+  disjoint coverage, one index type, and for vector segments one model -- metric, partition count,
+  centroids and PQ codebook equal within 1e-5 ("IVF centroids mismatch across shards"; an
+  IVF_HNSW_SQ merge takes the first segment's SQ bounds, as Lance's does). A single vector segment
+  is returned as it is. nanolance merges by building the segment over the union of the fragments
+  with the first segment's model and settings -- the index Lance's merge produces, not a
+  byte-for-byte merge of the segments' files.
+- **`commit_existing_index_segments(name, column, segments)`** publishes segments (nanolance's or
+  pylance's `Index` objects) as one logical index, with Lance's replacement rules.
+- **Legacy INVERTED flow**: `create_scalar_index(..., fragment_ids=[f], index_uuid=u)` per fragment
+  stages the parts, `merge_index_metadata(u, "INVERTED", progress_callback=)` builds the index (with
+  Lance's three progress stages), and `LanceDataset.commit(uri, LanceOperation.CreateIndex([...],
+  []))` commits it -- the one operation `LanceDataset.commit` takes so far; an `Index` without
+  `index_details` gets them from its files, as Lance infers them. BTREE / vector types get Lance's
+  "no longer supports merge_index_metadata".
+- **`lance.indices.IndicesBuilder`** (pylance's own module, its native calls in
+  `lance.lance.indices`): `train_ivf`, `train_pq`, `prepare_global_ivf_pq` on float16, float32 and
+  float64 vectors, over chosen fragments; `transform_vectors`, `shuffle_transformed_vectors`,
+  `load_shuffled_vectors`. `IvfModel` / `PqModel` save and load as Lance files either library reads.
+  Not supported: accelerators, the hamming distance, multivector columns.
+- **`centroids()`** / **`get_ivf_model()`** of a vector index.
+
+`tests/test_distributed_index.py`: segments built, merged and committed by nanolance are answered
+by pylance as the index it builds in one go (the same rows, scores, and for vector indexes with a
+shared model the same rows and distances as pylance's own segments); pylance's segments are merged
+and committed by nanolance and nanolance's committed by pylance; models trained by either load in
+the other.
 
 ### Full-text indexes: built and searched
 
@@ -296,37 +337,40 @@ Current results (pylance 12.0.0 tests; this machine; `bench/results/pylance_suit
 | | tests passing |
 |---|---|
 | pylance itself | 1,473 (362 skipped, 14 failing here for environment reasons) |
-| nanolance.lance | **393**, every one of which pylance also passes (383 before the writer tail, 336 before the small dataset APIs, 316 before JSON columns and filter functions, 312 before compaction planning, 311 before transaction files, 305 before `order_by`, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
+| nanolance.lance | **603**, every one of which pylance also passes (483 before distributed index builds, 393 before blobs, 383 before the writer tail, 336 before the small dataset APIs, 316 before JSON columns and filter functions, 312 before compaction planning, 311 before transaction files, 305 before `order_by`, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes) |
 
 By test file, where nanolance passes any:
 
 | file | pylance | nanolance |
 |---|---|---|
 | test_dataset.py | 250 | 146 |
-| test_scalar_index.py | 189 | 50 |
+| test_blob.py | 214 | 87 |
+| test_scalar_index.py | 189 | 82 |
+| test_bitmap.py | 66 | 55 |
 | test_file.py | 40 | 31 |
+| test_vector_index.py | 97 | 31 |
 | test_column_names.py | 27 | 27 |
-| test_filter.py | 26 | 24 |
-| test_vector_index.py | 97 | 23 |
+| test_filter.py | 26 | 25 |
+| test_indices.py | 27 | 23 |
 | test_map_type.py | 19 | 17 |
 | test_lance.py | 23 | 11 |
 | test_json.py | 18 | 10 |
 | test_fragment.py | 85 | 10 |
 | test_coerce_query_vector.py | 10 | 10 |
-| test_optimize.py | 22 | 6 |
+| test_optimize.py | 22 | 8 |
+| test_pydantic.py | 12 | 6 |
 | test_schema.py | 4 | 4 |
 | test_schema_evolution.py | 23 | 4 |
-| test_pydantic.py | 12 | 6 |
 | test_vector.py | 9 | 3 |
-| others | | 11 |
+| others | | 14 |
 
 The main reasons tests fail today:
 
 - Most need full-text features nanolance lacks (fuzzy matching, other
-  tokenizers, list columns, distributed builds), scalar indexes other than BTree / Bitmap /
-  LabelList / INVERTED or their build options (about 145 in `test_scalar_index.py`), vector index kinds other than
-  IVF_FLAT / IVF_PQ or `lance.indices.IndicesBuilder` (about 30), namespaces (about 130), object
-  stores or the `mem_wal`.
+  tokenizers, list columns), scalar indexes other than BTree / Bitmap / LabelList / INVERTED or
+  their build options (about 110 in `test_scalar_index.py`), vector index kinds other than
+  IVF_FLAT / IVF_PQ / IVF_HNSW_SQ, indexes on float16 / float64 / binary / multivector columns
+  (about 60), namespaces (about 130), object stores or the `mem_wal`.
 - About 90 need the transaction API, fragment-level writes, stable row ids or multiple base paths.
 - About 25 need filter functions nanolance lacks, or a data storage version other than 2.2.
 - A tail of writer gaps in nanolance itself: dictionary columns inside structs or lists, null

@@ -762,7 +762,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
         return false;
     }
-    const bool commit = target == nullptr || target->out == nullptr;
+    // Training alone (target->trained) commits nothing either.
+    const bool commit = target == nullptr || (target->out == nullptr && target->trained == nullptr);
     if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
         error = "a vector index on a dataset with stable row ids is not supported";
         return false;
@@ -810,7 +811,10 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     }
     const std::string format = type->format == nullptr ? "" : type->format;
     const std::string item = type->n_children == 1 && type->children[0]->format != nullptr ? type->children[0]->format : "";
-    if (format.rfind("+w:", 0) != 0 || item != "f") {
+    // Training alone (IndicesBuilder) takes float16 and float64 vectors too, as Lance's does; the
+    // index files nanolance writes hold float32.
+    const bool trains_only = target != nullptr && target->trained != nullptr;
+    if (format.rfind("+w:", 0) != 0 || !(item == "f" || (trains_only && (item == "e" || item == "g")))) {
         error = "Vector column " + column + " must be a fixed-size list of float32 (got '" + format + "' of '" + item +
                 "')";
         return false;
@@ -868,12 +872,23 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         const ArrowArrayView* items = list->children[0];
         const ArrowArrayView* addrs = view.children[view.n_children - 1];
         const float* values = items->buffer_views[1].data.as_float + items->offset;
+        const bool widen = item != "f";
+        const bool half = item == "e";
+        std::vector<float> widened(widen ? dim : 0U);
         for (std::int64_t r = 0; r < batch.length; ++r) {
             const std::int64_t row = view.offset + r;
             if (ArrowArrayViewIsNull(list, row)) {
                 continue;
             }
             const float* v = values + (list->offset + row) * static_cast<std::int64_t>(dim);
+            if (widen) {
+                const std::int64_t first = items->offset + (list->offset + row) * static_cast<std::int64_t>(dim);
+                for (std::size_t j = 0; j < dim; ++j) {
+                    widened[j] = half ? ArrowHalfFloatToFloat(items->buffer_views[1].data.as_uint16[first + j])
+                                             : static_cast<float>(items->buffer_views[1].data.as_double[first + j]);
+                }
+                v = widened.data();
+            }
             if (!std::all_of(v, v + dim, [](float x) { return std::isfinite(x); })) {
                 continue;
             }

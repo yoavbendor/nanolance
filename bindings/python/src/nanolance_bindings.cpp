@@ -13,6 +13,7 @@
 #include <nanolance/jsonb.hpp>
 #include <nanolance/fts_search.hpp>
 #include <nanolance/index_optimize.hpp>
+#include <nanolance/index_segments.hpp>
 #include <nanolance/lance_table_reader.hpp>
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
@@ -32,6 +33,7 @@
 #include <nanobind/stl/tuple.h>
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -780,6 +782,106 @@ void run_op(F&& f) {
     }
 }
 
+
+/// A segment operation: InvalidArgument failures are ValueError, as Lance's are.
+template <typename F>
+void run_segment_op(F&& f) {
+    std::string error;
+    nano_lance::SegmentErrorKind kind{};
+    bool ok = false;
+    {
+        nb::gil_scoped_release release;
+        ok = f(error, kind);
+    }
+    if (!ok) {
+        if (kind == nano_lance::SegmentErrorKind::InvalidArgument) {
+            throw nb::value_error(error.c_str());
+        }
+        throw_dataset(error);
+    }
+}
+
+std::vector<float> floats_of(const std::optional<nb::bytes>& b) {
+    std::vector<float> out;
+    if (b) {
+        out.resize(b->size() / sizeof(float));
+        std::memcpy(out.data(), b->c_str(), out.size() * sizeof(float));
+    }
+    return out;
+}
+
+nb::bytes bytes_of(const void* data, std::size_t size) { return nb::bytes(static_cast<const char*>(data), size); }
+
+std::vector<std::uint8_t> vec_of(const nb::bytes& b) {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(b.c_str());
+    return {p, p + b.size()};
+}
+
+std::array<std::uint8_t, 16> uuid_of(const nb::bytes& b) {
+    if (b.size() != 16U) {
+        throw nb::value_error("a segment UUID is 16 bytes");
+    }
+    std::array<std::uint8_t, 16> out{};
+    std::memcpy(out.data(), b.c_str(), 16);
+    return out;
+}
+
+nano_lance::VectorIndexOptions vector_options_of(const nb::dict& d) {
+    nano_lance::VectorIndexOptions o;
+    if (d.contains("metric")) {
+        const auto metric = nb::cast<std::string>(d["metric"]);
+        if (!nano_lance::parse_vector_metric(metric, o.metric)) {
+            throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot)").c_str());
+        }
+    }
+    if (d.contains("num_partitions") && !d["num_partitions"].is_none()) {
+        o.num_partitions = nb::cast<std::uint32_t>(d["num_partitions"]);
+    }
+    if (d.contains("target_partition_size") && !d["target_partition_size"].is_none()) {
+        o.target_partition_size = nb::cast<std::uint32_t>(d["target_partition_size"]);
+    }
+    const auto u32 = [&](const char* key, std::uint32_t& out) {
+        if (d.contains(key) && !d[key].is_none()) {
+            out = nb::cast<std::uint32_t>(d[key]);
+        }
+    };
+    u32("num_sub_vectors", o.num_sub_vectors);
+    u32("num_bits", o.num_bits);
+    u32("max_iters", o.max_iters);
+    u32("sample_rate", o.sample_rate);
+    u32("m", o.hnsw_m);
+    u32("ef_construction", o.hnsw_ef_construction);
+    u32("max_level", o.hnsw_max_level);
+    if (d.contains("seed") && !d["seed"].is_none()) {
+        o.seed = nb::cast<std::uint64_t>(d["seed"]);
+    }
+    return o;
+}
+
+nb::dict segment_dict(const std::vector<std::uint8_t>& message) {
+    nano_lance::IndexSegmentInfo s;
+    std::string error;
+    if (!nano_lance::decode_index_segment(message, s, error)) {
+        throw nb::value_error(error.c_str());
+    }
+    nb::dict d;
+    d["uuid"] = bytes_of(s.uuid.data(), 16);
+    d["name"] = s.name;
+    d["fields"] = s.fields;
+    d["dataset_version"] = s.dataset_version;
+    d["fragment_ids"] = s.has_fragment_ids ? nb::cast(s.fragment_ids) : nb::none();
+    d["index_version"] = s.index_version;
+    d["created_at"] = s.created_at;
+    d["details_type_url"] = s.details_type_url;
+    d["details_value"] = bytes_of(s.details_value.data(), s.details_value.size());
+    nb::list files;
+    for (const auto& [path, size] : s.files) {
+        files.append(nb::make_tuple(path, size));
+    }
+    d["files"] = files;
+    return d;
+}
+
 }  // namespace
 
 NB_MODULE(_nanolance, m) {
@@ -1233,6 +1335,105 @@ NB_MODULE(_nanolance, m) {
             return nano_lance::dataset_create_inverted_index(path, column, options, version, e);
         });
         return version;
+    });
+    m.def("_index_segment_decode", [](const nb::bytes& message) { return segment_dict(vec_of(message)); });
+    m.def("_index_segment_encode", [](const nb::dict& d) {
+        nano_lance::IndexSegmentInfo s;
+        s.uuid = uuid_of(nb::cast<nb::bytes>(d["uuid"]));
+        s.name = nb::cast<std::string>(d["name"]);
+        s.fields = nb::cast<std::vector<std::int32_t>>(d["fields"]);
+        s.dataset_version = nb::cast<std::uint64_t>(d["dataset_version"]);
+        s.has_fragment_ids = !d["fragment_ids"].is_none();
+        if (s.has_fragment_ids) {
+            s.fragment_ids = nb::cast<std::vector<std::uint32_t>>(d["fragment_ids"]);
+        }
+        s.index_version = nb::cast<std::uint32_t>(d["index_version"]);
+        s.created_at = nb::cast<std::uint64_t>(d["created_at"]);
+        s.details_type_url = nb::cast<std::string>(d["details_type_url"]);
+        s.details_value = vec_of(nb::cast<nb::bytes>(d["details_value"]));
+        for (auto item : nb::cast<nb::list>(d["files"])) {
+            auto t = nb::cast<nb::tuple>(item);
+            s.files.emplace_back(nb::cast<std::string>(t[0]), nb::cast<std::uint64_t>(t[1]));
+        }
+        const auto out = nano_lance::encode_index_segment(s);
+        return bytes_of(out.data(), out.size());
+    });
+    m.def("_index_segment_details", [](const std::filesystem::path& path, const std::string& column,
+                                       const nb::bytes& uuid) {
+        std::string url;
+        std::vector<std::uint8_t> value;
+        const auto id = uuid_of(uuid);
+        run_op([&](std::string& e) { return nano_lance::infer_index_segment_details(path, column, id, url, value, e); });
+        return nb::make_tuple(url, bytes_of(value.data(), value.size()));
+    });
+    m.def("_index_build_segment",
+          [](const std::filesystem::path& path, const std::string& column, const std::string& type,
+             const std::string& name, std::optional<std::uint64_t> version,
+             std::optional<std::vector<std::uint64_t>> fragments, std::optional<nb::bytes> uuid,
+             const std::string& inverted_params, const nb::dict& vector, std::optional<nb::bytes> ivf_centroids,
+             std::optional<nb::bytes> pq_codebook) {
+              nano_lance::IndexSegmentBuild b;
+              b.type = type;
+              b.name = name;
+              b.version = version.value_or(0U);
+              b.fragments = std::move(fragments);
+              if (uuid) {
+                  b.uuid = uuid_of(*uuid);
+              }
+              if (type == "INVERTED") {
+                  std::string error;
+                  if (!nano_lance::fts::parse_params(inverted_params, b.inverted.params, error)) {
+                      throw nb::value_error(error.c_str());
+                  }
+              }
+              b.vector = vector_options_of(vector);
+              b.ivf_centroids = floats_of(ivf_centroids);
+              b.pq_codebook = floats_of(pq_codebook);
+              std::vector<std::uint8_t> segment;
+              run_segment_op([&](std::string& e, nano_lance::SegmentErrorKind& k) {
+                  return nano_lance::dataset_build_index_segment(path, column, b, segment, e, k);
+              });
+              return bytes_of(segment.data(), segment.size());
+          });
+    m.def("_index_merge_segments", [](const std::filesystem::path& path, const std::vector<nb::bytes>& segments) {
+        std::vector<std::vector<std::uint8_t>> in;
+        for (const auto& s : segments) {
+            in.push_back(vec_of(s));
+        }
+        std::vector<std::uint8_t> merged;
+        run_segment_op([&](std::string& e, nano_lance::SegmentErrorKind& k) {
+            return nano_lance::dataset_merge_index_segments(path, in, merged, e, k);
+        });
+        return bytes_of(merged.data(), merged.size());
+    });
+    m.def("_index_commit_segments", [](const std::filesystem::path& path, const std::string& name,
+                                       const std::string& column, const std::vector<nb::bytes>& segments) {
+        std::vector<std::vector<std::uint8_t>> in;
+        for (const auto& s : segments) {
+            in.push_back(vec_of(s));
+        }
+        std::uint64_t version = 0;
+        run_segment_op([&](std::string& e, nano_lance::SegmentErrorKind& k) {
+            return nano_lance::dataset_commit_index_segments(path, name, column, in, version, e, k);
+        });
+        return version;
+    });
+    m.def("_index_train_model", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
+                                   const std::string& column, const std::string& type, const nb::dict& options,
+                                   std::optional<std::vector<std::uint64_t>> fragments,
+                                   std::optional<nb::bytes> ivf_centroids) {
+        auto o = vector_options_of(options);
+        o.type = type;
+        const auto centroids = floats_of(ivf_centroids);
+        nano_lance::TrainedVectorModel model;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_train_vector_model(path, version.value_or(0U), column, o,
+                                                          fragments ? &*fragments : nullptr,
+                                                          ivf_centroids ? &centroids : nullptr, model, e);
+        });
+        return nb::make_tuple(model.dim, model.partitions,
+                              bytes_of(model.centroids.data(), model.centroids.size() * sizeof(float)),
+                              bytes_of(model.codebook.data(), model.codebook.size() * sizeof(float)));
     });
     m.def("_ds_drop_index", [](const std::filesystem::path& path, const std::string& name) {
         std::uint64_t version = 0;

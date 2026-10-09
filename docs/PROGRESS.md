@@ -3110,3 +3110,41 @@ first, without degrading function or speed.
 - **Verified**: `tests/test_writer_tail.py` (every shape written by both libraries and read by
   both); pylance's suite 393 (383 before); ctest 60/60, lance-c 106/106, the Python suite.
 
+
+## Distributed index builds
+
+- **Segments**: `create_index_uncommitted` builds one segment over chosen fragments without
+  committing it (BTree, Bitmap, LabelList, Inverted, IVF_FLAT, IVF_PQ, IVF_HNSW_SQ; vector segments
+  with a shared `ivf_centroids` / `pq_codebook` or a model of their own) and returns pylance's
+  `Index` -- uuid, fields, version, `fragment_ids` as a `lance.bitmap.Bitmap`, the files written,
+  the index details. `merge_existing_index_segments` folds a group into one new segment and
+  `commit_existing_index_segments` publishes segments of either library as one logical index. The
+  core gained `dataset_build_index_segment`, `dataset_merge_index_segments`,
+  `dataset_train_vector_model`, `infer_index_segment_details` and the IndexMetadata codec
+  (`include/nanolance/index_segments.hpp`) over the segment builders lance-c already used.
+- **Merging** is a build over the union of the segments' fragments at the oldest of their versions,
+  with the first segment's settings and, for vector segments, its model -- after Lance's checks
+  (one keyed field, disjoint coverage, one type; metric, partition count, centroids and codebook
+  equal within 1e-5, Lance's "... mismatch across shards" errors; SQ bounds from the first segment,
+  as Lance's merger takes them). The result is the index Lance's merge produces; the files are not
+  a byte-level merge of the segments'.
+- **The legacy INVERTED flow**: `create_scalar_index(fragment_ids=, index_uuid=)` stages parts under
+  `_indices/<uuid>/`, `merge_index_metadata` builds the index there (reporting Lance's three
+  progress stages as `lance.progress.IndexProgress`), and `LanceDataset.commit(...,
+  LanceOperation.CreateIndex(...))` commits it; an `Index` without details gets them from its
+  files, as Lance infers them.
+- **`lance.indices.IndicesBuilder`**, pylance's module adapted, with its native calls in
+  `lance.lance.indices` (where pylance's tests patch them): IVF and PQ training on float16 / 32 / 64
+  vectors and chosen fragments, `prepare_global_ivf_pq`, and the transform / shuffle / load steps.
+  `IvfModel` / `PqModel` files are written and read by either library. Also `centroids()`,
+  `get_ivf_model()`, and `lance.bitmap.Bitmap` (pylance's `test_bitmap.py`: 55 of 66).
+- **Fixed on the way**: training a model (lance-c's `lance_index_train_*_model` too) on a dataset
+  that already had an index of the default name failed with "already exists"; nanolance's data files
+  did not carry the schema metadata Lance writes into each (so `LanceFileWriter` lost it, and with it
+  `IvfModel.save`'s distance type).
+- **Verified**: `tests/test_distributed_index.py` (17 tests: nanolance's segments answer in pylance
+  as pylance's one-go index -- rows, FTS scores, and with a shared model the same vector rows and
+  distances as pylance's own segments; cross-built segments both ways; models both ways); pylance's
+  suite 603 (483 before: `test_indices.py` 23, `test_bitmap.py` 55, 32 more in
+  `test_scalar_index.py`, 8 more in `test_vector_index.py`); ctest 60/60, lance-c 106/106, the
+  Python suite (2156), the interop suite.
