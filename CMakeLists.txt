@@ -324,6 +324,7 @@ add_library(nanolance STATIC
     src/expr.cpp
     src/arrow_slice.cpp
     src/dataset_ops.cpp
+    src/dataset_transaction.cpp
     src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp

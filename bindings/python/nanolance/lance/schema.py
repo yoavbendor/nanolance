@@ -106,10 +106,12 @@ class LanceSchema:
     """A Lance schema: its fields (with ids and children) and its metadata."""
 
     def __init__(self, fields: List[Dict[str, Any]], metadata: Optional[Dict[str, str]] = None,
-                 arrow: Optional[pa.Schema] = None):
+                 arrow: Optional[pa.Schema] = None, messages: Optional[List[bytes]] = None):
         self._infos = [dict(f) for f in fields]
         self._metadata = dict(metadata or {})
         self._arrow = arrow
+        # The fields as Lance encodes them (lance.file.Field), what a hand-built transaction carries.
+        self._messages = None if messages is None else [bytes(m) for m in messages]
         by_id: Dict[int, LanceField] = {}
         kids: Dict[int, List[Dict[str, Any]]] = {}
         for f in self._infos:
@@ -132,9 +134,18 @@ class LanceSchema:
 
     @staticmethod
     def from_pyarrow(schema: pa.Schema) -> "LanceSchema":
-        fields = _nanolance._lance_fields_from_arrow(schema)
+        from nanolance.lance.dataset import _json_in_schema
+
+        stored = _json_in_schema(schema)  # JSON columns (arrow.json) as Lance stores them (lance.json)
+        fields = _nanolance._lance_fields_from_arrow(stored)
         metadata = {k.decode(): v.decode() for k, v in (schema.metadata or {}).items()}
-        return LanceSchema(fields, metadata, schema)
+        return LanceSchema(fields, metadata, schema, _nanolance._lance_field_messages_from_arrow(stored))
+
+    @staticmethod
+    def _from_messages(messages: List[bytes], metadata: Optional[Dict[str, str]] = None,
+                       arrow: Optional[pa.Schema] = None) -> "LanceSchema":
+        """From lance.file.Field messages, parents first."""
+        return LanceSchema([_decode_field(bytes(m)) for m in messages], metadata, arrow, messages)
 
     @staticmethod
     def _from_protos(metadata_json: str, *field_protos: bytes) -> "LanceSchema":
@@ -153,14 +164,14 @@ class LanceSchema:
                     f"references parent id {f['parent_id']}, which must appear earlier in the protobuf field list")
             seen.add(f["id"])
             fields.append(f)
-        return LanceSchema(fields, metadata)
+        return LanceSchema(fields, metadata, None, [bytes(p) for p in field_protos])
 
     @staticmethod
-    def _restore(fields, metadata, arrow) -> "LanceSchema":
-        return LanceSchema(fields, metadata, arrow)
+    def _restore(fields, metadata, arrow, messages=None) -> "LanceSchema":
+        return LanceSchema(fields, metadata, arrow, messages)
 
     def __reduce__(self):
-        return (LanceSchema._restore, (self._infos, self._metadata, self._arrow))
+        return (LanceSchema._restore, (self._infos, self._metadata, self._arrow, self._messages))
 
     # ── access ────────────────────────────────────────────────────────────────────────────────────
 
@@ -210,7 +221,10 @@ class LanceSchema:
 
     def to_pyarrow(self) -> pa.Schema:
         if self._arrow is None:
-            raise NotImplementedError("this schema has no Arrow form here (a schema rebuilt from protos)")
+            if self._messages is None:
+                raise NotImplementedError("this schema has no Arrow form here (a schema without its Lance fields)")
+            metadata = {k: v.encode() for k, v in self._metadata.items()}
+            self._arrow = pa.schema(_nanolance._arrow_schema_from_field_messages(self._messages, metadata))
         return self._arrow
 
     def __eq__(self, other) -> bool:

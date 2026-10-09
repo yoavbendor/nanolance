@@ -73,3 +73,41 @@ class Bitmap(MutableSet):
 
     def __repr__(self) -> str:
         return f"Bitmap({sorted(self._ids)!r})" if self._ids else "Bitmap()"
+
+
+def _serialize_roaring(values: Iterable[int]) -> bytes:
+    """`values` (u32) in the portable RoaringBitmap format, as roaring-rs writes it without run
+    containers: array containers up to 4096 values, bitmap containers above."""
+    import struct
+
+    by_key = {}
+    for v in sorted(set(int(x) for x in values)):
+        by_key.setdefault(v >> 16, []).append(v & 0xFFFF)
+    keys = sorted(by_key)
+    out = bytearray(struct.pack("<II", 12346, len(keys)))
+    for k in keys:
+        out += struct.pack("<HH", k, len(by_key[k]) - 1)
+    offset = len(out) + 4 * len(keys)
+    bodies = []
+    for k in keys:
+        low = by_key[k]
+        if len(low) <= 4096:
+            body = struct.pack(f"<{len(low)}H", *low)
+        else:
+            words = [0] * 1024
+            for v in low:
+                words[v >> 6] |= 1 << (v & 63)
+            body = struct.pack("<1024Q", *words)
+        out += struct.pack("<I", offset)
+        offset += len(body)
+        bodies.append(body)
+    for body in bodies:
+        out += body
+    return bytes(out)
+
+
+def _bitmap_serialize(self) -> bytes:
+    return _serialize_roaring(self._ids)
+
+
+Bitmap.serialize = _bitmap_serialize

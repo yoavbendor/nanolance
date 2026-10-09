@@ -72,6 +72,23 @@ const pb::Field* find_descriptor_field(const pb::FileDescriptor& descriptor, con
     return nullptr;
 }
 
+/// The file's own record of the dataset field the manifest lists `index`-th for it (`field_id`, named
+/// `name`). Lance matches a data file's fields to the manifest's by position rather than by the ids the
+/// file carries -- a file written alone (pylance's LanceFileWriter) numbers its fields from 0 -- so
+/// the file's id is taken only when its name agrees; otherwise the position decides.
+const pb::Field* on_disk_field(const pb::FileDescriptor& descriptor, const pb::DataFile& data_file, std::size_t index,
+                               std::int32_t field_id, const std::string& name) {
+    const auto* by_id = find_descriptor_field(descriptor, field_id);
+    if (by_id != nullptr && by_id->name == name) {
+        return by_id;
+    }
+    if (descriptor.fields.size() == data_file.fields.size() && index < descriptor.fields.size() &&
+        descriptor.fields[index].name == name) {
+        return &descriptor.fields[index];
+    }
+    return by_id;
+}
+
 bool set_schema_metadata(ArrowSchema& schema, const std::string& key, const std::string& value) {
     ArrowBuffer buffer;
     if (ArrowMetadataBuilderInit(&buffer, schema.metadata) != NANOARROW_OK) {
@@ -2162,7 +2179,8 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
                 error = "data file column index out of range";
                 return false;
             }
-            const auto* on_disk = find_descriptor_field(open.descriptor, field_id);
+            const auto* on_disk =
+                on_disk_field(open.descriptor, data_file, i, field_id, find_mapping_field(mapping, field_id)->name);
             if (on_disk == nullptr) {
                 error = "data file references unknown field id";
                 return false;
@@ -2527,7 +2545,8 @@ bool decode_data_file_rows(const std::filesystem::path& dataset_path, const Plan
                 error = "data file column index out of range";
                 return false;
             }
-            const auto* on_disk = find_descriptor_field(descriptor, field_id);
+            const auto* on_disk =
+                on_disk_field(descriptor, data_file, i, field_id, find_mapping_field(mapping, field_id)->name);
             if (on_disk == nullptr) {
                 error = "data file references unknown field id";
                 return false;
@@ -3585,6 +3604,24 @@ bool lance_dataset_schema(const std::filesystem::path& dataset_path, const Lance
         return false;
     }
     if (!set_dataset_schema_metadata(out_schema, manifest, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
+    return true;
+}
+
+bool lance_fields_arrow_schema(const std::vector<pb::Field>& fields,
+                               const std::map<std::string, std::vector<std::uint8_t>>& schema_metadata,
+                               ArrowSchema& out_schema, std::string& error) {
+    error.clear();
+    ArrowSchemaInit(&out_schema);
+    pb::Manifest manifest{};
+    manifest.fields = fields;
+    manifest.schema_metadata = schema_metadata;
+    LanceSchemaMapping mapping;
+    if (!lance_schema_mapping_from_manifest(manifest, mapping, error) ||
+        !build_schema_from_mapping(mapping, out_schema, error) ||
+        !set_dataset_schema_metadata(out_schema, manifest, error)) {
         release_schema_if_held(out_schema);
         return false;
     }

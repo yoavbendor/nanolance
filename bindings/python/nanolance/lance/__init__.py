@@ -42,6 +42,7 @@ from nanolance.lance.dataset import (
 from nanolance.lance.blob import Blob, BlobArray, BlobColumn, BlobFile, blob_array, blob_field
 from nanolance.lance.fragment import DataFile, DeletionFile, FragmentMetadata, LanceFragment
 from nanolance.lance._transactions import LanceOperation, Transaction
+from nanolance.lance.udf import batch_udf
 
 #: The pylance release whose API (and test suite) this module tracks.
 PYLANCE_API_VERSION = "12.0.0"
@@ -65,6 +66,7 @@ __all__ = [
     "__version__",
     "blob_array",
     "blob_field",
+    "batch_udf",
     "dataset",
     "install_as_lance",
     "uninstall_as_lance",

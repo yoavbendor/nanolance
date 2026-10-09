@@ -50,6 +50,9 @@ void write_le64(std::ostream& out, std::uint64_t value) {
 
 /// Lance's V2 manifest filename: `u64::MAX - version`, zero-padded to 20 digits.
 std::string manifest_filename(std::uint64_t version, bool v2) {
+    if ((version & (1ULL << 63U)) != 0U) {
+        return "d" + std::to_string(version) + ".manifest";  // a detached version, outside the lineage
+    }
     if (!v2) {
         return std::to_string(version) + ".manifest";
     }
@@ -241,7 +244,9 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     if (!ec) {
         drop_transaction.committed = true;
         std::filesystem::remove(temp_path, ec);
-        run_auto_cleanup(dataset_path, manifest.version, manifest.config);
+        if ((manifest.version & (1ULL << 63U)) == 0U) {
+            run_auto_cleanup(dataset_path, manifest.version, manifest.config);
+        }
         return true;
     }
     if (std::filesystem::exists(final_path)) {

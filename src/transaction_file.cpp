@@ -269,9 +269,7 @@ std::pair<std::uint32_t, Bytes> operation(const pb::Manifest* parent, const pb::
                     }
                 }
             }
-            if (f.files.size() != old->files.size()) {
-                files_changed = true;
-            }
+            // (Files only removed -- those a dropped column left empty -- change no data: a Project.)
         }
     }
     std::vector<std::uint64_t> removed;
@@ -452,12 +450,14 @@ std::pair<std::uint32_t, Bytes> operation(const pb::Manifest* parent, const pb::
 
 bool write_transaction_file(const std::filesystem::path& dataset_path, const pb::Manifest& next,
                             std::string& file_name, std::string& error) {
-    const std::uint64_t read_version = next.version > 0U ? next.version - 1U : 0U;
+    const bool explicit_op = next.explicit_operation_field != 0U;
+    const std::uint64_t read_version =
+        explicit_op ? next.explicit_read_version : (next.version > 0U ? next.version - 1U : 0U);
     pb::Manifest parent;
     bool has_parent = false;
     // An append, an overwrite and a restore say what they do; the rest is read off the change.
     using Op = pb::Manifest::Operation;
-    const bool needs_parent = next.operation != Op::Append && next.operation != Op::Overwrite &&
+    const bool needs_parent = !explicit_op && next.operation != Op::Append && next.operation != Op::Overwrite &&
                               next.operation != Op::Restore && next.operation != Op::Reserve;
     if (read_version > 0U && needs_parent) {
         std::string load_error;
@@ -477,8 +477,12 @@ bool write_transaction_file(const std::filesystem::path& dataset_path, const pb:
         put_string(entry, 2, value);
         put_bytes(tx, 4, entry);
     }
-    const auto [field, op] = operation(has_parent ? &parent : nullptr, next);
-    put_bytes(tx, field, op);
+    if (explicit_op) {
+        put_bytes(tx, next.explicit_operation_field, next.explicit_operation);
+    } else {
+        const auto [field, op] = operation(has_parent ? &parent : nullptr, next);
+        put_bytes(tx, field, op);
+    }
 
     file_name = std::to_string(read_version) + "-" + uuid + ".txn";
     const auto dir = dataset_path / "_transactions";
@@ -497,6 +501,11 @@ bool write_transaction_file(const std::filesystem::path& dataset_path, const pb:
         return false;
     }
     return true;
+}
+
+std::pair<std::uint32_t, std::vector<std::uint8_t>> derive_transaction_operation(const pb::Manifest& parent,
+                                                                                  const pb::Manifest& next) {
+    return operation(&parent, next);
 }
 
 void remove_transaction_file(const std::filesystem::path& dataset_path, const std::string& file_name) {

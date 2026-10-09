@@ -40,8 +40,8 @@ compared, results are checked against pylance on the same files, in both directi
 | Versions | `version`, `latest_version`, `versions()` (with pylance's summary metadata), `version_refs()`, `checkout_version` (a number or a tag), `checkout_latest`, `restore`; `tags` (`list`, `list_ordered`, `get_version`, `create`, `update`, `delete`, `replace_metadata`, in Lance's `_refs/tags` files, so pylance and nanolance see each other's); `cleanup_old_versions` / `explain_cleanup_old_versions` with all of pylance's options, by Lance's rules (the read version, newer and tagged versions kept; files no version names kept until 7 days old; only files no newer than the earliest version kept are listed); automatic cleanup from `lance.auto_cleanup.*` after every commit (`auto_cleanup_options`, `optimize.enable_auto_cleanup` / `disable_auto_cleanup`); `LanceDataset.drop` (refused unless the path holds a readable manifest). Branches are not supported. |
 | Metadata | `schema` (with its schema metadata), `lance_schema` (`lance.schema.LanceSchema` / `LanceField`: ids, parents, field metadata, keys, `field` / `field_case_insensitive`, `from_pyarrow`, pickling), `data_storage_version`, `config` / `update_config` / `delete_config_keys`, `metadata` / `update_metadata`, `schema_metadata` / `update_schema_metadata` / `replace_schema_metadata`, `update_field_metadata` (by path; set, remove, replace) |
 | Statistics | `stats.dataset_stats`, `stats.data_stats` (bytes on disk per field, as Lance sums them), `stats.index_stats` / `index_statistics` (the same numbers as pylance's for BTree, Bitmap, LabelList, INVERTED, IVF_FLAT, IVF_PQ and IVF_HNSW_SQ, on either library's index), `validate` |
-| Transactions | `read_transaction`, `get_transactions` (as `Transaction` / `LanceOperation.*`, from the `_transactions/*.txn` file every commit writes; pylance and nanolance read either library's the same way), `transaction_properties=` and `commit_message=` on writes. Committing a hand-built transaction is not implemented. |
-| Fragments | `get_fragments`, `get_fragment`; `LanceFragment`: `fragment_id`, `metadata` (`FragmentMetadata`, `DataFile`, `DeletionFile`), `count_rows`, `physical_rows`, `num_deletions`, `to_table`, `to_batches`, `scanner`, `head`, `take` |
+| Transactions | `read_transaction`, `get_transactions` (as `Transaction` / `LanceOperation.*`, from the `_transactions/*.txn` file every commit writes; pylance and nanolance read either library's the same way), `transaction_properties=` and `commit_message=` on writes. Hand-built transactions: `LanceDataset.commit` of `Append`, `Overwrite`, `Delete`, `Update`, `Merge`, `Project`, `Rewrite`, `Restore`, `UpdateConfig`, `DataReplacement` and `CreateIndex` operations, or of a `Transaction`; `commit_batch` (Append transactions); `detached=True`; `max_retries`, `commit_timeout`. Each is applied as Lance's `build_manifest` applies it, after Lance's checks, and checked against the transactions committed since its read version by Lance's conflict rules (`lance.commit.CommitConflictError`, `retryable` or not); the transaction file records the operation as given. `MergeInsertBuilder.execute_uncommitted`. |
+| Fragments | `get_fragments`, `get_fragment`; `LanceFragment`: `fragment_id`, `metadata` (`FragmentMetadata`, `DataFile`, `DeletionFile`, as pylance shapes them: `to_json` / `from_json`, pickling), `count_rows`, `physical_rows`, `num_deletions`, `to_table`, `to_batches`, `scanner` (`include_deleted_rows`), `head`, `take`, `validate`. Writes apart from any commit, for a commit to publish: `lance.fragment.write_fragments` (fragments or, with `return_transaction`, the transaction), `LanceFragment.create`, `create_from_file`, `DataFile.create`, `delete` / `delete_rows` (a new deletion file), `merge_columns` (SQL expressions, a function of each batch, or data), `merge` (a join), `update_columns` (Lance's tombstoned layout, `with_offsets`). `add_columns` with a function or `lance.batch_udf` (and its checkpoint file). |
 | Filters | `filter=` on `to_table`, `to_batches`, `scanner`, `count_rows` and fragments: an SQL string or a pyarrow compute expression. Comparisons, `AND` / `OR` / `NOT` with SQL's three-valued logic, `IS [NOT] NULL`, `IN`, `BETWEEN`, `LIKE` / `ILIKE`, arithmetic, `CAST`, `DATE` / `TIMESTAMP` literals, struct fields (`s.a`), and the functions `lower`, `upper`, `length`, `abs`, `coalesce`, `starts_with`, `ends_with`, `contains`. With a filter, `offset` and `limit` count the rows that pass, as in pylance. |
 | Changes | `delete`, `update` (SQL values), `merge_insert` (`when_matched_update_all`, with or without a condition over `source.*` / `target.*`, `when_matched_delete`, `when_matched_fail`, `when_not_matched_insert_all`, `when_not_matched_by_source_delete`, `write_mode`, `execute`; `on` defaults to the schema's unenforced primary key; a source with part of the columns keeps the matched rows' other values and gives inserted rows nulls there, written as whole rows in every `write_mode`), `add_columns` (SQL expressions, a `pa.field` / schema of null columns, or a reader), `merge` (new columns joined on a key; not yet into a dataset with deleted rows), `drop_columns`, `alter_columns` (rename, nullability, data type), `optimize.compact_files`, `optimize.optimize_indices`. Each is one version (compaction of indexed
 fragments two: see "Keeping indexes up to date"), and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column. |
@@ -159,7 +159,7 @@ As pylance 12 builds an index on many machines, and with the same results:
 - **Legacy INVERTED flow**: `create_scalar_index(..., fragment_ids=[f], index_uuid=u)` per fragment
   stages the parts, `merge_index_metadata(u, "INVERTED", progress_callback=)` builds the index (with
   Lance's three progress stages), and `LanceDataset.commit(uri, LanceOperation.CreateIndex([...],
-  []))` commits it -- the one operation `LanceDataset.commit` takes so far; an `Index` without
+  []))` commits it (see "Transactions" for the other operations it takes); an `Index` without
   `index_details` gets them from its files, as Lance infers them. BTREE / vector types get Lance's
   "no longer supports merge_index_metadata".
 - **`lance.indices.IndicesBuilder`** (pylance's own module, its native calls in
@@ -294,12 +294,12 @@ them is silently ignored:
 - Substrait filters, `LanceDataset.sql`, and SQL functions beyond those listed (the filter dialect
   now has the `json_*` functions, `regexp_match` / `regexp_like`, `::` / `arrow_cast` casts and
   `array_has_any` / `array_has_all` / `array_contains`). A function it lacks is refused by name.
-- Committing transactions (`LanceDataset.commit`, `commit_batch`, `write_fragments`,
-  `LanceFragment.create`; `LanceOperation` exists for reading them), `LanceFragment.merge_columns`
-  / `update_columns`. (Racing writers are retried as Lance retries them:
-  an append or overwrite is built again on the newer version, a change is rebased when the other
-  writers only added fragments, and a delete, update, merge, compaction or index optimization whose
-  fragments another writer rewrote runs again on the latest version, up to Lance's 20 tries.)
+- `LanceOperation.DataOverlay` (Lance 12's unstable overlay files), `commit_lock`, `update_columns`
+  of a blob column, writing the legacy (v1) file format or V1 manifest names. (Racing writers are
+  retried as Lance retries them: an append or overwrite is built again on the newer version, a
+  change is rebased when the other writers only added fragments, and a delete, update, merge,
+  compaction or index optimization whose fragments another writer rewrote runs again on the latest
+  version, up to Lance's 20 tries.)
 - Fuzzy full-text queries and the full-text features listed under "Full-text indexes",
   vector indexes other than IVF_FLAT and IVF_PQ, and scalar indexes other than BTree, Bitmap,
   LabelList and INVERTED. An index pylance built is kept, though: see "Indexes" below.
@@ -308,7 +308,7 @@ them is silently ignored:
   `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`); blob data through `add_columns` or
   `write_fragments`.
 - Object stores and namespaces (`s3://`, `gs://`, REST and directory namespaces).
-- torch and Hugging Face integration, UDFs, blob-file APIs, the memtable write-ahead log
+- torch and Hugging Face integration, blob-file APIs, the memtable write-ahead log
   (`mem_wal`).
 
 A name from pylance that nanolance does not implement still imports, for example
@@ -423,6 +423,21 @@ The runs found these bugs in nanolance's core. All are fixed and pinned in
   one already committed. Data files are now named at random (128 bits from the system's entropy
   source on every call, as a seeded generator would be copied into forked processes), as Lance
   names them by UUID; deletion file ids take random bits too (`test_concurrent_writers.py`).
+
+- **A dropped column's data files stayed in their fragments.** Lance's Project removes a data file
+  left holding none of the schema's fields; nanolance kept it, so the two libraries' fragments of the
+  same dataset differed (and a new fragment for it took different field ids). Now removed as Lance
+  removes it.
+- **A data file written on its own could not be read in a dataset.** A file from pylance's
+  `LanceFileWriter` numbers its fields from 0; the manifest maps them to the dataset's ids by
+  position, and nanolance looked the dataset's ids up in the file ("data file references unknown
+  field id"). It now matches them as Lance does.
+- **New SQL columns were typed differently.** `add_columns({"one": "1"})` gave a nullable field where
+  Lance's is `not null`, and `value + 1` over an int32 column an int64 one where Lance keeps int32
+  (its planner casts a literal to the column's type). Both now match, and the Merge transaction's
+  nullability claim with them.
+- **Data files are named as Lance names them**: a random UUID's first 3 bytes as 24 binary digits,
+  then 26 hex digits (they were `fragment-<hex>.lance`).
 
 - **Reading format 2.1 was refused outright**, and a fixed-size-binary constant wider than 32 bytes
   in a pylance-written 2.2 dataset was refused. The file footer holds the major version and then

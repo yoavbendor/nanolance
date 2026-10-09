@@ -2756,6 +2756,13 @@ TypeGuess guess(const Node& n, const ArrowSchema& root) {
                 if (a.column != nullptr && a.type == b.type) {
                     return a;  // int32 + int32 stays int32, as DataFusion keeps it
                 }
+                // A literal takes the column's type (Lance's planner casts it so): int32 + 1 is int32.
+                if (a.column != nullptr && n.args[1]->op == Op::Literal) {
+                    return a;
+                }
+                if (b.column != nullptr && n.args[0]->op == Op::Literal) {
+                    return b;
+                }
                 g.type = NANOARROW_TYPE_INT64;
                 return g;
             }
@@ -2823,6 +2830,42 @@ TypeGuess guess(const Node& n, const ArrowSchema& root) {
 
 }  // namespace
 
+namespace {
+
+/// Whether the expression can yield a null, as DataFusion types it (and so Lance's add_columns marks
+/// the new field): a literal only when it is NULL, a column when it is nullable, IS [NOT] NULL / TRUE /
+/// FALSE never, an operator when one of its inputs can, a function always.
+bool may_be_null(const Node& n, const ArrowSchema& root) {
+    switch (n.op) {
+        case Op::Literal:
+            return n.literal.kind == Kind::Null;
+        case Op::Column: {
+            const ArrowSchema* at = &root;
+            for (const auto index : n.column.indices) {
+                at = at->children[index];
+                if ((at->flags & ARROW_FLAG_NULLABLE) != 0) {
+                    return true;
+                }
+            }
+            return n.column.indices.empty();
+        }
+        case Op::IsNull:
+        case Op::IsNotNull:
+        case Op::IsTrue:
+        case Op::IsFalse:
+        case Op::IsNotTrue:
+        case Op::IsNotFalse:
+            return false;
+        case Op::Func:
+            return true;
+        default:
+            return std::any_of(n.args.begin(), n.args.end(),
+                               [&](const std::unique_ptr<Node>& a) { return a && may_be_null(*a, root); });
+    }
+}
+
+}  // namespace
+
 bool Expression::result_type(const std::string& name, ArrowSchema& out, std::string& error) const {
     error.clear();
     if (!binding_) {
@@ -2848,7 +2891,11 @@ bool Expression::result_type(const std::string& name, ArrowSchema& out, std::str
         }
         return false;
     }
-    out.flags |= ARROW_FLAG_NULLABLE;
+    if (may_be_null(*root_, binding_->schema)) {
+        out.flags |= ARROW_FLAG_NULLABLE;
+    } else {
+        out.flags &= ~ARROW_FLAG_NULLABLE;
+    }
     return true;
 }
 

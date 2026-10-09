@@ -15,6 +15,7 @@
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -556,21 +557,35 @@ void reset_column_values(WriterState& state) {
     state.column_values.resize(count_non_blob_physical_columns(state.schema_mapping));
 }
 
-/// A new data file's name: `fragment-<32 hex digits>.lance`, random, as Lance names its files by a
-/// UUID. Writers in other processes add files to the same `data/` at the same time, so a name
-/// derived from what is already there (a counter) could be taken twice -- and the second file would
+/// A new data file's name, as Lance names its files (generate_random_filename): a random UUID v4, its
+/// first 3 bytes as 24 binary digits, then the other 13 as 26 hex digits -- 50 characters, ".lance".
+/// Random because writers in other processes add files to the same `data/` at the same time: a name
+/// derived from what is already there (a counter) could be taken twice, and the second file would
 /// overwrite one the first writer has committed.
 /// The bits come from the system's entropy source on every call: a seeded generator would be
 /// copied into each process a writer forks, and those would then all draw the same names.
 std::string new_data_file_name() {
     std::random_device device;
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::string name = "fragment-";
-    for (int word = 0; word < 4; ++word) {
-        auto bits = static_cast<std::uint32_t>(device());
-        for (int k = 0; k < 8; ++k, bits >>= 4U) {
-            name += kHex[bits & 0xFU];
+    std::array<std::uint8_t, 16> uuid{};
+    for (std::size_t i = 0; i < uuid.size(); i += 4) {
+        const auto bits = static_cast<std::uint32_t>(device());
+        for (std::size_t k = 0; k < 4; ++k) {
+            uuid[i + k] = static_cast<std::uint8_t>(bits >> (8U * k));
         }
+    }
+    uuid[6] = static_cast<std::uint8_t>((uuid[6] & 0x0FU) | 0x40U);  // version 4
+    uuid[8] = static_cast<std::uint8_t>((uuid[8] & 0x3FU) | 0x80U);  // RFC 4122 variant
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string name;
+    name.reserve(56);
+    for (std::size_t i = 0; i < 3; ++i) {
+        for (int bit = 7; bit >= 0; --bit) {
+            name += ((uuid[i] >> bit) & 1U) != 0U ? '1' : '0';
+        }
+    }
+    for (std::size_t i = 3; i < uuid.size(); ++i) {
+        name += kHex[uuid[i] >> 4U];
+        name += kHex[uuid[i] & 0xFU];
     }
     return name + ".lance";
 }

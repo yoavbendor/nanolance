@@ -165,6 +165,7 @@ class LanceDataset(pa.dataset.Dataset):
         self._uri = _path_of(uri)
         if isinstance(version, str):
             version = _tag_version(self._uri, version, ValueError)
+        self._storage_options = storage_options
         self._default_scan_options = dict(default_scan_options or {})
         with native():
             info = _nanolance._ds_info(self._uri, version)
@@ -175,6 +176,17 @@ class LanceDataset(pa.dataset.Dataset):
         self._info = info
         self._version = int(info["version"])
         self._schema_cache = None
+        self._fragment_message_cache = None
+
+    def _fragment_messages(self) -> Dict[int, bytes]:
+        """This version's fragments as the manifest encodes them (lance.table.DataFragment), by id."""
+        if self._fragment_message_cache is None:
+            from nanolance.lance._transactions import _fragment_id
+
+            with native():
+                messages = _nanolance._ds_fragment_messages(self._uri, self._version)
+            self._fragment_message_cache = {_fragment_id(m): bytes(m) for m in messages}
+        return self._fragment_message_cache
 
     def _refresh_latest(self) -> None:
         with native():
@@ -241,7 +253,14 @@ class LanceDataset(pa.dataset.Dataset):
 
     @property
     def max_field_id(self) -> int:
-        return max(len(self._data_schema.names) - 1, 0)
+        """The highest field id the dataset has used: its schema's, and its data files' (a dropped
+        column's id stays taken)."""
+        with native():
+            ids = [f["id"] for f in _nanolance._ds_fields(self._uri, self._version)]
+        for fragment in self._info["fragments"]:
+            for f in fragment["files"]:
+                ids.extend(int(i) for i in f["fields"])
+        return max(ids, default=-1)
 
     @property
     def partition_expression(self):
@@ -760,11 +779,33 @@ class LanceDataset(pa.dataset.Dataset):
             with native():
                 _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields))
         elif callable(transforms):
-            raise unsupported("add_columns with a UDF")
+            self._add_columns_udf(transforms, read_columns, batch_size)
+            return
         else:
             reader = _coerce_reader(transforms, reader_schema)
             with native():
                 _nanolance._ds_add_columns_stream(self._uri, reader)
+        self._refresh_latest()
+
+    def _add_columns_udf(self, transforms, read_columns, batch_size) -> None:
+        """New columns computed by a function of each batch: a new data file per fragment, then one
+        Merge commit -- what Lance does. A BatchUDF's checkpoint keeps the batches computed, so a run
+        that fails resumes without computing them again; it is removed once the commit is made."""
+        from nanolance.lance.udf import normalize_transform
+
+        udf = normalize_transform(transforms, self, read_columns)
+        fragments = []
+        schema = None
+        for fragment in self.get_fragments():
+            table = fragment._new_columns(udf, read_columns, batch_size, cache=udf.cache)
+            metadata, schema = fragment._write_columns(table, replace=False)
+            fragments.append(metadata)
+        if schema is None:  # no rows: the columns alone
+            self.add_columns(list(udf.output_schema))
+        else:
+            LanceDataset.commit(self._uri, LanceOperation.Merge(fragments, schema), read_version=self._version)
+        if udf.cache is not None:
+            udf.cache.cleanup()
         self._refresh_latest()
 
     def truncate_table(self) -> None:
@@ -1325,8 +1366,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         with native():
             fields = _nanolance._ds_fields(self._uri, self._version)
+            messages, _ = _nanolance._ds_field_messages(self._uri, self._version)
         metadata = {k.decode(): v.decode(errors="replace") for k, v in self._info["schema_metadata"].items()}
-        return LanceSchema(fields, metadata, self.schema)
+        return LanceSchema(fields, metadata, self.schema, list(messages))
 
     def update_field_metadata(self, field_updates: Dict[str, Dict[str, Optional[str]]], *,
                               replace: bool = False) -> None:
@@ -1377,15 +1419,104 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def commit(base_uri, operation, read_version: Optional[int] = None, commit_lock=None,
                storage_options=None, enable_v2_manifest_paths=None, detached: bool = False, max_retries: int = 20,
-               **kwargs) -> "LanceDataset":
-        """Commit a hand-built operation. Of Lance's operations nanolance commits ``CreateIndex`` --
-        the last step of a distributed index build: its new segments become the index they name,
-        replacing the segments of that name they cover."""
-        uri = base_uri.uri if isinstance(base_uri, LanceDataset) else os.fspath(base_uri)
-        if not isinstance(operation, LanceOperation.CreateIndex):
-            raise unsupported(f"LanceDataset.commit of {type(operation).__name__}")
+               *, commit_message: Optional[str] = None, enable_stable_row_ids: Optional[bool] = None,
+               namespace_client=None, table_id=None, namespace_client_managed_versioning: bool = False,
+               base_store_params=None, commit_timeout=None, **kwargs) -> "LanceDataset":
+        """Publish a hand-built operation (or Transaction) as the dataset's next version: the last
+        step of a distributed write, whose workers wrote their files with ``write_fragments`` /
+        ``LanceFragment.create`` and friends. Checked first against what was committed since
+        ``read_version``, as Lance checks it (a conflict raises ``lance.commit.CommitConflictError``)."""
+        if isinstance(base_uri, Path):
+            base_uri = str(base_uri)
+        elif isinstance(base_uri, LanceDataset):
+            base_uri = base_uri.uri
+        elif not isinstance(base_uri, str):
+            raise TypeError(f"base_uri must be str, Path, or LanceDataset, got {type(base_uri)}")
+        if commit_lock and not callable(commit_lock):
+            raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
+        if (isinstance(operation, LanceOperation.BaseOperation) and read_version is None
+                and not isinstance(operation, (LanceOperation.Overwrite, LanceOperation.Restore))):
+            raise ValueError("read_version is required for all operations except Overwrite and Restore")
+        properties: Dict[str, str] = {}
+        if isinstance(operation, Transaction):
+            if commit_message is not None:
+                raise ValueError("commit_message is not supported when calling commit with a Transaction.  "
+                                 "Set the message on the transaction properties instead.")
+            read_version = operation.read_version
+            properties = {str(k): str(v) for k, v in (operation.transaction_properties or {}).items()}
+            operation = operation.operation
+        elif isinstance(operation, LanceOperation.BaseOperation):
+            if commit_message is not None:
+                properties[LANCE_COMMIT_MESSAGE_KEY] = str(commit_message)
+        else:
+            raise TypeError("operation must be a LanceOperation.BaseOperation or Transaction, "
+                            f"got {type(operation)}")
+        if (namespace_client is None) != (table_id is None):
+            raise ValueError("Both 'namespace_client' and 'table_id' must be provided together.")
+        if namespace_client is not None:
+            raise unsupported("namespaces")
+        if enable_stable_row_ids:
+            raise unsupported("stable row ids")
+        from nanolance.lance._transactions import encode_operation
+
+        timeout = None
+        if commit_timeout is not None:
+            seconds = commit_timeout.total_seconds() if hasattr(commit_timeout, "total_seconds") \
+                else float(commit_timeout)
+            if seconds < 0:
+                raise ValueError("Cannot convert negative timedelta to a duration")
+            if seconds == 0:
+                raise OSError("Invalid user input: commit_timeout must be a non-zero duration")
+            timeout = seconds
+        path = _path_of(base_uri)
         if detached:
-            raise unsupported("detached commits")
+            if _exists(path) and not _uses_v2_manifest_paths(path):
+                raise OSError("Invalid user input: Detached commits cannot be used with v1 manifest paths")
+            if read_version is None or not _exists(path):
+                raise OSError("Invalid user input: a detached commit needs a dataset and a read version")
+            field, message = encode_operation(operation)
+            with native():
+                version = _nanolance._ds_commit_hand_built(path, field, message, int(read_version),
+                                                           int(read_version), properties, True)
+            return LanceDataset(path, version=int(version))
+        if isinstance(operation, LanceOperation.CreateIndex):
+            return LanceDataset._commit_create_index(path, operation)
+        version = _commit_hand_built(path, operation, read_version, properties, int(max_retries), timeout)
+        return LanceDataset(path, version=version)
+
+    @staticmethod
+    def commit_batch(dest, transactions, commit_lock=None, storage_options=None, enable_v2_manifest_paths=None,
+                     detached: bool = False, max_retries: int = 20, base_store_params=None,
+                     commit_timeout=None) -> Dict[str, Any]:
+        """Commit several Append transactions as one: {"dataset": the new version, "merged": the
+        transaction committed}."""
+        if isinstance(dest, Path):
+            dest = str(dest)
+        elif isinstance(dest, LanceDataset):
+            dest = dest.uri
+        elif not isinstance(dest, str):
+            raise TypeError(f"base_uri must be str, Path, or LanceDataset, got {type(dest)}")
+        if commit_lock and not callable(commit_lock):
+            raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
+        transactions = list(transactions)
+        if not transactions:
+            raise ValueError("Invalid user input: commit_batch needs at least one transaction")
+        fragments: List[FragmentMetadata] = []
+        properties: Dict[str, str] = {}
+        for txn in transactions:
+            if not isinstance(txn.operation, LanceOperation.Append):
+                raise unsupported(f"commit_batch of {type(txn.operation).__name__} (only Append transactions)")
+            fragments.extend(txn.operation.fragments)
+            properties.update(txn.transaction_properties or {})
+        read_version = min(txn.read_version for txn in transactions)
+        merged = Transaction(read_version, LanceOperation.Append(fragments), transaction_properties=properties)
+        ds = LanceDataset.commit(dest, merged, detached=detached, max_retries=max_retries)
+        return {"dataset": ds, "merged": merged}
+
+    @staticmethod
+    def _commit_create_index(uri: str, operation) -> "LanceDataset":
+        """A CreateIndex: its new segments become the index they name, replacing the segments of that
+        name they cover (the last step of a distributed index build)."""
         if operation.removed_indices:
             raise unsupported("CreateIndex with removed_indices (the new segments replace those they cover)")
         names = {index.name for index in operation.new_indices}
@@ -1409,12 +1540,88 @@ class LanceDataset(pa.dataset.Dataset):
         known = {
             "create_index",
             "branches", "create_branch", "sql",
-            "shallow_clone", "deep_clone", "commit_batch", "session", "join", "delta",
+            "shallow_clone", "deep_clone", "session", "join", "delta",
             "prewarm_index",
         }
         if name in known:
             raise unsupported(f"LanceDataset.{name}")
         raise AttributeError(name)
+
+
+def _uses_v2_manifest_paths(path: str) -> bool:
+    names = os.listdir(os.path.join(path, "_versions"))
+    return any(n.endswith(".manifest") and n[:-len(".manifest")].isdigit() and len(n[:-len(".manifest")]) == 20
+               for n in names)
+
+
+def _commit_hand_built(path: str, operation, read_version: Optional[int], properties: Dict[str, str],
+                       max_retries: int, timeout: Optional[float] = None) -> int:
+    """Commit `operation` as Lance's commit_transaction does: check the transactions committed since
+    `read_version` (a conflict raises CommitConflictError), apply it to the latest version, and try
+    again when another writer takes that version first."""
+    import random
+    import time
+
+    from nanolance.lance._transactions import conflict_with, encode_operation, operation_name
+    from nanolance.lance.commit import CommitConflictError
+
+    field, message = encode_operation(operation)
+    name = operation_name(operation)
+    strict = isinstance(operation, LanceOperation.Overwrite) and max_retries == 0
+    attempts = max(max_retries, 1)
+    base = 0
+    started = time.monotonic()
+    for attempt in range(attempts):
+        if not _exists(path):
+            base = 0
+            if not isinstance(operation, LanceOperation.Overwrite):
+                raise OSError(f"Invalid user input: Cannot apply operation {name} to non-existent dataset")
+        else:
+            with native():
+                latest = int(_nanolance._ds_latest_version(path))
+            since = latest if read_version is None or int(read_version) == 0 else int(read_version)
+            if strict:
+                base = since
+            else:
+                if since > latest:
+                    raise ValueError(f"Version not found: {since}")
+                reader = LanceDataset(path, version=latest)
+                for version in range(since + 1, latest + 1):
+                    txn = reader.read_transaction(version)
+                    if txn is None:
+                        raise OSError(f"Invalid user input: Transaction at version {version} does not have a "
+                                      "transaction file, so this commit cannot be checked against it")
+                    theirs = txn.operation
+                    verdict = conflict_with(operation, theirs)
+                    if verdict == "retryable":
+                        raise CommitConflictError(
+                            f"Retryable commit conflict for version {version}: This {name} transaction was "
+                            f"preempted by concurrent transaction {operation_name(theirs)} at version {version}. "
+                            "Please retry.", retryable=True)
+                    if verdict == "incompatible":
+                        raise CommitConflictError(
+                            f"Incompatible transaction: This {name} transaction is incompatible with concurrent "
+                            f"transaction {operation_name(theirs)} at version {version}.", retryable=False)
+                base = latest
+        try:
+            with native():
+                return int(_nanolance._ds_commit_hand_built(path, field, message, base, int(read_version or 0),
+                                                            properties, False))
+        except Exception as exc:  # another writer took base + 1: check again and retry
+            text = str(exc)
+            if "commit conflict" not in text.lower():
+                from nanolance.lance._errors import NotSupportedError
+
+                if isinstance(exc, NotSupportedError):
+                    raise
+                raise OSError(text) from None  # pylance's commit raises its errors as IOError
+            if strict or attempt + 1 >= attempts:
+                break
+            if timeout is not None and time.monotonic() - started > timeout:
+                raise TimeoutError(f"Commit timed out after {timeout} seconds ({attempt + 1} attempts)")
+            time.sleep(random.uniform(0.001, min(0.05, 0.001 * (2 ** min(attempt, 5)))))
+    raise CommitConflictError(f"Commit conflict for version {base + 1}: Failed to commit the transaction after "
+                              f"{max_retries} retries.", retryable=True)
 
 
 def _format_duration(seconds: int) -> str:
@@ -2044,11 +2251,11 @@ class MergeInsertBuilder:
                 _check_append_schema(target, reader.schema, allow_subset=True)
             keys = reader.read_all().select(self._on)
             with native():
-                stats, _ = _nanolance._ds_merge_insert(
+                stats, _, self._transaction = _nanolance._ds_merge_insert(
                     self._ds.uri, self._on, False, False, self._delete_by_source, self._delete_condition,
                     self._fill_missing_columns(pa.RecordBatchReader.from_batches(keys.schema, keys.to_batches()),
                                                target, read_old=False),
-                    "", "delete")
+                    "", "delete", self._uncommitted)
             self._ds._refresh_latest()
             return {k: int(v) for k, v in stats.items()}
         _check_append_schema(target, reader.schema, allow_subset=True)
@@ -2075,11 +2282,33 @@ class MergeInsertBuilder:
         else:
             conformed = pa.RecordBatchReader.from_batches(target, (_conform(b, target) for b in reader))
         with native():
-            stats, _ = _nanolance._ds_merge_insert(self._ds.uri, self._on, self._update_all, self._insert_all,
-                                                   self._delete_by_source, self._delete_condition, conformed,
-                                                   self._update_condition, self._when_matched)
+            stats, _, self._transaction = _nanolance._ds_merge_insert(
+                self._ds.uri, self._on, self._update_all, self._insert_all, self._delete_by_source,
+                self._delete_condition, conformed, self._update_condition, self._when_matched, self._uncommitted)
         self._ds._refresh_latest()
         return {k: int(v) for k, v in stats.items()}
+
+    _uncommitted = False
+    _transaction = None
+
+    def execute_uncommitted(self, data_obj, *, schema: Optional[pa.Schema] = None):
+        """The merge's files written but nothing committed: (the Transaction that commits it, its
+        statistics). Commit it with ``LanceDataset.commit``."""
+        from nanolance.lance._transactions import _operation
+
+        self._uncommitted = True
+        try:
+            stats = self.execute(data_obj, schema=schema)
+        finally:
+            self._uncommitted = False
+        read_version, field, message = self._transaction
+        operation = _operation(int(field), bytes(message))
+        for fragment in getattr(operation, "new_fragments", None) or getattr(operation, "fragments", None) or []:
+            fragment.id = 0  # ids are assigned when the transaction commits
+        if isinstance(operation, LanceOperation.Update) and operation.update_mode == "rewrite_rows" and \
+                not operation.updated_fragment_offsets:
+            operation.updated_fragment_offsets = None
+        return Transaction(int(read_version), operation), stats
 
 
     def _fill_missing_columns(self, reader: pa.RecordBatchReader, target: pa.Schema,
@@ -2430,8 +2659,11 @@ class LanceScanner(pa.dataset.Scanner):
             raise unsupported("hybrid (vector and full-text) search")
         if substrait_filter is not None:
             raise unsupported("substrait filters")
-        if include_deleted_rows:
-            raise unsupported("include_deleted_rows")
+        if include_deleted_rows and not (with_row_id or (columns is not None and "_rowid" in list(columns))):
+            raise ValueError("include_deleted_rows is set but with_row_id is false")
+        if include_deleted_rows and (nearest is not None or full_text_query is not None):
+            raise ValueError("Cannot include deleted rows in a vector or full-text search")
+        self._include_deleted = bool(include_deleted_rows)
         self._filter = _filter_sql(filter)
         # A filter on _rowid / _rowaddr is evaluated here, over the rows the scan returns with their
         # addresses, before limit and offset (the scan cannot push it down).
@@ -2491,7 +2723,27 @@ class LanceScanner(pa.dataset.Scanner):
         self._with_row_address = bool(with_row_address)
         self._use_scalar_index = use_scalar_index is not False
 
+    def _read_with_deleted(self) -> pa.Table:
+        """Every physical row, deleted ones too -- those with a null `_rowid`, as Lance returns them."""
+        import pyarrow.compute as pc
+
+        length = -1 if self._limit is None else self._limit
+        with native():
+            table = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version, self._names, self._fragment_ids,
+                                                 self._offset, length, True, True, False, self._filter,
+                                                 self._blob_handling, False, True))
+            live = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version, [], self._fragment_ids, 0, -1,
+                                                False, True, False, None, 0, False))
+        alive = pc.is_in(table.column("_rowaddr"), value_set=live.column("_rowaddr").combine_chunks())
+        rowid = pc.if_else(alive, table.column("_rowid"), pa.scalar(None, pa.uint64()))
+        table = table.set_column(table.schema.get_field_index("_rowid"), "_rowid", rowid)
+        if not self._with_row_address:
+            table = table.drop_columns(["_rowaddr"])
+        return table
+
     def _read(self, stream: bool):
+        if self._include_deleted:
+            return self._read_with_deleted()
         if self._filter is None:
             n = self._ds.count_rows() if self._fragment_ids is None else sum(
                 self._ds.get_fragment(i).count_rows() for i in self._fragment_ids
@@ -3067,7 +3319,6 @@ def write_dataset(
         _validate_threshold("blob_pack_file_size_threshold", blob_pack_file_size_threshold, allow_zero=False)
     path = _path_of(uri)
     reader = _coerce_reader(data_obj, schema)
-    blob_columns = [i for i, f in enumerate(reader.schema) if _is_blob_v2(f)]
     exists = _exists(path)
     in_memory = not isinstance(uri, LanceDataset) and os.fspath(uri).startswith("memory://")
     if mode == "create" and exists and in_memory:
@@ -3078,6 +3329,41 @@ def write_dataset(
         exists = False
     if mode == "create" and exists:
         raise OSError(f"Dataset already exists: {path}")
+
+    def setup(writer, exists: bool) -> None:
+        if auto_cleanup_options is not None and not exists:
+            # Recorded in the first version's config, as Lance records it when it creates a dataset.
+            with native():
+                writer.set_initial_config("lance.auto_cleanup.interval", str(int(auto_cleanup_options["interval"])))
+                writer.set_initial_config("lance.auto_cleanup.older_than",
+                                          _format_duration(int(auto_cleanup_options["older_than_seconds"])))
+        properties = dict(transaction_properties or {})
+        if commit_message is not None:
+            properties[LANCE_COMMIT_MESSAGE_KEY] = str(commit_message)
+        for key, value in properties.items():
+            with native():
+                writer.set_transaction_property(str(key), str(value))
+        if blob_pack_file_size_threshold is not None:
+            writer.set_blob_pack_file_size(int(blob_pack_file_size_threshold))
+
+    writer, _ = _stage_write(path, reader, mode=mode, max_rows_per_file=max_rows_per_file,
+                             max_bytes_per_file=max_bytes_per_file, external_blob_mode=external_blob_mode,
+                             allow_external_blob_outside_bases=allow_external_blob_outside_bases, setup=setup)
+    append = mode == "append" and exists
+    code = _MODES["append" if append else ("create" if mode == "create" else "overwrite")]
+    with native():
+        writer.finish(code)
+    return LanceDataset(path)
+
+
+def _stage_write(path: str, reader: pa.RecordBatchReader, *, mode: str, max_rows_per_file: Optional[int],
+                 max_bytes_per_file: Optional[int], external_blob_mode: str = "reference",
+                 allow_external_blob_outside_bases: bool = False, setup=None, keep_empty: bool = True):
+    """Write `reader`'s rows as staged data files under `path` (none published): appended to the
+    dataset's schema with mode "append" on a dataset that exists, a new schema otherwise. Returns the
+    writer -- for its finish() to commit the files or take() to hand them over -- and the rows written."""
+    blob_columns = [i for i, f in enumerate(reader.schema) if _is_blob_v2(f)]
+    exists = _exists(path)
     append = mode == "append" and exists
     target = None
     if append:
@@ -3085,23 +3371,12 @@ def write_dataset(
         _check_append_schema(target, reader.schema, allow_subset=True)
         _check_blob_thresholds(target, reader.schema)
     options = _nanolance.WriteOptions()
+    max_bytes = int(max_bytes_per_file or 0)
     with native():
         writer = _nanolance._StagedWriter(path, options, append, int(max_rows_per_file or 0),
-                                          int(max_bytes_per_file or 0) if max_bytes_per_file < 2**62 else 0)
-    if auto_cleanup_options is not None and not exists:
-        # Recorded in the first version's config, as Lance records it when it creates a dataset.
-        with native():
-            writer.set_initial_config("lance.auto_cleanup.interval", str(int(auto_cleanup_options["interval"])))
-            writer.set_initial_config("lance.auto_cleanup.older_than",
-                                      _format_duration(int(auto_cleanup_options["older_than_seconds"])))
-    properties = dict(transaction_properties or {})
-    if commit_message is not None:
-        properties[LANCE_COMMIT_MESSAGE_KEY] = str(commit_message)
-    for key, value in properties.items():
-        with native():
-            writer.set_transaction_property(str(key), str(value))
-    if blob_pack_file_size_threshold is not None:
-        writer.set_blob_pack_file_size(int(blob_pack_file_size_threshold))
+                                          max_bytes if max_bytes < 2**62 else 0)
+    if setup is not None:
+        setup(writer, exists)
     if target is not None and len(reader.schema.names) < len(target.names):
         # Part of the schema: the new files hold those columns alone, as Lance writes them, and the
         # others read as null.
@@ -3109,6 +3384,7 @@ def write_dataset(
         with native():
             writer.project(target.names)
     wrote = False
+    rows = 0
     limit = int(max_rows_per_file or 0)
     in_file = 0
     for batch in reader:
@@ -3116,8 +3392,9 @@ def write_dataset(
             batch = _blob_batch(batch, blob_columns, external_blob_mode, allow_external_blob_outside_bases)
         if target is not None:
             batch = _conform(batch, target)
-        if batch.num_rows == 0 and wrote:
+        if batch.num_rows == 0 and (wrote or not keep_empty):
             continue
+        rows += batch.num_rows
         # A file (fragment) ends at max_rows_per_file rows, wherever that falls in a batch.
         start = 0
         while True:
@@ -3130,14 +3407,11 @@ def write_dataset(
             start += take
             if start >= batch.num_rows:
                 break
-    if not wrote:
+    if not wrote and keep_empty:
         empty_schema = target if target is not None else reader.schema
         with native():
             writer.write_batch(pa.RecordBatch.from_pylist([], schema=empty_schema))
-    code = _MODES["append" if append else ("create" if mode == "create" else "overwrite")]
-    with native():
-        writer.finish(code)
-    return LanceDataset(path)
+    return writer, rows
 
 
 def _is_blob_field(field: pa.Field) -> bool:
@@ -3321,7 +3595,8 @@ def dataset(
         if not candidates:
             raise ValueError(f"no version of {uri} at or before {asof}")
         return LanceDataset(uri, version=candidates[-1]["version"])
-    return LanceDataset(uri, version=version, default_scan_options=default_scan_options)
+    return LanceDataset(uri, version=version, default_scan_options=default_scan_options,
+                        storage_options=storage_options)
 
 
 def __getattr__(name: str):

@@ -20,6 +20,7 @@
 #include "nanolance/writer_internal.hpp"
 
 #include "lance_minimal.pb.hpp"
+#include "transaction_file.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -215,6 +216,11 @@ public:
         open_ = true;
         nano_lance_writer_set_ignore_nullability(&writer_, true);
         return append || writer_set_field_id_base(&writer_, field_id_base, error);
+    }
+
+    /// On an append writer: write only these top-level columns, with the dataset's field ids.
+    bool project(const std::vector<std::string>& columns, std::string& error) {
+        return writer_project_append(&writer_, columns, error);
     }
 
     bool write(ArrowArray& batch, ArrowSchema& schema, std::string& error) {
@@ -1074,22 +1080,34 @@ bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeIns
         add_fragments(manifest, staged.mapping(), staged.files());
     }
     manifest.operation = pb::Manifest::Operation::Update;  // its transaction: Lance's Update
+    if (spec.uncommitted != nullptr) {
+        pb::Manifest parent;
+        if (!load_manifest_version(dataset_path, version, parent, error)) {
+            return false;
+        }
+        retain_relevant_indices(manifest.indices, manifest.fields, manifest.fragments);
+        auto [field, op] = derive_transaction_operation(parent, manifest);
+        spec.uncommitted->read_version = version;
+        spec.uncommitted->operation_field = field;
+        spec.uncommitted->operation = std::move(op);
+        new_version = version;
+        return true;
+    }
     return commit(dataset_path, std::move(manifest), new_version, error);
 }
 
 // ── columns ─────────────────────────────────────────────────────────────────────────────────────
 
-bool dataset_add_columns_sql(const std::filesystem::path& dataset_path,
-                             const std::vector<std::pair<std::string, std::string>>& columns,
-                             std::uint64_t& new_version, std::string& error) {
-    error.clear();
+namespace {
+
+/// New columns from SQL expressions over version `version`, one data file per fragment of `ids` (in
+/// order, every physical row) written through `staged`.
+bool write_sql_columns(const std::filesystem::path& dataset_path, const pb::Manifest& manifest, std::uint64_t version,
+                       const std::vector<std::uint64_t>& ids,
+                       const std::vector<std::pair<std::string, std::string>>& columns, StagedFiles& staged,
+                       std::string& error) {
     if (columns.empty()) {
         error = "no columns to add";
-        return false;
-    }
-    pb::Manifest manifest;
-    std::uint64_t version = 0;
-    if (!load_latest(dataset_path, manifest, version, error)) {
         return false;
     }
     std::vector<std::string> names;
@@ -1113,11 +1131,6 @@ bool dataset_add_columns_sql(const std::filesystem::path& dataset_path,
     if (!check_new_names(manifest, names, error)) {
         return false;
     }
-    StagedFiles staged;
-    if (!staged.open(dataset_path, false, max_field_id(manifest) + 1, error)) {
-        return false;
-    }
-    const auto ids = fragment_ids(manifest);
     OwnedSchema new_schema;
     bool typed = false;
     for (const auto id : ids) {
@@ -1179,7 +1192,27 @@ bool dataset_add_columns_sql(const std::filesystem::path& dataset_path,
             return false;
         }
     }
-    if (!attach_columns(manifest, ids, staged, error)) {
+    return true;
+}
+
+}  // namespace
+
+bool dataset_add_columns_sql(const std::filesystem::path& dataset_path,
+                             const std::vector<std::pair<std::string, std::string>>& columns,
+                             std::uint64_t& new_version, std::string& error) {
+    error.clear();
+    pb::Manifest manifest;
+    std::uint64_t version = 0;
+    if (!load_latest(dataset_path, manifest, version, error)) {
+        return false;
+    }
+    StagedFiles staged;
+    if (!staged.open(dataset_path, false, max_field_id(manifest) + 1, error)) {
+        return false;
+    }
+    const auto ids = fragment_ids(manifest);
+    if (!write_sql_columns(dataset_path, manifest, version, ids, columns, staged, error) ||
+        !attach_columns(manifest, ids, staged, error)) {
         return false;
     }
     return commit(dataset_path, std::move(manifest), new_version, error);
@@ -1350,6 +1383,20 @@ bool dataset_drop_columns(const std::filesystem::path& dataset_path, const std::
         return false;
     }
     manifest.fields = std::move(kept);
+    // A data file left holding none of the schema's fields leaves its fragment, as Lance's Project
+    // drops it (the file itself stays on disk for cleanup to find).
+    std::unordered_set<std::int32_t> remaining;
+    for (const auto& f : manifest.fields) {
+        remaining.insert(f.id);
+    }
+    for (auto& fragment : manifest.fragments) {
+        fragment.files.erase(std::remove_if(fragment.files.begin(), fragment.files.end(),
+                                            [&](const pb::DataFile& file) {
+                                                return std::none_of(file.fields.begin(), file.fields.end(),
+                                                                    [&](std::int32_t id) { return remaining.count(id); });
+                                            }),
+                             fragment.files.end());
+    }
     return commit(dataset_path, std::move(manifest), new_version, error);
 }
 
@@ -1784,6 +1831,215 @@ bool compact_once(const std::filesystem::path& dataset_path, const CompactionOpt
             metrics.indexes_not_reindexed.push_back(name);
         }
     }
+    return true;
+}
+
+
+// ── one fragment, uncommitted ────────────────────────────────────────────────────────────────────
+
+namespace {
+
+bool fragment_of(const std::filesystem::path& path, std::uint64_t version, std::uint64_t fragment_id,
+                 pb::Manifest& manifest, pb::DataFragment*& fragment, std::string& error) {
+    if (!load_manifest_version(path, version, manifest, error)) {
+        return false;
+    }
+    fragment = nullptr;
+    for (auto& f : manifest.fragments) {
+        if (f.id == fragment_id) {
+            fragment = &f;
+        }
+    }
+    if (fragment == nullptr) {
+        error = "Fragment " + std::to_string(fragment_id) + " not found";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool fragment_delete_rows(const std::filesystem::path& dataset_path, std::uint64_t version, std::uint64_t fragment_id,
+                          const std::string* predicate, const std::vector<std::uint32_t>& offsets,
+                          std::vector<std::uint8_t>& fragment_out, bool& emptied, std::string& error) {
+    error.clear();
+    emptied = false;
+    pb::Manifest manifest;
+    pb::DataFragment* fragment = nullptr;
+    if (!fragment_of(dataset_path, version, fragment_id, manifest, fragment, error)) {
+        return false;
+    }
+    std::vector<std::uint32_t> rows;
+    if (!read_deletion_vector(dataset_path, fragment->id, fragment->deletion_file, rows, error)) {
+        return false;
+    }
+    const auto before = rows.size();
+    if (predicate != nullptr) {
+        LanceScanRequest request;
+        request.has_version = true;
+        request.version = version;
+        const std::vector<std::string> none;
+        request.columns = &none;
+        request.with_row_address = true;
+        request.filter = predicate;
+        const std::vector<std::uint64_t> only{fragment_id};
+        request.fragment_ids = &only;
+        OwnedSchema schema;
+        OwnedBatches batches;
+        if (!scan(dataset_path, request, schema, batches, error)) {
+            return false;
+        }
+        for (const auto& b : batches.v) {
+            const ArrowArray* addr = b.children[b.n_children - 1];
+            const auto* values = static_cast<const std::uint64_t*>(addr->buffers[1]) + addr->offset;
+            for (int64_t i = 0; i < b.length; ++i) {
+                rows.push_back(static_cast<std::uint32_t>(values[i] & 0xFFFFFFFFULL));
+            }
+        }
+    } else {
+        for (const auto o : offsets) {
+            if (o >= fragment->physical_rows) {
+                error = "Invalid user input: row offset " + std::to_string(o) + " is out of range for fragment " +
+                        std::to_string(fragment_id) + " with " + std::to_string(fragment->physical_rows) +
+                        " physical rows";
+                return false;
+            }
+            rows.push_back(o);
+        }
+    }
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    if (rows.size() >= fragment->physical_rows) {
+        emptied = true;
+        return true;
+    }
+    if (rows.size() != before &&
+        !write_deletion_file(dataset_path, fragment->id, version, rows, fragment->deletion_file, error)) {
+        return false;
+    }
+    fragment_out = pb::encode_data_fragment(*fragment);
+    return true;
+}
+
+bool fragment_add_columns_sql(const std::filesystem::path& dataset_path, std::uint64_t version,
+                              std::uint64_t fragment_id,
+                              const std::vector<std::pair<std::string, std::string>>& columns,
+                              std::int32_t max_field_id, std::vector<std::uint8_t>& fragment_out,
+                              std::vector<std::vector<std::uint8_t>>& new_fields, std::string& error) {
+    error.clear();
+    new_fields.clear();
+    pb::Manifest manifest;
+    pb::DataFragment* fragment = nullptr;
+    if (!fragment_of(dataset_path, version, fragment_id, manifest, fragment, error)) {
+        return false;
+    }
+    StagedFiles staged;
+    if (!staged.open(dataset_path, false, std::max(max_field_id, nano_lance::max_field_id(manifest)) + 1, error) ||
+        !write_sql_columns(dataset_path, manifest, version, {fragment_id}, columns, staged, error)) {
+        return false;
+    }
+    if (staged.files().size() != 1U || staged.files().front().rows != fragment->physical_rows) {
+        error = "the new columns do not cover fragment " + std::to_string(fragment_id);
+        return false;
+    }
+    fragment->files.push_back(make_data_fragment(staged.mapping(), staged.files().front(), fragment->id).files.front());
+    for (const auto& f : staged.mapping().fields) {
+        new_fields.push_back(pb::encode_field(make_manifest_field(f)));
+    }
+    fragment_out = pb::encode_data_fragment(*fragment);
+    return true;
+}
+
+bool fragment_write_columns(const std::filesystem::path& dataset_path, std::uint64_t version,
+                            std::uint64_t fragment_id, ArrowArrayStream& stream, bool replace,
+                            std::int32_t max_field_id, std::vector<std::uint8_t>& fragment_out,
+                            std::vector<std::vector<std::uint8_t>>& new_fields,
+                            std::vector<std::int32_t>& fields_written, std::string& error) {
+    struct Release {
+        ArrowArrayStream* s;
+        ~Release() {
+            if (s->release != nullptr) {
+                s->release(s);
+            }
+        }
+    } release{&stream};
+    error.clear();
+    new_fields.clear();
+    fields_written.clear();
+    pb::Manifest manifest;
+    pb::DataFragment* fragment = nullptr;
+    if (!fragment_of(dataset_path, version, fragment_id, manifest, fragment, error)) {
+        return false;
+    }
+    OwnedSchema schema;
+    if (stream.get_schema(&stream, &schema.s) != 0) {
+        error = "failed to read the stream's schema";
+        return false;
+    }
+    std::vector<std::string> names;
+    for (int64_t i = 0; i < schema.s.n_children; ++i) {
+        names.emplace_back(schema.s.children[i]->name != nullptr ? schema.s.children[i]->name : "");
+    }
+    if (!replace && !check_new_names(manifest, names, error)) {
+        return false;
+    }
+    StagedFiles staged;
+    if (!staged.open(dataset_path, replace, std::max(max_field_id, nano_lance::max_field_id(manifest)) + 1, error)) {
+        return false;
+    }
+    if (replace && !staged.project(names, error)) {
+        return false;
+    }
+    std::uint64_t rows = 0;
+    for (;;) {
+        ArrowArray b{};
+        if (stream.get_next(&stream, &b) != 0) {
+            error = "reading the stream failed";
+            return false;
+        }
+        if (b.release == nullptr) {
+            break;
+        }
+        rows += static_cast<std::uint64_t>(b.length);
+        const bool ok = staged.write(b, schema.s, error);
+        if (b.release != nullptr) {
+            b.release(&b);
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+    if (rows != fragment->physical_rows) {
+        error = "the new columns have " + std::to_string(rows) + " rows for fragment " + std::to_string(fragment_id) +
+                " of " + std::to_string(fragment->physical_rows);
+        return false;
+    }
+    if (!staged.cut(error, true)) {
+        return false;
+    }
+    if (staged.files().size() != 1U) {
+        error = "wrote " + std::to_string(staged.files().size()) + " files for one fragment";
+        return false;
+    }
+    auto file = make_data_fragment(staged.mapping(), staged.files().front(), fragment->id).files.front();
+    for (const auto& f : staged.mapping().fields) {
+        fields_written.push_back(f.id);
+        if (!replace) {
+            new_fields.push_back(pb::encode_field(make_manifest_field(f)));
+        }
+    }
+    if (replace) {
+        const std::set<std::int32_t> rewritten(fields_written.begin(), fields_written.end());
+        for (auto& old : fragment->files) {
+            for (auto& id : old.fields) {
+                if (rewritten.count(id) != 0U) {
+                    id = -2;  // tombstoned: the new file answers for it
+                }
+            }
+        }
+    }
+    fragment->files.push_back(std::move(file));
+    fragment_out = pb::encode_data_fragment(*fragment);
     return true;
 }
 

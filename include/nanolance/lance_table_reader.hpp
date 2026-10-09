@@ -12,6 +12,10 @@
 #include <string>
 #include <vector>
 
+namespace nano_lance::pb {
+struct Field;
+}  // namespace nano_lance::pb
+
 namespace nano_lance {
 
 /// A half-open row range: rows `[offset, offset + length)`.
@@ -80,6 +84,12 @@ struct LanceScanRequest {
     /// LabelList; index_search.hpp). The rows returned are the same either way.
     bool use_scalar_index = true;
 };
+
+/// The Arrow schema of Lance schema fields (lance.file.Field records, parents first) and schema
+/// metadata, as a dataset with that schema reads.
+bool lance_fields_arrow_schema(const std::vector<pb::Field>& fields,
+                               const std::map<std::string, std::vector<std::uint8_t>>& schema_metadata,
+                               ArrowSchema& out_schema, std::string& error);
 
 /// A read as `request` describes it. See lance_table_read_dataset for the ownership rules.
 bool lance_dataset_scan(const std::filesystem::path& dataset_path, const LanceScanRequest& request,

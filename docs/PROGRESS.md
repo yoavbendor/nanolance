@@ -3148,3 +3148,49 @@ first, without degrading function or speed.
   suite 603 (483 before: `test_indices.py` 23, `test_bitmap.py` 55, 32 more in
   `test_scalar_index.py`, 8 more in `test_vector_index.py`); ctest 60/60, lance-c 106/106, the
   Python suite (2156), the interop suite.
+
+
+## Transactions and fragment-level writes
+
+What Ray / Daft / Spark writers use: workers write fragments apart from any commit, one commit
+publishes them.
+
+- **Uncommitted writes**: `lance.fragment.write_fragments` (the fragments, or with
+  `return_transaction` the Append / Overwrite transaction), `LanceFragment.create` and
+  `create_from_file`, `DataFile.create` -- through the same staged writer as `write_dataset` (so
+  blobs, JSON, partial schemas and Lance's field ids of an append behave as there), the fragments
+  handed back instead of committed. `LanceFragment.delete` / `delete_rows` write a deletion file;
+  `merge_columns` (SQL expressions, a function of each batch, `lance.batch_udf`, or data),
+  `merge` (a join) and `update_columns` (the columns rewritten into a new file, their old field ids
+  tombstoned, as Lance lays it out; `with_offsets`) write a new data file for the fragment. Rows a
+  fragment has deleted take a copy of a live row, so a column stays as non-nullable as its values.
+  `FragmentMetadata`, `DataFile` and `DeletionFile` are shaped as pylance's (`to_json` / `from_json`,
+  pickling), so fragments cross between the two libraries as JSON.
+- **Commits**: `LanceDataset.commit` of `Append`, `Overwrite`, `Delete`, `Update`, `Merge`,
+  `Project`, `Rewrite`, `Restore`, `UpdateConfig`, `DataReplacement` and `CreateIndex`, or of a
+  `Transaction`; `commit_batch`; `detached=True`. The operation crosses to the core
+  (`include/nanolance/dataset_transaction.hpp`) as Lance encodes it, is checked as Lance's
+  `validate.rs` checks it, applied as its `build_manifest` applies it, and written into the
+  transaction file as given. Before that, it is checked against the transactions committed since
+  its read version by Lance's conflict rules (`conflict_resolver.rs`): a retryable or incompatible
+  conflict raises `lance.commit.CommitConflictError` with Lance's wording and `retryable`; a race
+  for the next version is retried up to `max_retries` (a strict overwrite, `max_retries=0`, is not).
+  `MergeInsertBuilder.execute_uncommitted` returns the Update its merge would commit.
+- **Also**: `add_columns` with a function or `batch_udf` (its checkpoint file resumes a failed run
+  without recomputing finished batches), `include_deleted_rows` in scans, `LanceFragment.validate`,
+  `LanceSchema.to_pyarrow` of a schema rebuilt from Lance's field records, `lance.commit`,
+  `lance.udf`, `lance.dependencies`.
+- **Found on the way**: a dropped column's data files stayed in their fragments (Lance's Project
+  removes a file left with none of the schema's fields), so the two libraries' fragments of one
+  dataset differed; a file from `LanceFileWriter`, whose fields count from 0, could not be read in a
+  dataset ("data file references unknown field id": the manifest maps fields by position);
+  `LanceSchema.from_pyarrow` stored a JSON column as a string, not Lance's `json`; new SQL columns
+  were typed unlike Lance (`"1"` nullable, `int32 + 1` int64); data files are now named as Lance
+  names them (24 binary digits, then 26 hex digits).
+- **Left**: `DataOverlay` (Lance 12's unstable overlay files), `commit_lock`, `update_columns` of a
+  blob column, conflict checks for index builds made from an older version, V1 manifest names.
+- **Verified**: `tests/test_fragment_writes.py` -- the same flows on both libraries give the same
+  tables at every version, pylance reads and validates nanolance's commits and reads back the
+  operations committed, fragments written by one library commit in the other, conflicts come out
+  as Lance decides them; pylance's suite 698 (603 before); ctest 60/60, lance-c 106/106, the Python
+  suite 2161, interop green.

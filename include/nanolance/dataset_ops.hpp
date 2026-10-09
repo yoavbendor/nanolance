@@ -41,6 +41,14 @@ struct MergeInsertSpec {
     bool when_not_matched_insert_all = true;
     bool when_not_matched_by_source_delete = false;
     std::string when_not_matched_by_source_condition;  // SQL over the dataset's rows; empty: all
+    /// Set: write the change's files but commit nothing, and return the transaction that would commit
+    /// it (pylance's execute_uncommitted), as a lance.table.Transaction operation.
+    struct Uncommitted {
+        std::uint64_t read_version = 0;
+        std::uint32_t operation_field = 0;
+        std::vector<std::uint8_t> operation;
+    };
+    Uncommitted* uncommitted = nullptr;
 };
 
 struct MergeInsertStats {
@@ -120,5 +128,37 @@ struct CompactionMetrics {
 /// nothing when there is nothing to compact (`new_version` is then the current one).
 bool dataset_compact_files(const std::filesystem::path& dataset_path, const CompactionOptions& options,
                            CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error);
+
+// ── one fragment, uncommitted ────────────────────────────────────────────────────────────────────
+//
+// What pylance's LanceFragment.delete / merge_columns / update_columns do: write the files of a
+// change to one fragment of version `version` and return the fragment as it would then be (a
+// lance.table.DataFragment message), for a hand-built transaction (dataset_transaction.hpp) to commit.
+
+/// Delete the rows of fragment `fragment_id` where `predicate` is TRUE, or (`predicate` null) the rows
+/// at physical `offsets`: a new deletion file, with the fragment's earlier deletions too.
+/// `emptied` when no row is left (the fragment is then to be deleted outright; no file is written).
+bool fragment_delete_rows(const std::filesystem::path& dataset_path, std::uint64_t version, std::uint64_t fragment_id,
+                          const std::string* predicate, const std::vector<std::uint32_t>& offsets,
+                          std::vector<std::uint8_t>& fragment_out, bool& emptied, std::string& error);
+
+/// New columns for fragment `fragment_id`, each an SQL expression over its other columns: one new data
+/// file, the columns numbered after `max_field_id` (merge_columns with a dict).
+bool fragment_add_columns_sql(const std::filesystem::path& dataset_path, std::uint64_t version,
+                              std::uint64_t fragment_id,
+                              const std::vector<std::pair<std::string, std::string>>& columns,
+                              std::int32_t max_field_id, std::vector<std::uint8_t>& fragment_out,
+                              std::vector<std::vector<std::uint8_t>>& new_fields, std::string& error);
+
+/// Write `stream` -- one row per physical row of fragment `fragment_id`, deleted rows included -- as a
+/// new data file of the fragment. `replace`: its columns are the dataset's own (top-level names) and
+/// keep their field ids, which other files of the fragment then tombstone (Lance's update_columns);
+/// otherwise they are new columns, numbered after `max_field_id` (merge_columns), and
+/// `new_fields` holds their schema fields (lance.file.Field messages). `stream` is consumed.
+bool fragment_write_columns(const std::filesystem::path& dataset_path, std::uint64_t version,
+                            std::uint64_t fragment_id, ArrowArrayStream& stream, bool replace,
+                            std::int32_t max_field_id, std::vector<std::uint8_t>& fragment_out,
+                            std::vector<std::vector<std::uint8_t>>& new_fields,
+                            std::vector<std::int32_t>& fields_written, std::string& error);
 
 }  // namespace nano_lance

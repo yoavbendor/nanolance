@@ -9,6 +9,8 @@
 #include <nanolance/dataset.hpp>
 #include <nanolance/dataset_ops.hpp>
 #include <nanolance/dataset_refs.hpp>
+#include <nanolance/dataset_transaction.hpp>
+#include <nanolance/manifest_writer.hpp>
 #include <nanolance/expr.hpp>
 #include <nanolance/jsonb.hpp>
 #include <nanolance/fts_search.hpp>
@@ -414,9 +416,10 @@ nb::object ds_scan(const std::filesystem::path& path, std::optional<std::uint64_
                    std::optional<std::vector<std::string>> columns,
                    std::optional<std::vector<std::uint64_t>> fragment_ids, std::uint64_t offset, std::int64_t length,
                    bool with_row_id, bool with_row_address, bool stream, std::optional<std::string> filter,
-                   int blob_handling, bool use_scalar_index) {
+                   int blob_handling, bool use_scalar_index, bool include_deleted_rows) {
     auto request = make_request(version, columns, fragment_ids, with_row_id, with_row_address);
     request.use_scalar_index = use_scalar_index;
+    request.include_deleted_rows = include_deleted_rows;
     request.blob_handling = static_cast<nano_lance::BlobHandling>(blob_handling);
     request.filter = filter ? &*filter : nullptr;
     request.range.offset = offset;
@@ -698,6 +701,37 @@ public:
         }
     }
 
+    /// The staged data files as fragments (lance.table.DataFragment messages, ids not yet assigned)
+    /// and the schema they were written with (lance.file.Field messages) -- for a commit made apart
+    /// (LanceFragment.create / write_fragments) instead of finish().
+    nb::tuple take(bool keep_empty) {
+        std::vector<nano_lance::NewFragment> files;
+        nano_lance::LanceSchemaMapping mapping;
+        std::string error;
+        bool ok = false;
+        {
+            nb::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            ok = nano_lance::writer_take_staged(&writer_, files, mapping, error, keep_empty);
+        }
+        if (!ok) {
+            throw_dataset(error);
+        }
+        nb::list fragments;
+        for (const auto& f : files) {
+            const auto bytes = nano_lance::pb::encode_data_fragment(nano_lance::make_data_fragment(mapping, f, 0));
+            fragments.append(nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+        }
+        nb::list fields;
+        for (const auto& f : mapping.fields) {
+            const auto bytes = nano_lance::pb::encode_field(nano_lance::make_manifest_field(f));
+            fields.append(nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+        }
+        nano_lance_writer_close(&writer_);
+        open_ = false;
+        return nb::make_tuple(fragments, fields);
+    }
+
     std::uint64_t finish(int mode, bool keep_empty) {
         std::uint64_t version = 0;
         int rc = NANO_LANCE_OK;
@@ -975,7 +1009,8 @@ NB_MODULE(_nanolance, m) {
     m.def("_ds_scan", &ds_scan, nb::arg("path"), nb::arg("version").none(), nb::arg("columns").none(),
           nb::arg("fragment_ids").none(), nb::arg("offset"), nb::arg("length"), nb::arg("with_row_id"),
           nb::arg("with_row_address"), nb::arg("stream"), nb::arg("filter").none() = nb::none(),
-          nb::arg("blob_handling") = 0, nb::arg("use_scalar_index") = true);
+          nb::arg("blob_handling") = 0, nb::arg("use_scalar_index") = true,
+          nb::arg("include_deleted_rows") = false);
     m.def("_ds_take", &ds_take, nb::arg("path"), nb::arg("version").none(), nb::arg("rows"),
           nb::arg("columns").none(), nb::arg("with_row_id"), nb::arg("with_row_address"), nb::arg("addresses"),
           nb::arg("blob_handling") = 0);
@@ -1174,7 +1209,8 @@ NB_MODULE(_nanolance, m) {
         .def("set_initial_config", &StagedWriter::set_initial_config)
         .def("set_transaction_property", &StagedWriter::set_transaction_property)
         .def("set_blob_pack_file_size", &StagedWriter::set_blob_pack_file_size)
-        .def("finish", &StagedWriter::finish, nb::arg("mode"), nb::arg("keep_empty") = false);
+        .def("finish", &StagedWriter::finish, nb::arg("mode"), nb::arg("keep_empty") = false)
+        .def("take", &StagedWriter::take, nb::arg("keep_empty") = false);
     m.attr("COMMIT_CREATE") = static_cast<int>(NANO_LANCE_COMMIT_CREATE);
     m.attr("COMMIT_APPEND") = static_cast<int>(NANO_LANCE_COMMIT_APPEND);
     m.attr("COMMIT_OVERWRITE") = static_cast<int>(NANO_LANCE_COMMIT_OVERWRITE);
@@ -1262,8 +1298,13 @@ NB_MODULE(_nanolance, m) {
     m.def("_ds_merge_insert", [](const std::filesystem::path& path, const std::vector<std::string>& on,
                                  bool update_all, bool insert_all, bool delete_by_source,
                                  const std::string& delete_condition, nb::handle data,
-                                 const std::string& update_condition, const std::string& when_matched) {
+                                 const std::string& update_condition, const std::string& when_matched,
+                                 bool uncommitted) {
         nano_lance::MergeInsertSpec spec;
+        nano_lance::MergeInsertSpec::Uncommitted transaction;
+        if (uncommitted) {
+            spec.uncommitted = &transaction;
+        }
         spec.on = on;
         spec.when_matched = !update_all             ? nano_lance::MergeInsertSpec::WhenMatched::DoNothing
                             : update_condition.empty() ? nano_lance::MergeInsertSpec::WhenMatched::UpdateAll
@@ -1285,7 +1326,138 @@ NB_MODULE(_nanolance, m) {
         d["num_inserted_rows"] = stats.inserted;
         d["num_updated_rows"] = stats.updated;
         d["num_deleted_rows"] = stats.deleted;
-        return nb::make_tuple(d, version);
+        if (uncommitted) {
+            return nb::make_tuple(d, version,
+                                  nb::make_tuple(transaction.read_version, transaction.operation_field,
+                                                 bytes_of(transaction.operation.data(), transaction.operation.size())));
+        }
+        return nb::make_tuple(d, version, nb::none());
+    });
+    m.def("_ds_commit_hand_built", [](const std::filesystem::path& path, std::uint32_t operation_field,
+                                       const nb::bytes& operation, std::uint64_t base_version,
+                                       std::uint64_t read_version, const std::map<std::string, std::string>& properties,
+                                       bool detached) {
+        nano_lance::HandBuiltCommit commit;
+        commit.detached = detached;
+        commit.operation_field = operation_field;
+        commit.operation = vec_of(operation);
+        commit.base_version = base_version;
+        commit.read_version = read_version;
+        commit.transaction_properties = properties;
+        std::uint64_t version = 0;
+        run_op([&](std::string& e) { return nano_lance::dataset_commit_hand_built(path, commit, version, e); });
+        return version;
+    });
+    m.def("_ds_fragment_messages", [](const std::filesystem::path& path, std::optional<std::uint64_t> version) {
+        std::vector<std::vector<std::uint8_t>> out;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_fragment_messages(path, version.has_value(), version.value_or(0), out, e);
+        });
+        nb::list list;
+        for (const auto& b : out) {
+            list.append(bytes_of(b.data(), b.size()));
+        }
+        return list;
+    });
+    m.def("_ds_field_messages", [](const std::filesystem::path& path, std::optional<std::uint64_t> version) {
+        std::vector<std::vector<std::uint8_t>> fields;
+        std::map<std::string, std::vector<std::uint8_t>> metadata;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_field_messages(path, version.has_value(), version.value_or(0), fields,
+                                                      metadata, e);
+        });
+        nb::list list;
+        for (const auto& b : fields) {
+            list.append(bytes_of(b.data(), b.size()));
+        }
+        nb::dict meta;
+        for (const auto& [k, v] : metadata) {
+            meta[nb::str(k.c_str(), k.size())] = bytes_of(v.data(), v.size());
+        }
+        return nb::make_tuple(list, meta);
+    });
+    m.def("_arrow_schema_from_field_messages", [](const std::vector<nb::bytes>& messages,
+                                                   const std::map<std::string, nb::bytes>& metadata) {
+        std::vector<nano_lance::pb::Field> fields;
+        for (const auto& m : messages) {
+            nano_lance::pb::Field f;
+            if (!nano_lance::pb::decode_field(vec_of(m), f)) {
+                throw nb::value_error("Failed to decode a schema field");
+            }
+            fields.push_back(std::move(f));
+        }
+        std::map<std::string, std::vector<std::uint8_t>> meta;
+        for (const auto& [k, v] : metadata) {
+            meta[k] = vec_of(v);
+        }
+        std::string error;
+        ArrowSchema schema{};
+        if (!nano_lance::lance_fields_arrow_schema(fields, meta, schema, error)) {
+            throw_dataset(error);
+        }
+        return ExportedSchema::adopt(std::move(schema));
+    });
+    m.def("_lance_field_messages_from_arrow", [](nb::handle schema) {
+        SchemaHolder holder;
+        schema_of(schema, holder);
+        nano_lance::LanceSchemaMapping mapping;
+        std::string error;
+        if (!nano_lance::map_arrow_schema(holder.schema, mapping, error)) {
+            throw nb::value_error(error.c_str());
+        }
+        nb::list out;
+        for (const auto& f : mapping.fields) {
+            const auto bytes = nano_lance::pb::encode_field(nano_lance::make_manifest_field(f));
+            out.append(bytes_of(bytes.data(), bytes.size()));
+        }
+        return out;
+    });
+    m.def("_fragment_delete", [](const std::filesystem::path& path, std::uint64_t version, std::uint64_t fragment_id,
+                                 std::optional<std::string> predicate, const std::vector<std::uint32_t>& offsets)
+              -> nb::object {
+        std::vector<std::uint8_t> out;
+        bool emptied = false;
+        run_op([&](std::string& e) {
+            return nano_lance::fragment_delete_rows(path, version, fragment_id, predicate ? &*predicate : nullptr,
+                                                    offsets, out, emptied, e);
+        });
+        if (emptied) {
+            return nb::none();
+        }
+        return bytes_of(out.data(), out.size());
+    });
+    m.def("_fragment_add_columns_sql", [](const std::filesystem::path& path, std::uint64_t version,
+                                          std::uint64_t fragment_id,
+                                          const std::vector<std::pair<std::string, std::string>>& columns,
+                                          std::int32_t max_field_id) {
+        std::vector<std::uint8_t> fragment;
+        std::vector<std::vector<std::uint8_t>> fields;
+        run_op([&](std::string& e) {
+            return nano_lance::fragment_add_columns_sql(path, version, fragment_id, columns, max_field_id, fragment,
+                                                        fields, e);
+        });
+        nb::list field_list;
+        for (const auto& b : fields) {
+            field_list.append(bytes_of(b.data(), b.size()));
+        }
+        return nb::make_tuple(bytes_of(fragment.data(), fragment.size()), field_list);
+    });
+    m.def("_fragment_write_columns", [](const std::filesystem::path& path, std::uint64_t version,
+                                        std::uint64_t fragment_id, nb::handle data, bool replace,
+                                        std::int32_t max_field_id) {
+        ArrowArrayStream stream = stream_of(data);
+        std::vector<std::uint8_t> fragment;
+        std::vector<std::vector<std::uint8_t>> fields;
+        std::vector<std::int32_t> written;
+        run_op([&](std::string& e) {
+            return nano_lance::fragment_write_columns(path, version, fragment_id, stream, replace, max_field_id,
+                                                      fragment, fields, written, e);
+        });
+        nb::list field_list;
+        for (const auto& b : fields) {
+            field_list.append(bytes_of(b.data(), b.size()));
+        }
+        return nb::make_tuple(bytes_of(fragment.data(), fragment.size()), field_list, written);
     });
     m.def("_ds_add_columns_sql", [](const std::filesystem::path& path,
                                     const std::vector<std::pair<std::string, std::string>>& columns) {
