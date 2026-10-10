@@ -427,8 +427,9 @@ still calls vector and full-text indexes out of scope; it should be updated alon
    - `lance_scanner_set_substrait_filter`: Substrait filters.
    - Object-store URIs (`s3://` and others) in `lance_dataset_open` and the writes; `storage_opts`
      is accepted and ignored today.
-   - Writes in Lance's inline, packed and dedicated blob layouts (nanolance writes external blobs
-     and reads every layout).
+   - ~~Writes in Lance's inline, packed and dedicated blob layouts~~ -- done: `lance_dataset_write`
+     goes through the same writer as the Python module (checked 2026-10-10 with a Blob v2 column of
+     inline, packed, dedicated, external, empty and null values, read back by pylance and nanolance).
 
 What is left: the features item 2 waits on, the rest of item 4, and the options and index kinds
 `docs/LANCE_C_COMPAT.md` lists as not implemented (BTREE / BITMAP / LABEL_LIST parameters, nearest

@@ -66,8 +66,9 @@ URIs: local paths, `file://`, and `memory://` (a directory private to the proces
   `{"with_position": true}`); an index without them gets lance-c's own error.
 - Parameters for BTREE, BITMAP and LABEL_LIST indexes (`params_json`).
 - Nearest or full-text search combined with `set_fragment_ids`.
-- Substrait filters, object stores, writing Lance's inline, packed and dedicated blob layouts
-  (nanolance writes external blobs; it reads all of them), and datasets with stable row ids.
+- Substrait filters, object stores, and datasets with stable row ids. (Blob v2 columns are written
+  in all of Lance's layouts -- inline, packed, dedicated, external -- by `lance_dataset_write`, as by
+  the Python module, and read in all of them; pylance reads what lance-c writes.)
 
 `tests/test_lance_c_search.cpp` drives the search API end to end through the C API (a dataset
 written with `lance_dataset_write`, its indexes built with lance-c's calls) and compares every
