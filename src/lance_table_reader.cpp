@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/lance_table_reader.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include "nanolance/index_search.hpp"
 
@@ -1487,6 +1488,8 @@ struct PlannedFile {
     std::filesystem::path data_dir;    // where the data files are; empty: <dataset>/data
     /// A filtered read a scalar index answered: the only physical rows that may pass (ascending).
     std::shared_ptr<const std::vector<std::uint32_t>> candidates;
+    /// With stable row ids: the fragment's row ids, by physical row. Null: a row's id is its address.
+    std::shared_ptr<const RowIdSequence> row_ids;
 
     bool partial() const { return skip != 0U || take != rows; }
 };
@@ -1912,11 +1915,20 @@ bool make_u64_array(const std::vector<std::uint64_t>& values, ArrowArray& out, s
 /// Replace `batch` (a struct array) by one with the row identity columns of `physical` (offsets in
 /// fragment `fragment_id`) after its own. `batch.release` null means a batch without data columns.
 bool add_row_id_columns(ArrowArray& batch, std::int64_t length, std::uint64_t fragment_id,
-                        const std::vector<std::uint64_t>& physical, const RowIdColumns& ids, std::string& error) {
+                        const std::vector<std::uint64_t>& physical, const RowIdColumns& ids,
+                        const RowIdSequence* stable_ids, std::string& error) {
     std::vector<std::uint64_t> addresses(physical.size());
     for (std::size_t i = 0; i < physical.size(); ++i) {
         addresses[i] = row_address(fragment_id, physical[i]);
     }
+    std::vector<std::uint64_t> row_ids;
+    if (ids.row_id && stable_ids != nullptr) {
+        if (!stable_ids->select(physical, row_ids)) {
+            error = "a row of fragment " + std::to_string(fragment_id) + " has no row id";
+            return false;
+        }
+    }
+    const std::vector<std::uint64_t>& id_values = stable_ids != nullptr ? row_ids : addresses;
     const auto own = batch.release == nullptr ? 0 : batch.n_children;
     const auto extra = static_cast<std::int64_t>(ids.row_id) + static_cast<std::int64_t>(ids.row_address);
     ArrowArray out{};
@@ -1932,7 +1944,7 @@ bool add_row_id_columns(ArrowArray& batch, std::int64_t length, std::uint64_t fr
         ArrowArrayMove(batch.children[c], out.children[c]);
     }
     auto next = own;
-    if (ids.row_id && !make_u64_array(addresses, *out.children[next++], error)) {
+    if (ids.row_id && !make_u64_array(id_values, *out.children[next++], error)) {
         ArrowArrayRelease(&out);
         return false;
     }
@@ -2367,7 +2379,7 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
             return;
         }
         if (ids.any() && !add_row_id_columns(batches[k], static_cast<std::int64_t>(out_rows), planned.fragment_id,
-                                             physical_rows, ids, why)) {
+                                             physical_rows, ids, planned.row_ids.get(), why)) {
             return;
         }
         built[k] = 1U;
@@ -2653,7 +2665,8 @@ bool read_candidate_rows(const std::filesystem::path& dataset_path, const Planne
         return false;
     }
     if (ids.any() &&
-        !add_row_id_columns(batch, static_cast<std::int64_t>(out_rows), planned.fragment_id, physical, ids, error)) {
+        !add_row_id_columns(batch, static_cast<std::int64_t>(out_rows), planned.fragment_id, physical, ids,
+                           planned.row_ids.get(), error)) {
         if (batch.release != nullptr) {
             ArrowArrayRelease(&batch);
         }
@@ -2759,11 +2772,7 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
         error = "a read must name at least one column";
         return false;
     }
-    if (plan.ids.row_id && (manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
-        release_schema_if_held(out_schema);
-        error = "row ids of a dataset with stable row ids are not supported";
-        return false;
-    }
+    const bool stable_row_ids = (manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U;
     LanceSchemaMapping full_mapping;
     if (!lance_schema_mapping_from_manifest(manifest, full_mapping, error)) {
         release_schema_if_held(out_schema);
@@ -2990,6 +2999,14 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
 
         PlannedFile planned;
         planned.fragment_id = fragment.id;
+        if (stable_row_ids && plan.ids.row_id) {
+            RowIdSequence sequence;
+            if (!fragment_row_ids(fragment, sequence, error)) {
+                release_schema_if_held(out_schema);
+                return false;
+            }
+            planned.row_ids = std::make_shared<const RowIdSequence>(std::move(sequence));
+        }
         planned.deletion_file = fragment.deletion_file;
         planned.physical_rows = fragment.physical_rows;
         planned.rows = rows;
@@ -3307,7 +3324,8 @@ bool take_physical(const ReadPlan& plan, ArrowSchema& out_schema,
             return false;
         }
         if (plan.ids.any() && !add_row_id_columns(batch, static_cast<std::int64_t>(physical.size()),
-                                                  planned->fragment_id, physical, plan.ids, error)) {
+                                                  planned->fragment_id, physical, plan.ids,
+                                                  planned->row_ids.get(), error)) {
             release_partial_read(out_schema, out_batches);
             return false;
         }

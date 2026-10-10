@@ -27,6 +27,7 @@
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/parallel.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include "lance_minimal.pb.hpp"
 
@@ -764,8 +765,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     }
     // Training alone (target->trained) commits nothing either.
     const bool commit = target == nullptr || (target->out == nullptr && target->trained == nullptr);
-    if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
-        error = "a vector index on a dataset with stable row ids is not supported";
+    AddressToRowId to_row_id;  // stable row ids go into the index, row addresses otherwise
+    if (!AddressToRowId::build(manifest, to_row_id, error)) {
         return false;
     }
     std::vector<std::string> parts;
@@ -907,7 +908,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             } else {
                 data.v.insert(data.v.end(), v, v + dim);
             }
-            ids.push_back(ArrowArrayViewGetUIntUnsafe(addrs, row));
+            ids.push_back(to_row_id(ArrowArrayViewGetUIntUnsafe(addrs, row)));
         }
         ArrowArrayViewReset(&view);
     }

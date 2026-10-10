@@ -340,6 +340,16 @@ bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t ve
         manifest.has_max_fragment_id = true;
         manifest.max_fragment_id = std::max(manifest.max_fragment_id, latest.max_fragment_id);
     }
+    // Row ids are a high-water mark too: rewinding would hand ids already used to new rows. And stable
+    // row ids cannot be turned off again, or row addresses would collide with the ids handed out.
+    if ((latest.reader_feature_flags & pb::kFlagStableRowIds) != 0U &&
+        (manifest.reader_feature_flags & pb::kFlagStableRowIds) == 0U) {
+        error = "Cannot restore version " + std::to_string(version) +
+                ": stable row ids were enabled after it, and turning them back off would let row addresses "
+                "collide with ids this table has already used";
+        return false;
+    }
+    manifest.next_row_id = std::max(manifest.next_row_id, latest.next_row_id);
     manifest.version = latest_version;  // committed on top of the latest, which it replaces
     manifest.operation = pb::Manifest::Operation::Restore;
     manifest.restored_version = version;

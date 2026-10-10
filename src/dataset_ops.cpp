@@ -6,6 +6,7 @@
 // latest manifest with the changed fragments and schema.
 
 #include "nanolance/dataset_ops.hpp"
+#include "nanolance/row_ids.hpp"
 #include "nanolance/index_optimize.hpp"
 
 #include "nanolance/arrow_slice.hpp"
@@ -296,13 +297,202 @@ bool commit(const std::filesystem::path& path, pb::Manifest manifest, std::uint6
     return commit_next_version(path, std::move(manifest), new_version, error);
 }
 
-/// Every fragment of a dataset with stable row ids carries its rows' ids; one nanolance writes would
-/// carry none, and the dataset's row ids (and any index keyed on them) would no longer resolve.
-bool refuse_stable_row_ids(const pb::Manifest& manifest, const char* operation, std::string& error) {
-    if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) == 0U) {
+bool is_stable(const pb::Manifest& manifest) {
+    return (manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U;
+}
+
+/// The version each row at `addresses` was created at, from the fragments' created-at sequences
+/// (1 for a fragment that carries none, as Lance reads it).
+bool created_versions_of(const pb::Manifest& manifest, const std::vector<std::uint64_t>& addresses,
+                         std::vector<std::uint64_t>& out, std::string& error) {
+    std::map<std::uint64_t, const pb::DataFragment*> fragments;
+    for (const auto& f : manifest.fragments) {
+        fragments.emplace(f.id, &f);
+    }
+    std::map<std::uint64_t, std::optional<RowVersionSequence>> cache;
+    out.clear();
+    out.reserve(addresses.size());
+    for (const auto address : addresses) {
+        const auto fragment_id = address >> 32U;
+        auto slot = cache.find(fragment_id);
+        if (slot == cache.end()) {
+            std::optional<RowVersionSequence> seq;
+            const auto it = fragments.find(fragment_id);
+            if (it != fragments.end()) {
+                FragmentRowMeta meta;
+                if (!read_fragment_row_meta(*it->second, meta, error)) {
+                    return false;
+                }
+                if (meta.has_created) {
+                    RowVersionSequence decoded;
+                    if (!RowVersionSequence::decode(meta.created.data(), meta.created.size(), decoded, error)) {
+                        return false;
+                    }
+                    seq = std::move(decoded);
+                }
+            }
+            slot = cache.emplace(fragment_id, std::move(seq)).first;
+        }
+        const auto offset = address & 0xFFFFFFFFULL;
+        const std::uint64_t version = slot->second ? slot->second->at(offset) : 0U;
+        out.push_back(version == 0U ? 1U : version);
+    }
+    return true;
+}
+
+constexpr std::uint64_t kNewRow = UINT64_MAX;  // an address in a list of moved rows that is no row yet
+
+/// For rows at `addresses` (kNewRow: a row that does not exist yet), their ids and creation versions.
+/// New rows are marked kNewRow in `ids`, for stamp_new_fragments to number.
+bool moved_row_meta(const pb::Manifest& manifest, const std::vector<std::uint64_t>& addresses,
+                    std::vector<std::uint64_t>& ids, std::vector<std::uint64_t>& created, std::string& error) {
+    std::map<std::uint64_t, const pb::DataFragment*> fragments;
+    for (const auto& f : manifest.fragments) {
+        fragments.emplace(f.id, &f);
+    }
+    struct Known {
+        std::optional<RowIdSequence> ids;
+        std::optional<RowVersionSequence> created;
+    };
+    std::map<std::uint64_t, Known> cache;
+    ids.clear();
+    created.clear();
+    for (const auto address : addresses) {
+        if (address == kNewRow) {
+            ids.push_back(kNewRow);
+            created.push_back(0);
+            continue;
+        }
+        const auto fragment_id = address >> 32U;
+        auto slot = cache.find(fragment_id);
+        if (slot == cache.end()) {
+            Known known;
+            const auto it = fragments.find(fragment_id);
+            if (it == fragments.end()) {
+                error = "internal error: a moved row's fragment is gone";
+                return false;
+            }
+            RowIdSequence seq;
+            if (!fragment_row_ids(*it->second, seq, error)) {
+                return false;
+            }
+            known.ids = std::move(seq);
+            FragmentRowMeta meta;
+            if (!read_fragment_row_meta(*it->second, meta, error)) {
+                return false;
+            }
+            if (meta.has_created) {
+                RowVersionSequence decoded;
+                if (!RowVersionSequence::decode(meta.created.data(), meta.created.size(), decoded, error)) {
+                    return false;
+                }
+                known.created = std::move(decoded);
+            }
+            slot = cache.emplace(fragment_id, std::move(known)).first;
+        }
+        const auto offset = address & 0xFFFFFFFFULL;
+        if (offset >= slot->second.ids->size()) {
+            error = "internal error: a moved row is past its fragment";
+            return false;
+        }
+        ids.push_back(slot->second.ids->at(offset));
+        const std::uint64_t version = slot->second.created ? slot->second.created->at(offset) : 0U;
+        created.push_back(version == 0U ? 1U : version);
+    }
+    return true;
+}
+
+/// Give `fragments` from index `first` on -- new files holding rows that moved or arrived -- their rows'
+/// ids and versions. `ids`, `created` and `updated` are per row, in the order the rows were written; a
+/// row whose id is kNewRow is a new row: the next id from `next_row_id`, created and updated at
+/// `new_version`.
+bool stamp_fragments(std::vector<pb::DataFragment>& fragments, std::size_t first, const std::vector<std::uint64_t>& ids,
+                     const std::vector<std::uint64_t>& created, const std::vector<std::uint64_t>& updated,
+                     std::uint64_t& next_row_id, std::uint64_t new_version, std::string& error) {
+    std::size_t at = 0;
+    for (std::size_t f = first; f < fragments.size(); ++f) {
+        auto& fragment = fragments[f];
+        std::vector<std::uint64_t> frag_ids;
+        std::vector<std::uint64_t> frag_created;
+        std::vector<std::uint64_t> frag_updated;
+        frag_ids.reserve(static_cast<std::size_t>(fragment.physical_rows));
+        for (std::uint64_t r = 0; r < fragment.physical_rows; ++r, ++at) {
+            if (at < ids.size() && ids[at] != kNewRow) {
+                frag_ids.push_back(ids[at]);
+                frag_created.push_back(created[at]);
+                frag_updated.push_back(updated[at]);
+            } else {
+                frag_ids.push_back(next_row_id++);
+                frag_created.push_back(new_version);
+                frag_updated.push_back(new_version);
+            }
+        }
+        FragmentRowMeta meta;
+        meta.has_row_ids = true;
+        meta.row_ids = RowIdSequence::from_values(std::move(frag_ids)).encode();
+        meta.has_created = meta.has_last_updated = true;
+        meta.created = RowVersionSequence::from_values(frag_created).encode();
+        meta.last_updated = RowVersionSequence::from_values(frag_updated).encode();
+        write_fragment_row_meta(fragment, meta);
+    }
+    if (at < ids.size()) {
+        error = "internal error: rows moved to new fragments are missing";
         return false;
     }
-    error = std::string(operation) + " on a dataset with stable row ids is not supported";
+    return true;
+}
+
+/// stamp_fragments for an update: the moved rows were last updated now.
+bool stamp_new_fragments(pb::Manifest& manifest, std::size_t first, const std::vector<std::uint64_t>& ids,
+                         const std::vector<std::uint64_t>& created, std::uint64_t new_version, std::string& error) {
+    const std::vector<std::uint64_t> updated(ids.size(), new_version);
+    return stamp_fragments(manifest.fragments, first, ids, created, updated, manifest.next_row_id, new_version, error);
+}
+
+/// The live rows of `fragment` in order: their ids, creation and last update versions.
+bool live_row_meta(const std::filesystem::path& dataset_path, const pb::DataFragment& fragment,
+                   std::vector<std::uint64_t>& ids, std::vector<std::uint64_t>& created,
+                   std::vector<std::uint64_t>& updated, std::string& error) {
+    RowIdSequence sequence;
+    if (!fragment_row_ids(fragment, sequence, error)) {
+        return false;
+    }
+    FragmentRowMeta meta;
+    if (!read_fragment_row_meta(fragment, meta, error)) {
+        return false;
+    }
+    std::vector<std::uint64_t> created_all;
+    std::vector<std::uint64_t> updated_all;
+    RowVersionSequence decoded;
+    if (meta.has_created) {
+        if (!RowVersionSequence::decode(meta.created.data(), meta.created.size(), decoded, error)) {
+            return false;
+        }
+        created_all = decoded.to_vector();
+    }
+    if (meta.has_last_updated) {
+        if (!RowVersionSequence::decode(meta.last_updated.data(), meta.last_updated.size(), decoded, error)) {
+            return false;
+        }
+        updated_all = decoded.to_vector();
+    }
+    std::vector<std::uint32_t> deleted;
+    if (fragment.deletion_file.present &&
+        !read_deletion_vector(dataset_path, fragment.id, fragment.deletion_file, deleted, error)) {
+        return false;
+    }
+    std::size_t next_deleted = 0;
+    for (std::uint64_t i = 0; i < sequence.size(); ++i) {
+        while (next_deleted < deleted.size() && deleted[next_deleted] < i) {
+            ++next_deleted;
+        }
+        if (next_deleted < deleted.size() && deleted[next_deleted] == i) {
+            continue;
+        }
+        ids.push_back(sequence.at(i));
+        created.push_back(i < created_all.size() ? created_all[i] : 1U);
+        updated.push_back(i < updated_all.size() ? updated_all[i] : 1U);
+    }
     return true;
 }
 
@@ -603,20 +793,21 @@ bool update_once(const std::filesystem::path& dataset_path, const std::string* p
     if (!load_latest(dataset_path, manifest, version, error)) {
         return false;
     }
-    if (refuse_stable_row_ids(manifest, "update", error)) {
-        return false;
-    }
+    const bool stable = is_stable(manifest);
     LanceScanRequest request;
     request.has_version = true;
     request.version = version;
     request.with_row_address = true;
+    request.with_row_id = stable;  // after the data columns: _rowid, then _rowaddr
     request.filter = predicate != nullptr && !predicate->empty() ? predicate : nullptr;
     OwnedSchema schema;
     OwnedBatches batches;
     if (!scan(dataset_path, request, schema, batches, error)) {
         return false;
     }
-    const auto data_columns = schema.s.n_children - 1;  // the last is _rowaddr
+    const auto data_columns = schema.s.n_children - (stable ? 2 : 1);  // then _rowid (stable) and _rowaddr
+    std::vector<std::uint64_t> moved_ids;
+    std::vector<std::uint64_t> moved_addresses;
     std::vector<std::pair<int64_t, expr::Expression>> sets;
     for (const auto& [column, value] : assignments) {
         const auto index = child_index(schema.s, column);
@@ -645,10 +836,18 @@ bool update_once(const std::filesystem::path& dataset_path, const std::string* p
         if (batch.length == 0) {
             continue;
         }
-        const ArrowArray* addr = batch.children[data_columns];
+        const ArrowArray* addr = batch.children[data_columns + (stable ? 1 : 0)];
         const auto* values = static_cast<const std::uint64_t*>(addr->buffers[1]) + addr->offset;
         for (int64_t i = 0; i < batch.length; ++i) {
             rewritten[values[i] >> 32U].push_back(static_cast<std::uint32_t>(values[i] & 0xFFFFFFFFULL));
+            if (stable) {
+                moved_addresses.push_back(values[i]);
+            }
+        }
+        if (stable) {
+            const ArrowArray* idc = batch.children[data_columns];
+            const auto* idv = static_cast<const std::uint64_t*>(idc->buffers[1]) + idc->offset;
+            moved_ids.insert(moved_ids.end(), idv, idv + batch.length);
         }
         std::vector<ArrowArray> replaced(static_cast<std::size_t>(data_columns));
         for (auto& [index, e] : sets) {
@@ -690,11 +889,19 @@ bool update_once(const std::filesystem::path& dataset_path, const std::string* p
     if (opened && !staged.finish(error)) {
         return false;
     }
+    std::vector<std::uint64_t> moved_created;
+    if (stable && !created_versions_of(manifest, moved_addresses, moved_created, error)) {
+        return false;
+    }
     if (!apply_deletions(dataset_path, manifest, version, rewritten, error)) {
         return false;
     }
+    const auto first_new = manifest.fragments.size();
     if (opened) {
         add_fragments(manifest, staged.mapping(), staged.files());
+    }
+    if (stable && !stamp_new_fragments(manifest, first_new, moved_ids, moved_created, version + 1U, error)) {
+        return false;
     }
     manifest.operation = pb::Manifest::Operation::Update;  // its transaction: Lance's Update
     return commit(dataset_path, std::move(manifest), new_version, error);
@@ -868,9 +1075,7 @@ bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeIns
     if (!load_latest(dataset_path, manifest, version, error)) {
         return false;
     }
-    if (refuse_stable_row_ids(manifest, "merge_insert", error)) {
-        return false;
-    }
+    const bool stable = is_stable(manifest);
     // The dataset's schema, to put the source's columns in its order.
     OwnedSchema target_schema;
     {
@@ -991,6 +1196,7 @@ bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeIns
     StagedFiles staged;
     bool opened = false;
     std::string key;
+    std::vector<std::uint64_t> kept_targets;  // stable ids: each written row's target address, or kNewRow
     for (std::size_t sb = 0; sb < source_batches.size(); ++sb) {
         const auto& shared = source_batches[sb];
         BatchView view;
@@ -1018,9 +1224,15 @@ bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeIns
                     deletions[it->second >> 32U].push_back(static_cast<std::uint32_t>(it->second & 0xFFFFFFFFULL));
                     ++(spec.when_matched == WM::UpdateAll ? stats.updated : stats.deleted);
                 }
+                if (stable && keep[static_cast<std::size_t>(i)] != 0U) {
+                    kept_targets.push_back(it->second);
+                }
             } else if (spec.when_not_matched_insert_all) {
                 keep[static_cast<std::size_t>(i)] = 1U;
                 ++stats.inserted;
+                if (stable) {
+                    kept_targets.push_back(kNewRow);
+                }
             }
         }
         // Runs of kept rows, as slices in the dataset's column order.
@@ -1073,11 +1285,20 @@ bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeIns
     if (opened && !staged.finish(error)) {
         return false;
     }
+    std::vector<std::uint64_t> moved_ids;
+    std::vector<std::uint64_t> moved_created;
+    if (stable && !moved_row_meta(manifest, kept_targets, moved_ids, moved_created, error)) {
+        return false;
+    }
     if (!apply_deletions(dataset_path, manifest, version, deletions, error)) {
         return false;
     }
+    const auto first_new = manifest.fragments.size();
     if (opened) {
         add_fragments(manifest, staged.mapping(), staged.files());
+    }
+    if (stable && !stamp_new_fragments(manifest, first_new, moved_ids, moved_created, version + 1U, error)) {
+        return false;
     }
     manifest.operation = pb::Manifest::Operation::Update;  // its transaction: Lance's Update
     if (spec.uncommitted != nullptr) {
@@ -1551,9 +1772,7 @@ bool compact_once(const std::filesystem::path& dataset_path, const CompactionOpt
     if (!load_latest(dataset_path, manifest, version, error)) {
         return false;
     }
-    if (refuse_stable_row_ids(manifest, "compaction", error)) {
-        return false;
-    }
+    const bool stable = is_stable(manifest);
     new_version = version;
     for (const auto& [name, value] :
          {std::pair<const char*, std::optional<std::uint64_t>>{"max_source_fragments", options.max_source_fragments},
@@ -1694,6 +1913,16 @@ bool compact_once(const std::filesystem::path& dataset_path, const CompactionOpt
                 metrics.files_removed += old[m].files.size() + (old[m].deletion_file.present ? 1U : 0U);
             }
             metrics.fragments_removed += members.size();
+            std::vector<std::uint64_t> bin_ids;
+            std::vector<std::uint64_t> bin_created;
+            std::vector<std::uint64_t> bin_updated;
+            if (stable) {
+                for (const auto m : members) {
+                    if (!live_row_meta(dataset_path, old[m], bin_ids, bin_created, bin_updated, error)) {
+                        return false;
+                    }
+                }
+            }
             LanceScanRequest request;
             request.has_version = true;
             request.version = version;
@@ -1734,6 +1963,7 @@ bool compact_once(const std::filesystem::path& dataset_path, const CompactionOpt
             if (!staged.finish(error)) {
                 return false;
             }
+            const auto first_created = created.size();
             for (const auto& f : staged.files()) {
                 if (f.rows == 0U) {
                     continue;
@@ -1741,6 +1971,13 @@ bool compact_once(const std::filesystem::path& dataset_path, const CompactionOpt
                 created.push_back(make_data_fragment(staged.mapping(), f, 0));
                 ++metrics.fragments_added;
                 ++metrics.files_added;
+            }
+            if (stable) {
+                std::uint64_t unused_next_row_id = 0;  // every row of a compaction keeps its id
+                if (!stamp_fragments(created, first_created, bin_ids, bin_created, bin_updated, unused_next_row_id,
+                                     version + 1U, error)) {
+                    return false;
+                }
             }
             i = members.back() + 1U;
             ++next_bin;

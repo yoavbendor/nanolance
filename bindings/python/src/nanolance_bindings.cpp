@@ -19,6 +19,7 @@
 #include <nanolance/lance_table_reader.hpp>
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
+#include <nanolance/row_ids.hpp>
 #include <nanolance/scalar_index.hpp>
 #include <nanolance/schema_mapper.hpp>
 #include <nanolance/vector_search.hpp>
@@ -412,6 +413,39 @@ ExportedTable table_of(ArrowSchema& schema, std::vector<ArrowArray>& batches) {
     return out;
 }
 
+std::vector<std::uint64_t> ds_resolve_row_ids(const std::filesystem::path& path,
+                                              std::optional<std::uint64_t> version,
+                                              const std::vector<std::uint64_t>& ids) {
+    std::vector<std::uint64_t> addresses;
+    std::string error;
+    bool ok = false;
+    {
+        nb::gil_scoped_release release;
+        ok = nano_lance::resolve_row_ids(path, version, ids, addresses, error, /*skip_missing=*/true);
+    }
+    if (!ok) {
+        throw_dataset(error);
+    }
+    return addresses;
+}
+
+std::pair<std::vector<std::uint64_t>, std::vector<std::uint64_t>> ds_row_versions(
+    const std::filesystem::path& path, std::optional<std::uint64_t> version,
+    const std::vector<std::uint64_t>& addresses) {
+    std::vector<std::uint64_t> created;
+    std::vector<std::uint64_t> updated;
+    std::string error;
+    bool ok = false;
+    {
+        nb::gil_scoped_release release;
+        ok = nano_lance::row_versions_at(path, version, addresses, created, updated, error);
+    }
+    if (!ok) {
+        throw_dataset(error);
+    }
+    return {std::move(created), std::move(updated)};
+}
+
 nb::object ds_scan(const std::filesystem::path& path, std::optional<std::uint64_t> version,
                    std::optional<std::vector<std::string>> columns,
                    std::optional<std::vector<std::uint64_t>> fragment_ids, std::uint64_t offset, std::int64_t length,
@@ -695,6 +729,12 @@ public:
             throw std::runtime_error("failed to set the blob pack file size");
         }
     }
+    void set_stable_row_ids(bool enable) {
+        if (nano_lance_writer_set_stable_row_ids(&writer_, enable ? 1 : 0) != 0) {
+            throw std::runtime_error(writer_.last_error);
+        }
+    }
+
     void set_initial_config(const std::string& key, const std::string& value) {
         if (nano_lance_writer_set_initial_config(&writer_, key.c_str(), value.c_str()) != 0) {
             throw std::runtime_error("failed to set the dataset config");
@@ -1053,6 +1093,30 @@ NB_MODULE(_nanolance, m) {
     m.attr("BLOB_BINARY") = 2;
     m.attr("BLOB_LOCATIONS") = 3;
     m.def("_ds_schema", &ds_schema, nb::arg("path"), nb::arg("version").none());
+    m.def("_ds_row_versions", &ds_row_versions, nb::arg("path"), nb::arg("version").none(), nb::arg("addresses"));
+    m.def("_ds_resolve_row_ids", &ds_resolve_row_ids, nb::arg("path"), nb::arg("version").none(), nb::arg("ids"));
+    m.def("_row_id_sequence_encode", [](const std::vector<std::uint64_t>& values) {
+        const auto encoded = nano_lance::RowIdSequence::from_values(values).encode();
+        return bytes_of(encoded.data(), encoded.size());
+    }, nb::arg("values"));
+    m.def("_row_id_sequence_decode", [](const nb::bytes& data) {
+        nano_lance::RowIdSequence sequence;
+        std::string error;
+        if (!nano_lance::RowIdSequence::decode(reinterpret_cast<const std::uint8_t*>(data.c_str()), data.size(),
+                                               sequence, error)) {
+            throw std::runtime_error(error);
+        }
+        return sequence.to_vector();
+    }, nb::arg("data"));
+    m.def("_version_sequence_decode", [](const nb::bytes& data) {
+        nano_lance::RowVersionSequence sequence;
+        std::string error;
+        if (!nano_lance::RowVersionSequence::decode(reinterpret_cast<const std::uint8_t*>(data.c_str()),
+                                                    data.size(), sequence, error)) {
+            throw std::runtime_error(error);
+        }
+        return sequence.to_vector();
+    }, nb::arg("data"));
     m.def("_ds_info", &ds_info, nb::arg("path"), nb::arg("version").none());
     m.def("_ds_versions", &ds_versions, nb::arg("path"));
     m.def("_ds_latest_version", [](const std::filesystem::path& path) {
@@ -1207,6 +1271,7 @@ NB_MODULE(_nanolance, m) {
         .def("write_batch", &StagedWriter::write_batch)
         .def("project", &StagedWriter::project)
         .def("set_initial_config", &StagedWriter::set_initial_config)
+        .def("set_stable_row_ids", &StagedWriter::set_stable_row_ids)
         .def("set_transaction_property", &StagedWriter::set_transaction_property)
         .def("set_blob_pack_file_size", &StagedWriter::set_blob_pack_file_size)
         .def("finish", &StagedWriter::finish, nb::arg("mode"), nb::arg("keep_empty") = false)
@@ -1336,9 +1401,10 @@ NB_MODULE(_nanolance, m) {
     m.def("_ds_commit_hand_built", [](const std::filesystem::path& path, std::uint32_t operation_field,
                                        const nb::bytes& operation, std::uint64_t base_version,
                                        std::uint64_t read_version, const std::map<std::string, std::string>& properties,
-                                       bool detached) {
+                                       bool detached, bool enable_stable_row_ids) {
         nano_lance::HandBuiltCommit commit;
         commit.detached = detached;
+        commit.enable_stable_row_ids = enable_stable_row_ids;
         commit.operation_field = operation_field;
         commit.operation = vec_of(operation);
         commit.base_version = base_version;

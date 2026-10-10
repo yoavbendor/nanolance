@@ -153,6 +153,152 @@ class DeletionFile:
         return (DeletionFile, (self.read_version, self.id, self.file_type, self.num_deleted_rows, self.base_id))
 
 
+class RowIdMeta:
+    """A fragment's stable row ids, as Lance stores them inline: a serialized RowIdSequence."""
+
+    def __init__(self, inline: bytes = b""):
+        self._inline = bytes(inline)
+
+    def asdict(self) -> dict:
+        return {"Inline": list(self._inline)}
+
+    def json(self) -> str:
+        return json.dumps({"Inline": list(self._inline)}, separators=(",", ":"))
+
+    @staticmethod
+    def from_dict(d: dict) -> "RowIdMeta":
+        if "Inline" not in d:
+            raise unsupported("row ids kept in an external file")
+        return RowIdMeta(bytes(d["Inline"]))
+
+    @staticmethod
+    def from_json(data: str) -> "RowIdMeta":
+        return RowIdMeta.from_dict(json.loads(data))
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, RowIdMeta) and self._inline == other._inline
+
+    def __hash__(self) -> int:
+        return hash(self._inline)
+
+    def __repr__(self) -> str:
+        return f"<lance.fragment.RowIdMeta object at {hex(id(self))}>"
+
+    def __reduce__(self):
+        return (RowIdMeta, (self._inline,))
+
+
+class RowDatasetVersionMeta:
+    """The versions a fragment's rows were created / last updated at: a serialized
+    RowDatasetVersionSequence."""
+
+    def __init__(self, inline: bytes = b""):
+        self._inline = bytes(inline)
+
+    def asdict(self):
+        raise NotImplementedError("PyRowDatasetVersionMeta.asdict is not yet supported.")
+
+    def json(self) -> str:
+        return json.dumps({"inline": list(self._inline)}, separators=(",", ":"))
+
+    @staticmethod
+    def from_json(data: str) -> "RowDatasetVersionMeta":
+        d = json.loads(data)
+        if "inline" not in d:
+            raise unsupported("row versions kept in an external file")
+        return RowDatasetVersionMeta(bytes(d["inline"]))
+
+    def versions(self) -> List[int]:
+        return list(_nanolance._version_sequence_decode(self._inline))
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, RowDatasetVersionMeta) and self._inline == other._inline
+
+    def __hash__(self) -> int:
+        return hash(self._inline)
+
+    def __repr__(self) -> str:
+        return f"<lance.fragment.RowDatasetVersionMeta object at {hex(id(self))}>"
+
+    def __reduce__(self):
+        return (RowDatasetVersionMeta.from_json, (self.json(),))
+
+
+def _row_id_values(row_ids) -> List[int]:
+    if isinstance(row_ids, pa.ChunkedArray):
+        row_ids = row_ids.combine_chunks()
+    if isinstance(row_ids, pa.Array):
+        if not pa.types.is_integer(row_ids.type):
+            raise TypeError(f"Row ids must be an array of integers, got {row_ids.type}")
+        if row_ids.null_count:
+            raise ValueError("Row ids must not be null")
+        values = row_ids.to_pylist()
+        if any(v < 0 for v in values):
+            raise ValueError("Row ids must fit in uint64: found a negative value")
+        return values
+    if isinstance(row_ids, range):
+        if len(row_ids) and min(row_ids[0], row_ids[-1]) < 0:
+            raise ValueError("Row ids must be non-negative")
+        return list(row_ids)
+    try:
+        iterator = iter(row_ids)
+    except TypeError:
+        raise TypeError(f"Row ids must be an iterable of integers, got {type(row_ids).__name__}") from None
+    values = []
+    for v in iterator:
+        if v is None:
+            raise ValueError("Row ids must not be null")
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise TypeError(f"Row ids must be an iterable of integers, got element {type(v).__name__}")
+        if v < 0 or v >= 1 << 64:
+            raise ValueError("Row ids must be non-negative integers that fit in uint64")
+        values.append(v)
+    return values
+
+
+class RowIdSequence:
+    """The stable row ids of a fragment, in row order. Build one from any iterable of unique
+    integers; ``to_inline_metadata`` gives the ``FragmentMetadata.row_id_meta`` that carries it."""
+
+    def __init__(self, row_ids=()):
+        values = _row_id_values(row_ids)
+        if len(set(values)) != len(values):
+            raise ValueError("Row ids must be unique")
+        self._values = values
+
+    @staticmethod
+    def from_inline_metadata(meta: RowIdMeta) -> "RowIdSequence":
+        sequence = RowIdSequence.__new__(RowIdSequence)
+        sequence._values = list(_nanolance._row_id_sequence_decode(meta._inline))
+        return sequence
+
+    def to_inline_metadata(self) -> RowIdMeta:
+        return RowIdMeta(_nanolance._row_id_sequence_encode(self._values))
+
+    def to_pyarrow(self) -> pa.Array:
+        return pa.array(self._values, pa.uint64())
+
+    def __iter__(self):
+        return iter(list(self._values))
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, RowIdSequence) and self._values == other._values
+
+    __hash__ = None
+
+    def __repr__(self) -> str:
+        if len(self._values) <= 10:
+            return f"RowIdSequence({self._values})"
+        head = ", ".join(str(v) for v in self._values[:10])
+        return f"RowIdSequence([{head}, ...], len={len(self._values)})"
+
+    def __reduce__(self):
+        return (RowIdSequence, (list(self._values),))
+
+
 @dataclass
 class FragmentMetadata:
     """A fragment as a manifest records it: its id, data files, row count and deletion file."""
@@ -190,9 +336,11 @@ class FragmentMetadata:
             overlays=[],
             physical_rows=self.physical_rows,
             deletion_file=None if self.deletion_file is None else self.deletion_file.asdict(),
-            row_id_meta=None,
-            created_at_version_meta=None,
-            last_updated_at_version_meta=None,
+            row_id_meta=None if self.row_id_meta is None else {"Inline": list(self.row_id_meta._inline)},
+            created_at_version_meta=None if self.created_at_version_meta is None
+            else {"inline": list(self.created_at_version_meta._inline)},
+            last_updated_at_version_meta=None if self.last_updated_at_version_meta is None
+            else {"inline": list(self.last_updated_at_version_meta._inline)},
         )
 
     @staticmethod
@@ -201,13 +349,17 @@ class FragmentMetadata:
         deletion = data.get("deletion_file")
         if deletion is not None:
             deletion = DeletionFile(**deletion)
-        for key in ("row_id_meta", "created_at_version_meta", "last_updated_at_version_meta"):
-            if data.get(key) is not None:
-                raise unsupported("stable row ids")
         if data.get("overlays"):
             raise unsupported("data overlay files")
-        return FragmentMetadata(id=data["id"], files=[DataFile(**f) for f in data["files"]],
-                                physical_rows=data["physical_rows"], deletion_file=deletion)
+        row_ids = data.get("row_id_meta")
+        created = data.get("created_at_version_meta")
+        updated = data.get("last_updated_at_version_meta")
+        return FragmentMetadata(
+            id=data["id"], files=[DataFile(**f) for f in data["files"]], physical_rows=data["physical_rows"],
+            deletion_file=deletion, row_id_meta=None if row_ids is None else RowIdMeta.from_dict(row_ids),
+            created_at_version_meta=None if created is None else RowDatasetVersionMeta.from_json(json.dumps(created)),
+            last_updated_at_version_meta=None if updated is None
+            else RowDatasetVersionMeta.from_json(json.dumps(updated)))
 
 
 class LanceFragment(pa.dataset.Fragment):
@@ -633,8 +785,6 @@ def write_fragments(data, dataset_uri, schema: Optional[pa.Schema] = None, *, re
     from nanolance.lance.dataset import LanceDataset, _exists, _path_of
 
     _check_namespace(namespace_client, table_id)
-    if enable_stable_row_ids:
-        raise unsupported("stable row ids")
     if target_bases or target_all_bases or initial_bases:
         raise unsupported("multiple base paths")
     if external_blob_mode not in ("reference", "ingest"):

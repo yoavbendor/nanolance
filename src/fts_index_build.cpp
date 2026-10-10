@@ -17,6 +17,7 @@
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/parallel.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include "lance_minimal.pb.hpp"
 
@@ -239,7 +240,7 @@ struct Built {
 
 /// The documents of `batches` (column 0 text, column 1 row address), added in order.
 bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, const fts::Analyzer& analyzer,
-                   Built& b, std::string& error) {
+                   const AddressToRowId& to_row_id, Built& b, std::string& error) {
     for (auto& batch : batches) {
         ArrowArrayView view{};
         ArrowError e{};
@@ -275,7 +276,7 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
                 return false;
             }
             const auto doc = static_cast<std::uint32_t>(b.row_ids.size());
-            b.row_ids.push_back(ArrowArrayViewGetUIntUnsafe(addr, view.offset + static_cast<std::int64_t>(r)));
+            b.row_ids.push_back(to_row_id(ArrowArrayViewGetUIntUnsafe(addr, view.offset + static_cast<std::int64_t>(r))));
             b.num_tokens.push_back(static_cast<std::uint32_t>(tokens[r].size()));
             b.total_tokens += tokens[r].size();
             counts.clear();
@@ -575,8 +576,8 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
         return false;
     }
     const bool commit = target == nullptr || target->out == nullptr;
-    if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
-        error = "an INVERTED index on a dataset with stable row ids is not supported";
+    AddressToRowId to_row_id;  // stable row ids go into the index, row addresses otherwise
+    if (!AddressToRowId::build(manifest, to_row_id, error)) {
         return false;
     }
     std::vector<std::string> parts;
@@ -626,8 +627,21 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
         index_files::OwnedBatches rows;
         LanceScanRequest by_address = request;
         by_address.fragment_ids = nullptr;
-        if (!lance_dataset_take_rows(dataset_path, by_address, *target->rows, taken.s, rows.v, error) ||
-            !is_text(taken.s) || !add_documents(taken.s, rows.v, analyzer, built, error)) {
+        std::vector<std::uint64_t> addresses = *target->rows;
+        if (to_row_id.stable()) {  // the old segment's rows are ids
+            RowIdToAddress resolver;
+            if (!RowIdToAddress::build(dataset_path, manifest, resolver, error)) {
+                return false;
+            }
+            for (auto& row : addresses) {
+                if (!resolver.find(row, row)) {
+                    row = UINT64_MAX;
+                }
+            }
+            addresses.erase(std::remove(addresses.begin(), addresses.end(), UINT64_MAX), addresses.end());
+        }
+        if (!lance_dataset_take_rows(dataset_path, by_address, addresses, taken.s, rows.v, error) ||
+            !is_text(taken.s) || !add_documents(taken.s, rows.v, analyzer, to_row_id, built, error)) {
             return false;
         }
     }
@@ -635,7 +649,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
         OwnedSchema scanned;
         index_files::OwnedBatches batches;
         if (!lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error) || !is_text(scanned.s) ||
-            !add_documents(scanned.s, batches.v, analyzer, built, error)) {
+            !add_documents(scanned.s, batches.v, analyzer, to_row_id, built, error)) {
             return false;
         }
     }

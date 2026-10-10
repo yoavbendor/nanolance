@@ -66,7 +66,9 @@ URIs: local paths, `file://`, and `memory://` (a directory private to the proces
   `{"with_position": true}`); an index without them gets lance-c's own error.
 - Parameters for BTREE, BITMAP and LABEL_LIST indexes (`params_json`).
 - Nearest or full-text search combined with `set_fragment_ids`.
-- Substrait filters, object stores, and datasets with stable row ids. (Blob v2 columns are written
+- Substrait filters and object stores. (Datasets with stable row ids work: `enable_stable_row_ids` in
+  `LanceWriteParams`, `_rowid` through delete / update / compaction, `lance_dataset_take_rows` and
+  `lance_dataset_take_blobs` by stable row id, indexes of every kind. Blob v2 columns are written
   in all of Lance's layouts -- inline, packed, dedicated, external -- by `lance_dataset_write`, as by
   the Python module, and read in all of them; pylance reads what lance-c writes.)
 

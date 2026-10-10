@@ -307,6 +307,7 @@ add_library(nanolance STATIC
     src/index_optimize.cpp
     src/data_file_reader.cpp
     src/deletion_vector.cpp
+    src/row_ids.cpp
     src/data_file_writer.cpp
     src/fsst.cpp
     src/lz4_block.cpp
@@ -583,6 +584,10 @@ add_executable(nano_lance_writer_lifecycle_test tests/test_writer_lifecycle.cpp)
 target_compile_features(nano_lance_writer_lifecycle_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_writer_lifecycle_test PRIVATE nanolance)
 
+add_executable(nano_lance_row_ids_test tests/test_row_ids.cpp)
+target_compile_features(nano_lance_row_ids_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_row_ids_test PRIVATE nanolance)
+
 add_executable(nano_lance_blob_builder_test tests/test_blob_builder.cpp)
 target_compile_features(nano_lance_blob_builder_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_blob_builder_test PRIVATE nanolance)
@@ -623,6 +628,12 @@ if(TARGET lance_c)
     target_link_libraries(nano_lance_lance_c_search_test PRIVATE lance_c nanolance)
     add_test(NAME nano_lance_lance_c_search COMMAND $<TARGET_FILE:nano_lance_lance_c_search_test>
              "${CMAKE_CURRENT_BINARY_DIR}/lance_c_search_tmp")
+
+    add_executable(nano_lance_lance_c_stable_row_ids_test tests/test_lance_c_stable_row_ids.cpp)
+    target_compile_features(nano_lance_lance_c_stable_row_ids_test PRIVATE cxx_std_20)
+    target_link_libraries(nano_lance_lance_c_stable_row_ids_test PRIVATE lance_c nanolance)
+    add_test(NAME nano_lance_lance_c_stable_row_ids COMMAND $<TARGET_FILE:nano_lance_lance_c_stable_row_ids_test>
+             "${CMAKE_CURRENT_BINARY_DIR}/lance_c_stable_tmp")
 endif()
 
 add_executable(nano_lance_fts_fst_test tests/test_fts_fst.cpp)
@@ -782,6 +793,7 @@ set_tests_properties(nano_lance_proto_roundtrip PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_writer_lifecycle COMMAND $<TARGET_FILE:nano_lance_writer_lifecycle_test>)
 set_tests_properties(nano_lance_writer_lifecycle PROPERTIES LABELS "smoke")
 
+add_test(NAME nano_lance_row_ids COMMAND $<TARGET_FILE:nano_lance_row_ids_test>)
 add_test(NAME nano_lance_blob_builder COMMAND $<TARGET_FILE:nano_lance_blob_builder_test>)
 set_tests_properties(nano_lance_blob_builder PROPERTIES LABELS "smoke")
 

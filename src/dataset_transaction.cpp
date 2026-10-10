@@ -10,6 +10,7 @@
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/manifest_writer.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include "lance_minimal.pb.hpp"
 
@@ -775,7 +776,53 @@ bool data_replacement(pb::Manifest& next, const Operation& op, std::string& erro
     return true;
 }
 
-bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest& next, std::string& error) {
+/// Stable row ids: a fragment that arrives without row ids takes the next ones from the manifest's
+/// high-water mark, and one without version metadata is created and last updated at `version`
+/// (Lance's assign_row_ids / build_version_meta). Fragments that carry their own are kept as given.
+bool stamp_missing_row_meta(std::vector<pb::DataFragment>& fragments, std::uint64_t& next_row_id,
+                            std::uint64_t version, std::string& error) {
+    for (auto& fragment : fragments) {
+        FragmentRowMeta meta;
+        if (!read_fragment_row_meta(fragment, meta, error)) {
+            return false;
+        }
+        bool changed = false;
+        if (!meta.has_row_ids && !meta.external) {
+            meta.has_row_ids = true;
+            meta.row_ids = RowIdSequence::range(next_row_id, fragment.physical_rows).encode();
+            next_row_id += fragment.physical_rows;
+            changed = true;
+        } else if (meta.has_row_ids) {
+            RowIdSequence ids;
+            std::uint64_t top = 0;
+            if (!RowIdSequence::decode(meta.row_ids.data(), meta.row_ids.size(), ids, error)) {
+                return false;
+            }
+            if (ids.max_id(top)) {
+                next_row_id = std::max(next_row_id, top + 1U);
+            }
+        }
+        if (fragment.physical_rows != 0U && !meta.external) {
+            if (!meta.has_created) {
+                meta.has_created = true;
+                meta.created = RowVersionSequence::uniform(fragment.physical_rows, version).encode();
+                changed = true;
+            }
+            if (!meta.has_last_updated) {
+                meta.has_last_updated = true;
+                meta.last_updated = RowVersionSequence::uniform(fragment.physical_rows, version).encode();
+                changed = true;
+            }
+        }
+        if (changed) {
+            write_fragment_row_meta(fragment, meta);
+        }
+    }
+    return true;
+}
+
+bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest& next, std::string& error,
+                     bool enable_stable_row_ids = false, std::uint64_t new_version = 0) {
     if (base == nullptr && op.kind != kOverwrite) {
         error = std::string("Invalid user input: Cannot apply operation ") + operation_name(op.kind) +
                 " to non-existent dataset";
@@ -814,11 +861,16 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
         next.schema_metadata = op.schema_metadata;
     }
     std::uint64_t next_id = base != nullptr ? next_fragment_id(*base) : 0U;
+    const bool stable = (next.reader_feature_flags & pb::kFlagStableRowIds) != 0U ||
+                        (enable_stable_row_ids && (base == nullptr || op.kind == kOverwrite));
 
     switch (op.kind) {
         case kAppend: {
             auto added = op.fragments;
             assign_ids(added, next_id);
+            if (stable && !stamp_missing_row_meta(added, next.next_row_id, new_version, error)) {
+                return false;
+            }
             next.fragments.insert(next.fragments.end(), added.begin(), added.end());
             break;
         }
@@ -860,6 +912,9 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
             prune_updated_fields(next.indices, updated_ids, op.fields_modified);
             auto added = op.fragments;
             assign_ids(added, next_id);
+            if (stable && !stamp_missing_row_meta(added, next.next_row_id, new_version, error)) {
+                return false;
+            }
             next.fragments.insert(next.fragments.end(), added.begin(), added.end());
             retain_relevant_indices(next.indices, next.fields, next.fragments);
             break;
@@ -868,6 +923,9 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
             auto added = op.fragments;
             for (auto& f : added) {
                 f.id = next_id++;  // every fragment of an overwrite is new, whatever id it came with
+            }
+            if (stable && !stamp_missing_row_meta(added, next.next_row_id, new_version, error)) {
+                return false;
             }
             next.fragments = std::move(added);
             next.indices.clear();
@@ -1004,6 +1062,10 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
         next.has_max_fragment_id = true;
         next.max_fragment_id = static_cast<std::uint32_t>(max_id);
     }
+    if (stable) {
+        next.reader_feature_flags |= pb::kFlagStableRowIds;
+        next.writer_feature_flags |= pb::kFlagStableRowIds;
+    }
     const bool deletions = std::any_of(next.fragments.begin(), next.fragments.end(),
                                        [](const pb::DataFragment& f) { return f.deletion_file.present; });
     if (deletions) {
@@ -1066,7 +1128,8 @@ bool dataset_commit_hand_built(const std::filesystem::path& dataset_path, const 
             next.max_fragment_id = std::max(next.max_fragment_id, base.max_fragment_id);
         }
         next.next_row_id = std::max(next.next_row_id, base.next_row_id);
-    } else if (!apply_operation(exists ? &base : nullptr, op, next, error)) {
+    } else if (!apply_operation(exists ? &base : nullptr, op, next, error, commit.enable_stable_row_ids,
+                                commit.base_version + 1U)) {
         return false;
     }
     next.version = commit.base_version + 1U;

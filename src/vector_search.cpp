@@ -14,6 +14,7 @@
 //             (distance, row id).
 
 #include "nanolance/vector_search.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include "index_build.hpp"
 #include "fts_json.hpp"
@@ -953,6 +954,8 @@ struct RowMask {
     std::set<std::uint32_t> limit;                              // empty: any fragment
     bool has_count = false;  // an explicit prefilter: how many rows it allows
     std::uint64_t count = 0;
+    /// With stable row ids the index holds ids, not addresses: this finds the address of one.
+    const RowIdToAddress* resolver = nullptr;
 
     /// Index the above by fragment id; call once they are set.
     void seal() {
@@ -970,6 +973,9 @@ struct RowMask {
     }
 
     bool allows(std::uint64_t id) const {
+        if (resolver != nullptr && resolver->stable() && !resolver->find(id, id)) {
+            return false;  // an id whose row is gone
+        }
         const auto frag = static_cast<std::uint32_t>(id >> 32U);
         const auto offset = id & 0xFFFFFFFFULL;
         if (frag >= frags_.size()) {
@@ -1995,9 +2001,6 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
     if (!q.use_index) {
         not_used = "use_index=False";
     } else if (!segments.empty()) {
-        if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
-            not_used = "stable row ids";
-        }
         for (const auto* s : segments) {
             if (!not_used.empty()) {
                 break;
@@ -2031,6 +2034,10 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
     for (const auto& f : manifest.fragments) {
         all_fragments.push_back(f.id);
     }
+    RowIdToAddress resolver;  // stable row ids: what the index holds are ids
+    if (!loaded.empty() && !RowIdToAddress::build(dataset_path, manifest, resolver, error)) {
+        return false;
+    }
     std::vector<Candidate> hits;
     if (loaded.empty()) {
         if (!segments.empty() && !not_used.empty()) {
@@ -2051,6 +2058,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                            loaded.front()->type + ")");
         for (std::size_t s = 0; s < loaded.size(); ++s) {
             RowMask mask;
+            mask.resolver = &resolver;
             for (const auto& f : manifest.fragments) {
                 mask.physical[static_cast<std::uint32_t>(f.id)] = f.physical_rows;
             }
@@ -2091,6 +2099,11 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                 return false;
             }
             out.plan.push_back("  " + line);
+        }
+        if (resolver.stable()) {  // from here on the candidates are addresses, as the exact search's are
+            for (auto& hit : ann) {
+                resolver.find(hit.id, hit.id);
+            }
         }
         keep_best(ann, kk);
         std::vector<std::uint64_t> unindexed;

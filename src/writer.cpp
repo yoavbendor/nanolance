@@ -72,6 +72,8 @@ struct WriterState {
     std::map<std::string, std::vector<std::uint8_t>> schema_metadata;
     /// Table config recorded when the commit creates the dataset (nano_lance_writer_set_initial_config).
     std::map<std::string, std::string> initial_config;
+    /// Create the dataset with stable row ids (nano_lance_writer_set_stable_row_ids).
+    bool stable_row_ids = false;
     /// Recorded in the finishing commit's transaction file (nano_lance_writer_set_transaction_property).
     std::map<std::string, std::string> transaction_properties;
     /// Field ids of the schema taken from the first batch start here (writer_set_field_id_base): new
@@ -1230,6 +1232,7 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
         std::uint64_t version = 0;
         nano_lance::CommitExtras extras;
         extras.schema_metadata = is_append ? nullptr : &state->schema_metadata;
+        extras.stable_row_ids = state->stable_row_ids;
         if (!nano_lance::commit_dataset_version(state->dataset_path, disk_schema,
                                                 {nano_lance::NewFragment{data_file, state->pending_rows}},
                                                 is_append ? nano_lance::CommitMode::Append
@@ -1288,6 +1291,7 @@ int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* versio
     extras.schema_metadata = commit_mode == nano_lance::CommitMode::Append ? nullptr : &state->schema_metadata;
     extras.initial_config = state->initial_config;
     extras.transaction_properties = state->transaction_properties;
+    extras.stable_row_ids = state->stable_row_ids;
     std::filesystem::create_directories(state->dataset_path / "data", ec);
     if (!nano_lance::commit_dataset_version(state->dataset_path, mapping, state->staged, commit_mode, version, error,
                                             extras)) {
@@ -1310,6 +1314,16 @@ int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* ke
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "config key and value are required");
     }
     state->initial_config[key] = value;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_stable_row_ids(NanoLanceWriter* writer, int enable) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    state->stable_row_ids = enable != 0;
     clear_error(writer);
     return NANO_LANCE_OK;
 }

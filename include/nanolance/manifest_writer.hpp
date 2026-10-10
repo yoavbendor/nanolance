@@ -38,6 +38,10 @@ struct CommitExtras {
     std::map<std::string, std::string> initial_config;
     /// Recorded in the commit's transaction file.
     std::map<std::string, std::string> transaction_properties;
+    /// Create the dataset with stable row ids, or (an append, or an overwrite of a dataset that has
+    /// them) keep them: each new fragment is given row ids from the manifest's `next_row_id` and the
+    /// version stamps of its rows. A dataset that has them keeps them whatever this says.
+    bool stable_row_ids = false;
 };
 
 /// Publish one new version holding `fragments` (possibly none), numbered after the latest one. Table

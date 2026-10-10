@@ -347,10 +347,6 @@ bool optimize_indices_once(const std::filesystem::path& dataset_path, const Opti
         return false;
     }
     result.version = version;
-    if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U && !manifest.indices.empty()) {
-        error = "optimizing indexes of a dataset with stable row ids is not supported";
-        return false;
-    }
     // The indexes, by name, in the manifest's order; each one's segments in order.
     std::vector<std::string> names;
     std::map<std::string, std::vector<const pb::IndexMetadata*>> by_name;

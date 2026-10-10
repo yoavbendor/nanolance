@@ -18,6 +18,7 @@
 #include "nanolance/arrow_slice.hpp"
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/dataset.hpp"
+#include "nanolance/row_ids.hpp"
 #include "nanolance/dataset_ops.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/expr.hpp"
@@ -1229,10 +1230,6 @@ int32_t write_impl(const WriteRequest& req) {
                 return -1;
             }
         }
-        if (req.params->enable_stable_row_ids) {
-            not_supported("stable row ids");
-            return -1;
-        }
     }
     ArrowSchema stream_schema{};
     if (req.stream->get_schema(req.stream, &stream_schema) != 0) {
@@ -1274,6 +1271,9 @@ int32_t write_impl(const WriteRequest& req) {
         ~CloseWriter() { nano_lance_writer_close(w); }
     } close_writer{&writer};
     nano_lance_writer_set_ignore_nullability(&writer, true);
+    if (req.params != nullptr && req.params->enable_stable_row_ids) {
+        nano_lance_writer_set_stable_row_ids(&writer, 1);
+    }
     if (req.commit) {
         // What lance-c records on create: every 20 versions, versions older than 14 days are
         // reclaimed (run_auto_cleanup after each commit, as Lance's auto cleanup hook).
@@ -1734,13 +1734,17 @@ int32_t lance_dataset_take(const LanceDataset* dataset, const uint64_t* indices,
 
 int32_t lance_dataset_take_rows(const LanceDataset* dataset, const uint64_t* row_ids, size_t num_row_ids,
                                 const char* const* columns, struct ArrowArrayStream* out) {
-    if (dataset != nullptr && dataset->info.stable_row_ids()) {
-        not_supported("row ids of a dataset with stable row ids");
-        return -1;
-    }
     // Row ids that name no row are left out, as lance-c allows.
     std::vector<uint64_t> found;
-    if (dataset != nullptr && row_ids != nullptr) {
+    if (dataset != nullptr && row_ids != nullptr && dataset->info.stable_row_ids()) {
+        // A stable row id is not an address: find the rows (those that were deleted are left out).
+        std::string why;
+        const std::vector<uint64_t> ids(row_ids, row_ids + num_row_ids);
+        if (!nano_lance::resolve_row_ids(dataset->path, dataset->version, ids, found, why, true)) {
+            fail(why);
+            return -1;
+        }
+    } else if (dataset != nullptr && row_ids != nullptr) {
         for (size_t i = 0; i < num_row_ids; ++i) {
             const auto fragment = row_ids[i] >> 32U;
             const auto offset = row_ids[i] & 0xFFFFFFFFULL;
@@ -3018,7 +3022,16 @@ int32_t take_blobs(const LanceDataset* dataset, const uint64_t* rows, size_t cou
         return 0;
     }
     return guarded<int32_t>(-1, [&]() -> int32_t {
-        const std::vector<uint64_t> wanted(rows, rows + count);
+        std::vector<uint64_t> wanted(rows, rows + count);
+        if (by_id && dataset->info.stable_row_ids()) {
+            std::string why;
+            std::vector<uint64_t> addresses;
+            if (!nano_lance::resolve_row_ids(dataset->path, dataset->version, wanted, addresses, why)) {
+                fail(why);
+                return -1;
+            }
+            wanted = std::move(addresses);
+        }
         std::vector<uint64_t> sorted(wanted);
         std::sort(sorted.begin(), sorted.end());
         sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());

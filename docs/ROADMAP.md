@@ -36,7 +36,7 @@ plain append / update / scan comes before a whole subsystem.
 | 2 | ~~Distributed index builds from Python~~ -- **done (2026-10-09)**: `create_index_uncommitted` (BTree, Bitmap, LabelList, Inverted, IVF_FLAT, IVF_PQ, IVF_HNSW_SQ, with shared IVF / PQ models), `merge_existing_index_segments` (Lance's checks and errors: one keyed field, disjoint coverage, one model within 1e-5), `commit_existing_index_segments`, the legacy INVERTED flow (`create_scalar_index(fragment_ids=, index_uuid=)`, `merge_index_metadata` with its progress events, `LanceDataset.commit(CreateIndex)`), `lance.indices.IndicesBuilder` (`train_ivf` / `train_pq` / `prepare_global_ivf_pq` on float16 / 32 / 64 vectors, `transform_vectors`, `shuffle_transformed_vectors`, `load_shuffled_vectors`), `IvfModel` / `PqModel` files, `lance.bitmap.Bitmap`, `centroids()` / `get_ivf_model`; 120 more of pylance's tests. Found on the way: training a model on a dataset that already had an index of the default name failed ("already exists"), and data files dropped the schema metadata Lance writes into each. Left: merging is a rebuild over the union of fragments (the same index, not a physical merge of the segments' files), indexes over float16 / float64 columns, the index types of tier 3 | -- |
 | 2 | ~~Transactions and fragment-level writes~~ -- **done (2026-10-09)**: `write_fragments`, `LanceFragment.create` / `create_from_file`, `DataFile.create`, fragment `delete` / `delete_rows` / `merge` / `merge_columns` / `update_columns`, `LanceDataset.commit` of every operation but `DataOverlay` (Lance's checks, `build_manifest`, and conflict rules: `CommitConflictError`, retryable or not), `commit_batch`, detached commits, `execute_uncommitted`, `add_columns` with UDFs and `batch_udf` checkpoints, `include_deleted_rows`; 95 more of pylance's tests. Found on the way: dropped columns' data files stayed in their fragments, a `LanceFileWriter` file (fields numbered from 0) could not be read in a dataset, JSON columns in `LanceSchema.from_pyarrow`, SQL column types (`"1"` not null, `int32 + 1` int32), Lance's data file names. Left: `DataOverlay`, `commit_lock`, `update_columns` of blob columns, conflict checks for index builds made from an older version, V1 manifest names | -- |
 | 2 | ~~Namespaces~~ -- **done (2026-10-09)**: `DirectoryNamespace` (Lance's `__manifest` catalog, read and written by either library, concurrent writers retrying as Lance's do; directory listing, declared / registered / deregistered tables), `RestNamespace` and `RestAdapter` (each works against Lance's), `lance.dataset` / `write_dataset` / `commit` with `namespace_client`, managed versioning through `create_table_version`; 130 more of pylance's tests (130 of the 134 that pylance passes here; the other 4 need branches). Left: table branches, credential vending, materialized views, structured full-text queries in `query_table` | -- |
-| 2 | Stable row ids | ~57 |
+| 2 | ~~Stable row ids~~ -- **done (2026-10-10)** | -- |
 | 3 | Search breadth: fuzzy full-text, ZONEMAP / NGRAM / BLOOMFILTER, more tokenizers (icu, jieba, lindera), full-text on list columns, Hamming and binary vectors, IVF_SQ / IVF_HNSW_PQ / IVF_HNSW_FLAT, Lance's tie order under a limit | ~60 |
 | 4 | Niche: `mem_wal`, writing data storage versions other than 2.2, multiple base paths, samplers, debug / logging / otel hooks, bfloat16 and image extension arrays, `lance.util.KMeans` | ~120 |
 
@@ -361,8 +361,8 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
    scale. Related search gaps: batch query vectors, multivector (ColBERT-style) search, Hamming
    distance, building on float16 / float64 vectors (`stats.index_stats`, which most of pylance's
    own HNSW tests read, is done).
-3. **Stable row ids.** Optional in pylance, but some workflows depend on it. nanolance refuses to
-   build or use any index on such a dataset.
+3. ~~**Stable row ids.**~~ -- **done (2026-10-10)**: format, reads, writes, mutations, compaction,
+   indexes of every kind, lance-c.
 4. **Full-text search beyond LanceDB's defaults:**
    - ~~positions (`with_position=True`) and phrase queries~~ -- **done (2026-10-08)**: read,
      searched (slop included) and built as Lance 12 does, in pylance and lance-c;
@@ -423,7 +423,7 @@ still calls vector and full-text indexes out of scope; it should be updated alon
      `lance_scanner_set_scalar_index_segment`, `lance_scanner_set_fts_index_segments`.
 4. **Finish the partial ones:**
    - ~~`UPDATE_IF` and `include_deleted_rows`~~ -- done (2026-10-08).
-   - `lance_dataset_take_rows` on a dataset with stable row ids (with item 3 of the index gaps).
+   - ~~`lance_dataset_take_rows` on a dataset with stable row ids~~ -- done (2026-10-10).
    - `lance_scanner_set_substrait_filter`: Substrait filters.
    - Object-store URIs (`s3://` and others) in `lance_dataset_open` and the writes; `storage_opts`
      is accepted and ignored today.

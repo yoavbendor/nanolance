@@ -174,6 +174,9 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append);
 int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* version_out);
 /// Staged writers only: a table config entry to record if the finishing commit creates the dataset.
 int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* key, const char* value);
+
+/* Create the dataset with stable row ids (an append to one keeps them either way). */
+int nano_lance_writer_set_stable_row_ids(NanoLanceWriter* writer, int enable);
 /// Staged writers only: a property recorded in the finishing commit's transaction file (Lance's
 /// transaction_properties; "__lance_commit_message" holds a commit message).
 int nano_lance_writer_set_transaction_property(NanoLanceWriter* writer, const char* key, const char* value);

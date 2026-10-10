@@ -577,10 +577,16 @@ class LanceDataset(pa.dataset.Dataset):
         return _json_out(_rename(self._take(wanted, names, addresses=False), columns))
 
     def _take_rows(self, row_ids, columns=None, **kwargs) -> pa.Table:
-        if self.has_stable_row_ids:
-            raise unsupported("taking rows of a dataset with stable row ids")
-        return _json_out(_rename(self._take(_index_list(row_ids), _normalize_columns(columns), addresses=True),
-                                 columns))
+        return _json_out(_rename(self._take(self._row_addresses(_index_list(row_ids)), _normalize_columns(columns),
+                                            addresses=True), columns))
+
+    def _row_addresses(self, row_ids: List[int]) -> List[int]:
+        """The addresses of rows given by id: the ids themselves without stable row ids, else where the
+        fragments' row id sequences put them (a row id that is gone raises)."""
+        if not self.has_stable_row_ids:
+            return row_ids
+        with native():
+            return list(_nanolance._ds_resolve_row_ids(self._uri, self._version, row_ids))
 
     def take_rows(self, row_ids, columns=None, **kwargs) -> pa.Table:
         return self._take_rows(row_ids, columns, **kwargs)
@@ -589,12 +595,18 @@ class LanceDataset(pa.dataset.Dataset):
               blob_handling=None):
         blob_handling = _nanolance.BLOB_DESCRIPTIONS if blob_handling is None else blob_handling
         order = None
+        versions_by_address = False
+        address_requested = False
         derived = []  # system columns computed here rather than read
         if names is not None and any(n in _SYSTEM_COLUMNS for n in names):
             order = list(names)
             with_row_id = with_row_id or "_rowid" in names
             with_row_address = with_row_address or "_rowaddr" in names
             derived = [n for n in names if n in ("_rowoffset",) + _VERSION_COLUMNS]
+            if any(n in _VERSION_COLUMNS for n in derived) and self.has_stable_row_ids:
+                versions_by_address = True
+                address_requested = with_row_address
+                with_row_address = True
             if "_rowoffset" in derived and addresses:
                 raise unsupported("_rowoffset when taking rows by id or address")
             names = [n for n in names if n not in _SYSTEM_COLUMNS]
@@ -612,18 +624,25 @@ class LanceDataset(pa.dataset.Dataset):
                 table = table.append_column(pa.field(column, pa.uint64(), nullable=False),
                                             pa.array(wanted, pa.uint64()))
             else:
-                table = table.append_column(column, self._row_versions(table.num_rows))
+                table = table.append_column(column, self._row_versions(table.num_rows, table, column))
+        if versions_by_address and not address_requested and "_rowaddr" in table.column_names:
+            table = table.drop_columns(["_rowaddr"])
         if order is not None:
             return table.select(order)
         if names is not None:
             table = table.select(names + [c for c in ("_rowid", "_rowaddr") if c in table.column_names])
         return table
 
-    def _row_versions(self, rows: int) -> pa.Array:
+    def _row_versions(self, rows: int, table: Optional[pa.Table] = None, column: str = "_row_created_at_version"
+                      ) -> pa.Array:
         """`_row_created_at_version` / `_row_last_updated_at_version`: Lance keeps them per row only
-        with stable row ids; without, every row reads as version 1, as in Lance."""
+        with stable row ids (from the fragments' version sequences, found by the rows' addresses in
+        `table`); without, every row reads as version 1, as in Lance."""
         if self.has_stable_row_ids:
-            raise unsupported("row version columns of a dataset with stable row ids")
+            with native():
+                created, updated = _nanolance._ds_row_versions(self._uri, self._version,
+                                                               table.column("_rowaddr").to_pylist())
+            return pa.array(created if column == "_row_created_at_version" else updated, pa.uint64())
         return pa.array([1] * rows, pa.uint64())
 
     def to_polars(self, batch_size: Optional[int] = None):
@@ -1464,8 +1483,6 @@ class LanceDataset(pa.dataset.Dataset):
                             f"got {type(operation)}")
         if (namespace_client is None) != (table_id is None):
             raise ValueError("Both 'namespace_client' and 'table_id' must be provided together.")
-        if enable_stable_row_ids:
-            raise unsupported("stable row ids")
         from nanolance.lance._transactions import encode_operation
 
         timeout = None
@@ -1486,12 +1503,14 @@ class LanceDataset(pa.dataset.Dataset):
             field, message = encode_operation(operation)
             with native():
                 version = _nanolance._ds_commit_hand_built(path, field, message, int(read_version),
-                                                           int(read_version), properties, True)
+                                                           int(read_version), properties, True,
+                                                           bool(enable_stable_row_ids))
             return LanceDataset(path, version=int(version))
         if isinstance(operation, LanceOperation.CreateIndex):
             return LanceDataset._commit_create_index(path, operation)
         before = LanceDataset(path).version if _exists(path) else 0
-        version = _commit_hand_built(path, operation, read_version, properties, int(max_retries), timeout)
+        version = _commit_hand_built(path, operation, read_version, properties, int(max_retries), timeout,
+                                     bool(enable_stable_row_ids))
         ds = LanceDataset(path, version=version)
         if namespace_client is not None:
             ds._attach_namespace(namespace_client, table_id, namespace_client_managed_versioning)
@@ -1606,7 +1625,8 @@ def _uses_v2_manifest_paths(path: str) -> bool:
 
 
 def _commit_hand_built(path: str, operation, read_version: Optional[int], properties: Dict[str, str],
-                       max_retries: int, timeout: Optional[float] = None) -> int:
+                       max_retries: int, timeout: Optional[float] = None,
+                       enable_stable_row_ids: bool = False) -> int:
     """Commit `operation` as Lance's commit_transaction does: check the transactions committed since
     `read_version` (a conflict raises CommitConflictError), apply it to the latest version, and try
     again when another writer takes that version first."""
@@ -1657,7 +1677,7 @@ def _commit_hand_built(path: str, operation, read_version: Optional[int], proper
         try:
             with native():
                 return int(_nanolance._ds_commit_hand_built(path, field, message, base, int(read_version or 0),
-                                                            properties, False))
+                                                            properties, False, enable_stable_row_ids))
         except Exception as exc:  # another writer took base + 1: check again and retry
             text = str(exc)
             if "commit conflict" not in text.lower():
@@ -2740,6 +2760,9 @@ class LanceScanner(pa.dataset.Scanner):
             with_row_address = with_row_address or "_rowaddr" in self._names
             self._row_offset = "_rowoffset" in self._names
             self._row_versions = [n for n in self._names if n in _VERSION_COLUMNS]
+            self._address_requested = with_row_address
+            if self._row_versions and ds.has_stable_row_ids:
+                with_row_address = True  # the versions are found by address
             self._names = [n for n in self._names if n not in _SYSTEM_COLUMNS]
             if not self._names and not (with_row_id or with_row_address):
                 with_row_address = True  # something to count rows by; not returned
@@ -2815,6 +2838,7 @@ class LanceScanner(pa.dataset.Scanner):
                                        self._blob_handling, self._use_scalar_index)
 
     _drop_rowaddr = False
+    _address_requested = False
     _row_versions: List[str] = []
 
     def _shape(self, table: pa.Table) -> pa.Table:
@@ -2831,7 +2855,10 @@ class LanceScanner(pa.dataset.Scanner):
                 first += starts[self._fragment_ids[0]] if len(self._fragment_ids) == 1 else 0
             table = table.append_column("_rowoffset", pa.array(range(first, first + table.num_rows), pa.uint64()))
         for column in self._row_versions:
-            table = table.append_column(column, self._ds._row_versions(table.num_rows))
+            table = table.append_column(column, self._ds._row_versions(table.num_rows, table, column))
+        if self._row_versions and self._ds.has_stable_row_ids and not self._address_requested \
+                and "_rowaddr" in table.column_names:
+            table = table.drop_columns(["_rowaddr"])
         for name, path in self._nested.items():
             import pyarrow.compute as pc
 
@@ -2839,11 +2866,12 @@ class LanceScanner(pa.dataset.Scanner):
             for part in path[1:]:
                 column = pc.struct_field(column, part)
             table = table.append_column(name, column)
-        if self._order is not None and self._nested:
-            extra = [c for c in ("_rowid", "_rowaddr") if c in table.column_names and c not in self._order]
-            return table.select(self._order + extra)
         if self._order is not None:
-            return table.select(self._order)
+            # Row id columns asked for by flag rather than named in the projection come last.
+            extra = [c for c in ("_rowid", "_rowaddr") if c in table.column_names and c not in self._order
+                     and (self._nested or (c == "_rowid" and self._with_row_id)
+                          or (c == "_rowaddr" and self._address_requested))]
+            return table.select(self._order + extra)
         if self._names is not None:
             table = table.select(self._names + [c for c in ("_rowid", "_rowaddr") if c in table.column_names])
         table = _rename(table, self._columns)
@@ -2929,8 +2957,7 @@ class LanceScanner(pa.dataset.Scanner):
         import re
 
         sql = self._post_filter
-        if self._ds.has_stable_row_ids:
-            raise unsupported("a filter on _rowid or _rowaddr over a dataset with stable row ids")
+        stable = self._ds.has_stable_row_ids
         names = self._names
         extra = []
         if names is not None:
@@ -2941,10 +2968,11 @@ class LanceScanner(pa.dataset.Scanner):
         with native():
             table = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version,
                                                  None if names is None else names + extra, self._fragment_ids, 0, -1,
-                                                 False, True, False, None, self._blob_handling,
+                                                 stable, True, False, None, self._blob_handling,
                                                  self._use_scalar_index))
         address = table.column("_rowaddr")
-        probe = table.append_column("_rowid", address)  # without stable row ids, a row's id is its address
+        # without stable row ids, a row's id is its address
+        probe = table if stable else table.append_column("_rowid", address)
         masks = []
         for batch in probe.combine_chunks().to_batches():
             with native():
@@ -2953,9 +2981,11 @@ class LanceScanner(pa.dataset.Scanner):
         table = table.filter(pa.array(mask, pa.bool_()))
         if self._offset or self._limit is not None:
             table = table.slice(self._offset, self._limit)
-        if self._with_row_id:
+        if self._with_row_id and not stable:
             table = table.append_column("_rowid", table.column("_rowaddr"))
         drop = extra + ([] if self._with_row_address else ["_rowaddr"])
+        if stable and not self._with_row_id:
+            drop.append("_rowid")
         return table.drop_columns([c for c in drop if c in table.column_names])
 
     def _search(self):
@@ -3393,8 +3423,6 @@ def write_dataset(
         raise ValueError(f"Invalid mode: {mode}; expected one of create, append, overwrite")
     if data_storage_version not in (None, "stable", "2.2", "next") or use_legacy_format:
         raise unsupported(f"data_storage_version={data_storage_version!r} (nanolance writes 2.2)")
-    if enable_stable_row_ids:
-        raise unsupported("stable row ids")
     if max_rows_per_file is not None and int(max_rows_per_file) <= 0:
         raise ValueError("max_rows_per_file must be greater than 0")
     if external_blob_mode not in ("reference", "ingest"):
@@ -3434,6 +3462,9 @@ def write_dataset(
                 writer.set_transaction_property(str(key), str(value))
         if blob_pack_file_size_threshold is not None:
             writer.set_blob_pack_file_size(int(blob_pack_file_size_threshold))
+        if enable_stable_row_ids:
+            with native():
+                writer.set_stable_row_ids(True)
 
     writer, _ = _stage_write(path, reader, mode=mode, max_rows_per_file=max_rows_per_file,
                              max_bytes_per_file=max_bytes_per_file, external_blob_mode=external_blob_mode,

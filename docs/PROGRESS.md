@@ -3226,3 +3226,29 @@ publishes them.
   errors as pylance for 21 failing calls, REST each way, managed versioning across libraries);
   pylance's suite 828 (698 before: `test_namespace_dir.py` 97, `test_namespace_rest.py` 33);
   the Python suite 2170, interop green.
+
+
+## Stable row ids
+
+- **Format** (`include/nanolance/row_ids.hpp`, `src/row_ids.cpp`): Lance's `RowIdSequence` (Range,
+  RangeWithHoles, RangeWithBitmap, SortedArray, Array segments; EncodedU64Array as U16 / U32 / U64;
+  encoded as Lance picks, byte-identical to pylance's), `RowDatasetVersionSequence` run-length
+  encoding, the fragment fields (5 / 7 / 9 inline; external 6 / 8 / 10 refused), `next_row_id`, the
+  reader / writer feature flag, `RowIdIndex` (live rows only: a deleted row's id stays in its old
+  fragment's sequence), `AddressToRowId` / `RowIdToAddress` for the indexes.
+- **Reads**: `_rowid` from the sequences, filters on it, `_take_rows` (skipping unknown and deleted
+  ids, as pylance), the two version columns, `with_row_id` alongside system columns.
+- **Writes**: create / append / overwrite, `update`, `merge_insert` (moved rows keep their ids,
+  inserts take `next_row_id`), compaction (ids and both version sequences carried over), `restore`
+  (keeps the `next_row_id` high-water mark; refuses to turn the feature off), hand-built
+  `LanceDataset.commit` (`enable_stable_row_ids=`; fragments without ids are numbered, fragments
+  with their own kept).
+- **Indexes**: the builds write ids (`AddressToRowId`), the searches turn ids into addresses and
+  drop an entry whose row left its segment's fragments; `optimize_indices` works.
+- **Python**: `RowIdSequence`, `RowIdMeta`, `RowDatasetVersionMeta`, `FragmentMetadata` fields, JSON
+  and pickle. **lance-c**: `enable_stable_row_ids`, `lance_dataset_take_rows` / `take_blobs` by id.
+- **Found on the way**: a deleted row's id sits in two fragments after an update, so the id index
+  must skip deleted rows; `restore` lost the `next_row_id` high-water mark (ids repeated);
+  `to_table(columns=[system columns], filter=..., with_row_id=True)` dropped `_rowid`.
+- **Verified**: `tests/test_stable_row_ids.py` (14 tests against pylance, both directions, indexes
+  included), `tests/test_row_ids.cpp`, `tests/test_lance_c_stable_row_ids.cpp`; pylance's suite.

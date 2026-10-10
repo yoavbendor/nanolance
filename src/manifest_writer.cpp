@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/manifest_writer.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include "lance_minimal.pb.hpp"
 #include "nanolance/index_maintenance.hpp"
@@ -378,12 +379,14 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
         if (!load_latest_manifest(dataset_path, prior, prior_version, error)) {
             return false;
         }
-        if (mode == CommitMode::Append && (prior.writer_feature_flags & pb::kFlagStableRowIds) != 0U) {
-            // Every fragment of such a dataset carries its row ids; ours would carry none.
-            error = "appending to a dataset with stable row ids is not supported";
-            return false;
-        }
     }
+    const bool prior_stable = exists && (prior.reader_feature_flags & pb::kFlagStableRowIds) != 0U;
+    if (extras.stable_row_ids && exists && mode == CommitMode::Append && !prior_stable) {
+        error = "This dataset was not created with the stable row ids feature.  Please run "
+                "`migrate_to_stable_row_ids` before attempting to use stable row ids";
+        return false;
+    }
+    const bool stable = prior_stable || (extras.stable_row_ids && mode != CommitMode::Append);
 
     pb::Manifest manifest;
     manifest.version = version;
@@ -449,6 +452,7 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
         next_id = exists && prior.has_max_fragment_id ? next_id : 0U;
         manifest.operation = pb::Manifest::Operation::Overwrite;
     }
+    std::uint64_t next_row_id = exists ? prior.next_row_id : 0U;
     for (const auto& fragment : fragments) {
         if (next_id > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
             error = "fragment id overflow";
@@ -458,7 +462,24 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
         added.id = next_id++;
         added.physical_rows = fragment.rows;
         added.files.push_back(manifest_data_file(mapping, fragment.data_file));
+        if (stable) {
+            // Row ids from the table's high-water mark, and every row stamped with this version.
+            FragmentRowMeta meta;
+            meta.has_row_ids = true;
+            meta.row_ids = RowIdSequence::range(next_row_id, fragment.rows).encode();
+            next_row_id += fragment.rows;
+            if (fragment.rows != 0U) {
+                meta.has_created = meta.has_last_updated = true;
+                meta.created = meta.last_updated = RowVersionSequence::uniform(fragment.rows, version).encode();
+            }
+            write_fragment_row_meta(added, meta);
+        }
         manifest.fragments.push_back(std::move(added));
+    }
+    if (stable) {
+        manifest.next_row_id = next_row_id;
+        manifest.reader_feature_flags |= pb::kFlagStableRowIds;
+        manifest.writer_feature_flags |= pb::kFlagStableRowIds;
     }
     std::uint64_t max_id = 0;
     bool any = false;

@@ -91,7 +91,7 @@ Speed, 5M rows in 5 fragments, 4 cores (`docs/BENCHMARKS.md`, "Scalar indexes"):
 one-row lookup returning every column (2.9 ms vs 1.3 ms).
 
 Not built: Lance's other scalar indexes (NGRAM, ZONEMAP, BLOOMFILTER, JSON, RTREE; INVERTED is below),
-build options (`fragment_ids`, `train=False`, ...), and indexes on a dataset with stable row ids.
+build options (`fragment_ids`, `train=False`, ...).
 Those a dataset already has are kept, as below.
 
 ### Vector indexes: built and searched
@@ -132,8 +132,7 @@ exactly) are searched by pylance with nanolance's answers, at the recall of pyla
 
 Not supported: IVF_HNSW_PQ, IVF_HNSW_FLAT, IVF_SQ and IVF_RQ indexes (a search falls back to an exact
 one, its plan says why), batch and multivector queries, binary (Hamming) vectors, building an index on
-float16 / float64 vectors (training a model on them is supported, below), and a vector index on a
-dataset with stable row ids.
+float16 / float64 vectors (training a model on them is supported, below).
 
 ### Distributed index builds
 
@@ -218,8 +217,7 @@ Not supported:
 - tokenizers other than simple, whitespace and raw (icu, ngram, code, jieba, lindera), and
   languages other than English;
 - full-text search over list columns;
-- 256-document posting blocks (index format v3);
-- an INVERTED index on a dataset with stable row ids.
+- 256-document posting blocks (index format v3).
 
 ### Keeping indexes up to date
 
@@ -342,7 +340,7 @@ them is silently ignored:
 - Fuzzy full-text queries and the full-text features listed under "Full-text indexes",
   vector indexes other than IVF_FLAT and IVF_PQ, and scalar indexes other than BTree, Bitmap,
   LabelList and INVERTED. An index pylance built is kept, though: see "Indexes" below.
-- Branches, stable row ids, multiple base paths, shallow and deep clones.
+- Branches, multiple base paths, shallow and deep clones.
 - External blobs under registered base paths, and the prepared-layout blob writers (`PackedBlobWriter`,
   `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`); blob data through `add_columns` or
   `write_fragments`.
@@ -416,7 +414,7 @@ The main reasons tests fail today:
   their build options (about 110 in `test_scalar_index.py`), vector index kinds other than
   IVF_FLAT / IVF_PQ / IVF_HNSW_SQ, indexes on float16 / float64 / binary / multivector columns
   (about 60), table branches, object stores or the `mem_wal`.
-- Many need stable row ids, multiple base paths or table branches.
+- Many need multiple base paths or table branches.
 - About 25 need filter functions nanolance lacks, or a data storage version other than 2.2.
 - A tail of writer gaps in nanolance itself: dictionary columns inside structs or lists, null
   elements of a fixed-size list under a list or struct, bfloat16. Each is a real gap, listed by
@@ -503,3 +501,28 @@ The Rust crates' own encoding tests run against nanolance too: see [RUST_SUITE.m
 The same work made the manifest codec keep everything pylance writes, so nanolance no longer drops
 it: timestamps, writer version, table config and metadata, schema metadata, feature flags, and
 fields it does not model.
+
+
+## Stable row ids
+
+`write_dataset(..., enable_stable_row_ids=True)` (or `LanceDataset.commit(..., enable_stable_row_ids=True)`
+on a create / overwrite) gives every row an id that never changes: `_rowid` is not `_rowaddr`, and a
+row keeps its id through `update`, `merge_insert`, compaction, `restore` (the high-water mark
+`next_row_id` is kept) and `delete` of its neighbours. Supported as pylance 12 has them:
+
+- the format: `DataFragment` row id sequences (all five segment kinds, read; written as Lance picks the
+  smallest), `created_at` / `last_updated_at` version sequences, `next_row_id`, the feature flag;
+- reads: `_rowid` in `to_table` / `scanner` / `filter="_rowid in (...)"`, `_take_rows` / `take_rows`
+  (unknown and deleted ids are left out), `_row_created_at_version` / `_row_last_updated_at_version`;
+- writes: `write_dataset` create / append / overwrite, `update`, `merge_insert`, `compact_files`,
+  `restore`, `add_columns`, `drop_columns`, `truncate_table`, hand-built `LanceDataset.commit` of every
+  operation (new fragments with no ids are numbered from `next_row_id`; fragments that carry their
+  own, as in pylance's "manual update", keep them);
+- `RowIdSequence`, `RowIdMeta`, `RowDatasetVersionMeta` and the `FragmentMetadata` fields, JSON and
+  pickle included;
+- indexes: BTree, Bitmap, LabelList, INVERTED and IVF_* hold row ids, not addresses, and are searched,
+  kept up to date and re-covered after compaction as on a dataset without stable ids; an entry whose
+  row has since moved out of its segment's fragments (an update, a compaction) is ignored.
+
+Not supported: row ids kept in an external file (`DataFragment` fields 6 / 8 / 10), which Lance writes
+only for very large datasets.

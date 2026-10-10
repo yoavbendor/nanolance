@@ -26,6 +26,7 @@
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/roaring_bitmap.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -573,6 +574,28 @@ struct Search {
     std::map<std::uint32_t, std::uint64_t> physical;  // fragment id: its rows
     std::string& error;
     std::vector<std::string> used;
+    const RowIdToAddress* row_ids = nullptr;  // with stable row ids: what an index holds are ids
+
+    /// An answer read from an index of a dataset with stable row ids is in ids; make it addresses
+    /// (a row whose id is gone, deleted, is dropped).
+    void to_addresses(RowSet& set) const {
+        if (row_ids == nullptr || !row_ids->stable()) {
+            return;
+        }
+        std::map<std::uint32_t, std::vector<std::uint32_t>> moved;
+        for (const auto& [high, offsets] : set.rows) {
+            for (const auto offset : offsets) {
+                std::uint64_t address = 0;
+                if (row_ids->find((static_cast<std::uint64_t>(high) << 32U) | offset, address)) {
+                    moved[static_cast<std::uint32_t>(address >> 32U)].push_back(static_cast<std::uint32_t>(address));
+                }
+            }
+        }
+        for (auto& [fragment, offsets] : moved) {
+            std::sort(offsets.begin(), offsets.end());
+        }
+        set.rows = std::move(moved);
+    }
 
     /// The field a column path names: exact, else case-insensitively unique (as the filter binds).
     const pb::Field* field_of(const std::vector<std::string>& path) const {
@@ -666,6 +689,7 @@ struct Search {
                     answered_all = false;
                     break;
                 }
+                to_addresses(one);
                 one.covered.insert(index->fragment_ids.begin(), index->fragment_ids.end());
                 set.covered.insert(one.covered.begin(), one.covered.end());
                 for (auto& [f, rows] : one.rows) {
@@ -719,14 +743,17 @@ bool index_candidates(const std::filesystem::path& dataset_path, const pb::Manif
     out.rows.clear();
     out.used.clear();
     error.clear();
-    // Index row ids are row addresses only without stable row ids; and an index whose rows a
-    // deferred compaction moved needs the fragment-reuse index to be found again.
-    if (manifest.indices.empty() || (manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U ||
+    // An index whose rows a deferred compaction moved needs the fragment-reuse index to be found again.
+    if (manifest.indices.empty() ||
         std::any_of(manifest.indices.begin(), manifest.indices.end(),
                     [](const pb::IndexMetadata& i) { return i.name == "__lance_frag_reuse"; })) {
         return true;
     }
-    Search search{dataset_path, manifest, {}, error, {}};
+    RowIdToAddress resolver;
+    if (!RowIdToAddress::build(dataset_path, manifest, resolver, error)) {
+        return false;
+    }
+    Search search{dataset_path, manifest, {}, error, {}, &resolver};
     for (const auto& f : manifest.fragments) {
         search.physical[static_cast<std::uint32_t>(f.id)] = f.physical_rows;
     }

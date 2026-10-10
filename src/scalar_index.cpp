@@ -20,6 +20,7 @@
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/roaring_bitmap.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include "lance_minimal.pb.hpp"
 
@@ -583,6 +584,12 @@ bool binary_array(const std::vector<std::vector<std::uint8_t>>& values, ArrowArr
 /// Lance's RowAddrTreeMap serialization: [u32 fragments] then per fragment, ascending, [u32 id]
 /// [u32 size][a Roaring bitmap of the rows' offsets]. `addrs` ascending (repeats allowed).
 std::vector<std::uint8_t> serialize_treemap(const std::uint64_t* addrs, std::size_t n) {
+    std::vector<std::uint64_t> sorted;  // stable row ids are not in address order
+    if (!std::is_sorted(addrs, addrs + n)) {
+        sorted.assign(addrs, addrs + n);
+        std::sort(sorted.begin(), sorted.end());
+        addrs = sorted.data();
+    }
     std::vector<std::uint8_t> out(4, 0);
     std::uint32_t fragments = 0;
     std::vector<std::uint32_t> rows;
@@ -743,8 +750,8 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         return false;
     }
     const bool commit = target == nullptr || target->out == nullptr;
-    if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
-        error = "a scalar index on a dataset with stable row ids is not supported";
+    AddressToRowId to_row_id;  // stable row ids go into the index, row addresses otherwise
+    if (!AddressToRowId::build(manifest, to_row_id, error)) {
         return false;
     }
     std::vector<std::string> parts;
@@ -857,7 +864,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
             const auto vi = static_cast<std::uint32_t>(items.views.size());
             items.views.push_back(v);
             for (std::int64_t r = 0; r < batch.length; ++r) {
-                items.push(vi, r, addrs[r]);
+                items.push(vi, r, to_row_id(addrs[r]));
             }
             continue;
         }
@@ -865,13 +872,13 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         items.views.push_back(v->children[0]);
         for (std::int64_t r = 0; r < batch.length; ++r) {
             if (ArrowArrayViewIsNull(v, r)) {
-                null_lists.push_back(addrs[r]);
+                null_lists.push_back(to_row_id(addrs[r]));
                 continue;
             }
             const auto begin = ArrowArrayViewListChildOffset(v, r);
             const auto end = ArrowArrayViewListChildOffset(v, r + 1);
             for (auto e = begin; e < end; ++e) {
-                items.push(vi, e, addrs[r]);
+                items.push(vi, e, to_row_id(addrs[r]));
             }
         }
     }

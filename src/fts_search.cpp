@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/fts_search.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include "fts_fst.hpp"
 #include "fts_json.hpp"
@@ -843,8 +844,17 @@ private:
 struct RowMask {
     std::map<std::uint32_t, std::vector<std::uint8_t>> rows;
     std::set<std::uint32_t> fragments;
+    /// With stable row ids the rows this is asked about are ids, which this turns into addresses.
+    const RowIdToAddress* resolver = nullptr;
 
-    bool allows(std::uint64_t addr) const {
+    /// `cover`: the fragments the index segment holding the row covers -- with stable row ids a
+    /// row that was updated or compacted since has an entry in the old segment too, which is stale.
+    bool allows(std::uint64_t addr, const std::set<std::uint32_t>* cover = nullptr) const {
+        if (resolver != nullptr && resolver->stable()) {
+            if (!resolver->find(addr, addr) || (cover != nullptr && cover->count(static_cast<std::uint32_t>(addr >> 32U)) == 0U)) {
+                return false;  // an id whose row is gone, or moved out of the segment's fragments
+            }
+        }
         const auto frag = static_cast<std::uint32_t>(addr >> 32U);
         if (!cached_ || frag != cached_frag_) {
             cached_ = true;
@@ -907,6 +917,14 @@ struct Search {
     std::map<std::string, ColumnIndex> columns;    // every column with an INVERTED index
     std::map<std::string, ColumnIndex> unindexed;  // columns searched without one
     RowMask mask;
+    AddressToRowId to_id;      // stable row ids: hits are ids until they are returned
+    RowIdToAddress resolver;
+    /// With stable row ids: each index partition's segment's fragments.
+    std::unordered_map<const Partition*, std::shared_ptr<const std::set<std::uint32_t>>> cover;
+    const std::set<std::uint32_t>* cover_of(const Partition& part) const {
+        const auto it = cover.find(&part);
+        return it == cover.end() ? nullptr : it->second.get();
+    }
     std::vector<std::string>* plan = nullptr;
     // Scoring buffers, by document, kept zeroed between uses.
     std::vector<float> scores_;
@@ -1129,7 +1147,7 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
                 if (tokens.empty()) {
                     continue;
                 }
-                c.flat.addrs.push_back(ArrowArrayViewGetUIntUnsafe(view.children[ac], row));
+                c.flat.addrs.push_back(to_id(ArrowArrayViewGetUIntUnsafe(view.children[ac], row)));
                 std::vector<std::string> words;
                 std::vector<std::uint32_t> at;
                 words.reserve(tokens.size());
@@ -1296,6 +1314,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             if (posting == nullptr) {
                 continue;
             }
+            const auto* part_cover = cover_of(part);
             std::uint32_t key;
             std::memcpy(&key, &avg, sizeof(key));
             const auto bounds = posting->block_bounds(norm, key);
@@ -1316,7 +1335,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
                 for (std::size_t k = b * kBoundBlock; k < end; ++k) {
                     const std::uint32_t d = posting->docs[k];
                     const std::uint64_t row = part.row_ids[d];
-                    if (mask.allows(row)) {
+                    if (mask.allows(row, part_cover)) {
                         sink.add(row, score_of(doc_weight_with_norm(posting->freqs[k], norm[d])));
                     }
                 }
@@ -1421,10 +1440,11 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
 }
 
 void Search::emit(const Partition& part, std::uint32_t need, HitSink& sink) {
+    const auto* part_cover = cover_of(part);
     const auto one = [&](std::uint32_t d) {
         if (seen_[d] == need) {
             const std::uint64_t row = part.row_ids[d];
-            if (mask.allows(row)) {
+            if (mask.allows(row, part_cover)) {
                 sink.add(row, scores_[d]);
             }
         }
@@ -1811,10 +1831,11 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
             segments[column].push_back(&index);
         }
     }
-    if (!segments.empty() && (s.manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
-        error = "full-text search over a dataset with stable row ids is not supported by nanolance";
+    if (!AddressToRowId::build(s.manifest, s.to_id, error) ||
+        !RowIdToAddress::build(dataset_path, s.manifest, s.resolver, error)) {
         return false;
     }
+    s.mask.resolver = &s.resolver;
     const std::set<std::array<std::uint8_t, 16>> chosen(request.segments.begin(), request.segments.end());
     for (const auto& uuid : chosen) {
         bool known = false;
@@ -1839,6 +1860,13 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
             if (!load_inverted(dataset_path / "_indices" / pb::uuid_string(seg->uuid), index, error)) {
                 error = "index " + seg->name + ": " + error;
                 return false;
+            }
+            if (s.resolver.stable()) {
+                auto fragments = std::make_shared<std::set<std::uint32_t>>(seg->fragment_ids.begin(),
+                                                                          seg->fragment_ids.end());
+                for (const auto& p : index->partitions) {
+                    s.cover[p.get()] = fragments;
+                }
             }
             if (!chosen.empty()) {
                 if (picked == nullptr) {
@@ -1938,6 +1966,11 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
         sort_hits(hits);
     } else {
         std::sort(hits.begin(), hits.end(), better_hit);
+    }
+    if (s.resolver.stable()) {  // hits are ids; what is returned and filtered are addresses
+        for (auto& hit : hits) {
+            s.resolver.find(hit.first, hit.first);
+        }
     }
     if (request.filter && !request.prefilter) {
         out.plan.push_back("FilterExec: " + *request.filter + " (after the search)");

@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
-from nanolance.lance.fragment import DataFile, DeletionFile, FragmentMetadata
+from nanolance.lance.fragment import (DataFile, DeletionFile, FragmentMetadata, RowDatasetVersionMeta,
+                                      RowIdMeta)
 
 __all__ = ["Index", "IndexFile", "LanceOperation", "Transaction", "decode_transaction"]
 
@@ -303,6 +304,12 @@ def _fragment(data: bytes) -> FragmentMetadata:
                                                   d.get(4, 0), d.get(7))
         elif number == 4:
             fragment.physical_rows = value
+        elif number == 5:
+            fragment.row_id_meta = RowIdMeta(bytes(value))
+        elif number == 7:
+            fragment.last_updated_at_version_meta = RowDatasetVersionMeta(bytes(value))
+        elif number == 9:
+            fragment.created_at_version_meta = RowDatasetVersionMeta(bytes(value))
     return fragment
 
 
@@ -642,9 +649,6 @@ def _encode_data_file(f: DataFile) -> bytes:
 def _encode_fragment(f: FragmentMetadata) -> bytes:
     from nanolance.lance._errors import unsupported
 
-    if f.row_id_meta is not None or f.created_at_version_meta is not None or \
-            f.last_updated_at_version_meta is not None:
-        raise unsupported("stable row ids")
     if f.overlays:
         raise unsupported("data overlay files")
     out = bytearray()
@@ -663,6 +667,12 @@ def _encode_fragment(f: FragmentMetadata) -> bytes:
             _put_varint(deletion, int(d.base_id))
         _put_bytes(out, 3, bytes(deletion))
     _put_uint(out, 4, f.physical_rows)
+    if f.row_id_meta is not None:
+        _put_bytes(out, 5, bytes(f.row_id_meta._inline))
+    if f.last_updated_at_version_meta is not None:
+        _put_bytes(out, 7, bytes(f.last_updated_at_version_meta._inline))
+    if f.created_at_version_meta is not None:
+        _put_bytes(out, 9, bytes(f.created_at_version_meta._inline))
     return bytes(out)
 
 

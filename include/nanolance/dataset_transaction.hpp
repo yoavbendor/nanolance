@@ -36,6 +36,9 @@ struct HandBuiltCommit {
     /// Commit a detached version (Lance's detached commits): built on `base_version`, numbered at
     /// random with the high bit set, outside the lineage -- never the latest, reachable by its number.
     bool detached = false;
+    /// Create / overwrite with stable row ids on (Lance's enable_stable_row_ids): new fragments that
+    /// carry no row ids are given them. Once a dataset has them, every later commit keeps assigning.
+    bool enable_stable_row_ids = false;
 };
 
 bool dataset_commit_hand_built(const std::filesystem::path& dataset_path, const HandBuiltCommit& commit,
