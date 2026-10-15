@@ -165,6 +165,28 @@ do not invent a new on-disk encoding; the page encoding must stay what `blob_v2_
 produces. Do not try to validate that the sidecar exists. Then make the data-replacement test pass,
 plus the same scenario read back by **real pylance** (section 6).
 
+**Phase B design notes (from the reviewer, read before coding):**
+
+- In `append_blob_v2_batch_column_values` (`src/blob_v2_external.cpp`, ~line 720) the input shape is
+  chosen from the children found with `find_child(mapping, blob_field.id, name)`. Add the
+  descriptor shape (all six names present) as a third branch; the existing loop (~lines 780-860) shows
+  how a row is read (`large_binary_value`, `utf8_value`, `uint64_value`), how a null row is recorded
+  (`record_validity(out, index, false)` + `row_packed_sizes.push_back(0U)`), and how a row is emitted:
+  `append_packed_row(out, kind, position, size, blob_id, uri_ptr, uri_len, error)` (~line 188). You
+  will need a `uint8` and a `uint32` reader like `uint64_value` -- add them next to it.
+- Kinds 1 / 2 / 3: emit `append_packed_row(out, kind, position, blob_size, blob_id, <uri or nullptr>, ...)`
+  directly -- the bytes already exist, nothing is placed. A null `position` reads as 0.
+- Kind 0 (inline bytes in `data`): today, rows with bytes are emitted as `kBlobKindPendingData` and
+  `BlobV2Placer::place` (~line 359) later decides inline / packed / dedicated **by size thresholds**.
+  A descriptor that says inline must stay inline: add `kBlobKindPendingInline = 0xFE` next to
+  `kBlobKindPendingData` in `include/nanolance/blob_v2_external.hpp`, emit that, and in `place` and
+  `blob_v2_has_pending` treat it like pending data but always take the inline branch.
+- Then `finalize_blob_v2_schema_for_write` rewrites the field to the physical descriptor columns; check
+  it does not assume 2 or 4 input children (grep it; fix only if it does).
+- Write a C++ test only if cheap; the Python differential test (section 6 item 5) is the oracle.
+- If `DataFile.create` / the `DataReplacement` commit then fails for a reason in field ids or schema
+  mapping (not in the blob column itself), stop and report it with the error -- do not redesign that.
+
 Build after C++ changes (both are needed for Python to see it):
 
     cd /home/user/nanolance/build && ninja && ctest -j8
