@@ -115,3 +115,22 @@ Tails of: `cd build && ctest -j8 | grep "tests passed"`; the oracle `-k` run; yo
 `python3 tools/pylance_suite.py | tail -4` ("all N expected tests passed"); last, once, quiet:
 `cd bindings/python && python3 -m pytest -o addopts= -q -x -p no:cacheprovider tests | tail -1`.
 Files changed, per-test status, decisions, questions.
+
+**N1 investigation (2026-10-15), no code changed -- reviewer's answers:**
+- N1 is split: **N1a** = RoaringTreemap encoder, tokenizer, build, search, `contains` routing, explain
+  line, describe / stats, drop, empty dataset, and the oracle tests among those; **N1b** = optimize
+  deltas, compaction re-cover, `create_index_uncommitted` / merge / commit segments,
+  `test_optimize_indices_second_call_is_noop`.
+- **Approved:** a new `expr::Predicate::Test::Contains` (include/nanolance/expr.hpp ~58), recognized
+  only from `contains(<string column>, '<literal>')` in the Condition walk (src/expr.cpp ~2980-3050,
+  `HasAny` / `Has` are the precedent), with `filter()`, `to_string()` (~3189), `predicate_node`
+  (~3080) and the switch arms in src/index_search.cpp (~407, ~443, ~626, ~790). Row-evaluation
+  semantics unchanged.
+- `LIKE '%x%'` and `regexp_like` are **not** routed in N1: Lance sends them through
+  `TextQuery::Regex` and `ngram/ngram_regex.rs` (`visit_like`, lance-index `scalar/expression.rs`
+  ~970). A later item.
+- Known pieces: `write_file` / `struct_schema` (src/index_files.cpp 183-197) drop child field metadata,
+  so `posting_list` needs a schema carrying `lance-encoding:compression = none`; the inner bitmaps can
+  use `roaring::encode` (roaring_bitmap.hpp:20); export a lower-case + ASCII-fold helper from
+  `Analyzer::emit` (src/fts_tokenizer.cpp 395-424) and include non-ASCII cases in the byte test (its
+  `kLower` table may differ from Rust's `to_lowercase` on rare characters: report any difference).
