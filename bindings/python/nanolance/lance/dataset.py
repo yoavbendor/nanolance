@@ -1297,6 +1297,7 @@ class LanceDataset(pa.dataset.Dataset):
                  "version": i["dataset_version"], "fragment_ids": set(i["fragment_ids"]), "base_id": None}
                 for i in indices]
 
+    @property
     def has_index(self) -> bool:
         return bool(self.list_indices())
 
