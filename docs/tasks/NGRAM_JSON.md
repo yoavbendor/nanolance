@@ -163,3 +163,24 @@ cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance test
   are a later item.
 - IndexConfig is the only form (no kwargs `index_type="JSON"`). The plan line and stats name the
   target (`@j_idx(BTree)`, `index_type "BTree"`) -- special-case it in src/index_search.cpp ~1190.
+
+**N2 code map (2026-10-15, second investigation session; no code changed).** N2 is split:
+**N2a** = steps 1-3 + their tests, **N2b** = steps 4-6.
+1. Python: `create_scalar_index` (dataset.py ~973-1017) drops IndexConfig parameters other than
+   rows_per_zone / bloom options: add a json branch (IndexConfig only; validate `target_index_type` /
+   `path`, the agreed refusals). Native: `_ds_create_scalar_index`
+   (bindings/python/src/nanolance_bindings.cpp:1637) needs a path argument; `ScalarIndexOptions`
+   (include/nanolance/scalar_index.hpp:34) a `json_path` field.
+2. C++: in `create_scalar_index` (src/scalar_index.cpp ~1118-1415) the json branch must come before
+   the `key_kind_of` check (it rejects extension types). JSONPath subset: optional leading `$`,
+   dot-separated member names (`$['x']` -> pylance's "Invalid JSONPath"). Extract per batch into typed
+   nanoarrow arrays, type inference with Lance's error text, then the existing `write_btree` /
+   `sort_items`; JsonIndexDetails wrapper (path=1, target Any=2), index_version 0.
+3. describe (`index_type "Json"` from the URL) / stats (as BTree): check both against pylance.
+   `test_describe_indices`' json column is all-null at path "x" -> inferred type Utf8.
+4. Routing: `json_get_int/float/bool/string(col, 'k') <op> literal` for identifier-like paths only,
+   a new predicate kind as N1's `Test::Contains`; src/index_search.cpp ~1137-1190, plan line
+   `@j_idx(BTree)` (special-case the type name).
+5. Optimize / merge / compaction re-cover / drop as BTree (src/index_optimize.cpp Kind mapping,
+   src/index_segments.cpp type maps).
+6. Tests on tmp_path in test_ngram_json_index.py, including the `a.b` divergence test.
