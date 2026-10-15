@@ -10,6 +10,25 @@ two items the backlog called large are small.
 
 ---
 
+## Working order and delegation (2026-10-15)
+
+Order for the remaining work, as agreed: (1) ~~stable row ids~~ (done 2026-10-10); (2) the
+prepared-layout blob writers; (3) multi-base paths; (4) vector index kinds and search breadth
+(IVF_SQ / IVF_RQ / IVF_HNSW_PQ / FLAT, multivector, Hamming); (5) scalar / full-text breadth
+(ZONEMAP, NGRAM, BLOOMFILTER, fuzzy, tokenizers, FTS on lists); (6) DataOverlay and `commit_lock`;
+(7) branches; (8) torch samplers / Hugging Face, SQL, logging hooks; **last**: object stores and
+writing data storage versions other than 2.2.
+
+Well-bounded tasks are now **delegated**: Opus writes a self-contained task definition under
+`docs/tasks/` (goal, acceptance tests, the exact behaviour measured on pylance, the files to touch,
+the build / test commands, the repository's rules, when to stop and ask), a Haiku agent implements
+and tests it, and Opus reviews the diff, re-runs the checks, answers its questions and commits.
+Tasks needing format archaeology or design calls stay with Opus.
+
+| task | definition | implementer | status |
+|---|---|---|---|
+| Prepared-layout blob writers (`PackedBlobWriter`, `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`, descriptor-form blob columns in the file writer) | `docs/tasks/BLOB_WRITERS.md` | Haiku 5.5, reviewed by Opus | phase A (Python writers) in progress; phase B (C++ descriptor input) next |
+
 ## Priority: competing with pylance directly (2026-10-08)
 
 This order supersedes the "Suggested order" lines further down. The evidence is pylance 12's own
