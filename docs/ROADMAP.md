@@ -45,8 +45,10 @@ Small items found by delegated sessions, not yet done:
 - External blob URIs under a registered base path: the descriptor should carry the base id and a
   base-relative URI (pylance's `test_blob_extension_write_fragments_external_registered_base`).
   Found by the multi-base phase C session; touches the external-blob writer, so left to Opus.
-- HNSW index builds are not byte-stable: the same IVF_HNSW_SQ build gives a different `index.idx`
-  run to run (graph construction order). Found by the V1b session.
+- ~~HNSW index builds are not byte-stable~~ -- by design (reviewed 2026-10-15): nodes are inserted
+  into the graph concurrently on nanolance's threads, as Lance builds it, so the graph differs between
+  multi-threaded runs (with one thread, or `NANOLANCE_THREADS=1`, it is deterministic). Serializing the
+  insertion would cost the build its parallelism for no compatibility gain.
 - `lance.dataset.VectorIndexReader` (`num_partitions`, `read_partition(id, with_vector=)`): Lance returns
   `_rowid` plus `flat` (IVF_FLAT) or `__pq_code` (IVF_PQ) columns. Small, delegable.
 - `row_addr_allowlist=` / `serialize_row_addrs` in scans and searches (12 of pylance's tests in
