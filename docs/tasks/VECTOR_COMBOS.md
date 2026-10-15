@@ -87,3 +87,27 @@ Tails of: `cd build && ctest -j8 | tail -3`; the oracle `-k` run; your test file
 `python3 tools/pylance_suite.py | tail -4` ("all N expected tests passed"); last, once, quiet:
 `cd bindings/python && python3 -m pytest -o addopts= -q -x -p no:cacheprovider tests | tail -3`.
 Files changed, per-test status, decisions, questions.
+
+**C1 investigation (2026-10-15), no code changed -- facts for the implementing session:**
+- pylance's files match section 1 (probe scripts: `/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/c1/`
+  -- `build_pylance.py` builds all kinds, `meta.py` dumps them).
+- Today a pylance IVF_SQ / IVF_HNSW_PQ / IVF_HNSW_FLAT index is **silently not used**: `load_ivf`
+  (src/vector_search.cpp ~750) refuses the type, `dataset_nearest` falls back to an exact search and
+  the plan says why (results exact, so they differ from pylance's approximate ones). Keep that
+  fallback for kinds still unsupported (reviewer's call).
+- Coupling points to decouple (vector_search.cpp): type whitelist ~750 and `pq` / `hnsw` flags from
+  the name ~754; the storage column choice in `partition()` ~664; `load_hnsw_partition` ~542-566
+  assumes uint8 codes of stride `dim`; the PQ codebook loads only when `pq` ~866-900; `score` ~1534
+  dispatches HNSW first and `hnsw_partition` ~1446 / `hnsw_flat` ~1394 hard-wire `SqDistance` ~1268;
+  the non-HNSW exhaustive branch ~1561 expects float vectors (IVF_SQ needs an SQ distance there).
+  `describe_indices` raises through `vector_index_details` -> `load_ivf`.
+- Distances (Lance's source, checked by the reviewer): the IVF layer hands each storage the query, as a
+  residual (query - partition centroid) only when the quantizer uses residuals -- PQ for L2 / cosine
+  (`PQBuildParams::use_residual`), never for SQ or FLAT. Inside HNSW the storage's distance calculator
+  is used unchanged: PQ = the PQ distance table built on that (residual) query, exactly as nanolance's
+  IVF_PQ path does today; SQ = `SqDistance`; FLAT = plain float distance.
+- Order (agreed): (a) IVF_HNSW_FLAT, (b) IVF_SQ, (c) IVF_HNSW_PQ. Tests go in
+  `bindings/python/tests/test_hnsw.py`.
+- C2 will need: lance_c.cpp ~2459 (`vector_options` refuses these kinds at build), dataset.py ~1136 and
+  ~1280 (create_index refusals), and `tests/test_lance_c_search.cpp` ~358 asserts an IVF_HNSW_PQ build
+  is refused.
