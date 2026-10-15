@@ -3252,3 +3252,19 @@ publishes them.
   `to_table(columns=[system columns], filter=..., with_row_id=True)` dropped `_rowid`.
 - **Verified**: `tests/test_stable_row_ids.py` (14 tests against pylance, both directions, indexes
   included), `tests/test_row_ids.cpp`, `tests/test_lance_c_stable_row_ids.cpp`; pylance's suite.
+
+## Prepared-layout blob writers
+
+- **What**: `PackedBlobWriter`, `DedicatedBlobWriter` and `BlobDescriptorArrayBuilder` as pylance 12
+  has them (`LanceFileSession.open_packed_blob_writer` / `open_dedicated_blob_writer`,
+  `nanolance.lance.BlobDescriptorArrayBuilder`). The C++ data file writer takes descriptor-shaped
+  blob columns (`src/blob_v2_external.cpp`), so a `LanceFileSession.open_writer` file can hold them
+  and a `DataReplacement` commits them. `DataFile.create` reads only the footer's top-level names.
+- **Found on the way**: `DataReplacement` keeps the replaced fragment's row count, in pylance too, so
+  a replacement with more or fewer rows than the fragment reads back wrong. A test precondition, not
+  a nanolance bug.
+- **Verified**: `tests/test_blob_writers.py` runs the writers against pylance on the same calls
+  (descriptor reprs, sidecar bytes, paths, errors), and the end-to-end replacements (packed, empty
+  packed, inline, dedicated, mixed, packed + null; sidecars from either engine; read back by both).
+  `test_blob_writers.py` + `test_blob_kinds.py`: 69 passed. Full Python suite: 2244 collected, exit 0.
+  pylance's suite: all 869 expected tests pass.

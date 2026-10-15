@@ -264,8 +264,103 @@ def test_rejected_calls_raise_the_same_error_as_pylance(tmp_path, lance, case):
         assert results[name][0] is expected_type, f"{name}: {results[name]}"
         assert fragment in results[name][1], f"{name}: {results[name][1]}"
 
+# Section 6 item 5: end to end. The sidecars come from one engine's writers, the data file and the
+# DataReplacement commit always come from nanolance, and the blobs are read back by both engines.
+_REPLACEMENT_FILE = "replacement.lance"
 
-# TODO(phase B, section 6 item 5): end-to-end test -- write the sidecars with nanolance's writers, the
-# data file with LanceFileSession.open_writer (blob column = descriptor struct), commit DataReplacement, then
-# read the blobs back with take_blobs / read_blobs in both engines; and the reverse with pylance's writers.
-# This needs the descriptor-form blob column in the C++ data file writer (src/blob_v2_external.cpp).
+# Each case is a list of row operations, in row order.
+_REPLACEMENT_CASES = {
+    "packed": [("packed", [b"p0", b"p1", b"p2"])],
+    "empty_packed": [("packed", []), ("inline", b"after-empty")],
+    "inline": [("inline", b"i0"), ("inline", b"i1")],
+    "dedicated": [("dedicated", [b"ded", b"icated"])],
+    "mixed": [("packed", [b"packed-one", b""]), ("inline", b"inl"), ("dedicated", [b"dedic", b"ated"])],
+    # kept apart from "mixed": take_blobs on a null row in a mixed replacement raises in pylance too
+    "packed_null": [("packed", [b"packed-one"]), ("null", None)],
+}
+
+
+def _expected_blobs(ops) -> list:
+    out = []
+    for kind, value in ops:
+        if kind == "packed":
+            out.extend(value)
+        elif kind == "inline":
+            out.append(value)
+        elif kind == "dedicated":
+            out.append(b"".join(value))
+        else:
+            out.append(None)
+    return out
+
+
+def _replacement_column(module, files, ops):
+    """The blob descriptor column for ``ops``, built with ``module``'s writers and builder."""
+    builder = module.BlobDescriptorArrayBuilder("blob")
+    for kind, value in ops:
+        if kind == "packed":
+            writer = files.open_packed_blob_writer(_REPLACEMENT_FILE, 1)
+            for payload in value:
+                writer.write_blob(payload)
+            builder.extend(writer.finish())
+        elif kind == "inline":
+            builder.append_inline(value)
+        elif kind == "dedicated":
+            writer = files.open_dedicated_blob_writer(_REPLACEMENT_FILE, 2)
+            for chunk in value:
+                writer.write(chunk)
+            builder.append(writer.finish())
+        else:
+            builder.append_null()
+    return builder
+
+
+def _blob_dataset(lance, uri, n_rows: int) -> None:
+    """One fragment of ``n_rows`` rows. DataReplacement keeps the replaced fragment's row count, so the
+    replacement must have the same number of rows (pylance does the same)."""
+    logical = pa.schema([pa.field("id", pa.uint32(), nullable=False), lance.blob_field("blob")])
+    table = pa.table([pa.array([0] * n_rows, type=pa.uint32()),
+                      lance.blob_array([b"old-%d" % i for i in range(n_rows)])], schema=logical)
+    lance.write_dataset(table, str(uri), data_storage_version="2.2")
+
+
+def _commit_replacement(uri, schema, batch) -> None:
+    """nanolance's data file writer, DataFile.create and DataReplacement commit, for fragment 0."""
+    with nl.file.LanceFileSession(os.path.join(uri, "data")).open_writer(
+            _REPLACEMENT_FILE, schema=schema, version="2.2") as writer:
+        writer.write_batch(batch)
+    ds = nl.dataset(str(uri))
+    data_file = nl.fragment.DataFile.create(ds, _REPLACEMENT_FILE)
+    op = nl.LanceOperation.DataReplacement([nl.LanceOperation.DataReplacementGroup(0, data_file)])
+    nl.LanceDataset.commit(str(uri), op, read_version=ds.version)
+
+
+def _read_back(module, uri, n_rows) -> tuple:
+    ds = module.dataset(str(uri))
+    ids = ds.to_table(columns=["id"]).column("id").to_pylist()
+    blobs = []
+    for i in range(n_rows):
+        (blob,) = ds.take_blobs("blob", indices=[i])
+        blobs.append(None if blob is None else blob.readall())
+    return ids, blobs
+
+
+@pytest.mark.parametrize("sidecar_writer", ["nanolance", "pylance"])
+@pytest.mark.parametrize("case", sorted(_REPLACEMENT_CASES))
+def test_replacement_commit_reads_back_the_same_bytes_in_both_engines(tmp_path, lance, case, sidecar_writer):
+    ops = _REPLACEMENT_CASES[case]
+    n_rows = len(_expected_blobs(ops))
+    uri = tmp_path / "ds"
+    _blob_dataset(lance, uri, n_rows)
+
+    writers = nl if sidecar_writer == "nanolance" else lance
+    files = writers.file.LanceFileSession(os.path.join(uri, "data"))
+    builder = _replacement_column(writers, files, ops)
+    schema = pa.schema([pa.field("id", pa.uint32(), nullable=False), builder.field])
+    batch = pa.record_batch([pa.array(range(1, n_rows + 1), type=pa.uint32()), builder.finish()],
+                            schema=schema)
+    _commit_replacement(uri, schema, batch)
+
+    expected = (list(range(1, n_rows + 1)), _expected_blobs(ops))
+    assert _read_back(nl, uri, n_rows) == expected
+    assert _read_back(lance, uri, n_rows) == expected
