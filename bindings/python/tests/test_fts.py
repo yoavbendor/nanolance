@@ -451,8 +451,6 @@ def test_format_3_at_block_128_is_format_2_with_its_version(tmp_path):
      "FTS format_version=1 is incompatible with block_size=256; use format_version=3"),
     ({"format_version": 2, "block_size": 256}, ValueError,
      "FTS format_version=2 is incompatible with block_size=256; use format_version=3"),
-    ({"block_size": 256}, nl.NotSupportedError, "block_size=256"),
-    ({"format_version": 3, "block_size": 256}, nl.NotSupportedError, "block_size=256"),
 ])
 def test_inverted_format_and_block_options_are_validated(tmp_path, kwargs, error, message):
     path = str(tmp_path / "a.lance")
@@ -460,3 +458,70 @@ def test_inverted_format_and_block_options_are_validated(tmp_path, kwargs, error
     with pytest.raises(error, match=message):
         nl.dataset(path).create_scalar_index("text", "INVERTED", **kwargs)
     assert nl.dataset(path).describe_indices() == []
+
+
+# ── block size 256 (format 3): BitPacker8x doc ids, patched-FOR frequencies, no score prefix ───────
+
+
+def _block_table(n=1200, seed=5):
+    """Documents with "alpha" in each (several full 256-document posting blocks and a tail), "beta"
+    in two thirds, "gamma" in half, "delta" in a quarter, and "epsilon" repeated 150 times in three
+    documents (frequencies above 100: patched-FOR exceptions) as a run, so "epsilon epsilon" is a
+    phrase there."""
+    rng = random.Random(seed)
+    texts = []
+    for i in range(n):
+        words = [rng.choice(WORDS) for _ in range(rng.randint(3, 12))] + ["alpha"]
+        rng.shuffle(words)
+        words += ["beta"] if i % 3 else []
+        words += ["gamma"] if i % 2 else []
+        words += ["delta"] if i % 4 == 0 else []
+        words += ["epsilon"] * 150 if i in (7, 300, 901) else []
+        texts.append(" ".join(words))
+    return pa.table({"id": pa.array(range(n), pa.int64()), "text": pa.array(texts, pa.string())}), texts
+
+
+@pytest.mark.parametrize("with_position", [False, True])
+def test_block_256_builds_match_pylance(lance, tmp_path, with_position):
+    table, texts = _block_table()
+    for who, mod in (("p", lance), ("n", nl)):
+        # One fragment: pylance numbers the tokens in the order its fragment workers finish.
+        mod.write_dataset(table, str(tmp_path / f"{who}.lance"))
+        mod.dataset(str(tmp_path / f"{who}.lance")).create_scalar_index(
+            "text", "INVERTED", block_size=256, with_position=with_position)
+    p, n = str(tmp_path / "p.lance"), str(tmp_path / "n.lance")
+    for path in (p, n):  # block 256 defaults to format 3
+        assert lance.dataset(path).describe_indices()[0].segments[0].index_version == 3
+        assert nl.dataset(path).describe_indices()[0].segments[0].index_version == 3
+    assert _index_content(p, "text")["invert.lance"][2][b"posting_block_size"] == b"256"
+    _same_index(p, n, "text")
+    # The posting blobs (and impacts, positions) of both builds are equal, column by column.
+    assert _index_content(p, "text")["invert.lance"][0] == _index_content(n, "text")["invert.lance"][0]
+    specs = [("match", q, op) for q in ("alpha", "alpha beta", "gamma delta", "epsilon", "beta gamma delta")
+             for op in ("OR", "AND")]
+    specs += [("match", q, op) for q in _queries(n=10) for op in ("OR", "AND")]
+    if with_position:
+        specs += [("phrase", phrase, None) for phrase in _phrases(texts, n=10) + ["epsilon epsilon"]]
+    for kind, text, op in specs:
+        query = (lambda mod: _match(mod, text, op)) if kind == "match" else (lambda mod: _phrase(mod, text))
+        ref = _search(lance, p, query(lance))
+        _same_scores(ref, _search(lance, n, query(lance)))  # pylance reads nanolance's build
+        _same_scores(ref, _search(nl, p, query(nl)))  # nanolance reads pylance's build
+        _same_scores(ref, _search(nl, n, query(nl)))
+
+
+def test_block_256_top_k_scores_match(lance, tmp_path):
+    """The top-k (WAND) path: the bounds are read from the posting blocks, not a score prefix."""
+    table, _ = _block_table()
+    for who, mod in (("p", lance), ("n", nl)):
+        mod.write_dataset(table, str(tmp_path / f"{who}.lance"))
+        mod.dataset(str(tmp_path / f"{who}.lance")).create_scalar_index("text", "INVERTED", block_size=256)
+    p, n = str(tmp_path / "p.lance"), str(tmp_path / "n.lance")
+    for text in ("alpha", "alpha gamma", "epsilon delta", "beta gamma delta"):
+        for limit in (5, 50):
+            ref = [s for _, s in _search(lance, p, _match(lance, text, "OR"), limit=limit)]
+            assert len(ref) == limit
+            for path, mod in ((p, nl), (n, lance), (n, nl)):
+                got = [s for _, s in _search(mod, path, _match(mod, text, "OR"), limit=limit)]
+                assert got == pytest.approx(ref, abs=1e-5)
+

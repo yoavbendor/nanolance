@@ -132,3 +132,10 @@ decoded columns and metadata (the Lance file writer's bytes differ from nanolanc
 pylance's `tokens.lance` token order varies between multi-fragment builds, so index-content
 comparisons use one fragment. Reviewer: the six `test_describe_indices[*]` pass every FTS assertion
 and then need JSON and NGRAM indexes (separate roadmap items). +1 pylance test (1036).
+
+**F2 outcome (2026-10-15):** done. 256-document blocks built and read (BitPacker8x doc ids, patched-FOR
+frequencies, no score prefix); decoded posting blobs, impacts and positions byte-equal to pylance's.
+Found and added (confirmed in `index/doc_set.rs` ~112-238): **256-block partitions score with
+quantized document lengths** (Lucene SmallFloat style, `quantize_doc_length` / `dequantize_doc_length`;
+lengths < 8 exact); the flat path over unindexed fragments stays exact. Block-128 encoder output
+unchanged. +1 pylance test (1037).

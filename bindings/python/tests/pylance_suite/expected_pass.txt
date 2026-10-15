@@ -849,6 +849,7 @@ tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[2
 tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[3-creation_options2-3]
 tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[3-creation_options3-3]
 tests/test_scalar_index.py::test_create_scalar_index_fts_alias
+tests/test_scalar_index.py::test_create_scalar_index_fts_block_size
 tests/test_scalar_index.py::test_create_scalar_index_rejects_invalid_uuid
 tests/test_scalar_index.py::test_create_text_inverted_index_defaults_to_v2_without_env
 tests/test_scalar_index.py::test_describe_indices_vector_and_scalar

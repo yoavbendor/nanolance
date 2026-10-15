@@ -1048,8 +1048,6 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError("format_version must be 1, 2, 3, 'v1', 'v2', or 'v3'")
         if version < 3 and block == 256:
             raise ValueError(f"FTS format_version={version} is incompatible with block_size=256; use format_version=3")
-        if block == 256:
-            raise unsupported("INVERTED index posting blocks of 256 documents (block_size=256)")
         params["format_version"] = version
         params["block_size"] = block
 

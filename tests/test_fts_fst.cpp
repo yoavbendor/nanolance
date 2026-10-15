@@ -182,11 +182,11 @@ int main(int argc, char** argv) {
             std::vector<std::uint32_t> docs;
             std::vector<std::uint32_t> freqs;
             std::string error;
-            (void)nano_lance::fts::decode_posting(blocks, length, nano_lance::fts::TailCodec::VarintDelta, docs, freqs,
+            (void)nano_lance::fts::decode_posting(blocks, length, nano_lance::fts::TailCodec::VarintDelta, nano_lance::fts::kPostingBlock, docs, freqs,
                                                   error);
             docs.clear();
             freqs.clear();
-            (void)nano_lance::fts::decode_posting(blocks, length, nano_lance::fts::TailCodec::Fixed32, docs, freqs,
+            (void)nano_lance::fts::decode_posting(blocks, length, nano_lance::fts::TailCodec::Fixed32, nano_lance::fts::kPostingBlock, docs, freqs,
                                                   error);
         }
         // And encoded blocks round-trip.
@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
             std::vector<std::uint32_t> f2;
             std::string error;
             const bool ok = nano_lance::fts::decode_posting({{block.data(), block.size()}}, static_cast<std::uint32_t>(n),
-                                                            nano_lance::fts::TailCodec::VarintDelta, d2, f2, error);
+                                                            nano_lance::fts::TailCodec::VarintDelta, nano_lance::fts::kPostingBlock, d2, f2, error);
             check(ok && d2 == docs && f2 == freqs, "posting block round trip");
         }
     }

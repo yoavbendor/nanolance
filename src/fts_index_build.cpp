@@ -256,6 +256,7 @@ struct Built {
     bool with_positions = false;
     std::vector<std::vector<std::uint32_t>> positions;
     std::uint32_t format_version = 2;  // 1: fixed32_v1 tails and the legacy per-document _position
+    std::size_t block_size = 128;      // posting blocks: 128 (BitPacker4x) or 256 (BitPacker8x)
 };
 
 /// The documents of `batches` (column 0 text, column 1 row address), added in order.
@@ -484,7 +485,7 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
     std::vector<std::uint8_t> stream;
     const std::size_t n_docs = b.row_ids.size();
     const float avgdl = static_cast<float>(b.total_tokens) / static_cast<float>(n_docs);
-    std::vector<std::uint8_t> block;
+    std::vector<std::uint8_t> bytes;
     std::vector<std::uint8_t> entry;
     std::vector<Impact> impacts;
     std::vector<Impact> level1;
@@ -502,8 +503,9 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
         level1.clear();
         level1_entries.clear();
         std::size_t blocks = 0;
-        for (std::size_t at = 0; ok && at < length; at += fts::kPostingBlock) {
-            const std::size_t n = std::min(fts::kPostingBlock, length - at);
+        const std::size_t block = b.block_size;
+        for (std::size_t at = 0; ok && at < length; at += block) {
+            const std::size_t n = std::min(block, length - at);
             float best = std::numeric_limits<float>::lowest();
             impacts.clear();
             for (std::size_t i = at; i < at + n; ++i) {
@@ -515,10 +517,11 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
             }
             const float score = best * idf_scale;
             max_score = std::max(max_score, score);
-            block.clear();
-            fts::encode_posting_block(docs.data() + at, freqs.data() + at, n, score, block,
-                                      b.format_version == 1U ? fts::TailCodec::Fixed32 : fts::TailCodec::VarintDelta);
-            ok = append_bytes(postings->children[0], block.data(), block.size());
+            bytes.clear();
+            fts::encode_posting_block(docs.data() + at, freqs.data() + at, n, score, bytes,
+                                      b.format_version == 1U ? fts::TailCodec::Fixed32 : fts::TailCodec::VarintDelta,
+                                      block);
+            ok = append_bytes(postings->children[0], bytes.data(), bytes.size());
             encode_impact_entry(impacts, scratch, entry);
             ok = ok && append_bytes(impact_list->children[0], entry.data(), entry.size());
             level1.insert(level1.end(), impacts.begin(), impacts.end());
@@ -544,8 +547,8 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
             stream.clear();
             ArrowArray* offsets = batch.a.children[5];
             std::size_t first = 0;
-            for (std::size_t at = 0; ok && at < length; at += fts::kPostingBlock) {
-                const std::size_t n = std::min(fts::kPostingBlock, length - at);
+            for (std::size_t at = 0; ok && at < length; at += b.block_size) {
+                const std::size_t n = std::min(b.block_size, length - at);
                 ok = ArrowArrayAppendUInt(offsets->children[0], stream.size()) == NANOARROW_OK;
                 encode_position_block(b.positions[t].data() + first, freqs.data() + at, n, stream);
                 for (std::size_t i = at; i < at + n; ++i) {
@@ -580,7 +583,7 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
     LanceFileExtras extras;
     extras.bitpack_integers = true;
     extras.schema_metadata["format_version"] = index_files::bytes_of(std::to_string(b.format_version));
-    extras.schema_metadata["posting_block_size"] = index_files::bytes_of("128");
+    extras.schema_metadata["posting_block_size"] = index_files::bytes_of(std::to_string(b.block_size));
     if (b.format_version >= 2U) {  // format 1's invert.lance has no posting_tail_codec
         extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of(posting_tail_codec(b.format_version));
     }
@@ -613,7 +616,7 @@ bool write_metadata(const std::filesystem::path& dir, const fts::AnalyzerParams&
     const std::uint32_t format = fts::resolved_format_version(params);
     extras.schema_metadata["format_version"] = index_files::bytes_of(std::to_string(format));
     extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of(posting_tail_codec(format));
-    extras.schema_metadata["posting_block_size"] = index_files::bytes_of("128");
+    extras.schema_metadata["posting_block_size"] = index_files::bytes_of(std::to_string(params.block_size));
     if (params.with_position && format >= 2) {  // format 1 keeps its positions in the legacy _position
         extras.schema_metadata["positions_layout"] = index_files::bytes_of("shared_stream_v2");
         extras.schema_metadata["positions_codec"] = index_files::bytes_of("packed_delta_v1");
@@ -644,10 +647,6 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     if (format < 3U && params.block_size == 256U) {
         error = "FTS format_version=" + std::to_string(format) +
                 " is incompatible with block_size=256; use format_version=3";
-        return false;
-    }
-    if (params.block_size != 128U) {  // 256-document posting blocks: not written yet
-        error = "INVERTED index posting blocks of 256 documents are not supported (128 are)";
         return false;
     }
     params.format_version = format;
@@ -706,6 +705,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     Built built;
     built.with_positions = params.with_position;
     built.format_version = format;
+    built.block_size = params.block_size;
     const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
     if (progress != nullptr) {
         (*progress)(0, "tokenize_docs", 0, "rows", 0);

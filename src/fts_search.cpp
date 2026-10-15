@@ -262,6 +262,7 @@ struct BlockBounds {
 struct Posting {
     std::vector<std::uint32_t> docs;
     std::vector<std::uint32_t> freqs;
+    std::size_t block = fts::kPostingBlock;  // the posting blocks' size (128 or 256) it was read with
 
     mutable std::mutex mutex;
     mutable std::uint32_t bounds_key = 0;
@@ -290,6 +291,7 @@ struct Partition {
     bool use_fst = true;
     std::vector<std::uint64_t> row_ids;
     std::vector<std::uint32_t> num_tokens;
+    bool quantized_lengths = false;  // 256-document blocks: scoring sees quantized_doc_length(num_tokens)
     std::uint64_t total_tokens = 0;
     bool rows_sorted = true;  // documents in row order (as nanolance writes them)
 
@@ -311,7 +313,7 @@ struct Partition {
     }
 
     /// The posting lists of `ids` (token ids), loaded on first use.
-    bool load(const std::vector<std::uint32_t>& ids, fts::TailCodec codec,
+    bool load(const std::vector<std::uint32_t>& ids, fts::TailCodec codec, std::size_t block,
               std::vector<std::shared_ptr<const Posting>>& out, std::string& error) const;
 
     /// The positions of token `id`, whose posting list is `posting`, loaded on first use.
@@ -323,6 +325,7 @@ struct Partition {
 struct InvertedIndex {
     fts::Analyzer analyzer;
     fts::TailCodec codec = fts::TailCodec::VarintDelta;
+    std::size_t block_size = fts::kPostingBlock;  // posting blocks: 128 or 256 documents
     bool with_positions = false;   // positions nanolance reads (see positions_layout)
     PositionsLayout positions_layout = PositionsLayout::PackedShared;
     std::string positions_error;   // with positions nanolance cannot read: why (matches still work)
@@ -517,7 +520,8 @@ bool Partition::load_positions(std::uint32_t id, const Posting& posting, Positio
         const ArrowArrayView* offsets = view.children[1];
         const std::int64_t first = ArrowArrayViewListChildOffset(offsets, row);
         const std::int64_t last = ArrowArrayViewListChildOffset(offsets, row + 1);
-        const std::size_t blocks = (posting.docs.size() + fts::kPostingBlock - 1U) / fts::kPostingBlock;
+        const std::size_t block = posting.block;
+        const std::size_t blocks = (posting.docs.size() + block - 1U) / block;
         const auto size = static_cast<std::size_t>(stream.size_bytes);
         ok = static_cast<std::size_t>(last - first) == blocks;
         result->values.reserve(posting.docs.size());
@@ -527,8 +531,8 @@ bool Partition::load_positions(std::uint32_t id, const Posting& posting, Positio
                                  ? static_cast<std::size_t>(ArrowArrayViewGetUIntUnsafe(
                                        offsets->children[0], first + static_cast<std::int64_t>(b) + 1))
                                  : size;
-            const std::size_t d0 = b * fts::kPostingBlock;
-            const std::size_t nd = std::min(fts::kPostingBlock, posting.docs.size() - d0);
+            const std::size_t d0 = b * block;
+            const std::size_t nd = std::min(block, posting.docs.size() - d0);
             ok = begin <= end && end <= size &&
                  decode_position_block(stream.data.as_uint8 + begin, end - begin, posting.freqs.data() + d0, nd,
                                        layout == PositionsLayout::PackedShared, result->values);
@@ -554,7 +558,7 @@ bool Partition::load_positions(std::uint32_t id, const Posting& posting, Positio
     return true;
 }
 
-bool Partition::load(const std::vector<std::uint32_t>& ids, fts::TailCodec codec,
+bool Partition::load(const std::vector<std::uint32_t>& ids, fts::TailCodec codec, std::size_t block,
                      std::vector<std::shared_ptr<const Posting>>& out, std::string& error) const {
     out.assign(ids.size(), nullptr);
     std::vector<std::uint64_t> missing;
@@ -603,11 +607,12 @@ bool Partition::load(const std::vector<std::uint32_t>& ids, fts::TailCodec codec
                 blocks.push_back({b.data.as_uint8, static_cast<std::size_t>(b.size_bytes)});
             }
             auto posting = std::make_shared<Posting>();
+            posting->block = block;
             const auto length = static_cast<std::uint32_t>(ArrowArrayViewGetUIntUnsafe(lengths, row));
             posting->docs.reserve(length);
             posting->freqs.reserve(length);
             ok = at < missing.size() &&
-                 fts::decode_posting(blocks, length, codec, posting->docs, posting->freqs, error);
+                 fts::decode_posting(blocks, length, codec, block, posting->docs, posting->freqs, error);
             for (const auto d : posting->docs) {
                 if (ok && d >= row_ids.size()) {
                     error = "posting list: document " + std::to_string(d) + " out of range";
@@ -653,6 +658,21 @@ float length_norm(std::uint32_t doc_tokens, float avg_doc_length) {
     return kK1 * (1.0F - kB + kB * static_cast<float>(doc_tokens) / avg_doc_length);
 }
 
+/// The document length a 256-document-block partition scores (Lance's quantize_doc_length and
+/// dequantize_doc_length, index/doc_set.rs): exact below 8, else the top four significant bits,
+/// decoded to the bucket floor (the floor only ever shortens a document).
+std::uint32_t quantized_doc_length(std::uint32_t value) {
+    const std::uint8_t num_bits = fts::bit_width(value);
+    std::uint32_t code = value;
+    if (num_bits >= 4U) {
+        const std::uint32_t shift = num_bits - 4U;
+        code = ((value >> shift) & 0x07U) | ((shift + 1U) << 3U);
+    }
+    const std::uint32_t bits = code & 0x07U;
+    const auto shift = static_cast<std::int32_t>(code >> 3U) - 1;
+    return shift < 0 ? bits : (bits | 0x08U) << static_cast<std::uint32_t>(shift);
+}
+
 float doc_weight_with_norm(std::uint32_t freq, float norm) {
     const auto f = static_cast<float>(freq);
     return (kK1 + 1.0F) * f / (f + norm);
@@ -687,7 +707,7 @@ std::shared_ptr<const std::vector<float>> Partition::length_norms(float avg) con
     if (norms == nullptr || norms_key != key) {
         auto v = std::make_shared<std::vector<float>>(num_tokens.size());
         for (std::size_t d = 0; d < num_tokens.size(); ++d) {
-            (*v)[d] = length_norm(num_tokens[d], avg);
+            (*v)[d] = length_norm(quantized_lengths ? quantized_doc_length(num_tokens[d]) : num_tokens[d], avg);
         }
         norms = std::move(v);
         norms_key = key;
@@ -815,10 +835,11 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
         return false;
     }
     const std::string block = metadata_value(meta, "posting_block_size", found, error);
-    if (found && block != "128") {
-        error = "INVERTED index posting blocks of " + block + " documents are not supported (128 are)";
+    if (found && block != "128" && block != "256") {
+        error = "INVERTED index posting blocks of " + block + " documents are not supported (128 and 256 are)";
         return false;
     }
+    index->block_size = found && block == "256" ? fts::kLargePostingBlock : fts::kPostingBlock;
     const std::string tail = metadata_value(meta, "posting_tail_codec", found, error);
     if (found && tail == "fixed32_v1") {
         index->codec = fts::TailCodec::Fixed32;
@@ -869,6 +890,7 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
         if (!load_partition(dir, static_cast<std::uint64_t>(p.n), *part, error)) {
             return false;
         }
+        part->quantized_lengths = index->block_size == fts::kLargePostingBlock;
         index->partitions.push_back(std::move(part));
     }
     index_cache().put(key, index);
@@ -1356,7 +1378,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             }
         }
         std::vector<std::shared_ptr<const Posting>> loaded;
-        if (!parts[p]->load(ids, c.index->codec, loaded, error)) {
+        if (!parts[p]->load(ids, c.index->codec, c.index->block_size, loaded, error)) {
             return false;
         }
         postings[p].assign(nt, nullptr);
@@ -1378,7 +1400,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
                 }
             }
             std::vector<std::shared_ptr<const Posting>> loaded;
-            if (!part->load(ids, c.stats->codec, loaded, error)) {
+            if (!part->load(ids, c.stats->codec, c.stats->block_size, loaded, error)) {
                 return false;
             }
             for (std::size_t k = 0; k < ids.size(); ++k) {
@@ -1980,6 +2002,7 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
                     picked = std::make_shared<InvertedIndex>();
                     picked->analyzer = index->analyzer;
                     picked->codec = index->codec;
+                    picked->block_size = index->block_size;
                 }
                 if (chosen.count(seg->uuid) != 0U) {
                     c.covered.insert(seg->fragment_ids.begin(), seg->fragment_ids.end());
@@ -2005,8 +2028,9 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
                 merged = std::make_shared<InvertedIndex>();
                 merged->analyzer = index->analyzer;
                 merged->codec = index->codec;
+                merged->block_size = index->block_size;
             }
-            if (index->codec != merged->codec) {
+            if (index->codec != merged->codec || index->block_size != merged->block_size) {
                 error = "INVERTED index " + seg->name + ": segments with different posting codecs";
                 return false;
             }
