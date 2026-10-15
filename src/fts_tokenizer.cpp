@@ -155,6 +155,8 @@ bool parse_params(std::string_view text, AnalyzerParams& out, std::string& error
             flag(out.prefix_only);
         } else if (key == "block_size") {
             number(out.block_size);
+        } else if (key == "format_version") {
+            number(out.format_version);
         }
     }
     return true;

@@ -66,6 +66,11 @@ void put_string(std::vector<std::uint8_t>& out, std::uint32_t field, const std::
 }
 
 /// InvertedIndexDetails, as Lance 12 fills it in (the language is kept as a JSON string).
+/// The posting tail codec of format `format_version` (metadata.lance's posting_tail_codec).
+std::string posting_tail_codec(std::uint32_t format_version) {
+    return format_version == 1U ? "fixed32_v1" : "varint_delta_v1";
+}
+
 std::vector<std::uint8_t> index_details(const fts::AnalyzerParams& p) {
     std::vector<std::uint8_t> out;
     put_string(out, 1, p.base_tokenizer);
@@ -93,7 +98,7 @@ std::vector<std::uint8_t> index_details(const fts::AnalyzerParams& p) {
     }
     flag(11, p.prefix_only);
     put_uint(out, 12, p.block_size);
-    put_uint(out, 15, 2);  // posting_format_version
+    put_uint(out, 15, fts::resolved_format_version(p));  // posting_format_version
     return out;
 }
 
@@ -189,6 +194,20 @@ bool list_field(ArrowSchema* s, const char* name) {
     return true;
 }
 
+/// `_position`: list<list<large_binary>>, a posting's documents, each a list of compressed blocks.
+bool legacy_position_field(ArrowSchema* s) {
+    if (ArrowSchemaInitFromType(s, NANOARROW_TYPE_LIST) != NANOARROW_OK ||
+        ArrowSchemaSetName(s, "_position") != NANOARROW_OK ||
+        ArrowSchemaInitFromType(s->children[0], NANOARROW_TYPE_LIST) != NANOARROW_OK ||
+        ArrowSchemaSetName(s->children[0], "item") != NANOARROW_OK ||
+        ArrowSchemaSetType(s->children[0]->children[0], NANOARROW_TYPE_LARGE_BINARY) != NANOARROW_OK ||
+        ArrowSchemaSetName(s->children[0]->children[0], "item") != NANOARROW_OK) {
+        return false;
+    }
+    s->flags &= ~ARROW_FLAG_NULLABLE;
+    return true;
+}
+
 bool struct_schema(ArrowSchema& out, std::size_t n) {
     ArrowSchemaInit(&out);
     return ArrowSchemaSetTypeStruct(&out, static_cast<std::int64_t>(n)) == NANOARROW_OK;
@@ -236,6 +255,7 @@ struct Built {
     /// with_position: by token id, every posting's positions in order (freqs[t][k] for posting k).
     bool with_positions = false;
     std::vector<std::vector<std::uint32_t>> positions;
+    std::uint32_t format_version = 2;  // 1: fixed32_v1 tails and the legacy per-document _position
 };
 
 /// The documents of `batches` (column 0 text, column 1 row address), added in order.
@@ -406,25 +426,59 @@ void encode_position_block(const std::uint32_t* positions, const std::uint32_t* 
     }
 }
 
+/// One document's positions as lance-index's compress_positions writes them, one element each: the
+/// count (u32), a sorted block per full 128 positions ([u32 first][u8 bits][packed deltas]), then the
+/// remainder's plain u32s.
+void legacy_position_elements(const std::uint32_t* positions, std::size_t n,
+                              std::vector<std::vector<std::uint8_t>>& out) {
+    out.clear();
+    std::vector<std::uint8_t> head(4);
+    const auto count = static_cast<std::uint32_t>(n);
+    std::memcpy(head.data(), &count, 4);
+    out.push_back(std::move(head));
+    std::size_t at = 0;
+    for (; at + fts::kPostingBlock <= n; at += fts::kPostingBlock) {
+        std::uint32_t deltas[fts::kPostingBlock];
+        std::uint32_t any = 0;
+        for (std::size_t i = 0; i < fts::kPostingBlock; ++i) {
+            deltas[i] = positions[at + i] - (i == 0 ? positions[at] : positions[at + i - 1]);
+            any |= deltas[i];
+        }
+        const std::uint8_t bits = fts::bit_width(any);
+        std::vector<std::uint8_t> block(5 + 16U * bits);
+        std::memcpy(block.data(), &positions[at], 4);
+        block[4] = bits;
+        fts::bitpack4x_pack(deltas, bits, block.data() + 5);
+        out.push_back(std::move(block));
+    }
+    if (at < n) {
+        std::vector<std::uint8_t> rest(4 * (n - at));
+        std::memcpy(rest.data(), positions + at, rest.size());
+        out.push_back(std::move(rest));
+    }
+}
+
 bool write_postings(const std::filesystem::path& dir, const Built& b, std::vector<WrittenFile>& files,
                     std::string& error) {
     OwnedSchema schema;
     OwnedArray batch;
     const bool with_positions = b.with_positions;
-    if (!struct_schema(schema.s, with_positions ? 6 : 4) || !list_field(schema.s.children[0], "_posting") ||
+    const bool legacy = with_positions && b.format_version == 1U;  // one _position per posting
+    if (!struct_schema(schema.s, with_positions ? (legacy ? 5 : 6) : 4) ||
+        !list_field(schema.s.children[0], "_posting") ||
         !field(schema.s.children[1], "_max_score", NANOARROW_TYPE_FLOAT, false) ||
         !field(schema.s.children[2], "_length", NANOARROW_TYPE_UINT32, false) ||
         !list_field(schema.s.children[3], "_impacts") ||
-        (with_positions &&
+        (with_positions && !legacy &&
          (!field(schema.s.children[4], "_compressed_position", NANOARROW_TYPE_LARGE_BINARY, false) ||
           ArrowSchemaInitFromType(schema.s.children[5], NANOARROW_TYPE_LIST) != NANOARROW_OK ||
           ArrowSchemaSetName(schema.s.children[5], "_position_block_offset") != NANOARROW_OK ||
           ArrowSchemaSetType(schema.s.children[5]->children[0], NANOARROW_TYPE_UINT32) != NANOARROW_OK)) ||
-        !start(schema.s, batch.a)) {
+        (legacy && !legacy_position_field(schema.s.children[4])) || !start(schema.s, batch.a)) {
         error = "out of memory";
         return false;
     }
-    if (with_positions) {
+    if (with_positions && !legacy) {
         schema.s.children[5]->flags &= ~ARROW_FLAG_NULLABLE;
     }
     std::vector<std::uint8_t> stream;
@@ -462,7 +516,8 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
             const float score = best * idf_scale;
             max_score = std::max(max_score, score);
             block.clear();
-            fts::encode_posting_block(docs.data() + at, freqs.data() + at, n, score, block);
+            fts::encode_posting_block(docs.data() + at, freqs.data() + at, n, score, block,
+                                      b.format_version == 1U ? fts::TailCodec::Fixed32 : fts::TailCodec::VarintDelta);
             ok = append_bytes(postings->children[0], block.data(), block.size());
             encode_impact_entry(impacts, scratch, entry);
             ok = ok && append_bytes(impact_list->children[0], entry.data(), entry.size());
@@ -484,7 +539,7 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
              ArrowArrayAppendDouble(batch.a.children[1], max_score) == NANOARROW_OK &&
              ArrowArrayAppendUInt(batch.a.children[2], length) == NANOARROW_OK &&
              ArrowArrayFinishElement(impact_list) == NANOARROW_OK;
-        if (ok && with_positions) {
+        if (ok && with_positions && !legacy) {
             // Every block's positions, one stream after another, and where each starts.
             stream.clear();
             ArrowArray* offsets = batch.a.children[5];
@@ -500,6 +555,21 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
             ok = ok && append_bytes(batch.a.children[4], stream.data(), stream.size()) &&
                  ArrowArrayFinishElement(offsets) == NANOARROW_OK;
         }
+        if (ok && legacy) {
+            // One list per document of this posting, in posting order.
+            ArrowArray* per_doc = batch.a.children[4];
+            std::vector<std::vector<std::uint8_t>> elements;
+            std::size_t first = 0;
+            for (std::size_t k = 0; ok && k < length; ++k) {
+                legacy_position_elements(b.positions[t].data() + first, freqs[k], elements);
+                for (const auto& e : elements) {
+                    ok = ok && append_bytes(per_doc->children[0]->children[0], e.data(), e.size());
+                }
+                ok = ok && ArrowArrayFinishElement(per_doc->children[0]) == NANOARROW_OK;
+                first += freqs[k];
+            }
+            ok = ok && ArrowArrayFinishElement(per_doc) == NANOARROW_OK;
+        }
     }
     if (!ok || !finish(batch.a, static_cast<std::int64_t>(b.tokens.size()), error)) {
         if (error.empty()) {
@@ -509,10 +579,12 @@ bool write_postings(const std::filesystem::path& dir, const Built& b, std::vecto
     }
     LanceFileExtras extras;
     extras.bitpack_integers = true;
-    extras.schema_metadata["format_version"] = index_files::bytes_of("2");
+    extras.schema_metadata["format_version"] = index_files::bytes_of(std::to_string(b.format_version));
     extras.schema_metadata["posting_block_size"] = index_files::bytes_of("128");
-    extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of("varint_delta_v1");
-    if (with_positions) {
+    if (b.format_version >= 2U) {  // format 1's invert.lance has no posting_tail_codec
+        extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of(posting_tail_codec(b.format_version));
+    }
+    if (with_positions && !legacy) {
         extras.schema_metadata["positions_layout"] = index_files::bytes_of("shared_stream_v2");
         extras.schema_metadata["positions_codec"] = index_files::bytes_of("packed_delta_v1");
     }
@@ -538,10 +610,11 @@ bool write_metadata(const std::filesystem::path& dir, const fts::AnalyzerParams&
     extras.schema_metadata["partitions"] = index_files::bytes_of("[0]");
     extras.schema_metadata["token_set_format"] = index_files::bytes_of("fst");
     extras.schema_metadata["params"] = index_files::bytes_of(fts::params_json(params));
-    extras.schema_metadata["format_version"] = index_files::bytes_of("2");
-    extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of("varint_delta_v1");
+    const std::uint32_t format = fts::resolved_format_version(params);
+    extras.schema_metadata["format_version"] = index_files::bytes_of(std::to_string(format));
+    extras.schema_metadata["posting_tail_codec"] = index_files::bytes_of(posting_tail_codec(format));
     extras.schema_metadata["posting_block_size"] = index_files::bytes_of("128");
-    if (params.with_position) {
+    if (params.with_position && format >= 2) {  // format 1 keeps its positions in the legacy _position
         extras.schema_metadata["positions_layout"] = index_files::bytes_of("shared_stream_v2");
         extras.schema_metadata["positions_codec"] = index_files::bytes_of("packed_delta_v1");
     }
@@ -558,11 +631,26 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     error.clear();
     fts::AnalyzerParams params = options.params;
 
-    if (params.block_size != 128U) {
-        error = "INVERTED index posting blocks of " + std::to_string(params.block_size) +
-                " documents are not supported (128 are)";
+    // Lance's rules (format.rs, tokenizer.rs): the block sizes, the format versions, their pairs.
+    if (params.block_size != 128U && params.block_size != 256U) {
+        error = "FTS inverted index block_size must be one of 128 or 256, got " + std::to_string(params.block_size);
         return false;
     }
+    const std::uint32_t format = fts::resolved_format_version(params);
+    if (format < 1U || format > 3U) {
+        error = "unsupported FTS format version " + std::to_string(format) + ", expected 1, 2, or 3";
+        return false;
+    }
+    if (format < 3U && params.block_size == 256U) {
+        error = "FTS format_version=" + std::to_string(format) +
+                " is incompatible with block_size=256; use format_version=3";
+        return false;
+    }
+    if (params.block_size != 128U) {  // 256-document posting blocks: not written yet
+        error = "INVERTED index posting blocks of 256 documents are not supported (128 are)";
+        return false;
+    }
+    params.format_version = format;
     fts::Analyzer analyzer;
     if (!analyzer.init(params, error)) {
         return false;
@@ -617,6 +705,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     };
     Built built;
     built.with_positions = params.with_position;
+    built.format_version = format;
     const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
     if (progress != nullptr) {
         (*progress)(0, "tokenize_docs", 0, "rows", 0);
@@ -696,7 +785,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
     auto entry = pb::make_index_metadata(uuid, {f->id}, name, version, fragment_ids,
-                                                       "/lance.table.InvertedIndexDetails", 2,
+                                                       "/lance.table.InvertedIndexDetails", format,
                                                        static_cast<std::uint64_t>(now), index_files_list,
                                                        index_details(params));
     if (!commit) {

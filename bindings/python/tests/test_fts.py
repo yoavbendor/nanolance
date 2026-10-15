@@ -89,6 +89,16 @@ def _index_dir(path, column):
     return os.path.join(path, "_indices", uuid)
 
 
+def _untagged(field):
+    """The field without nanolance's own tags (nanolance:packing marks the integer columns it
+    bit-packs; Lance ignores them), its list children too."""
+    typ = field.type
+    if isinstance(typ, pa.ListType):
+        typ = pa.list_(_untagged(typ.value_field))
+    meta = {k: v for k, v in (field.metadata or {}).items() if not k.startswith(b"nanolance:")}
+    return pa.field(field.name, typ, field.nullable, meta or None)
+
+
 def _index_content(path, column):
     from lance.file import LanceFileReader
 
@@ -99,9 +109,7 @@ def _index_content(path, column):
         meta = dict(t.schema.metadata or {})
         meta.pop(b"partitions", None)  # which partition number Lance's workers end up with varies
         key = f.split("_", 2)[-1] if f.startswith("part_") else f
-        # nanolance tags the integer columns it bit-packs (nanolance:packing); Lance ignores the tag.
-        schema = pa.schema([f.remove_metadata() if f.metadata and all(k.startswith(b"nanolance:") for k in f.metadata)
-                            else f for f in t.schema.remove_metadata()])
+        schema = pa.schema([_untagged(f) for f in t.schema])
         out[key] = (t.replace_schema_metadata(None).to_pydict(), str(schema), meta)
     return out
 
@@ -334,3 +342,121 @@ def test_errors(built, tmp_path):
         nl.dataset(bare).to_table(full_text_query="file")
     assert json.loads(json.dumps(nq.MatchQuery("a", "text").inner.spec))["match"]["column"] == "text"
     assert glob.glob(os.path.join(path, "_indices", "*", "metadata.lance"))
+
+
+# ── index format versions (format 1 and 3 at block 128) ─────────────────────────────────────────
+
+
+def _phrases(texts, n=12):
+    """Two-word phrases that occur in the texts (phrase queries need positions)."""
+    rng = random.Random(11)
+    usable = [t for t in texts if t and len(t.split(" ")) >= 2]
+    out = []
+    for text in rng.sample(usable, n):
+        words = text.split(" ")
+        at = rng.randrange(len(words) - 1)
+        out.append(" ".join(words[at:at + 2]))
+    return out
+
+
+def _same_scores(ref, got):
+    """The same rows, each score within 1e-5."""
+    assert sorted(r for r, _ in ref) == sorted(r for r, _ in got)
+    by_row = dict(got)
+    for row, score in ref:
+        assert by_row[row] == pytest.approx(score, abs=1e-5)
+
+
+def _match(mod, text, operator):
+    if mod is nl:
+        return nq.MatchQuery(text, "text", operator=nq.FullTextOperator[operator])
+    return mod.query.MatchQuery(text, "text", operator=mod.query.FullTextOperator[operator])
+
+
+def _phrase(mod, text):
+    if mod is nl:
+        return nq.PhraseQuery(text, "text")
+    return mod.query.PhraseQuery(text, "text")
+
+
+@pytest.mark.parametrize(("format_version", "with_position"),
+                         [(1, False), (1, True), (2, False), (2, True), (3, False), (3, True)])
+def test_format_version_builds_match_pylance(lance, tmp_path, format_version, with_position):
+    texts = _texts(800, 0)
+    for who, mod in (("p", lance), ("n", nl)):
+        # One fragment: pylance numbers the tokens in the order its fragment workers finish, so only a
+        # single fragment's index is the same from one build to the next.
+        path = str(tmp_path / f"{who}.lance")
+        mod.write_dataset(_table(800), path)
+        mod.dataset(path).create_scalar_index("text", "INVERTED", format_version=format_version,
+                                              with_position=with_position)
+    p, n = str(tmp_path / "p.lance"), str(tmp_path / "n.lance")
+    for path in (p, n):
+        assert lance.dataset(path).describe_indices()[0].segments[0].index_version == format_version
+        assert nl.dataset(path).describe_indices()[0].segments[0].index_version == format_version
+    _same_index(p, n, "text")
+    specs = [("match", q, op) for q in _queries(n=10) for op in ("OR", "AND")]
+    if with_position:
+        specs += [("phrase", phrase, None) for phrase in _phrases(texts)]
+    for kind, text, op in specs:
+        query = (lambda mod: _match(mod, text, op)) if kind == "match" else (lambda mod: _phrase(mod, text))
+        ref = _search(lance, p, query(lance))
+        _same_scores(ref, _search(lance, n, query(lance)))  # pylance reads nanolance's build
+        _same_scores(ref, _search(nl, p, query(nl)))  # nanolance reads pylance's build
+        _same_scores(ref, _search(nl, n, query(nl)))
+
+
+@pytest.mark.parametrize("format_version", [1, 3])
+def test_phrase_queries_on_positions(lance, tmp_path, format_version):
+    """Phrase queries answer the same from either engine's build, and only where the phrase is."""
+    texts = _texts(800, 0)
+    phrase = _phrases(texts, n=1)[0]
+    for who, mod in (("p", lance), ("n", nl)):
+        mod.write_dataset(_table(800), str(tmp_path / f"{who}.lance"), max_rows_per_file=300)
+        mod.dataset(str(tmp_path / f"{who}.lance")).create_scalar_index(
+            "text", "INVERTED", format_version=format_version, with_position=True)
+    p, n = str(tmp_path / "p.lance"), str(tmp_path / "n.lance")
+    ref = _search(lance, p, _phrase(lance, phrase))
+    assert ref
+    _same_scores(ref, _search(nl, p, _phrase(nl, phrase)))
+    _same_scores(ref, _search(lance, n, _phrase(lance, phrase)))
+    _same_scores(ref, _search(nl, n, _phrase(nl, phrase)))
+
+
+def test_format_3_at_block_128_is_format_2_with_its_version(tmp_path):
+    """V3 at block 128 writes V2's bytes, except the format version and the files that carry it."""
+    for fv in (2, 3):
+        nl.write_dataset(_table(800), str(tmp_path / f"v{fv}.lance"), max_rows_per_file=300).create_scalar_index(
+            "text", "INVERTED", format_version=fv)
+    two, three = str(tmp_path / "v2.lance"), str(tmp_path / "v3.lance")
+    a, b = _index_content(two, "text"), _index_content(three, "text")
+    assert a.keys() == b.keys()
+    for key in ("docs.lance", "tokens.lance"):
+        assert a[key] == b[key]
+    for key in ("invert.lance", "metadata.lance"):
+        assert a[key][:2] == b[key][:2]
+        assert a[key][2].pop(b"format_version") == b"2"
+        assert b[key][2].pop(b"format_version") == b"3"
+        assert a[key][2] == b[key][2]
+
+
+@pytest.mark.parametrize(("kwargs", "error", "message"), [
+    ({"format_version": "v5"}, ValueError, "unsupported FTS format version v5, expected 1, 2, or 3"),
+    ({"format_version": 4}, ValueError, "unsupported FTS format version 4, expected 1, 2, or 3"),
+    ({"format_version": 0}, ValueError, "unsupported FTS format version 0, expected 1, 2, or 3"),
+    ({"format_version": 2.0}, ValueError, "format_version must be 1, 2, 3, 'v1', 'v2', or 'v3'"),
+    ({"block_size": 129}, ValueError, "block_size must be one of 128 or 256, got 129"),
+    ({"block_size": 512}, ValueError, "block_size must be one of 128 or 256, got 512"),
+    ({"format_version": 1, "block_size": 256}, ValueError,
+     "FTS format_version=1 is incompatible with block_size=256; use format_version=3"),
+    ({"format_version": 2, "block_size": 256}, ValueError,
+     "FTS format_version=2 is incompatible with block_size=256; use format_version=3"),
+    ({"block_size": 256}, nl.NotSupportedError, "block_size=256"),
+    ({"format_version": 3, "block_size": 256}, nl.NotSupportedError, "block_size=256"),
+])
+def test_inverted_format_and_block_options_are_validated(tmp_path, kwargs, error, message):
+    path = str(tmp_path / "a.lance")
+    nl.write_dataset(_table(100), path)
+    with pytest.raises(error, match=message):
+        nl.dataset(path).create_scalar_index("text", "INVERTED", **kwargs)
+    assert nl.dataset(path).describe_indices() == []

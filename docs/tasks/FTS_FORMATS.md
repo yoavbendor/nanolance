@@ -123,3 +123,12 @@ Tails of: `cd build && ctest -j8 | tail -3`; the oracle `-k` run; your test file
 `python3 tools/pylance_suite.py | tail -4` ("all N expected tests passed"); last, once, quiet:
 `cd bindings/python && python3 -m pytest -o addopts= -q -x -p no:cacheprovider tests | tail -3`.
 Files changed, per-test status, decisions, questions.
+
+**F1 outcome (2026-10-15):** done. `format_version` 1 / 2 / 3 and `block_size` options with Lance's
+checks and messages; V1 (fixed32_v1 tail, legacy per-document `_position`) and V3/128 built and read,
+phrase queries on V1 and V3 positions; manifest `index_version` = format; `describe_indices` details
+for INVERTED; format-2 builds byte-identical to before. Notes for F2/F3: cross-engine checks compare
+decoded columns and metadata (the Lance file writer's bytes differ from nanolance's even for format 2);
+pylance's `tokens.lance` token order varies between multi-fragment builds, so index-content
+comparisons use one fragment. Reviewer: the six `test_describe_indices[*]` pass every FTS assertion
+and then need JSON and NGRAM indexes (separate roadmap items). +1 pylance test (1036).

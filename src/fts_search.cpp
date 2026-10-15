@@ -278,6 +278,10 @@ struct Positions {
     std::vector<std::uint32_t> start;
 };
 
+/// How an index stores its positions: Lance's shared stream (packed or varint deltas, format 2 and
+/// 3), or format 1's legacy per-document `_position` lists.
+enum class PositionsLayout { PackedShared, VarintShared, Legacy };
+
 struct Partition {
     std::filesystem::path invert;
     std::vector<std::uint8_t> fst_bytes;
@@ -312,15 +316,15 @@ struct Partition {
 
     /// The positions of token `id`, whose posting list is `posting`, loaded on first use.
     mutable std::unordered_map<std::uint32_t, std::shared_ptr<const Positions>> positions;
-    bool load_positions(std::uint32_t id, const Posting& posting, bool packed, std::shared_ptr<const Positions>& out,
-                        std::string& error) const;
+    bool load_positions(std::uint32_t id, const Posting& posting, PositionsLayout layout,
+                        std::shared_ptr<const Positions>& out, std::string& error) const;
 };
 
 struct InvertedIndex {
     fts::Analyzer analyzer;
     fts::TailCodec codec = fts::TailCodec::VarintDelta;
-    bool with_positions = false;   // shared-stream positions (Lance's positions_layout shared_stream_v2)
-    bool packed_positions = true;  // positions_codec packed_delta_v1, else varint_doc_delta_v2
+    bool with_positions = false;   // positions nanolance reads (see positions_layout)
+    PositionsLayout positions_layout = PositionsLayout::PackedShared;
     std::string positions_error;   // with positions nanolance cannot read: why (matches still work)
     std::vector<std::shared_ptr<const Partition>> partitions;
 };
@@ -390,7 +394,87 @@ bool decode_position_block(const std::uint8_t* src, std::size_t size, const std:
     return true;
 }
 
-bool Partition::load_positions(std::uint32_t id, const Posting& posting, bool packed,
+/// A byte range of a `_position` element.
+struct Piece {
+    const std::uint8_t* data = nullptr;
+    std::size_t size = 0;
+};
+
+std::uint32_t u32_le(const std::uint8_t* p) {
+    std::uint32_t v = 0;
+    std::memcpy(&v, p, 4);
+    return v;
+}
+
+/// One document's positions in format 1's layout (lance-index compress_positions): the count, a
+/// sorted block per full 128 positions ([u32 first][u8 bits][packed deltas]), then the remainder's
+/// plain u32s. `expect` is the document's frequency.
+bool decode_legacy_document(const std::vector<Piece>& e, std::uint32_t expect, std::vector<std::uint32_t>& out) {
+    if (e.empty() || e[0].size != 4U) {
+        return false;
+    }
+    const std::uint32_t count = u32_le(e[0].data);
+    const std::size_t full = count / fts::kPostingBlock;
+    const std::size_t rest = count % fts::kPostingBlock;
+    if (count != expect || e.size() != 1U + full + (rest > 0 ? 1U : 0U)) {
+        return false;
+    }
+    std::uint32_t deltas[fts::kPostingBlock];
+    for (std::size_t b = 0; b < full; ++b) {
+        const Piece& block = e[1U + b];
+        if (block.size < 5U || block.data[4] > 32U || block.size != 5U + 16U * block.data[4]) {
+            return false;
+        }
+        fts::bitpack4x_unpack(block.data + 5, block.data[4], deltas);
+        std::uint32_t value = u32_le(block.data);
+        out.push_back(value);
+        for (std::size_t i = 1; i < fts::kPostingBlock; ++i) {
+            value += deltas[i];
+            out.push_back(value);
+        }
+    }
+    if (rest > 0) {
+        const Piece& tail = e.back();
+        if (tail.size != 4U * rest) {
+            return false;
+        }
+        for (std::size_t i = 0; i < rest; ++i) {
+            out.push_back(u32_le(tail.data + 4 * i));
+        }
+    }
+    return true;
+}
+
+/// A format 1 token's positions: its one `_position` row, a list per document of element lists.
+bool decode_legacy_positions_row(const ArrowArrayView& view, const Posting& posting,
+                                 std::vector<std::uint32_t>& values) {
+    const ArrowArrayView* documents = view.children[0];
+    if (documents->n_children != 1 || documents->children[0]->n_children != 1) {
+        return false;
+    }
+    const ArrowArrayView* elements = documents->children[0];
+    const ArrowArrayView* leaf = elements->children[0];
+    const std::int64_t d0 = ArrowArrayViewListChildOffset(documents, 0);
+    if (ArrowArrayViewListChildOffset(documents, 1) - d0 != static_cast<std::int64_t>(posting.docs.size())) {
+        return false;
+    }
+    std::vector<Piece> pieces;
+    for (std::size_t k = 0; k < posting.docs.size(); ++k) {
+        const std::int64_t document = d0 + static_cast<std::int64_t>(k);
+        pieces.clear();
+        for (std::int64_t j = ArrowArrayViewListChildOffset(elements, document);
+             j < ArrowArrayViewListChildOffset(elements, document + 1); ++j) {
+            const ArrowBufferView bytes = ArrowArrayViewGetBytesUnsafe(leaf, j);
+            pieces.push_back({bytes.data.as_uint8, static_cast<std::size_t>(bytes.size_bytes)});
+        }
+        if (!decode_legacy_document(pieces, posting.freqs[k], values)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Partition::load_positions(std::uint32_t id, const Posting& posting, PositionsLayout layout,
                                std::shared_ptr<const Positions>& out, std::string& error) const {
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -401,7 +485,10 @@ bool Partition::load_positions(std::uint32_t id, const Posting& posting, bool pa
         }
     }
     FileTable table;
-    const std::vector<std::string> columns = {"_compressed_position", "_position_block_offset"};
+    const bool legacy = layout == PositionsLayout::Legacy;
+    const std::vector<std::string> columns = legacy ? std::vector<std::string>{"_position"}
+                                                    : std::vector<std::string>{"_compressed_position",
+                                                                               "_position_block_offset"};
     if (!index_files::take_table(invert, &columns, {id}, table, error)) {
         error = invert.filename().string() + ": " + error;
         return false;
@@ -415,8 +502,13 @@ bool Partition::load_positions(std::uint32_t id, const Posting& posting, bool pa
         ArrowArrayView view{};
         ArrowError e{};
         if (ArrowArrayViewInitFromSchema(&view, &table.schema, &e) != NANOARROW_OK ||
-            ArrowArrayViewSetArray(&view, &batch, &e) != NANOARROW_OK || view.n_children < 2 ||
-            view.children[1]->n_children != 1) {
+            ArrowArrayViewSetArray(&view, &batch, &e) != NANOARROW_OK ||
+            (legacy ? view.n_children < 1 : view.n_children < 2 || view.children[1]->n_children != 1)) {
+            ArrowArrayViewReset(&view);
+            break;
+        }
+        if (legacy) {
+            ok = decode_legacy_positions_row(view, posting, result->values);
             ArrowArrayViewReset(&view);
             break;
         }
@@ -439,7 +531,7 @@ bool Partition::load_positions(std::uint32_t id, const Posting& posting, bool pa
             const std::size_t nd = std::min(fts::kPostingBlock, posting.docs.size() - d0);
             ok = begin <= end && end <= size &&
                  decode_position_block(stream.data.as_uint8 + begin, end - begin, posting.freqs.data() + d0, nd,
-                                       packed, result->values);
+                                       layout == PositionsLayout::PackedShared, result->values);
         }
         ArrowArrayViewReset(&view);
         break;
@@ -717,9 +809,9 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
     if (!error.empty()) {
         return false;
     }
-    if (!found || format != "2") {
+    if (!found || (format != "1" && format != "2" && format != "3")) {
         error = "INVERTED index format version " + (found ? format : std::string("1")) +
-                " is not supported (2 is; rebuild the index with Lance 12 or nanolance)";
+                " is not supported (1, 2 and 3 are; rebuild the index with Lance 12 or nanolance)";
         return false;
     }
     const std::string block = metadata_value(meta, "posting_block_size", found, error);
@@ -728,7 +820,7 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
         return false;
     }
     const std::string tail = metadata_value(meta, "posting_tail_codec", found, error);
-    if (found && tail == "fixed32") {
+    if (found && tail == "fixed32_v1") {
         index->codec = fts::TailCodec::Fixed32;
     } else if (found && tail != "varint_delta_v1") {
         error = "INVERTED index posting tail codec '" + tail + "' is not supported";
@@ -740,7 +832,11 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
         return false;
     }
     bool found_codec = false;
-    if (params.with_position) {
+    if (params.with_position && format == "1") {
+        // Format 1: no positions_layout; each posting's positions are its legacy _position column.
+        index->with_positions = true;
+        index->positions_layout = PositionsLayout::Legacy;
+    } else if (params.with_position) {
         const std::string layout = metadata_value(meta, "positions_layout", found, error);
         const std::string codec = metadata_value(meta, "positions_codec", found_codec, error);
         if (!found || layout != "shared_stream_v2") {
@@ -751,7 +847,8 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
             index->positions_error = "INVERTED index positions codec '" + codec + "' is not supported by nanolance";
         } else {
             index->with_positions = true;
-            index->packed_positions = found_codec && codec == "packed_delta_v1";
+            index->positions_layout = found_codec && codec == "varint_doc_delta_v2" ? PositionsLayout::VarintShared
+                                                                                   : PositionsLayout::PackedShared;
         }
     }
     if (!index->analyzer.init(params, error)) {
@@ -955,7 +1052,7 @@ struct Search {
                                             const std::vector<std::shared_ptr<const Posting>>& postings,
                                             const std::vector<std::string>& distinct,
                                             const std::vector<std::size_t>& order,
-                                            const std::vector<std::int32_t>& query_positions, bool packed,
+                                            const std::vector<std::int32_t>& query_positions, PositionsLayout layout,
                                             std::uint32_t need, std::string& error);
     bool run(const FtsQuery& q, Hits& out, std::string& error);
 };
@@ -1382,7 +1479,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             need = 1U + 2U * static_cast<std::uint32_t>(nt);
         }
         if (check_phrase &&
-            !drop_non_phrases(part, postings[p], distinct, order, query_positions, c.index->packed_positions, need,
+            !drop_non_phrases(part, postings[p], distinct, order, query_positions, c.index->positions_layout, need,
                               error)) {
             return false;
         }
@@ -1477,13 +1574,13 @@ void Search::emit(const Partition& part, std::uint32_t need, HitSink& sink) {
 
 bool Search::drop_non_phrases(const Partition& part, const std::vector<std::shared_ptr<const Posting>>& postings,
                               const std::vector<std::string>& distinct, const std::vector<std::size_t>& order,
-                              const std::vector<std::int32_t>& query_positions, bool packed, std::uint32_t need,
-                              std::string& error) {
+                              const std::vector<std::int32_t>& query_positions, PositionsLayout layout,
+                              std::uint32_t need, std::string& error) {
     // The distinct terms' positions.
     std::vector<std::shared_ptr<const Positions>> positions(distinct.size());
     for (std::size_t t = 0; t < distinct.size(); ++t) {
         const auto id = part.token_id(distinct[t]);
-        if (!id || !part.load_positions(*id, *postings[t], packed, positions[t], error)) {
+        if (!id || !part.load_positions(*id, *postings[t], layout, positions[t], error)) {
             if (error.empty()) {
                 error = "positions of a phrase term are missing";
             }
@@ -2007,7 +2104,16 @@ bool index_build::load_inverted_params(const std::filesystem::path& dir, fts::An
         return false;
     }
     out = fts::AnalyzerParams{};
-    return !found || fts::parse_params(text, out, error);
+    if (!found || !fts::parse_params(text, out, error)) {
+        return !found;
+    }
+    // The format is metadata.lance's, not params': an index rebuilt from these settings keeps it.
+    const std::string format = metadata_value(dir / "metadata.lance", "format_version", found, error);
+    if (!error.empty()) {
+        return false;
+    }
+    out.format_version = format == "1" ? 1U : format == "3" ? 3U : format == "2" ? 2U : 0U;
+    return true;
 }
 
 bool index_build::load_inverted_rows(const std::filesystem::path& dir, std::vector<std::uint64_t>& out,

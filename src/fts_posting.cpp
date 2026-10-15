@@ -147,7 +147,7 @@ void put_varint(std::vector<std::uint8_t>& out, std::uint64_t v) {
 }
 
 void encode_posting_block(const std::uint32_t* docs, const std::uint32_t* freqs, std::size_t n, float score,
-                          std::vector<std::uint8_t>& out) {
+                          std::vector<std::uint8_t>& out, TailCodec tail) {
     std::uint8_t bytes[4];
     std::memcpy(bytes, &score, 4);
     out.insert(out.end(), bytes, bytes + 4);
@@ -174,6 +174,17 @@ void encode_posting_block(const std::uint32_t* docs, const std::uint32_t* freqs,
         at = out.size();
         out.resize(at + 16U * bits);
         bitpack4x_pack(freqs, bits, out.data() + at);
+        return;
+    }
+    if (tail == TailCodec::Fixed32) {
+        for (std::size_t i = 0; i < n; ++i) {
+            std::memcpy(bytes, &docs[i], 4);
+            out.insert(out.end(), bytes, bytes + 4);
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            std::memcpy(bytes, &freqs[i], 4);
+            out.insert(out.end(), bytes, bytes + 4);
+        }
         return;
     }
     for (std::size_t i = 0; i < n; ++i) {

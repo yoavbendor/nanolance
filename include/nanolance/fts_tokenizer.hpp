@@ -36,8 +36,20 @@ struct AnalyzerParams {
     std::uint32_t max_ngram_length = 3;
     bool prefix_only = false;
     std::uint32_t block_size = 128;
+    /// The on-disk FTS format (1, 2 or 3) a new index is written in; 0 = the default for block_size
+    /// (2 at 128, 3 at 256). Read from the `format_version` key of an index's params JSON, never
+    /// written into `params` (Lance keeps the format in metadata.lance and the index details).
+    std::uint32_t format_version = 0;
     std::string lance_tokenizer = "text";
 };
+
+/// The format version an index with `params` is (or would be) written in.
+inline std::uint32_t resolved_format_version(const AnalyzerParams& params) {
+    if (params.format_version != 0U) {
+        return params.format_version;
+    }
+    return params.block_size == 256U ? 3U : 2U;
+}
 
 /// Lance's params JSON (metadata.lance's `params`). Fields it leaves out keep their defaults.
 bool parse_params(std::string_view json, AnalyzerParams& out, std::string& error);

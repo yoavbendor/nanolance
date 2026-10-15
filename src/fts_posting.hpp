@@ -43,9 +43,10 @@ struct PostingBlockView {
 bool decode_posting(const std::vector<PostingBlockView>& blocks, std::uint32_t length, TailCodec codec,
                     std::vector<std::uint32_t>& docs, std::vector<std::uint32_t>& freqs, std::string& error);
 
-/// One block of `n` (<= 128) pairs, prefixed by `score`: packed when full, varints otherwise.
+/// One block of `n` (<= 128) pairs, prefixed by `score`: packed when full, otherwise the tail
+/// codec's remainder (varints, or plain u32s for fixed32_v1 / format 1).
 void encode_posting_block(const std::uint32_t* docs, const std::uint32_t* freqs, std::size_t n, float score,
-                          std::vector<std::uint8_t>& out);
+                          std::vector<std::uint8_t>& out, TailCodec tail = TailCodec::VarintDelta);
 
 void put_varint(std::vector<std::uint8_t>& out, std::uint64_t v);
 

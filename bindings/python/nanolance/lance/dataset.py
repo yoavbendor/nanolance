@@ -1016,7 +1016,42 @@ class LanceDataset(pa.dataset.Dataset):
 
     _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
                          "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
-                         "max_ngram_length", "prefix_only")
+                         "max_ngram_length", "prefix_only", "format_version", "block_size")
+
+    @staticmethod
+    def _inverted_format_and_block(params: dict) -> None:
+        """Check `format_version` and `block_size` in `params` as Lance does (format.rs, tokenizer.rs,
+        and the binding's conversions), and write the resolved format_version back into it."""
+        import operator
+
+        block = 128
+        if params.get("block_size") is not None:
+            block = operator.index(params["block_size"])
+            if block < 0:
+                raise OverflowError("can't convert negative int to unsigned")
+            if block not in (128, 256):
+                raise ValueError(f"FTS inverted index block_size must be one of 128 or 256, got {block}")
+        version = params.get("format_version")
+        if version is None:
+            version = 3 if block == 256 else 2
+        elif isinstance(version, str):
+            text = version.strip()
+            named = {"1": 1, "v1": 1, "V1": 1, "2": 2, "v2": 2, "V2": 2, "3": 3, "v3": 3, "V3": 3}
+            if text not in named:
+                raise ValueError(f"unsupported FTS format version {text}, expected 1, 2, or 3")
+            version = named[text]
+        elif isinstance(version, int) and 0 <= version <= 0xFFFFFFFF:
+            version = int(version)  # a bool is an int here, as in the binding
+            if version not in (1, 2, 3):
+                raise ValueError(f"unsupported FTS format version {version}, expected 1, 2, or 3")
+        else:
+            raise ValueError("format_version must be 1, 2, 3, 'v1', 'v2', or 'v3'")
+        if version < 3 and block == 256:
+            raise ValueError(f"FTS format_version={version} is incompatible with block_size=256; use format_version=3")
+        if block == 256:
+            raise unsupported("INVERTED index posting blocks of 256 documents (block_size=256)")
+        params["format_version"] = version
+        params["block_size"] = block
 
     def _inverted_params(self, kwargs) -> str:
         """The analyzer settings among `kwargs` (taken out of it) as the native layer's JSON."""
@@ -1033,6 +1068,7 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs.pop(ignored, None)
         if kwargs:
             raise unsupported(f"INVERTED index options {sorted(kwargs)}")
+        self._inverted_format_and_block(params)
         return json.dumps(params)
 
     def _create_inverted_index(self, column, name, replace, kwargs) -> "LanceDataset":
@@ -1409,9 +1445,64 @@ class LanceDataset(pa.dataset.Dataset):
     def has_index(self) -> bool:
         return bool(self.list_indices())
 
+    @staticmethod
+    def _inverted_details(raw: bytes) -> dict:
+        """An INVERTED index's InvertedIndexDetails (lance's index_old.proto) as pylance reports them:
+        absent optional fields are None, and language is the name, not its JSON string."""
+        import json
+
+        fields = {}
+        pos = 0
+
+        def varint(at):
+            value, shift = 0, 0
+            while True:
+                byte = raw[at]
+                value |= (byte & 0x7F) << shift
+                at += 1
+                shift += 7
+                if byte < 0x80:
+                    return value, at
+
+        while pos < len(raw):
+            key, pos = varint(pos)
+            wire = key & 7
+            if wire == 0:
+                fields[key >> 3], pos = varint(pos)
+            elif wire == 2:
+                size, pos = varint(pos)
+                fields[key >> 3], pos = raw[pos:pos + size], pos + size
+            else:
+                raise ValueError("malformed InvertedIndexDetails")
+
+        def text(number):
+            return fields[number].decode() if number in fields else None
+
+        language = text(2)
+        try:
+            language = json.loads(language) if language is not None else None
+        except ValueError:
+            pass
+        return {
+            "lance_tokenizer": None,
+            "base_tokenizer": text(1),
+            "language": language,
+            "with_position": bool(fields.get(3, 0)),
+            "max_token_length": fields.get(4),
+            "lower_case": bool(fields.get(5, 0)),
+            "stem": bool(fields.get(6, 0)),
+            "remove_stop_words": bool(fields.get(7, 0)),
+            "ascii_folding": bool(fields.get(8, 0)),
+            "min_ngram_length": fields.get(9, 0),
+            "max_ngram_length": fields.get(10, 0),
+            "prefix_only": bool(fields.get(11, 0)),
+        }
+
     def _index_details(self, index: dict) -> dict:
-        """What a vector index's build recorded (metric, PQ compression, runtime hints); {} for the other
-        index types."""
+        """What an index's build recorded: a vector index's metric, PQ compression and runtime hints, an
+        INVERTED index's analyzer settings; {} for the other index types."""
+        if index["type_url"] == "/lance.table.InvertedIndexDetails":
+            return self._inverted_details(bytes(index["details"]))
         if index["type_url"] != "/lance.index.pb.VectorIndexDetails":
             return {}
         with native():
