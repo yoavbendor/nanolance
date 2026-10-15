@@ -323,7 +323,14 @@ ParsedFormat parse_fixed_size_list(const ArrowSchema& field) {
                         "' is not supported; the element must be a fixed-width number, decimal or temporal type";
         return out;
     }
-    out.logical_type = "fixed_size_list:" + element.logical_type + ":" + std::to_string(items);
+    // A bfloat16 element (fixed_size_binary(2) tagged lance.bfloat16) travels as pylance's name for it.
+    std::string element_logical = element.logical_type;
+    std::string element_extension;
+    read_metadata_key(*field.children[0], kArrowExtensionNameKey, element_extension);
+    if (element_extension == "lance.bfloat16" && element_logical == "fixed_size_binary:2") {
+        element_logical = "lance.bfloat16";
+    }
+    out.logical_type = "fixed_size_list:" + element_logical + ":" + std::to_string(items);
     out.supported = true;
     return out;
 }
@@ -836,6 +843,10 @@ bool infer_arrow_format_from_internal(const std::string& logical_type, std::stri
 
     if (logical_type.rfind("fixed_size_binary:", 0) == 0) {
         arrow_format = "w:" + logical_type.substr(std::strlen("fixed_size_binary:"));
+        return true;
+    }
+    if (logical_type == "lance.bfloat16") {  // pylance's name for a bfloat16 element (fixed_size_binary(2))
+        arrow_format = "w:2";
         return true;
     }
     if (logical_type == "fixed_size_binary") {

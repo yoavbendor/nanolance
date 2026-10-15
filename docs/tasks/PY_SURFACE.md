@@ -110,3 +110,14 @@ names of rarer commits follow Lance's Operation enum, unmeasured. `test_lance_lo
 cannot pass in this sandbox (root can create `/invalid/...`; pylance fails it too) -- a stray
 `/invalid/path/.../lance.log` from a September pylance baseline run is still there (removal needs the
 user).
+
+**P2 outcome (2026-10-15):** done. `lance.arrow` (BFloat16 scalar / type / arrays / pandas dtype,
+`bfloat16_array`, `cast`, image URI / encoded / tensor types): bit patterns and reprs equal pylance's
+on 3950 values (edge values, ties, subnormals, NaN payloads). C++: `lance_extension_is_lance_owned`
+now means only `lance.blob.v2` (every `lance.*` column used to be read as a blob shell, so bf16 and
+image columns failed); a bf16 fixed-size list's element is Lance's `lance.bfloat16` on disk
+(reviewer added the shape to the encoding matrix). +17 pylance tests (1097). Not done:
+`test_struct_variable_children_roundtrip` needs a new writer encoding (variable-width packed struct,
+FullZip) -- roadmap; the two image-tensor tests need Pillow (pylance fails them here too; not
+installed). nanolance accepts a few conversions pylance refuses (to_numpy / cast with nulls,
+BFloat16Array.from_pandas returns bfloat16).

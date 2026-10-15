@@ -258,6 +258,12 @@ bool init_schema_from_field(const LanceField& field, const LanceSchemaMapping& m
             }
             return false;
         }
+        if (element == "lance.bfloat16" &&
+            (!set_schema_metadata(*schema.children[0], "ARROW:extension:name", "lance.bfloat16") ||
+             !set_schema_metadata(*schema.children[0], "ARROW:extension:metadata", ""))) {
+            error = "failed to tag the bfloat16 element of " + field.name;
+            return false;
+        }
     } else if (!field.dictionary_index_format.empty()) {
         // An Arrow dictionary column: the indices' type, with the values' as its dictionary.
         if (ArrowSchemaSetFormat(&schema, field.dictionary_index_format.c_str()) != NANOARROW_OK ||

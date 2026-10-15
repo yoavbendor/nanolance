@@ -1,4 +1,20 @@
 # pylance 12.0.0 tests that pass against nanolance.lance (tools/pylance_suite.py --update)
+tests/test_arrow.py::test_bf16_array_cast
+tests/test_arrow.py::test_bf16_array_str
+tests/test_arrow.py::test_bf16_fixed_size_list_cast
+tests/test_arrow.py::test_bf16_from_bytes_invalid_length_raises[\x00\x00\x00\x00]
+tests/test_arrow.py::test_bf16_from_bytes_invalid_length_raises[\x00\x00\x00]
+tests/test_arrow.py::test_bf16_from_bytes_invalid_length_raises[\x00]
+tests/test_arrow.py::test_bf16_from_bytes_invalid_length_raises[]
+tests/test_arrow.py::test_bf16_from_bytes_roundtrip
+tests/test_arrow.py::test_bf16_numpy
+tests/test_arrow.py::test_bf16_pandas[False]
+tests/test_arrow.py::test_bf16_pandas[True]
+tests/test_arrow.py::test_bf16_repr
+tests/test_arrow.py::test_bf16_roundtrip
+tests/test_arrow.py::test_bf16_value
+tests/test_arrow.py::test_image_array_pickle
+tests/test_arrow.py::test_image_uri_arrays
 tests/test_arrow.py::test_roundtrip_take_ext_types
 tests/test_backwards_compatibility.py::test_legacy_string_encoding
 tests/test_bitmap.py::test_add_discard_update
@@ -606,6 +622,7 @@ tests/test_lance.py::test_input_types[True]
 tests/test_lance.py::test_nearest
 tests/test_lance.py::test_nearest_cosine
 tests/test_lance.py::test_roundtrip_schema
+tests/test_lance.py::test_roundtrip_types
 tests/test_lance.py::test_table_roundtrip[False]
 tests/test_lance.py::test_table_roundtrip[True]
 tests/test_lance.py::test_with_row_id[with_row_address-_rowaddr]

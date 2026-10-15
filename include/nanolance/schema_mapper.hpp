@@ -43,10 +43,11 @@ struct LanceSchemaMapping {
 /// An Arrow extension type Lance itself defines (lance.blob.v2, ...), which nanolance lays out on its
 /// own terms. Any other extension type (arrow.fixed_shape_tensor, arrow.uuid, a user's) is stored as
 /// its storage type, with the extension recorded in the field's metadata.
-/// A Lance extension whose field is a logical shell over other fields (a blob struct). lance.json is
-/// not one: it is an ordinary large-binary column holding JSONB.
+/// A Lance extension whose field is a logical shell over other fields (a blob struct). Only
+/// lance.blob.v2 is one. The other lance.* names are ordinary storage-backed columns: lance.json is
+/// large-binary holding JSONB, lance.bfloat16 is fixed_size_binary(2), lance.arrow.* are image types.
 inline bool lance_extension_is_lance_owned(const std::string& extension_name) {
-    return extension_name.rfind("lance.", 0) == 0 && extension_name != "lance.json";
+    return extension_name == "lance.blob.v2";
 }
 
 inline bool lance_field_is_physical(const LanceField& field) {
@@ -173,6 +174,9 @@ inline std::size_t lance_logical_type_value_bytes(const std::string& logical_typ
     // halffloat is 2 bytes. Without this line it fell through to the 8-byte default below, which
     // would have read four rows as one.
     if (logical_type == "int16" || logical_type == "uint16" || logical_type == "halffloat") {
+        return 2U;
+    }
+    if (logical_type == "lance.bfloat16") {  // the element name of a bfloat16 fixed-size list
         return 2U;
     }
     if (logical_type == "int32" || logical_type == "uint32" || logical_type == "float") {
