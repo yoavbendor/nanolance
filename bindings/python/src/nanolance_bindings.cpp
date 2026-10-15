@@ -1423,13 +1423,16 @@ NB_MODULE(_nanolance, m) {
                                  bool update_all, bool insert_all, bool delete_by_source,
                                  const std::string& delete_condition, nb::handle data,
                                  const std::string& update_condition, const std::string& when_matched,
-                                 bool uncommitted) {
+                                 bool uncommitted, const std::vector<std::string>& target_dirs,
+                                 const std::vector<std::uint32_t>& target_base_ids) {
         nano_lance::MergeInsertSpec spec;
         nano_lance::MergeInsertSpec::Uncommitted transaction;
         if (uncommitted) {
             spec.uncommitted = &transaction;
         }
         spec.on = on;
+        spec.target_dirs = target_dirs;
+        spec.target_base_ids = target_base_ids;
         spec.when_matched = !update_all             ? nano_lance::MergeInsertSpec::WhenMatched::DoNothing
                             : update_condition.empty() ? nano_lance::MergeInsertSpec::WhenMatched::UpdateAll
                                                        : nano_lance::MergeInsertSpec::WhenMatched::UpdateIf;

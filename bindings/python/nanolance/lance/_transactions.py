@@ -771,8 +771,6 @@ def encode_operation(op: LanceOperation.BaseOperation) -> Tuple[int, bytes]:
         if op.predicate:
             _put_bytes(out, 3, str(op.predicate).encode())
     elif isinstance(op, L.Overwrite):
-        if op.initial_bases:
-            raise unsupported("Overwrite with initial_bases (multiple base paths)")
         for f in op.fragments:
             _put_bytes(out, 1, _encode_fragment(f))
         messages, metadata = _schema_messages(op.new_schema)
@@ -780,6 +778,14 @@ def encode_operation(op: LanceOperation.BaseOperation) -> Tuple[int, bytes]:
             _put_bytes(out, 2, m)
         for k, v in metadata.items():
             _put_map_entry(out, 3, k.encode(), v.encode())
+        for i, base in enumerate(op.initial_bases or []):
+            entry = bytearray()
+            _put_uint(entry, 1, i + 1)  # ids count from 1 in the order given
+            if base.name is not None:
+                _put_bytes(entry, 2, str(base.name).encode())
+            _put_uint(entry, 3, 1 if base.is_dataset_root else 0)
+            _put_bytes(entry, 4, os.fspath(base.path).encode())
+            _put_bytes(out, 5, bytes(entry))
     elif isinstance(op, L.Rewrite):
         for g in op.groups:
             group = bytearray()

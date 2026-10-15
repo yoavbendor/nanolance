@@ -155,3 +155,10 @@ over the targets per write call), the UpdateBases operation (field 114), a priva
 `LanceDataset._ds.base_paths()` shim that pylance's own tests reach through. Overwrite with
 `initial_bases` in a hand-built transaction is still refused (phase C). Reviewer fix: `add_bases`
 raises its checks as ValueError, as pylance does.
+
+**Phase C outcome (2026-10-15):** done but one test. `write_fragments(target_bases=)`,
+`DataFile.create(base_id=)`, Overwrite transactions with `initial_bases`, DataReplacement into a base
+(the reader now resolves a directory per data file when a fragment's files span bases),
+`merge_insert(...).target_bases / target_all_bases`. Left (reviewer's call): external blob URIs
+under a registered base -- they need the descriptor's blob_id to be the base id, which crosses the
+external-blob writer's URI-dictionary packing; logged in ROADMAP.md.

@@ -77,11 +77,10 @@ class DataFile:
     def create(cls, dataset: "LanceDataset", path: str, *, base_id: Optional[int] = None) -> "DataFile":
         """The record of a Lance file already in the dataset's ``data/`` directory: its columns matched
         to the dataset's fields by name."""
-        if base_id is not None:
-            raise unsupported("DataFile.create with a base_id (multiple base paths)")
+        from nanolance.lance.base_path import _base_data_dir
         from nanolance.lance.file import _footer
 
-        full = os.path.join(dataset.uri, "data", path)
+        full = os.path.join(_base_data_dir(dataset.uri, dataset._info.get("base_paths", []), base_id), path)
         if not os.path.exists(full):
             raise OSError(f"Not found: {full}")
         # The footer's top-level names are enough, and all a file with a blob column offers on its own.
@@ -736,7 +735,7 @@ def _storage_version(data_storage_version: Optional[str], use_legacy_format: Opt
 def _write_uncommitted(data, dataset_uri, schema, *, mode: str, max_rows_per_file: Optional[int],
                        max_bytes_per_file: Optional[int], progress, data_storage_version: Optional[str],
                        single: bool = False, external_blob_mode: str = "reference",
-                       allow_external_blob_outside_bases: bool = False):
+                       allow_external_blob_outside_bases: bool = False, base_setup=None):
     """Write `data` as data files under `dataset_uri` without committing them: the fragments (ids 0,
     to be assigned at commit) and the schema they were written with (a LanceSchema)."""
     from nanolance.lance.dataset import LanceDataset, _coerce_reader, _path_of, _stage_write
@@ -754,7 +753,7 @@ def _write_uncommitted(data, dataset_uri, schema, *, mode: str, max_rows_per_fil
                                       max_rows_per_file=max_rows_per_file, max_bytes_per_file=max_bytes_per_file,
                                       external_blob_mode=external_blob_mode,
                                       allow_external_blob_outside_bases=allow_external_blob_outside_bases,
-                                      keep_empty=False)
+                                      keep_empty=False, setup=base_setup)
     with native():
         messages, fields = writer.take(False)
     fragments = [_decode_fragment(m) for m in messages]
@@ -784,11 +783,9 @@ def write_fragments(data, dataset_uri, schema: Optional[pa.Schema] = None, *, re
     """Write ``data`` into one or more fragments, uncommitted (a distributed write's per-worker step):
     their FragmentMetadata, or with ``return_transaction`` the Transaction that commits them."""
     from nanolance.lance._transactions import LanceOperation, Transaction
-    from nanolance.lance.dataset import LanceDataset, _exists, _path_of
+    from nanolance.lance.dataset import LanceDataset, _base_plan, _exists, _path_of, _set_base_plan
 
     _check_namespace(namespace_client, table_id)
-    if target_bases or target_all_bases or initial_bases:
-        raise unsupported("multiple base paths")
     if external_blob_mode not in ("reference", "ingest"):
         raise ValueError(f"Invalid user input: Invalid external blob mode: {external_blob_mode}")
     if external_blob_mode == "ingest" and allow_external_blob_outside_bases:
@@ -797,18 +794,23 @@ def write_fragments(data, dataset_uri, schema: Optional[pa.Schema] = None, *, re
     if not isinstance(dataset_uri, (str, Path, LanceDataset)):
         raise TypeError(f"Unknown dataset_uri type {type(dataset_uri)}")
     data_storage_version = _storage_version(data_storage_version, use_legacy_format)
+    path = _path_of(dataset_uri)
+    exists = _exists(path)
+    targets = _base_plan(dataset_uri, path, exists, mode, initial_bases, target_bases, target_all_bases)
     fragments, lance_schema = _write_uncommitted(
         data, dataset_uri, schema, mode=mode, max_rows_per_file=max_rows_per_file,
         max_bytes_per_file=max_bytes_per_file, progress=progress, data_storage_version=data_storage_version,
-        external_blob_mode=external_blob_mode, allow_external_blob_outside_bases=allow_external_blob_outside_bases)
+        external_blob_mode=external_blob_mode, allow_external_blob_outside_bases=allow_external_blob_outside_bases,
+        base_setup=lambda writer, exists: _set_base_plan(writer, initial_bases, targets, exists))
     if not return_transaction:
         return fragments
-    path = _path_of(dataset_uri)
-    read_version = LanceDataset(path).latest_version if _exists(path) else 0
+    read_version = LanceDataset(path).latest_version if exists else 0
     if mode == "append":
         operation = LanceOperation.Append(fragments)
     else:
-        operation = LanceOperation.Overwrite(lance_schema, fragments)
+        # A new dataset registers its initial bases with its first version.
+        operation = LanceOperation.Overwrite(lance_schema, fragments,
+                                             initial_bases=None if exists else initial_bases)
     return Transaction(read_version, operation)
 
 

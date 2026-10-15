@@ -219,6 +219,20 @@ public:
         return append || writer_set_field_id_base(&writer_, field_id_base, error);
     }
 
+    bool set_fragment_targets(const std::vector<std::string>& dirs, const std::vector<std::uint32_t>& base_ids,
+                              std::string& error) {
+        std::vector<const char*> paths;
+        for (const auto& dir : dirs) {
+            paths.push_back(dir.c_str());
+        }
+        if (nano_lance_writer_set_fragment_targets(&writer_, paths.size(), paths.data(), base_ids.data()) !=
+            NANO_LANCE_OK) {
+            error = writer_.last_error;
+            return false;
+        }
+        return true;
+    }
+
     /// On an append writer: write only these top-level columns, with the dataset's field ids.
     bool project(const std::vector<std::string>& columns, std::string& error) {
         return writer_project_append(&writer_, columns, error);
@@ -1247,7 +1261,9 @@ bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeIns
                 ++j;
             }
             ArrowArray piece = slice_batch(shared, i, j - i, order);
-            if (!opened && !staged.open(dataset_path, true, 0, error)) {
+            if (!opened && (!staged.open(dataset_path, true, 0, error) ||
+                            (!spec.target_dirs.empty() &&
+                             !staged.set_fragment_targets(spec.target_dirs, spec.target_base_ids, error)))) {
                 piece.release(&piece);
                 return false;
             }

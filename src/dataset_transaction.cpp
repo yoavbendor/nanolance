@@ -263,7 +263,7 @@ struct Operation {
     bool has_schema_metadata = false;
     std::map<std::string, Bytes> schema_metadata;     // Overwrite, Merge
     std::map<std::string, std::string> config_upserts;  // Overwrite
-    bool has_initial_bases = false;
+    std::vector<Bytes> initial_bases;                 // Overwrite: each a lance.table.BasePath
     std::vector<std::uint64_t> fields_modified;       // Update
     std::vector<RewriteGroup> groups;                 // Rewrite
     std::vector<RewrittenIndex> rewritten_indices;    // Rewrite
@@ -321,7 +321,7 @@ bool decode_operation(std::uint32_t kind, const Bytes& message, Operation& op, s
                     auto [k, v] = map_entry(f);
                     op.config_upserts[k] = std::string(v.begin(), v.end());
                 }
-                if (kind == kOverwrite && f.number == 5) op.has_initial_bases = true;
+                if (kind == kOverwrite && f.number == 5) op.initial_bases.push_back(f.bytes());
                 break;
             case kProject:
                 if (f.number == 1) schema.push_back(f);
@@ -835,10 +835,6 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
         return false;
     }
     if (op.kind == kOverwrite) {
-        if (op.has_initial_bases) {
-            error = "Overwrite with initial_bases (multiple base paths) is not supported";
-            return false;
-        }
         if (!overwrite_fragments_valid(op.fragments, error) || !files_have_fields(op.fragments, error)) {
             return false;
         }
@@ -938,6 +934,19 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
             next.index_section_error.clear();
             for (const auto& [k, v] : op.config_upserts) {
                 next.config[k] = v;
+            }
+            if (!op.initial_bases.empty()) {
+                // The bases the dataset registers, ids from 1 in the order given (as Lance numbers them).
+                std::vector<BasePath> bases;
+                for (const auto& message : op.initial_bases) {
+                    BasePath base;
+                    if (!decode_base_path_message(message.data(), message.size(), base, error)) {
+                        return false;
+                    }
+                    base.id = static_cast<std::uint32_t>(bases.size() + 1);
+                    bases.push_back(std::move(base));
+                }
+                write_base_paths(next, bases);
             }
             break;
         }

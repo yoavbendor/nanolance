@@ -49,6 +49,10 @@ struct MergeInsertSpec {
         std::vector<std::uint8_t> operation;
     };
     Uncommitted* uncommitted = nullptr;
+    /// Where the new data files go, in turn: a directory and base id per target (as
+    /// nano_lance_writer_set_fragment_targets). Empty: the dataset's own data directory.
+    std::vector<std::string> target_dirs;
+    std::vector<std::uint32_t> target_base_ids;
 };
 
 struct MergeInsertStats {

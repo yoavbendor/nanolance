@@ -246,3 +246,50 @@ def test_add_bases_duplicate_refused_both_engines(lance, tmp_path, bases):
             ds.add_bases([module.DatasetBasePath(str(p2), name="path1")])
         messages.append("conflict" in str(excinfo.value).lower())
     assert messages == [True, True]
+
+
+def test_write_fragments_into_target_base_same_on_both_engines(lance, tmp_path, bases):
+    """write_fragments(target_bases=) routes its fragments to the named base: the same layout on both
+    engines, and pylance reads what nanolance committed."""
+    p1, p2 = bases
+    result = {}
+    for name, module in {"pylance": lance, "nanolance": nl}.items():
+        root = tmp_path / name
+        root.mkdir()
+        primary = str(root / "primary")
+        module.write_dataset(table(0, 100), primary,
+                             initial_bases=[module.DatasetBasePath(str(root / "p1"), name="path1"),
+                                            module.DatasetBasePath(str(root / "p2"), name="path2")],
+                             target_bases=["path1"], max_rows_per_file=50)
+        ds = module.dataset(primary)
+        fragments = module.fragment.write_fragments(table(100, 50), ds, mode="append", target_bases=["path2"],
+                                                    max_rows_per_file=25)
+        module.LanceDataset.commit(primary, module.LanceOperation.Append(fragments), read_version=ds.version)
+        result[name] = (base_ids(module.dataset(primary)), rows(module.dataset(primary)))
+    assert result["nanolance"] == result["pylance"]
+    assert result["pylance"][0] == [[1], [1], [2], [2]]
+    assert_reads_match(lance, tmp_path / "nanolance" / "primary")
+
+
+def test_merge_insert_into_target_base_same_on_both_engines(lance, tmp_path, bases):
+    """merge_insert(target_bases=) writes its matched and new rows into the named base, as pylance does."""
+    p1, p2 = bases
+    result = {}
+    for name, module in {"pylance": lance, "nanolance": nl}.items():
+        root = tmp_path / name
+        root.mkdir()
+        primary = str(root / "primary")
+        module.write_dataset(table(0, 100), primary,
+                             initial_bases=[module.DatasetBasePath(str(root / "p1"), name="path1"),
+                                            module.DatasetBasePath(str(root / "p2"), name="path2")],
+                             target_bases=["path1"], max_rows_per_file=50)
+        stats = (module.dataset(primary).merge_insert("id").when_matched_update_all()
+                 .when_not_matched_insert_all().target_bases(["path2"]).execute(table(50, 100)))
+        ds = module.dataset(primary)
+        result[name] = (stats["num_updated_rows"], stats["num_inserted_rows"], base_ids(ds), rows(ds))
+    assert result["nanolance"] == result["pylance"]
+    assert result["pylance"][:2] == (50, 50)
+    assert result["pylance"][2][-1] == [2]
+    # pylance reads the merge nanolance committed, rows and base ids alike.
+    pl = lance.dataset(str(tmp_path / "nanolance" / "primary"))
+    assert (base_ids(pl), rows(pl)) == (result["nanolance"][2], result["nanolance"][3])

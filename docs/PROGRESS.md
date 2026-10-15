@@ -3268,3 +3268,23 @@ publishes them.
   packed, inline, dedicated, mixed, packed + null; sidecars from either engine; read back by both).
   `test_blob_writers.py` + `test_blob_kinds.py`: 69 passed. Full Python suite: 2244 collected, exit 0.
   pylance's suite: all 869 expected tests pass.
+
+## Multi-base datasets
+
+pylance 12 keeps data files outside the dataset's own directory: `DatasetBasePath`, `initial_bases`,
+`target_bases` / `target_all_bases`, `add_bases`. Done in three phases, each checked against pylance's
+own tests (`tests/test_multi_base.py`, `test_blob.py`, through `tools/pylance_suite.py`).
+
+- **Read**: a fragment's files may sit in the dataset's directory or in a base (`base_id` on each
+  data file, deletion file and index). The reader resolves each data file's directory on its own,
+  so a fragment whose files span bases reads correctly (a DataReplacement can add a file to a base).
+- **write_dataset and add_bases**: registering bases on create, rotating new fragments over the
+  targets, `UpdateBases` commits for `add_bases`. 21 of pylance's `TestMultiBase` / `TestAddBases`
+  pass.
+- **Fragment-level writes**: `write_fragments` and `merge_insert` take the same target arguments as
+  `write_dataset` (one shared base plan); `DataFile.create(base_id=)` reads from the base's directory;
+  an Overwrite transaction carries `initial_bases`. Passing: `TestWriteFragmentsWithTargetBases`,
+  `TestDataReplacementWithBases`, `TestMergeInsertMultiBase`, and `test_blob_extension_take_blobs_multi_base`.
+- **Not yet**: `test_blob_extension_write_fragments_external_registered_base`. An external blob URI
+  under a registered base must be stored as that base's id plus a relative path; the blob writer
+  packs its own URI-dictionary index in that field today, so it needs its own change.

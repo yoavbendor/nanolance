@@ -1487,6 +1487,9 @@ struct PlannedFile {
     std::uint64_t skip = 0;            // logical rows to drop from the front
     std::uint64_t take = 0;            // logical rows to keep
     std::filesystem::path data_dir;    // where the data files are; empty: <dataset>/data
+    /// Where each data file is, by index, when the files are in different base paths (else empty and
+    /// data_dir holds for all of them).
+    std::vector<std::filesystem::path> file_dirs;
     /// A filtered read a scalar index answered: the only physical rows that may pass (ascending).
     std::shared_ptr<const std::vector<std::uint32_t>> candidates;
     /// With stable row ids: the fragment's row ids, by physical row. Null: a row's id is its address.
@@ -1494,6 +1497,16 @@ struct PlannedFile {
 
     bool partial() const { return skip != 0U || take != rows; }
 };
+
+/// The directory of data file `index` of a planned fragment: its own base path's when the fragment's
+/// files are spread over base paths, else the fragment's directory (<dataset>/data when it has none).
+std::filesystem::path planned_file_dir(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                                       std::size_t index) {
+    if (index < planned.file_dirs.size()) {
+        return planned.file_dirs[index];
+    }
+    return planned.data_dir.empty() ? dataset_path / "data" : planned.data_dir;
+}
 
 /// One column of one data file, as the fragment's read decodes it.
 struct ColumnSource {
@@ -2138,8 +2151,7 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
         // under <dataset>/data/ so a hostile ".."/absolute path can't make the reader open a file
         // outside the dataset. The writer only ever stores a bare filename here, so legitimate
         // datasets are unaffected.
-        const auto jailed = safe_join_under(planned.data_dir.empty() ? dataset_path / "data" : planned.data_dir,
-                                            data_file.path);
+        const auto jailed = safe_join_under(planned_file_dir(dataset_path, planned, f), data_file.path);
         if (!jailed) {
             error = "data file path escapes the dataset directory";
             return false;
@@ -2511,9 +2523,9 @@ bool decode_data_file_rows(const std::filesystem::path& dataset_path, const Plan
     // The columns to take, then taken side by side (each is its own file reads and decode).
     std::vector<std::shared_ptr<const CachedFileMetadata>> files;
     columns.clear();
-    for (const auto& data_file : planned.files) {
-        const auto jailed = safe_join_under(planned.data_dir.empty() ? dataset_path / "data" : planned.data_dir,
-                                            data_file.path);
+    for (std::size_t f = 0; f < planned.files.size(); ++f) {
+        const auto& data_file = planned.files[f];
+        const auto jailed = safe_join_under(planned_file_dir(dataset_path, planned, f), data_file.path);
         if (!jailed) {
             error = "data file path escapes the dataset directory";
             return false;
@@ -2760,22 +2772,19 @@ bool open_read_plan(const std::filesystem::path& dataset_path, const LanceScanRe
     return open_read_plan_from_manifest(dataset_path, manifest, request, plan, out_schema, error);
 }
 
-/// The directory holding a fragment's data files. They must all sit in one: a read plans one directory
-/// per fragment, and a fragment whose files span base paths is refused rather than misread.
-bool fragment_data_dir(const std::filesystem::path& dataset_path, const std::vector<BasePath>& bases,
-                       const pb::DataFragment& fragment, std::filesystem::path& out, std::string& error) {
+/// The fragment's data directory (`out`), and each file's when they differ (`file_dirs`, else empty).
+bool fragment_data_dirs(const std::filesystem::path& dataset_path, const std::vector<BasePath>& bases,
+                        const pb::DataFragment& fragment, std::filesystem::path& out,
+                        std::vector<std::filesystem::path>& file_dirs, std::string& error) {
+    std::vector<std::filesystem::path> dirs(fragment.files.size());
     for (std::size_t i = 0; i < fragment.files.size(); ++i) {
-        std::filesystem::path dir;
-        if (!data_file_dir(dataset_path, bases, fragment.files[i], dir, error)) {
+        if (!data_file_dir(dataset_path, bases, fragment.files[i], dirs[i], error)) {
             return false;
         }
-        if (i == 0) {
-            out = dir;
-        } else if (dir != out) {
-            error = "the data files of fragment " + std::to_string(fragment.id) +
-                    " are in different base paths, which is not supported";
-            return false;
-        }
+    }
+    out = dirs.empty() ? std::filesystem::path() : dirs.front();
+    if (std::any_of(dirs.begin(), dirs.end(), [&](const std::filesystem::path& d) { return d != out; })) {
+        file_dirs = std::move(dirs);
     }
     return true;
 }
@@ -3025,7 +3034,7 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
 
         PlannedFile planned;
         planned.fragment_id = fragment.id;
-        if (!fragment_data_dir(dataset_path, bases, fragment, planned.data_dir, error)) {
+        if (!fragment_data_dirs(dataset_path, bases, fragment, planned.data_dir, planned.file_dirs, error)) {
             release_schema_if_held(out_schema);
             return false;
         }

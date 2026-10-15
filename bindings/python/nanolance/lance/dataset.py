@@ -2286,6 +2286,9 @@ class MergeInsertBuilder:
         self._update_condition = ""
         self._when_matched = ""  # "fail" / "delete"; otherwise by _update_all
         self._write_mode = "auto"
+        self._target_bases = None
+        self._target_all_bases = False
+        self._include_primary = True
 
     def when_matched_update_all(self, condition: Optional[str] = None) -> "MergeInsertBuilder":
         """Update matched rows; with `condition` (SQL over `source.<col>` and `target.<col>`), only
@@ -2313,6 +2316,19 @@ class MergeInsertBuilder:
         if mode not in ("auto", "rewrite_rows", "rewrite_columns"):
             raise ValueError(f"Invalid write_mode: {mode}. Expected one of 'auto', 'rewrite_rows', 'rewrite_columns'")
         self._write_mode = mode
+        return self
+
+    def target_bases(self, bases) -> "MergeInsertBuilder":
+        """The new data files go to these bases, in turn: by name or path (the dataset's own uri is its
+        primary storage)."""
+        self._target_bases = list(bases)
+        return self
+
+    def target_all_bases(self, include_primary: bool = True) -> "MergeInsertBuilder":
+        """The new data files go to every base in turn, the dataset's own storage first unless
+        ``include_primary`` is false."""
+        self._target_all_bases = True
+        self._include_primary = bool(include_primary)
         return self
 
     def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
@@ -2349,10 +2365,11 @@ class MergeInsertBuilder:
                     self._ds.uri, self._on, False, False, self._delete_by_source, self._delete_condition,
                     self._fill_missing_columns(pa.RecordBatchReader.from_batches(keys.schema, keys.to_batches()),
                                                target, read_old=False),
-                    "", "delete", self._uncommitted)
+                    "", "delete", self._uncommitted, *self._targets())
             self._ds._refresh_latest()
             return {k: int(v) for k, v in stats.items()}
         _check_append_schema(target, reader.schema, allow_subset=True)
+        dirs, base_ids = self._targets()
         if self._write_mode == "rewrite_columns":
             if len(reader.schema.names) >= len(target.names) or self._insert_all:
                 raise OSError(
@@ -2378,12 +2395,21 @@ class MergeInsertBuilder:
         with native():
             stats, _, self._transaction = _nanolance._ds_merge_insert(
                 self._ds.uri, self._on, self._update_all, self._insert_all, self._delete_by_source,
-                self._delete_condition, conformed, self._update_condition, self._when_matched, self._uncommitted)
+                self._delete_condition, conformed, self._update_condition, self._when_matched, self._uncommitted,
+                dirs, base_ids)
         self._ds._refresh_latest()
         return {k: int(v) for k, v in stats.items()}
 
     _uncommitted = False
     _transaction = None
+
+    def _targets(self) -> Tuple[List[str], List[int]]:
+        """Where the new data files go, as the native merge takes them: directories and base ids."""
+        if self._target_bases is None and not self._target_all_bases:
+            return [], []
+        plan = _base_plan(self._ds, self._ds.uri, True, "append", None, self._target_bases,
+                          self._target_all_bases, self._include_primary) or []
+        return [directory for directory, _ in plan], [int(base_id) for _, base_id in plan]
 
     def execute_uncommitted(self, data_obj, *, schema: Optional[pa.Schema] = None):
         """The merge's files written but nothing committed: (the Transaction that commits it, its
@@ -3471,21 +3497,7 @@ def write_dataset(
         exists = False
     if mode == "create" and exists:
         raise OSError(f"Dataset already exists: {path}")
-    # Base paths: an existing dataset keeps its own (an overwrite inherits them); a new one registers
-    # initial_bases. New fragments go where target_bases / target_all_bases say, else the dataset's data.
-    bases: list = []
-    if exists and (initial_bases or target_bases or target_all_bases):
-        if initial_bases and mode == "append":
-            raise OSError("Invalid user input: Cannot register new bases in Append mode. "
-                          "Only CREATE mode can register new bases.")
-        if initial_bases:
-            raise unsupported("Overwrite with initial_bases (multiple base paths)")
-        current = uri if isinstance(uri, LanceDataset) else LanceDataset(path)
-        bases = list(current._info.get("base_paths", []))
-    if not exists:
-        bases = _new_base_dicts(initial_bases or [])
-    targets = _fragment_targets(path, bases, target_bases, target_all_bases) if (target_bases or target_all_bases) \
-        else None
+    targets = _base_plan(uri, path, exists, mode, initial_bases, target_bases, target_all_bases)
 
     def setup(writer, exists: bool) -> None:
         if auto_cleanup_options is not None and not exists:
@@ -3505,15 +3517,7 @@ def write_dataset(
         if enable_stable_row_ids:
             with native():
                 writer.set_stable_row_ids(True)
-        if initial_bases and not exists:
-            with native():
-                writer.set_initial_bases([base.path for base in initial_bases],
-                                         [base.name for base in initial_bases],
-                                         [int(bool(base.is_dataset_root)) for base in initial_bases])
-        if targets is not None:
-            with native():
-                writer.set_fragment_targets([directory for directory, _ in targets],
-                                            [int(base_id) for _, base_id in targets])
+        _set_base_plan(writer, initial_bases, targets, exists)
 
     writer, _ = _stage_write(path, reader, mode=mode, max_rows_per_file=max_rows_per_file,
                              max_bytes_per_file=max_bytes_per_file, external_blob_mode=external_blob_mode,
@@ -3523,6 +3527,39 @@ def write_dataset(
     with native():
         writer.finish(code)
     return LanceDataset(path)
+
+
+def _base_plan(uri, path: str, exists: bool, mode: str, initial_bases, target_bases, target_all_bases,
+               include_primary: bool = True):
+    """The base paths a write sees, and where its new fragments go: (directory, base_id) pairs, or None
+    for the dataset's own data. An existing dataset keeps its bases (an overwrite inherits them); a new
+    one registers initial_bases."""
+    bases: list = []
+    if exists and (initial_bases or target_bases or target_all_bases):
+        if initial_bases and mode == "append":
+            raise OSError("Invalid user input: Cannot register new bases in Append mode. "
+                          "Only CREATE mode can register new bases.")
+        if initial_bases:
+            raise unsupported("Overwrite with initial_bases (multiple base paths)")
+        current = uri if isinstance(uri, LanceDataset) else LanceDataset(path)
+        bases = list(current._info.get("base_paths", []))
+    if not exists:
+        bases = _new_base_dicts(initial_bases or [])
+    return _fragment_targets(path, bases, target_bases, target_all_bases, include_primary) \
+        if (target_bases or target_all_bases) else None
+
+
+def _set_base_plan(writer, initial_bases, targets, exists: bool) -> None:
+    """Hand a base plan to the writer: the bases a new dataset registers, and where its fragments go."""
+    if initial_bases and not exists:
+        with native():
+            writer.set_initial_bases([base.path for base in initial_bases],
+                                     [base.name for base in initial_bases],
+                                     [int(bool(base.is_dataset_root)) for base in initial_bases])
+    if targets is not None:
+        with native():
+            writer.set_fragment_targets([directory for directory, _ in targets],
+                                        [int(base_id) for _, base_id in targets])
 
 
 def _stage_write(path: str, reader: pa.RecordBatchReader, *, mode: str, max_rows_per_file: Optional[int],

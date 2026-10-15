@@ -46,23 +46,27 @@ def _new_base_dicts(initial_bases) -> list:
             for i, base in enumerate(initial_bases)]
 
 
-def _base_id_of(reference, bases: list) -> int:
-    """The id of the base a ``target_bases`` entry names: by its name, or by its path."""
+def _base_id_of(reference, bases: list, dataset_uri: str) -> int:
+    """The id of the base a ``target_bases`` entry names: by its name, or by its path. The dataset's own
+    uri names the primary storage, id 0."""
     text = os.fspath(reference)
+    if os.path.normpath(text) == os.path.normpath(dataset_uri):
+        return 0
     for base in bases:
         if base["name"] == text or os.path.normpath(base["path"]) == os.path.normpath(text):
             return base["id"]
     raise OSError(f"Invalid user input: Base reference '{text}' not found in available bases")
 
 
-def _fragment_targets(dataset_uri: str, bases: list, target_bases, target_all_bases) -> list:
+def _fragment_targets(dataset_uri: str, bases: list, target_bases, target_all_bases,
+                      include_primary: bool = True) -> list:
     """Where new fragments go, in turn, as (directory, base_id) pairs (base_id 0: the dataset itself):
-    every base in turn after the dataset with ``target_all_bases``, the named ones in turn with
-    ``target_bases``, else the dataset alone."""
+    every base in turn after the dataset with ``target_all_bases`` (without the dataset when
+    ``include_primary`` is false), the named ones in turn with ``target_bases``, else the dataset alone."""
     if target_all_bases:
-        ids = [0] + [base["id"] for base in bases]
+        ids = ([0] if include_primary else []) + [base["id"] for base in bases]
     elif target_bases:
-        ids = [_base_id_of(reference, bases) for reference in target_bases]
+        ids = [_base_id_of(reference, bases, dataset_uri) for reference in target_bases]
     else:
         ids = [0]
     return [(_base_data_dir(dataset_uri, bases, base_id or None), base_id) for base_id in ids]

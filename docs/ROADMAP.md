@@ -13,7 +13,7 @@ two items the backlog called large are small.
 ## Working order and delegation (2026-10-15)
 
 Order for the remaining work, as agreed: (1) ~~stable row ids~~ (done 2026-10-10); (2) ~~the
-prepared-layout blob writers~~ (done 2026-10-15); (3) multi-base paths; (4) vector index kinds and search breadth
+prepared-layout blob writers~~ (done 2026-10-15); (3) ~~multi-base paths~~ (done 2026-10-15); (4) vector index kinds and search breadth
 (IVF_SQ / IVF_RQ / IVF_HNSW_PQ / FLAT, multivector, Hamming); (5) scalar / full-text breadth
 (ZONEMAP, NGRAM, BLOOMFILTER, fuzzy, tokenizers, FTS on lists); (6) DataOverlay and `commit_lock`;
 (7) branches; (8) torch samplers / Hugging Face, SQL, logging hooks; **last**: object stores and
@@ -28,7 +28,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 | task | definition | implementer | status |
 |---|---|---|---|
 | Prepared-layout blob writers (`PackedBlobWriter`, `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`, descriptor-form blob columns in the file writer) | `docs/tasks/BLOB_WRITERS.md` | Haiku 5.5, reviewed by Opus | ~~done~~ 2026-10-15: phase A (Python writers; reviewed, one fix: coalesced sidecar writes), phase B (C++ descriptor input; end-to-end tests in `tests/test_blob_writers.py`) |
-| Multi-base datasets (`DatasetBasePath`, `initial_bases` / `target_bases` / `target_all_bases`, `add_bases`, fragment writes into bases) | `docs/tasks/MULTI_BASE.md` | Haiku 5.5, reviewed by Opus | phase A (read) and B (`write_dataset`, `add_bases`) done 2026-10-15; C (fragment writes) in progress |
+| Multi-base datasets (`DatasetBasePath`, `initial_bases` / `target_bases` / `target_all_bases`, `add_bases`, fragment writes into bases) | `docs/tasks/MULTI_BASE.md` | Haiku 5.5, reviewed by Opus | ~~done 2026-10-15~~ (three Haiku sessions, reviewed): 30 more of pylance's tests. Left: external blob URIs under a registered base (`test_blob_extension_write_fragments_external_registered_base`), `write_dataset(mode="overwrite", initial_bases=)` on an existing dataset, object-store bases |
 
 Lessons from the first delegated task (blob writers, three Haiku sessions of 95-160k tokens each):
 behaviour measured on pylance and written into the spec (messages, reprs, paths) let phase A land in
@@ -38,6 +38,9 @@ was a 30-line fix; a fresh session per phase kept each one inside its context. N
 "finish" session its known facts up front, and say which pytest flags print a summary.
 
 Small items found by delegated sessions, not yet done:
+- External blob URIs under a registered base path: the descriptor should carry the base id and a
+  base-relative URI (pylance's `test_blob_extension_write_fragments_external_registered_base`).
+  Found by the multi-base phase C session; touches the external-blob writer, so left to Opus.
 - `_take_rows` of a deleted row's address returns the row; pylance leaves it out (plain datasets,
   without stable row ids). Found by the multi-base phase A session.
 
