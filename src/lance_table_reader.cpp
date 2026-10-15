@@ -4,6 +4,7 @@
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/base_paths.hpp"
 #include "nanolance/row_ids.hpp"
+#include "nanolance/roaring_bitmap.hpp"
 
 #include "nanolance/index_search.hpp"
 
@@ -1479,6 +1480,52 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
 /// same rows. `add_columns` produces exactly that -- the computed column lands in a second file
 /// beside the original. Treating each file as its own batch (which this used to do) silently dropped
 /// every column after the first file's.
+}  // namespace
+
+bool decode_row_addr_treemap(const std::uint8_t* data, std::size_t size, RowAddrMask::Rows& rows,
+                             std::string& error) {
+    const auto invalid = [&](const char* why) {
+        error = std::string("invalid row address mask: ") + why;
+        return false;
+    };
+    if (size < 4U) {
+        return invalid("truncated");
+    }
+    std::uint32_t count = 0;
+    std::memcpy(&count, data, 4);
+    std::size_t at = 4;
+    std::vector<std::uint32_t> offsets;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (size - at < 8U) {
+            return invalid("truncated");
+        }
+        std::uint32_t fragment = 0;
+        std::uint32_t bytes = 0;
+        std::memcpy(&fragment, data + at, 4);
+        std::memcpy(&bytes, data + at + 4, 4);
+        at += 8;
+        if (bytes == 0U || size - at < bytes) {
+            return invalid("a fragment's bitmap is missing or truncated");
+        }
+        offsets.clear();
+        if (!roaring::decode(data + at, bytes, offsets, error)) {
+            error = "invalid row address mask: " + error;
+            return false;
+        }
+        at += bytes;
+        auto& to = rows[fragment];
+        to.insert(to.end(), offsets.begin(), offsets.end());
+        std::sort(to.begin(), to.end());
+        to.erase(std::unique(to.begin(), to.end()), to.end());
+    }
+    if (at != size) {
+        return invalid("trailing bytes");
+    }
+    return true;
+}
+
+namespace {
+
 struct PlannedFile {
     std::vector<pb::DataFile> files;
     /// The fragment's data overlays (oldest first); null when it has none.
@@ -1495,6 +1542,8 @@ struct PlannedFile {
     std::vector<std::filesystem::path> file_dirs;
     /// A filtered read a scalar index answered: the only physical rows that may pass (ascending).
     std::shared_ptr<const std::vector<std::uint32_t>> candidates;
+    /// A row-address mask: per physical row, 1 where the mask allows it. Null: no mask.
+    std::shared_ptr<const std::vector<std::uint8_t>> mask_keep;
     /// With stable row ids: the fragment's row ids, by physical row. Null: a row's id is its address.
     std::shared_ptr<const RowIdSequence> row_ids;
 
@@ -2373,8 +2422,8 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
             keep[row] = 0U;
         }
     }
-    const auto logical = keep.empty() ? physical
-                                      : static_cast<std::uint64_t>(std::count(keep.begin(), keep.end(), 1U));
+    auto logical = keep.empty() ? physical
+                                : static_cast<std::uint64_t>(std::count(keep.begin(), keep.end(), 1U));
     // The plan's skip/take came from the MANIFEST's per-fragment row count, while the rows are here in
     // the data file. If the two disagree, the arithmetic that decided which files to skip was wrong,
     // and a silently misaligned row range is exactly the failure this must not have.
@@ -2382,6 +2431,22 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
         error = "data file holds " + std::to_string(logical) + " rows but the manifest claims " +
                 std::to_string(planned.rows) + "; refusing to guess which rows a range covers";
         return false;
+    }
+    if (planned.mask_keep != nullptr) {
+        // A row-address mask excludes rows the way deletions do: the rows it allows are the rows here.
+        if (planned.mask_keep->size() != physical) {
+            error = "row address mask covers " + std::to_string(planned.mask_keep->size()) + " rows but the data "
+                    "file holds " + std::to_string(length);
+            return false;
+        }
+        if (keep.empty()) {
+            keep = *planned.mask_keep;
+        } else {
+            for (std::size_t r = 0; r < keep.size(); ++r) {
+                keep[r] &= (*planned.mask_keep)[r];
+            }
+        }
+        logical = static_cast<std::uint64_t>(std::count(keep.begin(), keep.end(), 1U));
     }
     const auto want_first = planned.partial() ? planned.skip : 0U;
     const auto want_end = planned.partial() ? planned.skip + planned.take : logical;
@@ -3130,11 +3195,14 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
         }
     }
     // A filtered read decodes whole fragments; its range counts the rows that pass the filter.
-    if (plan.filter && !range.is_whole_dataset()) {
+    // A row-address mask counts like a filter: the range is applied to the rows it lets through, and the
+    // planning arithmetic over manifest row counts never sees a masked row.
+    const bool has_mask = request.row_mask != nullptr;
+    if ((plan.filter || has_mask) && !range.is_whole_dataset()) {
         plan.has_post_range = true;
         plan.post_range = range;
     }
-    const bool ranged = !plan.filter && !range.is_whole_dataset();
+    const bool ranged = !plan.filter && !has_mask && !range.is_whole_dataset();
     std::vector<BasePath> bases;
     if (!read_base_paths(manifest, bases, error)) {
         release_schema_if_held(out_schema);
@@ -3191,6 +3259,20 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
         planned.physical_rows = fragment.physical_rows;
         planned.rows = rows;
 
+        std::shared_ptr<const std::vector<std::uint8_t>> mask_keep;
+        if (has_mask) {
+            auto allowed = std::make_shared<std::vector<std::uint8_t>>(static_cast<std::size_t>(fragment.physical_rows));
+            std::uint64_t kept = 0;
+            for (std::uint64_t r = 0; r < fragment.physical_rows; ++r) {
+                (*allowed)[static_cast<std::size_t>(r)] = request.row_mask->allows((fragment.id << 32U) | r) ? 1U : 0U;
+                kept += (*allowed)[static_cast<std::size_t>(r)];
+            }
+            if (kept == 0U) {
+                continue;  // the mask lets none of its rows through
+            }
+            mask_keep = std::move(allowed);
+        }
+
         if (!ranged) {
             const auto answered = candidates.rows.find(fragment.id);
             if (answered != candidates.rows.end()) {
@@ -3198,13 +3280,15 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
                 if (answered->second.empty()) {
                     continue;  // no row of it can pass
                 }
-                // Too many rows to pick out one by one: reading the fragment through is faster.
-                if (answered->second.size() * 8U < fragment.physical_rows) {
+                // Too many rows to pick out one by one: reading the fragment through is faster. (A mask is
+                // applied to whole fragments, so candidates are not used with one.)
+                if (answered->second.size() * 8U < fragment.physical_rows && !has_mask) {
                     planned.candidates =
                         std::make_shared<const std::vector<std::uint32_t>>(std::move(answered->second));
                 }
             }
             planned.files = std::move(fragment.files);
+            planned.mask_keep = std::move(mask_keep);
             planned.skip = 0U;
             planned.take = rows;
             plan.files.push_back(std::move(planned));

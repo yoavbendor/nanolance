@@ -447,12 +447,37 @@ std::pair<std::vector<std::uint64_t>, std::vector<std::uint64_t>> ds_row_version
     return {std::move(created), std::move(updated)};
 }
 
+/// The row-address masks (serialize_row_addrs bytes; None: no mask), decoded once. ValueError when malformed.
+std::optional<nano_lance::RowAddrMask> row_addr_mask(const std::optional<nb::bytes>& allowlist,
+                                                     const std::optional<nb::bytes>& blocklist) {
+    if (!allowlist && !blocklist) {
+        return std::nullopt;
+    }
+    nano_lance::RowAddrMask mask;
+    std::string error;
+    if (allowlist) {
+        mask.has_allowlist = true;
+        if (!nano_lance::decode_row_addr_treemap(reinterpret_cast<const std::uint8_t*>(allowlist->c_str()),
+                                                 allowlist->size(), mask.allowlist, error)) {
+            throw nb::value_error(error.c_str());
+        }
+    }
+    if (blocklist && !nano_lance::decode_row_addr_treemap(reinterpret_cast<const std::uint8_t*>(blocklist->c_str()),
+                                                          blocklist->size(), mask.blocklist, error)) {
+        throw nb::value_error(error.c_str());
+    }
+    return mask;
+}
+
 nb::object ds_scan(const std::filesystem::path& path, std::optional<std::uint64_t> version,
                    std::optional<std::vector<std::string>> columns,
                    std::optional<std::vector<std::uint64_t>> fragment_ids, std::uint64_t offset, std::int64_t length,
                    bool with_row_id, bool with_row_address, bool stream, std::optional<std::string> filter,
-                   int blob_handling, bool use_scalar_index, bool include_deleted_rows) {
+                   int blob_handling, bool use_scalar_index, bool include_deleted_rows,
+                   std::optional<nb::bytes> row_addr_allowlist, std::optional<nb::bytes> row_addr_blocklist) {
     auto request = make_request(version, columns, fragment_ids, with_row_id, with_row_address);
+    const auto mask = row_addr_mask(row_addr_allowlist, row_addr_blocklist);
+    request.row_mask = mask ? &*mask : nullptr;
     request.use_scalar_index = use_scalar_index;
     request.include_deleted_rows = include_deleted_rows;
     request.blob_handling = static_cast<nano_lance::BlobHandling>(blob_handling);
@@ -1106,7 +1131,8 @@ NB_MODULE(_nanolance, m) {
           nb::arg("fragment_ids").none(), nb::arg("offset"), nb::arg("length"), nb::arg("with_row_id"),
           nb::arg("with_row_address"), nb::arg("stream"), nb::arg("filter").none() = nb::none(),
           nb::arg("blob_handling") = 0, nb::arg("use_scalar_index") = true,
-          nb::arg("include_deleted_rows") = false);
+          nb::arg("include_deleted_rows") = false, nb::arg("row_addr_allowlist").none() = nb::none(),
+          nb::arg("row_addr_blocklist").none() = nb::none());
     m.def("_ds_take", &ds_take, nb::arg("path"), nb::arg("version").none(), nb::arg("rows"),
           nb::arg("columns").none(), nb::arg("with_row_id"), nb::arg("with_row_address"), nb::arg("addresses"),
           nb::arg("blob_handling") = 0);
@@ -1864,8 +1890,11 @@ NB_MODULE(_nanolance, m) {
                             std::optional<std::uint32_t> refine_factor, std::optional<std::string> metric,
                             bool use_index, std::optional<float> lower_bound, std::optional<float> upper_bound,
                             std::optional<std::string> filter, bool prefilter, bool fast_search,
-                            std::optional<std::uint32_t> ef, bool index_cache, const std::vector<nb::bytes>& segments) {
+                            std::optional<std::uint32_t> ef, bool index_cache, const std::vector<nb::bytes>& segments,
+                            std::optional<nb::bytes> row_addr_allowlist, std::optional<nb::bytes> row_addr_blocklist) {
         nano_lance::NearestQuery q;
+        const auto mask = row_addr_mask(row_addr_allowlist, row_addr_blocklist);
+        q.row_mask = mask ? &*mask : nullptr;
         q.ef = ef;
         q.index_cache = index_cache;
         for (const auto& s : segments) {
@@ -1923,8 +1952,12 @@ NB_MODULE(_nanolance, m) {
     });
     m.def("_ds_full_text_search", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
                                      const std::string& query, std::optional<std::uint64_t> limit,
-                                     std::optional<std::string> filter, bool prefilter, bool fast_search) {
+                                     std::optional<std::string> filter, bool prefilter, bool fast_search,
+                                     std::optional<nb::bytes> row_addr_allowlist,
+                                     std::optional<nb::bytes> row_addr_blocklist) {
         nano_lance::FtsSearchRequest r;
+        const auto mask = row_addr_mask(row_addr_allowlist, row_addr_blocklist);
+        r.row_mask = mask ? &*mask : nullptr;
         r.has_version = version.has_value();
         r.version = version.value_or(0);
         std::string error;

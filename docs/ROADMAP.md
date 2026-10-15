@@ -32,7 +32,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 | Vector-index API gaps: validation, describe / explain, cache stats, `create_index(ivf_centroids=, pq_codebook=, progress=...)` (no new formats) | `docs/tasks/VECTOR_API.md` | Haiku 5.5, reviewed by Opus | V1a done 2026-10-15 (13 of 15, +20 pylance tests); V1b done (12 of 15, +12). Reviewer first: `has_index` as a property (6 tests) |
 | ZONEMAP and BLOOMFILTER scalar indexes (build, search, maintain; Parquet SBBF) | `docs/tasks/ZONED_INDEXES.md` | Haiku 5.5, reviewed by Opus | ~~done 2026-10-15~~: Z1 ZONEMAP (+13), Z2 BLOOMFILTER (+5; bit-for-bit SBBF) |
 | IVF_SQ, IVF_HNSW_PQ, IVF_HNSW_FLAT (storage x sub-index recombinations) | `docs/tasks/VECTOR_COMBOS.md` | Haiku 5.5, reviewed by Opus | ~~done 2026-10-15~~: C1 read + search, C2 build (+4) |
-| Small items 1: `row_addr_allowlist` / `serialize_row_addrs` (12 tests), `VectorIndexReader`, `_take_rows` of deleted rows | `docs/tasks/SMALL_ITEMS_1.md` | Haiku 5.5, reviewed by Opus | queued |
+| Small items 1: `row_addr_allowlist` / `serialize_row_addrs` (12 tests), `VectorIndexReader`, `_take_rows` of deleted rows | `docs/tasks/SMALL_ITEMS_1.md` | Haiku 5.5, reviewed by Opus | item 1 done 2026-10-15 (+12); items 2-3 in progress |
 | IVF_RQ (RaBitQ), Hamming / binary vectors, NGRAM, fuzzy FTS, more tokenizers | (Opus: format research first) | -- | not yet specified |
 
 Lessons from the first delegated task (blob writers, three Haiku sessions of 95-160k tokens each):

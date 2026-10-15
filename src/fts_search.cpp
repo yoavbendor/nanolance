@@ -847,6 +847,8 @@ struct RowMask {
     std::set<std::uint32_t> fragments;
     /// With stable row ids the rows this is asked about are ids, which this turns into addresses.
     const RowIdToAddress* resolver = nullptr;
+    /// The caller's row-address masks, which every row must pass as well (null: none).
+    const RowAddrMask* caller = nullptr;
 
     /// `cover`: the fragments the index segment holding the row covers -- with stable row ids a
     /// row that was updated or compacted since has an entry in the old segment too, which is stale.
@@ -855,6 +857,9 @@ struct RowMask {
             if (!resolver->find(addr, addr) || (cover != nullptr && cover->count(static_cast<std::uint32_t>(addr >> 32U)) == 0U)) {
                 return false;  // an id whose row is gone, or moved out of the segment's fragments
             }
+        }
+        if (caller != nullptr && !caller->allows(addr)) {
+            return false;  // the caller's mask (`addr` is an address by now)
         }
         const auto frag = static_cast<std::uint32_t>(addr >> 32U);
         if (!cached_ || frag != cached_frag_) {
@@ -1103,6 +1108,7 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
     }
     const std::vector<std::string> cols = {c.name};
     LanceScanRequest scan;
+    scan.row_mask = request->row_mask;
     scan.columns = &cols;
     scan.has_version = request->has_version;
     scan.version = request->version;
@@ -1688,6 +1694,7 @@ bool row_addresses(const std::filesystem::path& path, const FtsSearchRequest& q,
                    std::vector<std::uint64_t>& out, std::string& error) {
     const std::vector<std::string> none;
     LanceScanRequest request;
+    request.row_mask = q.row_mask;
     request.columns = &none;
     request.has_version = q.has_version;
     request.version = q.version;
@@ -1744,6 +1751,7 @@ bool post_filter(const std::filesystem::path& path, const FtsSearchRequest& q, H
     std::sort(addrs.begin(), addrs.end());
     addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
     LanceScanRequest request;
+    request.row_mask = q.row_mask;
     request.columns = &columns;
     request.has_version = q.has_version;
     request.version = q.version;
@@ -1837,6 +1845,7 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
         return false;
     }
     s.mask.resolver = &s.resolver;
+    s.mask.caller = request.row_mask;
     const std::set<std::array<std::uint8_t, 16>> chosen(request.segments.begin(), request.segments.end());
     for (const auto& uuid : chosen) {
         bool known = false;

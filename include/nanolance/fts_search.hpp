@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "nanolance/lance_table_reader.hpp"
 #include "nanolance/fts_tokenizer.hpp"
 
 /// Full-text search over text columns with an INVERTED index (built by Lance or by nanolance;
@@ -70,6 +71,8 @@ struct FtsSearchRequest {
     /// An SQL filter: applied before the search with `prefilter`, else to the rows found.
     std::optional<std::string> filter;
     bool prefilter = false;
+    /// Row-address masks: the top hits are taken over the rows they allow (null: no mask).
+    const RowAddrMask* row_mask = nullptr;
     /// Search only the fragments the index covers.
     bool fast_search = false;
     /// When set, search only these segments (by UUID) of the columns' indexes -- one worker's share

@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "nanolance/lance_table_reader.hpp"
+
 /// Nearest-neighbour search over a vector column (a fixed-size list of floats), as Lance's
 /// `nearest` answers it: from the column's IVF_FLAT / IVF_PQ index where there is one (built by
 /// Lance or by nanolance; docs/VECTOR_INDEX.md), exactly over the fragments it does not cover, and
@@ -56,6 +58,8 @@ struct NearestQuery {
     /// nearest (fewer may pass).
     std::optional<std::string> filter;
     bool prefilter = false;
+    /// Row-address masks: the top k is taken over the rows they allow (null: no mask).
+    const RowAddrMask* row_mask = nullptr;
     /// Search only the fragments the index covers.
     bool fast_search = false;
     /// When set, search these segments (by UUID) of the column's index and nothing else -- no exact

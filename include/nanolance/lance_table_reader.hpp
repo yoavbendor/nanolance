@@ -5,6 +5,7 @@
 
 #include <nanoarrow/nanoarrow.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -56,6 +57,33 @@ enum class BlobHandling {
     Locations,
 };
 
+/// The caller's row-address masks (row_addr_allowlist / row_addr_blocklist), per fragment: the physical
+/// offsets listed, ascending. A row passes when it is listed by the allowlist (if there is one) and not
+/// listed by the blocklist. Decoded once from serialize_row_addrs bytes (decode_row_addr_treemap).
+struct RowAddrMask {
+    using Rows = std::map<std::uint64_t, std::vector<std::uint32_t>>;
+    bool has_allowlist = false;
+    Rows allowlist;
+    Rows blocklist;
+
+    /// Whether the row at `address` (fragment id in the high 32 bits, offset in the low) passes.
+    bool allows(std::uint64_t address) const {
+        return (!has_allowlist || listed(allowlist, address)) && !listed(blocklist, address);
+    }
+
+private:
+    static bool listed(const Rows& rows, std::uint64_t address) {
+        const auto it = rows.find(address >> 32U);
+        return it != rows.end() &&
+               std::binary_search(it->second.begin(), it->second.end(), static_cast<std::uint32_t>(address));
+    }
+};
+
+/// Decode a serialized RowAddrTreeMap into `rows` (appended to; each fragment's offsets sorted). False,
+/// with `error` naming an "invalid row address mask", when the bytes are malformed.
+bool decode_row_addr_treemap(const std::uint8_t* data, std::size_t size, RowAddrMask::Rows& rows,
+                             std::string& error);
+
 struct LanceScanRequest {
     /// Top-level columns to read (their children come along). Null reads every column; an empty list
     /// reads none, which is only useful with a row id column.
@@ -83,6 +111,9 @@ struct LanceScanRequest {
     /// With a filter: read only the rows the dataset's scalar indices say may pass (BTree, Bitmap,
     /// LabelList; index_search.hpp). The rows returned are the same either way.
     bool use_scalar_index = true;
+    /// Row-address masks: only the rows the mask allows are read, before the filter, the range and any
+    /// ranking. With a mask, `range` counts the rows that pass it (as with a filter). Null: no mask.
+    const RowAddrMask* row_mask = nullptr;
 };
 
 /// The Arrow schema of Lance schema fields (lance.file.Field records, parents first) and schema

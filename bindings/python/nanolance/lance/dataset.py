@@ -564,6 +564,8 @@ class LanceDataset(pa.dataset.Dataset):
         substrait_filter=None,
         blob_handling=None,
         index_segments=None,
+        row_addr_allowlist=None,
+        row_addr_blocklist=None,
         **kwargs,
     ) -> "LanceScanner":
         options = dict(self._default_scan_options)
@@ -574,7 +576,8 @@ class LanceDataset(pa.dataset.Dataset):
             substrait_filter=substrait_filter, scan_stats_callback=scan_stats_callback, blob_handling=blob_handling,
             use_scalar_index=use_scalar_index, prefilter=prefilter, fast_search=fast_search,
             disable_scoring_autoprojection=disable_scoring_autoprojection, batch_size_bytes=batch_size_bytes,
-            index_segments=index_segments,
+            index_segments=index_segments, row_addr_allowlist=row_addr_allowlist,
+            row_addr_blocklist=row_addr_blocklist,
         )
         options.update({k: v for k, v in given.items() if v is not None})
         return LanceScanner(self, **options)
@@ -2896,7 +2899,8 @@ class LanceScanner(pa.dataset.Scanner):
                  batch_size=None, fragments=None, full_text_query=None, with_row_id=False, with_row_address=False,
                  include_deleted_rows=None, order_by=None, substrait_filter=None, scan_stats_callback=None,
                  blob_handling=None, use_scalar_index=None, prefilter=None, fast_search=None,
-                 disable_scoring_autoprojection=None, batch_size_bytes=None, index_segments=None, **ignored):
+                 disable_scoring_autoprojection=None, batch_size_bytes=None, index_segments=None,
+                 row_addr_allowlist=None, row_addr_blocklist=None, **ignored):
         self._args = {k: v for k, v in locals().items() if k not in ("self", "ds", "ignored", "__class__")}
         self._args.update(ignored)
         # order_by: the scan without limit and offset (and with the sort columns), sorted, then sliced.
@@ -2993,6 +2997,11 @@ class LanceScanner(pa.dataset.Scanner):
         self._with_row_id = bool(with_row_id)
         self._with_row_address = bool(with_row_address)
         self._use_scalar_index = use_scalar_index is not False
+        # Row-address masks (serialize_row_addrs bytes): the native scan decodes them and applies them
+        # before the filter, the range and any ranking; offset and limit then count the rows they allow.
+        self._mask = {"row_addr_allowlist": None if row_addr_allowlist is None else bytes(row_addr_allowlist),
+                      "row_addr_blocklist": None if row_addr_blocklist is None else bytes(row_addr_blocklist)}
+        self._masked = any(v is not None for v in self._mask.values())
 
     def _read_with_deleted(self) -> pa.Table:
         """Every physical row, deleted ones too -- those with a null `_rowid`, as Lance returns them."""
@@ -3002,7 +3011,7 @@ class LanceScanner(pa.dataset.Scanner):
         with native():
             table = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version, self._names, self._fragment_ids,
                                                  self._offset, length, True, True, False, self._filter,
-                                                 self._blob_handling, False, True))
+                                                 self._blob_handling, False, True, **self._mask))
             live = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version, [], self._fragment_ids, 0, -1,
                                                 False, True, False, None, 0, False))
         alive = pc.is_in(table.column("_rowaddr"), value_set=live.column("_rowaddr").combine_chunks())
@@ -3015,7 +3024,7 @@ class LanceScanner(pa.dataset.Scanner):
     def _read(self, stream: bool):
         if self._include_deleted:
             return self._read_with_deleted()
-        if self._filter is None:
+        if self._filter is None and not self._masked:
             n = self._ds.count_rows() if self._fragment_ids is None else sum(
                 self._ds.get_fragment(i).count_rows() for i in self._fragment_ids
             )
@@ -3028,11 +3037,11 @@ class LanceScanner(pa.dataset.Scanner):
             with native():
                 return _nanolance._ds_scan(self._ds.uri, self._ds.version, [], self._fragment_ids, offset, length,
                                            False, True, stream, self._filter, self._blob_handling,
-                                           self._use_scalar_index)
+                                           self._use_scalar_index, **self._mask)
         with native():
             return _nanolance._ds_scan(self._ds.uri, self._ds.version, self._names, self._fragment_ids, offset,
                                        length, self._with_row_id, self._with_row_address, stream, self._filter,
-                                       self._blob_handling, self._use_scalar_index)
+                                       self._blob_handling, self._use_scalar_index, **self._mask)
 
     _drop_rowaddr = False
     _address_requested = False
@@ -3166,7 +3175,7 @@ class LanceScanner(pa.dataset.Scanner):
             table = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version,
                                                  None if names is None else names + extra, self._fragment_ids, 0, -1,
                                                  stable, True, False, None, self._blob_handling,
-                                                 self._use_scalar_index))
+                                                 self._use_scalar_index, **self._mask))
         address = table.column("_rowaddr")
         # without stable row ids, a row's id is its address
         probe = table if stable else table.append_column("_rowid", address)
@@ -3192,7 +3201,8 @@ class LanceScanner(pa.dataset.Scanner):
                 self._ds.uri, self._ds.version, n["column"], n["q"], n["k"], n["minimum_nprobes"],
                 n["maximum_nprobes"], n["refine_factor"], n["metric"], n["use_index"], n["lower_bound"],
                 n["upper_bound"], self._filter, self._prefilter, self._fast_search, n.get("ef"),
-                self._ds._index_cache_enabled(), self._index_segments)
+                self._ds._index_cache_enabled(), self._index_segments, self._mask["row_addr_allowlist"],
+                self._mask["row_addr_blocklist"])
         self._ds._count_index_cache(hits, misses)
         return ids, distances, plan
 
@@ -3229,7 +3239,8 @@ class LanceScanner(pa.dataset.Scanner):
         limit = None if self._limit is None else self._offset + self._limit
         with native():
             return _nanolance._ds_full_text_search(self._ds.uri, self._ds.version, self._fts, limit, self._filter,
-                                                   self._prefilter, self._fast_search)
+                                                   self._prefilter, self._fast_search,
+                                                   self._mask["row_addr_allowlist"], self._mask["row_addr_blocklist"])
 
     def _fts_table(self) -> pa.Table:
         """The matching rows, best first: the columns asked for, then ``_score`` (then the row id columns)."""
@@ -3362,6 +3373,10 @@ class ScannerBuilder:
 
     def batch_size(self, batch_size: int) -> "ScannerBuilder":
         return self._set(batch_size=batch_size)
+
+    def row_addr_prefilter(self, allowlist=None, blocklist=None) -> "ScannerBuilder":
+        """Restrict the scan to the row addresses in `allowlist` and not in `blocklist` (serialize_row_addrs bytes)."""
+        return self._set(row_addr_allowlist=allowlist, row_addr_blocklist=blocklist)
 
     def with_row_id(self, enabled: bool = True) -> "ScannerBuilder":
         return self._set(with_row_id=enabled)

@@ -1004,6 +1004,8 @@ struct RowMask {
     std::uint64_t count = 0;
     /// With stable row ids the index holds ids, not addresses: this finds the address of one.
     const RowIdToAddress* resolver = nullptr;
+    /// The caller's row-address masks, which every candidate must pass as well (null: none).
+    const RowAddrMask* caller = nullptr;
 
     /// Index the above by fragment id; call once they are set.
     void seal() {
@@ -1023,6 +1025,9 @@ struct RowMask {
     bool allows(std::uint64_t id) const {
         if (resolver != nullptr && resolver->stable() && !resolver->find(id, id)) {
             return false;  // an id whose row is gone
+        }
+        if (caller != nullptr && !caller->allows(id)) {
+            return false;  // the caller's mask (`id` is an address by now)
         }
         const auto frag = static_cast<std::uint32_t>(id >> 32U);
         const auto offset = id & 0xFFFFFFFFULL;
@@ -1047,6 +1052,7 @@ bool row_addresses(const std::filesystem::path& path, const NearestQuery& q, con
                    const std::string* filter, std::vector<std::uint64_t>& out, std::string& error) {
     const std::vector<std::string> none;
     LanceScanRequest request;
+    request.row_mask = q.row_mask;
     request.columns = &none;
     request.has_version = q.has_version;
     request.version = q.version;
@@ -1755,6 +1761,7 @@ bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMet
     addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
     const std::vector<std::string> columns = {q.column};
     LanceScanRequest request;
+    request.row_mask = q.row_mask;
     request.columns = &columns;
     request.has_version = q.has_version;
     request.version = q.version;
@@ -1799,6 +1806,7 @@ bool flat_search(const std::filesystem::path& path, const NearestQuery& q, Vecto
     }
     const std::vector<std::string> columns = {q.column};
     LanceScanRequest request;
+    request.row_mask = q.row_mask;
     request.columns = &columns;
     request.has_version = q.has_version;
     request.version = q.version;
@@ -1873,6 +1881,7 @@ bool post_filter(const std::filesystem::path& path, const NearestQuery& q, std::
     std::sort(addrs.begin(), addrs.end());
     addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
     LanceScanRequest request;
+    request.row_mask = q.row_mask;
     request.columns = &columns;
     request.has_version = q.has_version;
     request.version = q.version;
@@ -2228,6 +2237,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         for (std::size_t s = 0; s < loaded.size(); ++s) {
             RowMask mask;
             mask.resolver = &resolver;
+            mask.caller = q.row_mask;
             for (const auto& f : manifest.fragments) {
                 mask.physical[static_cast<std::uint32_t>(f.id)] = f.physical_rows;
             }

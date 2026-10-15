@@ -90,3 +90,8 @@ rest of item 1:**
 - Oracle: run pylance's tests through `python3 tools/pylance_suite.py -k "row_addr or serialize_row_addrs or allowlist or blocklist"`
   -- the runner loads nanolance as `lance`; plain `pytest` in `.deps/pylance-tests` tests pylance itself.
 - Add tests to `test_row_addr_masks.py` only as they pass (both engines, same rows).
+
+**Session 2 (2026-10-15):** item 1 done -- `row_addr_allowlist` / `row_addr_blocklist` in scans, filters,
+KNN (all index kinds), FTS and overlay rows, the malformed-mask error; all 12 of pylance's
+`test_row_addr_prefilter.py`. A mask turns off scalar-index candidates for that scan (correct, slower);
+a mask with `include_deleted_rows` masks the table scan only (untested). Items 2 and 3 next.
