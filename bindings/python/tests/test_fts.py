@@ -525,3 +525,69 @@ def test_block_256_top_k_scores_match(lance, tmp_path):
                 got = [s for _, s in _search(mod, path, _match(mod, text, "OR"), limit=limit)]
                 assert got == pytest.approx(ref, abs=1e-5)
 
+
+
+# ── the code analyzer ─────────────────────────────────────────────────────────────────────────────
+
+CODE_PIECES = (
+    "getUserName set_user_name user-name username parseHTML2JSON utf8_reader XMLHttpRequest HTTP2Server "
+    "snake_case_id __init__ value.parse::<usize>() value.parse<usize>() a->b c->d x!=y x=>y std::vec::Vec "
+    "Option<T> Vec::new() i+=1 ptr?.next naïveCAFÉ ÉtatCivil 0x1F count user name").split(" ")
+CODE_QUERIES = [("user", "OR"), ("user name", "AND"), ("getUserName", "AND"), ("parse", "OR"), ("::", "OR"),
+                ("->", "OR"), ("value.parse::<usize>()", "OR"), ("HTTP", "OR"), ("vec new", "AND"),
+                ("snake_case_id __init__", "OR")]
+CODE_OPTIONS = [
+    pytest.param({}, id="defaults"),
+    pytest.param({"split_identifiers": True}, id="split"),
+    pytest.param({"split_identifiers": True, "split_on_numerics": False, "preserve_original": False,
+                  "index_operators": True}, id="operators"),
+]
+
+
+def _code_table(n=400, seed=7):
+    rng = random.Random(seed)
+    texts = [" ".join(rng.choice(CODE_PIECES) for _ in range(rng.randint(2, 6))) for _ in range(n)]
+    return pa.table({"id": pa.array(range(n), pa.int64()), "text": pa.array(texts, pa.string())}), texts
+
+
+def _index_params(mod, path, column="text"):
+    return mod.dataset(path).stats.index_stats(f"{column}_idx")["indices"][0]["params"]
+
+
+@pytest.mark.parametrize("block_size", [128, 256])
+@pytest.mark.parametrize("options", CODE_OPTIONS)
+def test_code_analyzer_index_matches_pylance(lance, tmp_path, block_size, options):
+    table, _ = _code_table()
+    for who, mod in (("p", lance), ("n", nl)):  # one fragment: the same token numbering in both builds
+        mod.write_dataset(table, str(tmp_path / f"{who}.lance"))
+        mod.dataset(str(tmp_path / f"{who}.lance")).create_scalar_index(
+            "text", "INVERTED", analyzer="code", block_size=block_size, **options)
+    p, n = str(tmp_path / "p.lance"), str(tmp_path / "n.lance")
+    for path in (p, n):
+        assert lance.dataset(path).describe_indices()[0].segments[0].index_version == 3
+        assert nl.dataset(path).describe_indices()[0].segments[0].index_version == 3
+    assert _index_params(lance, p) == _index_params(nl, n)
+    assert _index_params(nl, n)["base_tokenizer"] == "code"
+    assert lance.dataset(p).describe_indices()[0].details == nl.dataset(n).describe_indices()[0].details
+    for text, operator in CODE_QUERIES:
+        ref = _search(lance, p, _match(lance, text, operator))
+        _same_scores(ref, _search(lance, n, _match(lance, text, operator)))  # pylance reads nanolance's build
+        _same_scores(ref, _search(nl, p, _match(nl, text, operator)))  # nanolance reads pylance's build
+        _same_scores(ref, _search(nl, n, _match(nl, text, operator)))
+    if options.get("index_operators"):
+        assert _search(lance, p, _match(lance, "::", "OR")) and _search(lance, p, _match(lance, "->", "OR"))
+
+
+@pytest.mark.parametrize(("kwargs", "message"), [
+    ({"analyzer": "text", "base_tokenizer": "code"}, "base_tokenizer='code' requires analyzer='code'"),
+    ({"analyzer": "code", "base_tokenizer": "simple"}, "analyzer='code' requires base_tokenizer='code', got 'simple'"),
+    ({"analyzer": "text", "split_identifiers": True}, "code analyzer flags require analyzer='code'"),
+    ({"analyzer": "bogus"}, "unknown analyzer 'bogus', expected 'text' or 'code'"),
+    ({"analyzer": "code", "format_version": 2}, "base_tokenizer='code' requires FTS format_version=3, got 2"),
+])
+def test_code_analyzer_options_are_validated(tmp_path, kwargs, message):
+    path = str(tmp_path / "t.lance")
+    nl.write_dataset(pa.table({"text": ["getUserName"]}), path)
+    with pytest.raises(ValueError) as excinfo:
+        nl.dataset(path).create_scalar_index("text", "INVERTED", **kwargs)
+    assert str(excinfo.value) == message

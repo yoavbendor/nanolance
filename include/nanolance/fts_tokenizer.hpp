@@ -41,6 +41,13 @@ struct AnalyzerParams {
     /// written into `params` (Lance keeps the format in metadata.lance and the index details).
     std::uint32_t format_version = 0;
     std::string lance_tokenizer = "text";
+    /// The code analyzer (base_tokenizer "code", Lance's CodeTokenizerConfig): identifiers split into
+    /// subwords, numerics as boundaries, the identifier kept too, operator tokens such as "::" and "->".
+    /// Written in the params JSON as they are (false for the text analyzer).
+    bool split_identifiers = false;
+    bool split_on_numerics = false;
+    bool preserve_original = false;
+    bool index_operators = false;
 };
 
 /// The format version an index with `params` is (or would be) written in.
@@ -65,7 +72,7 @@ struct Token {
 class Analyzer {
 public:
     /// False (with `error`) for settings nanolance's analyzer does not implement: base tokenizers
-    /// other than simple / whitespace / raw, stemming or built-in stop words in a language other than
+    /// other than simple / whitespace / raw / code, stemming or built-in stop words in a language other than
     /// English, JSON documents.
     bool init(const AnalyzerParams& params, std::string& error);
 

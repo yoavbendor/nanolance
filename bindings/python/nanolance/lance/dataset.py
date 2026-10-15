@@ -1016,7 +1016,37 @@ class LanceDataset(pa.dataset.Dataset):
 
     _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
                          "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
-                         "max_ngram_length", "prefix_only", "format_version", "block_size")
+                         "max_ngram_length", "prefix_only", "format_version", "block_size", "analyzer",
+                         "split_identifiers", "split_on_numerics", "preserve_original", "index_operators")
+    _CODE_FLAGS = ("split_identifiers", "split_on_numerics", "preserve_original", "index_operators")
+
+    @classmethod
+    def _inverted_analyzer(cls, params: dict) -> None:
+        """Resolve `analyzer` as Lance does (tokenizer.rs: resolve and validate). The analyzer is 'text' or
+        'code' (code when only base_tokenizer='code' is given). The code analyzer's defaults are Lance's:
+        stemming and stop words off, split_on_numerics and preserve_original on. Its flags go into the
+        params JSON; the text analyzer's do not (they are only ever false)."""
+        analyzer = params.pop("analyzer", None)
+        base = params.get("base_tokenizer")
+        if analyzer is None:
+            analyzer = "code" if base == "code" else "text"
+        elif analyzer not in ("text", "code"):
+            raise ValueError(f"unknown analyzer '{analyzer}', expected 'text' or 'code'")
+        if analyzer == "text" and base == "code":
+            raise ValueError("base_tokenizer='code' requires analyzer='code'")
+        if analyzer == "code" and base is not None and base != "code":
+            raise ValueError(f"analyzer='code' requires base_tokenizer='code', got '{base}'")
+        if analyzer == "text" and any(params.get(flag) for flag in cls._CODE_FLAGS):
+            raise ValueError("code analyzer flags require analyzer='code'")
+        if analyzer != "code":
+            return
+        params["base_tokenizer"] = "code"
+        params.setdefault("stem", False)
+        params.setdefault("remove_stop_words", False)
+        params.setdefault("split_identifiers", False)
+        params.setdefault("split_on_numerics", True)
+        params.setdefault("preserve_original", True)
+        params.setdefault("index_operators", False)
 
     @staticmethod
     def _inverted_format_and_block(params: dict) -> None:
@@ -1031,9 +1061,10 @@ class LanceDataset(pa.dataset.Dataset):
                 raise OverflowError("can't convert negative int to unsigned")
             if block not in (128, 256):
                 raise ValueError(f"FTS inverted index block_size must be one of 128 or 256, got {block}")
+        code = params.get("base_tokenizer") == "code"
         version = params.get("format_version")
         if version is None:
-            version = 3 if block == 256 else 2
+            version = 3 if block == 256 or code else 2
         elif isinstance(version, str):
             text = version.strip()
             named = {"1": 1, "v1": 1, "V1": 1, "2": 2, "v2": 2, "V2": 2, "3": 3, "v3": 3, "V3": 3}
@@ -1048,6 +1079,8 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError("format_version must be 1, 2, 3, 'v1', 'v2', or 'v3'")
         if version < 3 and block == 256:
             raise ValueError(f"FTS format_version={version} is incompatible with block_size=256; use format_version=3")
+        if version < 3 and code:
+            raise ValueError(f"base_tokenizer='code' requires FTS format_version=3, got {version}")
         params["format_version"] = version
         params["block_size"] = block
 
@@ -1066,6 +1099,7 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs.pop(ignored, None)
         if kwargs:
             raise unsupported(f"INVERTED index options {sorted(kwargs)}")
+        self._inverted_analyzer(params)
         self._inverted_format_and_block(params)
         return json.dumps(params)
 
@@ -1449,29 +1483,37 @@ class LanceDataset(pa.dataset.Dataset):
         absent optional fields are None, and language is the name, not its JSON string."""
         import json
 
-        fields = {}
-        pos = 0
+        def proto_fields(raw):
+            fields, pos = {}, 0
 
-        def varint(at):
-            value, shift = 0, 0
-            while True:
-                byte = raw[at]
-                value |= (byte & 0x7F) << shift
-                at += 1
-                shift += 7
-                if byte < 0x80:
-                    return value, at
+            def varint(at):
+                value, shift = 0, 0
+                while True:
+                    byte = raw[at]
+                    value |= (byte & 0x7F) << shift
+                    at += 1
+                    shift += 7
+                    if byte < 0x80:
+                        return value, at
 
-        while pos < len(raw):
-            key, pos = varint(pos)
-            wire = key & 7
-            if wire == 0:
-                fields[key >> 3], pos = varint(pos)
-            elif wire == 2:
-                size, pos = varint(pos)
-                fields[key >> 3], pos = raw[pos:pos + size], pos + size
-            else:
-                raise ValueError("malformed InvertedIndexDetails")
+            while pos < len(raw):
+                key, pos = varint(pos)
+                wire = key & 7
+                if wire == 0:
+                    fields[key >> 3], pos = varint(pos)
+                elif wire == 2:
+                    size, pos = varint(pos)
+                    fields[key >> 3], pos = raw[pos:pos + size], pos + size
+                else:
+                    raise ValueError("malformed InvertedIndexDetails")
+            return fields
+
+        fields = proto_fields(raw)
+        code = proto_fields(fields[13]) if 13 in fields else {}
+        is_code = fields.get(1, b"").decode() == "code"
+
+        def config_flag(number, default):
+            return bool(code[number]) if number in code else default
 
         def text(number):
             return fields[number].decode() if number in fields else None
@@ -1494,6 +1536,13 @@ class LanceDataset(pa.dataset.Dataset):
             "min_ngram_length": fields.get(9, 0),
             "max_ngram_length": fields.get(10, 0),
             "prefix_only": bool(fields.get(11, 0)),
+            "split_identifiers": config_flag(1, False),
+            "split_on_numerics": config_flag(2, is_code),
+            "preserve_original": config_flag(3, is_code),
+            "index_operators": config_flag(4, False),
+            "document_granularity": {0: "row", 1: "list_element"}.get(fields.get(14, 0)),
+            "block_size": fields.get(12, 128),  # absent: an index that predates the field (block 128)
+            "custom_stop_words": None,  # InvertedIndexDetails does not hold them (index_old.proto)
         }
 
     def _index_details(self, index: dict) -> dict:

@@ -159,3 +159,10 @@ unchanged. +1 pylance test (1037).
   case, stem, stop words, ASCII folding (matches `Analyzer::emit` after the tokenizer).
 - No Python tokenize binding: token-list cases go to `tests/golden/fts_tokenizer/cases.txt`
   (`tests/test_fts_tokenizer.cpp`, ctest `nano_lance_fts_tokenizer`).
+
+**F3 outcome (2026-10-15):** done. Code analyzer (`CodeLexTokenizer` + `WordDelimiterFilter` ported to
+`src/fts_tokenizer.cpp`, exact Unicode Lowercase / Uppercase tables generated from Rust std by
+`tools/fts_tables`), its options, Lance's messages, default format 3, `code_config` in
+InvertedIndexDetails (bytes equal to pylance's), details decoded in `describe_indices`. 528 golden
+code-analyzer token cases from Lance's own crate; all 8 `test_code_analyzer_*` pass (+8, 1045).
+Text-analyzer params unchanged. Left: `lance.tokenize` binding (`test_tokenize_fts_query`).

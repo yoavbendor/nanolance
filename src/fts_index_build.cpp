@@ -98,6 +98,20 @@ std::vector<std::uint8_t> index_details(const fts::AnalyzerParams& p) {
     }
     flag(11, p.prefix_only);
     put_uint(out, 12, p.block_size);
+    if (p.base_tokenizer == "code") {
+        // code_config (CodeTokenizerConfig, index_old.proto). The two optional flags are written even when
+        // false, as an explicit index-time choice; proto3 leaves out the other false ones.
+        std::vector<std::uint8_t> code;
+        if (p.split_identifiers) {
+            put_uint(code, 1, 1);
+        }
+        put_uint(code, 2, p.split_on_numerics ? 1U : 0U);
+        put_uint(code, 3, p.preserve_original ? 1U : 0U);
+        if (p.index_operators) {
+            put_uint(code, 4, 1);
+        }
+        put_string(out, 13, std::string(code.begin(), code.end()));
+    }
     put_uint(out, 15, fts::resolved_format_version(p));  // posting_format_version
     return out;
 }

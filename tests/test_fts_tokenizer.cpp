@@ -33,7 +33,30 @@ int main(int argc, char** argv) {
     std::size_t cases = 0;
     std::size_t failed = 0;
     std::vector<nano_lance::fts::Token> tokens;
-    while (std::getline(in, line) && std::getline(in, expected)) {
+    while (std::getline(in, line)) {
+        if (line.rfind("@@code ", 0) == 0) {
+            // A section of code-analyzer cases: "@@code ops=1 split=1 preserve=1 numerics=1".
+            const auto flag = [&line](const std::string& key) {
+                const auto at = line.find(key);
+                return at != std::string::npos && at + key.size() < line.size() && line[at + key.size()] == '1';
+            };
+            nano_lance::fts::AnalyzerParams code;
+            code.base_tokenizer = "code";
+            code.stem = false;
+            code.remove_stop_words = false;
+            code.index_operators = flag("ops=");
+            code.split_identifiers = flag("split=");
+            code.preserve_original = flag("preserve=");
+            code.split_on_numerics = flag("numerics=");
+            if (!analyzer.init(code, error)) {
+                std::cerr << error << "\n";
+                return 1;
+            }
+            continue;
+        }
+        if (!std::getline(in, expected)) {
+            break;
+        }
         tokens.clear();
         analyzer.tokenize(line, tokens);
         std::string got;
@@ -48,6 +71,10 @@ int main(int argc, char** argv) {
         }
     }
     // A few by hand, and the params Lance writes.
+    if (!analyzer.init({}, error)) {
+        std::cerr << error << "\n";
+        return 1;
+    }
     const std::pair<const char*, const char*> by_hand[] = {
         {"The quick brown fox jumps over the lazy dog's back", "quick@1 brown@2 fox@3 jump@4 lazi@7 dog@8 back@10"},
         {"Café crème brûlée is DELICIOUS", "cafe@0 creme@1 brulee@2 delici@4"},

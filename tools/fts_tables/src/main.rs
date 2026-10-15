@@ -4,8 +4,8 @@
 //   cargo run --release --offline -- tables > ../../src/fts_tables.inc   # the Unicode / stop word tables
 //   cargo run --release --offline -- tokenize < lines.txt                # tokens@positions, one line each
 //   cargo run --release --offline -- stem < words.txt                    # the English stemmer alone
-use lance_tokenizer::{AsciiFoldingFilter, Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer,
-                      StopWordFilter, TextAnalyzer, TokenStream};
+use lance_tokenizer::{AsciiFoldingFilter, CodeLexTokenizer, Language, LowerCaser, RemoveLongFilter,
+                      SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TokenStream, WordDelimiterFilter};
 use std::io::{self, BufRead, Write};
 
 fn analyzer() -> TextAnalyzer {
@@ -43,6 +43,31 @@ fn main() {
             }
         }
         "tables" => tables(&mut out),
+        // `code FLAGS`: CodeLexTokenizer (+ WordDelimiterFilter) as nanolance's code analyzer
+        // builds them; FLAGS = four digits: index_operators split_identifiers preserve_original
+        // split_on_numerics. Output format as `tokenize`.
+        "code" => {
+            let flags = std::env::args().nth(2).unwrap_or_else(|| "0000".to_string());
+            let f: Vec<bool> = flags.chars().map(|c| c == '1').collect();
+            let mut builder = TextAnalyzer::builder(CodeLexTokenizer::new(f[0])).dynamic();
+            if f[1] {
+                builder = builder.filter_dynamic(WordDelimiterFilter::new(f[2], f[3]));
+            }
+            let mut a = builder
+                .filter_dynamic(RemoveLongFilter::limit(40))
+                .filter_dynamic(LowerCaser)
+                .filter_dynamic(AsciiFoldingFilter)
+                .build();
+            for line in io::stdin().lock().lines() {
+                let line = line.unwrap();
+                let mut s = a.token_stream(&line);
+                let mut toks = Vec::new();
+                while s.advance() {
+                    toks.push(format!("{}@{}", s.token().text, s.token().position));
+                }
+                writeln!(out, "{}", toks.join(" ")).unwrap();
+            }
+        }
         // Lines "key<TAB>value" (keys sorted) -> the fst Map's bytes, written to argv[2].
         "fst" => {
             let path = std::env::args().nth(2).expect("output path");
@@ -122,6 +147,25 @@ fn tables(out: &mut impl Write) {
         writeln!(out, "    {{0x{:X}, 0x{:X}}},", a, b).unwrap();
     }
     writeln!(out, "}};").unwrap();
+    // char::is_lowercase / char::is_uppercase (the code analyzer's word delimiter), as ranges
+    for (name, pred) in [("kLowercase", char::is_lowercase as fn(char) -> bool), ("kUppercase", char::is_uppercase)] {
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for cp in 0u32..=0x10FFFF {
+            if let Some(c) = char::from_u32(cp) {
+                if pred(c) {
+                    match ranges.last_mut() {
+                        Some(r) if r.1 + 1 == cp => r.1 = cp,
+                        _ => ranges.push((cp, cp)),
+                    }
+                }
+            }
+        }
+        writeln!(out, "static const std::uint32_t {}[][2] = {{", name).unwrap();
+        for (a, b) in &ranges {
+            writeln!(out, "    {{0x{:X}, 0x{:X}}},", a, b).unwrap();
+        }
+        writeln!(out, "}};").unwrap();
+    }
     // lowercase: per character, where it changes
     writeln!(out, "struct CharMap {{ std::uint32_t cp; const char* to; }};").unwrap();
     writeln!(out, "static const CharMap kLower[] = {{").unwrap();

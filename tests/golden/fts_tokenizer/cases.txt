@@ -6001,3 +6001,1065 @@ d𘋥ᗺ@0 𛀆櫙䨔g @2
 뎽@0 獵@1 ﰾ節綂溞憐@2 ﭥ@3 뮏@4 栗ᒈඇ蚒r@5
 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy éééééééééééééééééééé éééééééééééééééééééa
 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@0 eeeeeeeeeeeeeeeeeeea@3
+@@code ops=0 split=0 preserve=0 numerics=0
+// SPDX-License-Identifier: Apache-2.0
+spdx@0 license@1 identifier@2 apache@3 2@4 0@5
+// Copyright (c) 2026 Yoav Bendor
+copyright@0 c@1 2026@2 yoav@3 bendor@4
+//
+
+// Lance's full-text analyzer (fts_tokenizer.hpp): lance-tokenizer 12.0.0's SimpleTokenizer /
+lance@0 s@1 full@2 text@3 analyzer@4 fts_tokenizer@5 hpp@6 lance@7 tokenizer@8 12@9 0@10 0@11 s@12 simpletokenizer@13
+// WhitespaceTokenizer / RawTokenizer, RemoveLongFilter, LowerCaser, Stemmer, StopWordFilter and
+whitespacetokenizer@0 rawtokenizer@1 removelongfilter@2 lowercaser@3 stemmer@4 stopwordfilter@5 and@6
+// AsciiFoldingFilter, chained as Lance 12's InvertedIndexParams::build chains them.
+asciifoldingfilter@0 chained@1 as@2 lance@3 12@4 s@5 invertedindexparams@6 build@7 chains@8 them@9
+#include "nanolance/fts_tokenizer.hpp"
+include@0 nanolance@1 fts_tokenizer@2 hpp@3
+#include "fts_json.hpp"
+include@0 fts_json@1 hpp@2
+#include <algorithm>
+include@0 algorithm@1
+#include <cctype>
+include@0 cctype@1
+#include <cstdint>
+include@0 cstdint@1
+#include <cstring>
+include@0 cstring@1
+#include <iterator>
+include@0 iterator@1
+#include <string>
+include@0 string@1
+namespace nano_lance::fts {
+namespace@0 nano_lance@1 fts@2
+namespace {
+namespace@0
+#include "fts_tables.inc"
+include@0 fts_tables@1 inc@2
+namespace snow {
+namespace@0 snow@1
+#include "fts_snowball_env.inc"
+include@0 fts_snowball_env@1 inc@2
+#include "fts_english_stem.inc"
+include@0 fts_english_stem@1 inc@2
+}  // namespace snow
+namespace@0 snow@1
+// ── UTF-8 ───────────────────────────────────────────────────────────────────────────────────────
+utf@0 8@1
+/// The code point at `text[i]` and its length in bytes (an invalid byte: itself, length 1).
+the@0 code@1 point@2 at@3 text@4 i@5 and@6 its@7 length@8 in@9 bytes@10 an@11 invalid@12 byte@13 itself@14 length@15 1@16
+std::uint32_t decode(std::string_view text, std::size_t i, std::size_t& len) {
+std@0 uint32_t@1 decode@2 std@3 string_view@4 text@5 std@6 size_t@7 i@8 std@9 size_t@10 len@11
+    const auto b0 = static_cast<unsigned char>(text[i]);
+const@0 auto@1 b0@2 static_cast@3 unsigned@4 char@5 text@6 i@7
+    const auto cont = [&](std::size_t k) {
+const@0 auto@1 cont@2 std@3 size_t@4 k@5
+        return i + k < text.size() && (static_cast<unsigned char>(text[i + k]) & 0xC0U) == 0x80U;
+return@0 i@1 k@2 text@3 size@4 static_cast@5 unsigned@6 char@7 text@8 i@9 k@10 0xc0u@11 0x80u@12
+    };
+
+    const auto c = [&](std::size_t k) { return static_cast<std::uint32_t>(static_cast<unsigned char>(text[i + k]) & 0x3FU); };
+const@0 auto@1 c@2 std@3 size_t@4 k@5 return@6 static_cast@7 std@8 uint32_t@9 static_cast@10 unsigned@11 char@12 text@13 i@14 k@15 0x3fu@16
+    if (b0 < 0x80U) {
+if@0 b0@1 0x80u@2
+// SPDX-License-Identifier: Apache-2.0
+spdx@0 license@1 identifier@2 apache@3 2@4 0@5
+// Copyright (c) 2026 Yoav Bendor
+copyright@0 c@1 2026@2 yoav@3 bendor@4
+//
+
+// Building an INVERTED (full-text) index in Lance 12's format (docs/FTS_INDEX.md): the column's
+building@0 an@1 inverted@2 full@3 text@4 index@5 in@6 lance@7 12@8 s@9 format@10 docs@11 fts_index@12 md@13 the@14 column@15 s@16
+// documents are tokenized as the index's analyzer does, token ids given in order of first
+documents@0 are@1 tokenized@2 as@3 the@4 index@5 s@6 analyzer@7 does@8 token@9 ids@10 given@11 in@12 order@13 of@14 first@15
+// appearance, and the four files and manifest entry written as Lance's InvertedIndexBuilder writes
+appearance@0 and@1 the@2 four@3 files@4 and@5 manifest@6 entry@7 written@8 as@9 lance@10 s@11 invertedindexbuilder@12 writes@13
+// them, one partition holding every document.
+them@0 one@1 partition@2 holding@3 every@4 document@5
+#include "index_build.hpp"
+include@0 index_build@1 hpp@2
+#include "nanolance/fts_search.hpp"
+include@0 nanolance@1 fts_search@2 hpp@3
+#include "fts_fst.hpp"
+include@0 fts_fst@1 hpp@2
+#include "fts_json.hpp"
+include@0 fts_json@1 hpp@2
+#include "fts_posting.hpp"
+include@0 fts_posting@1 hpp@2
+#include "index_files.hpp"
+include@0 index_files@1 hpp@2
+#include "nanolance/dataset_commit.hpp"
+include@0 nanolance@1 dataset_commit@2 hpp@3
+#include "nanolance/lance_table_reader.hpp"
+include@0 nanolance@1 lance_table_reader@2 hpp@3
+#include "nanolance/manifest_reader.hpp"
+include@0 nanolance@1 manifest_reader@2 hpp@3
+#include "nanolance/parallel.hpp"
+include@0 nanolance@1 parallel@2 hpp@3
+#include "nanolance/row_ids.hpp"
+include@0 nanolance@1 row_ids@2 hpp@3
+#include "lance_minimal.pb.hpp"
+include@0 lance_minimal@1 pb@2 hpp@3
+#include <nanoarrow/nanoarrow.h>
+include@0 nanoarrow@1 nanoarrow@2 h@3
+#include <algorithm>
+include@0 algorithm@1
+#include <chrono>
+include@0 chrono@1
+#include <cmath>
+include@0 cmath@1
+#include <cstring>
+include@0 cstring@1
+#include <limits>
+include@0 limits@1
+    _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
+_inverted_options@0 base_tokenizer@1 language@2 with_position@3 max_token_length@4 lower_case@5 stem@6
+                         "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
+remove_stop_words@0 custom_stop_words@1 ascii_folding@2 min_ngram_length@3
+                         "max_ngram_length", "prefix_only", "format_version", "block_size")
+max_ngram_length@0 prefix_only@1 format_version@2 block_size@3
+    @staticmethod
+staticmethod@0
+    def _inverted_format_and_block(params: dict) -> None:
+def@0 _inverted_format_and_block@1 params@2 dict@3 none@4
+        """Check `format_version` and `block_size` in `params` as Lance does (format.rs, tokenizer.rs,
+check@0 format_version@1 and@2 block_size@3 in@4 params@5 as@6 lance@7 does@8 format@9 rs@10 tokenizer@11 rs@12
+        and the binding's conversions), and write the resolved format_version back into it."""
+and@0 the@1 binding@2 s@3 conversions@4 and@5 write@6 the@7 resolved@8 format_version@9 back@10 into@11 it@12
+        import operator
+import@0 operator@1
+        block = 128
+block@0 128@1
+        if params.get("block_size") is not None:
+if@0 params@1 get@2 block_size@3 is@4 not@5 none@6
+            block = operator.index(params["block_size"])
+block@0 operator@1 index@2 params@3 block_size@4
+            if block < 0:
+if@0 block@1 0@2
+                raise OverflowError("can't convert negative int to unsigned")
+raise@0 overflowerror@1 can@2 t@3 convert@4 negative@5 int@6 to@7 unsigned@8
+            if block not in (128, 256):
+if@0 block@1 not@2 in@3 128@4 256@5
+                raise ValueError(f"FTS inverted index block_size must be one of 128 or 256, got {block}")
+raise@0 valueerror@1 f@2 fts@3 inverted@4 index@5 block_size@6 must@7 be@8 one@9 of@10 128@11 or@12 256@13 got@14 block@15
+        version = params.get("format_version")
+version@0 params@1 get@2 format_version@3
+        if version is None:
+if@0 version@1 is@2 none@3
+            version = 3 if block == 256 else 2
+version@0 3@1 if@2 block@3 256@4 else@5 2@6
+        elif isinstance(version, str):
+elif@0 isinstance@1 version@2 str@3
+            text = version.strip()
+text@0 version@1 strip@2
+            named = {"1": 1, "v1": 1, "V1": 1, "2": 2, "v2": 2, "V2": 2, "3": 3, "v3": 3, "V3": 3}
+named@0 1@1 1@2 v1@3 1@4 v1@5 1@6 2@7 2@8 v2@9 2@10 v2@11 2@12 3@13 3@14 v3@15 3@16 v3@17 3@18
+            if text not in named:
+if@0 text@1 not@2 in@3 named@4
+                raise ValueError(f"unsupported FTS format version {text}, expected 1, 2, or 3")
+raise@0 valueerror@1 f@2 unsupported@3 fts@4 format@5 version@6 text@7 expected@8 1@9 2@10 or@11 3@12
+            version = named[text]
+version@0 named@1 text@2
+        elif isinstance(version, int) and 0 <= version <= 0xFFFFFFFF:
+elif@0 isinstance@1 version@2 int@3 and@4 0@5 version@6 0xffffffff@7
+getUserName XMLHttpRequest parseHTML2JSON utf8_reader HTML2JSON
+getusername@0 xmlhttprequest@1 parsehtml2json@2 utf8_reader@3 html2json@4
+value.parse::<usize>() a::b != c->d a=>b x??=y ... ::: >>>= <=>
+value@0 parse@1 usize@2 a@3 b@4 c@5 d@6 a@7 b@8 x@9 y@10
+__init__ _ __ _x_ user__name getUserName_v2 snake_case_ID
+__init__@0 _@1 __@2 _x_@3 user__name@4 getusername_v2@5 snake_case_id@6
+naïveCAFÉ ÉtatCivil αβγΔεζ ΑΒΓδ straßeNAME Ǆungla ǅtitle ǈ
+naivecafe@0 etatcivil@1 αβγδεζ@2 αβγδ@3 strassename@4 dzungla@5 dztitle@6 lj@7
+x1y2z3 3dModel v8Engine i18nText ab12CD
+x1y2z3@0 3dmodel@1 v8engine@2 i18ntext@3 ab12cd@4
+a-b c+d e*f g/h (i) [j] {k} l;m n,o p.q r?s t|u v&w x^y ~z @a #b $c
+a@0 b@1 c@2 d@3 e@4 f@5 g@6 h@7 i@8 j@9 k@10 l@11 m@12 n@13 o@14 p@15 q@16 r@17 s@18 t@19 u@20 v@21 w@22 x@23 y@24 z@25 a@26 b@27 c@28
+for(i=0;i<n;i++){ total += arr[i]; }
+for@0 i@1 0@2 i@3 n@4 i@5 total@6 arr@7 i@8
+let mut v: Vec<u8> = Vec::new(); v.push(0x1F);
+let@0 mut@1 v@2 vec@3 u8@4 vec@5 new@6 v@7 push@8 0x1f@9
+@@code ops=1 split=0 preserve=0 numerics=0
+// SPDX-License-Identifier: Apache-2.0
+//@0 spdx@1 -@2 license@3 -@4 identifier@5 :@6 apache@7 -@8 2@9 0@10
+// Copyright (c) 2026 Yoav Bendor
+//@0 copyright@1 c@2 2026@3 yoav@4 bendor@5
+//
+//@0
+// Lance's full-text analyzer (fts_tokenizer.hpp): lance-tokenizer 12.0.0's SimpleTokenizer /
+//@0 lance@1 s@2 full@3 -@4 text@5 analyzer@6 fts_tokenizer@7 hpp@8 :@9 lance@10 -@11 tokenizer@12 12@13 0@14 0@15 s@16 simpletokenizer@17 /@18
+// WhitespaceTokenizer / RawTokenizer, RemoveLongFilter, LowerCaser, Stemmer, StopWordFilter and
+//@0 whitespacetokenizer@1 /@2 rawtokenizer@3 removelongfilter@4 lowercaser@5 stemmer@6 stopwordfilter@7 and@8
+// AsciiFoldingFilter, chained as Lance 12's InvertedIndexParams::build chains them.
+//@0 asciifoldingfilter@1 chained@2 as@3 lance@4 12@5 s@6 invertedindexparams@7 ::@8 build@9 chains@10 them@11
+#include "nanolance/fts_tokenizer.hpp"
+include@0 nanolance@1 /@2 fts_tokenizer@3 hpp@4
+#include "fts_json.hpp"
+include@0 fts_json@1 hpp@2
+#include <algorithm>
+include@0 <@1 algorithm@2 >@3
+#include <cctype>
+include@0 <@1 cctype@2 >@3
+#include <cstdint>
+include@0 <@1 cstdint@2 >@3
+#include <cstring>
+include@0 <@1 cstring@2 >@3
+#include <iterator>
+include@0 <@1 iterator@2 >@3
+#include <string>
+include@0 <@1 string@2 >@3
+namespace nano_lance::fts {
+namespace@0 nano_lance@1 ::@2 fts@3
+namespace {
+namespace@0
+#include "fts_tables.inc"
+include@0 fts_tables@1 inc@2
+namespace snow {
+namespace@0 snow@1
+#include "fts_snowball_env.inc"
+include@0 fts_snowball_env@1 inc@2
+#include "fts_english_stem.inc"
+include@0 fts_english_stem@1 inc@2
+}  // namespace snow
+//@0 namespace@1 snow@2
+// ── UTF-8 ───────────────────────────────────────────────────────────────────────────────────────
+//@0 utf@1 -@2 8@3
+/// The code point at `text[i]` and its length in bytes (an invalid byte: itself, length 1).
+//@0 /@1 the@2 code@3 point@4 at@5 text@6 i@7 and@8 its@9 length@10 in@11 bytes@12 an@13 invalid@14 byte@15 :@16 itself@17 length@18 1@19
+std::uint32_t decode(std::string_view text, std::size_t i, std::size_t& len) {
+std@0 ::@1 uint32_t@2 decode@3 std@4 ::@5 string_view@6 text@7 std@8 ::@9 size_t@10 i@11 std@12 ::@13 size_t@14 &@15 len@16
+    const auto b0 = static_cast<unsigned char>(text[i]);
+const@0 auto@1 b0@2 =@3 static_cast@4 <@5 unsigned@6 char@7 >@8 text@9 i@10
+    const auto cont = [&](std::size_t k) {
+const@0 auto@1 cont@2 =@3 &@4 std@5 ::@6 size_t@7 k@8
+        return i + k < text.size() && (static_cast<unsigned char>(text[i + k]) & 0xC0U) == 0x80U;
+return@0 i@1 +@2 k@3 <@4 text@5 size@6 &&@7 static_cast@8 <@9 unsigned@10 char@11 >@12 text@13 i@14 +@15 k@16 &@17 0xc0u@18 ==@19 0x80u@20
+    };
+
+    const auto c = [&](std::size_t k) { return static_cast<std::uint32_t>(static_cast<unsigned char>(text[i + k]) & 0x3FU); };
+const@0 auto@1 c@2 =@3 &@4 std@5 ::@6 size_t@7 k@8 return@9 static_cast@10 <@11 std@12 ::@13 uint32_t@14 >@15 static_cast@16 <@17 unsigned@18 char@19 >@20 text@21 i@22 +@23 k@24 &@25 0x3fu@26
+    if (b0 < 0x80U) {
+if@0 b0@1 <@2 0x80u@3
+// SPDX-License-Identifier: Apache-2.0
+//@0 spdx@1 -@2 license@3 -@4 identifier@5 :@6 apache@7 -@8 2@9 0@10
+// Copyright (c) 2026 Yoav Bendor
+//@0 copyright@1 c@2 2026@3 yoav@4 bendor@5
+//
+//@0
+// Building an INVERTED (full-text) index in Lance 12's format (docs/FTS_INDEX.md): the column's
+//@0 building@1 an@2 inverted@3 full@4 -@5 text@6 index@7 in@8 lance@9 12@10 s@11 format@12 docs@13 /@14 fts_index@15 md@16 :@17 the@18 column@19 s@20
+// documents are tokenized as the index's analyzer does, token ids given in order of first
+//@0 documents@1 are@2 tokenized@3 as@4 the@5 index@6 s@7 analyzer@8 does@9 token@10 ids@11 given@12 in@13 order@14 of@15 first@16
+// appearance, and the four files and manifest entry written as Lance's InvertedIndexBuilder writes
+//@0 appearance@1 and@2 the@3 four@4 files@5 and@6 manifest@7 entry@8 written@9 as@10 lance@11 s@12 invertedindexbuilder@13 writes@14
+// them, one partition holding every document.
+//@0 them@1 one@2 partition@3 holding@4 every@5 document@6
+#include "index_build.hpp"
+include@0 index_build@1 hpp@2
+#include "nanolance/fts_search.hpp"
+include@0 nanolance@1 /@2 fts_search@3 hpp@4
+#include "fts_fst.hpp"
+include@0 fts_fst@1 hpp@2
+#include "fts_json.hpp"
+include@0 fts_json@1 hpp@2
+#include "fts_posting.hpp"
+include@0 fts_posting@1 hpp@2
+#include "index_files.hpp"
+include@0 index_files@1 hpp@2
+#include "nanolance/dataset_commit.hpp"
+include@0 nanolance@1 /@2 dataset_commit@3 hpp@4
+#include "nanolance/lance_table_reader.hpp"
+include@0 nanolance@1 /@2 lance_table_reader@3 hpp@4
+#include "nanolance/manifest_reader.hpp"
+include@0 nanolance@1 /@2 manifest_reader@3 hpp@4
+#include "nanolance/parallel.hpp"
+include@0 nanolance@1 /@2 parallel@3 hpp@4
+#include "nanolance/row_ids.hpp"
+include@0 nanolance@1 /@2 row_ids@3 hpp@4
+#include "lance_minimal.pb.hpp"
+include@0 lance_minimal@1 pb@2 hpp@3
+#include <nanoarrow/nanoarrow.h>
+include@0 <@1 nanoarrow@2 /@3 nanoarrow@4 h@5 >@6
+#include <algorithm>
+include@0 <@1 algorithm@2 >@3
+#include <chrono>
+include@0 <@1 chrono@2 >@3
+#include <cmath>
+include@0 <@1 cmath@2 >@3
+#include <cstring>
+include@0 <@1 cstring@2 >@3
+#include <limits>
+include@0 <@1 limits@2 >@3
+    _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
+_inverted_options@0 =@1 base_tokenizer@2 language@3 with_position@4 max_token_length@5 lower_case@6 stem@7
+                         "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
+remove_stop_words@0 custom_stop_words@1 ascii_folding@2 min_ngram_length@3
+                         "max_ngram_length", "prefix_only", "format_version", "block_size")
+max_ngram_length@0 prefix_only@1 format_version@2 block_size@3
+    @staticmethod
+staticmethod@0
+    def _inverted_format_and_block(params: dict) -> None:
+def@0 _inverted_format_and_block@1 params@2 :@3 dict@4 ->@5 none@6 :@7
+        """Check `format_version` and `block_size` in `params` as Lance does (format.rs, tokenizer.rs,
+check@0 format_version@1 and@2 block_size@3 in@4 params@5 as@6 lance@7 does@8 format@9 rs@10 tokenizer@11 rs@12
+        and the binding's conversions), and write the resolved format_version back into it."""
+and@0 the@1 binding@2 s@3 conversions@4 and@5 write@6 the@7 resolved@8 format_version@9 back@10 into@11 it@12
+        import operator
+import@0 operator@1
+        block = 128
+block@0 =@1 128@2
+        if params.get("block_size") is not None:
+if@0 params@1 get@2 block_size@3 is@4 not@5 none@6 :@7
+            block = operator.index(params["block_size"])
+block@0 =@1 operator@2 index@3 params@4 block_size@5
+            if block < 0:
+if@0 block@1 <@2 0@3 :@4
+                raise OverflowError("can't convert negative int to unsigned")
+raise@0 overflowerror@1 can@2 t@3 convert@4 negative@5 int@6 to@7 unsigned@8
+            if block not in (128, 256):
+if@0 block@1 not@2 in@3 128@4 256@5 :@6
+                raise ValueError(f"FTS inverted index block_size must be one of 128 or 256, got {block}")
+raise@0 valueerror@1 f@2 fts@3 inverted@4 index@5 block_size@6 must@7 be@8 one@9 of@10 128@11 or@12 256@13 got@14 block@15
+        version = params.get("format_version")
+version@0 =@1 params@2 get@3 format_version@4
+        if version is None:
+if@0 version@1 is@2 none@3 :@4
+            version = 3 if block == 256 else 2
+version@0 =@1 3@2 if@3 block@4 ==@5 256@6 else@7 2@8
+        elif isinstance(version, str):
+elif@0 isinstance@1 version@2 str@3 :@4
+            text = version.strip()
+text@0 =@1 version@2 strip@3
+            named = {"1": 1, "v1": 1, "V1": 1, "2": 2, "v2": 2, "V2": 2, "3": 3, "v3": 3, "V3": 3}
+named@0 =@1 1@2 :@3 1@4 v1@5 :@6 1@7 v1@8 :@9 1@10 2@11 :@12 2@13 v2@14 :@15 2@16 v2@17 :@18 2@19 3@20 :@21 3@22 v3@23 :@24 3@25 v3@26 :@27 3@28
+            if text not in named:
+if@0 text@1 not@2 in@3 named@4 :@5
+                raise ValueError(f"unsupported FTS format version {text}, expected 1, 2, or 3")
+raise@0 valueerror@1 f@2 unsupported@3 fts@4 format@5 version@6 text@7 expected@8 1@9 2@10 or@11 3@12
+            version = named[text]
+version@0 =@1 named@2 text@3
+        elif isinstance(version, int) and 0 <= version <= 0xFFFFFFFF:
+elif@0 isinstance@1 version@2 int@3 and@4 0@5 <=@6 version@7 <=@8 0xffffffff@9 :@10
+getUserName XMLHttpRequest parseHTML2JSON utf8_reader HTML2JSON
+getusername@0 xmlhttprequest@1 parsehtml2json@2 utf8_reader@3 html2json@4
+value.parse::<usize>() a::b != c->d a=>b x??=y ... ::: >>>= <=>
+value@0 parse@1 ::@2 <@3 usize@4 >@5 a@6 ::@7 b@8 !=@9 c@10 ->@11 d@12 a@13 =>@14 b@15 x@16 ??=@17 y@18 ::@19 :@20 >>>=@21 <=>@22
+__init__ _ __ _x_ user__name getUserName_v2 snake_case_ID
+__init__@0 _@1 __@2 _x_@3 user__name@4 getusername_v2@5 snake_case_id@6
+naïveCAFÉ ÉtatCivil αβγΔεζ ΑΒΓδ straßeNAME Ǆungla ǅtitle ǈ
+naivecafe@0 etatcivil@1 αβγδεζ@2 αβγδ@3 strassename@4 dzungla@5 dztitle@6 lj@7
+x1y2z3 3dModel v8Engine i18nText ab12CD
+x1y2z3@0 3dmodel@1 v8engine@2 i18ntext@3 ab12cd@4
+a-b c+d e*f g/h (i) [j] {k} l;m n,o p.q r?s t|u v&w x^y ~z @a #b $c
+a@0 -@1 b@2 c@3 +@4 d@5 e@6 *@7 f@8 g@9 /@10 h@11 i@12 j@13 k@14 l@15 m@16 n@17 o@18 p@19 q@20 r@21 ?@22 s@23 t@24 |@25 u@26 v@27 &@28 w@29 x@30 ^@31 y@32 ~@33 z@34 a@35 b@36 c@37
+for(i=0;i<n;i++){ total += arr[i]; }
+for@0 i@1 =@2 0@3 i@4 <@5 n@6 i@7 ++@8 total@9 +=@10 arr@11 i@12
+let mut v: Vec<u8> = Vec::new(); v.push(0x1F);
+let@0 mut@1 v@2 :@3 vec@4 <@5 u8@6 >@7 =@8 vec@9 ::@10 new@11 v@12 push@13 0x1f@14
+@@code ops=0 split=1 preserve=1 numerics=1
+// SPDX-License-Identifier: Apache-2.0
+spdx@0 license@1 identifier@2 apache@3 2@4 0@5
+// Copyright (c) 2026 Yoav Bendor
+copyright@0 c@1 2026@2 yoav@3 bendor@4
+//
+
+// Lance's full-text analyzer (fts_tokenizer.hpp): lance-tokenizer 12.0.0's SimpleTokenizer /
+lance@0 s@1 full@2 text@3 analyzer@4 fts_tokenizer@5 fts@5 tokenizer@6 hpp@7 lance@8 tokenizer@9 12@10 0@11 0@12 s@13 simpletokenizer@14 simple@14 tokenizer@15
+// WhitespaceTokenizer / RawTokenizer, RemoveLongFilter, LowerCaser, Stemmer, StopWordFilter and
+whitespacetokenizer@0 whitespace@0 tokenizer@1 rawtokenizer@2 raw@2 tokenizer@3 removelongfilter@4 remove@4 long@5 filter@6 lowercaser@7 lower@7 caser@8 stemmer@9 stopwordfilter@10 stop@10 word@11 filter@12 and@13
+// AsciiFoldingFilter, chained as Lance 12's InvertedIndexParams::build chains them.
+asciifoldingfilter@0 ascii@0 folding@1 filter@2 chained@3 as@4 lance@5 12@6 s@7 invertedindexparams@8 inverted@8 index@9 params@10 build@11 chains@12 them@13
+#include "nanolance/fts_tokenizer.hpp"
+include@0 nanolance@1 fts_tokenizer@2 fts@2 tokenizer@3 hpp@4
+#include "fts_json.hpp"
+include@0 fts_json@1 fts@1 json@2 hpp@3
+#include <algorithm>
+include@0 algorithm@1
+#include <cctype>
+include@0 cctype@1
+#include <cstdint>
+include@0 cstdint@1
+#include <cstring>
+include@0 cstring@1
+#include <iterator>
+include@0 iterator@1
+#include <string>
+include@0 string@1
+namespace nano_lance::fts {
+namespace@0 nano_lance@1 nano@1 lance@2 fts@3
+namespace {
+namespace@0
+#include "fts_tables.inc"
+include@0 fts_tables@1 fts@1 tables@2 inc@3
+namespace snow {
+namespace@0 snow@1
+#include "fts_snowball_env.inc"
+include@0 fts_snowball_env@1 fts@1 snowball@2 env@3 inc@4
+#include "fts_english_stem.inc"
+include@0 fts_english_stem@1 fts@1 english@2 stem@3 inc@4
+}  // namespace snow
+namespace@0 snow@1
+// ── UTF-8 ───────────────────────────────────────────────────────────────────────────────────────
+utf@0 8@1
+/// The code point at `text[i]` and its length in bytes (an invalid byte: itself, length 1).
+the@0 code@1 point@2 at@3 text@4 i@5 and@6 its@7 length@8 in@9 bytes@10 an@11 invalid@12 byte@13 itself@14 length@15 1@16
+std::uint32_t decode(std::string_view text, std::size_t i, std::size_t& len) {
+std@0 uint32_t@1 uint@1 32@2 t@3 decode@4 std@5 string_view@6 string@6 view@7 text@8 std@9 size_t@10 size@10 t@11 i@12 std@13 size_t@14 size@14 t@15 len@16
+    const auto b0 = static_cast<unsigned char>(text[i]);
+const@0 auto@1 b0@2 b@2 0@3 static_cast@4 static@4 cast@5 unsigned@6 char@7 text@8 i@9
+    const auto cont = [&](std::size_t k) {
+const@0 auto@1 cont@2 std@3 size_t@4 size@4 t@5 k@6
+        return i + k < text.size() && (static_cast<unsigned char>(text[i + k]) & 0xC0U) == 0x80U;
+return@0 i@1 k@2 text@3 size@4 static_cast@5 static@5 cast@6 unsigned@7 char@8 text@9 i@10 k@11 0xc0u@12 0@12 x@13 c@14 0@15 u@16 0x80u@17 0@17 x@18 80@19 u@20
+    };
+
+    const auto c = [&](std::size_t k) { return static_cast<std::uint32_t>(static_cast<unsigned char>(text[i + k]) & 0x3FU); };
+const@0 auto@1 c@2 std@3 size_t@4 size@4 t@5 k@6 return@7 static_cast@8 static@8 cast@9 std@10 uint32_t@11 uint@11 32@12 t@13 static_cast@14 static@14 cast@15 unsigned@16 char@17 text@18 i@19 k@20 0x3fu@21 0@21 x@22 3@23 fu@24
+    if (b0 < 0x80U) {
+if@0 b0@1 b@1 0@2 0x80u@3 0@3 x@4 80@5 u@6
+// SPDX-License-Identifier: Apache-2.0
+spdx@0 license@1 identifier@2 apache@3 2@4 0@5
+// Copyright (c) 2026 Yoav Bendor
+copyright@0 c@1 2026@2 yoav@3 bendor@4
+//
+
+// Building an INVERTED (full-text) index in Lance 12's format (docs/FTS_INDEX.md): the column's
+building@0 an@1 inverted@2 full@3 text@4 index@5 in@6 lance@7 12@8 s@9 format@10 docs@11 fts_index@12 fts@12 index@13 md@14 the@15 column@16 s@17
+// documents are tokenized as the index's analyzer does, token ids given in order of first
+documents@0 are@1 tokenized@2 as@3 the@4 index@5 s@6 analyzer@7 does@8 token@9 ids@10 given@11 in@12 order@13 of@14 first@15
+// appearance, and the four files and manifest entry written as Lance's InvertedIndexBuilder writes
+appearance@0 and@1 the@2 four@3 files@4 and@5 manifest@6 entry@7 written@8 as@9 lance@10 s@11 invertedindexbuilder@12 inverted@12 index@13 builder@14 writes@15
+// them, one partition holding every document.
+them@0 one@1 partition@2 holding@3 every@4 document@5
+#include "index_build.hpp"
+include@0 index_build@1 index@1 build@2 hpp@3
+#include "nanolance/fts_search.hpp"
+include@0 nanolance@1 fts_search@2 fts@2 search@3 hpp@4
+#include "fts_fst.hpp"
+include@0 fts_fst@1 fts@1 fst@2 hpp@3
+#include "fts_json.hpp"
+include@0 fts_json@1 fts@1 json@2 hpp@3
+#include "fts_posting.hpp"
+include@0 fts_posting@1 fts@1 posting@2 hpp@3
+#include "index_files.hpp"
+include@0 index_files@1 index@1 files@2 hpp@3
+#include "nanolance/dataset_commit.hpp"
+include@0 nanolance@1 dataset_commit@2 dataset@2 commit@3 hpp@4
+#include "nanolance/lance_table_reader.hpp"
+include@0 nanolance@1 lance_table_reader@2 lance@2 table@3 reader@4 hpp@5
+#include "nanolance/manifest_reader.hpp"
+include@0 nanolance@1 manifest_reader@2 manifest@2 reader@3 hpp@4
+#include "nanolance/parallel.hpp"
+include@0 nanolance@1 parallel@2 hpp@3
+#include "nanolance/row_ids.hpp"
+include@0 nanolance@1 row_ids@2 row@2 ids@3 hpp@4
+#include "lance_minimal.pb.hpp"
+include@0 lance_minimal@1 lance@1 minimal@2 pb@3 hpp@4
+#include <nanoarrow/nanoarrow.h>
+include@0 nanoarrow@1 nanoarrow@2 h@3
+#include <algorithm>
+include@0 algorithm@1
+#include <chrono>
+include@0 chrono@1
+#include <cmath>
+include@0 cmath@1
+#include <cstring>
+include@0 cstring@1
+#include <limits>
+include@0 limits@1
+    _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
+_inverted_options@0 inverted@0 options@1 base_tokenizer@2 base@2 tokenizer@3 language@4 with_position@5 with@5 position@6 max_token_length@7 max@7 token@8 length@9 lower_case@10 lower@10 case@11 stem@12
+                         "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
+remove_stop_words@0 remove@0 stop@1 words@2 custom_stop_words@3 custom@3 stop@4 words@5 ascii_folding@6 ascii@6 folding@7 min_ngram_length@8 min@8 ngram@9 length@10
+                         "max_ngram_length", "prefix_only", "format_version", "block_size")
+max_ngram_length@0 max@0 ngram@1 length@2 prefix_only@3 prefix@3 only@4 format_version@5 format@5 version@6 block_size@7 block@7 size@8
+    @staticmethod
+staticmethod@0
+    def _inverted_format_and_block(params: dict) -> None:
+def@0 _inverted_format_and_block@1 inverted@1 format@2 and@3 block@4 params@5 dict@6 none@7
+        """Check `format_version` and `block_size` in `params` as Lance does (format.rs, tokenizer.rs,
+check@0 format_version@1 format@1 version@2 and@3 block_size@4 block@4 size@5 in@6 params@7 as@8 lance@9 does@10 format@11 rs@12 tokenizer@13 rs@14
+        and the binding's conversions), and write the resolved format_version back into it."""
+and@0 the@1 binding@2 s@3 conversions@4 and@5 write@6 the@7 resolved@8 format_version@9 format@9 version@10 back@11 into@12 it@13
+        import operator
+import@0 operator@1
+        block = 128
+block@0 128@1
+        if params.get("block_size") is not None:
+if@0 params@1 get@2 block_size@3 block@3 size@4 is@5 not@6 none@7
+            block = operator.index(params["block_size"])
+block@0 operator@1 index@2 params@3 block_size@4 block@4 size@5
+            if block < 0:
+if@0 block@1 0@2
+                raise OverflowError("can't convert negative int to unsigned")
+raise@0 overflowerror@1 overflow@1 error@2 can@3 t@4 convert@5 negative@6 int@7 to@8 unsigned@9
+            if block not in (128, 256):
+if@0 block@1 not@2 in@3 128@4 256@5
+                raise ValueError(f"FTS inverted index block_size must be one of 128 or 256, got {block}")
+raise@0 valueerror@1 value@1 error@2 f@3 fts@4 inverted@5 index@6 block_size@7 block@7 size@8 must@9 be@10 one@11 of@12 128@13 or@14 256@15 got@16 block@17
+        version = params.get("format_version")
+version@0 params@1 get@2 format_version@3 format@3 version@4
+        if version is None:
+if@0 version@1 is@2 none@3
+            version = 3 if block == 256 else 2
+version@0 3@1 if@2 block@3 256@4 else@5 2@6
+        elif isinstance(version, str):
+elif@0 isinstance@1 version@2 str@3
+            text = version.strip()
+text@0 version@1 strip@2
+            named = {"1": 1, "v1": 1, "V1": 1, "2": 2, "v2": 2, "V2": 2, "3": 3, "v3": 3, "V3": 3}
+named@0 1@1 1@2 v1@3 v@3 1@4 1@5 v1@6 v@6 1@7 1@8 2@9 2@10 v2@11 v@11 2@12 2@13 v2@14 v@14 2@15 2@16 3@17 3@18 v3@19 v@19 3@20 3@21 v3@22 v@22 3@23 3@24
+            if text not in named:
+if@0 text@1 not@2 in@3 named@4
+                raise ValueError(f"unsupported FTS format version {text}, expected 1, 2, or 3")
+raise@0 valueerror@1 value@1 error@2 f@3 unsupported@4 fts@5 format@6 version@7 text@8 expected@9 1@10 2@11 or@12 3@13
+            version = named[text]
+version@0 named@1 text@2
+        elif isinstance(version, int) and 0 <= version <= 0xFFFFFFFF:
+elif@0 isinstance@1 version@2 int@3 and@4 0@5 version@6 0xffffffff@7 0@7 x@8 ffffffff@9
+getUserName XMLHttpRequest parseHTML2JSON utf8_reader HTML2JSON
+getusername@0 get@0 user@1 name@2 xmlhttprequest@3 xml@3 http@4 request@5 parsehtml2json@6 parse@6 html@7 2@8 json@9 utf8_reader@10 utf@10 8@11 reader@12 html2json@13 html@13 2@14 json@15
+value.parse::<usize>() a::b != c->d a=>b x??=y ... ::: >>>= <=>
+value@0 parse@1 usize@2 a@3 b@4 c@5 d@6 a@7 b@8 x@9 y@10
+__init__ _ __ _x_ user__name getUserName_v2 snake_case_ID
+__init__@0 _@1 __@2 _x_@3 user__name@4 user@4 name@5 getusername_v2@6 get@6 user@7 name@8 v@9 2@10 snake_case_id@11 snake@11 case@12 id@13
+naïveCAFÉ ÉtatCivil αβγΔεζ ΑΒΓδ straßeNAME Ǆungla ǅtitle ǈ
+naivecafe@0 naive@0 cafe@1 etatcivil@2 etat@2 civil@3 αβγδεζ@4 αβγ@4 δεζ@5 αβγδ@6 αβ@6 γδ@7 strassename@8 strasse@8 name@9 dzungla@10 dztitle@11 lj@12
+x1y2z3 3dModel v8Engine i18nText ab12CD
+x1y2z3@0 x@0 1@1 y@2 2@3 z@4 3@5 3dmodel@6 3@6 d@7 model@8 v8engine@9 v@9 8@10 engine@11 i18ntext@12 i@12 18@13 n@14 text@15 ab12cd@16 ab@16 12@17 cd@18
+a-b c+d e*f g/h (i) [j] {k} l;m n,o p.q r?s t|u v&w x^y ~z @a #b $c
+a@0 b@1 c@2 d@3 e@4 f@5 g@6 h@7 i@8 j@9 k@10 l@11 m@12 n@13 o@14 p@15 q@16 r@17 s@18 t@19 u@20 v@21 w@22 x@23 y@24 z@25 a@26 b@27 c@28
+for(i=0;i<n;i++){ total += arr[i]; }
+for@0 i@1 0@2 i@3 n@4 i@5 total@6 arr@7 i@8
+let mut v: Vec<u8> = Vec::new(); v.push(0x1F);
+let@0 mut@1 v@2 vec@3 u8@4 u@4 8@5 vec@6 new@7 v@8 push@9 0x1f@10 0@10 x@11 1@12 f@13
+@@code ops=0 split=1 preserve=0 numerics=1
+// SPDX-License-Identifier: Apache-2.0
+spdx@0 license@1 identifier@2 apache@3 2@4 0@5
+// Copyright (c) 2026 Yoav Bendor
+copyright@0 c@1 2026@2 yoav@3 bendor@4
+//
+
+// Lance's full-text analyzer (fts_tokenizer.hpp): lance-tokenizer 12.0.0's SimpleTokenizer /
+lance@0 s@1 full@2 text@3 analyzer@4 fts@5 tokenizer@6 hpp@7 lance@8 tokenizer@9 12@10 0@11 0@12 s@13 simple@14 tokenizer@15
+// WhitespaceTokenizer / RawTokenizer, RemoveLongFilter, LowerCaser, Stemmer, StopWordFilter and
+whitespace@0 tokenizer@1 raw@2 tokenizer@3 remove@4 long@5 filter@6 lower@7 caser@8 stemmer@9 stop@10 word@11 filter@12 and@13
+// AsciiFoldingFilter, chained as Lance 12's InvertedIndexParams::build chains them.
+ascii@0 folding@1 filter@2 chained@3 as@4 lance@5 12@6 s@7 inverted@8 index@9 params@10 build@11 chains@12 them@13
+#include "nanolance/fts_tokenizer.hpp"
+include@0 nanolance@1 fts@2 tokenizer@3 hpp@4
+#include "fts_json.hpp"
+include@0 fts@1 json@2 hpp@3
+#include <algorithm>
+include@0 algorithm@1
+#include <cctype>
+include@0 cctype@1
+#include <cstdint>
+include@0 cstdint@1
+#include <cstring>
+include@0 cstring@1
+#include <iterator>
+include@0 iterator@1
+#include <string>
+include@0 string@1
+namespace nano_lance::fts {
+namespace@0 nano@1 lance@2 fts@3
+namespace {
+namespace@0
+#include "fts_tables.inc"
+include@0 fts@1 tables@2 inc@3
+namespace snow {
+namespace@0 snow@1
+#include "fts_snowball_env.inc"
+include@0 fts@1 snowball@2 env@3 inc@4
+#include "fts_english_stem.inc"
+include@0 fts@1 english@2 stem@3 inc@4
+}  // namespace snow
+namespace@0 snow@1
+// ── UTF-8 ───────────────────────────────────────────────────────────────────────────────────────
+utf@0 8@1
+/// The code point at `text[i]` and its length in bytes (an invalid byte: itself, length 1).
+the@0 code@1 point@2 at@3 text@4 i@5 and@6 its@7 length@8 in@9 bytes@10 an@11 invalid@12 byte@13 itself@14 length@15 1@16
+std::uint32_t decode(std::string_view text, std::size_t i, std::size_t& len) {
+std@0 uint@1 32@2 t@3 decode@4 std@5 string@6 view@7 text@8 std@9 size@10 t@11 i@12 std@13 size@14 t@15 len@16
+    const auto b0 = static_cast<unsigned char>(text[i]);
+const@0 auto@1 b@2 0@3 static@4 cast@5 unsigned@6 char@7 text@8 i@9
+    const auto cont = [&](std::size_t k) {
+const@0 auto@1 cont@2 std@3 size@4 t@5 k@6
+        return i + k < text.size() && (static_cast<unsigned char>(text[i + k]) & 0xC0U) == 0x80U;
+return@0 i@1 k@2 text@3 size@4 static@5 cast@6 unsigned@7 char@8 text@9 i@10 k@11 0@12 x@13 c@14 0@15 u@16 0@17 x@18 80@19 u@20
+    };
+
+    const auto c = [&](std::size_t k) { return static_cast<std::uint32_t>(static_cast<unsigned char>(text[i + k]) & 0x3FU); };
+const@0 auto@1 c@2 std@3 size@4 t@5 k@6 return@7 static@8 cast@9 std@10 uint@11 32@12 t@13 static@14 cast@15 unsigned@16 char@17 text@18 i@19 k@20 0@21 x@22 3@23 fu@24
+    if (b0 < 0x80U) {
+if@0 b@1 0@2 0@3 x@4 80@5 u@6
+// SPDX-License-Identifier: Apache-2.0
+spdx@0 license@1 identifier@2 apache@3 2@4 0@5
+// Copyright (c) 2026 Yoav Bendor
+copyright@0 c@1 2026@2 yoav@3 bendor@4
+//
+
+// Building an INVERTED (full-text) index in Lance 12's format (docs/FTS_INDEX.md): the column's
+building@0 an@1 inverted@2 full@3 text@4 index@5 in@6 lance@7 12@8 s@9 format@10 docs@11 fts@12 index@13 md@14 the@15 column@16 s@17
+// documents are tokenized as the index's analyzer does, token ids given in order of first
+documents@0 are@1 tokenized@2 as@3 the@4 index@5 s@6 analyzer@7 does@8 token@9 ids@10 given@11 in@12 order@13 of@14 first@15
+// appearance, and the four files and manifest entry written as Lance's InvertedIndexBuilder writes
+appearance@0 and@1 the@2 four@3 files@4 and@5 manifest@6 entry@7 written@8 as@9 lance@10 s@11 inverted@12 index@13 builder@14 writes@15
+// them, one partition holding every document.
+them@0 one@1 partition@2 holding@3 every@4 document@5
+#include "index_build.hpp"
+include@0 index@1 build@2 hpp@3
+#include "nanolance/fts_search.hpp"
+include@0 nanolance@1 fts@2 search@3 hpp@4
+#include "fts_fst.hpp"
+include@0 fts@1 fst@2 hpp@3
+#include "fts_json.hpp"
+include@0 fts@1 json@2 hpp@3
+#include "fts_posting.hpp"
+include@0 fts@1 posting@2 hpp@3
+#include "index_files.hpp"
+include@0 index@1 files@2 hpp@3
+#include "nanolance/dataset_commit.hpp"
+include@0 nanolance@1 dataset@2 commit@3 hpp@4
+#include "nanolance/lance_table_reader.hpp"
+include@0 nanolance@1 lance@2 table@3 reader@4 hpp@5
+#include "nanolance/manifest_reader.hpp"
+include@0 nanolance@1 manifest@2 reader@3 hpp@4
+#include "nanolance/parallel.hpp"
+include@0 nanolance@1 parallel@2 hpp@3
+#include "nanolance/row_ids.hpp"
+include@0 nanolance@1 row@2 ids@3 hpp@4
+#include "lance_minimal.pb.hpp"
+include@0 lance@1 minimal@2 pb@3 hpp@4
+#include <nanoarrow/nanoarrow.h>
+include@0 nanoarrow@1 nanoarrow@2 h@3
+#include <algorithm>
+include@0 algorithm@1
+#include <chrono>
+include@0 chrono@1
+#include <cmath>
+include@0 cmath@1
+#include <cstring>
+include@0 cstring@1
+#include <limits>
+include@0 limits@1
+    _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
+inverted@0 options@1 base@2 tokenizer@3 language@4 with@5 position@6 max@7 token@8 length@9 lower@10 case@11 stem@12
+                         "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
+remove@0 stop@1 words@2 custom@3 stop@4 words@5 ascii@6 folding@7 min@8 ngram@9 length@10
+                         "max_ngram_length", "prefix_only", "format_version", "block_size")
+max@0 ngram@1 length@2 prefix@3 only@4 format@5 version@6 block@7 size@8
+    @staticmethod
+staticmethod@0
+    def _inverted_format_and_block(params: dict) -> None:
+def@0 inverted@1 format@2 and@3 block@4 params@5 dict@6 none@7
+        """Check `format_version` and `block_size` in `params` as Lance does (format.rs, tokenizer.rs,
+check@0 format@1 version@2 and@3 block@4 size@5 in@6 params@7 as@8 lance@9 does@10 format@11 rs@12 tokenizer@13 rs@14
+        and the binding's conversions), and write the resolved format_version back into it."""
+and@0 the@1 binding@2 s@3 conversions@4 and@5 write@6 the@7 resolved@8 format@9 version@10 back@11 into@12 it@13
+        import operator
+import@0 operator@1
+        block = 128
+block@0 128@1
+        if params.get("block_size") is not None:
+if@0 params@1 get@2 block@3 size@4 is@5 not@6 none@7
+            block = operator.index(params["block_size"])
+block@0 operator@1 index@2 params@3 block@4 size@5
+            if block < 0:
+if@0 block@1 0@2
+                raise OverflowError("can't convert negative int to unsigned")
+raise@0 overflow@1 error@2 can@3 t@4 convert@5 negative@6 int@7 to@8 unsigned@9
+            if block not in (128, 256):
+if@0 block@1 not@2 in@3 128@4 256@5
+                raise ValueError(f"FTS inverted index block_size must be one of 128 or 256, got {block}")
+raise@0 value@1 error@2 f@3 fts@4 inverted@5 index@6 block@7 size@8 must@9 be@10 one@11 of@12 128@13 or@14 256@15 got@16 block@17
+        version = params.get("format_version")
+version@0 params@1 get@2 format@3 version@4
+        if version is None:
+if@0 version@1 is@2 none@3
+            version = 3 if block == 256 else 2
+version@0 3@1 if@2 block@3 256@4 else@5 2@6
+        elif isinstance(version, str):
+elif@0 isinstance@1 version@2 str@3
+            text = version.strip()
+text@0 version@1 strip@2
+            named = {"1": 1, "v1": 1, "V1": 1, "2": 2, "v2": 2, "V2": 2, "3": 3, "v3": 3, "V3": 3}
+named@0 1@1 1@2 v@3 1@4 1@5 v@6 1@7 1@8 2@9 2@10 v@11 2@12 2@13 v@14 2@15 2@16 3@17 3@18 v@19 3@20 3@21 v@22 3@23 3@24
+            if text not in named:
+if@0 text@1 not@2 in@3 named@4
+                raise ValueError(f"unsupported FTS format version {text}, expected 1, 2, or 3")
+raise@0 value@1 error@2 f@3 unsupported@4 fts@5 format@6 version@7 text@8 expected@9 1@10 2@11 or@12 3@13
+            version = named[text]
+version@0 named@1 text@2
+        elif isinstance(version, int) and 0 <= version <= 0xFFFFFFFF:
+elif@0 isinstance@1 version@2 int@3 and@4 0@5 version@6 0@7 x@8 ffffffff@9
+getUserName XMLHttpRequest parseHTML2JSON utf8_reader HTML2JSON
+get@0 user@1 name@2 xml@3 http@4 request@5 parse@6 html@7 2@8 json@9 utf@10 8@11 reader@12 html@13 2@14 json@15
+value.parse::<usize>() a::b != c->d a=>b x??=y ... ::: >>>= <=>
+value@0 parse@1 usize@2 a@3 b@4 c@5 d@6 a@7 b@8 x@9 y@10
+__init__ _ __ _x_ user__name getUserName_v2 snake_case_ID
+__init__@0 _@1 __@2 _x_@3 user@4 name@5 get@6 user@7 name@8 v@9 2@10 snake@11 case@12 id@13
+naïveCAFÉ ÉtatCivil αβγΔεζ ΑΒΓδ straßeNAME Ǆungla ǅtitle ǈ
+naive@0 cafe@1 etat@2 civil@3 αβγ@4 δεζ@5 αβ@6 γδ@7 strasse@8 name@9 dzungla@10 dztitle@11 lj@12
+x1y2z3 3dModel v8Engine i18nText ab12CD
+x@0 1@1 y@2 2@3 z@4 3@5 3@6 d@7 model@8 v@9 8@10 engine@11 i@12 18@13 n@14 text@15 ab@16 12@17 cd@18
+a-b c+d e*f g/h (i) [j] {k} l;m n,o p.q r?s t|u v&w x^y ~z @a #b $c
+a@0 b@1 c@2 d@3 e@4 f@5 g@6 h@7 i@8 j@9 k@10 l@11 m@12 n@13 o@14 p@15 q@16 r@17 s@18 t@19 u@20 v@21 w@22 x@23 y@24 z@25 a@26 b@27 c@28
+for(i=0;i<n;i++){ total += arr[i]; }
+for@0 i@1 0@2 i@3 n@4 i@5 total@6 arr@7 i@8
+let mut v: Vec<u8> = Vec::new(); v.push(0x1F);
+let@0 mut@1 v@2 vec@3 u@4 8@5 vec@6 new@7 v@8 push@9 0@10 x@11 1@12 f@13
+@@code ops=0 split=1 preserve=1 numerics=0
+// SPDX-License-Identifier: Apache-2.0
+spdx@0 license@1 identifier@2 apache@3 2@4 0@5
+// Copyright (c) 2026 Yoav Bendor
+copyright@0 c@1 2026@2 yoav@3 bendor@4
+//
+
+// Lance's full-text analyzer (fts_tokenizer.hpp): lance-tokenizer 12.0.0's SimpleTokenizer /
+lance@0 s@1 full@2 text@3 analyzer@4 fts_tokenizer@5 fts@5 tokenizer@6 hpp@7 lance@8 tokenizer@9 12@10 0@11 0@12 s@13 simpletokenizer@14 simple@14 tokenizer@15
+// WhitespaceTokenizer / RawTokenizer, RemoveLongFilter, LowerCaser, Stemmer, StopWordFilter and
+whitespacetokenizer@0 whitespace@0 tokenizer@1 rawtokenizer@2 raw@2 tokenizer@3 removelongfilter@4 remove@4 long@5 filter@6 lowercaser@7 lower@7 caser@8 stemmer@9 stopwordfilter@10 stop@10 word@11 filter@12 and@13
+// AsciiFoldingFilter, chained as Lance 12's InvertedIndexParams::build chains them.
+asciifoldingfilter@0 ascii@0 folding@1 filter@2 chained@3 as@4 lance@5 12@6 s@7 invertedindexparams@8 inverted@8 index@9 params@10 build@11 chains@12 them@13
+#include "nanolance/fts_tokenizer.hpp"
+include@0 nanolance@1 fts_tokenizer@2 fts@2 tokenizer@3 hpp@4
+#include "fts_json.hpp"
+include@0 fts_json@1 fts@1 json@2 hpp@3
+#include <algorithm>
+include@0 algorithm@1
+#include <cctype>
+include@0 cctype@1
+#include <cstdint>
+include@0 cstdint@1
+#include <cstring>
+include@0 cstring@1
+#include <iterator>
+include@0 iterator@1
+#include <string>
+include@0 string@1
+namespace nano_lance::fts {
+namespace@0 nano_lance@1 nano@1 lance@2 fts@3
+namespace {
+namespace@0
+#include "fts_tables.inc"
+include@0 fts_tables@1 fts@1 tables@2 inc@3
+namespace snow {
+namespace@0 snow@1
+#include "fts_snowball_env.inc"
+include@0 fts_snowball_env@1 fts@1 snowball@2 env@3 inc@4
+#include "fts_english_stem.inc"
+include@0 fts_english_stem@1 fts@1 english@2 stem@3 inc@4
+}  // namespace snow
+namespace@0 snow@1
+// ── UTF-8 ───────────────────────────────────────────────────────────────────────────────────────
+utf@0 8@1
+/// The code point at `text[i]` and its length in bytes (an invalid byte: itself, length 1).
+the@0 code@1 point@2 at@3 text@4 i@5 and@6 its@7 length@8 in@9 bytes@10 an@11 invalid@12 byte@13 itself@14 length@15 1@16
+std::uint32_t decode(std::string_view text, std::size_t i, std::size_t& len) {
+std@0 uint32_t@1 uint32@1 t@2 decode@3 std@4 string_view@5 string@5 view@6 text@7 std@8 size_t@9 size@9 t@10 i@11 std@12 size_t@13 size@13 t@14 len@15
+    const auto b0 = static_cast<unsigned char>(text[i]);
+const@0 auto@1 b0@2 static_cast@3 static@3 cast@4 unsigned@5 char@6 text@7 i@8
+    const auto cont = [&](std::size_t k) {
+const@0 auto@1 cont@2 std@3 size_t@4 size@4 t@5 k@6
+        return i + k < text.size() && (static_cast<unsigned char>(text[i + k]) & 0xC0U) == 0x80U;
+return@0 i@1 k@2 text@3 size@4 static_cast@5 static@5 cast@6 unsigned@7 char@8 text@9 i@10 k@11 0xc0u@12 0x@12 c0u@13 0x80u@14
+    };
+
+    const auto c = [&](std::size_t k) { return static_cast<std::uint32_t>(static_cast<unsigned char>(text[i + k]) & 0x3FU); };
+const@0 auto@1 c@2 std@3 size_t@4 size@4 t@5 k@6 return@7 static_cast@8 static@8 cast@9 std@10 uint32_t@11 uint32@11 t@12 static_cast@13 static@13 cast@14 unsigned@15 char@16 text@17 i@18 k@19 0x3fu@20
+    if (b0 < 0x80U) {
+if@0 b0@1 0x80u@2
+// SPDX-License-Identifier: Apache-2.0
+spdx@0 license@1 identifier@2 apache@3 2@4 0@5
+// Copyright (c) 2026 Yoav Bendor
+copyright@0 c@1 2026@2 yoav@3 bendor@4
+//
+
+// Building an INVERTED (full-text) index in Lance 12's format (docs/FTS_INDEX.md): the column's
+building@0 an@1 inverted@2 full@3 text@4 index@5 in@6 lance@7 12@8 s@9 format@10 docs@11 fts_index@12 fts@12 index@13 md@14 the@15 column@16 s@17
+// documents are tokenized as the index's analyzer does, token ids given in order of first
+documents@0 are@1 tokenized@2 as@3 the@4 index@5 s@6 analyzer@7 does@8 token@9 ids@10 given@11 in@12 order@13 of@14 first@15
+// appearance, and the four files and manifest entry written as Lance's InvertedIndexBuilder writes
+appearance@0 and@1 the@2 four@3 files@4 and@5 manifest@6 entry@7 written@8 as@9 lance@10 s@11 invertedindexbuilder@12 inverted@12 index@13 builder@14 writes@15
+// them, one partition holding every document.
+them@0 one@1 partition@2 holding@3 every@4 document@5
+#include "index_build.hpp"
+include@0 index_build@1 index@1 build@2 hpp@3
+#include "nanolance/fts_search.hpp"
+include@0 nanolance@1 fts_search@2 fts@2 search@3 hpp@4
+#include "fts_fst.hpp"
+include@0 fts_fst@1 fts@1 fst@2 hpp@3
+#include "fts_json.hpp"
+include@0 fts_json@1 fts@1 json@2 hpp@3
+#include "fts_posting.hpp"
+include@0 fts_posting@1 fts@1 posting@2 hpp@3
+#include "index_files.hpp"
+include@0 index_files@1 index@1 files@2 hpp@3
+#include "nanolance/dataset_commit.hpp"
+include@0 nanolance@1 dataset_commit@2 dataset@2 commit@3 hpp@4
+#include "nanolance/lance_table_reader.hpp"
+include@0 nanolance@1 lance_table_reader@2 lance@2 table@3 reader@4 hpp@5
+#include "nanolance/manifest_reader.hpp"
+include@0 nanolance@1 manifest_reader@2 manifest@2 reader@3 hpp@4
+#include "nanolance/parallel.hpp"
+include@0 nanolance@1 parallel@2 hpp@3
+#include "nanolance/row_ids.hpp"
+include@0 nanolance@1 row_ids@2 row@2 ids@3 hpp@4
+#include "lance_minimal.pb.hpp"
+include@0 lance_minimal@1 lance@1 minimal@2 pb@3 hpp@4
+#include <nanoarrow/nanoarrow.h>
+include@0 nanoarrow@1 nanoarrow@2 h@3
+#include <algorithm>
+include@0 algorithm@1
+#include <chrono>
+include@0 chrono@1
+#include <cmath>
+include@0 cmath@1
+#include <cstring>
+include@0 cstring@1
+#include <limits>
+include@0 limits@1
+    _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
+_inverted_options@0 inverted@0 options@1 base_tokenizer@2 base@2 tokenizer@3 language@4 with_position@5 with@5 position@6 max_token_length@7 max@7 token@8 length@9 lower_case@10 lower@10 case@11 stem@12
+                         "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
+remove_stop_words@0 remove@0 stop@1 words@2 custom_stop_words@3 custom@3 stop@4 words@5 ascii_folding@6 ascii@6 folding@7 min_ngram_length@8 min@8 ngram@9 length@10
+                         "max_ngram_length", "prefix_only", "format_version", "block_size")
+max_ngram_length@0 max@0 ngram@1 length@2 prefix_only@3 prefix@3 only@4 format_version@5 format@5 version@6 block_size@7 block@7 size@8
+    @staticmethod
+staticmethod@0
+    def _inverted_format_and_block(params: dict) -> None:
+def@0 _inverted_format_and_block@1 inverted@1 format@2 and@3 block@4 params@5 dict@6 none@7
+        """Check `format_version` and `block_size` in `params` as Lance does (format.rs, tokenizer.rs,
+check@0 format_version@1 format@1 version@2 and@3 block_size@4 block@4 size@5 in@6 params@7 as@8 lance@9 does@10 format@11 rs@12 tokenizer@13 rs@14
+        and the binding's conversions), and write the resolved format_version back into it."""
+and@0 the@1 binding@2 s@3 conversions@4 and@5 write@6 the@7 resolved@8 format_version@9 format@9 version@10 back@11 into@12 it@13
+        import operator
+import@0 operator@1
+        block = 128
+block@0 128@1
+        if params.get("block_size") is not None:
+if@0 params@1 get@2 block_size@3 block@3 size@4 is@5 not@6 none@7
+            block = operator.index(params["block_size"])
+block@0 operator@1 index@2 params@3 block_size@4 block@4 size@5
+            if block < 0:
+if@0 block@1 0@2
+                raise OverflowError("can't convert negative int to unsigned")
+raise@0 overflowerror@1 overflow@1 error@2 can@3 t@4 convert@5 negative@6 int@7 to@8 unsigned@9
+            if block not in (128, 256):
+if@0 block@1 not@2 in@3 128@4 256@5
+                raise ValueError(f"FTS inverted index block_size must be one of 128 or 256, got {block}")
+raise@0 valueerror@1 value@1 error@2 f@3 fts@4 inverted@5 index@6 block_size@7 block@7 size@8 must@9 be@10 one@11 of@12 128@13 or@14 256@15 got@16 block@17
+        version = params.get("format_version")
+version@0 params@1 get@2 format_version@3 format@3 version@4
+        if version is None:
+if@0 version@1 is@2 none@3
+            version = 3 if block == 256 else 2
+version@0 3@1 if@2 block@3 256@4 else@5 2@6
+        elif isinstance(version, str):
+elif@0 isinstance@1 version@2 str@3
+            text = version.strip()
+text@0 version@1 strip@2
+            named = {"1": 1, "v1": 1, "V1": 1, "2": 2, "v2": 2, "V2": 2, "3": 3, "v3": 3, "V3": 3}
+named@0 1@1 1@2 v1@3 1@4 v1@5 1@6 2@7 2@8 v2@9 2@10 v2@11 2@12 3@13 3@14 v3@15 3@16 v3@17 3@18
+            if text not in named:
+if@0 text@1 not@2 in@3 named@4
+                raise ValueError(f"unsupported FTS format version {text}, expected 1, 2, or 3")
+raise@0 valueerror@1 value@1 error@2 f@3 unsupported@4 fts@5 format@6 version@7 text@8 expected@9 1@10 2@11 or@12 3@13
+            version = named[text]
+version@0 named@1 text@2
+        elif isinstance(version, int) and 0 <= version <= 0xFFFFFFFF:
+elif@0 isinstance@1 version@2 int@3 and@4 0@5 version@6 0xffffffff@7 0x@7 ffffffff@8
+getUserName XMLHttpRequest parseHTML2JSON utf8_reader HTML2JSON
+getusername@0 get@0 user@1 name@2 xmlhttprequest@3 xml@3 http@4 request@5 parsehtml2json@6 parse@6 html2json@7 utf8_reader@8 utf8@8 reader@9 html2json@10
+value.parse::<usize>() a::b != c->d a=>b x??=y ... ::: >>>= <=>
+value@0 parse@1 usize@2 a@3 b@4 c@5 d@6 a@7 b@8 x@9 y@10
+__init__ _ __ _x_ user__name getUserName_v2 snake_case_ID
+__init__@0 _@1 __@2 _x_@3 user__name@4 user@4 name@5 getusername_v2@6 get@6 user@7 name@8 v2@9 snake_case_id@10 snake@10 case@11 id@12
+naïveCAFÉ ÉtatCivil αβγΔεζ ΑΒΓδ straßeNAME Ǆungla ǅtitle ǈ
+naivecafe@0 naive@0 cafe@1 etatcivil@2 etat@2 civil@3 αβγδεζ@4 αβγ@4 δεζ@5 αβγδ@6 αβ@6 γδ@7 strassename@8 strasse@8 name@9 dzungla@10 dztitle@11 lj@12
+x1y2z3 3dModel v8Engine i18nText ab12CD
+x1y2z3@0 3dmodel@1 3d@1 model@2 v8engine@3 i18ntext@4 i18n@4 text@5 ab12cd@6
+a-b c+d e*f g/h (i) [j] {k} l;m n,o p.q r?s t|u v&w x^y ~z @a #b $c
+a@0 b@1 c@2 d@3 e@4 f@5 g@6 h@7 i@8 j@9 k@10 l@11 m@12 n@13 o@14 p@15 q@16 r@17 s@18 t@19 u@20 v@21 w@22 x@23 y@24 z@25 a@26 b@27 c@28
+for(i=0;i<n;i++){ total += arr[i]; }
+for@0 i@1 0@2 i@3 n@4 i@5 total@6 arr@7 i@8
+let mut v: Vec<u8> = Vec::new(); v.push(0x1F);
+let@0 mut@1 v@2 vec@3 u8@4 vec@5 new@6 v@7 push@8 0x1f@9
+@@code ops=1 split=1 preserve=1 numerics=1
+// SPDX-License-Identifier: Apache-2.0
+//@0 spdx@1 -@2 license@3 -@4 identifier@5 :@6 apache@7 -@8 2@9 0@10
+// Copyright (c) 2026 Yoav Bendor
+//@0 copyright@1 c@2 2026@3 yoav@4 bendor@5
+//
+//@0
+// Lance's full-text analyzer (fts_tokenizer.hpp): lance-tokenizer 12.0.0's SimpleTokenizer /
+//@0 lance@1 s@2 full@3 -@4 text@5 analyzer@6 fts_tokenizer@7 fts@7 tokenizer@8 hpp@9 :@10 lance@11 -@12 tokenizer@13 12@14 0@15 0@16 s@17 simpletokenizer@18 simple@18 tokenizer@19 /@20
+// WhitespaceTokenizer / RawTokenizer, RemoveLongFilter, LowerCaser, Stemmer, StopWordFilter and
+//@0 whitespacetokenizer@1 whitespace@1 tokenizer@2 /@3 rawtokenizer@4 raw@4 tokenizer@5 removelongfilter@6 remove@6 long@7 filter@8 lowercaser@9 lower@9 caser@10 stemmer@11 stopwordfilter@12 stop@12 word@13 filter@14 and@15
+// AsciiFoldingFilter, chained as Lance 12's InvertedIndexParams::build chains them.
+//@0 asciifoldingfilter@1 ascii@1 folding@2 filter@3 chained@4 as@5 lance@6 12@7 s@8 invertedindexparams@9 inverted@9 index@10 params@11 ::@12 build@13 chains@14 them@15
+#include "nanolance/fts_tokenizer.hpp"
+include@0 nanolance@1 /@2 fts_tokenizer@3 fts@3 tokenizer@4 hpp@5
+#include "fts_json.hpp"
+include@0 fts_json@1 fts@1 json@2 hpp@3
+#include <algorithm>
+include@0 <@1 algorithm@2 >@3
+#include <cctype>
+include@0 <@1 cctype@2 >@3
+#include <cstdint>
+include@0 <@1 cstdint@2 >@3
+#include <cstring>
+include@0 <@1 cstring@2 >@3
+#include <iterator>
+include@0 <@1 iterator@2 >@3
+#include <string>
+include@0 <@1 string@2 >@3
+namespace nano_lance::fts {
+namespace@0 nano_lance@1 nano@1 lance@2 ::@3 fts@4
+namespace {
+namespace@0
+#include "fts_tables.inc"
+include@0 fts_tables@1 fts@1 tables@2 inc@3
+namespace snow {
+namespace@0 snow@1
+#include "fts_snowball_env.inc"
+include@0 fts_snowball_env@1 fts@1 snowball@2 env@3 inc@4
+#include "fts_english_stem.inc"
+include@0 fts_english_stem@1 fts@1 english@2 stem@3 inc@4
+}  // namespace snow
+//@0 namespace@1 snow@2
+// ── UTF-8 ───────────────────────────────────────────────────────────────────────────────────────
+//@0 utf@1 -@2 8@3
+/// The code point at `text[i]` and its length in bytes (an invalid byte: itself, length 1).
+//@0 /@1 the@2 code@3 point@4 at@5 text@6 i@7 and@8 its@9 length@10 in@11 bytes@12 an@13 invalid@14 byte@15 :@16 itself@17 length@18 1@19
+std::uint32_t decode(std::string_view text, std::size_t i, std::size_t& len) {
+std@0 ::@1 uint32_t@2 uint@2 32@3 t@4 decode@5 std@6 ::@7 string_view@8 string@8 view@9 text@10 std@11 ::@12 size_t@13 size@13 t@14 i@15 std@16 ::@17 size_t@18 size@18 t@19 &@20 len@21
+    const auto b0 = static_cast<unsigned char>(text[i]);
+const@0 auto@1 b0@2 b@2 0@3 =@4 static_cast@5 static@5 cast@6 <@7 unsigned@8 char@9 >@10 text@11 i@12
+    const auto cont = [&](std::size_t k) {
+const@0 auto@1 cont@2 =@3 &@4 std@5 ::@6 size_t@7 size@7 t@8 k@9
+        return i + k < text.size() && (static_cast<unsigned char>(text[i + k]) & 0xC0U) == 0x80U;
+return@0 i@1 +@2 k@3 <@4 text@5 size@6 &&@7 static_cast@8 static@8 cast@9 <@10 unsigned@11 char@12 >@13 text@14 i@15 +@16 k@17 &@18 0xc0u@19 0@19 x@20 c@21 0@22 u@23 ==@24 0x80u@25 0@25 x@26 80@27 u@28
+    };
+
+    const auto c = [&](std::size_t k) { return static_cast<std::uint32_t>(static_cast<unsigned char>(text[i + k]) & 0x3FU); };
+const@0 auto@1 c@2 =@3 &@4 std@5 ::@6 size_t@7 size@7 t@8 k@9 return@10 static_cast@11 static@11 cast@12 <@13 std@14 ::@15 uint32_t@16 uint@16 32@17 t@18 >@19 static_cast@20 static@20 cast@21 <@22 unsigned@23 char@24 >@25 text@26 i@27 +@28 k@29 &@30 0x3fu@31 0@31 x@32 3@33 fu@34
+    if (b0 < 0x80U) {
+if@0 b0@1 b@1 0@2 <@3 0x80u@4 0@4 x@5 80@6 u@7
+// SPDX-License-Identifier: Apache-2.0
+//@0 spdx@1 -@2 license@3 -@4 identifier@5 :@6 apache@7 -@8 2@9 0@10
+// Copyright (c) 2026 Yoav Bendor
+//@0 copyright@1 c@2 2026@3 yoav@4 bendor@5
+//
+//@0
+// Building an INVERTED (full-text) index in Lance 12's format (docs/FTS_INDEX.md): the column's
+//@0 building@1 an@2 inverted@3 full@4 -@5 text@6 index@7 in@8 lance@9 12@10 s@11 format@12 docs@13 /@14 fts_index@15 fts@15 index@16 md@17 :@18 the@19 column@20 s@21
+// documents are tokenized as the index's analyzer does, token ids given in order of first
+//@0 documents@1 are@2 tokenized@3 as@4 the@5 index@6 s@7 analyzer@8 does@9 token@10 ids@11 given@12 in@13 order@14 of@15 first@16
+// appearance, and the four files and manifest entry written as Lance's InvertedIndexBuilder writes
+//@0 appearance@1 and@2 the@3 four@4 files@5 and@6 manifest@7 entry@8 written@9 as@10 lance@11 s@12 invertedindexbuilder@13 inverted@13 index@14 builder@15 writes@16
+// them, one partition holding every document.
+//@0 them@1 one@2 partition@3 holding@4 every@5 document@6
+#include "index_build.hpp"
+include@0 index_build@1 index@1 build@2 hpp@3
+#include "nanolance/fts_search.hpp"
+include@0 nanolance@1 /@2 fts_search@3 fts@3 search@4 hpp@5
+#include "fts_fst.hpp"
+include@0 fts_fst@1 fts@1 fst@2 hpp@3
+#include "fts_json.hpp"
+include@0 fts_json@1 fts@1 json@2 hpp@3
+#include "fts_posting.hpp"
+include@0 fts_posting@1 fts@1 posting@2 hpp@3
+#include "index_files.hpp"
+include@0 index_files@1 index@1 files@2 hpp@3
+#include "nanolance/dataset_commit.hpp"
+include@0 nanolance@1 /@2 dataset_commit@3 dataset@3 commit@4 hpp@5
+#include "nanolance/lance_table_reader.hpp"
+include@0 nanolance@1 /@2 lance_table_reader@3 lance@3 table@4 reader@5 hpp@6
+#include "nanolance/manifest_reader.hpp"
+include@0 nanolance@1 /@2 manifest_reader@3 manifest@3 reader@4 hpp@5
+#include "nanolance/parallel.hpp"
+include@0 nanolance@1 /@2 parallel@3 hpp@4
+#include "nanolance/row_ids.hpp"
+include@0 nanolance@1 /@2 row_ids@3 row@3 ids@4 hpp@5
+#include "lance_minimal.pb.hpp"
+include@0 lance_minimal@1 lance@1 minimal@2 pb@3 hpp@4
+#include <nanoarrow/nanoarrow.h>
+include@0 <@1 nanoarrow@2 /@3 nanoarrow@4 h@5 >@6
+#include <algorithm>
+include@0 <@1 algorithm@2 >@3
+#include <chrono>
+include@0 <@1 chrono@2 >@3
+#include <cmath>
+include@0 <@1 cmath@2 >@3
+#include <cstring>
+include@0 <@1 cstring@2 >@3
+#include <limits>
+include@0 <@1 limits@2 >@3
+    _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
+_inverted_options@0 inverted@0 options@1 =@2 base_tokenizer@3 base@3 tokenizer@4 language@5 with_position@6 with@6 position@7 max_token_length@8 max@8 token@9 length@10 lower_case@11 lower@11 case@12 stem@13
+                         "remove_stop_words", "custom_stop_words", "ascii_folding", "min_ngram_length",
+remove_stop_words@0 remove@0 stop@1 words@2 custom_stop_words@3 custom@3 stop@4 words@5 ascii_folding@6 ascii@6 folding@7 min_ngram_length@8 min@8 ngram@9 length@10
+                         "max_ngram_length", "prefix_only", "format_version", "block_size")
+max_ngram_length@0 max@0 ngram@1 length@2 prefix_only@3 prefix@3 only@4 format_version@5 format@5 version@6 block_size@7 block@7 size@8
+    @staticmethod
+staticmethod@0
+    def _inverted_format_and_block(params: dict) -> None:
+def@0 _inverted_format_and_block@1 inverted@1 format@2 and@3 block@4 params@5 :@6 dict@7 ->@8 none@9 :@10
+        """Check `format_version` and `block_size` in `params` as Lance does (format.rs, tokenizer.rs,
+check@0 format_version@1 format@1 version@2 and@3 block_size@4 block@4 size@5 in@6 params@7 as@8 lance@9 does@10 format@11 rs@12 tokenizer@13 rs@14
+        and the binding's conversions), and write the resolved format_version back into it."""
+and@0 the@1 binding@2 s@3 conversions@4 and@5 write@6 the@7 resolved@8 format_version@9 format@9 version@10 back@11 into@12 it@13
+        import operator
+import@0 operator@1
+        block = 128
+block@0 =@1 128@2
+        if params.get("block_size") is not None:
+if@0 params@1 get@2 block_size@3 block@3 size@4 is@5 not@6 none@7 :@8
+            block = operator.index(params["block_size"])
+block@0 =@1 operator@2 index@3 params@4 block_size@5 block@5 size@6
+            if block < 0:
+if@0 block@1 <@2 0@3 :@4
+                raise OverflowError("can't convert negative int to unsigned")
+raise@0 overflowerror@1 overflow@1 error@2 can@3 t@4 convert@5 negative@6 int@7 to@8 unsigned@9
+            if block not in (128, 256):
+if@0 block@1 not@2 in@3 128@4 256@5 :@6
+                raise ValueError(f"FTS inverted index block_size must be one of 128 or 256, got {block}")
+raise@0 valueerror@1 value@1 error@2 f@3 fts@4 inverted@5 index@6 block_size@7 block@7 size@8 must@9 be@10 one@11 of@12 128@13 or@14 256@15 got@16 block@17
+        version = params.get("format_version")
+version@0 =@1 params@2 get@3 format_version@4 format@4 version@5
+        if version is None:
+if@0 version@1 is@2 none@3 :@4
+            version = 3 if block == 256 else 2
+version@0 =@1 3@2 if@3 block@4 ==@5 256@6 else@7 2@8
+        elif isinstance(version, str):
+elif@0 isinstance@1 version@2 str@3 :@4
+            text = version.strip()
+text@0 =@1 version@2 strip@3
+            named = {"1": 1, "v1": 1, "V1": 1, "2": 2, "v2": 2, "V2": 2, "3": 3, "v3": 3, "V3": 3}
+named@0 =@1 1@2 :@3 1@4 v1@5 v@5 1@6 :@7 1@8 v1@9 v@9 1@10 :@11 1@12 2@13 :@14 2@15 v2@16 v@16 2@17 :@18 2@19 v2@20 v@20 2@21 :@22 2@23 3@24 :@25 3@26 v3@27 v@27 3@28 :@29 3@30 v3@31 v@31 3@32 :@33 3@34
+            if text not in named:
+if@0 text@1 not@2 in@3 named@4 :@5
+                raise ValueError(f"unsupported FTS format version {text}, expected 1, 2, or 3")
+raise@0 valueerror@1 value@1 error@2 f@3 unsupported@4 fts@5 format@6 version@7 text@8 expected@9 1@10 2@11 or@12 3@13
+            version = named[text]
+version@0 =@1 named@2 text@3
+        elif isinstance(version, int) and 0 <= version <= 0xFFFFFFFF:
+elif@0 isinstance@1 version@2 int@3 and@4 0@5 <=@6 version@7 <=@8 0xffffffff@9 0@9 x@10 ffffffff@11 :@12
+getUserName XMLHttpRequest parseHTML2JSON utf8_reader HTML2JSON
+getusername@0 get@0 user@1 name@2 xmlhttprequest@3 xml@3 http@4 request@5 parsehtml2json@6 parse@6 html@7 2@8 json@9 utf8_reader@10 utf@10 8@11 reader@12 html2json@13 html@13 2@14 json@15
+value.parse::<usize>() a::b != c->d a=>b x??=y ... ::: >>>= <=>
+value@0 parse@1 ::@2 <@3 usize@4 >@5 a@6 ::@7 b@8 !=@9 c@10 ->@11 d@12 a@13 =>@14 b@15 x@16 ??=@17 y@18 ::@19 :@20 >>>=@21 <=>@22
+__init__ _ __ _x_ user__name getUserName_v2 snake_case_ID
+__init__@0 _@1 __@2 _x_@3 user__name@4 user@4 name@5 getusername_v2@6 get@6 user@7 name@8 v@9 2@10 snake_case_id@11 snake@11 case@12 id@13
+naïveCAFÉ ÉtatCivil αβγΔεζ ΑΒΓδ straßeNAME Ǆungla ǅtitle ǈ
+naivecafe@0 naive@0 cafe@1 etatcivil@2 etat@2 civil@3 αβγδεζ@4 αβγ@4 δεζ@5 αβγδ@6 αβ@6 γδ@7 strassename@8 strasse@8 name@9 dzungla@10 dztitle@11 lj@12
+x1y2z3 3dModel v8Engine i18nText ab12CD
+x1y2z3@0 x@0 1@1 y@2 2@3 z@4 3@5 3dmodel@6 3@6 d@7 model@8 v8engine@9 v@9 8@10 engine@11 i18ntext@12 i@12 18@13 n@14 text@15 ab12cd@16 ab@16 12@17 cd@18
+a-b c+d e*f g/h (i) [j] {k} l;m n,o p.q r?s t|u v&w x^y ~z @a #b $c
+a@0 -@1 b@2 c@3 +@4 d@5 e@6 *@7 f@8 g@9 /@10 h@11 i@12 j@13 k@14 l@15 m@16 n@17 o@18 p@19 q@20 r@21 ?@22 s@23 t@24 |@25 u@26 v@27 &@28 w@29 x@30 ^@31 y@32 ~@33 z@34 a@35 b@36 c@37
+for(i=0;i<n;i++){ total += arr[i]; }
+for@0 i@1 =@2 0@3 i@4 <@5 n@6 i@7 ++@8 total@9 +=@10 arr@11 i@12
+let mut v: Vec<u8> = Vec::new(); v.push(0x1F);
+let@0 mut@1 v@2 :@3 vec@4 <@5 u8@6 u@6 8@7 >@8 =@9 vec@10 ::@11 new@12 v@13 push@14 0x1f@15 0@15 x@16 1@17 f@18

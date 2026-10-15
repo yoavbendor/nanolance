@@ -95,6 +95,168 @@ void map_chars(std::string_view in, const CharMap* begin, const CharMap* end, bo
     }
 }
 
+// ── the code analyzer: CodeLexTokenizer, then WordDelimiterFilter (lance-tokenizer's
+// code_tokenizer.rs and word_delimiter_filter.rs, ported token for token) ─────────────────────────
+
+bool in_ranges(const std::uint32_t (*begin)[2], const std::uint32_t (*end)[2], std::uint32_t cp) {
+    const auto* it = std::upper_bound(begin, end, cp, [](std::uint32_t v, const std::uint32_t (&r)[2]) { return v < r[0]; });
+    return it != begin && cp <= (*(it - 1))[1];
+}
+
+bool is_lowercase(std::uint32_t cp) { return in_ranges(std::begin(kLowercase), std::end(kLowercase), cp); }
+bool is_uppercase(std::uint32_t cp) { return in_ranges(std::begin(kUppercase), std::end(kUppercase), cp); }
+bool is_ascii_digit(std::uint32_t cp) { return cp >= '0' && cp <= '9'; }
+
+bool is_code_identifier(std::uint32_t cp) { return cp == '_' || is_alphanumeric(cp); }
+
+bool is_code_operator_char(std::uint32_t cp) {
+    switch (cp) {
+        case '!': case '%': case '&': case '*': case '+': case '-': case '/': case ':': case '<': case '=':
+        case '>': case '?': case '^': case '|': case '~':
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// MULTI_CHAR_OPERATORS of code_tokenizer.rs (longest match wins).
+constexpr std::string_view kMultiCharOperators[] = {
+    ">>>=", "<<=", ">>=", "&&=", "||=", "?\?=", "**=", "//=", "===", "!==", ">>>", "<=>", "::", "->", "=>", "==",
+    "!=", "<=", ">=", "&&", "||", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<", ">>", "**",
+    "//", "??", ":=", "<-", "|>", "~=",
+};
+
+/// The byte length of the operator token at text[i]: its longest multi-character operator, else 1.
+std::size_t operator_length(std::string_view text, std::size_t i) {
+    std::size_t best = 1;
+    const auto rest = text.substr(i);
+    for (const auto op : kMultiCharOperators) {
+        if (op.size() > best && rest.substr(0, op.size()) == op) {
+            best = op.size();
+        }
+    }
+    return best;
+}
+
+struct CodeToken {
+    std::size_t from;
+    std::size_t to;
+    std::uint32_t position;
+};
+
+/// CodeLexTokenizer: identifiers, and with `operators` the operator tokens; positions 0, 1, ...
+std::vector<CodeToken> lex_code(std::string_view text, bool operators) {
+    std::vector<CodeToken> out;
+    std::uint32_t position = 0;
+    std::size_t i = 0;
+    while (i < text.size()) {
+        std::size_t len = 0;
+        const auto cp = decode(text, i, len);
+        std::size_t end = 0;
+        if (is_code_identifier(cp)) {
+            end = i + len;
+            while (end < text.size()) {
+                std::size_t next = 0;
+                if (!is_code_identifier(decode(text, end, next))) {
+                    break;
+                }
+                end += next;
+            }
+        } else if (operators && is_code_operator_char(cp)) {
+            end = i + operator_length(text, i);
+        } else {
+            i += len;
+            continue;
+        }
+        out.push_back(CodeToken{i, end, position++});
+        i = end;
+    }
+    return out;
+}
+
+/// A byte range of an identifier.
+struct Piece {
+    std::size_t from;
+    std::size_t to;
+};
+
+/// The pieces of one run of identifier characters without '_' (split_segment in word_delimiter_filter.rs).
+void split_segment(std::string_view text, std::size_t start, std::size_t end, bool numerics, std::vector<Piece>& pieces) {
+    struct Char {
+        std::size_t offset;
+        std::uint32_t cp;
+    };
+    std::vector<Char> chars;
+    for (std::size_t i = start; i < end;) {
+        std::size_t len = 0;
+        const auto cp = decode(text, i, len);
+        chars.push_back(Char{i, cp});
+        i += len;
+    }
+    std::size_t piece_start = start;
+    for (std::size_t idx = 1; idx < chars.size(); ++idx) {
+        const auto prev = chars[idx - 1].cp;
+        const auto cur = chars[idx].cp;
+        const bool boundary = (numerics && is_ascii_digit(prev) != is_ascii_digit(cur)) ||
+                              (is_lowercase(prev) && is_uppercase(cur)) ||
+                              (is_uppercase(prev) && is_uppercase(cur) && idx + 1 < chars.size() &&
+                               is_lowercase(chars[idx + 1].cp));
+        if (boundary) {
+            pieces.push_back(Piece{piece_start, chars[idx].offset});
+            piece_start = chars[idx].offset;
+        }
+    }
+    pieces.push_back(Piece{piece_start, end});
+}
+
+/// split_identifier in word_delimiter_filter.rs: the pieces of `text` between its underscores.
+std::vector<Piece> split_identifier(std::string_view text, bool numerics) {
+    std::vector<Piece> pieces;
+    std::size_t segment_start = 0;
+    bool in_segment = false;
+    for (std::size_t i = 0; i < text.size();) {
+        std::size_t len = 0;
+        const auto cp = decode(text, i, len);
+        if (cp == '_') {
+            if (in_segment) {
+                split_segment(text, segment_start, i, numerics, pieces);
+                in_segment = false;
+            }
+        } else if (!in_segment) {
+            segment_start = i;
+            in_segment = true;
+        }
+        i += len;
+    }
+    if (in_segment) {
+        split_segment(text, segment_start, text.size(), numerics, pieces);
+    }
+    return pieces;
+}
+
+/// The code analyzer's words and positions for `text` (before the filters that follow it).
+void code_words(std::string_view text, const AnalyzerParams& p,
+                std::vector<std::pair<std::string_view, std::uint32_t>>& out) {
+    std::uint32_t shift = 0;  // WordDelimiterFilter's position_offset: the extra pieces so far
+    for (const auto& tok : lex_code(text, p.index_operators)) {
+        const std::string_view word = text.substr(tok.from, tok.to - tok.from);
+        const std::uint32_t position = tok.position + shift;
+        const auto pieces = p.split_identifiers ? split_identifier(word, p.split_on_numerics) : std::vector<Piece>{};
+        if (pieces.size() <= 1) {
+            out.emplace_back(word, position);
+            continue;
+        }
+        if (p.preserve_original) {
+            out.emplace_back(word, position);
+        }
+        for (std::size_t k = 0; k < pieces.size(); ++k) {
+            out.emplace_back(word.substr(pieces[k].from, pieces[k].to - pieces[k].from),
+                             position + static_cast<std::uint32_t>(k));
+        }
+        shift += static_cast<std::uint32_t>(pieces.size() - 1);
+    }
+}
+
 }  // namespace
 
 bool parse_params(std::string_view text, AnalyzerParams& out, std::string& error) {
@@ -157,6 +319,14 @@ bool parse_params(std::string_view text, AnalyzerParams& out, std::string& error
             number(out.block_size);
         } else if (key == "format_version") {
             number(out.format_version);
+        } else if (key == "split_identifiers") {
+            flag(out.split_identifiers);
+        } else if (key == "split_on_numerics") {
+            flag(out.split_on_numerics);
+        } else if (key == "preserve_original") {
+            flag(out.preserve_original);
+        } else if (key == "index_operators") {
+            flag(out.index_operators);
         }
     }
     return true;
@@ -182,15 +352,21 @@ std::string params_json(const AnalyzerParams& p) {
     out += ",\"ascii_folding\":" + std::string(b(p.ascii_folding)) + ",\"min_ngram_length\":" +
            std::to_string(p.min_ngram_length) + ",\"max_ngram_length\":" + std::to_string(p.max_ngram_length) +
            ",\"prefix_only\":" + b(p.prefix_only) + ",\"block_size\":" + std::to_string(p.block_size) +
-           ",\"split_identifiers\":false,\"split_on_numerics\":false,\"preserve_original\":false,"
-           "\"index_operators\":false}";
+           ",\"split_identifiers\":" + b(p.split_identifiers) + ",\"split_on_numerics\":" + b(p.split_on_numerics) +
+           ",\"preserve_original\":" + b(p.preserve_original) + ",\"index_operators\":" + b(p.index_operators) + "}";
     return out;
 }
 
 bool Analyzer::init(const AnalyzerParams& params, std::string& error) {
     params_ = params;
-    if (params.base_tokenizer != "simple" && params.base_tokenizer != "whitespace" && params.base_tokenizer != "raw") {
-        error = "the '" + params.base_tokenizer + "' tokenizer is not supported (simple, whitespace and raw are)";
+    if (params.base_tokenizer != "simple" && params.base_tokenizer != "whitespace" && params.base_tokenizer != "raw" &&
+        params.base_tokenizer != "code") {
+        error = "the '" + params.base_tokenizer + "' tokenizer is not supported (simple, whitespace, raw and code are)";
+        return false;
+    }
+    if (params.base_tokenizer != "code" && (params.split_identifiers || params.split_on_numerics ||
+                                            params.preserve_original || params.index_operators)) {
+        error = "code analyzer flags require base_tokenizer='code'";
         return false;
     }
     if (params.lance_tokenizer != "text") {
@@ -251,6 +427,14 @@ void Analyzer::tokenize(std::string_view text, std::vector<Token>& out) const {
     std::uint32_t position = 0;
     if (params_.base_tokenizer == "raw") {
         emit(text, 0, out);
+        return;
+    }
+    if (params_.base_tokenizer == "code") {
+        std::vector<std::pair<std::string_view, std::uint32_t>> words;
+        code_words(text, params_, words);
+        for (const auto& [word, at] : words) {
+            emit(word, at, out);
+        }
         return;
     }
     const bool simple = params_.base_tokenizer == "simple";
