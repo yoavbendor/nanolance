@@ -99,6 +99,8 @@ std::vector<std::string> blob_v2_parse_uri_dictionary(const std::string& seriali
 /// When `dictionary_mode` is true, distinct URIs are deduplicated into `out.blob_v2.uri_dictionary`
 /// and each packed row stores `blob_id` = dictionary index with an empty inline URI (smaller, but
 /// produces a nanolance-only layout). When false, URIs are stored inline per row (Lance-compatible).
+/// The column may also be a prepared descriptor struct (children kind, data, uri, blob_id, blob_size,
+/// position): each row is then kept as the descriptor says (packed, dedicated or external) or inline.
 bool append_blob_v2_batch_column_values(const ArrowArray& batch,
                                          const LanceSchemaMapping& mapping,
                                          const LanceField& blob_field,
@@ -127,6 +129,9 @@ constexpr std::uint8_t kBlobKindExternal = 3;   // at `blob_uri`, `position`
 /// Writer-side only, never on disk: a blob given as bytes, placed (inline, packed or dedicated) when
 /// its data file is written. The row's trailing bytes -- a URI's place -- are the blob itself.
 constexpr std::uint8_t kBlobKindPendingData = 0xFF;
+/// Writer-side only, never on disk: a blob given as inline bytes by a descriptor (kind 0). Placed like
+/// kBlobKindPendingData but always inline, whatever its size.
+constexpr std::uint8_t kBlobKindPendingInline = 0xFE;
 
 /// Lance's storage thresholds for a Blob v2 field, from its field metadata
 /// (`lance-encoding:blob-{inline,dedicated,pack-file}-size-threshold`): a blob of more than `inline_max`

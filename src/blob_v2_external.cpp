@@ -127,6 +127,41 @@ bool uint64_value(const ArrowArray& array, std::int64_t row_index, bool* is_null
     return true;
 }
 
+bool uint8_value(const ArrowArray& array, std::int64_t row_index, bool* is_null, std::uint8_t* out) {
+    *is_null = false;
+    *out = 0;
+    if (array.length <= 0 || row_index < 0 || row_index >= array.length) {
+        return false;
+    }
+    if (array.n_buffers < 2 || array.buffers == nullptr || array.buffers[1] == nullptr) {
+        return false;
+    }
+    if (array.buffers[0] != nullptr && arrow_row_is_null(array, row_index)) {
+        *is_null = true;
+        return true;
+    }
+    *out = static_cast<const std::uint8_t*>(array.buffers[1])[array.offset + row_index];
+    return true;
+}
+
+bool uint32_value(const ArrowArray& array, std::int64_t row_index, bool* is_null, std::uint32_t* out) {
+    *is_null = false;
+    *out = 0;
+    if (array.length <= 0 || row_index < 0 || row_index >= array.length) {
+        return false;
+    }
+    if (array.n_buffers < 2 || array.buffers == nullptr || array.buffers[1] == nullptr) {
+        return false;
+    }
+    if (array.buffers[0] != nullptr && arrow_row_is_null(array, row_index)) {
+        *is_null = true;
+        return true;
+    }
+    const auto* values = static_cast<const std::uint8_t*>(array.buffers[1]);
+    std::memcpy(out, values + static_cast<std::size_t>(array.offset + row_index) * 4U, sizeof(std::uint32_t));
+    return true;
+}
+
 const LanceField* find_child(const LanceSchemaMapping& mapping, std::int32_t parent_id, const std::string& name) {
     for (const auto& field : mapping.fields) {
         if (field.parent_id == parent_id && field.name == name) {
@@ -348,7 +383,8 @@ bool BlobV2Placer::write_sidecar(const std::uint32_t id, const std::uint8_t* dat
 bool blob_v2_has_pending(const ColumnValues& values) {
     std::size_t offset = 0;
     for (const auto row_size : values.blob_v2.row_packed_sizes) {
-        if (row_size >= kBlobV2RecordHeaderBytes && values.blob_v2.packed_payload[offset + 4U] == kBlobKindPendingData) {
+        if (row_size >= kBlobV2RecordHeaderBytes && (values.blob_v2.packed_payload[offset + 4U] == kBlobKindPendingData ||
+                                                     values.blob_v2.packed_payload[offset + 4U] == kBlobKindPendingInline)) {
             return true;
         }
         offset += row_size;
@@ -370,7 +406,8 @@ bool BlobV2Placer::place(const ColumnValues& values, const BlobV2Thresholds& thr
     for (const auto row_size : values.blob_v2.row_packed_sizes) {
         const auto* row = values.blob_v2.packed_payload.data() + offset;
         offset += row_size;
-        if (row_size < kBlobV2RecordHeaderBytes || row[4] != kBlobKindPendingData) {
+        const bool pending_inline = row_size >= kBlobV2RecordHeaderBytes && row[4] == kBlobKindPendingInline;
+        if (row_size < kBlobV2RecordHeaderBytes || (row[4] != kBlobKindPendingData && !pending_inline)) {
             placed.blob_v2.packed_payload.insert(placed.blob_v2.packed_payload.end(), row, row + row_size);
             placed.blob_v2.row_packed_sizes.push_back(row_size);
             continue;
@@ -380,13 +417,14 @@ bool BlobV2Placer::place(const ColumnValues& values, const BlobV2Thresholds& thr
         std::uint8_t kind = kBlobKindInline;
         std::uint64_t position = 0;
         std::uint32_t id = 0;
-        if (n > thresholds.dedicated_above) {
+        // A descriptor that says inline stays inline, whatever its size.
+        if (!pending_inline && n > thresholds.dedicated_above) {
             kind = kBlobKindDedicated;
             id = next_id_++;
             if (!write_sidecar(id, data, n, error)) {
                 return false;
             }
-        } else if (n > thresholds.inline_max) {
+        } else if (!pending_inline && n > thresholds.inline_max) {
             kind = kBlobKindPacked;
             if (pack_id_ == 0U || pack_max != pack_max_ || pack_size_ + n > pack_max) {
                 if (!finish(error)) {
@@ -543,6 +581,22 @@ bool finalize_blob_v2_schema_for_write(LanceSchemaMapping& mapping, std::string&
     if (ids.empty()) {
         return true;
     }
+    // A prepared descriptor (children kind, data, uri, blob_id, blob_size, position) is written as the
+    // descriptor it is: its kind, blob_id and blob_size children have no place of their own in the
+    // logical field, which is what the file writer lays out as the descriptor's physical columns.
+    std::vector<std::int32_t> descriptor_ids;
+    for (const auto id : ids) {
+        if (find_child(mapping, id, "blob_size") != nullptr) {
+            descriptor_ids.push_back(id);
+        }
+    }
+    mapping.fields.erase(std::remove_if(mapping.fields.begin(), mapping.fields.end(),
+                                        [&](const LanceField& f) {
+                                            return std::find(descriptor_ids.begin(), descriptor_ids.end(), f.parent_id) !=
+                                                       descriptor_ids.end() &&
+                                                   (f.name == "kind" || f.name == "blob_id" || f.name == "blob_size");
+                                        }),
+                         mapping.fields.end());
     for (const auto id : ids) {
         if (find_child(mapping, id, "kind") != nullptr) {
             continue;  // an older nanolance dataset's descriptor-shaped field, appended to as it is
@@ -717,6 +771,29 @@ std::vector<std::string> blob_v2_parse_uri_dictionary(const std::string& seriali
     return out;
 }
 
+/// One external reference row (kind 3). With `dictionary_mode` its URI is deduplicated into the column's
+/// dictionary and the row carries the dictionary index; otherwise the URI is stored inline in the row.
+bool append_external_row(ColumnValues& out, bool dictionary_mode, const std::uint8_t* uri_ptr, std::int32_t uri_len,
+                         std::uint64_t position, std::uint64_t size, std::string& error) {
+    std::string uri(reinterpret_cast<const char*>(uri_ptr), static_cast<std::size_t>(uri_len));
+    std::uint32_t blob_id = 0;
+    if (dictionary_mode) {
+        // Deduplicate the URI: assign a stable dictionary index and store it once.
+        // The packed row then carries blob_id = index and an empty inline URI.
+        const auto it = out.blob_v2.uri_to_id.find(uri);
+        if (it == out.blob_v2.uri_to_id.end()) {
+            blob_id = static_cast<std::uint32_t>(out.blob_v2.uri_dictionary.size());
+            out.blob_v2.uri_dictionary.push_back(uri);
+            out.blob_v2.uri_to_id.emplace(uri, blob_id);
+        } else {
+            blob_id = it->second;
+        }
+        uri.clear();
+    }
+    return append_packed_row(out, kBlobKindExternal, position, size, blob_id,
+                             reinterpret_cast<const std::uint8_t*>(uri.data()), uri.size(), error);
+}
+
 bool append_blob_v2_batch_column_values(const ArrowArray& batch,
                                         const LanceSchemaMapping& mapping,
                                         const LanceField& blob_field,
@@ -724,14 +801,20 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
                                         ColumnValues& out,
                                         std::string& error) {
     error.clear();
-    // Lance's logical shape: struct<data, uri> or struct<data, uri, position, size>.
+    // Lance's logical shape: struct<data, uri> or struct<data, uri, position, size>; or a prepared
+    // descriptor, struct<kind, data, uri, blob_id, blob_size, position> (the descriptor's own names).
+    const auto* kind_f = find_child(mapping, blob_field.id, "kind");
+    const bool descriptor = kind_f != nullptr;
     const auto* data_f = find_child(mapping, blob_field.id, "data");
     const auto* uri_f = find_child(mapping, blob_field.id, "uri");
     const auto* pos_f = find_child(mapping, blob_field.id, "position");
-    const auto* size_f = find_child(mapping, blob_field.id, "size");
-    if (data_f == nullptr || uri_f == nullptr || (pos_f == nullptr) != (size_f == nullptr)) {
+    const auto* size_f = find_child(mapping, blob_field.id, descriptor ? "blob_size" : "size");
+    const auto* blob_id_f = descriptor ? find_child(mapping, blob_field.id, "blob_id") : nullptr;
+    if (data_f == nullptr || uri_f == nullptr || (pos_f == nullptr) != (size_f == nullptr) ||
+        (descriptor && (blob_id_f == nullptr || pos_f == nullptr))) {
         error = "Blob v2 field '" + blob_field.name +
-                "' must be struct<data: large_binary, uri: utf8> or struct<data, uri, position: uint64, size: uint64>";
+                "' must be struct<data: large_binary, uri: utf8> or struct<data, uri, position: uint64, size: uint64>"
+                " or a descriptor struct<kind, data, uri, blob_id, blob_size, position>";
         return false;
     }
     const bool ranged = pos_f != nullptr;
@@ -741,6 +824,8 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
     ArrowArray uri_a{};
     ArrowArray pos_a{};
     ArrowArray size_a{};
+    ArrowArray kind_a{};
+    ArrowArray blob_id_a{};
     std::vector<std::uint8_t> ancestor_null;  // nested: per item, whether a parent is null there
     if (blob_field.parent_id < 0) {
         if (!resolve_field_array(batch, mapping, blob_field, struct_array)) {
@@ -749,7 +834,9 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
         }
         if (!resolve_field_array(batch, mapping, *data_f, data_a) || !resolve_field_array(batch, mapping, *uri_f, uri_a) ||
             (ranged && (!resolve_field_array(batch, mapping, *pos_f, pos_a) ||
-                        !resolve_field_array(batch, mapping, *size_f, size_a)))) {
+                        !resolve_field_array(batch, mapping, *size_f, size_a))) ||
+            (descriptor && (!resolve_field_array(batch, mapping, *kind_f, kind_a) ||
+                            !resolve_field_array(batch, mapping, *blob_id_f, blob_id_a)))) {
             error = "missing Arrow arrays for blob children";
             return false;
         }
@@ -777,7 +864,8 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
             return true;
         };
         if (!child_view(data_f, data_a) || !child_view(uri_f, uri_a) ||
-            (ranged && (!child_view(pos_f, pos_a) || !child_view(size_f, size_a)))) {
+            (ranged && (!child_view(pos_f, pos_a) || !child_view(size_f, size_a))) ||
+            (descriptor && (!child_view(kind_f, kind_a) || !child_view(blob_id_f, blob_id_a)))) {
             error = "missing Arrow arrays for blob children";
             return false;
         }
@@ -819,6 +907,51 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
             error = "failed to read the children of blob field " + blob_field.name;
             return false;
         }
+        if (descriptor) {
+            // A prepared descriptor row: kept as the descriptor says, its bytes (kind 0) placed by the file writer.
+            bool kind_null = true;
+            std::uint8_t kind = 0;
+            bool id_null = true;
+            std::uint32_t blob_id = 0;
+            if (!uint8_value(kind_a, row, &kind_null, &kind) || !uint32_value(blob_id_a, row, &id_null, &blob_id)) {
+                return row_error(row, "has unreadable descriptor children");
+            }
+            if (kind_null) {
+                return row_error(row, "descriptor has no `kind`");
+            }
+            if (kind == kBlobKindInline) {
+                if (data_null) {
+                    return row_error(row, "is inline but has no `data`");
+                }
+                record_validity(out, index, true);
+                if (!append_packed_row(out, kBlobKindPendingInline, 0, static_cast<std::uint64_t>(data_size), 0,
+                                       data_ptr, static_cast<std::size_t>(data_size), error)) {
+                    return false;
+                }
+            } else if (kind == kBlobKindPacked || kind == kBlobKindDedicated) {
+                if (id_null || size_null) {
+                    return row_error(row, "must set `blob_id` and `blob_size`");
+                }
+                record_validity(out, index, true);
+                if (!append_packed_row(out, kind, position, size, blob_id, nullptr, 0, error)) {
+                    return false;
+                }
+            } else if (kind == kBlobKindExternal) {
+                if (uri_null || uri_len <= 0) {
+                    return row_error(row, "is external but has no `uri`");
+                }
+                if (size_null || size == 0U) {
+                    return row_error(row, "external `blob_size` must be greater than zero");
+                }
+                record_validity(out, index, true);
+                if (!append_external_row(out, dictionary_mode, uri_ptr, uri_len, position, size, error)) {
+                    return false;
+                }
+            } else {
+                return row_error(row, "has an unknown descriptor `kind`");
+            }
+            continue;
+        }
         if (pos_null != size_null) {
             return row_error(row, "must set both `position` and `size`, or neither");
         }
@@ -843,23 +976,7 @@ bool append_blob_v2_batch_column_values(const ArrowArray& batch,
         if (uri_len <= 0) {
             return row_error(row, "has an empty `uri`");
         }
-        std::string uri(reinterpret_cast<const char*>(uri_ptr), static_cast<std::size_t>(uri_len));
-        std::uint32_t blob_id = 0;
-        if (dictionary_mode) {
-            // Deduplicate the URI: assign a stable dictionary index and store it once.
-            // The packed row then carries blob_id = index and an empty inline URI.
-            const auto it = out.blob_v2.uri_to_id.find(uri);
-            if (it == out.blob_v2.uri_to_id.end()) {
-                blob_id = static_cast<std::uint32_t>(out.blob_v2.uri_dictionary.size());
-                out.blob_v2.uri_dictionary.push_back(uri);
-                out.blob_v2.uri_to_id.emplace(uri, blob_id);
-            } else {
-                blob_id = it->second;
-            }
-            uri.clear();
-        }
-        if (!append_packed_row(out, kBlobKindExternal, position, size, blob_id,
-                               reinterpret_cast<const std::uint8_t*>(uri.data()), uri.size(), error)) {
+        if (!append_external_row(out, dictionary_mode, uri_ptr, uri_len, position, size, error)) {
             return false;
         }
     }

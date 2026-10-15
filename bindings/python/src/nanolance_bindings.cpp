@@ -19,6 +19,7 @@
 #include <nanolance/lance_table_reader.hpp>
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
+#include <nanolance/data_file_reader.hpp>
 #include <nanolance/row_ids.hpp>
 #include <nanolance/scalar_index.hpp>
 #include <nanolance/schema_mapper.hpp>
@@ -657,6 +658,25 @@ nb::tuple file_info(const std::filesystem::path& path) {
     return nb::make_tuple(info.num_rows, info.num_columns, ExportedSchema::adopt(std::move(schema)), columns, metadata);
 }
 
+/// A data file's top-level field names and its format version, from its footer alone -- what
+/// DataFile.create needs, and all a file with a blob column offers outside a dataset (Lance's own
+/// reader cannot read one either: its descriptor's children are positional).
+nb::tuple file_top_fields(const std::filesystem::path& path) {
+    nano_lance::pb::FileDescriptor descriptor;
+    nano_lance::LanceDataFileFooterLayout layout{};
+    std::string error;
+    if (!nano_lance::read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
+        throw_dataset(error);
+    }
+    nb::list names;
+    for (const auto& f : descriptor.fields) {
+        if (f.parent_id < 0 && f.id >= 0) {
+            names.append(f.name);
+        }
+    }
+    return nb::make_tuple(names, layout.major_version, layout.minor_version);
+}
+
 /// A writer that stages fragments and publishes them as one version at finish() -- a Lance write.
 class StagedWriter {
 public:
@@ -1264,6 +1284,7 @@ NB_MODULE(_nanolance, m) {
           nb::arg("length"));
     m.def("_file_take", &file_take, nb::arg("path"), nb::arg("rows"), nb::arg("columns").none());
     m.def("_file_info", &file_info, nb::arg("path"));
+    m.def("_file_top_fields", &file_top_fields, nb::arg("path"));
     nb::class_<StagedWriter>(m, "_StagedWriter")
         .def(nb::init<const std::filesystem::path&, const LanceWriterOptions&, bool, std::int64_t, std::uint64_t>(),
              nb::arg("path"), nb::arg("options"), nb::arg("append"), nb::arg("max_rows_per_file"),

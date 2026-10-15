@@ -79,26 +79,28 @@ class DataFile:
         to the dataset's fields by name."""
         if base_id is not None:
             raise unsupported("DataFile.create with a base_id (multiple base paths)")
-        from nanolance.lance.file import LanceFileReader
+        from nanolance.lance.file import _footer
 
         full = os.path.join(dataset.uri, "data", path)
         if not os.path.exists(full):
             raise OSError(f"Not found: {full}")
-        reader = LanceFileReader(full)
-        meta = reader.metadata()
-        schema = reader.metadata().schema
+        # The footer's top-level names are enough, and all a file with a blob column offers on its own.
+        with native():
+            names, _, _ = _nanolance._file_top_fields(full)
+        major, minor = _footer(full)[4:6]
         fields, indices = [], []
         by_name = {f.name(): f for f in dataset.lance_schema.fields()}
         column = 0
-        for arrow_field in schema:
-            lance_field = by_name.get(arrow_field.name)
+        for name in names:
+            lance_field = by_name.get(name)
             if lance_field is None:
-                raise ValueError(f"Field '{arrow_field.name}' not found in the dataset schema")
-            for f in _pre_order(lance_field):
+                raise ValueError(f"Field '{name}' not found in the dataset schema")
+            # A Blob v2 column is one column of descriptors, whatever its logical children.
+            blob = lance_field.metadata.get("ARROW:extension:name") == "lance.blob.v2"
+            for f in [lance_field] if blob else _pre_order(lance_field):
                 fields.append(f.id())
                 indices.append(column)
                 column += 1
-        major, minor = meta.major_version, meta.minor_version
         return cls(path, fields, indices, major, minor, os.path.getsize(full))
 
 
