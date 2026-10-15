@@ -27,7 +27,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 
 | task | definition | implementer | status |
 |---|---|---|---|
-| Prepared-layout blob writers (`PackedBlobWriter`, `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`, descriptor-form blob columns in the file writer) | `docs/tasks/BLOB_WRITERS.md` | Haiku 5.5, reviewed by Opus | phase A (Python writers) in progress; phase B (C++ descriptor input) next |
+| Prepared-layout blob writers (`PackedBlobWriter`, `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`, descriptor-form blob columns in the file writer) | `docs/tasks/BLOB_WRITERS.md` | Haiku 5.5, reviewed by Opus | phase A (Python writers) done 2026-10-15 (Haiku; reviewed, one fix: coalesced sidecar writes); phase B (C++ descriptor input) in progress |
 
 ## Priority: competing with pylance directly (2026-10-08)
 

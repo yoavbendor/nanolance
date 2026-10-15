@@ -21,9 +21,11 @@ from typing import IO, Any, Iterator, List, Optional, Tuple, Union
 import pyarrow as pa
 
 from .. import _nanolance
+from ._blob_writers import BlobDescriptor, BlobDescriptorArrayBuilder, DedicatedBlobWriter, PackedBlobWriter
 from ._errors import native
 
-__all__ = ["Blob", "BlobArray", "BlobColumn", "BlobFile", "BlobIterator", "BlobType", "blob_array", "blob_field"]
+__all__ = ["Blob", "BlobArray", "BlobColumn", "BlobDescriptor", "BlobDescriptorArrayBuilder", "BlobFile",
+           "BlobIterator", "BlobType", "DedicatedBlobWriter", "PackedBlobWriter", "blob_array", "blob_field"]
 
 _BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
 _BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-dedicated-size-threshold"

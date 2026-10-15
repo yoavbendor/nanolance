@@ -16,6 +16,7 @@ import pyarrow as pa
 
 from nanolance import _nanolance
 from nanolance.lance._errors import native, unsupported
+from nanolance.lance._blob_writers import DedicatedBlobWriter, PackedBlobWriter
 
 #: The file format version nanolance writes, and the one pylance 12 calls stable.
 _VERSION = "2.2"
@@ -297,6 +298,14 @@ class LanceFileSession:
     def open_writer(self, path: str, *, schema: Optional[pa.Schema] = None, data_cache_bytes=None, version=None,
                     keep_original_array=None, max_page_bytes=None) -> LanceFileWriter:
         return LanceFileWriter(self._p(path), schema, version=version)
+
+    def open_packed_blob_writer(self, path: str, blob_id: int) -> PackedBlobWriter:
+        """Blobs appended to one sidecar of the data file ``path``, for a blob column written later."""
+        return PackedBlobWriter(self._base, path, blob_id)
+
+    def open_dedicated_blob_writer(self, path: str, blob_id: int) -> DedicatedBlobWriter:
+        """One blob in a sidecar of its own, for the data file ``path``."""
+        return DedicatedBlobWriter(self._base, path, blob_id)
 
     def contains(self, path: str) -> bool:
         return os.path.exists(self._p(path))
