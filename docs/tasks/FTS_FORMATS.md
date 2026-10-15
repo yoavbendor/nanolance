@@ -139,3 +139,23 @@ Found and added (confirmed in `index/doc_set.rs` ~112-238): **256-block partitio
 quantized document lengths** (Lucene SmallFloat style, `quantize_doc_length` / `dequantize_doc_length`;
 lengths < 8 exact); the flat path over unindexed fragments stays exact. Block-128 encoder output
 unchanged. +1 pylance test (1037).
+
+**F3 investigation (2026-10-15), no code changed -- facts for the implementing session:**
+- Oracle = 8 cases (7 `test_code_analyzer_*` functions; `does_not_split_identifiers_by_default` x {128, 256}).
+- Reviewer's answer on Unicode: `WordDelimiterFilter` uses `char::is_lowercase` / `is_uppercase`
+  (~148-158). Generate exact **Lowercase and Uppercase range tables** from Rust std with
+  `tools/fts_tables` (it builds offline in ~30 s against lance-tokenizer 12.0.0), the same way `kAlnum`
+  is generated, into `src/fts_tables.inc`. `is_alphanumeric` = existing `kAlnum` (`src/fts_tokenizer.cpp`
+  ~58). The Rust oracle in `tools/fts_tables` can also emit golden token lists for the code analyzer.
+- Params JSON key order already matches pylance (`params_json`); write the four flags' real values for
+  code indexes only, so text-analyzer params stay byte-identical.
+- `describe_indices()` details show the four flags for **both** analyzers (false for text) plus
+  `document_granularity`: `_inverted_details` decodes `code_config` (InvertedIndexDetails field 13;
+  CodeTokenizerConfig fields 1-4, `index_old.proto`).
+- Resolution: `RawInvertedIndexParams::resolve` (tokenizer.rs 288-335); code defaults
+  split_on_numerics=true, preserve_original=true, stem=false, remove_stop_words=false; explicit flags
+  override; default format 3; format 1/2 -> `base_tokenizer='code' requires FTS format_version=3, got N`.
+- Pipeline: CodeLexTokenizer, WordDelimiterFilter only if split_identifiers, then remove-long, lower
+  case, stem, stop words, ASCII folding (matches `Analyzer::emit` after the tokenizer).
+- No Python tokenize binding: token-list cases go to `tests/golden/fts_tokenizer/cases.txt`
+  (`tests/test_fts_tokenizer.cpp`, ctest `nano_lance_fts_tokenizer`).
