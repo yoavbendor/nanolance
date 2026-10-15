@@ -89,3 +89,12 @@ class _DatasetBases:
         return {base["id"]: DatasetBasePath(base["path"], name=base["name"],
                                             is_dataset_root=base["is_dataset_root"], id=base["id"])
                 for base in self._dataset._info.get("base_paths", [])}
+
+    def take_scan(self, ranges, columns=None, batch_readahead=None):
+        """pylance's ``take_scan``: one RecordBatch per ``(start, end)`` row range, in the order given.
+
+        Rows are logical (deleted rows are skipped, as in ``take``). ``ranges`` may be a generator.
+        """
+        for start, end in ranges:
+            table = self._dataset.to_table(columns=columns, offset=start, limit=end - start)
+            yield from table.combine_chunks().to_batches()

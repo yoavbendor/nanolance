@@ -418,3 +418,142 @@ def test_image_types_match_pylance(tmp_path):
     actual = _json("nanolance", IMAGE_SCRIPT, str(tmp_path))
     assert actual == expected
     assert actual["encoded_scalar"] == "EncodedImageScalar"
+
+
+# ---------------------------------------------------------------------------------------------
+# lance.sampler and lance._dataset.sharded_batch_iterator (docs/tasks/PY_SURFACE.md, P3)
+
+SAMPLER_DATA_SCRIPT = """
+import sys
+import pyarrow as pa
+tbl = pa.table({"id": pa.array(range(2000), pa.int64()), "v": pa.array([float(i) for i in range(2000)]),
+                "tag": pa.array([f"t{i % 5}" for i in range(2000)])})
+ds = lance.write_dataset(tbl, sys.argv[1], max_rows_per_file=300, max_rows_per_group=64)
+ds.delete("id % 7 = 3")
+print(len(ds), len(ds.get_fragments()))
+"""
+
+SAMPLER_SCRIPT = """
+import json, sys, warnings
+from lance.sampler import (FullScanSampler, ShardedBatchSampler, ShardedFixedBatchSampler,
+                           ShardedFragmentSampler, maybe_sample, reservoir_sampling)
+from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
+warnings.simplefilter("ignore")
+ds = lance.dataset(sys.argv[1])
+cases = json.loads(sys.argv[2])
+
+
+def rows(batches):
+    return [[b.num_rows, b["id"].to_pylist()] for b in batches]
+
+
+def run(c):
+    kind, kw = c["kind"], c["kw"]
+    if kind == "fragment":
+        return rows(ShardedFragmentSampler(kw["rank"], kw["ws"], randomize=kw["randomize"], seed=kw["seed"])(
+            ds, batch_size=kw["bs"], columns=["id"], filter=kw["filter"]))
+    if kind == "full":
+        return rows(FullScanSampler()(ds, batch_size=kw["bs"], columns=["id"], filter=kw["filter"]))
+    if kind == "batch":
+        return rows(ShardedBatchSampler(kw["rank"], kw["ws"], randomize=kw["randomize"], seed=kw["seed"])(
+            ds, batch_size=kw["bs"], columns=["id"], filter=kw["filter"]))
+    if kind == "fixed":
+        sampler = ShardedFixedBatchSampler(kw["rank"], kw["ws"], randomize=kw["randomize"], seed=kw["seed"],
+                                           batch_size=kw["bs"], total_num_rows=len(ds))
+        return [list(b) for b in sampler]
+    if kind == "maybe":
+        import numpy as np
+        np.random.seed(kw["seed"])
+        return rows(maybe_sample(ds, kw["n"], ["id"], batch_size=kw["bs"], max_takes=kw["max_takes"],
+                                 filt=kw["filter"]))
+    if kind == "iter":
+        return rows(ShardedBatchIterator(ds, kw["rank"], kw["ws"], columns=["id"], batch_size=kw["bs"],
+                                         granularity=kw["granularity"]))
+    if kind == "reservoir":
+        got = reservoir_sampling(range(1000), 10)
+        return [len(got), len(set(got)), all(0 <= x < 1000 for x in got)]
+    raise ValueError(kind)
+
+
+out = {}
+for c in cases:
+    try:
+        out[c["name"]] = run(c)
+    except Exception as exc:  # the same error on both engines is a match
+        out[c["name"]] = {"error": type(exc).__name__}
+print(json.dumps(out, default=str))
+"""
+
+
+@pytest.fixture(scope="module")
+def sampler_dataset(tmp_path_factory):
+    require_pylance()
+    path = str(tmp_path_factory.mktemp("sampler") / "data.lance")
+    _run("pylance", SAMPLER_DATA_SCRIPT, path)
+    return path
+
+
+def _sampler_cases():
+    cases = []
+    for ws in (1, 3, 4):
+        for rank in range(ws):
+            for randomize, seed in ((False, 0), (True, 5)):
+                for filt in (None, "id < 1000"):
+                    kw = dict(rank=rank, ws=ws, randomize=randomize, seed=seed, bs=100, filter=filt)
+                    cases.append({"name": f"fragment-{rank}/{ws}-{randomize}-{seed}-{filt}", "kind": "fragment", "kw": kw})
+                    cases.append({"name": f"batch-{rank}/{ws}-{randomize}-{seed}-{filt}-bs", "kind": "batch",
+                                  "kw": dict(kw, bs=64 if rank else 1)})
+                for bs in (7, 250):
+                    cases.append({"name": f"fixed-{rank}/{ws}-{randomize}-{seed}-{bs}", "kind": "fixed",
+                                  "kw": dict(rank=rank, ws=ws, randomize=randomize, seed=seed, bs=bs)})
+    for filt in (None, "id % 2 = 0", "id is not null"):
+        for bs in (100, 1024):
+            cases.append({"name": f"batch-filter-{filt}-{bs}", "kind": "batch",
+                          "kw": dict(rank=2, ws=4, randomize=True, seed=1, bs=bs, filter=filt)})
+    cases.append({"name": "full", "kind": "full", "kw": dict(bs=100, filter=None)})
+    cases.append({"name": "full-filter", "kind": "full", "kw": dict(bs=100, filter="id < 300")})
+    for seed in (0, 1, 2):
+        for n, max_takes, filt in ((10, 2048, None), (300, 32, None), (100, 8, "id is not null"),
+                                   (5000, 2048, None), (1500, 64, None)):
+            cases.append({"name": f"maybe-{seed}-{n}-{max_takes}-{filt}", "kind": "maybe",
+                          "kw": dict(seed=seed, n=n, bs=64, max_takes=max_takes, filter=filt)})
+    for gran in ("fragment", "batch"):
+        for rank in (0, 1):
+            cases.append({"name": f"iter-{gran}-{rank}", "kind": "iter",
+                          "kw": dict(rank=rank, ws=2, bs=100, granularity=gran)})
+    cases.append({"name": "reservoir", "kind": "reservoir", "kw": {}})
+    return cases
+
+
+def test_sampler_outputs_match_pylance(sampler_dataset):
+    cases = _sampler_cases()
+    args = json.dumps(cases)
+    expected, actual = (_json(engine, SAMPLER_SCRIPT, sampler_dataset, args) for engine in ENGINES)
+    assert len(actual) == len(cases)
+    # not vacuous: the full scan returns every live row, and the sharded cases returned rows
+    assert sum(b[0] for b in expected["full"]) == sum(1 for i in range(2000) if i % 7 != 3)
+    assert all(expected[name] for name in ("fragment-0/4-False-0-None", "maybe-1-300-32-None", "iter-batch-0"))
+    mismatches = sorted(name for name in expected if expected[name] != actual[name])
+    assert mismatches == []
+
+
+def test_sampler_shards_partition_the_dataset(sampler_dataset):
+    require_pylance()
+    cases = [{"name": "full", "kind": "full", "kw": dict(bs=100, filter=None)}]
+    for ws in (1, 3, 4):
+        for rank in range(ws):
+            cases.append({"name": f"fragment-{rank}-{ws}", "kind": "fragment",
+                          "kw": dict(rank=rank, ws=ws, randomize=True, seed=3, bs=50, filter=None)})
+            cases.append({"name": f"batch-{rank}-{ws}", "kind": "batch",
+                          "kw": dict(rank=rank, ws=ws, randomize=False, seed=0, bs=50, filter=None)})
+    for engine in ENGINES:
+        got = _json(engine, SAMPLER_SCRIPT, sampler_dataset, json.dumps(cases))
+        logical = sorted(i for i in range(2000) if i % 7 != 3)
+        assert sorted(sum((b[1] for b in got["full"]), [])) == logical, engine
+        for ws in (1, 3, 4):
+            for kind in ("fragment", "batch"):
+                rows = sorted(i for rank in range(ws) for b in got[f"{kind}-{rank}-{ws}"] for i in b[1])
+                assert rows == logical, (engine, kind, ws)
+        reservoir = _json(engine, SAMPLER_SCRIPT, sampler_dataset,
+                          json.dumps([{"name": "r", "kind": "reservoir", "kw": {}}]))["r"]
+        assert reservoir == [10, 10, True], engine

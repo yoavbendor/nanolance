@@ -121,3 +121,9 @@ image columns failed); a bf16 fixed-size list's element is Lance's `lance.bfloat
 FullZip) -- roadmap; the two image-tensor tests need Pillow (pylance fails them here too; not
 installed). nanolance accepts a few conversions pylance refuses (to_numpy / cast with nulls,
 BFloat16Array.from_pandas returns bfloat16).
+
+**P3 outcome (2026-10-15):** done (Python only). `lance.sampler` (all exports) and the deprecated
+`lance._dataset.sharded_batch_iterator.ShardedBatchIterator`, plus `_ds.take_scan`; ~150 sampler
+cases equal pylance's (shards, ranks, seeds, filters, deletions). +12 pylance tests (1109). Reviewer:
+both modules follow pylance's code closely (needed for identical random draws) -- attributed as
+derived works in their headers and in NOTICE (Apache-2.0). Task PY_SURFACE done.

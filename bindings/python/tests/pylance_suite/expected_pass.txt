@@ -410,6 +410,9 @@ tests/test_dataset.py::test_schema_project_drop_column
 tests/test_dataset.py::test_schema_project_rename_column
 tests/test_dataset.py::test_schema_project_swap_column
 tests/test_dataset.py::test_scoring_columns
+tests/test_dataset.py::test_sharded_iterator_batches
+tests/test_dataset.py::test_sharded_iterator_fragments
+tests/test_dataset.py::test_sharded_iterator_non_full_batch
 tests/test_dataset.py::test_stats
 tests/test_dataset.py::test_strict_overwrite
 tests/test_dataset.py::test_system_columns
@@ -856,6 +859,15 @@ tests/test_row_addr_prefilter.py::test_overlay_stale_replay_ann_respects_mask
 tests/test_row_addr_prefilter.py::test_overlay_stale_replay_scan_respects_mask
 tests/test_row_addr_prefilter.py::test_rejects_a_malformed_mask
 tests/test_row_addr_prefilter.py::test_serialize_row_addrs_round_trips_through_a_scan
+tests/test_sampler.py::test_consecutive_index_blocks
+tests/test_sampler.py::test_data_stream_without_filter
+tests/test_sampler.py::test_edge_cases
+tests/test_sampler.py::test_filtered_data_handling
+tests/test_sampler.py::test_randomization_effect
+tests/test_sampler.py::test_sample_dataset[10240]
+tests/test_sampler.py::test_sample_dataset[10337]
+tests/test_sampler.py::test_sample_dataset[10]
+tests/test_sampler.py::test_sample_dataset[11264]
 tests/test_scalar_index.py::test_address_domain_index_not_query_with_stable_row_ids[BLOOMFILTER]
 tests/test_scalar_index.py::test_address_domain_index_not_query_with_stable_row_ids[ZONEMAP]
 tests/test_scalar_index.py::test_address_domain_index_with_stable_row_ids[BLOOMFILTER]

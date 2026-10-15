@@ -35,7 +35,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 | Small items 1: `row_addr_allowlist` / `serialize_row_addrs` (12 tests), `VectorIndexReader`, `_take_rows` of deleted rows | `docs/tasks/SMALL_ITEMS_1.md` | Haiku 5.5, reviewed by Opus | ~~done 2026-10-15~~: item 1 (+12), items 2-3 (+2; Hamming left) |
 | INVERTED format versions 1 / 3, 256-document posting blocks, the code analyzer (16 of pylance's tests) | `docs/tasks/FTS_FORMATS.md` | Haiku 5.5, reviewed by Opus | F1 done 2026-10-15 (+1; the six describe_indices also need JSON + NGRAM indexes); F2 done (+1); F3 done (+8): task done |
 | NGRAM and JSON scalar indexes, the ngram tokenizer for INVERTED (~11 of pylance's tests) | `docs/tasks/NGRAM_JSON.md` | Haiku 5.5, reviewed by Opus | N1 done 2026-10-15 (N1a +5, N1b +4); N2 done (N2a +6, N2b +2); N3 done (+1): task done |
-| Python surface: `lance.log` + Lance's log output, `lance.arrow` (bf16, image types), `lance.sampler` (~50 of pylance's tests) | `docs/tasks/PY_SURFACE.md` | Haiku 5.5, reviewed by Opus | P1 done 2026-10-15 (+17); P2 done (+17); P3 next |
+| Python surface: `lance.log` + Lance's log output, `lance.arrow` (bf16, image types), `lance.sampler` (~50 of pylance's tests) | `docs/tasks/PY_SURFACE.md` | Haiku 5.5, reviewed by Opus | P1 done 2026-10-15 (+17); P2 done (+17); P3 done (+12) |
 | IVF_RQ (RaBitQ), Hamming / binary vectors, fuzzy FTS, icu / jieba / lindera tokenizers, `lance.tokenize` | (Opus: format research first) | -- | not yet specified |
 
 Lessons from the first delegated task (blob writers, three Haiku sessions of 95-160k tokens each):
@@ -89,7 +89,7 @@ plain append / update / scan comes before a whole subsystem.
 | 2 | ~~Namespaces~~ -- **done (2026-10-09)**: `DirectoryNamespace` (Lance's `__manifest` catalog, read and written by either library, concurrent writers retrying as Lance's do; directory listing, declared / registered / deregistered tables), `RestNamespace` and `RestAdapter` (each works against Lance's), `lance.dataset` / `write_dataset` / `commit` with `namespace_client`, managed versioning through `create_table_version`; 130 more of pylance's tests (130 of the 134 that pylance passes here; the other 4 need branches). Left: table branches, credential vending, materialized views, structured full-text queries in `query_table` | -- |
 | 2 | ~~Stable row ids~~ -- **done (2026-10-10)** | -- |
 | 3 | Search breadth: fuzzy full-text, ZONEMAP / NGRAM / BLOOMFILTER, more tokenizers (icu, jieba, lindera), full-text on list columns, Hamming and binary vectors, IVF_SQ / IVF_HNSW_PQ / IVF_HNSW_FLAT, Lance's tie order under a limit | ~60 |
-| 4 | Niche: `mem_wal`, writing data storage versions other than 2.2, multiple base paths, samplers, debug / logging / otel hooks, bfloat16 and image extension arrays, `lance.util.KMeans` | ~120 |
+| 4 | Niche: `mem_wal`, writing data storage versions other than 2.2, multiple base paths, debug / logging / otel hooks, bfloat16 and image extension arrays, `lance.util.KMeans` | ~120 |
 
 Order of work: tier 1 top to bottom (each item is days, not weeks, and removes an error from an
 everyday workflow); then distributed index builds (done); then transactions and fragment-level writes (done); then namespaces (done) and stable row
