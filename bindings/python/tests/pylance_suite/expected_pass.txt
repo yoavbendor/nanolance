@@ -963,6 +963,7 @@ tests/test_vector_index.py::test_create_index_dot
 tests/test_vector_index.py::test_create_index_progress_callback_error_before_completion_propagates
 tests/test_vector_index.py::test_create_ivf_pq_skip_transpose
 tests/test_vector_index.py::test_create_ivf_pq_with_target_partition_size
+tests/test_vector_index.py::test_create_ivf_sq_index
 tests/test_vector_index.py::test_describe_index_runtime_hints_stored
 tests/test_vector_index.py::test_describe_indices
 tests/test_vector_index.py::test_describe_vector_index
@@ -970,7 +971,9 @@ tests/test_vector_index.py::test_distributed_ivf_pq_order_invariance
 tests/test_vector_index.py::test_distributed_ivf_pq_partition_window_env_override
 tests/test_vector_index.py::test_distributed_ivf_two_shard_build_merge_and_search[IVF_FLAT]
 tests/test_vector_index.py::test_distributed_ivf_two_shard_build_merge_and_search[IVF_PQ]
+tests/test_vector_index.py::test_distributed_ivf_two_shard_build_merge_and_search[IVF_SQ]
 tests/test_vector_index.py::test_distributed_vector[dataset-IVF_FLAT-index_params0-0.8]
+tests/test_vector_index.py::test_distributed_vector[dataset-IVF_SQ-index_params2-0.8]
 tests/test_vector_index.py::test_distributed_vector[indexed_dataset-IVF_PQ-index_params1-0.8]
 tests/test_vector_index.py::test_drop_indices
 tests/test_vector_index.py::test_flat
@@ -983,6 +986,7 @@ tests/test_vector_index.py::test_index_cache_size
 tests/test_vector_index.py::test_index_cache_size_bytes
 tests/test_vector_index.py::test_index_cache_size_deprecation
 tests/test_vector_index.py::test_index_size_stats
+tests/test_vector_index.py::test_index_type
 tests/test_vector_index.py::test_index_with_4bit_numpy_pq_codebook
 tests/test_vector_index.py::test_index_with_nans[V3]
 tests/test_vector_index.py::test_index_with_pq_codebook

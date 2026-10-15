@@ -2457,9 +2457,9 @@ bool vector_options(const LanceVectorIndexSegmentParams& p, nano_lance::VectorIn
     case LANCE_INDEX_IVF_FLAT: o.type = "IVF_FLAT"; break;
     case LANCE_INDEX_IVF_PQ: o.type = "IVF_PQ"; break;
     case LANCE_INDEX_IVF_HNSW_SQ: o.type = "IVF_HNSW_SQ"; break;
-    case LANCE_INDEX_IVF_SQ: not_supported("IVF_SQ indexes"); return false;
-    case LANCE_INDEX_IVF_HNSW_PQ: not_supported("IVF_HNSW_PQ indexes"); return false;
-    case LANCE_INDEX_IVF_HNSW_FLAT: not_supported("IVF_HNSW_FLAT indexes"); return false;
+    case LANCE_INDEX_IVF_SQ: o.type = "IVF_SQ"; break;
+    case LANCE_INDEX_IVF_HNSW_PQ: o.type = "IVF_HNSW_PQ"; break;
+    case LANCE_INDEX_IVF_HNSW_FLAT: o.type = "IVF_HNSW_FLAT"; break;
     default: return invalid("invalid LanceVectorIndexType " + std::to_string(p.index_type));
     }
     switch (p.metric) {
@@ -2473,7 +2473,7 @@ bool vector_options(const LanceVectorIndexSegmentParams& p, nano_lance::VectorIn
         return invalid("num_partitions is required for this index type and must be > 0");
     }
     o.num_partitions = p.num_partitions;
-    if (o.type == "IVF_PQ") {
+    if (o.type == "IVF_PQ" || o.type == "IVF_HNSW_PQ") {
         if (p.num_sub_vectors == 0U) {
             return invalid("num_sub_vectors is required for this index type and must be > 0");
         }
@@ -2483,11 +2483,11 @@ bool vector_options(const LanceVectorIndexSegmentParams& p, nano_lance::VectorIn
             return invalid("num_bits must be 4 or 8 for Lance PQ indexes, got " + std::to_string(o.num_bits));
         }
     }
-    if (o.type == "IVF_HNSW_SQ") {
+    if (o.type.rfind("IVF_HNSW_", 0) == 0) {
         if (p.hnsw_m == 0U) {
             return invalid("hnsw_m is required for this index type and must be > 0");
         }
-        if (p.num_bits != 0U && p.num_bits != 8U) {
+        if (o.type == "IVF_HNSW_SQ" && p.num_bits != 0U && p.num_bits != 8U) {
             return invalid("num_bits must be 0 or 8 for Lance SQ indexes, got " + std::to_string(p.num_bits));
         }
         o.hnsw_m = p.hnsw_m;
@@ -3260,10 +3260,10 @@ int32_t lance_dataset_create_vector_index(LanceDataset* dataset, const char* col
     switch (params->index_type) {
     case LANCE_INDEX_IVF_FLAT: options.type = "IVF_FLAT"; break;
     case LANCE_INDEX_IVF_PQ: options.type = "IVF_PQ"; break;
-    case LANCE_INDEX_IVF_SQ: NL_UNSUPPORTED_INT("IVF_SQ indexes");
+    case LANCE_INDEX_IVF_SQ: options.type = "IVF_SQ"; break;
     case LANCE_INDEX_IVF_HNSW_SQ: options.type = "IVF_HNSW_SQ"; break;
-    case LANCE_INDEX_IVF_HNSW_PQ: NL_UNSUPPORTED_INT("IVF_HNSW_PQ indexes");
-    case LANCE_INDEX_IVF_HNSW_FLAT: NL_UNSUPPORTED_INT("IVF_HNSW_FLAT indexes");
+    case LANCE_INDEX_IVF_HNSW_PQ: options.type = "IVF_HNSW_PQ"; break;
+    case LANCE_INDEX_IVF_HNSW_FLAT: options.type = "IVF_HNSW_FLAT"; break;
     default:
         invalid("unknown vector index type " + std::to_string(static_cast<int>(params->index_type)));
         return -1;
@@ -3282,7 +3282,7 @@ int32_t lance_dataset_create_vector_index(LanceDataset* dataset, const char* col
         return -1;
     }
     options.num_partitions = params->num_partitions;
-    if (options.type == "IVF_PQ") {
+    if (options.type == "IVF_PQ" || options.type == "IVF_HNSW_PQ") {
         if (params->num_sub_vectors == 0U) {
             invalid("num_sub_vectors is required and must be greater than 0");
             return -1;
@@ -3294,12 +3294,12 @@ int32_t lance_dataset_create_vector_index(LanceDataset* dataset, const char* col
             return -1;
         }
     }
-    if (options.type == "IVF_HNSW_SQ") {
+    if (options.type.rfind("IVF_HNSW_", 0) == 0) {
         if (params->hnsw_m == 0U) {
             invalid("hnsw_m is required for this index type and must be > 0");
             return -1;
         }
-        if (params->num_bits != 0U && params->num_bits != 8U) {
+        if (options.type == "IVF_HNSW_SQ" && params->num_bits != 0U && params->num_bits != 8U) {
             invalid("num_bits must be 0 or 8 for Lance SQ indexes, got " + std::to_string(params->num_bits));
             return -1;
         }

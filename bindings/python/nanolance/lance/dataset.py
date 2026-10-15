@@ -1133,8 +1133,8 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError("create_index_uncommitted requires fragment_ids for distributed index build")
         if not scalar and kind not in self._VECTOR_INDEX_TYPES:
             raise unsupported(f"{kind} index segments")
-        if not scalar and kind not in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"):
-            raise unsupported(f"{kind} indexes (IVF_FLAT, IVF_PQ and IVF_HNSW_SQ are supported)")
+        if not scalar and kind not in self._BUILDABLE_VECTOR_INDEX_TYPES:
+            raise unsupported(f"{kind} indexes ({', '.join(self._BUILDABLE_VECTOR_INDEX_TYPES)} are supported)")
         for option, value in (("ivf_centroids_file", ivf_centroids_file), ("accelerator", accelerator),
                               ("precomputed_partition_dataset", precomputed_partition_dataset)):
             if value is not None:
@@ -1149,7 +1149,7 @@ class LanceDataset(pa.dataset.Dataset):
                 raise unsupported(f"create_index_uncommitted options {sorted(kwargs)}")
         else:
             dim = self._vector_dimension(str(column))
-            if kind == "IVF_PQ" and num_sub_vectors is None and pq_codebook is None:
+            if kind in ("IVF_PQ", "IVF_HNSW_PQ") and num_sub_vectors is None and pq_codebook is None:
                 raise ValueError("num_partitions and num_sub_vectors are required for IVF_PQ")
             if ivf_centroids is not None:
                 centroids = _float32_matrix(ivf_centroids, dim)
@@ -1257,6 +1257,8 @@ class LanceDataset(pa.dataset.Dataset):
         return field
 
     _VECTOR_INDEX_TYPES = ["IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ", "IVF_RQ"]
+    # The kinds nanolance builds (create_index, create_index_uncommitted); IVF_RQ is not built yet.
+    _BUILDABLE_VECTOR_INDEX_TYPES = ("IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ")
 
     def create_index(self, column, index_type: str, name: Optional[str] = None, metric: str = "L2",
                      replace: bool = False, num_partitions: Optional[int] = None, ivf_centroids=None,
@@ -1266,7 +1268,7 @@ class LanceDataset(pa.dataset.Dataset):
                      precomputed_partition_dataset=None, storage_options=None, filter_nan: bool = True,
                      train: bool = True, fragment_ids=None, index_uuid=None, *,
                      target_partition_size: Optional[int] = None, **kwargs) -> "LanceDataset":
-        """Build an index on `column`, in Lance's format. IVF_FLAT, IVF_PQ and IVF_HNSW_SQ vector indexes
+        """Build an index on `column`, in Lance's format. IVF_FLAT, IVF_SQ, IVF_PQ, IVF_HNSW_FLAT, IVF_HNSW_PQ and IVF_HNSW_SQ vector indexes
         (pylance and LanceDB search them as their own); scalar index types go to create_scalar_index."""
         kind = str(index_type).upper()
         if isinstance(column, (list, tuple)):
@@ -1277,8 +1279,8 @@ class LanceDataset(pa.dataset.Dataset):
             return self.create_scalar_index(column, kind, name, replace=replace, **kwargs)
         if kind not in self._VECTOR_INDEX_TYPES:
             raise NotImplementedError(f"Only {self._VECTOR_INDEX_TYPES} index types supported. Got {index_type}")
-        if kind not in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"):
-            raise unsupported(f"{kind} indexes (IVF_FLAT, IVF_PQ and IVF_HNSW_SQ are supported)")
+        if kind not in self._BUILDABLE_VECTOR_INDEX_TYPES:
+            raise unsupported(f"{kind} indexes ({', '.join(self._BUILDABLE_VECTOR_INDEX_TYPES)} are supported)")
         for option, value in (("ivf_centroids_file", ivf_centroids_file),
                               ("precomputed_partition_dataset", precomputed_partition_dataset),
                               ("fragment_ids", fragment_ids), ("index_uuid", index_uuid)):
@@ -1287,16 +1289,16 @@ class LanceDataset(pa.dataset.Dataset):
         if not train:
             raise unsupported("create_index(train=False)")
         if accelerator is not None:
-            if kind == "IVF_PQ":
-                raise unsupported("create_index(accelerator=) for IVF_PQ (nanolance builds on the CPU)")
+            if kind in ("IVF_PQ", "IVF_HNSW_PQ"):
+                raise unsupported(f"create_index(accelerator=) for {kind} (nanolance builds on the CPU)")
             LOGGER.warning("Index type %s does not support GPU acceleration; falling back to CPU", kind)
         index_file_version = kwargs.pop("index_file_version", "V3")
         if str(getattr(index_file_version, "value", index_file_version)) != "V3":
             raise unsupported(f"create_index(index_file_version={index_file_version!r}) (V3 is written)")
         progress_callback = kwargs.pop("progress_callback", None)
         skip_transpose = bool(kwargs.pop("skip_transpose", False))
-        if kind == "IVF_PQ" and num_sub_vectors is None:
-            raise ValueError("num_partitions and num_sub_vectors are required for IVF_PQ")
+        if kind in ("IVF_PQ", "IVF_HNSW_PQ") and num_sub_vectors is None:
+            raise ValueError(f"num_partitions and num_sub_vectors are required for {kind}")
         num_bits = int(kwargs.pop("num_bits", 8))
         max_iters = int(kwargs.pop("max_iters", 50))
         sample_rate = int(kwargs.pop("sample_rate", 256))

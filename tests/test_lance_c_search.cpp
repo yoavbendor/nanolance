@@ -356,9 +356,12 @@ void test_errors(const std::string& uri) {
               last_error().find("ef_construction") != std::string::npos,
           "ef_construction under m");
     p.index_type = LANCE_INDEX_IVF_HNSW_PQ;
-    check(lance_dataset_create_vector_index(ds, "vec", "h", &p, true) != 0 &&
-              lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED,
-          "IVF_HNSW_PQ");
+    p.num_sub_vectors = 4;
+    p.num_bits = 4;  // 16 codes per sub-vector: few rows train it
+    p.hnsw_ef_construction = 0;  // the default (m is 8 here)
+    check(lance_dataset_create_vector_index(ds, "vec", "hp", &p, true) == 0, "IVF_HNSW_PQ build: " + last_error());
+    p.num_sub_vectors = 0;
+    p.num_bits = 0;
     p.index_type = LANCE_INDEX_IVF_PQ;
     check(lance_dataset_create_vector_index(ds, "vec", "h", &p, true) != 0 &&
               lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,

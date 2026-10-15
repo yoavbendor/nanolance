@@ -119,3 +119,9 @@ exhaustive settings (3 kinds x 3 metrics, with deletions). Reviewer's calls: tie
 may differ (tests compare the rows nearer than it; Lance's tie order is a roadmap item); HNSW_PQ dot
 distance is Lance's `1 - dot`. **For C2:** also test 4-bit PQ codes under HNSW (the exhaustive IVF_PQ
 path sums quantized table entries past the first max(200, k) rows; check what Lance's HNSW PQ does).
+
+**C2 outcome (2026-10-15):** done. nanolance builds IVF_SQ, IVF_HNSW_FLAT and IVF_HNSW_PQ (8- and
+4-bit; Lance's HNSW PQ sums plain f32 table entries, dot = 1 - dot), through create_index, distributed
+segments, optimize deltas and lance-c; pylance reads, searches and describes them with the same top-k
+under exhaustive settings. Existing kinds byte-identical with one thread and a fixed seed. Left:
+IVF_RQ (RaBitQ), the default partition size of the HNSW kinds vs pylance's (unchecked).

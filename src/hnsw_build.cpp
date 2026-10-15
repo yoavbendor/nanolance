@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The HNSW graph of one IVF_HNSW_SQ partition, after lance-index 12's HnswBuilder
+// The HNSW graph of one IVF_HNSW_* partition (SQ codes, floats or PQ codes), after lance-index 12's HnswBuilder
 // (vector/hnsw/builder.rs): node levels from a SmallRng seeded with 42, insertion with a beam of
 // ef_construction, Algorithm 4's neighbour heuristic (keeping pruned connections), reciprocal edges
 // pruned to 2m on level 0 and m above, then a pass linking nodes that level 0 cannot reach from the
@@ -102,7 +102,7 @@ public:
         value_scale_ = static_cast<float>(c_.end - c_.start) / 255.0F;
         scale_ = value_scale_ * value_scale_;
         lower_ = static_cast<float>(c_.start);
-        if (c_.dot) {
+        if (c_.dot && c_.storage == Storage::Sq) {
             sums_.resize(c_.n);
             for (std::size_t i = 0; i < c_.n; ++i) {
                 std::uint32_t s = 0;
@@ -190,9 +190,52 @@ private:
     };
 
     const std::uint8_t* code(std::uint32_t id) const { return c_.data + static_cast<std::size_t>(id) * c_.dim; }
+    const float* vec(std::uint32_t id) const { return c_.vectors + static_cast<std::size_t>(id) * c_.dim; }
+
+    /// Lance's distance calculator from `a`, to `b`: the storage's own (FLAT, PQ or SQ).
+    float dist(std::uint32_t a, std::uint32_t b) const {
+        if (c_.storage == Storage::Flat) {
+            return flat_dist(vec(a), vec(b));
+        }
+        if (c_.storage == Storage::Pq) {
+            return pq_dist(code(a), code(b));
+        }
+        return sq_dist(a, b);
+    }
+
+    /// FLAT: squared L2, or 1 - dot (cosine over normalized vectors is the same).
+    float flat_dist(const float* x, const float* y) const {
+        float s = 0;
+        if (c_.dot) {
+            for (std::size_t j = 0; j < c_.dim; ++j) {
+                s += x[j] * y[j];
+            }
+            return 1.0F - s;
+        }
+        for (std::size_t j = 0; j < c_.dim; ++j) {
+            const float t = x[j] - y[j];
+            s += t * t;
+        }
+        return s;
+    }
+
+    /// PQ: the sum over sub-vectors of the pairwise table entries (PQDistCalculator::from_codes).
+    float pq_dist(const std::uint8_t* x, const std::uint8_t* y) const {
+        const std::size_t nc = std::size_t{1} << c_.nbits;
+        float acc = 0;
+        for (std::size_t s = 0; s < c_.m; ++s) {
+            const std::size_t a = c_.nbits == 8U ? x[s] : ((s % 2U == 0U) ? (x[s / 2U] & 0x0FU) : (x[s / 2U] >> 4U));
+            const std::size_t b = c_.nbits == 8U ? y[s] : ((s % 2U == 0U) ? (y[s / 2U] & 0x0FU) : (y[s / 2U] >> 4U));
+            acc += c_.pq_table[(s * nc + a) * nc + b];
+        }
+        if (c_.dot) {  // Lance's PQDistCalculator: dot sums m sub-vector dot distances, less (m - 1)
+            return acc - (static_cast<float>(c_.m) - 1.0F);
+        }
+        return acc;
+    }
 
     /// SQDistCalculator::from_id(a).distance(b).
-    float dist(std::uint32_t a, std::uint32_t b) const {
+    float sq_dist(std::uint32_t a, std::uint32_t b) const {
         const std::uint8_t* x = code(a);
         const std::uint8_t* y = code(b);
         if (c_.dot) {

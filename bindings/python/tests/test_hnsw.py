@@ -253,3 +253,68 @@ def test_new_kinds_describe_list_and_plan(lance, new_kinds, kind):
     # The index serves the search (not an exact scan): the plan names it.
     plan = nl.dataset(path).scanner(nearest={"column": "vec", "q": v[0], "k": 5, "nprobes": 1}).explain_plan()
     assert f"({kind})" in plan, plan
+
+
+# C2: nanolance builds IVF_SQ, IVF_HNSW_FLAT and IVF_HNSW_PQ (8- and 4-bit codes); pylance reads and
+# searches them, and nanolance reads its own. Exhaustive settings: every partition, a large ef.
+BUILT = [("IVF_SQ", {}), ("IVF_HNSW_FLAT", {}), ("IVF_HNSW_PQ", {"num_sub_vectors": 4}),
+         ("IVF_HNSW_PQ", {"num_sub_vectors": 4, "num_bits": 4})]
+BUILT_IDS = ["IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_PQ-4bit"]
+
+
+def _built_dataset(tmp_path, name):
+    v = _vectors()
+    path = str(tmp_path / f"{name}.lance")
+    vec = pa.FixedSizeListArray.from_arrays(pa.array(v.ravel()), DIM)
+    nl.write_dataset(pa.table({"id": np.arange(N), "vec": vec}), path, max_rows_per_file=1001)
+    return v, path
+
+
+@pytest.mark.parametrize("kind, extra", BUILT, ids=BUILT_IDS)
+@pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
+def test_nanolance_builds_read_by_pylance(lance, tmp_path, kind, extra, metric):
+    v, path = _built_dataset(tmp_path, "built")
+    ours = nl.dataset(path)
+    ours.create_index("vec", kind, num_partitions=PARTS, metric=metric, seed=42, **extra)
+    theirs = lance.dataset(path)
+    assert theirs.stats.index_stats("vec_idx")["index_type"] == kind
+    assert ours.describe_indices()[0].index_type == kind
+    rng = np.random.default_rng(2)
+    for _ in range(4):
+        q = v[rng.integers(0, N)] + rng.standard_normal(DIM).astype(np.float32) * 0.5
+        for o in EXHAUSTIVE[:2]:
+            nearest = {"column": "vec", "q": q, **o}
+            ref = theirs.to_table(nearest=nearest, columns=["id"])
+            got = ours.to_table(nearest=nearest, columns=["id"])
+            assert len(ref) == len(got) == o["k"]
+            assert got.column("id").to_pylist() == ref.column("id").to_pylist()
+
+
+@pytest.mark.parametrize("kind, extra", BUILT, ids=BUILT_IDS)
+def test_nanolance_builds_describe_like_pylance(lance, tmp_path, kind, extra):
+    _, path = _built_dataset(tmp_path, "described")
+    nl.dataset(path).create_index("vec", kind, num_partitions=PARTS, seed=42, **extra)
+    theirs, ours = lance.dataset(path).stats.index_stats("vec_idx"), nl.dataset(path).stats.index_stats("vec_idx")
+    for key in ("index_type", "num_indexed_rows", "num_unindexed_rows", "num_partitions", "distance_type"):
+        assert ours.get(key) == theirs.get(key), key
+    if "HNSW" in kind:
+        assert ours["indices"][0]["sub_index"]["params"] == theirs["indices"][0]["sub_index"]["params"]
+
+
+@pytest.mark.parametrize("kind, extra", BUILT, ids=BUILT_IDS)
+def test_built_kinds_take_appended_rows_by_optimize(lance, tmp_path, kind, extra):
+    v, path = _built_dataset(tmp_path, "delta")
+    nl.dataset(path).create_index("vec", kind, num_partitions=PARTS, seed=42, **extra)
+    more = _vectors(seed=9)[:500]
+    nl.write_dataset(pa.table({"id": np.arange(N, N + 500),
+                               "vec": pa.FixedSizeListArray.from_arrays(pa.array(more.ravel()), DIM)}),
+                     path, mode="append")
+    nl.dataset(path).optimize.optimize_indices()
+    theirs, ours = lance.dataset(path), nl.dataset(path)
+    assert theirs.stats.index_stats("vec_idx")["num_indexed_rows"] == N + 500
+    rng = np.random.default_rng(6)
+    for _ in range(3):
+        q = rng.standard_normal(DIM).astype(np.float32)
+        nearest = {"column": "vec", "q": q, "k": 10, "nprobes": PARTS, "ef": 1000}
+        assert ours.to_table(nearest=nearest, columns=["id"]).column("id").to_pylist() == \
+            theirs.to_table(nearest=nearest, columns=["id"]).column("id").to_pylist()

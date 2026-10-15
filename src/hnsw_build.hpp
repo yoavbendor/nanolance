@@ -22,14 +22,28 @@ struct Edge {
     std::uint32_t id;
 };
 
-/// The 8-bit SQ codes of one partition and how Lance measures between them.
+/// The storage a partition's graph is built over, and how Lance measures between its rows.
+enum class Storage {
+    Sq,    // 8-bit SQ codes: data, n rows of dim codes; start / end are the SQ bounds
+    Flat,  // float vectors: vectors, n rows of dim floats (IVF_HNSW_FLAT)
+    Pq,    // PQ codes: data, n rows of dim (= code bytes); pq_table as in Lance (IVF_HNSW_PQ)
+};
+
+/// One partition's rows and how Lance measures between them.
 struct Codes {
-    const std::uint8_t* data = nullptr;  // n rows of dim codes
+    Storage storage = Storage::Sq;
+    const std::uint8_t* data = nullptr;  // Sq and Pq: n rows of dim bytes
+    const float* vectors = nullptr;      // Flat: n rows of dim floats
     std::size_t n = 0;
     std::size_t dim = 0;
     bool dot = false;  // dot product; else squared L2 (also for cosine, over normalized vectors)
     double start = 0;  // the SQ bounds
     double end = 0;
+    // Pq: the pairwise table [m][2^nbits][2^nbits] of sub-vector distances (PQ's pairwise_distance_table),
+    // and the sub-vector count and bit width (4-bit codes are two sub-vectors per byte).
+    const float* pq_table = nullptr;
+    std::size_t m = 0;
+    std::uint32_t nbits = 8;
 };
 
 struct Graph {

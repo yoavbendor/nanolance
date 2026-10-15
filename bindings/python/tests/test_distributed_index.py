@@ -196,11 +196,11 @@ def _nearest(ds, q, k=10, **kw):
     return t["id"].to_pylist(), np.round(t["_distance"].to_numpy(), 4).tolist()
 
 
-@pytest.mark.parametrize("kind", ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"])
+@pytest.mark.parametrize("kind", ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ"])
 def test_vector_segments_with_a_shared_model(lance, make, kind):
     ours = nl.dataset(make("ours"))
     builder = IndicesBuilder(ours, "vec")
-    if kind == "IVF_PQ":
+    if kind in ("IVF_PQ", "IVF_HNSW_PQ"):
         model = builder.prepare_global_ivf_pq(4, 4, sample_rate=2, max_iters=10)
         params = {"num_sub_vectors": 4, **model}
     else:
@@ -224,7 +224,7 @@ def test_vector_segments_with_a_shared_model(lance, make, kind):
         exact = _nearest(theirs, q, use_index=False)[0]
         ids, dist = _nearest(theirs, q, nprobes=4, refine_factor=5)
         assert _nearest(ours, q, nprobes=4, refine_factor=5)[0] == ids
-        if kind != "IVF_HNSW_SQ":  # the same codes in the same partitions: the same answers
+        if "HNSW" not in kind:  # the same codes in the same partitions: the same answers
             assert (ids, dist) == _nearest(whole, q, nprobes=4, refine_factor=5)
         assert len(set(ids) & set(exact)) >= 7
 

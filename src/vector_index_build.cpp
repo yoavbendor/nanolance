@@ -62,7 +62,7 @@ constexpr std::size_t kMaxPartitions = 4096;  // Lance's recommended_num_partiti
 
 /// Lance's IndexType::target_partition_size.
 std::size_t default_partition_size(const std::string& type) {
-    return type == "IVF_FLAT" ? 4096U : (type == "IVF_HNSW_SQ" ? std::size_t{1} << 20U : 8192U);
+    return type == "IVF_FLAT" ? 4096U : (type.rfind("IVF_HNSW_", 0) == 0 ? std::size_t{1} << 20U : 8192U);
 }
 constexpr std::size_t kHierarchyFanOut = 16;  // Lance's hierarchical_k
 constexpr double kTolerance = 1e-4;           // Lance's KMeansParams::tolerance
@@ -711,6 +711,42 @@ void adjust_partitions(const Rows& data, std::vector<float>& centroids, std::siz
     k = next;
 }
 
+/// Lance's PQ pairwise distance table: for each sub-vector, the distance between every two of its
+/// codebook entries under the metric's sub-vector distance (PQ's build_pairwise_distance_table).
+/// Layout [m][nc][nc]; the HNSW graph over PQ codes sums its entries.
+std::vector<float> pairwise_table(const std::vector<float>& codebook, std::size_t m, std::size_t nc, std::size_t w,
+                                  VectorMetric metric) {
+    std::vector<float> table(m * nc * nc);
+    for (std::size_t s = 0; s < m; ++s) {
+        const float* book = codebook.data() + s * nc * w;
+        for (std::size_t a = 0; a < nc; ++a) {
+            for (std::size_t b = 0; b < nc; ++b) {
+                const float* x = book + a * w;
+                const float* y = book + b * w;
+                float dot = 0;
+                float nx = 0;
+                float ny = 0;
+                float l2 = 0;
+                for (std::size_t j = 0; j < w; ++j) {
+                    dot += x[j] * y[j];
+                    nx += x[j] * x[j];
+                    ny += y[j] * y[j];
+                    const float t = x[j] - y[j];
+                    l2 += t * t;
+                }
+                float d = l2;
+                if (metric == VectorMetric::Dot) {
+                    d = 1.0F - dot;
+                } else if (metric == VectorMetric::Cosine) {
+                    d = 1.0F - dot / std::sqrt(nx * ny);
+                }
+                table[(s * nc + a) * nc + b] = d;
+            }
+        }
+    }
+    return table;
+}
+
 bool create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,
                          const VectorIndexOptions& given, const index_build::SegmentTarget* target,
                          std::uint64_t& new_version, std::string& error) {
@@ -728,10 +764,14 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         options.hnsw_ef_construction = model->hnsw_ef_construction;
         options.hnsw_max_level = model->hnsw_max_level;
     }
-    const bool pq = options.type == "IVF_PQ";
-    const bool hnsw = options.type == "IVF_HNSW_SQ";
-    if (!pq && !hnsw && options.type != "IVF_FLAT") {
-        error = "vector index type '" + options.type + "' is not supported (IVF_FLAT, IVF_PQ and IVF_HNSW_SQ are)";
+    // The storage (PQ codes, SQ codes or floats) and the sub-index (FLAT, or an HNSW graph per partition).
+    const bool pq = options.type == "IVF_PQ" || options.type == "IVF_HNSW_PQ";
+    const bool sq_storage = options.type == "IVF_SQ" || options.type == "IVF_HNSW_SQ";
+    const bool flat_storage = options.type == "IVF_FLAT" || options.type == "IVF_HNSW_FLAT";
+    const bool hnsw = options.type.rfind("IVF_HNSW_", 0) == 0;
+    if (!pq && !sq_storage && !flat_storage) {
+        error = "vector index type '" + options.type +
+                "' is not supported (IVF_FLAT, IVF_SQ, IVF_PQ, IVF_HNSW_FLAT, IVF_HNSW_SQ and IVF_HNSW_PQ are)";
         return false;
     }
     if (hnsw) {
@@ -1005,6 +1045,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     const std::size_t code_bytes = pq ? (options.num_bits == 4U ? m / 2U : m) : 0U;
     std::vector<float> codebook;           // [m][nc][w]
     std::vector<std::uint8_t> codes;       // per partition: [code_bytes][n_p], partitions in order
+    std::vector<std::uint8_t> pq_rows;     // HNSW over PQ codes: [row][code_bytes], rows in `order`
+    std::vector<float> pq_table;           // HNSW over PQ codes: Lance's pairwise table
     if (pq) {
         const auto residual = [&](std::size_t r, float* out) {
             const float* v = data.row(r);
@@ -1059,6 +1101,9 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         if (progress != nullptr) {
             (*progress)(0, "merge_partitions", partitions, "partitions", 0);
         }
+        if (hnsw) {
+            pq_table = pairwise_table(codebook, m, nc, w, options.metric);
+        }
         // Codes: each sub-vector's nearest codebook entry by L2, whatever the metric.
         std::vector<std::uint8_t> row_codes(data.n * m);  // [row][m], rows in `order`
         parallel::for_each(m, [&](std::size_t s) {
@@ -1081,6 +1126,9 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         });
         // Transposed per partition: [code byte][row of the partition]; skip_transpose: [row][code byte].
         codes.resize(data.n * code_bytes);
+        if (hnsw) {
+            pq_rows.resize(data.n * code_bytes);
+        }
         for (std::size_t p = 0; p < partitions; ++p) {
             const std::size_t first = offsets[p];
             const std::size_t n = lengths[p];
@@ -1096,18 +1144,22 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                     } else {
                         out[b * n + r] = code;
                     }
+                    if (hnsw) {
+                        pq_rows[(first + r) * code_bytes + b] = code;
+                    }
                 }
             }
         }
     }
 
     // SQ: the bounds of a sample's values (or the model's), every row's 8-bit codes (Lance's
-    // scale_to_u8), and each partition's HNSW graph over them.
+    // scale_to_u8). HNSW: each partition's graph over its storage: SQ codes, floats or PQ codes.
     double sq_start = 0;
     double sq_end = 0;
     std::vector<std::uint8_t> sq;  // [row][dim], rows in `order`
+    std::vector<float> flat_rows;  // HNSW_FLAT: [row][dim], rows in `order`
     std::vector<hnsw_build::Graph> graphs;
-    if (hnsw) {
+    if (sq_storage) {
         if (progress != nullptr) {
             (*progress)(0, "train_quantizer", 0, "", 0);
         }
@@ -1141,6 +1193,19 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                 }
             }
         });
+    }
+    if (hnsw) {
+        if (progress != nullptr && !sq_storage) {
+            (*progress)(0, "train_quantizer", 0, "", 0);
+            (*progress)(2, "train_quantizer", 0, "", 0);
+            (*progress)(0, "merge_partitions", partitions, "partitions", 0);
+        }
+        if (flat_storage) {
+            flat_rows.resize(data.n * dim);
+            for (std::size_t i = 0; i < data.n; ++i) {
+                std::memcpy(flat_rows.data() + i * dim, data.row(order[i]), dim * sizeof(float));
+            }
+        }
         hnsw_build::Params params;
         params.m = options.hnsw_m;
         params.ef_construction = options.hnsw_ef_construction;
@@ -1148,19 +1213,31 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         graphs.resize(partitions);
         for (std::size_t p = 0; p < partitions; ++p) {
             hnsw_build::Codes codes;
-            codes.data = sq.data() + offsets[p] * dim;
             codes.n = lengths[p];
             codes.dim = dim;
             codes.dot = dot_metric;
-            codes.start = sq_start;
-            codes.end = sq_end;
+            if (flat_storage) {
+                codes.storage = hnsw_build::Storage::Flat;
+                codes.vectors = flat_rows.data() + offsets[p] * dim;
+            } else if (pq) {
+                codes.storage = hnsw_build::Storage::Pq;
+                codes.data = pq_rows.data() + offsets[p] * code_bytes;
+                codes.dim = code_bytes;
+                codes.pq_table = pq_table.data();
+                codes.m = m;
+                codes.nbits = options.num_bits;
+            } else {
+                codes.data = sq.data() + offsets[p] * dim;
+                codes.start = sq_start;
+                codes.end = sq_end;
+            }
             graphs[p] = hnsw_build::build(codes, params);
             if (progress != nullptr) {
                 (*progress)(1, "merge_partitions", 0, "", p + 1U);
             }
         }
     }
-    if (!pq && !hnsw && progress != nullptr) {
+    if (!pq && !sq_storage && progress != nullptr) {
         (*progress)(0, "train_quantizer", 0, "", 0);
         (*progress)(2, "train_quantizer", 0, "", 0);
         (*progress)(0, "merge_partitions", partitions, "partitions", 0);
@@ -1189,7 +1266,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         if (!scalar_schema("_rowid", NANOARROW_TYPE_UINT64, true, children[0]) ||
             !(pq     ? fsl_schema("__pq_code", NANOARROW_TYPE_UINT8, static_cast<std::int64_t>(code_bytes), true,
                                   children[1])
-              : hnsw ? fsl_schema("__sq_code", NANOARROW_TYPE_UINT8, static_cast<std::int64_t>(dim), true, children[1])
+              : sq_storage ? fsl_schema("__sq_code", NANOARROW_TYPE_UINT8, static_cast<std::int64_t>(dim), true, children[1])
                      : fsl_schema("flat", NANOARROW_TYPE_FLOAT, static_cast<std::int64_t>(dim), false, children[1])) ||
             !table_schema(children, schema.s)) {
             return fail("out of memory");
@@ -1197,7 +1274,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         OwnedArray rowid;
         OwnedArray values;
         std::vector<float> flat;
-        if (!pq && !hnsw) {
+        if (flat_storage) {
             flat.resize(data.n * dim);
             for (std::size_t i = 0; i < data.n; ++i) {
                 std::memcpy(flat.data() + i * dim, data.row(order[i]), dim * sizeof(float));
@@ -1206,7 +1283,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         if (!u64_array(sorted_ids, rowid.a) ||
             !(pq     ? fsl_array(NANOARROW_TYPE_UINT8, 1, codes.data(), static_cast<std::int64_t>(data.n),
                                  static_cast<std::int64_t>(code_bytes), values.a)
-              : hnsw ? fsl_array(NANOARROW_TYPE_UINT8, 1, sq.data(), static_cast<std::int64_t>(data.n),
+              : sq_storage ? fsl_array(NANOARROW_TYPE_UINT8, 1, sq.data(), static_cast<std::int64_t>(data.n),
                                  static_cast<std::int64_t>(dim), values.a)
                      : fsl_array(NANOARROW_TYPE_FLOAT, 4, flat.data(), static_cast<std::int64_t>(data.n),
                                  static_cast<std::int64_t>(dim), values.a))) {
@@ -1224,7 +1301,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             storage = "{\"codebook_position\":2,\"nbits\":" + std::to_string(options.num_bits) +
                       ",\"num_sub_vectors\":" + std::to_string(m) + ",\"dimension\":" + std::to_string(dim) +
                       ",\"codebook_tensor\":[],\"transposed\":" + (options.skip_transpose ? "false" : "true") + "}";
-        } else if (hnsw) {
+        } else if (sq_storage) {
             storage = "{\"dim\":" + std::to_string(dim) + ",\"num_bits\":8,\"bounds\":{\"start\":" +
                       json_double(sq_start) + ",\"end\":" + json_double(sq_end) + "}}";
         } else {
@@ -1302,7 +1379,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         LanceFileExtras extras;
         extras.schema_metadata["lance:hnsw"] = bytes_of(hnsw_list);
         extras.schema_metadata["lance:index"] =
-            bytes_of("{\"type\":\"IVF_HNSW_SQ\",\"distance_type\":\"" + metric_name + "\"}");
+            bytes_of("{\"type\":\"" + options.type + "\",\"distance_type\":\"" + metric_name + "\"}");
         extras.schema_metadata["lance:ivf"] = bytes_of("1");
         const auto tensor = tensor_message({partitions, dim}, centroids);
         extras.global_buffers.push_back(ivf_message(graph_offsets, graph_lengths, &tensor, &loss));
@@ -1364,7 +1441,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         put_key(pq_details, 2, 0);
         put_varint(pq_details, m);
         put_bytes(details, 4, pq_details.data(), pq_details.size());
-    } else if (hnsw) {
+    } else if (sq_storage) {
         std::vector<std::uint8_t> sq_details;  // ScalarQuantization { num_bits }
         put_key(sq_details, 1, 0);
         put_varint(sq_details, 8U);
@@ -1388,7 +1465,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         hint("lance.pq.sample_rate", std::to_string(options.sample_rate));
         hint("lance.pq.kmeans_redos", "1");
     }
-    if (hnsw) {
+    if (sq_storage) {
         hint("lance.sq.sample_rate", std::to_string(options.sample_rate));
     }
     if (options.skip_transpose) {  // as pylance stores it; its default ("false") is not written here
@@ -1463,7 +1540,7 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
         model.dim = options.ivf_centroids.size() / model.partitions;
         model.centroids = options.ivf_centroids;
         model.nbits = options.num_bits;
-        model.m = options.type == "IVF_PQ" ? options.num_sub_vectors : 0U;
+        model.m = options.type == "IVF_PQ" || options.type == "IVF_HNSW_PQ" ? options.num_sub_vectors : 0U;
         model.has_codebook = !options.pq_codebook.empty();
         model.codebook = options.pq_codebook;
         model.has_sq = false;

@@ -572,7 +572,8 @@ bool dataset_build_index_segment(const std::filesystem::path& dataset_path, cons
         return fail(error, kind, SegmentErrorKind::InvalidArgument, std::move(message));
     };
     static const std::set<std::string> types = {"BTREE",    "BITMAP", "LABEL_LIST", "INVERTED", "ZONEMAP",
-                                                "BLOOMFILTER", "IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"};
+                                                "BLOOMFILTER", "IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_HNSW_FLAT",
+                                                "IVF_HNSW_SQ", "IVF_HNSW_PQ"};
     if (types.count(build.type) == 0U) {
         return fail(error, kind, SegmentErrorKind::Other,
                     "index type '" + build.type + "' is not supported for an index segment");
@@ -630,7 +631,7 @@ bool dataset_build_index_segment(const std::filesystem::path& dataset_path, cons
         m.partitions = partitions;
         m.centroids = build.ivf_centroids;
         m.nbits = v.num_bits;
-        m.m = build.type == "IVF_PQ" ? v.num_sub_vectors : 0U;
+        m.m = build.type == "IVF_PQ" || build.type == "IVF_HNSW_PQ" ? v.num_sub_vectors : 0U;
         m.has_codebook = !build.pq_codebook.empty();
         m.codebook = build.pq_codebook;
         m.has_sq = false;
@@ -803,7 +804,7 @@ bool dataset_merge_index_segments(const std::filesystem::path& dataset_path,
             if (!close(m.centroids, first.centroids)) {
                 return mismatch("IVF centroids mismatch across shards");
             }
-            if (m.type == "IVF_PQ") {
+            if (m.type == "IVF_PQ" || m.type == "IVF_HNSW_PQ") {
                 if (m.m != first.m || m.nbits != first.nbits) {
                     return mismatch("Distributed PQ merge: structural mismatch across shards; first(dim=" +
                                     std::to_string(first.dim) + ", m=" + std::to_string(first.m) +
