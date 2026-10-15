@@ -99,3 +99,14 @@ Tails of: `cd build && ctest -j8 | grep "tests passed"` (if C++ changed); the or
 test file; `python3 tools/pylance_suite.py | tail -4` ("all N expected tests passed"); last, once:
 `cd bindings/python && python3 -m pytest -o addopts= -q -x -p no:cacheprovider tests | tail -1`.
 Files changed, per-test status, decisions, questions.
+
+**P1 outcome (2026-10-15):** done (Python only). `lance.log` (pylance's API), and Lance's native
+log in `_native_log.py`: `LANCE_LOG` filters, `LANCE_LOG_FILE` (parents created, unwritable path ->
+stderr message), `LANCE_LOG_TS_PRECISION`; `dataset_events` loading / writing / committed and
+`file_audit` data / manifest lines equal pylance's for write / append / open, committed + manifest for
+delete (every commit path logs through `_refresh_latest(operation)`). +17 pylance tests (1080).
+Not emitted: pylance's deletion-file audit lines and `lance::events::execution` plan lines; operation
+names of rarer commits follow Lance's Operation enum, unmeasured. `test_lance_log_file_invalid_path`
+cannot pass in this sandbox (root can create `/invalid/...`; pylance fails it too) -- a stray
+`/invalid/path/.../lance.log` from a September pylance baseline run is still there (removal needs the
+user).

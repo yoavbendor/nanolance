@@ -26,6 +26,7 @@ import pyarrow as pa
 import pyarrow.dataset
 
 from nanolance import _nanolance
+from nanolance.lance import _native_log
 from nanolance.lance._errors import NotSupportedError, native, unsupported
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
 from nanolance.lance._transactions import Index, IndexFile, LanceOperation, Transaction
@@ -84,6 +85,15 @@ def _memory_root() -> str:
         _MEMORY_ROOT = tempfile.mkdtemp(prefix="nanolance-memory-")
         atexit.register(shutil.rmtree, _MEMORY_ROOT, True)
     return _MEMORY_ROOT
+
+
+def _display_uri(uri, path: str) -> str:
+    """The uri as the caller wrote it, which is what Lance's log shows; the local path for a dataset."""
+    if isinstance(uri, str):
+        return uri
+    if isinstance(uri, Path):
+        return str(uri)
+    return path
 
 
 def _path_of(uri: Union[str, Path, "LanceDataset"]) -> str:
@@ -190,6 +200,7 @@ class LanceDataset(pa.dataset.Dataset):
         **kwargs,
     ):
         self._uri = _path_of(uri)
+        self._log_uri = _display_uri(uri, self._uri)
         if index_cache_size is not None:
             warnings.warn("index_cache_size is deprecated; use index_cache_size_bytes instead",
                           DeprecationWarning, stacklevel=2)
@@ -200,8 +211,14 @@ class LanceDataset(pa.dataset.Dataset):
             version = _tag_version(self._uri, version, ValueError)
         self._storage_options = storage_options
         self._default_scan_options = dict(default_scan_options or {})
-        with native():
-            info = _nanolance._ds_info(self._uri, version)
+        try:
+            with native():
+                info = _nanolance._ds_info(self._uri, version)
+        except Exception:
+            _native_log.loading(self._log_uri, status="error")
+            raise
+        _native_log.loading(self._log_uri, status="success", version=int(info["version"]))
+        _native_log.debug("nanolance::dataset", f"opened {self._log_uri} at version {int(info['version'])}")
         self._pinned = version is not None
         self._set_info(info)
 
@@ -221,12 +238,14 @@ class LanceDataset(pa.dataset.Dataset):
             self._fragment_message_cache = {_fragment_id(m): bytes(m) for m in messages}
         return self._fragment_message_cache
 
-    def _refresh_latest(self) -> None:
+    def _refresh_latest(self, operation: str) -> None:
         """Move to the latest version after a commit of this object's (reported to a namespace that
-        manages the table's versions)."""
+        manages the table's versions). ``operation`` names the commit's transaction, as Lance logs it."""
         before = self._version
         with native():
             self._set_info(_nanolance._ds_info(self._uri, None))
+        _native_log.new_versions(getattr(self, "_log_uri", self._uri), self._uri, before, self._version,
+                                 operation)
         if getattr(self, "_ns_managed", False) and self._version > before:
             _report_versions(self, before)
 
@@ -286,7 +305,7 @@ class LanceDataset(pa.dataset.Dataset):
             if "Invalid user input" in str(exc):
                 raise ValueError(str(exc)) from None  # pylance's add_bases raises its checks as ValueError
             raise
-        self._refresh_latest()
+        self._refresh_latest("UpdateBases")
         return self
 
     @property
@@ -456,7 +475,7 @@ class LanceDataset(pa.dataset.Dataset):
     def restore(self) -> None:
         with native():
             _nanolance._ds_restore(self._uri, self._version)
-        self._refresh_latest()
+        self._refresh_latest("Restore")
 
     # ── config and metadata ───────────────────────────────────────────────────────────────────────
 
@@ -471,13 +490,13 @@ class LanceDataset(pa.dataset.Dataset):
         upsert = {k: str(v) for k, v in values.items() if v is not None}
         with native():
             _nanolance._ds_update_config(self._uri, upsert, remove)
-        self._refresh_latest()
+        self._refresh_latest("UpdateConfig")
         return self.config()
 
     def delete_config_keys(self, keys: List[str]) -> None:
         with native():
             _nanolance._ds_update_config(self._uri, {}, list(keys))
-        self._refresh_latest()
+        self._refresh_latest("UpdateConfig")
 
     @property
     def metadata(self) -> Dict[str, str]:
@@ -492,7 +511,7 @@ class LanceDataset(pa.dataset.Dataset):
                 merged[k] = str(v)
         with native():
             _nanolance._ds_update_table_metadata(self._uri, merged, True)
-        self._refresh_latest()
+        self._refresh_latest("UpdateConfig")
         return self.metadata
 
     @property
@@ -508,7 +527,7 @@ class LanceDataset(pa.dataset.Dataset):
                 merged[k] = str(v)
         with native():
             _nanolance._ds_update_schema_metadata(self._uri, merged, True)
-        self._refresh_latest()
+        self._refresh_latest("UpdateConfig")
         return self.schema_metadata
 
     def replace_schema_metadata(self, new_metadata: Dict[str, str]) -> None:
@@ -847,7 +866,7 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError("delete needs a predicate")
         with native():
             deleted, _ = _nanolance._ds_delete(self._uri, sql)
-        self._refresh_latest()
+        self._refresh_latest("Delete")
         return {"num_deleted_rows": int(deleted)}
 
     def update(self, updates: Dict[str, str], where: Optional[str] = None, conflict_retries: int = 10,
@@ -858,7 +877,7 @@ class LanceDataset(pa.dataset.Dataset):
         assignments = [(str(k), str(v)) for k, v in updates.items()]
         with native():
             updated, _ = _nanolance._ds_update(self._uri, _filter_sql(where), assignments)
-        self._refresh_latest()
+        self._refresh_latest("Update")
         return {"num_rows_updated": int(updated)}
 
     def merge_insert(self, on=None) -> "MergeInsertBuilder":
@@ -884,7 +903,7 @@ class LanceDataset(pa.dataset.Dataset):
             reader = _coerce_reader(transforms, reader_schema)
             with native():
                 _nanolance._ds_add_columns_stream(self._uri, reader)
-        self._refresh_latest()
+        self._refresh_latest("Merge")
 
     def _add_columns_udf(self, transforms, read_columns, batch_size) -> None:
         """New columns computed by a function of each batch: a new data file per fragment, then one
@@ -905,7 +924,7 @@ class LanceDataset(pa.dataset.Dataset):
             LanceDataset.commit(self._uri, LanceOperation.Merge(fragments, schema), read_version=self._version)
         if udf.cache is not None:
             udf.cache.cleanup()
-        self._refresh_latest()
+        self._refresh_latest("Merge")
 
     def truncate_table(self) -> None:
         """Delete every row, keeping the schema: a new version (Lance's delete("true"))."""
@@ -943,14 +962,14 @@ class LanceDataset(pa.dataset.Dataset):
         with native():
             _nanolance._ds_add_columns_stream(self._uri, pa.RecordBatchReader.from_batches(
                 added.schema, added.to_batches()))
-        self._refresh_latest()
+        self._refresh_latest("Merge")
 
     def drop_columns(self, columns: List[str]) -> None:
         if isinstance(columns, str):
             columns = [columns]
         with native():
             _nanolance._ds_drop_columns(self._uri, [str(c) for c in columns])
-        self._refresh_latest()
+        self._refresh_latest("Project")
 
     def alter_columns(self, *alterations) -> None:
         items = []
@@ -966,7 +985,7 @@ class LanceDataset(pa.dataset.Dataset):
             items.append(item)
         with native():
             _nanolance._ds_alter_columns(self._uri, items)
-        self._refresh_latest()
+        self._refresh_latest("Project")
 
     # ── indices ───────────────────────────────────────────────────────────────────────────────────
 
@@ -1017,7 +1036,7 @@ class LanceDataset(pa.dataset.Dataset):
         with native():
             _nanolance._ds_create_scalar_index(self._uri, str(column), kind, name or "", bool(replace), rows_per_zone,
                                                number_of_items, probability, None)
-        self._refresh_latest()
+        self._refresh_latest("CreateIndex")
         return self
 
     # A JSON index's target_index_type and path (pylance's json.rs takes them). The other target types are
@@ -1048,7 +1067,7 @@ class LanceDataset(pa.dataset.Dataset):
         with native():
             _nanolance._ds_create_scalar_index(self._uri, str(column), "BTREE", name or "", bool(replace), 0, 0, 0.0,
                                                path)
-        self._refresh_latest()
+        self._refresh_latest("CreateIndex")
         return self
 
     _INVERTED_OPTIONS = ("base_tokenizer", "language", "with_position", "max_token_length", "lower_case", "stem",
@@ -1153,7 +1172,7 @@ class LanceDataset(pa.dataset.Dataset):
             column = column[0]
         with _lance_errors():
             _nanolance._ds_create_inverted_index(self._uri, str(column), name or "", bool(replace), params)
-        self._refresh_latest()
+        self._refresh_latest("CreateIndex")
         return self
 
     def _stage_inverted_part(self, column, name, fragment_ids, uuid_bytes, kwargs) -> "LanceDataset":
@@ -1333,7 +1352,7 @@ class LanceDataset(pa.dataset.Dataset):
                 column = ".".join(path)
         with _lance_errors():
             _nanolance._index_commit_segments(self._uri, str(index_name), str(column), messages)
-        self._refresh_latest()
+        self._refresh_latest("CreateIndex")
         return self
 
     def get_ivf_model(self, index_name: str):
@@ -1500,7 +1519,7 @@ class LanceDataset(pa.dataset.Dataset):
             if callback_errors:
                 raise callback_errors[0] from None
             raise
-        self._refresh_latest()
+        self._refresh_latest("CreateIndex")
         return self
 
     def drop_index(self, name: str) -> None:
@@ -1508,7 +1527,7 @@ class LanceDataset(pa.dataset.Dataset):
             raise RuntimeError(f"Lance index not found: name={name}")  # pylance's error for a missing name
         with native():
             _nanolance._ds_drop_index(self._uri, str(name))
-        self._refresh_latest()
+        self._refresh_latest("CreateIndex")
 
     def list_indices(self) -> List[Dict[str, Any]]:
         with native():
@@ -1767,7 +1786,7 @@ class LanceDataset(pa.dataset.Dataset):
             by_id[field.id()] = entries
         with native():
             _nanolance._ds_update_field_metadata(self._uri, by_id, bool(replace))
-        self._refresh_latest()
+        self._refresh_latest("UpdateConfig")
 
     @property
     def stats(self) -> "LanceStats":
@@ -1838,13 +1857,21 @@ class LanceDataset(pa.dataset.Dataset):
                 version = _nanolance._ds_commit_hand_built(path, field, message, int(read_version),
                                                            int(read_version), properties, True,
                                                            bool(enable_stable_row_ids))
-            return LanceDataset(path, version=int(version))
+            _native_log.committed(_display_uri(base_uri, path), read_version=int(read_version),
+                                  committed_version=int(version), operation=type(operation).__name__,
+                                  detached=True)
+            with _native_log.quiet():
+                return LanceDataset(path, version=int(version))
         if isinstance(operation, LanceOperation.CreateIndex):
             return LanceDataset._commit_create_index(path, operation)
-        before = LanceDataset(path).version if _exists(path) else 0
+        with _native_log.quiet():
+            before = LanceDataset(path).version if _exists(path) else 0
         version = _commit_hand_built(path, operation, read_version, properties, int(max_retries), timeout,
                                      bool(enable_stable_row_ids))
-        ds = LanceDataset(path, version=version)
+        _native_log.new_versions(_display_uri(base_uri, path), path, before, int(version),
+                                 type(operation).__name__, read_version=read_version)
+        with _native_log.quiet():
+            ds = LanceDataset(path, version=version)
         if namespace_client is not None:
             ds._attach_namespace(namespace_client, table_id, namespace_client_managed_versioning)
             if namespace_client_managed_versioning:
@@ -2690,7 +2717,7 @@ class MergeInsertBuilder:
                     self._fill_missing_columns(pa.RecordBatchReader.from_batches(keys.schema, keys.to_batches()),
                                                target, read_old=False),
                     "", "delete", self._uncommitted, *self._targets())
-            self._ds._refresh_latest()
+            self._ds._refresh_latest("Update")
             return {k: int(v) for k, v in stats.items()}
         _check_append_schema(target, reader.schema, allow_subset=True)
         dirs, base_ids = self._targets()
@@ -2721,7 +2748,7 @@ class MergeInsertBuilder:
                 self._ds.uri, self._on, self._update_all, self._insert_all, self._delete_by_source,
                 self._delete_condition, conformed, self._update_condition, self._when_matched, self._uncommitted,
                 dirs, base_ids)
-        self._ds._refresh_latest()
+        self._ds._refresh_latest("Update")
         return {k: int(v) for k, v in stats.items()}
 
     _uncommitted = False
@@ -2833,7 +2860,7 @@ class DatasetOptimizer:
                                  for v in (max_source_fragments, max_source_rows, max_source_bytes)),
                 sorted({int(i) for i in (excluded_fragment_ids or [])}), int(max_bytes_per_file or 0),
                 int(batch_size or 0))
-        self._ds._refresh_latest()
+        self._ds._refresh_latest("Rewrite")
         return CompactionMetrics(**{k: int(v) for k, v in metrics.items() if not k.startswith("indexes_")})
 
     def enable_auto_cleanup(self, auto_cleanup_config, **kwargs) -> None:
@@ -2861,7 +2888,7 @@ class DatasetOptimizer:
             _nanolance._ds_optimize_indices(self._ds.uri, names,
                                             None if num_indices_to_merge is None else int(num_indices_to_merge),
                                             bool(retrain))
-        self._ds._refresh_latest()
+        self._ds._refresh_latest("CreateIndex")
 
 
 class IndexSegmentDescription:
@@ -3942,14 +3969,39 @@ def write_dataset(
                 writer.set_stable_row_ids(True)
         _set_base_plan(writer, initial_bases, targets, exists)
 
-    writer, _ = _stage_write(path, reader, mode=mode, max_rows_per_file=max_rows_per_file,
-                             max_bytes_per_file=max_bytes_per_file, external_blob_mode=external_blob_mode,
-                             allow_external_blob_outside_bases=allow_external_blob_outside_bases, setup=setup)
     append = mode == "append" and exists
     code = _MODES["append" if append else ("create" if mode == "create" else "overwrite")]
+    shown = _display_uri(uri, path)
+    log = _native_log.enabled(_native_log.DATASET_EVENTS) or _native_log.enabled(_native_log.FILE_AUDIT)
+    if log:
+        # Lance's log for a write: opened (or not, for a create), writing, data files, commit.
+        before_version = 0
+        if exists:
+            with native():
+                before_version = int(_nanolance._ds_info(path, None)["version"])
+            _native_log.loading(shown, status="success", version=before_version)
+        else:
+            _native_log.loading(shown, status="error")
+        _native_log.writing(shown, "Append" if append else ("Overwrite" if exists else "Create"))
+        before_files = _native_log.data_files(path)
+    with _native_log.quiet():
+        writer, _ = _stage_write(path, reader, mode=mode, max_rows_per_file=max_rows_per_file,
+                                 max_bytes_per_file=max_bytes_per_file, external_blob_mode=external_blob_mode,
+                                 allow_external_blob_outside_bases=allow_external_blob_outside_bases, setup=setup)
     with native():
         writer.finish(code)
-    return LanceDataset(path)
+    if log:
+        new_files = sorted(_native_log.data_files(path) - before_files)
+        for name in new_files:
+            _native_log.file_audit("create", "data", name)
+        _native_log.debug("nanolance::dataset", f"write {shown}: {len(new_files)} data file(s) written")
+        if not exists:
+            _native_log.loading(shown, status="error")
+        with native():
+            after_version = int(_nanolance._ds_info(path, None)["version"])
+        _native_log.new_versions(shown, path, before_version, after_version, "Append" if append else "Overwrite")
+    with _native_log.quiet():
+        return LanceDataset(path)
 
 
 def _base_plan(uri, path: str, exists: bool, mode: str, initial_bases, target_bases, target_all_bases,
