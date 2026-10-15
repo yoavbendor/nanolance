@@ -6,6 +6,7 @@
 #include "nanolance/lance_file_writer.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 
@@ -66,6 +67,25 @@ bool schema_metadata(const std::filesystem::path& path, const std::string& key, 
     found = it != descriptor.schema_metadata.end();
     if (found) {
         value.assign(it->second.begin(), it->second.end());
+    }
+    return true;
+}
+
+bool zonemap_rows_per_zone(const std::filesystem::path& dir, std::uint64_t& rows_per_zone, std::string& error) {
+    std::string value;
+    bool found = false;
+    LanceDataFileFooterLayout layout{};
+    if (!schema_metadata(dir / "zonemap.lance", "rows_per_zone", value, found, layout, error)) {
+        return false;
+    }
+    if (!found || value.empty()) {
+        error = "zonemap.lance has no rows_per_zone";
+        return false;
+    }
+    rows_per_zone = std::strtoull(value.c_str(), nullptr, 10);
+    if (rows_per_zone == 0) {
+        error = "zonemap.lance has rows_per_zone 0";
+        return false;
     }
     return true;
 }

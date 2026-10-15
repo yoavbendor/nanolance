@@ -451,6 +451,7 @@ std::string type_details_kind(const std::string& type) {
     if (type == "BITMAP") return "BitmapIndexDetails";
     if (type == "LABEL_LIST") return "LabelListIndexDetails";
     if (type == "INVERTED") return "InvertedIndexDetails";
+    if (type == "ZONEMAP") return "ZoneMapIndexDetails";
     return "VectorIndexDetails";
 }
 
@@ -569,7 +570,7 @@ bool dataset_build_index_segment(const std::filesystem::path& dataset_path, cons
     const auto invalid = [&](std::string message) {
         return fail(error, kind, SegmentErrorKind::InvalidArgument, std::move(message));
     };
-    static const std::set<std::string> types = {"BTREE",    "BITMAP", "LABEL_LIST",  "INVERTED",
+    static const std::set<std::string> types = {"BTREE",    "BITMAP", "LABEL_LIST", "INVERTED", "ZONEMAP",
                                                 "IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"};
     if (types.count(build.type) == 0U) {
         return fail(error, kind, SegmentErrorKind::Other,
@@ -749,6 +750,8 @@ bool dataset_merge_index_segments(const std::filesystem::path& dataset_path,
         type = "BITMAP";
     } else if (kind_name == "LabelListIndexDetails") {
         type = "LABEL_LIST";
+    } else if (kind_name == "ZoneMapIndexDetails") {
+        type = "ZONEMAP";
     } else if (kind_name == "InvertedIndexDetails") {
         type = "INVERTED";
         if (!index_build::load_inverted_params(dir_of(in.front()), inverted.params, error)) {
@@ -890,6 +893,10 @@ bool infer_index_segment_details(const std::filesystem::path& dataset_path, cons
         const bool list = field != nullptr && (field->logical_type.rfind("list", 0) == 0 ||
                                                field->logical_type.rfind("large_list", 0) == 0);
         type_url = list ? "/lance.table.LabelListIndexDetails" : "/lance.table.BitmapIndexDetails";
+        return true;
+    }
+    if (has("zonemap.lance")) {
+        type_url = "/lance.table.ZoneMapIndexDetails";
         return true;
     }
     if (has("page_lookup.lance")) {

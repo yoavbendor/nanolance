@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -428,6 +429,9 @@ void for_chunks(std::size_t n, const std::function<void(std::size_t, std::size_t
     parallel::for_each(chunks, [&](std::size_t c) { task(c * kChunk, std::min(n, (c + 1) * kChunk)); });
 }
 
+/// A pick that names no item: gather writes a null there (a zone with no minimum, say).
+constexpr std::uint32_t kNoPick = UINT32_MAX;
+
 /// The items at `picks` as one array of `type` (a plain Arrow type: no dictionary, no children).
 bool gather(const ArrowSchema& type, const Items& items, const std::vector<std::uint32_t>& picks, ArrowArray& out,
             std::string& error) {
@@ -447,7 +451,7 @@ bool gather(const ArrowSchema& type, const Items& items, const std::vector<std::
     for_chunks(n, [&](std::size_t begin, std::size_t end) {
         std::int64_t nulls = 0;
         for (auto r = begin; r < end; ++r) {
-            if (items.is_null(picks[r])) {
+            if (picks[r] == kNoPick || items.is_null(picks[r])) {
                 ++nulls;
             } else {
                 valid[r >> 3U] = static_cast<std::uint8_t>(valid[r >> 3U] | (1U << (r & 7U)));
@@ -714,6 +718,216 @@ bool write_bitmap(const std::filesystem::path& dir, const ArrowSchema& type, con
     return write_file(dir, "bitmap_page_lookup.lance", schema.s, batch.a, std::move(extras), files, error);
 }
 
+
+// ── zonemaps ────────────────────────────────────────────────────────────────────────────────────
+
+/// One zone (zoned.rs's ZoneTrainer): up to `rows_per_zone` rows of one fragment, nulls included.
+/// Its span runs from its first row's offset to its last one's (deleted rows leave gaps in it).
+struct Zone {
+    std::uint64_t fragment = 0;
+    std::uint64_t start = 0;
+    std::uint64_t length = 0;
+    std::uint32_t nulls = 0;
+    std::uint32_t nans = 0;
+    std::uint32_t min = kNoPick;  // the item holding the minimum (kNoPick: no value)
+    std::uint32_t max = kNoPick;  // the item holding the maximum
+    std::uint32_t nan = kNoPick;  // an item that is NaN
+};
+
+/// Cut the items (row-address order) into zones and count each zone's rows, keyed by `zone_of`.
+std::vector<Zone> cut_zones(const Items& items, std::uint64_t rows_per_zone, std::vector<std::uint32_t>& zone_of) {
+    std::vector<Zone> zones;
+    zone_of.assign(items.size(), 0);
+    std::uint64_t rows = 0;
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        const auto fragment = items.addr[k] >> 32U;
+        const auto offset = items.addr[k] & 0xFFFFFFFFU;
+        if (zones.empty() || zones.back().fragment != fragment || rows == rows_per_zone) {
+            Zone z;
+            z.fragment = fragment;
+            z.start = offset;
+            zones.push_back(z);
+            rows = 0;
+        }
+        Zone& z = zones.back();
+        z.length = offset - z.start + 1;
+        ++rows;
+        if (items.is_null(k)) {
+            ++z.nulls;
+        }
+        zone_of[k] = static_cast<std::uint32_t>(zones.size() - 1);
+    }
+    return zones;
+}
+
+/// The zones' NaNs and extreme values, the values compared as `extract`'s keys (nulls are counted by
+/// cut_zones). NaN is no minimum or maximum (arrow_stats), and a null is neither.
+template <typename K, typename Extract>
+void zone_extrema(const Items& items, const std::vector<std::uint32_t>& zone_of, bool floating, Extract extract,
+                  std::vector<Zone>& zones) {
+    const auto key = [&](std::uint32_t k) { return extract(items.views[items.view[k]], items.index[k]); };
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        Zone& z = zones[zone_of[k]];
+        const auto item = static_cast<std::uint32_t>(k);
+        if (items.is_null(k)) {
+            continue;
+        }
+        if (floating && std::isnan(ArrowArrayViewGetDoubleUnsafe(items.views[items.view[k]], items.index[k]))) {
+            ++z.nans;
+            if (z.nan == kNoPick) {
+                z.nan = item;
+            }
+            continue;
+        }
+        if (z.min == kNoPick || key(item) < key(z.min)) {
+            z.min = item;
+        }
+        if (z.max == kNoPick || key(z.max) < key(item)) {
+            z.max = item;
+        }
+    }
+}
+
+void zone_extrema_of(const Items& items, KeyKind kind, const std::vector<std::uint32_t>& zone_of,
+                     std::vector<Zone>& zones) {
+    switch (kind) {
+    case KeyKind::Int:
+    case KeyKind::Bool:
+        zone_extrema<std::int64_t>(
+            items, zone_of, false, [](const ArrowArrayView* v, std::int64_t i) { return ArrowArrayViewGetIntUnsafe(v, i); },
+            zones);
+        break;
+    case KeyKind::UInt:
+        zone_extrema<std::uint64_t>(
+            items, zone_of, false, [](const ArrowArrayView* v, std::int64_t i) { return ArrowArrayViewGetUIntUnsafe(v, i); },
+            zones);
+        break;
+    case KeyKind::Float16:
+        zone_extrema<std::uint16_t>(
+            items, zone_of, true,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                std::uint16_t bits = 0;
+                std::memcpy(&bits, fixed_value(v, i, 2), 2);
+                return total_order<std::uint16_t>(bits, 16);
+            },
+            zones);
+        break;
+    case KeyKind::Float32:
+        zone_extrema<std::uint32_t>(
+            items, zone_of, true,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                std::uint32_t bits = 0;
+                std::memcpy(&bits, fixed_value(v, i, 4), 4);
+                return total_order<std::uint32_t>(bits, 32);
+            },
+            zones);
+        break;
+    case KeyKind::Float64:
+        zone_extrema<std::uint64_t>(
+            items, zone_of, true,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                std::uint64_t bits = 0;
+                std::memcpy(&bits, fixed_value(v, i, 8), 8);
+                return total_order<std::uint64_t>(bits, 64);
+            },
+            zones);
+        break;
+    case KeyKind::Decimal128:
+        zone_extrema<Int128>(
+            items, zone_of, false,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                Int128 value;
+                std::memcpy(&value.lo, fixed_value(v, i, 16), 8);
+                std::memcpy(&value.hi, fixed_value(v, i, 16) + 8, 8);
+                return value;
+            },
+            zones);
+        break;
+    case KeyKind::Bytes:
+        zone_extrema<StringKey>(
+            items, zone_of, false, [](const ArrowArrayView* v, std::int64_t i) { return string_key(v, i, 0); }, zones);
+        break;
+    }
+}
+
+/// `n` nulls of `type` (a nested type: its children are null too, as the layout needs).
+bool all_null_array(const ArrowSchema& type, std::int64_t n, ArrowArray& out, std::string& error) {
+    ArrowError err;
+    if (ArrowArrayInitFromSchema(&out, &type, &err) != NANOARROW_OK || ArrowArrayAppendNull(&out, n) != NANOARROW_OK ||
+        ArrowArrayFinishBuildingDefault(&out, &err) != NANOARROW_OK) {
+        error = std::string("zonemap: ") + err.message;
+        return false;
+    }
+    return true;
+}
+
+/// zonemap.lance: min, max (the column's type), null_count, nan_count, fragment_id, zone_start,
+/// zone_length; the null rows' addresses as global buffer 1 (rows_per_zone, null_bitmap in the
+/// schema metadata). A zone whose values are all NaN has no minimum, and its maximum is NaN, as
+/// Lance writes it (zonemap.rs's max_value_from_stats).
+bool write_zonemap(const std::filesystem::path& dir, const ArrowSchema& type, const Items& items,
+                   const std::vector<Zone>& zones, bool floating, bool nested, std::uint64_t rows_per_zone,
+                   std::vector<WrittenFile>& files, std::string& error) {
+    const auto n = static_cast<std::int64_t>(zones.size());
+    std::vector<std::uint32_t> mins;
+    std::vector<std::uint32_t> maxs;
+    std::vector<std::uint32_t> nulls;
+    std::vector<std::uint32_t> nans;
+    std::vector<std::uint64_t> fragments;
+    std::vector<std::uint64_t> starts;
+    std::vector<std::uint64_t> lengths;
+    for (const auto& z : zones) {
+        mins.push_back(z.min);
+        maxs.push_back(floating && z.nans > 0 ? z.nan : z.max);
+        nulls.push_back(z.nulls);
+        nans.push_back(z.nans);
+        fragments.push_back(z.fragment);
+        starts.push_back(z.start);
+        lengths.push_back(z.length);
+    }
+    std::vector<std::uint64_t> null_addrs;
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        if (items.is_null(k)) {
+            null_addrs.push_back(items.addr[k]);
+        }
+    }
+    const auto null_bitmap = serialize_treemap(null_addrs.data(), null_addrs.size());
+
+    OwnedSchema schema;
+    OwnedSchema u32;
+    OwnedSchema u64;
+    OwnedArray min_array;
+    OwnedArray max_array;
+    OwnedArray null_array;
+    OwnedArray nan_array;
+    OwnedArray fragment_array;
+    OwnedArray start_array;
+    OwnedArray length_array;
+    OwnedArray batch;
+    LanceFileExtras extras;
+    extras.schema_metadata["rows_per_zone"] = bytes_of(std::to_string(rows_per_zone));
+    extras.schema_metadata["null_bitmap"] = bytes_of("1");
+    extras.global_buffers.push_back(null_bitmap);
+    if (!type_schema(NANOARROW_TYPE_UINT32, u32.s) || !type_schema(NANOARROW_TYPE_UINT64, u64.s) ||
+        !struct_schema({{"min", &type, true}, {"max", &type, true}, {"null_count", &u32.s, false},
+                        {"nan_count", &u32.s, false}, {"fragment_id", &u64.s, false},
+                        {"zone_start", &u64.s, false}, {"zone_length", &u64.s, false}},
+                       schema.s, error) ||
+        !(nested ? all_null_array(type, n, min_array.a, error) && all_null_array(type, n, max_array.a, error)
+                 : gather(type, items, mins, min_array.a, error) && gather(type, items, maxs, max_array.a, error)) ||
+        !uint_array(NANOARROW_TYPE_UINT32, nulls.data(), n, 4, null_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT32, nans.data(), n, 4, nan_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, fragments.data(), n, 8, fragment_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, starts.data(), n, 8, start_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, lengths.data(), n, 8, length_array.a, error) ||
+        !struct_batch({&min_array.a, &max_array.a, &null_array.a, &nan_array.a, &fragment_array.a, &start_array.a,
+                       &length_array.a},
+                      n, batch.a, error)) {
+        return error.empty() ? (error = "out of memory", false) : false;
+    }
+    return write_file(dir, "zonemap.lance", schema.s, batch.a, std::move(extras), files, error);
+}
+
 // ── the dataset ─────────────────────────────────────────────────────────────────────────────────
 
 }  // namespace
@@ -729,6 +943,8 @@ bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type) {
         type = ScalarIndexType::Bitmap;
     } else if (upper == "LABEL_LIST" || upper == "LABELLIST") {
         type = ScalarIndexType::LabelList;
+    } else if (upper == "ZONEMAP") {
+        type = ScalarIndexType::ZoneMap;
     } else {
         return false;
     }
@@ -736,6 +952,12 @@ bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type) {
 }
 
 namespace {
+
+/// A ZONEMAP on a fixed-size list (the only nested type a zonemap is built on here; list columns take
+/// LABEL_LIST).
+bool zoned_nested(ScalarIndexType type, const ArrowSchemaView& view) {
+    return type == ScalarIndexType::ZoneMap && view.type == NANOARROW_TYPE_FIXED_SIZE_LIST;
+}
 
 bool create_scalar_index(const std::filesystem::path& dataset_path, const std::string& column, ScalarIndexType type,
                          const ScalarIndexOptions& options, const index_build::SegmentTarget* target,
@@ -812,9 +1034,16 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     }
     if (type != ScalarIndexType::LabelList && list) {
         error = "a list column takes a LABEL_LIST index, not a " +
-                std::string(type == ScalarIndexType::BTree ? "BTREE" : "BITMAP");
+                std::string(type == ScalarIndexType::BTree    ? "BTREE"
+                            : type == ScalarIndexType::ZoneMap ? "ZONEMAP"
+                                                              : "BITMAP");
         return false;
     }
+    if (type == ScalarIndexType::ZoneMap && options.rows_per_zone > UINT32_MAX) {
+        error = "rows_per_zone is over 4 billion";
+        return false;
+    }
+    const std::uint64_t rows_per_zone = options.rows_per_zone != 0 ? options.rows_per_zone : 8192;  // Lance's default
     const ArrowSchema* key_type = list ? col_type->children[0] : col_type;
     ArrowSchemaView key_view;
     KeyKind kind{};
@@ -822,14 +1051,18 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         error = err.message;
         return false;
     }
-    if (key_view.extension_name.data != nullptr || !key_kind_of(key_view, kind, error)) {
+    // A zonemap of a fixed-size list keeps only the null counts (zonemap.rs: nested types have no min or max).
+    const bool nested = zoned_nested(type, key_view);
+    if (!nested && (key_view.extension_name.data != nullptr || !key_kind_of(key_view, kind, error))) {
         if (error.empty()) {
             error = "a scalar index on an extension type is not supported";
         }
         return false;
     }
 
-    // The values (or list elements) in row-address order; a label list's null lists aside.
+    // The values (or list elements) in row-address order; a label list's null lists aside. A zonemap
+    // keeps the row addresses themselves (its zones are of fragments and offsets), not stable row ids.
+    const bool zoned = type == ScalarIndexType::ZoneMap;
     Items items;
     OwnedViews views;
     std::vector<std::uint64_t> null_lists;
@@ -864,7 +1097,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
             const auto vi = static_cast<std::uint32_t>(items.views.size());
             items.views.push_back(v);
             for (std::int64_t r = 0; r < batch.length; ++r) {
-                items.push(vi, r, to_row_id(addrs[r]));
+                items.push(vi, r, zoned ? addrs[r] : to_row_id(addrs[r]));
             }
             continue;
         }
@@ -887,7 +1120,16 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         return false;
     }
     Sorted sorted;
-    sort_items(items, kind, type != ScalarIndexType::BTree, sorted);
+    std::vector<std::uint32_t> zone_of;
+    std::vector<Zone> zones;
+    if (zoned) {
+        zones = cut_zones(items, rows_per_zone, zone_of);
+        if (!nested) {
+            zone_extrema_of(items, kind, zone_of, zones);
+        }
+    } else {
+        sort_items(items, kind, type != ScalarIndexType::BTree, sorted);
+    }
 
     const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
@@ -903,6 +1145,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     bool written = false;
     const char* write_stage = type == ScalarIndexType::BTree    ? "write_lookup_file"
                               : type == ScalarIndexType::Bitmap ? "write_bitmap_index"
+                              : type == ScalarIndexType::ZoneMap ? "write_zonemap_index"
                                                                 : "write_label_list_index";
     if (progress != nullptr) {
         (*progress)(0, write_stage, 1, "files", 0);
@@ -923,6 +1166,12 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         index_version = 1;
         break;
     }
+    case ScalarIndexType::ZoneMap:
+        written = write_zonemap(dir, *key_type, items, zones,
+                                kind == KeyKind::Float16 || kind == KeyKind::Float32 || kind == KeyKind::Float64,
+                                nested, rows_per_zone, files, error);
+        details = "/lance.table.ZoneMapIndexDetails";
+        break;
     }
     if (!written) {
         std::filesystem::remove_all(dir, ec);

@@ -1607,7 +1607,8 @@ NB_MODULE(_nanolance, m) {
         return version;
     });
     m.def("_ds_create_scalar_index", [](const std::filesystem::path& path, const std::string& column,
-                                          const std::string& index_type, const std::string& name, bool replace) {
+                                          const std::string& index_type, const std::string& name, bool replace,
+                                          std::uint64_t rows_per_zone) {
         nano_lance::ScalarIndexType type{};
         if (!nano_lance::parse_scalar_index_type(index_type, type)) {
             throw nb::value_error(("unsupported index type '" + index_type + "'").c_str());
@@ -1615,6 +1616,7 @@ NB_MODULE(_nanolance, m) {
         nano_lance::ScalarIndexOptions options;
         options.name = name;
         options.replace = replace;
+        options.rows_per_zone = rows_per_zone;
         std::uint64_t version = 0;
         run_op([&](std::string& e) {
             return nano_lance::dataset_create_scalar_index(path, column, type, options, version, e);

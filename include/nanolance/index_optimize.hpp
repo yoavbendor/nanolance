@@ -44,7 +44,7 @@ struct OptimizeIndicesResult {
 };
 
 /// Optimize the indexes of the latest version. Fails, committing nothing, when an index to optimize
-/// is of a kind nanolance cannot build (IVF_HNSW_*, NGRAM, ZONEMAP, ...): name the others instead.
+/// is of a kind nanolance cannot build (IVF_HNSW_*, NGRAM, BLOOMFILTER, ...): name the others instead.
 bool dataset_optimize_indices(const std::filesystem::path& dataset_path, const OptimizeIndicesOptions& options,
                               OptimizeIndicesResult& result, std::string& error);
 

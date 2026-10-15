@@ -946,8 +946,9 @@ class LanceDataset(pa.dataset.Dataset):
     def create_scalar_index(self, column: str, index_type: str, name: Optional[str] = None, *,
                             replace: bool = True, train: bool = True, fragment_ids: Optional[List[int]] = None,
                             index_uuid: Optional[str] = None, **kwargs) -> "LanceDataset":
-        """Build a BTREE, BITMAP, LABEL_LIST or INVERTED (full-text) index on `column`, in Lance's own
-        format: pylance and LanceDB use it as one they built. Commits a new version.
+        """Build a BTREE, BITMAP, LABEL_LIST, ZONEMAP or INVERTED (full-text) index on `column`, in Lance's
+        own format: pylance and LanceDB use it as one they built. Commits a new version. ZONEMAP takes
+        `rows_per_zone` (nanolance; pylance 12 has no argument for it).
 
         With `fragment_ids`, an INVERTED index is staged for those fragments under `index_uuid` and
         not committed (Lance's legacy distributed build): ``merge_index_metadata`` builds it once every
@@ -956,10 +957,14 @@ class LanceDataset(pa.dataset.Dataset):
             path = _resolve_path(self._data_schema, column)
             if path is not None:
                 column = ".".join(path)  # the schema's own names, as Lance stores them
+        config: Dict[str, Any] = {}
+        if hasattr(index_type, "index_type"):  # an IndexConfig: its type, and its parameters
+            config = {str(k).lower(): v for k, v in dict(index_type.parameters or {}).items()}
+            index_type = index_type.index_type
         kind = str(index_type).upper()
         if kind == "FTS":
             kind = "INVERTED"
-        if fragment_ids is not None and kind in ("BTREE", "BITMAP", "LABEL_LIST"):
+        if fragment_ids is not None and kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP"):
             raise ValueError(f"{kind} distributed indexing uses create_index_uncommitted(..., "
                              f'index_type="{kind}", fragment_ids=...)')
         uuid_bytes = _parse_index_uuid(index_uuid)
@@ -968,10 +973,11 @@ class LanceDataset(pa.dataset.Dataset):
                 return self._stage_inverted_part(column, name, fragment_ids, uuid_bytes, kwargs)
             return self._create_inverted_index(column, name, replace, kwargs)
         kwargs.pop("progress_callback", None)
-        if kwargs:
-            raise unsupported(f"create_scalar_index options {sorted(kwargs)}")
+        rows_per_zone = int(kwargs.pop("rows_per_zone", 0) or config.pop("rows_per_zone", 0) or 0)  # ZONEMAP
+        if kwargs or config:
+            raise unsupported(f"create_scalar_index options {sorted(kwargs) + sorted(config)}")
         with native():
-            _nanolance._ds_create_scalar_index(self._uri, str(column), kind, name or "", bool(replace))
+            _nanolance._ds_create_scalar_index(self._uri, str(column), kind, name or "", bool(replace), rows_per_zone)
         self._refresh_latest()
         return self
 
@@ -1116,7 +1122,7 @@ class LanceDataset(pa.dataset.Dataset):
             path = _resolve_path(self._data_schema, column)
             if path is not None:
                 column = ".".join(path)
-        scalar = kind in ("BTREE", "BITMAP", "LABEL_LIST", "INVERTED")
+        scalar = kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "INVERTED")
         if scalar and fragment_ids is None:
             raise ValueError("create_index_uncommitted requires fragment_ids for distributed index build")
         if not scalar and kind not in self._VECTOR_INDEX_TYPES:
@@ -2759,6 +2765,9 @@ def _segment_statistics(ds: "LanceDataset", segment: dict) -> Dict[str, Any]:
     try:
         if kind in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ", "IVF_SQ", "IVF_HNSW_PQ", "IVF_HNSW_FLAT"):
             return _vector_statistics(ds, segment, directory)
+        if kind == "ZoneMap":
+            meta = metadata("zonemap.lance")
+            return {"rows_per_zone": int(meta[b"rows_per_zone"]), "num_zones": rows("zonemap.lance")}
         if kind == "BTree":
             table = pa.table(_nanolance._file_read(os.path.join(directory, "page_lookup.lance"), None, 0, -1))
             mins, maxs = table.column(0).to_pylist(), table.column(1).to_pylist()

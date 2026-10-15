@@ -17,11 +17,14 @@
 ///               (bitmap_page_lookup.lance). For columns with few distinct values.
 ///   LABEL_LIST  a bitmap index over the elements of a list column, plus the rows whose list is null
 ///               (global buffer 1): array_has_any / array_has_all / array_contains.
+///   ZONEMAP     zonemap.lance: per zone of up to `rows_per_zone` rows of one fragment, its min, max,
+///               null count and NaN count, with the zone's fragment and row span; the null rows as a
+///               row-address bitmap (global buffer 1). Answers inexactly: the zones that may match.
 namespace nano_lance {
 
-enum class ScalarIndexType { BTree, Bitmap, LabelList };
+enum class ScalarIndexType { BTree, Bitmap, LabelList, ZoneMap };
 
-/// "BTREE", "BITMAP", "LABEL_LIST" (any case) as a type; false for anything else.
+/// "BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP" (any case) as a type; false for anything else.
 bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type);
 
 struct ScalarIndexOptions {
@@ -29,6 +32,8 @@ struct ScalarIndexOptions {
     std::string name;
     /// An index of the same name is replaced; without `replace`, that is an error.
     bool replace = true;
+    /// ZONEMAP: rows per zone (Lance's default, 8192, when 0).
+    std::uint64_t rows_per_zone = 0;
 };
 
 /// Index `column` (a top-level column or a `struct.child` path) of the latest version, committed as

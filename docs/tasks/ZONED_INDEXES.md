@@ -121,3 +121,10 @@ Tails of: `cd build && ctest -j8 | tail -3`; the phase's `-k` run; `python3 -m p
 tests/test_zoned_indexes.py | tail -2`; `python3 tools/pylance_suite.py | tail -4` ("all N expected
 tests passed"); last, once, quiet machine: the full `pytest -o addopts= -q -x -p no:cacheprovider tests
 | tail -3`. Report under 40 lines: files, per-test status, tails, decisions, questions.
+
+**Z1 outcome (2026-10-15):** ZONEMAP built, searched, maintained and in distributed segments; 13 of
+pylance's zonemap tests (the rest need `scan_stats_callback`, decimal / duration `arrow_cast` filters, or
+decimal256). Same rows / schema / metadata as pylance's files, different page bytes (pylance reads them).
+Reviewer's calls: compaction keeps re-covering every index kind (nanolance's documented divergence from
+Lance, which leaves rewritten fragments unindexed until optimize_indices); BTree and ZoneMap share
+`prune_by_bounds` (a NaN maximum counts as unbounded, conservative).

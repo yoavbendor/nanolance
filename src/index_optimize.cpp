@@ -10,6 +10,7 @@
 #include "nanolance/index_optimize.hpp"
 
 #include "index_build.hpp"
+#include "index_files.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -53,7 +54,7 @@ std::filesystem::path segment_dir(const std::filesystem::path& dataset_path, con
     return dataset_path / "_indices" / pb::uuid_string(index.uuid);
 }
 
-enum class Kind { BTree, Bitmap, LabelList, Inverted, Vector, Other };
+enum class Kind { BTree, Bitmap, LabelList, ZoneMap, Inverted, Vector, Other };
 
 Kind kind_of(const std::filesystem::path& dataset_path, const pb::IndexMetadata& index) {
     const auto& url = index.details_type_url;
@@ -65,6 +66,9 @@ Kind kind_of(const std::filesystem::path& dataset_path, const pb::IndexMetadata&
     }
     if (ends_with(url, "LabelListIndexDetails")) {
         return Kind::LabelList;
+    }
+    if (ends_with(url, "ZoneMapIndexDetails")) {
+        return Kind::ZoneMap;
     }
     if (ends_with(url, "InvertedIndexDetails")) {
         return Kind::Inverted;
@@ -246,12 +250,22 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
     switch (kind) {
     case Kind::BTree:
     case Kind::Bitmap:
-    case Kind::LabelList: {
+    case Kind::LabelList:
+    case Kind::ZoneMap: {
         ScalarIndexOptions o;
         o.name = last.name;
         const ScalarIndexType type = kind == Kind::BTree    ? ScalarIndexType::BTree
                                      : kind == Kind::Bitmap ? ScalarIndexType::Bitmap
+                                     : kind == Kind::ZoneMap ? ScalarIndexType::ZoneMap
                                                             : ScalarIndexType::LabelList;
+        if (kind == Kind::ZoneMap) {
+            // The new zones are cut as the segment they follow was (Lance keeps the parameters).
+            std::string zone_error;
+            if (!index_files::zonemap_rows_per_zone(segment_dir(dataset_path, reference), o.rows_per_zone, zone_error)) {
+                error = "index '" + last.name + "': " + zone_error;
+                return false;
+            }
+        }
         if (!index_build::build_scalar_segment(dataset_path, column, type, o, where, error)) {
             return false;
         }

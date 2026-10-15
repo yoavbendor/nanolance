@@ -51,6 +51,9 @@ std::string file_key(const std::filesystem::path& path);
 bool schema_metadata(const std::filesystem::path& path, const std::string& key, std::string& value, bool& found,
                      LanceDataFileFooterLayout& layout, std::string& error);
 
+/// The rows per zone of the zonemap.lance in `dir` (its schema metadata).
+bool zonemap_rows_per_zone(const std::filesystem::path& dir, std::uint64_t& rows_per_zone, std::string& error);
+
 /// Loaded indices, by file_key.
 template <typename T>
 class IndexCache {

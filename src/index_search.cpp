@@ -13,6 +13,9 @@
 //   LabelList  the same over a list column's elements, plus the rows whose list is null (global
 //              buffer 1): array_has_any is the union of the named elements' rows, array_has_all
 //              their intersection.
+//   ZoneMap    zonemap.lance: per zone, its min, max and null count; the bounds keep the zones that
+//              may match, and a kept zone's rows (its fragment's offsets over its span, deleted rows
+//              among them) are the answer. Zones hold row addresses, not stable row ids.
 //
 // Each index covers the fragments of its fragment bitmap: an answer says nothing about the others.
 // AND intersects answers where both apply; OR unites them where both apply; NOT and anything
@@ -132,6 +135,35 @@ bool load_bitmap(const std::filesystem::path& dir, std::shared_ptr<const BitmapI
     }
     if (index->keys.schema.n_children != 1) {
         error = "bitmap index: no keys column";
+        return false;
+    }
+    out = index;
+    cache.put(key, out);
+    return true;
+}
+
+struct ZoneMapIndex {
+    FileTable zones;  // min, max, null_count, nan_count, fragment_id, zone_start, zone_length
+};
+
+bool load_zonemap(const std::filesystem::path& dir, std::shared_ptr<const ZoneMapIndex>& out, std::string& error) {
+    static IndexCache<ZoneMapIndex> cache;
+    const auto path = dir / "zonemap.lance";
+    const auto key = file_key(path);
+    if ((out = cache.find(key)) != nullptr) {
+        return true;
+    }
+    auto index = std::make_shared<ZoneMapIndex>();
+    if (!read_table(path, nullptr, LanceRowRange{}, index->zones, error)) {
+        return false;
+    }
+    const auto format = [&](std::int64_t c) {
+        return std::string(index->zones.schema.children[c]->format == nullptr ? "" : index->zones.schema.children[c]->format);
+    };
+    if (index->zones.schema.n_children != 7 || format(2) != "I" || format(3) != "I" || format(4) != "L" ||
+        format(5) != "L" || format(6) != "L") {
+        error = "zonemap index: zonemap.lance is not min, max, null_count, nan_count (uint32), fragment_id, "
+                "zone_start, zone_length (uint64)";
         return false;
     }
     out = index;
@@ -306,39 +338,44 @@ std::vector<std::uint32_t> u32_column(const FileTable& table, std::size_t c) {
     return out;
 }
 
-bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
-                  std::string& error) {
-    answered = false;
-    if (p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has) {
-        return true;
+std::vector<std::uint64_t> u64_column(const FileTable& table, std::size_t c) {
+    std::vector<std::uint64_t> out;
+    for (const auto& b : table.batches) {
+        const ArrowArray* a = b.children[c];
+        const auto* v = static_cast<const std::uint64_t*>(a->buffers[1]) + a->offset;
+        out.insert(out.end(), v, v + a->length);
     }
-    std::shared_ptr<const BTreeIndex> index;
-    if (!load_btree(dir, index, error)) {
-        return false;
-    }
-    const auto& lookup = index->lookup;
-    const auto null_counts = u32_column(lookup, 2);
-    const auto page_idx = u32_column(lookup, 3);
-    const auto pages = page_idx.size();
+    return out;
+}
+
+/// The bounded units (pages, zones) of `bounds` -- its min and max (columns 0 and 1) and each one's
+/// null count -- that may hold a row the predicate passes. `handled` is false for a predicate these
+/// bounds do not decide (nothing is kept then).
+bool prune_by_bounds(const expr::Predicate& p, const FileTable& bounds, const std::vector<std::uint32_t>& null_counts,
+                     std::vector<std::uint8_t>& keep, bool& handled, std::string& error) {
+    handled = true;
+    const std::size_t pages = null_counts.size();
     std::vector<std::uint8_t> min_null;
     std::vector<std::uint8_t> min_nan;
     std::vector<std::uint8_t> max_null;
     std::vector<std::uint8_t> max_nan;
-    nulls_of(lookup, 0, min_null, min_nan);
-    nulls_of(lookup, 1, max_null, max_nan);
-
-    // A page may hold a match where its bounds allow one. Its min may be a null (the page starts
-    // with nulls): no lower bound then. A NaN min (-NaN sorts first) needs no care -- filters
-    // order -NaN below every value too -- but is still treated as unbounded (conservative).
-    std::vector<std::uint8_t> keep(pages, 0);
+    nulls_of(bounds, 0, min_null, min_nan);
+    nulls_of(bounds, 1, max_null, max_nan);
+    keep.assign(pages, 0);
+    // A unit may hold a match where its bounds allow one. Its min may be a null (it starts with
+    // nulls): no lower bound then. A NaN min (-NaN sorts first) needs no care -- filters order -NaN
+    // below every value too -- but is still treated as unbounded (conservative), and so is a NaN max.
     std::vector<std::uint8_t> pass;
     const auto bound = [&](const expr::Predicate& q, std::size_t column, std::vector<std::uint8_t>& ok) {
-        if (!evaluate(q, lookup, column, ok, error)) {
+        if (!evaluate(q, bounds, column, ok, error)) {
             return false;
         }
         for (std::size_t i = 0; i < pages; ++i) {
             if (column == 0 && (min_null[i] != 0 || min_nan[i] != 0)) {
                 ok[i] = 1;
+            }
+            if (column == 1 && max_nan[i] != 0) {
+                ok[i] = 1;  // a NaN maximum (NaN sorts last) says nothing about the others
             }
             if (max_null[i] != 0) {
                 ok[i] = 0;  // all null: no value matches
@@ -390,8 +427,12 @@ bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, Ro
             break;
         }
         case Test::Between:
-            if (p.constants() != 2U || !value_range(0, ">=", 1, "<=", keep)) {
-                return p.constants() == 2U ? false : true;
+            if (p.constants() != 2U) {
+                handled = false;
+                return true;
+            }
+            if (!value_range(0, ">=", 1, "<=", keep)) {
+                return false;
             }
             break;
         case Test::In:
@@ -406,12 +447,40 @@ bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, Ro
             }
             break;
         default:
+            handled = false;
             return true;
+    }
+    return true;
+
+}
+
+bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
+                  std::string& error) {
+    answered = false;
+    if (p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has) {
+        return true;
+    }
+    std::shared_ptr<const BTreeIndex> index;
+    if (!load_btree(dir, index, error)) {
+        return false;
+    }
+    const auto& lookup = index->lookup;
+    const auto null_counts = u32_column(lookup, 2);
+    const auto page_idx = u32_column(lookup, 3);
+    const auto pages = page_idx.size();
+    std::vector<std::uint8_t> keep;
+    bool handled = false;
+    if (!prune_by_bounds(p, lookup, null_counts, keep, handled, error)) {
+        return false;
+    }
+    if (!handled) {
+        return true;
     }
 
     // The kept pages' values, the predicate on each: their row ids are the answer. Adjacent pages
     // are read as one range.
     std::vector<std::uint64_t> addrs;
+    std::vector<std::uint8_t> pass;
     for (std::size_t i = 0; i < pages;) {
         if (keep[i] == 0) {
             ++i;
@@ -449,6 +518,49 @@ bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, Ro
         i = j + 1;
     }
     add_addresses(out, addrs);
+    answered = true;
+    return true;
+}
+
+/// A zonemap answers with the rows of its kept zones: each zone's span of offsets in its fragment.
+bool search_zonemap(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
+                    std::string& error) {
+    answered = false;
+    if (p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has) {
+        return true;
+    }
+    std::shared_ptr<const ZoneMapIndex> index;
+    if (!load_zonemap(dir, index, error)) {
+        return false;
+    }
+    const auto& zones = index->zones;
+    // A nested column's zones have no bounds (min and max are null): only their null counts answer.
+    const char* min_format = zones.schema.children[0]->format;
+    const bool nested = min_format != nullptr && min_format[0] == '+';
+    if (nested && p.test() != Test::IsNull) {
+        return true;
+    }
+    const auto null_counts = u32_column(zones, 2);
+    const auto fragments = u64_column(zones, 4);
+    const auto starts = u64_column(zones, 5);
+    const auto lengths = u64_column(zones, 6);
+    std::vector<std::uint8_t> keep;
+    bool handled = false;
+    if (!prune_by_bounds(p, zones, null_counts, keep, handled, error)) {
+        return false;
+    }
+    if (!handled) {
+        return true;
+    }
+    for (std::size_t z = 0; z < keep.size(); ++z) {
+        if (keep[z] == 0) {
+            continue;
+        }
+        auto& rows = out.rows[static_cast<std::uint32_t>(fragments[z])];
+        for (std::uint64_t r = starts[z]; r < starts[z] + lengths[z]; ++r) {
+            rows.push_back(static_cast<std::uint32_t>(r));
+        }
+    }
     answered = true;
     return true;
 }
@@ -674,10 +786,13 @@ struct Search {
                 RowSet one;
                 bool answered = false;
                 bool ok = true;
+                const bool zoned = kind == "/lance.table.ZoneMapIndexDetails";
                 if (kind == "/lance.table.BTreeIndexDetails" && index->files.size() == 2U &&
                     std::any_of(index->files.begin(), index->files.end(),
                                 [](const pb::IndexMetadata::File& f) { return f.path == "page_lookup.lance"; })) {
                     ok = search_btree(dir, p, one, answered, error);
+                } else if (zoned && !index->files.empty()) {
+                    ok = search_zonemap(dir, p, one, answered, error);
                 } else if ((kind == "/lance.table.BitmapIndexDetails" || kind == "/lance.table.LabelListIndexDetails") &&
                            !index->files.empty()) {
                     ok = search_bitmap(dir, kind == "/lance.table.LabelListIndexDetails", p, physical, one, answered,
@@ -690,7 +805,9 @@ struct Search {
                     answered_all = false;
                     break;
                 }
-                to_addresses(one);
+                if (!zoned) {
+                    to_addresses(one);  // a zonemap holds addresses already
+                }
                 one.covered.insert(index->fragment_ids.begin(), index->fragment_ids.end());
                 for (const auto stale : fragments_stale_for_index(manifest, index->fields, index->dataset_version)) {
                     one.covered.erase(stale);  // overlaid since the index was built: scanned instead
