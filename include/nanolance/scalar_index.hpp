@@ -23,11 +23,13 @@
 ///   BLOOMFILTER bloomfilter.lance: per zone of `number_of_items` rows of one fragment, its span, whether
 ///               it holds a null, and a split-block bloom filter of its values (nulls not hashed), of
 ///               one size for the index. Answers inexactly, for =, IN and IS NULL.
+///   NGRAM       ngram_postings.lance: per distinct trigram of the lower-cased, ASCII-folded values, the rows
+///               holding it (a RoaringTreemap of row ids); token 0 holds the null rows. For contains(col, 'x').
 namespace nano_lance {
 
-enum class ScalarIndexType { BTree, Bitmap, LabelList, ZoneMap, BloomFilter };
+enum class ScalarIndexType { BTree, Bitmap, LabelList, ZoneMap, BloomFilter, NGram };
 
-/// "BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER" (any case) as a type; false for anything else.
+/// "BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER", "NGRAM" (any case) as a type; false for anything else.
 bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type);
 
 struct ScalarIndexOptions {

@@ -1462,6 +1462,8 @@ class LanceDataset(pa.dataset.Dataset):
         return self
 
     def drop_index(self, name: str) -> None:
+        if not any(i["name"] == str(name) for i in self.list_indices()):
+            raise RuntimeError(f"Lance index not found: name={name}")  # pylance's error for a missing name
         with native():
             _nanolance._ds_drop_index(self._uri, str(name))
         self._refresh_latest()

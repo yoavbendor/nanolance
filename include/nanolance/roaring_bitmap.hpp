@@ -19,4 +19,15 @@ bool decode(const std::uint8_t* data, std::size_t size, std::vector<std::uint32_
 /// `ids` (ascending, distinct) as array and bitmap containers: what any reader of the format reads.
 std::vector<std::uint8_t> encode(const std::vector<std::uint32_t>& ids);
 
+/// As decode, for a bitmap at the start of `data`: `consumed` is the bytes it takes (more may follow).
+bool decode_prefix(const std::uint8_t* data, std::size_t size, std::vector<std::uint32_t>& out, std::size_t& consumed,
+                   std::string& error);
+
+/// A 64-bit set as Lance's RoaringTreemap serializes it: u64 LE count of 32-bit high keys, then per key
+/// ascending, [u32 LE high][the portable bitmap of the low 32 bits]. `ids` ascending and distinct.
+std::vector<std::uint8_t> encode_treemap(const std::vector<std::uint64_t>& ids);
+
+/// The ids of a RoaringTreemap, ascending.
+bool decode_treemap(const std::uint8_t* data, std::size_t size, std::vector<std::uint64_t>& out, std::string& error);
+
 }  // namespace nano_lance::roaring

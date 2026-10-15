@@ -392,6 +392,66 @@ bool Analyzer::init(const AnalyzerParams& params, std::string& error) {
     return true;
 }
 
+namespace {
+
+std::string lower_case(std::string_view word) {
+    std::string text;
+    if (is_ascii(word)) {
+        text.assign(word);
+        for (auto& c : text) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+    } else {
+        map_chars(word, std::begin(kLower), std::end(kLower), true, text);
+    }
+    return text;
+}
+
+std::string ascii_fold(std::string_view text) {
+    if (is_ascii(text)) {
+        return std::string(text);
+    }
+    std::string folded;
+    map_chars(text, std::begin(kFold), std::end(kFold), false, folded);
+    return folded;
+}
+
+}  // namespace
+
+std::string lower_and_fold(std::string_view word) { return ascii_fold(lower_case(word)); }
+
+namespace {
+
+bool ngram_alphanumeric(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+
+/// ngram.rs ngram_to_token for three bytes: each '0'-'9' -> 1-10, the rest as byte - 'a' + 11 (u8 arithmetic,
+/// as Lance's release build wraps it), base 37, first character most significant.
+std::uint32_t trigram_token(const char* t) {
+    std::uint32_t token = 0;
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto byte = static_cast<std::uint8_t>(t[i]);
+        const auto base = byte <= '9' ? static_cast<std::uint8_t>(byte - '0')
+                                      : static_cast<std::uint8_t>(static_cast<std::uint8_t>(byte - 'a') + 10U);
+        const auto pos = static_cast<std::uint8_t>(base + 1U);
+        token = token * 37U + pos;
+    }
+    return token;
+}
+
+}  // namespace
+
+std::vector<std::uint32_t> ngram_tokens(std::string_view folded) {
+    std::vector<std::uint32_t> tokens;
+    for (std::size_t i = 0; i + 3 <= folded.size(); ++i) {
+        if (ngram_alphanumeric(folded[i]) && ngram_alphanumeric(folded[i + 1]) && ngram_alphanumeric(folded[i + 2])) {
+            tokens.push_back(trigram_token(folded.data() + i));
+        }
+    }
+    std::sort(tokens.begin(), tokens.end());
+    tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+    return tokens;
+}
+
 void Analyzer::emit(std::string_view word, std::uint32_t position, std::vector<Token>& out) const {
     if (params_.max_token_length && word.size() >= *params_.max_token_length) {
         return;
@@ -399,13 +459,8 @@ void Analyzer::emit(std::string_view word, std::uint32_t position, std::vector<T
     std::string text;
     if (!params_.lower_case) {
         text.assign(word);
-    } else if (is_ascii(word)) {
-        text.assign(word);
-        for (auto& c : text) {
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
     } else {
-        map_chars(word, std::begin(kLower), std::end(kLower), true, text);
+        text = lower_case(word);
     }
     if (params_.stem) {
         snow::SnowballEnv env(text);
@@ -415,10 +470,8 @@ void Analyzer::emit(std::string_view word, std::uint32_t position, std::vector<T
     if (params_.remove_stop_words && stop_words_.count(text) != 0U) {
         return;
     }
-    if (params_.ascii_folding && !is_ascii(text)) {
-        std::string folded;
-        map_chars(text, std::begin(kFold), std::end(kFold), false, folded);
-        text = std::move(folded);
+    if (params_.ascii_folding) {
+        text = ascii_fold(text);
     }
     out.push_back(Token{std::move(text), position});
 }

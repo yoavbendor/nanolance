@@ -57,7 +57,8 @@ void put32(std::vector<std::uint8_t>& out, std::uint32_t v) {
 
 }  // namespace
 
-bool decode(const std::uint8_t* data, std::size_t size, std::vector<std::uint32_t>& out, std::string& error) {
+bool decode_prefix(const std::uint8_t* data, std::size_t size, std::vector<std::uint32_t>& out,
+                   std::size_t& consumed, std::string& error) {
     out.clear();
     Reader r{data, size};
     std::uint32_t cookie = 0;
@@ -168,7 +169,13 @@ bool decode(const std::uint8_t* data, std::size_t size, std::vector<std::uint32_
             return false;
         }
     }
+    consumed = r.at;
     return true;
+}
+
+bool decode(const std::uint8_t* data, std::size_t size, std::vector<std::uint32_t>& out, std::string& error) {
+    std::size_t consumed = 0;
+    return decode_prefix(data, size, out, consumed, error);
 }
 
 std::vector<std::uint8_t> encode(const std::vector<std::uint32_t>& ids) {
@@ -208,6 +215,67 @@ std::vector<std::uint8_t> encode(const std::vector<std::uint32_t>& ids) {
             }
             out.insert(out.end(), bits.begin(), bits.end());
         }
+    }
+    return out;
+}
+
+bool decode_treemap(const std::uint8_t* data, std::size_t size, std::vector<std::uint64_t>& out, std::string& error) {
+    out.clear();
+    if (size < 8U) {
+        error = "roaring treemap: no key count";
+        return false;
+    }
+    std::uint64_t keys = 0;
+    for (std::size_t b = 0; b < 8U; ++b) {
+        keys |= static_cast<std::uint64_t>(data[b]) << (8U * b);
+    }
+    if (keys > (size - 8U) / 4U) {
+        error = "roaring treemap: implausible key count";
+        return false;
+    }
+    std::size_t at = 8U;
+    std::vector<std::uint32_t> low;
+    for (std::uint64_t k = 0; k < keys; ++k) {
+        if (size - at < 4U) {
+            error = "roaring treemap: truncated key";
+            return false;
+        }
+        std::uint32_t high = 0;
+        for (std::size_t b = 0; b < 4U; ++b) {
+            high |= static_cast<std::uint32_t>(data[at + b]) << (8U * b);
+        }
+        at += 4U;
+        std::size_t consumed = 0;
+        if (!decode_prefix(data + at, size - at, low, consumed, error)) {
+            return false;
+        }
+        at += consumed;
+        for (const auto v : low) {
+            out.push_back((static_cast<std::uint64_t>(high) << 32U) | v);
+        }
+    }
+    return true;
+}
+
+std::vector<std::uint8_t> encode_treemap(const std::vector<std::uint64_t>& ids) {
+    std::vector<std::uint8_t> out(8U, 0U);
+    std::uint64_t keys = 0;
+    std::vector<std::uint32_t> low;
+    for (std::size_t i = 0; i < ids.size();) {
+        const auto high = static_cast<std::uint32_t>(ids[i] >> 32U);
+        low.clear();
+        for (; i < ids.size() && static_cast<std::uint32_t>(ids[i] >> 32U) == high; ++i) {
+            low.push_back(static_cast<std::uint32_t>(ids[i]));
+        }
+        for (std::size_t b = 0; b < 4U; ++b) {
+            out.push_back(static_cast<std::uint8_t>(high >> (8U * b)));
+        }
+        const auto bitmap = encode(low);
+        out.insert(out.end(), bitmap.begin(), bitmap.end());
+        ++keys;
+    }
+    for (std::size_t b = 0; b < 8U; ++b) {
+        out[b] = static_cast<std::uint8_t>(keys >> (8U * b));
     }
     return out;
 }

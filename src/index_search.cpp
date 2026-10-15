@@ -19,6 +19,9 @@
 //   BloomFilter bloomfilter.lance: per zone, its span, whether it holds a null and its bloom filter.
 //              `=` and IN keep the zones whose filter may hold a constant (probed with its bytes in
 //              the column's type); IS NULL keeps the zones with a null. Zones hold row addresses.
+//   NGram      ngram_postings.lance: for contains(col, 'x'), the rows holding every trigram of the
+//              needle (lower-cased, folded), read from the posting lists; a needle shorter than three
+//              characters, or with no trigram, says nothing; a trigram the index lacks means no row.
 //
 // Each index covers the fragments of its fragment bitmap: an answer says nothing about the others.
 // AND intersects answers where both apply; OR unites them where both apply; NOT and anything
@@ -29,6 +32,7 @@
 #include "index_files.hpp"
 
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/fts_tokenizer.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/bloom_filter.hpp"
@@ -45,6 +49,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <iterator>
 #include <set>
 #include <system_error>
 #include <unordered_map>
@@ -462,7 +467,7 @@ bool prune_by_bounds(const expr::Predicate& p, const FileTable& bounds, const st
 bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
                   std::string& error) {
     answered = false;
-    if (p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has) {
+    if (p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has || p.test() == Test::Contains) {
         return true;
     }
     std::shared_ptr<const BTreeIndex> index;
@@ -531,7 +536,7 @@ bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, Ro
 bool search_zonemap(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
                     std::string& error) {
     answered = false;
-    if (p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has) {
+    if (p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has || p.test() == Test::Contains) {
         return true;
     }
     std::shared_ptr<const ZoneMapIndex> index;
@@ -783,10 +788,181 @@ bool bitmap_rows(const BitmapIndex& index, const std::vector<std::uint64_t>& key
     return true;
 }
 
+// ── NGRAM ───────────────────────────────────────────────────────────────────────────────────────
+
+/// ngram_postings.lance: `tokens` (the trigram ids, uint32) and `posting_list` (a RoaringTreemap of row
+/// ids per token). Only the tokens are read up front; a query takes the posting lists it needs.
+struct NGramIndex {
+    FileTable tokens;
+    std::filesystem::path file;
+    std::unordered_map<std::uint32_t, std::uint64_t> rows;  // token -> its row in the file
+};
+
+bool load_ngram(const std::filesystem::path& dir, std::shared_ptr<const NGramIndex>& out, std::string& error) {
+    static IndexCache<NGramIndex> cache;
+    const auto path = dir / "ngram_postings.lance";
+    const auto key = file_key(path);
+    if ((out = cache.find(key)) != nullptr) {
+        return true;
+    }
+    auto index = std::make_shared<NGramIndex>();
+    index->file = path;
+    const std::vector<std::string> columns = {"tokens"};
+    if (!read_table(path, &columns, LanceRowRange{}, index->tokens, error)) {
+        return false;
+    }
+    if (index->tokens.schema.n_children != 1 || index->tokens.schema.children[0]->format == nullptr ||
+        std::string(index->tokens.schema.children[0]->format) != "I") {
+        error = "ngram index: ngram_postings.lance has no uint32 tokens column";
+        return false;
+    }
+    std::uint64_t row = 0;
+    for (const auto& b : index->tokens.batches) {
+        ArrowArrayView view;
+        ArrowError aerr;
+        if (ArrowArrayViewInitFromSchema(&view, &index->tokens.type(0), &aerr) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&view, b.children[0], &aerr) != NANOARROW_OK) {
+            ArrowArrayViewReset(&view);
+            error = std::string("ngram index: ") + aerr.message;
+            return false;
+        }
+        for (std::int64_t r = 0; r < b.length; ++r, ++row) {
+            if (!ArrowArrayViewIsNull(&view, r)) {
+                index->rows.emplace(static_cast<std::uint32_t>(ArrowArrayViewGetUIntUnsafe(&view, r)), row);
+            }
+        }
+        ArrowArrayViewReset(&view);
+    }
+    out = index;
+    cache.put(key, out);
+    return true;
+}
+
+/// contains(col, 'needle'): the rows holding every trigram of the needle, as Lance answers it (ngram.rs
+/// StringContains). A needle of under three characters, or with no trigram, is not answered (every row
+/// is read); a trigram the index lacks means no row holds the needle (an answer with none); otherwise the
+/// intersection of the trigrams' posting lists is the candidates, which the scan still checks.
+bool search_ngram(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
+                  std::string& error) {
+    answered = false;
+    if (p.test() != Test::Contains || p.constants() != 1U) {
+        return true;
+    }
+    ArrowSchema text_type;
+    ArrowSchemaInit(&text_type);
+    if (ArrowSchemaSetType(&text_type, NANOARROW_TYPE_STRING) != NANOARROW_OK) {
+        error = "out of memory";
+        return false;
+    }
+    ArrowArray needle{};
+    const bool converted = p.constant_as(0, text_type, needle, error);
+    text_type.release(&text_type);
+    if (!converted) {
+        return false;
+    }
+    ArrowArrayView view;
+    ArrowError aerr;
+    ArrowArrayViewInitFromType(&view, NANOARROW_TYPE_STRING);
+    if (ArrowArrayViewSetArray(&view, &needle, &aerr) != NANOARROW_OK) {
+        ArrowArrayViewReset(&view);
+        if (needle.release != nullptr) {
+            needle.release(&needle);
+        }
+        error = std::string("ngram index: ") + aerr.message;
+        return false;
+    }
+    const bool is_null = ArrowArrayViewIsNull(&view, 0);
+    std::string text;
+    if (!is_null) {
+        const auto sv = ArrowArrayViewGetStringUnsafe(&view, 0);
+        text.assign(sv.data, static_cast<std::size_t>(sv.size_bytes));
+    }
+    ArrowArrayViewReset(&view);
+    if (needle.release != nullptr) {
+        needle.release(&needle);
+    }
+    if (is_null) {
+        return true;
+    }
+    std::size_t characters = 0;  // UTF-8 code points, as Lance counts the needle
+    for (const char c : text) {
+        if ((static_cast<unsigned char>(c) & 0xC0U) != 0x80U) {
+            ++characters;
+        }
+    }
+    if (characters < 3U) {
+        return true;
+    }
+    const auto tokens = fts::ngram_tokens(fts::lower_and_fold(text));
+    if (tokens.empty()) {
+        return true;
+    }
+    std::shared_ptr<const NGramIndex> index;
+    if (!load_ngram(dir, index, error)) {
+        return false;
+    }
+    std::vector<std::uint64_t> rows;  // the file rows of the needle's tokens
+    rows.reserve(tokens.size());
+    for (const auto token : tokens) {
+        const auto found = index->rows.find(token);
+        if (found == index->rows.end()) {
+            answered = true;  // no row holds this trigram, so none holds the needle
+            return true;
+        }
+        rows.push_back(found->second);
+    }
+    FileTable taken;
+    const std::vector<std::string> postings = {"posting_list"};
+    if (!take_table(index->file, &postings, rows, taken, error)) {
+        return false;
+    }
+    bool first = true;
+    std::vector<std::uint64_t> common;  // the row ids holding every trigram
+    for (const auto& b : taken.batches) {
+        ArrowArrayView list;
+        ArrowError lerr;
+        if (ArrowArrayViewInitFromSchema(&list, &taken.type(0), &lerr) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&list, b.children[0], &lerr) != NANOARROW_OK) {
+            ArrowArrayViewReset(&list);
+            error = std::string("ngram index: ") + lerr.message;
+            return false;
+        }
+        bool ok = true;
+        for (std::int64_t r = 0; ok && r < b.length; ++r) {
+            if (ArrowArrayViewIsNull(&list, r)) {
+                continue;
+            }
+            const auto bytes = ArrowArrayViewGetBytesUnsafe(&list, r);
+            std::vector<std::uint64_t> ids;
+            ok = roaring::decode_treemap(bytes.data.as_uint8, static_cast<std::size_t>(bytes.size_bytes), ids, error);
+            if (ok && first) {
+                common = std::move(ids);
+            } else if (ok) {
+                std::vector<std::uint64_t> merged;
+                std::set_intersection(common.begin(), common.end(), ids.begin(), ids.end(), std::back_inserter(merged));
+                common = std::move(merged);
+            }
+            first = false;
+        }
+        ArrowArrayViewReset(&list);
+        if (!ok) {
+            return false;
+        }
+    }
+    for (const auto id : common) {
+        out.rows[static_cast<std::uint32_t>(id >> 32U)].push_back(static_cast<std::uint32_t>(id));
+    }
+    answered = true;
+    return true;
+}
+
 bool search_bitmap(const std::filesystem::path& dir, bool label_list, const expr::Predicate& p,
                    const std::map<std::uint32_t, std::uint64_t>& physical, RowSet& out, bool& answered,
                    std::string& error) {
     answered = false;
+    if (p.test() == Test::Contains) {
+        return true;
+    }
     const bool array_test = p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has;
     if (array_test != label_list && !(label_list && p.test() == Test::IsNull)) {
         return true;
@@ -982,6 +1158,8 @@ struct Search {
                            !index->files.empty()) {
                     ok = search_bitmap(dir, kind == "/lance.table.LabelListIndexDetails", p, physical, one, answered,
                                        error);
+                } else if (kind == "/lance.table.NGramIndexDetails" && !index->files.empty()) {
+                    ok = search_ngram(dir, p, one, answered, error);
                 }
                 if (!ok) {
                     return false;

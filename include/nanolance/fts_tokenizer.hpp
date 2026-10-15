@@ -64,6 +64,14 @@ bool parse_params(std::string_view json, AnalyzerParams& out, std::string& error
 /// The params as Lance writes them.
 std::string params_json(const AnalyzerParams& params);
 
+/// `word` as Lance's NGRAM index makes its tokens' text (ngram.rs TEXT_PREPPER): lower-cased (LowerCaser,
+/// the same mapping the analyzer uses), then ASCII-folded (AsciiFoldingFilter).
+std::string lower_and_fold(std::string_view word);
+
+/// The NGRAM index's tokens of `folded` (lower_and_fold's output): every three consecutive characters that
+/// are all ASCII alphanumerics, each as ngram.rs's ngram_to_token numbers it; sorted and distinct.
+std::vector<std::uint32_t> ngram_tokens(std::string_view folded);
+
 struct Token {
     std::string text;
     std::uint32_t position = 0;

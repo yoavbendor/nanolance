@@ -453,6 +453,7 @@ std::string type_details_kind(const std::string& type) {
     if (type == "INVERTED") return "InvertedIndexDetails";
     if (type == "ZONEMAP") return "ZoneMapIndexDetails";
     if (type == "BLOOMFILTER") return "BloomFilterIndexDetails";
+    if (type == "NGRAM") return "NGramIndexDetails";
     return "VectorIndexDetails";
 }
 
@@ -572,7 +573,7 @@ bool dataset_build_index_segment(const std::filesystem::path& dataset_path, cons
         return fail(error, kind, SegmentErrorKind::InvalidArgument, std::move(message));
     };
     static const std::set<std::string> types = {"BTREE",    "BITMAP", "LABEL_LIST", "INVERTED", "ZONEMAP",
-                                                "BLOOMFILTER", "IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_HNSW_FLAT",
+                                                "BLOOMFILTER", "NGRAM", "IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_HNSW_FLAT",
                                                 "IVF_HNSW_SQ", "IVF_HNSW_PQ"};
     if (types.count(build.type) == 0U) {
         return fail(error, kind, SegmentErrorKind::Other,
@@ -756,6 +757,8 @@ bool dataset_merge_index_segments(const std::filesystem::path& dataset_path,
         type = "ZONEMAP";
     } else if (kind_name == "BloomFilterIndexDetails") {
         type = "BLOOMFILTER";
+    } else if (kind_name == "NGramIndexDetails") {
+        type = "NGRAM";
     } else if (kind_name == "InvertedIndexDetails") {
         type = "INVERTED";
         if (!index_build::load_inverted_params(dir_of(in.front()), inverted.params, error)) {
@@ -905,6 +908,10 @@ bool infer_index_segment_details(const std::filesystem::path& dataset_path, cons
     }
     if (has("bloomfilter.lance")) {
         type_url = "/lance.index.pb.BloomFilterIndexDetails";
+        return true;
+    }
+    if (has("ngram_postings.lance")) {
+        type_url = "/lance.table.NGramIndexDetails";
         return true;
     }
     if (has("page_lookup.lance")) {

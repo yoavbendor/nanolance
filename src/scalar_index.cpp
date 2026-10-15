@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include "nanolance/bloom_filter.hpp"
+#include "nanolance/fts_tokenizer.hpp"
 
 #include <array>
 #include <cctype>
@@ -722,6 +723,66 @@ bool write_bitmap(const std::filesystem::path& dir, const ArrowSchema& type, con
 }
 
 
+// ── ngram postings ──────────────────────────────────────────────────────────────────────────────
+
+/// ngram_postings.lance (ngram.rs): one row per distinct trigram token, ascending, with the rows holding
+/// it as a RoaringTreemap of row ids. Token 0 holds the null rows; a value's trigrams are its
+/// lower-cased, ASCII-folded text's (fts::ngram_tokens). `posting_list` is uncompressed, as Lance's own.
+bool write_ngram(const std::filesystem::path& dir, const Items& items, std::vector<WrittenFile>& files,
+                 std::string& error) {
+    std::map<std::uint32_t, std::vector<std::uint64_t>> postings;
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        if (items.is_null(k)) {
+            postings[0].push_back(items.addr[k]);
+            continue;
+        }
+        const auto sv = ArrowArrayViewGetStringUnsafe(items.views[items.view[k]], items.index[k]);
+        const auto folded = fts::lower_and_fold(std::string_view(sv.data, static_cast<std::size_t>(sv.size_bytes)));
+        for (const auto token : fts::ngram_tokens(folded)) {
+            postings[token].push_back(items.addr[k]);
+        }
+    }
+    std::vector<std::uint32_t> keys;
+    std::vector<std::vector<std::uint8_t>> bitmaps;
+    keys.reserve(postings.size());
+    bitmaps.reserve(postings.size());
+    for (auto& [token, ids] : postings) {
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        keys.push_back(token);
+        bitmaps.push_back(roaring::encode_treemap(ids));
+    }
+    const auto n = static_cast<std::int64_t>(keys.size());
+    OwnedSchema tokens_type;
+    OwnedSchema binary;
+    OwnedSchema schema;
+    OwnedArray token_array;
+    OwnedArray bitmap_array;
+    OwnedArray batch;
+    if (!type_schema(NANOARROW_TYPE_UINT32, tokens_type.s) || !type_schema(NANOARROW_TYPE_BINARY, binary.s) ||
+        !struct_schema({{"tokens", &tokens_type.s, true}, {"posting_list", &binary.s, false}}, schema.s, error)) {
+        return error.empty() ? (error = "out of memory", false) : false;
+    }
+    // struct_schema drops the children's metadata: posting_list keeps Lance's no-compression tag (POSTINGS_FIELD).
+    ArrowBuffer meta;
+    if (ArrowMetadataBuilderInit(&meta, nullptr) != NANOARROW_OK ||
+        ArrowMetadataBuilderAppend(&meta, ArrowCharView("lance-encoding:compression"), ArrowCharView("none")) !=
+            NANOARROW_OK ||
+        ArrowSchemaSetMetadata(schema.s.children[1], reinterpret_cast<const char*>(meta.data)) != NANOARROW_OK) {
+        ArrowBufferReset(&meta);
+        error = "out of memory";
+        return false;
+    }
+    ArrowBufferReset(&meta);
+    LanceFileExtras extras;
+    if (!uint_array(NANOARROW_TYPE_UINT32, keys.data(), n, sizeof(std::uint32_t), token_array.a, error) ||
+        !binary_array(bitmaps, bitmap_array.a, error) ||
+        !struct_batch({&token_array.a, &bitmap_array.a}, n, batch.a, error)) {
+        return error.empty() ? (error = "out of memory", false) : false;
+    }
+    return write_file(dir, "ngram_postings.lance", schema.s, batch.a, std::move(extras), files, error);
+}
+
 // ── zonemaps ────────────────────────────────────────────────────────────────────────────────────
 
 /// One zone (zoned.rs's ZoneTrainer): up to `rows_per_zone` rows of one fragment, nulls included.
@@ -1033,6 +1094,8 @@ bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type) {
         type = ScalarIndexType::ZoneMap;
     } else if (upper == "BLOOMFILTER") {
         type = ScalarIndexType::BloomFilter;
+    } else if (upper == "NGRAM") {
+        type = ScalarIndexType::NGram;
     } else {
         return false;
     }
@@ -1124,6 +1187,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         error = "a list column takes a LABEL_LIST index, not a " +
                 std::string(type == ScalarIndexType::BTree         ? "BTREE"
                             : type == ScalarIndexType::ZoneMap      ? "ZONEMAP"
+                            : type == ScalarIndexType::NGram       ? "NGRAM"
                             : type == ScalarIndexType::BloomFilter ? "BLOOMFILTER"
                                                                    : "BITMAP");
         return false;
@@ -1138,6 +1202,11 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     KeyKind kind{};
     if (ArrowSchemaViewInit(&key_view, key_type, &err) != NANOARROW_OK) {
         error = err.message;
+        return false;
+    }
+    if (type == ScalarIndexType::NGram && key_view.type != NANOARROW_TYPE_STRING &&
+        key_view.type != NANOARROW_TYPE_LARGE_STRING) {
+        error = "an NGRAM index needs a string column; '" + column + "' is " + ArrowTypeString(key_view.type);
         return false;
     }
     // A zonemap of a fixed-size list keeps only the null counts (zonemap.rs: nested types have no min or max).
@@ -1232,7 +1301,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         if (!nested && !bloom) {
             zone_extrema_of(items, kind, zone_of, zones);
         }
-    } else {
+    } else if (type != ScalarIndexType::NGram) {
         sort_items(items, kind, type != ScalarIndexType::BTree, sorted);
     }
 
@@ -1251,6 +1320,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     const char* write_stage = type == ScalarIndexType::BTree    ? "write_lookup_file"
                               : type == ScalarIndexType::Bitmap ? "write_bitmap_index"
                               : type == ScalarIndexType::ZoneMap ? "write_zonemap_index"
+                              : type == ScalarIndexType::NGram  ? "write_ngram_index"
                               : bloom                            ? "write_bloomfilter_index"
                                                                  : "write_label_list_index";
     if (progress != nullptr) {
@@ -1277,6 +1347,10 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
                                 kind == KeyKind::Float16 || kind == KeyKind::Float32 || kind == KeyKind::Float64,
                                 nested, rows_per_zone, files, error);
         details = "/lance.table.ZoneMapIndexDetails";
+        break;
+    case ScalarIndexType::NGram:
+        written = write_ngram(dir, items, files, error);
+        details = "/lance.table.NGramIndexDetails";
         break;
     case ScalarIndexType::BloomFilter:
         written = write_bloomfilter(dir, items, zones, zone_of,

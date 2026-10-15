@@ -134,3 +134,11 @@ Files changed, per-test status, decisions, questions.
   use `roaring::encode` (roaring_bitmap.hpp:20); export a lower-case + ASCII-fold helper from
   `Analyzer::emit` (src/fts_tokenizer.cpp 395-424) and include non-ASCII cases in the byte test (its
   `kLower` table may differ from Rust's `to_lowercase` on rare characters: report any difference).
+
+**N1a outcome (2026-10-15):** done. NGRAM build / search / `contains` routing / plan line / describe /
+stats / drop / empty dataset; token rows and posting bytes equal pylance's (nulls, empty strings,
+non-ASCII; a sweep of every code point U+0080..U+10FFFF found no lower-case table difference).
+Reviewer: `drop_index` of a missing name now raises pylance's `RuntimeError("Lance index not found:
+name=...")`. +5 pylance tests (1050). **N1b** next: `test_optimize_no_new_data`,
+`test_create_index_empty_dataset` (both reach `optimize_indices` on NGRAM),
+`test_optimize_indices_second_call_is_noop`, `test_ngram_segment_merge_and_commit_from_python`.

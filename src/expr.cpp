@@ -3020,6 +3020,17 @@ Condition Expression::conditions() const {
                     return leaf(std::move(p));
                 }
                 case Op::Func: {
+                    if (n.name == "contains") {
+                        if (n.args.size() != 2U || n.args[0]->op != Op::Column || n.args[1]->op != Op::Literal ||
+                            n.args[1]->literal.kind != Kind::String) {
+                            return c;
+                        }
+                        Predicate p;
+                        p.test_ = Predicate::Test::Contains;
+                        p.column_ = n.args[0]->column.path;
+                        p.constants_.push_back(literal_node(n.args[1]->literal));
+                        return leaf(std::move(p));
+                    }
                     if (!is_array_function(n.name) || n.args.size() != 2U || n.args[0]->op != Op::Column ||
                         n.args[1]->op != Op::Literal) {
                         return c;
@@ -3086,6 +3097,10 @@ std::unique_ptr<Node> predicate_node(Predicate::Test test, const std::string& op
         case Predicate::Test::Between: n->op = Op::Between; break;
         case Predicate::Test::IsNull: n->op = Op::IsNull; break;
         case Predicate::Test::IsNotNull: n->op = Op::IsNotNull; break;
+        case Predicate::Test::Contains:
+            n->op = Op::Func;
+            n->name = "contains";
+            break;
     }
     for (const auto& c : constants) {
         n->args.push_back(clone(*c));
@@ -3192,6 +3207,8 @@ std::string Predicate::to_string() const {
         case Test::HasAny: return "array_has_any(" + column + ", [" + list + "])";
         case Test::HasAll: return "array_has_all(" + column + ", [" + list + "])";
         case Test::Has: return "array_has(" + column + ", " + list + ")";
+        case Test::Contains:  // Lance prints the needle as a Utf8 literal
+            return "contains(" + column + ", Utf8(\"" + std::string(constants_.front()->literal.s) + "\"))";
     }
     return column;
 }

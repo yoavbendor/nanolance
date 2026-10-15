@@ -52,7 +52,8 @@ struct Condition {
 /// any values of the column's type -- an index's keys, a page's bounds.
 class Predicate {
 public:
-    enum class Test { Compare, In, Between, IsNull, IsNotNull, HasAny, HasAll, Has };
+    /// Contains: `contains(<string column>, '<literal>')`, the one constant a string literal.
+    enum class Test { Compare, In, Between, IsNull, IsNotNull, HasAny, HasAll, Has, Contains };
 
     Test test() const { return test_; }
     /// The column, as written ("s.child" is {"s", "child"}).
