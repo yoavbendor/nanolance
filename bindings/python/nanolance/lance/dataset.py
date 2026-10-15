@@ -1062,7 +1062,8 @@ class LanceDataset(pa.dataset.Dataset):
         """Resolve `analyzer` as Lance does (tokenizer.rs: resolve and validate). The analyzer is 'text' or
         'code' (code when only base_tokenizer='code' is given). The code analyzer's defaults are Lance's:
         stemming and stop words off, split_on_numerics and preserve_original on. Its flags go into the
-        params JSON; the text analyzer's do not (they are only ever false)."""
+        params JSON; the text analyzer's do not (they are only ever false). base_tokenizer='ngram' (text
+        analyzer) defaults stemming and stop words off, as Lance's apply_ngram_defaults does."""
         analyzer = params.pop("analyzer", None)
         base = params.get("base_tokenizer")
         if analyzer is None:
@@ -1075,6 +1076,10 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError(f"analyzer='code' requires base_tokenizer='code', got '{base}'")
         if analyzer == "text" and any(params.get(flag) for flag in cls._CODE_FLAGS):
             raise ValueError("code analyzer flags require analyzer='code'")
+        if analyzer == "text" and base == "ngram":
+            # apply_ngram_defaults: substrings stay searchable, so no stemming and no stop words by default.
+            params.setdefault("stem", False)
+            params.setdefault("remove_stop_words", False)
         if analyzer != "code":
             return
         params["base_tokenizer"] = "code"

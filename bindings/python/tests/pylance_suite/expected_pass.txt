@@ -886,6 +886,7 @@ tests/test_scalar_index.py::test_fts_deleted_rows_with_stable_row_ids
 tests/test_scalar_index.py::test_fts_flat_fallback_matches_wand
 tests/test_scalar_index.py::test_fts_fts[simple]
 tests/test_scalar_index.py::test_fts_multi_match_query
+tests/test_scalar_index.py::test_fts_ngram_tokenizer
 tests/test_scalar_index.py::test_fts_phrase_query
 tests/test_scalar_index.py::test_fts_score[simple]
 tests/test_scalar_index.py::test_fts_stats

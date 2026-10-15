@@ -32,6 +32,8 @@ struct AnalyzerParams {
     bool remove_stop_words = true;
     std::optional<std::vector<std::string>> custom_stop_words;
     bool ascii_folding = true;
+    /// The ngram base tokenizer's gram lengths in characters and whether only prefixes are made (Lance's
+    /// NgramTokenizer). Written in the params JSON for every analyzer, as Lance does.
     std::uint32_t min_ngram_length = 3;
     std::uint32_t max_ngram_length = 3;
     bool prefix_only = false;
@@ -80,8 +82,8 @@ struct Token {
 class Analyzer {
 public:
     /// False (with `error`) for settings nanolance's analyzer does not implement: base tokenizers
-    /// other than simple / whitespace / raw / code, stemming or built-in stop words in a language other than
-    /// English, JSON documents.
+    /// other than simple / whitespace / raw / code / ngram, an ngram length range Lance rejects, stemming
+    /// or built-in stop words in a language other than English, JSON documents.
     bool init(const AnalyzerParams& params, std::string& error);
 
     /// `text`'s tokens, appended to `out`.

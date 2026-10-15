@@ -5,7 +5,7 @@
 //   cargo run --release --offline -- tokenize < lines.txt                # tokens@positions, one line each
 //   cargo run --release --offline -- stem < words.txt                    # the English stemmer alone
 use lance_tokenizer::{AsciiFoldingFilter, CodeLexTokenizer, Language, LowerCaser, RemoveLongFilter,
-                      SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TokenStream, WordDelimiterFilter};
+                      NgramTokenizer, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TokenStream, WordDelimiterFilter};
 use std::io::{self, BufRead, Write};
 
 fn analyzer() -> TextAnalyzer {
@@ -68,6 +68,30 @@ fn main() {
                 writeln!(out, "{}", toks.join(" ")).unwrap();
             }
         }
+        // `ngram MIN MAX PREFIX_ONLY`: NgramTokenizer as nanolance's ngram base tokenizer builds it (ngram
+        // filter chain: RemoveLongFilter(40), LowerCaser, AsciiFoldingFilter; no stemming, no stop words).
+        // Output format as `tokenize`.
+        "ngram" => {
+            let args: Vec<String> = std::env::args().collect();
+            let min: usize = args[2].parse().unwrap();
+            let max: usize = args[3].parse().unwrap();
+            let prefix = args[4] == "1";
+            let tokenizer = NgramTokenizer::new(min, max, prefix).unwrap_or_else(|e| panic!("{e}"));
+            let mut a = TextAnalyzer::builder(tokenizer)
+                .filter_dynamic(RemoveLongFilter::limit(40))
+                .filter_dynamic(LowerCaser)
+                .filter_dynamic(AsciiFoldingFilter)
+                .build();
+            for line in io::stdin().lock().lines() {
+                let line = line.unwrap();
+                let mut s = a.token_stream(&line);
+                let mut toks = Vec::new();
+                while s.advance() {
+                    toks.push(format!("{}@{}", s.token().text, s.token().position));
+                }
+                writeln!(out, "{}", toks.join(" ")).unwrap();
+            }
+        }
         // Lines "key<TAB>value" (keys sorted) -> the fst Map's bytes, written to argv[2].
         "fst" => {
             let path = std::env::args().nth(2).expect("output path");
@@ -79,7 +103,7 @@ fn main() {
             }
             std::fs::write(path, b.into_inner().unwrap()).unwrap();
         }
-        _ => eprintln!("usage: fts_tables tokenize|stem|tables|fst OUT"),
+        _ => eprintln!("usage: fts_tables tokenize|code|ngram|stem|tables|fst OUT"),
     }
 }
 

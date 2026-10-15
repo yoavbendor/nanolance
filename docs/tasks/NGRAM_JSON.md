@@ -202,3 +202,15 @@ re-cover / drop as BTree; pylance's `test_json_index` and `test_json_index_non_e
 is one query where pylance prints NOT(...) / AND(...); `json_get_float` on an Int64 index scans
 (pylance routes it and its answer differed from its scan). Design: a `JsonAccess` on the Predicate
 instead of a new test kind. N3 next.
+
+**N3 outcome (2026-10-15):** done (Haiku: tokenizer port, options, golden cases; reviewer: query
+semantics). `base_tokenizer="ngram"` with min / max / prefix_only, Lance's messages, 108 golden token
+cases from the Rust oracle; `test_fts_ngram_tokenizer` passes (+1, 1063). Reviewer found and fixed a
+**general full-text rule** (not ngram-specific), from lance-index `index/partition.rs`
+`load_posting_lists_with_policy` / `summarize_position_matches`: query tokens are de-duplicated by
+(token, position), and under AND the tokens sharing a query position form a union -- a document
+needs one token of each position's group (the score stays the sum of every matched token). The ngram
+tokenizer puts every gram at position 0, so AND over several grams answers as OR. Phrase queries are
+unchanged. Score comparisons allow 1e-6 relative (float32 summation order of many terms).
+Task NGRAM_JSON done; left for later: LIKE / regexp_like routing to NGRAM (`ngram_regex.rs`), JSON
+targets other than btree, pylance's NOT / AND plan text for JSON queries.

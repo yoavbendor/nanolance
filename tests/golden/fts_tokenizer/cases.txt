@@ -7063,3 +7063,249 @@ for(i=0;i<n;i++){ total += arr[i]; }
 for@0 i@1 =@2 0@3 i@4 <@5 n@6 i@7 ++@8 total@9 +=@10 arr@11 i@12
 let mut v: Vec<u8> = Vec::new(); v.push(0x1F);
 let@0 mut@1 v@2 :@3 vec@4 <@5 u8@6 u@6 8@7 >@8 =@9 vec@10 ::@11 new@12 v@13 push@14 0x1f@15 0@15 x@16 1@17 f@18
+@@ngram min=3 max=3 prefix=0
+
+
+a
+
+ab
+
+abc
+abc@0
+abcd
+abc@0 bcd@0
+The Quick, brown fox!
+the@0 he @0 e q@0  qu@0 qui@0 uic@0 ick@0 ck,@0 k, @0 , b@0  br@0 bro@0 row@0 own@0 wn @0 n f@0  fo@0 fox@0 ox!@0
+hello world  rust
+hel@0 ell@0 llo@0 lo @0 o w@0  wo@0 wor@0 orl@0 rld@0 ld @0 d  @0   r@0  ru@0 rus@0 ust@0
+Hello-World_42 ABC
+hel@0 ell@0 llo@0 lo-@0 o-w@0 -wo@0 wor@0 orl@0 rld@0 ld_@0 d_4@0 _42@0 42 @0 2 a@0  ab@0 abc@0
+Café crème brûlée
+caf@0 afe@0 fe @0 e c@0  cr@0 cre@0 rem@0 eme@0 me @0 e b@0  br@0 bru@0 rul@0 ule@0 lee@0
+naïve résumé ÅNGSTRÖM
+nai@0 aiv@0 ive@0 ve @0 e r@0  re@0 res@0 esu@0 sum@0 ume@0 me @0 e a@0  an@0 ang@0 ngs@0 gst@0 str@0 tro@0 rom@0
+日本語のテキスト
+日本語@0 本語の@0 語のテ@0 のテキ@0 テキス@0 キスト@0
+こんにちは 世界
+こんに@0 んにち@0 にちは@0 ちは @0 は 世@0  世界@0
+emoji 🚀🔥 test
+emo@0 moj@0 oji@0 ji @0 i 🚀@0  🚀🔥@0 🚀🔥 @0 🔥 t@0  te@0 tes@0 est@0
+ñandú 123
+nan@0 and@0 ndu@0 du @0 u 1@0  12@0 123@0
+x	yz
+x	y@0 	yz@0
+
+
+q
+
+שלום עולם
+שלו@0 לום@0 ום @0 ם ע@0  עו@0 עול@0 ולם@0
+aaaaa
+aaa@0 aaa@0 aaa@0
+Ǆǅǆ DŽ
+dzdzdz@0 dzdz @0 dz d@0  dz@0
+@@ngram min=2 max=3 prefix=0
+
+
+a
+
+ab
+ab@0
+abc
+ab@0 abc@0 bc@0
+abcd
+ab@0 abc@0 bc@0 bcd@0 cd@0
+The Quick, brown fox!
+th@0 the@0 he@0 he @0 e @0 e q@0  q@0  qu@0 qu@0 qui@0 ui@0 uic@0 ic@0 ick@0 ck@0 ck,@0 k,@0 k, @0 , @0 , b@0  b@0  br@0 br@0 bro@0 ro@0 row@0 ow@0 own@0 wn@0 wn @0 n @0 n f@0  f@0  fo@0 fo@0 fox@0 ox@0 ox!@0 x!@0
+hello world  rust
+he@0 hel@0 el@0 ell@0 ll@0 llo@0 lo@0 lo @0 o @0 o w@0  w@0  wo@0 wo@0 wor@0 or@0 orl@0 rl@0 rld@0 ld@0 ld @0 d @0 d  @0   @0   r@0  r@0  ru@0 ru@0 rus@0 us@0 ust@0 st@0
+Hello-World_42 ABC
+he@0 hel@0 el@0 ell@0 ll@0 llo@0 lo@0 lo-@0 o-@0 o-w@0 -w@0 -wo@0 wo@0 wor@0 or@0 orl@0 rl@0 rld@0 ld@0 ld_@0 d_@0 d_4@0 _4@0 _42@0 42@0 42 @0 2 @0 2 a@0  a@0  ab@0 ab@0 abc@0 bc@0
+Café crème brûlée
+ca@0 caf@0 af@0 afe@0 fe@0 fe @0 e @0 e c@0  c@0  cr@0 cr@0 cre@0 re@0 rem@0 em@0 eme@0 me@0 me @0 e @0 e b@0  b@0  br@0 br@0 bru@0 ru@0 rul@0 ul@0 ule@0 le@0 lee@0 ee@0
+naïve résumé ÅNGSTRÖM
+na@0 nai@0 ai@0 aiv@0 iv@0 ive@0 ve@0 ve @0 e @0 e r@0  r@0  re@0 re@0 res@0 es@0 esu@0 su@0 sum@0 um@0 ume@0 me@0 me @0 e @0 e a@0  a@0  an@0 an@0 ang@0 ng@0 ngs@0 gs@0 gst@0 st@0 str@0 tr@0 tro@0 ro@0 rom@0 om@0
+日本語のテキスト
+日本@0 日本語@0 本語@0 本語の@0 語の@0 語のテ@0 のテ@0 のテキ@0 テキ@0 テキス@0 キス@0 キスト@0 スト@0
+こんにちは 世界
+こん@0 こんに@0 んに@0 んにち@0 にち@0 にちは@0 ちは@0 ちは @0 は @0 は 世@0  世@0  世界@0 世界@0
+emoji 🚀🔥 test
+em@0 emo@0 mo@0 moj@0 oj@0 oji@0 ji@0 ji @0 i @0 i 🚀@0  🚀@0  🚀🔥@0 🚀🔥@0 🚀🔥 @0 🔥 @0 🔥 t@0  t@0  te@0 te@0 tes@0 es@0 est@0 st@0
+ñandú 123
+na@0 nan@0 an@0 and@0 nd@0 ndu@0 du@0 du @0 u @0 u 1@0  1@0  12@0 12@0 123@0 23@0
+x	yz
+x	@0 x	y@0 	y@0 	yz@0 yz@0
+
+
+q
+
+שלום עולם
+של@0 שלו@0 לו@0 לום@0 ום@0 ום @0 ם @0 ם ע@0  ע@0  עו@0 עו@0 עול@0 ול@0 ולם@0 לם@0
+aaaaa
+aa@0 aaa@0 aa@0 aaa@0 aa@0 aaa@0 aa@0
+Ǆǅǆ DŽ
+dzdz@0 dzdzdz@0 dzdz@0 dzdz @0 dz @0 dz d@0  d@0  dz@0 dz@0
+@@ngram min=1 max=2 prefix=1
+
+
+a
+a@0
+ab
+a@0 ab@0
+abc
+a@0 ab@0
+abcd
+a@0 ab@0
+The Quick, brown fox!
+t@0 th@0
+hello world  rust
+h@0 he@0
+Hello-World_42 ABC
+h@0 he@0
+Café crème brûlée
+c@0 ca@0
+naïve résumé ÅNGSTRÖM
+n@0 na@0
+日本語のテキスト
+日@0 日本@0
+こんにちは 世界
+こ@0 こん@0
+emoji 🚀🔥 test
+e@0 em@0
+ñandú 123
+n@0 na@0
+x	yz
+x@0 x	@0
+
+
+q
+q@0
+שלום עולם
+ש@0 של@0
+aaaaa
+a@0 aa@0
+Ǆǅǆ DŽ
+dz@0 dzdz@0
+@@ngram min=2 max=4 prefix=1
+
+
+a
+
+ab
+ab@0
+abc
+ab@0 abc@0
+abcd
+ab@0 abc@0 abcd@0
+The Quick, brown fox!
+th@0 the@0 the @0
+hello world  rust
+he@0 hel@0 hell@0
+Hello-World_42 ABC
+he@0 hel@0 hell@0
+Café crème brûlée
+ca@0 caf@0 cafe@0
+naïve résumé ÅNGSTRÖM
+na@0 nai@0 naiv@0
+日本語のテキスト
+日本@0 日本語@0 日本語の@0
+こんにちは 世界
+こん@0 こんに@0 こんにち@0
+emoji 🚀🔥 test
+em@0 emo@0 emoj@0
+ñandú 123
+na@0 nan@0 nand@0
+x	yz
+x	@0 x	y@0 x	yz@0
+
+
+q
+
+שלום עולם
+של@0 שלו@0 שלום@0
+aaaaa
+aa@0 aaa@0 aaaa@0
+Ǆǅǆ DŽ
+dzdz@0 dzdzdz@0 dzdzdz @0
+@@ngram min=3 max=3 prefix=1
+
+
+a
+
+ab
+
+abc
+abc@0
+abcd
+abc@0
+The Quick, brown fox!
+the@0
+hello world  rust
+hel@0
+Hello-World_42 ABC
+hel@0
+Café crème brûlée
+caf@0
+naïve résumé ÅNGSTRÖM
+nai@0
+日本語のテキスト
+日本語@0
+こんにちは 世界
+こんに@0
+emoji 🚀🔥 test
+emo@0
+ñandú 123
+nan@0
+x	yz
+x	y@0
+
+
+q
+
+שלום עולם
+שלו@0
+aaaaa
+aaa@0
+Ǆǅǆ DŽ
+dzdzdz@0
+@@ngram min=4 max=6 prefix=0
+
+
+a
+
+ab
+
+abc
+
+abcd
+abcd@0
+The Quick, brown fox!
+the @0 the q@0 the qu@0 he q@0 he qu@0 he qui@0 e qu@0 e qui@0 e quic@0  qui@0  quic@0  quick@0 quic@0 quick@0 quick,@0 uick@0 uick,@0 uick, @0 ick,@0 ick, @0 ick, b@0 ck, @0 ck, b@0 ck, br@0 k, b@0 k, br@0 k, bro@0 , br@0 , bro@0 , brow@0  bro@0  brow@0  brown@0 brow@0 brown@0 brown @0 rown@0 rown @0 rown f@0 own @0 own f@0 own fo@0 wn f@0 wn fo@0 wn fox@0 n fo@0 n fox@0 n fox!@0  fox@0  fox!@0 fox!@0
+hello world  rust
+hell@0 hello@0 hello @0 ello@0 ello @0 ello w@0 llo @0 llo w@0 llo wo@0 lo w@0 lo wo@0 lo wor@0 o wo@0 o wor@0 o worl@0  wor@0  worl@0  world@0 worl@0 world@0 world @0 orld@0 orld @0 orld  @0 rld @0 rld  @0 rld  r@0 ld  @0 ld  r@0 ld  ru@0 d  r@0 d  ru@0 d  rus@0   ru@0   rus@0   rust@0  rus@0  rust@0 rust@0
+Hello-World_42 ABC
+hell@0 hello@0 hello-@0 ello@0 ello-@0 ello-w@0 llo-@0 llo-w@0 llo-wo@0 lo-w@0 lo-wo@0 lo-wor@0 o-wo@0 o-wor@0 o-worl@0 -wor@0 -worl@0 -world@0 worl@0 world@0 world_@0 orld@0 orld_@0 orld_4@0 rld_@0 rld_4@0 rld_42@0 ld_4@0 ld_42@0 ld_42 @0 d_42@0 d_42 @0 d_42 a@0 _42 @0 _42 a@0 _42 ab@0 42 a@0 42 ab@0 42 abc@0 2 ab@0 2 abc@0  abc@0
+Café crème brûlée
+cafe@0 cafe @0 cafe c@0 afe @0 afe c@0 afe cr@0 fe c@0 fe cr@0 fe cre@0 e cr@0 e cre@0 e crem@0  cre@0  crem@0  creme@0 crem@0 creme@0 creme @0 reme@0 reme @0 reme b@0 eme @0 eme b@0 eme br@0 me b@0 me br@0 me bru@0 e br@0 e bru@0 e brul@0  bru@0  brul@0  brule@0 brul@0 brule@0 brulee@0 rule@0 rulee@0 ulee@0
+naïve résumé ÅNGSTRÖM
+naiv@0 naive@0 naive @0 aive@0 aive @0 aive r@0 ive @0 ive r@0 ive re@0 ve r@0 ve re@0 ve res@0 e re@0 e res@0 e resu@0  res@0  resu@0  resum@0 resu@0 resum@0 resume@0 esum@0 esume@0 esume @0 sume@0 sume @0 sume a@0 ume @0 ume a@0 ume an@0 me a@0 me an@0 me ang@0 e an@0 e ang@0 e angs@0  ang@0  angs@0  angst@0 angs@0 angst@0 angstr@0 ngst@0 ngstr@0 ngstro@0 gstr@0 gstro@0 gstrom@0 stro@0 strom@0 trom@0
+日本語のテキスト
+日本語の@0 日本語のテ@0 日本語のテキ@0 本語のテ@0 本語のテキ@0 本語のテキス@0 語のテキ@0 語のテキス@0 語のテキスト@0 のテキス@0 のテキスト@0 テキスト@0
+こんにちは 世界
+こんにち@0 こんにちは@0 こんにちは @0 んにちは@0 んにちは @0 んにちは 世@0 にちは @0 にちは 世@0 にちは 世界@0 ちは 世@0 ちは 世界@0 は 世界@0
+emoji 🚀🔥 test
+emoj@0 emoji@0 emoji @0 moji@0 moji @0 moji 🚀@0 oji @0 oji 🚀@0 oji 🚀🔥@0 ji 🚀@0 ji 🚀🔥@0 ji 🚀🔥 @0 i 🚀🔥@0 i 🚀🔥 @0 i 🚀🔥 t@0  🚀🔥 @0  🚀🔥 t@0  🚀🔥 te@0 🚀🔥 t@0 🚀🔥 te@0 🚀🔥 tes@0 🔥 te@0 🔥 tes@0 🔥 test@0  tes@0  test@0 test@0
+ñandú 123
+nand@0 nandu@0 nandu @0 andu@0 andu @0 andu 1@0 ndu @0 ndu 1@0 ndu 12@0 du 1@0 du 12@0 du 123@0 u 12@0 u 123@0  123@0
+x	yz
+x	yz@0
+
+
+q
+
+שלום עולם
+שלום@0 שלום @0 שלום ע@0 לום @0 לום ע@0 לום עו@0 ום ע@0 ום עו@0 ום עול@0 ם עו@0 ם עול@0 ם עולם@0  עול@0  עולם@0 עולם@0
+aaaaa
+aaaa@0 aaaaa@0 aaaa@0
+Ǆǅǆ DŽ
+dzdzdz @0 dzdzdz d@0 dzdzdz dz@0 dzdz d@0 dzdz dz@0 dz dz@0

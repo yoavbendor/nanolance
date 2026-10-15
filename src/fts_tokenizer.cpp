@@ -360,8 +360,17 @@ std::string params_json(const AnalyzerParams& p) {
 bool Analyzer::init(const AnalyzerParams& params, std::string& error) {
     params_ = params;
     if (params.base_tokenizer != "simple" && params.base_tokenizer != "whitespace" && params.base_tokenizer != "raw" &&
-        params.base_tokenizer != "code") {
-        error = "the '" + params.base_tokenizer + "' tokenizer is not supported (simple, whitespace, raw and code are)";
+        params.base_tokenizer != "code" && params.base_tokenizer != "ngram") {
+        error = "the '" + params.base_tokenizer +
+                "' tokenizer is not supported (simple, whitespace, raw, code and ngram are)";
+        return false;
+    }
+    if (params.base_tokenizer == "ngram" && params.min_ngram_length == 0U) {
+        error = "min_gram must be greater than 0";
+        return false;
+    }
+    if (params.base_tokenizer == "ngram" && params.min_ngram_length > params.max_ngram_length) {
+        error = "min_gram must not be greater than max_gram";
         return false;
     }
     if (params.base_tokenizer != "code" && (params.split_identifiers || params.split_on_numerics ||
@@ -452,6 +461,67 @@ std::vector<std::uint32_t> ngram_tokens(std::string_view folded) {
     return tokens;
 }
 
+namespace {
+
+/// ngram_tokenizer.rs's UTF-8 codepoint widths, indexed by the lead byte's high nibble.
+constexpr std::uint8_t kCodepointWidth[16] = {1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 4};
+
+/// NgramTokenizer's grams of `text` in Lance's order (StutteringIterator over CodepointFrontiers): every
+/// gram of min_gram to max_gram characters from each start, the window sliding one character at a time.
+/// `visit(from, to)` gets the gram's byte range and returns false to stop (prefix_only stops at the first
+/// gram that starts after byte 0).
+template <typename Visit>
+void ngram_grams(std::string_view text, std::size_t min_gram, std::size_t max_gram, bool prefix_only, Visit visit) {
+    std::vector<std::size_t> frontiers;  // the byte offset of each character, then text.size()
+    for (std::size_t at = 0; at < text.size();) {
+        frontiers.push_back(at);
+        const auto width = static_cast<std::size_t>(kCodepointWidth[static_cast<unsigned char>(text[at]) >> 4U]);
+        at += std::min(width, text.size() - at);
+    }
+    frontiers.push_back(text.size());
+    // The Rust iterator's state: `memory` holds the last max_gram + 1 frontiers as a ring; the signed
+    // bounds let max_gram fall below min_gram exactly as Lance's do.
+    std::size_t next = 0;
+    std::vector<std::size_t> memory;
+    while (memory.size() < max_gram + 1 && next < frontiers.size()) {
+        memory.push_back(frontiers[next++]);
+    }
+    long long lo = static_cast<long long>(min_gram);
+    long long hi = static_cast<long long>(memory.size()) - 1;
+    long long gram_len = lo;
+    if (memory.size() <= min_gram) {
+        lo = 1;
+        hi = 0;
+        gram_len = 0;
+    }
+    std::size_t cursor = 0;
+    while (true) {
+        if (gram_len > hi) {
+            gram_len = lo;
+            if (next < frontiers.size()) {
+                memory[cursor] = frontiers[next++];
+            } else {
+                --hi;
+            }
+            cursor = (cursor + 1) % memory.size();
+        }
+        if (hi < lo) {
+            return;
+        }
+        const auto from = memory[cursor];
+        const auto to = memory[(cursor + static_cast<std::size_t>(gram_len)) % memory.size()];
+        ++gram_len;
+        if (prefix_only && from > 0) {
+            return;
+        }
+        if (!visit(from, to)) {
+            return;
+        }
+    }
+}
+
+}  // namespace
+
 void Analyzer::emit(std::string_view word, std::uint32_t position, std::vector<Token>& out) const {
     if (params_.max_token_length && word.size() >= *params_.max_token_length) {
         return;
@@ -480,6 +550,15 @@ void Analyzer::tokenize(std::string_view text, std::vector<Token>& out) const {
     std::uint32_t position = 0;
     if (params_.base_tokenizer == "raw") {
         emit(text, 0, out);
+        return;
+    }
+    if (params_.base_tokenizer == "ngram") {
+        // Lance's NgramTokenizer emits every gram at position 0, then the same filters as any word.
+        ngram_grams(text, params_.min_ngram_length, params_.max_ngram_length, params_.prefix_only,
+                    [&](std::size_t from, std::size_t to) {
+                        emit(text.substr(from, to - from), 0, out);
+                        return true;
+                    });
         return;
     }
     if (params_.base_tokenizer == "code") {

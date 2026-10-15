@@ -213,8 +213,6 @@ def test_build_rejects_what_it_cannot_write(tmp_path):
     nl.write_dataset(_table(100), path)
     with pytest.raises(Exception, match="string column"):
         nl.dataset(path).create_scalar_index("id", "INVERTED")
-    with pytest.raises(Exception):
-        nl.dataset(path).create_scalar_index("text", "INVERTED", base_tokenizer="ngram")
 
 
 # ── searching ────────────────────────────────────────────────────────────────────────────────────
@@ -360,11 +358,12 @@ def _phrases(texts, n=12):
 
 
 def _same_scores(ref, got):
-    """The same rows, each score within 1e-5."""
+    """The same rows, each score within 1e-5 (or 1e-6 relative: float32 sums of many terms, e.g. an
+    ngram query's, differ in their last bits with the summation order)."""
     assert sorted(r for r, _ in ref) == sorted(r for r, _ in got)
     by_row = dict(got)
     for row, score in ref:
-        assert by_row[row] == pytest.approx(score, abs=1e-5)
+        assert by_row[row] == pytest.approx(score, abs=1e-5, rel=1e-6)
 
 
 def _match(mod, text, operator):
@@ -590,4 +589,76 @@ def test_code_analyzer_options_are_validated(tmp_path, kwargs, message):
     nl.write_dataset(pa.table({"text": ["getUserName"]}), path)
     with pytest.raises(ValueError) as excinfo:
         nl.dataset(path).create_scalar_index("text", "INVERTED", **kwargs)
+    assert str(excinfo.value) == message
+
+
+# ── the ngram base tokenizer (Lance's NgramTokenizer) ──────────────────────────────────────────
+
+NGRAM_OPTIONS = [
+    pytest.param({}, id="defaults"),
+    pytest.param({"min_ngram_length": 2, "max_ngram_length": 4}, id="two-to-four"),
+    pytest.param({"min_ngram_length": 1, "max_ngram_length": 3, "prefix_only": True}, id="prefix-only"),
+]
+NGRAM_WORDS = ["lance", "Database", "theatre", "Café", "crème", "naïve", "日本語", "🚀", "hello", "World",
+               "ÅNGSTRÖM", "ab", "x9", "resume", "Ǆǅǆ"]
+
+
+def _ngram_table(n=300, seed=11):
+    rng = random.Random(seed)
+    texts = [""]
+    for _ in range(n - 1):
+        words = [rng.choice(NGRAM_WORDS) for _ in range(rng.randint(1, 4))]
+        texts.append(rng.choice([" ", ", ", "-", "_", "  "]).join(words))
+    return pa.table({"id": pa.array(range(n), pa.int64()), "text": pa.array(texts, pa.string())}), texts
+
+
+def _ngram_queries(texts, seed=5, n=40):
+    """Queries over the ngram index, OR and AND. Every gram sits at position 0, and Lance unions the
+    tokens sharing a query position, so AND over several grams answers as OR does."""
+    rng = random.Random(seed)
+    queries = [("lan", "OR"), ("the", "OR"), ("nce", "AND"), ("ab", "OR"), ("Café", "OR"), ("日本語", "AND"),
+               ("🚀", "OR"), ("hello world", "OR"), ("hello", "AND"), ("ÅNG", "OR"), ("x", "OR"),
+               ("helloworld", "AND"), ("hello world", "AND"), ("aaaa", "AND")]
+    for _ in range(n):
+        text = rng.choice(texts)
+        if text:
+            start = rng.randrange(len(text))
+            queries.append((text[start:start + rng.randint(1, 6)], rng.choice(["OR", "AND"])))
+    return queries
+
+
+@pytest.mark.parametrize("block_size", [128, 256])
+@pytest.mark.parametrize("options", NGRAM_OPTIONS)
+def test_ngram_tokenizer_index_matches_pylance(lance, tmp_path, block_size, options):
+    table, texts = _ngram_table()
+    for who, mod in (("p", lance), ("n", nl)):  # one fragment: the same token numbering in both builds
+        mod.write_dataset(table, str(tmp_path / f"{who}.lance"))
+        mod.dataset(str(tmp_path / f"{who}.lance")).create_scalar_index(
+            "text", "INVERTED", base_tokenizer="ngram", block_size=block_size, **options)
+    p, n = str(tmp_path / "p.lance"), str(tmp_path / "n.lance")
+    params = _index_params(nl, n)
+    assert params["base_tokenizer"] == "ngram"
+    assert params["stem"] is False and params["remove_stop_words"] is False
+    assert params["block_size"] == block_size
+    assert _index_params(lance, p) == params
+    assert lance.dataset(p).describe_indices()[0].details == nl.dataset(n).describe_indices()[0].details
+    hits = 0
+    for text, operator in _ngram_queries(texts):
+        ref = _search(lance, p, _match(lance, text, operator))
+        hits += bool(ref)
+        _same_scores(ref, _search(lance, n, _match(lance, text, operator)))  # pylance reads nanolance's build
+        _same_scores(ref, _search(nl, p, _match(nl, text, operator)))  # nanolance reads pylance's build
+        _same_scores(ref, _search(nl, n, _match(nl, text, operator)))
+    assert hits > 20
+
+
+@pytest.mark.parametrize(("kwargs", "message"), [
+    ({"min_ngram_length": 0}, "min_gram must be greater than 0"),
+    ({"min_ngram_length": 4, "max_ngram_length": 3}, "min_gram must not be greater than max_gram"),
+])
+def test_ngram_tokenizer_lengths_are_validated(tmp_path, kwargs, message):
+    path = str(tmp_path / "t.lance")
+    nl.write_dataset(pa.table({"text": ["hello"]}), path)
+    with pytest.raises(ValueError) as excinfo:
+        nl.dataset(path).create_scalar_index("text", "INVERTED", base_tokenizer="ngram", **kwargs)
     assert str(excinfo.value) == message

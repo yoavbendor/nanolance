@@ -1055,6 +1055,7 @@ struct Search {
     std::vector<float> scores_;
     std::vector<std::uint32_t> seen_;
     std::vector<std::uint32_t> touched_;
+    std::vector<std::uint32_t> group_mark_;  // AND: the last position group that counted a document
     /// When only the best `top_k_` rows of a match can matter (a Match or MultiMatch at the root,
     /// with a limit), a match keeps just those.
     std::size_t top_k_ = 0;
@@ -1343,17 +1344,47 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
     if (query_tokens.empty()) {
         return true;
     }
-    // Distinct tokens, and each query token's place among them (duplicates score again).
+    // Distinct tokens, and each query token's place among them (duplicates score again). Outside a
+    // phrase, Lance keeps one of each (token, position) pair (load_posting_lists' dedup), so a
+    // token repeated at one position (an ngram tokenizer's) scores once.
     std::vector<std::string> distinct;
     std::vector<std::size_t> order;
+    std::vector<std::uint32_t> order_positions;
     for (const auto& t : query_tokens) {
         const auto at = std::find(distinct.begin(), distinct.end(), t.text);
-        order.push_back(static_cast<std::size_t>(at - distinct.begin()));
+        const auto idx = static_cast<std::size_t>(at - distinct.begin());
+        if (!phrase_ && at != distinct.end()) {
+            bool repeated = false;
+            for (std::size_t k = 0; k < order.size(); ++k) {
+                repeated = repeated || (order[k] == idx && order_positions[k] == t.position);
+            }
+            if (repeated) {
+                continue;
+            }
+        }
+        order.push_back(idx);
+        order_positions.push_back(t.position);
         if (at == distinct.end()) {
             distinct.push_back(t.text);
         }
     }
     const std::size_t nt = distinct.size();
+    // AND outside a phrase: Lance unions the tokens sharing a query position (an ngram tokenizer
+    // puts every gram at position 0; the code analyzer's preserved original shares its parts'), so
+    // a document needs one token of every position's group (summarize_position_matches).
+    std::vector<std::vector<std::size_t>> groups;
+    {
+        std::map<std::uint32_t, std::vector<std::size_t>> by_position;
+        for (std::size_t k = 0; k < order.size(); ++k) {
+            auto& g = by_position[order_positions[k]];
+            if (std::find(g.begin(), g.end(), order[k]) == g.end()) {
+                g.push_back(order[k]);
+            }
+        }
+        for (auto& [position, g] : by_position) {
+            groups.push_back(std::move(g));
+        }
+    }
     // A phrase: each query term's place, counted from the first term kept (Lance's
     // collect_query_tokens), and every distinct term required.
     std::vector<std::int32_t> query_positions;
@@ -1422,8 +1453,18 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         const Partition& part = *parts[p];
         if (and_terms) {
             bool all = true;
-            for (std::size_t t = 0; t < nt; ++t) {
-                all = all && postings[p][t] != nullptr;
+            if (phrase_) {
+                for (std::size_t t = 0; t < nt; ++t) {
+                    all = all && postings[p][t] != nullptr;
+                }
+            } else {
+                for (const auto& g : groups) {
+                    bool any = false;
+                    for (const std::size_t t : g) {
+                        any = any || postings[p][t] != nullptr;
+                    }
+                    all = all && any;
+                }
             }
             if (!all) {
                 continue;
@@ -1491,7 +1532,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             }
         }
         std::uint32_t need = 1U;
-        if (and_terms) {
+        if (and_terms && phrase_) {
             // Count each distinct token's documents (above the "touched" bit).
             for (std::size_t t = 0; t < nt; ++t) {
                 for (const std::uint32_t d : postings[p][t]->docs) {
@@ -1499,6 +1540,29 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
                 }
             }
             need = 1U + 2U * static_cast<std::uint32_t>(nt);
+        } else if (and_terms) {
+            // Count each position group's documents once (above the "touched" bit).
+            if (group_mark_.size() < n) {
+                group_mark_.resize(n, 0U);
+            }
+            for (std::size_t g = 0; g < groups.size(); ++g) {
+                const auto stamp = static_cast<std::uint32_t>(g + 1U);
+                for (const std::size_t t : groups[g]) {
+                    if (postings[p][t] == nullptr) {
+                        continue;
+                    }
+                    for (const std::uint32_t d : postings[p][t]->docs) {
+                        if (group_mark_[d] != stamp) {
+                            group_mark_[d] = stamp;
+                            seen_[d] += 2U;
+                        }
+                    }
+                }
+            }
+            for (const std::uint32_t d : touched_) {
+                group_mark_[d] = 0U;
+            }
+            need = 1U + 2U * static_cast<std::uint32_t>(groups.size());
         }
         if (check_phrase &&
             !drop_non_phrases(part, postings[p], distinct, order, query_positions, c.index->positions_layout, need,
@@ -1537,7 +1601,15 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             for (std::size_t t = 0; t < nt; ++t) {
                 found += counts[d][t] != 0U ? 1U : 0U;
             }
-            if (found == 0U || (and_terms && found != nt)) {
+            bool every_group = true;
+            for (const auto& g : groups) {
+                bool any = false;
+                for (const std::size_t t : g) {
+                    any = any || counts[d][t] != 0U;
+                }
+                every_group = every_group && any;
+            }
+            if (found == 0U || (and_terms && (phrase_ ? found != nt : !every_group))) {
                 continue;
             }
             if (check_phrase &&
