@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/lance_table_reader.hpp"
+#include "nanolance/base_paths.hpp"
 #include "nanolance/row_ids.hpp"
 
 #include "nanolance/index_search.hpp"
@@ -2759,6 +2760,26 @@ bool open_read_plan(const std::filesystem::path& dataset_path, const LanceScanRe
     return open_read_plan_from_manifest(dataset_path, manifest, request, plan, out_schema, error);
 }
 
+/// The directory holding a fragment's data files. They must all sit in one: a read plans one directory
+/// per fragment, and a fragment whose files span base paths is refused rather than misread.
+bool fragment_data_dir(const std::filesystem::path& dataset_path, const std::vector<BasePath>& bases,
+                       const pb::DataFragment& fragment, std::filesystem::path& out, std::string& error) {
+    for (std::size_t i = 0; i < fragment.files.size(); ++i) {
+        std::filesystem::path dir;
+        if (!data_file_dir(dataset_path, bases, fragment.files[i], dir, error)) {
+            return false;
+        }
+        if (i == 0) {
+            out = dir;
+        } else if (dir != out) {
+            error = "the data files of fragment " + std::to_string(fragment.id) +
+                    " are in different base paths, which is not supported";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb::Manifest& manifest,
                                   const LanceScanRequest& request, ReadPlan& plan, ArrowSchema& out_schema,
                                   std::string& error) {
@@ -2972,6 +2993,11 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
         plan.post_range = range;
     }
     const bool ranged = !plan.filter && !range.is_whole_dataset();
+    std::vector<BasePath> bases;
+    if (!read_base_paths(manifest, bases, error)) {
+        release_schema_if_held(out_schema);
+        return false;
+    }
     std::uint64_t cursor = 0;  // absolute row index of the next fragment's first row
     for (auto& fragment : fragments) {
         if (fragment.files.empty()) {
@@ -2999,6 +3025,10 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
 
         PlannedFile planned;
         planned.fragment_id = fragment.id;
+        if (!fragment_data_dir(dataset_path, bases, fragment, planned.data_dir, error)) {
+            release_schema_if_held(out_schema);
+            return false;
+        }
         if (stable_row_ids && plan.ids.row_id) {
             RowIdSequence sequence;
             if (!fragment_row_ids(fragment, sequence, error)) {

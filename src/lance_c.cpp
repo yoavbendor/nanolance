@@ -16,6 +16,7 @@
 #include "lance/lance.h"
 
 #include "nanolance/arrow_slice.hpp"
+#include "nanolance/base_paths.hpp"
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/dataset.hpp"
 #include "nanolance/row_ids.hpp"
@@ -1368,9 +1369,19 @@ bool data_statistics(const LanceDataset& ds, LanceDataStatistics& out) {
     for (const auto& f : manifest.fields) {
         bytes[static_cast<uint32_t>(f.id)] = 0;
     }
+    std::vector<nano_lance::BasePath> bases;
+    if (!nano_lance::read_base_paths(manifest, bases, error)) {
+        fail(error);
+        return false;
+    }
     for (const auto& fragment : manifest.fragments) {
         for (const auto& file : fragment.files) {
-            const auto jailed = nano_lance::safe_join_under(ds.path / "data", file.path);
+            std::filesystem::path data_dir;
+            if (!nano_lance::data_file_dir(ds.path, bases, file, data_dir, error)) {
+                fail(error);
+                return false;
+            }
+            const auto jailed = nano_lance::safe_join_under(data_dir, file.path);
             if (!jailed) {
                 fail("data file path escapes the dataset directory");
                 return false;

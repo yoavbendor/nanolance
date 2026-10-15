@@ -11,6 +11,7 @@
 #include <random>
 #include <cstdio>
 
+#include "nanolance/base_paths.hpp"
 #include "nanolance/read_safety.hpp"
 
 #include <zstd.h>
@@ -20,6 +21,7 @@
 #include <fstream>
 #include <bit>
 #include <limits>
+#include <optional>
 
 namespace nano_lance {
 namespace {
@@ -665,6 +667,16 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
     error.clear();
     if (!deletion_file.present) {
         return true;
+    }
+    // Lance writes the deletions of rows in a base path to the dataset's own _deletions, with no
+    // base_id (the case here). A deletion file that names a base is not read yet.
+    std::optional<std::uint32_t> base_id;
+    if (!deletion_file_base_id(deletion_file, base_id, error)) {
+        return false;
+    }
+    if (base_id && *base_id != 0U) {
+        error = "deletion file of fragment " + std::to_string(fragment_id) + " is in a base path, which is not supported";
+        return false;
     }
 
     const bool bitmap = deletion_file.file_type == 1U;

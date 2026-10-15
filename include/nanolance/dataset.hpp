@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "nanolance/base_paths.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -17,11 +19,12 @@
 namespace nano_lance {
 
 struct DatasetFile {
-    std::string path;                   // relative to <dataset>/data
+    std::string path;                   // relative to its directory: <dataset>/data, or the base path's
     std::vector<std::int32_t> fields;   // field ids it holds
     std::uint32_t major_version = 0;
     std::uint32_t minor_version = 0;
     std::uint64_t size_bytes = 0;
+    std::optional<std::uint32_t> base_id;  // the base path it is in; nullopt: the dataset's own directory
 };
 
 struct DatasetFragmentInfo {
@@ -50,6 +53,7 @@ struct DatasetInfo {
     std::uint64_t latest_version = 0;
     std::string data_storage_version;  // e.g. "2.2"
     std::vector<DatasetFragmentInfo> fragments;  // in manifest order
+    std::vector<BasePath> base_paths;            // the dataset's base paths, in manifest order
     std::uint64_t max_fragment_id = 0;
     bool has_max_fragment_id = false;
     std::map<std::string, std::string> config;

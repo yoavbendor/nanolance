@@ -115,6 +115,14 @@ Read each failing test's body (`sed -n`), measure pylance, implement:
 `write_fragments(target_bases=, initial_bases=)`, `DataFile.create(..., base_id=)` (today refused in
 `fragment.py:~80`), Overwrite transactions with `initial_bases` (refused in `_transactions.py:~769` and
 `src/dataset_transaction.cpp` `apply_operation`: `op.has_initial_bases`), `merge_insert` `target_bases`.
+**Reviewer note for phase C:** phase A plans one directory per fragment (`fragment_data_dir` in
+`src/lance_table_reader.cpp` refuses a fragment whose files span bases). `TestDataReplacementWithBases`
+adds a new column's file in a base to a fragment whose other files are in the primary: make the
+reader resolve the directory **per data file** (`PlannedFile` / the per-file open path) instead of
+per fragment -- that is the one planner change allowed here.
+
+**Phase A outcome (2026-10-15):** done. Deletion files naming a base are refused (pylance never
+writes them); `fragment_data_dir` per fragment as above.
 
 ## 4. Rules (read `AGENTS.md` sections 5 and 7 only -- grep the headings)
 

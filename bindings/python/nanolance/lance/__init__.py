@@ -41,6 +41,7 @@ from nanolance.lance.dataset import (
 )
 from nanolance.lance.blob import (Blob, BlobArray, BlobColumn, BlobDescriptor, BlobDescriptorArrayBuilder, BlobFile,
                                   DedicatedBlobWriter, PackedBlobWriter, blob_array, blob_field)
+from nanolance.lance.base_path import DatasetBasePath
 from nanolance.lance.fragment import DataFile, DeletionFile, FragmentMetadata, LanceFragment
 from nanolance.lance._transactions import LanceOperation, Transaction
 from nanolance.lance.udf import batch_udf
@@ -55,6 +56,7 @@ __all__ = [
     "BlobColumn",
     "BlobFile",
     "DataFile",
+    "DatasetBasePath",
     "DeletionFile",
     "FragmentMetadata",
     "LanceDataset",

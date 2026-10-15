@@ -562,12 +562,23 @@ nb::dict ds_info(const std::filesystem::path& path, std::optional<std::uint64_t>
             fi["major_version"] = file.major_version;
             fi["minor_version"] = file.minor_version;
             fi["size_bytes"] = file.size_bytes;
+            fi["base_id"] = file.base_id ? nb::cast(*file.base_id) : nb::none();
             files.append(fi);
         }
         fd["files"] = files;
         fragments.append(fd);
     }
     d["fragments"] = fragments;
+    nb::list base_paths;
+    for (const auto& base : info.base_paths) {
+        nb::dict bd;
+        bd["id"] = base.id;
+        bd["name"] = base.has_name ? nb::cast(base.name) : nb::none();
+        bd["path"] = base.path;
+        bd["is_dataset_root"] = base.is_dataset_root;
+        base_paths.append(bd);
+    }
+    d["base_paths"] = base_paths;
     return d;
 }
 

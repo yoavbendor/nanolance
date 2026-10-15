@@ -24,6 +24,7 @@ import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance._errors import native, unsupported
+from nanolance.lance.base_path import _base_data_dir
 from nanolance.lance._transactions import Index, IndexFile, LanceOperation, Transaction
 
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
@@ -1345,7 +1346,8 @@ class LanceDataset(pa.dataset.Dataset):
                         raise OSError(f"LanceError(IO): Field id {field_id} is duplicated in fragment {f['id']}")
                     seen.add(field_id)
                 with native():
-                    lengths.append(int(_nanolance._file_info(os.path.join(path, "data", file["path"]))[0]))
+                    data_dir = _base_data_dir(path, self._info["base_paths"], file.get("base_id"))
+                    lengths.append(int(_nanolance._file_info(os.path.join(data_dir, file["path"]))[0]))
             for file, n in zip(f["files"], lengths):
                 if n != lengths[0]:
                     raise OSError(f"LanceError(IO): data file has incorrect length. Expected: {lengths[0]} "

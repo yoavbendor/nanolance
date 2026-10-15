@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/dataset.hpp"
+#include "nanolance/base_paths.hpp"
 #include "nanolance/dataset_commit.hpp"
 
 #include "nanolance/manifest_reader.hpp"
@@ -258,6 +259,9 @@ bool dataset_info(const std::filesystem::path& dataset_path, bool has_version, s
         return false;
     }
     out.version = version_info(manifest);
+    if (!read_base_paths(manifest, out.base_paths, error)) {
+        return false;
+    }
     if (out.version.version == 0U) {
         out.version.version = has_version ? version : out.latest_version;
     }
@@ -294,6 +298,9 @@ bool dataset_info(const std::filesystem::path& dataset_path, bool has_version, s
             f.major_version = file.file_major_version;
             f.minor_version = file.file_minor_version;
             f.size_bytes = file.file_size_bytes;
+            if (!data_file_base_id(file, f.base_id, error)) {
+                return false;
+            }
             info.files.push_back(std::move(f));
         }
         out.fragments.push_back(std::move(info));
@@ -471,6 +478,10 @@ bool dataset_data_stats(const std::filesystem::path& dataset_path, bool has_vers
         bytes[field.id] = 0;
         out.emplace_back(field.id, 0);
     }
+    std::vector<BasePath> bases;
+    if (!read_base_paths(manifest, bases, error)) {
+        return false;
+    }
     for (const auto& fragment : manifest.fragments) {
         for (const auto& file : fragment.files) {
             // Lance opens the files that hold a field of the schema.
@@ -487,7 +498,11 @@ bool dataset_data_stats(const std::filesystem::path& dataset_path, bool has_vers
             if (!in_schema || file.file_major_version < 2U) {
                 continue;  // Lance keeps no statistics for legacy (v1) files
             }
-            const auto jailed = safe_join_under(dataset_path / "data", file.path);
+            std::filesystem::path data_dir;
+            if (!data_file_dir(dataset_path, bases, file, data_dir, error)) {
+                return false;
+            }
+            const auto jailed = safe_join_under(data_dir, file.path);
             if (!jailed) {
                 error = "data file path escapes the dataset: " + file.path;
                 return false;

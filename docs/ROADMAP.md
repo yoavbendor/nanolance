@@ -28,7 +28,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 | task | definition | implementer | status |
 |---|---|---|---|
 | Prepared-layout blob writers (`PackedBlobWriter`, `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`, descriptor-form blob columns in the file writer) | `docs/tasks/BLOB_WRITERS.md` | Haiku 5.5, reviewed by Opus | ~~done~~ 2026-10-15: phase A (Python writers; reviewed, one fix: coalesced sidecar writes), phase B (C++ descriptor input; end-to-end tests in `tests/test_blob_writers.py`) |
-| Multi-base datasets (`DatasetBasePath`, `initial_bases` / `target_bases` / `target_all_bases`, `add_bases`, fragment writes into bases) | `docs/tasks/MULTI_BASE.md` | Haiku 5.5, reviewed by Opus | phase A (read) in progress; B (`write_dataset`, `add_bases`) and C (fragment writes) next |
+| Multi-base datasets (`DatasetBasePath`, `initial_bases` / `target_bases` / `target_all_bases`, `add_bases`, fragment writes into bases) | `docs/tasks/MULTI_BASE.md` | Haiku 5.5, reviewed by Opus | phase A (read) done 2026-10-15; B (`write_dataset`, `add_bases`) in progress; C (fragment writes) next |
 
 Lessons from the first delegated task (blob writers, three Haiku sessions of 95-160k tokens each):
 behaviour measured on pylance and written into the spec (messages, reprs, paths) let phase A land in
@@ -36,6 +36,10 @@ one pass; the stop rule worked -- phase B stopped at a reader / schema-mapping q
 redesigning it, and the reviewer's answer (pylance's `DataFile.create` reads only top-level names)
 was a 30-line fix; a fresh session per phase kept each one inside its context. Next time: give the
 "finish" session its known facts up front, and say which pytest flags print a summary.
+
+Small items found by delegated sessions, not yet done:
+- `_take_rows` of a deleted row's address returns the row; pylance leaves it out (plain datasets,
+  without stable row ids). Found by the multi-base phase A session.
 
 ## Priority: competing with pylance directly (2026-10-08)
 

@@ -307,6 +307,8 @@ add_library(nanolance STATIC
     src/index_optimize.cpp
     src/data_file_reader.cpp
     src/deletion_vector.cpp
+    src/base_paths.cpp
+    src/proto_wire.hpp
     src/row_ids.cpp
     src/data_file_writer.cpp
     src/fsst.cpp
