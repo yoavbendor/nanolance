@@ -532,6 +532,29 @@ bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, Ro
     return true;
 }
 
+/// A JSON index answers a JSON test of its own path and the accessor's type, as its BTree does over the
+/// values at the path (the same pages, the same comparisons). Any other JSON test is not its to answer.
+bool search_json(const std::filesystem::path& dir, const pb::IndexMetadata& index, const expr::Predicate& p,
+                 RowSet& out, bool& answered, std::string& error) {
+    answered = false;
+    std::string path;
+    if (!index_files::json_index_path(index.details_value, path)) {
+        error = "json index: malformed JsonIndexDetails";
+        return false;
+    }
+    if (!p.json().has_value() || path != p.json()->path || index.files.size() != 2U) {
+        return true;
+    }
+    std::shared_ptr<const BTreeIndex> btree;
+    if (!load_btree(dir, btree, error)) {
+        return false;
+    }
+    if (!p.routes_to_json_index(btree->lookup.schema.children[0]->format)) {
+        return true;
+    }
+    return search_btree(dir, p, out, answered, error);
+}
+
 /// A zonemap answers with the rows of its kept zones: each zone's span of offsets in its fragment.
 bool search_zonemap(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
                     std::string& error) {
@@ -1139,9 +1162,18 @@ struct Search {
                 RowSet one;
                 bool answered = false;
                 bool ok = true;
+                // A JSON index answers the JSON tests and they only it: a plain test of the column would
+                // compare the document, not the values at the path.
+                const bool json_index = kind == "/lance.index.pb.JsonIndexDetails";
+                if (json_index != p.json().has_value()) {
+                    answered_all = false;
+                    break;
+                }
                 const bool bloom = kind == "/lance.index.pb.BloomFilterIndexDetails";
                 const bool zoned = kind == "/lance.table.ZoneMapIndexDetails" || bloom;
-                if (kind == "/lance.table.BTreeIndexDetails" && index->files.size() == 2U &&
+                if (json_index) {
+                    ok = search_json(dir, *index, p, one, answered, error);
+                } else if (kind == "/lance.table.BTreeIndexDetails" && index->files.size() == 2U &&
                     std::any_of(index->files.begin(), index->files.end(),
                                 [](const pb::IndexMetadata::File& f) { return f.path == "page_lookup.lance"; })) {
                     ok = search_btree(dir, p, one, answered, error);
@@ -1187,6 +1219,9 @@ struct Search {
                 const auto& url = segments.front()->details_type_url;
                 std::string type = url.substr(url.rfind('.') + 1);
                 type = type.substr(0, type.size() - std::string("IndexDetails").size());
+                if (type == "Json") {
+                    type = "BTree";  // the plan names the BTree a JSON index is built over
+                }
                 used.push_back("ScalarIndexQuery: query=[" + p.to_string() + "]@" + name + "(" + type + ")");
                 answer = std::move(set);
                 return true;

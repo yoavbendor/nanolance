@@ -161,6 +161,9 @@ bool write_file(const std::filesystem::path& dir, const std::string& name, const
 /// The field at dotted `path` (its parts in `parts`), or null.
 const pb::Field* find_field(const pb::Manifest& manifest, const std::string& path, std::vector<std::string>& parts);
 
+/// The path of a JsonIndexDetails (its field 1; empty when absent). False on a malformed message.
+bool json_index_path(const std::vector<std::uint8_t>& details, std::string& path);
+
 /// A random (version 4) UUID.
 std::array<std::uint8_t, 16> new_uuid();
 

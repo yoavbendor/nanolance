@@ -529,13 +529,201 @@ def test_json_index_type_mismatch_as_pylance(lance, tmp_path):
     assert errors["nanolance"] == "Invalid user input: JSON path 'x' expected Int64, but batch row 1 has JSON type Float64"
 
 
-def test_json_index_optimize_is_refused_until_it_is_supported(lance, tmp_path):
-    values = JSON_CASES["int"][0]
-    out = _fresh(tmp_path, "opt.lance")
-    ds = nl.write_dataset(_json_table(values), out)
-    ds.create_scalar_index("j", _json_config("nanolance", "x"), name="j_idx")
-    ds = nl.dataset(out)
-    with pytest.raises(NotImplementedError, match="JSON index.*not supported yet"):
+# --- N2b: routing, optimize, compaction, drop ---
+
+ROUTE_ROWS = ['{"x": 1, "f": 1.5, "b": true, "s": "a"}', '{"x": 11, "f": 2.5, "b": false, "s": "bb"}',
+              '{"y": 3}', None, '{"x": null}', '{"x": 7, "f": 0.5, "b": true, "s": "c"}', '{"s": ""}',
+              '{"s": "\u00e9", "f": 100}']
+
+# (index path, filter, pylance's ScalarIndexQuery text after `@j_idx(BTree)`'s bracket), measured on pylance
+ROUTED = [
+    ("x", "json_get_int(j, 'x') = 11", "Json(j = 11->x)"),
+    ("x", "json_get_int(j, 'x') < 11", "Json(j < 11->x)"),
+    ("x", "json_get_int(j, 'x') <= 7", "Json(j <= 7->x)"),
+    ("x", "json_get_int(j, 'x') > 1", "Json(j > 1->x)"),
+    ("x", "json_get_int(j, 'x') >= 7", "Json(j >= 7->x)"),
+    ("x", "json_get_int(j, 'x') IN (1, 7)", "Json(j IN [1,7]->x)"),
+    ("x", "json_get_int(j, 'x') IN (7)", "Json(j = 7->x)"),
+    ("x", "json_get_int(j, 'x') IS NULL", "Json(j IS NULL->x)"),
+    ("x", "json_get_int(j, 'x') = 11 AND id > 0", "Json(j = 11->x)"),
+    ("f", "json_get_float(j, 'f') < 2", "Json(j < 2->f)"),
+    ("f", "json_get_float(j, 'f') = 2.5", "Json(j = 2.5->f)"),
+    ("f", "json_get_float(j, 'f') = 1", "Json(j = 1->f)"),
+    ("f", "json_get_float(j, 'f') IN (1.5, 0.5)", "Json(j IN [1.5,0.5]->f)"),
+    ("f", "json_get_float(j, 'f') IS NULL", "Json(j IS NULL->f)"),
+    ("b", "json_get_bool(j, 'b') < true", "Json(j < true->b)"),
+    ("b", "json_get_bool(j, 'b') IS NULL", "Json(j IS NULL->b)"),
+    ("s", "json_get_string(j, 's') = 'bb'", "Json(j = bb->s)"),
+    ("s", "json_get_string(j, 's') >= 'b'", "Json(j >= b->s)"),
+    ("s", "json_get_string(j, 's') IN ('a', 'c')", "Json(j IN [a,c]->s)"),
+    ("s", "json_get_string(j, 's') IS NULL", "Json(j IS NULL->s)"),
+]
+
+# Routed by nanolance with pylance's answers, but pylance's plan is another shape (NOT(...), AND(...)): the
+# plan text is nanolance's own, and its answers equal the scan.
+ROUTED_OTHER_PLAN = [
+    ("x", "json_get_int(j, 'x') != 7", "Json(j != 7->x)"),
+    ("x", "json_get_int(j, 'x') BETWEEN 1 AND 8", "Json(j >= 1 && j <= 8->x)"),
+    ("b", "json_get_bool(j, 'b') IS NOT NULL", "Json(j IS NOT NULL->b)"),
+]
+
+# Not routed: a scan (no ScalarIndexQuery in the plan), whatever the index.
+SCANNED = [
+    ("x", "json_get_int(j, 'x') = 7.0"),         # a float constant on an integer accessor: a CAST in pylance
+    ("x", "json_get_int(j, 'y') = 3"),           # another path
+    ("x", "json_get_int(j, 'a.b') = 3"),         # a dotted path: scanned, as the index's own answer differs
+    ("x", "json_get_float(j, 'x') = 7"),         # another accessor type
+    ("x", "json_get_string(j, 'x') = '7'"),
+    ("x", "json_get_int(j, 'x') = 11 OR id = 5"),  # OR is not routed
+    ("b", "json_get_bool(j, 'b') = true"),       # pylance rewrites a bool's equality to the bare accessor
+    ("b", "json_get_bool(j, 'b') != true"),
+]
+
+
+def _scalar_lines(ds, flt):
+    plan = ds.scanner(filter=flt, columns=["id"]).explain_plan()
+    return [line.strip() for line in plan.splitlines() if "ScalarIndexQuery" in line]
+
+
+def _ids_of(ds, flt, **kw):
+    return sorted(ds.to_table(filter=flt, columns=["id"], **kw)["id"].to_pylist())
+
+
+@pytest.mark.parametrize("path,flt,expected", ROUTED, ids=[c[1] for c in ROUTED])
+def test_json_index_routes_each_operator_as_pylance(lance, tmp_path, path, flt, expected):
+    paths = _build_json_pair(lance, tmp_path, ROUTE_ROWS, path)
+    line = f"ScalarIndexQuery: query=[{expected}]@j_idx(BTree)"
+    nano = nl.dataset(paths["nanolance"])
+    assert _scalar_lines(nano, flt) == [line]
+    assert _scalar_lines(lance.dataset(paths["pylance"]), flt) == [line]
+    assert _ids_of(nano, flt) == _ids_of(nano, flt, use_scalar_index=False)
+
+
+@pytest.mark.parametrize("path,flt,expected", ROUTED_OTHER_PLAN, ids=[c[1] for c in ROUTED_OTHER_PLAN])
+def test_json_index_routed_with_nanolance_plan_text(lance, tmp_path, path, flt, expected):
+    paths = _build_json_pair(lance, tmp_path, ROUTE_ROWS, path)
+    nano = nl.dataset(paths["nanolance"])
+    assert _scalar_lines(nano, flt) == [f"ScalarIndexQuery: query=[{expected}]@j_idx(BTree)"]
+    assert _ids_of(nano, flt) == _ids_of(nano, flt, use_scalar_index=False)
+
+
+@pytest.mark.parametrize("path,flt", SCANNED, ids=[c[1] for c in SCANNED])
+def test_json_index_not_routed_scans_and_equals_scan(lance, tmp_path, path, flt):
+    paths = _build_json_pair(lance, tmp_path, ROUTE_ROWS, path)
+    nano = nl.dataset(paths["nanolance"])
+    assert _scalar_lines(nano, flt) == []
+    assert _ids_of(nano, flt) == _ids_of(nano, flt, use_scalar_index=False)
+
+
+def test_json_index_type_error_is_raised_with_and_without_the_index(lance, tmp_path):
+    paths = _build_json_pair(lance, tmp_path, ROUTE_ROWS, "s")
+    nano = nl.dataset(paths["nanolance"])
+    with pytest.raises(ValueError, match="cannot compare string with integer"):
+        nano.to_table(filter="json_get_string(j, 's') = 1")
+    with pytest.raises(ValueError, match="cannot compare string with integer"):
+        nano.to_table(filter="json_get_string(j, 's') = 1", use_scalar_index=False)
+
+
+def test_json_index_dotted_path_answers_as_a_scan(lance, tmp_path):
+    """pylance's index parses `a.b` as a JSONPath and answers differently from its own scan (the divergence
+    the N2 investigation measured). nanolance does not route a dotted accessor: its answer is the scan's."""
+    rows = ['{"a": {"b": 3}}', '{"a.b": 3, "id2": 1}', '{"a": {"b": 4}}', None]
+    paths = _build_json_pair(lance, tmp_path, rows, "a.b")
+    flt = "json_get_int(j, 'a.b') = 3"
+    nano = nl.dataset(paths["nanolance"])
+    plain = nl.write_dataset(_json_table(rows), _fresh(tmp_path, "plain.lance"))
+    assert _scalar_lines(nano, flt) == []
+    assert _ids_of(nano, flt) == _ids_of(plain, flt)
+    assert _ids_of(lance.dataset(paths["pylance"]), flt) != _ids_of(plain, flt)
+
+
+def test_json_index_answers_equal_scan_after_deletes_and_nulls(lance, tmp_path):
+    paths = _build_json_pair(lance, tmp_path, ROUTE_ROWS, "x")
+    nano = nl.dataset(paths["nanolance"])
+    nano.delete("id = 1")
+    nano = nl.dataset(paths["nanolance"])
+    for flt in ["json_get_int(j, 'x') <= 7", "json_get_int(j, 'x') IS NULL", "json_get_int(j, 'x') != 7"]:
+        assert _ids_of(nano, flt) == _ids_of(nano, flt, use_scalar_index=False), flt
+
+
+def test_json_index_appends_and_optimize_equal_pylance(lance, tmp_path):
+    paths = _build_json_pair(lance, tmp_path, JSON_CASES["int"][0], "x")
+    new = pa.table({"j": pa.array(['{"x": 7}', '{"x": 1}', None, '{"y": 2}'], pa.json_()),
+                    "id": pa.array([10, 11, 12, 13], pa.int64())})
+    seen = {}
+    for engine in ("pylance", "nanolance"):
+        module = _module(engine, lance)
+        module.dataset(paths[engine]).insert(new)
+        ds = module.dataset(paths[engine])
+        assert ds.stats.index_stats("j_idx")["num_unindexed_rows"] == 4
         ds.optimize.optimize_indices()
-    # the refusal leaves the index and its answers as they were
-    assert sorted(ds.to_table(filter="json_get_int(j, 'x') = 7")["id"].to_pylist()) == [0, 4]
+        ds = module.dataset(paths[engine])
+        (d,) = ds.describe_indices()
+        stats = {k: v for k, v in ds.stats.index_stats("j_idx").items() if k != "updated_at_timestamp_ms"}
+        seen[engine] = (d.name, d.type_url, d.index_type, d.details, d.num_rows_indexed,
+                        len(d.segments), stats["num_unindexed_rows"], stats["num_indexed_rows"], stats["index_type"])
+    assert seen["nanolance"] == seen["pylance"]
+    nano = nl.dataset(paths["nanolance"])
+    for flt in ["json_get_int(j, 'x') = 7", "json_get_int(j, 'x') > 0", "json_get_int(j, 'x') IS NULL"]:
+        assert _scalar_lines(nano, flt) != []
+        assert _ids_of(nano, flt) == _ids_of(nano, flt, use_scalar_index=False), flt
+
+
+def test_json_index_delete_then_optimize_equals_scan(lance, tmp_path):
+    values = JSON_CASES["int"][0] * 3
+    paths = _build_json_pair(lance, tmp_path, values, "x")
+    nano = nl.dataset(paths["nanolance"])
+    nano.delete("id < 4")
+    nl.dataset(paths["nanolance"]).optimize.optimize_indices()
+    nano = nl.dataset(paths["nanolance"])
+    for flt in ["json_get_int(j, 'x') = 7", "json_get_int(j, 'x') <= 0"]:
+        assert _ids_of(nano, flt) == _ids_of(nano, flt, use_scalar_index=False), flt
+
+
+def test_json_index_compaction_then_search_equals_scan(lance, tmp_path):
+    values = JSON_CASES["int"][0] * 3
+    out = _fresh(tmp_path, "compact.lance")
+    nl.write_dataset(_json_table(values), out, max_rows_per_file=4)
+    nl.dataset(out).create_scalar_index("j", _json_config("nanolance", "x"), name="j_idx")
+    nl.dataset(out).insert(_json_table(['{"x": 7}']))
+    nl.dataset(out).optimize.compact_files(target_rows_per_fragment=100)
+    nano = nl.dataset(out)
+    for flt in ["json_get_int(j, 'x') = 7", "json_get_int(j, 'x') IS NULL", "json_get_int(j, 'x') < 5"]:
+        assert _ids_of(nano, flt) == _ids_of(nano, flt, use_scalar_index=False), flt
+
+
+def test_json_index_drop_then_scan(lance, tmp_path):
+    paths = _build_json_pair(lance, tmp_path, JSON_CASES["int"][0], "x")
+    for engine in ("pylance", "nanolance"):
+        module = _module(engine, lance)
+        module.dataset(paths[engine]).drop_index("j_idx")
+        ds = module.dataset(paths[engine])
+        assert ds.describe_indices() == []
+    nano = nl.dataset(paths["nanolance"])
+    assert _scalar_lines(nano, "json_get_int(j, 'x') = 7") == []
+    assert _ids_of(nano, "json_get_int(j, 'x') = 7") == [0, 4]
+
+
+# Ported from pylance's test_json_index and test_json_index_non_exact_floats (memory:// -> tmp_path).
+def test_json_index_ported_from_pylance(tmp_path):
+    vals = ['{"x": 7, "y": 10}', '{"x": 11, "y": 22}', '{"y": 0}', '{"x": 10}']
+    ds = nl.write_dataset(pa.table({"jsons": pa.array(vals, pa.json_())}), _fresh(tmp_path, "a.lance"))
+    ds.create_scalar_index("jsons", _json_config("nanolance", "x"))
+    filter = "json_get_int(jsons, 'x') = 10"
+    assert "ScalarIndexQuery" in ds.scanner(filter=filter).explain_plan()
+    assert ds.to_table(filter=filter) == ds.to_table(filter=filter, use_scalar_index=False)
+
+
+def test_json_index_non_exact_floats_ported_from_pylance(tmp_path):
+    vals = ['{"latitude": 10.5}', '{"latitude": 40.1}', '{"latitude": -3.2}']
+    ds = nl.write_dataset(pa.table({"data": pa.array(vals, pa.json_())}), _fresh(tmp_path, "b.lance"))
+    ds.create_scalar_index("data", _json_config("nanolance", "latitude"))
+    for filter in [
+        "json_get_float(data, 'latitude') > 0",
+        "json_get_float(data, 'latitude') >= 10.5",
+        "json_get_float(data, 'latitude') = 40.1",
+        "json_get_float(data, 'latitude') = 10.5",
+        "json_get_float(data, 'latitude') < 100",
+    ]:
+        assert "ScalarIndexQuery" in ds.scanner(filter=filter).explain_plan(), filter
+        assert ds.to_table(filter=filter) == ds.to_table(filter=filter, use_scalar_index=False), filter

@@ -14,6 +14,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <regex>
@@ -2958,6 +2959,34 @@ Op op_of(const std::string& op) {
 
 Condition Expression::conditions() const {
     struct Walk {
+        /// The column a test reads: `x`, or a JSON accessor of it at an identifier path.
+        static bool column_of(const Node& n, Predicate& p) {
+            if (n.op == Op::Column) {
+                p.column_ = n.column.path;
+                return true;
+            }
+            static const char* const kAccessors[] = {"json_get_int", "json_get_float", "json_get_bool",
+                                                     "json_get_string"};
+            if (n.op != Op::Func || n.args.size() != 2U || n.args[0]->op != Op::Column ||
+                n.args[1]->op != Op::Literal || n.args[1]->literal.kind != Kind::String ||
+                std::none_of(std::begin(kAccessors), std::end(kAccessors),
+                             [&](const char* f) { return n.name == f; })) {
+                return false;
+            }
+            const std::string path(n.args[1]->literal.s);
+            const auto alpha = [](char ch) { return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_'; };
+            const auto digit = [](char ch) { return ch >= '0' && ch <= '9'; };
+            const bool identifier = !path.empty() && alpha(path[0]) &&
+                                    std::all_of(path.begin() + 1, path.end(),
+                                                [&](char ch) { return alpha(ch) || digit(ch); });
+            if (!identifier) {
+                return false;
+            }
+            p.column_ = n.args[0]->column.path;
+            p.json_ = JsonAccess{path, n.name};
+            return true;
+        }
+
         static Condition at(const Node& n) {
             Condition c;
             auto leaf = [&](Predicate p) {
@@ -2982,28 +3011,26 @@ Condition Expression::conditions() const {
                 case Op::Le:
                 case Op::Gt:
                 case Op::Ge: {
-                    const bool left = n.args[0]->op == Op::Column && constant(*n.args[1]);
-                    const bool right = n.args[1]->op == Op::Column && constant(*n.args[0]);
+                    Predicate p;
+                    const bool left = constant(*n.args[1]) && column_of(*n.args[0], p);
+                    const bool right = !left && constant(*n.args[0]) && column_of(*n.args[1], p);
                     if (!left && !right) {
                         return c;
                     }
-                    Predicate p;
                     p.test_ = Predicate::Test::Compare;
-                    p.column_ = (left ? n.args[0] : n.args[1])->column.path;
                     p.op_ = left ? op_text(n.op) : flipped(n.op);
                     p.constants_.push_back(shared_clone(left ? *n.args[1] : *n.args[0]));
                     return leaf(std::move(p));
                 }
                 case Op::In:
                 case Op::Between: {
-                    if (n.args[0]->op != Op::Column ||
-                        !std::all_of(n.args.begin() + 1, n.args.end(),
-                                     [](const std::unique_ptr<Node>& a) { return constant(*a); })) {
+                    Predicate p;
+                    if (!std::all_of(n.args.begin() + 1, n.args.end(),
+                                     [](const std::unique_ptr<Node>& a) { return constant(*a); }) ||
+                        !column_of(*n.args[0], p)) {
                         return c;
                     }
-                    Predicate p;
                     p.test_ = n.op == Op::In ? Predicate::Test::In : Predicate::Test::Between;
-                    p.column_ = n.args[0]->column.path;
                     for (std::size_t k = 1; k < n.args.size(); ++k) {
                         p.constants_.push_back(shared_clone(*n.args[k]));
                     }
@@ -3011,12 +3038,11 @@ Condition Expression::conditions() const {
                 }
                 case Op::IsNull:
                 case Op::IsNotNull: {
-                    if (n.args[0]->op != Op::Column) {
+                    Predicate p;
+                    if (!column_of(*n.args[0], p)) {
                         return c;
                     }
-                    Predicate p;
                     p.test_ = n.op == Op::IsNull ? Predicate::Test::IsNull : Predicate::Test::IsNotNull;
-                    p.column_ = n.args[0]->column.path;
                     return leaf(std::move(p));
                 }
                 case Op::Func: {
@@ -3188,10 +3214,79 @@ bool Predicate::constant_as(std::size_t k, const ArrowSchema& type, ArrowArray& 
     return e.evaluate(batch, type, out, error);
 }
 
+bool Predicate::routes_to_json_index(const char* value_format) const {
+    if (!json_ || value_format == nullptr) {
+        return false;
+    }
+    // The accessor's type is the index's value type: Int64, Float64, Boolean, Utf8 (Arrow's l, g, b, u).
+    const std::string& fn = json_->function;
+    const std::string_view want = fn == "json_get_int"     ? "l"
+                                  : fn == "json_get_float" ? "g"
+                                  : fn == "json_get_bool"  ? "b"
+                                                           : "u";
+    if (std::string_view(value_format) != want) {
+        return false;
+    }
+    // Constants of the accessor's type: DataFusion casts an integer to a float accessor's type, and
+    // nothing else is routed (`= 7.0` on an integer accessor is a CAST, which pylance scans).
+    for (const auto& c : constants_) {
+        if (c->op != Op::Literal) {
+            return false;
+        }
+        const Kind k = c->literal.kind;
+        const bool ok = fn == "json_get_int"     ? k == Kind::Int
+                        : fn == "json_get_float" ? (k == Kind::Int || k == Kind::Double)
+                        : fn == "json_get_bool"  ? k == Kind::Bool
+                                                 : k == Kind::String;
+        if (!ok) {
+            return false;
+        }
+    }
+    // A bool's equality, inequality and IN are rewritten to the bare accessor, which pylance scans.
+    if (fn == "json_get_bool" &&
+        (test_ == Test::In || (test_ == Test::Compare && (op_ == "=" || op_ == "!=")))) {
+        return false;
+    }
+    return true;
+}
+
 std::string Predicate::to_string() const {
     std::string column;
     for (const auto& p : column_) {
         column += (column.empty() ? "" : ".") + p;
+    }
+    if (json_) {
+        // Lance's form: the test on the value, then the path. A one-item IN is an equality there, and a
+        // string or bool constant is written bare (true, not TRUE).
+        const auto value = [](const Node& n) {
+            if (n.op == Op::Literal && n.literal.kind == Kind::String) {
+                return std::string(n.literal.s);
+            }
+            if (n.op == Op::Literal && n.literal.kind == Kind::Bool) {
+                return std::string(n.literal.b ? "true" : "false");
+            }
+            return print(n);
+        };
+        const std::string at = "->" + json_->path + ")";
+        const std::string head = "Json(" + column + " ";
+        switch (test_) {
+            case Test::Compare: return head + op_ + " " + value(*constants_.front()) + at;
+            case Test::In: {
+                if (constants_.size() == 1U) {
+                    return head + "= " + value(*constants_.front()) + at;
+                }
+                std::string items;
+                for (const auto& c : constants_) {
+                    items += (items.empty() ? "" : ",") + value(*c);
+                }
+                return head + "IN [" + items + "]" + at;
+            }
+            case Test::Between:  // Lance prints the two bounds as an AND of two queries
+                return head + ">= " + value(*constants_[0]) + " && " + column + " <= " + value(*constants_[1]) + at;
+            case Test::IsNull: return head + "IS NULL" + at;
+            case Test::IsNotNull: return head + "IS NOT NULL" + at;
+            default: break;  // not a JSON accessor's test
+        }
     }
     std::string list;
     for (const auto& c : constants_) {

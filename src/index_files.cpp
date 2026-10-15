@@ -6,6 +6,7 @@
 #include "nanolance/bloom_filter.hpp"
 
 #include "nanolance/lance_file_writer.hpp"
+#include "proto_wire.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -280,6 +281,19 @@ std::array<std::uint8_t, 16> new_uuid() {
     id[6] = static_cast<std::uint8_t>((id[6] & 0x0FU) | 0x40U);  // version 4
     id[8] = static_cast<std::uint8_t>((id[8] & 0x3FU) | 0x80U);  // RFC 4122 variant
     return id;
+}
+
+bool json_index_path(const std::vector<std::uint8_t>& details, std::string& path) {
+    path.clear();
+    proto_wire::Reader reader(details.data(), details.size());
+    proto_wire::Field f;
+    while (reader.next(f)) {
+        if (f.number == 1U && f.wire == 2U) {
+            path.assign(reinterpret_cast<const char*>(f.data), f.size);
+            return true;
+        }
+    }
+    return reader.ok();
 }
 
 }  // namespace nano_lance::index_files

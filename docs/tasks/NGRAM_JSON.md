@@ -193,3 +193,12 @@ null-min pages, all-null and binary values (pre-existing divergence, display onl
 texts drop pylance's Rust source location; distributed JSON builds refused. **N2b** next: routing
 (only when the json_get_* type equals the index type -- pylance's own scan errors otherwise), optimize /
 merge / compaction, drop.
+
+**N2b outcome (2026-10-15):** done. `json_get_int/float/bool/string(col, '<identifier>')` with =, <>,
+<, <=, >, >=, IN, BETWEEN, IS [NOT] NULL routed to the JSON index when the accessor type, the
+literal and the index value type match (bool =, <>, IN not routed, as pylance); optimize / compaction
+re-cover / drop as BTree; pylance's `test_json_index` and `test_json_index_non_exact_floats` pass
+(+2, 1062). Accepted divergences (answers equal a scan): the plan text for !=, BETWEEN and IS NOT NULL
+is one query where pylance prints NOT(...) / AND(...); `json_get_float` on an Int64 index scans
+(pylance routes it and its answer differed from its scan). Design: a `JsonAccess` on the Predicate
+instead of a new test kind. N3 next.

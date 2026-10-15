@@ -59,8 +59,8 @@ enum class Kind { BTree, Bitmap, LabelList, ZoneMap, BloomFilter, NGram, Inverte
 
 Kind kind_of(const std::filesystem::path& dataset_path, const pb::IndexMetadata& index) {
     const auto& url = index.details_type_url;
-    if (ends_with(url, "BTreeIndexDetails")) {
-        return Kind::BTree;
+    if (ends_with(url, "BTreeIndexDetails") || ends_with(url, "JsonIndexDetails")) {
+        return Kind::BTree;  // a JSON index is a BTree over the values at its path
     }
     if (ends_with(url, "BitmapIndexDetails")) {
         return Kind::Bitmap;
@@ -156,10 +156,6 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
                   pb::IndexMetadata& out, std::vector<const pb::IndexMetadata*>& replaced, std::string& error) {
     const auto& last = *segments.back();
     const Kind kind = kind_of(dataset_path, last);
-    if (ends_with(last.details_type_url, "JsonIndexDetails")) {
-        error = "index '" + last.name + "' is a JSON index: optimize_indices on a JSON index is not supported yet";
-        return false;
-    }
     if (kind == Kind::Other) {
         error = "index '" + last.name + "' (" + last.details_type_url +
                 ") is of a kind nanolance cannot build, so it cannot be optimized";
@@ -301,6 +297,15 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
     case Kind::BloomFilter: {
         ScalarIndexOptions o;
         o.name = last.name;
+        if (ends_with(last.details_type_url, "JsonIndexDetails")) {
+            // The new segment's values are extracted at the path, from the rows of every fragment it covers.
+            std::string path;
+            if (!index_files::json_index_path(last.details_value, path)) {
+                error = "index '" + last.name + "': malformed JsonIndexDetails";
+                return false;
+            }
+            o.json_path = path;
+        }
         const ScalarIndexType type = kind == Kind::BTree    ? ScalarIndexType::BTree
                                      : kind == Kind::Bitmap ? ScalarIndexType::Bitmap
                                      : kind == Kind::ZoneMap ? ScalarIndexType::ZoneMap
