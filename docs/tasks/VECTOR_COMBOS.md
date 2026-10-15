@@ -111,3 +111,11 @@ Files changed, per-test status, decisions, questions.
 - C2 will need: lance_c.cpp ~2459 (`vector_options` refuses these kinds at build), dataset.py ~1136 and
   ~1280 (create_index refusals), and `tests/test_lance_c_search.cpp` ~358 asserts an IVF_HNSW_PQ build
   is refused.
+
+**C1 outcome (2026-10-15):** done. IvfIndex has Storage {Flat, Pq, Sq} x SubIndex {Flat, Hnsw}; one
+distance abstraction (SqDistance, FloatDistance, PqDistance) under both HNSW and the exhaustive scan;
+pylance's IVF_SQ / IVF_HNSW_PQ / IVF_HNSW_FLAT searched with 0 id mismatches against pylance under
+exhaustive settings (3 kinds x 3 metrics, with deletions). Reviewer's calls: ties at the k-th distance
+may differ (tests compare the rows nearer than it; Lance's tie order is a roadmap item); HNSW_PQ dot
+distance is Lance's `1 - dot`. **For C2:** also test 4-bit PQ codes under HNSW (the exhaustive IVF_PQ
+path sums quantized table entries past the first max(200, k) rows; check what Lance's HNSW PQ does).

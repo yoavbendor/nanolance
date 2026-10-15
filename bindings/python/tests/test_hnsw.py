@@ -177,3 +177,79 @@ def test_build_errors_as_pylance_raises_them(lance, tmp_path, kw, error):
     for module in (lance, nl):
         with pytest.raises(ValueError, match=error.replace("(", r"\(").replace(")", r"\)")):
             module.dataset(path).create_index("vec", "IVF_HNSW_SQ", num_partitions=2, **kw)
+
+
+# IVF_SQ, IVF_HNSW_PQ and IVF_HNSW_FLAT: pylance builds them, nanolance searches them. Under
+# exhaustive settings (every partition, a large ef) nanolance returns pylance's rows and distances.
+NEW_KINDS = {"IVF_SQ": {}, "IVF_HNSW_PQ": {"num_sub_vectors": 4}, "IVF_HNSW_FLAT": {}}
+EXHAUSTIVE = [{"k": 10, "nprobes": PARTS, "ef": 1000}, {"k": 1, "nprobes": PARTS, "ef": 1000},
+              {"k": 30, "nprobes": PARTS, "ef": 1000, "refine_factor": 3},
+              {"k": 10, "nprobes": PARTS, "ef": 1000, "distance_range": (0.0, 30.0)}]
+
+
+@pytest.fixture(scope="module")
+def new_kinds(lance, tmp_path_factory):
+    root = tmp_path_factory.mktemp("new_kinds")
+    v = _vectors()
+    out = {}
+    for kind, extra in NEW_KINDS.items():
+        for metric in ("l2", "cosine", "dot"):
+            for deleted in (False, True):
+                path = str(root / f"{kind}_{metric}_{deleted}.lance")
+                vec = pa.FixedSizeListArray.from_arrays(pa.array(v.ravel()), DIM)
+                lance.write_dataset(pa.table({"id": np.arange(N), "vec": vec}), path, max_rows_per_file=1001)
+                lance.dataset(path).create_index("vec", kind, num_partitions=PARTS, metric=metric, **extra)
+                if deleted:
+                    lance.dataset(path).delete("id % 11 = 4")
+                out[kind, metric, deleted] = path
+    return v, out
+
+
+@pytest.mark.parametrize("kind", list(NEW_KINDS))
+@pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
+@pytest.mark.parametrize("deleted", [False, True])
+def test_new_kinds_match_pylance(lance, new_kinds, kind, metric, deleted):
+    v, paths = new_kinds
+    theirs, ours = lance.dataset(paths[kind, metric, deleted]), nl.dataset(paths[kind, metric, deleted])
+    rng = np.random.default_rng(1)
+    for _ in range(4):
+        q = v[rng.integers(0, N)] + rng.standard_normal(DIM).astype(np.float32) * 0.5
+        for o in EXHAUSTIVE:
+            for flt, pre in FILTERS:
+                nearest = {"column": "vec", "q": q, **o}
+                ref = theirs.to_table(nearest=nearest, columns=["id"], filter=flt, prefilter=pre)
+                got = ours.to_table(nearest=nearest, columns=["id"], filter=flt, prefilter=pre)
+                rd, gd = ref.column("_distance").to_numpy(), got.column("_distance").to_numpy()
+                assert len(rd) == len(gd), (o, flt, pre)
+                if metric == "dot" and flt is not None:
+                    # A race between partitions in pylance: compare what any run could return.
+                    assert np.all(np.isfinite(gd) == np.isfinite(rd)), (o, flt, pre)
+                    continue
+                # dot: 1 - dot cancels near zero in float32, so the sums' order shows as ~3e-5 absolute.
+                atol = 3e-5 if metric == "dot" else 1e-6
+                assert np.allclose(rd, gd, rtol=1e-5, atol=atol), (o, flt, pre, rd[:5], gd[:5])
+                _same_rows(rd, ref.column("id").to_numpy(), gd, got.column("id").to_numpy(), (o, flt, pre))
+
+
+def _same_rows(rd, ri, gd, gi, where):
+    """Rows in pylance's order, except at the last distance: duplicate vectors tie there, and which
+    of them makes the cut is pylance's scan order (the existing IVF_FLAT path breaks such ties the
+    same way with deletions and a prefilter). Everything nearer than that must match exactly."""
+    tied = np.isclose(rd, rd[-1], rtol=1e-5, atol=1e-6) if len(rd) else np.zeros(0, bool)
+    near = ~tied
+    assert ri[near].tolist() == gi[near].tolist(), where
+
+
+@pytest.mark.parametrize("kind", list(NEW_KINDS))
+def test_new_kinds_describe_list_and_plan(lance, new_kinds, kind):
+    v, paths = new_kinds
+    path = paths[kind, "l2", False]
+    def described(ds):
+        return [(d.name, d.type_url, d.num_rows_indexed, list(d.fields), list(d.field_names))
+                for d in ds.describe_indices()]
+    assert described(nl.dataset(path)) == described(lance.dataset(path))
+    assert [(x["name"], x["type"], x["fields"]) for x in nl.dataset(path).list_indices()] == \
+        [(x["name"], x["type"], x["fields"]) for x in lance.dataset(path).list_indices()]
+    # The index serves the search (not an exact scan): the plan names it.
+    plan = nl.dataset(path).scanner(nearest={"column": "vec", "q": v[0], "k": 5, "nprobes": 1}).explain_plan()
+    assert f"({kind})" in plan, plan

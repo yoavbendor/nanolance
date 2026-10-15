@@ -502,11 +502,37 @@ struct CacheCount {
     std::atomic<std::uint64_t> misses{0};
 };
 
+/// An IVF index's rows (auxiliary.idx): FLAT floats, PQ codes or 8-bit SQ codes.
+enum class Storage { Flat, Pq, Sq };
+/// The sub-index over each partition (index.idx): FLAT (exhaustive) or an HNSW graph.
+enum class SubIndex { Flat, Hnsw };
+
+/// IVF_<storage> or IVF_HNSW_<storage>: the storage and the sub-index of an index type.
+bool split_index_type(const std::string& type, Storage& storage, SubIndex& sub) {
+    if (type.rfind("IVF_", 0) != 0) {
+        return false;
+    }
+    const bool hnsw = type.rfind("IVF_HNSW_", 0) == 0;
+    const std::string name = type.substr(hnsw ? 9U : 4U);
+    if (name == "FLAT") {
+        storage = Storage::Flat;
+    } else if (name == "PQ") {
+        storage = Storage::Pq;
+    } else if (name == "SQ") {
+        storage = Storage::Sq;
+    } else {
+        return false;
+    }
+    sub = hnsw ? SubIndex::Hnsw : SubIndex::Flat;
+    return true;
+}
+
 struct IvfIndex {
     std::filesystem::path aux;
-    std::string type;  // "IVF_FLAT" / "IVF_PQ"
+    std::string type;  // "IVF_FLAT", "IVF_HNSW_PQ", ...: split into storage and sub-index
     VectorMetric metric = VectorMetric::L2;
-    bool pq = false;
+    Storage storage = Storage::Flat;
+    SubIndex sub = SubIndex::Flat;
     std::size_t dim = 0;
     std::size_t partitions = 0;
     std::vector<float> centroids;  // partitions * dim
@@ -517,8 +543,7 @@ struct IvfIndex {
     std::size_t code_bytes = 0;   // m, or m / 2 with 4 bits
     bool transposed = true;
     std::vector<float> codebook;    // [m][2^nbits][dim / m]
-    // IVF_HNSW_SQ: 8-bit scalar quantization over [sq_start, sq_end], and the graphs in index.idx.
-    bool hnsw = false;
+    // SQ storage: 8-bit scalar quantization over [sq_start, sq_end]; HNSW: the graphs in index.idx.
     double sq_start = 0;
     double sq_end = 0;
     std::filesystem::path graph;
@@ -535,12 +560,12 @@ struct IvfIndex {
 
     bool partition(std::size_t p, std::shared_ptr<const Partition>& out, std::string& error,
                    CacheCount& count) const;
-    bool load_hnsw_partition(std::size_t p, const FileTable& table, int id_col, int code_col, Partition& part,
-                             std::string& error) const;
+    bool load_sq_rows(const FileTable& table, int id_col, int code_col, Partition& part, std::string& error) const;
+    bool load_graph(std::size_t p, Partition& part, std::string& error) const;
 };
 
-bool IvfIndex::load_hnsw_partition(std::size_t p, const FileTable& table, int id_col, int code_col, Partition& part,
-                                   std::string& error) const {
+bool IvfIndex::load_sq_rows(const FileTable& table, int id_col, int code_col, Partition& part,
+                            std::string& error) const {
     for (const auto& batch : table.batches) {
         BatchView b(table.schema, batch, error);
         if (!b.ok) {
@@ -557,6 +582,10 @@ bool IvfIndex::load_hnsw_partition(std::size_t p, const FileTable& table, int id
             part.codes.insert(part.codes.end(), src, src + dim);
         }
     }
+    return true;
+}
+
+bool IvfIndex::load_graph(std::size_t p, Partition& part, std::string& error) const {
     const std::size_t n = part.ids.size();
     // The graph: index.idx rows of this partition, level by level.
     const HnswMeta& meta = hnsw_meta[p];
@@ -661,7 +690,8 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
     auto part = std::make_shared<Partition>();
     const std::uint64_t n = lengths[p];
     if (n != 0U) {
-        const std::vector<std::string> columns = {"_rowid", pq ? "__pq_code" : (hnsw ? "__sq_code" : "flat")};
+        const std::vector<std::string> columns = {
+            "_rowid", storage == Storage::Pq ? "__pq_code" : (storage == Storage::Sq ? "__sq_code" : "flat")};
         FileTable table;
         if (!read_table(aux, &columns, LanceRowRange{offsets[p], n}, table, error)) {
             return false;
@@ -672,11 +702,11 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
             error = "vector index: auxiliary.idx has no _rowid / " + columns[1] + " column";
             return false;
         }
-        if (hnsw) {
-            if (!load_hnsw_partition(p, table, id_col, value_col, *part, error)) {
+        if (storage == Storage::Sq) {
+            if (!load_sq_rows(table, id_col, value_col, *part, error)) {
                 return false;
             }
-        } else if (!pq) {
+        } else if (storage == Storage::Flat) {
             VectorRows rows;
             rows.dim = dim;
             if (!collect_vectors(table.schema, table.batches, value_col, id_col, rows, error)) {
@@ -722,6 +752,9 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
             error = "vector index: partition " + std::to_string(p) + " is short";
             return false;
         }
+        if (sub == SubIndex::Hnsw && !load_graph(p, *part, error)) {
+            return false;
+        }
     }
     std::lock_guard<std::mutex> lock(mutex);
     out = loaded.emplace(p, std::move(part)).first->second;
@@ -747,12 +780,10 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
         return false;
     }
     index->type = found ? json_value(value, "type") : std::string{};
-    if (index->type != "IVF_FLAT" && index->type != "IVF_PQ" && index->type != "IVF_HNSW_SQ") {
+    if (!split_index_type(index->type, index->storage, index->sub)) {
         error = "vector index type '" + index->type + "' is not supported";
         return false;
     }
-    index->pq = index->type == "IVF_PQ";
-    index->hnsw = index->type == "IVF_HNSW_SQ";
     if (!parse_vector_metric(json_value(value, "distance_type"), index->metric)) {
         error = "vector index: unknown distance type '" + json_value(value, "distance_type") + "'";
         return false;
@@ -801,7 +832,7 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
                 std::to_string(index->dim) + " do not match its centroids and partition table";
         return false;
     }
-    if (index->hnsw) {
+    if (index->storage == Storage::Sq) {
         // {"dim", "num_bits": 8, "bounds": {"start", "end"}}, and per partition {"entry_point",
         // "params", "level_offsets"}; the graph rows of each partition from index.idx's IVF table.
         fts::json::Value sq_list;
@@ -820,6 +851,9 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
         }
         index->sq_start = sq.get("bounds")->get("start")->n;
         index->sq_end = sq.get("bounds")->get("end")->n;
+        index->code_bytes = index->dim;
+    }
+    if (index->sub == SubIndex::Hnsw) {
         index->graph = index_path;
         index->graph_offsets = model.offsets;
         index->graph_lengths = model.lengths;
@@ -861,9 +895,8 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
             }
             index->hnsw_meta.push_back(std::move(m));
         }
-        index->code_bytes = index->dim;
     }
-    if (index->pq) {
+    if (index->storage == Storage::Pq) {
         index->nbits = static_cast<std::uint32_t>(std::strtoul(json_value(storage, "nbits").c_str(), nullptr, 10));
         index->m = static_cast<std::size_t>(std::strtoul(json_value(storage, "num_sub_vectors").c_str(), nullptr, 10));
         index->transposed = json_value(storage, "transposed") != "false";
@@ -1044,8 +1077,10 @@ bool row_addresses(const std::filesystem::path& path, const NearestQuery& q, con
 // ── searching a segment ─────────────────────────────────────────────────────────────────────────
 
 /// PQ distance table for `query` (the residual for L2 / cosine): [m][2^nbits]. Each entry sums its
-/// sub-vector's dimensions in order, as Lance's prepared (transposed) tables do.
-void pq_table(const IvfIndex& index, const float* query, std::vector<float>& table) {
+/// sub-vector's dimensions in order, as Lance's prepared (transposed) tables do. Dot: 1 - dot per
+/// sub-vector, so the exhaustive scan's distance is m - dot; `dot_once` gives the HNSW graphs' 1 - dot
+/// (negated entries; the caller adds the 1 once).
+void pq_table(const IvfIndex& index, const float* query, std::vector<float>& table, bool dot_once = false) {
     const std::size_t nc = std::size_t{1} << index.nbits;
     const std::size_t w = index.dim / index.m;
     table.assign(index.m * nc, 0.0F);
@@ -1068,7 +1103,7 @@ void pq_table(const IvfIndex& index, const float* query, std::vector<float>& tab
         }
         if (dot_metric) {
             for (std::size_t c = 0; c < nc; ++c) {
-                t[c] = 1.0F - t[c];
+                t[c] = dot_once ? -t[c] : 1.0F - t[c];
             }
         }
     }
@@ -1313,10 +1348,47 @@ struct SqDistance {
     }
 };
 
+/// Distances to one partition's float rows (IVF_HNSW_FLAT), as the exhaustive scan computes them.
+struct FloatDistance {
+    const IvfIndex* index = nullptr;
+    const Partition* part = nullptr;
+    const std::vector<float>* key = nullptr;
+    float operator()(std::uint32_t id) const {
+        return distance(index->metric, part->vectors.data() + static_cast<std::size_t>(id) * index->dim, key->data(),
+                        index->dim, 1.0F);
+    }
+};
+
+/// Distances to one partition's PQ codes (IVF_HNSW_PQ): the sum of the query's table entries, in
+/// sub-vector order, as the exhaustive scan sums them. `table` is pq_table's for this partition.
+struct PqDistance {
+    const IvfIndex* index = nullptr;
+    const Partition* part = nullptr;
+    std::vector<float> table;
+    float bias = 0.0F;  // dot: 1
+    float operator()(std::uint32_t id) const {
+        const std::size_t n = part->ids.size();
+        const std::size_t nc = std::size_t{1} << index->nbits;
+        float acc = bias;
+        for (std::size_t s = 0; s < index->m; ++s) {
+            std::size_t c = 0;
+            if (index->nbits == 8U) {
+                c = part->codes[s * n + id];
+            } else {  // two 4-bit codes per byte: sub-vectors 2j (low) and 2j + 1 (high)
+                const std::uint8_t byte = part->codes[(s / 2U) * n + id];
+                c = s % 2U == 0U ? (byte & 0x0FU) : (byte >> 4U);
+            }
+            acc += table[s * nc + c];
+        }
+        return acc;
+    }
+};
+
 /// One partition's HNSW search (lance-index HNSW::search): greedy descent to level 1, a beam of
 /// `ef` at level 0, the best `k`. `accept` filters results (a prefilter, a distance range); null
 /// accepts all.
-std::vector<HnswNode> hnsw_search(const Partition& part, const SqDistance& dist, std::size_t k, std::size_t ef,
+template <typename Dist>
+std::vector<HnswNode> hnsw_search(const Partition& part, const Dist& dist, std::size_t k, std::size_t ef,
                                   const std::function<bool(std::uint32_t, float)>* accept) {
     const std::size_t n = part.ids.size();
     if (n == 0U) {
@@ -1391,7 +1463,8 @@ std::vector<HnswNode> hnsw_search(const Partition& part, const SqDistance& dist,
 }
 
 /// A partition's prefiltered search when few rows pass (under 10%): every passing row, exactly.
-std::vector<HnswNode> hnsw_flat(const Partition& part, const SqDistance& dist, std::size_t k,
+template <typename Dist>
+std::vector<HnswNode> hnsw_flat(const Partition& part, const Dist& dist, std::size_t k,
                                 const std::vector<std::uint32_t>& passing, const NearestQuery& q) {
     const auto by_dist = [](const HnswNode& a, const HnswNode& b) { return dist_less(a.dist, b.dist); };
     RustHeap<HnswNode, decltype(by_dist)> heap(by_dist);
@@ -1439,13 +1512,12 @@ std::size_t late_parallelism(const NearestQuery& q) {
     return q.query_parallelism > 0 ? std::clamp<std::size_t>(static_cast<std::size_t>(q.query_parallelism), 1, pool) : 1U;
 }
 
-/// One IVF_HNSW_SQ partition's best `kk` rows (Lance's HNSW::search): the rows that may come back
-/// (the prefilter: deletions, a filter); all of them -- a plain search; under 10% -- every one of
-/// them, exactly; otherwise the graph search, keeping only those. Out of line, so the IVF_FLAT /
-/// IVF_PQ path around it compiles as before.
-[[gnu::noinline]] bool hnsw_partition(const IvfIndex& index, const Partition& part, const NearestQuery& q,
-                                      const RowMask& mask, const std::vector<float>& key, std::size_t kk,
-                                      std::vector<Candidate>& local, std::string& why) {
+/// One HNSW partition's best `kk` rows (Lance's HNSW::search), with any distance: the rows that may
+/// come back (the prefilter: deletions, a filter); all of them -- a plain search; under 10% -- every
+/// one of them, exactly; otherwise the graph search, keeping only those.
+template <typename Dist>
+bool hnsw_search_partition(const Partition& part, const Dist& dist, const NearestQuery& q, const RowMask& mask,
+                           std::size_t kk, std::vector<Candidate>& local, std::string& why) {
     const std::size_t n = part.ids.size();
     std::vector<std::uint32_t> passing;
     for (std::size_t r = 0; r < n; ++r) {
@@ -1453,7 +1525,6 @@ std::size_t late_parallelism(const NearestQuery& q) {
             passing.push_back(static_cast<std::uint32_t>(r));
         }
     }
-    const SqDistance dist(index, part, key);
     const std::size_t ef = q.ef.value_or(kk + kk / 2U);
     if (ef < kk) {
         why = "ef must be greater than or equal to k";
@@ -1490,6 +1561,33 @@ std::size_t late_parallelism(const NearestQuery& q) {
         }
     }
     return true;
+}
+
+/// One HNSW partition's best `kk` rows, with the distances of its storage: PQ tables on the query
+/// (the residual for L2 / cosine, as the IVF_PQ path), SQ codes, or floats.
+[[gnu::noinline]] bool hnsw_partition(const IvfIndex& index, const Partition& part, std::size_t p,
+                                      const NearestQuery& q, const RowMask& mask, const std::vector<float>& key,
+                                      std::size_t kk, std::vector<Candidate>& local, std::string& why) {
+    if (index.storage == Storage::Pq) {
+        std::vector<float> table;
+        const bool dot = index.metric == VectorMetric::Dot;
+        if (dot) {
+            pq_table(index, key.data(), table, true);
+        } else {
+            std::vector<float> residual(index.dim);
+            const float* c = index.centroids.data() + p * index.dim;
+            for (std::size_t j = 0; j < index.dim; ++j) {
+                residual[j] = key[j] - c[j];
+            }
+            pq_table(index, residual.data(), table);
+        }
+        const PqDistance dist{&index, &part, std::move(table), dot ? 1.0F : 0.0F};
+        return hnsw_search_partition(part, dist, q, mask, kk, local, why);
+    }
+    if (index.storage == Storage::Sq) {
+        return hnsw_search_partition(part, SqDistance(index, part, key), q, mask, kk, local, why);
+    }
+    return hnsw_search_partition(part, FloatDistance{&index, &part, &key}, q, mask, kk, local, why);
 }
 
 /// The best `kk` candidates of one index segment.
@@ -1531,7 +1629,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         mask.has_count ? std::min<std::uint64_t>(q.k, mask.count) : static_cast<std::uint64_t>(q.k);
 
     std::vector<float> dot_table;  // dot: one table for every partition
-    if (index.pq && index.metric == VectorMetric::Dot) {
+    if (index.storage == Storage::Pq && index.metric == VectorMetric::Dot) {
         pq_table(index, key.data(), dot_table);
     }
     // One partition's best `kk` rows the mask and the distance range allow.
@@ -1542,10 +1640,10 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         }
         const std::size_t n = part->ids.size();
         std::vector<float> d;
-        if (index.hnsw) {
-            return hnsw_partition(index, *part, q, mask, key, kk, local, why);
+        if (index.sub == SubIndex::Hnsw) {
+            return hnsw_partition(index, *part, p, q, mask, key, kk, local, why);
         }
-        if (index.pq) {
+        if (index.storage == Storage::Pq) {
             std::vector<float> own;
             if (index.metric != VectorMetric::Dot) {
                 std::vector<float> residual(dim);
@@ -1556,6 +1654,12 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
                 pq_table(index, residual.data(), own);
             }
             pq_distances(index, index.metric == VectorMetric::Dot ? dot_table : own, part->codes, n, kk, d);
+        } else if (index.storage == Storage::Sq) {
+            const SqDistance dist(index, *part, key);
+            d.resize(n);
+            for (std::size_t r = 0; r < n; ++r) {
+                d[r] = dist(static_cast<std::uint32_t>(r));
+            }
         } else {
             d.resize(n);
             for (std::size_t r = 0; r < n; ++r) {
@@ -1592,7 +1696,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
     const bool few = mask.has_count && mask.count <= q.k && found < mask.count;
     if (!few && found < max_results && searched < most) {
         const std::size_t remaining = most - searched;
-        std::size_t pulled = index.hnsw ? std::min(remaining, late_parallelism(q)) : 1U;
+        std::size_t pulled = index.sub == SubIndex::Hnsw ?std::min(remaining, late_parallelism(q)) : 1U;
         for (std::size_t done = 0; done < pulled; ++done) {
             std::vector<Candidate> local;
             if (!score(order[searched + done], local, error)) {
@@ -1839,8 +1943,8 @@ bool index_build::load_vector_model(const std::filesystem::path& dir, VectorMode
     out.partitions = index->partitions;
     out.centroids = index->centroids;
     out.nbits = index->nbits;
-    out.m = index->pq ? index->m : 0U;
-    out.codebook = index->pq ? index->codebook : std::vector<float>{};
+    out.m = index->storage == Storage::Pq ? index->m : 0U;
+    out.codebook = index->storage == Storage::Pq ? index->codebook : std::vector<float>{};
     out.lengths = index->lengths;
     out.sq_start = index->sq_start;
     out.sq_end = index->sq_end;
@@ -1937,7 +2041,7 @@ bool vector_index_details(const std::filesystem::path& index_dir, VectorIndexDet
     }
     out.type = index->type;
     out.metric = vector_metric_name(index->metric);
-    out.pq = index->pq;
+    out.pq = index->storage == Storage::Pq;
     out.num_bits = index->nbits;
     out.num_sub_vectors = index->m;
     return true;
