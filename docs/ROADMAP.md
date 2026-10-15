@@ -46,6 +46,7 @@ was a 30-line fix; a fresh session per phase kept each one inside its context. N
 "finish" session its known facts up front, and say which pytest flags print a summary.
 
 Small items found by delegated sessions, not yet done:
+- An intermittent single failure in the full Python test run (seen twice around test ~2370 / ~367 on 2026-10-15, not reproduced in four reruns, name not captured): run with `-rf` and record it when it shows again.
 - External blob URIs under a registered base path: the descriptor should carry the base id and a
   base-relative URI (pylance's `test_blob_extension_write_fragments_external_registered_base`).
   Found by the multi-base phase C session; touches the external-blob writer, so left to Opus.
