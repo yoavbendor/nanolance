@@ -50,6 +50,28 @@ class Version(TypedDict):
 _MEMORY_ROOT: Optional[str] = None
 
 
+def serialize_row_addrs(row_addrs) -> bytes:
+    """Row addresses (fragment id in the high 32 bits, row offset in the low 32) as the bytes
+    ``row_addr_allowlist`` / ``row_addr_blocklist`` take: Lance's RowAddrTreeMap, a u32 fragment
+    count, then per fragment in ascending order a u32 fragment id, a u32 byte size and the portable
+    roaring bitmap of its row offsets. Byte-identical to pylance's ``serialize_row_addrs``."""
+    import struct
+
+    from nanolance.lance.bitmap import _serialize_roaring
+
+    by_fragment: dict = {}
+    for addr in row_addrs:
+        addr = int(addr)
+        if not 0 <= addr < 1 << 64:
+            raise ValueError(f"row address {addr} is out of range")
+        by_fragment.setdefault(addr >> 32, set()).add(addr & 0xFFFFFFFF)
+    out = bytearray(struct.pack("<I", len(by_fragment)))
+    for fragment in sorted(by_fragment):
+        body = _serialize_roaring(by_fragment[fragment])
+        out += struct.pack("<II", fragment, len(body)) + body
+    return bytes(out)
+
+
 def _memory_root() -> str:
     """Where ``memory://`` datasets live: a directory private to this process, removed at exit --
     what pylance's in-memory object store gives, on the local file system."""

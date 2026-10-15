@@ -73,3 +73,20 @@ Done -- report tails of: `cd build && ctest -j8 | tail -3`; the oracle `-k` runs
 `python3 tools/pylance_suite.py | tail -4` ("all N expected tests passed"); last, once, quiet:
 `cd bindings/python && python3 -m pytest -o addopts= -q -x -p no:cacheprovider tests | tail -3`.
 Report under 40 lines: files, per-item status, tails, decisions, questions.
+
+**Session 1 (2026-10-15):** `serialize_row_addrs` done (byte-identical to pylance;
+`tests/test_row_addr_masks.py`). Stopped at the stop rule on the scan mask. **Reviewer's design for the
+rest of item 1:**
+- In the reader (`src/lance_table_reader.cpp`), a row the mask excludes is dropped exactly like a
+  deleted row: build the fragment's `keep` vector from its deletion file AND the mask (allowlist: only
+  listed offsets; blocklist: listed offsets off), so slicing, compaction and row ids keep working.
+  A fragment with no allowed rows is skipped at planning.
+- With a mask present, offset / limit are applied after the read (`plan.post_range`, as a filter
+  already does): the planning arithmetic over manifest row counts must never see masked rows. That is
+  the one planning change approved; nothing else in the planner changes.
+- KNN and FTS: intersect the existing `RowMask` (vector_search.cpp, fts_search.cpp) with the caller's
+  mask, decoded once in C++ from the bytes (`read_treemap`'s format); the exhaustive / unindexed scans go
+  through the reader and get it there.
+- Oracle: run pylance's tests through `python3 tools/pylance_suite.py -k "row_addr or serialize_row_addrs or allowlist or blocklist"`
+  -- the runner loads nanolance as `lance`; plain `pytest` in `.deps/pylance-tests` tests pylance itself.
+- Add tests to `test_row_addr_masks.py` only as they pass (both engines, same rows).
