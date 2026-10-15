@@ -73,10 +73,16 @@ def _fragment_targets(dataset_uri: str, bases: list, target_bases, target_all_ba
 
 
 class _DatasetBases:
-    """The part of pylance's inner dataset handle (``dataset._ds``) that base paths live on."""
+    """The part of pylance's inner dataset handle (``dataset._ds``) that base paths and the index cache live on."""
 
     def __init__(self, dataset):
         self._dataset = dataset
+
+    def index_cache_hit_rate(self) -> float:
+        """The share of this handle's index partition lookups that the index cache answered (0.0 before any)."""
+        hits = getattr(self._dataset, "_index_cache_hits", 0)
+        misses = getattr(self._dataset, "_index_cache_misses", 0)
+        return hits / (hits + misses) if hits + misses else 0.0
 
     def base_paths(self) -> dict:
         """The dataset's base paths by id, as DatasetBasePath objects."""

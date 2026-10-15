@@ -45,6 +45,8 @@ struct NearestQuery {
     /// exactly, as Lance does.
     std::optional<VectorMetric> metric;
     bool use_index = true;
+    /// Keep loaded indices in the process-wide cache (false: load them afresh for this search).
+    bool index_cache = true;
     /// Only rows with lower_bound <= distance < upper_bound.
     std::optional<float> lower_bound;
     std::optional<float> upper_bound;
@@ -61,10 +63,24 @@ struct NearestQuery {
     std::vector<std::array<std::uint8_t, 16>> segments;
 };
 
+/// What an index's build recorded, as its describe() reports it.
+struct VectorIndexDetails {
+    std::string type;    // IVF_FLAT, IVF_PQ
+    std::string metric;  // as the index was built: "l2", "cosine", "dot"
+    bool pq = false;
+    std::uint32_t num_bits = 0;
+    std::uint64_t num_sub_vectors = 0;
+};
+
+/// The details of the vector index in `index_dir` (dataset/_indices/<uuid>).
+bool vector_index_details(const std::filesystem::path& index_dir, VectorIndexDetails& out, std::string& error);
+
 struct NearestResult {
     std::vector<std::uint64_t> row_ids;  // row addresses, nearest first (ties by row id)
     std::vector<float> distances;
     std::vector<std::string> plan;  // what answered, one line per step
+    std::uint64_t index_cache_hits = 0;    // partitions found loaded
+    std::uint64_t index_cache_misses = 0;  // partitions loaded from the index files
 };
 
 bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQuery& query, NearestResult& out,

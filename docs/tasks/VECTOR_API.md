@@ -63,6 +63,16 @@ Tests: `test_index_with_pq_codebook`, `test_index_with_4bit_numpy_pq_codebook`,
 `test_create_index_progress_callback_error_before_completion_propagates`,
 `test_create_index_accelerator_fallback`, `test_index_with_nans[V3|Legacy]`,
 `test_create_ivf_pq_skip_transpose`.
+Moved here from V1a by the reviewer: `test_describe_index_runtime_hints_stored` (store what pylance
+stores for `max_iters` / `sample_rate` -- build the same index with pylance first and diff its
+manifest IndexMetadata / index files against nanolance's; storing it is approved if it is exactly
+pylance's field) and `test_nested_field_vector_index` (`lance.dataset.VectorIndexReader`:
+`num_partitions()`, `read_partition(id, with_vector=)` -- copy the schema real pylance returns, for
+IVF_FLAT and IVF_PQ, before building it).
+
+**V1a outcome (2026-10-15):** 13 of 15 done (validation, describe, cache stats, utilities); the two
+above moved to V1b. Cache sizes other than 0 are not enforced (0 bypasses the cache); query_parallelism
+and approx_mode are validated in Python only.
 
 Facts: the option refusals are in `bindings/python/nanolance/lance/dataset.py`
 (`grep -n "create_index option" bindings/python/nanolance/lance/dataset.py`). The C++ build already

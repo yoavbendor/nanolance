@@ -14,6 +14,8 @@ import contextlib
 import dataclasses
 import os
 import re
+import uuid
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypedDict, Union
@@ -23,7 +25,7 @@ import pyarrow as pa
 import pyarrow.dataset
 
 from nanolance import _nanolance
-from nanolance.lance._errors import native, unsupported
+from nanolance.lance._errors import NotSupportedError, native, unsupported
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
 from nanolance.lance._transactions import Index, IndexFile, LanceOperation, Transaction
 
@@ -164,6 +166,12 @@ class LanceDataset(pa.dataset.Dataset):
         **kwargs,
     ):
         self._uri = _path_of(uri)
+        if index_cache_size is not None:
+            warnings.warn("index_cache_size is deprecated; use index_cache_size_bytes instead",
+                          DeprecationWarning, stacklevel=2)
+        self._index_cache_bytes = index_cache_size_bytes
+        self._index_cache_hits = 0
+        self._index_cache_misses = 0
         if isinstance(version, str):
             version = _tag_version(self._uri, version, ValueError)
         self._storage_options = storage_options
@@ -227,6 +235,14 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def version(self) -> int:
         return self._version
+
+    def _index_cache_enabled(self) -> bool:
+        # index_cache_size_bytes=0: no index cache for this handle; each search loads its indices afresh.
+        return getattr(self, "_index_cache_bytes", None) != 0
+
+    def _count_index_cache(self, hits: int, misses: int) -> None:
+        self._index_cache_hits = getattr(self, "_index_cache_hits", 0) + hits
+        self._index_cache_misses = getattr(self, "_index_cache_misses", 0) + misses
 
     @property
     def _ds(self) -> "_DatasetBases":
@@ -523,6 +539,7 @@ class LanceDataset(pa.dataset.Dataset):
         disable_scoring_autoprojection: Optional[bool] = None,
         substrait_filter=None,
         blob_handling=None,
+        index_segments=None,
         **kwargs,
     ) -> "LanceScanner":
         options = dict(self._default_scan_options)
@@ -533,6 +550,7 @@ class LanceDataset(pa.dataset.Dataset):
             substrait_filter=substrait_filter, scan_stats_callback=scan_stats_callback, blob_handling=blob_handling,
             use_scalar_index=use_scalar_index, prefilter=prefilter, fast_search=fast_search,
             disable_scoring_autoprojection=disable_scoring_autoprojection, batch_size_bytes=batch_size_bytes,
+            index_segments=index_segments,
         )
         options.update({k: v for k, v in given.items() if v is not None})
         return LanceScanner(self, **options)
@@ -1301,6 +1319,18 @@ class LanceDataset(pa.dataset.Dataset):
     def has_index(self) -> bool:
         return bool(self.list_indices())
 
+    def _index_details(self, index: dict) -> dict:
+        """What a vector index's build recorded (metric, PQ compression); {} for the other index types."""
+        if index["type_url"] != "/lance.index.pb.VectorIndexDetails":
+            return {}
+        with native():
+            built = _nanolance._ds_vector_index_details(os.path.join(self._uri, "_indices", index["uuid"]))
+        details = {"metric_type": {"l2": "L2", "cosine": "Cosine", "dot": "Dot"}[built["metric"]]}
+        if built["pq"]:
+            details["compression"] = {"type": "pq", "num_bits": built["num_bits"],
+                                      "num_sub_vectors": built["num_sub_vectors"]}
+        return details
+
     def describe_indices(self) -> List["IndexDescription"]:
         with native():
             indices = _nanolance._ds_list_indices(self._uri, self._version)
@@ -1314,7 +1344,7 @@ class LanceDataset(pa.dataset.Dataset):
                 name=name, type_url=first["type_url"], index_type=first["type"] if first["type_url"] else "Unknown",
                 fields=list(first["field_ids"]), field_names=list(first["fields"]),
                 num_rows_indexed=sum(s["rows_indexed"] for s in segments),
-                total_size_bytes=sum(s["size_bytes"] for s in segments), details={},
+                total_size_bytes=sum(s["size_bytes"] for s in segments), details=self._index_details(first),
                 segments=[IndexSegmentDescription(
                     uuid=s["uuid"], fragment_ids=set(s["fragment_ids"]), index_version=s["index_version"],
                     dataset_version_at_last_update=s["dataset_version"], size_bytes=s["size_bytes"],
@@ -2145,8 +2175,8 @@ def _fts_query_json(query) -> str:
     return json.dumps(spec)
 
 
-def _nearest_query(ds, nearest) -> dict:
-    """``nearest={...}`` checked as pylance checks it."""
+def _nearest_query(ds, nearest, limit=None) -> dict:
+    """``nearest={...}`` checked as pylance checks it. Without ``k``, the scan's ``limit`` is k."""
     if not isinstance(nearest, dict):
         raise TypeError(f"nearest must be a dict, got {type(nearest)}")
     known = {"column", "q", "k", "metric", "distance_type", "nprobes", "minimum_nprobes", "maximum_nprobes",
@@ -2155,7 +2185,13 @@ def _nearest_query(ds, nearest) -> dict:
     if unknown:
         raise TypeError(f"nearest() got unexpected keyword arguments {sorted(unknown)}")
     column = nearest.get("column")
-    q = _query_vector(nearest.get("q"))
+    try:
+        q = _query_vector(nearest.get("q"))
+    except NotSupportedError:
+        if "query_index" in ds._data_schema.names:
+            raise ValueError("Invalid user input: batch nearest neighbor search cannot be used on datasets "
+                             "with column 'query_index'") from None
+        raise
     node = None
     for i, part in enumerate(str(column).split(".")):
         if i > 0 and not pa.types.is_struct(node.type):
@@ -2177,6 +2213,14 @@ def _nearest_query(ds, nearest) -> dict:
     if len(q) != dim:
         raise ValueError(f"Query vector size {len(q)} does not match index column size {dim}")
     k, nprobes = nearest.get("k"), nearest.get("nprobes")
+    if k is None and limit is not None:
+        k = limit
+    query_parallelism = nearest.get("query_parallelism")
+    if query_parallelism is not None and int(query_parallelism) < -1:
+        raise ValueError(f"query_parallelism must be >= -1 but got {query_parallelism}")
+    approx_mode = nearest.get("approx_mode")
+    if approx_mode is not None and approx_mode not in ("fast", "normal", "accurate"):
+        raise ValueError(f"approx_mode must be one of 'fast', 'normal', or 'accurate', got '{approx_mode}'")
     minimum, maximum = nearest.get("minimum_nprobes"), nearest.get("maximum_nprobes")
     refine = nearest.get("refine_factor")
     if k is not None and int(k) <= 0:
@@ -2754,7 +2798,7 @@ class LanceScanner(pa.dataset.Scanner):
                  batch_size=None, fragments=None, full_text_query=None, with_row_id=False, with_row_address=False,
                  include_deleted_rows=None, order_by=None, substrait_filter=None, scan_stats_callback=None,
                  blob_handling=None, use_scalar_index=None, prefilter=None, fast_search=None,
-                 disable_scoring_autoprojection=None, batch_size_bytes=None, **ignored):
+                 disable_scoring_autoprojection=None, batch_size_bytes=None, index_segments=None, **ignored):
         self._args = {k: v for k, v in locals().items() if k not in ("self", "ds", "ignored", "__class__")}
         self._args.update(ignored)
         # order_by: the scan without limit and offset (and with the sort columns), sorted, then sliced.
@@ -2772,7 +2816,12 @@ class LanceScanner(pa.dataset.Scanner):
         # With a projection, `_distance` / `_score` come back only where named (Lance's
         # disable_scoring_autoprojection); otherwise after the named columns.
         self._no_score_autoprojection = bool(disable_scoring_autoprojection) and columns is not None
-        self._nearest = None if nearest is None else _nearest_query(ds, nearest)
+        self._nearest = None if nearest is None else _nearest_query(ds, nearest, limit)
+        # with_index_segments: search these index segments (by UUID) of the vector index and nothing else.
+        self._index_segments = [uuid.UUID(str(s)).bytes for s in index_segments or []]
+        if self._nearest is not None and fragments is not None and not prefilter:
+            # A fragment scan of an ANN search needs its filter applied before the search.
+            raise ValueError("This operation is not supported for fragment scan")
         self._prefilter = bool(prefilter)
         self._fast_search = bool(fast_search)
         self._fts = None if full_text_query is None else _fts_query_json(full_text_query)
@@ -3041,10 +3090,13 @@ class LanceScanner(pa.dataset.Scanner):
     def _search(self):
         n = self._nearest
         with native():
-            return _nanolance._ds_nearest(
+            ids, distances, plan, hits, misses = _nanolance._ds_nearest(
                 self._ds.uri, self._ds.version, n["column"], n["q"], n["k"], n["minimum_nprobes"],
                 n["maximum_nprobes"], n["refine_factor"], n["metric"], n["use_index"], n["lower_bound"],
-                n["upper_bound"], self._filter, self._prefilter, self._fast_search, n.get("ef"))
+                n["upper_bound"], self._filter, self._prefilter, self._fast_search, n.get("ef"),
+                self._ds._index_cache_enabled(), self._index_segments)
+        self._ds._count_index_cache(hits, misses)
+        return ids, distances, plan
 
     def _nearest_table(self) -> pa.Table:
         """The k nearest rows: the columns asked for, then ``_distance`` (then the row id columns)."""
@@ -3843,7 +3895,8 @@ def dataset(
             raise ValueError(f"no version of {uri} at or before {asof}")
         return LanceDataset(uri, version=candidates[-1]["version"])
     return LanceDataset(uri, version=version, default_scan_options=default_scan_options,
-                        storage_options=storage_options)
+                        storage_options=storage_options, index_cache_size=index_cache_size,
+                        index_cache_size_bytes=index_cache_size_bytes)
 
 
 def __getattr__(name: str):

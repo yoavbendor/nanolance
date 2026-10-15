@@ -31,6 +31,7 @@
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -494,6 +495,12 @@ struct HnswMeta {
     std::vector<std::uint64_t> level_offsets;
 };
 
+/// Partition lookups in the index cache during one search: a hit found the partition loaded.
+struct CacheCount {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+};
+
 struct IvfIndex {
     std::filesystem::path aux;
     std::string type;  // "IVF_FLAT" / "IVF_PQ"
@@ -525,7 +532,8 @@ struct IvfIndex {
     mutable std::mutex mutex;
     mutable std::unordered_map<std::size_t, std::shared_ptr<const Partition>> loaded;
 
-    bool partition(std::size_t p, std::shared_ptr<const Partition>& out, std::string& error) const;
+    bool partition(std::size_t p, std::shared_ptr<const Partition>& out, std::string& error,
+                   CacheCount& count) const;
     bool load_hnsw_partition(std::size_t p, const FileTable& table, int id_col, int code_col, Partition& part,
                              std::string& error) const;
 };
@@ -637,15 +645,18 @@ bool IvfIndex::load_hnsw_partition(std::size_t p, const FileTable& table, int id
     return true;
 }
 
-bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, std::string& error) const {
+bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, std::string& error,
+                         CacheCount& count) const {
     {
         std::lock_guard<std::mutex> lock(mutex);
         const auto it = loaded.find(p);
         if (it != loaded.end()) {
+            count.hits++;
             out = it->second;
             return true;
         }
     }
+    count.misses++;
     auto part = std::make_shared<Partition>();
     const std::uint64_t n = lengths[p];
     if (n != 0U) {
@@ -716,12 +727,13 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
     return true;
 }
 
-bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>& out, std::string& error) {
+bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>& out, std::string& error,
+              bool use_cache = true) {
     static IndexCache<IvfIndex> cache;
     const auto index_path = dir / "index.idx";
     const auto aux_path = dir / "auxiliary.idx";
     const auto key = file_key(index_path) + "|" + file_key(aux_path);
-    if ((out = cache.find(key)) != nullptr) {
+    if (use_cache && (out = cache.find(key)) != nullptr) {
         return true;
     }
     auto index = std::make_shared<IvfIndex>();
@@ -887,7 +899,9 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
         }
     }
     out = index;
-    cache.put(key, out);
+    if (use_cache) {
+        cache.put(key, out);
+    }
     return true;
 }
 
@@ -1479,7 +1493,8 @@ std::size_t late_parallelism(const NearestQuery& q) {
 
 /// The best `kk` candidates of one index segment.
 bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_column, const RowMask& mask,
-                    std::size_t kk, std::vector<Candidate>& out, std::string& plan, std::string& error) {
+                    std::size_t kk, std::vector<Candidate>& out, std::string& plan, std::string& error,
+                    CacheCount& count) {
     if (q.key.size() != index.dim) {
         error = "Query vector size " + std::to_string(q.key.size()) + " does not match index column size " +
                 std::to_string(index.dim);
@@ -1521,7 +1536,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
     // One partition's best `kk` rows the mask and the distance range allow.
     const auto score = [&](std::size_t p, std::vector<Candidate>& local, std::string& why) {
         std::shared_ptr<const Partition> part;
-        if (!index.partition(p, part, why)) {
+        if (!index.partition(p, part, why, count)) {
             return false;
         }
         const std::size_t n = part->ids.size();
@@ -1608,7 +1623,9 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
     }
     keep_best(out, kk);
     plan = "ANNIvfPartition: nprobes=" + std::to_string(searched) + " of " + std::to_string(P) +
-           " (minimum " + std::to_string(first) + ")";
+           " (minimum " + std::to_string(first) + ") minimum_nprobes=" + std::to_string(q.minimum_nprobes) +
+           " maximum_nprobes=" +
+           (q.maximum_nprobes ? "Some(" + std::to_string(*q.maximum_nprobes) + ")" : std::string("None"));
     return true;
 }
 
@@ -1879,6 +1896,19 @@ std::string vector_index_type(const std::vector<std::uint8_t>& details) {
     return std::string(hnsw ? "IVF_HNSW_" : "IVF_") + compression;
 }
 
+bool vector_index_details(const std::filesystem::path& index_dir, VectorIndexDetails& out, std::string& error) {
+    std::shared_ptr<const IvfIndex> index;
+    if (!load_ivf(index_dir, index, error)) {
+        return false;
+    }
+    out.type = index->type;
+    out.metric = vector_metric_name(index->metric);
+    out.pq = index->pq;
+    out.num_bits = index->nbits;
+    out.num_sub_vectors = index->m;
+    return true;
+}
+
 bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQuery& q, NearestResult& out,
                      std::string& error) {
     out = NearestResult{};
@@ -2007,7 +2037,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             }
             std::shared_ptr<const IvfIndex> index;
             std::string why;
-            if (!load_ivf(dataset_path / "_indices" / pb::uuid_string(s->uuid), index, why)) {
+            if (!load_ivf(dataset_path / "_indices" / pb::uuid_string(s->uuid), index, why, q.index_cache)) {
                 not_used = why;
             } else if (q.metric && *q.metric != index->metric) {
                 if (chosen) {
@@ -2053,6 +2083,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         const std::size_t kk = static_cast<std::size_t>(q.k) * std::max<std::size_t>(refine, 1U);
         std::set<std::uint32_t> covered;
         std::vector<Candidate> ann;
+        CacheCount counts;
         out.plan.push_back("ANNSubIndex: name=" + index_name + ", k=" + std::to_string(q.k) + ", deltas=" +
                            std::to_string(loaded.size()) + ", metric=" + vector_metric_name(metric) + " (" +
                            loaded.front()->type + ")");
@@ -2095,11 +2126,13 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             }
             mask.seal();
             std::string line;
-            if (!search_segment(*loaded[s], q, f32_column, mask, kk, ann, line, error)) {
+            if (!search_segment(*loaded[s], q, f32_column, mask, kk, ann, line, error, counts)) {
                 return false;
             }
             out.plan.push_back("  " + line);
         }
+        out.index_cache_hits = counts.hits.load();
+        out.index_cache_misses = counts.misses.load();
         if (resolver.stable()) {  // from here on the candidates are addresses, as the exact search's are
             for (auto& hit : ann) {
                 resolver.find(hit.id, hit.id);

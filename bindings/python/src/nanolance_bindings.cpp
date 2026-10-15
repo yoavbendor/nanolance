@@ -1858,9 +1858,13 @@ NB_MODULE(_nanolance, m) {
                             std::optional<std::uint32_t> refine_factor, std::optional<std::string> metric,
                             bool use_index, std::optional<float> lower_bound, std::optional<float> upper_bound,
                             std::optional<std::string> filter, bool prefilter, bool fast_search,
-                            std::optional<std::uint32_t> ef) {
+                            std::optional<std::uint32_t> ef, bool index_cache, const std::vector<nb::bytes>& segments) {
         nano_lance::NearestQuery q;
         q.ef = ef;
+        q.index_cache = index_cache;
+        for (const auto& s : segments) {
+            q.segments.push_back(uuid_of(s));
+        }
         q.has_version = version.has_value();
         q.version = version.value_or(0);
         q.column = column;
@@ -1884,7 +1888,19 @@ NB_MODULE(_nanolance, m) {
         q.fast_search = fast_search;
         nano_lance::NearestResult result;
         run_op([&](std::string& e) { return nano_lance::dataset_nearest(path, q, result, e); });
-        return std::make_tuple(result.row_ids, result.distances, result.plan);
+        return std::make_tuple(result.row_ids, result.distances, result.plan, result.index_cache_hits,
+                               result.index_cache_misses);
+    });
+    m.def("_ds_vector_index_details", [](const std::filesystem::path& index_dir) {
+        nano_lance::VectorIndexDetails d;
+        run_op([&](std::string& e) { return nano_lance::vector_index_details(index_dir, d, e); });
+        nb::dict out;
+        out["type"] = d.type;
+        out["metric"] = d.metric;
+        out["pq"] = d.pq;
+        out["num_bits"] = d.num_bits;
+        out["num_sub_vectors"] = d.num_sub_vectors;
+        return out;
     });
     m.def("_ds_full_text_search", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
                                      const std::string& query, std::optional<std::uint64_t> limit,
