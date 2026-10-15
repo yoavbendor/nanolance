@@ -200,3 +200,119 @@ def test_drop_index_of_missing_name_raises_runtime_error_as_pylance(tmp_path):
         ds = engine.write_dataset(pa.table({"a": [1, 2]}), str(tmp_path / engine.__name__))
         with pytest.raises(RuntimeError, match="index not found"):
             ds.drop_index("nonexistent_name")
+
+
+# ── N1b: maintenance and distributed builds ──────────────────────────────────────────────────────────
+
+T2 = ["apple tart", None, "x y z", "Straße ÆØ ß", "apple"]
+T3 = ["ÉCOLE again", "banana split", ""]
+
+# Each scenario: (op, argument). Rows are ids 0..14 (VALUES), then the inserted rows in order.
+SCENARIOS = {
+    "append_optimized": [("insert", T2), ("optimize", {})],
+    "delta_then_merge": [("insert", T2), ("optimize", {"num_indices_to_merge": 0}), ("insert", T3),
+                         ("optimize", {})],
+    "delete_optimized": [("delete", "id = 2 OR id = 6"), ("optimize", {})],
+    "append_delete_merge": [("insert", T2), ("optimize", {"num_indices_to_merge": 0}), ("delete", "id = 3"),
+                            ("optimize", {"num_indices_to_merge": 2})],
+    "merge_without_new_rows": [("insert", T2), ("optimize", {"num_indices_to_merge": 0}),
+                               ("optimize", {"num_indices_to_merge": 2})],
+}
+
+
+def _run(module, path, steps, indexed=True, stable=False):
+    """VALUES written to `path` (4 rows per fragment), an NGRAM index on `w` built by `module`, then the
+    steps: inserts, deletes, optimize_indices. Returns the dataset."""
+    shutil.rmtree(path, ignore_errors=True)
+    module.write_dataset(_table(), path, max_rows_per_file=4, enable_stable_row_ids=stable or None)
+    if indexed:
+        module.dataset(path).create_scalar_index("w", index_type="NGRAM", name="w_idx")
+    next_id = len(VALUES)
+    for op, arg in steps:
+        ds = module.dataset(path)
+        if op == "insert":
+            ds.insert(pa.table({"w": pa.array(arg, pa.string()),
+                                "id": pa.array(range(next_id, next_id + len(arg)), pa.int64())}))
+            next_id += len(arg)
+        elif op == "delete":
+            ds.delete(arg)
+        else:
+            ds.optimize.optimize_indices(**arg)
+    return module.dataset(path)
+
+
+def _segment_postings(path):
+    """Each segment's token rows (token, posting bytes), sorted: the segments' order is their UUIDs'."""
+    from lance.file import LanceFileReader
+
+    segments = []
+    for file in glob.glob(os.path.join(path, "_indices", "*", "ngram_postings.lance")):
+        table = LanceFileReader(file).read_all().to_table()
+        segments.append(sorted(zip(table.column("tokens").to_pylist(), table.column("posting_list").to_pylist())))
+    return sorted(segments)
+
+
+def _state(module, path):
+    """What describe_indices and stats say, and the posting rows on disk, for the index on `w`."""
+    ds = module.dataset(path)
+    described = [(i.name, i.index_type, len(i.segments)) for i in ds.describe_indices()]
+    stats = {k: v for k, v in ds.stats.index_stats("w_idx").items() if k != "updated_at_timestamp_ms"}
+    return described, stats, _segment_postings(path)
+
+
+@pytest.mark.parametrize("stable", [False, True], ids=["addresses", "stable_row_ids"])
+@pytest.mark.parametrize("scenario", list(SCENARIOS))
+def test_optimize_matches_pylance_and_scan(lance, tmp_path, scenario, stable):
+    states, paths = {}, {}
+    for engine, module in (("pylance", lance), ("nanolance", nl)):
+        paths[engine] = _fresh(tmp_path, f"{scenario}_{engine}.lance")
+        _run(module, paths[engine], SCENARIOS[scenario], stable=stable)
+        states[engine] = _state(module, paths[engine])
+    scan = _run(nl, _fresh(tmp_path, f"{scenario}_scan.lance"), SCENARIOS[scenario], indexed=False, stable=stable)
+    if not stable:
+        # Under stable row ids nanolance rebuilds the segment over the live rows (the row ids are not
+        # addresses, so the old postings cannot be kept as Lance keeps them): only the answers are compared.
+        assert states["nanolance"] == states["pylance"]
+    for engine in paths:
+        for module in (lance, nl):
+            ds = module.dataset(paths[engine])
+            for needle in NEEDLES:
+                f = f"contains(w, '{needle}')"
+                assert ds.count_rows(f) == scan.count_rows(f), (engine, needle)
+
+
+def test_search_after_compaction_equals_scan(lance, tmp_path):
+    """Compaction rewrites rows to new addresses: each engine's index still answers as a scan does. (The
+    coverage it leaves differs from pylance's, which remaps the postings instead of re-covering: not compared.)"""
+    for module, name in ((lance, "pylance"), (nl, "nanolance")):
+        path = _fresh(tmp_path, f"compact_{name}.lance")
+        ds = _run(module, path, [("insert", T2)])
+        ds.optimize.compact_files(target_rows_per_fragment=100)
+        scan = _run(nl, _fresh(tmp_path, f"compact_scan_{name}.lance"), [("insert", T2)], indexed=False)
+        for reader in (lance, nl):
+            indexed = reader.dataset(path)
+            for needle in NEEDLES:
+                f = f"contains(w, '{needle}')"
+                assert indexed.count_rows(f) == scan.count_rows(f), (name, needle)
+
+
+def test_distributed_segments_merge_and_commit_match_pylance(lance, tmp_path):
+    states, paths = {}, {}
+    for engine, module in (("pylance", lance), ("nanolance", nl)):
+        path = _fresh(tmp_path, f"dist_{engine}.lance")
+        ds = module.write_dataset(_table(), path, max_rows_per_file=4)
+        segments = [
+            ds.create_index_uncommitted(column="w", index_type="NGRAM", name="w_idx", fragment_ids=[f.fragment_id])
+            for f in ds.get_fragments()
+        ]
+        ds.commit_existing_index_segments("w_idx", "w", [ds.merge_existing_index_segments(segments)])
+        paths[engine] = path
+        states[engine] = _state(module, path)
+    assert states["nanolance"] == states["pylance"]
+    scan = _run(nl, _fresh(tmp_path, "dist_scan.lance"), [], indexed=False)
+    for engine in paths:
+        for module in (lance, nl):
+            ds = module.dataset(paths[engine])
+            for needle in NEEDLES:
+                f = f"contains(w, '{needle}')"
+                assert ds.count_rows(f) == scan.count_rows(f), (engine, needle)

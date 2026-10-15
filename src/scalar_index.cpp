@@ -728,9 +728,14 @@ bool write_bitmap(const std::filesystem::path& dir, const ArrowSchema& type, con
 /// ngram_postings.lance (ngram.rs): one row per distinct trigram token, ascending, with the rows holding
 /// it as a RoaringTreemap of row ids. Token 0 holds the null rows; a value's trigrams are its
 /// lower-cased, ASCII-folded text's (fts::ngram_tokens). `posting_list` is uncompressed, as Lance's own.
-bool write_ngram(const std::filesystem::path& dir, const Items& items, std::vector<WrittenFile>& files,
-                 std::string& error) {
+bool write_ngram(const std::filesystem::path& dir, const Items& items, const index_build::NGramPostings* base,
+                 std::vector<WrittenFile>& files, std::string& error) {
     std::map<std::uint32_t, std::vector<std::uint64_t>> postings;
+    if (base != nullptr) {
+        for (const auto& [token, ids] : *base) {
+            postings[token].insert(postings[token].end(), ids.begin(), ids.end());
+        }
+    }
     for (std::size_t k = 0; k < items.size(); ++k) {
         if (items.is_null(k)) {
             postings[0].push_back(items.addr[k]);
@@ -1349,7 +1354,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         details = "/lance.table.ZoneMapIndexDetails";
         break;
     case ScalarIndexType::NGram:
-        written = write_ngram(dir, items, files, error);
+        written = write_ngram(dir, items, target != nullptr ? target->postings : nullptr, files, error);
         details = "/lance.table.NGramIndexDetails";
         break;
     case ScalarIndexType::BloomFilter:
@@ -1418,6 +1423,53 @@ bool index_build::build_scalar_segment(const std::filesystem::path& dataset_path
                                        const SegmentTarget& target, std::string& error) {
     std::uint64_t unused = 0;
     return create_scalar_index(dataset_path, column, type, options, &target, unused, error);
+}
+
+bool index_build::load_ngram_postings(const std::filesystem::path& dir, NGramPostings& out, std::string& error) {
+    out.clear();
+    index_files::FileTable table;
+    const std::vector<std::string> columns = {"tokens", "posting_list"};
+    if (!index_files::read_table(dir / "ngram_postings.lance", &columns, LanceRowRange{}, table, error)) {
+        return false;
+    }
+    if (table.schema.n_children != 2) {
+        error = "ngram index: ngram_postings.lance has no tokens and posting_list columns";
+        return false;
+    }
+    for (const auto& batch : table.batches) {
+        ArrowArrayView tokens;
+        ArrowArrayView lists;
+        ArrowError e{};
+        if (ArrowArrayViewInitFromSchema(&tokens, &table.type(0), &e) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&tokens, batch.children[0], &e) != NANOARROW_OK ||
+            ArrowArrayViewInitFromSchema(&lists, &table.type(1), &e) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&lists, batch.children[1], &e) != NANOARROW_OK) {
+            ArrowArrayViewReset(&tokens);
+            ArrowArrayViewReset(&lists);
+            error = std::string("ngram index: ") + e.message;
+            return false;
+        }
+        bool ok = true;
+        for (std::int64_t r = 0; ok && r < batch.length; ++r) {
+            if (ArrowArrayViewIsNull(&tokens, r) || ArrowArrayViewIsNull(&lists, r)) {
+                continue;
+            }
+            const auto token = static_cast<std::uint32_t>(ArrowArrayViewGetUIntUnsafe(&tokens, r));
+            const auto bytes = ArrowArrayViewGetBytesUnsafe(&lists, r);
+            std::vector<std::uint64_t> ids;
+            ok = roaring::decode_treemap(bytes.data.as_uint8, static_cast<std::size_t>(bytes.size_bytes), ids, error);
+            if (ok) {
+                auto& to = out[token];
+                to.insert(to.end(), ids.begin(), ids.end());
+            }
+        }
+        ArrowArrayViewReset(&tokens);
+        ArrowArrayViewReset(&lists);
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,

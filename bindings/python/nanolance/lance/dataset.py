@@ -991,7 +991,7 @@ class LanceDataset(pa.dataset.Dataset):
         kind = str(index_type).upper()
         if kind == "FTS":
             kind = "INVERTED"
-        if fragment_ids is not None and kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER"):
+        if fragment_ids is not None and kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER", "NGRAM"):
             raise ValueError(f"{kind} distributed indexing uses create_index_uncommitted(..., "
                              f'index_type="{kind}", fragment_ids=...)')
         uuid_bytes = _parse_index_uuid(index_uuid)
@@ -1223,7 +1223,7 @@ class LanceDataset(pa.dataset.Dataset):
             path = _resolve_path(self._data_schema, column)
             if path is not None:
                 column = ".".join(path)
-        scalar = kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER", "INVERTED")
+        scalar = kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER", "NGRAM", "INVERTED")
         if scalar and fragment_ids is None:
             raise ValueError("create_index_uncommitted requires fragment_ids for distributed index build")
         if not scalar and kind not in self._VECTOR_INDEX_TYPES:

@@ -212,13 +212,26 @@ def test_compaction_keeps_indexes(lance, tmp_path):
     assert all(i % 11 for i in a.column("id").to_pylist()) and a.num_rows > 0
 
 
-def test_index_kind_it_cannot_build(lance, tmp_path):
+def test_optimize_with_ngram_and_btree(lance, tmp_path):
+    # NGRAM is maintained by nanolance (N1b): the appended rows are folded into it, as pylance folds them.
     path = str(tmp_path / "h.lance")
     lance.write_dataset(_table(2_000), path)
     lance.dataset(path).create_scalar_index("id", "BTREE")
     lance.dataset(path).create_scalar_index("text", "NGRAM", name="ng")
     nl.write_dataset(_table(100, start=2_000), path, mode="append")
-    with pytest.raises(Exception, match="cannot"):
-        nl.dataset(path).optimize.optimize_indices()
+    nl.dataset(path).optimize.optimize_indices()
+    assert lance.dataset(path).stats.index_stats("ng")["num_unindexed_rows"] == 0
     nl.dataset(path).optimize.optimize_indices(index_names=["id_idx"])
     assert lance.dataset(path).stats.index_stats("id_idx")["num_unindexed_rows"] == 0
+
+
+def test_index_kind_it_cannot_build(lance, tmp_path):
+    # IVF_RQ (RaBitQ) is a kind nanolance does not build yet: optimizing it is refused, not done wrong.
+    path = str(tmp_path / "rq.lance")
+    v = np.random.default_rng(0).standard_normal((512, 16)).astype(np.float32)
+    table = pa.table({"id": range(512), "v": pa.FixedSizeListArray.from_arrays(pa.array(v.ravel()), 16)})
+    lance.write_dataset(table, path)
+    lance.dataset(path).create_index("v", index_type="IVF_RQ", num_partitions=2)
+    nl.write_dataset(table, path, mode="append")
+    with pytest.raises(Exception, match="not supported"):
+        nl.dataset(path).optimize.optimize_indices()

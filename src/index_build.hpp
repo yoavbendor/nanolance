@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -78,6 +79,12 @@ bool load_inverted_rows(const std::filesystem::path& dir, std::vector<std::uint6
 /// Where a segment is built: on `manifest` (version `version`), over `fragments` (every fragment of
 /// the version when null). The segment's files are written under _indices/<uuid>/ and its manifest
 /// entry is returned in `out`; nothing is committed.
+/// An NGRAM index's posting lists: token -> the row ids holding it (as stored, sorted when merged).
+using NGramPostings = std::map<std::uint32_t, std::vector<std::uint64_t>>;
+
+/// The posting lists of the ngram_postings.lance in `dir`.
+bool load_ngram_postings(const std::filesystem::path& dir, NGramPostings& out, std::string& error);
+
 struct SegmentTarget {
     const pb::Manifest* manifest = nullptr;
     std::uint64_t version = 0;
@@ -88,6 +95,8 @@ struct SegmentTarget {
     /// An INVERTED index: these rows too, by address, deleted or not -- an old segment's documents,
     /// which Lance keeps (and counts in its statistics) when it merges new rows into the segment.
     const std::vector<std::uint64_t>* rows = nullptr;
+    /// An NGRAM index: these posting lists (an old segment's, already filtered) merged with the new rows'.
+    const NGramPostings* postings = nullptr;
     /// A vector index: this model instead of training one (its type, metric, PQ settings win).
     const VectorModel* model = nullptr;
     /// A vector index with `model`: adjust its partitions to this target size as Lance does when it

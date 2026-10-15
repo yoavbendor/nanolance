@@ -142,3 +142,11 @@ Reviewer: `drop_index` of a missing name now raises pylance's `RuntimeError("Lan
 name=...")`. +5 pylance tests (1050). **N1b** next: `test_optimize_no_new_data`,
 `test_create_index_empty_dataset` (both reach `optimize_indices` on NGRAM),
 `test_optimize_indices_second_call_is_noop`, `test_ngram_segment_merge_and_commit_from_python`.
+
+**N1b outcome (2026-10-15):** done. NGRAM `optimize_indices` (merge by default, a delta with
+`num_indices_to_merge=0`; replaced segments' postings kept, deleted rows included, as Lance's
+`open_and_merge_segments`), compaction re-cover, distributed segments; describe / stats / posting rows
+equal pylance's after the same steps, with and without stable row ids. Reviewer: after compaction
+nanolance re-indexes the rewritten fragments for every kind while pylance remaps and leaves them
+unindexed -- the documented divergence stands (answers equal a scan either way); the "kind nanolance
+cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance tests (1054). N2 next.

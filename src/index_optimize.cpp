@@ -18,6 +18,7 @@
 #include "lance_minimal.pb.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <map>
 #include <set>
 #include <system_error>
@@ -54,7 +55,7 @@ std::filesystem::path segment_dir(const std::filesystem::path& dataset_path, con
     return dataset_path / "_indices" / pb::uuid_string(index.uuid);
 }
 
-enum class Kind { BTree, Bitmap, LabelList, ZoneMap, BloomFilter, Inverted, Vector, Other };
+enum class Kind { BTree, Bitmap, LabelList, ZoneMap, BloomFilter, NGram, Inverted, Vector, Other };
 
 Kind kind_of(const std::filesystem::path& dataset_path, const pb::IndexMetadata& index) {
     const auto& url = index.details_type_url;
@@ -72,6 +73,9 @@ Kind kind_of(const std::filesystem::path& dataset_path, const pb::IndexMetadata&
     }
     if (ends_with(url, "BloomFilterIndexDetails")) {
         return Kind::BloomFilter;
+    }
+    if (ends_with(url, "NGramIndexDetails")) {
+        return Kind::NGram;
     }
     if (ends_with(url, "InvertedIndexDetails")) {
         return Kind::Inverted;
@@ -251,6 +255,41 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
     where.fragments = &fragments;
     where.out = &out;
     switch (kind) {
+    case Kind::NGram: {
+        // As Lance merges new rows into a segment (ngram.rs open_and_merge_segments): the replaced
+        // segments' postings of the live fragments stay, deleted rows included (they are masked when
+        // read and leave with a rebuild), and only the uncovered fragments are scanned. Under stable row
+        // ids a row id is not an address, so the segment is rebuilt over the live fragments instead.
+        ScalarIndexOptions o;
+        o.name = last.name;
+        index_build::NGramPostings base;
+        if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) == 0U) {
+            for (const auto* s : replaced) {
+                index_build::NGramPostings part;
+                if (!index_build::load_ngram_postings(segment_dir(dataset_path, *s), part, error)) {
+                    error = "index '" + last.name + "': " + error;
+                    return false;
+                }
+                for (const auto& [token, ids] : part) {
+                    for (const auto r : ids) {
+                        if (live.count(r >> 32U) != 0U) {
+                            base[token].push_back(r);
+                        }
+                    }
+                }
+            }
+            for (auto it = base.begin(); it != base.end();) {
+                it = it->second.empty() ? base.erase(it) : std::next(it);
+            }
+            where.postings = &base;
+            where.fragments = &unindexed;
+            where.coverage = &fragments;
+        }
+        if (!index_build::build_scalar_segment(dataset_path, column, ScalarIndexType::NGram, o, where, error)) {
+            return false;
+        }
+        break;
+    }
     case Kind::BTree:
     case Kind::Bitmap:
     case Kind::LabelList:
