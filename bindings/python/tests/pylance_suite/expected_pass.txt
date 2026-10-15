@@ -924,8 +924,12 @@ tests/test_vector_index.py::test_commit_existing_index_segments_accepts_index_me
 tests/test_vector_index.py::test_commit_existing_index_segments_accepts_uncommitted_vector_segments
 tests/test_vector_index.py::test_create_4bit_ivf_pq_index
 tests/test_vector_index.py::test_create_dot_index
+tests/test_vector_index.py::test_create_index_accelerator_fallback
 tests/test_vector_index.py::test_create_index_dot
+tests/test_vector_index.py::test_create_index_progress_callback_error_before_completion_propagates
+tests/test_vector_index.py::test_create_ivf_pq_skip_transpose
 tests/test_vector_index.py::test_create_ivf_pq_with_target_partition_size
+tests/test_vector_index.py::test_describe_index_runtime_hints_stored
 tests/test_vector_index.py::test_describe_indices
 tests/test_vector_index.py::test_describe_vector_index
 tests/test_vector_index.py::test_distributed_ivf_pq_order_invariance
@@ -945,6 +949,10 @@ tests/test_vector_index.py::test_index_cache_size
 tests/test_vector_index.py::test_index_cache_size_bytes
 tests/test_vector_index.py::test_index_cache_size_deprecation
 tests/test_vector_index.py::test_index_size_stats
+tests/test_vector_index.py::test_index_with_4bit_numpy_pq_codebook
+tests/test_vector_index.py::test_index_with_nans[V3]
+tests/test_vector_index.py::test_index_with_pq_codebook
+tests/test_vector_index.py::test_index_with_pq_codebook_rejects_wrong_num_bits_shape
 tests/test_vector_index.py::test_invalid_subvectors
 tests/test_vector_index.py::test_knn_deleted_rows
 tests/test_vector_index.py::test_knn_with_deletions
@@ -955,6 +963,10 @@ tests/test_vector_index.py::test_optimize_index
 tests/test_vector_index.py::test_optimize_index_cosine
 tests/test_vector_index.py::test_optimize_index_recall
 tests/test_vector_index.py::test_optimize_indices
+tests/test_vector_index.py::test_pre_populated_ivf_centroids
+tests/test_vector_index.py::test_retrain_indices[False]
+tests/test_vector_index.py::test_retrain_indices[None]
+tests/test_vector_index.py::test_retrain_indices[True]
 tests/test_vector_index.py::test_rowid_order
 tests/test_vector_index.py::test_scanner_rejects_unknown_index_segments
 tests/test_vector_index.py::test_segment_ownership_filter_precedes_partition_topk[False]

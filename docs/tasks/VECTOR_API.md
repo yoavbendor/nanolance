@@ -95,3 +95,10 @@ progress (`index_build::Progress` in C++, `progress=` in Python) -- copy that fo
 
 Report (under 40 lines): files changed; status per test; the tails; decisions not covered here;
 questions.
+
+**V1b outcome (2026-10-15):** 12 of 15. `create_index(ivf_centroids=, pq_codebook=, skip_transpose=,
+progress_callback=, accelerator=, index_file_version="V3")`, runtime hints in `describe_indices`;
+default index bytes unchanged (checked on 5 configurations). Reviewer's calls on the rest: Legacy index
+file version -- out of scope; Lance's progress stage order (quantizer trained before the shuffle) --
+declined, it would change how the PQ codebook is trained; `VectorIndexReader` -- its own small task.
+Found: the HNSW `index.idx` differs between runs of the same build (pre-existing; logged in ROADMAP).

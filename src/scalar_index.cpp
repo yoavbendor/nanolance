@@ -1037,6 +1037,7 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
         info.dataset_version = index.dataset_version;
         info.index_version = index.index_version;
         info.type_url = index.details_type_url;
+        info.details_value = index.details_value;
         info.field_ids = index.fields;
         info.created_at = index.created_at;
         for (const auto& f : index.files) {

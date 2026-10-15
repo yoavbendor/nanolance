@@ -53,6 +53,7 @@ struct IndexInfo {
     std::uint64_t dataset_version = 0;
     std::uint32_t index_version = 0;
     std::string type_url;              // the index details' type, e.g. "/lance.table.BTreeIndexDetails"
+    std::vector<std::uint8_t> details_value;  // the details' encoded message (type_url's type)
     std::vector<std::int32_t> field_ids;
     std::uint64_t created_at = 0;      // milliseconds since the epoch
     std::uint64_t size_bytes = 0;      // its files

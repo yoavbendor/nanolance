@@ -1079,7 +1079,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                 row_codes[i * m + s] = static_cast<std::uint8_t>(nearest[i]);
             }
         });
-        // Transposed per partition: [code byte][row of the partition].
+        // Transposed per partition: [code byte][row of the partition]; skip_transpose: [row][code byte].
         codes.resize(data.n * code_bytes);
         for (std::size_t p = 0; p < partitions; ++p) {
             const std::size_t first = offsets[p];
@@ -1088,9 +1088,14 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             for (std::size_t r = 0; r < n; ++r) {
                 const std::uint8_t* rc = row_codes.data() + (first + r) * m;
                 for (std::size_t b = 0; b < code_bytes; ++b) {
-                    out[b * n + r] = options.num_bits == 4U
-                                         ? static_cast<std::uint8_t>((rc[2U * b] & 0x0FU) | (rc[2U * b + 1U] << 4U))
-                                         : rc[b];
+                    const std::uint8_t code = options.num_bits == 4U
+                                                  ? static_cast<std::uint8_t>((rc[2U * b] & 0x0FU) | (rc[2U * b + 1U] << 4U))
+                                                  : rc[b];
+                    if (options.skip_transpose) {
+                        out[r * code_bytes + b] = code;
+                    } else {
+                        out[b * n + r] = code;
+                    }
                 }
             }
         }
@@ -1218,7 +1223,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         if (pq) {
             storage = "{\"codebook_position\":2,\"nbits\":" + std::to_string(options.num_bits) +
                       ",\"num_sub_vectors\":" + std::to_string(m) + ",\"dimension\":" + std::to_string(dim) +
-                      ",\"codebook_tensor\":[],\"transposed\":true}";
+                      ",\"codebook_tensor\":[],\"transposed\":" + (options.skip_transpose ? "false" : "true") + "}";
         } else if (hnsw) {
             storage = "{\"dim\":" + std::to_string(dim) + ",\"num_bits\":8,\"bounds\":{\"start\":" +
                       json_double(sq_start) + ",\"end\":" + json_double(sq_end) + "}}";
@@ -1386,6 +1391,9 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     if (hnsw) {
         hint("lance.sq.sample_rate", std::to_string(options.sample_rate));
     }
+    if (options.skip_transpose) {  // as pylance stores it; its default ("false") is not written here
+        hint("lance.skip_transpose", "true");
+    }
 
     std::vector<std::uint32_t> fragment_ids;
     if (target != nullptr && (target->coverage != nullptr || target->fragments != nullptr)) {
@@ -1435,7 +1443,39 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
 
 bool dataset_create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,
                                  const VectorIndexOptions& options, std::uint64_t& new_version, std::string& error) {
-    return create_vector_index(dataset_path, column, options, nullptr, new_version, error);
+    if (options.ivf_centroids.empty() && !options.progress) {
+        return create_vector_index(dataset_path, column, options, nullptr, new_version, error);
+    }
+    // Supplied centroids (and codebook) are a model, as a distributed build's segments share theirs;
+    // the build still commits. Its progress goes to the callback.
+    index_build::VectorModel model;
+    index_build::Progress progress = options.progress;
+    index_build::SegmentTarget target;
+    if (!options.ivf_centroids.empty()) {
+        if (options.num_partitions.value_or(0U) == 0U ||
+            options.ivf_centroids.size() % options.num_partitions.value_or(1U) != 0U) {
+            error = "ivf_centroids does not match num_partitions";
+            return false;
+        }
+        model.type = options.type;
+        model.metric = options.metric;
+        model.partitions = *options.num_partitions;
+        model.dim = options.ivf_centroids.size() / model.partitions;
+        model.centroids = options.ivf_centroids;
+        model.nbits = options.num_bits;
+        model.m = options.type == "IVF_PQ" ? options.num_sub_vectors : 0U;
+        model.has_codebook = !options.pq_codebook.empty();
+        model.codebook = options.pq_codebook;
+        model.has_sq = false;
+        model.hnsw_m = options.hnsw_m;
+        model.hnsw_ef_construction = options.hnsw_ef_construction;
+        model.hnsw_max_level = options.hnsw_max_level;
+        target.model = &model;
+    }
+    if (options.progress) {
+        target.progress = &progress;
+    }
+    return create_vector_index(dataset_path, column, options, &target, new_version, error);
 }
 
 bool index_build::build_vector_segment(const std::filesystem::path& dataset_path, const std::string& column,

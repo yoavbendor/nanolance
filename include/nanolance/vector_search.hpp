@@ -6,8 +6,10 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 /// Nearest-neighbour search over a vector column (a fixed-size list of floats), as Lance's
@@ -72,6 +74,11 @@ struct VectorIndexDetails {
     std::uint64_t num_sub_vectors = 0;
 };
 
+/// The runtime hints a vector index's details (the manifest's VectorIndexDetails bytes) record, in
+/// their stored order: "lance.ivf.max_iters" and the like.
+bool vector_index_runtime_hints(const std::vector<std::uint8_t>& details,
+                                std::vector<std::pair<std::string, std::string>>& out);
+
 /// The details of the vector index in `index_dir` (dataset/_indices/<uuid>).
 bool vector_index_details(const std::filesystem::path& index_dir, VectorIndexDetails& out, std::string& error);
 
@@ -104,6 +111,19 @@ struct VectorIndexOptions {
     std::uint32_t hnsw_m = 20;                 // edges per node (2 * m on level 0); at least 4
     std::uint32_t hnsw_ef_construction = 150;  // the beam while inserting; at least m
     std::uint32_t hnsw_max_level = 7;          // levels, 1 to 16
+    /// IVF centroids supplied instead of trained, [partitions][dim] (num_partitions is their count);
+    /// IVF_PQ: with `pq_codebook` too, Lance's flat [num_sub_vectors][2^num_bits][dim / num_sub_vectors],
+    /// else the codebook is trained on the residuals.
+    std::vector<float> ivf_centroids;
+    std::vector<float> pq_codebook;
+    /// IVF_PQ: store the codes row by row rather than transposed (Lance's skip_transpose).
+    bool skip_transpose = false;
+    /// Where the build reports its stages (Lance's progress events: 0 starts a stage of `total` units,
+    /// 1 reports `completed` of them, 2 ends it); nothing when empty. An exception it throws stops the
+    /// build, and nothing is committed.
+    std::function<void(int event, const char* stage, std::uint64_t total, const char* unit,
+                       std::uint64_t completed)>
+        progress;
 };
 
 /// Build an IVF_FLAT / IVF_PQ / IVF_HNSW_SQ index on `column` (a fixed-size list of float32) in Lance's format --

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import logging
 import os
 import re
 import uuid
@@ -29,6 +30,7 @@ from nanolance.lance._errors import NotSupportedError, native, unsupported
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
 from nanolance.lance._transactions import Index, IndexFile, LanceOperation, Transaction
 
+LOGGER = logging.getLogger("lance.dataset")
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 
 ReaderLike = Any
@@ -1265,14 +1267,22 @@ class LanceDataset(pa.dataset.Dataset):
             raise NotImplementedError(f"Only {self._VECTOR_INDEX_TYPES} index types supported. Got {index_type}")
         if kind not in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"):
             raise unsupported(f"{kind} indexes (IVF_FLAT, IVF_PQ and IVF_HNSW_SQ are supported)")
-        for option, value in (("ivf_centroids", ivf_centroids), ("pq_codebook", pq_codebook),
-                              ("ivf_centroids_file", ivf_centroids_file), ("accelerator", accelerator),
+        for option, value in (("ivf_centroids_file", ivf_centroids_file),
                               ("precomputed_partition_dataset", precomputed_partition_dataset),
                               ("fragment_ids", fragment_ids), ("index_uuid", index_uuid)):
             if value is not None:
                 raise unsupported(f"create_index option {option}")
         if not train:
             raise unsupported("create_index(train=False)")
+        if accelerator is not None:
+            if kind == "IVF_PQ":
+                raise unsupported("create_index(accelerator=) for IVF_PQ (nanolance builds on the CPU)")
+            LOGGER.warning("Index type %s does not support GPU acceleration; falling back to CPU", kind)
+        index_file_version = kwargs.pop("index_file_version", "V3")
+        if str(getattr(index_file_version, "value", index_file_version)) != "V3":
+            raise unsupported(f"create_index(index_file_version={index_file_version!r}) (V3 is written)")
+        progress_callback = kwargs.pop("progress_callback", None)
+        skip_transpose = bool(kwargs.pop("skip_transpose", False))
         if kind == "IVF_PQ" and num_sub_vectors is None:
             raise ValueError("num_partitions and num_sub_vectors are required for IVF_PQ")
         num_bits = int(kwargs.pop("num_bits", 8))
@@ -1282,7 +1292,7 @@ class LanceDataset(pa.dataset.Dataset):
         hnsw_m = int(kwargs.pop("m", 20))
         ef_construction = int(kwargs.pop("ef_construction", 150))
         max_level = int(kwargs.pop("max_level", 7))
-        for ignored in ("one_pass_ivfpq", "skip_transpose", "streaming_sample_rate", "streaming_coreset_rate",
+        for ignored in ("one_pass_ivfpq", "streaming_sample_rate", "streaming_coreset_rate",
                         "streaming_refine_passes", "progress", "kmeans_redos"):
             kwargs.pop(ignored, None)
         if kwargs:
@@ -1293,13 +1303,52 @@ class LanceDataset(pa.dataset.Dataset):
             if not pa.types.is_fixed_size_list(storage):
                 raise TypeError(f"Vector column {column} must be FixedSizeListArray 1-dimensional "
                                 f"FixedShapeTensorArray, got {field.type}")
-        with _lance_errors():
-            _nanolance._ds_create_vector_index(
-                self._uri, str(column), kind, name or "", str(metric).lower(), bool(replace),
-                None if num_partitions is None else int(num_partitions),
-                None if target_partition_size is None else int(target_partition_size),
-                0 if num_sub_vectors is None else int(num_sub_vectors), num_bits, max_iters, sample_rate,
-                None if seed is None else int(seed), hnsw_m, ef_construction, max_level)
+        centroids_bytes = codebook_bytes = None
+        if ivf_centroids is not None:
+            centroids = _float32_matrix(ivf_centroids, self._vector_dimension(str(column)))
+            if num_partitions is not None and int(num_partitions) != len(centroids):
+                raise ValueError(f"ivf_centroids has {len(centroids)} centroids but num_partitions is "
+                                 f"{num_partitions}")
+            num_partitions = len(centroids)
+            centroids_bytes = centroids.tobytes()
+        if pq_codebook is not None:
+            if centroids_bytes is None:
+                raise ValueError("pq_codebook requires ivf_centroids")
+            dim = self._vector_dimension(str(column))
+            subs = 0 if num_sub_vectors is None else int(num_sub_vectors)
+            book = pq_codebook.to_numpy_ndarray() if hasattr(pq_codebook, "to_numpy_ndarray") else np.asarray(pq_codebook)
+            want = (subs, 2 ** int(num_bits), dim // subs if subs else 0)
+            if subs == 0 or dim % subs or tuple(book.shape) != want:
+                raise ValueError(f"pq_codebook must be (sub_vectors, {2 ** int(num_bits)}, dim) for "
+                                 f"num_bits={num_bits}, got {tuple(book.shape)}")
+            codebook_bytes = np.ascontiguousarray(book, dtype=np.float32).tobytes()
+        native_progress = None
+        callback_errors: list = []
+        if progress_callback is not None:
+            from nanolance.lance.progress import IndexProgress
+
+            events = ("start", "progress", "complete")
+
+            def native_progress(event, stage, total, unit, completed):
+                try:
+                    progress_callback(IndexProgress(events[event], stage, completed if event == 1 else None,
+                                                    total or None, unit or None))
+                except BaseException as exc:
+                    callback_errors.append(exc)  # the build stops; the callback's error is raised as is
+                    raise
+        try:
+            with _lance_errors():
+                _nanolance._ds_create_vector_index(
+                    self._uri, str(column), kind, name or "", str(metric).lower(), bool(replace),
+                    None if num_partitions is None else int(num_partitions),
+                    None if target_partition_size is None else int(target_partition_size),
+                    0 if num_sub_vectors is None else int(num_sub_vectors), num_bits, max_iters, sample_rate,
+                    None if seed is None else int(seed), hnsw_m, ef_construction, max_level,
+                    centroids_bytes, codebook_bytes, skip_transpose, native_progress)
+        except Exception:
+            if callback_errors:
+                raise callback_errors[0] from None
+            raise
         self._refresh_latest()
         return self
 
@@ -1320,7 +1369,8 @@ class LanceDataset(pa.dataset.Dataset):
         return bool(self.list_indices())
 
     def _index_details(self, index: dict) -> dict:
-        """What a vector index's build recorded (metric, PQ compression); {} for the other index types."""
+        """What a vector index's build recorded (metric, PQ compression, runtime hints); {} for the other
+        index types."""
         if index["type_url"] != "/lance.index.pb.VectorIndexDetails":
             return {}
         with native():
@@ -1329,6 +1379,10 @@ class LanceDataset(pa.dataset.Dataset):
         if built["pq"]:
             details["compression"] = {"type": "pq", "num_bits": built["num_bits"],
                                       "num_sub_vectors": built["num_sub_vectors"]}
+        with native():
+            hints = _nanolance._vector_index_runtime_hints(index["details"])
+        if hints:
+            details["runtime_hints"] = dict(hints)
         return details
 
     def describe_indices(self) -> List["IndexDescription"]:

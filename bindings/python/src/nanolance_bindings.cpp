@@ -1756,6 +1756,7 @@ NB_MODULE(_nanolance, m) {
             d["dataset_version"] = i.dataset_version;
             d["index_version"] = i.index_version;
             d["type_url"] = i.type_url;
+            d["details"] = nb::bytes(reinterpret_cast<const char*>(i.details_value.data()), i.details_value.size());
             d["field_ids"] = i.field_ids;
             d["created_at"] = i.created_at;
             d["size_bytes"] = i.size_bytes;
@@ -1891,6 +1892,19 @@ NB_MODULE(_nanolance, m) {
         return std::make_tuple(result.row_ids, result.distances, result.plan, result.index_cache_hits,
                                result.index_cache_misses);
     });
+    m.def("_vector_index_runtime_hints", [](nb::bytes details) {
+        std::vector<std::uint8_t> value(reinterpret_cast<const std::uint8_t*>(details.c_str()),
+                                        reinterpret_cast<const std::uint8_t*>(details.c_str()) + details.size());
+        std::vector<std::pair<std::string, std::string>> hints;
+        if (!nano_lance::vector_index_runtime_hints(value, hints)) {
+            throw nb::value_error("the index details are malformed");
+        }
+        nb::dict out;
+        for (const auto& [key, value_text] : hints) {
+            out[key.c_str()] = value_text;
+        }
+        return out;
+    });
     m.def("_ds_vector_index_details", [](const std::filesystem::path& index_dir) {
         nano_lance::VectorIndexDetails d;
         run_op([&](std::string& e) { return nano_lance::vector_index_details(index_dir, d, e); });
@@ -1927,9 +1941,22 @@ NB_MODULE(_nanolance, m) {
                                         std::uint32_t num_sub_vectors, std::uint32_t num_bits, std::uint32_t max_iters,
                                         std::uint32_t sample_rate, std::optional<std::uint64_t> seed,
                                         std::uint32_t hnsw_m, std::uint32_t ef_construction,
-                                        std::uint32_t max_level) {
+                                        std::uint32_t max_level, std::optional<nb::bytes> ivf_centroids,
+                                        std::optional<nb::bytes> pq_codebook, bool skip_transpose,
+                                        nb::object progress) {
         nano_lance::VectorIndexOptions o;
         o.type = type;
+        o.ivf_centroids = floats_of(ivf_centroids);
+        o.pq_codebook = floats_of(pq_codebook);
+        o.skip_transpose = skip_transpose;
+        if (!progress.is_none()) {
+            // Called with the GIL held; an exception it raises unwinds the build, and nothing is committed.
+            o.progress = [callback = nb::object(progress)](int event, const char* stage, std::uint64_t total,
+                                                           const char* unit, std::uint64_t completed) {
+                nb::gil_scoped_acquire acquire;
+                callback(event, std::string(stage), total, std::string(unit), completed);
+            };
+        }
         o.name = name;
         if (!nano_lance::parse_vector_metric(metric, o.metric)) {
             throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot)").c_str());
@@ -1948,7 +1975,11 @@ NB_MODULE(_nanolance, m) {
         std::uint64_t version = 0;
         run_op([&](std::string& e) { return nano_lance::dataset_create_vector_index(path, column, o, version, e); });
         return version;
-    });
+    }, nb::arg("path"), nb::arg("column"), nb::arg("type"), nb::arg("name"), nb::arg("metric"), nb::arg("replace"),
+       nb::arg("num_partitions"), nb::arg("target_partition_size"), nb::arg("num_sub_vectors"), nb::arg("num_bits"),
+       nb::arg("max_iters"), nb::arg("sample_rate"), nb::arg("seed"), nb::arg("hnsw_m"),
+       nb::arg("ef_construction"), nb::arg("max_level"), nb::arg("ivf_centroids") = nb::none(),
+       nb::arg("pq_codebook") = nb::none(), nb::arg("skip_transpose") = false, nb::arg("progress") = nb::none());
     m.def("_ds_drop_columns", [](const std::filesystem::path& path, const std::vector<std::string>& columns) {
         std::uint64_t version = 0;
         run_op([&](std::string& e) { return nano_lance::dataset_drop_columns(path, columns, version, e); });

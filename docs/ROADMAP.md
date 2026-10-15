@@ -29,7 +29,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 |---|---|---|---|
 | Prepared-layout blob writers (`PackedBlobWriter`, `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`, descriptor-form blob columns in the file writer) | `docs/tasks/BLOB_WRITERS.md` | Haiku 5.5, reviewed by Opus | ~~done~~ 2026-10-15: phase A (Python writers; reviewed, one fix: coalesced sidecar writes), phase B (C++ descriptor input; end-to-end tests in `tests/test_blob_writers.py`) |
 | Multi-base datasets (`DatasetBasePath`, `initial_bases` / `target_bases` / `target_all_bases`, `add_bases`, fragment writes into bases) | `docs/tasks/MULTI_BASE.md` | Haiku 5.5, reviewed by Opus | ~~done 2026-10-15~~ (three Haiku sessions, reviewed): 30 more of pylance's tests. Left: external blob URIs under a registered base (`test_blob_extension_write_fragments_external_registered_base`), `write_dataset(mode="overwrite", initial_bases=)` on an existing dataset, object-store bases |
-| Vector-index API gaps: validation, describe / explain, cache stats, `create_index(ivf_centroids=, pq_codebook=, progress=...)` (no new formats) | `docs/tasks/VECTOR_API.md` | Haiku 5.5, reviewed by Opus | V1a done 2026-10-15 (13 of 15, +20 pylance tests); V1b in progress. Reviewer first: `has_index` as a property (6 tests) |
+| Vector-index API gaps: validation, describe / explain, cache stats, `create_index(ivf_centroids=, pq_codebook=, progress=...)` (no new formats) | `docs/tasks/VECTOR_API.md` | Haiku 5.5, reviewed by Opus | V1a done 2026-10-15 (13 of 15, +20 pylance tests); V1b done (12 of 15, +12). Reviewer first: `has_index` as a property (6 tests) |
 | ZONEMAP and BLOOMFILTER scalar indexes (build, search, maintain; Parquet SBBF) | `docs/tasks/ZONED_INDEXES.md` | Haiku 5.5, reviewed by Opus | queued after V1b (Z1 ZONEMAP, Z2 BLOOMFILTER) |
 | IVF_SQ, IVF_HNSW_PQ, IVF_HNSW_FLAT (storage x sub-index recombinations) | `docs/tasks/VECTOR_COMBOS.md` | Haiku 5.5, reviewed by Opus | queued (C1 read + search, C2 build) |
 | IVF_RQ (RaBitQ), Hamming / binary vectors, NGRAM, fuzzy FTS, more tokenizers | (Opus: format research first) | -- | not yet specified |
@@ -45,6 +45,12 @@ Small items found by delegated sessions, not yet done:
 - External blob URIs under a registered base path: the descriptor should carry the base id and a
   base-relative URI (pylance's `test_blob_extension_write_fragments_external_registered_base`).
   Found by the multi-base phase C session; touches the external-blob writer, so left to Opus.
+- HNSW index builds are not byte-stable: the same IVF_HNSW_SQ build gives a different `index.idx`
+  run to run (graph construction order). Found by the V1b session.
+- `lance.dataset.VectorIndexReader` (`num_partitions`, `read_partition(id, with_vector=)`): Lance returns
+  `_rowid` plus `flat` (IVF_FLAT) or `__pq_code` (IVF_PQ) columns. Small, delegable.
+- `row_addr_allowlist=` / `serialize_row_addrs` in scans and searches (12 of pylance's tests in
+  `test_row_addr_prefilter.py`). Delegable.
 - `_take_rows` of a deleted row's address returns the row; pylance leaves it out (plain datasets,
   without stable row ids). Found by the multi-base phase A session.
 

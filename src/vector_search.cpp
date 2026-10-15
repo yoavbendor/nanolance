@@ -1896,6 +1896,39 @@ std::string vector_index_type(const std::vector<std::uint8_t>& details) {
     return std::string(hnsw ? "IVF_HNSW_" : "IVF_") + compression;
 }
 
+bool vector_index_runtime_hints(const std::vector<std::uint8_t>& details,
+                                std::vector<std::pair<std::string, std::string>>& out) {
+    out.clear();
+    const auto* p = details.data();
+    const auto* end = p + details.size();
+    Field f;
+    while (p < end) {
+        if (!next_field(p, end, f)) {
+            return false;
+        }
+        if (f.number != 9 || f.wire != 2) {  // runtime_hints: a map entry {key = 1, value = 2}
+            continue;
+        }
+        std::string key;
+        std::string value;
+        const auto* q = f.data;
+        const auto* entry_end = f.data + f.size;
+        Field g;
+        while (q < entry_end) {
+            if (!next_field(q, entry_end, g)) {
+                return false;
+            }
+            if (g.wire == 2 && g.number == 1) {
+                key.assign(reinterpret_cast<const char*>(g.data), g.size);
+            } else if (g.wire == 2 && g.number == 2) {
+                value.assign(reinterpret_cast<const char*>(g.data), g.size);
+            }
+        }
+        out.emplace_back(std::move(key), std::move(value));
+    }
+    return true;
+}
+
 bool vector_index_details(const std::filesystem::path& index_dir, VectorIndexDetails& out, std::string& error) {
     std::shared_ptr<const IvfIndex> index;
     if (!load_ivf(index_dir, index, error)) {
