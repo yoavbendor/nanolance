@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import shutil
 
 import pyarrow as pa
@@ -316,3 +317,225 @@ def test_distributed_segments_merge_and_commit_match_pylance(lance, tmp_path):
             for needle in NEEDLES:
                 f = f"contains(w, '{needle}')"
                 assert ds.count_rows(f) == scan.count_rows(f), (engine, needle)
+
+
+# ── JSON scalar indexes (IndexConfig, target btree): pages, describe / stats, reads, errors ──────────
+
+JSON_CASES = {
+    "int": (['{"x": 7}', '{"x": -2}', None, '{"y": 1}', '{"x": 7}'], "x"),
+    "float_with_ints": (['{"x": 1.5}', '{"x": 2}', '{"x": -0.25}', None], "x"),
+    "float_then_ints": (['{"x": 2.5}', '{"x": 1}', None, '{"x": 4}'], "x"),
+    "string": (['{"x": "apple"}', '{"x": ""}', None, '{"x": "ÉCOLE ab"}', '{"x": "ΟΔΟΣ"}'], "x"),
+    "bool": (['{"x": true}', '{"x": false}', None, '{"x": null}'], "x"),
+    "all_null": ([None, '{"y": 1}', '{"x": null}'], "x"),
+    "array": (['{"x": [1, "a", null]}', '{"x": []}', None], "x"),
+    "object": (['{"x": {"b": [true, 2.5], "a": "é"}}', '{"x": {}}'], "x"),
+    "big_unsigned": (['{"x": 18446744073709551615}', '{"x": 5}'], "x"),
+    "missing_path": (['{"x": 1}', '{"z": 1}', '3', '"s"'], "q"),
+    "dotted_path": (['{"a": {"b": 3}}', '{"a": {"b": 5}, "b": 9}', '{"a.b": 4}'], "a.b"),
+    "nested_dotted": (['{"a": {"b": 3}}', '{"a": {"b": 5}}', '{"a": {"c": 1}}'], "a.b"),
+    "dollar_root": (['{"x": 1}', '{"x": 2}'], "$"),
+    "empty_path_scalar_root": (['3', '5', None], ""),
+    "dollar_dot": (['{"x": 3}', '{"x": 4}'], "$.x"),
+}
+
+
+def _json_table(values):
+    return pa.table({
+        "j": pa.array(values, pa.json_()),
+        "id": pa.array(range(len(values)), pa.int64()),
+    })
+
+
+def _json_config(module, path, target="btree"):
+    if module == "nanolance":
+        from nanolance.lance.indices import IndexConfig
+    else:
+        from lance.indices import IndexConfig
+    return IndexConfig(index_type="json", parameters={"target_index_type": target, "path": path})
+
+
+def _module(which, lance):
+    return lance if which == "pylance" else nl
+
+
+def _page_rows(path):
+    """The BTree files of the JSON index on `path`, read with pylance's file reader: [(schema, rows)]."""
+    from lance.file import LanceFileReader
+
+    (directory,) = glob.glob(os.path.join(path, "_indices", "*"))
+    out = {}
+    for name in ("page_data.lance", "page_lookup.lance"):
+        table = LanceFileReader(os.path.join(directory, name)).read_all().to_table()
+        out[name] = ([(f.name, str(f.type)) for f in table.schema], table.to_pylist())
+    return out
+
+
+def _lance_text(error):
+    """pylance's message without the Rust source location it appends (', /home/runner/...rs:164:17')."""
+    return re.sub(r", /home/runner/\S+$", "", str(error))
+
+
+def _build_json_pair(lance, tmp_path, values, path, name="j_idx"):
+    """The same JSON table written twice, each engine building the index with the same IndexConfig."""
+    paths = {}
+    for engine in ("pylance", "nanolance"):
+        out = _fresh(tmp_path, f"{engine}.lance")
+        ds = _module(engine, lance).write_dataset(_json_table(values), out)
+        ds.create_scalar_index("j", _json_config(engine, path), name=name)
+        paths[engine] = out
+    return paths
+
+
+@pytest.mark.parametrize("case", list(JSON_CASES))
+def test_json_index_pages_equal_pylance(lance, tmp_path, case):
+    values, path = JSON_CASES[case]
+    paths = _build_json_pair(lance, tmp_path, values, path)
+    assert _page_rows(paths["nanolance"]) == _page_rows(paths["pylance"])
+    assert len(_page_rows(paths["nanolance"])["page_data.lance"][1]) == len(values)
+
+
+@pytest.mark.parametrize("case", list(JSON_CASES))
+def test_json_index_describe_and_stats_equal_pylance(lance, tmp_path, case):
+    values, path = JSON_CASES[case]
+    paths = _build_json_pair(lance, tmp_path, values, path)
+    seen = {}
+    for engine in ("pylance", "nanolance"):
+        ds = _module(engine, lance).dataset(paths[engine])
+        (d,) = ds.describe_indices()
+        seen[engine] = (d.name, d.type_url, d.index_type, d.details, d.fields, d.field_names, d.num_rows_indexed,
+                        [s.index_version for s in d.segments], d.details == {"path": path, "target_details": {}})
+        stats = ds.stats.index_stats("j_idx")
+        seen[engine] += (stats["index_type"], stats["indices"], stats["segments"], stats["num_indexed_rows"])
+    assert seen["nanolance"] == seen["pylance"]
+    assert seen["nanolance"][1] == "/lance.index.pb.JsonIndexDetails"
+    assert seen["nanolance"][2] == "Json"
+    assert seen["nanolance"][8] is True
+    assert seen["nanolance"][9] == "BTree"
+
+
+# Filters whose function type is the index's (an Int64 index on `x`): pylance errors on a mismatched type
+# even with its own index, so the reader test keeps to the matching ones (and one off-path lookup).
+INT_FILTERS = ["json_get_int(j, 'x') = 7", "json_get_int(j, 'x') > 0", "json_get_int(j, 'x') IS NULL",
+               "json_get_int(j, 'x') <= 7", "json_get_int(j, 'a.b') = 3"]
+
+
+@pytest.mark.parametrize("writer", ["pylance", "nanolance"])
+def test_each_engine_reads_the_others_json_index(lance, tmp_path, writer):
+    values = JSON_CASES["int"][0] + ['{"x": 7, "a": {"b": 3}}', '{"x": 8}']
+    paths = _build_json_pair(lance, tmp_path, values, "x")
+    indexed = paths[writer]
+    plain = _fresh(tmp_path, "plain.lance")
+    lance.write_dataset(_json_table(values), plain)
+    for reader in ("pylance", "nanolance"):
+        module = _module(reader, lance)
+        ds = module.dataset(indexed)
+        assert [(d.name, d.index_type, d.details) for d in ds.describe_indices()] == [
+            ("j_idx", "Json", {"path": "x", "target_details": {}})]
+        assert ds.stats.index_stats("j_idx")["index_type"] == "BTree"
+        for flt in INT_FILTERS:
+            got = sorted(module.dataset(indexed).to_table(filter=flt)["id"].to_pylist())
+            want = sorted(lance.dataset(plain).to_table(filter=flt)["id"].to_pylist())
+            assert got == want, (reader, flt)
+
+
+def test_json_index_after_deletes_and_appends_equals_pylance(lance, tmp_path):
+    values = JSON_CASES["int"][0] * 3
+    paths = _build_json_pair(lance, tmp_path, values, "x")
+    counts = {}
+    for engine in ("pylance", "nanolance"):
+        module = _module(engine, lance)
+        ds = module.dataset(paths[engine])
+        ds.delete("id < 4")
+        ds = module.dataset(paths[engine])
+        ds.insert(_json_table(['{"x": 7}', '{"x": 1}']))
+        ds = module.dataset(paths[engine])
+        (d,) = ds.describe_indices()
+        counts[engine] = (d.num_rows_indexed, ds.stats.index_stats("j_idx")["num_unindexed_rows"])
+        assert sorted(ds.to_table(filter="json_get_int(j, 'x') = 7")["id"].to_pylist()) == sorted(
+            lance.dataset(paths["pylance"]).to_table(filter="json_get_int(j, 'x') = 7")["id"].to_pylist())
+    assert counts["nanolance"] == counts["pylance"]
+
+
+def test_json_index_on_pylance_built_index_scans_equal(lance, tmp_path):
+    values = JSON_CASES["string"][0] + ['{"y": 2}']
+    paths = _build_json_pair(lance, tmp_path, values, "x")
+    for flt in ["json_get_string(j, 'x') = 'apple'", "json_get_string(j, 'x') IS NULL"]:
+        got = sorted(nl.dataset(paths["pylance"]).to_table(filter=flt)["id"].to_pylist())
+        want = sorted(lance.dataset(paths["pylance"]).to_table(filter=flt)["id"].to_pylist())
+        assert got == want
+
+
+ERROR_CASES = [
+    ("bitmap_target", {"target_index_type": "bitmap", "path": "x"}, None),
+    ("label_list_target", {"target_index_type": "label_list", "path": "x"}, None),
+    ("unknown_target", {"target_index_type": "foo", "path": "x"}, None),
+    ("json_target", {"target_index_type": "json", "path": "x"}, None),
+    ("unsupported_path", {"target_index_type": "btree", "path": "a[0]"}, None),
+    ("path_with_brackets", {"target_index_type": "btree", "path": "$['x']"}, None),
+    ("path_with_space", {"target_index_type": "btree", "path": "x y"}, None),
+]
+
+
+@pytest.mark.parametrize("name,params,_", ERROR_CASES, ids=[c[0] for c in ERROR_CASES])
+def test_json_index_errors_as_pylance(lance, tmp_path, name, params, _):
+    """Targets pylance rejects: the same exception type and text (minus Rust's location). Paths outside the
+    supported subset are refused by nanolance by name (pylance may accept them as JSONPath)."""
+    values = ['{"x": 1}']
+    messages = {}
+    for engine in ("pylance", "nanolance"):
+        out = _fresh(tmp_path, f"{engine}.lance")
+        ds = _module(engine, lance).write_dataset(_json_table(values), out)
+        try:
+            ds.create_scalar_index("j", _json_config(engine, params["path"], params["target_index_type"]), name="z")
+            messages[engine] = "built"
+        except Exception as e:  # noqa: BLE001 -- the type and text are the point of the comparison
+            messages[engine] = (type(e).__name__, _lance_text(e))
+    if params["target_index_type"] in ("bitmap",) or params["path"] in ("a[0]", "$['x']", "x y"):
+        assert messages["nanolance"][0] == "NotSupportedError"
+    else:
+        assert messages["nanolance"] == messages["pylance"]
+
+
+def test_json_index_error_texts(lance, tmp_path):
+    out = _fresh(tmp_path, "texts.lance")
+    ds = nl.write_dataset(_json_table(['{"x": 1}']), out)
+    with pytest.raises(NotImplementedError, match='target_index_type \'bitmap\' is not supported yet \\(supported: btree\\)'):
+        ds.create_scalar_index("j", _json_config("nanolance", "x", "bitmap"))
+    with pytest.raises(ValueError, match="^Invalid user input: No scalar index plugin found for name 'label_list'$"):
+        ds.create_scalar_index("j", _json_config("nanolance", "x", "label_list"))
+    with pytest.raises(ValueError, match="needs the parameter path"):
+        from nanolance.lance.indices import IndexConfig
+        ds.create_scalar_index("j", IndexConfig(index_type="json", parameters={"target_index_type": "btree"}))
+    with pytest.raises(NotImplementedError, match="Received JSON"):
+        ds.create_scalar_index("j", "JSON")
+    with pytest.raises(ValueError, match="^Invalid user input: A JSON index can only be created on a Binary"):
+        ds2 = nl.write_dataset(pa.table({"s": ["a"], "id": [0]}), _fresh(tmp_path, "str.lance"))
+        ds2.create_scalar_index("s", _json_config("nanolance", "x"))
+
+
+def test_json_index_type_mismatch_as_pylance(lance, tmp_path):
+    values = ['{"x": 7}', '{"x": 1.5}']
+    paths = {}
+    errors = {}
+    for engine in ("pylance", "nanolance"):
+        out = _fresh(tmp_path, f"{engine}.lance")
+        ds = _module(engine, lance).write_dataset(_json_table(values), out)
+        with pytest.raises(ValueError) as info:
+            ds.create_scalar_index("j", _json_config(engine, "x"))
+        errors[engine] = _lance_text(info.value)
+        paths[engine] = out
+    assert errors["nanolance"] == errors["pylance"]
+    assert errors["nanolance"] == "Invalid user input: JSON path 'x' expected Int64, but batch row 1 has JSON type Float64"
+
+
+def test_json_index_optimize_is_refused_until_it_is_supported(lance, tmp_path):
+    values = JSON_CASES["int"][0]
+    out = _fresh(tmp_path, "opt.lance")
+    ds = nl.write_dataset(_json_table(values), out)
+    ds.create_scalar_index("j", _json_config("nanolance", "x"), name="j_idx")
+    ds = nl.dataset(out)
+    with pytest.raises(NotImplementedError, match="JSON index.*not supported yet"):
+        ds.optimize.optimize_indices()
+    # the refusal leaves the index and its answers as they were
+    assert sorted(ds.to_table(filter="json_get_int(j, 'x') = 7")["id"].to_pylist()) == [0, 4]

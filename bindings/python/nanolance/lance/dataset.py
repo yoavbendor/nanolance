@@ -985,12 +985,18 @@ class LanceDataset(pa.dataset.Dataset):
             if path is not None:
                 column = ".".join(path)  # the schema's own names, as Lance stores them
         config: Dict[str, Any] = {}
-        if hasattr(index_type, "index_type"):  # an IndexConfig: its type, and its parameters
+        is_config = hasattr(index_type, "index_type")
+        if is_config:  # an IndexConfig: its type, and its parameters
             config = {str(k).lower(): v for k, v in dict(index_type.parameters or {}).items()}
             index_type = index_type.index_type
         kind = str(index_type).upper()
         if kind == "FTS":
             kind = "INVERTED"
+        if kind == "JSON":  # only as an IndexConfig, as pylance takes it
+            if not is_config:
+                raise NotImplementedError('Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", "INVERTED", '
+                                          '"BLOOMFILTER" or "RTREE" are supported for scalar columns.  Received JSON')
+            return self._create_json_index(column, name, replace, config, fragment_ids)
         if fragment_ids is not None and kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER", "NGRAM"):
             raise ValueError(f"{kind} distributed indexing uses create_index_uncommitted(..., "
                              f'index_type="{kind}", fragment_ids=...)')
@@ -1010,7 +1016,38 @@ class LanceDataset(pa.dataset.Dataset):
             raise unsupported(f"create_scalar_index options {sorted(kwargs) + sorted(config)}")
         with native():
             _nanolance._ds_create_scalar_index(self._uri, str(column), kind, name or "", bool(replace), rows_per_zone,
-                                               number_of_items, probability)
+                                               number_of_items, probability, None)
+        self._refresh_latest()
+        return self
+
+    # A JSON index's target_index_type and path (pylance's json.rs takes them). The other target types are
+    # not built yet; the names pylance knows as target types are refused by name, the rest are pylance's errors.
+    _JSON_REFUSED_TARGETS = ("bitmap", "zonemap", "bloomfilter", "ngram", "inverted", "rtree")
+    _JSON_PATH = re.compile(r"\$(?:\.[A-Za-z0-9_]+)*|[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*|")
+
+    def _create_json_index(self, column, name, replace, config, fragment_ids) -> "LanceDataset":
+        """A JSON index: a BTREE over the values at `path` of a JSON column, as Lance's JsonIndexDetails."""
+        if fragment_ids is not None:
+            raise unsupported("distributed JSON indexes")
+        for key in ("target_index_type", "path"):
+            if key not in config:
+                raise ValueError(f"a JSON index needs the parameter {key}")
+        target = str(config["target_index_type"])
+        if target.lower() == "json":
+            raise ValueError("Invalid user input: A JSON index can only be created on a Binary or LargeBinary field.")
+        if target.lower() in self._JSON_REFUSED_TARGETS:
+            raise NotSupportedError(f"target_index_type '{target}' is not supported yet (supported: btree)")
+        if target.lower() != "btree":
+            raise ValueError(f"Invalid user input: No scalar index plugin found for name '{target}'")
+        path = config["path"]
+        if not isinstance(path, str):
+            raise ValueError("a JSON index path must be a string")
+        if self._JSON_PATH.fullmatch(path) is None:
+            raise NotSupportedError(f"JSON index path '{path}' is not supported yet "
+                                    "(supported: an optional '$', then dot-separated names)")
+        with native():
+            _nanolance._ds_create_scalar_index(self._uri, str(column), "BTREE", name or "", bool(replace), 0, 0, 0.0,
+                                               path)
         self._refresh_latest()
         return self
 
@@ -1552,6 +1589,8 @@ class LanceDataset(pa.dataset.Dataset):
         INVERTED index's analyzer settings; {} for the other index types."""
         if index["type_url"] == "/lance.table.InvertedIndexDetails":
             return self._inverted_details(bytes(index["details"]))
+        if index["type_url"] == "/lance.index.pb.JsonIndexDetails":
+            return _json_index_details(bytes(index["details"]))
         if index["type_url"] != "/lance.index.pb.VectorIndexDetails":
             return {}
         with native():
@@ -2874,6 +2913,31 @@ class LanceStats:
         return DataStatistics(fields=[FieldStatistics(id=i, bytes_on_disk=b) for i, b in stats])
 
 
+def _json_index_details(raw: bytes) -> dict:
+    """JsonIndexDetails (lance index.proto): the path (field 1); the target's details (field 2, an Any), which
+    a BTREE target leaves empty."""
+    def varint(i: int) -> Tuple[int, int]:
+        value, shift = 0, 0
+        while True:
+            byte = raw[i]
+            i += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                return value, i
+
+    fields: Dict[int, bytes] = {}
+    i = 0
+    while i < len(raw):
+        key, i = varint(i)
+        if key & 7 != 2:
+            raise ValueError("JsonIndexDetails: unexpected protobuf field")
+        size, i = varint(i)
+        fields[key >> 3] = raw[i:i + size]
+        i += size
+    return {"path": fields.get(1, b"").decode("utf-8"), "target_details": {}}
+
+
 def _index_statistics(ds: "LanceDataset", index_name: str) -> Dict[str, Any]:
     """Lance's index_statistics: per-segment details from the index files, coverage from the manifest."""
     with native():
@@ -2884,6 +2948,7 @@ def _index_statistics(ds: "LanceDataset", index_name: str) -> Dict[str, Any]:
     kind = details[0].get("index_type") if details and isinstance(details[0].get("index_type"), str) else None
     if kind is None:
         kind = segments[0]["type"] if segments[0]["type_url"] else "N/A"
+        kind = "BTree" if kind == "Json" else kind
     live = {f["id"]: f["physical_rows"] - f["deleted_rows"] for f in ds._info["fragments"]}
     per_delta = [sum(live[i] for i in s["fragment_ids"] if i in live) for s in segments]
     covered = [i for s in segments for i in s["fragment_ids"] if i in live]
@@ -2917,8 +2982,8 @@ def _scalar_display(value) -> Optional[str]:
         if np.isinf(value):
             return "inf" if value > 0 else "-inf"
         return np.format_float_positional(value, trim="-")
-    if isinstance(value, bytes):
-        return value.hex()
+    if isinstance(value, bytes):  # DataFusion's Binary: the first 10 bytes in hex, then ... when longer
+        return value[:10].hex() + ("..." if len(value) > 10 else "")
     return str(value)
 
 
@@ -2948,16 +3013,20 @@ def _segment_statistics(ds: "LanceDataset", segment: dict) -> Dict[str, Any]:
             return {"type": "BloomFilter", "num_blocks": rows("bloomfilter.lance"),
                     "number_of_items": int(meta[b"bloomfilter_item"]),
                     "probability": float(meta[b"bloomfilter_probability"])}
-        if kind == "BTree":
+        if kind in ("BTree", "Json"):  # a JSON index is a BTree over the values at its path
             table = pa.table(_nanolance._file_read(os.path.join(directory, "page_lookup.lance"), None, 0, -1))
             mins, maxs = table.column(0).to_pylist(), table.column(1).to_pylist()
-            start = next((k for k, v in enumerate(mins) if v is not None), len(mins))
+            # Lance's statistics (btree.rs): the first page that is not all-null, and the last page's max; a
+            # null value prints as NULL, and N/A when every page is all-null.
+            start = next((k for k, (lo, hi) in enumerate(zip(mins, maxs)) if lo is not None or hi is not None),
+                         len(mins))
             if pa.types.is_floating(table.schema.field(0).type):
                 np_type = table.schema.field(0).type.to_pandas_dtype()
                 mins = [None if v is None else np_type(v) for v in mins]
                 maxs = [None if v is None else np_type(v) for v in maxs]
-            return {"min": _scalar_display(mins[start]) if start < len(mins) else None,
-                    "max": _scalar_display(maxs[-1]) if start < len(mins) else None,
+            shown = (lambda v: "NULL" if v is None else _scalar_display(v))
+            return {"min": shown(mins[start]) if start < len(mins) else "N/A",
+                    "max": shown(maxs[-1]) if start < len(mins) else "N/A",
                     "num_pages": len(mins)}
         if kind in ("Bitmap", "LabelList"):
             stats = metadata("bitmap_page_lookup.lance").get(b"lance:index_stats")

@@ -34,7 +34,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 | IVF_SQ, IVF_HNSW_PQ, IVF_HNSW_FLAT (storage x sub-index recombinations) | `docs/tasks/VECTOR_COMBOS.md` | Haiku 5.5, reviewed by Opus | ~~done 2026-10-15~~: C1 read + search, C2 build (+4) |
 | Small items 1: `row_addr_allowlist` / `serialize_row_addrs` (12 tests), `VectorIndexReader`, `_take_rows` of deleted rows | `docs/tasks/SMALL_ITEMS_1.md` | Haiku 5.5, reviewed by Opus | ~~done 2026-10-15~~: item 1 (+12), items 2-3 (+2; Hamming left) |
 | INVERTED format versions 1 / 3, 256-document posting blocks, the code analyzer (16 of pylance's tests) | `docs/tasks/FTS_FORMATS.md` | Haiku 5.5, reviewed by Opus | F1 done 2026-10-15 (+1; the six describe_indices also need JSON + NGRAM indexes); F2 done (+1); F3 done (+8): task done |
-| NGRAM and JSON scalar indexes, the ngram tokenizer for INVERTED (~11 of pylance's tests) | `docs/tasks/NGRAM_JSON.md` | Haiku 5.5, reviewed by Opus | N1 done 2026-10-15 (N1a +5, N1b +4); N2, N3 next |
+| NGRAM and JSON scalar indexes, the ngram tokenizer for INVERTED (~11 of pylance's tests) | `docs/tasks/NGRAM_JSON.md` | Haiku 5.5, reviewed by Opus | N1 done 2026-10-15 (N1a +5, N1b +4); N2a done (+6); N2b, N3 next |
 | IVF_RQ (RaBitQ), Hamming / binary vectors, fuzzy FTS, icu / jieba / lindera tokenizers, `lance.tokenize` | (Opus: format research first) | -- | not yet specified |
 
 Lessons from the first delegated task (blob writers, three Haiku sessions of 95-160k tokens each):

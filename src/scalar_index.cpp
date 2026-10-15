@@ -29,6 +29,7 @@
 #include <algorithm>
 #include "nanolance/bloom_filter.hpp"
 #include "nanolance/fts_tokenizer.hpp"
+#include "nanolance/jsonb.hpp"
 
 #include <array>
 #include <cctype>
@@ -1115,6 +1116,303 @@ bool zoned_nested(ScalarIndexType type, const ArrowSchemaView& view) {
     return type == ScalarIndexType::ZoneMap && view.type == NANOARROW_TYPE_FIXED_SIZE_LIST;
 }
 
+// ── JSON indexes: the values at a path of a JSON column, typed as Lance types them (json.rs) ──
+
+/// The paths a JSON index takes: "" or "$" (the whole value), then an optional "$" and dot-separated
+/// member names. A name is [A-Za-z0-9_]+; anything else is refused here, not sent to Lance's JSONPath.
+bool parse_json_path(const std::string& path, std::vector<std::string>& names, std::string& error) {
+    names.clear();
+    std::string_view rest = path;
+    const bool dollar = !rest.empty() && rest.front() == '$';
+    if (dollar) {
+        rest.remove_prefix(1);
+    }
+    bool ok = true;
+    if (dollar && !rest.empty()) {
+        ok = rest.front() == '.';
+        rest.remove_prefix(ok ? 1 : 0);
+    }
+    while (ok && !rest.empty()) {
+        const auto dot = rest.find('.');
+        const auto name = rest.substr(0, dot);
+        ok = !name.empty() && std::all_of(name.begin(), name.end(), [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+        });
+        names.emplace_back(name);
+        if (dot == std::string_view::npos) {
+            break;
+        }
+        rest.remove_prefix(dot + 1);
+        ok = ok && !rest.empty();
+    }
+    if (!ok) {
+        names.clear();
+        error = "JSON index path '" + path + "' is not supported yet (supported: an optional '$', then dot-separated names)";
+    }
+    return ok;
+}
+
+/// A JSON value's type as Lance's JsonbType names it (json.rs).
+enum class JsonbType { Boolean, Int64, Float64, String, Array, Object };
+/// The type a path's values are indexed as: the Arrow type Lance infers from the first non-null value.
+enum class JsonTarget { Boolean, Int64, Float64, String, Binary };
+
+const char* jsonb_name(JsonbType t) {
+    switch (t) {
+    case JsonbType::Boolean: return "Boolean";
+    case JsonbType::Int64: return "Int64";
+    case JsonbType::Float64: return "Float64";
+    case JsonbType::String: return "String";
+    case JsonbType::Array: return "Array";
+    case JsonbType::Object: return "Object";
+    }
+    return "";
+}
+
+const char* target_name(JsonTarget t) {
+    switch (t) {
+    case JsonTarget::Boolean: return "Boolean";
+    case JsonTarget::Int64: return "Int64";
+    case JsonTarget::Float64: return "Float64";
+    case JsonTarget::String: return "Utf8";
+    case JsonTarget::Binary: return "LargeBinary";
+    }
+    return "";
+}
+
+JsonTarget target_of(JsonbType t) {
+    switch (t) {
+    case JsonbType::Boolean: return JsonTarget::Boolean;
+    case JsonbType::Int64: return JsonTarget::Int64;
+    case JsonbType::Float64: return JsonTarget::Float64;
+    case JsonbType::String: return JsonTarget::String;
+    case JsonbType::Array:
+    case JsonbType::Object: return JsonTarget::Binary;
+    }
+    return JsonTarget::Binary;
+}
+
+/// Lance's validate (json.rs): an Int64 value fits a Float64 path; nothing else converts.
+bool json_compatible(JsonTarget target, JsonbType actual) {
+    switch (target) {
+    case JsonTarget::Boolean: return actual == JsonbType::Boolean;
+    case JsonTarget::Int64: return actual == JsonbType::Int64;
+    case JsonTarget::Float64: return actual == JsonbType::Int64 || actual == JsonbType::Float64;
+    case JsonTarget::String: return actual == JsonbType::String;
+    case JsonTarget::Binary: return actual == JsonbType::Array || actual == JsonbType::Object;
+    }
+    return false;
+}
+
+/// The value at `names` in row `row` of a JSON column. `has` is false for a null row, a missing member
+/// or a JSON null (Lance's null).
+bool json_value_at(const ArrowArrayView* column, std::int64_t row, const std::vector<std::string>& names,
+                   jsonb::Item& item, JsonbType& type, bool& has, std::string& error) {
+    has = false;
+    if (ArrowArrayViewIsNull(column, row)) {
+        return true;
+    }
+    const auto bytes = ArrowArrayViewGetBytesUnsafe(column, row);
+    if (!jsonb::Item::root(std::string_view(bytes.data.as_char, static_cast<std::size_t>(bytes.size_bytes)), item)) {
+        error = "a JSON index column holds a value that is not JSONB";
+        return false;
+    }
+    for (const auto& name : names) {
+        jsonb::Item next;
+        if (item.type() != jsonb::Item::Type::Object || !item.get(name, next)) {
+            return true;
+        }
+        item = next;
+    }
+    switch (item.type()) {
+    case jsonb::Item::Type::Null:
+        return true;
+    case jsonb::Item::Type::True:
+    case jsonb::Item::Type::False:
+        type = JsonbType::Boolean;
+        break;
+    case jsonb::Item::Type::Number: {
+        jsonb::Number n;
+        if (!item.number(n)) {
+            error = "a JSON index column holds an invalid number";
+            return false;
+        }
+        const bool integral = n.kind == jsonb::Number::Kind::Int ||
+                              (n.kind == jsonb::Number::Kind::UInt && n.u <= static_cast<std::uint64_t>(INT64_MAX));
+        type = integral ? JsonbType::Int64 : JsonbType::Float64;
+        break;
+    }
+    case jsonb::Item::Type::String:
+        type = JsonbType::String;
+        break;
+    case jsonb::Item::Type::Array:
+        type = JsonbType::Array;
+        break;
+    case jsonb::Item::Type::Object:
+        type = JsonbType::Object;
+        break;
+    case jsonb::Item::Type::Other:
+        error = "a JSON index does not take values of JSON extension types";
+        return false;
+    }
+    has = true;
+    return true;
+}
+
+/// Writes the JsonIndexDetails of a JSON index (lance index.proto): path = 1, target_details = 2, an Any
+/// naming the BTree details (which are empty).
+std::vector<std::uint8_t> json_index_details(const std::string& path) {
+    const auto put_len = [](std::vector<std::uint8_t>& out, std::uint32_t field, std::string_view bytes) {
+        std::uint64_t v = (static_cast<std::uint64_t>(field) << 3U) | 2U;
+        const auto varint = [&](std::uint64_t x) {
+            while (x >= 0x80U) {
+                out.push_back(static_cast<std::uint8_t>((x & 0x7FU) | 0x80U));
+                x >>= 7U;
+            }
+            out.push_back(static_cast<std::uint8_t>(x));
+        };
+        varint(v);
+        varint(bytes.size());
+        out.insert(out.end(), bytes.begin(), bytes.end());
+    };
+    std::vector<std::uint8_t> any;  // google.protobuf.Any: type_url = 1
+    put_len(any, 1, "/lance.table.BTreeIndexDetails");
+    std::vector<std::uint8_t> out;
+    if (!path.empty()) {
+        put_len(out, 1, path);
+    }
+    put_len(out, 2, std::string_view(reinterpret_cast<const char*>(any.data()), any.size()));
+    return out;
+}
+
+/// The values of a JSON index, one array per scanned batch, typed as Lance types the path: the first
+/// non-null value's type, Int64 values allowed in a Float64 path, Utf8 when every value is null. The
+/// values are checked in row order and the first mismatch is the error, as Lance words it.
+bool extract_json_values(const std::vector<ArrowArray>& batches, const std::vector<std::size_t>& path_index,
+                         const ArrowSchema& column_type, const std::vector<std::string>& names,
+                         const std::string& path, OwnedSchema& type, std::vector<ArrowArray>& out,
+                         std::string& error) {
+    const auto column_of = [&](const ArrowArray& batch) {
+        const ArrowArray* arr = batch.children[0];
+        for (const auto c : path_index) {
+            arr = arr->children[c];
+        }
+        return arr;
+    };
+    OwnedViews views;
+    const auto view_of = [&](const ArrowArray* arr, const ArrowSchema& schema) -> const ArrowArrayView* {
+        auto view = std::make_unique<ArrowArrayView>();
+        ArrowError err;
+        if (ArrowArrayViewInitFromSchema(view.get(), &schema, &err) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(view.get(), arr, &err) != NANOARROW_OK) {
+            ArrowArrayViewReset(view.get());
+            error = err.message;
+            return nullptr;
+        }
+        views.v.push_back(std::move(view));
+        return views.v.back().get();
+    };
+    // Pass 1: the type, and every value checked.
+    std::optional<JsonTarget> target;
+    for (const auto& batch : batches) {
+        const ArrowArray* arr = column_of(batch);
+        const ArrowArrayView* view = view_of(arr, column_type);
+        if (view == nullptr) {
+            return false;
+        }
+        for (std::int64_t r = 0; r < arr->length; ++r) {
+            jsonb::Item item;
+            JsonbType actual{};
+            bool has = false;
+            if (!json_value_at(view, r, names, item, actual, has, error)) {
+                return false;
+            }
+            if (!has) {
+                continue;
+            }
+            if (!target) {
+                target = target_of(actual);
+            } else if (!json_compatible(*target, actual)) {
+                error = "Invalid user input: JSON path '" + path + "' expected " + target_name(*target) + ", but batch row " +
+                        std::to_string(r) + " has JSON type " + jsonb_name(actual);
+                return false;
+            }
+        }
+    }
+    const JsonTarget type_of = target.value_or(JsonTarget::String);
+    const ArrowType arrow_type = type_of == JsonTarget::Boolean   ? NANOARROW_TYPE_BOOL
+                                 : type_of == JsonTarget::Int64   ? NANOARROW_TYPE_INT64
+                                 : type_of == JsonTarget::Float64 ? NANOARROW_TYPE_DOUBLE
+                                 : type_of == JsonTarget::String  ? NANOARROW_TYPE_STRING
+                                                                  : NANOARROW_TYPE_LARGE_BINARY;
+    ArrowSchemaInit(&type.s);
+    if (ArrowSchemaSetType(&type.s, arrow_type) != NANOARROW_OK) {
+        error = "out of memory";
+        return false;
+    }
+    // Pass 2: the values, typed.
+    for (const auto& batch : batches) {
+        const ArrowArray* arr = column_of(batch);
+        const ArrowArrayView* view = view_of(arr, column_type);
+        if (view == nullptr) {
+            return false;
+        }
+        ArrowArray built;
+        if (ArrowArrayInitFromType(&built, arrow_type) != NANOARROW_OK ||
+            ArrowArrayStartAppending(&built) != NANOARROW_OK) {
+            error = "out of memory";
+            return false;
+        }
+        for (std::int64_t r = 0; r < arr->length; ++r) {
+            jsonb::Item item;
+            JsonbType actual{};
+            bool has = false;
+            if (!json_value_at(view, r, names, item, actual, has, error)) {
+                built.release(&built);
+                return false;
+            }
+            ArrowErrorCode code = NANOARROW_OK;
+            if (!has) {
+                code = ArrowArrayAppendNull(&built, 1);
+            } else if (type_of == JsonTarget::Boolean) {
+                code = ArrowArrayAppendInt(&built, item.type() == jsonb::Item::Type::True ? 1 : 0);
+            } else if (type_of == JsonTarget::Int64) {
+                jsonb::Number n;
+                item.number(n);
+                code = ArrowArrayAppendInt(&built, n.kind == jsonb::Number::Kind::Int ? n.i : static_cast<std::int64_t>(n.u));
+            } else if (type_of == JsonTarget::Float64) {
+                jsonb::Number n;
+                item.number(n);
+                code = ArrowArrayAppendDouble(&built, n.as_double());
+            } else if (type_of == JsonTarget::String) {
+                const auto s = item.string();
+                ArrowBufferView v;
+                v.data.as_char = s.data();
+                v.size_bytes = static_cast<std::int64_t>(s.size());
+                code = ArrowArrayAppendBytes(&built, v);
+            } else {
+                const auto doc = item.document();
+                ArrowBufferView v;
+                v.data.as_char = doc.data();
+                v.size_bytes = static_cast<std::int64_t>(doc.size());
+                code = ArrowArrayAppendBytes(&built, v);
+            }
+            if (code != NANOARROW_OK) {
+                built.release(&built);
+                error = "out of memory";
+                return false;
+            }
+        }
+        if (ArrowArrayFinishBuildingDefault(&built, nullptr) != NANOARROW_OK) {
+            built.release(&built);
+            error = "out of memory";
+            return false;
+        }
+        out.push_back(built);
+    }
+    return true;
+}
+
 bool create_scalar_index(const std::filesystem::path& dataset_path, const std::string& column, ScalarIndexType type,
                          const ScalarIndexOptions& options, const index_build::SegmentTarget* target,
                          std::uint64_t& new_version, std::string& error) {
@@ -1183,6 +1481,44 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         error = err.message;
         return false;
     }
+    // A JSON index: the values at its path, typed as Lance types them. Its BTree is built over those.
+    const bool json = options.json_path.has_value();
+    OwnedSchema json_type;
+    OwnedBatches json_values;
+    if (json) {
+        std::vector<std::string> json_names;
+        if (type != ScalarIndexType::BTree || !parse_json_path(*options.json_path, json_names, error)) {
+            return false;
+        }
+        const bool binary = col_view.storage_type == NANOARROW_TYPE_BINARY ||
+                            col_view.storage_type == NANOARROW_TYPE_LARGE_BINARY;
+        if (!binary) {
+            error = "Invalid user input: A JSON index can only be created on a Binary or LargeBinary field.";
+            return false;
+        }
+        if (col_view.extension_name.data == nullptr ||
+            std::string(col_view.extension_name.data, static_cast<std::size_t>(col_view.extension_name.size_bytes)) !=
+                "lance.json") {
+            error = "a JSON index needs a JSON column; '" + column + "' is " + ArrowTypeString(col_view.type);
+            return false;
+        }
+        if (!extract_json_values(batches.v, path_index, *col_type, json_names, *options.json_path, json_type,
+                                 json_values.v, error)) {
+            return false;
+        }
+        col_type = &json_type.s;
+    }
+    // The scanned column's array in a batch: the JSON values, or the column below its struct path.
+    const auto column_of = [&](std::size_t b) -> const ArrowArray* {
+        if (json) {
+            return &json_values.v[b];
+        }
+        const ArrowArray* arr = batches.v[b].children[0];
+        for (const auto c : path_index) {
+            arr = arr->children[c];
+        }
+        return arr;
+    };
     const bool list = col_view.type == NANOARROW_TYPE_LIST || col_view.type == NANOARROW_TYPE_LARGE_LIST;
     if (type == ScalarIndexType::LabelList && !list) {
         error = "a LABEL_LIST index needs a list column; '" + column + "' is " + ArrowTypeString(col_view.type);
@@ -1246,21 +1582,16 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     OwnedViews views;
     std::vector<std::uint64_t> null_lists;
     std::size_t capacity = 0;
-    for (const auto& batch : batches.v) {
-        const ArrowArray* arr = batch.children[0];
-        for (const auto c : path_index) {
-            arr = arr->children[c];
-        }
+    for (std::size_t b = 0; b < batches.v.size(); ++b) {
+        const ArrowArray* arr = column_of(b);
         capacity += static_cast<std::size_t>(list ? arr->children[0]->length : arr->length);
     }
     items.view.reserve(capacity);
     items.index.reserve(capacity);
     items.addr.reserve(capacity);
-    for (const auto& batch : batches.v) {
-        const ArrowArray* arr = batch.children[0];
-        for (const auto c : path_index) {
-            arr = arr->children[c];
-        }
+    for (std::size_t b = 0; b < batches.v.size(); ++b) {
+        const auto& batch = batches.v[b];
+        const ArrowArray* arr = column_of(b);
         const ArrowArray* addr_arr = batch.children[batch.n_children - 1];
         const auto* addrs = static_cast<const std::uint64_t*>(addr_arr->buffers[1]) + addr_arr->offset;
         auto view = std::make_unique<ArrowArrayView>();
@@ -1320,6 +1651,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     }
     std::vector<WrittenFile> files;
     std::string details;
+    std::vector<std::uint8_t> details_value;  // a JSON index's JsonIndexDetails
     std::uint32_t index_version = 0;
     bool written = false;
     const char* write_stage = type == ScalarIndexType::BTree    ? "write_lookup_file"
@@ -1334,7 +1666,10 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     switch (type) {
     case ScalarIndexType::BTree:
         written = write_btree(dir, *key_type, items, sorted, files, error);
-        details = "/lance.table.BTreeIndexDetails";
+        details = json ? "/lance.index.pb.JsonIndexDetails" : "/lance.table.BTreeIndexDetails";
+        if (json) {
+            details_value = json_index_details(*options.json_path);
+        }
         break;
     case ScalarIndexType::Bitmap:
         written = write_bitmap(dir, *key_type, items, sorted, nullptr, files, error);
@@ -1391,7 +1726,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
     auto entry = pb::make_index_metadata(uuid, {field->id}, name, version, fragment_ids, details,
-                                                       index_version, static_cast<std::uint64_t>(now), index_files);
+                                                       index_version, static_cast<std::uint64_t>(now), index_files, details_value);
     if (!commit) {
         *target->out = std::move(entry);
         return true;

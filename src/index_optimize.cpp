@@ -156,6 +156,10 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
                   pb::IndexMetadata& out, std::vector<const pb::IndexMetadata*>& replaced, std::string& error) {
     const auto& last = *segments.back();
     const Kind kind = kind_of(dataset_path, last);
+    if (ends_with(last.details_type_url, "JsonIndexDetails")) {
+        error = "index '" + last.name + "' is a JSON index: optimize_indices on a JSON index is not supported yet";
+        return false;
+    }
     if (kind == Kind::Other) {
         error = "index '" + last.name + "' (" + last.details_type_url +
                 ") is of a kind nanolance cannot build, so it cannot be optimized";

@@ -862,6 +862,12 @@ tests/test_scalar_index.py::test_create_scalar_index_fts_alias
 tests/test_scalar_index.py::test_create_scalar_index_fts_block_size
 tests/test_scalar_index.py::test_create_scalar_index_rejects_invalid_uuid
 tests/test_scalar_index.py::test_create_text_inverted_index_defaults_to_v2_without_env
+tests/test_scalar_index.py::test_describe_indices[1-1]
+tests/test_scalar_index.py::test_describe_indices[2-2]
+tests/test_scalar_index.py::test_describe_indices[3-3]
+tests/test_scalar_index.py::test_describe_indices[v1-1]
+tests/test_scalar_index.py::test_describe_indices[v2-2]
+tests/test_scalar_index.py::test_describe_indices[v3-3]
 tests/test_scalar_index.py::test_describe_indices_vector_and_scalar
 tests/test_scalar_index.py::test_distribute_btree_index_build
 tests/test_scalar_index.py::test_distribute_fts_index_build

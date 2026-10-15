@@ -184,3 +184,12 @@ cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance test
 5. Optimize / merge / compaction re-cover / drop as BTree (src/index_optimize.cpp Kind mapping,
    src/index_segments.cpp type maps).
 6. Tests on tmp_path in test_ngram_json_index.py, including the `a.b` divergence test.
+
+**N2a outcome (2026-10-15):** done. JSON index build (IndexConfig, btree target; JSONPath subset
+`$` + dotted names, others refused by name), Lance's type inference and messages, BTree pages equal
+pylance's for every value type, JsonIndexDetails, describe / stats; optimize on a JSON index refuses
+clearly until N2b. All 6 `test_describe_indices` pass (+6, 1060). Also fixed: BTree stats display for
+null-min pages, all-null and binary values (pre-existing divergence, display only). Accepted: error
+texts drop pylance's Rust source location; distributed JSON builds refused. **N2b** next: routing
+(only when the json_get_* type equals the index type -- pylance's own scan errors otherwise), optimize /
+merge / compaction, drop.

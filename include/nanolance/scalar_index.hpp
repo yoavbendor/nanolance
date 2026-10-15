@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,9 @@ struct ScalarIndexOptions {
     /// false-positive probability (Lance's default, 0.00057, when 0).
     std::uint64_t number_of_items = 0;
     double probability = 0.0;
+    /// A JSON index (Lance's JsonIndexDetails over a BTree): the path of the values to index, as the
+    /// caller wrote it ("", "$", "a.b" or "$.a.b"). Set only with ScalarIndexType::BTree, on a JSON column.
+    std::optional<std::string> json_path;
 };
 
 /// Index `column` (a top-level column or a `struct.child` path) of the latest version, committed as
