@@ -158,6 +158,21 @@ struct VectorIndexModel {
 };
 bool read_vector_index_model(const std::filesystem::path& dir, VectorIndexModel& out, std::string& error);
 
+/// One IVF partition's rows as the index stores them (VectorIndexReader): the row ids in stored order,
+/// and the storage column -- float32 values (IVF_FLAT, IVF_HNSW_FLAT: `flat`) or uint8 codes (IVF_PQ and
+/// IVF_HNSW_PQ: `__pq_code`, `width` code bytes a row; IVF_SQ and IVF_HNSW_SQ: `__sq_code`, dim bytes).
+struct VectorIndexPartition {
+    std::size_t partitions = 0;
+    std::size_t width = 0;  // values per row: dim (flat), code bytes (PQ), dim (SQ)
+    std::string column;     // "flat", "__pq_code" or "__sq_code"
+    std::vector<std::uint64_t> ids;
+    std::vector<float> floats;         // flat: ids.size() * width
+    std::vector<std::uint8_t> codes;   // PQ / SQ: ids.size() * width, row by row as stored
+};
+/// Partition `partition` of the IVF index in `dir` (_indices/<uuid>); the values only when `with_values`.
+bool read_vector_index_partition(const std::filesystem::path& dir, std::size_t partition, bool with_values,
+                                 VectorIndexPartition& out, std::string& error);
+
 /// Whether an index's details type is a vector index's (Lance has used more than one package name).
 bool is_vector_index_url(const std::string& url);
 

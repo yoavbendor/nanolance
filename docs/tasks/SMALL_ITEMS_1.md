@@ -95,3 +95,11 @@ rest of item 1:**
 KNN (all index kinds), FTS and overlay rows, the malformed-mask error; all 12 of pylance's
 `test_row_addr_prefilter.py`. A mask turns off scalar-index candidates for that scan (correct, slower);
 a mask with `include_deleted_rows` masks the table scan only (untested). Items 2 and 3 next.
+
+**Session 3 (2026-10-15):** items 2 and 3 done. `lance.dataset.VectorIndexReader` (`num_partitions`,
+`read_partition(with_vector=)`) equals pylance's tables for all seven IVF kinds, on indexes built by
+either engine; `_take_rows` of a deleted row's address leaves it out (`resolve_row_ids(skip_deleted)`).
+Reviewer: a KNN on a nested vector (`data.embedding`) over unindexed fragments failed in the exhaustive
+scan (it projected the dotted path); it now reads the root struct and descends
+(`vector_sub_path`, src/vector_search.cpp). Left: `test_read_partition_nested_vector_quoted_field`
+needs a Hamming index (roadmap). +2 pylance tests (1035).

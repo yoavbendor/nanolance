@@ -416,13 +416,14 @@ ExportedTable table_of(ArrowSchema& schema, std::vector<ArrowArray>& batches) {
 
 std::vector<std::uint64_t> ds_resolve_row_ids(const std::filesystem::path& path,
                                               std::optional<std::uint64_t> version,
-                                              const std::vector<std::uint64_t>& ids) {
+                                              const std::vector<std::uint64_t>& ids, bool skip_missing,
+                                              bool skip_deleted) {
     std::vector<std::uint64_t> addresses;
     std::string error;
     bool ok = false;
     {
         nb::gil_scoped_release release;
-        ok = nano_lance::resolve_row_ids(path, version, ids, addresses, error, /*skip_missing=*/true);
+        ok = nano_lance::resolve_row_ids(path, version, ids, addresses, error, skip_missing, skip_deleted);
     }
     if (!ok) {
         throw_dataset(error);
@@ -1176,7 +1177,8 @@ NB_MODULE(_nanolance, m) {
     m.attr("BLOB_LOCATIONS") = 3;
     m.def("_ds_schema", &ds_schema, nb::arg("path"), nb::arg("version").none());
     m.def("_ds_row_versions", &ds_row_versions, nb::arg("path"), nb::arg("version").none(), nb::arg("addresses"));
-    m.def("_ds_resolve_row_ids", &ds_resolve_row_ids, nb::arg("path"), nb::arg("version").none(), nb::arg("ids"));
+    m.def("_ds_resolve_row_ids", &ds_resolve_row_ids, nb::arg("path"), nb::arg("version").none(), nb::arg("ids"),
+          nb::arg("skip_missing") = true, nb::arg("skip_deleted") = false);
     m.def("_row_id_sequence_encode", [](const std::vector<std::uint64_t>& values) {
         const auto encoded = nano_lance::RowIdSequence::from_values(values).encode();
         return bytes_of(encoded.data(), encoded.size());
@@ -1876,6 +1878,24 @@ NB_MODULE(_nanolance, m) {
         d["loss"] = model.has_loss ? nb::cast(model.loss) : nb::none();
         return d;
     });
+    m.def("_vector_index_partition", [](const std::filesystem::path& dir, std::size_t partition, bool with_values) {
+        nano_lance::VectorIndexPartition part;
+        run_op([&](std::string& e) {
+            return nano_lance::read_vector_index_partition(dir, partition, with_values, part, e);
+        });
+        nb::dict d;
+        d["partitions"] = part.partitions;
+        d["width"] = part.width;
+        d["column"] = part.column;
+        d["ids"] = nb::bytes(reinterpret_cast<const char*>(part.ids.data()), part.ids.size() * sizeof(std::uint64_t));
+        if (!part.floats.empty()) {
+            d["values"] = nb::bytes(reinterpret_cast<const char*>(part.floats.data()),
+                                    part.floats.size() * sizeof(float));
+        } else {
+            d["values"] = nb::bytes(reinterpret_cast<const char*>(part.codes.data()), part.codes.size());
+        }
+        return d;
+    }, nb::arg("dir"), nb::arg("partition"), nb::arg("with_values"));
     m.def("_ds_explain_filter", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
                                    const std::string& filter) {
         std::vector<std::string> lines;

@@ -1007,6 +1007,7 @@ tests/test_vector_index.py::test_invalid_subvectors
 tests/test_vector_index.py::test_knn_deleted_rows
 tests/test_vector_index.py::test_knn_with_deletions
 tests/test_vector_index.py::test_nearest_errors
+tests/test_vector_index.py::test_nested_field_vector_index
 tests/test_vector_index.py::test_no_include_deleted_rows
 tests/test_vector_index.py::test_no_stale_duplicate_after_partial_column_update
 tests/test_vector_index.py::test_optimize_index
@@ -1014,6 +1015,7 @@ tests/test_vector_index.py::test_optimize_index_cosine
 tests/test_vector_index.py::test_optimize_index_recall
 tests/test_vector_index.py::test_optimize_indices
 tests/test_vector_index.py::test_pre_populated_ivf_centroids
+tests/test_vector_index.py::test_read_partition
 tests/test_vector_index.py::test_retrain_indices[False]
 tests/test_vector_index.py::test_retrain_indices[None]
 tests/test_vector_index.py::test_retrain_indices[True]

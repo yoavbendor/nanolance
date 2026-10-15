@@ -8,6 +8,7 @@ by quantized distances, so rows of equal distance may come in another order ther
 
 from __future__ import annotations
 
+import importlib
 import shutil
 
 import numpy as np
@@ -15,6 +16,7 @@ import pyarrow as pa
 import pytest
 
 import nanolance.lance as nl
+from nanolance.lance.dataset import VectorIndexReader as NanoVectorIndexReader
 from tests.support import require_pylance
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -306,3 +308,81 @@ def test_build_errors_as_pylance_raises_them(lance, tmp_path, n, kw, error):
             mod.dataset(path).create_index("vec", **kw)
     with pytest.raises(TypeError, match="Vector column id must be"):
         nl.dataset(path).create_index("id", "IVF_FLAT", num_partitions=2)
+
+
+READER_INDEXES = [
+    ("IVF_FLAT", {}), ("IVF_PQ", {"num_sub_vectors": 4}), ("IVF_PQ", {"num_sub_vectors": 4, "num_bits": 4}),
+    ("IVF_SQ", {}), ("IVF_HNSW_SQ", {}), ("IVF_HNSW_PQ", {"num_sub_vectors": 4}), ("IVF_HNSW_FLAT", {}),
+]
+
+
+def _partitions(reader, with_vector):
+    return [reader.read_partition(p, with_vector=with_vector) for p in range(reader.num_partitions())]
+
+
+@pytest.mark.parametrize("builder", ["pylance", "nanolance"])
+@pytest.mark.parametrize("kind,kw", READER_INDEXES, ids=lambda x: str(x))
+def test_vector_index_reader_matches_pylance(lance, tmp_path, builder, kind, kw):
+    """VectorIndexReader returns each partition as pylance does: the same schema, the same rows in the
+    same order, the same values -- for an index either engine built."""
+    path = str(tmp_path / "t.lance")
+    table = _table(_vectors(900), nulls=False)
+    if builder == "pylance":
+        lance.write_dataset(table, path, max_rows_per_file=400)
+        lance.dataset(path).create_index("vec", kind, num_partitions=6, **kw)
+    else:
+        nl.write_dataset(table, path, max_rows_per_file=400)
+        nl.dataset(path).create_index("vec", kind, num_partitions=6, **kw)
+    ref_ds, got_ds = lance.dataset(path), nl.dataset(path)
+    ref_reader = importlib.import_module(f"{lance.__name__}.dataset").VectorIndexReader
+    ref = ref_reader(ref_ds, ref_ds.describe_indices()[0].name)
+    got = NanoVectorIndexReader(got_ds, got_ds.describe_indices()[0].name)
+    assert got.num_partitions() == ref.num_partitions() == 6
+    for with_vector in (False, True):
+        for a, b in zip(_partitions(ref, with_vector), _partitions(got, with_vector)):
+            assert b.schema.equals(a.schema, check_metadata=False), (b.schema, a.schema)
+            assert b.equals(a)
+    assert sum(p.num_rows for p in _partitions(got, True)) == 900
+    column = "flat" if kind.endswith("FLAT") else ("__pq_code" if "PQ" in kind else "__sq_code")
+    assert all(column in p.column_names for p in _partitions(got, True))
+
+
+def test_vector_index_reader_errors_as_pylance_raises_them(lance, tmp_path):
+    path = str(tmp_path / "t.lance")
+    lance.write_dataset(_table(_vectors(300), nulls=False), path)
+    lance.dataset(path).create_index("vec", "IVF_FLAT", num_partitions=4)
+    lance.dataset(path).create_scalar_index("id", index_type="BTREE")
+    ds = nl.dataset(path)
+    reader = NanoVectorIndexReader(ds, "vec_idx")
+    with pytest.raises(IndexError, match="out of range"):
+        reader.read_partition(reader.num_partitions())
+    with pytest.raises(IndexError, match="out of range"):
+        reader.read_partition(-1)
+    with pytest.raises(ValueError, match="not vector index"):
+        NanoVectorIndexReader(ds, "id_idx")
+    with pytest.raises(KeyError):
+        NanoVectorIndexReader(ds, "missing_idx")
+
+
+def test_nearest_on_nested_vector_covers_unindexed_fragments(lance, tmp_path):
+    """A KNN on `data.embedding` after an append searches the unindexed fragment too, as pylance does."""
+    dim, n = 32, 256
+    v = np.random.default_rng(3).standard_normal((n, dim)).astype(np.float32)
+    struct = pa.struct([pa.field("embedding", pa.list_(pa.float32(), dim)), pa.field("label", pa.string())])
+    schema = pa.schema([pa.field("id", pa.int64()), pa.field("data", struct)])
+
+    def table(rows, ids):
+        vec = pa.FixedSizeListArray.from_arrays(pa.array(rows.flatten()), dim)
+        data = pa.StructArray.from_arrays([vec, pa.array([f"l{i}" for i in ids])], names=["embedding", "label"])
+        return pa.table({"id": list(ids), "data": data}, schema=schema)
+
+    got = {}
+    for name, engine in (("nano", nl), ("pylance", lance)):
+        uri = str(tmp_path / name)
+        engine.write_dataset(table(v, range(n)), uri)
+        engine.dataset(uri).create_index(column="data.embedding", index_type="IVF_FLAT", num_partitions=2)
+        ds = engine.write_dataset(table(v[:10], range(n, n + 10)), uri, mode="append")
+        got[name] = ds.to_table(columns=["id"], nearest={"column": "data.embedding", "q": v[0], "k": 15,
+                                                         "nprobes": 2})["id"].to_pylist()
+    assert got["nano"] == got["pylance"]
+    assert {0, n} <= set(got["nano"])

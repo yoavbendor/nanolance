@@ -342,13 +342,16 @@ int child_index(const ArrowSchema& schema, const std::string& name) {
 
 /// Append the rows of `batches`' column `vector_column` (and uint64 `id_column`) to `out`.
 bool collect_vectors(const ArrowSchema& schema, const std::vector<ArrowArray>& batches, int vector_column,
-                     int id_column, VectorRows& out, std::string& error) {
+                     int id_column, VectorRows& out, std::string& error, const std::vector<int>& sub_path = {}) {
     for (const auto& batch : batches) {
         BatchView b(schema, batch, error);
         if (!b.ok) {
             return false;
         }
         const ArrowArrayView* list = b.view.children[vector_column];
+        for (const int child : sub_path) {  // a vector inside structs: struct children share the row index
+            list = list->children[child];
+        }
         const ArrowArrayView* items = list->children[0];
         const ArrowArrayView* ids = id_column < 0 ? nullptr : b.view.children[id_column];
         const auto dim = static_cast<std::int64_t>(out.dim);
@@ -1742,6 +1745,33 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
 
 // ── exact distances ─────────────────────────────────────────────────────────────────────────────
 
+/// The top-level column a scan must read for vector column `column` -- `column` itself, or the struct
+/// holding it for a nested path `a.b.c` -- and, once `schema` is read, the child path down to it.
+std::string vector_root(const std::string& column) {
+    return column.substr(0, column.find('.'));
+}
+
+bool vector_sub_path(const ArrowSchema& schema, const std::string& column, int& root, std::vector<int>& path,
+                     std::string& error) {
+    path.clear();
+    root = child_index(schema, vector_root(column));
+    const ArrowSchema* at = root >= 0 ? schema.children[root] : nullptr;
+    std::size_t start = column.find('.');
+    while (at != nullptr && start != std::string::npos) {
+        const std::size_t end = column.find('.', start + 1);
+        const std::string name = column.substr(start + 1, end == std::string::npos ? std::string::npos : end - start - 1);
+        const int i = child_index(*at, name);
+        at = i >= 0 ? at->children[i] : nullptr;
+        path.push_back(i);
+        start = end;
+    }
+    if (at == nullptr) {
+        error = "vector column '" + column + "' not read";
+        return false;
+    }
+    return true;
+}
+
 /// Exact distances of `rows`' vectors (null vectors dropped).
 bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMetric metric, std::size_t dim,
              std::vector<Candidate>& rows, std::string& error) {
@@ -1759,7 +1789,7 @@ bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMet
     }
     std::sort(addrs.begin(), addrs.end());
     addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
-    const std::vector<std::string> columns = {q.column};
+    const std::vector<std::string> columns = {vector_root(q.column)};
     LanceScanRequest request;
     request.row_mask = q.row_mask;
     request.columns = &columns;
@@ -1773,8 +1803,10 @@ bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMet
     }
     VectorRows v;
     v.dim = dim;
-    bool ok = addrs.empty() ||
-              collect_vectors(schema, batches, child_index(schema, q.column), child_index(schema, "_rowaddr"), v, error);
+    int vc = -1;
+    std::vector<int> sub;
+    bool ok = addrs.empty() || (vector_sub_path(schema, q.column, vc, sub, error) &&
+                                collect_vectors(schema, batches, vc, child_index(schema, "_rowaddr"), v, error, sub));
     for (auto& b : batches) {
         b.release(&b);
     }
@@ -1804,7 +1836,7 @@ bool flat_search(const std::filesystem::path& path, const NearestQuery& q, Vecto
     if (fragments.empty()) {
         return true;
     }
-    const std::vector<std::string> columns = {q.column};
+    const std::vector<std::string> columns = {vector_root(q.column)};
     LanceScanRequest request;
     request.row_mask = q.row_mask;
     request.columns = &columns;
@@ -1819,10 +1851,11 @@ bool flat_search(const std::filesystem::path& path, const NearestQuery& q, Vecto
         return false;
     }
     const float q_norm = std::sqrt(dot(q.key.data(), q.key.data(), dim));
-    const int vc = child_index(schema, q.column);
+    int vc = -1;
+    std::vector<int> sub;
     const int ic = child_index(schema, "_rowaddr");
-    bool ok = vc >= 0 && ic >= 0;
-    if (!ok) {
+    bool ok = vector_sub_path(schema, q.column, vc, sub, error) && ic >= 0;
+    if (!ok && error.empty()) {
         error = "vector column '" + q.column + "' not read";
     }
     std::vector<Candidate> found;
@@ -1832,7 +1865,7 @@ bool flat_search(const std::filesystem::path& path, const NearestQuery& q, Vecto
             v.dim = dim;
             std::vector<ArrowArray> one;  // collect_vectors takes a list; reuse without copying ownership
             one.push_back(batch);
-            ok = collect_vectors(schema, one, vc, ic, v, error);
+            ok = collect_vectors(schema, one, vc, ic, v, error, sub);
             for (std::size_t r = 0; ok && r < v.ids.size(); ++r) {
                 if (v.valid[r] == 0U) {
                     continue;
@@ -2378,6 +2411,55 @@ bool read_vector_index_model(const std::filesystem::path& dir, VectorIndexModel&
     out.has_loss = model.has_loss;
     out.loss = model.loss;
     out.partition_sizes = std::move(parts.lengths);
+    return true;
+}
+
+
+bool read_vector_index_partition(const std::filesystem::path& dir, std::size_t p, bool with_values,
+                                 VectorIndexPartition& out, std::string& error) {
+    out = VectorIndexPartition{};
+    std::shared_ptr<const IvfIndex> index;
+    if (!load_ivf(dir, index, error)) {
+        return false;
+    }
+    out.partitions = index->partitions;
+    if (p >= index->partitions) {
+        error = "vector index: partition " + std::to_string(p) + " is out of range (" +
+                std::to_string(index->partitions) + " partitions)";
+        return false;
+    }
+    std::shared_ptr<const Partition> part;
+    CacheCount count;
+    if (!index->partition(p, part, error, count)) {
+        return false;
+    }
+    out.ids = part->ids;
+    if (!with_values) {
+        return true;
+    }
+    const std::size_t n = part->ids.size();
+    if (index->storage == Storage::Flat) {
+        out.column = "flat";
+        out.width = index->dim;
+        out.floats = part->vectors;
+    } else if (index->storage == Storage::Pq) {
+        out.column = "__pq_code";
+        out.width = index->code_bytes;
+        if (index->transposed) {
+            out.codes = part->codes;
+        } else {  // the partition holds [code byte][row]: back to row by row
+            out.codes.resize(n * out.width);
+            for (std::size_t r = 0; r < n; ++r) {
+                for (std::size_t s = 0; s < out.width; ++s) {
+                    out.codes[r * out.width + s] = part->codes[s * n + r];
+                }
+            }
+        }
+    } else {
+        out.column = "__sq_code";
+        out.width = index->dim;
+        out.codes = part->codes;
+    }
     return true;
 }
 

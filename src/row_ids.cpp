@@ -669,7 +669,7 @@ bool RowIdIndex::find(std::uint64_t row_id, std::uint64_t& address) const {
 
 bool resolve_row_ids(const std::filesystem::path& dataset_path, std::optional<std::uint64_t> version,
                      const std::vector<std::uint64_t>& ids, std::vector<std::uint64_t>& addresses,
-                     std::string& error, bool skip_missing) {
+                     std::string& error, bool skip_missing, bool skip_deleted) {
     pb::Manifest manifest;
     if (version) {
         if (!load_manifest_version(dataset_path, *version, manifest, error)) {
@@ -723,7 +723,7 @@ bool resolve_row_ids(const std::filesystem::path& dataset_path, std::optional<st
                            .first;
             }
             if (slot->second.count(static_cast<std::uint32_t>(address & 0xFFFFFFFFULL)) != 0U) {
-                if (skip_missing) {
+                if (skip_missing || skip_deleted) {
                     continue;
                 }
                 error = "row id " + std::to_string(id) + " is not in the dataset (its row was deleted)";

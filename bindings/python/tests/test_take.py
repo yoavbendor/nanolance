@@ -18,6 +18,7 @@ import pyarrow as pa
 import pytest
 
 import nanolance
+import nanolance.lance as nl
 from tests.support import require_pylance
 
 N = 20_000
@@ -155,3 +156,19 @@ def test_take_without_the_decoded_column_cache(tmp_path):
         env = {**os.environ, "NANOLANCE_TAKE_CACHE_MB": budget}
         out = subprocess.run([sys.executable, "-c", script], env=env, check=True, capture_output=True, text=True)
         assert out.stdout == expected, f"NANOLANCE_TAKE_CACHE_MB={budget}"
+
+
+def test_take_rows_leaves_out_deleted_addresses(lance_mod, tmp_path):
+    """Without stable row ids a row address is a row's position: _take_rows of a deleted row's address
+    leaves that row out, as pylance does, and returns the others in order."""
+    path = str(tmp_path / "addr.lance")
+    nl.write_dataset(pa.table({"id": pa.array(range(300), pa.int64())}), path, max_rows_per_file=100)
+    lance_mod.dataset(path).delete("id % 4 = 1")
+    addresses = [(0 << 32) | 5, (0 << 32) | 6, (1 << 32) | 1, (2 << 32) | 0, (2 << 32) | 1]
+    assert lance_mod.dataset(path)._take_rows([(0 << 32) | 5]).to_pylist() == []
+    expected = [6, 200]
+    assert lance_mod.dataset(path)._take_rows(addresses).column("id").to_pylist() == expected
+    assert nl.dataset(path)._take_rows(addresses).column("id").to_pylist() == expected
+    assert nl.dataset(path)._take_rows([(0 << 32) | 5]).to_pylist() == []
+    with pytest.raises((OSError, ValueError)):
+        nl.dataset(path)._take_rows([(0 << 32) | 1000])

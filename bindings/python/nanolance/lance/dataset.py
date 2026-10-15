@@ -648,11 +648,13 @@ class LanceDataset(pa.dataset.Dataset):
                                             addresses=True), columns))
 
     def _row_addresses(self, row_ids: List[int]) -> List[int]:
-        """The addresses of rows given by id: the ids themselves without stable row ids, else where the
+        """The addresses of rows given by id: the ids themselves without stable row ids (an address of a
+        deleted row is left out, as pylance does; one outside the dataset raises), else where the
         fragments' row id sequences put them (a row id that is gone raises)."""
-        if not self.has_stable_row_ids:
-            return row_ids
         with native():
+            if not self.has_stable_row_ids:
+                return list(_nanolance._ds_resolve_row_ids(self._uri, self._version, row_ids,
+                                                           skip_missing=False, skip_deleted=True))
             return list(_nanolance._ds_resolve_row_ids(self._uri, self._version, row_ids))
 
     def take_rows(self, row_ids, columns=None, **kwargs) -> pa.Table:
@@ -2871,6 +2873,47 @@ def _vector_statistics(ds: "LanceDataset", segment: dict, directory: str) -> Dic
         "loss": model["loss"],
         "index_file_version": "V3",
     }
+
+
+class VectorIndexReader:
+    """Reads the partitions of a vector index. Mirrors ``lance.dataset.VectorIndexReader``: ``read_partition``
+    returns one partition's rows as a table -- ``_rowid``, and with ``with_vector`` the storage column
+    (``flat`` for IVF_FLAT and IVF_HNSW_FLAT, ``__pq_code`` for IVF_PQ and IVF_HNSW_PQ, ``__sq_code`` for
+    IVF_SQ and IVF_HNSW_SQ) -- in the order the index stores them."""
+
+    def __init__(self, dataset: "LanceDataset", index_name: str):
+        segments = [i for i in dataset.list_indices() if i["name"] == index_name]
+        if not segments:
+            raise KeyError(f'Index "{index_name}" not found')
+        description = next(d for d in dataset.describe_indices() if d.name == index_name)
+        if description.type_url != "/lance.index.pb.VectorIndexDetails":
+            raise ValueError(f"Index {index_name} is not vector index")
+        self._dir = os.path.join(dataset._uri, "_indices", segments[0]["uuid"])
+        with native():
+            self._partitions = _nanolance._vector_index_partition(self._dir, 0, False)["partitions"]
+
+    def num_partitions(self) -> int:
+        return self._partitions
+
+    def read_partition(self, partition_id: int, with_vector: bool = False) -> pa.Table:
+        if not 0 <= partition_id < self._partitions:
+            raise IndexError(f"Partition id {partition_id} is out of range, "
+                             f"expected 0 <= partition_id < {self._partitions}")
+        with native():
+            part = _nanolance._vector_index_partition(self._dir, partition_id, with_vector)
+        arrays = [pa.array(np.frombuffer(part["ids"], dtype=np.uint64).copy())]
+        fields = [pa.field("_rowid", pa.uint64())]
+        if with_vector:
+            width, column = part["width"], part["column"]
+            if column == "flat":
+                values = pa.array(np.frombuffer(part["values"], dtype=np.float32).copy())
+                arrays.append(pa.FixedSizeListArray.from_arrays(values, width))
+                fields.append(pa.field(column, pa.list_(pa.float32(), width), nullable=False))
+            else:
+                values = pa.array(np.frombuffer(part["values"], dtype=np.uint8).copy())
+                arrays.append(pa.FixedSizeListArray.from_arrays(values, width))
+                fields.append(pa.field(column, pa.list_(pa.uint8(), width)))
+        return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
 
 
 class IndexDescription:

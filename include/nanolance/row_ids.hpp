@@ -174,10 +174,11 @@ private:
 /// The addresses (fragment << 32 | offset) of rows given by id, in order, at `version` (the latest
 /// when null). Without stable row ids an id is its address and is only checked to exist. False and
 /// `error` when an id is not in the dataset or its row has been deleted -- unless `skip_missing`, which
-/// leaves such ids out (what pylance's take_rows does with a dataset's stable row ids).
+/// leaves such ids out (what pylance's take_rows does with a dataset's stable row ids). `skip_deleted`
+/// leaves out only the ids whose rows were deleted (what pylance's take_rows does without stable row ids).
 bool resolve_row_ids(const std::filesystem::path& dataset_path, std::optional<std::uint64_t> version,
                      const std::vector<std::uint64_t>& ids, std::vector<std::uint64_t>& addresses,
-                     std::string& error, bool skip_missing = false);
+                     std::string& error, bool skip_missing = false, bool skip_deleted = false);
 
 /// The version each row at `addresses` was created and last updated at (1 for a fragment without
 /// version metadata, as Lance reads it), at `version` (the latest when null).
