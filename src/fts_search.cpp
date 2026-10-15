@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/fts_search.hpp"
+#include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
 
 #include "fts_fst.hpp"
@@ -1881,6 +1882,9 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
                 }
             } else {
                 c.covered.insert(seg->fragment_ids.begin(), seg->fragment_ids.end());
+            }
+            for (const auto stale : fragments_stale_for_index(s.manifest, seg->fields, seg->dataset_version)) {
+                c.covered.erase(stale);  // overlaid since the index was built: searched as unindexed
             }
             for (const auto& p : index->partitions) {
                 c.num_docs += p->row_ids.size();

@@ -773,4 +773,116 @@ bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>
     return true;
 }
 
+bool merge_column_rows(ColumnValues& base, std::uint64_t rows, std::size_t value_bytes,
+                       const std::vector<RowPick>& picks, const std::vector<const ColumnValues*>& sources,
+                       std::string& error) {
+    if (picks.size() != rows) {
+        error = "internal error: one pick per row";
+        return false;
+    }
+    if (!base.layers.empty() || base.kind == ColumnValues::Kind::BlobV2External || base.dictionary != nullptr) {
+        error = "data overlays on nested, blob or dictionary columns are not supported";
+        return false;
+    }
+    for (const auto* s : sources) {
+        if (!s->layers.empty() || s->kind != base.kind) {
+            error = "a data overlay's values do not match the column they overlay";
+            return false;
+        }
+    }
+    const auto valid = [](const ColumnValues& c, std::uint64_t r) {
+        return c.validity.empty() || bit_set(c.validity, r);
+    };
+    // The row at `r` of the result: (column, its row).
+    const auto source_of = [&](std::uint64_t r) -> std::pair<const ColumnValues*, std::uint64_t> {
+        const auto& pick = picks[static_cast<std::size_t>(r)];
+        if (pick.source < 0) {
+            return {&base, r};
+        }
+        return {sources[static_cast<std::size_t>(pick.source)], pick.row};
+    };
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        const auto [c, at] = source_of(r);
+        if (c != &base && at >= c->rows && c->rows != 0U) {
+            error = "a data overlay has fewer values than the offsets it covers";
+            return false;
+        }
+    }
+    ColumnValues out;
+    out.kind = base.kind;
+    out.rows = rows;
+    out.items_per_row = base.items_per_row;
+    bool any_null = false;
+    for (std::uint64_t r = 0; r < rows && !any_null; ++r) {
+        const auto [c, at] = source_of(r);
+        any_null = !valid(*c, at);
+    }
+    if (any_null) {
+        out.validity.assign(bitmap_bytes(rows), 0U);
+        for (std::uint64_t r = 0; r < rows; ++r) {
+            const auto [c, at] = source_of(r);
+            if (valid(*c, at)) {
+                out.validity[static_cast<std::size_t>(r >> 3U)] |= static_cast<std::uint8_t>(1U << (r & 7U));
+            } else {
+                ++out.null_count;
+            }
+        }
+    }
+    if (base.kind == ColumnValues::Kind::FixedWidth) {
+        if (value_bytes == 0U) {
+            error = "fixed-width column has no value width";
+            return false;
+        }
+        out.fixed.assign(static_cast<std::size_t>(rows) * value_bytes, 0U);
+        for (std::uint64_t r = 0; r < rows; ++r) {
+            const auto [c, at] = source_of(r);
+            if (c->fixed.size() >= (at + 1U) * value_bytes) {
+                std::memcpy(out.fixed.data() + r * value_bytes, c->fixed.data() + at * value_bytes, value_bytes);
+            }
+        }
+        const auto per_row = base.items_per_row;
+        bool item_nulls = !base.item_validity.empty();
+        for (const auto* s : sources) {
+            item_nulls = item_nulls || !s->item_validity.empty();
+        }
+        if (item_nulls && per_row != 0U) {
+            out.item_validity.assign(bitmap_bytes(rows * per_row), 0U);
+            for (std::uint64_t r = 0; r < rows; ++r) {
+                const auto [c, at] = source_of(r);
+                for (std::uint64_t e = 0; e < per_row; ++e) {
+                    const bool ok = c->item_validity.empty() || bit_set(c->item_validity, at * per_row + e);
+                    const auto d = r * per_row + e;
+                    if (ok) {
+                        out.item_validity[static_cast<std::size_t>(d >> 3U)] |= static_cast<std::uint8_t>(1U << (d & 7U));
+                    } else {
+                        ++out.item_null_count;
+                    }
+                }
+            }
+        }
+    } else {
+        const bool large = base.variable.large;
+        out.variable.large = large;
+        const std::size_t width = large ? 8U : 4U;
+        out.variable.offsets.assign((static_cast<std::size_t>(rows) + 1U) * width, 0U);
+        std::uint64_t end = 0;
+        for (std::uint64_t r = 0; r < rows; ++r) {
+            const auto [c, at] = source_of(r);
+            const bool has = c->variable.offsets.size() >= (at + 2U) * (c->variable.large ? 8U : 4U);
+            const auto b = has ? read_offset(c->variable.offsets, at, c->variable.large) : 0U;
+            const auto e = has ? read_offset(c->variable.offsets, at + 1U, c->variable.large) : 0U;
+            if (e < b || e > c->variable.data.size()) {
+                error = "variable-width offset runs past the data buffer";
+                return false;
+            }
+            out.variable.data.insert(out.variable.data.end(), c->variable.data.begin() + static_cast<std::ptrdiff_t>(b),
+                                     c->variable.data.begin() + static_cast<std::ptrdiff_t>(e));
+            end += e - b;
+            write_offset(out.variable.offsets.data() + (r + 1U) * width, end, large);
+        }
+    }
+    base = std::move(out);
+    return true;
+}
+
 }  // namespace nano_lance

@@ -11,6 +11,7 @@
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/manifest_writer.hpp"
+#include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
 
 #include "lance_minimal.pb.hpp"
@@ -217,7 +218,8 @@ void apply_update_map(Map& target, const UpdateMap& update, Convert convert) {
 
 constexpr std::uint32_t kAppend = 100, kDelete = 101, kOverwrite = 102, kCreateIndex = 103, kRewrite = 104,
                         kMerge = 105, kRestore = 106, kReserveFragments = 107, kUpdate = 108, kProject = 109,
-                        kUpdateConfig = 110, kDataReplacement = 111, kUpdateBases = 114;
+                        kUpdateConfig = 110, kDataReplacement = 111, kUpdateBases = 114,
+                        kDataOverlay = 115;
 constexpr std::int32_t kTombstone = -2;
 
 const char* operation_name(std::uint32_t field) {
@@ -235,6 +237,7 @@ const char* operation_name(std::uint32_t field) {
         case kUpdateConfig: return "UpdateConfig";
         case kDataReplacement: return "DataReplacement";
         case kUpdateBases: return "UpdateBases";
+        case kDataOverlay: return "DataOverlay";
         default: return "an operation";
     }
 }
@@ -273,6 +276,8 @@ struct Operation {
     std::map<std::int32_t, UpdateMap> field_metadata_updates;
     std::vector<std::pair<std::uint64_t, pb::DataFile>> replacements;  // DataReplacement
     std::vector<Bytes> new_bases;                     // UpdateBases: each a lance.table.BasePath
+    /// DataOverlay: per group, the fragment and its new overlays (each a lance.table.DataOverlayFile).
+    std::vector<std::pair<std::uint64_t, std::vector<Bytes>>> overlay_groups;
 };
 
 bool uuid_of(const WireField& f, std::array<std::uint8_t, 16>& out) {
@@ -427,6 +432,18 @@ bool decode_operation(std::uint32_t kind, const Bytes& message, Operation& op, s
                         return false;
                     }
                     op.replacements.emplace_back(id, std::move(file));
+                }
+                break;
+            case kDataOverlay:
+                if (f.number == 1) {
+                    std::pair<std::uint64_t, std::vector<Bytes>> group;
+                    WireReader gr(f);
+                    WireField g;
+                    while (gr.next(g)) {
+                        if (g.number == 1) group.first = g.value;
+                        if (g.number == 2) group.second.push_back(g.bytes());
+                    }
+                    op.overlay_groups.push_back(std::move(group));
                 }
                 break;
             default:
@@ -1079,6 +1096,22 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
             write_base_paths(next, bases);
             break;
         }
+        case kDataOverlay:
+            // Lance's DataOverlay: each group's overlays go after the fragment's own, stamped with
+            // this commit's version.
+            for (const auto& [fragment_id, overlays] : op.overlay_groups) {
+                auto it = std::find_if(next.fragments.begin(), next.fragments.end(),
+                                       [&](const pb::DataFragment& f) { return f.id == fragment_id; });
+                if (it == next.fragments.end()) {
+                    error = "Invalid user input: data overlay for fragment " + std::to_string(fragment_id) +
+                            ", which the dataset does not have";
+                    return false;
+                }
+                if (!append_fragment_overlays(*it, overlays, new_version, error)) {
+                    return false;
+                }
+            }
+            break;
         default:
             error = std::string("LanceDataset.commit of ") + operation_name(op.kind) + " is not supported";
             return false;
@@ -1110,6 +1143,16 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
     if (stable) {
         next.reader_feature_flags |= pb::kFlagStableRowIds;
         next.writer_feature_flags |= pb::kFlagStableRowIds;
+    }
+    // Overlays present: the feature flag Lance sets (pylance 12 reads such a dataset only with
+    // LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES set).
+    if (std::any_of(next.fragments.begin(), next.fragments.end(),
+                    [](const pb::DataFragment& f) { return fragment_has_overlays(f); })) {
+        next.reader_feature_flags |= kFlagDataOverlays;
+        next.writer_feature_flags |= kFlagDataOverlays;
+    } else {
+        next.reader_feature_flags &= ~kFlagDataOverlays;
+        next.writer_feature_flags &= ~kFlagDataOverlays;
     }
     const bool deletions = std::any_of(next.fragments.begin(), next.fragments.end(),
                                        [](const pb::DataFragment& f) { return f.deletion_file.present; });

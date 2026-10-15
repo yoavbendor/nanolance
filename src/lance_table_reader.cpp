@@ -18,6 +18,7 @@
 #include "nanolance/lance_column_decoder.hpp"
 #include "nanolance/lance_v20_decoder.hpp"
 #include "nanolance/manifest_reader.hpp"
+#include "nanolance/overlays.hpp"
 #include "nanolance/page_layout.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/work_stats.hpp"
@@ -1480,6 +1481,8 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
 /// every column after the first file's.
 struct PlannedFile {
     std::vector<pb::DataFile> files;
+    /// The fragment's data overlays (oldest first); null when it has none.
+    std::shared_ptr<const std::vector<DataOverlay>> overlays;
     std::uint64_t fragment_id = 0;
     pb::DeletionFile deletion_file;    // `present` false when the fragment has no deletions
     std::uint64_t physical_rows = 0;   // rows on disk, before deletions
@@ -2084,6 +2087,120 @@ bool read_candidate_rows(const std::filesystem::path& dataset_path, const Planne
                          const std::unordered_set<std::int32_t>* allowed_field_ids, const RowIdColumns& ids,
                          const FilterSpec& filter);
 
+/// The overlay values a fragment read needs: for each overlaid column, each overlay covering it, newest
+/// first, with its decoded values (Lance's resolution order: higher committed_version wins, then the
+/// later overlay in the fragment's list).
+struct FragmentOverlays {
+    struct Layer {
+        std::uint64_t version = 0;
+        std::size_t order = 0;
+        const std::vector<std::uint32_t>* offsets = nullptr;
+        ColumnValues values;
+    };
+    std::unordered_map<std::int32_t, std::vector<Layer>> by_field;
+};
+
+bool load_fragment_overlays(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+                            const std::vector<ColumnSource>& columns, FragmentOverlays& out, std::string& error) {
+    out.by_field.clear();
+    if (planned.overlays == nullptr) {
+        return true;
+    }
+    for (const auto& column : columns) {
+        for (std::size_t k = 0; k < planned.overlays->size(); ++k) {
+            const auto& overlay = (*planned.overlays)[k];
+            const auto& file = overlay.data_file;
+            const auto at = std::find(file.fields.begin(), file.fields.end(), column.field_id);
+            if (at == file.fields.end()) {
+                continue;
+            }
+            const auto i = static_cast<std::size_t>(at - file.fields.begin());
+            if (i >= file.column_indices.size()) {
+                error = "data overlay field/column index mismatch";
+                return false;
+            }
+            const auto jailed = safe_join_under(dataset_path / "data", file.path);
+            if (!jailed) {
+                error = "data overlay path escapes the dataset directory";
+                return false;
+            }
+            pb::FileDescriptor descriptor;
+            std::vector<pb::ColumnMetadata> metadatas;
+            LanceDataFileFooterLayout layout{};
+            if (!read_lance_data_file_footer_and_descriptor(*jailed, descriptor, layout, error) ||
+                !read_lance_data_file_column_metadatas(*jailed, layout, metadatas, error)) {
+                return false;
+            }
+            const auto column_index = file.column_indices[i];
+            if (layout.is_v2_0() || column_index < 0 || static_cast<std::size_t>(column_index) >= metadatas.size()) {
+                error = "data overlay file " + file.path + " is not a Lance 2.1+ file with that column";
+                return false;
+            }
+            const auto* on_disk = on_disk_field(descriptor, file, i, column.field_id, column.on_disk->name);
+            if (on_disk == nullptr) {
+                error = "data overlay file " + file.path + " has no field " + std::to_string(column.field_id);
+                return false;
+            }
+            FragmentOverlays::Layer layer;
+            layer.version = overlay.committed_version;
+            layer.order = k;
+            layer.offsets = &overlay.offsets_for(i);
+            if (!decode_lance_physical_column(*jailed, *on_disk, metadatas[static_cast<std::size_t>(column_index)],
+                                              layer.values, error)) {
+                return false;
+            }
+            out.by_field[column.field_id].push_back(std::move(layer));
+        }
+    }
+    for (auto& [field, layers] : out.by_field) {
+        std::sort(layers.begin(), layers.end(), [](const FragmentOverlays::Layer& a, const FragmentOverlays::Layer& b) {
+            return a.version != b.version ? a.version > b.version : a.order > b.order;
+        });
+    }
+    return true;
+}
+
+/// Put the overlays' values in place of the data files' in `by_field`: `rows` decoded rows, row `r`
+/// at physical offset `physical(r)`. Deleted rows are dropped afterwards, so their overlay values die.
+template <typename Physical>
+bool apply_fragment_overlays(const FragmentOverlays& overlays, const std::vector<ColumnSource>& columns,
+                             std::unordered_map<std::int32_t, ColumnValues>& by_field, std::uint64_t rows,
+                             Physical physical, std::string& error) {
+    for (const auto& column : columns) {
+        const auto it = overlays.by_field.find(column.field_id);
+        if (it == overlays.by_field.end()) {
+            continue;
+        }
+        const auto& layers = it->second;
+        std::vector<RowPick> picks(static_cast<std::size_t>(rows));
+        bool any = false;
+        for (std::uint64_t r = 0; r < rows; ++r) {
+            const auto p = physical(r);
+            for (std::size_t l = 0; l < layers.size(); ++l) {
+                const auto& offsets = *layers[l].offsets;
+                const auto found = std::lower_bound(offsets.begin(), offsets.end(), p);
+                if (found != offsets.end() && *found == p) {
+                    picks[static_cast<std::size_t>(r)] = {static_cast<std::int32_t>(l),
+                                                          static_cast<std::uint64_t>(found - offsets.begin())};
+                    any = true;
+                    break;
+                }
+            }
+        }
+        if (!any) {
+            continue;
+        }
+        std::vector<const ColumnValues*> sources;
+        for (const auto& layer : layers) {
+            sources.push_back(&layer.values);
+        }
+        if (!merge_column_rows(by_field[column.field_id], rows, column.value_bytes, picks, sources, error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool read_data_file_batches(const std::filesystem::path& dataset_path, const PlannedFile& planned,
                             const LanceSchemaMapping& mapping, const ArrowSchema& batch_schema,
                             std::vector<ArrowArray>& out, std::string& error,
@@ -2317,8 +2434,12 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
             return false;
         }
     }
+    FragmentOverlays overlays;
+    if (!load_fragment_overlays(dataset_path, planned, columns, overlays, error)) {
+        return false;
+    }
 
-    // Each morsel: its deletions, its part of the range, its batch.
+    // Each morsel: its overlays, its deletions, its part of the range, its batch.
     std::vector<ArrowArray> batches(morsels.size(), ArrowArray{});
     std::vector<std::uint8_t> built(morsels.size(), 0U);
     std::vector<std::string> batch_errors(morsels.size());
@@ -2330,6 +2451,11 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
         std::unordered_map<std::int32_t, ColumnValues> by_field;
         for (std::size_t c = 0; c < n_columns; ++c) {
             by_field.emplace(columns[c].field_id, std::move(decoded[k * n_columns + c]));
+        }
+        if (!overlays.by_field.empty() &&
+            !apply_fragment_overlays(overlays, columns, by_field, p1 - p0,
+                                     [p0 = p0](std::uint64_t r) { return p0 + r; }, why)) {
+            return;
         }
         if (!keep.empty()) {
             const std::vector<std::uint8_t> part(keep.begin() + static_cast<std::ptrdiff_t>(p0),
@@ -2609,6 +2735,13 @@ bool decode_data_file_rows(const std::filesystem::path& dataset_path, const Plan
             return false;
         }
         decoded_by_field_id.emplace(columns[c].field_id, std::move(decoded[c]));
+    }
+    FragmentOverlays overlays;
+    if (!load_fragment_overlays(dataset_path, planned, columns, overlays, error) ||
+        (!overlays.by_field.empty() &&
+         !apply_fragment_overlays(overlays, columns, decoded_by_field_id, physical.size(),
+                                  [&](std::uint64_t r) { return physical[static_cast<std::size_t>(r)]; }, error))) {
+        return false;
     }
     missing = fields_missing_from(planned, mapping, allowed_field_ids, columns);
     for (const auto* field : missing) {
@@ -3047,6 +3180,14 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
             planned.row_ids = std::make_shared<const RowIdSequence>(std::move(sequence));
         }
         planned.deletion_file = fragment.deletion_file;
+        if (fragment_has_overlays(fragment)) {
+            auto overlays = std::make_shared<std::vector<DataOverlay>>();
+            if (!read_fragment_overlays(fragment, *overlays, error)) {
+                release_schema_if_held(out_schema);
+                return false;
+            }
+            planned.overlays = std::move(overlays);
+        }
         planned.physical_rows = fragment.physical_rows;
         planned.rows = rows;
 

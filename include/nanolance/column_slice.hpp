@@ -52,4 +52,18 @@ bool compact_column_values(ColumnValues& values, const std::vector<std::uint8_t>
 bool gather_column_values(const ColumnValues& src, const std::vector<std::uint8_t>& keep, std::uint64_t total,
                           std::size_t value_bytes, ColumnValues& out, std::string& error);
 
+/// Where row `r` of a merged column comes from: `source` -1 is the column itself (its row `r`), else
+/// `sources[source]`, row `row`.
+struct RowPick {
+    std::int32_t source = -1;
+    std::uint64_t row = 0;
+};
+
+/// Replace rows of `base` (`rows` of them) as `picks` says, from `sources` -- how a data overlay's
+/// values take the place of the data file's. Flat columns only (no list or struct layers, blob or
+/// dictionary columns): those are refused with an error.
+bool merge_column_rows(ColumnValues& base, std::uint64_t rows, std::size_t value_bytes,
+                       const std::vector<RowPick>& picks, const std::vector<const ColumnValues*>& sources,
+                       std::string& error);
+
 }  // namespace nano_lance

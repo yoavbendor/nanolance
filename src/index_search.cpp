@@ -26,6 +26,7 @@
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/roaring_bitmap.hpp"
+#include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
 
 #include <nanoarrow/nanoarrow.h>
@@ -691,6 +692,9 @@ struct Search {
                 }
                 to_addresses(one);
                 one.covered.insert(index->fragment_ids.begin(), index->fragment_ids.end());
+                for (const auto stale : fragments_stale_for_index(manifest, index->fields, index->dataset_version)) {
+                    one.covered.erase(stale);  // overlaid since the index was built: scanned instead
+                }
                 set.covered.insert(one.covered.begin(), one.covered.end());
                 for (auto& [f, rows] : one.rows) {
                     if (one.covered.count(f) != 0U) {

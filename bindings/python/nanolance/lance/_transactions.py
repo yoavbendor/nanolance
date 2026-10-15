@@ -316,6 +316,8 @@ def _fragment(data: bytes) -> FragmentMetadata:
             fragment.last_updated_at_version_meta = RowDatasetVersionMeta(bytes(value))
         elif number == 9:
             fragment.created_at_version_meta = RowDatasetVersionMeta(bytes(value))
+        elif number == 11:
+            fragment.overlays.append(_overlay(value))
     return fragment
 
 
@@ -652,11 +654,79 @@ def _encode_data_file(f: DataFile) -> bytes:
     return bytes(out)
 
 
+_OFFSETS_SHAPE = ("DataOverlayFile.offsets must be an iterable of ints (dense coverage shared by every field) or "
+                  "an iterable of per-field int iterables (sparse coverage)")
+
+
+def _offset_list(values) -> List[int]:
+    out = []
+    for v in values:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(_OFFSETS_SHAPE)
+        if not 0 <= v < 2**32:
+            raise ValueError(f"Bitmap values must fit in an unsigned 32-bit integer, got {v}")
+        out.append(v)
+    seen = set()
+    for v in out:
+        if v in seen:
+            raise ValueError(f"DataOverlayFile.offsets must not repeat an offset, but {v} appears more than once; "
+                             "each offset maps positionally to a row of the overlay's value file")
+        seen.add(v)
+    return sorted(out)
+
+
+def _overlay_offsets(offsets) -> Tuple[bool, List]:
+    """(dense, offsets): a dense overlay's ascending offsets, or a sparse one's per field."""
+    from nanolance.lance.bitmap import Bitmap
+
+    if isinstance(offsets, Bitmap):
+        return True, sorted(offsets)
+    if isinstance(offsets, (str, bytes)) or not hasattr(offsets, "__iter__"):
+        raise ValueError(_OFFSETS_SHAPE)
+    items = list(offsets)  # a one-shot iterable is read once
+    if items and all(isinstance(i, Bitmap) or (hasattr(i, "__iter__") and not isinstance(i, (str, bytes)))
+                     for i in items):
+        return False, [sorted(i) if isinstance(i, Bitmap) else _offset_list(list(i)) for i in items]
+    return True, _offset_list(items)
+
+
+def _encode_overlay(o) -> bytes:
+    from nanolance.lance.bitmap import _serialize_roaring
+
+    out = bytearray()
+    _put_bytes(out, 1, _encode_data_file(o.data_file))
+    dense, offsets = _overlay_offsets(o.offsets)
+    if dense:
+        _put_bytes(out, 2, _serialize_roaring(offsets))
+    else:
+        coverage = bytearray()
+        for field_offsets in offsets:
+            _put_bytes(coverage, 1, _serialize_roaring(field_offsets))
+        _put_bytes(out, 4, bytes(coverage))
+    if o.committed_version:
+        _put_uint(out, 3, o.committed_version)
+    return bytes(out)
+
+
+def _overlay(data: bytes):
+    from nanolance.lance.bitmap import Bitmap
+
+    data_file, dense, sparse, version = None, None, None, None
+    for number, _, value in _fields(data):
+        if number == 1:
+            data_file = _data_file(value)
+        elif number == 2:
+            dense = Bitmap(_roaring(value))
+        elif number == 3:
+            version = value
+        elif number == 4:
+            sparse = [Bitmap(_roaring(v)) for n, _, v in _fields(value) if n == 1]
+    return LanceOperation.DataOverlayFile(data_file, dense if sparse is None else sparse, version)
+
+
 def _encode_fragment(f: FragmentMetadata) -> bytes:
     from nanolance.lance._errors import unsupported
 
-    if f.overlays:
-        raise unsupported("data overlay files")
     out = bytearray()
     _put_uint(out, 1, f.id)
     for file in f.files:
@@ -675,6 +745,8 @@ def _encode_fragment(f: FragmentMetadata) -> bytes:
     _put_uint(out, 4, f.physical_rows)
     if f.row_id_meta is not None:
         _put_bytes(out, 5, bytes(f.row_id_meta._inline))
+    for overlay in f.overlays:
+        _put_bytes(out, 11, _encode_overlay(overlay))
     if f.last_updated_at_version_meta is not None:
         _put_bytes(out, 7, bytes(f.last_updated_at_version_meta._inline))
     if f.created_at_version_meta is not None:
@@ -867,6 +939,13 @@ def encode_operation(op: LanceOperation.BaseOperation) -> Tuple[int, bytes]:
             group = bytearray()
             _put_uint(group, 1, g.fragment_id)
             _put_bytes(group, 2, _encode_data_file(g.new_file))
+            _put_bytes(out, 1, bytes(group))
+    elif isinstance(op, L.DataOverlay):
+        for g in op.groups:
+            group = bytearray()
+            _put_uint(group, 1, g.fragment_id)
+            for overlay in g.overlays:
+                _put_bytes(group, 2, _encode_overlay(overlay))
             _put_bytes(out, 1, bytes(group))
     else:
         raise unsupported(f"LanceDataset.commit of {operation_name(op)}")

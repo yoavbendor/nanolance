@@ -334,7 +334,7 @@ class FragmentMetadata:
         return dict(
             id=self.id,
             files=[file_json(f) for f in self.files],
-            overlays=[],
+            overlays=[_overlay_json(o, file_json) for o in self.overlays],
             physical_rows=self.physical_rows,
             deletion_file=None if self.deletion_file is None else self.deletion_file.asdict(),
             row_id_meta=None if self.row_id_meta is None else {"Inline": list(self.row_id_meta._inline)},
@@ -350,8 +350,7 @@ class FragmentMetadata:
         deletion = data.get("deletion_file")
         if deletion is not None:
             deletion = DeletionFile(**deletion)
-        if data.get("overlays"):
-            raise unsupported("data overlay files")
+        overlays = [_overlay_from_json(o) for o in data.get("overlays") or []]
         row_ids = data.get("row_id_meta")
         created = data.get("created_at_version_meta")
         updated = data.get("last_updated_at_version_meta")
@@ -360,7 +359,27 @@ class FragmentMetadata:
             deletion_file=deletion, row_id_meta=None if row_ids is None else RowIdMeta.from_dict(row_ids),
             created_at_version_meta=None if created is None else RowDatasetVersionMeta.from_json(json.dumps(created)),
             last_updated_at_version_meta=None if updated is None
-            else RowDatasetVersionMeta.from_json(json.dumps(updated)))
+            else RowDatasetVersionMeta.from_json(json.dumps(updated)), overlays=overlays)
+
+
+def _overlay_json(o, file_json) -> dict:
+    """A DataOverlayFile as pylance's to_json writes it: offsets as plain (per-field) lists."""
+    from nanolance.lance._transactions import _overlay_offsets
+
+    _, offsets = _overlay_offsets(o.offsets)
+    return {"data_file": file_json(o.data_file), "offsets": offsets, "committed_version": o.committed_version}
+
+
+def _overlay_from_json(d: dict):
+    from nanolance.lance._transactions import LanceOperation
+    from nanolance.lance.bitmap import Bitmap
+
+    offsets = d["offsets"]
+    if offsets and isinstance(offsets[0], list):
+        offsets = [Bitmap(o) for o in offsets]
+    else:
+        offsets = Bitmap(offsets)
+    return LanceOperation.DataOverlayFile(DataFile(**d["data_file"]), offsets, d.get("committed_version"))
 
 
 class LanceFragment(pa.dataset.Fragment):

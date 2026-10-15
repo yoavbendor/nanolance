@@ -14,6 +14,7 @@
 //             (distance, row id).
 
 #include "nanolance/vector_search.hpp"
+#include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
 
 #include "index_build.hpp"
@@ -2127,7 +2128,14 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                 mask.physical[static_cast<std::uint32_t>(f.id)] = f.physical_rows;
             }
             mask.limit.insert(segments[s]->fragment_ids.begin(), segments[s]->fragment_ids.end());
-            covered.insert(segments[s]->fragment_ids.begin(), segments[s]->fragment_ids.end());
+            for (const auto stale : fragments_stale_for_index(manifest, segments[s]->fields,
+                                                              segments[s]->dataset_version)) {
+                mask.limit.erase(stale);  // overlaid since the index was built: searched exactly instead
+            }
+            covered.insert(mask.limit.begin(), mask.limit.end());
+            if (mask.limit.empty()) {
+                mask.limit.insert(UINT32_MAX);  // an empty limit means any fragment; this one has none left
+            }
             std::vector<std::uint64_t> frags;
             bool deletions = false;
             for (const auto& f : manifest.fragments) {

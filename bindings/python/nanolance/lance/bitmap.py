@@ -28,6 +28,11 @@ class Bitmap(MutableSet):
     def __len__(self) -> int:
         return len(self._ids)
 
+    def __eq__(self, other) -> bool:
+        if isinstance(other, (list, tuple)):  # pylance's Bitmap equals the ascending list of its values
+            return sorted(self._ids) == list(other)
+        return super().__eq__(other)
+
     def add(self, value: int) -> None:
         value = int(value)
         if not 0 <= value < 2**32:
