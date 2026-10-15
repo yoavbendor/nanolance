@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "nanolance/base_paths.hpp"
 #include "nanolance/data_file_writer.hpp"
 #include "nanolance/schema_mapper.hpp"
 
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,6 +29,8 @@ enum class CommitMode {
 struct NewFragment {
     DataFileResult data_file;
     std::uint64_t rows = 0;
+    /// The base path the data file lives in (DataFile.base_id); nullopt: the dataset's own directory.
+    std::optional<std::uint32_t> base_id;
 };
 
 struct CommitExtras {
@@ -42,6 +46,9 @@ struct CommitExtras {
     /// them) keep them: each new fragment is given row ids from the manifest's `next_row_id` and the
     /// version stamps of its rows. A dataset that has them keeps them whatever this says.
     bool stable_row_ids = false;
+    /// The base paths a dataset created by this commit registers (Lance's initial_bases; ids are set
+    /// already). Ignored when the dataset exists: its base paths carry over.
+    const std::vector<BasePath>* initial_bases = nullptr;
 };
 
 /// Publish one new version holding `fragments` (possibly none), numbered after the latest one. Table

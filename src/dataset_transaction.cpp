@@ -6,6 +6,7 @@
 
 #include "nanolance/dataset_transaction.hpp"
 
+#include "nanolance/base_paths.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -216,7 +217,7 @@ void apply_update_map(Map& target, const UpdateMap& update, Convert convert) {
 
 constexpr std::uint32_t kAppend = 100, kDelete = 101, kOverwrite = 102, kCreateIndex = 103, kRewrite = 104,
                         kMerge = 105, kRestore = 106, kReserveFragments = 107, kUpdate = 108, kProject = 109,
-                        kUpdateConfig = 110, kDataReplacement = 111;
+                        kUpdateConfig = 110, kDataReplacement = 111, kUpdateBases = 114;
 constexpr std::int32_t kTombstone = -2;
 
 const char* operation_name(std::uint32_t field) {
@@ -233,6 +234,7 @@ const char* operation_name(std::uint32_t field) {
         case kProject: return "Project";
         case kUpdateConfig: return "UpdateConfig";
         case kDataReplacement: return "DataReplacement";
+        case kUpdateBases: return "UpdateBases";
         default: return "an operation";
     }
 }
@@ -270,6 +272,7 @@ struct Operation {
     std::optional<UpdateMap> config_updates, table_metadata_updates, schema_metadata_updates;  // UpdateConfig
     std::map<std::int32_t, UpdateMap> field_metadata_updates;
     std::vector<std::pair<std::uint64_t, pb::DataFile>> replacements;  // DataReplacement
+    std::vector<Bytes> new_bases;                     // UpdateBases: each a lance.table.BasePath
 };
 
 bool uuid_of(const WireField& f, std::array<std::uint8_t, 16>& out) {
@@ -374,6 +377,9 @@ bool decode_operation(std::uint32_t kind, const Bytes& message, Operation& op, s
                 }
                 break;
             }
+            case kUpdateBases:
+                if (f.number == 1) op.new_bases.push_back(f.bytes());
+                break;
             case kUpdateConfig:
                 if (f.number == 6) op.config_updates = decode_update_map(f);
                 if (f.number == 7) op.table_metadata_updates = decode_update_map(f);
@@ -1034,6 +1040,36 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
                 return false;
             }
             break;
+        case kUpdateBases: {
+            // Lance's UpdateBases: each new base takes the next id after the largest one registered; a
+            // name or a path already registered is a conflict.
+            std::vector<BasePath> bases;
+            if (!read_base_paths(next, bases, error)) {
+                return false;
+            }
+            for (const auto& message : op.new_bases) {
+                BasePath base;
+                if (!decode_base_path_message(message.data(), message.size(), base, error)) {
+                    return false;
+                }
+                for (const auto& known : bases) {
+                    if ((base.has_name && known.has_name && base.name == known.name) || base.path == known.path) {
+                        error = "Invalid user input: Conflict detected: Base path with name '" +
+                                (base.has_name ? base.name : std::string("None")) + "' or path '" + base.path +
+                                "' already exists";
+                        return false;
+                    }
+                }
+                std::uint32_t next_id = 1;
+                for (const auto& known : bases) {
+                    next_id = std::max(next_id, known.id + 1U);
+                }
+                base.id = next_id;
+                bases.push_back(std::move(base));
+            }
+            write_base_paths(next, bases);
+            break;
+        }
         default:
             error = std::string("LanceDataset.commit of ") + operation_name(op.kind) + " is not supported";
             return false;

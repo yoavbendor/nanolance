@@ -772,6 +772,31 @@ public:
         }
     }
 
+    /// Base paths for a dataset this write creates: (path, name or None, is_dataset_root) per base.
+    void set_initial_bases(const std::vector<std::string>& paths, const std::vector<std::optional<std::string>>& names,
+                           const std::vector<int>& is_dataset_root) {
+        std::vector<const char*> path_ptrs, name_ptrs;
+        for (std::size_t i = 0; i < paths.size(); ++i) {
+            path_ptrs.push_back(paths[i].c_str());
+            name_ptrs.push_back(names[i] ? names[i]->c_str() : nullptr);
+        }
+        if (nano_lance_writer_set_initial_bases(&writer_, paths.size(), path_ptrs.data(), name_ptrs.data(),
+                                                is_dataset_root.data()) != 0) {
+            throw std::runtime_error(writer_.last_error);
+        }
+    }
+
+    /// Directories the new fragments go to in turn, with the base id each records (0: none).
+    void set_fragment_targets(const std::vector<std::string>& dirs, const std::vector<std::uint32_t>& base_ids) {
+        std::vector<const char*> dir_ptrs;
+        for (const auto& dir : dirs) {
+            dir_ptrs.push_back(dir.c_str());
+        }
+        if (nano_lance_writer_set_fragment_targets(&writer_, dirs.size(), dir_ptrs.data(), base_ids.data()) != 0) {
+            throw std::runtime_error(writer_.last_error);
+        }
+    }
+
     /// The staged data files as fragments (lance.table.DataFragment messages, ids not yet assigned)
     /// and the schema they were written with (lance.file.Field messages) -- for a commit made apart
     /// (LanceFragment.create / write_fragments) instead of finish().
@@ -1303,6 +1328,8 @@ NB_MODULE(_nanolance, m) {
         .def("write_batch", &StagedWriter::write_batch)
         .def("project", &StagedWriter::project)
         .def("set_initial_config", &StagedWriter::set_initial_config)
+        .def("set_initial_bases", &StagedWriter::set_initial_bases)
+        .def("set_fragment_targets", &StagedWriter::set_fragment_targets)
         .def("set_stable_row_ids", &StagedWriter::set_stable_row_ids)
         .def("set_transaction_property", &StagedWriter::set_transaction_property)
         .def("set_blob_pack_file_size", &StagedWriter::set_blob_pack_file_size)

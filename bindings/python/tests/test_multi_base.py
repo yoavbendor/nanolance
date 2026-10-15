@@ -49,7 +49,7 @@ def assert_reads_match(lance, path, *, keys=(0, 1, 2)):
     assert rows(nn) == rows(pl)
     assert rows(nn, filter="id > 150 AND id < 260") == rows(pl, filter="id > 150 AND id < 260")
     assert rows(nn, columns=["v"], filter="id % 7 = 3") == rows(pl, columns=["v"], filter="id % 7 = 3")
-    indices = [0, 17, 101, 199, pl.count_rows() - 1]
+    indices = sorted({i for i in (0, 17, 101, 199, pl.count_rows() - 1) if i < pl.count_rows()})
     assert nn.take(indices).to_pydict() == pl.take(indices).to_pydict()
     # fragment << 32 | row, in fragments 1 and 2. Live rows only: _take_rows of a deleted row's address
     # returns it (on plain datasets too), which is not what this file is about.
@@ -141,3 +141,108 @@ def test_blobs_in_base_packed_and_dedicated(lance, tmp_path, bases):
     assert got == [blobs[i] for i in wanted]
     assert [f.base_id for f in nn.get_fragments()[0].data_files()] == \
         [f.base_id for f in pl.get_fragments()[0].data_files()]
+
+
+def base_table(ds):
+    """A dataset's base paths as (id, name, path, is_dataset_root), in id order."""
+    return sorted((b.id, b.name, b.path, b.is_dataset_root) for b in ds._ds.base_paths().values())
+
+
+def test_write_all_bases_by_nanolance_pylance_reads(lance, tmp_path, bases):
+    """nanolance writes the rotation pylance writes: primary, then each base in turn."""
+    p1, p2 = bases
+    primary = tmp_path / "primary"
+    nl.write_dataset(table(0, 300), str(primary),
+                     initial_bases=[nl.DatasetBasePath(str(p1), name="path1"),
+                                    nl.DatasetBasePath(str(p2), name="path2", is_dataset_root=True)],
+                     target_all_bases=True, max_rows_per_file=100)
+    assert base_ids(lance.dataset(str(primary))) == [[None], [1], [2]]
+    assert (p1 / "data").exists() is False and list(p1.glob("*.lance"))
+    assert list((p2 / "data").glob("*.lance"))
+    assert_reads_match(lance, primary)
+
+
+def test_same_calls_same_layout_on_both_engines(lance, tmp_path, bases):
+    """The same write, each engine in its own directory: the same base ids, base paths and rows."""
+    p1, p2 = bases
+    engines = {"pylance": lance, "nanolance": nl}
+    result = {}
+    for name, module in engines.items():
+        root = tmp_path / name
+        root.mkdir()
+        ds = module.write_dataset(table(0, 100), str(root / "primary"),
+                                  initial_bases=[module.DatasetBasePath(str(root / "p1"), name="path1")],
+                                  target_bases=["path1"], max_rows_per_file=50)
+        ds = module.write_dataset(table(100, 50), ds, mode="append", target_bases=["path1"], max_rows_per_file=25)
+        # The base paths relative to each engine's own root: the layout, not the directory it sits in.
+        bases_relative = [(b[0], b[1], b[3]) for b in base_table(ds)]
+        result[name] = (base_ids(ds), bases_relative, rows(ds))
+    assert result["nanolance"] == result["pylance"]
+    assert result["pylance"][0] == [[1], [1], [1], [1]]
+
+
+def test_append_and_overwrite_with_bases_by_nanolance(lance, tmp_path, bases):
+    """An append targets a base by name or by path; an overwrite keeps the bases and writes the primary."""
+    p1, p2 = bases
+    primary = tmp_path / "primary"
+    ds = nl.write_dataset(table(0, 100), str(primary),
+                          initial_bases=[nl.DatasetBasePath(str(p1), name="path1"),
+                                         nl.DatasetBasePath(str(p2), name="path2")],
+                          target_bases=["path1"], max_rows_per_file=50)
+    ds = nl.write_dataset(table(100, 50), ds, mode="append", target_bases=[str(p2)], max_rows_per_file=25)
+    assert base_ids(lance.dataset(str(primary))) == [[1], [1], [2], [2]]
+    ds = nl.write_dataset(table(200, 30), ds, mode="overwrite", max_rows_per_file=10)
+    assert base_ids(lance.dataset(str(primary))) == [[None]] * 3
+    assert len(base_table(ds)) == 2
+    # After an overwrite, fragment ids go on from the old ones, so the addresses assert_reads_match takes
+    # are gone: compare the rows and the layout.
+    pl = lance.dataset(str(primary))
+    assert rows(ds) == rows(pl)
+    assert base_ids(ds) == base_ids(pl)
+
+
+def test_write_validation_refused_like_pylance(lance, tmp_path, bases):
+    p1, p2 = bases
+    primary = tmp_path / "primary"
+    with pytest.raises(OSError, match="not found"):
+        nl.write_dataset(table(0, 10), str(primary), initial_bases=[nl.DatasetBasePath(str(p1), name="path1")],
+                         target_bases=["path9"])
+    assert not primary.exists()
+    ds = nl.write_dataset(table(0, 10), str(primary), initial_bases=[nl.DatasetBasePath(str(p1), name="path1")],
+                          target_bases=["path1"])
+    with pytest.raises(OSError, match="Cannot register new bases in Append mode"):
+        nl.write_dataset(table(10, 10), ds, mode="append",
+                         initial_bases=[nl.DatasetBasePath(str(p2), name="path2")], target_bases=["path2"])
+
+
+def test_add_bases_by_nanolance_pylance_reads(lance, tmp_path, bases):
+    """add_bases returns the dataset moved to the new version; pylance reads the bases and the rows."""
+    p1, p2 = bases
+    primary = tmp_path / "primary"
+    nl.write_dataset(table(0, 40), str(primary), initial_bases=[nl.DatasetBasePath(str(p1), name="path1")],
+                     target_bases=["path1"], max_rows_per_file=20)
+    ds = nl.dataset(str(primary))
+    assert ds.add_bases([nl.DatasetBasePath(str(p2), name="path2", is_dataset_root=True)],
+                        transaction_properties={"team": "data"}) is ds
+    assert ds.version == 2
+    ds = nl.write_dataset(table(40, 20), ds, mode="append", target_bases=["path2"], max_rows_per_file=20)
+    pl = lance.dataset(str(primary))
+    assert base_table(pl) == base_table(ds)
+    assert [b[1:] for b in base_table(pl)] == [("path1", str(p1), False), ("path2", str(p2), True)]
+    assert pl.read_transaction(2).transaction_properties["team"] == "data"
+    assert base_ids(pl) == [[1], [1], [2]]
+    assert_reads_match(lance, primary)
+
+
+def test_add_bases_duplicate_refused_both_engines(lance, tmp_path, bases):
+    p1, p2 = bases
+    messages = []
+    for module in (lance, nl):
+        primary = tmp_path / module.__name__.replace(".", "_")
+        ds = module.write_dataset(table(0, 10), str(primary),
+                                  initial_bases=[module.DatasetBasePath(str(p1), name="path1")],
+                                  target_bases=["path1"])
+        with pytest.raises(Exception) as excinfo:
+            ds.add_bases([module.DatasetBasePath(str(p2), name="path1")])
+        messages.append("conflict" in str(excinfo.value).lower())
+    assert messages == [True, True]

@@ -177,6 +177,16 @@ int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* ke
 
 /* Create the dataset with stable row ids (an append to one keeps them either way). */
 int nano_lance_writer_set_stable_row_ids(NanoLanceWriter* writer, int enable);
+/// Create the dataset with these base paths (Lance's initial_bases; ids count from 1 in the order
+/// given). `names[i]` may be NULL (unnamed); `is_dataset_root` may be NULL (all false). Ignored when the
+/// commit finds a dataset: its base paths carry over.
+int nano_lance_writer_set_initial_bases(NanoLanceWriter* writer, size_t count, const char* const* paths,
+                                        const char* const* names, const int* is_dataset_root);
+/// Write the new fragments into these directories in turn (fragment i into dirs[i % count]), each data
+/// file recording base_ids[i] as its base (0: the dataset itself, no base_id). Count 0: the dataset's data
+/// directory, as always.
+int nano_lance_writer_set_fragment_targets(NanoLanceWriter* writer, size_t count, const char* const* dirs,
+                                           const uint32_t* base_ids);
 /// Staged writers only: a property recorded in the finishing commit's transaction file (Lance's
 /// transaction_properties; "__lance_commit_message" holds a commit message).
 int nano_lance_writer_set_transaction_property(NanoLanceWriter* writer, const char* key, const char* value);

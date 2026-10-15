@@ -18,6 +18,7 @@
 #include <array>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <memory>
 #include <random>
 #include <chrono>
@@ -74,6 +75,15 @@ struct WriterState {
     std::map<std::string, std::string> initial_config;
     /// Create the dataset with stable row ids (nano_lance_writer_set_stable_row_ids).
     bool stable_row_ids = false;
+    /// Base paths a dataset created by this writer registers (nano_lance_writer_set_initial_bases).
+    std::vector<nano_lance::BasePath> initial_bases;
+    /// Where each new fragment goes, in turn (nano_lance_writer_set_fragment_targets); none: the data dir.
+    struct FragmentTarget {
+        std::filesystem::path dir;
+        std::uint32_t base_id = 0;  // 0: the dataset itself
+    };
+    std::vector<FragmentTarget> fragment_targets;
+    std::uint64_t fragments_written = 0;
     /// Recorded in the finishing commit's transaction file (nano_lance_writer_set_transaction_property).
     std::map<std::string, std::string> transaction_properties;
     /// Field ids of the schema taken from the first batch start here (writer_set_field_id_base): new
@@ -1210,6 +1220,15 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     nano_lance::LanceFileExtras file_extras;
     file_extras.blob_pack_file_size = state->blob_pack_file_size;
     file_extras.schema_metadata = state->schema_metadata;  // Lance writes it into every data file
+    std::optional<std::uint32_t> base_id;
+    if (!state->fragment_targets.empty()) {
+        const auto& target = state->fragment_targets[state->fragments_written % state->fragment_targets.size()];
+        file_extras.path = target.dir / data_file_name;
+        if (target.base_id != 0U) {
+            base_id = target.base_id;
+        }
+    }
+    state->fragments_written++;
     if (!nano_lance::write_lance_data_file(state->dataset_path,
                                            data_file_name,
                                            disk_schema,
@@ -1226,15 +1245,16 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     if (state->stage) {
-        state->staged.push_back(nano_lance::NewFragment{data_file, state->pending_rows});
+        state->staged.push_back(nano_lance::NewFragment{data_file, state->pending_rows, base_id});
         state->staged_schema = disk_schema;
     } else {
         std::uint64_t version = 0;
         nano_lance::CommitExtras extras;
         extras.schema_metadata = is_append ? nullptr : &state->schema_metadata;
         extras.stable_row_ids = state->stable_row_ids;
+        extras.initial_bases = state->initial_bases.empty() ? nullptr : &state->initial_bases;
         if (!nano_lance::commit_dataset_version(state->dataset_path, disk_schema,
-                                                {nano_lance::NewFragment{data_file, state->pending_rows}},
+                                                {nano_lance::NewFragment{data_file, state->pending_rows, base_id}},
                                                 is_append ? nano_lance::CommitMode::Append
                                                           : nano_lance::CommitMode::Overwrite,
                                                 version, writer_error, extras)) {
@@ -1292,6 +1312,7 @@ int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* versio
     extras.initial_config = state->initial_config;
     extras.transaction_properties = state->transaction_properties;
     extras.stable_row_ids = state->stable_row_ids;
+    extras.initial_bases = state->initial_bases.empty() ? nullptr : &state->initial_bases;
     std::filesystem::create_directories(state->dataset_path / "data", ec);
     if (!nano_lance::commit_dataset_version(state->dataset_path, mapping, state->staged, commit_mode, version, error,
                                             extras)) {
@@ -1324,6 +1345,56 @@ int nano_lance_writer_set_stable_row_ids(NanoLanceWriter* writer, int enable) {
         return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
     }
     state->stable_row_ids = enable != 0;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_initial_bases(NanoLanceWriter* writer, size_t count, const char* const* paths,
+                                        const char* const* names, const int* is_dataset_root) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (count > 0 && paths == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "base paths are required");
+    }
+    std::vector<nano_lance::BasePath> bases;
+    for (size_t i = 0; i < count; ++i) {
+        if (paths[i] == nullptr || paths[i][0] == '\0') {
+            return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "a base path is empty");
+        }
+        nano_lance::BasePath base;
+        base.id = static_cast<std::uint32_t>(i + 1U);
+        base.path = paths[i];
+        if (names != nullptr && names[i] != nullptr) {
+            base.name = names[i];
+            base.has_name = true;
+        }
+        base.is_dataset_root = is_dataset_root != nullptr && is_dataset_root[i] != 0;
+        bases.push_back(std::move(base));
+    }
+    state->initial_bases = std::move(bases);
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_fragment_targets(NanoLanceWriter* writer, size_t count, const char* const* dirs,
+                                           const uint32_t* base_ids) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (count > 0 && (dirs == nullptr || base_ids == nullptr)) {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "fragment targets need directories and base ids");
+    }
+    std::vector<WriterState::FragmentTarget> targets;
+    for (size_t i = 0; i < count; ++i) {
+        if (dirs[i] == nullptr || dirs[i][0] == '\0') {
+            return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "a fragment target directory is empty");
+        }
+        targets.push_back(WriterState::FragmentTarget{std::filesystem::path(dirs[i]), base_ids[i]});
+    }
+    state->fragment_targets = std::move(targets);
     clear_error(writer);
     return NANO_LANCE_OK;
 }

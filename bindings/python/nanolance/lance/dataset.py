@@ -24,7 +24,7 @@ import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance._errors import native, unsupported
-from nanolance.lance.base_path import _base_data_dir
+from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
 from nanolance.lance._transactions import Index, IndexFile, LanceOperation, Transaction
 
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
@@ -227,6 +227,27 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def version(self) -> int:
         return self._version
+
+    @property
+    def _ds(self) -> "_DatasetBases":
+        """pylance's inner dataset handle, as far as nanolance has one: ``base_paths()``."""
+        return _DatasetBases(self)
+
+    def add_bases(self, new_bases, transaction_properties: Optional[Dict[str, str]] = None) -> "LanceDataset":
+        """Register ``new_bases`` (DatasetBasePath objects) in a new version, as pylance's add_bases does.
+        Returns this dataset, moved to that version."""
+        from nanolance.lance._transactions import LanceOperation
+
+        operation = LanceOperation.UpdateBases([base for base in new_bases])
+        properties = {str(k): str(v) for k, v in (transaction_properties or {}).items()}
+        try:
+            _commit_hand_built(self._uri, operation, self._version, properties, 20)
+        except OSError as exc:
+            if "Invalid user input" in str(exc):
+                raise ValueError(str(exc)) from None  # pylance's add_bases raises its checks as ValueError
+            raise
+        self._refresh_latest()
+        return self
 
     @property
     def latest_version(self) -> int:
@@ -3368,6 +3389,7 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases=None,
     target_bases=None,
+    target_all_bases: bool = False,
     namespace=None,
     table_id=None,
     external_blob_mode: str = "reference",
@@ -3414,6 +3436,7 @@ def write_dataset(
                            enable_stable_row_ids=enable_stable_row_ids, auto_cleanup_options=auto_cleanup_options,
                            commit_message=commit_message, transaction_properties=transaction_properties,
                            initial_bases=initial_bases, target_bases=target_bases,
+                           target_all_bases=target_all_bases,
                            external_blob_mode=external_blob_mode,
                            allow_external_blob_outside_bases=allow_external_blob_outside_bases,
                            blob_pack_file_size_threshold=blob_pack_file_size_threshold, **kwargs)
@@ -3448,6 +3471,21 @@ def write_dataset(
         exists = False
     if mode == "create" and exists:
         raise OSError(f"Dataset already exists: {path}")
+    # Base paths: an existing dataset keeps its own (an overwrite inherits them); a new one registers
+    # initial_bases. New fragments go where target_bases / target_all_bases say, else the dataset's data.
+    bases: list = []
+    if exists and (initial_bases or target_bases or target_all_bases):
+        if initial_bases and mode == "append":
+            raise OSError("Invalid user input: Cannot register new bases in Append mode. "
+                          "Only CREATE mode can register new bases.")
+        if initial_bases:
+            raise unsupported("Overwrite with initial_bases (multiple base paths)")
+        current = uri if isinstance(uri, LanceDataset) else LanceDataset(path)
+        bases = list(current._info.get("base_paths", []))
+    if not exists:
+        bases = _new_base_dicts(initial_bases or [])
+    targets = _fragment_targets(path, bases, target_bases, target_all_bases) if (target_bases or target_all_bases) \
+        else None
 
     def setup(writer, exists: bool) -> None:
         if auto_cleanup_options is not None and not exists:
@@ -3467,6 +3505,15 @@ def write_dataset(
         if enable_stable_row_ids:
             with native():
                 writer.set_stable_row_ids(True)
+        if initial_bases and not exists:
+            with native():
+                writer.set_initial_bases([base.path for base in initial_bases],
+                                         [base.name for base in initial_bases],
+                                         [int(bool(base.is_dataset_root)) for base in initial_bases])
+        if targets is not None:
+            with native():
+                writer.set_fragment_targets([directory for directory, _ in targets],
+                                            [int(base_id) for _, base_id in targets])
 
     writer, _ = _stage_write(path, reader, mode=mode, max_rows_per_file=max_rows_per_file,
                              max_bytes_per_file=max_bytes_per_file, external_blob_mode=external_blob_mode,

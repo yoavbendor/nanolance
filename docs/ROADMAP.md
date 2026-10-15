@@ -28,7 +28,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 | task | definition | implementer | status |
 |---|---|---|---|
 | Prepared-layout blob writers (`PackedBlobWriter`, `DedicatedBlobWriter`, `BlobDescriptorArrayBuilder`, descriptor-form blob columns in the file writer) | `docs/tasks/BLOB_WRITERS.md` | Haiku 5.5, reviewed by Opus | ~~done~~ 2026-10-15: phase A (Python writers; reviewed, one fix: coalesced sidecar writes), phase B (C++ descriptor input; end-to-end tests in `tests/test_blob_writers.py`) |
-| Multi-base datasets (`DatasetBasePath`, `initial_bases` / `target_bases` / `target_all_bases`, `add_bases`, fragment writes into bases) | `docs/tasks/MULTI_BASE.md` | Haiku 5.5, reviewed by Opus | phase A (read) done 2026-10-15; B (`write_dataset`, `add_bases`) in progress; C (fragment writes) next |
+| Multi-base datasets (`DatasetBasePath`, `initial_bases` / `target_bases` / `target_all_bases`, `add_bases`, fragment writes into bases) | `docs/tasks/MULTI_BASE.md` | Haiku 5.5, reviewed by Opus | phase A (read) and B (`write_dataset`, `add_bases`) done 2026-10-15; C (fragment writes) in progress |
 
 Lessons from the first delegated task (blob writers, three Haiku sessions of 95-160k tokens each):
 behaviour measured on pylance and written into the spec (messages, reprs, paths) let phase A land in

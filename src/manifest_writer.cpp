@@ -313,6 +313,9 @@ pb::DataFragment make_data_fragment(const LanceSchemaMapping& mapping, const New
     out.id = id;
     out.physical_rows = fragment.rows;
     out.files.push_back(manifest_data_file(mapping, fragment.data_file));
+    if (fragment.base_id) {
+        set_data_file_base_id(out.files.back(), fragment.base_id);
+    }
     return out;
 }
 
@@ -411,6 +414,9 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
     }
     manifest.transaction_properties = extras.transaction_properties;
     if (!exists) {
+        if (extras.initial_bases != nullptr && !extras.initial_bases->empty()) {
+            write_base_paths(manifest, *extras.initial_bases);
+        }
         for (const auto& kv : extras.initial_config) {
             manifest.config[kv.first] = kv.second;
         }
@@ -462,6 +468,9 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
         added.id = next_id++;
         added.physical_rows = fragment.rows;
         added.files.push_back(manifest_data_file(mapping, fragment.data_file));
+        if (fragment.base_id) {
+            set_data_file_base_id(added.files.back(), fragment.base_id);
+        }
         if (stable) {
             // Row ids from the table's high-water mark, and every row stamped with this version.
             FragmentRowMeta meta;
@@ -514,7 +523,7 @@ bool write_dataset_manifest(const std::filesystem::path& dataset_path,
                             std::uint64_t& version,
                             std::string& error) {
     // A commit that is not an append replaces whatever is there: what the writer has always done.
-    return commit_dataset_version(dataset_path, mapping, {NewFragment{data_file, rows}},
+    return commit_dataset_version(dataset_path, mapping, {NewFragment{data_file, rows, std::nullopt}},
                                   is_append ? CommitMode::Append : CommitMode::Overwrite, version, error);
 }
 

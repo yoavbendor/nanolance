@@ -24,6 +24,9 @@ struct BasePath {
     std::string path;
 };
 
+/// One BasePath message (Lance's lance.table.BasePath), as a Transaction's UpdateBases carries it.
+bool decode_base_path_message(const std::uint8_t* data, std::size_t size, BasePath& out, std::string& error);
+
 /// The manifest's base paths. Empty when it has none.
 bool read_base_paths(const pb::Manifest& manifest, std::vector<BasePath>& out, std::string& error);
 

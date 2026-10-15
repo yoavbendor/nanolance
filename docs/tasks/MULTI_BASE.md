@@ -148,3 +148,10 @@ writes them); `fragment_data_dir` per fragment as above.
 
 Files changed; per phase status; the tail lines of the done-commands; failures with error text;
 decisions you made that this spec did not cover; questions.
+
+**Phase B outcome (2026-10-15):** done. 21 of pylance's TestMultiBase / TestAddBases tests pass.
+New writer calls `nano_lance_writer_set_initial_bases` / `set_fragment_targets` (fragments rotate
+over the targets per write call), the UpdateBases operation (field 114), a private
+`LanceDataset._ds.base_paths()` shim that pylance's own tests reach through. Overwrite with
+`initial_bases` in a hand-built transaction is still refused (phase C). Reviewer fix: `add_bases`
+raises its checks as ValueError, as pylance does.

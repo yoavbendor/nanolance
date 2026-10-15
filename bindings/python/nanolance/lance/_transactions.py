@@ -12,6 +12,7 @@ them (``conflict_with``), and committed by the native library (dataset_transacti
 from __future__ import annotations
 
 import dataclasses
+import os
 import struct
 import uuid as _uuid
 from abc import ABC
@@ -190,6 +191,11 @@ class LanceOperation:
     class UpdateMap:
         updates: Dict[str, Optional[str]]
         replace: bool = False
+
+    @dataclass
+    class UpdateBases(BaseOperation):
+        """Register new base paths (DatasetBasePath); Lance gives them the next ids."""
+        new_bases: List[Any]
 
     @dataclass
     class UpdateConfig(BaseOperation):
@@ -830,6 +836,14 @@ def encode_operation(op: LanceOperation.BaseOperation) -> Tuple[int, bytes]:
         for m in messages:
             _put_bytes(out, 1, m)
         _put_uint(out, 2, 1 if op.preserves_nullability else 0)
+    elif isinstance(op, L.UpdateBases):
+        for base in op.new_bases:
+            entry = bytearray()
+            if base.name is not None:
+                _put_bytes(entry, 2, str(base.name).encode())
+            _put_uint(entry, 3, 1 if base.is_dataset_root else 0)
+            _put_bytes(entry, 4, os.fspath(base.path).encode())
+            _put_bytes(out, 1, bytes(entry))
     elif isinstance(op, L.UpdateConfig):
         if op.config_updates is not None:
             _put_bytes(out, 6, _encode_update_map(op.config_updates))

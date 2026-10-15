@@ -96,6 +96,10 @@ bool decode_base_path(const std::uint8_t* data, std::size_t size, BasePath& out,
 
 }  // namespace
 
+bool decode_base_path_message(const std::uint8_t* data, std::size_t size, BasePath& out, std::string& error) {
+    return decode_base_path(data, size, out, error);
+}
+
 bool read_base_paths(const pb::Manifest& manifest, std::vector<BasePath>& out, std::string& error) {
     out.clear();
     Reader r(manifest.unknown.data(), manifest.unknown.size());
