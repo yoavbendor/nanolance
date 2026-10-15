@@ -150,3 +150,16 @@ equal pylance's after the same steps, with and without stable row ids. Reviewer:
 nanolance re-indexes the rewritten fragments for every kind while pylance remaps and leaves them
 unindexed -- the documented divergence stands (answers equal a scan either way); the "kind nanolance
 cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance tests (1054). N2 next.
+
+**N2 investigation (2026-10-15) -- reviewer's answers:**
+- pylance's JSON index disagrees with its own scan for dotted / `$` paths (the index parses the path as
+  JSONPath; `json_get_*(col, 'k')` is a literal key lookup -- measured: index `a.b` answers `[0]` where
+  the scan gives `[]`). **Decision (a):** build every path as pylance does (byte-equal BTree), but route
+  to the index only identifier-like paths `[A-Za-z_][A-Za-z0-9_]*`; queries on other paths scan.
+  Documented divergence: nanolance's answers stay equal to a scan, pylance's do not.
+- `target_index_type`: **btree only** in N2 (any case). pylance also accepts bitmap, zonemap,
+  bloomfilter, ngram, inverted -- refuse those with `target_index_type 'X' is not supported yet
+  (supported: btree)`; label_list / json / unknown names get pylance's own errors. The other targets
+  are a later item.
+- IndexConfig is the only form (no kwargs `index_type="JSON"`). The plan line and stats name the
+  target (`@j_idx(BTree)`, `index_type "BTree"`) -- special-case it in src/index_search.cpp ~1190.
