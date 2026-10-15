@@ -15,7 +15,7 @@ two items the backlog called large are small.
 Order for the remaining work, as agreed: (1) ~~stable row ids~~ (done 2026-10-10); (2) ~~the
 prepared-layout blob writers~~ (done 2026-10-15); (3) ~~multi-base paths~~ (done 2026-10-15); (4) vector index kinds and search breadth
 (IVF_SQ / IVF_RQ / IVF_HNSW_PQ / FLAT, multivector, Hamming); (5) scalar / full-text breadth
-(ZONEMAP, NGRAM, BLOOMFILTER, fuzzy, tokenizers, FTS on lists); (6) DataOverlay and `commit_lock`;
+(ZONEMAP, NGRAM, BLOOMFILTER, fuzzy, tokenizers, FTS on lists); (6) ~~DataOverlay~~ (done 2026-10-15, Opus) and `commit_lock`;
 (7) branches; (8) torch samplers / Hugging Face, SQL, logging hooks; **last**: object stores and
 writing data storage versions other than 2.2.
 

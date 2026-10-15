@@ -3288,3 +3288,20 @@ own tests (`tests/test_multi_base.py`, `test_blob.py`, through `tools/pylance_su
 - **Not yet**: `test_blob_extension_write_fragments_external_registered_base`. An external blob URI
   under a registered base must be stored as that base's id plus a relative path; the blob writer
   packs its own URI-dictionary index in that field today, so it needs its own change.
+
+
+## Data overlay files
+
+- **What**: Lance's DataOverlay (`DataFragment.overlays`, field 11; operation field 115; feature flag 64,
+  which pylance 12 honours only with `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES`). Commit stamps each
+  overlay's `committed_version`; scans, filters and takes merge an overlay's values in place of the
+  data file's before deletions are applied (`merge_column_rows` in `src/column_slice.cpp`, the hook in
+  `read_data_file_batches` / `decode_data_file_rows`); newest overlay wins, values by rank. Flat columns;
+  nested, blob and dictionary columns are refused by name. An index older than an overlay on its field
+  does not answer for that fragment (`fragments_stale_for_index`, used by scalar, vector and full-text
+  search).
+- **Found on the way**: nanolance read a pylance dataset with overlays silently wrong before (it
+  ignored field 11 and flag 64).
+- **Verified**: pylance's 16 `test_data_overlay_*`; `tests/test_data_overlay.py` (6, both engines:
+  dense / sparse / newest wins, strings + NULL overrides + deletions + take, stale BTree and IVF indexes,
+  cross-engine metadata, compaction).
