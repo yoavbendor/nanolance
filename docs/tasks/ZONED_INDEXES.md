@@ -128,3 +128,24 @@ decimal256). Same rows / schema / metadata as pylance's files, different page by
 Reviewer's calls: compaction keeps re-covering every index kind (nanolance's documented divergence from
 Lance, which leaves rewritten fragments unindexed until optimize_indices); BTree and ZoneMap share
 `prune_by_bounds` (a NaN maximum counts as unbounded, conservative).
+
+**Z2 first session (2026-10-15): format verified, nothing built.** Facts for the session that builds it:
+- A pure-Python XXH64 (seed 0) + SBBF reproduces pylance's `bloom_filter_data` bit for bit (int64 and
+  string columns, two fragments, a null): `/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/bf/check.py`
+  and `check2.py` -- port those to C++. Port XXH64 in-tree (~50 lines, a new small source file); do not
+  depend on zstd's `xxhash.h`.
+- Size fixed per index: `min_log2_bytes(number_of_items, probability)` (sbbf.rs ~173-213: needs lgamma
+  and `ldexp(1.0, mid)`), 8192 items at 0.00057 -> 32768 bytes. Zone = `number_of_items` rows, cut like
+  ZONEMAP (reuse Z1's zone cutting). `has_null` = the zone has a null; nulls are not hashed.
+- Types: ints, uints, float32/64, date32/64, time32/64, timestamp, utf8 / large_utf8, binary /
+  large_binary. Refuse (Lance's error) bool, decimal, float16, fixed-size binary, lists, structs.
+- Parameters: Lance's `number_of_items` and `probability` (BloomFilterIndexBuilderParams), not
+  `rows_per_zone` (reviewer's call).
+- Search: `=` and `IN` probe the filter with the literal's bytes in the column's type (coerce as the
+  filter does; float literals as float32 for a float32 column); a literal 0.0 / -0.0 / NaN keeps every
+  zone (equal values, different bytes); date / timestamp literals may keep every zone at first
+  (correct, no pruning; reviewer approved). `IS NULL` uses `has_null`. The probe needs the column's
+  Arrow type: find where `Search::predicate` can get the field's logical type (the manifest field is
+  `field_of(...)`; `logical_type` is on it).
+- Oracle tests also need `stats.index_stats` for BLOOMFILTER (num_blocks = zone count,
+  number_of_items, probability), `describe_indices`, distributed segments.
