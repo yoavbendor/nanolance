@@ -16,6 +16,9 @@
 //   ZoneMap    zonemap.lance: per zone, its min, max and null count; the bounds keep the zones that
 //              may match, and a kept zone's rows (its fragment's offsets over its span, deleted rows
 //              among them) are the answer. Zones hold row addresses, not stable row ids.
+//   BloomFilter bloomfilter.lance: per zone, its span, whether it holds a null and its bloom filter.
+//              `=` and IN keep the zones whose filter may hold a constant (probed with its bytes in
+//              the column's type); IS NULL keeps the zones with a null. Zones hold row addresses.
 //
 // Each index covers the fragments of its fragment bitmap: an answer says nothing about the others.
 // AND intersects answers where both apply; OR unites them where both apply; NOT and anything
@@ -28,7 +31,9 @@
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/lance_table_reader.hpp"
+#include "nanolance/bloom_filter.hpp"
 #include "nanolance/roaring_bitmap.hpp"
+#include "nanolance/schema_mapper.hpp"
 #include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
 
@@ -565,6 +570,178 @@ bool search_zonemap(const std::filesystem::path& dir, const expr::Predicate& p, 
     return true;
 }
 
+// ── bloom filters ───────────────────────────────────────────────────────────────────────────────
+
+struct BloomFilterIndex {
+    FileTable zones;  // fragment_id, zone_start, zone_length, has_null, bloom_filter_data
+};
+
+bool load_bloomfilter(const std::filesystem::path& dir, std::shared_ptr<const BloomFilterIndex>& out,
+                      std::string& error) {
+    static IndexCache<BloomFilterIndex> cache;
+    const auto path = dir / "bloomfilter.lance";
+    const auto key = file_key(path);
+    if ((out = cache.find(key)) != nullptr) {
+        return true;
+    }
+    auto index = std::make_shared<BloomFilterIndex>();
+    if (!read_table(path, nullptr, LanceRowRange{}, index->zones, error)) {
+        return false;
+    }
+    const auto format = [&](std::int64_t c) {
+        return std::string(index->zones.schema.children[c]->format == nullptr ? "" : index->zones.schema.children[c]->format);
+    };
+    if (index->zones.schema.n_children != 5 || format(0) != "L" || format(1) != "L" || format(2) != "L" ||
+        format(3) != "b" || format(4) != "z") {
+        error = "bloomfilter index: bloomfilter.lance is not fragment_id, zone_start, zone_length (uint64), "
+                "has_null (bool), bloom_filter_data (binary)";
+        return false;
+    }
+    out = index;
+    cache.put(key, out);
+    return true;
+}
+
+/// The Arrow type of a manifest field, as its format (a leaf column's type; a bloom filter's values).
+bool arrow_column_type(const pb::Field& field, ArrowSchema& out, std::string& error) {
+    std::string format;
+    if (!lance_arrow_format_for_logical_type(field.logical_type, format, error)) {
+        return false;
+    }
+    ArrowSchemaInit(&out);
+    if (ArrowSchemaSetFormat(&out, format.c_str()) != NANOARROW_OK) {
+        error = "bloom filter index: cannot read the column's type";
+        return false;
+    }
+    return true;
+}
+
+/// The zones that may hold a row the predicate passes. `=` and IN probe each zone's filter with the
+/// constants' bytes (a constant is cast to the column's type first); a constant that does not convert
+/// leaves the predicate to the scan. Zones of a float column: a zero or NaN constant may match values of
+/// other bit patterns, and dates and times are not probed: every zone is kept then.
+bool search_bloomfilter(const std::filesystem::path& dir, const ArrowSchema& column, const expr::Predicate& p,
+                        RowSet& out, bool& answered, std::string& error) {
+    answered = false;
+    const bool equal = p.test() == Test::In || (p.test() == Test::Compare && p.op() == "=");
+    if (p.test() != Test::IsNull && !equal) {
+        return true;
+    }
+    std::shared_ptr<const BloomFilterIndex> index;
+    if (!load_bloomfilter(dir, index, error)) {
+        return false;
+    }
+    const auto& zones = index->zones;
+    const auto fragments = u64_column(zones, 0);
+    const auto starts = u64_column(zones, 1);
+    const auto lengths = u64_column(zones, 2);
+    std::vector<std::uint8_t> keep(fragments.size(), 0);
+    if (p.test() == Test::IsNull) {
+        std::size_t z = 0;
+        for (const auto& b : zones.batches) {
+            const ArrowArray* a = b.children[3];
+            for (std::int64_t r = 0; r < a->length; ++r, ++z) {
+                keep[z] = static_cast<std::uint8_t>(ArrowBitGet(static_cast<const std::uint8_t*>(a->buffers[1]), a->offset + r));
+            }
+        }
+        answered = true;
+    } else {
+        ArrowSchemaView column_view;
+        ArrowError aerr;
+        if (ArrowSchemaViewInit(&column_view, &column, &aerr) != NANOARROW_OK) {
+            error = std::string("bloom filter index: ") + aerr.message;
+            return false;
+        }
+        const auto type = column_view.type;
+        const bool floating = type == NANOARROW_TYPE_FLOAT || type == NANOARROW_TYPE_DOUBLE;
+        const bool temporal = type == NANOARROW_TYPE_DATE32 || type == NANOARROW_TYPE_DATE64 ||
+                              type == NANOARROW_TYPE_TIME32 || type == NANOARROW_TYPE_TIME64 ||
+                              type == NANOARROW_TYPE_TIMESTAMP;
+        std::size_t width = 0;
+        if (!index_files::bloom_value_width(column_view, width, error)) {
+            return false;
+        }
+        bool keep_all = temporal;
+        std::vector<std::uint64_t> hashes;
+        for (std::size_t k = 0; !keep_all && k < p.constants(); ++k) {
+            ArrowArray value{};
+            std::string convert_error;
+            if (!p.constant_as(k, column, value, convert_error)) {
+                return true;  // the scan evaluates the filter, and reports what it cannot convert
+            }
+            ArrowArrayView view;
+            if (ArrowArrayViewInitFromSchema(&view, &column, &aerr) != NANOARROW_OK ||
+                ArrowArrayViewSetArray(&view, &value, &aerr) != NANOARROW_OK) {
+                ArrowArrayViewReset(&view);
+                if (value.release != nullptr) {
+                    value.release(&value);
+                }
+                error = std::string("bloom filter index: ") + aerr.message;
+                return false;
+            }
+            if (!ArrowArrayViewIsNull(&view, 0)) {
+                const std::uint8_t* bytes = view.buffer_views[1].data.as_uint8 + static_cast<std::size_t>(view.offset) * width;
+                if (floating && width == 4) {
+                    float f = 0.0F;
+                    std::memcpy(&f, bytes, 4);
+                    keep_all = keep_all || f == 0.0F || std::isnan(f);
+                } else if (floating) {
+                    double d = 0.0;
+                    std::memcpy(&d, bytes, 8);
+                    keep_all = keep_all || d == 0.0 || std::isnan(d);
+                }
+                hashes.push_back(index_files::bloom_hash(&view, 0, width));
+            }
+            ArrowArrayViewReset(&view);
+            if (value.release != nullptr) {
+                value.release(&value);
+            }
+        }
+        if (keep_all) {
+            keep.assign(keep.size(), 1);
+        } else {
+            std::size_t z = 0;
+            for (const auto& b : zones.batches) {
+                ArrowArrayView bv;
+                if (ArrowArrayViewInitFromSchema(&bv, &zones.type(4), &aerr) != NANOARROW_OK ||
+                    ArrowArrayViewSetArray(&bv, b.children[4], &aerr) != NANOARROW_OK) {
+                    ArrowArrayViewReset(&bv);
+                    error = std::string("bloom filter index: ") + aerr.message;
+                    return false;
+                }
+                for (std::int64_t r = 0; r < b.length; ++r, ++z) {
+                    const auto filter = ArrowArrayViewGetBytesUnsafe(&bv, r);
+                    const auto size = static_cast<std::size_t>(filter.size_bytes);
+                    if (size < 32U || (size & (size - 1U)) != 0U) {
+                        ArrowArrayViewReset(&bv);
+                        error = "bloom filter index: a zone's filter is not a power of two of at least 32 bytes";
+                        return false;
+                    }
+                    const auto* data = reinterpret_cast<const std::uint8_t*>(filter.data.as_char);
+                    for (const auto hash : hashes) {
+                        if (bloom_filter::may_contain(data, size, hash)) {
+                            keep[z] = 1;
+                            break;
+                        }
+                    }
+                }
+                ArrowArrayViewReset(&bv);
+            }
+        }
+        answered = true;
+    }
+    for (std::size_t z = 0; z < keep.size(); ++z) {
+        if (keep[z] == 0) {
+            continue;
+        }
+        auto& rows = out.rows[static_cast<std::uint32_t>(fragments[z])];
+        for (std::uint64_t r = starts[z]; r < starts[z] + lengths[z]; ++r) {
+            rows.push_back(static_cast<std::uint32_t>(r));
+        }
+    }
+    return true;
+}
+
 /// The rows of the keys at `key_rows` (their bitmaps, united).
 bool bitmap_rows(const BitmapIndex& index, const std::vector<std::uint64_t>& key_rows,
                  const std::map<std::uint32_t, std::uint64_t>& physical, RowSet& out, std::string& error) {
@@ -786,11 +963,19 @@ struct Search {
                 RowSet one;
                 bool answered = false;
                 bool ok = true;
-                const bool zoned = kind == "/lance.table.ZoneMapIndexDetails";
+                const bool bloom = kind == "/lance.index.pb.BloomFilterIndexDetails";
+                const bool zoned = kind == "/lance.table.ZoneMapIndexDetails" || bloom;
                 if (kind == "/lance.table.BTreeIndexDetails" && index->files.size() == 2U &&
                     std::any_of(index->files.begin(), index->files.end(),
                                 [](const pb::IndexMetadata::File& f) { return f.path == "page_lookup.lance"; })) {
                     ok = search_btree(dir, p, one, answered, error);
+                } else if (bloom && !index->files.empty()) {
+                    ArrowSchema column{};
+                    ok = arrow_column_type(*field, column, error) &&
+                         search_bloomfilter(dir, column, p, one, answered, error);
+                    if (column.release != nullptr) {
+                        column.release(&column);
+                    }
                 } else if (zoned && !index->files.empty()) {
                     ok = search_zonemap(dir, p, one, answered, error);
                 } else if ((kind == "/lance.table.BitmapIndexDetails" || kind == "/lance.table.LabelListIndexDetails") &&

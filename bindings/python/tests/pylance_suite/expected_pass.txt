@@ -809,7 +809,9 @@ tests/test_pydantic.py::test_optional_field_is_nullable
 tests/test_pydantic.py::test_scalar_and_optional_and_list_unchanged
 tests/test_pydantic.py::test_string_enum_is_dictionary_encoded
 tests/test_row_addr_prefilter.py::test_no_mask_reads_everything
+tests/test_scalar_index.py::test_address_domain_index_not_query_with_stable_row_ids[BLOOMFILTER]
 tests/test_scalar_index.py::test_address_domain_index_not_query_with_stable_row_ids[ZONEMAP]
+tests/test_scalar_index.py::test_address_domain_index_with_stable_row_ids[BLOOMFILTER]
 tests/test_scalar_index.py::test_address_domain_index_with_stable_row_ids[ZONEMAP]
 tests/test_scalar_index.py::test_all_null_chunk
 tests/test_scalar_index.py::test_backward_compatibility_no_fragment_ids
@@ -817,6 +819,9 @@ tests/test_scalar_index.py::test_bitmap_empty_range
 tests/test_scalar_index.py::test_bitmap_index
 tests/test_scalar_index.py::test_bitmap_remap
 tests/test_scalar_index.py::test_bitmap_uncommitted_segments_can_be_committed_from_python
+tests/test_scalar_index.py::test_bloomfilter_deletion_handling
+tests/test_scalar_index.py::test_bloomfilter_index
+tests/test_scalar_index.py::test_bloomfilter_segment_merge_and_commit_from_python
 tests/test_scalar_index.py::test_btree_fragment_ids_parameter_validation
 tests/test_scalar_index.py::test_btree_query_comparison
 tests/test_scalar_index.py::test_btree_remap_big_deletions

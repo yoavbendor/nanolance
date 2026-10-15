@@ -293,6 +293,7 @@ add_library(nanolance STATIC
     src/index_maintenance.cpp
     src/lance_file_writer.cpp
     src/scalar_index.cpp
+    src/bloom_filter.cpp
     src/index_search.cpp
     src/index_files.cpp
     src/vector_search.cpp

@@ -149,3 +149,5 @@ Lance, which leaves rewritten fragments unindexed until optimize_indices); BTree
   `field_of(...)`; `logical_type` is on it).
 - Oracle tests also need `stats.index_stats` for BLOOMFILTER (num_blocks = zone count,
   number_of_items, probability), `describe_indices`, distributed segments.
+
+**Z2 outcome (BLOOMFILTER):** built, searched (`=`, IN, IS NULL), maintained (append, delete, optimize_indices, compaction, stable row ids) and in distributed segments; `index_stats` matches pylance. The filter bytes, the zone spans, `has_null` and the metadata are identical to pylance's files (int8 to timestamp, string, float64 with NaN, nulls, four `number_of_items`/`probability` settings). Manifest type URL is `/lance.index.pb.BloomFilterIndexDetails` (pylance ignores `/lance.table.` one). Floats: a 0 or NaN literal keeps every zone; date and time literals are not probed (every zone kept, answered). Refused: bool, decimal, float16, fixed-size binary, lists, structs. XXH64 and SBBF are in `src/bloom_filter.cpp`.

@@ -20,11 +20,14 @@
 ///   ZONEMAP     zonemap.lance: per zone of up to `rows_per_zone` rows of one fragment, its min, max,
 ///               null count and NaN count, with the zone's fragment and row span; the null rows as a
 ///               row-address bitmap (global buffer 1). Answers inexactly: the zones that may match.
+///   BLOOMFILTER bloomfilter.lance: per zone of `number_of_items` rows of one fragment, its span, whether
+///               it holds a null, and a split-block bloom filter of its values (nulls not hashed), of
+///               one size for the index. Answers inexactly, for =, IN and IS NULL.
 namespace nano_lance {
 
-enum class ScalarIndexType { BTree, Bitmap, LabelList, ZoneMap };
+enum class ScalarIndexType { BTree, Bitmap, LabelList, ZoneMap, BloomFilter };
 
-/// "BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP" (any case) as a type; false for anything else.
+/// "BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER" (any case) as a type; false for anything else.
 bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type);
 
 struct ScalarIndexOptions {
@@ -34,6 +37,10 @@ struct ScalarIndexOptions {
     bool replace = true;
     /// ZONEMAP: rows per zone (Lance's default, 8192, when 0).
     std::uint64_t rows_per_zone = 0;
+    /// BLOOMFILTER: the values per zone the filter is sized for (Lance's default, 8192, when 0), and its
+    /// false-positive probability (Lance's default, 0.00057, when 0).
+    std::uint64_t number_of_items = 0;
+    double probability = 0.0;
 };
 
 /// Index `column` (a top-level column or a `struct.child` path) of the latest version, committed as

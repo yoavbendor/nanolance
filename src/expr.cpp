@@ -3141,6 +3141,38 @@ bool Predicate::filter(const ArrowSchema& type, const ArrowArray& values, std::v
     return e.filter(batch, pass, error);
 }
 
+bool Predicate::constant_as(std::size_t k, const ArrowSchema& type, ArrowArray& out, std::string& error) const {
+    error.clear();
+    if (k >= constants_.size()) {
+        error = "no such constant";
+        return false;
+    }
+    // The constant alone, bound to an empty schema, evaluated over one row of no columns.
+    Expression e;
+    e.root_ = clone(*constants_[k]);
+    ArrowSchema schema;
+    ArrowSchemaInit(&schema);
+    if (ArrowSchemaSetTypeStruct(&schema, 0) != NANOARROW_OK) {
+        schema.release(&schema);
+        error = "out of memory";
+        return false;
+    }
+    const bool bound = e.bind(schema, error);
+    schema.release(&schema);
+    if (!bound) {
+        return false;
+    }
+    const void* buffers[1] = {nullptr};
+    ArrowArray batch{};
+    batch.length = 1;
+    batch.n_buffers = 1;
+    batch.buffers = buffers;
+    batch.n_children = 0;
+    batch.children = nullptr;
+    batch.release = no_release_array;
+    return e.evaluate(batch, type, out, error);
+}
+
 std::string Predicate::to_string() const {
     std::string column;
     for (const auto& p : column_) {

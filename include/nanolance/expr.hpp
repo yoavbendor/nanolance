@@ -66,6 +66,11 @@ public:
     /// `column <op> constant k`, a Compare.
     Predicate compare_with(const std::string& op, std::size_t k) const;
 
+    /// Constant k as one value of `type` (the column's type, cast as the filter casts it): a one-element
+    /// array in `out` (the caller releases it), NULL for a NULL constant. False with `error` set when the
+    /// constant does not convert.
+    bool constant_as(std::size_t k, const ArrowSchema& type, ArrowArray& out, std::string& error) const;
+
     /// Evaluate on `values`, of the column's type -- for HasAny, HasAll and Has, of its elements'
     /// type, and then TRUE for an element the test names. `pass[i]` is 1 where the test is TRUE.
     bool filter(const ArrowSchema& type, const ArrowArray& values, std::vector<std::uint8_t>& pass,

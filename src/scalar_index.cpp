@@ -27,10 +27,13 @@
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
+#include "nanolance/bloom_filter.hpp"
+
 #include <array>
 #include <cctype>
 #include <cmath>
 #include <chrono>
+#include <charconv>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -928,6 +931,89 @@ bool write_zonemap(const std::filesystem::path& dir, const ArrowSchema& type, co
     return write_file(dir, "zonemap.lance", schema.s, batch.a, std::move(extras), files, error);
 }
 
+// ── bloom filters ───────────────────────────────────────────────────────────────────────────────
+
+/// bloomfilter.lance: per zone its fragment, span, whether it holds a null, and its bloom filter of
+/// the non-null values (Lance's BloomFilterIndex layout). The null rows' addresses are global buffer 1;
+/// number_of_items and probability are in the schema metadata.
+bool write_bloomfilter(const std::filesystem::path& dir, const Items& items,
+                       const std::vector<Zone>& zones, const std::vector<std::uint32_t>& zone_of,
+                       std::uint8_t log2_bytes, std::uint64_t number_of_items, double probability,
+                       std::size_t width, std::vector<WrittenFile>& files, std::string& error) {
+    const auto n = static_cast<std::int64_t>(zones.size());
+    const std::size_t num_bytes = std::size_t{1} << log2_bytes;
+    std::vector<std::vector<std::uint8_t>> filters(zones.size(), bloom_filter::empty_filter(num_bytes));
+    std::vector<std::uint64_t> null_addrs;
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        if (items.is_null(k)) {
+            null_addrs.push_back(items.addr[k]);
+            continue;
+        }
+        const auto hash = index_files::bloom_hash(items.views[items.view[k]], items.index[k], width);
+        bloom_filter::insert(filters[zone_of[k]].data(), num_bytes, hash);
+    }
+    const auto null_bitmap = serialize_treemap(null_addrs.data(), null_addrs.size());
+
+    std::vector<std::uint64_t> fragments;
+    std::vector<std::uint64_t> starts;
+    std::vector<std::uint64_t> lengths;
+    for (const auto& z : zones) {
+        fragments.push_back(z.fragment);
+        starts.push_back(z.start);
+        lengths.push_back(z.length);
+    }
+
+    OwnedSchema schema;
+    OwnedSchema u64;
+    OwnedSchema boolean;
+    OwnedSchema binary;
+    OwnedArray fragment_array;
+    OwnedArray start_array;
+    OwnedArray length_array;
+    OwnedArray has_null_array;
+    OwnedArray filter_array;
+    OwnedArray batch;
+    LanceFileExtras extras;
+    // Lance's metadata: the probability as Rust prints an f64 (no exponent), read back as the same value.
+    char probability_text[64];
+    const auto end = std::to_chars(probability_text, probability_text + sizeof probability_text - 1, probability,
+                                   std::chars_format::fixed);
+    extras.schema_metadata["bloomfilter_item"] = bytes_of(std::to_string(number_of_items));
+    extras.schema_metadata["bloomfilter_probability"] = bytes_of(std::string(probability_text, end.ptr));
+    extras.schema_metadata["null_bitmap"] = bytes_of("1");
+    extras.global_buffers.push_back(null_bitmap);
+    ArrowError err;
+    if (!type_schema(NANOARROW_TYPE_UINT64, u64.s) || !type_schema(NANOARROW_TYPE_BOOL, boolean.s) ||
+        !type_schema(NANOARROW_TYPE_BINARY, binary.s) ||
+        !struct_schema({{"fragment_id", &u64.s, false}, {"zone_start", &u64.s, false},
+                        {"zone_length", &u64.s, false}, {"has_null", &boolean.s, false},
+                        {"bloom_filter_data", &binary.s, false}},
+                       schema.s, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, fragments.data(), n, 8, fragment_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, starts.data(), n, 8, start_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, lengths.data(), n, 8, length_array.a, error) ||
+        !binary_array(filters, filter_array.a, error)) {
+        return error.empty() ? (error = "out of memory", false) : false;
+    }
+    if (ArrowArrayInitFromType(&has_null_array.a, NANOARROW_TYPE_BOOL) != NANOARROW_OK ||
+        ArrowArrayStartAppending(&has_null_array.a) != NANOARROW_OK) {
+        error = "out of memory";
+        return false;
+    }
+    for (const auto& z : zones) {
+        if (ArrowArrayAppendInt(&has_null_array.a, z.nulls > 0 ? 1 : 0) != NANOARROW_OK) {
+            error = "out of memory";
+            return false;
+        }
+    }
+    if (ArrowArrayFinishBuildingDefault(&has_null_array.a, &err) != NANOARROW_OK ||
+        !struct_batch({&fragment_array.a, &start_array.a, &length_array.a, &has_null_array.a, &filter_array.a}, n,
+                      batch.a, error)) {
+        return error.empty() ? (error = "out of memory", false) : false;
+    }
+    return write_file(dir, "bloomfilter.lance", schema.s, batch.a, std::move(extras), files, error);
+}
+
 // ── the dataset ─────────────────────────────────────────────────────────────────────────────────
 
 }  // namespace
@@ -945,6 +1031,8 @@ bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type) {
         type = ScalarIndexType::LabelList;
     } else if (upper == "ZONEMAP") {
         type = ScalarIndexType::ZoneMap;
+    } else if (upper == "BLOOMFILTER") {
+        type = ScalarIndexType::BloomFilter;
     } else {
         return false;
     }
@@ -1034,9 +1122,10 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     }
     if (type != ScalarIndexType::LabelList && list) {
         error = "a list column takes a LABEL_LIST index, not a " +
-                std::string(type == ScalarIndexType::BTree    ? "BTREE"
-                            : type == ScalarIndexType::ZoneMap ? "ZONEMAP"
-                                                              : "BITMAP");
+                std::string(type == ScalarIndexType::BTree         ? "BTREE"
+                            : type == ScalarIndexType::ZoneMap      ? "ZONEMAP"
+                            : type == ScalarIndexType::BloomFilter ? "BLOOMFILTER"
+                                                                   : "BITMAP");
         return false;
     }
     if (type == ScalarIndexType::ZoneMap && options.rows_per_zone > UINT32_MAX) {
@@ -1053,16 +1142,32 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     }
     // A zonemap of a fixed-size list keeps only the null counts (zonemap.rs: nested types have no min or max).
     const bool nested = zoned_nested(type, key_view);
-    if (!nested && (key_view.extension_name.data != nullptr || !key_kind_of(key_view, kind, error))) {
+    const bool bloom = type == ScalarIndexType::BloomFilter;
+    std::size_t value_width = 0;
+    if (bloom) {
+        if (key_view.extension_name.data != nullptr || !index_files::bloom_value_width(key_view, value_width, error)) {
+            if (error.empty()) {
+                error = "a BLOOMFILTER index on an extension type is not supported";
+            }
+            return false;
+        }
+    } else if (!nested && (key_view.extension_name.data != nullptr || !key_kind_of(key_view, kind, error))) {
         if (error.empty()) {
             error = "a scalar index on an extension type is not supported";
         }
         return false;
     }
+    // BLOOMFILTER: Lance's BloomFilterIndexBuilderParams defaults, checked as its filter checks them.
+    const std::uint64_t number_of_items = options.number_of_items != 0 ? options.number_of_items : 8192;
+    const double probability = options.probability != 0.0 ? options.probability : 0.00057;
+    if (bloom && !(probability > 0.0 && probability < 1.0)) {
+        error = "a BLOOMFILTER probability must be between 0 and 1";
+        return false;
+    }
 
     // The values (or list elements) in row-address order; a label list's null lists aside. A zonemap
     // keeps the row addresses themselves (its zones are of fragments and offsets), not stable row ids.
-    const bool zoned = type == ScalarIndexType::ZoneMap;
+    const bool zoned = type == ScalarIndexType::ZoneMap || bloom;
     Items items;
     OwnedViews views;
     std::vector<std::uint64_t> null_lists;
@@ -1123,8 +1228,8 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     std::vector<std::uint32_t> zone_of;
     std::vector<Zone> zones;
     if (zoned) {
-        zones = cut_zones(items, rows_per_zone, zone_of);
-        if (!nested) {
+        zones = cut_zones(items, bloom ? number_of_items : rows_per_zone, zone_of);
+        if (!nested && !bloom) {
             zone_extrema_of(items, kind, zone_of, zones);
         }
     } else {
@@ -1146,7 +1251,8 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     const char* write_stage = type == ScalarIndexType::BTree    ? "write_lookup_file"
                               : type == ScalarIndexType::Bitmap ? "write_bitmap_index"
                               : type == ScalarIndexType::ZoneMap ? "write_zonemap_index"
-                                                                : "write_label_list_index";
+                              : bloom                            ? "write_bloomfilter_index"
+                                                                 : "write_label_list_index";
     if (progress != nullptr) {
         (*progress)(0, write_stage, 1, "files", 0);
     }
@@ -1171,6 +1277,12 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
                                 kind == KeyKind::Float16 || kind == KeyKind::Float32 || kind == KeyKind::Float64,
                                 nested, rows_per_zone, files, error);
         details = "/lance.table.ZoneMapIndexDetails";
+        break;
+    case ScalarIndexType::BloomFilter:
+        written = write_bloomfilter(dir, items, zones, zone_of,
+                                    bloom_filter::log2_bytes_for(number_of_items, probability), number_of_items,
+                                    probability, value_width, files, error);
+        details = "/lance.index.pb.BloomFilterIndexDetails";
         break;
     }
     if (!written) {

@@ -216,7 +216,7 @@ def test_index_kind_it_cannot_build(lance, tmp_path):
     path = str(tmp_path / "h.lance")
     lance.write_dataset(_table(2_000), path)
     lance.dataset(path).create_scalar_index("id", "BTREE")
-    lance.dataset(path).create_scalar_index("id", "BLOOMFILTER", name="bf")
+    lance.dataset(path).create_scalar_index("text", "NGRAM", name="ng")
     nl.write_dataset(_table(100, start=2_000), path, mode="append")
     with pytest.raises(Exception, match="cannot"):
         nl.dataset(path).optimize.optimize_indices()

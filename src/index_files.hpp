@@ -51,6 +51,17 @@ std::string file_key(const std::filesystem::path& path);
 bool schema_metadata(const std::filesystem::path& path, const std::string& key, std::string& value, bool& found,
                      LanceDataFileFooterLayout& layout, std::string& error);
 
+/// The bytes a BLOOMFILTER hashes per value (as_bytes.rs): a fixed-width value's bytes (`width`), a
+/// string's or binary's bytes (width 0). False, with `error`, for a type Lance's filter does not take.
+bool bloom_value_width(const ArrowSchemaView& view, std::size_t& width, std::string& error);
+
+/// The hash of element `i` of `v`: XXH64 of the bytes `bloom_value_width` names for its `width`.
+std::uint64_t bloom_hash(const ArrowArrayView* v, std::int64_t i, std::size_t width);
+
+/// The values per zone and the probability of the bloomfilter.lance in `dir` (its schema metadata).
+bool bloomfilter_params(const std::filesystem::path& dir, std::uint64_t& number_of_items, double& probability,
+                        std::string& error);
+
 /// The rows per zone of the zonemap.lance in `dir` (its schema metadata).
 bool zonemap_rows_per_zone(const std::filesystem::path& dir, std::uint64_t& rows_per_zone, std::string& error);
 

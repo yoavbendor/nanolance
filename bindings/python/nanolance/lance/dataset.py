@@ -946,7 +946,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_scalar_index(self, column: str, index_type: str, name: Optional[str] = None, *,
                             replace: bool = True, train: bool = True, fragment_ids: Optional[List[int]] = None,
                             index_uuid: Optional[str] = None, **kwargs) -> "LanceDataset":
-        """Build a BTREE, BITMAP, LABEL_LIST, ZONEMAP or INVERTED (full-text) index on `column`, in Lance's
+        """Build a BTREE, BITMAP, LABEL_LIST, ZONEMAP, BLOOMFILTER or INVERTED (full-text) index on `column`, in Lance's
         own format: pylance and LanceDB use it as one they built. Commits a new version. ZONEMAP takes
         `rows_per_zone` (nanolance; pylance 12 has no argument for it).
 
@@ -964,7 +964,7 @@ class LanceDataset(pa.dataset.Dataset):
         kind = str(index_type).upper()
         if kind == "FTS":
             kind = "INVERTED"
-        if fragment_ids is not None and kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP"):
+        if fragment_ids is not None and kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER"):
             raise ValueError(f"{kind} distributed indexing uses create_index_uncommitted(..., "
                              f'index_type="{kind}", fragment_ids=...)')
         uuid_bytes = _parse_index_uuid(index_uuid)
@@ -974,10 +974,16 @@ class LanceDataset(pa.dataset.Dataset):
             return self._create_inverted_index(column, name, replace, kwargs)
         kwargs.pop("progress_callback", None)
         rows_per_zone = int(kwargs.pop("rows_per_zone", 0) or config.pop("rows_per_zone", 0) or 0)  # ZONEMAP
+        # BLOOMFILTER: Lance's BloomFilterIndexBuilderParams (its defaults when 0 / absent)
+        number_of_items = int(kwargs.pop("number_of_items", 0) or config.pop("number_of_items", 0) or 0)
+        probability = float(kwargs.pop("probability", 0.0) or config.pop("probability", 0.0) or 0.0)
+        if kind != "BLOOMFILTER" and (number_of_items or probability):
+            raise ValueError(f"number_of_items and probability are BLOOMFILTER options, not {kind}'s")
         if kwargs or config:
             raise unsupported(f"create_scalar_index options {sorted(kwargs) + sorted(config)}")
         with native():
-            _nanolance._ds_create_scalar_index(self._uri, str(column), kind, name or "", bool(replace), rows_per_zone)
+            _nanolance._ds_create_scalar_index(self._uri, str(column), kind, name or "", bool(replace), rows_per_zone,
+                                               number_of_items, probability)
         self._refresh_latest()
         return self
 
@@ -1122,7 +1128,7 @@ class LanceDataset(pa.dataset.Dataset):
             path = _resolve_path(self._data_schema, column)
             if path is not None:
                 column = ".".join(path)
-        scalar = kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "INVERTED")
+        scalar = kind in ("BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER", "INVERTED")
         if scalar and fragment_ids is None:
             raise ValueError("create_index_uncommitted requires fragment_ids for distributed index build")
         if not scalar and kind not in self._VECTOR_INDEX_TYPES:
@@ -2768,6 +2774,11 @@ def _segment_statistics(ds: "LanceDataset", segment: dict) -> Dict[str, Any]:
         if kind == "ZoneMap":
             meta = metadata("zonemap.lance")
             return {"rows_per_zone": int(meta[b"rows_per_zone"]), "num_zones": rows("zonemap.lance")}
+        if kind == "BloomFilter":
+            meta = metadata("bloomfilter.lance")
+            return {"type": "BloomFilter", "num_blocks": rows("bloomfilter.lance"),
+                    "number_of_items": int(meta[b"bloomfilter_item"]),
+                    "probability": float(meta[b"bloomfilter_probability"])}
         if kind == "BTree":
             table = pa.table(_nanolance._file_read(os.path.join(directory, "page_lookup.lance"), None, 0, -1))
             mins, maxs = table.column(0).to_pylist(), table.column(1).to_pylist()

@@ -3,6 +3,8 @@
 
 #include "index_files.hpp"
 
+#include "nanolance/bloom_filter.hpp"
+
 #include "nanolance/lance_file_writer.hpp"
 
 #include <chrono>
@@ -71,6 +73,57 @@ bool schema_metadata(const std::filesystem::path& path, const std::string& key, 
     return true;
 }
 
+/// The bytes a BLOOMFILTER hashes per value (as_bytes.rs): a fixed-width value's bytes (`width`), a
+/// string's or binary's bytes (width 0). False, with `error`, for a type Lance's filter does not take.
+bool bloom_value_width(const ArrowSchemaView& view, std::size_t& width, std::string& error) {
+    switch (view.type) {
+    case NANOARROW_TYPE_INT8:
+    case NANOARROW_TYPE_UINT8:
+        width = 1;
+        break;
+    case NANOARROW_TYPE_INT16:
+    case NANOARROW_TYPE_UINT16:
+        width = 2;
+        break;
+    case NANOARROW_TYPE_INT32:
+    case NANOARROW_TYPE_UINT32:
+    case NANOARROW_TYPE_FLOAT:
+    case NANOARROW_TYPE_DATE32:
+    case NANOARROW_TYPE_TIME32:
+        width = 4;
+        break;
+    case NANOARROW_TYPE_INT64:
+    case NANOARROW_TYPE_UINT64:
+    case NANOARROW_TYPE_DOUBLE:
+    case NANOARROW_TYPE_DATE64:
+    case NANOARROW_TYPE_TIME64:
+    case NANOARROW_TYPE_TIMESTAMP:
+        width = 8;
+        break;
+    case NANOARROW_TYPE_STRING:
+    case NANOARROW_TYPE_LARGE_STRING:
+    case NANOARROW_TYPE_BINARY:
+    case NANOARROW_TYPE_LARGE_BINARY:
+        width = 0;
+        break;
+    default:
+        error = std::string("a BLOOMFILTER index on a column of type ") + ArrowTypeString(view.type) +
+                " is not supported";
+        return false;
+    }
+    return true;
+}
+
+/// The hash of item `k`'s value: XXH64 of the bytes `bloom_value_width` names.
+std::uint64_t bloom_hash(const ArrowArrayView* v, std::int64_t i, std::size_t width) {
+    if (width == 0) {
+        const auto b = ArrowArrayViewGetBytesUnsafe(v, i);
+        return bloom_filter::xxh64(reinterpret_cast<const std::uint8_t*>(b.data.as_char),
+                                   static_cast<std::size_t>(b.size_bytes));
+    }
+    return bloom_filter::xxh64(v->buffer_views[1].data.as_uint8 + static_cast<std::size_t>(v->offset + i) * width, width);
+}
+
 bool zonemap_rows_per_zone(const std::filesystem::path& dir, std::uint64_t& rows_per_zone, std::string& error) {
     std::string value;
     bool found = false;
@@ -85,6 +138,30 @@ bool zonemap_rows_per_zone(const std::filesystem::path& dir, std::uint64_t& rows
     rows_per_zone = std::strtoull(value.c_str(), nullptr, 10);
     if (rows_per_zone == 0) {
         error = "zonemap.lance has rows_per_zone 0";
+        return false;
+    }
+    return true;
+}
+
+bool bloomfilter_params(const std::filesystem::path& dir, std::uint64_t& number_of_items, double& probability,
+                        std::string& error) {
+    std::string items;
+    std::string fpp;
+    bool found = false;
+    LanceDataFileFooterLayout layout{};
+    if (!schema_metadata(dir / "bloomfilter.lance", "bloomfilter_item", items, found, layout, error)) {
+        return false;
+    }
+    if (!found || items.empty() || !schema_metadata(dir / "bloomfilter.lance", "bloomfilter_probability", fpp, found,
+                                                    layout, error) ||
+        !found || fpp.empty()) {
+        error = "bloomfilter.lance has no bloomfilter_item or bloomfilter_probability";
+        return false;
+    }
+    number_of_items = std::strtoull(items.c_str(), nullptr, 10);
+    probability = std::strtod(fpp.c_str(), nullptr);
+    if (number_of_items == 0 || !(probability > 0.0 && probability < 1.0)) {
+        error = "bloomfilter.lance has bloomfilter_item " + items + " and bloomfilter_probability " + fpp;
         return false;
     }
     return true;
