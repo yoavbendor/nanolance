@@ -27,6 +27,7 @@
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
+#include <type_traits>
 #include "nanolance/bloom_filter.hpp"
 #include "nanolance/fts_tokenizer.hpp"
 #include "nanolance/jsonb.hpp"
@@ -190,6 +191,52 @@ void parallel_sort(std::vector<T>& v, Less less) {
     }
 }
 
+/// Stable LSD radix sort of `v` by `bits(entry)`, an unsigned integer, a byte per pass; a byte all
+/// keys share is skipped (ids 0..5M take 3 passes of 8). Entries that tie keep their order. A
+/// comparison sort of 5M random int64 keys was most of a BTREE build.
+template <typename T, typename Bits>
+void radix_sort(std::vector<T>& v, Bits bits) {
+    using U = decltype(bits(v.front()));
+    constexpr std::size_t kBytes = sizeof(U);
+    const std::size_t n = v.size();
+    if (n < 2048U) {
+        std::stable_sort(v.begin(), v.end(), [&](const T& a, const T& b) { return bits(a) < bits(b); });
+        return;
+    }
+    std::vector<std::array<std::size_t, 256>> counts(kBytes);
+    for (auto& c : counts) {
+        c.fill(0);
+    }
+    for (const auto& e : v) {
+        const U key = bits(e);
+        for (std::size_t b = 0; b < kBytes; ++b) {
+            ++counts[b][static_cast<std::size_t>((key >> (8U * b)) & 0xFFU)];
+        }
+    }
+    std::vector<T> other(n);
+    auto* from = &v;
+    auto* to = &other;
+    for (std::size_t b = 0; b < kBytes; ++b) {
+        auto& c = counts[b];
+        if (std::any_of(c.begin(), c.end(), [n](std::size_t k) { return k == n; })) {
+            continue;  // every key has the same byte here
+        }
+        std::size_t at = 0;
+        for (auto& k : c) {
+            const auto here = k;
+            k = at;
+            at += here;
+        }
+        for (const auto& e : *from) {
+            (*to)[c[static_cast<std::size_t>((bits(e) >> (8U * b)) & 0xFFU)]++] = e;
+        }
+        std::swap(from, to);
+    }
+    if (from != &v) {
+        v.swap(other);
+    }
+}
+
 /// A string key: its first 8 bytes, big-endian and zero-padded, decide most comparisons without
 /// touching the string; the whole string decides the rest.
 struct StringKey {
@@ -291,10 +338,20 @@ void sort_all(const Items& items, Extract extract, Sorted& out) {
     if (out.nulls > 0U) {
         out.group_starts.push_back(0);
     }
-    // Items are in row-address order, so the item number breaks ties by address.
-    parallel_sort(entries, [](const Entry& a, const Entry& b) {
-        return a.key < b.key || (!(b.key < a.key) && a.item < b.item);
-    });
+    // Items are in row-address order, so the item number breaks ties by address (a stable sort
+    // keeps it).
+    if constexpr (std::is_integral_v<K>) {
+        using U = std::make_unsigned_t<K>;
+        radix_sort(entries, [](const Entry& e) {
+            // Signed keys with the sign bit flipped order as unsigned ones.
+            return std::is_signed_v<K> ? static_cast<U>(static_cast<U>(e.key) ^ (U{1} << (sizeof(U) * 8U - 1U)))
+                                       : static_cast<U>(e.key);
+        });
+    } else {
+        parallel_sort(entries, [](const Entry& a, const Entry& b) {
+            return a.key < b.key || (!(b.key < a.key) && a.item < b.item);
+        });
+    }
     out.order.reserve(items.size());
     for (std::size_t i = 0; i < entries.size(); ++i) {
         if (i == 0 || entries[i - 1].key < entries[i].key) {
