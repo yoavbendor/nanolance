@@ -2808,20 +2808,21 @@ class MergeInsertBuilder:
         return "\n".join(lines)
 
     def analyze_plan(self, source, *, schema: Optional[pa.Schema] = None) -> str:
-        """The plan with the row counts the merge would produce, computed by a key join of the source
-        against the dataset. Nothing is written; conditions are not evaluated, so counts that depend on
-        one are left out."""
-        src = _coerce_reader(source, schema).read_all()
-        tgt = self._ds.to_table(columns=self._on)
-        matched = src.join(tgt, keys=self._on, join_type="left semi").num_rows
-        metrics = [f"num_inserted_rows={src.num_rows - matched if self._insert_all else 0}"]
-        if not self._update_condition and self._when_matched != "delete":
-            metrics.append(f"num_updated_rows={matched if self._update_all else 0}")
-        if self._when_matched == "delete":
-            metrics.append(f"num_deleted_rows={matched}")
-        elif self._delete_by_source and not self._delete_condition:
-            metrics.append(f"num_deleted_rows={tgt.join(src.select(self._on), keys=self._on, join_type='left anti').num_rows}")
-        return f"{self._clauses()}\n  metrics=[{', '.join(metrics)}] (dry run: nothing written)"
+        """The plan with the metrics of the merge, which runs: its new and rewritten data files are written
+        as the merge writes them, but nothing is committed. The dataset's version is unchanged and the
+        files are left unreferenced, as Lance leaves them."""
+        txn, stats = self.execute_uncommitted(source, schema=schema)
+        before = {f._path for frag in self._ds.get_fragments() for f in frag.files}
+        written = [f for frag in [*txn.operation.new_fragments, *txn.operation.updated_fragments]
+                   for f in frag.files if f._path not in before]
+        metrics = {
+            "bytes_written": sum(f.file_size_bytes or 0 for f in written),
+            "num_deleted_rows": stats["num_deleted_rows"],
+            "num_files_written": len(written),
+            "num_inserted_rows": stats["num_inserted_rows"],
+            "num_updated_rows": stats["num_updated_rows"],
+        }
+        return f"{self._clauses()}, metrics=[{', '.join(f'{k}={v}' for k, v in metrics.items())}]"
 
     def execute(self, data_obj, *, schema: Optional[pa.Schema] = None) -> Dict[str, int]:
         reader = _coerce_reader(data_obj, schema)
@@ -3299,6 +3300,48 @@ def _restore_dataset(state) -> "LanceDataset":
     return ds
 
 
+def _fixed_width(t: pa.DataType) -> Optional[int]:
+    """A value's byte width when it is fixed (Lance's ``byte_width_opt``), else None. Lists take their
+    items' width, as the measured defaults of pylance 12 do; booleans and nulls have none."""
+    if pa.types.is_boolean(t) or pa.types.is_null(t) or pa.types.is_map(t):
+        return None
+    if pa.types.is_dictionary(t):
+        return _fixed_width(t.value_type)
+    if pa.types.is_fixed_size_binary(t):
+        return t.byte_width
+    if pa.types.is_fixed_size_list(t):
+        item = _fixed_width(t.value_type)
+        return None if item is None else item * t.list_size
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return _fixed_width(t.value_type)
+    if pa.types.is_struct(t):
+        widths = [_fixed_width(t.field(i).type) for i in range(t.num_fields)]
+        return None if any(w is None for w in widths) else sum(widths)
+    try:
+        return t.bit_width // 8
+    except ValueError:  # no fixed bit width: strings, binaries, extension types
+        return None
+
+
+def _whole_fragments(ds) -> bool:
+    """Whether every fragment is one data file holding all the dataset's columns (no partial schema, no
+    column added later in its own file): the layout the default late read is exact for."""
+    if any(_is_blob_field(f) for f in ds._data_schema):  # a blob's handling is not kept by the late read
+        return False
+    width = len(ds._data_schema.names)
+    return all(len(f.files) == 1 and len(f.files[0].column_indices) == width for f in ds.get_fragments())
+
+
+def _early_by_default(field: pa.Field) -> bool:
+    """Whether a column is read early when late_materialization is not given: Lance's heuristic for
+    local storage (a fixed width under 10 bytes; a blob returned as descriptions is early). nanolance
+    reads local datasets only, so the cloud threshold (1000 bytes) does not apply."""
+    if _is_blob_field(field):
+        return True
+    width = _fixed_width(field.type)
+    return width is not None and width < 10
+
+
 class LanceScanner(pa.dataset.Scanner):
     """A configured read. Mirrors ``lance.LanceScanner``."""
 
@@ -3445,16 +3488,22 @@ class LanceScanner(pa.dataset.Scanner):
                 if re.search(r"(?<![A-Za-z0-9_])" + re.escape(n) + r"(?![A-Za-z0-9_])", sql)]
 
     def _late_columns(self) -> List[str]:
-        """Columns fetched after the filter, by row address (late_materialization=True or a list of
-        names). Only a filtered projection without row id or row address is read this way; the filter's
+        """Columns fetched after the filter, by row address (late_materialization=True, a list of
+        names, or None for Lance's default per column). Only a filtered projection without row id or row address is read this way; the filter's
         own columns always come first, so they are never late."""
         lm = self._late_materialization
-        if not lm or self._filter is None or self._include_deleted or self._masked \
+        if (lm is not None and not lm) or self._filter is None or self._include_deleted or self._masked \
                 or self._with_row_id or self._with_row_address or self._nearest is not None \
                 or self._fts is not None or self._order_by:
             return []
         filter_cols = self._filter_columns()
-        return [n for n in self._scan_names() if n not in filter_cols and (lm is True or n in lm)]
+        names = [n for n in self._scan_names() if n not in filter_cols]
+        if lm is None:  # the default: Lance's heuristic, column by column
+            schema = self._ds._data_schema
+            if not _whole_fragments(self._ds):  # partial schemas read early (the late read is not exact there)
+                return []
+            return [n for n in names if not _early_by_default(schema.field(n))]
+        return [n for n in names if lm is True or n in lm]
 
     def _scan_names(self) -> List[str]:
         return list(self._names) if self._names is not None else list(self._ds._data_schema.names)

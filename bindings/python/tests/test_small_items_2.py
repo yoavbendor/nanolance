@@ -180,19 +180,65 @@ def test_b6_late_materialization_plan_lines_and_results(tmp_path, late_materiali
     table = pa.table({"filter": range(2000), "values": range(2000)})
     ours = nano.write_dataset(table, str(tmp_path / "ds"), data_storage_version="stable")
     theirs = lance.write_dataset(table, str(tmp_path / "theirs"), data_storage_version="stable")
-    # Default (None) is pylance's own heuristic; nanolance keeps every column eager, so it is not compared here.
-    if late_materialization is not None:
-        assert ours.scanner(filter="filter % 2 == 0", late_materialization=late_materialization).explain_plan(
-            True
-        ).count("source=stream") == (1 if is_late else 0)
+    # Both engines: the same late read (one `source=stream`) for the same parameter.
+    for ds in (ours, theirs):
+        plan = ds.scanner(filter="filter % 2 == 0", late_materialization=late_materialization).explain_plan(True)
+        assert plan.count("source=stream") == (1 if is_late else 0), plan
     expected = theirs.to_table(filter="filter % 2 == 0")
     assert ours.to_table(filter="filter % 2 == 0", late_materialization=late_materialization) == expected
+
+
+def _late_by_default(lance, path, column_type, values):
+    """Whether a filtered scan reads `values` late under the default (late_materialization=None)."""
+    table = pa.table({"filter": range(len(values)), "values": pa.array(values, column_type)})
+    ds = lance.write_dataset(table, str(path), data_storage_version="stable", max_rows_per_file=10000)
+    plan = ds.scanner(filter="filter % 2 == 0", late_materialization=None).explain_plan(True)
+    return "source=stream" in plan
+
+
+@pytest.mark.parametrize(
+    ("column_type", "values"),
+    [
+        (pa.int64(), [1, 2, 3, 4]),
+        (pa.int8(), [1, 2, 3, 4]),
+        (pa.float16(), [1, 2, 3, 4]),
+        (pa.date32(), [1, 2, 3, 4]),
+        (pa.timestamp("us"), [1, 2, 3, 4]),
+        (pa.duration("ms"), [1, 2, 3, 4]),
+        (pa.binary(4), [b"abcd"] * 4),
+        (pa.binary(16), [b"abcdefghijklmnop"] * 4),
+        (pa.decimal128(10, 2), [1, 2, 3, 4]),
+        (pa.bool_(), [True, False, True, False]),
+        (pa.string(), ["a", "b", "c", "d"]),
+        (pa.binary(), [b"a", b"b", b"c", b"d"]),
+        (pa.list_(pa.int64()), [[1], [2], [3], [4]]),
+        (pa.list_(pa.string()), [["a"], ["b"], ["c"], ["d"]]),
+        (pa.struct([("x", pa.int64())]), [{"x": 1}] * 4),
+        (pa.struct([("x", pa.string())]), [{"x": "a"}] * 4),
+        (pa.list_(pa.int64(), 2), [[1, 2]] * 4),
+        (pa.list_(pa.float32(), 2), [[1.0, 2.0]] * 4),
+    ],
+    ids=lambda v: str(v) if isinstance(v, pa.DataType) else None,
+)
+def test_b6_default_late_materialization_by_type_equals_pylance(tmp_path, column_type, values):
+    lance = require_pylance()
+    table = pa.table({"filter": range(len(values)), "values": pa.array(values, column_type)})
+    ours = nano.write_dataset(table, str(tmp_path / "ds"), data_storage_version="stable", max_rows_per_file=10000)
+    theirs = lance.write_dataset(table, str(tmp_path / "theirs"), data_storage_version="stable",
+                                 max_rows_per_file=10000)
+    late = "source=stream" in ours.scanner(filter="filter % 2 == 0", late_materialization=None).explain_plan(True)
+    assert late == _late_by_default(lance, tmp_path / "pylance_only", column_type, values)
+    assert ours.to_table(filter="filter % 2 == 0") == theirs.to_table(filter="filter % 2 == 0")
 
 
 def test_b6_late_materialization_rejects_bad_values(tmp_path):
     ds = nano.write_dataset(pa.table({"a": range(10)}), str(tmp_path / "ds"))
     with pytest.raises(ValueError, match="late_materialization must be a bool or a list of strings"):
         ds.scanner(late_materialization=123)
+
+
+def _metric(analysis, name):
+    return int(re.search(rf"\b{name}=(\d+)", analysis).group(1))
 
 
 def test_b7_merge_insert_plan_and_dry_run_counts(tmp_path):
@@ -211,8 +257,32 @@ def test_b7_merge_insert_plan_and_dry_run_counts(tmp_path):
     assert "MergeInsert" in builder(theirs).explain_plan()
     assert "write_mode=auto" in builder(ours).explain_plan(verbose=True)
 
+    # analyze_plan writes the merge's files but commits nothing: the version is unchanged and the
+    # written files are on disk, unreferenced (as Lance leaves them).
+    data_dir = tmp_path / "ours" / "data"
+    before = set(data_dir.iterdir())
     version = ours.version
     analysis = builder(ours).analyze_plan(source)
-    assert "num_inserted_rows=1" in analysis and "num_updated_rows=1" in analysis
-    assert "nothing written" in analysis
-    assert ours.version == version and ours.count_rows() == 4
+    written = set(data_dir.iterdir()) - before
+    assert ours.version == version and lance.dataset(str(tmp_path / "ours")).version == version
+    assert ours.count_rows() == 4
+    assert len(written) == 1 and sum(p.stat().st_size for p in written) == _metric(analysis, "bytes_written")
+    assert "nothing written" not in analysis
+
+    # The counts equal pylance's for the same merge.
+    theirs_analysis = builder(theirs).analyze_plan(source)
+    for name in ("num_inserted_rows", "num_updated_rows", "num_deleted_rows", "num_files_written"):
+        assert _metric(analysis, name) == _metric(theirs_analysis, name), name
+
+
+def test_b7_merge_insert_delete_counts_equal_pylance(tmp_path):
+    lance = require_pylance()
+    data = pa.table({"id": [1, 2, 3, 4], "value": ["a", "b", "c", "d"]})
+    ours = nano.write_dataset(data, str(tmp_path / "ours"))
+    theirs = lance.write_dataset(data, str(tmp_path / "theirs"))
+    keys = pa.table({"id": [1, 2]})
+    ours_analysis = ours.merge_insert("id").when_matched_delete().analyze_plan(keys)
+    theirs_analysis = theirs.merge_insert("id").when_matched_delete().analyze_plan(keys)
+    assert _metric(ours_analysis, "num_deleted_rows") == _metric(theirs_analysis, "num_deleted_rows") == 2
+    assert _metric(ours_analysis, "num_files_written") == _metric(theirs_analysis, "num_files_written") == 0
+    assert ours.count_rows() == 4 and ours.version == 1

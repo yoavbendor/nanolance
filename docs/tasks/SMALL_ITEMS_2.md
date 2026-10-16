@@ -110,3 +110,12 @@ by address; plan lines only for what runs), item 7 partial (`MergeInsertBuilder.
 - Items 3 (`CountFromMask`: a count answered from an exact scalar-index mask without reading) and 5
   (index cache hit / miss through `scan_stats_callback` / `ScanStatistics`) need shared scan /
   planning code: roadmap items, not this bundle.
+
+**Phase B outcome, part 2 (2026-10-16):** items 6 and 7 done. `late_materialization=None` follows
+pylance (measured on 24 types: early iff the fixed byte width < 10 -- lists by their items' width,
+structs by their children's sum, fixed-size lists by items x size; booleans, nulls, maps, variable
+types late; blobs early), kept early for partial-schema fragments and datasets with blob columns
+(exactness guards). `MergeInsertBuilder.analyze_plan(source)` writes through the uncommitted merge
+(version unchanged, files orphaned as Lance) and reports num_inserted / updated / deleted rows,
+num_files_written and bytes_written. Phase C next. Benchmark the default-late change (filtered scans of
+wide columns now read late) in the coming performance review.
