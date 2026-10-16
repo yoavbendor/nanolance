@@ -1019,14 +1019,17 @@ tests/test_scalar_index.py::test_optimize_no_new_data
 tests/test_scalar_index.py::test_rowid_order
 tests/test_scalar_index.py::test_scalar_index_types[bitmap-binary]
 tests/test_scalar_index.py::test_scalar_index_types[bitmap-decimal128]
+tests/test_scalar_index.py::test_scalar_index_types[bitmap-duration]
 tests/test_scalar_index.py::test_scalar_index_types[bitmap-large-binary]
 tests/test_scalar_index.py::test_scalar_index_types[bitmap-large-string]
 tests/test_scalar_index.py::test_scalar_index_types[btree-binary]
 tests/test_scalar_index.py::test_scalar_index_types[btree-decimal128]
+tests/test_scalar_index.py::test_scalar_index_types[btree-duration]
 tests/test_scalar_index.py::test_scalar_index_types[btree-large-binary]
 tests/test_scalar_index.py::test_scalar_index_types[btree-large-string]
 tests/test_scalar_index.py::test_scalar_index_types[zonemap-binary]
 tests/test_scalar_index.py::test_scalar_index_types[zonemap-decimal128]
+tests/test_scalar_index.py::test_scalar_index_types[zonemap-duration]
 tests/test_scalar_index.py::test_scalar_index_types[zonemap-large-binary]
 tests/test_scalar_index.py::test_scalar_index_types[zonemap-large-string]
 tests/test_scalar_index.py::test_scalar_index_with_nulls
