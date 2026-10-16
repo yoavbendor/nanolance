@@ -2253,10 +2253,15 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         if (!segments.empty() && !not_used.empty()) {
             out.plan.push_back("index " + index_name + " not used: " + not_used);
         }
-        out.plan.push_back(std::string("KNNVectorDistance: metric=") + vector_metric_name(metric) +
-                           " (exact, " + std::to_string(all_fragments.size()) + " fragments)");
-        if (!flat_search(dataset_path, q, metric, dim, all_fragments, hits, error)) {
-            return false;
+        if (q.fast_search) {  // as pylance: fast_search skips the unindexed rows, so without an index, none
+            out.plan.push_back(std::string("KNNVectorDistance: metric=") + vector_metric_name(metric) +
+                               " (fast_search, no index: no rows)");
+        } else {
+            out.plan.push_back(std::string("KNNVectorDistance: metric=") + vector_metric_name(metric) +
+                               " (exact, " + std::to_string(all_fragments.size()) + " fragments)");
+            if (!flat_search(dataset_path, q, metric, dim, all_fragments, hits, error)) {
+                return false;
+            }
         }
     } else {
         const std::size_t refine = q.refine_factor.value_or(1U);

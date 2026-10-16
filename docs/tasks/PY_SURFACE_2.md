@@ -110,3 +110,11 @@ a fixed 1024-byte estimate per entry. Tests: `test_py_surface.py` Session sectio
 for errors, reprs and behaviour; nanolance-only index estimates). Oracle: all 9 `test_session.py` tests and
 `test_metadata_cache_size` pass (+10). Remaining failure matched by the `-k`: `test_file.py::
 test_session_list_with_delimiter` (LanceFileSession listing, not Q2, failing before this change).
+
+**Q3 outcome (2026-10-16):** done. Batch KNN (`q` of shape (n, dim) or a list of lists): leading
+`query_index: int32 not null`, k rows per query in order, limit / offset over the whole result,
+filters and `distance_range` per query, pylance's errors; each query's rows equal its single query's.
+Also fixed: `fast_search` without an index now returns no rows (pylance), not an exact scan. +7
+pylance tests (1132). Task PY_SURFACE_2 done. Known single-query divergences (small items): with
+`with_row_id=True` and `_rowid` also in `columns` pylance puts `_rowid` last; pylance adds `_rowid` to
+`fast_search` output; a batch's explain_plan prints the first query's plan plus a note.

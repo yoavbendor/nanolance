@@ -862,3 +862,143 @@ def test_session_index_entries_are_on_disk_sizes(tmp_path):
                 "shared_search_counts_once", "small_budget_refuses_index"):
         assert out[key] is True, key
     assert out["zero_index_budget_size"] == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# batch KNN: nearest={"q": 2-D array} (tests/test_vector_index.py of pylance)
+# ---------------------------------------------------------------------------------------------
+
+BATCH_SCRIPT = """
+import json, os, sys, warnings
+import numpy as np, pyarrow as pa
+warnings.filterwarnings("ignore")
+base, kind = sys.argv[1], sys.argv[2]
+dim, n = 16, 300
+rng = np.random.default_rng(7)
+
+def table(lo, hi):
+    ids = np.arange(lo, hi)
+    vec = rng.standard_normal((hi - lo, dim)).astype(np.float32)
+    return pa.table({"id": pa.array(ids, pa.int64()), "tag": pa.array([f"t{i % 3}" for i in ids]),
+                     "vector": pa.FixedSizeListArray.from_arrays(pa.array(vec.ravel()), dim)})
+
+path = os.path.join(base, kind + ".lance")
+ds = lance.write_dataset(table(0, n), path, max_rows_per_file=100)
+if kind != "flat":
+    ds.create_index("vector", index_type=kind, num_partitions=4, **({"num_sub_vectors": 4} if kind == "IVF_PQ" else {}))
+    ds = lance.write_dataset(table(n, n + 40), path, mode="append")  # rows the index does not cover
+ds.delete("id % 7 = 0")
+ds = lance.dataset(path)
+queries = rng.standard_normal((3, dim)).astype(np.float32)
+flat = kind == "flat"
+base_nn = {"k": 5} if flat else {"k": 5, "nprobes": 4}
+configs = {
+    "plain": (dict(base_nn), {}, ("id",), queries),
+    "filter_prefilter": (dict(base_nn, k=4), {"filter": "tag = 't1'", "prefilter": True}, ("id",), queries),
+    "filter_postfilter": (dict(base_nn, k=4), {"filter": "tag = 't1'"}, ("id",), queries),
+    "distance_range": (dict(base_nn, distance_range=(1.0, 4.0)), {}, ("id",), queries),
+    "limit": (dict(base_nn), {"limit": 7}, ("id",), queries),
+    "offset": (dict(base_nn), {"offset": 4, "limit": 6}, ("id",), queries),
+    "columns_row_id": (dict(base_nn, k=3), {}, ("id", "_rowid", "tag"), queries),
+    "with_row_id": (dict(base_nn, k=3), {"with_row_id": True}, ("id", "tag"), queries),
+    "single_row": (dict(base_nn, k=3), {}, ("id",), queries[:1]),
+    "list_of_lists": (dict(base_nn, k=3), {}, ("id",), queries.tolist()),
+    "fast_search": (dict(base_nn, k=3), {"fast_search": True}, ("id",), queries),
+}
+if not flat:
+    configs["refine_factor"] = (dict(base_nn, refine_factor=2), {}, ("id",), queries)
+
+def run(nn, kw, cols, q):
+    extra = {k: v for k, v in kw.items() if k not in ("limit", "offset")}
+    def call(qq, opts):
+        return ds.to_table(columns=list(cols), nearest=dict(nn, column="vector", q=qq), **opts)
+    batch = call(q, kw)
+    parts = []
+    for i, row in enumerate(np.asarray(q, np.float32)):
+        parts += [dict(r, query_index=i) for r in call(row, extra).to_pylist()]
+    off, lim = kw.get("offset", 0), kw.get("limit")
+    expected = parts[off:] if lim is None else parts[off:off + lim]
+    got = batch.to_pylist()
+    has_qi = "query_index" in batch.column_names
+    return {"names": batch.column_names, "query_index": batch["query_index"].to_pylist() if has_qi else None,
+            "ids": batch["id"].to_pylist(), "distances": [round(x, 4) for x in batch["_distance"].to_pylist()],
+            "matches_singles": got == expected, "rows": len(got)}
+
+print(json.dumps({name: run(*spec) for name, spec in configs.items()}, sort_keys=True))
+"""
+
+ERRORS_SCRIPT = """
+import json, sys, warnings
+import numpy as np, pyarrow as pa
+warnings.filterwarnings("ignore")
+base = sys.argv[1]
+dim, n = 16, 60
+rng = np.random.default_rng(3)
+vec = rng.standard_normal((n, dim)).astype(np.float32)
+arr = pa.FixedSizeListArray.from_arrays(pa.array(vec.ravel()), dim)
+ds = lance.write_dataset(pa.table({"id": pa.array(range(n), pa.int64()), "vector": arr}), base + "/e.lance")
+qi = lance.write_dataset(pa.table({"id": pa.array(range(n), pa.int64()),
+                                   "query_index": pa.array(range(n), pa.uint32()), "vector": arr}), base + "/q.lance")
+two = rng.standard_normal((2, dim)).astype(np.float32)
+
+def attempt(target, **nn):
+    try:
+        target.to_table(columns=["id"], nearest=dict({"column": "vector", "k": 3, "use_index": False}, **nn))
+        return "ok"
+    except Exception as e:
+        return [type(e).__name__, str(e).split(", /")[0]]
+
+cases = {
+    "dim_1d": attempt(ds, q=np.zeros(256, np.float32)),
+    "dim_2d": attempt(ds, q=np.zeros((2, 20), np.float32)),
+    "dim_one_row": attempt(ds, q=np.zeros((1, 20), np.float32)),
+    "k_zero_batch": attempt(ds, q=two, k=0),
+    "arrow_fixed_size_list": attempt(ds, q=pa.array(two.tolist(), pa.list_(pa.float32(), dim))),
+    "arrow_list": attempt(ds, q=pa.array(two.tolist(), pa.list_(pa.float32()))),
+    "query_index_column_batch": attempt(qi, q=two),
+    "query_index_column_single": attempt(qi, q=two[0]),
+}
+print(json.dumps(cases, sort_keys=True))
+"""
+
+
+@pytest.mark.parametrize("kind", ["flat", "IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"])
+def test_batch_knn_matches_pylance_and_single_queries(tmp_path, kind):
+    require_pylance()
+    out = {}
+    for engine in ENGINES:
+        (tmp_path / engine).mkdir()
+        out[engine] = _json(engine, BATCH_SCRIPT, str(tmp_path / engine), kind)
+    expected, actual = out["pylance"], out["nanolance"]
+    assert actual.keys() == expected.keys()
+    for name, got in actual.items():
+        assert got["matches_singles"] is True, name
+        assert got["query_index"] == expected[name]["query_index"], name
+        if name == "fast_search":
+            # the scan skips unindexed rows: none without an index, the indexed ones with one (pylance also
+            # lists _rowid here, nanolance's single does not)
+            if kind == "flat":
+                assert got["ids"] == [] and "query_index" in got["names"], name
+            else:
+                assert len(got["ids"]) == len(expected[name]["ids"]), name
+            continue
+        assert got["names"] == expected[name]["names"], name
+        if kind == "flat":
+            # exact search: the same rows and distances as pylance
+            assert got["ids"] == expected[name]["ids"], name
+            assert got["distances"] == expected[name]["distances"], name
+        else:
+            # an index is built by each engine: the same shape, not the same approximate rows
+            assert len(got["ids"]) == len(expected[name]["ids"]), name
+
+
+def test_batch_errors_match_pylance(tmp_path):
+    require_pylance()
+    out = {}
+    for engine in ENGINES:
+        (tmp_path / engine).mkdir()
+        out[engine] = _json(engine, ERRORS_SCRIPT, str(tmp_path / engine))
+    expected, actual = out["pylance"], out["nanolance"]
+    assert actual == expected
+    assert expected["query_index_column_single"] == "ok"
+    assert expected["dim_1d"] == ["ValueError", "Query vector size 256 does not match index column size 16"]

@@ -2459,12 +2459,13 @@ def _coerce_query_vector(query):
     return query, len(query)
 
 
-def _query_vector(q) -> np.ndarray:
-    """A single query vector as float32."""
+def _query_rows(q) -> tuple:
+    """The query vectors of ``q`` as float32 rows, and whether ``q`` is a batch (a 2-D array or a list of
+    vectors). Each row of a batch runs as a single query; the results carry ``query_index``."""
     array, _ = _coerce_query_vector(q)
     if pa.types.is_list(array.type):
-        raise unsupported("batch and multivector queries (a 2-D q)")
-    return np.asarray(array.to_numpy(zero_copy_only=False), np.float32).ravel()
+        return [np.asarray(v, np.float32) for v in array.to_pylist()], True
+    return [np.asarray(array.to_numpy(zero_copy_only=False), np.float32).ravel()], False
 
 
 def _fts_query_json(query) -> str:
@@ -2501,13 +2502,10 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
     if unknown:
         raise TypeError(f"nearest() got unexpected keyword arguments {sorted(unknown)}")
     column = nearest.get("column")
-    try:
-        q = _query_vector(nearest.get("q"))
-    except NotSupportedError:
-        if "query_index" in ds._data_schema.names:
-            raise ValueError("Invalid user input: batch nearest neighbor search cannot be used on datasets "
-                             "with column 'query_index'") from None
-        raise
+    rows, batch = _query_rows(nearest.get("q"))
+    if batch and "query_index" in ds._data_schema.names:
+        raise ValueError("Invalid user input: batch nearest neighbor search cannot be used on datasets "
+                         "with column 'query_index'")
     node = None
     for i, part in enumerate(str(column).split(".")):
         if i > 0 and not pa.types.is_struct(node.type):
@@ -2526,8 +2524,10 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
         raise unsupported("multivector search")
     else:
         raise TypeError(f"Query column {column} must be a vector. Got {arrow_type}.")
-    if len(q) != dim:
-        raise ValueError(f"Query vector size {len(q)} does not match index column size {dim}")
+    if len(rows[0]) != dim:
+        # pylance's message: for a batch, the size it names is the number of query rows.
+        size = len(rows) if batch else len(rows[0])
+        raise ValueError(f"Query vector size {size} does not match index column size {dim}")
     k, nprobes = nearest.get("k"), nearest.get("nprobes")
     if k is None and limit is not None:
         k = limit
@@ -2565,8 +2565,8 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
             raise ValueError("distance_range must be a tuple of (lower_bound, upper_bound)")
         lower, upper = distance_range
     metric = nearest.get("metric") or nearest.get("distance_type")
-    return {
-        "column": str(column), "q": q.tolist(), "k": 10 if k is None else int(k),
+    shared = {
+        "column": str(column), "k": 10 if k is None else int(k),
         "minimum_nprobes": 1 if minimum is None else int(minimum),
         "maximum_nprobes": None if maximum is None else int(maximum),
         "refine_factor": None if refine is None else int(refine),
@@ -2576,6 +2576,10 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
         "upper_bound": None if upper is None else float(upper),
         "ef": None if ef is None else int(ef),
     }
+    if batch:
+        # One query per row, in row order: the list is the batch (see ScannerBuilder._nearest_table).
+        return [dict(shared, q=row.tolist()) for row in rows]
+    return dict(shared, q=rows[0].tolist())
 
 
 def _filter_sql(filter) -> Optional[str]:
@@ -3492,8 +3496,7 @@ class LanceScanner(pa.dataset.Scanner):
             drop.append("_rowid")
         return table.drop_columns([c for c in drop if c in table.column_names])
 
-    def _search(self):
-        n = self._nearest
+    def _search(self, n):
         with native():
             ids, distances, plan, hits, misses = _nanolance._ds_nearest(
                 self._ds.uri, self._ds.version, n["column"], n["q"], n["k"], n["minimum_nprobes"],
@@ -3505,9 +3508,9 @@ class LanceScanner(pa.dataset.Scanner):
         note_indexes(self._ds, column=n["column"])
         return ids, distances, plan
 
-    def _nearest_table(self) -> pa.Table:
-        """The k nearest rows: the columns asked for, then ``_distance`` (then the row id columns)."""
-        ids, distances, _ = self._search()
+    def _nearest_one(self, n) -> pa.Table:
+        """One query's k nearest rows: the columns asked for, then ``_distance`` (then the row id columns)."""
+        ids, distances, _ = self._search(n)
         names = self._names
         if self._order is not None and "_distance" in self._order:
             names = [c for c in names if c != "_distance"] if names is not None else None
@@ -3518,14 +3521,28 @@ class LanceScanner(pa.dataset.Scanner):
         out = data.append_column("_distance", pa.array(distances, pa.float32()))
         for c in system:
             out = out.append_column(c, table.column(c))
+        return out
+
+    def _nearest_table(self) -> pa.Table:
+        """The k nearest rows. A batch (``self._nearest`` a list) runs each query in turn, its rows in query
+        order with a leading ``query_index``; offset and limit then apply to the whole result."""
+        batch = isinstance(self._nearest, list)
+        tables = [self._nearest_one(n) for n in (self._nearest if batch else [self._nearest])]
+        out = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
+        if batch:
+            index = np.repeat(np.arange(len(tables), dtype=np.int32), [t.num_rows for t in tables])
+            out = out.add_column(0, pa.field("query_index", pa.int32(), nullable=False), pa.array(index, pa.int32()))
         if self._offset or self._limit is not None:
             out = out.slice(self._offset, self._limit)
+        system = [c for c in ("_rowid", "_rowaddr") if c in out.column_names]
         if self._order is not None:
             # Named columns where named; `_distance`, when not named, after them (as Lance).
             order = [c for c in self._order if c in out.column_names]
             if "_distance" not in order and not self._no_score_autoprojection:
                 order.append("_distance")
             order += [c for c in system if c not in order]
+            if batch:
+                order.insert(0, "query_index")
             out = out.select(order)
         elif self._no_score_autoprojection:
             out = out.drop_columns(["_distance"])
@@ -3632,7 +3649,10 @@ class LanceScanner(pa.dataset.Scanner):
     def explain_plan(self, verbose: bool = False) -> str:
         lines = [f"nanolance scan of {self._ds.uri} v{self._ds.version}"]
         if self._nearest is not None:
-            lines += ["  " + line for line in self._search()[2]]
+            first = self._nearest[0] if isinstance(self._nearest, list) else self._nearest
+            if isinstance(self._nearest, list):
+                lines.append(f"  batch of {len(self._nearest)} queries: each runs as a single query, rows concatenated")
+            lines += ["  " + line for line in self._search(first)[2]]
             return "\n".join(lines)
         if self._fts is not None:
             lines += ["  " + line for line in self._fts_search()[2]]
