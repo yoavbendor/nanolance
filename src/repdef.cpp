@@ -4,6 +4,7 @@
 #include "nanolance/repdef.hpp"
 #include "nanolance/parallel.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cstring>
 #include <cstddef>
@@ -290,7 +291,10 @@ struct LayerFlags {
     bool has_empty = false;
 };
 
-class Serializer {
+/// Cache-line aligned: serializers working side by side sit next to each other in a vector, and
+/// each writes its counters on every level while the next one reads its layers -- unaligned, the
+/// threads shared those lines and the parallel serialize was slower than one thread.
+class alignas(64) Serializer {
 public:
     Serializer(const std::vector<SerializeLayer>& layers, const std::vector<std::uint8_t>& item_validity)
         : layers_(layers), item_validity_(item_validity), flags_(layers.size() + 1U) {
@@ -328,7 +332,9 @@ public:
         if (k == layers_.size()) {
             const bool valid = valid_at(&item_validity_, idx);
             if (!emit) {
-                flags_[k].has_null = flags_[k].has_null || !valid;
+                if (!valid) {
+                    flags_[k].has_null = true;  // written only on a null: serializers side by side share heap lines
+                }
                 ++levels_;
                 ++items_;
                 return true;
