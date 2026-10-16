@@ -85,3 +85,12 @@ type-system code, or more than ~250 lines; skip to the next item and report it.
 Tails of: `cd build && ctest -j8 | grep "tests passed"`; each item's oracle; your test file;
 `python3 tools/pylance_suite.py | tail -4`; last, once: the full pytest (`-q -rf`) tail. Per item:
 done / partial / not started, decisions, questions.
+
+**Phase A outcome (2026-10-16):** item 1 done (Bitmap construction / update / add errors as pylance,
++8 pylance tests). Item 2: decimal128 and duration BTREE / BITMAP / ZONEMAP already build with pages
+equal to pylance's (tests added); left for a separate item (reviewer): Decimal and Duration value
+kinds in the expression engine (filters cannot compare decimal columns; `arrow_cast` to
+Decimal / Duration refused; duration literals are unit-unaware) and a 256-bit key kind for decimal256
+indexes -- shared type-system code, grouped with the result-type item on the roadmap. Reviewer also
+fixed a flaky batch-KNN test: with an index and a post-filter the per-query row counts depend on each
+engine's own index, so only query_index's shape is compared there (`matches_singles` stays exact).

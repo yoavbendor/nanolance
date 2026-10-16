@@ -34,9 +34,17 @@ tests/test_bitmap.py::test_construct_from_pyarrow_array[arrow_type4]
 tests/test_bitmap.py::test_construct_from_pyarrow_array[arrow_type5]
 tests/test_bitmap.py::test_construct_from_pyarrow_array[arrow_type6]
 tests/test_bitmap.py::test_construct_from_pyarrow_array[arrow_type7]
+tests/test_bitmap.py::test_construct_from_pyarrow_rejects_non_integer
+tests/test_bitmap.py::test_construct_from_pyarrow_rejects_nulls
+tests/test_bitmap.py::test_construct_from_pyarrow_rejects_out_of_range[negative]
+tests/test_bitmap.py::test_construct_from_pyarrow_rejects_out_of_range[too_large_int64]
+tests/test_bitmap.py::test_construct_from_pyarrow_rejects_out_of_range[too_large_uint64]
 tests/test_bitmap.py::test_construct_from_range
 tests/test_bitmap.py::test_construct_from_sliced_pyarrow_array
 tests/test_bitmap.py::test_construct_from_unaligned_pyarrow_buffer
+tests/test_bitmap.py::test_construct_rejects_non_integer_values
+tests/test_bitmap.py::test_construct_rejects_out_of_range_values[negative]
+tests/test_bitmap.py::test_construct_rejects_out_of_range_values[too_large]
 tests/test_bitmap.py::test_copy_is_independent
 tests/test_bitmap.py::test_equality
 tests/test_bitmap.py::test_equality_against_incompatible_type_is_false_not_error
