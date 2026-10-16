@@ -12,6 +12,7 @@ import os
 import random
 from decimal import Decimal
 
+import numpy as np
 import pyarrow as pa
 import pytest
 
@@ -433,3 +434,176 @@ def test_uuid_index_keeps_the_extension_type(tmp_path):
     other = theirs.to_table(filter=flt, columns=["u"])
     assert mine.schema == other.schema
     assert mine.column("u").to_pylist() == other.column("u").to_pylist()
+
+
+# ---------------------------------------------------------------------------------------------
+# Phase B, item 5: bracket indexing, `l[1]` (1-based, negative from the end) and `s['x']`.
+
+
+def _bracket_table() -> pa.Table:
+    return pa.table(
+        {
+            "i": pa.array(range(6), pa.int64()),
+            "l": pa.array([[10, 20, 30], [], None, [None, 5], [7], [1, 2, 3, 4]], pa.list_(pa.int64())),
+            "ls": pa.array(
+                [[{"x": 1, "y": True}], [], None, [{"x": None, "y": False}, {"x": 9, "y": True}],
+                 [{"x": 3, "y": None}], None],
+                pa.list_(pa.struct([("x", pa.int64()), ("y", pa.bool_())])),
+            ),
+            "fl": pa.array([[1.5, 2.25, -3.0], None, [0.1, 1e6, 70000.0], [], [None, 2.0], [1.0]],
+                           pa.list_(pa.float32())),
+            "s": pa.array([{"x": 1}, None, {"x": None}, {"x": 4}, {"x": 5}, {"x": 6}],
+                          pa.struct([("x", pa.int64())])),
+        }
+    )
+
+
+def _proj(ds, expr):
+    try:
+        t = ds.to_table(columns={"r": expr})
+    except Exception as exc:  # noqa: BLE001 -- the outcome is what is compared
+        return ("error", str(exc))
+    return ("values", t.column("r").to_pylist(), str(t.schema.field("r").type))
+
+
+@pytest.mark.parametrize(
+    "expr",
+    ["l[1]", "l[2]", "l[3]", "l[0]", "l[-1]", "l[-4]", "l[4]", "l[9]", "l[-9]", "l[1] + 1",
+     "CAST(l[1] AS DOUBLE)", "fl[-1]", "fl[2]", "ls[1].x", "ls[1]['y']",
+     "ls[2]['x']", "ls[4]['x']", "ls[1]['x'] + 1", "s['x']", "s.x", "s['x'] + 1"],
+)
+def test_bracket_projection_equals_pylance(tmp_path, expr):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _bracket_table())
+    mine = _proj(ours, expr)
+    other = _proj(theirs, expr)
+    assert other[0] == "values", other
+    assert mine == other, expr
+
+
+@pytest.mark.parametrize(
+    "flt",
+    ["l[1] = 10", "l[2] IS NULL", "l[1] IS NULL", "l[3] = 5", "l[-1] = 3", "l[0] IS NULL", "l[1] IN (10, 20)",
+     "l[1] BETWEEN 5 AND 25", "ls[1]['x'] = 1", "ls[2]['x'] IS NULL", "s['x'] = 4", "s['x'] > 1 AND l[1] > 5",
+     "fl[1] > 2", "ls[1]['y'] AND i > 0"],
+)
+def test_bracket_filter_equals_pylance(tmp_path, flt):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _bracket_table())
+    _assert_same(ours, theirs, flt)
+    assert _rows(theirs, flt)[0] == "rows", flt
+
+
+@pytest.mark.parametrize("expr", ["l[1]['x']", "s[1]", "ls[1][1]", "l['1']", "l[1.0]"])
+def test_bracket_errors_like_pylance(tmp_path, expr):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _bracket_table())
+    assert _proj(theirs, expr)[0] == "error", expr
+    assert _proj(ours, expr)[0] == "error", expr
+
+
+# ---------------------------------------------------------------------------------------------
+# Phase B, item 6: `_cast_list_f16(vector)`, the float16 cast pylance's vector search uses.
+
+
+def _f16_table() -> pa.Table:
+    return pa.table(
+        {
+            "i": pa.array(range(4), pa.int64()),
+            "fsl": pa.array([[1.5, 2.25, -3.0], None, [0.1, 1e6, 70000.0], [2**-24, 1e-7, 65520.0]],
+                            pa.list_(pa.float32(), 3)),
+            "vl": pa.array([[1.5, 2.25], None, [0.1, 1e6], []], pa.list_(pa.float32())),
+        }
+    )
+
+
+@pytest.mark.parametrize("column", ["fsl", "vl"])
+def test_cast_list_f16_equals_pylance(tmp_path, column):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _f16_table())
+    expr = f"_cast_list_f16({column})"
+    mine = _proj(ours, expr)
+    other = _proj(theirs, expr)
+    assert other[0] == "values" and "halffloat" in other[2]
+    assert mine == other
+
+
+def test_cast_list_f16_rounds_like_numpy(tmp_path):
+    lance = require_pylance()
+    rng = np.random.default_rng(7)
+    values = np.concatenate([
+        rng.standard_normal(3000).astype(np.float32),
+        (rng.standard_normal(2000) * 1e-5).astype(np.float32),  # subnormal in float16
+        (rng.standard_normal(1000) * 3e4).astype(np.float32),  # near the overflow edge
+        np.array([65504, 65520, -65520, 2.0**-24, 2.0**-25, 6.1035156e-05, np.inf], np.float32),
+    ])
+    table = pa.table({"i": pa.array(range(len(values)), pa.int64()),
+                      "v": pa.array([[float(x)] for x in values], pa.list_(pa.float32()))})
+    ours, theirs = _datasets(lance, tmp_path, table)
+    with np.errstate(over="ignore"):
+        expected = values.astype(np.float16).astype(np.float64)
+    got = np.array([row[0] for row in ours.to_table(columns={"r": "_cast_list_f16(v)"})["r"].to_pylist()])
+    assert np.array_equal(got, expected)
+    assert _proj(ours, "_cast_list_f16(v)") == _proj(theirs, "_cast_list_f16(v)")
+
+
+@pytest.mark.parametrize("expr", ["_cast_list_f16(i)", "_cast_list_f16(v)"])
+def test_cast_list_f16_refuses_non_float_lists_like_pylance(tmp_path, expr):
+    lance = require_pylance()
+    table = pa.table({"i": pa.array(range(2), pa.int64()), "v": pa.array([[1, 2], None], pa.list_(pa.int64()))})
+    ours, theirs = _datasets(lance, tmp_path, table)
+    assert _proj(theirs, expr)[0] == "error", expr
+    assert _proj(ours, expr)[0] == "error", expr
+
+
+# ---------------------------------------------------------------------------------------------
+# Phase B, item 3 (the A3 follow-up): decimals of different widths whose common type needs more
+# than 76 digits are refused, as DataFusion refuses them. The rule: Decimal128 against Decimal256,
+# and max(p1 - s1, p2 - s2) + max(s1, s2) > 76.
+
+
+def _clash_table() -> pa.Table:
+    return pa.table(
+        {
+            "i": pa.array(range(3), pa.int64()),
+            "a": pa.array([D("1.500"), D("-2.000"), None], pa.decimal256(76, 3)),
+            "b": pa.array([D("1.500"), D("0.000"), None], pa.decimal128(38, 3)),
+            "c": pa.array([D("1.50000"), D("-2.00000"), None], pa.decimal128(10, 5)),
+            "n": pa.array([D("1.5000"), D("0.0000"), None], pa.decimal128(10, 4)),
+            "k": pa.array([D("1"), D("2"), None], pa.decimal256(76, 0)),
+            "m": pa.array([D("1.5"), D("2.0"), None], pa.decimal128(38, 1)),
+            "j": pa.array([D("1.5"), D("2.0"), None], pa.decimal256(40, 30)),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "flt, message",
+    [
+        ("a = c", "Cannot infer common argument type for comparison operation Decimal256(76, 3) = Decimal128(10, 5)"),
+        ("c = a", "Cannot infer common argument type for comparison operation Decimal128(10, 5) = Decimal256(76, 3)"),
+        ("a < c", "Cannot infer common argument type for comparison operation Decimal256(76, 3) < Decimal128(10, 5)"),
+        ("a <> n", "Cannot infer common argument type for comparison operation Decimal256(76, 3) != Decimal128(10, 4)"),
+        ("k = m", "Cannot infer common argument type for comparison operation Decimal256(76, 0) = Decimal128(38, 1)"),
+        ("a = arrow_cast(1, 'Decimal128(10, 4)')",
+         "Cannot infer common argument type for comparison operation Decimal256(76, 3) = Decimal128(10, 4)"),
+        ("a IN (c)", "Can not find compatible types to compare Decimal256(76, 3) with [Decimal128(10, 5)]"),
+        ("a BETWEEN b AND c", "Failed to coerce types Decimal256(76, 3) and Decimal128(10, 5) in BETWEEN expression."),
+    ],
+)
+def test_decimal_clash_is_refused_like_pylance(tmp_path, flt, message):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _clash_table())
+    mine = _rows(ours, flt)
+    assert mine[0] == "error" and message in mine[1], mine
+    assert _rows(theirs, flt)[0] == "error"
+
+
+@pytest.mark.parametrize(
+    "flt",
+    ["a = b", "k = j", "c = n", "a = arrow_cast(1.5, 'Decimal256(40, 3)')", "a = k", "a BETWEEN b AND b"],
+)
+def test_decimal_pairs_that_fit_are_not_refused(tmp_path, flt):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _clash_table())
+    _assert_same(ours, theirs, flt)

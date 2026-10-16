@@ -125,6 +125,13 @@ them exactly -- refuse the same way. Lists of uuid stay unindexable.
 6. `arrow_cast(vec, 'FixedSizeList(n, Float16)')` or whatever
    `test_dynamic_projection_with_vectors_index` uses (grep it): a list cast to float16 in projections.
 
+**B outcome (2026-10-16):** `l[k]` (1-based; 0, past the end, null list / element -> null; negative
+from the end), `s['x']` (as `s.x`), chains, in filters and projections; pylance's `_cast_list_f16`
+UDF with round-to-nearest-even float16 (checked against numpy); decimal comparisons of mixed widths
+whose common type passes 76 digits refused with DataFusion's messages. +2 pylance tests (1183). Left:
+non-literal indexes (`l[1 + 1]`), projecting a struct element (`ls[1]`), `array_element(...)`,
+case-insensitive struct fields (pylance refuses `s.X`; nanolance accepts it -- an older divergence).
+
 **Phase C -- DataFusion's result types (no single pylance test; nanolance's own tests)**
 
 7. Arithmetic and function result types as DataFusion coerces them, in `result_type` and evaluation:

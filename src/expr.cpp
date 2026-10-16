@@ -542,8 +542,13 @@ enum class Op {
 };
 
 struct ColumnRef {
-    std::vector<std::string> path;  // as written: "s.child" is {"s", "child"}
-    // Bound: child indices from the batch down, the leaf's storage type, and its timestamp unit.
+    static constexpr std::int64_t kNoElement = INT64_MIN;
+    std::vector<std::string> path;  // as written: "s.child" is {"s", "child"}; "l[1]" is {"l", "[1]"}
+    // List-element steps (`l[1]`, 1-based, negative from the end): elements[k] is the index applied at
+    // path[k], or kNoElement for a struct field. Empty when the path has no list-element step.
+    std::vector<std::int64_t> elements;
+    // Bound: child indices from the batch down (-1 for a list-element step), the leaf's storage type,
+    // and its timestamp unit.
     std::vector<int64_t> indices;
     ArrowType type = NANOARROW_TYPE_UNINITIALIZED;
     ArrowTimeUnit unit = NANOARROW_TIME_UNIT_SECOND;
@@ -606,6 +611,7 @@ std::unique_ptr<Node> fold_decimal_cast(const Node& arg, const std::string& type
     auto n = std::make_unique<Node>();
     n->op = Op::Literal;
     n->literal = Value::decimal(limbs, scale);
+    n->name = type;  // the declared type, for the comparison rule in coerce()
     return n;
 }
 
@@ -1317,13 +1323,48 @@ private:
         return n;
     }
 
+    /// Appends one step to a column path: a field name, or (element != kNoElement) a list element.
+    static void push_step(ColumnRef& c, std::string text, std::int64_t element = ColumnRef::kNoElement) {
+        if (element != ColumnRef::kNoElement && c.elements.empty()) {
+            c.elements.assign(c.path.size(), ColumnRef::kNoElement);
+        }
+        c.path.push_back(std::move(text));
+        if (!c.elements.empty()) {
+            c.elements.push_back(element);
+        }
+    }
+
+    /// `name.field`, `name['field']` and `name[1]` (a 1-based list element, negative from the end).
     std::unique_ptr<Node> parse_column() {
         auto n = std::make_unique<Node>();
         n->op = Op::Column;
-        n->column.path.push_back(next().text);
-        while (peek().kind == Tok::Dot && (peek(1).kind == Tok::Ident || peek(1).kind == Tok::QuotedIdent)) {
+        push_step(n->column, next().text);
+        for (;;) {
+            if (peek().kind == Tok::Dot && (peek(1).kind == Tok::Ident || peek(1).kind == Tok::QuotedIdent)) {
+                next();
+                push_step(n->column, next().text);
+                continue;
+            }
+            if (peek().kind != Tok::LBracket) {
+                break;
+            }
             next();
-            n->column.path.push_back(next().text);
+            if (peek().kind == Tok::String || peek().kind == Tok::QuotedIdent) {
+                push_step(n->column, next().text);
+            } else {
+                const bool negative = accept_op("-");
+                if (peek().kind != Tok::Number || peek().text.find_first_not_of("0123456789") != std::string::npos ||
+                    peek().text.size() > 18) {
+                    return fail("list index must be an integer literal, not '" + describe(peek()) + "'");
+                }
+                std::int64_t index = 0;
+                std::from_chars(peek().text.data(), peek().text.data() + peek().text.size(), index);
+                push_step(n->column, "[" + std::string(negative ? "-" : "") + next().text + "]",
+                          negative ? -index : index);
+            }
+            if (next().kind != Tok::RBracket) {
+                return fail("expected ']' to close the index");
+            }
         }
         return n;
     }
@@ -1361,8 +1402,9 @@ std::string print(const Node& n) {
         case Op::Literal: return format_value(n.literal);
         case Op::Column: {
             std::string out;
-            for (const auto& p : n.column.path) {
-                out += (out.empty() ? "" : ".") + p;
+            for (std::size_t k = 0; k < n.column.path.size(); ++k) {
+                out += (out.empty() || (!n.column.elements.empty() && n.column.elements[k] != ColumnRef::kNoElement)
+                            ? "" : ".") + n.column.path[k];
             }
             return out;
         }
@@ -1398,9 +1440,13 @@ std::string print(const Node& n) {
 
 void collect_columns(const Node& n, std::vector<std::string>& out) {
     if (n.op == Op::Column) {
+        // The column read: the path up to its first list element (`l[1].x` reads `l`).
         std::string full;
-        for (const auto& p : n.column.path) {
-            full += (full.empty() ? "" : ".") + p;
+        for (std::size_t k = 0; k < n.column.path.size(); ++k) {
+            if (!n.column.elements.empty() && n.column.elements[k] != ColumnRef::kNoElement) {
+                break;
+            }
+            full += (full.empty() ? "" : ".") + n.column.path[k];
         }
         if (std::find(out.begin(), out.end(), full) == out.end()) {
             out.push_back(full);
@@ -1499,22 +1545,41 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
         const ArrowSchema* at = &schema;
         // "a.b" may be a column named "a.b" as well as a struct path.
         std::string joined;
-        for (const auto& p : c.path) {
-            joined += (joined.empty() ? "" : ".") + p;
+        for (std::size_t k = 0; k < c.path.size(); ++k) {
+            const bool element = !c.elements.empty() && c.elements[k] != ColumnRef::kNoElement;
+            joined += (joined.empty() || element ? "" : ".") + c.path[k];
         }
-        const int64_t whole = c.path.size() > 1 ? find_child(schema, joined) : -1;
+        const int64_t whole = c.path.size() > 1 && c.elements.empty() ? find_child(schema, joined) : -1;
         if (whole >= 0) {
             c.indices.push_back(whole);
             at = schema.children[whole];
         } else {
-            for (const auto& p : c.path) {
-                const int64_t k = find_child(*at, p);
-                if (k < 0) {
+            for (std::size_t k = 0; k < c.path.size(); ++k) {
+                if (!c.elements.empty() && c.elements[k] != ColumnRef::kNoElement) {
+                    // `l[1]`: a list whose items are not lists (pylance refuses nested indexing too).
+                    ArrowSchemaView lv{};
+                    ArrowError lerr;
+                    if (ArrowSchemaViewInit(&lv, at, &lerr) != NANOARROW_OK || !is_list_type(lv.type) ||
+                        at->n_children != 1) {
+                        error = "column '" + joined + "' is not a list, so it cannot take " + c.path[k];
+                        return false;
+                    }
+                    ArrowSchemaView item{};
+                    if (ArrowSchemaViewInit(&item, at->children[0], &lerr) != NANOARROW_OK || is_list_type(item.type)) {
+                        error = "column '" + joined + "' is a list of lists, which filters cannot index";
+                        return false;
+                    }
+                    c.indices.push_back(-1);
+                    at = at->children[0];
+                    continue;
+                }
+                const int64_t found = find_child(*at, c.path[k]);
+                if (found < 0) {
                     error = "column '" + joined + "' not found";
                     return false;
                 }
-                c.indices.push_back(k);
-                at = at->children[k];
+                c.indices.push_back(found);
+                at = at->children[found];
             }
         }
         ArrowSchemaView sv{};  // time_unit is only set for temporal types: zero, not garbage, otherwise
@@ -1547,7 +1612,7 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
     }
     const bool null_test = n.op == Op::IsNull || n.op == Op::IsNotNull ||
                            (n.op == Op::Func && (n.name == "is_null" || n.name == "is_valid"));
-    const bool array_function = n.op == Op::Func && is_array_function(n.name);
+    const bool array_function = n.op == Op::Func && (is_array_function(n.name) || n.name == "_cast_list_f16");
     for (auto& a : n.args) {
         const bool first = a.get() == n.args.front().get();
         if (!bind_node(*a, schema, null_test && first, error, array_function && first)) {
@@ -1566,6 +1631,7 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
             {"json_get", {2, 2}},      {"json_get_string", {2, 2}}, {"json_get_int", {2, 2}},
             {"json_get_float", {2, 2}}, {"json_get_bool", {2, 2}},  {"json_extract", {2, 2}},
             {"json_exists", {2, 2}},   {"json_array_contains", {3, 3}}, {"json_array_length", {2, 2}},
+            {"_cast_list_f16", {1, 1}},
         };
         const auto it = arity.find(n.name);
         if (it == arity.end()) {
@@ -1576,6 +1642,17 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
         if (count < it->second.first || count > it->second.second) {
             error = "wrong number of arguments to " + n.name + "()";
             return false;
+        }
+        if (n.name == "_cast_list_f16") {  // pylance's words for a list that is not of floats
+            const auto& a = *n.args[0];
+            if (a.op != Op::Column || !is_list_type(a.column.type)) {
+                error = "cast_list_f16 only supports FixedSizeList/List arguments";
+                return false;
+            }
+            if (a.column.item_type != NANOARROW_TYPE_FLOAT && a.column.item_type != NANOARROW_TYPE_HALF_FLOAT) {
+                error = "cast_list_f16 only supports list of float32 or float16";
+                return false;
+            }
         }
     }
     return true;
@@ -1616,6 +1693,52 @@ std::string datafusion_literal(const Value& v) {
     }
 }
 
+/// A decimal operand's type as the planner sees it: a decimal column, or a folded
+/// arrow_cast(number, 'Decimal..') literal.
+struct DecimalType {
+    bool wide = false;  // Decimal256
+    std::int32_t precision = 0;
+    std::int32_t scale = 0;
+};
+
+bool decimal_type_of(const Node& n, DecimalType& t) {
+    if (n.op == Op::Column && (n.column.type == NANOARROW_TYPE_DECIMAL128 || n.column.type == NANOARROW_TYPE_DECIMAL256)) {
+        t = DecimalType{n.column.type == NANOARROW_TYPE_DECIMAL256, n.column.precision, n.column.scale};
+        return true;
+    }
+    int width = 0;
+    int precision = 0;
+    int scale = 0;
+    if (n.op == Op::Literal && n.literal.kind == Kind::Decimal &&
+        std::sscanf(n.name.c_str(), "Decimal%d(%d, %d)", &width, &precision, &scale) == 3) {
+        t = DecimalType{width == 256, precision, scale};
+        return true;
+    }
+    return false;
+}
+
+std::string decimal_type_text(const DecimalType& t) {
+    return std::string(t.wide ? "Decimal256(" : "Decimal128(") + std::to_string(t.precision) + ", " +
+           std::to_string(t.scale) + ")";
+}
+
+/// DataFusion coerces two decimals of different widths to one type with the larger integer digits and
+/// the larger scale, and refuses it when it needs more than 76 digits. Same-width pairs are not refused.
+bool decimals_clash(const Node& a, const Node& b, std::string& x_text, std::string& y_text) {
+    DecimalType x;
+    DecimalType y;
+    if (!decimal_type_of(a, x) || !decimal_type_of(b, y) || x.wide == y.wide) {
+        return false;
+    }
+    const std::int32_t integer_digits = std::max(x.precision - x.scale, y.precision - y.scale);
+    if (integer_digits + std::max(x.scale, y.scale) <= 76) {
+        return false;
+    }
+    x_text = decimal_type_text(x);
+    y_text = decimal_type_text(y);
+    return true;
+}
+
 bool coerce(Node& n, std::string& error) {
     for (auto& a : n.args) {
         if (!coerce(*a, error)) {
@@ -1627,6 +1750,30 @@ bool coerce(Node& n, std::string& error) {
                           n.op == Op::NotBetween;
     if (!compares) {
         return true;
+    }
+    // Decimals of different widths whose common type needs more than 76 digits: DataFusion's refusals.
+    std::string x;
+    std::string y;
+    if (n.args.size() == 2 && decimals_clash(*n.args[0], *n.args[1], x, y) &&
+        (n.op == Op::Eq || n.op == Op::Ne || n.op == Op::Lt || n.op == Op::Le || n.op == Op::Gt || n.op == Op::Ge)) {
+        error = "Cannot infer common argument type for comparison operation " + x + " " + op_text(n.op) + " " + y;
+        return false;
+    }
+    if (n.op == Op::In || n.op == Op::NotIn) {
+        for (std::size_t k = 1; k < n.args.size(); ++k) {
+            if (decimals_clash(*n.args[0], *n.args[k], x, y)) {
+                error = "Can not find compatible types to compare " + x + " with [" + y + "]";
+                return false;
+            }
+        }
+    }
+    if (n.op == Op::Between || n.op == Op::NotBetween) {
+        for (std::size_t k = 1; k < n.args.size() && k <= 2; ++k) {
+            if (decimals_clash(*n.args[0], *n.args[k], x, y)) {
+                error = "Failed to coerce types " + x + " and " + y + " in BETWEEN expression.";
+                return false;
+            }
+        }
     }
     // pylance refuses a number or string literal against a duration column (arrow_cast(x, 'Duration(..)')
     // is the way to write one), and words the refusal with the literal as DataFusion types it.
@@ -1724,12 +1871,38 @@ Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowT
 Value read_column(const ColumnRef& c, int64_t row, Context& ctx) {
     const ArrowArrayView* view = ctx.batch;
     int64_t at = row;
-    for (const auto index : c.indices) {
+    for (std::size_t step = 0; step < c.indices.size(); ++step) {
         if (view->storage_type == NANOARROW_TYPE_STRUCT && ArrowArrayViewIsNull(view, at)) {
             return Value::null();
         }
+        if (!c.elements.empty() && c.elements[step] != ColumnRef::kNoElement) {
+            // A list element: `at` becomes its position among the list's children (absolute, as
+            // ArrowArrayViewListChildOffset gives it). Out of range, or a null list, is null.
+            if (ArrowArrayViewIsNull(view, at)) {
+                return Value::null();
+            }
+            int64_t begin = 0;
+            int64_t length = 0;
+            if (view->storage_type == NANOARROW_TYPE_FIXED_SIZE_LIST) {
+                length = view->layout.child_size_elements;
+                begin = (view->offset + at) * length;
+            } else {
+                begin = ArrowArrayViewListChildOffset(view, at);
+                length = ArrowArrayViewListChildOffset(view, at + 1) - begin;
+            }
+            int64_t k = c.elements[step];
+            if (k < 0) {
+                k += length + 1;
+            }
+            if (k < 1 || k > length) {
+                return Value::null();
+            }
+            at = begin + k - 1;
+            view = view->children[0];
+            continue;
+        }
         at += view->offset;
-        view = view->children[index];
+        view = view->children[c.indices[step]];
     }
     if (ArrowArrayViewIsNull(view, at)) {
         return Value::null();
@@ -2511,6 +2684,9 @@ Value eval(const Node& n, int64_t row, Context& ctx) {
             if (n.family == Node::Family::Json) {
                 return eval_json(n, row, ctx);
             }
+            if (f == "_cast_list_f16") {  // the items are rounded to Float16 when they are appended
+                return eval(*n.args[0], row, ctx);
+            }
             if (n.family == Node::Family::Regexp) {
                 const Value a = eval(*n.args[0], row, ctx);
                 if (a.is_null()) {
@@ -2666,6 +2842,43 @@ Value eval(const Node& n, int64_t row, Context& ctx) {
 }
 
 /// Append `v` to `out` (being built for `type`), converting as CAST would.
+/// The IEEE binary16 bits of `f`, rounded to nearest, ties to even (subnormals and overflow included).
+/// nanoarrow's ArrowFloatToHalfFloat truncates and flushes subnormals, which numpy does not.
+static std::uint16_t float16_bits(float f) {
+    std::uint32_t x = 0;
+    std::memcpy(&x, &f, sizeof x);
+    const std::uint32_t sign = (x >> 16) & 0x8000U;
+    const std::uint32_t mag = x & 0x7fffffffU;
+    if (mag >= 0x7f800000U) {  // infinity, or NaN with its top mantissa bit kept
+        return static_cast<std::uint16_t>(sign | 0x7c00U | (mag > 0x7f800000U ? 0x200U : 0U));
+    }
+    if (mag >= 0x477ff000U) {  // from 65520 up, rounds to infinity
+        return static_cast<std::uint16_t>(sign | 0x7c00U);
+    }
+    if (mag <= 0x33000000U) {  // up to half of the smallest subnormal rounds to zero
+        return static_cast<std::uint16_t>(sign);
+    }
+    if (mag < 0x38800000U) {  // subnormal in binary16: units of 2^-24
+        const std::int32_t exponent = static_cast<std::int32_t>(mag >> 23) - 127;  // -25 .. -15 here
+        const std::uint32_t significand = (mag & 0x7fffffU) | 0x800000U;
+        const auto shift = static_cast<std::uint32_t>(-exponent - 1);  // 2^-24 units: 14 .. 24 bits
+        std::uint32_t q = significand >> shift;
+        const std::uint32_t rem = significand & ((std::uint32_t{1} << shift) - 1);
+        const std::uint32_t half = std::uint32_t{1} << (shift - 1);
+        if (rem > half || (rem == half && (q & 1U) != 0)) {
+            ++q;  // a carry to 0x400 is the smallest normal, as the encoding has it
+        }
+        return static_cast<std::uint16_t>(sign | q);
+    }
+    const std::uint32_t exponent = (mag >> 23) - 127 + 15;
+    std::uint32_t q = (exponent << 10) | ((mag & 0x7fffffU) >> 13);
+    const std::uint32_t rem = mag & 0x1fffU;
+    if (rem > 0x1000U || (rem == 0x1000U && (q & 1U) != 0)) {
+        ++q;  // a carry can reach infinity, as it should
+    }
+    return static_cast<std::uint16_t>(sign | q);
+}
+
 bool append_value(ArrowArray& out, const ArrowSchemaView& type, const Value& v, Context& ctx) {
     if (v.is_null()) {
         return ArrowArrayAppendNull(&out, 1) == NANOARROW_OK;
@@ -2729,7 +2942,23 @@ bool append_value(ArrowArray& out, const ArrowSchemaView& type, const Value& v, 
             }
             return true;
         }
-        case NANOARROW_TYPE_HALF_FLOAT:
+        case NANOARROW_TYPE_HALF_FLOAT: {
+            const Value d = cast_value(v, "double", ctx);
+            if (ctx.failed) {
+                return false;
+            }
+            // The element as ArrowArrayAppendDouble writes it, with the bits from float16_bits.
+            if (ArrowBufferAppendUInt16(ArrowArrayBuffer(&out, 1), float16_bits(static_cast<float>(d.d))) !=
+                NANOARROW_OK) {
+                return false;
+            }
+            struct ArrowBitmap* validity = ArrowArrayValidityBitmap(&out);
+            if (validity->buffer.data != nullptr && ArrowBitmapAppend(validity, 1, 1) != NANOARROW_OK) {
+                return false;
+            }
+            ++out.length;
+            return true;
+        }
         case NANOARROW_TYPE_FLOAT:
         case NANOARROW_TYPE_DOUBLE: {
             const Value d = cast_value(v, "double", ctx);
@@ -3308,8 +3537,9 @@ struct TypeGuess {
 
 const ArrowSchema* column_schema(const ArrowSchema& root, const ColumnRef& c) {
     const ArrowSchema* at = &root;
-    for (const auto index : c.indices) {
-        at = at->children[index];
+    for (std::size_t step = 0; step < c.indices.size(); ++step) {
+        const bool element = !c.elements.empty() && c.elements[step] != ColumnRef::kNoElement;
+        at = at->children[element ? 0 : c.indices[step]];  // a list element: the item schema
     }
     return at;
 }
@@ -3443,8 +3673,11 @@ bool may_be_null(const Node& n, const ArrowSchema& root) {
             return n.literal.kind == Kind::Null;
         case Op::Column: {
             const ArrowSchema* at = &root;
-            for (const auto index : n.column.indices) {
-                at = at->children[index];
+            for (std::size_t step = 0; step < n.column.indices.size(); ++step) {
+                if (!n.column.elements.empty() && n.column.elements[step] != ColumnRef::kNoElement) {
+                    return true;  // an element past the end, or of a null list, is null
+                }
+                at = at->children[n.column.indices[step]];
                 if ((at->flags & ARROW_FLAG_NULLABLE) != 0) {
                     return true;
                 }
@@ -3478,10 +3711,15 @@ bool Expression::result_type(const std::string& name, ArrowSchema& out, std::str
         error = "a projection of a decimal literal is not supported in nanolance (use it in a filter)";
         return false;
     }
-    const auto g = guess(*root_, binding_->schema);
+    // _cast_list_f16(list): the same container (list or fixed_size_list), its items Float16.
+    const bool list_cast = root_->op == Op::Func && root_->name == "_cast_list_f16";
+    const auto g = list_cast ? guess(*root_->args[0], binding_->schema) : guess(*root_, binding_->schema);
     int rc = NANOARROW_OK;
     if (g.column != nullptr) {
         rc = ArrowSchemaDeepCopy(g.column, &out);
+        if (rc == NANOARROW_OK && list_cast) {
+            rc = ArrowSchemaSetType(out.children[0], NANOARROW_TYPE_HALF_FLOAT);
+        }
     } else {
         ArrowSchemaInit(&out);
         if (g.type == NANOARROW_TYPE_TIMESTAMP) {
@@ -3568,6 +3806,9 @@ Condition Expression::conditions() const {
         /// The column a test reads: `x`, or a JSON accessor of it at an identifier path.
         static bool column_of(const Node& n, Predicate& p) {
             if (n.op == Op::Column) {
+                if (!n.column.elements.empty()) {  // `l[1]` is not a column of the dataset: no pushdown
+                    return false;
+                }
                 p.column_ = n.column.path;
                 return true;
             }
@@ -3585,7 +3826,7 @@ Condition Expression::conditions() const {
             const bool identifier = !path.empty() && alpha(path[0]) &&
                                     std::all_of(path.begin() + 1, path.end(),
                                                 [&](char ch) { return alpha(ch) || digit(ch); });
-            if (!identifier) {
+            if (!identifier || !n.args[0]->column.elements.empty()) {
                 return false;
             }
             p.column_ = n.args[0]->column.path;
@@ -3654,7 +3895,7 @@ Condition Expression::conditions() const {
                 case Op::Func: {
                     if (n.name == "contains") {
                         if (n.args.size() != 2U || n.args[0]->op != Op::Column || n.args[1]->op != Op::Literal ||
-                            n.args[1]->literal.kind != Kind::String) {
+                            n.args[1]->literal.kind != Kind::String || !n.args[0]->column.elements.empty()) {
                             return c;
                         }
                         Predicate p;
@@ -3664,7 +3905,7 @@ Condition Expression::conditions() const {
                         return leaf(std::move(p));
                     }
                     if (!is_array_function(n.name) || n.args.size() != 2U || n.args[0]->op != Op::Column ||
-                        n.args[1]->op != Op::Literal) {
+                        n.args[1]->op != Op::Literal || !n.args[0]->column.elements.empty()) {
                         return c;
                     }
                     const bool any = n.name == "array_has_any" || n.name == "list_has_any";

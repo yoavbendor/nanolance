@@ -404,6 +404,7 @@ tests/test_dataset.py::test_merge_with_schema_holes
 tests/test_dataset.py::test_metadata_apis_return_post_image
 tests/test_dataset.py::test_metadata_cache_size
 tests/test_dataset.py::test_nested_projection
+tests/test_dataset.py::test_nested_projection_list
 tests/test_dataset.py::test_null_reader_with_deletes
 tests/test_dataset.py::test_pickle
 tests/test_dataset.py::test_pickle_fragment
@@ -1134,6 +1135,7 @@ tests/test_vector_index.py::test_distributed_vector[dataset-IVF_FLAT-index_param
 tests/test_vector_index.py::test_distributed_vector[dataset-IVF_SQ-index_params2-0.8]
 tests/test_vector_index.py::test_distributed_vector[indexed_dataset-IVF_PQ-index_params1-0.8]
 tests/test_vector_index.py::test_drop_indices
+tests/test_vector_index.py::test_dynamic_projection_with_vectors_index
 tests/test_vector_index.py::test_flat
 tests/test_vector_index.py::test_flat_1d_query_length_multiple_of_dim_is_rejected
 tests/test_vector_index.py::test_fragment_scan_allowed_on_ann_with_file_scan_prefilter
