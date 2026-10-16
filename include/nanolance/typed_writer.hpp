@@ -419,6 +419,7 @@ private:
         std::array<ArrowArray*, 4> blob_array_children{};
         std::array<std::array<const void*, 3>, 4> blob_buffers{};
         std::vector<std::int64_t> blob_data_offsets;
+        std::vector<std::uint8_t> blob_data_validity;  // all null: an external blob has no data
         std::vector<std::int32_t> blob_uri_offsets;
         std::string blob_uri_data;
         std::vector<std::uint64_t> blob_positions;
@@ -482,9 +483,12 @@ private:
             storage.blob_buffers[c][0] = nullptr;
             storage.blob_array_children[c] = &carr;
         }
+        storage.blob_data_validity.assign((n + 7U) / 8U + 1U, 0);
+        storage.blob_buffers[0][0] = storage.blob_data_validity.data();
         storage.blob_buffers[0][1] = storage.blob_data_offsets.data();
         storage.blob_buffers[0][2] = &kDummyByte;
         storage.blob_child_arrays[0].n_buffers = 3;
+        storage.blob_child_arrays[0].null_count = static_cast<std::int64_t>(n);
         storage.blob_buffers[1][1] = uri_offsets.data();
         storage.blob_buffers[1][2] = uri_data.data();
         storage.blob_child_arrays[1].n_buffers = 3;

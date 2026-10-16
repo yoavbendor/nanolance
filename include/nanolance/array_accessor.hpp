@@ -28,7 +28,16 @@ bool append_batch_column_values(const ArrowArray& batch,
                                 std::vector<ColumnValues>& columns,
                                 std::string& error);
 
-/// Append physical columns, skipping write-side children under `blob_parent_id` when set. With
+/// The items of `field`, a field inside lists or structs: appends the batch's layers above it to
+/// `out.layers` (as a nested leaf's are recorded), and gives `leaf` -- the field's array, its offset
+/// and length narrowed to those items -- and, per item, whether an ancestor is null there (Lance
+/// pushes a parent's nulls down before it looks at the children).
+bool nested_leaf_view(const ArrowArray& batch, const LanceSchemaMapping& mapping, const LanceField& field,
+                      ColumnValues& out, ArrowArray& leaf, std::vector<std::uint8_t>& ancestor_null,
+                      std::string& error);
+
+/// Append physical columns, skipping (with `skip_blob_children`) the write-side children of every
+/// top-level lance.blob.v2 column, which the blob ingest reads instead. With
 /// `borrow_fixed_buffers`, a fixed-width (non-bool) column written in a single batch records a view of
 /// the caller's Arrow buffer in ColumnValues::fixed_borrowed instead of copying -- the caller must keep
 /// the buffer alive and unmodified until the dataset is committed. A second batch for a borrowed column
@@ -37,7 +46,7 @@ bool append_batch_column_values(const ArrowArray& batch,
                                 const LanceSchemaMapping& mapping,
                                 std::vector<ColumnValues>& columns,
                                 std::string& error,
-                                std::int32_t skip_blob_parent_id,
+                                bool skip_blob_children,
                                 bool borrow_fixed_buffers = false);
 
 }  // namespace nano_lance

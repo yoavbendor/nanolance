@@ -7,14 +7,18 @@
 // decode that produced the batch.
 
 #include "nanolance/expr.hpp"
+#include "nanolance/jsonb.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <optional>
+#include <regex>
+#include <chrono>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -269,6 +273,8 @@ struct Node {
     ColumnRef column;
     std::string name;  // Func: lower-cased name; Cast: target type name
     std::vector<std::unique_ptr<Node>> args;
+    std::shared_ptr<const std::regex> regex;  // regexp_*: the pattern, when it is a literal
+    enum class Family : std::uint8_t { Other, Json, Regexp } family = Family::Other;  // Func, set at parse
 };
 
 namespace {
@@ -366,7 +372,7 @@ bool tokenize(std::string_view sql, std::vector<Token>& out, std::string& error)
             t.kind = Tok::Dot;
             ++i;
         } else {
-            static const char* two[] = {"<=", ">=", "<>", "!=", "==", "||"};
+            static const char* two[] = {"<=", ">=", "<>", "!=", "==", "||", "::"};
             t.kind = Tok::Op;
             for (const char* op : two) {
                 if (sql.substr(i, 2) == op) {
@@ -375,7 +381,12 @@ bool tokenize(std::string_view sql, std::vector<Token>& out, std::string& error)
             }
             if (t.text.empty()) {
                 if (std::strchr("=<>+-*/%", c) == nullptr) {
-                    error = std::string("unexpected character '") + c + "' at position " + std::to_string(i);
+                    // The whole UTF-8 character, not its first byte (half a character is not text).
+                    std::size_t len = 1;
+                    const auto lead = static_cast<unsigned char>(c);
+                    if (lead >= 0xF0U) len = 4; else if (lead >= 0xE0U) len = 3; else if (lead >= 0xC0U) len = 2;
+                    error = "unexpected character '" + std::string(sql.substr(i, len)) + "' at position " +
+                            std::to_string(i);
                     return false;
                 }
                 t.text = std::string(1, c);
@@ -640,7 +651,31 @@ private:
         if (accept_op("+")) {
             return parse_unary();
         }
-        return parse_primary();
+        return parse_postfix();
+    }
+
+    /// `expr::type`, PostgreSQL's cast (it binds tighter than a unary minus, as there).
+    std::unique_ptr<Node> parse_postfix() {
+        auto n = parse_primary();
+        while (n && accept_op("::")) {
+            std::string type;
+            while (peek().kind == Tok::Ident) {
+                type += (type.empty() ? "" : " ") + lower(next().text);
+            }
+            if (type.empty()) {
+                return fail("expected a type after '::'");
+            }
+            if (peek().kind == Tok::LParen) {  // timestamp(6), decimal(10, 2): the size is ignored
+                while (peek().kind != Tok::RParen && peek().kind != Tok::End) {
+                    next();
+                }
+                next();
+            }
+            auto cast = make(Op::Cast, std::move(n));
+            cast->name = type;
+            n = std::move(cast);
+        }
+        return n;
     }
 
     static std::unique_ptr<Node> literal(Value v) {
@@ -652,6 +687,21 @@ private:
 
     std::unique_ptr<Node> parse_primary() {
         const Token t = peek();
+        if (t.kind == Tok::Number && t.text == "0" && peek(1).kind == Tok::Ident && peek(1).pos == t.pos + 1 &&
+            (peek(1).text[0] == 'x' || peek(1).text[0] == 'X')) {
+            // 0x<hex>: a binary literal, as DataFusion reads it.
+            next();
+            const std::string hex = next().text.substr(1);
+            if (hex.empty() || hex.size() % 2 != 0 ||
+                hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+                return fail("invalid hex literal 0x" + hex);
+            }
+            std::string bytes;
+            for (std::size_t k = 0; k < hex.size(); k += 2) {
+                bytes += static_cast<char>(std::stoi(hex.substr(k, 2), nullptr, 16));
+            }
+            return literal(Value::string(bytes, Kind::Binary));
+        }
         if (t.kind == Tok::Number) {
             next();
             if (t.text.find_first_of(".eE") != std::string::npos) {
@@ -670,7 +720,10 @@ private:
             next();
             return literal(Value::string(t.text));
         }
-        if (t.kind == Tok::LBracket) {
+        if (t.kind == Tok::Ident && upper(t.text) == "ARRAY" && peek(1).kind == Tok::LBracket) {
+            next();  // ARRAY['a', 'b']: the array literal below
+        }
+        if (peek().kind == Tok::LBracket) {
             next();
             std::vector<Value> items;
             if (peek().kind != Tok::RBracket) {
@@ -801,9 +854,83 @@ private:
             if (next().kind != Tok::RParen) {
                 return fail("expected ')' to close " + t.text + "(...)");
             }
-            return n;
+            return rewrite_function(std::move(n));
         }
         return parse_column();
+    }
+
+    /// Functions that are another construct: pyarrow's arithmetic names, arrow_cast, the clock.
+    std::unique_ptr<Node> rewrite_function(std::unique_ptr<Node> n) {
+        static const std::unordered_map<std::string, Op> arithmetic = {
+            {"add", Op::Add}, {"add_checked", Op::Add}, {"subtract", Op::Sub}, {"subtract_checked", Op::Sub},
+            {"multiply", Op::Mul}, {"multiply_checked", Op::Mul}, {"divide", Op::Div}, {"divide_checked", Op::Div},
+        };
+        if (const auto it = arithmetic.find(n->name); it != arithmetic.end() && n->args.size() == 2U) {
+            return make(it->second, std::move(n->args[0]), std::move(n->args[1]));
+        }
+        if ((n->name == "negate" || n->name == "negate_checked") && n->args.size() == 1U) {
+            return make(Op::Neg, std::move(n->args[0]));
+        }
+        const auto now_ns = [] {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::system_clock::now().time_since_epoch()).count();
+        };
+        if (n->name == "current_date" && n->args.empty()) {
+            const auto ns = now_ns();
+            return literal(Value::date(ns / kNsPerDay - (ns % kNsPerDay < 0 ? 1 : 0)));
+        }
+        if ((n->name == "now" || n->name == "current_timestamp") && n->args.empty()) {
+            return literal(Value::timestamp(now_ns()));
+        }
+        if (n->name == "arrow_cast") {
+            if (n->args.size() != 2U || n->args[1]->op != Op::Literal || n->args[1]->literal.kind != Kind::String) {
+                return fail("arrow_cast(expression, 'Type') takes a type name");
+            }
+            const std::string type(n->args[1]->literal.s);
+            static const std::vector<std::pair<std::string, std::string>> types = {
+                {"Int8", "bigint"}, {"Int16", "bigint"}, {"Int32", "bigint"}, {"Int64", "bigint"},
+                {"UInt8", "bigint"}, {"UInt16", "bigint"}, {"UInt32", "bigint"}, {"UInt64", "bigint"},
+                {"Float16", "double"}, {"Float32", "double"}, {"Float64", "double"},
+                {"Utf8", "string"}, {"LargeUtf8", "string"}, {"Utf8View", "string"},
+                {"Binary", "binary"}, {"LargeBinary", "binary"}, {"BinaryView", "binary"},
+                {"Boolean", "boolean"}, {"Date32", "date"}, {"Date64", "date"},
+            };
+            std::string target;
+            for (const auto& [arrow, sql] : types) {
+                if (type == arrow) {
+                    target = sql;
+                }
+            }
+            if (target.empty() && type.rfind("Timestamp(", 0) == 0) {
+                target = "timestamp";
+            }
+            if (target.empty()) {
+                return fail("arrow_cast to '" + type + "' is not supported in nanolance filters");
+            }
+            auto cast = make(Op::Cast, std::move(n->args[0]));
+            cast->name = target;
+            return cast;
+        }
+        if (n->name.rfind("json_", 0) == 0) {
+            n->family = Node::Family::Json;
+        }
+        if (n->name == "regexp_match" || n->name == "regexp_like") {
+            n->family = Node::Family::Regexp;
+        }
+        if ((n->name == "regexp_match" || n->name == "regexp_like") && n->args.size() >= 2U &&
+            n->args[1]->op == Op::Literal && n->args[1]->literal.kind == Kind::String) {
+            auto flags = std::regex::ECMAScript;
+            if (n->args.size() == 3U && n->args[2]->op == Op::Literal && n->args[2]->literal.kind == Kind::String &&
+                std::string_view(n->args[2]->literal.s).find('i') != std::string_view::npos) {
+                flags |= std::regex::icase;
+            }
+            try {
+                n->regex = std::make_shared<const std::regex>(std::string(n->args[1]->literal.s), flags);
+            } catch (const std::regex_error& e) {
+                return fail("invalid regular expression '" + std::string(n->args[1]->literal.s) + "': " + e.what());
+            }
+        }
+        return n;
     }
 
     std::unique_ptr<Node> parse_column() {
@@ -1004,7 +1131,7 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
                 at = at->children[k];
             }
         }
-        ArrowSchemaView sv;
+        ArrowSchemaView sv{};  // time_unit is only set for temporal types: zero, not garbage, otherwise
         ArrowError aerr;
         if (ArrowSchemaViewInit(&sv, at, &aerr) != NANOARROW_OK) {
             error = std::string("cannot read the type of column '") + joined + "': " + aerr.message;
@@ -1014,7 +1141,7 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
         c.unit = sv.time_unit;
         c.item_type = NANOARROW_TYPE_UNINITIALIZED;
         if (under_array_function && is_list_type(sv.type)) {
-            ArrowSchemaView item;
+            ArrowSchemaView item{};
             if (ArrowSchemaViewInit(&item, at->children[0], &aerr) != NANOARROW_OK || !scalar_type(item.type)) {
                 error = "column '" + joined + "' is a list of a type filters cannot compare";
                 return false;
@@ -1046,6 +1173,10 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
             {"invert", {1, 1}},     {"and_", {2, 2}},        {"or_", {2, 2}},      {"equal", {2, 2}},
             {"array_has_any", {2, 2}}, {"array_has_all", {2, 2}}, {"array_has", {2, 2}}, {"array_contains", {2, 2}},
             {"list_has_any", {2, 2}},  {"list_has_all", {2, 2}},  {"list_has", {2, 2}},  {"list_contains", {2, 2}},
+            {"regexp_match", {2, 3}},  {"regexp_like", {2, 3}},
+            {"json_get", {2, 2}},      {"json_get_string", {2, 2}}, {"json_get_int", {2, 2}},
+            {"json_get_float", {2, 2}}, {"json_get_bool", {2, 2}},  {"json_extract", {2, 2}},
+            {"json_exists", {2, 2}},   {"json_array_contains", {3, 3}}, {"json_array_length", {2, 2}},
         };
         const auto it = arity.find(n.name);
         if (it == arity.end()) {
@@ -1065,8 +1196,21 @@ bool temporal_type(ArrowType t) {
     return t == NANOARROW_TYPE_DATE32 || t == NANOARROW_TYPE_DATE64 || t == NANOARROW_TYPE_TIMESTAMP;
 }
 
-/// A string literal compared with a date or timestamp column becomes a date / timestamp literal,
-/// as DataFusion coerces it.
+/// `d` rounded to the nearest float32 (out of range: +-inf), held as a double.
+double round_to_float32(double d) {
+    // Past the midpoint between FLT_MAX and 2^128, float32 rounding gives infinity.
+    if (std::isfinite(d) && std::fabs(d) >= 0x1.ffffffp127) {
+        return std::copysign(std::numeric_limits<double>::infinity(), d);
+    }
+    if (std::isfinite(d) && std::fabs(d) > std::numeric_limits<float>::max()) {
+        return std::copysign(static_cast<double>(std::numeric_limits<float>::max()), d);
+    }
+    return static_cast<float>(d);
+}
+
+/// As DataFusion coerces a comparison's literals to its column's type: a string literal compared
+/// with a date or timestamp column becomes a date / timestamp literal, and a number compared with
+/// a float32 column is rounded to float32 (so `x = 0.1` matches the float32 0.1).
 bool coerce(Node& n, std::string& error) {
     for (auto& a : n.args) {
         if (!coerce(*a, error)) {
@@ -1081,11 +1225,19 @@ bool coerce(Node& n, std::string& error) {
     }
     const Node* column = nullptr;
     for (const auto& a : n.args) {
-        if (a->op == Op::Column && temporal_type(a->column.type)) {
+        if (a->op == Op::Column && (temporal_type(a->column.type) || a->column.type == NANOARROW_TYPE_FLOAT)) {
             column = a.get();
         }
     }
     if (column == nullptr) {
+        return true;
+    }
+    if (column->column.type == NANOARROW_TYPE_FLOAT) {
+        for (auto& a : n.args) {
+            if (a->op == Op::Literal && a->literal.numeric()) {
+                a->literal = Value::real(round_to_float32(a->literal.as_double()));
+            }
+        }
         return true;
     }
     for (auto& a : n.args) {
@@ -1207,18 +1359,24 @@ Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowT
     }
 }
 
+/// Floats as Lance's filters order them (scan, BTree and Bitmap alike): IEEE total order with
+/// the zeros equal -- -NaN < -inf < ... < -0 = +0 < ... < +inf < +NaN.
+int float_way(double x, double y) {
+    const bool x_nan = std::isnan(x);
+    const bool y_nan = std::isnan(y);
+    if (!x_nan && !y_nan) {
+        return x < y ? -1 : (x > y ? 1 : 0);
+    }
+    const int rx = x_nan ? (std::signbit(x) ? -1 : 1) : 0;
+    const int ry = y_nan ? (std::signbit(y) ? -1 : 1) : 0;
+    return rx < ry ? -1 : (rx > ry ? 1 : 0);
+}
+
 /// -1, 0, 1, or nullopt when the two cannot be compared.
 std::optional<int> compare(const Value& a, const Value& b) {
     if (a.numeric() && b.numeric()) {
         if (a.kind == Kind::Double || b.kind == Kind::Double) {
-            // As DataFusion compares floats: NaN equals NaN and is greater than every other value;
-            // -0.0 equals 0.0.
-            const double x = a.as_double();
-            const double y = b.as_double();
-            if (std::isnan(x) || std::isnan(y)) {
-                return std::isnan(x) == std::isnan(y) ? 0 : (std::isnan(x) ? 1 : -1);
-            }
-            return x < y ? -1 : (x > y ? 1 : 0);
+            return float_way(a.as_double(), b.as_double());
         }
         if (a.kind == Kind::Int && b.kind == Kind::Int) {
             return a.i < b.i ? -1 : (a.i > b.i ? 1 : 0);
@@ -1378,7 +1536,8 @@ Value cast_value(const Value& v, const std::string& type, Context& ctx) {
     if (v.is_null()) {
         return v;
     }
-    const auto first = type.substr(0, type.find(' '));
+    const auto first_word = type.substr(0, type.find(' '));
+    const auto first = first_word == "datetime" ? std::string("timestamp") : first_word;
     if (first == "int" || first == "integer" || first == "bigint" || first == "smallint" || first == "tinyint" ||
         first == "int8" || first == "int16" || first == "int32" || first == "int64") {
         if (v.kind == Kind::Int) {
@@ -1427,6 +1586,12 @@ Value cast_value(const Value& v, const std::string& type, Context& ctx) {
                 return Value::boolean(t == "true");
             }
         }
+    } else if (first == "binary" || first == "bytea" || first == "varbinary") {
+        if (v.kind == Kind::String || v.kind == Kind::Binary) {
+            Value out = v;
+            out.kind = Kind::Binary;
+            return out;
+        }
     } else if (first == "date" || first == "timestamp") {
         if (v.temporal()) {
             return first == "date" ? Value::date(v.as_ns() / kNsPerDay) : Value::timestamp(v.as_ns());
@@ -1449,6 +1614,194 @@ Value truth(const Value& v, Context& ctx) {
         return v;
     }
     return ctx.fail(std::string("expected a boolean, got ") + kind_name(v.kind));
+}
+
+/// Lance's json_* functions (lance-datafusion's udf/json.rs) over JSONB values: a JSON null reads as
+/// SQL NULL; a value the typed getters cannot convert fails the query, as there.
+Value eval_json(const Node& n, int64_t row, Context& ctx) {
+    namespace jb = nano_lance::jsonb;
+    const auto& f = n.name;
+    const Value doc = eval(*n.args[0], row, ctx);
+    if (doc.is_null() || ctx.failed) {
+        return Value::null();
+    }
+    if (doc.kind != Kind::Binary) {
+        return ctx.fail(f + "() needs a JSON column (or json_get's result) as its first argument");
+    }
+    jb::Item root;
+    if (!jb::Item::root(doc.s, root)) {
+        return ctx.fail(f + "(): the value is not JSONB");
+    }
+    const Value arg = eval(*n.args[1], row, ctx);
+    if (arg.is_null() || ctx.failed) {
+        return Value::null();
+    }
+    if (arg.kind != Kind::String) {
+        return ctx.fail(f + "() needs a string as its second argument");
+    }
+    std::string error;
+    auto text_of = [&](const jb::Item& item, std::string& out) {
+        out.clear();
+        if (!item.text(out, error)) {
+            ctx.fail(error);
+            return false;
+        }
+        return true;
+    };
+    if (f == "json_get" || f.rfind("json_get_", 0) == 0) {
+        // A key of an object; an index of an array; anything else is no value.
+        jb::Item v;
+        bool found = false;
+        if (root.type() == jb::Item::Type::Object) {
+            found = root.get(arg.s, v);
+        } else if (root.type() == jb::Item::Type::Array) {
+            std::size_t index = 0;
+            const auto [p, ec] = std::from_chars(arg.s.data(), arg.s.data() + arg.s.size(), index);
+            found = ec == std::errc() && p == arg.s.data() + arg.s.size() && root.at(index, v);
+        }
+        if (!found) {
+            return Value::null();
+        }
+        if (f == "json_get") {
+            return Value::string(v.document(), Kind::Binary);
+        }
+        if (v.type() == jb::Item::Type::Null) {
+            return Value::null();
+        }
+        const bool is_bool = v.type() == jb::Item::Type::True || v.type() == jb::Item::Type::False;
+        const bool truth = v.type() == jb::Item::Type::True;
+        jb::Number num;
+        const bool is_number = v.number(num);
+        const bool is_string = v.type() == jb::Item::Type::String;
+        if (f == "json_get_string") {
+            if (is_bool) {
+                return Value::string(truth ? "true" : "false");
+            }
+            if (is_string) {
+                return Value::string(std::string(v.string()));
+            }
+            std::string out;
+            if (is_number && text_of(v, out)) {
+                return Value::string(out);
+            }
+            return ctx.fail("Failed to convert to string: InvalidCast");
+        }
+        if (f == "json_get_int") {
+            if (is_bool) {
+                return Value::integer(truth ? 1 : 0);
+            }
+            auto from_double = [&](double d) -> Value {
+                const double r = std::round(d);  // half away from zero, as the crate rounds
+                if (!std::isfinite(r) || r < -9223372036854775808.0 || r >= 9223372036854775808.0) {
+                    return ctx.fail("Failed to convert to integer: InvalidCast");
+                }
+                return Value::integer(static_cast<std::int64_t>(r));
+            };
+            if (is_number) {
+                if (num.kind == jb::Number::Kind::Int) {
+                    return Value::integer(num.i);
+                }
+                if (num.kind == jb::Number::Kind::UInt) {
+                    if (num.u > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                        return ctx.fail("Failed to convert to integer: InvalidCast");
+                    }
+                    return Value::integer(static_cast<std::int64_t>(num.u));
+                }
+                return from_double(num.f);
+            }
+            if (is_string) {
+                std::string_view s = v.string();
+                if (!s.empty() && s.front() == '+') {
+                    s.remove_prefix(1);
+                }
+                std::int64_t out = 0;
+                const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
+                if (ec == std::errc() && p == s.data() + s.size() && !s.empty()) {
+                    return Value::integer(out);
+                }
+                const std::string text(v.string());
+                char* end = nullptr;
+                const double d = std::strtod(text.c_str(), &end);
+                if (!text.empty() && end != nullptr && *end == '\0') {
+                    return from_double(d);
+                }
+            }
+            return ctx.fail("Failed to convert to integer: InvalidCast");
+        }
+        if (f == "json_get_float") {
+            if (is_bool) {
+                return Value::real(truth ? 1.0 : 0.0);
+            }
+            if (is_number) {
+                return Value::real(num.as_double());
+            }
+            if (is_string) {
+                const std::string text(v.string());
+                char* end = nullptr;
+                const double d = std::strtod(text.c_str(), &end);
+                if (!text.empty() && end != nullptr && *end == '\0') {
+                    return Value::real(d);
+                }
+            }
+            return ctx.fail("Failed to convert to float: InvalidCast");
+        }
+        if (f == "json_get_bool") {
+            if (is_bool) {
+                return Value::boolean(truth);
+            }
+            if (is_string) {
+                const auto s = lower(std::string(v.string()));
+                if (s == "true" || s == "yes" || s == "false" || s == "no") {
+                    return Value::boolean(s == "true" || s == "yes");
+                }
+            }
+            return ctx.fail("Failed to convert to boolean: InvalidCast");
+        }
+        return ctx.fail("function '" + f + "' is not supported in nanolance filters");
+    }
+    // The rest take a JSONPath.
+    std::vector<jb::Item> selected;
+    if (!jb::select(root, arg.s, selected, error)) {
+        return ctx.fail(error);
+    }
+    if (f == "json_exists") {
+        return Value::boolean(!selected.empty());
+    }
+    if (f == "json_extract") {
+        std::string out;
+        if (selected.empty()) {
+            return Value::null();
+        }
+        return text_of(selected.front(), out) ? Value::string(out) : Value::null();
+    }
+    if (f == "json_array_length") {
+        if (selected.empty()) {
+            return Value::null();
+        }
+        if (selected.front().type() != jb::Item::Type::Array) {
+            return ctx.fail("Path '" + std::string(arg.s) + "' does not point to an array");
+        }
+        return Value::integer(static_cast<std::int64_t>(selected.front().size()));
+    }
+    if (f == "json_array_contains") {
+        const Value wanted = eval(*n.args[2], row, ctx);
+        if (wanted.is_null() || ctx.failed) {
+            return Value::null();
+        }
+        const std::string needle(wanted.s);
+        const std::string quoted = "\"" + needle + "\"";
+        std::string elem;
+        for (const auto& value : selected) {
+            for (std::size_t k = 0; value.type() == jb::Item::Type::Array && k < value.size(); ++k) {
+                jb::Item item;
+                if (value.at(k, item) && text_of(item, elem) && (elem == needle || elem == quoted)) {
+                    return Value::boolean(true);
+                }
+            }
+        }
+        return Value::boolean(false);
+    }
+    return ctx.fail("function '" + f + "' is not supported in nanolance filters");
 }
 
 Value eval(const Node& n, int64_t row, Context& ctx) {
@@ -1610,6 +1963,31 @@ Value eval(const Node& n, int64_t row, Context& ctx) {
         case Op::Cast: return cast_value(eval(*n.args[0], row, ctx), n.name, ctx);
         case Op::Func: {
             const auto& f = n.name;
+            if (n.family == Node::Family::Json) {
+                return eval_json(n, row, ctx);
+            }
+            if (n.family == Node::Family::Regexp) {
+                const Value a = eval(*n.args[0], row, ctx);
+                if (a.is_null()) {
+                    return a;
+                }
+                if (a.kind != Kind::String) {
+                    return ctx.fail(f + "() needs a string");
+                }
+                std::shared_ptr<const std::regex> re = n.regex;
+                if (!re) {
+                    const Value p = eval(*n.args[1], row, ctx);
+                    if (p.is_null()) {
+                        return p;
+                    }
+                    try {
+                        re = std::make_shared<const std::regex>(std::string(p.s));
+                    } catch (const std::regex_error& e) {
+                        return ctx.fail("invalid regular expression: " + std::string(e.what()));
+                    }
+                }
+                return Value::boolean(std::regex_search(a.s.begin(), a.s.end(), *re));
+            }
             if (f == "coalesce") {
                 for (const auto& a : n.args) {
                     Value v = eval(*a, row, ctx);
@@ -1984,13 +2362,6 @@ int three_way(T a, T b) {
     return a < b ? -1 : (b < a ? 1 : 0);
 }
 
-int double_way(double x, double y) {
-    if (std::isnan(x) || std::isnan(y)) {
-        return std::isnan(x) == std::isnan(y) ? 0 : (std::isnan(x) ? 1 : -1);
-    }
-    return three_way(x, y);
-}
-
 /// `ways[r]` = compare(column value r, literal) for the non-null rows of a numeric, temporal or
 /// string column -- false when the pair is not one this handles.
 bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit, const Value& lit, int64_t n,
@@ -2032,7 +2403,7 @@ bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit,
                     ways[r] = static_cast<std::int8_t>(x < 0 ? -1 : three_way(static_cast<std::uint64_t>(x), lit.u));
                 }
             } else if (lit.kind == Kind::Double) {
-                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(static_cast<double>(signed_at(r)), lit.d));
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(float_way(static_cast<double>(signed_at(r)), lit.d));
             } else {
                 return false;
             }
@@ -2048,7 +2419,7 @@ bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit,
                     ways[r] = static_cast<std::int8_t>(lit.i < 0 ? 1 : three_way(unsigned_at(r), static_cast<std::uint64_t>(lit.i)));
                 }
             } else if (lit.kind == Kind::Double) {
-                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(static_cast<double>(unsigned_at(r)), lit.d));
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(float_way(static_cast<double>(unsigned_at(r)), lit.d));
             } else {
                 return false;
             }
@@ -2061,10 +2432,10 @@ bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit,
             const double y = lit.as_double();
             if (type == NANOARROW_TYPE_FLOAT) {
                 const auto* f = reinterpret_cast<const float*>(data) + v.offset;
-                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(f[r], y));
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(float_way(f[r], y));
             } else {
                 const auto* d = reinterpret_cast<const double*>(data) + v.offset;
-                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(double_way(d[r], y));
+                for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(float_way(d[r], y));
             }
             return true;
         }
@@ -2386,6 +2757,13 @@ TypeGuess guess(const Node& n, const ArrowSchema& root) {
                 if (a.column != nullptr && a.type == b.type) {
                     return a;  // int32 + int32 stays int32, as DataFusion keeps it
                 }
+                // A literal takes the column's type (Lance's planner casts it so): int32 + 1 is int32.
+                if (a.column != nullptr && n.args[1]->op == Op::Literal) {
+                    return a;
+                }
+                if (b.column != nullptr && n.args[0]->op == Op::Literal) {
+                    return b;
+                }
                 g.type = NANOARROW_TYPE_INT64;
                 return g;
             }
@@ -2418,7 +2796,7 @@ TypeGuess guess(const Node& n, const ArrowSchema& root) {
                 g.type = NANOARROW_TYPE_BOOL;
             } else if (first == "date") {
                 g.type = NANOARROW_TYPE_DATE32;
-            } else if (first == "timestamp") {
+            } else if (first == "timestamp" || first == "datetime") {
                 g.type = NANOARROW_TYPE_TIMESTAMP;
                 g.unit = NANOARROW_TIME_UNIT_MICRO;
             } else {
@@ -2427,7 +2805,15 @@ TypeGuess guess(const Node& n, const ArrowSchema& root) {
             return g;
         }
         case Op::Func:
-            if (n.name == "lower" || n.name == "upper") {
+            if (n.name == "json_get") {
+                g.type = NANOARROW_TYPE_LARGE_BINARY;
+            } else if (n.name == "json_get_string" || n.name == "json_extract") {
+                g.type = NANOARROW_TYPE_STRING;
+            } else if (n.name == "json_get_int" || n.name == "json_array_length") {
+                g.type = NANOARROW_TYPE_INT64;
+            } else if (n.name == "json_get_float") {
+                g.type = NANOARROW_TYPE_DOUBLE;
+            } else if (n.name == "lower" || n.name == "upper") {
                 g.type = NANOARROW_TYPE_STRING;
             } else if (n.name == "length" || n.name == "char_length" || n.name == "character_length") {
                 g.type = NANOARROW_TYPE_INT32;
@@ -2440,6 +2826,42 @@ TypeGuess guess(const Node& n, const ArrowSchema& root) {
         default:
             g.type = NANOARROW_TYPE_BOOL;
             return g;
+    }
+}
+
+}  // namespace
+
+namespace {
+
+/// Whether the expression can yield a null, as DataFusion types it (and so Lance's add_columns marks
+/// the new field): a literal only when it is NULL, a column when it is nullable, IS [NOT] NULL / TRUE /
+/// FALSE never, an operator when one of its inputs can, a function always.
+bool may_be_null(const Node& n, const ArrowSchema& root) {
+    switch (n.op) {
+        case Op::Literal:
+            return n.literal.kind == Kind::Null;
+        case Op::Column: {
+            const ArrowSchema* at = &root;
+            for (const auto index : n.column.indices) {
+                at = at->children[index];
+                if ((at->flags & ARROW_FLAG_NULLABLE) != 0) {
+                    return true;
+                }
+            }
+            return n.column.indices.empty();
+        }
+        case Op::IsNull:
+        case Op::IsNotNull:
+        case Op::IsTrue:
+        case Op::IsFalse:
+        case Op::IsNotTrue:
+        case Op::IsNotFalse:
+            return false;
+        case Op::Func:
+            return true;
+        default:
+            return std::any_of(n.args.begin(), n.args.end(),
+                               [&](const std::unique_ptr<Node>& a) { return a && may_be_null(*a, root); });
     }
 }
 
@@ -2470,7 +2892,11 @@ bool Expression::result_type(const std::string& name, ArrowSchema& out, std::str
         }
         return false;
     }
-    out.flags |= ARROW_FLAG_NULLABLE;
+    if (may_be_null(*root_, binding_->schema)) {
+        out.flags |= ARROW_FLAG_NULLABLE;
+    } else {
+        out.flags &= ~ARROW_FLAG_NULLABLE;
+    }
     return true;
 }
 
@@ -2533,6 +2959,34 @@ Op op_of(const std::string& op) {
 
 Condition Expression::conditions() const {
     struct Walk {
+        /// The column a test reads: `x`, or a JSON accessor of it at an identifier path.
+        static bool column_of(const Node& n, Predicate& p) {
+            if (n.op == Op::Column) {
+                p.column_ = n.column.path;
+                return true;
+            }
+            static const char* const kAccessors[] = {"json_get_int", "json_get_float", "json_get_bool",
+                                                     "json_get_string"};
+            if (n.op != Op::Func || n.args.size() != 2U || n.args[0]->op != Op::Column ||
+                n.args[1]->op != Op::Literal || n.args[1]->literal.kind != Kind::String ||
+                std::none_of(std::begin(kAccessors), std::end(kAccessors),
+                             [&](const char* f) { return n.name == f; })) {
+                return false;
+            }
+            const std::string path(n.args[1]->literal.s);
+            const auto alpha = [](char ch) { return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_'; };
+            const auto digit = [](char ch) { return ch >= '0' && ch <= '9'; };
+            const bool identifier = !path.empty() && alpha(path[0]) &&
+                                    std::all_of(path.begin() + 1, path.end(),
+                                                [&](char ch) { return alpha(ch) || digit(ch); });
+            if (!identifier) {
+                return false;
+            }
+            p.column_ = n.args[0]->column.path;
+            p.json_ = JsonAccess{path, n.name};
+            return true;
+        }
+
         static Condition at(const Node& n) {
             Condition c;
             auto leaf = [&](Predicate p) {
@@ -2557,28 +3011,26 @@ Condition Expression::conditions() const {
                 case Op::Le:
                 case Op::Gt:
                 case Op::Ge: {
-                    const bool left = n.args[0]->op == Op::Column && constant(*n.args[1]);
-                    const bool right = n.args[1]->op == Op::Column && constant(*n.args[0]);
+                    Predicate p;
+                    const bool left = constant(*n.args[1]) && column_of(*n.args[0], p);
+                    const bool right = !left && constant(*n.args[0]) && column_of(*n.args[1], p);
                     if (!left && !right) {
                         return c;
                     }
-                    Predicate p;
                     p.test_ = Predicate::Test::Compare;
-                    p.column_ = (left ? n.args[0] : n.args[1])->column.path;
                     p.op_ = left ? op_text(n.op) : flipped(n.op);
                     p.constants_.push_back(shared_clone(left ? *n.args[1] : *n.args[0]));
                     return leaf(std::move(p));
                 }
                 case Op::In:
                 case Op::Between: {
-                    if (n.args[0]->op != Op::Column ||
-                        !std::all_of(n.args.begin() + 1, n.args.end(),
-                                     [](const std::unique_ptr<Node>& a) { return constant(*a); })) {
+                    Predicate p;
+                    if (!std::all_of(n.args.begin() + 1, n.args.end(),
+                                     [](const std::unique_ptr<Node>& a) { return constant(*a); }) ||
+                        !column_of(*n.args[0], p)) {
                         return c;
                     }
-                    Predicate p;
                     p.test_ = n.op == Op::In ? Predicate::Test::In : Predicate::Test::Between;
-                    p.column_ = n.args[0]->column.path;
                     for (std::size_t k = 1; k < n.args.size(); ++k) {
                         p.constants_.push_back(shared_clone(*n.args[k]));
                     }
@@ -2586,15 +3038,25 @@ Condition Expression::conditions() const {
                 }
                 case Op::IsNull:
                 case Op::IsNotNull: {
-                    if (n.args[0]->op != Op::Column) {
+                    Predicate p;
+                    if (!column_of(*n.args[0], p)) {
                         return c;
                     }
-                    Predicate p;
                     p.test_ = n.op == Op::IsNull ? Predicate::Test::IsNull : Predicate::Test::IsNotNull;
-                    p.column_ = n.args[0]->column.path;
                     return leaf(std::move(p));
                 }
                 case Op::Func: {
+                    if (n.name == "contains") {
+                        if (n.args.size() != 2U || n.args[0]->op != Op::Column || n.args[1]->op != Op::Literal ||
+                            n.args[1]->literal.kind != Kind::String) {
+                            return c;
+                        }
+                        Predicate p;
+                        p.test_ = Predicate::Test::Contains;
+                        p.column_ = n.args[0]->column.path;
+                        p.constants_.push_back(literal_node(n.args[1]->literal));
+                        return leaf(std::move(p));
+                    }
                     if (!is_array_function(n.name) || n.args.size() != 2U || n.args[0]->op != Op::Column ||
                         n.args[1]->op != Op::Literal) {
                         return c;
@@ -2661,6 +3123,10 @@ std::unique_ptr<Node> predicate_node(Predicate::Test test, const std::string& op
         case Predicate::Test::Between: n->op = Op::Between; break;
         case Predicate::Test::IsNull: n->op = Op::IsNull; break;
         case Predicate::Test::IsNotNull: n->op = Op::IsNotNull; break;
+        case Predicate::Test::Contains:
+            n->op = Op::Func;
+            n->name = "contains";
+            break;
     }
     for (const auto& c : constants) {
         n->args.push_back(clone(*c));
@@ -2716,10 +3182,111 @@ bool Predicate::filter(const ArrowSchema& type, const ArrowArray& values, std::v
     return e.filter(batch, pass, error);
 }
 
+bool Predicate::constant_as(std::size_t k, const ArrowSchema& type, ArrowArray& out, std::string& error) const {
+    error.clear();
+    if (k >= constants_.size()) {
+        error = "no such constant";
+        return false;
+    }
+    // The constant alone, bound to an empty schema, evaluated over one row of no columns.
+    Expression e;
+    e.root_ = clone(*constants_[k]);
+    ArrowSchema schema;
+    ArrowSchemaInit(&schema);
+    if (ArrowSchemaSetTypeStruct(&schema, 0) != NANOARROW_OK) {
+        schema.release(&schema);
+        error = "out of memory";
+        return false;
+    }
+    const bool bound = e.bind(schema, error);
+    schema.release(&schema);
+    if (!bound) {
+        return false;
+    }
+    const void* buffers[1] = {nullptr};
+    ArrowArray batch{};
+    batch.length = 1;
+    batch.n_buffers = 1;
+    batch.buffers = buffers;
+    batch.n_children = 0;
+    batch.children = nullptr;
+    batch.release = no_release_array;
+    return e.evaluate(batch, type, out, error);
+}
+
+bool Predicate::routes_to_json_index(const char* value_format) const {
+    if (!json_ || value_format == nullptr) {
+        return false;
+    }
+    // The accessor's type is the index's value type: Int64, Float64, Boolean, Utf8 (Arrow's l, g, b, u).
+    const std::string& fn = json_->function;
+    const std::string_view want = fn == "json_get_int"     ? "l"
+                                  : fn == "json_get_float" ? "g"
+                                  : fn == "json_get_bool"  ? "b"
+                                                           : "u";
+    if (std::string_view(value_format) != want) {
+        return false;
+    }
+    // Constants of the accessor's type: DataFusion casts an integer to a float accessor's type, and
+    // nothing else is routed (`= 7.0` on an integer accessor is a CAST, which pylance scans).
+    for (const auto& c : constants_) {
+        if (c->op != Op::Literal) {
+            return false;
+        }
+        const Kind k = c->literal.kind;
+        const bool ok = fn == "json_get_int"     ? k == Kind::Int
+                        : fn == "json_get_float" ? (k == Kind::Int || k == Kind::Double)
+                        : fn == "json_get_bool"  ? k == Kind::Bool
+                                                 : k == Kind::String;
+        if (!ok) {
+            return false;
+        }
+    }
+    // A bool's equality, inequality and IN are rewritten to the bare accessor, which pylance scans.
+    if (fn == "json_get_bool" &&
+        (test_ == Test::In || (test_ == Test::Compare && (op_ == "=" || op_ == "!=")))) {
+        return false;
+    }
+    return true;
+}
+
 std::string Predicate::to_string() const {
     std::string column;
     for (const auto& p : column_) {
         column += (column.empty() ? "" : ".") + p;
+    }
+    if (json_) {
+        // Lance's form: the test on the value, then the path. A one-item IN is an equality there, and a
+        // string or bool constant is written bare (true, not TRUE).
+        const auto value = [](const Node& n) {
+            if (n.op == Op::Literal && n.literal.kind == Kind::String) {
+                return std::string(n.literal.s);
+            }
+            if (n.op == Op::Literal && n.literal.kind == Kind::Bool) {
+                return std::string(n.literal.b ? "true" : "false");
+            }
+            return print(n);
+        };
+        const std::string at = "->" + json_->path + ")";
+        const std::string head = "Json(" + column + " ";
+        switch (test_) {
+            case Test::Compare: return head + op_ + " " + value(*constants_.front()) + at;
+            case Test::In: {
+                if (constants_.size() == 1U) {
+                    return head + "= " + value(*constants_.front()) + at;
+                }
+                std::string items;
+                for (const auto& c : constants_) {
+                    items += (items.empty() ? "" : ",") + value(*c);
+                }
+                return head + "IN [" + items + "]" + at;
+            }
+            case Test::Between:  // Lance prints the two bounds as an AND of two queries
+                return head + ">= " + value(*constants_[0]) + " && " + column + " <= " + value(*constants_[1]) + at;
+            case Test::IsNull: return head + "IS NULL" + at;
+            case Test::IsNotNull: return head + "IS NOT NULL" + at;
+            default: break;  // not a JSON accessor's test
+        }
     }
     std::string list;
     for (const auto& c : constants_) {
@@ -2735,6 +3302,8 @@ std::string Predicate::to_string() const {
         case Test::HasAny: return "array_has_any(" + column + ", [" + list + "])";
         case Test::HasAll: return "array_has_all(" + column + ", [" + list + "])";
         case Test::Has: return "array_has(" + column + ", " + list + ")";
+        case Test::Contains:  // Lance prints the needle as a Utf8 literal
+            return "contains(" + column + ", Utf8(\"" + std::string(constants_.front()->literal.s) + "\"))";
     }
     return column;
 }

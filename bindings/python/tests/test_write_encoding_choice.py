@@ -28,9 +28,12 @@ from tests.support import require_pylance
 
 
 def _size(path) -> int:
+    """The dataset's bytes, without its transaction files (a few hundred bytes a commit, the same
+    whatever the encoding: what these tests compare is the data and the manifest)."""
     return sum(
         os.path.getsize(os.path.join(root, f))
         for root, _, files in os.walk(path)
+        if os.path.basename(root) != "_transactions"
         for f in files
     )
 

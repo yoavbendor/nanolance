@@ -121,7 +121,10 @@ def test_fragments_outside_the_range_are_never_opened(tmp_path):
         for batch in table.to_batches(max_chunksize=2_000):
             writer.write_batch(batch)
 
-    fragments = sorted((path / "data").glob("*.lance"))
+    # In fragment order, as the manifest lists them (data file names are random, as Lance's are).
+    from nanolance.lance import dataset as open_dataset
+
+    fragments = [path / "data" / f.metadata.files[0].path for f in open_dataset(str(path)).get_fragments()]
     assert len(fragments) == 4, fragments
     expected = table.slice(12_100, 50).to_pydict()
 

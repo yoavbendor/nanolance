@@ -293,9 +293,25 @@ add_library(nanolance STATIC
     src/index_maintenance.cpp
     src/lance_file_writer.cpp
     src/scalar_index.cpp
+    src/bloom_filter.cpp
     src/index_search.cpp
+    src/index_files.cpp
+    src/vector_search.cpp
+    src/vector_index_build.cpp
+    src/hnsw_build.cpp
+    src/index_segments.cpp
+    src/fts_tokenizer.cpp
+    src/fts_fst.cpp
+    src/fts_posting.cpp
+    src/fts_search.cpp
+    src/fts_index_build.cpp
+    src/index_optimize.cpp
     src/data_file_reader.cpp
     src/deletion_vector.cpp
+    src/base_paths.cpp
+    src/overlays.cpp
+    src/proto_wire.hpp
+    src/row_ids.cpp
     src/data_file_writer.cpp
     src/fsst.cpp
     src/lz4_block.cpp
@@ -307,9 +323,13 @@ add_library(nanolance STATIC
     src/nano_lance_table_reader_c.cpp
     src/manifest_writer.cpp
     src/dataset.cpp
+    src/dataset_refs.cpp
+    src/transaction_file.cpp
+    src/jsonb.cpp
     src/expr.cpp
     src/arrow_slice.cpp
     src/dataset_ops.cpp
+    src/dataset_transaction.cpp
     src/dataset_stitcher.cpp
     src/schema_mapper.cpp
     src/writer.cpp
@@ -568,6 +588,10 @@ add_executable(nano_lance_writer_lifecycle_test tests/test_writer_lifecycle.cpp)
 target_compile_features(nano_lance_writer_lifecycle_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_writer_lifecycle_test PRIVATE nanolance)
 
+add_executable(nano_lance_row_ids_test tests/test_row_ids.cpp)
+target_compile_features(nano_lance_row_ids_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_row_ids_test PRIVATE nanolance)
+
 add_executable(nano_lance_blob_builder_test tests/test_blob_builder.cpp)
 target_compile_features(nano_lance_blob_builder_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_blob_builder_test PRIVATE nanolance)
@@ -597,6 +621,28 @@ target_link_libraries(nano_lance_writer_memory_test PRIVATE nanolance)
 add_executable(nano_lance_bool_roundtrip_test tests/test_bool_roundtrip.cpp)
 target_compile_features(nano_lance_bool_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_bool_roundtrip_test PRIVATE nanolance)
+
+add_executable(nano_lance_fts_tokenizer_test tests/test_fts_tokenizer.cpp)
+target_compile_features(nano_lance_fts_tokenizer_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fts_tokenizer_test PRIVATE nanolance)
+
+if(TARGET lance_c)
+    add_executable(nano_lance_lance_c_search_test tests/test_lance_c_search.cpp)
+    target_compile_features(nano_lance_lance_c_search_test PRIVATE cxx_std_20)
+    target_link_libraries(nano_lance_lance_c_search_test PRIVATE lance_c nanolance)
+    add_test(NAME nano_lance_lance_c_search COMMAND $<TARGET_FILE:nano_lance_lance_c_search_test>
+             "${CMAKE_CURRENT_BINARY_DIR}/lance_c_search_tmp")
+
+    add_executable(nano_lance_lance_c_stable_row_ids_test tests/test_lance_c_stable_row_ids.cpp)
+    target_compile_features(nano_lance_lance_c_stable_row_ids_test PRIVATE cxx_std_20)
+    target_link_libraries(nano_lance_lance_c_stable_row_ids_test PRIVATE lance_c nanolance)
+    add_test(NAME nano_lance_lance_c_stable_row_ids COMMAND $<TARGET_FILE:nano_lance_lance_c_stable_row_ids_test>
+             "${CMAKE_CURRENT_BINARY_DIR}/lance_c_stable_tmp")
+endif()
+
+add_executable(nano_lance_fts_fst_test tests/test_fts_fst.cpp)
+target_compile_features(nano_lance_fts_fst_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_fts_fst_test PRIVATE nanolance)
 
 add_executable(nano_lance_bitpacking_roundtrip_test tests/test_bitpacking_roundtrip.cpp)
 target_compile_features(nano_lance_bitpacking_roundtrip_test PRIVATE cxx_std_20)
@@ -751,6 +797,7 @@ set_tests_properties(nano_lance_proto_roundtrip PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_writer_lifecycle COMMAND $<TARGET_FILE:nano_lance_writer_lifecycle_test>)
 set_tests_properties(nano_lance_writer_lifecycle PROPERTIES LABELS "smoke")
 
+add_test(NAME nano_lance_row_ids COMMAND $<TARGET_FILE:nano_lance_row_ids_test>)
 add_test(NAME nano_lance_blob_builder COMMAND $<TARGET_FILE:nano_lance_blob_builder_test>)
 set_tests_properties(nano_lance_blob_builder PROPERTIES LABELS "smoke")
 
@@ -781,6 +828,12 @@ set_tests_properties(nano_lance_typed_writer PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_typed_blob_writer COMMAND $<TARGET_FILE:nano_lance_typed_blob_writer_test>)
 set_tests_properties(nano_lance_typed_blob_writer PROPERTIES LABELS "smoke")
 
+add_test(NAME nano_lance_fts_tokenizer COMMAND $<TARGET_FILE:nano_lance_fts_tokenizer_test>
+         "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/fts_tokenizer/cases.txt")
+set_tests_properties(nano_lance_fts_tokenizer PROPERTIES LABELS "smoke")
+add_test(NAME nano_lance_fts_fst COMMAND $<TARGET_FILE:nano_lance_fts_fst_test>
+         "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/fts_fst")
+set_tests_properties(nano_lance_fts_fst PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_bitpacking_roundtrip COMMAND $<TARGET_FILE:nano_lance_bitpacking_roundtrip_test>)
 set_tests_properties(nano_lance_bitpacking_roundtrip PROPERTIES LABELS "smoke")
 

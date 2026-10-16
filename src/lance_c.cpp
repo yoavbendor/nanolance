@@ -16,33 +16,44 @@
 #include "lance/lance.h"
 
 #include "nanolance/arrow_slice.hpp"
+#include "nanolance/base_paths.hpp"
 #include "nanolance/blob_v2_external.hpp"
 #include "nanolance/dataset.hpp"
+#include "nanolance/row_ids.hpp"
 #include "nanolance/dataset_ops.hpp"
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/expr.hpp"
+#include "nanolance/fts_search.hpp"
+#include "nanolance/fts_tokenizer.hpp"
+#include "nanolance/index_optimize.hpp"
+#include "nanolance/index_segments.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/nano_lance_writer.h"
 #include "nanolance/path_safety.hpp"
 #include "nanolance/scalar_index.hpp"
+#include "nanolance/vector_search.hpp"
 #include "nanolance/work_stats.hpp"
+
+#include "index_build.hpp"
+#include "index_files.hpp"
 
 #include "lance_minimal.pb.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <set>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -69,7 +80,40 @@ struct LanceDataStatistics {
 
 struct LanceBatch;
 
+/// A prepared full-text query: the query, on the snapshot it was prepared on.
+struct FtsContextData {
+    const LanceDataset* origin = nullptr;  // the snapshot's handle: a scanner must come from it
+    std::filesystem::path path;
+    uint64_t version = 0;
+    nano_lance::FtsQuery query;
+    bool index_only = false;  // LANCE_FTS_COVERAGE_INDEX_ONLY: the indexed rows alone
+};
+
+/// What a scanner searches for, besides the rows it reads: a k-NN query or a full-text one.
+struct SearchSettings {
+    bool nearest = false;
+    std::string column;
+    std::vector<float> key;
+    uint32_t k = 0;
+    std::optional<uint32_t> minimum_nprobes;
+    std::optional<uint32_t> maximum_nprobes;
+    std::optional<uint32_t> refine_factor;
+    std::optional<uint32_t> ef;
+    int32_t query_parallelism = 0;
+    std::vector<std::array<uint8_t, 16>> index_segments;  // nearest: only these segments
+    std::vector<std::array<uint8_t, 16>> fts_index_segments;  // a prepared FTS query: only these
+    std::optional<std::array<uint8_t, 16>> scalar_segment;      // a plain scan scoped by one segment
+    std::optional<nano_lance::VectorMetric> metric;
+    bool use_index = true;
+    bool prefilter = false;
+    std::optional<nano_lance::FtsQuery> fts;
+    std::shared_ptr<const FtsContextData> fts_context;
+    bool use_scalar_index = true;
+    bool include_deleted_rows = false;
+};
+
 struct LanceScanner {
+    const LanceDataset* origin = nullptr;
     std::filesystem::path path;
     uint64_t version = 0;
     bool has_columns = false;
@@ -83,6 +127,7 @@ struct LanceScanner {
     bool has_fragments = false;
     std::vector<uint64_t> fragment_ids;
     int32_t blob_handling = LANCE_BLOB_HANDLING_BLOBS_DESCRIPTIONS;
+    SearchSettings search;
     std::atomic<bool> started{false};
     LanceScanStatisticsCallback stats_callback = nullptr;
     void* stats_ctx = nullptr;
@@ -106,9 +151,31 @@ struct LanceBlobFile {
     nano_lance::BlobV2Location location;
     uint64_t cursor = 0;
 };
-struct LanceIndexSegmentBuilder {};
-struct LanceIndexSegmentMetadata {};
-struct LanceFtsQueryContext {};
+struct LanceIndexSegmentBuilder {
+    std::filesystem::path path;
+    uint64_t version = 0;               // the snapshot the segment is built on
+    nano_lance::pb::Manifest manifest;  // that snapshot
+    std::string column;
+    std::string name;  // empty: Lance's default
+    std::optional<std::vector<uint64_t>> fragments;
+    std::optional<std::array<uint8_t, 16>> uuid;
+    int32_t mode = LANCE_INDEX_SEGMENT_BUILD_AUTO;
+    bool is_vector = false;
+    int32_t scalar_type = 0;
+    nano_lance::InvertedIndexOptions inverted;
+    nano_lance::VectorIndexOptions vector;
+    std::optional<nano_lance::index_build::VectorModel> model;
+    LanceIndexBuildProgressCallback callback = nullptr;
+    void* callback_ctx = nullptr;
+    bool executed = false;
+};
+struct LanceIndexSegmentMetadata {
+    nano_lance::pb::IndexMetadata index;
+    std::vector<uint32_t> fragment_ids;
+};
+struct LanceFtsQueryContext {
+    std::shared_ptr<const FtsContextData> data;
+};
 
 namespace {
 
@@ -137,6 +204,9 @@ LanceErrorCode code_for(const std::string& error) {
         return LANCE_ERR_DATASET_ALREADY_EXISTS;
     }
     // A bad expression, or a column it (or an operation) names that is not there.
+    if (has("with_index_segments") || has("CreateIndex:") || has("is not present in the attached query context")) {
+        return LANCE_ERR_INVALID_ARGUMENT;
+    }
     if (has("invalid filter") || has("filter column") || has("column '") || has("cannot compare") ||
         has("cannot drop every column") || has("merge insert")) {
         return LANCE_ERR_INVALID_ARGUMENT;
@@ -169,6 +239,8 @@ bool invalid(const char* what) {
     set_error(LANCE_ERR_INVALID_ARGUMENT, what);
     return false;
 }
+
+bool invalid(const std::string& what) { return invalid(what.c_str()); }
 
 /// Run `f`, turning an escaping C++ exception into LANCE_ERR_INTERNAL (the counterpart of
 /// lance-c's panic guard: nothing unwinds into the caller).
@@ -335,6 +407,10 @@ struct ScanStreamPrivate {
     bool reported = false;
     bool done = false;
     std::string last_error;
+    // include_deleted_rows: the live row ids (ascending); `_rowid` is NULL for every other row.
+    std::vector<uint64_t> live;
+    int64_t rowid_column = -1;  // in the decoded schema
+    bool mark_deleted = false;
 
     ~ScanStreamPrivate() {
         if (decoded_schema.release != nullptr) {
@@ -366,6 +442,34 @@ void report_statistics(ScanStreamPrivate* self) {
     stats.metrics = nullptr;
     stats.metrics_len = 0;
     self->callback(self->callback_ctx, &stats);
+}
+
+/// The batch's `_rowid` column with NULL for the rows that are deleted (lance-c's
+/// include_deleted_rows: deleted rows still in storage come back, without a row id).
+bool null_deleted_row_ids(const ScanStreamPrivate& self, ArrowArray& batch) {
+    ArrowArray* ids = batch.children[self.rowid_column];
+    const auto* values = static_cast<const uint64_t*>(ids->buffers[1]) + ids->offset;
+    const int64_t n = ids->length;
+    ArrowArray rebuilt{};
+    if (ArrowArrayInitFromType(&rebuilt, NANOARROW_TYPE_UINT64) != NANOARROW_OK ||
+        ArrowArrayStartAppending(&rebuilt) != NANOARROW_OK) {
+        return false;
+    }
+    for (int64_t i = 0; i < n; ++i) {  // the child's own rows (the parent's offset applies to them as before)
+        const uint64_t id = values[i];
+        const bool live = std::binary_search(self.live.begin(), self.live.end(), id);
+        if ((live ? ArrowArrayAppendUInt(&rebuilt, id) : ArrowArrayAppendNull(&rebuilt, 1)) != NANOARROW_OK) {
+            rebuilt.release(&rebuilt);
+            return false;
+        }
+    }
+    if (ArrowArrayFinishBuildingDefault(&rebuilt, nullptr) != NANOARROW_OK) {
+        rebuilt.release(&rebuilt);
+        return false;
+    }
+    ids->release(ids);
+    ArrowArrayMove(&rebuilt, ids);
+    return true;
 }
 
 int scan_get_next(ArrowArrayStream* stream, ArrowArray* out) {
@@ -400,6 +504,10 @@ int scan_get_next(ArrowArrayStream* stream, ArrowArray* out) {
         if (batch->array.length == 0) {
             continue;
         }
+        if (self->mark_deleted && !null_deleted_row_ids(*self, batch->array)) {
+            self->last_error = "out of memory";
+            return ENOMEM;
+        }
         self->current = std::move(batch);
         self->current_at = 0;
     }
@@ -430,7 +538,386 @@ void split_system_columns(std::vector<std::string>& names, bool& row_id, bool& r
     names = std::move(rest);
 }
 
+bool take_stream(ArrowSchema& decoded_schema, std::vector<ArrowArray>& batches, const std::vector<uint64_t>& sorted,
+                 const std::vector<uint64_t>& wanted, const std::vector<std::string>& names, ArrowArrayStream& out);
+
+float half_to_float(uint16_t h) {
+    const uint32_t sign = (h & 0x8000U) << 16U;
+    const uint32_t exp = (h >> 10U) & 0x1FU;
+    const uint32_t mant = h & 0x3FFU;
+    uint32_t bits = 0;
+    if (exp == 0U) {
+        if (mant == 0U) {
+            bits = sign;
+        } else {  // subnormal: normalize
+            uint32_t e = 127U - 15U + 1U;
+            uint32_t m = mant;
+            while ((m & 0x400U) == 0U) {
+                m <<= 1U;
+                --e;
+            }
+            bits = sign | (e << 23U) | ((m & 0x3FFU) << 13U);
+        }
+    } else if (exp == 0x1FU) {
+        bits = sign | 0x7F800000U | (mant << 13U);
+    } else {
+        bits = sign | ((exp + 127U - 15U) << 23U) | (mant << 13U);
+    }
+    float f = 0;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/// A full-text query context for `column` of `dataset`'s snapshot, as lance-c prepares one: the
+/// column must have an INVERTED index; STRICT coverage requires it to cover every fragment, and
+/// INDEX_ONLY searches (and scores) the rows it covers alone.
+LanceFtsQueryContext* prepare_fts(const LanceDataset* dataset, const char* column, const char* query,
+                                  int32_t coverage_mode, nano_lance::FtsQuery q, bool phrase) {
+    if (dataset == nullptr || column == nullptr || column[0] == '\0' || query == nullptr) {
+        invalid("dataset, column and query must not be NULL or empty");
+        return nullptr;
+    }
+    if (coverage_mode != LANCE_FTS_COVERAGE_STRICT && coverage_mode != LANCE_FTS_COVERAGE_INDEX_ONLY) {
+        invalid("invalid coverage_mode " + std::to_string(coverage_mode) + "; expected 0 (STRICT) or 1 (INDEX_ONLY)");
+        return nullptr;
+    }
+    std::vector<nano_lance::IndexInfo> indices;
+    std::string error;
+    if (!nano_lance::dataset_list_indices(dataset->path, true, dataset->version, indices, error)) {
+        fail(error);
+        return nullptr;
+    }
+    std::set<uint64_t> covered;
+    std::string uuid;
+    std::string name;  // the column's first INVERTED index: its segments
+    bool found = false;
+    for (const auto& index : indices) {
+        if (index.type == "Inverted" && index.fields.size() == 1U && index.fields[0] == column) {
+            if (found && index.name != name) {
+                continue;
+            }
+            found = true;
+            name = index.name;
+            uuid = index.uuid;
+            covered.insert(index.fragment_ids.begin(), index.fragment_ids.end());
+        }
+    }
+    if (!found) {
+        invalid("no committed FTS index exists for column '" + std::string(column) + "' in dataset version " +
+                std::to_string(dataset->version));
+        return nullptr;
+    }
+    std::vector<uint64_t> unindexed;
+    for (const auto& f : dataset->info.fragments) {
+        if (covered.count(f.id) == 0U) {
+            unindexed.push_back(f.id);
+        }
+    }
+    if (coverage_mode == LANCE_FTS_COVERAGE_STRICT && !unindexed.empty()) {
+        std::string ids;
+        for (const auto id : unindexed) {
+            ids += (ids.empty() ? "" : ", ") + std::to_string(id);
+        }
+        invalid("coverage_mode=STRICT requires every fragment in dataset version " + std::to_string(dataset->version) +
+                " to be indexed; column '" + column + "' has " + std::to_string(unindexed.size()) +
+                " unindexed fragments: [" + ids + "]");
+        return nullptr;
+    }
+    if (phrase) {
+        // Phrase queries need positions.
+        nano_lance::fts::AnalyzerParams params;
+        if (nano_lance::index_build::load_inverted_params(dataset->path / "_indices" / uuid, params, error) &&
+            !params.with_position) {
+            invalid("FTS index for column '" + std::string(column) +
+                    "' does not store token positions required by Phrase queries; recreate the index with positions "
+                    "enabled");
+            return nullptr;
+        }
+    }
+    auto data = std::make_shared<FtsContextData>();
+    data->origin = dataset;
+    data->path = dataset->path;
+    data->version = dataset->version;
+    q.text = query;
+    q.columns = {column};
+    data->query = std::move(q);
+    data->index_only = coverage_mode == LANCE_FTS_COVERAGE_INDEX_ONLY;
+    auto* context = new LanceFtsQueryContext;
+    context->data = std::move(data);
+    clear_error();
+    return context;
+}
+
+// ── nearest / full-text search: the rows found, in order, with their distance or score ──────────
+
+/// A struct batch with one more child, owning the batch it extends.
+struct ExtendedBatch {
+    ArrowArray base{};
+    ArrowArray extra{};
+    std::vector<ArrowArray*> children;
+};
+
+void release_extended(ArrowArray* array) {
+    auto* self = static_cast<ExtendedBatch*>(array->private_data);
+    if (self->extra.release != nullptr) {
+        self->extra.release(&self->extra);
+    }
+    if (self->base.release != nullptr) {
+        self->base.release(&self->base);
+    }
+    delete self;
+    array->release = nullptr;
+}
+
+/// `batch` with a float32 child of `values` (one a row, past the batch's offset) added last.
+bool extend_batch(ArrowArray& batch, const float* values, ArrowArray& out) {
+    auto self = std::make_unique<ExtendedBatch>();
+    if (ArrowArrayInitFromType(&self->extra, NANOARROW_TYPE_FLOAT) != NANOARROW_OK ||
+        ArrowArrayStartAppending(&self->extra) != NANOARROW_OK) {
+        return false;
+    }
+    for (int64_t i = 0; i < batch.offset; ++i) {
+        ArrowArrayAppendDouble(&self->extra, 0.0);
+    }
+    for (int64_t i = 0; i < batch.length; ++i) {
+        if (ArrowArrayAppendDouble(&self->extra, static_cast<double>(values[i])) != NANOARROW_OK) {
+            return false;
+        }
+    }
+    if (ArrowArrayFinishBuildingDefault(&self->extra, nullptr) != NANOARROW_OK) {
+        return false;
+    }
+    ArrowArrayMove(&batch, &self->base);
+    self->children.assign(self->base.children, self->base.children + self->base.n_children);
+    self->children.push_back(&self->extra);
+    out = self->base;
+    out.n_children = self->base.n_children + 1;
+    out.children = self->children.data();
+    out.release = &release_extended;
+    out.private_data = self.release();
+    return true;
+}
+
+/// `schema` with a nullable float32 child `name` added last (a deep copy).
+bool extend_schema(const ArrowSchema& schema, const char* name, ArrowSchema& out) {
+    ArrowSchemaInit(&out);
+    if (ArrowSchemaSetTypeStruct(&out, schema.n_children + 1) != NANOARROW_OK ||
+        ArrowSchemaSetMetadata(&out, schema.metadata) != NANOARROW_OK) {
+        out.release(&out);
+        return false;
+    }
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        out.children[i]->release(out.children[i]);
+        if (ArrowSchemaDeepCopy(schema.children[i], out.children[i]) != NANOARROW_OK) {
+            out.release(&out);
+            return false;
+        }
+    }
+    ArrowSchema* last = out.children[schema.n_children];
+    if (ArrowSchemaSetType(last, NANOARROW_TYPE_FLOAT) != NANOARROW_OK || ArrowSchemaSetName(last, name) != NANOARROW_OK) {
+        out.release(&out);
+        return false;
+    }
+    last->flags |= ARROW_FLAG_NULLABLE;
+    return true;
+}
+
+/// The k nearest rows, or the rows matching a full-text query, best first: the columns asked for,
+/// then `_distance` / `_score`, then the row id columns -- as Lance returns them.
+bool open_search(const LanceScanner& scanner, ArrowArrayStream& out) {
+    const SearchSettings& search = scanner.search;
+    if (scanner.has_fragments) {
+        not_supported("fragment_ids with nearest or full-text search");
+        return false;
+    }
+    std::vector<uint64_t> rows;
+    std::vector<float> values;
+    std::string error;
+    const char* value_name = search.nearest ? "_distance" : "_score";
+    if (search.nearest) {
+        nano_lance::NearestQuery q;
+        q.has_version = true;
+        q.version = scanner.version;
+        q.column = search.column;
+        q.key = search.key;
+        q.k = search.k;
+        q.minimum_nprobes = search.minimum_nprobes.value_or(1U);
+        q.maximum_nprobes = search.maximum_nprobes;
+        q.refine_factor = search.refine_factor;
+        q.ef = search.ef;
+        q.query_parallelism = search.query_parallelism;
+        q.segments = search.index_segments;
+        q.metric = search.metric;
+        q.use_index = search.use_index;
+        if (!scanner.filter.empty()) {
+            q.filter = scanner.filter;
+        }
+        q.prefilter = search.prefilter;
+        nano_lance::NearestResult result;
+        if (!nano_lance::dataset_nearest(scanner.path, q, result, error)) {
+            fail(error);
+            return false;
+        }
+        rows = std::move(result.row_ids);
+        values = std::move(result.distances);
+    } else {
+        nano_lance::FtsSearchRequest r;
+        r.has_version = true;
+        r.version = scanner.version;
+        if (search.fts_context != nullptr) {
+            r.query = search.fts_context->query;
+            r.fast_search = search.fts_context->index_only;
+            r.segments = search.fts_index_segments;
+        } else {
+            r.query = *search.fts;
+        }
+        if (scanner.limit >= 0) {
+            r.limit = static_cast<uint64_t>(scanner.limit + std::max<int64_t>(scanner.offset, 0));
+        }
+        if (!scanner.filter.empty()) {
+            r.filter = scanner.filter;
+        }
+        r.prefilter = search.prefilter;
+        nano_lance::FtsSearchResult result;
+        if (!nano_lance::dataset_full_text_search(scanner.path, r, result, error)) {
+            fail(error);
+            return false;
+        }
+        rows = std::move(result.row_ids);
+        values = std::move(result.scores);
+    }
+    // The scanner's offset and limit apply to the rows found.
+    const auto first = std::min<std::size_t>(static_cast<std::size_t>(std::max<int64_t>(scanner.offset, 0)), rows.size());
+    std::size_t last = rows.size();
+    if (scanner.limit >= 0) {
+        last = std::min(last, first + static_cast<std::size_t>(scanner.limit));
+    }
+    rows.assign(rows.begin() + static_cast<std::ptrdiff_t>(first), rows.begin() + static_cast<std::ptrdiff_t>(last));
+    values.assign(values.begin() + static_cast<std::ptrdiff_t>(first), values.begin() + static_cast<std::ptrdiff_t>(last));
+
+    std::vector<std::string> names = scanner.columns;
+    bool row_id = scanner.with_row_id;
+    bool row_address = scanner.with_row_address;
+    split_system_columns(names, row_id, row_address);
+    std::erase(names, std::string(value_name));
+    nano_lance::LanceScanRequest request;
+    request.has_version = true;
+    request.version = scanner.version;
+    request.columns = scanner.has_columns ? &names : nullptr;
+    request.with_row_id = row_id;
+    request.with_row_address = row_address;
+    request.blob_handling = scanner.blob_handling == LANCE_BLOB_HANDLING_ALL_BINARY
+                                ? nano_lance::BlobHandling::Binary
+                                : nano_lance::BlobHandling::Descriptions;
+    std::vector<uint64_t> sorted(rows);
+    std::sort(sorted.begin(), sorted.end());
+    std::vector<float> sorted_values(sorted.size());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const auto at = std::lower_bound(sorted.begin(), sorted.end(), rows[i]) - sorted.begin();
+        sorted_values[static_cast<std::size_t>(at)] = values[i];
+    }
+    ArrowSchema schema{};
+    std::vector<ArrowArray> batches;
+    if (!nano_lance::lance_dataset_take_rows(scanner.path, request, sorted, schema, batches, error)) {
+        fail(error);
+        return false;
+    }
+    const auto release_batches = [&] {
+        for (auto& b : batches) {
+            if (b.release != nullptr) {
+                b.release(&b);
+            }
+        }
+    };
+    // Each row's value, added as the batch's last column.
+    ArrowSchema extended{};
+    if (!extend_schema(schema, value_name, extended)) {
+        schema.release(&schema);
+        release_batches();
+        fail("out of memory");
+        return false;
+    }
+    std::vector<std::string> wanted;  // the data columns (in the order asked for), then the value
+    for (int64_t i = 0; i < schema.n_children; ++i) {
+        const char* n = schema.children[i]->name;
+        if (n != nullptr && std::strcmp(n, "_rowid") != 0 && std::strcmp(n, "_rowaddr") != 0) {
+            wanted.emplace_back(n);
+        }
+    }
+    schema.release(&schema);
+    if (scanner.has_columns) {
+        wanted = names;
+    }
+    wanted.emplace_back(value_name);
+    std::size_t at = 0;
+    for (auto& b : batches) {
+        ArrowArray e{};
+        if (!extend_batch(b, sorted_values.data() + at, e)) {
+            extended.release(&extended);
+            release_batches();
+            fail("out of memory");
+            return false;
+        }
+        at += static_cast<std::size_t>(e.length);
+        b = e;
+    }
+    return take_stream(extended, batches, sorted, rows, wanted, out);
+}
+
 bool open_scan(const LanceScanner& scanner, ArrowArrayStream& out) {
+    if (!scanner.search.index_segments.empty() && !scanner.search.nearest) {
+        return invalid("index_segments requires nearest() to be configured");
+    }
+    if (!scanner.search.fts_index_segments.empty() && scanner.search.fts_context == nullptr) {
+        return invalid("fts_index_segments requires an FTS query context");
+    }
+    bool use_scalar_index = scanner.search.use_scalar_index;
+    if (scanner.search.scalar_segment) {
+        // A worker's scoped scan (lance-c scalar_segment.rs): the rows of its fragments that pass the
+        // whole filter. The segment only speeds that up in Lance, so it is validated and the rows
+        // read as an ordinary filtered scan of those fragments, with no global scalar index.
+        const auto& search = scanner.search;
+        if (search.nearest || search.fts || search.fts_context != nullptr || !search.index_segments.empty() ||
+            !search.fts_index_segments.empty() || search.include_deleted_rows) {
+            return invalid("scalar_index_segment requires an ordinary scan of live rows; vector/FTS queries and "
+                           "include_deleted_rows=true are unsupported");
+        }
+        if (!scanner.has_fragments || scanner.fragment_ids.empty()) {
+            return invalid("scalar_index_segment requires explicit nonempty fragment_ids for its read and fallback "
+                           "domain");
+        }
+        nano_lance::pb::Manifest manifest;
+        std::string error;
+        if (!nano_lance::load_manifest_version(scanner.path, scanner.version, manifest, error)) {
+            fail(error);
+            return false;
+        }
+        std::set<uint64_t> visible;
+        for (const auto& f : manifest.fragments) {
+            visible.insert(f.id);
+        }
+        if (std::any_of(scanner.fragment_ids.begin(), scanner.fragment_ids.end(),
+                        [&](uint64_t id) { return visible.count(id) == 0U; })) {
+            return invalid("scalar segment fragment_ids contains a fragment absent from the dataset snapshot");
+        }
+        const auto index = std::find_if(manifest.indices.begin(), manifest.indices.end(),
+                                        [&](const auto& i) { return i.uuid == *search.scalar_segment; });
+        if (index == manifest.indices.end()) {
+            return invalid("scalar index segment " + nano_lance::pb::uuid_string(*search.scalar_segment) +
+                           " is absent from the dataset snapshot");
+        }
+        if (index->fields.size() != 1U) {
+            return invalid("scalar segment must index a single key field");
+        }
+        if (std::none_of(manifest.fields.begin(), manifest.fields.end(),
+                         [&](const auto& f) { return f.id == index->fields.front(); })) {
+            return invalid("scalar segment key field is absent from the dataset schema");
+        }
+        use_scalar_index = false;
+    }
+    if (scanner.search.nearest || scanner.search.fts || scanner.search.fts_context != nullptr) {
+        return open_search(scanner, out);
+    }
     auto self = std::make_unique<ScanStreamPrivate>();
     std::vector<std::string> names = scanner.columns;
     bool row_id = scanner.with_row_id;
@@ -447,6 +934,8 @@ bool open_scan(const LanceScanner& scanner, ArrowArrayStream& out) {
     request.with_row_id = row_id;
     request.with_row_address = row_address;
     request.filter = scanner.filter.empty() ? nullptr : &scanner.filter;
+    request.use_scalar_index = use_scalar_index;
+    request.include_deleted_rows = scanner.search.include_deleted_rows;
     // lance-c returns a blob column as its description unless asked for the bytes.
     request.blob_handling = scanner.blob_handling == LANCE_BLOB_HANDLING_ALL_BINARY
                                 ? nano_lance::BlobHandling::Binary
@@ -471,9 +960,51 @@ bool open_scan(const LanceScanner& scanner, ArrowArrayStream& out) {
     if (scanner.filter.empty()) {
         request.range.offset = std::min<uint64_t>(request.range.offset, rows);
     }
+    if (scanner.search.include_deleted_rows) {
+        if (!row_id) {
+            invalid("include_deleted_rows requires with_row_id=true");
+            return false;
+        }
+        // The live row ids, from a read of no column: the others are deleted.
+        nano_lance::LanceScanRequest live = request;
+        const std::vector<std::string> none;
+        live.columns = &none;
+        live.filter = nullptr;
+        live.include_deleted_rows = false;
+        live.with_row_address = false;
+        live.range = nano_lance::LanceRowRange{};
+        ArrowSchema live_schema{};
+        std::vector<ArrowArray> live_batches;
+        if (!nano_lance::lance_dataset_scan(scanner.path, live, live_schema, live_batches, error)) {
+            fail(error);
+            return false;
+        }
+        for (auto& b : live_batches) {
+            const ArrowArray* ids = b.children[b.n_children - 1];
+            const auto* v = static_cast<const uint64_t*>(ids->buffers[1]) + ids->offset;
+            self->live.insert(self->live.end(), v, v + ids->length);
+            b.release(&b);
+        }
+        live_schema.release(&live_schema);
+        std::sort(self->live.begin(), self->live.end());
+        self->mark_deleted = true;
+    }
     if (!nano_lance::LanceTableStream::open_request(scanner.path, request, self->decoded_schema, self->stream, error)) {
         fail(error);
         return false;
+    }
+    if (self->mark_deleted) {
+        for (int64_t i = 0; i < self->decoded_schema.n_children; ++i) {
+            const char* n = self->decoded_schema.children[i]->name;
+            if (n != nullptr && std::strcmp(n, "_rowid") == 0) {
+                self->rowid_column = i;
+                self->decoded_schema.children[i]->flags |= ARROW_FLAG_NULLABLE;
+            }
+        }
+        if (self->rowid_column < 0) {
+            fail("include_deleted_rows: the scan has no _rowid column");
+            return false;
+        }
     }
     std::vector<std::string> wanted = names;
     if (scanner.has_columns) {
@@ -700,10 +1231,6 @@ int32_t write_impl(const WriteRequest& req) {
                 return -1;
             }
         }
-        if (req.params->enable_stable_row_ids) {
-            not_supported("stable row ids");
-            return -1;
-        }
     }
     ArrowSchema stream_schema{};
     if (req.stream->get_schema(req.stream, &stream_schema) != 0) {
@@ -745,9 +1272,12 @@ int32_t write_impl(const WriteRequest& req) {
         ~CloseWriter() { nano_lance_writer_close(w); }
     } close_writer{&writer};
     nano_lance_writer_set_ignore_nullability(&writer, true);
+    if (req.params != nullptr && req.params->enable_stable_row_ids) {
+        nano_lance_writer_set_stable_row_ids(&writer, 1);
+    }
     if (req.commit) {
-        // What lance-c records on create: every 20 versions, versions older than 14 days may be
-        // reclaimed. nanolance reclaims nothing itself; Lance honors it when it next commits.
+        // What lance-c records on create: every 20 versions, versions older than 14 days are
+        // reclaimed (run_auto_cleanup after each commit, as Lance's auto cleanup hook).
         nano_lance_writer_set_initial_config(&writer, "lance.auto_cleanup.interval", "20");
         nano_lance_writer_set_initial_config(&writer, "lance.auto_cleanup.older_than", "14days");
     }
@@ -839,9 +1369,19 @@ bool data_statistics(const LanceDataset& ds, LanceDataStatistics& out) {
     for (const auto& f : manifest.fields) {
         bytes[static_cast<uint32_t>(f.id)] = 0;
     }
+    std::vector<nano_lance::BasePath> bases;
+    if (!nano_lance::read_base_paths(manifest, bases, error)) {
+        fail(error);
+        return false;
+    }
     for (const auto& fragment : manifest.fragments) {
         for (const auto& file : fragment.files) {
-            const auto jailed = nano_lance::safe_join_under(ds.path / "data", file.path);
+            std::filesystem::path data_dir;
+            if (!nano_lance::data_file_dir(ds.path, bases, file, data_dir, error)) {
+                fail(error);
+                return false;
+            }
+            const auto jailed = nano_lance::safe_join_under(data_dir, file.path);
             if (!jailed) {
                 fail("data file path escapes the dataset directory");
                 return false;
@@ -1205,13 +1745,17 @@ int32_t lance_dataset_take(const LanceDataset* dataset, const uint64_t* indices,
 
 int32_t lance_dataset_take_rows(const LanceDataset* dataset, const uint64_t* row_ids, size_t num_row_ids,
                                 const char* const* columns, struct ArrowArrayStream* out) {
-    if (dataset != nullptr && dataset->info.stable_row_ids()) {
-        not_supported("row ids of a dataset with stable row ids");
-        return -1;
-    }
     // Row ids that name no row are left out, as lance-c allows.
     std::vector<uint64_t> found;
-    if (dataset != nullptr && row_ids != nullptr) {
+    if (dataset != nullptr && row_ids != nullptr && dataset->info.stable_row_ids()) {
+        // A stable row id is not an address: find the rows (those that were deleted are left out).
+        std::string why;
+        const std::vector<uint64_t> ids(row_ids, row_ids + num_row_ids);
+        if (!nano_lance::resolve_row_ids(dataset->path, dataset->version, ids, found, why, true)) {
+            fail(why);
+            return -1;
+        }
+    } else if (dataset != nullptr && row_ids != nullptr) {
         for (size_t i = 0; i < num_row_ids; ++i) {
             const auto fragment = row_ids[i] >> 32U;
             const auto offset = row_ids[i] & 0xFFFFFFFFULL;
@@ -1251,6 +1795,7 @@ LanceScanner* lance_scanner_new(const LanceDataset* dataset, const char* const* 
         }
         scanner->filter = filter;
     }
+    scanner->origin = dataset;
     scanner->path = dataset->path;
     scanner->version = dataset->version;
     scanner->has_columns = columns != nullptr;
@@ -1306,8 +1851,11 @@ int32_t lance_scanner_set_target_parallelism(LanceScanner* scanner, size_t) {
 int32_t lance_scanner_set_scan_in_order(LanceScanner* scanner, bool) {
     return before_scan(scanner, [] { return true; });
 }
-int32_t lance_scanner_set_use_scalar_index(LanceScanner* scanner, bool) {
-    return before_scan(scanner, [] { return true; });
+int32_t lance_scanner_set_use_scalar_index(LanceScanner* scanner, bool enable) {
+    return before_scan(scanner, [&] {
+        scanner->search.use_scalar_index = enable;
+        return true;
+    });
 }
 int32_t lance_scanner_set_strict_batch_size(LanceScanner* scanner, bool) {
     return before_scan(scanner, [] { return true; });
@@ -1332,10 +1880,7 @@ int32_t lance_scanner_with_row_address(LanceScanner* scanner, bool enable) {
 
 int32_t lance_scanner_set_include_deleted_rows(LanceScanner* scanner, bool include_deleted_rows) {
     return before_scan(scanner, [&] {
-        if (include_deleted_rows) {
-            not_supported("include_deleted_rows");
-            return false;
-        }
+        scanner->search.include_deleted_rows = include_deleted_rows;
         return true;
     });
 }
@@ -1457,6 +2002,8 @@ void lance_scanner_scan_async(const LanceScanner* scanner, LanceCallback callbac
     copy->fragment_ids = scanner->fragment_ids;
     copy->stats_callback = scanner->stats_callback;
     copy->stats_ctx = scanner->stats_ctx;
+    copy->blob_handling = scanner->blob_handling;
+    copy->search = scanner->search;
     std::thread([copy, callback, callback_ctx] {
         auto* stream = new ArrowArrayStream{};
         const bool ok = guarded<bool>(false, [&] { return open_scan(*copy, *stream); });
@@ -1596,6 +2143,630 @@ int32_t mutate(LanceDataset* dataset, F&& op) {
     });
 }
 
+// ── index segments ──────────────────────────────────────────────────────────────────────────────
+
+namespace segments {
+
+// The provenance a trained model carries in its schema metadata (lance-c's index_model.rs).
+constexpr const char* kKind = "lance:index_model:kind";
+constexpr const char* kMetric = "lance:index_model:metric";
+constexpr const char* kDimension = "lance:index_model:dimension";
+constexpr const char* kIvfId = "lance:index_model:ivf_id";
+constexpr const char* kSubVectors = "lance:index_model:num_sub_vectors";
+constexpr const char* kBits = "lance:index_model:num_bits";
+
+struct Provenance {
+    std::string kind;
+    int32_t metric = 0;
+    std::size_t dimension = 0;
+    std::string ivf_id;
+    std::optional<uint32_t> num_sub_vectors;
+    std::optional<uint32_t> num_bits;
+};
+
+/// A FixedSizeList<Float32> model handed in through the Arrow C data interface, copied.
+struct Model {
+    std::vector<float> values;
+    std::size_t rows = 0;
+    std::size_t list_size = 0;
+    Provenance provenance;
+};
+
+std::string random_uuid_text() { return nano_lance::pb::uuid_string(nano_lance::index_files::new_uuid()); }
+
+bool parse_uuid(const std::string& text, std::array<uint8_t, 16>& out) {
+    std::string hex;
+    for (const char c : text) {
+        if (c != '-') {
+            hex += c;
+        }
+    }
+    if (hex.size() != 32U || text.size() != 36U) {
+        return false;
+    }
+    for (std::size_t i = 0; i < 16; ++i) {
+        unsigned v = 0;
+        if (std::sscanf(hex.c_str() + 2 * i, "%2x", &v) != 1) {
+            return false;
+        }
+        out[i] = static_cast<uint8_t>(v);
+    }
+    return true;
+}
+
+bool parse_number(const std::string& s, uint64_t& out) {
+    if (s.empty() || s.size() > 19U || !std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        return false;
+    }
+    out = std::strtoull(s.c_str(), nullptr, 10);
+    return true;
+}
+
+/// `name`_schema and its provenance metadata, `name` (the array) and its values.
+bool borrow_model(ArrowArray* array, const ArrowSchema* schema, const char* name, Model& out) {
+    const std::string n = name;
+    if (array == nullptr) {
+        return invalid(n + " must not be NULL");
+    }
+    if (schema == nullptr || schema->release == nullptr || schema->format == nullptr) {
+        return invalid(n + "_schema is uninitialized or already released");
+    }
+    const std::string format = schema->format;
+    if (format.rfind("+w:", 0) != 0 || schema->n_children != 1 || schema->children == nullptr ||
+        schema->children[0] == nullptr || schema->children[0]->format == nullptr ||
+        std::string(schema->children[0]->format) != "f") {
+        return invalid(n + "_schema must describe FixedSizeList<Float32> with positive list_size, got '" + format + "'");
+    }
+    uint64_t list_size = 0;
+    if (!parse_number(format.substr(3), list_size) || list_size == 0U) {
+        return invalid(n + "_schema must describe FixedSizeList<Float32> with positive list_size, got '" + format + "'");
+    }
+    // Provenance.
+    const auto value = [&](const char* key, std::string& v) {
+        ArrowStringView found{nullptr, 0};
+        if (schema->metadata == nullptr ||
+            ArrowMetadataGetValue(schema->metadata, ArrowCharView(key), &found) != NANOARROW_OK ||
+            found.data == nullptr) {
+            return false;
+        }
+        v.assign(found.data, static_cast<std::size_t>(found.size_bytes));
+        return true;
+    };
+    auto& p = out.provenance;
+    std::string text;
+    for (const char* key : {kKind, kMetric, kDimension, kIvfId}) {
+        if (!value(key, text)) {
+            return invalid(n + "_schema metadata is missing required key '" + key + "'");
+        }
+        if (key == kKind) {
+            p.kind = text;
+            continue;
+        }
+        uint64_t number = 0;
+        std::array<uint8_t, 16> uuid{};
+        if (key == kIvfId ? !parse_uuid(text, uuid) : !parse_number(text, number)) {
+            return invalid(n + "_schema metadata '" + key + "' is invalid: " + text);
+        }
+        if (key == kMetric) {
+            p.metric = static_cast<int32_t>(number);
+        } else if (key == kDimension) {
+            p.dimension = static_cast<std::size_t>(number);
+        } else {
+            p.ivf_id = text;
+        }
+    }
+    for (const char* key : {kSubVectors, kBits}) {
+        if (value(key, text)) {
+            uint64_t number = 0;
+            if (!parse_number(text, number) || number > UINT32_MAX) {
+                return invalid(n + "_schema metadata '" + key + "' value '" + text + "' is invalid");
+            }
+            (key == kSubVectors ? p.num_sub_vectors : p.num_bits) = static_cast<uint32_t>(number);
+        }
+    }
+    // The array: one list per row, no nulls.
+    if (array->release == nullptr) {
+        return invalid(n + " is uninitialized or already released");
+    }
+    if (array->length < 0 || array->offset < 0 || array->n_children != 1 || array->children == nullptr ||
+        array->children[0] == nullptr || array->children[0]->release == nullptr) {
+        return invalid(n + " must be a FixedSizeList array with one child");
+    }
+    if (array->null_count > 0) {
+        return invalid(n + " must not contain NULL lists; null_count is " + std::to_string(array->null_count));
+    }
+    const ArrowArray* child = array->children[0];
+    if (child->n_buffers != 2 || child->buffers == nullptr || child->offset < 0 || child->length < 0) {
+        return invalid(n + ".children[0] Float32 must have two buffers");
+    }
+    if (child->null_count > 0) {
+        return invalid(n + " values must not contain NULLs; null_count is " + std::to_string(child->null_count));
+    }
+    const auto rows = static_cast<std::size_t>(array->length);
+    const auto first = static_cast<std::size_t>(array->offset) * list_size + static_cast<std::size_t>(child->offset);
+    const auto count = rows * list_size;
+    if (static_cast<std::size_t>(child->offset) + static_cast<std::size_t>(child->length) <
+        static_cast<std::size_t>(array->offset + array->length) * list_size) {
+        return invalid(n + ".children[0] does not cover the parent range");
+    }
+    const auto* data = static_cast<const float*>(child->buffers[1]);
+    if (count > 0U && data == nullptr) {
+        return invalid(n + ".children[0] has a NULL values buffer");
+    }
+    out.values.assign(data == nullptr ? nullptr : data + first, data == nullptr ? nullptr : data + first + count);
+    out.rows = rows;
+    out.list_size = static_cast<std::size_t>(list_size);
+    return true;
+}
+
+/// Export `values` as a FixedSizeList<Float32>[list_size] named "model" with `metadata`.
+bool export_model(const std::vector<float>& values, std::size_t list_size, const std::map<std::string, std::string>& metadata,
+                  ArrowArray* out_array, ArrowSchema* out_schema) {
+    ArrowSchema schema;
+    ArrowSchemaInit(&schema);
+    ArrowBuffer meta;
+    bool ok = ArrowSchemaSetTypeFixedSize(&schema, NANOARROW_TYPE_FIXED_SIZE_LIST, static_cast<int32_t>(list_size)) ==
+                  NANOARROW_OK &&
+              ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_FLOAT) == NANOARROW_OK &&
+              ArrowSchemaSetName(schema.children[0], "item") == NANOARROW_OK &&
+              ArrowSchemaSetName(&schema, "model") == NANOARROW_OK;
+    schema.flags = 0;  // the model itself is not nullable; its items are
+    ok = ok && ArrowMetadataBuilderInit(&meta, nullptr) == NANOARROW_OK;
+    for (const auto& [k, v] : metadata) {
+        ok = ok && ArrowMetadataBuilderAppend(&meta, ArrowCharView(k.c_str()), ArrowCharView(v.c_str())) == NANOARROW_OK;
+    }
+    ok = ok && ArrowSchemaSetMetadata(&schema, reinterpret_cast<const char*>(meta.data)) == NANOARROW_OK;
+    ArrowBufferReset(&meta);
+    ArrowArray array;
+    array.release = nullptr;
+    ok = ok && ArrowArrayInitFromSchema(&array, &schema, nullptr) == NANOARROW_OK &&
+         ArrowBufferAppend(ArrowArrayBuffer(array.children[0], 1), values.data(),
+                           static_cast<int64_t>(values.size() * sizeof(float))) == NANOARROW_OK;
+    if (ok) {
+        array.children[0]->length = static_cast<int64_t>(values.size());
+        array.children[0]->null_count = 0;
+        array.length = static_cast<int64_t>(values.size() / list_size);
+        array.null_count = 0;
+        ok = ArrowArrayFinishBuildingDefault(&array, nullptr) == NANOARROW_OK;
+    }
+    if (!ok) {
+        if (array.release != nullptr) {
+            array.release(&array);
+        }
+        schema.release(&schema);
+        set_error(LANCE_ERR_INTERNAL, "out of memory");
+        return false;
+    }
+    ArrowArrayMove(&array, out_array);
+    ArrowSchemaMove(&schema, out_schema);
+    return true;
+}
+
+/// fragment_ids / fragment_count: none (every fragment), or distinct fragments of the version.
+bool parse_fragments(const nano_lance::pb::Manifest& manifest, uint64_t version, const uint32_t* ids, size_t count,
+                     std::optional<std::vector<uint64_t>>& out) {
+    if (ids == nullptr && count == 0U) {
+        out.reset();
+        return true;
+    }
+    if (ids == nullptr) {
+        return invalid("fragment_ids is NULL but fragment_count is " + std::to_string(count));
+    }
+    if (count == 0U) {
+        return invalid("fragment_ids is non-NULL but fragment_count is 0");
+    }
+    std::set<uint64_t> existing;
+    for (const auto& f : manifest.fragments) {
+        existing.insert(f.id);
+    }
+    std::set<uint32_t> seen;
+    std::vector<uint64_t> list;
+    for (size_t i = 0; i < count; ++i) {
+        if (!seen.insert(ids[i]).second) {
+            return invalid("fragment_ids[" + std::to_string(i) + "] is duplicate fragment id " + std::to_string(ids[i]));
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (existing.count(ids[i]) == 0U) {
+            return invalid("fragment_ids[" + std::to_string(i) + "]=" + std::to_string(ids[i]) +
+                           " does not exist in dataset version " + std::to_string(version));
+        }
+        list.push_back(ids[i]);
+    }
+    out = std::move(list);
+    return true;
+}
+
+bool load_snapshot(const LanceDataset& dataset, nano_lance::pb::Manifest& manifest) {
+    std::string error;
+    if (!nano_lance::load_manifest_version(dataset.path, dataset.version, manifest, error)) {
+        fail(error);
+        return false;
+    }
+    return true;
+}
+
+/// The dimension of the float32 vector column `column`.
+bool vector_dim(const nano_lance::pb::Manifest& manifest, const std::string& column, std::size_t& dim) {
+    std::vector<std::string> parts;
+    const auto* field = nano_lance::index_files::find_field(manifest, column, parts);
+    if (field == nullptr) {
+        return invalid("column '" + column + "' does not exist");
+    }
+    const std::string& t = field->logical_type;
+    const std::string prefix = "fixed_size_list:";
+    const auto last = t.rfind(':');
+    uint64_t n = 0;
+    if (t.rfind(prefix, 0) != 0 || last == std::string::npos || last < prefix.size() ||
+        !parse_number(t.substr(last + 1U), n) || n == 0U) {
+        return invalid("column '" + column + "' is not a vector column (got " + t + ")");
+    }
+    if (t.substr(prefix.size(), last - prefix.size()) != "float") {
+        return invalid("column '" + column + "' must have Float32 vector elements, got " +
+                       t.substr(prefix.size(), last - prefix.size()));
+    }
+    dim = static_cast<std::size_t>(n);
+    return true;
+}
+
+bool start_builder(LanceIndexSegmentBuilder& b, const LanceDataset& dataset, const char* column, const char* name,
+                   const LanceIndexSegmentBuildOptions* options, bool scalar) {
+    b.path = dataset.path;
+    b.version = dataset.version;
+    b.column = column;
+    if (name != nullptr) {
+        b.name = name;
+    }
+    if (!load_snapshot(dataset, b.manifest)) {
+        return false;
+    }
+    if (options == nullptr) {
+        return true;
+    }
+    if (!parse_fragments(b.manifest, b.version, options->fragment_ids, options->fragment_count, b.fragments)) {
+        return false;
+    }
+    if ((options->ivf_centroids == nullptr) != (options->ivf_centroids_schema == nullptr)) {
+        return invalid("ivf_centroids and ivf_centroids_schema must both be NULL or both be non-NULL");
+    }
+    if ((options->pq_codebook == nullptr) != (options->pq_codebook_schema == nullptr)) {
+        return invalid("pq_codebook and pq_codebook_schema must both be NULL or both be non-NULL");
+    }
+    if (scalar && (options->ivf_centroids != nullptr || options->pq_codebook != nullptr)) {
+        return invalid("ivf_centroids and pq_codebook are not valid for a scalar index segment");
+    }
+    if (options->mode < LANCE_INDEX_SEGMENT_BUILD_AUTO || options->mode > LANCE_INDEX_SEGMENT_BUILD_PRECOMPUTED) {
+        return invalid("mode must be 0 (AUTO), 1 (LOCAL_TRAIN), or 2 (PRECOMPUTED); got " +
+                       std::to_string(options->mode));
+    }
+    if (scalar && options->mode == LANCE_INDEX_SEGMENT_BUILD_PRECOMPUTED) {
+        return invalid("mode PRECOMPUTED is not valid for a scalar index segment");
+    }
+    b.mode = options->mode;
+    if (options->index_uuid != nullptr) {
+        std::array<uint8_t, 16> uuid{};
+        std::memcpy(uuid.data(), options->index_uuid, 16);
+        b.uuid = uuid;
+    }
+    return true;
+}
+
+/// The segment's vector index options from lance-c's parameters (index.rs build_vector_params).
+bool vector_options(const LanceVectorIndexSegmentParams& p, nano_lance::VectorIndexOptions& o) {
+    switch (p.index_type) {
+    case LANCE_INDEX_IVF_FLAT: o.type = "IVF_FLAT"; break;
+    case LANCE_INDEX_IVF_PQ: o.type = "IVF_PQ"; break;
+    case LANCE_INDEX_IVF_HNSW_SQ: o.type = "IVF_HNSW_SQ"; break;
+    case LANCE_INDEX_IVF_SQ: o.type = "IVF_SQ"; break;
+    case LANCE_INDEX_IVF_HNSW_PQ: o.type = "IVF_HNSW_PQ"; break;
+    case LANCE_INDEX_IVF_HNSW_FLAT: o.type = "IVF_HNSW_FLAT"; break;
+    default: return invalid("invalid LanceVectorIndexType " + std::to_string(p.index_type));
+    }
+    switch (p.metric) {
+    case LANCE_METRIC_L2: o.metric = nano_lance::VectorMetric::L2; break;
+    case LANCE_METRIC_COSINE: o.metric = nano_lance::VectorMetric::Cosine; break;
+    case LANCE_METRIC_DOT: o.metric = nano_lance::VectorMetric::Dot; break;
+    case LANCE_METRIC_HAMMING: not_supported("the hamming metric"); return false;
+    default: return invalid("invalid LanceMetricType " + std::to_string(p.metric));
+    }
+    if (p.num_partitions == 0U) {
+        return invalid("num_partitions is required for this index type and must be > 0");
+    }
+    o.num_partitions = p.num_partitions;
+    if (o.type == "IVF_PQ" || o.type == "IVF_HNSW_PQ") {
+        if (p.num_sub_vectors == 0U) {
+            return invalid("num_sub_vectors is required for this index type and must be > 0");
+        }
+        o.num_sub_vectors = p.num_sub_vectors;
+        o.num_bits = p.num_bits == 0U ? 8U : p.num_bits;
+        if (o.num_bits != 4U && o.num_bits != 8U) {
+            return invalid("num_bits must be 4 or 8 for Lance PQ indexes, got " + std::to_string(o.num_bits));
+        }
+    }
+    if (o.type.rfind("IVF_HNSW_", 0) == 0) {
+        if (p.hnsw_m == 0U) {
+            return invalid("hnsw_m is required for this index type and must be > 0");
+        }
+        if (o.type == "IVF_HNSW_SQ" && p.num_bits != 0U && p.num_bits != 8U) {
+            return invalid("num_bits must be 0 or 8 for Lance SQ indexes, got " + std::to_string(p.num_bits));
+        }
+        o.hnsw_m = p.hnsw_m;
+        if (p.hnsw_ef_construction != 0U) {
+            o.hnsw_ef_construction = p.hnsw_ef_construction;
+        }
+    }
+    if (p.max_iterations != 0U) {
+        o.max_iters = p.max_iterations;
+    }
+    if (p.sample_rate != 0U) {
+        o.sample_rate = p.sample_rate;
+    }
+    return true;
+}
+
+/// A trainer's inputs (index_model.rs parse_common).
+struct Trainer {
+    std::filesystem::path path;
+    uint64_t version = 0;
+    nano_lance::pb::Manifest manifest;
+    std::string column;
+    std::size_t dim = 0;
+    nano_lance::VectorMetric metric = nano_lance::VectorMetric::L2;
+    std::optional<std::vector<uint64_t>> fragments;
+};
+
+bool start_trainer(Trainer& t, const LanceDataset* dataset, const char* column, int32_t metric,
+                   const uint32_t* fragment_ids, size_t fragment_count, ArrowArray* out_array, ArrowSchema* out_schema) {
+    if (dataset == nullptr || column == nullptr || out_array == nullptr || out_schema == nullptr) {
+        return invalid("dataset, column, out_array, and out_schema must not be NULL");
+    }
+    if (out_array->release != nullptr || out_schema->release != nullptr) {
+        return invalid("out_array and out_schema must be empty (release callbacks must be NULL)");
+    }
+    switch (metric) {
+    case LANCE_METRIC_L2: t.metric = nano_lance::VectorMetric::L2; break;
+    case LANCE_METRIC_COSINE: t.metric = nano_lance::VectorMetric::Cosine; break;
+    case LANCE_METRIC_DOT: t.metric = nano_lance::VectorMetric::Dot; break;
+    case LANCE_METRIC_HAMMING: return invalid("the hamming metric is not valid for Float32 vectors");
+    default: return invalid("invalid LanceMetricType " + std::to_string(metric));
+    }
+    if (column[0] == '\0') {
+        return invalid("column must not be NULL or empty");
+    }
+    t.path = dataset->path;
+    t.version = dataset->version;
+    t.column = column;
+    return load_snapshot(*dataset, t.manifest) && vector_dim(t.manifest, t.column, t.dim) &&
+           parse_fragments(t.manifest, t.version, fragment_ids, fragment_count, t.fragments);
+}
+
+bool train(const Trainer& t, const nano_lance::VectorIndexOptions& o, const nano_lance::index_build::VectorModel* model,
+           nano_lance::index_build::VectorModel& trained) {
+    nano_lance::index_build::SegmentTarget target;
+    target.manifest = &t.manifest;
+    target.version = t.version;
+    target.fragments = t.fragments ? &*t.fragments : nullptr;
+    target.model = model;
+    target.trained = &trained;
+    std::string error;
+    if (!nano_lance::index_build::build_vector_segment(t.path, t.column, o, target, error)) {
+        fail(error);
+        return false;
+    }
+    return true;
+}
+
+/// The last part of an index details type URL: "BTreeIndexDetails", "VectorIndexDetails", ...
+std::string details_kind(const std::string& url) {
+    const auto dot = url.rfind('.');
+    return dot == std::string::npos ? url : url.substr(dot + 1U);
+}
+
+/// The index name a build gets (create.rs): the given one, else <column>_idx, then _2, _3, ... past
+/// indexes of that name on another column or of another kind; refused when an index of that kind
+/// on this column already holds it.
+bool resolve_name(LanceIndexSegmentBuilder& b, const std::string& kind) {
+    std::vector<std::string> parts;
+    const auto* field = nano_lance::index_files::find_field(b.manifest, b.column, parts);
+    if (field == nullptr) {
+        return invalid("column '" + b.column + "' does not exist");
+    }
+    const auto clashes = [&](const std::string& name) {
+        return std::any_of(b.manifest.indices.begin(), b.manifest.indices.end(), [&](const auto& i) {
+            return i.name == name && (i.fields.empty() || i.fields.front() != field->id ||
+                                      details_kind(i.details_type_url) != kind);
+        });
+    };
+    if (b.name.empty()) {
+        const std::string base = b.column + "_idx";
+        b.name = base;
+        for (int n = 2; clashes(b.name); ++n) {
+            b.name = base + "_" + std::to_string(n);
+        }
+    }
+    bool named = false;
+    for (const auto& i : b.manifest.indices) {
+        if (i.name != b.name) {
+            continue;
+        }
+        if (i.fields.empty() || i.fields.front() != field->id) {
+            set_error(LANCE_ERR_INDEX, "Index name '" + b.name +
+                                           "' already exists with different fields, please specify a different name");
+            return false;
+        }
+        named = true;
+    }
+    if (named) {
+        set_error(LANCE_ERR_INDEX,
+                  "Index name '" + b.name + "' already exists, please specify a different name or use replace=True");
+        return false;
+    }
+    return true;
+}
+
+bool execute(LanceIndexSegmentBuilder& b, std::vector<uint8_t>& bytes) {
+    std::string kind = "VectorIndexDetails";
+    if (!b.is_vector) {
+        kind = b.scalar_type == LANCE_SCALAR_BTREE    ? "BTreeIndexDetails"
+               : b.scalar_type == LANCE_SCALAR_BITMAP ? "BitmapIndexDetails"
+               : b.scalar_type == LANCE_SCALAR_LABEL_LIST ? "LabelListIndexDetails"
+                                                          : "InvertedIndexDetails";
+    }
+    if (!resolve_name(b, kind)) {
+        return false;
+    }
+    if (b.uuid && b.fragments && !b.fragments->empty() &&
+        (b.scalar_type == LANCE_SCALAR_BTREE || b.scalar_type == LANCE_SCALAR_LABEL_LIST)) {
+        return invalid(std::string("index_uuid is no longer accepted for ") +
+                       (b.scalar_type == LANCE_SCALAR_BTREE ? "BTree" : "LabelList") +
+                       " distributed index builds; segment UUIDs are generated by Lance and returned in the index "
+                       "metadata.");
+    }
+    nano_lance::pb::IndexMetadata entry;
+    nano_lance::index_build::Progress progress;
+    if (b.callback != nullptr) {
+        progress = [&b](int event, const char* stage, uint64_t total, const char* unit, uint64_t completed) {
+            b.callback(b.callback_ctx, event, stage, total, unit, completed);
+        };
+    }
+    nano_lance::index_build::SegmentTarget target;
+    target.manifest = &b.manifest;
+    target.version = b.version;
+    target.fragments = b.fragments ? &*b.fragments : nullptr;
+    target.out = &entry;
+    target.uuid = b.uuid ? &*b.uuid : nullptr;
+    target.progress = b.callback != nullptr ? &progress : nullptr;
+    std::string error;
+    bool ok = false;
+    if (b.is_vector) {
+        b.vector.name = b.name;
+        target.model = b.model ? &*b.model : nullptr;
+        ok = nano_lance::index_build::build_vector_segment(b.path, b.column, b.vector, target, error);
+    } else if (b.scalar_type == LANCE_SCALAR_INVERTED) {
+        b.inverted.name = b.name;
+        ok = nano_lance::index_build::build_inverted_segment(b.path, b.column, b.inverted, target, error);
+    } else {
+        nano_lance::ScalarIndexOptions o;
+        o.name = b.name;
+        const auto type = b.scalar_type == LANCE_SCALAR_BTREE    ? nano_lance::ScalarIndexType::BTree
+                          : b.scalar_type == LANCE_SCALAR_BITMAP ? nano_lance::ScalarIndexType::Bitmap
+                                                                 : nano_lance::ScalarIndexType::LabelList;
+        ok = nano_lance::index_build::build_scalar_segment(b.path, b.column, type, o, target, error);
+    }
+    if (!ok) {
+        fail(error);
+        return false;
+    }
+    bytes = nano_lance::pb::encode_index_message(entry);
+    return true;
+}
+
+/// One IndexMetadata message, with Lance's range checks (index_segment.rs decode_segment_metadata).
+bool decode_metadata(const uint8_t* bytes, size_t len, nano_lance::pb::IndexMetadata& out, std::string& error) {
+    if (!nano_lance::pb::decode_index_message(bytes, len, out, error)) {
+        error = "invalid IndexMetadata protobuf: " + error;
+        return false;
+    }
+    if (out.index_version > static_cast<uint32_t>(INT32_MAX)) {
+        error = "IndexMetadata index_version must be >= 0";
+        return false;
+    }
+    for (std::size_t i = 0; i < out.fields.size(); ++i) {
+        if (out.fields[i] < 0) {
+            error = "IndexMetadata fields[" + std::to_string(i) + "] must be >= 0, got " + std::to_string(out.fields[i]);
+            return false;
+        }
+    }
+    if (out.created_at > static_cast<uint64_t>(INT64_MAX)) {
+        error = "IndexMetadata created_at exceeds i64::MAX milliseconds";
+        return false;
+    }
+    return true;
+}
+
+/// Whether protobuf message `b` has field `number`.
+bool has_field(const std::vector<uint8_t>& b, uint64_t number) {
+    std::size_t i = 0;
+    const auto varint = [&](uint64_t& v) {
+        v = 0;
+        for (int shift = 0; i < b.size() && shift < 64; shift += 7) {
+            const auto c = b[i++];
+            v |= static_cast<uint64_t>(c & 0x7FU) << shift;
+            if ((c & 0x80U) == 0U) {
+                return true;
+            }
+        }
+        return false;
+    };
+    while (i < b.size()) {
+        uint64_t key = 0;
+        uint64_t v = 0;
+        if (!varint(key)) {
+            return false;
+        }
+        if ((key >> 3U) == number) {
+            return true;
+        }
+        switch (key & 7U) {
+        case 0: if (!varint(v)) return false; break;
+        case 1: i += 8; break;
+        case 2: if (!varint(v) || v > b.size() - i) return false; i += static_cast<std::size_t>(v); break;
+        case 5: i += 4; break;
+        default: return false;
+        }
+    }
+    return false;
+}
+
+/// LanceScalarIndexType / LanceVectorIndexType of a segment; -1 an unknown kind, -2 RQ.
+int32_t index_type_code(const nano_lance::pb::IndexMetadata& index) {
+    const auto kind = details_kind(index.details_type_url);
+    if (kind == "BTreeIndexDetails") return LANCE_SCALAR_BTREE;
+    if (kind == "BitmapIndexDetails") return LANCE_SCALAR_BITMAP;
+    if (kind == "LabelListIndexDetails") return LANCE_SCALAR_LABEL_LIST;
+    if (kind == "InvertedIndexDetails") return LANCE_SCALAR_INVERTED;
+    if (kind != "VectorIndexDetails") return -1;
+    const auto type = nano_lance::vector_index_type(index.details_value);
+    if (type.empty()) {
+        // No compression is Lance's flat; with an HNSW layer (field 3), IVF_HNSW_FLAT.
+        return has_field(index.details_value, 3) ? LANCE_INDEX_IVF_HNSW_FLAT : LANCE_INDEX_IVF_FLAT;
+    }
+    if (type == "IVF_FLAT") return LANCE_INDEX_IVF_FLAT;
+    if (type == "IVF_SQ") return LANCE_INDEX_IVF_SQ;
+    if (type == "IVF_PQ") return LANCE_INDEX_IVF_PQ;
+    if (type == "IVF_HNSW_SQ") return LANCE_INDEX_IVF_HNSW_SQ;
+    if (type == "IVF_HNSW_PQ") return LANCE_INDEX_IVF_HNSW_PQ;
+    if (type == "IVF_HNSW_FLAT") return LANCE_INDEX_IVF_HNSW_FLAT;
+    return -2;
+}
+
+LanceErrorCode code_of(nano_lance::SegmentErrorKind kind, const std::string& error) {
+    switch (kind) {
+    case nano_lance::SegmentErrorKind::InvalidArgument: return LANCE_ERR_INVALID_ARGUMENT;
+    case nano_lance::SegmentErrorKind::Index: return LANCE_ERR_INDEX;
+    case nano_lance::SegmentErrorKind::NotFound: return LANCE_ERR_NOT_FOUND;
+    default: return code_for(error);
+    }
+}
+
+bool list(const LanceDataset* dataset, const char* index_name, std::vector<std::array<uint8_t, 16>>& out) {
+    if (dataset == nullptr || index_name == nullptr) {
+        return invalid("dataset and index_name must not be NULL");
+    }
+    if (index_name[0] == '\0') {
+        return invalid("index_name must not be empty");
+    }
+    std::string error;
+    nano_lance::SegmentErrorKind kind{};
+    if (!nano_lance::dataset_index_segments(dataset->path, dataset->version, index_name, out, error, kind)) {
+        set_error(code_of(kind, error), error);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace segments
+
 }  // namespace
 
 extern "C" {
@@ -1662,11 +2833,16 @@ int32_t lance_dataset_merge_insert(LanceDataset* dataset, const char* const* on_
             case LANCE_MERGE_WHEN_MATCHED_FAIL: spec.when_matched = WM::Fail; break;
             case LANCE_MERGE_WHEN_MATCHED_DELETE: spec.when_matched = WM::Delete; break;
             case LANCE_MERGE_WHEN_MATCHED_UPDATE_IF:
-                if (source->release != nullptr) {
-                    source->release(source);
+                if (params->when_matched_expr == nullptr || params->when_matched_expr[0] == '\0') {
+                    if (source->release != nullptr) {
+                        source->release(source);
+                    }
+                    invalid("when_matched UPDATE_IF requires a non-empty when_matched_expr");
+                    return -1;
                 }
-                not_supported("merge insert WHEN MATCHED UPDATE IF (yet)");
-                return -1;
+                spec.when_matched = WM::UpdateIf;
+                spec.when_matched_condition = params->when_matched_expr;
+                break;
             default:
                 if (source->release != nullptr) {
                     source->release(source);
@@ -1857,7 +3033,16 @@ int32_t take_blobs(const LanceDataset* dataset, const uint64_t* rows, size_t cou
         return 0;
     }
     return guarded<int32_t>(-1, [&]() -> int32_t {
-        const std::vector<uint64_t> wanted(rows, rows + count);
+        std::vector<uint64_t> wanted(rows, rows + count);
+        if (by_id && dataset->info.stable_row_ids()) {
+            std::string why;
+            std::vector<uint64_t> addresses;
+            if (!nano_lance::resolve_row_ids(dataset->path, dataset->version, wanted, addresses, why)) {
+                fail(why);
+                return -1;
+            }
+            wanted = std::move(addresses);
+        }
         std::vector<uint64_t> sorted(wanted);
         std::sort(sorted.begin(), sorted.end());
         sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
@@ -2061,9 +3246,79 @@ int32_t lance_blob_file_tell(const LanceBlobFile* blob, uint64_t* pos) {
 
 void lance_blob_file_close(LanceBlobFile* blob) { delete blob; }
 
-int32_t lance_dataset_create_vector_index(LanceDataset*, const char*, const char*, const LanceVectorIndexParams*,
-                                          bool) {
-    NL_UNSUPPORTED_INT("indexes");
+int32_t lance_dataset_create_vector_index(LanceDataset* dataset, const char* column, const char* index_name,
+                                          const LanceVectorIndexParams* params, bool replace) {
+    if (dataset == nullptr || column == nullptr || params == nullptr) {
+        invalid("dataset, column, and params must not be NULL");
+        return -1;
+    }
+    if (column[0] == '\0') {
+        invalid("column must not be empty");
+        return -1;
+    }
+    nano_lance::VectorIndexOptions options;
+    switch (params->index_type) {
+    case LANCE_INDEX_IVF_FLAT: options.type = "IVF_FLAT"; break;
+    case LANCE_INDEX_IVF_PQ: options.type = "IVF_PQ"; break;
+    case LANCE_INDEX_IVF_SQ: options.type = "IVF_SQ"; break;
+    case LANCE_INDEX_IVF_HNSW_SQ: options.type = "IVF_HNSW_SQ"; break;
+    case LANCE_INDEX_IVF_HNSW_PQ: options.type = "IVF_HNSW_PQ"; break;
+    case LANCE_INDEX_IVF_HNSW_FLAT: options.type = "IVF_HNSW_FLAT"; break;
+    default:
+        invalid("unknown vector index type " + std::to_string(static_cast<int>(params->index_type)));
+        return -1;
+    }
+    switch (params->metric) {
+    case LANCE_METRIC_L2: options.metric = nano_lance::VectorMetric::L2; break;
+    case LANCE_METRIC_COSINE: options.metric = nano_lance::VectorMetric::Cosine; break;
+    case LANCE_METRIC_DOT: options.metric = nano_lance::VectorMetric::Dot; break;
+    case LANCE_METRIC_HAMMING: NL_UNSUPPORTED_INT("the hamming metric");
+    default:
+        invalid("unknown metric " + std::to_string(static_cast<int>(params->metric)));
+        return -1;
+    }
+    if (params->num_partitions == 0U) {
+        invalid("num_partitions is required and must be greater than 0");
+        return -1;
+    }
+    options.num_partitions = params->num_partitions;
+    if (options.type == "IVF_PQ" || options.type == "IVF_HNSW_PQ") {
+        if (params->num_sub_vectors == 0U) {
+            invalid("num_sub_vectors is required and must be greater than 0");
+            return -1;
+        }
+        options.num_sub_vectors = params->num_sub_vectors;
+        options.num_bits = params->num_bits == 0U ? 8U : params->num_bits;
+        if (options.num_bits != 4U && options.num_bits != 8U) {
+            invalid("num_bits must be 4 or 8 for Lance PQ indexes, got " + std::to_string(options.num_bits));
+            return -1;
+        }
+    }
+    if (options.type.rfind("IVF_HNSW_", 0) == 0) {
+        if (params->hnsw_m == 0U) {
+            invalid("hnsw_m is required for this index type and must be > 0");
+            return -1;
+        }
+        if (options.type == "IVF_HNSW_SQ" && params->num_bits != 0U && params->num_bits != 8U) {
+            invalid("num_bits must be 0 or 8 for Lance SQ indexes, got " + std::to_string(params->num_bits));
+            return -1;
+        }
+        options.hnsw_m = params->hnsw_m;
+        if (params->hnsw_ef_construction != 0U) {
+            options.hnsw_ef_construction = params->hnsw_ef_construction;
+        }
+    }
+    if (params->max_iterations != 0U) {
+        options.max_iters = params->max_iterations;
+    }
+    if (params->sample_rate != 0U) {
+        options.sample_rate = params->sample_rate;
+    }
+    options.name = index_name != nullptr ? index_name : "";
+    options.replace = replace;
+    return mutate(dataset, [&](uint64_t& v, std::string& e) {
+        return nano_lance::dataset_create_vector_index(dataset->path, column, options, v, e);
+    });
 }
 int32_t lance_dataset_create_scalar_index(LanceDataset* dataset, const char* column, const char* index_name,
                                           LanceScalarIndexType index_type, const char* params_json, bool replace) {
@@ -2071,12 +3326,32 @@ int32_t lance_dataset_create_scalar_index(LanceDataset* dataset, const char* col
         invalid("dataset and column must not be NULL or empty");
         return -1;
     }
+    if (index_type == LANCE_SCALAR_INVERTED) {
+        // The analyzer as Lance's InvertedIndexParams spell it ({"base_tokenizer": "simple", ...});
+        // LanceDB's defaults for what is left out.
+        nano_lance::InvertedIndexOptions options;
+        options.name = index_name != nullptr ? index_name : "";
+        options.replace = replace;
+        std::string error;
+        if (params_json != nullptr && params_json[0] != '\0' &&
+            !nano_lance::fts::parse_params(params_json, options.params, error)) {
+            set_error(error.find("not supported") != std::string::npos ? LANCE_ERR_NOT_SUPPORTED
+                                                                       : LANCE_ERR_INVALID_ARGUMENT,
+                      error);
+            return -1;
+        }
+        return mutate(dataset, [&](uint64_t& v, std::string& e) {
+            return nano_lance::dataset_create_inverted_index(dataset->path, column, options, v, e);
+        });
+    }
     nano_lance::ScalarIndexType type{};
     switch (index_type) {
         case LANCE_SCALAR_BTREE: type = nano_lance::ScalarIndexType::BTree; break;
         case LANCE_SCALAR_BITMAP: type = nano_lance::ScalarIndexType::Bitmap; break;
         case LANCE_SCALAR_LABEL_LIST: type = nano_lance::ScalarIndexType::LabelList; break;
-        default: NL_UNSUPPORTED_INT("this scalar index type");
+        default:
+            invalid("unknown scalar index type " + std::to_string(static_cast<int>(index_type)));
+            return -1;
     }
     if (params_json != nullptr && params_json[0] != '\0' && std::string(params_json) != "{}") {
         NL_UNSUPPORTED_INT("scalar index parameters");
@@ -2088,75 +3363,558 @@ int32_t lance_dataset_create_scalar_index(LanceDataset* dataset, const char* col
         return nano_lance::dataset_create_scalar_index(dataset->path, column, type, options, v, e);
     });
 }
-LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar(const LanceDataset*, const char*, const char*,
-                                                                 int32_t, const char*,
-                                                                 const LanceIndexSegmentBuildOptions*) {
-    not_supported("indexes");
-    return nullptr;
+LanceIndexSegmentBuilder* lance_index_segment_builder_new_scalar(const LanceDataset* dataset, const char* column,
+                                                                 const char* index_name, int32_t index_type,
+                                                                 const char* params_json,
+                                                                 const LanceIndexSegmentBuildOptions* options) {
+    return guarded<LanceIndexSegmentBuilder*>(nullptr, [&]() -> LanceIndexSegmentBuilder* {
+        if (dataset == nullptr || column == nullptr) {
+            invalid("dataset and column must not be NULL");
+            return nullptr;
+        }
+        if (column[0] == '\0') {
+            invalid("column must not be NULL or empty");
+            return nullptr;
+        }
+        if (index_type < LANCE_SCALAR_BTREE || index_type > LANCE_SCALAR_INVERTED) {
+            invalid("invalid LanceScalarIndexType " + std::to_string(index_type) +
+                    "; expected 1 (BTREE), 2 (BITMAP), 3 (LABEL_LIST), or 4 (INVERTED)");
+            return nullptr;
+        }
+        auto b = std::make_unique<LanceIndexSegmentBuilder>();
+        b->scalar_type = index_type;
+        if (index_type == LANCE_SCALAR_INVERTED) {
+            std::string error;
+            if (params_json != nullptr && params_json[0] != '\0' &&
+                !nano_lance::fts::parse_params(params_json, b->inverted.params, error)) {
+                set_error(error.find("not supported") != std::string::npos ? LANCE_ERR_NOT_SUPPORTED
+                                                                           : LANCE_ERR_INVALID_ARGUMENT,
+                          error);
+                return nullptr;
+            }
+        } else if (params_json != nullptr && params_json[0] != '\0' && std::string(params_json) != "{}") {
+            not_supported("scalar index parameters");
+            return nullptr;
+        }
+        if (!segments::start_builder(*b, *dataset, column, index_name, options, true)) {
+            return nullptr;
+        }
+        clear_error();
+        return b.release();
+    });
 }
-LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector(const LanceDataset*, const char*, const char*,
-                                                                 const LanceVectorIndexSegmentParams*,
-                                                                 const LanceIndexSegmentBuildOptions*) {
-    not_supported("indexes");
-    return nullptr;
+
+LanceIndexSegmentBuilder* lance_index_segment_builder_new_vector(const LanceDataset* dataset, const char* column,
+                                                                 const char* index_name,
+                                                                 const LanceVectorIndexSegmentParams* params,
+                                                                 const LanceIndexSegmentBuildOptions* options) {
+    return guarded<LanceIndexSegmentBuilder*>(nullptr, [&]() -> LanceIndexSegmentBuilder* {
+        if (dataset == nullptr || column == nullptr || params == nullptr) {
+            invalid("dataset, column, and params must not be NULL");
+            return nullptr;
+        }
+        if (column[0] == '\0') {
+            invalid("column must not be NULL or empty");
+            return nullptr;
+        }
+        auto b = std::make_unique<LanceIndexSegmentBuilder>();
+        b->is_vector = true;
+        if (!segments::vector_options(*params, b->vector) ||
+            !segments::start_builder(*b, *dataset, column, index_name, options, false)) {
+            return nullptr;
+        }
+        std::size_t dim = 0;
+        if (!segments::vector_dim(b->manifest, column, dim)) {
+            return nullptr;
+        }
+        const bool pq = params->index_type == LANCE_INDEX_IVF_PQ;
+        std::optional<segments::Model> centroids;
+        std::optional<segments::Model> codebook;
+        if (options != nullptr && options->ivf_centroids != nullptr) {
+            centroids.emplace();
+            if (!segments::borrow_model(options->ivf_centroids, options->ivf_centroids_schema, "ivf_centroids",
+                                        *centroids)) {
+                return nullptr;
+            }
+            const auto& p = centroids->provenance;
+            if (p.kind != "ivf" || p.metric != params->metric || p.dimension != dim) {
+                invalid("ivf_centroids provenance must be kind=ivf, metric=" + std::to_string(params->metric) +
+                        ", dimension=" + std::to_string(dim) + "; got kind=" + p.kind +
+                        ", metric=" + std::to_string(p.metric) + ", dimension=" + std::to_string(p.dimension));
+                return nullptr;
+            }
+        }
+        if (options != nullptr && options->pq_codebook != nullptr) {
+            codebook.emplace();
+            if (!segments::borrow_model(options->pq_codebook, options->pq_codebook_schema, "pq_codebook", *codebook)) {
+                return nullptr;
+            }
+            const auto bits = params->num_bits == 0U ? 8U : params->num_bits;
+            const auto& p = codebook->provenance;
+            if (p.kind != "pq" || p.metric != params->metric || p.dimension != dim ||
+                p.num_sub_vectors != std::optional<uint32_t>(params->num_sub_vectors) ||
+                p.num_bits != std::optional<uint32_t>(bits)) {
+                invalid("pq_codebook provenance does not match metric " + std::to_string(params->metric) +
+                        ", dimension " + std::to_string(dim) + ", num_sub_vectors " +
+                        std::to_string(params->num_sub_vectors) + ", num_bits " + std::to_string(bits));
+                return nullptr;
+            }
+            if (!centroids || centroids->provenance.ivf_id != p.ivf_id) {
+                invalid("pq_codebook was not trained with the supplied ivf_centroids");
+                return nullptr;
+            }
+        }
+        if (centroids) {
+            if (centroids->list_size != dim) {
+                invalid("ivf_centroids must have type FixedSizeList<Float32>[" + std::to_string(dim) + "], got list size " +
+                        std::to_string(centroids->list_size));
+                return nullptr;
+            }
+            if (centroids->rows != params->num_partitions) {
+                invalid("ivf_centroids length " + std::to_string(centroids->rows) + " does not match num_partitions " +
+                        std::to_string(params->num_partitions));
+                return nullptr;
+            }
+        }
+        if (!pq && codebook) {
+            invalid("pq_codebook is not valid for vector index type " + b->vector.type);
+            return nullptr;
+        }
+        if (pq && centroids.has_value() != codebook.has_value()) {
+            invalid("precomputed PQ segment builds require both ivf_centroids and pq_codebook");
+            return nullptr;
+        }
+        const bool has_models = centroids || codebook;
+        if (b->mode == LANCE_INDEX_SEGMENT_BUILD_LOCAL_TRAIN && has_models) {
+            invalid("mode LOCAL_TRAIN does not accept precomputed model arrays");
+            return nullptr;
+        }
+        if (b->mode == LANCE_INDEX_SEGMENT_BUILD_PRECOMPUTED && !has_models) {
+            invalid("mode PRECOMPUTED requires precomputed model arrays");
+            return nullptr;
+        }
+        if (codebook) {
+            const std::size_t m = params->num_sub_vectors;
+            if (m == 0U || dim % m != 0U) {
+                invalid("dimension " + std::to_string(dim) + " must be divisible by num_sub_vectors " + std::to_string(m));
+                return nullptr;
+            }
+            const std::size_t rows = m << b->vector.num_bits;
+            if (codebook->rows != rows || codebook->list_size != dim / m) {
+                invalid("pq_codebook must be FixedSizeList<Float32> with length " + std::to_string(rows) +
+                        " and list_size " + std::to_string(dim / m) + ", got length " +
+                        std::to_string(codebook->rows) + ", list size " + std::to_string(codebook->list_size));
+                return nullptr;
+            }
+            if (params->metric == LANCE_METRIC_DOT && b->fragments &&
+                b->fragments->size() != b->manifest.fragments.size()) {
+                invalid("pq_codebook is supplied for metric=DOT and an effective strict fragment subset (" +
+                        std::to_string(b->fragments->size()) + " of " +
+                        std::to_string(b->manifest.fragments.size()) +
+                        " fragments): cover the full dataset in one segment (pass NULL fragment_ids or list every "
+                        "fragment)");
+                return nullptr;
+            }
+        }
+        if (centroids) {
+            auto& model = b->model.emplace();
+            model.type = b->vector.type;
+            model.metric = b->vector.metric;
+            model.dim = dim;
+            model.partitions = centroids->rows;
+            model.centroids = std::move(centroids->values);
+            model.nbits = b->vector.num_bits;
+            model.m = pq ? params->num_sub_vectors : 0U;
+            model.has_codebook = codebook.has_value();
+            if (codebook) {
+                model.codebook = std::move(codebook->values);
+            }
+            model.has_sq = false;
+            model.hnsw_m = b->vector.hnsw_m;
+            model.hnsw_ef_construction = b->vector.hnsw_ef_construction;
+            model.hnsw_max_level = b->vector.hnsw_max_level;
+        }
+        clear_error();
+        return b.release();
+    });
 }
-int32_t lance_index_train_ivf_model(const LanceDataset*, const char*, uint32_t, int32_t, const uint32_t*, size_t,
-                                    struct ArrowArray*, struct ArrowSchema*) {
-    NL_UNSUPPORTED_INT("indexes");
+
+int32_t lance_index_train_ivf_model(const LanceDataset* dataset, const char* column, uint32_t num_partitions,
+                                    int32_t metric, const uint32_t* fragment_ids, size_t fragment_count,
+                                    struct ArrowArray* out_array, struct ArrowSchema* out_schema) {
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        if (num_partitions == 0U) {
+            invalid("num_partitions must be > 0, got 0");
+            return -1;
+        }
+        segments::Trainer t;
+        if (!segments::start_trainer(t, dataset, column, metric, fragment_ids, fragment_count, out_array,
+                                     out_schema)) {
+            return -1;
+        }
+        nano_lance::VectorIndexOptions o;
+        o.type = "IVF_FLAT";
+        o.metric = t.metric;
+        o.num_partitions = num_partitions;
+        nano_lance::index_build::VectorModel trained;
+        if (!segments::train(t, o, nullptr, trained)) {
+            return -1;
+        }
+        std::map<std::string, std::string> meta = {{segments::kKind, "ivf"},
+                                                   {segments::kMetric, std::to_string(metric)},
+                                                   {segments::kDimension, std::to_string(t.dim)},
+                                                   {segments::kIvfId, segments::random_uuid_text()}};
+        if (!segments::export_model(trained.centroids, t.dim, meta, out_array, out_schema)) {
+            return -1;
+        }
+        clear_error();
+        return 0;
+    });
 }
-int32_t lance_index_train_pq_model(const LanceDataset*, const char*, uint32_t, uint32_t, int32_t, const uint32_t*,
-                                   size_t, struct ArrowArray*, const struct ArrowSchema*, struct ArrowArray*,
-                                   struct ArrowSchema*) {
-    NL_UNSUPPORTED_INT("indexes");
+
+int32_t lance_index_train_pq_model(const LanceDataset* dataset, const char* column, uint32_t num_sub_vectors,
+                                   uint32_t num_bits, int32_t metric, const uint32_t* fragment_ids,
+                                   size_t fragment_count, struct ArrowArray* ivf_centroids,
+                                   const struct ArrowSchema* ivf_centroids_schema, struct ArrowArray* out_array,
+                                   struct ArrowSchema* out_schema) {
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        if (num_sub_vectors == 0U) {
+            invalid("num_sub_vectors must be > 0, got 0");
+            return -1;
+        }
+        if (num_bits != 4U && num_bits != 8U) {
+            invalid("num_bits must be 4 or 8 for Lance PQ indexes, got " + std::to_string(num_bits));
+            return -1;
+        }
+        segments::Trainer t;
+        if (!segments::start_trainer(t, dataset, column, metric, fragment_ids, fragment_count, out_array,
+                                     out_schema)) {
+            return -1;
+        }
+        if (t.dim % num_sub_vectors != 0U) {
+            invalid("dimension " + std::to_string(t.dim) + " must be divisible by num_sub_vectors " +
+                    std::to_string(num_sub_vectors));
+            return -1;
+        }
+        segments::Model centroids;
+        if (!segments::borrow_model(ivf_centroids, ivf_centroids_schema, "ivf_centroids", centroids)) {
+            return -1;
+        }
+        const auto& p = centroids.provenance;
+        if (p.kind != "ivf" || p.metric != metric || p.dimension != t.dim) {
+            invalid("ivf_centroids provenance must be kind=ivf, metric=" + std::to_string(metric) +
+                    ", dimension=" + std::to_string(t.dim) + "; got kind=" + p.kind + ", metric=" +
+                    std::to_string(p.metric) + ", dimension=" + std::to_string(p.dimension));
+            return -1;
+        }
+        if (centroids.rows == 0U || centroids.list_size != t.dim) {
+            invalid("ivf_centroids must be a non-empty FixedSizeList<Float32> with list_size " +
+                    std::to_string(t.dim));
+            return -1;
+        }
+        nano_lance::VectorIndexOptions o;
+        o.type = "IVF_PQ";
+        o.metric = t.metric;
+        o.num_partitions = static_cast<uint32_t>(centroids.rows);
+        o.num_sub_vectors = num_sub_vectors;
+        o.num_bits = num_bits;
+        nano_lance::index_build::VectorModel model;
+        model.type = "IVF_PQ";
+        model.metric = t.metric;
+        model.dim = t.dim;
+        model.partitions = centroids.rows;
+        model.centroids = std::move(centroids.values);
+        model.nbits = num_bits;
+        model.m = num_sub_vectors;
+        model.has_codebook = false;
+        model.has_sq = false;
+        nano_lance::index_build::VectorModel trained;
+        if (!segments::train(t, o, &model, trained)) {
+            return -1;
+        }
+        std::map<std::string, std::string> meta = {{segments::kKind, "pq"},
+                                                   {segments::kMetric, std::to_string(metric)},
+                                                   {segments::kDimension, std::to_string(t.dim)},
+                                                   {segments::kIvfId, p.ivf_id},
+                                                   {segments::kSubVectors, std::to_string(num_sub_vectors)},
+                                                   {segments::kBits, std::to_string(num_bits)}};
+        if (!segments::export_model(trained.codebook, t.dim / num_sub_vectors, meta, out_array, out_schema)) {
+            return -1;
+        }
+        clear_error();
+        return 0;
+    });
 }
-int32_t lance_index_segment_builder_execute_uncommitted(LanceIndexSegmentBuilder*, uint8_t**, size_t*) {
-    NL_UNSUPPORTED_INT("indexes");
+
+int32_t lance_index_segment_builder_execute_uncommitted(LanceIndexSegmentBuilder* builder, uint8_t** out_bytes,
+                                                        size_t* out_len) {
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        if (builder == nullptr) {
+            invalid("builder must not be NULL");
+            return -1;
+        }
+        if (builder->executed) {
+            invalid("index segment builder is single-use and has already been executed");
+            return -1;
+        }
+        builder->executed = true;
+        if (out_bytes == nullptr || out_len == nullptr) {
+            invalid("out_bytes and out_len must not be NULL");
+            return -1;
+        }
+        std::vector<uint8_t> bytes;
+        if (!segments::execute(*builder, bytes)) {
+            return -1;
+        }
+        auto* buffer = static_cast<uint8_t*>(std::malloc(bytes.size()));
+        if (buffer == nullptr) {
+            set_error(LANCE_ERR_INTERNAL, "failed to allocate " + std::to_string(bytes.size()) + " metadata bytes");
+            return -1;
+        }
+        std::memcpy(buffer, bytes.data(), bytes.size());
+        *out_bytes = buffer;
+        *out_len = bytes.size();
+        clear_error();
+        return 0;
+    });
 }
-int32_t lance_index_segment_builder_set_progress_callback(LanceIndexSegmentBuilder*,
-                                                          LanceIndexBuildProgressCallback, void*) {
-    NL_UNSUPPORTED_INT("indexes");
+
+int32_t lance_index_segment_builder_set_progress_callback(LanceIndexSegmentBuilder* builder,
+                                                          LanceIndexBuildProgressCallback callback,
+                                                          void* callback_ctx) {
+    if (builder == nullptr) {
+        invalid("builder must not be NULL");
+        return -1;
+    }
+    if (callback == nullptr) {
+        invalid("progress callback must not be NULL");
+        return -1;
+    }
+    if (builder->executed) {
+        invalid("progress callback must be set before the builder is executed");
+        return -1;
+    }
+    builder->callback = callback;
+    builder->callback_ctx = callback_ctx;
+    clear_error();
+    return 0;
 }
+
 void lance_index_segment_builder_free(LanceIndexSegmentBuilder* builder) { delete builder; }
-int32_t lance_index_segment_metadata_parse(const uint8_t*, size_t, LanceIndexSegmentMetadata**) {
-    NL_UNSUPPORTED_INT("indexes");
+
+int32_t lance_index_segment_metadata_parse(const uint8_t* bytes, size_t len, LanceIndexSegmentMetadata** out_metadata) {
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        if (bytes == nullptr || len == 0U || out_metadata == nullptr) {
+            invalid("bytes must be non-NULL, len must be > 0, and out_metadata must be non-NULL");
+            return -1;
+        }
+        auto md = std::make_unique<LanceIndexSegmentMetadata>();
+        std::string error;
+        if (!segments::decode_metadata(bytes, len, md->index, error)) {
+            invalid(error);
+            return -1;
+        }
+        if (md->index.name.find('\0') != std::string::npos) {
+            invalid("index metadata name contains an embedded NUL byte");
+            return -1;
+        }
+        md->fragment_ids = md->index.fragment_ids;
+        *out_metadata = md.release();
+        clear_error();
+        return 0;
+    });
 }
-int32_t lance_index_segment_metadata_uuid(const LanceIndexSegmentMetadata*, uint8_t*) {
-    NL_UNSUPPORTED_INT("indexes");
-}
-const char* lance_index_segment_metadata_name(const LanceIndexSegmentMetadata*) {
-    not_supported("indexes");
-    return nullptr;
-}
-uint64_t lance_index_segment_metadata_dataset_version(const LanceIndexSegmentMetadata*) {
-    not_supported("indexes");
+
+int32_t lance_index_segment_metadata_uuid(const LanceIndexSegmentMetadata* metadata, uint8_t* out_uuid) {
+    if (metadata == nullptr || out_uuid == nullptr) {
+        invalid("metadata and out_uuid must not be NULL");
+        return -1;
+    }
+    std::memcpy(out_uuid, metadata->index.uuid.data(), 16);
+    clear_error();
     return 0;
 }
-int32_t lance_index_segment_metadata_index_version(const LanceIndexSegmentMetadata*) {
-    NL_UNSUPPORTED_INT("indexes");
+
+const char* lance_index_segment_metadata_name(const LanceIndexSegmentMetadata* metadata) {
+    if (metadata == nullptr) {
+        invalid("metadata is NULL");
+        return nullptr;
+    }
+    clear_error();
+    return metadata->index.name.c_str();
 }
-int32_t lance_index_segment_metadata_index_type(const LanceIndexSegmentMetadata*) { NL_UNSUPPORTED_INT("indexes"); }
-const char* lance_index_segment_metadata_index_details_type_url(const LanceIndexSegmentMetadata*) {
-    not_supported("indexes");
-    return nullptr;
+
+uint64_t lance_index_segment_metadata_dataset_version(const LanceIndexSegmentMetadata* metadata) {
+    if (metadata == nullptr) {
+        invalid("metadata is NULL");
+        return 0;
+    }
+    clear_error();
+    return metadata->index.dataset_version;
 }
-size_t lance_index_segment_metadata_field_count(const LanceIndexSegmentMetadata*) {
-    not_supported("indexes");
+
+int32_t lance_index_segment_metadata_index_version(const LanceIndexSegmentMetadata* metadata) {
+    if (metadata == nullptr) {
+        invalid("metadata is NULL");
+        return -1;
+    }
+    clear_error();
+    return static_cast<int32_t>(metadata->index.index_version);
+}
+
+int32_t lance_index_segment_metadata_index_type(const LanceIndexSegmentMetadata* metadata) {
+    if (metadata == nullptr) {
+        invalid("metadata must not be NULL");
+        return -1;
+    }
+    const auto& url = metadata->index.details_type_url;
+    if (url.empty()) {
+        invalid("index metadata does not contain index_details");
+        return -1;
+    }
+    const int32_t type = segments::index_type_code(metadata->index);
+    if (type < 0) {
+        set_error(LANCE_ERR_NOT_SUPPORTED,
+                  type == -2 ? "Rabit-quantized vector metadata has no LanceVectorIndexType value"
+                             : "unsupported index_details type_url '" + url + "'");
+        return -1;
+    }
+    clear_error();
+    return type;
+}
+
+const char* lance_index_segment_metadata_index_details_type_url(const LanceIndexSegmentMetadata* metadata) {
+    if (metadata == nullptr) {
+        invalid("metadata is NULL");
+        return nullptr;
+    }
+    if (metadata->index.details_type_url.empty()) {
+        set_error(LANCE_ERR_NOT_FOUND, "index metadata does not contain index_details");
+        return nullptr;
+    }
+    clear_error();
+    return metadata->index.details_type_url.c_str();
+}
+
+size_t lance_index_segment_metadata_field_count(const LanceIndexSegmentMetadata* metadata) {
+    if (metadata == nullptr) {
+        invalid("metadata is NULL");
+        return 0;
+    }
+    clear_error();
+    return metadata->index.fields.size();
+}
+
+int32_t lance_index_segment_metadata_field_ids(const LanceIndexSegmentMetadata* metadata, int32_t* out_field_ids,
+                                               size_t capacity, size_t* out_count) {
+    if (metadata == nullptr || out_count == nullptr) {
+        invalid("metadata and out_count must not be NULL");
+        return -1;
+    }
+    const auto& ids = metadata->index.fields;
+    if (capacity < ids.size()) {
+        invalid("capacity " + std::to_string(capacity) + " is smaller than field_count " + std::to_string(ids.size()));
+        return -1;
+    }
+    if (!ids.empty() && out_field_ids == nullptr) {
+        invalid("out_field_ids is NULL but field_count is " + std::to_string(ids.size()));
+        return -1;
+    }
+    std::copy(ids.begin(), ids.end(), out_field_ids);
+    *out_count = ids.size();
+    clear_error();
     return 0;
 }
-int32_t lance_index_segment_metadata_field_ids(const LanceIndexSegmentMetadata*, int32_t*, size_t, size_t*) {
-    NL_UNSUPPORTED_INT("indexes");
+
+size_t lance_index_segment_metadata_fragment_count(const LanceIndexSegmentMetadata* metadata) {
+    if (metadata == nullptr) {
+        invalid("metadata is NULL");
+        return 0;
+    }
+    clear_error();
+    return metadata->fragment_ids.size();
 }
-size_t lance_index_segment_metadata_fragment_count(const LanceIndexSegmentMetadata*) {
-    not_supported("indexes");
+
+int32_t lance_index_segment_metadata_fragment_ids(const LanceIndexSegmentMetadata* metadata,
+                                                  uint32_t* out_fragment_ids, size_t capacity, size_t* out_count) {
+    if (metadata == nullptr || out_count == nullptr) {
+        invalid("metadata and out_count must not be NULL");
+        return -1;
+    }
+    const auto& ids = metadata->fragment_ids;
+    if (capacity < ids.size()) {
+        invalid("capacity " + std::to_string(capacity) + " is smaller than fragment_count " +
+                std::to_string(ids.size()));
+        return -1;
+    }
+    if (!ids.empty() && out_fragment_ids == nullptr) {
+        invalid("out_fragment_ids is NULL but fragment_count is " + std::to_string(ids.size()));
+        return -1;
+    }
+    std::copy(ids.begin(), ids.end(), out_fragment_ids);
+    *out_count = ids.size();
+    clear_error();
     return 0;
 }
-int32_t lance_index_segment_metadata_fragment_ids(const LanceIndexSegmentMetadata*, uint32_t*, size_t, size_t*) {
-    NL_UNSUPPORTED_INT("indexes");
-}
+
 void lance_index_segment_metadata_free(LanceIndexSegmentMetadata* metadata) { delete metadata; }
-int32_t lance_dataset_commit_index_segments(LanceDataset*, const char*, const char*, const uint8_t* const*,
-                                            const size_t*, size_t) {
-    NL_UNSUPPORTED_INT("indexes");
+
+int32_t lance_dataset_commit_index_segments(LanceDataset* dataset, const char* index_name, const char* column,
+                                            const uint8_t* const* segment_metadata_bytes,
+                                            const size_t* segment_metadata_lens, size_t segment_count) {
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        if (dataset == nullptr || index_name == nullptr || column == nullptr) {
+            invalid("dataset, index_name, and column must not be NULL");
+            return -1;
+        }
+        if (index_name[0] == '\0') {
+            invalid("index_name must not be NULL or empty");
+            return -1;
+        }
+        if (column[0] == '\0') {
+            invalid("column must not be NULL or empty");
+            return -1;
+        }
+        if (segment_count == 0U) {
+            invalid("segment_count must be > 0; at least one index segment is required to commit an index");
+            return -1;
+        }
+        if (segment_metadata_bytes == nullptr || segment_metadata_lens == nullptr) {
+            invalid("segment_metadata_bytes and segment_metadata_lens must not be NULL when segment_count is " +
+                    std::to_string(segment_count));
+            return -1;
+        }
+        std::vector<std::vector<uint8_t>> segment_set;
+        for (size_t i = 0; i < segment_count; ++i) {
+            const uint8_t* bytes = segment_metadata_bytes[i];
+            const size_t len = segment_metadata_lens[i];
+            if (bytes == nullptr || len == 0U) {
+                invalid("segment_metadata_bytes[" + std::to_string(i) + "] must be non-NULL and segment_metadata_lens[" +
+                        std::to_string(i) + "] must be > 0");
+                return -1;
+            }
+            nano_lance::pb::IndexMetadata check;
+            std::string error;
+            if (!segments::decode_metadata(bytes, len, check, error)) {
+                invalid("segment_metadata_bytes[" + std::to_string(i) + "]: " + error);
+                return -1;
+            }
+            segment_set.emplace_back(bytes, bytes + len);
+        }
+        uint64_t version = 0;
+        std::string error;
+        nano_lance::SegmentErrorKind kind{};
+        if (!nano_lance::dataset_commit_index_segments(dataset->path, index_name, column, segment_set, version, error,
+                                                       kind)) {
+            set_error(segments::code_of(kind, error), error);
+            return -1;
+        }
+        if (!refresh(dataset, version)) {
+            return -1;
+        }
+        clear_error();
+        return 0;
+    });
 }
 int32_t lance_dataset_drop_index(LanceDataset* dataset, const char* name) {
     if (dataset == nullptr || name == nullptr) {
@@ -2236,62 +3994,319 @@ const char* lance_dataset_index_list_json(const LanceDataset* dataset) {
     clear_error();
     return out;
 }
-uint64_t lance_dataset_index_segment_count(const LanceDataset*, const char*) {
-    not_supported("indexes");
-    return 0;
+uint64_t lance_dataset_index_segment_count(const LanceDataset* dataset, const char* index_name) {
+    return guarded<uint64_t>(0, [&]() -> uint64_t {
+        std::vector<std::array<uint8_t, 16>> uuids;
+        if (!segments::list(dataset, index_name, uuids)) {
+            return 0;
+        }
+        clear_error();
+        return uuids.size();
+    });
 }
-int32_t lance_dataset_index_segments(const LanceDataset*, const char*, uint8_t*, size_t, uint64_t*) {
-    NL_UNSUPPORTED_INT("indexes");
+int32_t lance_dataset_index_segments(const LanceDataset* dataset, const char* index_name, uint8_t* out_uuids,
+                                     size_t capacity, uint64_t* out_count) {
+    return guarded<int32_t>(-1, [&]() -> int32_t {
+        if (dataset == nullptr || index_name == nullptr || out_uuids == nullptr) {
+            invalid("dataset, index_name, and out_uuids must not be NULL");
+            return -1;
+        }
+        std::vector<std::array<uint8_t, 16>> uuids;
+        if (!segments::list(dataset, index_name, uuids)) {
+            return -1;
+        }
+        if (uuids.size() > capacity) {
+            invalid("out_uuids capacity (" + std::to_string(capacity) + ") too small for " +
+                    std::to_string(uuids.size()) + " segments");
+            return -1;
+        }
+        for (size_t i = 0; i < uuids.size(); ++i) {
+            std::memcpy(out_uuids + i * 16U, uuids[i].data(), 16);
+        }
+        if (out_count != nullptr) {
+            *out_count = uuids.size();
+        }
+        clear_error();
+        return 0;
+    });
 }
 
-int32_t lance_scanner_nearest(LanceScanner*, const char*, const void*, size_t, LanceDataType, uint32_t) {
-    NL_UNSUPPORTED_INT("vector search");
+int32_t lance_scanner_nearest(LanceScanner* scanner, const char* column, const void* query_data, size_t query_len,
+                              LanceDataType element_type, uint32_t k) {
+    return before_scan(scanner, [&] {
+        if (column == nullptr || column[0] == '\0' || query_data == nullptr || query_len == 0U) {
+            return invalid("column and query_data must not be NULL or empty");
+        }
+        if (k == 0U) {
+            return invalid("k must be greater than 0");
+        }
+        if (scanner->search.fts || scanner->search.fts_context != nullptr) {
+            return invalid("cannot call nearest after full_text_search; they are mutually exclusive");
+        }
+        std::vector<float> key(query_len);
+        switch (element_type) {
+        case LANCE_DTYPE_FLOAT32:
+            std::memcpy(key.data(), query_data, query_len * sizeof(float));
+            break;
+        case LANCE_DTYPE_FLOAT64:
+            for (size_t i = 0; i < query_len; ++i) {
+                key[i] = static_cast<float>(static_cast<const double*>(query_data)[i]);
+            }
+            break;
+        case LANCE_DTYPE_FLOAT16:
+            for (size_t i = 0; i < query_len; ++i) {
+                key[i] = half_to_float(static_cast<const uint16_t*>(query_data)[i]);
+            }
+            break;
+        case LANCE_DTYPE_UINT8:
+            for (size_t i = 0; i < query_len; ++i) {
+                key[i] = static_cast<float>(static_cast<const uint8_t*>(query_data)[i]);
+            }
+            break;
+        case LANCE_DTYPE_INT8:
+            for (size_t i = 0; i < query_len; ++i) {
+                key[i] = static_cast<float>(static_cast<const int8_t*>(query_data)[i]);
+            }
+            break;
+        default:
+            return invalid("unknown element_type " + std::to_string(static_cast<int>(element_type)));
+        }
+        scanner->search.nearest = true;
+        scanner->search.column = column;
+        scanner->search.key = std::move(key);
+        scanner->search.k = k;
+        return true;
+    });
 }
-int32_t lance_scanner_nearest_multivector(LanceScanner*, const char*, const void*, size_t, size_t, LanceDataType,
-                                          uint32_t) {
-    NL_UNSUPPORTED_INT("vector search");
+int32_t lance_scanner_nearest_multivector(LanceScanner* scanner, const char*, const void*, size_t, size_t,
+                                          LanceDataType, uint32_t) {
+    return before_scan(scanner, [] {
+        not_supported("multi-vector search");
+        return false;
+    });
 }
-int32_t lance_scanner_set_nprobes(LanceScanner*, uint32_t) { NL_UNSUPPORTED_INT("vector search"); }
-int32_t lance_scanner_set_minimum_nprobes(LanceScanner*, uint32_t) { NL_UNSUPPORTED_INT("vector search"); }
-int32_t lance_scanner_set_maximum_nprobes(LanceScanner*, uint32_t) { NL_UNSUPPORTED_INT("vector search"); }
-int32_t lance_scanner_set_approx_mode(LanceScanner*, LanceApproxMode) { NL_UNSUPPORTED_INT("vector search"); }
-int32_t lance_scanner_set_query_parallelism(LanceScanner*, int32_t) { NL_UNSUPPORTED_INT("vector search"); }
-int32_t lance_scanner_set_refine_factor(LanceScanner*, uint32_t) { NL_UNSUPPORTED_INT("vector search"); }
-int32_t lance_scanner_set_ef(LanceScanner*, uint32_t) { NL_UNSUPPORTED_INT("vector search"); }
-int32_t lance_scanner_set_metric(LanceScanner*, LanceMetricType) { NL_UNSUPPORTED_INT("vector search"); }
-int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool) {
-    return before_scan(scanner, [] { return true; });
+int32_t lance_scanner_set_nprobes(LanceScanner* scanner, uint32_t nprobes) {
+    return before_scan(scanner, [&] {
+        if (nprobes == 0U) {
+            return invalid("nprobes must be greater than 0, got 0");
+        }
+        scanner->search.minimum_nprobes = nprobes;
+        scanner->search.maximum_nprobes = nprobes;
+        return true;
+    });
 }
-int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool) {
-    return before_scan(scanner, [] { return true; });
+int32_t lance_scanner_set_minimum_nprobes(LanceScanner* scanner, uint32_t minimum_nprobes) {
+    return before_scan(scanner, [&] {
+        if (minimum_nprobes == 0U) {
+            return invalid("minimum_nprobes must be greater than 0, got 0");
+        }
+        if (scanner->search.maximum_nprobes && minimum_nprobes > *scanner->search.maximum_nprobes) {
+            return invalid("minimum_nprobes (" + std::to_string(minimum_nprobes) + ") must not exceed maximum_nprobes (" +
+                           std::to_string(*scanner->search.maximum_nprobes) + ")");
+        }
+        scanner->search.minimum_nprobes = minimum_nprobes;
+        return true;
+    });
 }
-int32_t lance_scanner_set_index_segments(LanceScanner*, const uint8_t*, size_t) { NL_UNSUPPORTED_INT("indexes"); }
-int32_t lance_scanner_set_scalar_index_segment(LanceScanner*, const uint8_t*) { NL_UNSUPPORTED_INT("indexes"); }
+int32_t lance_scanner_set_maximum_nprobes(LanceScanner* scanner, uint32_t maximum_nprobes) {
+    return before_scan(scanner, [&] {
+        if (maximum_nprobes == 0U) {
+            return invalid("maximum_nprobes must be greater than 0, got 0");
+        }
+        if (scanner->search.minimum_nprobes && maximum_nprobes < *scanner->search.minimum_nprobes) {
+            return invalid("maximum_nprobes (" + std::to_string(maximum_nprobes) +
+                           ") must not be less than minimum_nprobes (" +
+                           std::to_string(*scanner->search.minimum_nprobes) + ")");
+        }
+        scanner->search.maximum_nprobes = maximum_nprobes;
+        return true;
+    });
+}
+// The approximation mode changes only binary-quantized searches in Lance; for the indexes nanolance
+// searches it changes nothing, as in Lance.
+int32_t lance_scanner_set_approx_mode(LanceScanner* scanner, LanceApproxMode approx_mode) {
+    return before_scan(scanner, [&] {
+        const auto mode = static_cast<int32_t>(approx_mode);
+        return (mode >= 0 && mode <= 2) ||
+               invalid("approx_mode must be 0 (FAST), 1 (NORMAL), or 2 (ACCURATE), got " + std::to_string(mode));
+    });
+}
+int32_t lance_scanner_set_query_parallelism(LanceScanner* scanner, int32_t query_parallelism) {
+    return before_scan(scanner, [&] {
+        if (query_parallelism < -1) {
+            return invalid("query_parallelism must be -1, 0, or greater than 0, got " +
+                           std::to_string(query_parallelism));
+        }
+        scanner->search.query_parallelism = query_parallelism;
+        return true;
+    });
+}
+int32_t lance_scanner_set_refine_factor(LanceScanner* scanner, uint32_t f) {
+    return before_scan(scanner, [&] {
+        scanner->search.refine_factor = f;
+        return true;
+    });
+}
+int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e) {
+    return before_scan(scanner, [&] {
+        scanner->search.ef = e;
+        return true;
+    });
+}
+int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric) {
+    return before_scan(scanner, [&] {
+        switch (metric) {
+        case LANCE_METRIC_L2: scanner->search.metric = nano_lance::VectorMetric::L2; return true;
+        case LANCE_METRIC_COSINE: scanner->search.metric = nano_lance::VectorMetric::Cosine; return true;
+        case LANCE_METRIC_DOT: scanner->search.metric = nano_lance::VectorMetric::Dot; return true;
+        case LANCE_METRIC_HAMMING: not_supported("the hamming metric"); return false;
+        }
+        return invalid("unknown metric " + std::to_string(static_cast<int>(metric)));
+    });
+}
+int32_t lance_scanner_set_use_index(LanceScanner* scanner, bool enable) {
+    return before_scan(scanner, [&] {
+        scanner->search.use_index = enable;
+        return true;
+    });
+}
+int32_t lance_scanner_set_prefilter(LanceScanner* scanner, bool enable) {
+    return before_scan(scanner, [&] {
+        scanner->search.prefilter = enable;
+        return true;
+    });
+}
+int32_t lance_scanner_set_index_segments(LanceScanner* scanner, const uint8_t* segment_uuids, size_t len) {
+    return before_scan(scanner, [&] {
+        if (segment_uuids == nullptr && len > 0U) {
+            return invalid("segment_uuids is NULL but len > 0");
+        }
+        scanner->search.index_segments.assign(len, {});
+        for (size_t i = 0; i < len; ++i) {
+            std::memcpy(scanner->search.index_segments[i].data(), segment_uuids + i * 16U, 16);
+        }
+        return true;
+    });
+}
+int32_t lance_scanner_set_scalar_index_segment(LanceScanner* scanner, const uint8_t* segment_uuid) {
+    return before_scan(scanner, [&] {
+        if (segment_uuid == nullptr) {
+            scanner->search.scalar_segment.reset();
+            return true;
+        }
+        std::array<uint8_t, 16> uuid{};
+        std::memcpy(uuid.data(), segment_uuid, 16);
+        scanner->search.scalar_segment = uuid;
+        return true;
+    });
+}
 
-LanceFtsQueryContext* lance_dataset_prepare_fts_query(const LanceDataset*, const char*, const char*, uint32_t,
-                                                      int32_t) {
-    not_supported("full-text search");
-    return nullptr;
+LanceFtsQueryContext* lance_dataset_prepare_fts_query(const LanceDataset* dataset, const char* column,
+                                                      const char* query, uint32_t max_fuzzy_distance,
+                                                      int32_t coverage_mode) {
+    return lance_dataset_prepare_fts_match_query(dataset, column, query, LANCE_FTS_MATCH_OPERATOR_OR,
+                                                 max_fuzzy_distance, coverage_mode);
 }
-LanceFtsQueryContext* lance_dataset_prepare_fts_match_query(const LanceDataset*, const char*, const char*, int32_t,
-                                                            uint32_t, int32_t) {
-    not_supported("full-text search");
-    return nullptr;
+LanceFtsQueryContext* lance_dataset_prepare_fts_match_query(const LanceDataset* dataset, const char* column,
+                                                            const char* query, int32_t match_operator,
+                                                            uint32_t max_fuzzy_distance, int32_t coverage_mode) {
+    return guarded<LanceFtsQueryContext*>(nullptr, [&]() -> LanceFtsQueryContext* {
+        if (match_operator != LANCE_FTS_MATCH_OPERATOR_OR && match_operator != LANCE_FTS_MATCH_OPERATOR_AND) {
+            invalid("invalid match_operator " + std::to_string(match_operator) + "; expected 0 (OR) or 1 (AND)");
+            return nullptr;
+        }
+        if (max_fuzzy_distance != 0U) {
+            invalid("max_fuzzy_distance must be 0: prepared fuzzy matching is not available");
+            return nullptr;
+        }
+        nano_lance::FtsQuery q;
+        q.kind = nano_lance::FtsQuery::Kind::Match;
+        q.and_operator = match_operator == LANCE_FTS_MATCH_OPERATOR_AND;
+        return prepare_fts(dataset, column, query, coverage_mode, std::move(q), false);
+    });
 }
-LanceFtsQueryContext* lance_dataset_prepare_fts_phrase_query(const LanceDataset*, const char*, const char*, int32_t,
-                                                             int32_t) {
-    not_supported("full-text search");
-    return nullptr;
+LanceFtsQueryContext* lance_dataset_prepare_fts_phrase_query(const LanceDataset* dataset, const char* column,
+                                                             const char* query, int32_t slop,
+                                                             int32_t coverage_mode) {
+    return guarded<LanceFtsQueryContext*>(nullptr, [&]() -> LanceFtsQueryContext* {
+        if (slop < 0) {
+            invalid("slop must not be negative, got " + std::to_string(slop));
+            return nullptr;
+        }
+        nano_lance::FtsQuery q;
+        q.kind = nano_lance::FtsQuery::Kind::Phrase;
+        q.slop = static_cast<uint32_t>(slop);
+        return prepare_fts(dataset, column, query, coverage_mode, std::move(q), true);
+    });
 }
 void lance_fts_query_context_close(LanceFtsQueryContext* context) { delete context; }
-int32_t lance_scanner_full_text_search(LanceScanner*, const char*, const char* const*, uint32_t) {
-    NL_UNSUPPORTED_INT("full-text search");
+int32_t lance_scanner_full_text_search(LanceScanner* scanner, const char* query, const char* const* columns,
+                                       uint32_t max_fuzzy_distance) {
+    return before_scan(scanner, [&] {
+        if (query == nullptr) {
+            return invalid("scanner and query must not be NULL");
+        }
+        if (scanner->search.nearest) {
+            return invalid("cannot call full_text_search after nearest; they are mutually exclusive");
+        }
+        if (scanner->search.fts_context != nullptr) {
+            return invalid(
+                "cannot call full_text_search after attaching an FTS query context; the context already owns the query");
+        }
+        if (max_fuzzy_distance > 0U) {
+            not_supported("fuzzy full-text matching (max_fuzzy_distance > 0)");
+            return false;
+        }
+        // A query string over the columns given, or every column with an INVERTED index: Lance's
+        // FullTextSearchQuery::new(query).with_columns(columns).
+        nano_lance::FtsQuery q;
+        q.kind = nano_lance::FtsQuery::Kind::MultiMatch;
+        q.text = query;
+        q.columns = column_list(columns);
+        scanner->search.fts = std::move(q);
+        return true;
+    });
 }
-int32_t lance_scanner_set_fts_query_context(LanceScanner*, const LanceFtsQueryContext*) {
-    NL_UNSUPPORTED_INT("full-text search");
+int32_t lance_scanner_set_fts_query_context(LanceScanner* scanner, const LanceFtsQueryContext* context) {
+    return before_scan(scanner, [&] {
+        if (context == nullptr || context->data == nullptr) {
+            return invalid("context must not be NULL");
+        }
+        if (scanner->search.nearest) {
+            return invalid("cannot attach an FTS query context after nearest; they are mutually exclusive");
+        }
+        if (scanner->search.fts) {
+            return invalid("cannot attach an FTS query context after full_text_search; the context owns the query");
+        }
+        if (context->data->origin != scanner->origin || context->data->version != scanner->version) {
+            return invalid(
+                "the FTS query context was prepared on a different dataset snapshot than the scanner's");
+        }
+        if (scanner->has_fragments) {
+            return invalid("fragment_ids cannot be combined with an FTS query context; split the query by FTS index "
+                           "segment UUID instead");
+        }
+        scanner->search.fts_context = context->data;
+        return true;
+    });
 }
-int32_t lance_scanner_set_fts_index_segments(LanceScanner*, const uint8_t*, size_t) {
-    NL_UNSUPPORTED_INT("full-text search");
+int32_t lance_scanner_set_fts_index_segments(LanceScanner* scanner, const uint8_t* segment_uuids, size_t len) {
+    return before_scan(scanner, [&] {
+        if (segment_uuids == nullptr && len > 0U) {
+            return invalid("segment_uuids is NULL but len is greater than 0");
+        }
+        std::vector<std::array<uint8_t, 16>> uuids(len);
+        for (size_t i = 0; i < len; ++i) {
+            std::memcpy(uuids[i].data(), segment_uuids + i * 16U, 16);
+        }
+        const std::set<std::array<uint8_t, 16>> unique(uuids.begin(), uuids.end());
+        if (unique.size() != uuids.size()) {
+            return invalid("segment_uuids contains duplicate UUIDs; len=" + std::to_string(uuids.size()) +
+                           ", unique=" + std::to_string(unique.size()));
+        }
+        scanner->search.fts_index_segments = std::move(uuids);  // empty: every segment of the context
+        return true;
+    });
 }
 
 }  // extern "C"

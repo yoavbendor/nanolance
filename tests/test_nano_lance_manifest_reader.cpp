@@ -66,7 +66,12 @@ int main() {
     require(meta.fields_len > 0, "fields");
     require(meta.fragments[0].physical_rows == 4, "fragment rows");
     require(meta.fragments[0].files_len == 1, "one data file");
-    require(std::string(meta.fragments[0].files[0].path).find("fragment-") == 0, "fragment file name");
+    // Lance's names: 24 binary digits, 26 hex digits, ".lance".
+    const std::string file_name = meta.fragments[0].files[0].path;
+    require(file_name.size() == 56 && file_name.substr(0, 24).find_first_not_of("01") == std::string::npos &&
+                file_name.substr(24, 26).find_first_not_of("0123456789abcdef") == std::string::npos &&
+                file_name.substr(50) == ".lance",
+            "fragment file name");
     nano_lance_dataset_metadata_free(&meta);
 
     const std::filesystem::path golden_dir(NANO_LANCE_BLOB_V2_GOLDEN_DIR);

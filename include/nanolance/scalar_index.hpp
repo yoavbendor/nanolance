@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -17,11 +18,19 @@
 ///               (bitmap_page_lookup.lance). For columns with few distinct values.
 ///   LABEL_LIST  a bitmap index over the elements of a list column, plus the rows whose list is null
 ///               (global buffer 1): array_has_any / array_has_all / array_contains.
+///   ZONEMAP     zonemap.lance: per zone of up to `rows_per_zone` rows of one fragment, its min, max,
+///               null count and NaN count, with the zone's fragment and row span; the null rows as a
+///               row-address bitmap (global buffer 1). Answers inexactly: the zones that may match.
+///   BLOOMFILTER bloomfilter.lance: per zone of `number_of_items` rows of one fragment, its span, whether
+///               it holds a null, and a split-block bloom filter of its values (nulls not hashed), of
+///               one size for the index. Answers inexactly, for =, IN and IS NULL.
+///   NGRAM       ngram_postings.lance: per distinct trigram of the lower-cased, ASCII-folded values, the rows
+///               holding it (a RoaringTreemap of row ids); token 0 holds the null rows. For contains(col, 'x').
 namespace nano_lance {
 
-enum class ScalarIndexType { BTree, Bitmap, LabelList };
+enum class ScalarIndexType { BTree, Bitmap, LabelList, ZoneMap, BloomFilter, NGram };
 
-/// "BTREE", "BITMAP", "LABEL_LIST" (any case) as a type; false for anything else.
+/// "BTREE", "BITMAP", "LABEL_LIST", "ZONEMAP", "BLOOMFILTER", "NGRAM" (any case) as a type; false for anything else.
 bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type);
 
 struct ScalarIndexOptions {
@@ -29,6 +38,15 @@ struct ScalarIndexOptions {
     std::string name;
     /// An index of the same name is replaced; without `replace`, that is an error.
     bool replace = true;
+    /// ZONEMAP: rows per zone (Lance's default, 8192, when 0).
+    std::uint64_t rows_per_zone = 0;
+    /// BLOOMFILTER: the values per zone the filter is sized for (Lance's default, 8192, when 0), and its
+    /// false-positive probability (Lance's default, 0.00057, when 0).
+    std::uint64_t number_of_items = 0;
+    double probability = 0.0;
+    /// A JSON index (Lance's JsonIndexDetails over a BTree): the path of the values to index, as the
+    /// caller wrote it ("", "$", "a.b" or "$.a.b"). Set only with ScalarIndexType::BTree, on a JSON column.
+    std::optional<std::string> json_path;
 };
 
 /// Index `column` (a top-level column or a `struct.child` path) of the latest version, committed as
@@ -53,6 +71,7 @@ struct IndexInfo {
     std::uint64_t dataset_version = 0;
     std::uint32_t index_version = 0;
     std::string type_url;              // the index details' type, e.g. "/lance.table.BTreeIndexDetails"
+    std::vector<std::uint8_t> details_value;  // the details' encoded message (type_url's type)
     std::vector<std::int32_t> field_ids;
     std::uint64_t created_at = 0;      // milliseconds since the epoch
     std::uint64_t size_bytes = 0;      // its files

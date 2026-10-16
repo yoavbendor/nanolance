@@ -1,12 +1,15 @@
 # lance-c 426a8589a6f632b3dc12e69583ccf961acbad652 tests that pass against nanolance (tools/lance_c_suite.py --update)
 c/nanolance::test_add_columns
 c/nanolance::test_alter_columns
+c/nanolance::test_commit_index_segments
 c/nanolance::test_compact_files
 c/nanolance::test_data_statistics
 c/nanolance::test_dataset_write_roundtrip
 c/nanolance::test_delete
 c/nanolance::test_drop_columns
 c/nanolance::test_error_handling
+c/nanolance::test_index_segment_builder
+c/nanolance::test_index_segment_builder_progress
 c/nanolance::test_merge_insert
 c/nanolance::test_open_and_metadata
 c/nanolance::test_restore_to_current
@@ -16,15 +19,19 @@ c/nanolance::test_scanner_blob_handling
 c/nanolance::test_shared_session
 c/nanolance::test_take_blobs
 c/nanolance::test_update
+c/nanolance::test_vector_models_and_reusable_segments
 c/nanolance::test_versions
 c/pylance::test_add_columns
 c/pylance::test_alter_columns
+c/pylance::test_commit_index_segments
 c/pylance::test_compact_files
 c/pylance::test_data_statistics
 c/pylance::test_dataset_write_roundtrip
 c/pylance::test_delete
 c/pylance::test_drop_columns
 c/pylance::test_error_handling
+c/pylance::test_index_segment_builder
+c/pylance::test_index_segment_builder_progress
 c/pylance::test_merge_insert
 c/pylance::test_open_and_metadata
 c/pylance::test_restore_to_current
@@ -34,9 +41,11 @@ c/pylance::test_scanner_blob_handling
 c/pylance::test_shared_session
 c/pylance::test_take_blobs
 c/pylance::test_update
+c/pylance::test_vector_models_and_reusable_segments
 c/pylance::test_versions
 cpp/nanolance::test_add_columns
 cpp/nanolance::test_alter_columns
+cpp/nanolance::test_commit_index_segments
 cpp/nanolance::test_compact_files
 cpp/nanolance::test_data_statistics
 cpp/nanolance::test_dataset_open
@@ -49,6 +58,8 @@ cpp/nanolance::test_drop_columns
 cpp/nanolance::test_error_exception
 cpp/nanolance::test_fts_smoke
 cpp/nanolance::test_index_lifecycle
+cpp/nanolance::test_index_segment_builder
+cpp/nanolance::test_index_segment_builder_progress
 cpp/nanolance::test_index_segments_smoke
 cpp/nanolance::test_merge_insert
 cpp/nanolance::test_multivector_rejects_flat_column
@@ -61,9 +72,11 @@ cpp/nanolance::test_scanner_fluent
 cpp/nanolance::test_shared_session
 cpp/nanolance::test_take_blobs
 cpp/nanolance::test_update
+cpp/nanolance::test_vector_models_and_reusable_segments
 cpp/nanolance::test_versions
 cpp/pylance::test_add_columns
 cpp/pylance::test_alter_columns
+cpp/pylance::test_commit_index_segments
 cpp/pylance::test_compact_files
 cpp/pylance::test_data_statistics
 cpp/pylance::test_dataset_open
@@ -76,6 +89,8 @@ cpp/pylance::test_drop_columns
 cpp/pylance::test_error_exception
 cpp/pylance::test_fts_smoke
 cpp/pylance::test_index_lifecycle
+cpp/pylance::test_index_segment_builder
+cpp/pylance::test_index_segment_builder_progress
 cpp/pylance::test_index_segments_smoke
 cpp/pylance::test_merge_insert
 cpp/pylance::test_multivector_rejects_flat_column
@@ -88,4 +103,5 @@ cpp/pylance::test_scanner_fluent
 cpp/pylance::test_shared_session
 cpp/pylance::test_take_blobs
 cpp/pylance::test_update
+cpp/pylance::test_vector_models_and_reusable_segments
 cpp/pylance::test_versions

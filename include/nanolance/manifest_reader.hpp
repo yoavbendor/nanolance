@@ -39,6 +39,9 @@ std::vector<std::uint64_t> list_manifest_versions(const std::filesystem::path& d
 bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint64_t version, pb::Manifest& out,
                            std::string& error);
 
+/// Load the manifest in one `_versions` file (any naming scheme, detached ones included).
+bool load_manifest_file(const std::filesystem::path& manifest_path, pb::Manifest& out, std::string& error);
+
 bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifest& out, std::uint64_t& version_out,
                           std::string& error);
 

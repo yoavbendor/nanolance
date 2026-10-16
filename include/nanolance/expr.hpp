@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -47,12 +48,20 @@ struct Condition {
     std::shared_ptr<const Predicate> predicate;  // Predicate
 };
 
+/// A JSON accessor a test reads its column through: `json_get_int(<column>, '<path>')` (or the float, bool
+/// and string accessors). The test is then on the values at the path.
+struct JsonAccess {
+    std::string path;      // the path as written: an identifier
+    std::string function;  // json_get_int, json_get_float, json_get_bool or json_get_string
+};
+
 /// A test of one column against constants: `x < 5`, `x IN (1, 2)`, `x BETWEEN 1 AND 9`,
 /// `x IS NULL`, `array_has_any(tags, ['a', 'b'])`, ... Evaluated with the filter's own semantics, on
 /// any values of the column's type -- an index's keys, a page's bounds.
 class Predicate {
 public:
-    enum class Test { Compare, In, Between, IsNull, IsNotNull, HasAny, HasAll, Has };
+    /// Contains: `contains(<string column>, '<literal>')`, the one constant a string literal.
+    enum class Test { Compare, In, Between, IsNull, IsNotNull, HasAny, HasAll, Has, Contains };
 
     Test test() const { return test_; }
     /// The column, as written ("s.child" is {"s", "child"}).
@@ -66,16 +75,31 @@ public:
     /// `column <op> constant k`, a Compare.
     Predicate compare_with(const std::string& op, std::size_t k) const;
 
+    /// Constant k as one value of `type` (the column's type, cast as the filter casts it): a one-element
+    /// array in `out` (the caller releases it), NULL for a NULL constant. False with `error` set when the
+    /// constant does not convert.
+    bool constant_as(std::size_t k, const ArrowSchema& type, ArrowArray& out, std::string& error) const;
+
     /// Evaluate on `values`, of the column's type -- for HasAny, HasAll and Has, of its elements'
     /// type, and then TRUE for an element the test names. `pass[i]` is 1 where the test is TRUE.
     bool filter(const ArrowSchema& type, const ArrowArray& values, std::vector<std::uint8_t>& pass,
                 std::string& error) const;
+
+    /// Set when the test reads the column through a JSON accessor (`column`, `test` and constants are the
+    /// test's own, on the values at the path).
+    const std::optional<JsonAccess>& json() const { return json_; }
+
+    /// Whether a JSON index whose values have Arrow format `value_format` (its BTree's min column) can
+    /// answer this test: the accessor's type is the index's, and the constants and operator are ones
+    /// pylance routes (a bool's `=`, `!=` and IN are scanned there).
+    bool routes_to_json_index(const char* value_format) const;
 
     std::string to_string() const;
 
 private:
     friend class Expression;
     Test test_ = Test::Compare;
+    std::optional<JsonAccess> json_;
     std::vector<std::string> column_;
     std::string op_;
     std::vector<std::shared_ptr<const Node>> constants_;

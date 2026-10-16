@@ -6,7 +6,11 @@
 // its lists' elements -- sorted nulls first, then ascending, ties by row address, and written in
 // Lance's index files; the index is committed in the manifest's index section as Lance commits one.
 
+#include "index_build.hpp"
 #include "nanolance/scalar_index.hpp"
+#include "nanolance/vector_search.hpp"
+
+#include "index_files.hpp"
 
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/index_maintenance.hpp"
@@ -16,15 +20,22 @@
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/parallel.hpp"
 #include "nanolance/roaring_bitmap.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include "lance_minimal.pb.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
+#include "nanolance/bloom_filter.hpp"
+#include "nanolance/fts_tokenizer.hpp"
+#include "nanolance/jsonb.hpp"
+
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <chrono>
+#include <charconv>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -42,49 +53,19 @@ constexpr std::uint64_t kBTreePageRows = 4096;  // Lance's DEFAULT_BTREE_BATCH_S
 
 // ── Arrow ownership ─────────────────────────────────────────────────────────────────────────────
 
-struct OwnedSchema {
-    ArrowSchema s{};
-    OwnedSchema() = default;
-    OwnedSchema(const OwnedSchema&) = delete;
-    OwnedSchema& operator=(const OwnedSchema&) = delete;
-    ~OwnedSchema() {
-        if (s.release != nullptr) {
-            s.release(&s);
-        }
-    }
-};
-
-struct OwnedArray {
-    ArrowArray a{};
-    OwnedArray() = default;
-    OwnedArray(const OwnedArray&) = delete;
-    OwnedArray& operator=(const OwnedArray&) = delete;
-    ~OwnedArray() {
-        if (a.release != nullptr) {
-            a.release(&a);
-        }
-    }
-};
-
-struct OwnedBatches {
-    std::vector<ArrowArray> v;
-    ~OwnedBatches() {
-        for (auto& a : v) {
-            if (a.release != nullptr) {
-                a.release(&a);
-            }
-        }
-    }
-};
-
-struct OwnedViews {
-    std::vector<std::unique_ptr<ArrowArrayView>> v;
-    ~OwnedViews() {
-        for (auto& view : v) {
-            ArrowArrayViewReset(view.get());
-        }
-    }
-};
+using index_files::OwnedArray;
+using index_files::OwnedBatches;
+using index_files::OwnedSchema;
+using index_files::OwnedViews;
+using index_files::WrittenFile;
+using index_files::bytes_of;
+using index_files::find_field;
+using index_files::new_uuid;
+using index_files::struct_batch;
+using index_files::struct_schema;
+using index_files::type_schema;
+using index_files::uint_array;
+using index_files::write_file;
 
 // ── the values to index ─────────────────────────────────────────────────────────────────────────
 
@@ -453,6 +434,9 @@ void for_chunks(std::size_t n, const std::function<void(std::size_t, std::size_t
     parallel::for_each(chunks, [&](std::size_t c) { task(c * kChunk, std::min(n, (c + 1) * kChunk)); });
 }
 
+/// A pick that names no item: gather writes a null there (a zone with no minimum, say).
+constexpr std::uint32_t kNoPick = UINT32_MAX;
+
 /// The items at `picks` as one array of `type` (a plain Arrow type: no dictionary, no children).
 bool gather(const ArrowSchema& type, const Items& items, const std::vector<std::uint32_t>& picks, ArrowArray& out,
             std::string& error) {
@@ -472,7 +456,7 @@ bool gather(const ArrowSchema& type, const Items& items, const std::vector<std::
     for_chunks(n, [&](std::size_t begin, std::size_t end) {
         std::int64_t nulls = 0;
         for (auto r = begin; r < end; ++r) {
-            if (items.is_null(picks[r])) {
+            if (picks[r] == kNoPick || items.is_null(picks[r])) {
                 ++nulls;
             } else {
                 valid[r >> 3U] = static_cast<std::uint8_t>(valid[r >> 3U] | (1U << (r & 7U)));
@@ -586,18 +570,6 @@ bool gather(const ArrowSchema& type, const Items& items, const std::vector<std::
     return true;
 }
 
-bool uint_array(ArrowType type, const void* values, std::int64_t n, std::size_t width, ArrowArray& out,
-                std::string& error) {
-    if (ArrowArrayInitFromType(&out, type) != NANOARROW_OK ||
-        ArrowBufferAppend(ArrowArrayBuffer(&out, 1), values, n * static_cast<std::int64_t>(width)) != NANOARROW_OK) {
-        error = "out of memory";
-        return false;
-    }
-    out.length = n;
-    out.null_count = 0;
-    return ArrowArrayFinishBuildingDefault(&out, nullptr) == NANOARROW_OK || (error = "bad array", false);
-}
-
 bool binary_array(const std::vector<std::vector<std::uint8_t>>& values, ArrowArray& out, std::string& error) {
     if (ArrowArrayInitFromType(&out, NANOARROW_TYPE_BINARY) != NANOARROW_OK ||
         ArrowArrayStartAppending(&out) != NANOARROW_OK) {
@@ -616,54 +588,17 @@ bool binary_array(const std::vector<std::vector<std::uint8_t>>& values, ArrowArr
     return ArrowArrayFinishBuildingDefault(&out, nullptr) == NANOARROW_OK || (error = "bad array", false);
 }
 
-/// A struct schema of `children` (name, type to copy, nullable).
-bool struct_schema(const std::vector<std::tuple<const char*, const ArrowSchema*, bool>>& children, ArrowSchema& out,
-                   std::string& error) {
-    ArrowSchemaInit(&out);
-    if (ArrowSchemaSetTypeStruct(&out, static_cast<std::int64_t>(children.size())) != NANOARROW_OK) {
-        error = "out of memory";
-        return false;
-    }
-    for (std::size_t i = 0; i < children.size(); ++i) {
-        ArrowSchema* child = out.children[i];
-        child->release(child);
-        if (ArrowSchemaDeepCopy(std::get<1>(children[i]), child) != NANOARROW_OK ||
-            ArrowSchemaSetName(child, std::get<0>(children[i])) != NANOARROW_OK ||
-            ArrowSchemaSetMetadata(child, nullptr) != NANOARROW_OK) {
-            error = "out of memory";
-            return false;
-        }
-        child->flags = std::get<2>(children[i]) ? ARROW_FLAG_NULLABLE : 0;
-    }
-    return true;
-}
-
-bool type_schema(ArrowType type, ArrowSchema& out) {
-    ArrowSchemaInit(&out);
-    return ArrowSchemaSetType(&out, type) == NANOARROW_OK;
-}
-
-bool struct_batch(std::vector<ArrowArray*> children, std::int64_t length, ArrowArray& out, std::string& error) {
-    if (ArrowArrayInitFromType(&out, NANOARROW_TYPE_STRUCT) != NANOARROW_OK ||
-        ArrowArrayAllocateChildren(&out, static_cast<std::int64_t>(children.size())) != NANOARROW_OK) {
-        error = "out of memory";
-        return false;
-    }
-    for (std::size_t i = 0; i < children.size(); ++i) {
-        ArrowArrayMove(children[i], out.children[i]);
-    }
-    out.length = length;
-    out.null_count = 0;
-    return true;
-}
-
-std::vector<std::uint8_t> bytes_of(const std::string& s) { return {s.begin(), s.end()}; }
-
 // ── row bitmaps ─────────────────────────────────────────────────────────────────────────────────
 
 /// Lance's RowAddrTreeMap serialization: [u32 fragments] then per fragment, ascending, [u32 id]
 /// [u32 size][a Roaring bitmap of the rows' offsets]. `addrs` ascending (repeats allowed).
 std::vector<std::uint8_t> serialize_treemap(const std::uint64_t* addrs, std::size_t n) {
+    std::vector<std::uint64_t> sorted;  // stable row ids are not in address order
+    if (!std::is_sorted(addrs, addrs + n)) {
+        sorted.assign(addrs, addrs + n);
+        std::sort(sorted.begin(), sorted.end());
+        addrs = sorted.data();
+    }
     std::vector<std::uint8_t> out(4, 0);
     std::uint32_t fragments = 0;
     std::vector<std::uint32_t> rows;
@@ -688,24 +623,6 @@ std::vector<std::uint8_t> serialize_treemap(const std::uint64_t* addrs, std::siz
 }
 
 // ── the index files ─────────────────────────────────────────────────────────────────────────────
-
-struct WrittenFile {
-    std::string name;
-    std::uint64_t size = 0;
-};
-
-bool write_file(const std::filesystem::path& dir, const std::string& name, const ArrowSchema& schema,
-                ArrowArray& batch, LanceFileExtras extras, std::vector<WrittenFile>& files, std::string& error) {
-    extras.path = dir / name;
-    std::uint64_t size = 0;
-    const std::vector<const ArrowArray*> batches = {&batch};
-    if (!write_lance_file(schema, batches, extras, size, error)) {
-        error = name + ": " + error;
-        return false;
-    }
-    files.push_back({name, size});
-    return true;
-}
 
 bool write_btree(const std::filesystem::path& dir, const ArrowSchema& type, const Items& items, const Sorted& sorted,
                  std::vector<WrittenFile>& files, std::string& error) {
@@ -806,54 +723,365 @@ bool write_bitmap(const std::filesystem::path& dir, const ArrowSchema& type, con
     return write_file(dir, "bitmap_page_lookup.lance", schema.s, batch.a, std::move(extras), files, error);
 }
 
-// ── the dataset ─────────────────────────────────────────────────────────────────────────────────
 
-const pb::Field* find_field(const pb::Manifest& manifest, const std::string& path, std::vector<std::string>& parts) {
-    parts.clear();
-    for (const auto& f : manifest.fields) {
-        if (f.parent_id == -1 && f.name == path) {
-            parts.push_back(path);
-            return &f;
+// ── ngram postings ──────────────────────────────────────────────────────────────────────────────
+
+/// ngram_postings.lance (ngram.rs): one row per distinct trigram token, ascending, with the rows holding
+/// it as a RoaringTreemap of row ids. Token 0 holds the null rows; a value's trigrams are its
+/// lower-cased, ASCII-folded text's (fts::ngram_tokens). `posting_list` is uncompressed, as Lance's own.
+bool write_ngram(const std::filesystem::path& dir, const Items& items, const index_build::NGramPostings* base,
+                 std::vector<WrittenFile>& files, std::string& error) {
+    std::map<std::uint32_t, std::vector<std::uint64_t>> postings;
+    if (base != nullptr) {
+        for (const auto& [token, ids] : *base) {
+            postings[token].insert(postings[token].end(), ids.begin(), ids.end());
         }
     }
-    std::int32_t parent = -1;
-    const pb::Field* found = nullptr;
-    std::size_t start = 0;
-    while (true) {
-        const auto dot = path.find('.', start);
-        const auto part = path.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
-        found = nullptr;
-        for (const auto& f : manifest.fields) {
-            if (f.parent_id == parent && f.name == part) {
-                found = &f;
-                break;
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        if (items.is_null(k)) {
+            postings[0].push_back(items.addr[k]);
+            continue;
+        }
+        const auto sv = ArrowArrayViewGetStringUnsafe(items.views[items.view[k]], items.index[k]);
+        const auto folded = fts::lower_and_fold(std::string_view(sv.data, static_cast<std::size_t>(sv.size_bytes)));
+        for (const auto token : fts::ngram_tokens(folded)) {
+            postings[token].push_back(items.addr[k]);
+        }
+    }
+    std::vector<std::uint32_t> keys;
+    std::vector<std::vector<std::uint8_t>> bitmaps;
+    keys.reserve(postings.size());
+    bitmaps.reserve(postings.size());
+    for (auto& [token, ids] : postings) {
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        keys.push_back(token);
+        bitmaps.push_back(roaring::encode_treemap(ids));
+    }
+    const auto n = static_cast<std::int64_t>(keys.size());
+    OwnedSchema tokens_type;
+    OwnedSchema binary;
+    OwnedSchema schema;
+    OwnedArray token_array;
+    OwnedArray bitmap_array;
+    OwnedArray batch;
+    if (!type_schema(NANOARROW_TYPE_UINT32, tokens_type.s) || !type_schema(NANOARROW_TYPE_BINARY, binary.s) ||
+        !struct_schema({{"tokens", &tokens_type.s, true}, {"posting_list", &binary.s, false}}, schema.s, error)) {
+        return error.empty() ? (error = "out of memory", false) : false;
+    }
+    // struct_schema drops the children's metadata: posting_list keeps Lance's no-compression tag (POSTINGS_FIELD).
+    ArrowBuffer meta;
+    if (ArrowMetadataBuilderInit(&meta, nullptr) != NANOARROW_OK ||
+        ArrowMetadataBuilderAppend(&meta, ArrowCharView("lance-encoding:compression"), ArrowCharView("none")) !=
+            NANOARROW_OK ||
+        ArrowSchemaSetMetadata(schema.s.children[1], reinterpret_cast<const char*>(meta.data)) != NANOARROW_OK) {
+        ArrowBufferReset(&meta);
+        error = "out of memory";
+        return false;
+    }
+    ArrowBufferReset(&meta);
+    LanceFileExtras extras;
+    if (!uint_array(NANOARROW_TYPE_UINT32, keys.data(), n, sizeof(std::uint32_t), token_array.a, error) ||
+        !binary_array(bitmaps, bitmap_array.a, error) ||
+        !struct_batch({&token_array.a, &bitmap_array.a}, n, batch.a, error)) {
+        return error.empty() ? (error = "out of memory", false) : false;
+    }
+    return write_file(dir, "ngram_postings.lance", schema.s, batch.a, std::move(extras), files, error);
+}
+
+// ── zonemaps ────────────────────────────────────────────────────────────────────────────────────
+
+/// One zone (zoned.rs's ZoneTrainer): up to `rows_per_zone` rows of one fragment, nulls included.
+/// Its span runs from its first row's offset to its last one's (deleted rows leave gaps in it).
+struct Zone {
+    std::uint64_t fragment = 0;
+    std::uint64_t start = 0;
+    std::uint64_t length = 0;
+    std::uint32_t nulls = 0;
+    std::uint32_t nans = 0;
+    std::uint32_t min = kNoPick;  // the item holding the minimum (kNoPick: no value)
+    std::uint32_t max = kNoPick;  // the item holding the maximum
+    std::uint32_t nan = kNoPick;  // an item that is NaN
+};
+
+/// Cut the items (row-address order) into zones and count each zone's rows, keyed by `zone_of`.
+std::vector<Zone> cut_zones(const Items& items, std::uint64_t rows_per_zone, std::vector<std::uint32_t>& zone_of) {
+    std::vector<Zone> zones;
+    zone_of.assign(items.size(), 0);
+    std::uint64_t rows = 0;
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        const auto fragment = items.addr[k] >> 32U;
+        const auto offset = items.addr[k] & 0xFFFFFFFFU;
+        if (zones.empty() || zones.back().fragment != fragment || rows == rows_per_zone) {
+            Zone z;
+            z.fragment = fragment;
+            z.start = offset;
+            zones.push_back(z);
+            rows = 0;
+        }
+        Zone& z = zones.back();
+        z.length = offset - z.start + 1;
+        ++rows;
+        if (items.is_null(k)) {
+            ++z.nulls;
+        }
+        zone_of[k] = static_cast<std::uint32_t>(zones.size() - 1);
+    }
+    return zones;
+}
+
+/// The zones' NaNs and extreme values, the values compared as `extract`'s keys (nulls are counted by
+/// cut_zones). NaN is no minimum or maximum (arrow_stats), and a null is neither.
+template <typename K, typename Extract>
+void zone_extrema(const Items& items, const std::vector<std::uint32_t>& zone_of, bool floating, Extract extract,
+                  std::vector<Zone>& zones) {
+    const auto key = [&](std::uint32_t k) { return extract(items.views[items.view[k]], items.index[k]); };
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        Zone& z = zones[zone_of[k]];
+        const auto item = static_cast<std::uint32_t>(k);
+        if (items.is_null(k)) {
+            continue;
+        }
+        if (floating && std::isnan(ArrowArrayViewGetDoubleUnsafe(items.views[items.view[k]], items.index[k]))) {
+            ++z.nans;
+            if (z.nan == kNoPick) {
+                z.nan = item;
             }
+            continue;
         }
-        if (found == nullptr) {
-            return nullptr;
+        if (z.min == kNoPick || key(item) < key(z.min)) {
+            z.min = item;
         }
-        parts.push_back(part);
-        if (dot == std::string::npos) {
-            return found;
+        if (z.max == kNoPick || key(z.max) < key(item)) {
+            z.max = item;
         }
-        parent = found->id;
-        start = dot + 1;
     }
 }
 
-std::array<std::uint8_t, 16> new_uuid() {
-    std::random_device device;
-    std::mt19937_64 rng((static_cast<std::uint64_t>(device()) << 32U) ^ device() ^
-                        static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
-    std::array<std::uint8_t, 16> id{};
-    for (std::size_t i = 0; i < id.size(); i += 8) {
-        const auto r = rng();
-        std::memcpy(id.data() + i, &r, 8);
+void zone_extrema_of(const Items& items, KeyKind kind, const std::vector<std::uint32_t>& zone_of,
+                     std::vector<Zone>& zones) {
+    switch (kind) {
+    case KeyKind::Int:
+    case KeyKind::Bool:
+        zone_extrema<std::int64_t>(
+            items, zone_of, false, [](const ArrowArrayView* v, std::int64_t i) { return ArrowArrayViewGetIntUnsafe(v, i); },
+            zones);
+        break;
+    case KeyKind::UInt:
+        zone_extrema<std::uint64_t>(
+            items, zone_of, false, [](const ArrowArrayView* v, std::int64_t i) { return ArrowArrayViewGetUIntUnsafe(v, i); },
+            zones);
+        break;
+    case KeyKind::Float16:
+        zone_extrema<std::uint16_t>(
+            items, zone_of, true,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                std::uint16_t bits = 0;
+                std::memcpy(&bits, fixed_value(v, i, 2), 2);
+                return total_order<std::uint16_t>(bits, 16);
+            },
+            zones);
+        break;
+    case KeyKind::Float32:
+        zone_extrema<std::uint32_t>(
+            items, zone_of, true,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                std::uint32_t bits = 0;
+                std::memcpy(&bits, fixed_value(v, i, 4), 4);
+                return total_order<std::uint32_t>(bits, 32);
+            },
+            zones);
+        break;
+    case KeyKind::Float64:
+        zone_extrema<std::uint64_t>(
+            items, zone_of, true,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                std::uint64_t bits = 0;
+                std::memcpy(&bits, fixed_value(v, i, 8), 8);
+                return total_order<std::uint64_t>(bits, 64);
+            },
+            zones);
+        break;
+    case KeyKind::Decimal128:
+        zone_extrema<Int128>(
+            items, zone_of, false,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                Int128 value;
+                std::memcpy(&value.lo, fixed_value(v, i, 16), 8);
+                std::memcpy(&value.hi, fixed_value(v, i, 16) + 8, 8);
+                return value;
+            },
+            zones);
+        break;
+    case KeyKind::Bytes:
+        zone_extrema<StringKey>(
+            items, zone_of, false, [](const ArrowArrayView* v, std::int64_t i) { return string_key(v, i, 0); }, zones);
+        break;
     }
-    id[6] = static_cast<std::uint8_t>((id[6] & 0x0FU) | 0x40U);  // version 4
-    id[8] = static_cast<std::uint8_t>((id[8] & 0x3FU) | 0x80U);  // RFC 4122 variant
-    return id;
 }
+
+/// `n` nulls of `type` (a nested type: its children are null too, as the layout needs).
+bool all_null_array(const ArrowSchema& type, std::int64_t n, ArrowArray& out, std::string& error) {
+    ArrowError err;
+    if (ArrowArrayInitFromSchema(&out, &type, &err) != NANOARROW_OK || ArrowArrayAppendNull(&out, n) != NANOARROW_OK ||
+        ArrowArrayFinishBuildingDefault(&out, &err) != NANOARROW_OK) {
+        error = std::string("zonemap: ") + err.message;
+        return false;
+    }
+    return true;
+}
+
+/// zonemap.lance: min, max (the column's type), null_count, nan_count, fragment_id, zone_start,
+/// zone_length; the null rows' addresses as global buffer 1 (rows_per_zone, null_bitmap in the
+/// schema metadata). A zone whose values are all NaN has no minimum, and its maximum is NaN, as
+/// Lance writes it (zonemap.rs's max_value_from_stats).
+bool write_zonemap(const std::filesystem::path& dir, const ArrowSchema& type, const Items& items,
+                   const std::vector<Zone>& zones, bool floating, bool nested, std::uint64_t rows_per_zone,
+                   std::vector<WrittenFile>& files, std::string& error) {
+    const auto n = static_cast<std::int64_t>(zones.size());
+    std::vector<std::uint32_t> mins;
+    std::vector<std::uint32_t> maxs;
+    std::vector<std::uint32_t> nulls;
+    std::vector<std::uint32_t> nans;
+    std::vector<std::uint64_t> fragments;
+    std::vector<std::uint64_t> starts;
+    std::vector<std::uint64_t> lengths;
+    for (const auto& z : zones) {
+        mins.push_back(z.min);
+        maxs.push_back(floating && z.nans > 0 ? z.nan : z.max);
+        nulls.push_back(z.nulls);
+        nans.push_back(z.nans);
+        fragments.push_back(z.fragment);
+        starts.push_back(z.start);
+        lengths.push_back(z.length);
+    }
+    std::vector<std::uint64_t> null_addrs;
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        if (items.is_null(k)) {
+            null_addrs.push_back(items.addr[k]);
+        }
+    }
+    const auto null_bitmap = serialize_treemap(null_addrs.data(), null_addrs.size());
+
+    OwnedSchema schema;
+    OwnedSchema u32;
+    OwnedSchema u64;
+    OwnedArray min_array;
+    OwnedArray max_array;
+    OwnedArray null_array;
+    OwnedArray nan_array;
+    OwnedArray fragment_array;
+    OwnedArray start_array;
+    OwnedArray length_array;
+    OwnedArray batch;
+    LanceFileExtras extras;
+    extras.schema_metadata["rows_per_zone"] = bytes_of(std::to_string(rows_per_zone));
+    extras.schema_metadata["null_bitmap"] = bytes_of("1");
+    extras.global_buffers.push_back(null_bitmap);
+    if (!type_schema(NANOARROW_TYPE_UINT32, u32.s) || !type_schema(NANOARROW_TYPE_UINT64, u64.s) ||
+        !struct_schema({{"min", &type, true}, {"max", &type, true}, {"null_count", &u32.s, false},
+                        {"nan_count", &u32.s, false}, {"fragment_id", &u64.s, false},
+                        {"zone_start", &u64.s, false}, {"zone_length", &u64.s, false}},
+                       schema.s, error) ||
+        !(nested ? all_null_array(type, n, min_array.a, error) && all_null_array(type, n, max_array.a, error)
+                 : gather(type, items, mins, min_array.a, error) && gather(type, items, maxs, max_array.a, error)) ||
+        !uint_array(NANOARROW_TYPE_UINT32, nulls.data(), n, 4, null_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT32, nans.data(), n, 4, nan_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, fragments.data(), n, 8, fragment_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, starts.data(), n, 8, start_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, lengths.data(), n, 8, length_array.a, error) ||
+        !struct_batch({&min_array.a, &max_array.a, &null_array.a, &nan_array.a, &fragment_array.a, &start_array.a,
+                       &length_array.a},
+                      n, batch.a, error)) {
+        return error.empty() ? (error = "out of memory", false) : false;
+    }
+    return write_file(dir, "zonemap.lance", schema.s, batch.a, std::move(extras), files, error);
+}
+
+// ── bloom filters ───────────────────────────────────────────────────────────────────────────────
+
+/// bloomfilter.lance: per zone its fragment, span, whether it holds a null, and its bloom filter of
+/// the non-null values (Lance's BloomFilterIndex layout). The null rows' addresses are global buffer 1;
+/// number_of_items and probability are in the schema metadata.
+bool write_bloomfilter(const std::filesystem::path& dir, const Items& items,
+                       const std::vector<Zone>& zones, const std::vector<std::uint32_t>& zone_of,
+                       std::uint8_t log2_bytes, std::uint64_t number_of_items, double probability,
+                       std::size_t width, std::vector<WrittenFile>& files, std::string& error) {
+    const auto n = static_cast<std::int64_t>(zones.size());
+    const std::size_t num_bytes = std::size_t{1} << log2_bytes;
+    std::vector<std::vector<std::uint8_t>> filters(zones.size(), bloom_filter::empty_filter(num_bytes));
+    std::vector<std::uint64_t> null_addrs;
+    for (std::size_t k = 0; k < items.size(); ++k) {
+        if (items.is_null(k)) {
+            null_addrs.push_back(items.addr[k]);
+            continue;
+        }
+        const auto hash = index_files::bloom_hash(items.views[items.view[k]], items.index[k], width);
+        bloom_filter::insert(filters[zone_of[k]].data(), num_bytes, hash);
+    }
+    const auto null_bitmap = serialize_treemap(null_addrs.data(), null_addrs.size());
+
+    std::vector<std::uint64_t> fragments;
+    std::vector<std::uint64_t> starts;
+    std::vector<std::uint64_t> lengths;
+    for (const auto& z : zones) {
+        fragments.push_back(z.fragment);
+        starts.push_back(z.start);
+        lengths.push_back(z.length);
+    }
+
+    OwnedSchema schema;
+    OwnedSchema u64;
+    OwnedSchema boolean;
+    OwnedSchema binary;
+    OwnedArray fragment_array;
+    OwnedArray start_array;
+    OwnedArray length_array;
+    OwnedArray has_null_array;
+    OwnedArray filter_array;
+    OwnedArray batch;
+    LanceFileExtras extras;
+    // Lance's metadata: the probability as Rust prints an f64 (no exponent), read back as the same value.
+    char probability_text[64];
+    const auto end = std::to_chars(probability_text, probability_text + sizeof probability_text - 1, probability,
+                                   std::chars_format::fixed);
+    extras.schema_metadata["bloomfilter_item"] = bytes_of(std::to_string(number_of_items));
+    extras.schema_metadata["bloomfilter_probability"] = bytes_of(std::string(probability_text, end.ptr));
+    extras.schema_metadata["null_bitmap"] = bytes_of("1");
+    extras.global_buffers.push_back(null_bitmap);
+    ArrowError err;
+    if (!type_schema(NANOARROW_TYPE_UINT64, u64.s) || !type_schema(NANOARROW_TYPE_BOOL, boolean.s) ||
+        !type_schema(NANOARROW_TYPE_BINARY, binary.s) ||
+        !struct_schema({{"fragment_id", &u64.s, false}, {"zone_start", &u64.s, false},
+                        {"zone_length", &u64.s, false}, {"has_null", &boolean.s, false},
+                        {"bloom_filter_data", &binary.s, false}},
+                       schema.s, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, fragments.data(), n, 8, fragment_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, starts.data(), n, 8, start_array.a, error) ||
+        !uint_array(NANOARROW_TYPE_UINT64, lengths.data(), n, 8, length_array.a, error) ||
+        !binary_array(filters, filter_array.a, error)) {
+        return error.empty() ? (error = "out of memory", false) : false;
+    }
+    if (ArrowArrayInitFromType(&has_null_array.a, NANOARROW_TYPE_BOOL) != NANOARROW_OK ||
+        ArrowArrayStartAppending(&has_null_array.a) != NANOARROW_OK) {
+        error = "out of memory";
+        return false;
+    }
+    for (const auto& z : zones) {
+        if (ArrowArrayAppendInt(&has_null_array.a, z.nulls > 0 ? 1 : 0) != NANOARROW_OK) {
+            error = "out of memory";
+            return false;
+        }
+    }
+    if (ArrowArrayFinishBuildingDefault(&has_null_array.a, &err) != NANOARROW_OK ||
+        !struct_batch({&fragment_array.a, &start_array.a, &length_array.a, &has_null_array.a, &filter_array.a}, n,
+                      batch.a, error)) {
+        return error.empty() ? (error = "out of memory", false) : false;
+    }
+    return write_file(dir, "bloomfilter.lance", schema.s, batch.a, std::move(extras), files, error);
+}
+
+// ── the dataset ─────────────────────────────────────────────────────────────────────────────────
 
 }  // namespace
 
@@ -868,23 +1096,338 @@ bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type) {
         type = ScalarIndexType::Bitmap;
     } else if (upper == "LABEL_LIST" || upper == "LABELLIST") {
         type = ScalarIndexType::LabelList;
+    } else if (upper == "ZONEMAP") {
+        type = ScalarIndexType::ZoneMap;
+    } else if (upper == "BLOOMFILTER") {
+        type = ScalarIndexType::BloomFilter;
+    } else if (upper == "NGRAM") {
+        type = ScalarIndexType::NGram;
     } else {
         return false;
     }
     return true;
 }
 
-bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, const std::string& column,
-                                 ScalarIndexType type, const ScalarIndexOptions& options,
-                                 std::uint64_t& new_version, std::string& error) {
+namespace {
+
+/// A ZONEMAP on a fixed-size list (the only nested type a zonemap is built on here; list columns take
+/// LABEL_LIST).
+bool zoned_nested(ScalarIndexType type, const ArrowSchemaView& view) {
+    return type == ScalarIndexType::ZoneMap && view.type == NANOARROW_TYPE_FIXED_SIZE_LIST;
+}
+
+// ── JSON indexes: the values at a path of a JSON column, typed as Lance types them (json.rs) ──
+
+/// The paths a JSON index takes: "" or "$" (the whole value), then an optional "$" and dot-separated
+/// member names. A name is [A-Za-z0-9_]+; anything else is refused here, not sent to Lance's JSONPath.
+bool parse_json_path(const std::string& path, std::vector<std::string>& names, std::string& error) {
+    names.clear();
+    std::string_view rest = path;
+    const bool dollar = !rest.empty() && rest.front() == '$';
+    if (dollar) {
+        rest.remove_prefix(1);
+    }
+    bool ok = true;
+    if (dollar && !rest.empty()) {
+        ok = rest.front() == '.';
+        rest.remove_prefix(ok ? 1 : 0);
+    }
+    while (ok && !rest.empty()) {
+        const auto dot = rest.find('.');
+        const auto name = rest.substr(0, dot);
+        ok = !name.empty() && std::all_of(name.begin(), name.end(), [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+        });
+        names.emplace_back(name);
+        if (dot == std::string_view::npos) {
+            break;
+        }
+        rest.remove_prefix(dot + 1);
+        ok = ok && !rest.empty();
+    }
+    if (!ok) {
+        names.clear();
+        error = "JSON index path '" + path + "' is not supported yet (supported: an optional '$', then dot-separated names)";
+    }
+    return ok;
+}
+
+/// A JSON value's type as Lance's JsonbType names it (json.rs).
+enum class JsonbType { Boolean, Int64, Float64, String, Array, Object };
+/// The type a path's values are indexed as: the Arrow type Lance infers from the first non-null value.
+enum class JsonTarget { Boolean, Int64, Float64, String, Binary };
+
+const char* jsonb_name(JsonbType t) {
+    switch (t) {
+    case JsonbType::Boolean: return "Boolean";
+    case JsonbType::Int64: return "Int64";
+    case JsonbType::Float64: return "Float64";
+    case JsonbType::String: return "String";
+    case JsonbType::Array: return "Array";
+    case JsonbType::Object: return "Object";
+    }
+    return "";
+}
+
+const char* target_name(JsonTarget t) {
+    switch (t) {
+    case JsonTarget::Boolean: return "Boolean";
+    case JsonTarget::Int64: return "Int64";
+    case JsonTarget::Float64: return "Float64";
+    case JsonTarget::String: return "Utf8";
+    case JsonTarget::Binary: return "LargeBinary";
+    }
+    return "";
+}
+
+JsonTarget target_of(JsonbType t) {
+    switch (t) {
+    case JsonbType::Boolean: return JsonTarget::Boolean;
+    case JsonbType::Int64: return JsonTarget::Int64;
+    case JsonbType::Float64: return JsonTarget::Float64;
+    case JsonbType::String: return JsonTarget::String;
+    case JsonbType::Array:
+    case JsonbType::Object: return JsonTarget::Binary;
+    }
+    return JsonTarget::Binary;
+}
+
+/// Lance's validate (json.rs): an Int64 value fits a Float64 path; nothing else converts.
+bool json_compatible(JsonTarget target, JsonbType actual) {
+    switch (target) {
+    case JsonTarget::Boolean: return actual == JsonbType::Boolean;
+    case JsonTarget::Int64: return actual == JsonbType::Int64;
+    case JsonTarget::Float64: return actual == JsonbType::Int64 || actual == JsonbType::Float64;
+    case JsonTarget::String: return actual == JsonbType::String;
+    case JsonTarget::Binary: return actual == JsonbType::Array || actual == JsonbType::Object;
+    }
+    return false;
+}
+
+/// The value at `names` in row `row` of a JSON column. `has` is false for a null row, a missing member
+/// or a JSON null (Lance's null).
+bool json_value_at(const ArrowArrayView* column, std::int64_t row, const std::vector<std::string>& names,
+                   jsonb::Item& item, JsonbType& type, bool& has, std::string& error) {
+    has = false;
+    if (ArrowArrayViewIsNull(column, row)) {
+        return true;
+    }
+    const auto bytes = ArrowArrayViewGetBytesUnsafe(column, row);
+    if (!jsonb::Item::root(std::string_view(bytes.data.as_char, static_cast<std::size_t>(bytes.size_bytes)), item)) {
+        error = "a JSON index column holds a value that is not JSONB";
+        return false;
+    }
+    for (const auto& name : names) {
+        jsonb::Item next;
+        if (item.type() != jsonb::Item::Type::Object || !item.get(name, next)) {
+            return true;
+        }
+        item = next;
+    }
+    switch (item.type()) {
+    case jsonb::Item::Type::Null:
+        return true;
+    case jsonb::Item::Type::True:
+    case jsonb::Item::Type::False:
+        type = JsonbType::Boolean;
+        break;
+    case jsonb::Item::Type::Number: {
+        jsonb::Number n;
+        if (!item.number(n)) {
+            error = "a JSON index column holds an invalid number";
+            return false;
+        }
+        const bool integral = n.kind == jsonb::Number::Kind::Int ||
+                              (n.kind == jsonb::Number::Kind::UInt && n.u <= static_cast<std::uint64_t>(INT64_MAX));
+        type = integral ? JsonbType::Int64 : JsonbType::Float64;
+        break;
+    }
+    case jsonb::Item::Type::String:
+        type = JsonbType::String;
+        break;
+    case jsonb::Item::Type::Array:
+        type = JsonbType::Array;
+        break;
+    case jsonb::Item::Type::Object:
+        type = JsonbType::Object;
+        break;
+    case jsonb::Item::Type::Other:
+        error = "a JSON index does not take values of JSON extension types";
+        return false;
+    }
+    has = true;
+    return true;
+}
+
+/// Writes the JsonIndexDetails of a JSON index (lance index.proto): path = 1, target_details = 2, an Any
+/// naming the BTree details (which are empty).
+std::vector<std::uint8_t> json_index_details(const std::string& path) {
+    const auto put_len = [](std::vector<std::uint8_t>& out, std::uint32_t field, std::string_view bytes) {
+        std::uint64_t v = (static_cast<std::uint64_t>(field) << 3U) | 2U;
+        const auto varint = [&](std::uint64_t x) {
+            while (x >= 0x80U) {
+                out.push_back(static_cast<std::uint8_t>((x & 0x7FU) | 0x80U));
+                x >>= 7U;
+            }
+            out.push_back(static_cast<std::uint8_t>(x));
+        };
+        varint(v);
+        varint(bytes.size());
+        out.insert(out.end(), bytes.begin(), bytes.end());
+    };
+    std::vector<std::uint8_t> any;  // google.protobuf.Any: type_url = 1
+    put_len(any, 1, "/lance.table.BTreeIndexDetails");
+    std::vector<std::uint8_t> out;
+    if (!path.empty()) {
+        put_len(out, 1, path);
+    }
+    put_len(out, 2, std::string_view(reinterpret_cast<const char*>(any.data()), any.size()));
+    return out;
+}
+
+/// The values of a JSON index, one array per scanned batch, typed as Lance types the path: the first
+/// non-null value's type, Int64 values allowed in a Float64 path, Utf8 when every value is null. The
+/// values are checked in row order and the first mismatch is the error, as Lance words it.
+bool extract_json_values(const std::vector<ArrowArray>& batches, const std::vector<std::size_t>& path_index,
+                         const ArrowSchema& column_type, const std::vector<std::string>& names,
+                         const std::string& path, OwnedSchema& type, std::vector<ArrowArray>& out,
+                         std::string& error) {
+    const auto column_of = [&](const ArrowArray& batch) {
+        const ArrowArray* arr = batch.children[0];
+        for (const auto c : path_index) {
+            arr = arr->children[c];
+        }
+        return arr;
+    };
+    OwnedViews views;
+    const auto view_of = [&](const ArrowArray* arr, const ArrowSchema& schema) -> const ArrowArrayView* {
+        auto view = std::make_unique<ArrowArrayView>();
+        ArrowError err;
+        if (ArrowArrayViewInitFromSchema(view.get(), &schema, &err) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(view.get(), arr, &err) != NANOARROW_OK) {
+            ArrowArrayViewReset(view.get());
+            error = err.message;
+            return nullptr;
+        }
+        views.v.push_back(std::move(view));
+        return views.v.back().get();
+    };
+    // Pass 1: the type, and every value checked.
+    std::optional<JsonTarget> target;
+    for (const auto& batch : batches) {
+        const ArrowArray* arr = column_of(batch);
+        const ArrowArrayView* view = view_of(arr, column_type);
+        if (view == nullptr) {
+            return false;
+        }
+        for (std::int64_t r = 0; r < arr->length; ++r) {
+            jsonb::Item item;
+            JsonbType actual{};
+            bool has = false;
+            if (!json_value_at(view, r, names, item, actual, has, error)) {
+                return false;
+            }
+            if (!has) {
+                continue;
+            }
+            if (!target) {
+                target = target_of(actual);
+            } else if (!json_compatible(*target, actual)) {
+                error = "Invalid user input: JSON path '" + path + "' expected " + target_name(*target) + ", but batch row " +
+                        std::to_string(r) + " has JSON type " + jsonb_name(actual);
+                return false;
+            }
+        }
+    }
+    const JsonTarget type_of = target.value_or(JsonTarget::String);
+    const ArrowType arrow_type = type_of == JsonTarget::Boolean   ? NANOARROW_TYPE_BOOL
+                                 : type_of == JsonTarget::Int64   ? NANOARROW_TYPE_INT64
+                                 : type_of == JsonTarget::Float64 ? NANOARROW_TYPE_DOUBLE
+                                 : type_of == JsonTarget::String  ? NANOARROW_TYPE_STRING
+                                                                  : NANOARROW_TYPE_LARGE_BINARY;
+    ArrowSchemaInit(&type.s);
+    if (ArrowSchemaSetType(&type.s, arrow_type) != NANOARROW_OK) {
+        error = "out of memory";
+        return false;
+    }
+    // Pass 2: the values, typed.
+    for (const auto& batch : batches) {
+        const ArrowArray* arr = column_of(batch);
+        const ArrowArrayView* view = view_of(arr, column_type);
+        if (view == nullptr) {
+            return false;
+        }
+        ArrowArray built;
+        if (ArrowArrayInitFromType(&built, arrow_type) != NANOARROW_OK ||
+            ArrowArrayStartAppending(&built) != NANOARROW_OK) {
+            error = "out of memory";
+            return false;
+        }
+        for (std::int64_t r = 0; r < arr->length; ++r) {
+            jsonb::Item item;
+            JsonbType actual{};
+            bool has = false;
+            if (!json_value_at(view, r, names, item, actual, has, error)) {
+                built.release(&built);
+                return false;
+            }
+            ArrowErrorCode code = NANOARROW_OK;
+            if (!has) {
+                code = ArrowArrayAppendNull(&built, 1);
+            } else if (type_of == JsonTarget::Boolean) {
+                code = ArrowArrayAppendInt(&built, item.type() == jsonb::Item::Type::True ? 1 : 0);
+            } else if (type_of == JsonTarget::Int64) {
+                jsonb::Number n;
+                item.number(n);
+                code = ArrowArrayAppendInt(&built, n.kind == jsonb::Number::Kind::Int ? n.i : static_cast<std::int64_t>(n.u));
+            } else if (type_of == JsonTarget::Float64) {
+                jsonb::Number n;
+                item.number(n);
+                code = ArrowArrayAppendDouble(&built, n.as_double());
+            } else if (type_of == JsonTarget::String) {
+                const auto s = item.string();
+                ArrowBufferView v;
+                v.data.as_char = s.data();
+                v.size_bytes = static_cast<std::int64_t>(s.size());
+                code = ArrowArrayAppendBytes(&built, v);
+            } else {
+                const auto doc = item.document();
+                ArrowBufferView v;
+                v.data.as_char = doc.data();
+                v.size_bytes = static_cast<std::int64_t>(doc.size());
+                code = ArrowArrayAppendBytes(&built, v);
+            }
+            if (code != NANOARROW_OK) {
+                built.release(&built);
+                error = "out of memory";
+                return false;
+            }
+        }
+        if (ArrowArrayFinishBuildingDefault(&built, nullptr) != NANOARROW_OK) {
+            built.release(&built);
+            error = "out of memory";
+            return false;
+        }
+        out.push_back(built);
+    }
+    return true;
+}
+
+bool create_scalar_index(const std::filesystem::path& dataset_path, const std::string& column, ScalarIndexType type,
+                         const ScalarIndexOptions& options, const index_build::SegmentTarget* target,
+                         std::uint64_t& new_version, std::string& error) {
     error.clear();
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    if (target != nullptr && target->manifest != nullptr) {
+        manifest = *target->manifest;
+        version = target->version;
+    } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
         return false;
     }
-    if ((manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U) {
-        error = "a scalar index on a dataset with stable row ids is not supported";
+    const bool commit = target == nullptr || target->out == nullptr;
+    AddressToRowId to_row_id;  // stable row ids go into the index, row addresses otherwise
+    if (!AddressToRowId::build(manifest, to_row_id, error)) {
         return false;
     }
     std::vector<std::string> parts;
@@ -896,7 +1439,7 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
     const std::string name = options.name.empty() ? column + "_idx" : options.name;
     const auto existing = std::find_if(manifest.indices.begin(), manifest.indices.end(),
                                        [&](const pb::IndexMetadata& i) { return i.name == name; });
-    if (existing != manifest.indices.end() && !options.replace) {
+    if (commit && existing != manifest.indices.end() && !options.replace) {
         error = "index '" + name + "' already exists";
         return false;
     }
@@ -908,9 +1451,12 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
     const std::vector<std::string> columns = {parts.front()};
     request.columns = &columns;
     request.with_row_address = true;
+    request.fragment_ids = target != nullptr ? target->fragments : nullptr;
+    const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
     OwnedSchema scanned;
     OwnedBatches batches;
-    if (!lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error)) {
+    if (!index_build::stage(progress, "load_data", 0, "rows",
+                            [&] { return lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error); })) {
         return false;
     }
     const ArrowSchema* col_type = scanned.s.children[0];
@@ -935,6 +1481,44 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
         error = err.message;
         return false;
     }
+    // A JSON index: the values at its path, typed as Lance types them. Its BTree is built over those.
+    const bool json = options.json_path.has_value();
+    OwnedSchema json_type;
+    OwnedBatches json_values;
+    if (json) {
+        std::vector<std::string> json_names;
+        if (type != ScalarIndexType::BTree || !parse_json_path(*options.json_path, json_names, error)) {
+            return false;
+        }
+        const bool binary = col_view.storage_type == NANOARROW_TYPE_BINARY ||
+                            col_view.storage_type == NANOARROW_TYPE_LARGE_BINARY;
+        if (!binary) {
+            error = "Invalid user input: A JSON index can only be created on a Binary or LargeBinary field.";
+            return false;
+        }
+        if (col_view.extension_name.data == nullptr ||
+            std::string(col_view.extension_name.data, static_cast<std::size_t>(col_view.extension_name.size_bytes)) !=
+                "lance.json") {
+            error = "a JSON index needs a JSON column; '" + column + "' is " + ArrowTypeString(col_view.type);
+            return false;
+        }
+        if (!extract_json_values(batches.v, path_index, *col_type, json_names, *options.json_path, json_type,
+                                 json_values.v, error)) {
+            return false;
+        }
+        col_type = &json_type.s;
+    }
+    // The scanned column's array in a batch: the JSON values, or the column below its struct path.
+    const auto column_of = [&](std::size_t b) -> const ArrowArray* {
+        if (json) {
+            return &json_values.v[b];
+        }
+        const ArrowArray* arr = batches.v[b].children[0];
+        for (const auto c : path_index) {
+            arr = arr->children[c];
+        }
+        return arr;
+    };
     const bool list = col_view.type == NANOARROW_TYPE_LIST || col_view.type == NANOARROW_TYPE_LARGE_LIST;
     if (type == ScalarIndexType::LabelList && !list) {
         error = "a LABEL_LIST index needs a list column; '" + column + "' is " + ArrowTypeString(col_view.type);
@@ -942,9 +1526,18 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
     }
     if (type != ScalarIndexType::LabelList && list) {
         error = "a list column takes a LABEL_LIST index, not a " +
-                std::string(type == ScalarIndexType::BTree ? "BTREE" : "BITMAP");
+                std::string(type == ScalarIndexType::BTree         ? "BTREE"
+                            : type == ScalarIndexType::ZoneMap      ? "ZONEMAP"
+                            : type == ScalarIndexType::NGram       ? "NGRAM"
+                            : type == ScalarIndexType::BloomFilter ? "BLOOMFILTER"
+                                                                   : "BITMAP");
         return false;
     }
+    if (type == ScalarIndexType::ZoneMap && options.rows_per_zone > UINT32_MAX) {
+        error = "rows_per_zone is over 4 billion";
+        return false;
+    }
+    const std::uint64_t rows_per_zone = options.rows_per_zone != 0 ? options.rows_per_zone : 8192;  // Lance's default
     const ArrowSchema* key_type = list ? col_type->children[0] : col_type;
     ArrowSchemaView key_view;
     KeyKind kind{};
@@ -952,33 +1545,53 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
         error = err.message;
         return false;
     }
-    if (key_view.extension_name.data != nullptr || !key_kind_of(key_view, kind, error)) {
+    if (type == ScalarIndexType::NGram && key_view.type != NANOARROW_TYPE_STRING &&
+        key_view.type != NANOARROW_TYPE_LARGE_STRING) {
+        error = "an NGRAM index needs a string column; '" + column + "' is " + ArrowTypeString(key_view.type);
+        return false;
+    }
+    // A zonemap of a fixed-size list keeps only the null counts (zonemap.rs: nested types have no min or max).
+    const bool nested = zoned_nested(type, key_view);
+    const bool bloom = type == ScalarIndexType::BloomFilter;
+    std::size_t value_width = 0;
+    if (bloom) {
+        if (key_view.extension_name.data != nullptr || !index_files::bloom_value_width(key_view, value_width, error)) {
+            if (error.empty()) {
+                error = "a BLOOMFILTER index on an extension type is not supported";
+            }
+            return false;
+        }
+    } else if (!nested && (key_view.extension_name.data != nullptr || !key_kind_of(key_view, kind, error))) {
         if (error.empty()) {
             error = "a scalar index on an extension type is not supported";
         }
         return false;
     }
+    // BLOOMFILTER: Lance's BloomFilterIndexBuilderParams defaults, checked as its filter checks them.
+    const std::uint64_t number_of_items = options.number_of_items != 0 ? options.number_of_items : 8192;
+    const double probability = options.probability != 0.0 ? options.probability : 0.00057;
+    if (bloom && !(probability > 0.0 && probability < 1.0)) {
+        error = "a BLOOMFILTER probability must be between 0 and 1";
+        return false;
+    }
 
-    // The values (or list elements) in row-address order; a label list's null lists aside.
+    // The values (or list elements) in row-address order; a label list's null lists aside. A zonemap
+    // keeps the row addresses themselves (its zones are of fragments and offsets), not stable row ids.
+    const bool zoned = type == ScalarIndexType::ZoneMap || bloom;
     Items items;
     OwnedViews views;
     std::vector<std::uint64_t> null_lists;
     std::size_t capacity = 0;
-    for (const auto& batch : batches.v) {
-        const ArrowArray* arr = batch.children[0];
-        for (const auto c : path_index) {
-            arr = arr->children[c];
-        }
+    for (std::size_t b = 0; b < batches.v.size(); ++b) {
+        const ArrowArray* arr = column_of(b);
         capacity += static_cast<std::size_t>(list ? arr->children[0]->length : arr->length);
     }
     items.view.reserve(capacity);
     items.index.reserve(capacity);
     items.addr.reserve(capacity);
-    for (const auto& batch : batches.v) {
-        const ArrowArray* arr = batch.children[0];
-        for (const auto c : path_index) {
-            arr = arr->children[c];
-        }
+    for (std::size_t b = 0; b < batches.v.size(); ++b) {
+        const auto& batch = batches.v[b];
+        const ArrowArray* arr = column_of(b);
         const ArrowArray* addr_arr = batch.children[batch.n_children - 1];
         const auto* addrs = static_cast<const std::uint64_t*>(addr_arr->buffers[1]) + addr_arr->offset;
         auto view = std::make_unique<ArrowArrayView>();
@@ -994,7 +1607,7 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
             const auto vi = static_cast<std::uint32_t>(items.views.size());
             items.views.push_back(v);
             for (std::int64_t r = 0; r < batch.length; ++r) {
-                items.push(vi, r, addrs[r]);
+                items.push(vi, r, zoned ? addrs[r] : to_row_id(addrs[r]));
             }
             continue;
         }
@@ -1002,13 +1615,13 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
         items.views.push_back(v->children[0]);
         for (std::int64_t r = 0; r < batch.length; ++r) {
             if (ArrowArrayViewIsNull(v, r)) {
-                null_lists.push_back(addrs[r]);
+                null_lists.push_back(to_row_id(addrs[r]));
                 continue;
             }
             const auto begin = ArrowArrayViewListChildOffset(v, r);
             const auto end = ArrowArrayViewListChildOffset(v, r + 1);
             for (auto e = begin; e < end; ++e) {
-                items.push(vi, e, addrs[r]);
+                items.push(vi, e, to_row_id(addrs[r]));
             }
         }
     }
@@ -1017,9 +1630,18 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
         return false;
     }
     Sorted sorted;
-    sort_items(items, kind, type != ScalarIndexType::BTree, sorted);
+    std::vector<std::uint32_t> zone_of;
+    std::vector<Zone> zones;
+    if (zoned) {
+        zones = cut_zones(items, bloom ? number_of_items : rows_per_zone, zone_of);
+        if (!nested && !bloom) {
+            zone_extrema_of(items, kind, zone_of, zones);
+        }
+    } else if (type != ScalarIndexType::NGram) {
+        sort_items(items, kind, type != ScalarIndexType::BTree, sorted);
+    }
 
-    const auto uuid = new_uuid();
+    const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -1029,12 +1651,25 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
     }
     std::vector<WrittenFile> files;
     std::string details;
+    std::vector<std::uint8_t> details_value;  // a JSON index's JsonIndexDetails
     std::uint32_t index_version = 0;
     bool written = false;
+    const char* write_stage = type == ScalarIndexType::BTree    ? "write_lookup_file"
+                              : type == ScalarIndexType::Bitmap ? "write_bitmap_index"
+                              : type == ScalarIndexType::ZoneMap ? "write_zonemap_index"
+                              : type == ScalarIndexType::NGram  ? "write_ngram_index"
+                              : bloom                            ? "write_bloomfilter_index"
+                                                                 : "write_label_list_index";
+    if (progress != nullptr) {
+        (*progress)(0, write_stage, 1, "files", 0);
+    }
     switch (type) {
     case ScalarIndexType::BTree:
         written = write_btree(dir, *key_type, items, sorted, files, error);
-        details = "/lance.table.BTreeIndexDetails";
+        details = json ? "/lance.index.pb.JsonIndexDetails" : "/lance.table.BTreeIndexDetails";
+        if (json) {
+            details_value = json_index_details(*options.json_path);
+        }
         break;
     case ScalarIndexType::Bitmap:
         written = write_bitmap(dir, *key_type, items, sorted, nullptr, files, error);
@@ -1047,15 +1682,40 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
         index_version = 1;
         break;
     }
+    case ScalarIndexType::ZoneMap:
+        written = write_zonemap(dir, *key_type, items, zones,
+                                kind == KeyKind::Float16 || kind == KeyKind::Float32 || kind == KeyKind::Float64,
+                                nested, rows_per_zone, files, error);
+        details = "/lance.table.ZoneMapIndexDetails";
+        break;
+    case ScalarIndexType::NGram:
+        written = write_ngram(dir, items, target != nullptr ? target->postings : nullptr, files, error);
+        details = "/lance.table.NGramIndexDetails";
+        break;
+    case ScalarIndexType::BloomFilter:
+        written = write_bloomfilter(dir, items, zones, zone_of,
+                                    bloom_filter::log2_bytes_for(number_of_items, probability), number_of_items,
+                                    probability, value_width, files, error);
+        details = "/lance.index.pb.BloomFilterIndexDetails";
+        break;
     }
     if (!written) {
         std::filesystem::remove_all(dir, ec);
         return false;
     }
+    if (progress != nullptr) {
+        (*progress)(2, write_stage, 0, "", 0);
+    }
 
     std::vector<std::uint32_t> fragment_ids;
-    for (const auto& f : manifest.fragments) {
-        fragment_ids.push_back(static_cast<std::uint32_t>(f.id));
+    if (target != nullptr && (target->coverage != nullptr || target->fragments != nullptr)) {
+        for (const auto id : target->coverage != nullptr ? *target->coverage : *target->fragments) {
+            fragment_ids.push_back(static_cast<std::uint32_t>(id));
+        }
+    } else {
+        for (const auto& f : manifest.fragments) {
+            fragment_ids.push_back(static_cast<std::uint32_t>(f.id));
+        }
     }
     std::sort(fragment_ids.begin(), fragment_ids.end());
     std::vector<pb::IndexMetadata::File> index_files;
@@ -1065,17 +1725,84 @@ bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, cons
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
+    auto entry = pb::make_index_metadata(uuid, {field->id}, name, version, fragment_ids, details,
+                                                       index_version, static_cast<std::uint64_t>(now), index_files, details_value);
+    if (!commit) {
+        *target->out = std::move(entry);
+        return true;
+    }
     if (existing != manifest.indices.end()) {
         // Every segment of the replaced index goes.
         manifest.indices.erase(std::remove_if(manifest.indices.begin(), manifest.indices.end(),
                                               [&](const pb::IndexMetadata& i) { return i.name == name; }),
                                manifest.indices.end());
     }
-    manifest.indices.push_back(pb::make_index_metadata(uuid, {field->id}, name, version, fragment_ids, details,
-                                                       index_version, static_cast<std::uint64_t>(now), index_files));
+    manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
         std::filesystem::remove_all(dir, ec);
         return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool dataset_create_scalar_index(const std::filesystem::path& dataset_path, const std::string& column,
+                                 ScalarIndexType type, const ScalarIndexOptions& options,
+                                 std::uint64_t& new_version, std::string& error) {
+    return create_scalar_index(dataset_path, column, type, options, nullptr, new_version, error);
+}
+
+bool index_build::build_scalar_segment(const std::filesystem::path& dataset_path, const std::string& column,
+                                       ScalarIndexType type, const ScalarIndexOptions& options,
+                                       const SegmentTarget& target, std::string& error) {
+    std::uint64_t unused = 0;
+    return create_scalar_index(dataset_path, column, type, options, &target, unused, error);
+}
+
+bool index_build::load_ngram_postings(const std::filesystem::path& dir, NGramPostings& out, std::string& error) {
+    out.clear();
+    index_files::FileTable table;
+    const std::vector<std::string> columns = {"tokens", "posting_list"};
+    if (!index_files::read_table(dir / "ngram_postings.lance", &columns, LanceRowRange{}, table, error)) {
+        return false;
+    }
+    if (table.schema.n_children != 2) {
+        error = "ngram index: ngram_postings.lance has no tokens and posting_list columns";
+        return false;
+    }
+    for (const auto& batch : table.batches) {
+        ArrowArrayView tokens;
+        ArrowArrayView lists;
+        ArrowError e{};
+        if (ArrowArrayViewInitFromSchema(&tokens, &table.type(0), &e) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&tokens, batch.children[0], &e) != NANOARROW_OK ||
+            ArrowArrayViewInitFromSchema(&lists, &table.type(1), &e) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&lists, batch.children[1], &e) != NANOARROW_OK) {
+            ArrowArrayViewReset(&tokens);
+            ArrowArrayViewReset(&lists);
+            error = std::string("ngram index: ") + e.message;
+            return false;
+        }
+        bool ok = true;
+        for (std::int64_t r = 0; ok && r < batch.length; ++r) {
+            if (ArrowArrayViewIsNull(&tokens, r) || ArrowArrayViewIsNull(&lists, r)) {
+                continue;
+            }
+            const auto token = static_cast<std::uint32_t>(ArrowArrayViewGetUIntUnsafe(&tokens, r));
+            const auto bytes = ArrowArrayViewGetBytesUnsafe(&lists, r);
+            std::vector<std::uint64_t> ids;
+            ok = roaring::decode_treemap(bytes.data.as_uint8, static_cast<std::size_t>(bytes.size_bytes), ids, error);
+            if (ok) {
+                auto& to = out[token];
+                to.insert(to.end(), ids.begin(), ids.end());
+            }
+        }
+        ArrowArrayViewReset(&tokens);
+        ArrowArrayViewReset(&lists);
+        if (!ok) {
+            return false;
+        }
     }
     return true;
 }
@@ -1118,6 +1845,13 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
             details.resize(details.size() - suffix.size());
         }
         info.type = details;
+        if (is_vector_index_url(url)) {
+            const auto type =  // IVF_PQ, IVF_FLAT, ...
+                vector_index_type(dataset_path / "_indices" / pb::uuid_string(index.uuid), index.details_value);
+            if (!type.empty()) {
+                info.type = type;
+            }
+        }
         for (const auto id : index.fields) {
             info.fields.push_back(path_of(id));
         }
@@ -1125,6 +1859,7 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
         info.dataset_version = index.dataset_version;
         info.index_version = index.index_version;
         info.type_url = index.details_type_url;
+        info.details_value = index.details_value;
         info.field_ids = index.fields;
         info.created_at = index.created_at;
         for (const auto& f : index.files) {

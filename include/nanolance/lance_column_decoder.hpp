@@ -50,6 +50,12 @@ bool decode_lance_physical_column_range(const std::filesystem::path& data_file_p
                                         std::uint64_t count, std::size_t value_bytes, ColumnValues& out,
                                         std::string& error);
 
+/// The dictionary entries of a column's dictionary pages (each entry's bytes), in page order, each
+/// value once: what an Arrow dictionary column was written with. Empty when no page has one.
+bool lance_column_dictionary_entries(const std::filesystem::path& data_file_path, const pb::Field& on_disk_field,
+                                     const pb::ColumnMetadata& column_metadata, std::vector<std::string>& out,
+                                     std::string& error);
+
 /// A buffer compressed by Lance's general buffer compressor (`Compression.scheme`: "zstd", "lz4" or
 /// "none"/empty), decompressed into `out`. Bounded: never more than zstd/lz4 can produce from the
 /// bytes given, nor the decoded-size limit.

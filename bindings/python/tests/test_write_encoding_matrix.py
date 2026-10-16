@@ -39,6 +39,14 @@ def _null(i: int) -> bool:
     return i % 11 == 0
 
 
+def _bf16_vectors(values, dim):
+    """bfloat16 vectors: a fixed-size list of lance.bfloat16 extension elements (fixed_size_binary(2)
+    storage), which Lance names "lance.bfloat16" as the list's element type."""
+    from nanolance.lance.arrow import bfloat16_array
+
+    return pa.table({"c": pa.FixedSizeListArray.from_arrays(bfloat16_array(values), dim)})
+
+
 def _table(values, arrow_type=None):
     return pa.table({"c": pa.array(values, type=arrow_type)})
 
@@ -93,6 +101,9 @@ SHAPES = [
     ("fsl_f32_8", _table([[float(i + j) for j in range(8)] for i in range(N)], pa.list_(pa.float32(), 8)), "FixedSizeList{8xFlat}"),
     ("null_fsl_f32_4", _table([None if _null(i) else [float(i)] * 4 for i in range(N)], pa.list_(pa.float32(), 4)), "FixedSizeList + def levels"),
     ("fsl_i64_2", _table([[i, -i] for i in range(N)], pa.list_(pa.int64(), 2)), "FixedSizeList{2xFlat}"),
+    # A bfloat16 vector: fixed_size_binary(2) elements tagged lance.bfloat16, which pylance names
+    # "lance.bfloat16" as the list's element type.
+    ("fsl_bf16_4", _bf16_vectors([float(i % 97) * 0.5 for i in range(4 * N)], 4), "FixedSizeList{4xFlat} bf16"),
     # Long strings: stock Lance switches to FullZip at 256 bytes; nanolance keeps MiniBlock, which is
     # legal at any value size. This pins that stock Lance reads it.
     ("str_long", _table([("q" * 300) + str(i) for i in range(N)], pa.utf8()), "variable, 300-byte values"),

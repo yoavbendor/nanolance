@@ -19,6 +19,11 @@ namespace nano_lance {
 /// Number the field ids of the schema the first batch sets from `first_id` (after a dataset's own).
 bool writer_set_field_id_base(NanoLanceWriter* writer, std::int32_t first_id, std::string& error);
 
+/// On an append writer, before its first batch: write only the top-level fields named in `keep`
+/// (with their children), keeping the dataset's field ids and order. The files cover those fields
+/// alone, as Lance writes an append of part of the schema; readers fill the rest with nulls.
+bool writer_project_append(NanoLanceWriter* writer, const std::vector<std::string>& keep, std::string& error);
+
 /// Commit what is pending (a batch of no rows too, with `keep_empty`) and hand over every staged data
 /// file, with the schema they were written with, instead of publishing them.
 bool writer_take_staged(NanoLanceWriter* writer, std::vector<NewFragment>& out, LanceSchemaMapping& mapping,

@@ -21,9 +21,34 @@ def unsupported(what: str) -> NotSupportedError:
 def translate(message: str) -> Exception:
     text = str(message)
     lower = text.lower()
+    # Filter errors, as pylance words them (DataFusion's planner behind "Invalid user input").
+    import re
+
+    missing = re.match(r"filter column '(.*)' not found in schema", text)
+    if missing:
+        return ValueError(f"Invalid user input: Schema error: No field named {missing.group(1)}.")
+    if text.startswith("a filter must be a boolean expression"):
+        return ValueError(f"Invalid user input: the filter does not return a boolean ({text})")
+    if text.startswith(("invalid filter", "cannot compare", "cannot CAST")):
+        return ValueError(f"Invalid user input: {text}")
+    if "Legacy blob columns" in text:
+        return OSError("Invalid user input: " + text[text.index("Legacy blob columns"):])
+    for marker in ("Blob v2 field '", "Invalid blob threshold metadata"):
+        if marker in text:
+            return OSError("Invalid user input: " + text[text.index(marker):])
+    if "is declared as non-nullable but contains null values" in text:
+        return OSError("LanceError(Arrow): Invalid argument error: " + text[text.index("Column '"):])
+    if "Empty structs with rep/def information" in text:
+        return OSError("Invalid user input: " + text.split("write failed: ", 1)[-1])
+    if "dimension must be a positive integer" in text:
+        return OSError(text)
     if "already exists" in lower:
         return OSError(text)
+    if text.startswith("Invalid user input: CompactionOptions::"):
+        return OSError(text)
     if "append" in lower and "schema" in lower:
+        return OSError(text)
+    if "merge insert failed" in lower:
         return OSError(text)
     if "not found" in lower or "no manifest" in lower:
         return ValueError(text)

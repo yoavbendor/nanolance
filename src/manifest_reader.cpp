@@ -211,6 +211,14 @@ bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint6
     // The version is scheme-independent, so try both spellings rather than assuming one. A dataset
     // nanolance appended to after pylance created it can legitimately hold a mix.
     std::error_code path_ec;
+    if ((v & (1ULL << 63U)) != 0U) {  // a detached version: `d<version>.manifest`
+        const auto detached = dataset_path / "_versions" / ("d" + std::to_string(v) + ".manifest");
+        if (!std::filesystem::exists(detached, path_ec)) {
+            error = "version " + std::to_string(v) + " not found";
+            return false;
+        }
+        return load_manifest_file(detached, out, error);
+    }
     auto manifest_path = dataset_path / "_versions" / (std::to_string(v) + ".manifest");
     if (!std::filesystem::exists(manifest_path, path_ec)) {
         std::ostringstream inverted;
@@ -222,6 +230,12 @@ bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint6
             return false;
         }
     }
+    return load_manifest_file(manifest_path, out, error);
+}
+
+bool load_manifest_file(const std::filesystem::path& manifest_path, pb::Manifest& out, std::string& error) {
+    error.clear();
+    out = pb::Manifest{};
     std::vector<std::uint8_t> body;
     if (!read_manifest_file(manifest_path, body, error)) {
         return false;

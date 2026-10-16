@@ -39,29 +39,49 @@ from nanolance.lance.dataset import (
     dataset,
     write_dataset,
 )
-from nanolance.lance.blob import BlobFile, blob_array, blob_field
+from nanolance.lance.blob import (Blob, BlobArray, BlobColumn, BlobDescriptor, BlobDescriptorArrayBuilder, BlobFile,
+                                  DedicatedBlobWriter, PackedBlobWriter, blob_array, blob_field)
+from nanolance.lance.base_path import DatasetBasePath
 from nanolance.lance.fragment import DataFile, DeletionFile, FragmentMetadata, LanceFragment
+from nanolance.lance._transactions import LanceOperation, Transaction
+from nanolance.lance.udf import batch_udf
+from nanolance.lance.fts_tokenize import FtsToken, tokenize
+from nanolance.lance._session import Session
 
 #: The pylance release whose API (and test suite) this module tracks.
 PYLANCE_API_VERSION = "12.0.0"
 __version__ = f"{PYLANCE_API_VERSION}+nanolance.{_nanolance_pkg.__version__}"
 
 __all__ = [
+    "Blob",
+    "BlobArray",
+    "BlobColumn",
     "BlobFile",
     "DataFile",
+    "DatasetBasePath",
     "DeletionFile",
+    "FtsToken",
     "FragmentMetadata",
     "LanceDataset",
+    "BlobDescriptor",
+    "BlobDescriptorArrayBuilder",
+    "DedicatedBlobWriter",
     "LanceFragment",
+    "PackedBlobWriter",
+    "LanceOperation",
     "LanceScanner",
     "NotSupportedError",
     "ScannerBuilder",
+    "Transaction",
     "__version__",
     "blob_array",
     "blob_field",
+    "batch_udf",
     "dataset",
     "install_as_lance",
     "uninstall_as_lance",
+    "Session",
+    "tokenize",
     "write_dataset",
 ]
 

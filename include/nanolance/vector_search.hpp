@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Yoav Bendor
+
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "nanolance/lance_table_reader.hpp"
+
+/// Nearest-neighbour search over a vector column (a fixed-size list of floats), as Lance's
+/// `nearest` answers it: from the column's IVF_FLAT / IVF_PQ index where there is one (built by
+/// Lance or by nanolance; docs/VECTOR_INDEX.md), exactly over the fragments it does not cover, and
+/// exactly over everything without one.
+namespace nano_lance {
+
+enum class VectorMetric { L2, Cosine, Dot };
+
+/// "l2" / "euclidean", "cosine", "dot" (any case). False for anything else.
+bool parse_vector_metric(const std::string& name, VectorMetric& out);
+const char* vector_metric_name(VectorMetric metric);  // "l2", "cosine", "dot"
+
+struct NearestQuery {
+    bool has_version = false;
+    std::uint64_t version = 0;
+    std::string column;
+    std::vector<float> key;  // the query vector
+    std::uint64_t k = 10;
+    /// Partitions to probe: at least `minimum_nprobes` (Lance's adaptive count when it is 1 and
+    /// there is no maximum), at most `maximum_nprobes` (all when unset). `nprobes` sets both.
+    std::uint32_t minimum_nprobes = 1;
+    std::optional<std::uint32_t> maximum_nprobes;
+    /// Re-score the best `k * refine_factor` index candidates exactly and return the best k.
+    std::optional<std::uint32_t> refine_factor;
+    /// HNSW: the search beam's width; unset: 1.5 times the candidates kept (Lance's default).
+    std::optional<std::uint32_t> ef;
+    /// Partitions searched side by side once the first ones gave fewer than k rows (Lance's
+    /// query_parallelism): -1 every compute core, 0 Lance's choice for the index, n at most n. For
+    /// an HNSW index this decides how many partitions are searched (Lance searches them in batches),
+    /// so it is reproduced; elsewhere it changes nothing.
+    std::int32_t query_parallelism = 0;
+    /// The distance; unset: the index's (L2 without one). A metric other than the index's searches
+    /// exactly, as Lance does.
+    std::optional<VectorMetric> metric;
+    bool use_index = true;
+    /// Keep loaded indices in the process-wide cache (false: load them afresh for this search).
+    bool index_cache = true;
+    /// Only rows with lower_bound <= distance < upper_bound.
+    std::optional<float> lower_bound;
+    std::optional<float> upper_bound;
+    /// An SQL filter: applied before the search with `prefilter` (k matching rows), else to the k
+    /// nearest (fewer may pass).
+    std::optional<std::string> filter;
+    bool prefilter = false;
+    /// Row-address masks: the top k is taken over the rows they allow (null: no mask).
+    const RowAddrMask* row_mask = nullptr;
+    /// Search only the fragments the index covers.
+    bool fast_search = false;
+    /// When set, search these segments (by UUID) of the column's index and nothing else -- no exact
+    /// search of the fragments they do not cover (Lance's with_index_segments, which a distributed
+    /// query fans out over). They must exist and belong to one index on the column; a `metric` other
+    /// than theirs is an error. Ignored with use_index=false.
+    std::vector<std::array<std::uint8_t, 16>> segments;
+};
+
+/// What an index's build recorded, as its describe() reports it.
+struct VectorIndexDetails {
+    std::string type;    // IVF_FLAT, IVF_PQ
+    std::string metric;  // as the index was built: "l2", "cosine", "dot"
+    bool pq = false;
+    std::uint32_t num_bits = 0;
+    std::uint64_t num_sub_vectors = 0;
+};
+
+/// The runtime hints a vector index's details (the manifest's VectorIndexDetails bytes) record, in
+/// their stored order: "lance.ivf.max_iters" and the like.
+bool vector_index_runtime_hints(const std::vector<std::uint8_t>& details,
+                                std::vector<std::pair<std::string, std::string>>& out);
+
+/// The details of the vector index in `index_dir` (dataset/_indices/<uuid>).
+bool vector_index_details(const std::filesystem::path& index_dir, VectorIndexDetails& out, std::string& error);
+
+struct NearestResult {
+    std::vector<std::uint64_t> row_ids;  // row addresses, nearest first (ties by row id)
+    std::vector<float> distances;
+    std::vector<std::string> plan;  // what answered, one line per step
+    std::uint64_t index_cache_hits = 0;    // partitions found loaded
+    std::uint64_t index_cache_misses = 0;  // partitions loaded from the index files
+};
+
+bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQuery& query, NearestResult& out,
+                     std::string& error);
+
+struct VectorIndexOptions {
+    std::string type;  // "IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ", ...
+    std::string name;  // empty: <column>_idx
+    VectorMetric metric = VectorMetric::L2;
+    bool replace = false;
+    /// Partitions: as given, else rows / target_partition_size (Lance's 4096 for IVF_FLAT, 8192 for
+    /// IVF_PQ, 1 << 20 for IVF_HNSW_SQ), at least 1 and at most 4096.
+    std::optional<std::uint32_t> num_partitions;
+    std::optional<std::uint32_t> target_partition_size;
+    std::uint32_t num_sub_vectors = 0;  // IVF_PQ: required; must divide the dimension
+    std::uint32_t num_bits = 8;         // IVF_PQ: 8 or 4
+    std::uint32_t max_iters = 50;       // k-means iterations (IVF and PQ), as Lance's defaults
+    std::uint32_t sample_rate = 256;    // k-means trains on sample_rate * k vectors at most
+    std::optional<std::uint64_t> seed;  // the random sample and initial centroids
+    // IVF_HNSW_*: each partition's graph (Lance's HnswBuildParams and defaults).
+    std::uint32_t hnsw_m = 20;                 // edges per node (2 * m on level 0); at least 4
+    std::uint32_t hnsw_ef_construction = 150;  // the beam while inserting; at least m
+    std::uint32_t hnsw_max_level = 7;          // levels, 1 to 16
+    /// IVF centroids supplied instead of trained, [partitions][dim] (num_partitions is their count);
+    /// IVF_PQ: with `pq_codebook` too, Lance's flat [num_sub_vectors][2^num_bits][dim / num_sub_vectors],
+    /// else the codebook is trained on the residuals.
+    std::vector<float> ivf_centroids;
+    std::vector<float> pq_codebook;
+    /// IVF_PQ: store the codes row by row rather than transposed (Lance's skip_transpose).
+    bool skip_transpose = false;
+    /// Where the build reports its stages (Lance's progress events: 0 starts a stage of `total` units,
+    /// 1 reports `completed` of them, 2 ends it); nothing when empty. An exception it throws stops the
+    /// build, and nothing is committed.
+    std::function<void(int event, const char* stage, std::uint64_t total, const char* unit,
+                       std::uint64_t completed)>
+        progress;
+};
+
+/// Build an IVF_FLAT / IVF_SQ / IVF_PQ / IVF_HNSW_FLAT / IVF_HNSW_SQ / IVF_HNSW_PQ index on `column` (a fixed-size list of float32) in Lance's format --
+/// one pylance and LanceDB search as their own -- and commit it as the next version. Null vectors
+/// and vectors with NaN or infinite values are left out, as Lance leaves them out.
+bool dataset_create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,
+                                 const VectorIndexOptions& options, std::uint64_t& new_version, std::string& error);
+
+/// What Lance calls a vector index, from its manifest details (VectorIndexDetails): "IVF_PQ",
+/// "IVF_FLAT", "IVF_SQ", "IVF_RQ", "IVF_HNSW_PQ", ... Empty when the details do not say.
+std::string vector_index_type(const std::vector<std::uint8_t>& details);
+
+/// The same, falling back to what the index's files say (`dir`: _indices/<uuid>).
+std::string vector_index_type(const std::filesystem::path& dir, const std::vector<std::uint8_t>& details);
+
+/// A vector index's model, as its files (`dir`: _indices/<uuid>) hold it: what Lance reports as the
+/// index's statistics is made of these.
+struct VectorIndexModel {
+    std::string index_metadata;      // index.idx `lance:index` (JSON: type, distance_type)
+    std::string sub_index_metadata;  // index.idx `lance:hnsw` (JSON list, one per partition), if any
+    std::string storage_metadata;    // auxiliary.idx `storage_metadata` (JSON list)
+    std::vector<float> centroids;    // partitions * dim
+    std::size_t partitions = 0;
+    std::size_t dim = 0;
+    std::vector<std::uint64_t> partition_sizes;
+    bool has_loss = false;
+    double loss = 0;
+};
+bool read_vector_index_model(const std::filesystem::path& dir, VectorIndexModel& out, std::string& error);
+
+/// One IVF partition's rows as the index stores them (VectorIndexReader): the row ids in stored order,
+/// and the storage column -- float32 values (IVF_FLAT, IVF_HNSW_FLAT: `flat`) or uint8 codes (IVF_PQ and
+/// IVF_HNSW_PQ: `__pq_code`, `width` code bytes a row; IVF_SQ and IVF_HNSW_SQ: `__sq_code`, dim bytes).
+struct VectorIndexPartition {
+    std::size_t partitions = 0;
+    std::size_t width = 0;  // values per row: dim (flat), code bytes (PQ), dim (SQ)
+    std::string column;     // "flat", "__pq_code" or "__sq_code"
+    std::vector<std::uint64_t> ids;
+    std::vector<float> floats;         // flat: ids.size() * width
+    std::vector<std::uint8_t> codes;   // PQ / SQ: ids.size() * width, row by row as stored
+};
+/// Partition `partition` of the IVF index in `dir` (_indices/<uuid>); the values only when `with_values`.
+bool read_vector_index_partition(const std::filesystem::path& dir, std::size_t partition, bool with_values,
+                                 VectorIndexPartition& out, std::string& error);
+
+/// Whether an index's details type is a vector index's (Lance has used more than one package name).
+bool is_vector_index_url(const std::string& url);
+
+}  // namespace nano_lance

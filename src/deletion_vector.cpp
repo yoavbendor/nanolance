@@ -8,8 +8,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <random>
 #include <cstdio>
 
+#include "nanolance/base_paths.hpp"
 #include "nanolance/read_safety.hpp"
 
 #include <zstd.h>
@@ -19,6 +21,7 @@
 #include <fstream>
 #include <bit>
 #include <limits>
+#include <optional>
 
 namespace nano_lance {
 namespace {
@@ -665,6 +668,16 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
     if (!deletion_file.present) {
         return true;
     }
+    // Lance writes the deletions of rows in a base path to the dataset's own _deletions, with no
+    // base_id (the case here). A deletion file that names a base is not read yet.
+    std::optional<std::uint32_t> base_id;
+    if (!deletion_file_base_id(deletion_file, base_id, error)) {
+        return false;
+    }
+    if (base_id && *base_id != 0U) {
+        error = "deletion file of fragment " + std::to_string(fragment_id) + " is in a base path, which is not supported";
+        return false;
+    }
 
     const bool bitmap = deletion_file.file_type == 1U;
     const std::string name = std::to_string(fragment_id) + "-" + std::to_string(deletion_file.read_version) +
@@ -720,10 +733,14 @@ bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_
         error = "failed to create _deletions: " + ec.message();
         return false;
     }
+    // Random as well as clock-based: writers in other processes name files in the same directory.
     static std::atomic<std::uint64_t> counter{0};
+    // (Drawn from the entropy source each time: a seeded generator would be shared by forked processes.)
+    std::random_device device;
+    const std::uint64_t random = (static_cast<std::uint64_t>(device()) << 32U) ^ device();
     const std::uint64_t id =
         (static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) * 0x9E3779B97F4A7C15ULL) ^
-        (counter.fetch_add(1) + 1U) ^ (static_cast<std::uint64_t>(fragment_id) << 40U);
+        (counter.fetch_add(1) + 1U) ^ (static_cast<std::uint64_t>(fragment_id) << 40U) ^ random;
     const auto name = std::to_string(fragment_id) + "-" + std::to_string(read_version) + "-" +
                       std::to_string(id & 0x7FFFFFFFFFFFFFFFULL) + ".arrow";
     const auto path = dataset_path / "_deletions" / name;

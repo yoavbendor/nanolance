@@ -83,6 +83,7 @@ struct IndexMetadata {
     bool fragment_bitmap_changed = false;
     std::array<std::uint8_t, 16> uuid{};  // 1: UUID{bytes=1}
     std::string details_type_url;         // 6: the index_details Any's type, e.g. "/lance.table.BTreeIndexDetails"
+    std::vector<std::uint8_t> details_value;  // 6: the index_details Any's message
     std::uint32_t index_version = 0;      // 7
     std::uint64_t created_at = 0;         // 8: milliseconds since the epoch
     struct File {
@@ -97,7 +98,13 @@ IndexMetadata make_index_metadata(const std::array<std::uint8_t, 16>& uuid, cons
                                   const std::string& name, std::uint64_t dataset_version,
                                   const std::vector<std::uint32_t>& fragment_ids, const std::string& details_type_url,
                                   std::uint32_t index_version, std::uint64_t created_at,
-                                  const std::vector<IndexMetadata::File>& files);
+                                  const std::vector<IndexMetadata::File>& files,
+                                  const std::vector<std::uint8_t>& details_value = {});
+
+/// One IndexMetadata message: read (`raw` keeps the bytes), and written (`raw` itself unless the
+/// writer changed the coverage).
+bool decode_index_message(const std::uint8_t* data, std::size_t size, IndexMetadata& index, std::string& error);
+std::vector<std::uint8_t> encode_index_message(const IndexMetadata& index);
 
 /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", the directory name of an index under _indices/.
 std::string uuid_string(const std::array<std::uint8_t, 16>& uuid);
@@ -142,6 +149,24 @@ struct Manifest {
     /// file this was read from (version_aux_data, index_section, transaction_section) are not kept:
     /// they would point at the wrong bytes of a new file.
     std::vector<std::uint8_t> unknown;
+
+    /// Not on the wire: what a commit of this manifest does, for its transaction file, when the change
+    /// from the version before does not say it alone (an overwrite or a restore replaces every
+    /// fragment, as a compaction of all of them does). `Derive`: read it off the change.
+    enum class Operation { Derive, Append, Overwrite, Restore, Rewrite, Update, Reserve };
+    Operation operation = Operation::Derive;
+    std::uint64_t restored_version = 0;  // Restore: the version restored
+    std::size_t first_new_fragment = 0;  // Append: fragments from here on are the new ones
+    std::uint32_t reserved_fragments = 0;  // Reserve: fragment ids reserved (max_fragment_id raised by it)
+    /// Not on the wire: a commit that knows its transaction exactly (one built by hand, pylance's
+    /// LanceDataset.commit) -- the operation's field number in lance.table.Transaction, its message and
+    /// the version it was read at -- written into its transaction file as given. 0: derive it.
+    std::uint32_t explicit_operation_field = 0;
+    std::vector<std::uint8_t> explicit_operation;
+    std::uint64_t explicit_read_version = 0;
+    /// Not on the wire: the commit's transaction properties (its message among them), for its
+    /// transaction file.
+    std::map<std::string, std::string> transaction_properties;
 };
 
 /// Reader feature flags, as Lance defines them (Manifest.reader_feature_flags).
@@ -187,6 +212,7 @@ std::vector<std::uint8_t> encode_file_descriptor(const FileDescriptor& descripto
 bool decode_file_descriptor(const std::vector<std::uint8_t>& bytes, FileDescriptor& descriptor);
 
 std::vector<std::uint8_t> encode_data_fragment(const DataFragment& fragment);
+std::vector<std::uint8_t> encode_field(const Field& field);
 bool decode_data_fragment(const std::vector<std::uint8_t>& bytes, DataFragment& fragment);
 
 std::vector<std::uint8_t> encode_data_file(const DataFile& file);

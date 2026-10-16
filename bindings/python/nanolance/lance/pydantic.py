@@ -22,6 +22,7 @@ def _pydantic_reader(items, schema=None, model=None) -> pa.RecordBatchReader:
 def pydantic_to_schema(model) -> pa.Schema:
     """The Arrow schema of a pydantic model's fields (required fields are not nullable)."""
     import datetime
+    import enum
     import typing
 
     simple = {int: pa.int64(), float: pa.float64(), str: pa.utf8(), bool: pa.bool_(), bytes: pa.binary(),
@@ -39,6 +40,16 @@ def pydantic_to_schema(model) -> pa.Schema:
             return simple[tp], False
         if hasattr(tp, "model_fields"):
             return pa.struct([pa.field(n, *arrow_type(f.annotation)) for n, f in tp.model_fields.items()]), False
+        if isinstance(tp, type) and issubclass(tp, enum.Enum):
+            # As pylance: a string enum is dictionary-encoded, an enum of one other type takes that
+            # type, a mixed or empty one is utf8.
+            kinds = {type(m.value) for m in tp}
+            if len(kinds) == 1:
+                kind = kinds.pop()
+                if kind is str:
+                    return pa.dictionary(pa.int32(), pa.utf8()), False
+                return arrow_type(kind)[0], False
+            return pa.utf8(), False
         raise TypeError(f"no Arrow type for {tp!r}")
 
     fields = []

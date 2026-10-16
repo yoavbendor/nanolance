@@ -128,9 +128,12 @@ inline Bytes general(std::uint64_t scheme, const Bytes& values) {
     return detail::compressive(&wire::CompressiveEncoding::general, v);
 }
 /// FixedSizeList{ items_per_value, values }.
-inline Bytes fixed_size_list(std::uint64_t items_per_value, const Bytes& values) {
+inline Bytes fixed_size_list(std::uint64_t items_per_value, const Bytes& values, bool has_validity = false) {
     wire::FixedSizeList21 v;
     v.items_per_value = items_per_value;
+    if (has_validity) {
+        v.has_validity = 1U;
+    }
     v.values = detail::lazy(values);
     return detail::compressive(&wire::CompressiveEncoding::fixed_size_list, v);
 }

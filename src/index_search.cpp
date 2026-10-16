@@ -13,6 +13,15 @@
 //   LabelList  the same over a list column's elements, plus the rows whose list is null (global
 //              buffer 1): array_has_any is the union of the named elements' rows, array_has_all
 //              their intersection.
+//   ZoneMap    zonemap.lance: per zone, its min, max and null count; the bounds keep the zones that
+//              may match, and a kept zone's rows (its fragment's offsets over its span, deleted rows
+//              among them) are the answer. Zones hold row addresses, not stable row ids.
+//   BloomFilter bloomfilter.lance: per zone, its span, whether it holds a null and its bloom filter.
+//              `=` and IN keep the zones whose filter may hold a constant (probed with its bytes in
+//              the column's type); IS NULL keeps the zones with a null. Zones hold row addresses.
+//   NGram      ngram_postings.lance: for contains(col, 'x'), the rows holding every trigram of the
+//              needle (lower-cased, folded), read from the posting lists; a needle shorter than three
+//              characters, or with no trigram, says nothing; a trigram the index lacks means no row.
 //
 // Each index covers the fragments of its fragment bitmap: an answer says nothing about the others.
 // AND intersects answers where both apply; OR unites them where both apply; NOT and anything
@@ -20,10 +29,17 @@
 
 #include "nanolance/index_search.hpp"
 
+#include "index_files.hpp"
+
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/fts_tokenizer.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/lance_table_reader.hpp"
+#include "nanolance/bloom_filter.hpp"
 #include "nanolance/roaring_bitmap.hpp"
+#include "nanolance/schema_mapper.hpp"
+#include "nanolance/overlays.hpp"
+#include "nanolance/row_ids.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -33,6 +49,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <iterator>
 #include <set>
 #include <system_error>
 #include <unordered_map>
@@ -42,50 +59,12 @@ namespace {
 
 // ── loaded index files ──────────────────────────────────────────────────────────────────────────
 
-/// A read of an index file: its schema and batches, owned.
-struct FileTable {
-    ArrowSchema schema{};
-    std::vector<ArrowArray> batches;
-    FileTable() = default;
-    FileTable(const FileTable&) = delete;
-    FileTable& operator=(const FileTable&) = delete;
-    ~FileTable() {
-        for (auto& b : batches) {
-            if (b.release != nullptr) {
-                b.release(&b);
-            }
-        }
-        if (schema.release != nullptr) {
-            schema.release(&schema);
-        }
-    }
-    const ArrowSchema& type(std::size_t column) const { return *schema.children[column]; }
-};
-
-bool read_table(const std::filesystem::path& path, const std::vector<std::string>* columns, const LanceRowRange& range,
-                FileTable& out, std::string& error) {
-    LanceScanRequest request;
-    request.columns = columns;
-    request.range = range;
-    if (!lance_file_read(path, request, out.schema, out.batches, error)) {
-        out.schema = ArrowSchema{};  // released by the reader on failure
-        error = path.filename().string() + ": " + error;
-        return false;
-    }
-    return true;
-}
-
-bool take_table(const std::filesystem::path& path, const std::vector<std::string>* columns,
-                const std::vector<std::uint64_t>& rows, FileTable& out, std::string& error) {
-    LanceScanRequest request;
-    request.columns = columns;
-    if (!lance_file_take(path, request, rows, out.schema, out.batches, error)) {
-        out.schema = ArrowSchema{};
-        error = path.filename().string() + ": " + error;
-        return false;
-    }
-    return true;
-}
+using index_files::FileTable;
+using index_files::IndexCache;
+using index_files::file_key;
+using index_files::read_table;
+using index_files::schema_metadata;
+using index_files::take_table;
 
 struct BTreeIndex {
     FileTable lookup;  // min, max, null_count, page_idx
@@ -99,50 +78,6 @@ struct BitmapIndex {
     std::vector<std::uint8_t> list_nulls;  // LabelList: the null lists' serialized RowAddrTreeMap
     bool has_list_nulls = false;
 };
-
-/// Loaded indices, by file identity: an index's files never change, but a path could be reused by
-/// a dataset written anew, so size and modification time are part of the key.
-template <typename T>
-class IndexCache {
-public:
-    std::shared_ptr<const T> find(const std::string& key) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = entries_.find(key);
-        return it == entries_.end() ? nullptr : it->second;
-    }
-    void put(const std::string& key, std::shared_ptr<const T> value) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (entries_.size() >= 64U) {
-            entries_.erase(entries_.begin());
-        }
-        entries_[key] = std::move(value);
-    }
-
-private:
-    std::mutex mutex_;
-    std::unordered_map<std::string, std::shared_ptr<const T>> entries_;
-};
-
-std::string file_key(const std::filesystem::path& path) {
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    const auto mtime = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
-    return path.string() + "|" + std::to_string(size) + "|" + std::to_string(static_cast<long long>(mtime));  // libc++'s file_clock counts in __int128
-}
-
-bool schema_metadata(const std::filesystem::path& path, const std::string& key, std::string& value, bool& found,
-                     LanceDataFileFooterLayout& layout, std::string& error) {
-    pb::FileDescriptor descriptor;
-    if (!read_lance_data_file_footer_and_descriptor(path, descriptor, layout, error)) {
-        return false;
-    }
-    const auto it = descriptor.schema_metadata.find(key);
-    found = it != descriptor.schema_metadata.end();
-    if (found) {
-        value.assign(it->second.begin(), it->second.end());
-    }
-    return true;
-}
 
 bool load_btree(const std::filesystem::path& dir, std::shared_ptr<const BTreeIndex>& out, std::string& error) {
     static IndexCache<BTreeIndex> cache;
@@ -210,6 +145,35 @@ bool load_bitmap(const std::filesystem::path& dir, std::shared_ptr<const BitmapI
     }
     if (index->keys.schema.n_children != 1) {
         error = "bitmap index: no keys column";
+        return false;
+    }
+    out = index;
+    cache.put(key, out);
+    return true;
+}
+
+struct ZoneMapIndex {
+    FileTable zones;  // min, max, null_count, nan_count, fragment_id, zone_start, zone_length
+};
+
+bool load_zonemap(const std::filesystem::path& dir, std::shared_ptr<const ZoneMapIndex>& out, std::string& error) {
+    static IndexCache<ZoneMapIndex> cache;
+    const auto path = dir / "zonemap.lance";
+    const auto key = file_key(path);
+    if ((out = cache.find(key)) != nullptr) {
+        return true;
+    }
+    auto index = std::make_shared<ZoneMapIndex>();
+    if (!read_table(path, nullptr, LanceRowRange{}, index->zones, error)) {
+        return false;
+    }
+    const auto format = [&](std::int64_t c) {
+        return std::string(index->zones.schema.children[c]->format == nullptr ? "" : index->zones.schema.children[c]->format);
+    };
+    if (index->zones.schema.n_children != 7 || format(2) != "I" || format(3) != "I" || format(4) != "L" ||
+        format(5) != "L" || format(6) != "L") {
+        error = "zonemap index: zonemap.lance is not min, max, null_count, nan_count (uint32), fragment_id, "
+                "zone_start, zone_length (uint64)";
         return false;
     }
     out = index;
@@ -384,38 +348,44 @@ std::vector<std::uint32_t> u32_column(const FileTable& table, std::size_t c) {
     return out;
 }
 
-bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
-                  std::string& error) {
-    answered = false;
-    if (p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has) {
-        return true;
+std::vector<std::uint64_t> u64_column(const FileTable& table, std::size_t c) {
+    std::vector<std::uint64_t> out;
+    for (const auto& b : table.batches) {
+        const ArrowArray* a = b.children[c];
+        const auto* v = static_cast<const std::uint64_t*>(a->buffers[1]) + a->offset;
+        out.insert(out.end(), v, v + a->length);
     }
-    std::shared_ptr<const BTreeIndex> index;
-    if (!load_btree(dir, index, error)) {
-        return false;
-    }
-    const auto& lookup = index->lookup;
-    const auto null_counts = u32_column(lookup, 2);
-    const auto page_idx = u32_column(lookup, 3);
-    const auto pages = page_idx.size();
+    return out;
+}
+
+/// The bounded units (pages, zones) of `bounds` -- its min and max (columns 0 and 1) and each one's
+/// null count -- that may hold a row the predicate passes. `handled` is false for a predicate these
+/// bounds do not decide (nothing is kept then).
+bool prune_by_bounds(const expr::Predicate& p, const FileTable& bounds, const std::vector<std::uint32_t>& null_counts,
+                     std::vector<std::uint8_t>& keep, bool& handled, std::string& error) {
+    handled = true;
+    const std::size_t pages = null_counts.size();
     std::vector<std::uint8_t> min_null;
     std::vector<std::uint8_t> min_nan;
     std::vector<std::uint8_t> max_null;
     std::vector<std::uint8_t> max_nan;
-    nulls_of(lookup, 0, min_null, min_nan);
-    nulls_of(lookup, 1, max_null, max_nan);
-
-    // A page may hold a match where its bounds allow one. Its min may be a null (the page starts
-    // with nulls) or a NaN (sorted first when negative): no lower bound then.
-    std::vector<std::uint8_t> keep(pages, 0);
+    nulls_of(bounds, 0, min_null, min_nan);
+    nulls_of(bounds, 1, max_null, max_nan);
+    keep.assign(pages, 0);
+    // A unit may hold a match where its bounds allow one. Its min may be a null (it starts with
+    // nulls): no lower bound then. A NaN min (-NaN sorts first) needs no care -- filters order -NaN
+    // below every value too -- but is still treated as unbounded (conservative), and so is a NaN max.
     std::vector<std::uint8_t> pass;
     const auto bound = [&](const expr::Predicate& q, std::size_t column, std::vector<std::uint8_t>& ok) {
-        if (!evaluate(q, lookup, column, ok, error)) {
+        if (!evaluate(q, bounds, column, ok, error)) {
             return false;
         }
         for (std::size_t i = 0; i < pages; ++i) {
             if (column == 0 && (min_null[i] != 0 || min_nan[i] != 0)) {
                 ok[i] = 1;
+            }
+            if (column == 1 && max_nan[i] != 0) {
+                ok[i] = 1;  // a NaN maximum (NaN sorts last) says nothing about the others
             }
             if (max_null[i] != 0) {
                 ok[i] = 0;  // all null: no value matches
@@ -467,8 +437,12 @@ bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, Ro
             break;
         }
         case Test::Between:
-            if (p.constants() != 2U || !value_range(0, ">=", 1, "<=", keep)) {
-                return p.constants() == 2U ? false : true;
+            if (p.constants() != 2U) {
+                handled = false;
+                return true;
+            }
+            if (!value_range(0, ">=", 1, "<=", keep)) {
+                return false;
             }
             break;
         case Test::In:
@@ -483,12 +457,40 @@ bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, Ro
             }
             break;
         default:
+            handled = false;
             return true;
+    }
+    return true;
+
+}
+
+bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
+                  std::string& error) {
+    answered = false;
+    if (p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has || p.test() == Test::Contains) {
+        return true;
+    }
+    std::shared_ptr<const BTreeIndex> index;
+    if (!load_btree(dir, index, error)) {
+        return false;
+    }
+    const auto& lookup = index->lookup;
+    const auto null_counts = u32_column(lookup, 2);
+    const auto page_idx = u32_column(lookup, 3);
+    const auto pages = page_idx.size();
+    std::vector<std::uint8_t> keep;
+    bool handled = false;
+    if (!prune_by_bounds(p, lookup, null_counts, keep, handled, error)) {
+        return false;
+    }
+    if (!handled) {
+        return true;
     }
 
     // The kept pages' values, the predicate on each: their row ids are the answer. Adjacent pages
     // are read as one range.
     std::vector<std::uint64_t> addrs;
+    std::vector<std::uint8_t> pass;
     for (std::size_t i = 0; i < pages;) {
         if (keep[i] == 0) {
             ++i;
@@ -527,6 +529,244 @@ bool search_btree(const std::filesystem::path& dir, const expr::Predicate& p, Ro
     }
     add_addresses(out, addrs);
     answered = true;
+    return true;
+}
+
+/// A JSON index answers a JSON test of its own path and the accessor's type, as its BTree does over the
+/// values at the path (the same pages, the same comparisons). Any other JSON test is not its to answer.
+bool search_json(const std::filesystem::path& dir, const pb::IndexMetadata& index, const expr::Predicate& p,
+                 RowSet& out, bool& answered, std::string& error) {
+    answered = false;
+    std::string path;
+    if (!index_files::json_index_path(index.details_value, path)) {
+        error = "json index: malformed JsonIndexDetails";
+        return false;
+    }
+    if (!p.json().has_value() || path != p.json()->path || index.files.size() != 2U) {
+        return true;
+    }
+    std::shared_ptr<const BTreeIndex> btree;
+    if (!load_btree(dir, btree, error)) {
+        return false;
+    }
+    if (!p.routes_to_json_index(btree->lookup.schema.children[0]->format)) {
+        return true;
+    }
+    return search_btree(dir, p, out, answered, error);
+}
+
+/// A zonemap answers with the rows of its kept zones: each zone's span of offsets in its fragment.
+bool search_zonemap(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
+                    std::string& error) {
+    answered = false;
+    if (p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has || p.test() == Test::Contains) {
+        return true;
+    }
+    std::shared_ptr<const ZoneMapIndex> index;
+    if (!load_zonemap(dir, index, error)) {
+        return false;
+    }
+    const auto& zones = index->zones;
+    // A nested column's zones have no bounds (min and max are null): only their null counts answer.
+    const char* min_format = zones.schema.children[0]->format;
+    const bool nested = min_format != nullptr && min_format[0] == '+';
+    if (nested && p.test() != Test::IsNull) {
+        return true;
+    }
+    const auto null_counts = u32_column(zones, 2);
+    const auto fragments = u64_column(zones, 4);
+    const auto starts = u64_column(zones, 5);
+    const auto lengths = u64_column(zones, 6);
+    std::vector<std::uint8_t> keep;
+    bool handled = false;
+    if (!prune_by_bounds(p, zones, null_counts, keep, handled, error)) {
+        return false;
+    }
+    if (!handled) {
+        return true;
+    }
+    for (std::size_t z = 0; z < keep.size(); ++z) {
+        if (keep[z] == 0) {
+            continue;
+        }
+        auto& rows = out.rows[static_cast<std::uint32_t>(fragments[z])];
+        for (std::uint64_t r = starts[z]; r < starts[z] + lengths[z]; ++r) {
+            rows.push_back(static_cast<std::uint32_t>(r));
+        }
+    }
+    answered = true;
+    return true;
+}
+
+// ── bloom filters ───────────────────────────────────────────────────────────────────────────────
+
+struct BloomFilterIndex {
+    FileTable zones;  // fragment_id, zone_start, zone_length, has_null, bloom_filter_data
+};
+
+bool load_bloomfilter(const std::filesystem::path& dir, std::shared_ptr<const BloomFilterIndex>& out,
+                      std::string& error) {
+    static IndexCache<BloomFilterIndex> cache;
+    const auto path = dir / "bloomfilter.lance";
+    const auto key = file_key(path);
+    if ((out = cache.find(key)) != nullptr) {
+        return true;
+    }
+    auto index = std::make_shared<BloomFilterIndex>();
+    if (!read_table(path, nullptr, LanceRowRange{}, index->zones, error)) {
+        return false;
+    }
+    const auto format = [&](std::int64_t c) {
+        return std::string(index->zones.schema.children[c]->format == nullptr ? "" : index->zones.schema.children[c]->format);
+    };
+    if (index->zones.schema.n_children != 5 || format(0) != "L" || format(1) != "L" || format(2) != "L" ||
+        format(3) != "b" || format(4) != "z") {
+        error = "bloomfilter index: bloomfilter.lance is not fragment_id, zone_start, zone_length (uint64), "
+                "has_null (bool), bloom_filter_data (binary)";
+        return false;
+    }
+    out = index;
+    cache.put(key, out);
+    return true;
+}
+
+/// The Arrow type of a manifest field, as its format (a leaf column's type; a bloom filter's values).
+bool arrow_column_type(const pb::Field& field, ArrowSchema& out, std::string& error) {
+    std::string format;
+    if (!lance_arrow_format_for_logical_type(field.logical_type, format, error)) {
+        return false;
+    }
+    ArrowSchemaInit(&out);
+    if (ArrowSchemaSetFormat(&out, format.c_str()) != NANOARROW_OK) {
+        error = "bloom filter index: cannot read the column's type";
+        return false;
+    }
+    return true;
+}
+
+/// The zones that may hold a row the predicate passes. `=` and IN probe each zone's filter with the
+/// constants' bytes (a constant is cast to the column's type first); a constant that does not convert
+/// leaves the predicate to the scan. Zones of a float column: a zero or NaN constant may match values of
+/// other bit patterns, and dates and times are not probed: every zone is kept then.
+bool search_bloomfilter(const std::filesystem::path& dir, const ArrowSchema& column, const expr::Predicate& p,
+                        RowSet& out, bool& answered, std::string& error) {
+    answered = false;
+    const bool equal = p.test() == Test::In || (p.test() == Test::Compare && p.op() == "=");
+    if (p.test() != Test::IsNull && !equal) {
+        return true;
+    }
+    std::shared_ptr<const BloomFilterIndex> index;
+    if (!load_bloomfilter(dir, index, error)) {
+        return false;
+    }
+    const auto& zones = index->zones;
+    const auto fragments = u64_column(zones, 0);
+    const auto starts = u64_column(zones, 1);
+    const auto lengths = u64_column(zones, 2);
+    std::vector<std::uint8_t> keep(fragments.size(), 0);
+    if (p.test() == Test::IsNull) {
+        std::size_t z = 0;
+        for (const auto& b : zones.batches) {
+            const ArrowArray* a = b.children[3];
+            for (std::int64_t r = 0; r < a->length; ++r, ++z) {
+                keep[z] = static_cast<std::uint8_t>(ArrowBitGet(static_cast<const std::uint8_t*>(a->buffers[1]), a->offset + r));
+            }
+        }
+        answered = true;
+    } else {
+        ArrowSchemaView column_view;
+        ArrowError aerr;
+        if (ArrowSchemaViewInit(&column_view, &column, &aerr) != NANOARROW_OK) {
+            error = std::string("bloom filter index: ") + aerr.message;
+            return false;
+        }
+        const auto type = column_view.type;
+        const bool floating = type == NANOARROW_TYPE_FLOAT || type == NANOARROW_TYPE_DOUBLE;
+        const bool temporal = type == NANOARROW_TYPE_DATE32 || type == NANOARROW_TYPE_DATE64 ||
+                              type == NANOARROW_TYPE_TIME32 || type == NANOARROW_TYPE_TIME64 ||
+                              type == NANOARROW_TYPE_TIMESTAMP;
+        std::size_t width = 0;
+        if (!index_files::bloom_value_width(column_view, width, error)) {
+            return false;
+        }
+        bool keep_all = temporal;
+        std::vector<std::uint64_t> hashes;
+        for (std::size_t k = 0; !keep_all && k < p.constants(); ++k) {
+            ArrowArray value{};
+            std::string convert_error;
+            if (!p.constant_as(k, column, value, convert_error)) {
+                return true;  // the scan evaluates the filter, and reports what it cannot convert
+            }
+            ArrowArrayView view;
+            if (ArrowArrayViewInitFromSchema(&view, &column, &aerr) != NANOARROW_OK ||
+                ArrowArrayViewSetArray(&view, &value, &aerr) != NANOARROW_OK) {
+                ArrowArrayViewReset(&view);
+                if (value.release != nullptr) {
+                    value.release(&value);
+                }
+                error = std::string("bloom filter index: ") + aerr.message;
+                return false;
+            }
+            if (!ArrowArrayViewIsNull(&view, 0)) {
+                const std::uint8_t* bytes = view.buffer_views[1].data.as_uint8 + static_cast<std::size_t>(view.offset) * width;
+                if (floating && width == 4) {
+                    float f = 0.0F;
+                    std::memcpy(&f, bytes, 4);
+                    keep_all = keep_all || f == 0.0F || std::isnan(f);
+                } else if (floating) {
+                    double d = 0.0;
+                    std::memcpy(&d, bytes, 8);
+                    keep_all = keep_all || d == 0.0 || std::isnan(d);
+                }
+                hashes.push_back(index_files::bloom_hash(&view, 0, width));
+            }
+            ArrowArrayViewReset(&view);
+            if (value.release != nullptr) {
+                value.release(&value);
+            }
+        }
+        if (keep_all) {
+            keep.assign(keep.size(), 1);
+        } else {
+            std::size_t z = 0;
+            for (const auto& b : zones.batches) {
+                ArrowArrayView bv;
+                if (ArrowArrayViewInitFromSchema(&bv, &zones.type(4), &aerr) != NANOARROW_OK ||
+                    ArrowArrayViewSetArray(&bv, b.children[4], &aerr) != NANOARROW_OK) {
+                    ArrowArrayViewReset(&bv);
+                    error = std::string("bloom filter index: ") + aerr.message;
+                    return false;
+                }
+                for (std::int64_t r = 0; r < b.length; ++r, ++z) {
+                    const auto filter = ArrowArrayViewGetBytesUnsafe(&bv, r);
+                    const auto size = static_cast<std::size_t>(filter.size_bytes);
+                    if (size < 32U || (size & (size - 1U)) != 0U) {
+                        ArrowArrayViewReset(&bv);
+                        error = "bloom filter index: a zone's filter is not a power of two of at least 32 bytes";
+                        return false;
+                    }
+                    const auto* data = reinterpret_cast<const std::uint8_t*>(filter.data.as_char);
+                    for (const auto hash : hashes) {
+                        if (bloom_filter::may_contain(data, size, hash)) {
+                            keep[z] = 1;
+                            break;
+                        }
+                    }
+                }
+                ArrowArrayViewReset(&bv);
+            }
+        }
+        answered = true;
+    }
+    for (std::size_t z = 0; z < keep.size(); ++z) {
+        if (keep[z] == 0) {
+            continue;
+        }
+        auto& rows = out.rows[static_cast<std::uint32_t>(fragments[z])];
+        for (std::uint64_t r = starts[z]; r < starts[z] + lengths[z]; ++r) {
+            rows.push_back(static_cast<std::uint32_t>(r));
+        }
+    }
     return true;
 }
 
@@ -571,10 +811,181 @@ bool bitmap_rows(const BitmapIndex& index, const std::vector<std::uint64_t>& key
     return true;
 }
 
+// ── NGRAM ───────────────────────────────────────────────────────────────────────────────────────
+
+/// ngram_postings.lance: `tokens` (the trigram ids, uint32) and `posting_list` (a RoaringTreemap of row
+/// ids per token). Only the tokens are read up front; a query takes the posting lists it needs.
+struct NGramIndex {
+    FileTable tokens;
+    std::filesystem::path file;
+    std::unordered_map<std::uint32_t, std::uint64_t> rows;  // token -> its row in the file
+};
+
+bool load_ngram(const std::filesystem::path& dir, std::shared_ptr<const NGramIndex>& out, std::string& error) {
+    static IndexCache<NGramIndex> cache;
+    const auto path = dir / "ngram_postings.lance";
+    const auto key = file_key(path);
+    if ((out = cache.find(key)) != nullptr) {
+        return true;
+    }
+    auto index = std::make_shared<NGramIndex>();
+    index->file = path;
+    const std::vector<std::string> columns = {"tokens"};
+    if (!read_table(path, &columns, LanceRowRange{}, index->tokens, error)) {
+        return false;
+    }
+    if (index->tokens.schema.n_children != 1 || index->tokens.schema.children[0]->format == nullptr ||
+        std::string(index->tokens.schema.children[0]->format) != "I") {
+        error = "ngram index: ngram_postings.lance has no uint32 tokens column";
+        return false;
+    }
+    std::uint64_t row = 0;
+    for (const auto& b : index->tokens.batches) {
+        ArrowArrayView view;
+        ArrowError aerr;
+        if (ArrowArrayViewInitFromSchema(&view, &index->tokens.type(0), &aerr) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&view, b.children[0], &aerr) != NANOARROW_OK) {
+            ArrowArrayViewReset(&view);
+            error = std::string("ngram index: ") + aerr.message;
+            return false;
+        }
+        for (std::int64_t r = 0; r < b.length; ++r, ++row) {
+            if (!ArrowArrayViewIsNull(&view, r)) {
+                index->rows.emplace(static_cast<std::uint32_t>(ArrowArrayViewGetUIntUnsafe(&view, r)), row);
+            }
+        }
+        ArrowArrayViewReset(&view);
+    }
+    out = index;
+    cache.put(key, out);
+    return true;
+}
+
+/// contains(col, 'needle'): the rows holding every trigram of the needle, as Lance answers it (ngram.rs
+/// StringContains). A needle of under three characters, or with no trigram, is not answered (every row
+/// is read); a trigram the index lacks means no row holds the needle (an answer with none); otherwise the
+/// intersection of the trigrams' posting lists is the candidates, which the scan still checks.
+bool search_ngram(const std::filesystem::path& dir, const expr::Predicate& p, RowSet& out, bool& answered,
+                  std::string& error) {
+    answered = false;
+    if (p.test() != Test::Contains || p.constants() != 1U) {
+        return true;
+    }
+    ArrowSchema text_type;
+    ArrowSchemaInit(&text_type);
+    if (ArrowSchemaSetType(&text_type, NANOARROW_TYPE_STRING) != NANOARROW_OK) {
+        error = "out of memory";
+        return false;
+    }
+    ArrowArray needle{};
+    const bool converted = p.constant_as(0, text_type, needle, error);
+    text_type.release(&text_type);
+    if (!converted) {
+        return false;
+    }
+    ArrowArrayView view;
+    ArrowError aerr;
+    ArrowArrayViewInitFromType(&view, NANOARROW_TYPE_STRING);
+    if (ArrowArrayViewSetArray(&view, &needle, &aerr) != NANOARROW_OK) {
+        ArrowArrayViewReset(&view);
+        if (needle.release != nullptr) {
+            needle.release(&needle);
+        }
+        error = std::string("ngram index: ") + aerr.message;
+        return false;
+    }
+    const bool is_null = ArrowArrayViewIsNull(&view, 0);
+    std::string text;
+    if (!is_null) {
+        const auto sv = ArrowArrayViewGetStringUnsafe(&view, 0);
+        text.assign(sv.data, static_cast<std::size_t>(sv.size_bytes));
+    }
+    ArrowArrayViewReset(&view);
+    if (needle.release != nullptr) {
+        needle.release(&needle);
+    }
+    if (is_null) {
+        return true;
+    }
+    std::size_t characters = 0;  // UTF-8 code points, as Lance counts the needle
+    for (const char c : text) {
+        if ((static_cast<unsigned char>(c) & 0xC0U) != 0x80U) {
+            ++characters;
+        }
+    }
+    if (characters < 3U) {
+        return true;
+    }
+    const auto tokens = fts::ngram_tokens(fts::lower_and_fold(text));
+    if (tokens.empty()) {
+        return true;
+    }
+    std::shared_ptr<const NGramIndex> index;
+    if (!load_ngram(dir, index, error)) {
+        return false;
+    }
+    std::vector<std::uint64_t> rows;  // the file rows of the needle's tokens
+    rows.reserve(tokens.size());
+    for (const auto token : tokens) {
+        const auto found = index->rows.find(token);
+        if (found == index->rows.end()) {
+            answered = true;  // no row holds this trigram, so none holds the needle
+            return true;
+        }
+        rows.push_back(found->second);
+    }
+    FileTable taken;
+    const std::vector<std::string> postings = {"posting_list"};
+    if (!take_table(index->file, &postings, rows, taken, error)) {
+        return false;
+    }
+    bool first = true;
+    std::vector<std::uint64_t> common;  // the row ids holding every trigram
+    for (const auto& b : taken.batches) {
+        ArrowArrayView list;
+        ArrowError lerr;
+        if (ArrowArrayViewInitFromSchema(&list, &taken.type(0), &lerr) != NANOARROW_OK ||
+            ArrowArrayViewSetArray(&list, b.children[0], &lerr) != NANOARROW_OK) {
+            ArrowArrayViewReset(&list);
+            error = std::string("ngram index: ") + lerr.message;
+            return false;
+        }
+        bool ok = true;
+        for (std::int64_t r = 0; ok && r < b.length; ++r) {
+            if (ArrowArrayViewIsNull(&list, r)) {
+                continue;
+            }
+            const auto bytes = ArrowArrayViewGetBytesUnsafe(&list, r);
+            std::vector<std::uint64_t> ids;
+            ok = roaring::decode_treemap(bytes.data.as_uint8, static_cast<std::size_t>(bytes.size_bytes), ids, error);
+            if (ok && first) {
+                common = std::move(ids);
+            } else if (ok) {
+                std::vector<std::uint64_t> merged;
+                std::set_intersection(common.begin(), common.end(), ids.begin(), ids.end(), std::back_inserter(merged));
+                common = std::move(merged);
+            }
+            first = false;
+        }
+        ArrowArrayViewReset(&list);
+        if (!ok) {
+            return false;
+        }
+    }
+    for (const auto id : common) {
+        out.rows[static_cast<std::uint32_t>(id >> 32U)].push_back(static_cast<std::uint32_t>(id));
+    }
+    answered = true;
+    return true;
+}
+
 bool search_bitmap(const std::filesystem::path& dir, bool label_list, const expr::Predicate& p,
                    const std::map<std::uint32_t, std::uint64_t>& physical, RowSet& out, bool& answered,
                    std::string& error) {
     answered = false;
+    if (p.test() == Test::Contains) {
+        return true;
+    }
     const bool array_test = p.test() == Test::HasAny || p.test() == Test::HasAll || p.test() == Test::Has;
     if (array_test != label_list && !(label_list && p.test() == Test::IsNull)) {
         return true;
@@ -652,6 +1063,28 @@ struct Search {
     std::map<std::uint32_t, std::uint64_t> physical;  // fragment id: its rows
     std::string& error;
     std::vector<std::string> used;
+    const RowIdToAddress* row_ids = nullptr;  // with stable row ids: what an index holds are ids
+
+    /// An answer read from an index of a dataset with stable row ids is in ids; make it addresses
+    /// (a row whose id is gone, deleted, is dropped).
+    void to_addresses(RowSet& set) const {
+        if (row_ids == nullptr || !row_ids->stable()) {
+            return;
+        }
+        std::map<std::uint32_t, std::vector<std::uint32_t>> moved;
+        for (const auto& [high, offsets] : set.rows) {
+            for (const auto offset : offsets) {
+                std::uint64_t address = 0;
+                if (row_ids->find((static_cast<std::uint64_t>(high) << 32U) | offset, address)) {
+                    moved[static_cast<std::uint32_t>(address >> 32U)].push_back(static_cast<std::uint32_t>(address));
+                }
+            }
+        }
+        for (auto& [fragment, offsets] : moved) {
+            std::sort(offsets.begin(), offsets.end());
+        }
+        set.rows = std::move(moved);
+    }
 
     /// The field a column path names: exact, else case-insensitively unique (as the filter binds).
     const pb::Field* field_of(const std::vector<std::string>& path) const {
@@ -729,14 +1162,36 @@ struct Search {
                 RowSet one;
                 bool answered = false;
                 bool ok = true;
-                if (kind == "/lance.table.BTreeIndexDetails" && index->files.size() == 2U &&
+                // A JSON index answers the JSON tests and they only it: a plain test of the column would
+                // compare the document, not the values at the path.
+                const bool json_index = kind == "/lance.index.pb.JsonIndexDetails";
+                if (json_index != p.json().has_value()) {
+                    answered_all = false;
+                    break;
+                }
+                const bool bloom = kind == "/lance.index.pb.BloomFilterIndexDetails";
+                const bool zoned = kind == "/lance.table.ZoneMapIndexDetails" || bloom;
+                if (json_index) {
+                    ok = search_json(dir, *index, p, one, answered, error);
+                } else if (kind == "/lance.table.BTreeIndexDetails" && index->files.size() == 2U &&
                     std::any_of(index->files.begin(), index->files.end(),
                                 [](const pb::IndexMetadata::File& f) { return f.path == "page_lookup.lance"; })) {
                     ok = search_btree(dir, p, one, answered, error);
+                } else if (bloom && !index->files.empty()) {
+                    ArrowSchema column{};
+                    ok = arrow_column_type(*field, column, error) &&
+                         search_bloomfilter(dir, column, p, one, answered, error);
+                    if (column.release != nullptr) {
+                        column.release(&column);
+                    }
+                } else if (zoned && !index->files.empty()) {
+                    ok = search_zonemap(dir, p, one, answered, error);
                 } else if ((kind == "/lance.table.BitmapIndexDetails" || kind == "/lance.table.LabelListIndexDetails") &&
                            !index->files.empty()) {
                     ok = search_bitmap(dir, kind == "/lance.table.LabelListIndexDetails", p, physical, one, answered,
                                        error);
+                } else if (kind == "/lance.table.NGramIndexDetails" && !index->files.empty()) {
+                    ok = search_ngram(dir, p, one, answered, error);
                 }
                 if (!ok) {
                     return false;
@@ -745,7 +1200,13 @@ struct Search {
                     answered_all = false;
                     break;
                 }
+                if (!zoned) {
+                    to_addresses(one);  // a zonemap holds addresses already
+                }
                 one.covered.insert(index->fragment_ids.begin(), index->fragment_ids.end());
+                for (const auto stale : fragments_stale_for_index(manifest, index->fields, index->dataset_version)) {
+                    one.covered.erase(stale);  // overlaid since the index was built: scanned instead
+                }
                 set.covered.insert(one.covered.begin(), one.covered.end());
                 for (auto& [f, rows] : one.rows) {
                     if (one.covered.count(f) != 0U) {
@@ -758,6 +1219,9 @@ struct Search {
                 const auto& url = segments.front()->details_type_url;
                 std::string type = url.substr(url.rfind('.') + 1);
                 type = type.substr(0, type.size() - std::string("IndexDetails").size());
+                if (type == "Json") {
+                    type = "BTree";  // the plan names the BTree a JSON index is built over
+                }
                 used.push_back("ScalarIndexQuery: query=[" + p.to_string() + "]@" + name + "(" + type + ")");
                 answer = std::move(set);
                 return true;
@@ -798,14 +1262,17 @@ bool index_candidates(const std::filesystem::path& dataset_path, const pb::Manif
     out.rows.clear();
     out.used.clear();
     error.clear();
-    // Index row ids are row addresses only without stable row ids; and an index whose rows a
-    // deferred compaction moved needs the fragment-reuse index to be found again.
-    if (manifest.indices.empty() || (manifest.reader_feature_flags & pb::kFlagStableRowIds) != 0U ||
+    // An index whose rows a deferred compaction moved needs the fragment-reuse index to be found again.
+    if (manifest.indices.empty() ||
         std::any_of(manifest.indices.begin(), manifest.indices.end(),
                     [](const pb::IndexMetadata& i) { return i.name == "__lance_frag_reuse"; })) {
         return true;
     }
-    Search search{dataset_path, manifest, {}, error, {}};
+    RowIdToAddress resolver;
+    if (!RowIdToAddress::build(dataset_path, manifest, resolver, error)) {
+        return false;
+    }
+    Search search{dataset_path, manifest, {}, error, {}, &resolver};
     for (const auto& f : manifest.fragments) {
         search.physical[static_cast<std::uint32_t>(f.id)] = f.physical_rows;
     }

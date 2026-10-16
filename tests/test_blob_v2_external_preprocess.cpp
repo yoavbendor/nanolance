@@ -224,12 +224,14 @@ int main() {
         require(nano_lance::finalize_blob_v2_schema_for_write(write_mapping, error), error);
         const auto* finalized_parent = find_field_by_name(write_mapping, "payload_ref");
         require(finalized_parent->column_index == 1, "finalized blob column index mismatch");
-        require(finalized_parent->metadata.at("lance-encoding:packed") == "true", "packed metadata missing");
-        require(finalized_parent->metadata.at("lance-encoding:blob") == "true", "blob metadata missing");
-        require(find_field_by_name(write_mapping, "data") == nullptr, "write-side data child must be removed");
-        require(find_field_by_name(write_mapping, "uri") == nullptr, "write-side uri child must be removed");
-        require(find_field_by_name(write_mapping, "kind") != nullptr, "materialized kind child missing");
-        require(find_field_by_name(write_mapping, "blob_uri") != nullptr, "materialized blob_uri child missing");
+        // As Lance 12 keeps it in the manifest: the logical children, every one nullable, none a
+        // column (the data file holds the packed descriptor struct).
+        require(finalized_parent->metadata.at("ARROW:extension:metadata").empty(), "extension metadata missing");
+        for (const char* name : {"data", "uri", "position", "size"}) {
+            const auto* child = find_field_by_name(write_mapping, name);
+            require(child != nullptr && child->nullable && child->column_index == -1, name);
+        }
+        require(find_field_by_name(write_mapping, "kind") == nullptr, "no descriptor child in the manifest");
         require(nano_lance::lance_physical_fields(write_mapping).size() == 2U,
                 "finalized physical field count mismatch");
     }

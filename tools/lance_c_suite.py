@@ -121,10 +121,12 @@ def main(argv=None) -> int:
 
     results = {}
     for writer in args.writers.split(","):
-        with tempfile.TemporaryDirectory(prefix=f"lance-c-{writer}-") as tmp:
-            subprocess.run([sys.executable, str(ROOT / "tools" / "lance_c_fixtures.py"), tmp, "--writer", writer],
-                           check=True)
-            for kind in ("c", "cpp"):
+        for kind in ("c", "cpp"):
+            # Each binary gets fresh fixtures, as lance-c's own runner (compile_and_run_test.rs) gives
+            # them: the C tests commit indexes that the C++ tests' index counts must not see.
+            with tempfile.TemporaryDirectory(prefix=f"lance-c-{writer}-{kind}-") as tmp:
+                subprocess.run([sys.executable, str(ROOT / "tools" / "lance_c_fixtures.py"), tmp, "--writer", writer],
+                               check=True)
                 write_uri = os.path.join(tmp, f"write_{kind}")
                 exe = args.build_dir / f"lance_c_upstream_{kind}"
                 run = subprocess.run([str(exe), os.path.join(tmp, "c_test_ds"), write_uri, os.path.join(tmp, "blob_ds")],

@@ -1,0 +1,49 @@
+{
+ "environment": {
+  "pylance": "12.0.0",
+  "nanolance_commit": "4af2c68 with uncommitted changes",
+  "cores": 4,
+  "machine": "x86_64",
+  "date": "2026-10-06 21:02 UTC"
+ },
+ "rows": 500000,
+ "runs": 5,
+ "build_s": {
+  "pylance": 7.074232495000615,
+  "nanolance": 4.061311643999943
+ },
+ "index_bytes": {
+  "pylance": 16332830,
+  "nanolance": 16108480
+ },
+ "search_ms": {
+  "1 common word, limit 10": {
+   "pylance": 2.735703199996351,
+   "nanolance": 0.30887270000675926
+  },
+  "1 rare word, limit 10": {
+   "pylance": 2.405102499997156,
+   "nanolance": 0.4937290400084749
+  },
+  "2 words, limit 10": {
+   "pylance": 2.5530387399885512,
+   "nanolance": 1.338889079997898
+  },
+  "3 words, limit 10": {
+   "pylance": 2.653553579984873,
+   "nanolance": 1.2309283399918058
+  },
+  "3 words, limit 100": {
+   "pylance": 3.6457778600015445,
+   "nanolance": 2.0308084600037546
+  },
+  "2 words, AND, limit 10": {
+   "pylance": 2.350163760002033,
+   "nanolance": 1.208973180000612
+  },
+  "1 rare word, all matches": {
+   "pylance": 2.8617807799855655,
+   "nanolance": 1.2528086999918742
+  }
+ }
+}

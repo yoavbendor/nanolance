@@ -22,6 +22,10 @@ struct LanceFileExtras {
     std::vector<std::vector<std::uint8_t>> global_buffers;
     /// Where to write the file. Empty: <dataset_path>/data/<file_name>, as for a data file.
     std::filesystem::path path;
+    /// write_lance_file: bit-pack integer columns (tagged nanolance:packing in their field metadata).
+    bool bitpack_integers = false;
+    /// The most bytes a packed blob sidecar holds, over each blob field's own threshold (0: the field's).
+    std::uint64_t blob_pack_file_size = 0;
 };
 
 struct DataFileResult {

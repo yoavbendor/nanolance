@@ -15,9 +15,13 @@
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <memory>
+#include <random>
+#include <chrono>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -32,8 +36,11 @@ struct WriterState {
     std::uint64_t pending_rows = 0;
     nano_lance::LanceSchemaMapping schema_mapping;
     std::vector<nano_lance::ColumnValues> column_values;
-    nano_lance::ColumnValues blob_column_values;
-    const nano_lance::LanceField* blob_field = nullptr;
+    /// The top-level lance.blob.v2 columns (their field ids, in schema order) and their rows.
+    std::vector<std::int32_t> blob_ids;
+    std::vector<nano_lance::ColumnValues> blob_column_values;
+    /// write_dataset's blob_pack_file_size_threshold: over each blob field's own (0: the field's).
+    std::uint64_t blob_pack_file_size = 0;
     bool ignore_nullability = false;
     bool blob_uri_dictionary = false;
     bool compression = false;
@@ -66,6 +73,19 @@ struct WriterState {
     std::map<std::string, std::vector<std::uint8_t>> schema_metadata;
     /// Table config recorded when the commit creates the dataset (nano_lance_writer_set_initial_config).
     std::map<std::string, std::string> initial_config;
+    /// Create the dataset with stable row ids (nano_lance_writer_set_stable_row_ids).
+    bool stable_row_ids = false;
+    /// Base paths a dataset created by this writer registers (nano_lance_writer_set_initial_bases).
+    std::vector<nano_lance::BasePath> initial_bases;
+    /// Where each new fragment goes, in turn (nano_lance_writer_set_fragment_targets); none: the data dir.
+    struct FragmentTarget {
+        std::filesystem::path dir;
+        std::uint32_t base_id = 0;  // 0: the dataset itself
+    };
+    std::vector<FragmentTarget> fragment_targets;
+    std::uint64_t fragments_written = 0;
+    /// Recorded in the finishing commit's transaction file (nano_lance_writer_set_transaction_property).
+    std::map<std::string, std::string> transaction_properties;
     /// Field ids of the schema taken from the first batch start here (writer_set_field_id_base): new
     /// columns for an existing dataset, numbered after its fields.
     std::int32_t field_id_base = 0;
@@ -90,7 +110,10 @@ std::uint64_t pending_bytes(const WriterState& state) {
         }
         return n;
     };
-    std::uint64_t total = column_bytes(state.blob_column_values);
+    std::uint64_t total = 0;
+    for (const auto& cv : state.blob_column_values) {
+        total += column_bytes(cv);
+    }
     for (const auto& cv : state.column_values) {
         total += column_bytes(cv);
     }
@@ -528,55 +551,55 @@ const WriterState* state_from(const NanoLanceWriter* writer) {
     return static_cast<const WriterState*>(writer->private_data);
 }
 
-std::size_t count_non_blob_physical_columns(const nano_lance::LanceSchemaMapping& mapping,
-                                            std::int32_t blob_parent_id) {
+std::size_t count_non_blob_physical_columns(const nano_lance::LanceSchemaMapping& mapping) {
     std::size_t count = 0;
     for (const auto& field : mapping.fields) {
-        if (!nano_lance::lance_field_is_physical(field)) {
-            continue;
+        if (nano_lance::lance_field_is_physical(field) && !nano_lance::lance_field_is_blob_v2_part(mapping, field)) {
+            ++count;
         }
-        if (blob_parent_id >= 0 && field.parent_id == blob_parent_id) {
-            continue;
-        }
-        ++count;
     }
     return count;
 }
 
-/// Next numeric suffix for `data/fragment-<n>.lance` (0 if `data/` is missing or has no matching files).
-std::uint64_t next_fragment_numeric_suffix(const std::filesystem::path& dataset_path) {
-    const auto data_dir = dataset_path / "data";
-    std::error_code ec;
-    if (!std::filesystem::exists(data_dir, ec)) {
-        return 0;
-    }
-    std::uint64_t max_seen = 0;
-    bool found = false;
-    for (const auto& entry : std::filesystem::directory_iterator(data_dir, ec)) {
-        if (ec || !entry.is_regular_file()) {
-            continue;
-        }
-        const auto name = entry.path().filename().string();
-        constexpr const char kPrefix[] = "fragment-";
-        constexpr std::size_t kPrefixLen = sizeof(kPrefix) - 1U;
-        if (name.size() <= kPrefixLen + 6U) {
-            continue;
-        }
-        if (name.rfind(".lance") != name.size() - 6U) {
-            continue;
-        }
-        if (name.compare(0, kPrefixLen, kPrefix) != 0) {
-            continue;
-        }
-        const auto mid = name.substr(kPrefixLen, name.size() - 6U - kPrefixLen);
-        try {
-            const auto n = static_cast<std::uint64_t>(std::stoull(mid));
-            max_seen = std::max(max_seen, n);
-            found = true;
-        } catch (...) {
+/// Empty row buffers for the writer's schema: one per column, one per blob column.
+void reset_column_values(WriterState& state) {
+    state.blob_ids = nano_lance::blob_v2_parent_ids(state.schema_mapping);
+    state.blob_column_values.assign(state.blob_ids.size(), nano_lance::ColumnValues{});
+    state.column_values.clear();
+    state.column_values.resize(count_non_blob_physical_columns(state.schema_mapping));
+}
+
+/// A new data file's name, as Lance names its files (generate_random_filename): a random UUID v4, its
+/// first 3 bytes as 24 binary digits, then the other 13 as 26 hex digits -- 50 characters, ".lance".
+/// Random because writers in other processes add files to the same `data/` at the same time: a name
+/// derived from what is already there (a counter) could be taken twice, and the second file would
+/// overwrite one the first writer has committed.
+/// The bits come from the system's entropy source on every call: a seeded generator would be
+/// copied into each process a writer forks, and those would then all draw the same names.
+std::string new_data_file_name() {
+    std::random_device device;
+    std::array<std::uint8_t, 16> uuid{};
+    for (std::size_t i = 0; i < uuid.size(); i += 4) {
+        const auto bits = static_cast<std::uint32_t>(device());
+        for (std::size_t k = 0; k < 4; ++k) {
+            uuid[i + k] = static_cast<std::uint8_t>(bits >> (8U * k));
         }
     }
-    return found ? max_seen + 1U : 0U;
+    uuid[6] = static_cast<std::uint8_t>((uuid[6] & 0x0FU) | 0x40U);  // version 4
+    uuid[8] = static_cast<std::uint8_t>((uuid[8] & 0x3FU) | 0x80U);  // RFC 4122 variant
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string name;
+    name.reserve(56);
+    for (std::size_t i = 0; i < 3; ++i) {
+        for (int bit = 7; bit >= 0; --bit) {
+            name += ((uuid[i] >> bit) & 1U) != 0U ? '1' : '0';
+        }
+    }
+    for (std::size_t i = 3; i < uuid.size(); ++i) {
+        name += kHex[uuid[i] >> 4U];
+        name += kHex[uuid[i] & 0xFU];
+    }
+    return name + ".lance";
 }
 
 }  // namespace
@@ -668,9 +691,7 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
         // The new fragment is one file with every column, whatever files the latest fragment has.
         nano_lance::renumber_columns_for_one_file(state->schema_mapping);
 
-        state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
-        const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
-        state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
+        reset_column_values(*state);
         state->has_schema = true;
     }
 
@@ -836,7 +857,6 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
         return set_error(writer, NANO_LANCE_UNSUPPORTED, error);
     }
 
-    const auto* batch_blob_field = nano_lance::find_blob_v2_parent(batch_mapping);
     if (!state->has_schema) {
         ArrowMetadataReader reader;
         if (schema->metadata != nullptr && ArrowMetadataReaderInit(&reader, schema->metadata) == NANOARROW_OK) {
@@ -859,9 +879,7 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
                 }
             }
         }
-        state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
-        const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
-        state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
+        reset_column_values(*state);
         state->has_schema = true;
     } else if (!nano_lance::schema_mappings_equivalent(state->schema_mapping, batch_mapping)) {
         // `state->schema_mapping` is the ingest-shape mapping captured on the first batch; compare the
@@ -874,26 +892,28 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
                                                                           batch_mapping));
     }
 
-    const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
     if (!nano_lance::append_batch_column_values(*batch,
                                                 state->schema_mapping,
                                                 state->column_values,
                                                 error,
-                                                blob_parent_id,
+                                                !state->blob_ids.empty(),
                                                 state->borrow_buffers)) {
         return set_error(writer, NANO_LANCE_UNSUPPORTED, error);
     }
-    if (state->blob_field != nullptr) {
-        if (!nano_lance::append_blob_v2_batch_column_values(*batch,
-                                                            state->schema_mapping,
-                                                            *state->blob_field,
-                                                            state->blob_uri_dictionary,
-                                                            state->blob_column_values,
-                                                            error)) {
-            return set_error(writer, NANO_LANCE_UNSUPPORTED, error);
+    for (std::size_t b = 0; b < state->blob_ids.size(); ++b) {
+        const nano_lance::LanceField* blob_field = nullptr;
+        for (const auto& f : state->schema_mapping.fields) {
+            blob_field = f.id == state->blob_ids[b] ? &f : blob_field;
         }
-    } else if (batch_blob_field != nullptr) {
-        return set_error(writer, NANO_LANCE_UNSUPPORTED, "schema gained lance.blob.v2 mid-write (not supported)");
+        if (blob_field == nullptr ||
+            !nano_lance::append_blob_v2_batch_column_values(*batch,
+                                                            state->schema_mapping,
+                                                            *blob_field,
+                                                            state->blob_uri_dictionary,
+                                                            state->blob_column_values[b],
+                                                            error)) {
+            return set_error(writer, NANO_LANCE_UNSUPPORTED, error.empty() ? "blob column not found" : error);
+        }
     }
 
     ++state->pending_batches;
@@ -970,20 +990,21 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     nano_lance::LanceSchemaMapping disk_schema = state->schema_mapping;
-    if (state->blob_field != nullptr) {
+    if (!state->blob_ids.empty()) {
         if (!nano_lance::finalize_blob_v2_schema_for_write(disk_schema, writer_error)) {
             return set_error(writer, NANO_LANCE_UNSUPPORTED, writer_error);
         }
-        // Persist the URI dictionary on the blob parent field so the reader can resolve each row's
-        // URI by index. Stored in manifest/field metadata; only present in dictionary mode.
-        if (state->blob_uri_dictionary && !state->blob_column_values.blob_v2.uri_dictionary.empty()) {
-            const auto serialized =
-                nano_lance::blob_v2_serialize_uri_dictionary(state->blob_column_values.blob_v2.uri_dictionary);
+        // Persist each URI dictionary on its blob field so the reader can resolve each row's URI by
+        // index. Stored in manifest/field metadata; only present in dictionary mode.
+        for (std::size_t b = 0; state->blob_uri_dictionary && b < state->blob_ids.size(); ++b) {
+            const auto& dictionary = state->blob_column_values[b].blob_v2.uri_dictionary;
+            if (dictionary.empty()) {
+                continue;
+            }
             for (auto& field : disk_schema.fields) {
-                if (field.extension_name == nano_lance::kBlobV2ExtensionName && field.logical_type == "struct" &&
-                    field.parent_id == -1) {
-                    field.metadata[nano_lance::kBlobV2UriDictMetadataKey] = serialized;
-                    break;
+                if (field.id == state->blob_ids[b]) {
+                    field.metadata[nano_lance::kBlobV2UriDictMetadataKey] =
+                        nano_lance::blob_v2_serialize_uri_dictionary(dictionary);
                 }
             }
         }
@@ -1050,13 +1071,15 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     std::vector<nano_lance::ColumnValues> commit_columns;
-    if (state->blob_field != nullptr) {
+    if (!state->blob_ids.empty()) {
         const auto physical = nano_lance::lance_physical_fields(disk_schema);
         commit_columns.reserve(physical.size());
         std::size_t non_blob_index = 0;
         for (const auto* field : physical) {
-            if (field->extension_name == nano_lance::kBlobV2ExtensionName) {
-                commit_columns.push_back(state->blob_column_values);
+            const auto blob = std::find(state->blob_ids.begin(), state->blob_ids.end(), field->id);
+            if (blob != state->blob_ids.end()) {
+                commit_columns.push_back(
+                    std::move(state->blob_column_values[static_cast<std::size_t>(blob - state->blob_ids.begin())]));
                 continue;
             }
             if (non_blob_index >= state->column_values.size()) {
@@ -1193,8 +1216,19 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     nano_lance::DataFileResult data_file;
-    const auto data_file_name =
-        "fragment-" + std::to_string(next_fragment_numeric_suffix(state->dataset_path)) + ".lance";
+    const auto data_file_name = new_data_file_name();
+    nano_lance::LanceFileExtras file_extras;
+    file_extras.blob_pack_file_size = state->blob_pack_file_size;
+    file_extras.schema_metadata = state->schema_metadata;  // Lance writes it into every data file
+    std::optional<std::uint32_t> base_id;
+    if (!state->fragment_targets.empty()) {
+        const auto& target = state->fragment_targets[state->fragments_written % state->fragment_targets.size()];
+        file_extras.path = target.dir / data_file_name;
+        if (target.base_id != 0U) {
+            base_id = target.base_id;
+        }
+    }
+    state->fragments_written++;
     if (!nano_lance::write_lance_data_file(state->dataset_path,
                                            data_file_name,
                                            disk_schema,
@@ -1206,19 +1240,21 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
                                            writer_error,
                                            // A memory budget means resident bytes matter more
                                            // than speed: stream each column to the file.
-                                           state->max_pending_bytes == 0U)) {
+                                           state->max_pending_bytes == 0U, &file_extras)) {
         return set_error(writer, NANO_LANCE_IO_ERROR, writer_error);
     }
 
     if (state->stage) {
-        state->staged.push_back(nano_lance::NewFragment{data_file, state->pending_rows});
+        state->staged.push_back(nano_lance::NewFragment{data_file, state->pending_rows, base_id});
         state->staged_schema = disk_schema;
     } else {
         std::uint64_t version = 0;
         nano_lance::CommitExtras extras;
         extras.schema_metadata = is_append ? nullptr : &state->schema_metadata;
+        extras.stable_row_ids = state->stable_row_ids;
+        extras.initial_bases = state->initial_bases.empty() ? nullptr : &state->initial_bases;
         if (!nano_lance::commit_dataset_version(state->dataset_path, disk_schema,
-                                                {nano_lance::NewFragment{data_file, state->pending_rows}},
+                                                {nano_lance::NewFragment{data_file, state->pending_rows, base_id}},
                                                 is_append ? nano_lance::CommitMode::Append
                                                           : nano_lance::CommitMode::Overwrite,
                                                 version, writer_error, extras)) {
@@ -1228,13 +1264,7 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
     state->pending_batches = 0;
     state->pending_rows = 0;
-    state->column_values.clear();
-    state->blob_column_values = nano_lance::ColumnValues{};
-    state->blob_field = nano_lance::find_blob_v2_parent(state->schema_mapping);
-    {
-        const std::int32_t blob_parent_id = state->blob_field != nullptr ? state->blob_field->id : -1;
-        state->column_values.resize(count_non_blob_physical_columns(state->schema_mapping, blob_parent_id));
-    }
+    reset_column_values(*state);
     clear_error(writer);
     return NANO_LANCE_OK;
 }
@@ -1280,6 +1310,9 @@ int nano_lance_writer_finish(NanoLanceWriter* writer, int mode, uint64_t* versio
     nano_lance::CommitExtras extras;
     extras.schema_metadata = commit_mode == nano_lance::CommitMode::Append ? nullptr : &state->schema_metadata;
     extras.initial_config = state->initial_config;
+    extras.transaction_properties = state->transaction_properties;
+    extras.stable_row_ids = state->stable_row_ids;
+    extras.initial_bases = state->initial_bases.empty() ? nullptr : &state->initial_bases;
     std::filesystem::create_directories(state->dataset_path / "data", ec);
     if (!nano_lance::commit_dataset_version(state->dataset_path, mapping, state->staged, commit_mode, version, error,
                                             extras)) {
@@ -1302,6 +1335,89 @@ int nano_lance_writer_set_initial_config(NanoLanceWriter* writer, const char* ke
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "config key and value are required");
     }
     state->initial_config[key] = value;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_stable_row_ids(NanoLanceWriter* writer, int enable) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    state->stable_row_ids = enable != 0;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_initial_bases(NanoLanceWriter* writer, size_t count, const char* const* paths,
+                                        const char* const* names, const int* is_dataset_root) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (count > 0 && paths == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "base paths are required");
+    }
+    std::vector<nano_lance::BasePath> bases;
+    for (size_t i = 0; i < count; ++i) {
+        if (paths[i] == nullptr || paths[i][0] == '\0') {
+            return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "a base path is empty");
+        }
+        nano_lance::BasePath base;
+        base.id = static_cast<std::uint32_t>(i + 1U);
+        base.path = paths[i];
+        if (names != nullptr && names[i] != nullptr) {
+            base.name = names[i];
+            base.has_name = true;
+        }
+        base.is_dataset_root = is_dataset_root != nullptr && is_dataset_root[i] != 0;
+        bases.push_back(std::move(base));
+    }
+    state->initial_bases = std::move(bases);
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_fragment_targets(NanoLanceWriter* writer, size_t count, const char* const* dirs,
+                                           const uint32_t* base_ids) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (count > 0 && (dirs == nullptr || base_ids == nullptr)) {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "fragment targets need directories and base ids");
+    }
+    std::vector<WriterState::FragmentTarget> targets;
+    for (size_t i = 0; i < count; ++i) {
+        if (dirs[i] == nullptr || dirs[i][0] == '\0') {
+            return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "a fragment target directory is empty");
+        }
+        targets.push_back(WriterState::FragmentTarget{std::filesystem::path(dirs[i]), base_ids[i]});
+    }
+    state->fragment_targets = std::move(targets);
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_blob_pack_file_size(NanoLanceWriter* writer, uint64_t bytes) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    state->blob_pack_file_size = bytes;
+    clear_error(writer);
+    return NANO_LANCE_OK;
+}
+
+int nano_lance_writer_set_transaction_property(NanoLanceWriter* writer, const char* key, const char* value) {
+    auto* state = state_from(writer);
+    if (state == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_STATE, "writer is not initialized");
+    }
+    if (key == nullptr || value == nullptr) {
+        return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "property key and value are required");
+    }
+    state->transaction_properties[key] = value;
     clear_error(writer);
     return NANO_LANCE_OK;
 }
@@ -1358,6 +1474,39 @@ bool writer_set_field_id_base(NanoLanceWriter* writer, std::int32_t first_id, st
         return false;
     }
     state->field_id_base = first_id;
+    return true;
+}
+
+bool writer_project_append(NanoLanceWriter* writer, const std::vector<std::string>& keep, std::string& error) {
+    auto* state = state_from(writer);
+    if (state == nullptr || !state->append_only_commits || !state->has_schema || state->pending_batches != 0U ||
+        !state->staged.empty()) {
+        error = "only a new append writer can write part of the schema";
+        return false;
+    }
+    // A field is kept when its top-level ancestor is; parents come before their children.
+    std::map<std::int32_t, bool> kept;
+    LanceSchemaMapping projected;
+    for (const auto& f : state->schema_mapping.fields) {
+        const bool keep_it = f.parent_id < 0 ? std::find(keep.begin(), keep.end(), f.name) != keep.end()
+                                             : kept[f.parent_id];
+        kept[f.id] = keep_it;
+        if (keep_it) {
+            projected.fields.push_back(f);
+        }
+    }
+    for (const auto& name : keep) {
+        const bool found = std::any_of(projected.fields.begin(), projected.fields.end(), [&](const LanceField& f) {
+            return f.parent_id < 0 && f.name == name;
+        });
+        if (!found) {
+            error = "no column '" + name + "' in the dataset";
+            return false;
+        }
+    }
+    renumber_columns_for_one_file(projected);
+    state->schema_mapping = std::move(projected);
+    reset_column_values(*state);
     return true;
 }
 

@@ -141,7 +141,7 @@ def test_memory_uri():
 def test_unsupported_is_loud(tmp_path):
     ds = nl.write_dataset(table(3), str(tmp_path / "ds"))
     with pytest.raises(NotImplementedError):
-        ds.create_index("score", "IVF_PQ")
+        ds.create_index("score", "IVF_RQ")  # still unbuilt (RaBitQ is out of scope)
     with pytest.raises(NotImplementedError):
         nl.write_dataset(table(3), str(tmp_path / "old"), data_storage_version="2.0")
 
@@ -292,6 +292,13 @@ CHANGES = {
     "merge_upsert": lambda ds: ds.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute(
         pa.table({"id": [5, 500], "name": ["m", "n"], "x": [1.0, 2.0], "d": _rich().column("d").take([0, 1]),
                   "s": pa.array([{"a": 1, "b": "1"}, {"a": 2, "b": "2"}])})),
+    "merge_update_if": lambda ds: ds.merge_insert("id").when_matched_update_all(
+        "source.x > target.x OR target.name IS NULL").when_not_matched_insert_all().execute(
+        pa.table({"id": [2, 5, 10, 11, 33, 500], "name": ["a", "b", "c", "d", "e", "f"],
+                  "x": [100.0, -100.0, 1e9, 0.0, 1e9, 2.0], "d": _rich().column("d").take([0, 1, 2, 3, 4, 5]),
+                  "s": pa.array([{"a": i, "b": str(i)} for i in range(6)])})),
+    "merge_update_if_keys_only": lambda ds: ds.merge_insert("id").when_matched_update_all(
+        "source.name <> target.name").execute(_rich().slice(10, 10)),
     "merge_delete_by_source": lambda ds: ds.merge_insert("id").when_not_matched_by_source_delete("id > 30").execute(
         _rich().slice(0, 5)),
     "add_sql": lambda ds: ds.add_columns({"y": "id * 2", "z": "name || '!'"}),

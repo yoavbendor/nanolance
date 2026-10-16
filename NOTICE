@@ -56,3 +56,13 @@ system libraries dynamically (not redistributed here):
 
 See THIRD-PARTY-LICENSES.md for details. The pcapng2lance example additionally
 depends on the sister nanotins stack (Apache-2.0); see its own NOTICE.
+
+-------------------------------------------------------------------------------
+pylance Python modules
+-------------------------------------------------------------------------------
+bindings/python/nanolance/lance/sampler.py and
+bindings/python/nanolance/lance/_dataset/sharded_batch_iterator.py are derived from
+pylance's lance/sampler.py and lance/_dataset/sharded_batch_iterator.py
+(Copyright The Lance Authors, https://github.com/lance-format/lance, Apache-2.0),
+modified to run on nanolance's dataset API. They follow the originals closely so the
+same seeds and parameters give the same rows and batches.

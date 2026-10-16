@@ -1,0 +1,225 @@
+// Lance 12's full-text analyzer (LanceDB defaults), run by the crates Lance runs: the reference
+// nanolance's C++ analyzer is generated from and checked against.
+//
+//   cargo run --release --offline -- tables > ../../src/fts_tables.inc   # the Unicode / stop word tables
+//   cargo run --release --offline -- tokenize < lines.txt                # tokens@positions, one line each
+//   cargo run --release --offline -- stem < words.txt                    # the English stemmer alone
+use lance_tokenizer::{AsciiFoldingFilter, CodeLexTokenizer, Language, LowerCaser, RemoveLongFilter,
+                      NgramTokenizer, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TokenStream, WordDelimiterFilter};
+use std::io::{self, BufRead, Write};
+
+fn analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter_dynamic(RemoveLongFilter::limit(40))
+        .filter_dynamic(LowerCaser)
+        .filter_dynamic(Stemmer::new(Language::English))
+        .filter_dynamic(StopWordFilter::new(Language::English).unwrap())
+        .filter_dynamic(AsciiFoldingFilter)
+        .build()
+}
+
+fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    let out = io::stdout();
+    let mut out = out.lock();
+    match mode.as_str() {
+        "tokenize" => {
+            let mut a = analyzer();
+            for line in io::stdin().lock().lines() {
+                let line = line.unwrap();
+                let mut s = a.token_stream(&line);
+                let mut toks = Vec::new();
+                while s.advance() {
+                    toks.push(format!("{}@{}", s.token().text, s.token().position));
+                }
+                writeln!(out, "{}", toks.join(" ")).unwrap();
+            }
+        }
+        "stem" => {
+            let st = frostem::Stemmer::new(frostem::Algorithm::English);
+            for line in io::stdin().lock().lines() {
+                let line = line.unwrap();
+                writeln!(out, "{}", st.stem(&line)).unwrap();
+            }
+        }
+        "tables" => tables(&mut out),
+        // `code FLAGS`: CodeLexTokenizer (+ WordDelimiterFilter) as nanolance's code analyzer
+        // builds them; FLAGS = four digits: index_operators split_identifiers preserve_original
+        // split_on_numerics. Output format as `tokenize`.
+        "code" => {
+            let flags = std::env::args().nth(2).unwrap_or_else(|| "0000".to_string());
+            let f: Vec<bool> = flags.chars().map(|c| c == '1').collect();
+            let mut builder = TextAnalyzer::builder(CodeLexTokenizer::new(f[0])).dynamic();
+            if f[1] {
+                builder = builder.filter_dynamic(WordDelimiterFilter::new(f[2], f[3]));
+            }
+            let mut a = builder
+                .filter_dynamic(RemoveLongFilter::limit(40))
+                .filter_dynamic(LowerCaser)
+                .filter_dynamic(AsciiFoldingFilter)
+                .build();
+            for line in io::stdin().lock().lines() {
+                let line = line.unwrap();
+                let mut s = a.token_stream(&line);
+                let mut toks = Vec::new();
+                while s.advance() {
+                    toks.push(format!("{}@{}", s.token().text, s.token().position));
+                }
+                writeln!(out, "{}", toks.join(" ")).unwrap();
+            }
+        }
+        // `ngram MIN MAX PREFIX_ONLY`: NgramTokenizer as nanolance's ngram base tokenizer builds it (ngram
+        // filter chain: RemoveLongFilter(40), LowerCaser, AsciiFoldingFilter; no stemming, no stop words).
+        // Output format as `tokenize`.
+        "ngram" => {
+            let args: Vec<String> = std::env::args().collect();
+            let min: usize = args[2].parse().unwrap();
+            let max: usize = args[3].parse().unwrap();
+            let prefix = args[4] == "1";
+            let tokenizer = NgramTokenizer::new(min, max, prefix).unwrap_or_else(|e| panic!("{e}"));
+            let mut a = TextAnalyzer::builder(tokenizer)
+                .filter_dynamic(RemoveLongFilter::limit(40))
+                .filter_dynamic(LowerCaser)
+                .filter_dynamic(AsciiFoldingFilter)
+                .build();
+            for line in io::stdin().lock().lines() {
+                let line = line.unwrap();
+                let mut s = a.token_stream(&line);
+                let mut toks = Vec::new();
+                while s.advance() {
+                    toks.push(format!("{}@{}", s.token().text, s.token().position));
+                }
+                writeln!(out, "{}", toks.join(" ")).unwrap();
+            }
+        }
+        // Lines "key<TAB>value" (keys sorted) -> the fst Map's bytes, written to argv[2].
+        "fst" => {
+            let path = std::env::args().nth(2).expect("output path");
+            let mut b = fst::MapBuilder::memory();
+            for line in io::stdin().lock().lines() {
+                let line = line.unwrap();
+                let (k, v) = line.rsplit_once('\t').unwrap();
+                b.insert(unescape(k), v.parse::<u64>().unwrap()).unwrap();
+            }
+            std::fs::write(path, b.into_inner().unwrap()).unwrap();
+        }
+        _ => eprintln!("usage: fts_tables tokenize|code|ngram|stem|tables|fst OUT"),
+    }
+}
+
+// "\xNN" escapes -> bytes.
+fn unescape(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1] == b'x' {
+            out.push(u8::from_str_radix(&s[i + 2..i + 4], 16).unwrap());
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn c_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for b in s.bytes() {
+        if b == b'"' || b == b'\\' {
+            out.push('\\');
+            out.push(b as char);
+        } else if (0x20..0x7f).contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\x{:02x}\"\"", b));
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The tables the C++ analyzer needs, as Rust (and Lance's filters) compute them.
+fn tables(out: &mut impl Write) {
+    let fold = |c: char| -> String {
+        // Lance's AsciiFoldingFilter on the single character.
+        let mut a = TextAnalyzer::builder(lance_tokenizer::RawTokenizer::default())
+            .filter_dynamic(AsciiFoldingFilter)
+            .build();
+        let text = c.to_string();
+        let mut s = a.token_stream(&text);
+        s.advance();
+        s.token().text.clone()
+    };
+    writeln!(out, "// Generated by tools/fts_tables (lance-tokenizer 12.0.0, Rust {}): do not edit.", "std").unwrap();
+    writeln!(out, "// clang-format off").unwrap();
+    // alphanumeric ranges
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for cp in 0u32..=0x10FFFF {
+        if let Some(c) = char::from_u32(cp) {
+            if c.is_alphanumeric() {
+                match ranges.last_mut() {
+                    Some(r) if r.1 + 1 == cp => r.1 = cp,
+                    _ => ranges.push((cp, cp)),
+                }
+            }
+        }
+    }
+    writeln!(out, "static const std::uint32_t kAlnum[][2] = {{").unwrap();
+    for (a, b) in &ranges {
+        writeln!(out, "    {{0x{:X}, 0x{:X}}},", a, b).unwrap();
+    }
+    writeln!(out, "}};").unwrap();
+    // char::is_lowercase / char::is_uppercase (the code analyzer's word delimiter), as ranges
+    for (name, pred) in [("kLowercase", char::is_lowercase as fn(char) -> bool), ("kUppercase", char::is_uppercase)] {
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for cp in 0u32..=0x10FFFF {
+            if let Some(c) = char::from_u32(cp) {
+                if pred(c) {
+                    match ranges.last_mut() {
+                        Some(r) if r.1 + 1 == cp => r.1 = cp,
+                        _ => ranges.push((cp, cp)),
+                    }
+                }
+            }
+        }
+        writeln!(out, "static const std::uint32_t {}[][2] = {{", name).unwrap();
+        for (a, b) in &ranges {
+            writeln!(out, "    {{0x{:X}, 0x{:X}}},", a, b).unwrap();
+        }
+        writeln!(out, "}};").unwrap();
+    }
+    // lowercase: per character, where it changes
+    writeln!(out, "struct CharMap {{ std::uint32_t cp; const char* to; }};").unwrap();
+    writeln!(out, "static const CharMap kLower[] = {{").unwrap();
+    for cp in 0x80u32..=0x10FFFF {
+        if let Some(c) = char::from_u32(cp) {
+            let l: String = c.to_lowercase().collect();
+            if l != c.to_string() {
+                writeln!(out, "    {{0x{:X}, {}}},", cp, c_string(&l)).unwrap();
+            }
+        }
+    }
+    writeln!(out, "}};").unwrap();
+    // ascii folding: per non-ASCII character, where it changes
+    writeln!(out, "static const CharMap kFold[] = {{").unwrap();
+    for cp in 0x80u32..=0x10FFFF {
+        if let Some(c) = char::from_u32(cp) {
+            let f = fold(c);
+            if f != c.to_string() {
+                writeln!(out, "    {{0x{:X}, {}}},", cp, c_string(&f)).unwrap();
+            }
+        }
+    }
+    writeln!(out, "}};").unwrap();
+    let mut words: Vec<String> = stop_words::get("en").into_iter().map(|w| w.to_string()).collect();
+    words.sort();
+    words.dedup();
+    writeln!(out, "static const char* const kEnglishStopWords[] = {{").unwrap();
+    for w in &words {
+        writeln!(out, "    {},", c_string(w)).unwrap();
+    }
+    writeln!(out, "}};").unwrap();
+    writeln!(out, "// clang-format on").unwrap();
+}

@@ -4,6 +4,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -85,6 +87,11 @@ struct ColumnValues {
     std::vector<std::uint8_t> item_validity;
     std::uint64_t item_null_count = 0;
     std::uint64_t items_per_row = 0;
+
+    /// An Arrow dictionary column's dictionary, as stored: each entry's bytes (a fixed-width value,
+    /// or a string's bytes), in order. Read: the pages' dictionaries, unused entries included; write:
+    /// the batches'. The column itself still holds the VALUES; null when there is none to keep.
+    std::shared_ptr<const std::vector<std::string>> dictionary;
 
     /// Nested columns only: the list and struct layers above the leaf, OUTERMOST first
     /// (docs/NESTED_COLUMNS.md). When present, everything else in this struct describes the leaf

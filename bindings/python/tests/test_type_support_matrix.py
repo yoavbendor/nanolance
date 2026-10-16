@@ -100,24 +100,24 @@ ROUNDTRIPS = {
     "list_of_large_strings": _t(pa.large_list(pa.large_utf8()), [[f"s{i}", None][: i % 3] for i in range(N)]),
 }
 
+# Arrow dictionary columns (written as Lance's dict:<value>:<index> pages, read back with their
+# dictionary) and null elements inside valid vectors (FixedSizeList.has_validity): refused until
+# the writer tail (docs/ROADMAP.md) wrote them as pylance does.
+ROUNDTRIPS["dictionary"] = pa.table({"c": pa.array([f"d{i % 5}" for i in range(N)]).dictionary_encode()})
+ROUNDTRIPS["fixed_size_list_item_nulls"] = _t(pa.list_(pa.float32(), 2),
+                                              [[None, 1.0] if i % 5 == 0 else [1.0, 2.0] for i in range(N)])
+
 # Refused at write_batch, each with a message naming the column. The fragment is what the refusal has
 # to keep saying; a change that makes any of these WRITE must come here and justify itself.
 REFUSED_ON_WRITE = {
-    "dictionary": (
-        pa.table({"c": pa.array([f"d{i % 5}" for i in range(N)]).dictionary_encode()}),
-        "dictionary-encoded column",
-    ),
-    # A null element inside a VALID vector needs FixedSizeList.has_validity on write, which this
-    # writer does not emit yet. It reads correctly (pylance writes it; see test_lance_read_matrix).
-    "fixed_size_list_item_nulls": (
-        _t(pa.list_(pa.float32(), 2), [[None, 1.0] if i % 5 == 0 else [1.0, 2.0] for i in range(N)]),
+    # Element validity is written for a top-level fixed_size_list; under a list the nested page
+    # writer has no place for it (it used to write the null as 0.0).
+    "fixed_size_list_item_nulls_in_a_list": (
+        pa.table({"c": pa.ListArray.from_arrays(
+            pa.array([0, 1], pa.int32()),
+            pa.FixedSizeListArray.from_arrays(pa.array([1.0, None, 3.0, 4.0], pa.float32()), 4))}),
         "null element inside a row",
     ),
-}
-
-# Written by pylance and NOT readable. Pinned by message so each fails loudly when implemented.
-UNREADABLE_FROM_PYLANCE = {
-    "dictionary": "unsupported on-disk logical type",
 }
 
 
@@ -170,17 +170,3 @@ def test_stock_lance_written_type_reads_back(tmp_path, name):
     lance_mod.write_dataset(table, path)
     expected = lance_mod.dataset(path).to_table()
     assert pa.table(nanolance.read_table(path)).to_pydict() == expected.to_pydict()
-
-
-@pytest.mark.parametrize("name", sorted(UNREADABLE_FROM_PYLANCE))
-def test_unreadable_types_fail_by_name(tmp_path, name):
-    lance_mod = require_pylance()
-    table = REFUSED_ON_WRITE[name][0] if name in REFUSED_ON_WRITE else ROUNDTRIPS[name]
-    path = str(tmp_path / f"{name}.lance")
-    lance_mod.write_dataset(table, path)
-    with pytest.raises(Exception) as excinfo:
-        pa.table(nanolance.read_table(path))
-    assert UNREADABLE_FROM_PYLANCE[name] in str(excinfo.value), (
-        f"{name} now fails differently: {excinfo.value}. If it was implemented, move it out of "
-        f"UNREADABLE_FROM_PYLANCE."
-    )

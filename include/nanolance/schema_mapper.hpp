@@ -29,6 +29,11 @@ struct LanceField {
     std::map<std::string, std::string> metadata;
     bool is_dictionary_index = false;
     std::string dictionary_value_logical_type;
+    /// An Arrow dictionary column (Lance's "dict:<value>:<index>:<ordered>"): the index type's Arrow
+    /// format ("c", "i", ...). Empty otherwise. `logical_type` / `arrow_format` are the VALUES' type,
+    /// so the column decodes, filters and encodes as its values; only the Arrow form differs.
+    std::string dictionary_index_format;
+    bool dictionary_ordered = false;
 };
 
 struct LanceSchemaMapping {
@@ -38,8 +43,11 @@ struct LanceSchemaMapping {
 /// An Arrow extension type Lance itself defines (lance.blob.v2, ...), which nanolance lays out on its
 /// own terms. Any other extension type (arrow.fixed_shape_tensor, arrow.uuid, a user's) is stored as
 /// its storage type, with the extension recorded in the field's metadata.
+/// A Lance extension whose field is a logical shell over other fields (a blob struct). Only
+/// lance.blob.v2 is one. The other lance.* names are ordinary storage-backed columns: lance.json is
+/// large-binary holding JSONB, lance.bfloat16 is fixed_size_binary(2), lance.arrow.* are image types.
 inline bool lance_extension_is_lance_owned(const std::string& extension_name) {
-    return extension_name.rfind("lance.", 0) == 0;
+    return extension_name == "lance.blob.v2";
 }
 
 inline bool lance_field_is_physical(const LanceField& field) {
@@ -57,16 +65,18 @@ inline bool lance_logical_type_is_large_list(const std::string& logical_type) {
     return logical_type.rfind("large_list", 0) == 0;
 }
 
+/// Lance's "json" is JSONB in a large-binary column (jsonb.hpp).
 inline bool lance_field_is_variable_width(const std::string& logical_type) {
     return logical_type == "utf8" || logical_type == "large_utf8" || logical_type == "string" ||
-           logical_type == "large_string" || logical_type == "binary" || logical_type == "large_binary";
+           logical_type == "large_string" || logical_type == "binary" || logical_type == "large_binary" ||
+           logical_type == "json";
 }
 
 /// Does this logical type use 64-bit (rather than 32-bit) offsets? Accepts both the in-memory names
 /// (`large_utf8`) and the on-disk ones (`large_string`), since the same predicate runs on both sides.
 inline bool lance_logical_type_has_large_offsets(const std::string& logical_type) {
     return logical_type == "large_utf8" || logical_type == "large_string" ||
-           logical_type == "large_binary";
+           logical_type == "large_binary" || logical_type == "json";
 }
 
 /// Temporal types backed by a 32-bit integer on the wire (`date32:day`, `time32:s`, `time32:ms`).
@@ -101,10 +111,14 @@ inline bool lance_logical_type_is_bitpackable_integer(const std::string& logical
 inline constexpr std::size_t kMaxInlineConstantBytes = 32U;
 
 /// Lance `file.Field.encoding`: 1 = fixed-width, 2 = variable-width, 0 = none -- which is what
-/// pylance writes for a null-typed field, since it has no values to encode.
+/// pylance writes for a null-typed field, since it has no values to encode, and for a struct, whose
+/// values are its children's; 3 = dictionary.
 inline std::int32_t lance_on_disk_field_encoding(const std::string& logical_type) {
-    if (logical_type == "null") {
+    if (logical_type == "null" || logical_type == "struct") {
         return 0;
+    }
+    if (logical_type.rfind("dict:", 0) == 0) {
+        return 3;
     }
     return lance_field_is_variable_width(logical_type) ? 2 : 1;
 }
@@ -162,6 +176,9 @@ inline std::size_t lance_logical_type_value_bytes(const std::string& logical_typ
     if (logical_type == "int16" || logical_type == "uint16" || logical_type == "halffloat") {
         return 2U;
     }
+    if (logical_type == "lance.bfloat16") {  // the element name of a bfloat16 fixed-size list
+        return 2U;
+    }
     if (logical_type == "int32" || logical_type == "uint32" || logical_type == "float") {
         return 4U;
     }
@@ -202,6 +219,36 @@ inline std::size_t lance_logical_type_value_bytes(const std::string& logical_typ
 /// file -- stock Lance rejected it outright ("expected 32-bit offsets but got 64-bit offsets") and
 /// nanolance's own reader failed with "terminal offset out of range". Lance's on-disk name is
 /// "large_string", which is what pylance writes for a pa.large_string() column.
+inline std::string lance_on_disk_logical_type(const std::string& logical_type);
+
+/// Lance's name for an integer type given its Arrow format ("i" -> "int32"); empty if not one.
+inline std::string lance_integer_name_of_format(const std::string& format) {
+    if (format.size() != 1U) {
+        return {};
+    }
+    switch (format[0]) {
+        case 'c': return "int8";
+        case 'C': return "uint8";
+        case 's': return "int16";
+        case 'S': return "uint16";
+        case 'i': return "int32";
+        case 'I': return "uint32";
+        case 'l': return "int64";
+        case 'L': return "uint64";
+        default: return {};
+    }
+}
+
+/// The logical type a field is stored under in a manifest or a data file's schema.
+inline std::string lance_field_disk_logical_type(const LanceField& field) {
+    if (!field.dictionary_index_format.empty()) {
+        return "dict:" + lance_on_disk_logical_type(field.logical_type) + ":" +
+               lance_integer_name_of_format(field.dictionary_index_format) + ":" +
+               (field.dictionary_ordered ? "true" : "false");
+    }
+    return lance_on_disk_logical_type(field.logical_type);
+}
+
 inline std::string lance_on_disk_logical_type(const std::string& logical_type) {
     if (logical_type == "utf8") {
         return "string";
@@ -213,6 +260,41 @@ inline std::string lance_on_disk_logical_type(const std::string& logical_type) {
 }
 
 std::vector<const LanceField*> lance_physical_fields(const LanceSchemaMapping& mapping);
+
+/// A legacy (v1) blob column, as format 2.0 / 2.1 datasets hold one: large_binary marked with
+/// `lance-encoding:blob`, its values (position, size) descriptions of bytes stored in the data file.
+inline bool lance_field_is_legacy_blob(const LanceField& field) {
+    if (field.extension_name == "lance.blob.v2" ||
+        (field.logical_type != "large_binary" && field.logical_type != "binary")) {
+        return false;
+    }
+    const auto it = field.metadata.find("lance-encoding:blob");
+    return it != field.metadata.end() && it->second != "false" && it->second != "0";
+}
+
+/// A child of a lance.blob.v2 struct (its write-side data/uri/position/size), at any depth.
+inline bool lance_field_in_blob_v2(const LanceSchemaMapping& mapping, const LanceField& field) {
+    if (field.parent_id < 0) {
+        return false;
+    }
+    for (const auto& f : mapping.fields) {
+        if (f.id == field.parent_id) {
+            return f.extension_name == "lance.blob.v2" && f.logical_type == "struct";
+        }
+    }
+    return false;
+}
+
+/// A lance.blob.v2 struct -- at the top, or inside structs and lists -- or one of its children:
+/// written by the blob ingest as one column, not as ordinary columns, whichever of them a mapping
+/// makes the column (the dataset's: the struct; a batch's: its children).
+inline bool lance_field_is_blob_v2_part(const LanceSchemaMapping& mapping, const LanceField& field) {
+    return (field.extension_name == "lance.blob.v2" && field.logical_type == "struct") ||
+           lance_field_in_blob_v2(mapping, field);
+}
+
+/// A struct with no fields: a column of its own (one constant page), every row a valid empty struct.
+bool lance_field_is_empty_struct(const LanceField& field, const LanceSchemaMapping& mapping);
 
 /// \p ignore_nullability is accepted and ignored; it is kept so existing callers still compile.
 /// Nullable-flagged fields are always accepted now -- pyarrow marks essentially every field nullable,
