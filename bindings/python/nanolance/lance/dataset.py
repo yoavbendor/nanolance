@@ -116,14 +116,80 @@ def _exists(path: str) -> bool:
     )
 
 
+def _plain_column(expr) -> bool:
+    """A projection value that names a column (renamed by its alias), not an SQL expression."""
+    return isinstance(expr, str) and expr.isidentifier()
+
+
+def _has_expressions(columns) -> bool:
+    """A {alias: ...} projection that is built per batch: SQL expressions, or a system column under an
+    alias (which the scan returns only by its own name)."""
+    return isinstance(columns, dict) and any(
+        not _plain_column(v) or v in _SYSTEM_COLUMNS for v in columns.values())
+
+
+def _expression_inputs(columns: dict) -> List[str]:
+    """The columns a projection {alias: column | SQL expression} reads, in the order named. A system
+    column is not in an expression's scope (as in pylance), so naming one there is an error."""
+    names: List[str] = []
+    for expr in columns.values():
+        if _plain_column(expr):
+            reads = [expr]
+        else:
+            # A struct field (`s.x`) reads its top-level column.
+            reads = [_path_parts(name)[0] for name in _nanolance._expr_columns(expr)]
+            for name in reads:
+                if name in _SYSTEM_COLUMNS:
+                    raise ValueError(f"Invalid user input: Schema error: No field named {name}.")
+        names += [n for n in reads if n not in names]
+    if not names:
+        raise ValueError("Not supported: Scans must request at least one column.  "
+                         "Received only dynamic expressions")
+    return names
+
+
+_SCORE_COLUMNS = ("_distance", "_score")
+
+
+def _evaluate_projection(table: pa.Table, columns: dict) -> pa.Table:
+    """The projection {alias: column | SQL expression} of ``table``, in dict order: plain columns as
+    they are, each expression evaluated batch by batch by the native engine, typed by its result type."""
+    exprs = [(alias, expr) for alias, expr in columns.items() if not _plain_column(expr)]
+    plain_sources = {expr for expr in columns.values() if _plain_column(expr)}
+    batches = table.to_batches() or [pa.RecordBatch.from_pylist([], schema=table.schema)]
+    out = []
+    for batch in batches:
+        produced = iter(_nanolance._project_batch(batch, exprs)) if exprs else iter(())
+        fields, arrays = [], []
+        for alias, expr in columns.items():
+            if _plain_column(expr):
+                column = batch.column(expr)
+                fields.append(pa.field(alias, column.type, batch.schema.field(expr).nullable))
+                arrays.append(column)
+            else:
+                field_capsule, type_capsule, array_capsule = next(produced)
+                fields.append(pa.Field._import_from_c_capsule(field_capsule))
+                arrays.append(pa.Array._import_from_c_capsule(type_capsule, array_capsule))
+        # The scores the scan returns without being named (`_distance`, `_score`), after the named ones,
+        # as pylance does; a row id is returned only when named (or asked for by flag), not for being read.
+        for name in batch.schema.names:
+            if name not in columns and (name in _SCORE_COLUMNS or (name in _SYSTEM_COLUMNS
+                                                                    and name not in plain_sources)):
+                fields.append(batch.schema.field(name))
+                arrays.append(batch.column(name))
+        out.append(pa.RecordBatch.from_arrays(arrays, schema=pa.schema(fields)))
+    return pa.Table.from_batches(out, schema=out[0].schema)
+
+
 def _normalize_columns(columns) -> Optional[List[str]]:
     if columns is None:
         return None
     if isinstance(columns, dict):
-        # {"alias": "column"}: a rename of whole columns is all a projection can be here.
-        for alias, expr in columns.items():
-            if not isinstance(expr, str) or expr not in (alias,) and not expr.isidentifier():
-                raise unsupported("SQL expressions in a column projection")
+        if any(not isinstance(expr, str) for expr in columns.values()):
+            raise TypeError("the columns of a projection are column names or SQL expressions")
+        if _has_expressions(columns):
+            return _expression_inputs(columns)
+        # {"alias": "column"}: a rename of whole columns.
         return list(columns.values())
     if isinstance(columns, str):
         raise TypeError("columns must be a list of column names")
@@ -174,6 +240,8 @@ def _resolve_path(schema: pa.Schema, text: str) -> Optional[List[str]]:
 
 
 def _rename(table: pa.Table, columns) -> pa.Table:
+    if _has_expressions(columns):
+        return _evaluate_projection(table, columns)
     if isinstance(columns, dict):
         names = list(columns.keys()) + [n for n in table.column_names if n in ("_rowid", "_rowaddr")]
         return table.rename_columns(names)
@@ -3248,6 +3316,11 @@ class LanceScanner(pa.dataset.Scanner):
         if limit is not None and int(limit) < 0:
             raise ValueError("Limit must be non-negative")
         self._ds = ds
+        # A projection with SQL expressions: the scan reads the columns they name, and the table is
+        # projected after limit and offset (see to_table).
+        self._expressions = columns if _has_expressions(columns) else None
+        if self._expressions is not None:
+            columns = _normalize_columns(columns)
         self._columns = columns
         self._names = _normalize_columns(columns)
         # Lance's system columns, named in the projection, come back where they were named.
@@ -3411,7 +3484,10 @@ class LanceScanner(pa.dataset.Scanner):
         return table.drop_columns(list(dict.fromkeys(extra))) if extra else table
 
     def to_table(self) -> pa.Table:
-        return _json_out(self._to_table())
+        table = self._to_table()
+        if self._expressions is not None:
+            table = _evaluate_projection(table, self._expressions)
+        return _json_out(table)
 
     def to_pandas(self, *, blob_mode: str = "lazy", **kwargs):
         """The scan as a pandas DataFrame. Blob columns come back as ``blob_mode`` asks: "lazy", a

@@ -78,3 +78,15 @@ Tails of: `cd build && ctest -j8 | grep "tests passed"`; the oracle `-k` run; yo
 `python3 tools/pylance_suite.py | tail -4`; last, once:
 `cd bindings/python && python3 -m pytest -o addopts= -q -rf -p no:cacheprovider tests | tail -3`.
 Files changed, per-test status, decisions, questions.
+
+**S1 outcome (2026-10-16):** done except two tests. `columns={"alias": "<sql>"}` in to_table / scanner /
+to_batches / take / _take_rows, evaluated per batch in C++ (`_project_batch` over
+`Expression::evaluate`, typed by `result_type`) after filter / limit / offset; aliased system columns;
+`_distance` / `_score` after the named columns as pylance. +3 pylance tests (1135). Left (reviewer):
+`test_nested_projection_list` needs list / bracket indexing (`l[1]`, `s['x']`) in the expression
+grammar, and `test_dynamic_projection_with_vectors_index` needs a float16 list cast -- both roadmap
+items, the tests stay failing. Result-type differences from pylance (DataFusion's coercion), not
+changed: int32 + float32 -> float32 (nanolance double), uint8 + int32 -> int32 (int64), int32 column +
+float literal is an error in pylance, `abs(int32)` -> int64 there, `coalesce(x, 'lit')` non-null there,
+`S.X` case-insensitive struct access accepted by nanolance only, a stray trailing `)` accepted by
+pylance only. S2 next.

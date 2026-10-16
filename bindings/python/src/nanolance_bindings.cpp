@@ -1448,6 +1448,69 @@ NB_MODULE(_nanolance, m) {
         }
         return nb::bytes(reinterpret_cast<const char*>(keep.data()), keep.size());
     });
+    // The columns a projection expression reads (its top-level names, as written). Raises ValueError
+    // on a SQL syntax error or an unsupported construct.
+    m.def("_expr_columns", [](const std::string& sql) {
+        nano_lance::expr::Expression expression;
+        std::string error;
+        if (!nano_lance::expr::Expression::parse(sql, expression, error)) {
+            throw std::invalid_argument(error);
+        }
+        return expression.columns();
+    });
+    // Projection expressions over one record batch: each (alias, sql) is evaluated, in order, into an
+    // array typed by the expression's result_type. Returns one (field schema, array schema, array)
+    // capsule triple per expression; the field schema carries the name and nullability.
+    m.def("_project_batch", [](nb::handle batch, const std::vector<std::pair<std::string, std::string>>& exprs) {
+        struct SchemaHolder {
+            ArrowSchema schema{};
+            ~SchemaHolder() {
+                if (schema.release != nullptr) {
+                    schema.release(&schema);
+                }
+            }
+        };
+        auto imported = nanolance_py::arrow_capsule::import_batch(batch);
+        nb::list out;
+        for (const auto& [alias, sql] : exprs) {
+            nano_lance::expr::Expression expression;
+            std::string error;
+            if (!nano_lance::expr::Expression::parse(sql, expression, error) ||
+                !expression.bind(*imported.first, error)) {
+                throw std::invalid_argument(error);
+            }
+            SchemaHolder type;
+            if (!expression.result_type(alias, type.schema, error)) {
+                throw std::invalid_argument(error);
+            }
+            auto* array = static_cast<ArrowArray*>(std::malloc(sizeof(ArrowArray)));
+            if (array == nullptr) {
+                throw std::bad_alloc();
+            }
+            std::memset(array, 0, sizeof(ArrowArray));
+            if (!expression.evaluate(*imported.second, type.schema, *array, error)) {
+                std::free(array);
+                throw std::invalid_argument(error);
+            }
+            auto* field = static_cast<ArrowSchema*>(std::malloc(sizeof(ArrowSchema)));
+            auto* typed = static_cast<ArrowSchema*>(std::malloc(sizeof(ArrowSchema)));
+            if (field == nullptr || typed == nullptr) {
+                std::free(field);
+                std::free(typed);
+                throw std::bad_alloc();
+            }
+            std::memset(field, 0, sizeof(ArrowSchema));
+            std::memset(typed, 0, sizeof(ArrowSchema));
+            nanolance_py::arrow_capsule::nanoarrow_check("ArrowSchemaDeepCopy",
+                                                         ArrowSchemaDeepCopy(&type.schema, field));
+            nanolance_py::arrow_capsule::nanoarrow_check("ArrowSchemaDeepCopy",
+                                                         ArrowSchemaDeepCopy(&type.schema, typed));
+            out.append(nb::make_tuple(nanolance_py::arrow_capsule::detail::make_schema_capsule(field),
+                                      nanolance_py::arrow_capsule::detail::make_schema_capsule(typed),
+                                      nanolance_py::arrow_capsule::detail::make_array_capsule(array)));
+        }
+        return out;
+    });
     m.def("_ds_merge_insert", [](const std::filesystem::path& path, const std::vector<std::string>& on,
                                  bool update_all, bool insert_all, bool delete_by_source,
                                  const std::string& delete_condition, nb::handle data,

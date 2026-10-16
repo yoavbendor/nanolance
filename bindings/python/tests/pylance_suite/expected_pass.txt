@@ -324,6 +324,7 @@ tests/test_dataset.py::test_delete_with_commit
 tests/test_dataset.py::test_deletion_file
 tests/test_dataset.py::test_detached_commits
 tests/test_dataset.py::test_dictionaries
+tests/test_dataset.py::test_dynamic_projection
 tests/test_dataset.py::test_empty_structs
 tests/test_dataset.py::test_enable_disable_auto_cleanup
 tests/test_dataset.py::test_enable_stable_row_ids
@@ -434,6 +435,7 @@ tests/test_dataset.py::test_take_system_columns_values[_rowoffset]
 tests/test_dataset.py::test_take_version_system_columns
 tests/test_dataset.py::test_take_with_columns
 tests/test_dataset.py::test_take_with_json_column
+tests/test_dataset.py::test_take_with_projection
 tests/test_dataset.py::test_tensor_type
 tests/test_dataset.py::test_tilde_paths
 tests/test_dataset.py::test_to_batches
@@ -1017,6 +1019,7 @@ tests/test_schema_evolution.py::test_add_columns_callable[False]
 tests/test_schema_evolution.py::test_add_columns_callable[True]
 tests/test_schema_evolution.py::test_add_columns_exprs[False]
 tests/test_schema_evolution.py::test_add_columns_exprs[True]
+tests/test_schema_evolution.py::test_add_columns_from_file
 tests/test_schema_evolution.py::test_add_columns_udf[False]
 tests/test_schema_evolution.py::test_add_columns_udf[True]
 tests/test_schema_evolution.py::test_add_columns_udf_caching
