@@ -190,3 +190,111 @@ def test_bare_decimal_projection_equals_pylance(tmp_path, columns):
     other = theirs.to_table(columns=columns)
     assert mine.schema.types == other.schema.types
     assert mine.to_pydict() == other.to_pydict()
+
+
+# ---------------------------------------------------------------------------------------------
+# 4. Duration columns (EXPR_TYPES session A2): every unit, exact cross-unit compares, nulls,
+#    refused number / string literals, arrow_cast(<int>, 'Duration(Unit)'), bare projections.
+def _duration_table() -> pa.Table:
+    return pa.table(
+        {
+            "i": pa.array(range(8), pa.int64()),
+            "s": pa.array([1, 2, None, -3, 0, 1, 2, 9000000000], pa.duration("s")),
+            "ms": pa.array([2000, 2001, 2500, None, 0, -2000, 2000, 1], pa.duration("ms")),
+            "us": pa.array([2_000_000, 2_000_001, None, 3, 0, -1, 2000, 1], pa.duration("us")),
+            "ns": pa.array([2_000_000_000, 2_000_000_001, 2_500_000_000, None, 0, -2_000_000_000, 2_000_000_000, 1],
+                           pa.duration("ns")),
+        }
+    )
+
+
+DURATION_FILTERS = [
+    # each unit against its own unit, then against every other unit
+    "ms = arrow_cast(2000, 'Duration(Millisecond)')",
+    "ms = arrow_cast(2, 'Duration(Second)')",
+    "ms = arrow_cast(2000000, 'Duration(Microsecond)')",
+    "ms = arrow_cast(2000000000, 'Duration(Nanosecond)')",
+    "us = arrow_cast(2, 'Duration(Millisecond)')",
+    "us = arrow_cast(2000001, 'Duration(Microsecond)')",
+    "ns = arrow_cast(2, 'Duration(Second)')",
+    "ns >= arrow_cast(2500, 'Duration(Millisecond)')",
+    "s = arrow_cast(1, 'Duration(Second)')",
+    "s = arrow_cast(-3, 'Duration(Second)')",
+    "s = arrow_cast(1000, 'Duration(Millisecond)')",
+    "s >= arrow_cast(1, 'Duration(Millisecond)')",
+    "s > arrow_cast(1500, 'Duration(Millisecond)')",
+    # ranges and sets across units, nulls and negatives
+    "ms > arrow_cast(1, 'Duration(Second)')",
+    "ms <= arrow_cast(2, 'Duration(Second)')",
+    "us < arrow_cast(0, 'Duration(Second)')",
+    "ns < arrow_cast(-2, 'Duration(Second)')",
+    "ns != arrow_cast(2, 'Duration(Second)')",
+    "ms BETWEEN arrow_cast(1, 'Duration(Second)') AND arrow_cast(3, 'Duration(Second)')",
+    "ms NOT BETWEEN arrow_cast(1, 'Duration(Second)') AND arrow_cast(3, 'Duration(Second)')",
+    "ms IN (arrow_cast(2, 'Duration(Second)'), arrow_cast(2001, 'Duration(Millisecond)'))",
+    "us NOT IN (arrow_cast(2, 'Duration(Second)'))",
+    "ms IS NULL",
+    "us IS NOT NULL",
+    # the extreme values: 9e9 seconds is 9e18 nanoseconds, just inside int64, so a naive conversion of
+    # the other side would overflow; the compare must stay exact
+    "s = arrow_cast(9000000000000000000, 'Duration(Nanosecond)')",
+    "s = arrow_cast(9000000000, 'Duration(Second)')",
+    "s > arrow_cast(8999999999999999999, 'Duration(Nanosecond)')",
+    "s < arrow_cast(9000000000000000001, 'Duration(Nanosecond)')",
+]
+
+
+@pytest.mark.parametrize("flt", DURATION_FILTERS)
+def test_duration_filters_equal_pylance(tmp_path, flt):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _duration_table())
+    _assert_same(ours, theirs, flt)
+
+
+def test_duration_filters_across_fragments_equal_pylance(tmp_path):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _duration_table(), max_rows_per_file=3)
+    for flt in ("ms = arrow_cast(2000, 'Duration(Millisecond)')", "ns > arrow_cast(1, 'Duration(Second)')"):
+        _assert_same(ours, theirs, flt)
+
+
+@pytest.mark.parametrize(
+    "flt, message",
+    [
+        ("ms = 2", "Received literal Int64(2) and could not convert to literal of type 'Duration(Millisecond)'"),
+        ("ms = 2.5", "Received literal Float64(2.5) and could not convert to literal of type 'Duration(Millisecond)'"),
+        ("ms = 2.0", "Received literal Float64(2) and could not convert to literal of type 'Duration(Millisecond)'"),
+        ("ms > 1.5", "Received literal Float64(1.5) and could not convert to literal of type 'Duration(Millisecond)'"),
+        ("ms IN (2)", "Received literal Int64(2) and could not convert to literal of type 'Duration(Millisecond)'"),
+        ("ms BETWEEN 1 AND 3",
+         "Received literal Int64(1) and could not convert to literal of type 'Duration(Millisecond)'"),
+        ("us = 2", "Received literal Int64(2) and could not convert to literal of type 'Duration(Microsecond)'"),
+        ("ns = 2.5", "Received literal Float64(2.5) and could not convert to literal of type 'Duration(Nanosecond)'"),
+        ("s = 2", "Received literal Int64(2) and could not convert to literal of type 'Duration(Second)'"),
+        ("ms = '2'", "Received literal Utf8(\"2\") and could not convert to literal of type 'Duration(Millisecond)'"),
+    ],
+)
+def test_duration_bare_literal_errors_like_pylance(tmp_path, flt, message):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _duration_table())
+    mine = _rows(ours, flt)
+    assert mine[0] == "error" and message in mine[1], mine
+    assert _rows(theirs, flt)[0] == "error"
+
+
+def test_duration_arrow_cast_of_float_is_refused(tmp_path):
+    ours, _ = _datasets(require_pylance(), tmp_path, _duration_table())
+    mine = _rows(ours, "ms = arrow_cast(2.5, 'Duration(Millisecond)')")
+    assert mine[0] == "error" and "integer literal" in mine[1]
+
+
+@pytest.mark.parametrize("columns", [{"d": "ms"}, {"s": "s", "us": "us"}, {"ns": "ns", "i": "i"}],
+                         ids=["millisecond", "second_and_microsecond", "nanosecond"])
+def test_bare_duration_projection_equals_pylance(tmp_path, columns):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _duration_table())
+    mine = ours.to_table(columns=columns)
+    other = theirs.to_table(columns=columns)
+    assert mine.schema.types == other.schema.types
+    assert [str(t) for t in mine.schema.types] == [str(t) for t in other.schema.types]
+    assert mine.to_pydict() == other.to_pydict()

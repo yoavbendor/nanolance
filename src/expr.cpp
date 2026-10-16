@@ -31,7 +31,7 @@ namespace nano_lance::expr {
 
 namespace detail {
 
-enum class Kind { Null, Bool, Int, UInt, Double, String, Binary, Date, Timestamp, List, Decimal };
+enum class Kind { Null, Bool, Int, UInt, Double, String, Binary, Date, Timestamp, List, Decimal, Duration };
 
 /// A decimal's unscaled value: 256-bit two's complement, least significant 64-bit limb first.
 using Limbs256 = std::array<std::uint64_t, 4>;
@@ -295,12 +295,21 @@ struct Value {
     std::shared_ptr<std::vector<Value>> items;  // List
     Limbs256 dec{};       // Decimal: the unscaled value
     std::int32_t scale = 0;  // Decimal: digits after the point (the value is dec * 10^-scale)
+    ArrowTimeUnit unit = NANOARROW_TIME_UNIT_SECOND;  // Duration: the unit of `i`
 
     static Value decimal(const Limbs256& limbs, std::int32_t scale) {
         Value x;
         x.kind = Kind::Decimal;
         x.dec = limbs;
         x.scale = scale;
+        return x;
+    }
+    /// A duration of `count` units (count is in `i`; the unit is kept beside it).
+    static Value duration(std::int64_t count, ArrowTimeUnit unit) {
+        Value x;
+        x.kind = Kind::Duration;
+        x.i = count;
+        x.unit = unit;
         return x;
     }
 
@@ -362,6 +371,7 @@ struct Value {
     }
     bool is_null() const { return kind == Kind::Null; }
     bool numeric() const { return kind == Kind::Int || kind == Kind::UInt || kind == Kind::Double; }
+    bool duration() const { return kind == Kind::Duration; }
     bool temporal() const { return kind == Kind::Date || kind == Kind::Timestamp; }
     double as_double() const {
         switch (kind) {
@@ -465,6 +475,16 @@ inline bool parse_datetime(std::string_view text, std::int64_t& ns, bool& date_o
     return true;
 }
 
+/// The arrow_cast name of a time unit: 'Second', 'Millisecond', ...
+inline const char* unit_name(ArrowTimeUnit unit) {
+    switch (unit) {
+        case NANOARROW_TIME_UNIT_SECOND: return "Second";
+        case NANOARROW_TIME_UNIT_MILLI: return "Millisecond";
+        case NANOARROW_TIME_UNIT_MICRO: return "Microsecond";
+        default: return "Nanosecond";
+    }
+}
+
 inline std::string format_value(const Value& v) {
     switch (v.kind) {
         case Kind::Null: return "NULL";
@@ -505,6 +525,7 @@ inline std::string format_value(const Value& v) {
             return out + "]";
         }
         case Kind::Decimal: return mag_text(limbs_magnitude(v.dec), v.scale, limbs_negative(v.dec));
+        case Kind::Duration: return "DURATION(" + std::to_string(v.i) + " " + unit_name(v.unit) + ")";
     }
     return "?";
 }
@@ -1206,6 +1227,35 @@ private:
                 auto folded = fold_decimal_cast(*n->args[0], type, error);
                 return folded ? std::move(folded) : fail(error);
             }
+            if (type.rfind("Duration(", 0) == 0) {
+                // arrow_cast(<integer literal>, 'Duration(Unit)'): the count in that unit.
+                const auto close = type.find(')');
+                const std::string word = close == std::string::npos ? "" : type.substr(9, close - 9);
+                const auto& arg = *n->args[0];
+                ArrowTimeUnit unit = NANOARROW_TIME_UNIT_SECOND;
+                bool known = true;
+                if (word == "Second") {
+                    unit = NANOARROW_TIME_UNIT_SECOND;
+                } else if (word == "Millisecond") {
+                    unit = NANOARROW_TIME_UNIT_MILLI;
+                } else if (word == "Microsecond") {
+                    unit = NANOARROW_TIME_UNIT_MICRO;
+                } else if (word == "Nanosecond") {
+                    unit = NANOARROW_TIME_UNIT_NANO;
+                } else {
+                    known = false;
+                }
+                if (!known || close + 1 != type.size()) {
+                    return fail("arrow_cast to '" + type + "' is not supported in nanolance filters");
+                }
+                if (arg.op != Op::Literal || arg.literal.kind != Kind::Int) {
+                    return fail("arrow_cast to '" + type + "' takes an integer literal in nanolance filters");
+                }
+                auto lit = std::make_unique<Node>();
+                lit->op = Op::Literal;
+                lit->literal = Value::duration(arg.literal.i, unit);
+                return lit;
+            }
             static const std::vector<std::pair<std::string, std::string>> types = {
                 {"Int8", "bigint"}, {"Int16", "bigint"}, {"Int32", "bigint"}, {"Int64", "bigint"},
                 {"UInt8", "bigint"}, {"UInt16", "bigint"}, {"UInt32", "bigint"}, {"UInt64", "bigint"},
@@ -1535,6 +1585,22 @@ double round_to_float32(double d) {
 /// As DataFusion coerces a comparison's literals to its column's type: a string literal compared
 /// with a date or timestamp column becomes a date / timestamp literal, and a number compared with
 /// a float32 column is rounded to float32 (so `x = 0.1` matches the float32 0.1).
+/// A literal as DataFusion shows it in a type error: `Int64(2)`, `Float64(2.5)` (2.0 is `Float64(2)`,
+/// the shortest form), `Utf8("x")`; empty for any other kind.
+std::string datafusion_literal(const Value& v) {
+    switch (v.kind) {
+        case Kind::Int: return "Int64(" + std::to_string(v.i) + ")";
+        case Kind::UInt: return "UInt64(" + std::to_string(v.u) + ")";
+        case Kind::Double: {
+            char buf[64];
+            const auto end = std::to_chars(buf, buf + sizeof buf, v.d).ptr;
+            return "Float64(" + std::string(buf, end) + ")";
+        }
+        case Kind::String: return "Utf8(\"" + std::string(v.s) + "\")";
+        default: return {};
+    }
+}
+
 bool coerce(Node& n, std::string& error) {
     for (auto& a : n.args) {
         if (!coerce(*a, error)) {
@@ -1547,6 +1613,25 @@ bool coerce(Node& n, std::string& error) {
     if (!compares) {
         return true;
     }
+    // pylance refuses a number or string literal against a duration column (arrow_cast(x, 'Duration(..)')
+    // is the way to write one), and words the refusal with the literal as DataFusion types it.
+    for (const auto& a : n.args) {
+        if (a->op != Op::Column || a->column.type != NANOARROW_TYPE_DURATION) {
+            continue;
+        }
+        for (const auto& b : n.args) {
+            if (b->op != Op::Literal) {
+                continue;
+            }
+            const std::string shown = datafusion_literal(b->literal);
+            if (shown.empty()) {
+                continue;
+            }
+            error = "Received literal " + shown + " and could not convert to literal of type 'Duration(" +
+                    unit_name(a->column.unit) + ")'";
+            return false;
+        }
+    }
     // pylance refuses a bare float literal against a decimal column (arrow_cast(x, 'Float64') is fine).
     for (const auto& a : n.args) {
         if (a->op != Op::Column || (a->column.type != NANOARROW_TYPE_DECIMAL128 &&
@@ -1555,7 +1640,7 @@ bool coerce(Node& n, std::string& error) {
         }
         for (const auto& b : n.args) {
             if (b->op == Op::Literal && b->literal.kind == Kind::Double) {
-                error = "Received literal Float64(" + b->source + ") and could not convert to literal of type '" +
+                error = "Received literal " + datafusion_literal(b->literal) + " and could not convert to literal of type '" +
                         (a->column.type == NANOARROW_TYPE_DECIMAL128 ? "Decimal128" : "Decimal256") + "(" +
                         std::to_string(a->column.precision) + ", " + std::to_string(a->column.scale) + ")'";
                 return false;
@@ -1679,8 +1764,8 @@ Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowT
         case NANOARROW_TYPE_INT64:
         case NANOARROW_TYPE_TIME32:
         case NANOARROW_TYPE_TIME64:
-        case NANOARROW_TYPE_DURATION:
             return Value::integer(ArrowArrayViewGetIntUnsafe(view, at));
+        case NANOARROW_TYPE_DURATION: return Value::duration(ArrowArrayViewGetIntUnsafe(view, at), unit);
         case NANOARROW_TYPE_UINT8:
         case NANOARROW_TYPE_UINT16:
         case NANOARROW_TYPE_UINT32:
@@ -1761,8 +1846,42 @@ int compare_decimal(const Limbs256& a, int32_t sa, const Limbs256& b, int32_t sb
     return na ? -c : c;
 }
 
+/// The sign of x * k - y for k >= 1, without computing x * k (which can overflow): y is split as
+/// qy * k + ry with 0 <= ry < k, and x is compared with qy first.
+int compare_scaled(std::int64_t x, std::int64_t k, std::int64_t y) {
+    std::int64_t qy = y / k;
+    std::int64_t ry = y % k;
+    if (ry < 0) {
+        ry += k;
+        qy -= 1;
+    }
+    if (x > qy) return 1;
+    if (x < qy) return -1;
+    return ry > 0 ? -1 : 0;
+}
+
+/// Exact three-way comparison of count_a units of unit_a with count_b units of unit_b. Each unit is
+/// a power of ten of nanoseconds, so the coarser count is compared against the finer one scaled.
+int compare_duration(std::int64_t count_a, ArrowTimeUnit unit_a, std::int64_t count_b, ArrowTimeUnit unit_b) {
+    const std::int64_t fa = unit_to_ns(unit_a);
+    const std::int64_t fb = unit_to_ns(unit_b);
+    if (fa == fb) {
+        return count_a < count_b ? -1 : (count_a > count_b ? 1 : 0);
+    }
+    if (fa > fb) {
+        return compare_scaled(count_a, fa / fb, count_b);
+    }
+    return -compare_scaled(count_b, fb / fa, count_a);
+}
+
 /// -1, 0, 1, or nullopt when the two cannot be compared.
 std::optional<int> compare(const Value& a, const Value& b) {
+    if (a.duration() || b.duration()) {
+        if (!a.duration() || !b.duration()) {
+            return std::nullopt;  // a duration against a non-duration: refused at bind, never matches here
+        }
+        return compare_duration(a.i, a.unit, b.i, b.unit);
+    }
     if (a.kind == Kind::Decimal || b.kind == Kind::Decimal) {
         // A float is compared as a double (arrow_cast(x, 'Float64')); integers and decimals exactly.
         if (a.kind == Kind::Double || b.kind == Kind::Double) {
@@ -1829,6 +1948,7 @@ const char* kind_name(Kind k) {
         case Kind::Timestamp: return "timestamp";
         case Kind::List: return "list";
         case Kind::Decimal: return "decimal";
+        case Kind::Duration: return "duration";
     }
     return "?";
 }
@@ -1947,6 +2067,9 @@ Value cast_value(const Value& v, const std::string& type, Context& ctx) {
         if (v.kind == Kind::Int) {
             return v;
         }
+        if (v.kind == Kind::Duration) {
+            return Value::integer(v.i);
+        }
         if (v.kind == Kind::UInt) {
             return Value::integer(static_cast<std::int64_t>(v.u));
         }
@@ -1966,6 +2089,9 @@ Value cast_value(const Value& v, const std::string& type, Context& ctx) {
     } else if (first == "float" || first == "double" || first == "real" || first == "decimal" || first == "numeric") {
         if (v.numeric() || v.kind == Kind::Decimal) {
             return Value::real(v.as_double());
+        }
+        if (v.kind == Kind::Duration) {
+            return Value::real(static_cast<double>(v.i));
         }
         if (v.kind == Kind::String) {
             char* end = nullptr;
@@ -2562,8 +2688,7 @@ bool append_value(ArrowArray& out, const ArrowSchemaView& type, const Value& v, 
         case NANOARROW_TYPE_INT32:
         case NANOARROW_TYPE_INT64:
         case NANOARROW_TYPE_TIME32:
-        case NANOARROW_TYPE_TIME64:
-        case NANOARROW_TYPE_DURATION: {
+        case NANOARROW_TYPE_TIME64: {
             const Value i = cast_value(v, "bigint", ctx);
             if (ctx.failed || ArrowArrayAppendInt(&out, i.i) != NANOARROW_OK) {
                 if (!ctx.failed) {
@@ -2624,6 +2749,29 @@ bool append_value(ArrowArray& out, const ArrowSchemaView& type, const Value& v, 
         case NANOARROW_TYPE_TIMESTAMP: {
             const Value t = cast_value(v, "timestamp", ctx);
             return !ctx.failed && ArrowArrayAppendInt(&out, t.as_ns() / unit_to_ns(type.time_unit)) == NANOARROW_OK;
+        }
+        case NANOARROW_TYPE_DURATION: {
+            if (!v.duration()) {
+                const Value i = cast_value(v, "bigint", ctx);
+                return !ctx.failed && ArrowArrayAppendInt(&out, i.i) == NANOARROW_OK;
+            }
+            // Exact when the column's unit is finer; a coarser unit truncates toward zero (Arrow's cast).
+            const std::int64_t from = unit_to_ns(v.unit);
+            const std::int64_t to = unit_to_ns(type.time_unit);
+            std::int64_t count = v.i;
+            if (from != to) {
+                if (from > to) {
+                    const std::int64_t k = from / to;
+                    if (count > std::numeric_limits<std::int64_t>::max() / k || count < std::numeric_limits<std::int64_t>::min() / k) {
+                        ctx.fail("value " + format_value(v) + " does not fit the column");
+                        return false;
+                    }
+                    count *= k;
+                } else {
+                    count /= to / from;
+                }
+            }
+            return ArrowArrayAppendInt(&out, count) == NANOARROW_OK;
         }
         case NANOARROW_TYPE_FIXED_SIZE_LIST:
         case NANOARROW_TYPE_LIST:
@@ -2821,7 +2969,6 @@ bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit,
         case NANOARROW_TYPE_INT64:
         case NANOARROW_TYPE_TIME32:
         case NANOARROW_TYPE_TIME64:
-        case NANOARROW_TYPE_DURATION:
             if (lit.kind == Kind::Int) {
                 for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(three_way(signed_at(r), lit.i));
             } else if (lit.kind == Kind::UInt) {
@@ -2834,6 +2981,13 @@ bool compare_column(const ArrowArrayView& v, ArrowType type, ArrowTimeUnit unit,
             } else {
                 return false;
             }
+            return true;
+        case NANOARROW_TYPE_DURATION:
+            // Unit-aware: each row's count in its own unit against the literal's, exactly.
+            if (lit.kind != Kind::Duration) {
+                return false;
+            }
+            for (int64_t r = 0; r < n; ++r) ways[r] = static_cast<std::int8_t>(compare_duration(signed_at(r), unit, lit.i, lit.unit));
             return true;
         case NANOARROW_TYPE_UINT8:
         case NANOARROW_TYPE_UINT16:
@@ -3167,6 +3321,10 @@ TypeGuess guess(const Node& n, const ArrowSchema& root) {
                 case Kind::Null: g.type = NANOARROW_TYPE_NA; break;
                 case Kind::List: g.type = NANOARROW_TYPE_LIST; break;
                 case Kind::Decimal: g.type = NANOARROW_TYPE_DECIMAL128; break;  // precision and scale: see result_type
+                case Kind::Duration:
+                    g.type = NANOARROW_TYPE_DURATION;
+                    g.unit = n.literal.unit;
+                    break;
             }
             return g;
         case Op::Column:

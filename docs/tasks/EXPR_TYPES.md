@@ -100,6 +100,15 @@ Code map from A0 (grep-located):
   an extension type is not supported"): key the storage type, keep what page_data stores (measure).
 - src/index_search.cpp: grep `Decimal128` for the literal-to-key path.
 
+**A1 outcome (2026-10-16):** decimal128 / decimal256 in filters, exact (46 tests); rounding half away
+from zero, pylance's overflow and float-literal messages (pylance quotes the type: `'Decimal128(10,
+2)'`, and shows the literal as DataFusion types it, `Float64(2)` for `2.0`).
+**A2 outcome (2026-10-16):** durations of every unit in filters, exact across units without
+overflow; int / float / string literals refused with pylance's messages; bare projections keep the
+type (43 more tests); duration arithmetic and `abs()` refused as pylance refuses them. Divergence
+kept on purpose: `arrow_cast(2.5, 'Duration(Millisecond)')` is an error here, an empty result in
+pylance. Three pylance tests pass now (`test_scalar_index_types[*-duration]`). A3 next.
+
 **Phase B -- bracket indexing, float16 list casts (2 of pylance's tests)**
 
 5. `l[1]` (list element, 1-based as DataFusion's `array_element`: measure; out of range -> null) and
