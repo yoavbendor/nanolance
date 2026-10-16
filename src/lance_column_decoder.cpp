@@ -5197,10 +5197,11 @@ static bool decode_lance_physical_column_rows_impl(const std::filesystem::path& 
     // row). More chunks than this cost more read one by one than picked from the cached copy.
     constexpr std::size_t kFewChunks = 16;
     const bool few_chunks = chunked && chunks_touched <= kFewChunks;
-    if (!rows.empty() && !full_zip_lists && take_cache_budget() != 0U && encoded <= kCacheColumnBytes) {
+    // A few chunks are read even when the column is cached: picking rows out of the copy walks all
+    // of its rows (a list column's layers among them).
+    if (!rows.empty() && !full_zip_lists && !few_chunks && take_cache_budget() != 0U && encoded <= kCacheColumnBytes) {
         const auto whole = cached_whole_column(data_file_path, on_disk_field, column_metadata, error,
-                                               few_chunks                   ? CacheFill::Never
-                                               : encoded <= kSmallColumnBytes ? CacheFill::FirstTake
+                                               encoded <= kSmallColumnBytes ? CacheFill::FirstTake
                                                : chunked                    ? CacheFill::Never
                                                : nested                     ? CacheFill::SecondTake
                                                                             : CacheFill::FirstTake);
