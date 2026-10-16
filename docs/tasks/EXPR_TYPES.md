@@ -183,6 +183,16 @@ matches except `i8 + arrow_cast(1, 'Int32' / 'UInt8')` (the parser turns integer
 CAST AS bigint: C3; strict xfails). Left: a comparison or boolean projection (`i8 + 100 > 0` as a
 column) keeps the old typing inside; u64-with-signed / and % (C2).
 
+**C2 outcome (2026-10-16):** decimal arithmetic in projections, exact in 128 bits with pylance's
+overflow messages. Measured division rule: scale min(38, s1 + 4), precision min(38, p1 + s2 + 4)
+(the divisor's precision does not enter), truncating; numerator scale-up overflow and k > 38 fail
+as pylance fails. Precision caps at 38 with the scale kept; add / sub / mul check only 128-bit
+overflow, so a result past its precision is returned, as pylance returns it. mod: scale max(s1,
+s2), precision min(p1-s1, p2-s2) + scale. u64 with signed: the signed side as decimal(20, 0).
+coalesce(dec, f64 column) -> decimal(30,15). Left: an integer subtree beside a decimal (`dec + i32
+* 1` -> (22,2), `dec + i8 * 1` -> (15,2) in pylance; no rule found, refused here, strict xfail);
+integer arrow_cast / CAST (C3); decimal with float32; decimal256 projections untested.
+
 ## 3. Oracles
 
 `python3 tools/pylance_suite.py -k "<test names>" 2>&1 | grep -E "^FAILED|passed|failed" | tail -15`

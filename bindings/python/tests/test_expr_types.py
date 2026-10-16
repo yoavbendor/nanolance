@@ -779,3 +779,146 @@ def test_numeric_filters_keep_their_rows(tmp_path, flt, rows):
         assert got[0] == "error" and rows in got[1], f"{flt!r}: {got}"
     else:
         assert got == ("rows", rows), f"{flt!r}"
+
+
+# ── phase C2: decimal arithmetic in projections (exact, as pylance 12 types and values them) ──────
+
+
+def _decimal_table() -> pa.Table:
+    return pa.table(
+        {
+            "i": pa.array(range(4), pa.int64()),
+            "dec": pa.array([D("12.34"), D("-0.05"), D("1.00"), None], pa.decimal128(10, 2)),
+            "a": pa.array([D("12"), D("-7"), D("1"), None], pa.decimal128(10, 0)),
+            "b": pa.array([D("1.2345"), D("-0.0005"), D("2.5"), None], pa.decimal128(10, 4)),
+            "c": pa.array([D("1.5"), D("-3.25"), D("0.0000000001"), None], pa.decimal128(38, 10)),
+            "e": pa.array([D("12.34"), D("-0.05"), None, D("1.00")], pa.decimal128(20, 2)),
+            "f": pa.array([D("1.234"), D("-0.001"), D("9.999"), None], pa.decimal128(5, 3)),
+            "h": pa.array([D("1.00"), None, D("3.33"), D("-2.50")], pa.decimal128(38, 2)),
+            "lo": pa.array([D("1.5"), D("-0.25"), D("0.5"), None], pa.decimal128(38, 37)),
+            "x": pa.array([D(9) * D(10) ** 37, D(5) * D(10) ** 37, D(1), None], pa.decimal128(38, 0)),
+            "z": pa.array([D(10) ** 19, D(-10) ** 19, D(3), None], pa.decimal128(38, 0)),
+            "fl": pa.array([0.5, 2.5, -1.25, None], pa.float64()),
+            "u": pa.array([10, 7, 0, None], pa.uint64()),
+            "s": pa.array([3, -2, 5, None], pa.int8()),
+            "i8": pa.array([100, -128, 7, None], pa.int8()),
+            "i32": pa.array([2000000000, -7, 7, None], pa.int32()),
+        }
+    )
+
+
+# Projections that pylance returns: the same type and the same values, nulls and negatives included.
+C2_PROJECTIONS = [
+    "dec + 1", "dec * 2", "dec / 2", "dec / 3", "dec % 3", "dec + i32", "dec + i8", "dec - i8", "dec * u",
+    "dec + u", "dec * dec", "dec + dec", "dec - dec", "dec * dec * dec", "dec * dec * 2", "-dec * 2", "-dec + 1",
+    "abs(dec)", "-dec", "abs(-dec * 3)", "dec + fl", "dec / dec", "dec + 2", "dec + i", "dec * i", "dec * 0", "dec * arrow_cast(2, 'Decimal128(3, 0)')",
+    "dec / arrow_cast(4, 'Decimal128(10, 4)')", "dec + lo", "h % 3", "h / 3", "h + h", "h * 2",
+    # division scales (s1 + 4, precision p1 + s2 + 4, capped at 38) and the cap itself
+    "a / a", "a / b", "b / a", "b / b", "c / c", "c / a", "e / f", "f / e", "e / e", "a / 3", "3 / a", "e / 3",
+    "3 / e", "e / 100000", "i / a", "i / e",
+    "lo / a", "lo + lo", "z * z", "x + z",
+    # % and the scale of a remainder
+    "e % f", "e % a", "e % 3", "u % s", "u % dec", "e % u",
+    # u64 with a signed int is decimal(21, 0) / (38, 0) / (24, 4) / (20, 0), as pylance
+    "u + i8", "u - s", "u * s", "s * u", "u / s", "u / a", "u + e", "u % a",
+    # coalesce: the common type of its arguments (integers by digits, float64 as decimal(30, 15))
+    "coalesce(dec, 1)", "coalesce(dec, 1.5)", "coalesce(e, a)", "coalesce(e, f)", "coalesce(a, e)",
+    "coalesce(dec, fl)", "coalesce(fl, dec)", "coalesce(dec, -1.5)",
+]
+
+# Refused by both, with pylance's message contained in ours (the wording of the error may add a prefix).
+C2_REFUSALS = [
+    ("dec / 0", "Divide by zero error"),
+    ("dec % 0", "Divide by zero error"),
+    ("a / i", "Divide by zero error"),
+    ("e / lo", "Cannot get result type for decimal operation Decimal128(20, 2) / Decimal128(38, 37): Arithmetic "
+               "overflow: Overflow happened on: 10 ^ 41"),
+    ("e % 0", "Divide by zero error"),
+    ("dec + 1.5", "Received literal Float64(1.5) and could not convert to literal of type 'Decimal128(10, 2)'"),
+    ("dec * 0.5", "Received literal Float64(0.5) and could not convert to literal of type 'Decimal128(10, 2)'"),
+    ("dec / 100000000000", "Received literal Int64(100000000000) and could not convert to literal of type "
+                           "'Decimal128(10, 2)'"),
+    ("lo * 2", "Output scale of Decimal128(38, 37) * Decimal128(38, 37) would exceed max scale of 38"),
+    ("x + x", "Arithmetic overflow: Overflow happened on: 90000000000000000000000000000000000000 + "
+              "90000000000000000000000000000000000000"),
+    ("x * z", "Arithmetic overflow: Overflow happened on: 90000000000000000000000000000000000000 * "
+              "10000000000000000000"),
+    ("x / z", "Arithmetic overflow: Overflow happened on: 90000000000000000000000000000000000000 * 10000"),
+    ("lo / lo", "Arithmetic overflow: Overflow happened on: 15000000000000000000000000000000000000 * "
+                "100000000000000000000000000000000000000"),
+    ("lo / 2", "Arithmetic overflow: Overflow happened on: 15000000000000000000000000000000000000 * "
+               "100000000000000000000000000000000000000"),
+    ("x + lo", "Arithmetic overflow: Overflow happened on: 90000000000000000000000000000000000000 * "
+               "10000000000000000000000000000000000000"),
+]
+
+
+def _decimal_projection(ds, expr):
+    try:
+        t = ds.to_table(columns={"r": expr})
+    except Exception as exc:  # noqa: BLE001 -- the outcome is what is compared
+        return ("error", str(exc))
+    return ("values", str(t.schema.field("r").type), t.column("r").to_pylist())
+
+
+@pytest.mark.parametrize("expr", C2_PROJECTIONS)
+def test_decimal_projection_equals_pylance(tmp_path, expr):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _decimal_table())
+    mine = _decimal_projection(ours, expr)
+    other = _decimal_projection(theirs, expr)
+    assert other[0] == "values", f"pylance refuses {expr!r}: {other[1]}"
+    assert mine[0] == "values", f"pylance returns {other[1]} for {expr!r}; nanolance refuses: {mine[1]}"
+    assert mine[1] == other[1], f"{expr!r}: type {mine[1]} against pylance's {other[1]}"
+    assert _same_values(mine[2], other[2]), f"{expr!r}: {mine[2]} against pylance's {other[2]}"
+
+
+@pytest.mark.parametrize("expr, message", C2_REFUSALS)
+def test_decimal_projection_refusals_equal_pylance(tmp_path, expr, message):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _decimal_table())
+    mine = _decimal_projection(ours, expr)
+    other = _decimal_projection(theirs, expr)
+    assert other[0] == "error" and message in other[1], f"pylance says {other}"
+    assert mine[0] == "error" and message in mine[1], f"{expr!r}: nanolance {mine} against {other[1]!r}"
+
+
+@pytest.mark.parametrize("expr", ["z * z", "x + z", "c / a"])
+def test_decimal_results_past_their_precision_are_returned_like_pylance(tmp_path, expr):
+    # pylance checks the 128-bit range only: a value with more digits than its precision is returned
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _decimal_table())
+    assert _decimal_projection(ours, expr) == _decimal_projection(theirs, expr)
+
+
+@pytest.mark.xfail(strict=True, reason="phase C2 leftover: nested integer arithmetic beside a decimal (dec + i32 * 1)")
+def test_decimal_with_nested_integer_arithmetic_equals_pylance(tmp_path):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _decimal_table())
+    expr = "dec + i32 * 1"
+    assert _decimal_projection(ours, expr) == _decimal_projection(theirs, expr)
+
+
+@pytest.mark.parametrize(
+    "flt, outcome",
+    [
+        ("dec + 1 > 13", "cannot apply '+' to decimal and integer"),
+        ("dec * 2 = 24.68", "cannot apply '*' to decimal and integer"),
+        ("dec - dec = 0", "cannot apply '-' to decimal and decimal"),
+        ("-dec > 0", "cannot negate a decimal"),
+        ("abs(dec) > 1", "abs() needs a number"),
+    ],
+)
+def test_decimal_arithmetic_filters_are_unchanged(tmp_path, flt, outcome):
+    # filters keep their semantics (C1): decimal arithmetic in a filter is refused as it was before C2
+    ours = nano.write_dataset(_decimal_table(), str(tmp_path / "nano.lance"))
+    got = _rows(ours, flt)
+    assert got[0] == "error" and outcome in got[1], f"{flt!r}: {got}"
+
+
+@pytest.mark.parametrize("flt, rows", [("u + 1 > 3", [0, 1]), ("i8 + 1 > 0", [0, 2])])
+def test_integer_arithmetic_filters_keep_their_rows(tmp_path, flt, rows):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _decimal_table())
+    assert _rows(ours, flt) == ("rows", rows)
+    assert _rows(theirs, flt) == ("rows", rows)

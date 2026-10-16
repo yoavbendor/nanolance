@@ -3655,14 +3655,184 @@ Value as_num(const Value& v, NumType t) {
     return Value::real(v.d);
 }
 
+/// A decimal128 type of the typed path: precision and scale.
+struct DecType {
+    int p = 0;
+    int s = 0;
+};
+
+using I128 = __int128;
+
+std::string i128_text(I128 v) {
+    const bool neg = v < 0;
+    const auto u = static_cast<unsigned __int128>(v);
+    const std::uint64_t sign = neg ? ~std::uint64_t{0} : 0;
+    return mag_text(limbs_magnitude(Limbs256{static_cast<std::uint64_t>(u), static_cast<std::uint64_t>(u >> 64), sign, sign}),
+                    0, neg);
+}
+
+Value decimal_value(I128 v, int scale) {
+    const auto u = static_cast<unsigned __int128>(v);
+    const std::uint64_t sign = v < 0 ? ~std::uint64_t{0} : 0;
+    return Value::decimal(Limbs256{static_cast<std::uint64_t>(u), static_cast<std::uint64_t>(u >> 64), sign, sign},
+                          scale);
+}
+
+/// An integer or decimal Value as its unscaled 128-bit value and scale.
+bool value_i128(const Value& v, I128& out, int& scale) {
+    if (v.kind == Kind::Int) {
+        out = v.i;
+        scale = 0;
+        return true;
+    }
+    if (v.kind == Kind::UInt) {
+        out = static_cast<I128>(v.u);
+        scale = 0;
+        return true;
+    }
+    if (v.kind == Kind::Decimal) {
+        out = static_cast<I128>((static_cast<unsigned __int128>(v.dec[1]) << 64) | v.dec[0]);
+        scale = v.scale;
+        return true;
+    }
+    return false;
+}
+
+/// a sym b with DataFusion's message on i128 overflow (the operands as they are used).
+bool checked_i128(char sym, I128 a, I128 b, I128& r, std::string& err) {
+    const bool of = sym == '+' ? __builtin_add_overflow(a, b, &r)
+                    : sym == '-' ? __builtin_sub_overflow(a, b, &r)
+                                 : __builtin_mul_overflow(a, b, &r);
+    if (of) {
+        err = "Arithmetic overflow: Overflow happened on: " + i128_text(a) + " " + std::string(1, sym) + " " +
+              i128_text(b);
+    }
+    return !of;
+}
+
+/// v * 10^k with the same overflow check.
+bool rescale_i128(I128 v, int k, I128& out, std::string& err) {
+    I128 f = 1;
+    for (int i = 0; i < k; ++i) {
+        f *= 10;
+    }
+    return checked_i128('*', v, f, out, err);
+}
+
+double as_double_value(const Value& v) {
+    if (v.kind == Kind::Decimal) {
+        return decimal_as_double(v.dec, v.scale);
+    }
+    if (v.kind == Kind::Int) {
+        return static_cast<double>(v.i);
+    }
+    if (v.kind == Kind::UInt) {
+        return static_cast<double>(v.u);
+    }
+    return v.d;
+}
+
+/// The decimal type of `a op b` as DataFusion 12 gives it (measured on pylance; see the C2 notes).
+/// Precision is capped at 38 and nothing else is checked: a result past its precision is returned as
+/// it is, and only the 128-bit arithmetic can fail.
+bool decimal_result_type(Op op, DecType a, DecType b, DecType& r, std::string& error) {
+    switch (op) {
+        case Op::Add:
+        case Op::Sub:
+            r.s = std::max(a.s, b.s);
+            r.p = std::min(38, std::max(a.p - a.s, b.p - b.s) + r.s + 1);
+            return true;
+        case Op::Mul: {
+            r.s = a.s + b.s;
+            if (r.s > 38) {
+                const std::string x = "Decimal128(" + std::to_string(a.p) + ", " + std::to_string(a.s) + ")";
+                const std::string y = "Decimal128(" + std::to_string(b.p) + ", " + std::to_string(b.s) + ")";
+                error = "Invalid user input: Error during planning: Cannot get result type for decimal operation " + x +
+                        " * " + y + ": Invalid argument error: Output scale of " + x + " * " + y +
+                        " would exceed max scale of 38";
+                return false;
+            }
+            r.p = std::min(38, a.p + b.p + 1);
+            return true;
+        }
+        case Op::Div: {
+            r.s = std::min(38, a.s + 4);
+            const int k = r.s + b.s - a.s;  // the numerator is scaled up by 10^k before the division
+            if (k > 38) {
+                const std::string x = "Decimal128(" + std::to_string(a.p) + ", " + std::to_string(a.s) + ")";
+                const std::string y = "Decimal128(" + std::to_string(b.p) + ", " + std::to_string(b.s) + ")";
+                error = "Invalid user input: Error during planning: Cannot get result type for decimal operation " + x +
+                        " / " + y + ": Arithmetic overflow: Overflow happened on: 10 ^ " + std::to_string(k);
+                return false;
+            }
+            r.p = std::min(38, a.p + b.s + 4);
+            return true;
+        }
+        default:  // Mod
+            r.s = std::max(a.s, b.s);
+            r.p = std::min(38, std::min(a.p - a.s, b.p - b.s) + r.s);
+            return true;
+    }
+}
+
+/// `a op b` for decimals: both rescaled to the result scale, computed in 128 bits, truncated division.
+Value arith_decimal(Op op, int rs, const Value& a, const Value& b, Context& ctx) {
+    I128 x = 0;
+    I128 y = 0;
+    int sx = 0;
+    int sy = 0;
+    value_i128(a, x, sx);
+    value_i128(b, y, sy);
+    std::string err;
+    I128 r = 0;
+    if (op == Op::Mul) {
+        if (!checked_i128('*', x, y, r, err)) {
+            return ctx.fail(err);
+        }
+    } else if (op == Op::Div) {
+        I128 num = 0;
+        if (!rescale_i128(x, rs + sy - sx, num, err)) {
+            return ctx.fail(err);
+        }
+        if (y == 0) {
+            return ctx.fail("Divide by zero error");
+        }
+        if (y == -1) {
+            if (!checked_i128('-', 0, num, r, err)) {
+                return ctx.fail(err);
+            }
+        } else {
+            r = num / y;
+        }
+    } else {
+        I128 xs = 0;
+        I128 ys = 0;
+        if (!rescale_i128(x, rs - sx, xs, err) || !rescale_i128(y, rs - sy, ys, err)) {
+            return ctx.fail(err);
+        }
+        if (op == Op::Mod) {
+            if (ys == 0) {
+                return ctx.fail("Divide by zero error");
+            }
+            r = ys == -1 ? 0 : xs % ys;
+        } else if (!checked_i128(op == Op::Add ? '+' : '-', xs, ys, r, err)) {
+            return ctx.fail(err);
+        }
+    }
+    return decimal_value(r, rs);
+}
+
+
 struct TypedNode {
-    enum class Shape : std::uint8_t { Constant, Column, Arith, Neg, Abs, Coalesce };
+    enum class Shape : std::uint8_t { Constant, Column, Arith, Neg, Abs, Coalesce, ToDecimal };
     Shape shape = Shape::Constant;
-    Op op = Op::Add;  // Arith
-    NumType type = NumType::I64;
-    bool decimal = false;          // Arith: u64 with a signed int, decimal128(p, 0) (root only)
-    int precision = 0;             // Arith when decimal
-    Value constant;                // Constant: already of `type`
+    Op op = Op::Add;               // Arith
+    NumType type = NumType::I64;   // integer or float (not used when dec)
+    bool dec = false;              // a decimal128 of (dp, ds)
+    int dp = 0;
+    int ds = 0;
+    bool dbl = false;              // Arith: decimal beside a float64, computed in double
+    Value constant;                // Constant: already of its type
     const Node* column = nullptr;  // Column: the bound column reference
     std::vector<std::unique_ptr<TypedNode>> args;
 };
@@ -3689,6 +3859,23 @@ std::optional<NumType> numeric_column(const Node& n) {
         }
     }
     return num_of_arrow(n.column.type);
+}
+
+/// A decimal128 column (not a list element) or a folded decimal literal, and its type.
+bool decimal_of(const Node& n, DecType& t) {
+    if (n.op == Op::Column) {
+        for (const auto e : n.column.elements) {
+            if (e != ColumnRef::kNoElement) {
+                return false;
+            }
+        }
+    }
+    DecimalType d;
+    if (!decimal_type_of(n, d) || d.wide) {
+        return false;
+    }
+    t = DecType{d.precision, d.scale};
+    return true;
 }
 
 // Builders return true with `out` set. false with an empty `error` means the expression is not one
@@ -3722,10 +3909,133 @@ bool build_literal(const Node& n, std::optional<NumType> beside, TypedPtr& out, 
     return true;
 }
 
-/// An operand of a numeric operator: where the operator is the projection's root, a literal takes the
-/// type of a numeric column beside it (pylance narrows nowhere deeper: `abs(i8 + 1)` is int64).
+/// An integer literal beside a decimal takes the decimal's type (pylance: cast if it fits, else an error).
+/// Float literals are not handled here (false, no error: the caller refuses them as before).
+bool build_decimal_literal(const Node& n, DecType t, TypedPtr& out, std::string& error) {
+    const Value& v = n.literal;
+    if (v.kind != Kind::Int && v.kind != Kind::UInt) {
+        return false;
+    }
+    const auto mag = v.kind == Kind::UInt ? static_cast<unsigned __int128>(v.u)
+                     : v.i < 0            ? 0 - static_cast<unsigned __int128>(v.i)
+                                          : static_cast<unsigned __int128>(v.i);
+    unsigned __int128 bound = 1;
+    for (int k = 0; k < t.p - t.s; ++k) {
+        bound *= 10;
+    }
+    if (mag >= bound) {
+        error = "Received literal " + datafusion_literal(v) + " and could not convert to literal of type 'Decimal128(" +
+                std::to_string(t.p) + ", " + std::to_string(t.s) + ")'";
+        return false;
+    }
+    I128 unscaled = v.kind == Kind::UInt ? static_cast<I128>(v.u) : static_cast<I128>(v.i);
+    for (int k = 0; k < t.s; ++k) {
+        unscaled *= 10;
+    }
+    out = std::make_unique<TypedNode>();
+    out->shape = TypedNode::Shape::Constant;
+    out->dec = true;
+    out->dp = t.p;
+    out->ds = t.s;
+    out->constant = decimal_value(unscaled, t.s);
+    return true;
+}
+
+/// A float as decimal(30, 15), the type coalesce gives it beside a decimal: its exact text at 15 digits.
+bool float_decimal15(double d, Limbs256& limbs, std::string& error) {
+    char buf[400];
+    std::snprintf(buf, sizeof buf, "%.15f", d);
+    Magnitude m;
+    bool negative = false;
+    int scale = 0;
+    if (!parse_decimal_text(buf, m, negative, scale)) {
+        error = "cannot read a float as a decimal";
+        return false;
+    }
+    return fit_decimal(m, negative, scale, 15, 30, "Decimal128", limbs, error);
+}
+
+/// A float literal as decimal(30, 15) (coalesce's rule beside a decimal).
+bool float_literal_decimal(double d, TypedPtr& out, std::string& error) {
+    Limbs256 limbs{};
+    if (!float_decimal15(d, limbs, error)) {
+        return false;
+    }
+    out = std::make_unique<TypedNode>();
+    out->shape = TypedNode::Shape::Constant;
+    out->dec = true;
+    out->dp = 30;
+    out->ds = 15;
+    out->constant = Value::decimal(limbs, 15);
+    return true;
+}
+
+/// An operand of a decimal operation: its type, or false when it is not one of the typed shapes
+/// (a nested integer expression, an integer literal beside a non-column, a float32).
+bool decimal_operand(const TypedNode& n, const TypedNode& other, DecType& out) {
+    if (n.dec) {
+        out = DecType{n.dp, n.ds};
+        return true;
+    }
+    // An integer column, or an integer literal that did not take a decimal's type: decimal(p, 0).
+    if ((n.shape != TypedNode::Shape::Column && n.shape != TypedNode::Shape::Constant) || !num_is_int(n.type)) {
+        return false;
+    }
+    out = DecType{int_precision(n.type), 0};
+    if (num_is_signed(n.type) && !other.dec && other.type == NumType::U64) {
+        out.p = 20;  // a signed int beside a u64 is decimal(20, 0) too
+    }
+    return true;
+}
+
+/// `a op b` where one side is decimal (or both are integers of a u64 / signed pair, which DataFusion
+/// computes as decimal too). A decimal beside a float64 column is double arithmetic.
+bool build_decimal_arith(Op op, TypedPtr& a, TypedPtr& b, TypedPtr& out, std::string& error) {
+    const TypedNode& other_a = a->dec ? *b : *a;
+    if (!other_a.dec && other_a.type == NumType::F64 && other_a.shape == TypedNode::Shape::Column) {
+        out = std::make_unique<TypedNode>();
+        out->shape = TypedNode::Shape::Arith;
+        out->op = op;
+        out->type = NumType::F64;
+        out->dbl = true;
+        out->args.push_back(std::move(a));
+        out->args.push_back(std::move(b));
+        return true;
+    }
+    DecType da{};
+    DecType db{};
+    if (!decimal_operand(*a, *b, da) || !decimal_operand(*b, *a, db)) {
+        return false;
+    }
+    DecType r{};
+    if (!decimal_result_type(op, da, db, r, error)) {
+        return false;
+    }
+    out = std::make_unique<TypedNode>();
+    out->shape = TypedNode::Shape::Arith;
+    out->op = op;
+    out->dec = true;
+    out->dp = r.p;
+    out->ds = r.s;
+    out->args.push_back(std::move(a));
+    out->args.push_back(std::move(b));
+    return true;
+}
+
+/// An operand of a numeric operator: a literal takes the type of a column beside it when that column is a
+/// decimal (at any depth) or, for the root only, a numeric column (pylance narrows nowhere deeper).
 bool build_operand(const Node& n, const Node& other, bool narrow, TypedPtr& out, std::string& error) {
-    if (n.op == Op::Literal) {
+    if (n.op == Op::Literal && n.literal.kind != Kind::Decimal) {
+        DecType dt{};
+        if (decimal_of(other, dt) && other.op == Op::Column) {
+            if (n.literal.kind == Kind::Double) {
+                error = "Received literal " + datafusion_literal(n.literal) +
+                        " and could not convert to literal of type 'Decimal128(" + std::to_string(dt.p) + ", " +
+                        std::to_string(dt.s) + ")'";
+                return false;
+            }
+            return build_decimal_literal(n, dt, out, error);
+        }
         return build_literal(n, narrow ? numeric_column(other) : std::nullopt, out, error);
     }
     return build_typed(n, out, error);
@@ -3737,6 +4047,25 @@ bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root) {
         out->shape = TypedNode::Shape::Column;
         out->type = *t;
         out->column = &n;
+        return true;
+    }
+    DecType dt{};
+    if (n.op == Op::Column && decimal_of(n, dt)) {
+        out = std::make_unique<TypedNode>();
+        out->shape = TypedNode::Shape::Column;
+        out->dec = true;
+        out->dp = dt.p;
+        out->ds = dt.s;
+        out->column = &n;
+        return true;
+    }
+    if (n.op == Op::Literal && n.literal.kind == Kind::Decimal && decimal_of(n, dt)) {
+        out = std::make_unique<TypedNode>();
+        out->shape = TypedNode::Shape::Constant;
+        out->dec = true;
+        out->dp = dt.p;
+        out->ds = dt.s;
+        out->constant = n.literal;
         return true;
     }
     switch (n.op) {
@@ -3753,23 +4082,21 @@ bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root) {
                 !build_operand(*n.args[1], *n.args[0], root, b, error)) {
                 return false;
             }
+            if (a->dec || b->dec) {
+                return build_decimal_arith(n.op, a, b, out, error);
+            }
             bool decimal = false;
             const NumType t = common_num(a->type, b->type, decimal);
-            if (decimal && (!root || n.op == Op::Div || n.op == Op::Mod)) {
-                return false;  // decimal division and remainder are phase C2
+            if (decimal) {
+                if (!root) {
+                    return false;  // a nested u64 with a signed int keeps the caller's typing
+                }
+                return build_decimal_arith(n.op, a, b, out, error);
             }
             out = std::make_unique<TypedNode>();
             out->shape = TypedNode::Shape::Arith;
             out->op = n.op;
             out->type = t;
-            out->decimal = decimal;
-            if (decimal) {
-                // DataFusion's decimal rules for these integer precisions: add/sub max + 1, mul sum + 1
-                const int pa = int_precision(a->type);
-                const int pb = int_precision(b->type);
-                out->precision = std::min(38, n.op == Op::Mul ? pa + pb + 1 : std::max(pa, pb) + 1);
-                out->type = NumType::I64;  // not used: the result is decimal
-            }
             out->args.push_back(std::move(a));
             out->args.push_back(std::move(b));
             return true;
@@ -3779,7 +4106,7 @@ bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root) {
             if (!build_typed(*n.args[0], a, error)) {
                 return false;
             }
-            if (num_is_int(a->type) && !num_is_signed(a->type)) {
+            if (!a->dec && num_is_int(a->type) && !num_is_signed(a->type)) {
                 error = "Invalid user input: Error during planning: Negation only supports numeric, interval and "
                         "timestamp types";
                 return false;
@@ -3787,6 +4114,9 @@ bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root) {
             out = std::make_unique<TypedNode>();
             out->shape = TypedNode::Shape::Neg;
             out->type = a->type;
+            out->dec = a->dec;
+            out->dp = a->dp;
+            out->ds = a->ds;
             out->args.push_back(std::move(a));
             return true;
         }
@@ -3799,12 +4129,14 @@ bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root) {
                 out = std::make_unique<TypedNode>();
                 out->shape = TypedNode::Shape::Abs;
                 out->type = a->type;
+                out->dec = a->dec;
+                out->dp = a->dp;
+                out->ds = a->ds;
                 out->args.push_back(std::move(a));
                 return true;
             }
             if (n.name == "coalesce" && !n.args.empty()) {
                 // coalesce's literals are not narrowed to a column: each keeps its own type.
-                TypedPtr c;
                 out = std::make_unique<TypedNode>();
                 out->shape = TypedNode::Shape::Coalesce;
                 for (const auto& arg : n.args) {
@@ -3815,6 +4147,47 @@ bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root) {
                         return false;
                     }
                     out->args.push_back(std::move(item));
+                }
+                bool any_dec = false;
+                for (const auto& item : out->args) {
+                    any_dec = any_dec || item->dec;
+                }
+                if (any_dec) {
+                    // decimal(p, s) with p - s the larger integer digits and s the larger scale; a float
+                    // literal is decimal(30, 15) beside one, an integer its own digits (pylance 12).
+                    int integer_digits = 0;
+                    int scale = 0;
+                    for (auto& item : out->args) {
+                        if (!item->dec && item->shape == TypedNode::Shape::Constant && item->type == NumType::F64) {
+                            TypedPtr d;
+                            if (!float_literal_decimal(item->constant.d, d, error)) {
+                                return false;
+                            }
+                            item = std::move(d);
+                        } else if (!item->dec && item->shape == TypedNode::Shape::Column && item->type == NumType::F64) {
+                            auto d = std::make_unique<TypedNode>();
+                            d->shape = TypedNode::Shape::ToDecimal;
+                            d->dec = true;
+                            d->dp = 30;
+                            d->ds = 15;
+                            d->args.push_back(std::move(item));
+                            item = std::move(d);
+                        }
+                        DecType t{};
+                        if (item->dec) {
+                            t = DecType{item->dp, item->ds};
+                        } else if (item->shape != TypedNode::Shape::Arith && num_is_int(item->type)) {
+                            t = DecType{int_precision(item->type), 0};
+                        } else {
+                            return false;  // a float64 column beside a decimal: the caller keeps its typing
+                        }
+                        integer_digits = std::max(integer_digits, t.p - t.s);
+                        scale = std::max(scale, t.s);
+                    }
+                    out->dec = true;
+                    out->dp = std::min(38, integer_digits + scale);
+                    out->ds = scale;
+                    return true;
                 }
                 bool decimal = false;
                 NumType t = out->args[0]->type;
@@ -3924,21 +4297,22 @@ Value eval_typed(const TypedNode& t, int64_t row, Context& ctx) {
         case TypedNode::Shape::Constant:
             return t.constant;
         case TypedNode::Shape::Column:
+            if (t.dec) {
+                return eval(*t.column, row, ctx);
+            }
             return as_num(eval(*t.column, row, ctx), t.type);
         case TypedNode::Shape::Arith: {
-            if (t.decimal) {
+            if (t.dec || t.dbl) {
                 const Value a = eval_typed(*t.args[0], row, ctx);
                 const Value b = eval_typed(*t.args[1], row, ctx);
                 if (a.is_null() || b.is_null()) {
                     return Value::null();
                 }
-                const __int128 x = a.kind == Kind::UInt ? static_cast<__int128>(a.u) : static_cast<__int128>(a.i);
-                const __int128 y = b.kind == Kind::UInt ? static_cast<__int128>(b.u) : static_cast<__int128>(b.i);
-                const __int128 r = t.op == Op::Add ? x + y : t.op == Op::Sub ? x - y : x * y;
-                const auto lo = static_cast<std::uint64_t>(r);
-                const auto hi = static_cast<std::uint64_t>(static_cast<unsigned __int128>(r) >> 64);
-                const std::uint64_t sign = r < 0 ? ~std::uint64_t{0} : 0;
-                return Value::decimal(Limbs256{lo, hi, sign, sign}, 0);
+                if (t.dbl) {
+                    return arith_typed(t.op, NumType::F64, Value::real(as_double_value(a)),
+                                       Value::real(as_double_value(b)), ctx);
+                }
+                return arith_decimal(t.op, t.ds, a, b, ctx);
             }
             const Value a = as_num(eval_typed(*t.args[0], row, ctx), t.type);
             const Value b = as_num(eval_typed(*t.args[1], row, ctx), t.type);
@@ -3948,6 +4322,16 @@ Value eval_typed(const TypedNode& t, int64_t row, Context& ctx) {
             return arith_typed(t.op, t.type, a, b, ctx);
         }
         case TypedNode::Shape::Neg: {
+            if (t.dec) {
+                const Value a = eval_typed(*t.args[0], row, ctx);
+                if (a.is_null()) {
+                    return a;
+                }
+                I128 x = 0;
+                int scale = 0;
+                value_i128(a, x, scale);
+                return decimal_value(static_cast<I128>(0 - static_cast<unsigned __int128>(x)), t.ds);
+            }
             const Value a = as_num(eval_typed(*t.args[0], row, ctx), t.type);
             if (a.is_null()) {
                 return a;
@@ -3958,6 +4342,16 @@ Value eval_typed(const TypedNode& t, int64_t row, Context& ctx) {
             return Value::real(-a.d);
         }
         case TypedNode::Shape::Abs: {
+            if (t.dec) {
+                const Value a = eval_typed(*t.args[0], row, ctx);
+                if (a.is_null()) {
+                    return a;
+                }
+                I128 x = 0;
+                int scale = 0;
+                value_i128(a, x, scale);
+                return decimal_value(x < 0 ? static_cast<I128>(0 - static_cast<unsigned __int128>(x)) : x, t.ds);
+            }
             const Value a = as_num(eval_typed(*t.args[0], row, ctx), t.type);
             if (a.is_null()) {
                 return a;
@@ -3973,8 +4367,38 @@ Value eval_typed(const TypedNode& t, int64_t row, Context& ctx) {
             }
             return Value::integer(a.i < 0 ? -a.i : a.i);
         }
+        case TypedNode::Shape::ToDecimal: {
+            const Value v = as_num(eval_typed(*t.args[0], row, ctx), NumType::F64);
+            if (v.is_null()) {
+                return v;
+            }
+            Limbs256 limbs{};
+            std::string err;
+            if (!float_decimal15(v.d, limbs, err)) {
+                return ctx.fail(err);
+            }
+            return Value::decimal(limbs, 15);
+        }
         case TypedNode::Shape::Coalesce:
             for (const auto& arg : t.args) {
+                if (t.dec) {
+                    const Value v = eval_typed(*arg, row, ctx);
+                    if (ctx.failed) {
+                        return v;
+                    }
+                    if (v.is_null()) {
+                        continue;
+                    }
+                    I128 x = 0;
+                    int scale = 0;
+                    value_i128(v, x, scale);
+                    I128 r = 0;
+                    std::string err;
+                    if (!rescale_i128(x, t.ds - scale, r, err)) {
+                        return ctx.fail(err);
+                    }
+                    return decimal_value(r, t.ds);
+                }
                 const Value v = as_num(eval_typed(*arg, row, ctx), t.type);
                 if (ctx.failed || !v.is_null()) {
                     return v;
@@ -3983,6 +4407,21 @@ Value eval_typed(const TypedNode& t, int64_t row, Context& ctx) {
             return Value::null();
     }
     return Value::null();
+}
+
+/// A projected value. A decimal of the typed path is written as it is: pylance does not check the
+/// precision of arithmetic results (only the 128-bit range), so neither do we.
+bool append_projected(ArrowArray& out, const ArrowSchemaView& type, const Value& v, const TypedNode* typed,
+                      Context& ctx) {
+    if (typed != nullptr && typed->dec && v.kind == Kind::Decimal) {
+        ArrowDecimal dec{};
+        ArrowDecimalInit(&dec, 128, type.decimal_precision, type.decimal_scale);
+        for (std::size_t k = 0; k < 4; ++k) {
+            dec.words[k] = v.dec[k];
+        }
+        return ArrowArrayAppendDecimal(&out, &dec) == NANOARROW_OK;
+    }
+    return append_value(out, type, v, ctx);
 }
 
 }  // namespace
@@ -4019,7 +4458,7 @@ bool Expression::evaluate(const ArrowArray& batch, const ArrowSchema& type, Arro
     ctx.error = &error;
     for (int64_t r = 0; r < batch.length; ++r) {
         const Value v = typed ? eval_typed(*typed, r, ctx) : eval(*root_, r, ctx);
-        if (ctx.failed || !append_value(out, tv, v, ctx)) {
+        if (ctx.failed || !append_projected(out, tv, v, typed.get(), ctx)) {
             if (!ctx.failed) {
                 error = "cannot append a value to the output";
             }
@@ -4229,7 +4668,7 @@ bool Expression::result_type(const std::string& name, ArrowSchema& out, std::str
     auto g = list_cast ? guess(*root_->args[0], binding_->schema) : guess(*root_, binding_->schema);
     if (typed) {
         g = TypeGuess{};
-        g.type = typed->decimal ? NANOARROW_TYPE_DECIMAL128 : num_arrow(typed->type);
+        g.type = typed->dec ? NANOARROW_TYPE_DECIMAL128 : num_arrow(typed->type);
     }
     int rc = NANOARROW_OK;
     if (g.column != nullptr) {
@@ -4241,8 +4680,8 @@ bool Expression::result_type(const std::string& name, ArrowSchema& out, std::str
         ArrowSchemaInit(&out);
         if (g.type == NANOARROW_TYPE_TIMESTAMP) {
             rc = ArrowSchemaSetTypeDateTime(&out, NANOARROW_TYPE_TIMESTAMP, g.unit, nullptr);
-        } else if (typed && typed->decimal) {
-            rc = ArrowSchemaSetTypeDecimal(&out, NANOARROW_TYPE_DECIMAL128, typed->precision, 0);
+        } else if (typed && typed->dec) {
+            rc = ArrowSchemaSetTypeDecimal(&out, NANOARROW_TYPE_DECIMAL128, typed->dp, typed->ds);
         } else {
             rc = ArrowSchemaSetType(&out, g.type == NANOARROW_TYPE_NA ? NANOARROW_TYPE_NA : g.type);
         }

@@ -67,6 +67,7 @@ before it and against pylance 12.0.0 (`tools/bench_matrix.py`, `bench_scalar_ind
   encoding of one column split across threads.
 
 Small items found by delegated sessions, not yet done:
+- MSVC: `unsigned __int128` in src/row_ids.cpp (since 2026-10-15) and `__int128` in src/expr.cpp's decimal projections (EXPR_TYPES C2) do not compile with MSVC; the Windows job (`ci-platforms.yml`, manual) builds with it. Needs a small portable 128-bit type (or `_mul128` / `_umul128` under `_MSC_VER`).
 - Count from an exact scalar-index mask without reading (`CountFromMask`, tests/test_count_pushdown.py, 4) and scan statistics with index cache hit / miss (`scan_stats_callback`, `ScanStatistics`; btree / bitmap / fts cache tests, ~5) -- shared scan / planning code (SMALL_ITEMS_2 phase B).
 - Expression grammar: list / bracket indexing (`l[1]`, `s['x']`, `list_struct[1]['x']`) and a float16 list cast in projections and filters (SQL_SURFACE S1: `test_nested_projection_list`, `test_dynamic_projection_with_vectors_index`).
 - Expression result types: follow DataFusion's coercion as pylance does (int32 + float32 -> float32, uint8 + int32 -> int32, abs keeps int64, coalesce with a literal non-null; SQL_SURFACE S1 notes). Same area: Decimal and Duration value kinds in filters / `arrow_cast` (unit-aware durations) and a 256-bit key kind for decimal256 scalar indexes (`test_scalar_index_types[*-decimal*|*-duration]`, 9 tests; SMALL_ITEMS_2 phase A).
