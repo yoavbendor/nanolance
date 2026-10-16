@@ -48,6 +48,24 @@ redesigning it, and the reviewer's answer (pylance's `DataFile.create` reads onl
 was a 30-line fix; a fresh session per phase kept each one inside its context. Next time: give the
 "finish" session its known facts up front, and say which pytest flags print a summary.
 
+Performance review (2026-10-16, Opus), after the stretch of API work above, against the commit
+before it and against pylance 12.0.0 (`tools/bench_matrix.py`, `bench_scalar_index.py`,
+`bench_vector_index.py`, `bench_fts.py`):
+- Fixed: vector search scaled poorly across threads (an out-of-line row-mask check in the scoring
+  loop made its threads share cache lines); default late materialization (up to 3.7x slower);
+  takes of a few rows walked a fragment's whole row mask byte by byte, then decoded a whole small
+  column (a dictionary column: 15 ms for one row) or walked a cached copy of it; single-core scans
+  faulted in fresh memory for every page (string output grown value by value; mini-block chunks
+  copied into new vectors): Rust-written decimal128 7.5-10 -> 2.4-2.7 ms (Rust 6.9), ~1 KB
+  strings 41-51 -> 15 ms (Rust 40); BTREE builds sort integer keys with a radix sort.
+- Now, against pylance: vector search 3.8x, full-text 3.0x, scalar index queries 2.3x (all
+  faster; no query slower), index builds 1.2-3.8x, Python reads 3.5x, Python writes 1.9x.
+- Left: writes of a single nested column (map / list of strings / list of structs) do not use
+  threads -- the writer parallelizes across columns, and within a page only for string
+  dictionaries and FSST -- so pylance's multi-threaded writer is faster there (map_string_int64
+  through Python 0.59x; nanolance's C++ writer on one core is level with Rust's). Needs page
+  encoding of one column split across threads.
+
 Small items found by delegated sessions, not yet done:
 - Count from an exact scalar-index mask without reading (`CountFromMask`, tests/test_count_pushdown.py, 4) and scan statistics with index cache hit / miss (`scan_stats_callback`, `ScanStatistics`; btree / bitmap / fts cache tests, ~5) -- shared scan / planning code (SMALL_ITEMS_2 phase B).
 - Expression grammar: list / bracket indexing (`l[1]`, `s['x']`, `list_struct[1]['x']`) and a float16 list cast in projections and filters (SQL_SURFACE S1: `test_nested_projection_list`, `test_dynamic_projection_with_vectors_index`).
