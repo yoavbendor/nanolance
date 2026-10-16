@@ -119,3 +119,13 @@ types late; blobs early), kept early for partial-schema fragments and datasets w
 (version unchanged, files orphaned as Lance) and reports num_inserted / updated / deleted rows,
 num_files_written and bytes_written. Phase C next. Benchmark the default-late change (filtered scans of
 wide columns now read late) in the coming performance review.
+
+**Phase C outcome (2026-10-16):** items 8-12 done: `ds.delta(...)` (`delta.py`: list_transactions,
+get_inserted_rows / get_updated_rows / get_deleted_row_ids, pylance's validation), `update(where=
+"_rowid ...")` (resolved by a scan into a row-address allowlist for the native update), vector
+`create_index(train=False)` refused as pylance, `LanceFragment.open_session().take(...)`, CreateIndex
+covering-field checks. +11 pylance tests (1172). Reviewer: an address-driven update resolves on the
+latest version and is not retried on a conflict (the addresses name one version's rows). Left:
+`delete()` with `_rowid`; `delta()` raises version-not-found eagerly (pylance lazily);
+`test_create_empty_scalar_index` (train=False on a scalar index still indexes the rows). Task
+SMALL_ITEMS_2 done.

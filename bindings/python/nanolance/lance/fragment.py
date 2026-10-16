@@ -710,12 +710,42 @@ class LanceFragment(pa.dataset.Fragment):
         addresses = [(self._id << 32) | int(i) for i in indices]
         return self._ds._take_rows(addresses, columns=columns)
 
+    def open_session(self, columns=None, with_row_address=None) -> "FragmentSession":
+        """A session over this fragment's `columns`, for repeated takes (pylance's FragmentSession)."""
+        return FragmentSession(self, columns, with_row_address)
+
     def __repr__(self) -> str:
         return f"LanceFragment(id={self._id})"
 
     def __reduce__(self):
         return (_restore_fragment, (self._ds.uri, self._ds.version, self._id,
                                     getattr(self._ds, "_storage_options", None)))
+
+
+
+class FragmentSession:
+    """Repeated takes from one fragment over the same columns; `_rowaddr` (the rows' addresses) is
+    added when asked for, as pylance's session does."""
+
+    def __init__(self, fragment: LanceFragment, columns=None, with_row_address=None):
+        self._fragment = fragment
+        self._columns = None if columns is None else [str(c) for c in columns]
+        self._with_row_address = bool(with_row_address)
+
+    def take(self, indices) -> pa.Table:
+        indices = [int(i) for i in indices]
+        rows = self._fragment.metadata.physical_rows
+        for i in indices:  # pylance's session: a negative index is an OverflowError, one past the rows an OSError
+            if i < 0:
+                raise OverflowError("out of range integral type conversion attempted")
+            if i >= rows:
+                raise OSError(f"Invalid user input: Invalid read params Indices({i}) for fragment with {rows} "
+                              "addressable rows")
+        table = self._fragment.take(indices, columns=self._columns)
+        if self._with_row_address:
+            addresses = [(self._fragment._id << 32) | i for i in indices]
+            table = table.append_column("_rowaddr", pa.array(addresses, pa.uint64()))
+        return table
 
 
 def _restore_fragment(uri: str, version: int, fragment_id: int, storage_options=None) -> LanceFragment:

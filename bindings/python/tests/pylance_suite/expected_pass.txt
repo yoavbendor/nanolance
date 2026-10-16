@@ -259,8 +259,10 @@ tests/test_column_names.py::TestSpecialCharacterColumnNames::test_filter_with_sp
 tests/test_column_names.py::TestSpecialCharacterColumnNames::test_merge_insert_with_special_char_key
 tests/test_column_names.py::TestSpecialCharacterColumnNames::test_order_by_with_special_chars
 tests/test_column_names.py::TestSpecialCharacterColumnNames::test_scalar_index_with_special_chars
+tests/test_commit_index.py::test_commit_index_rejects_invalid_covering_fields
 tests/test_commit_index.py::test_commit_index_with_index_details
 tests/test_compat_version_snapshot.py::test_workers_share_the_controller_version_snapshot
+tests/test_create_empty_index.py::test_create_empty_vector_index
 tests/test_dataset.py::test_access_config
 tests/test_dataset.py::test_add_null_columns
 tests/test_dataset.py::test_analyze_filtered_scan
@@ -455,6 +457,8 @@ tests/test_dataset.py::test_tensor_type
 tests/test_dataset.py::test_tilde_paths
 tests/test_dataset.py::test_to_batches
 tests/test_dataset.py::test_truncate_table
+tests/test_dataset.py::test_update_by_rowid
+tests/test_dataset.py::test_update_by_rowid_in_list
 tests/test_dataset.py::test_update_config_transaction
 tests/test_dataset.py::test_update_dataset
 tests/test_dataset.py::test_update_dataset_all_types
@@ -472,6 +476,11 @@ tests/test_dataset.py::test_write_dataset_pydantic_list_rejects_invalid_item[dic
 tests/test_dataset.py::test_write_dataset_pydantic_list_rejects_invalid_item[different_model]
 tests/test_dataset.py::test_write_dataset_pydantic_optional_field_typed_correctly_when_all_none
 tests/test_dataset.py::test_write_zero_dimension_fixed_size_list[stable]
+tests/test_delta.py::test_delta_get_deleted_row_ids
+tests/test_delta.py::test_delta_get_inserted_rows
+tests/test_delta.py::test_delta_get_updated_rows
+tests/test_delta.py::test_delta_validation_errors
+tests/test_delta.py::test_delta_with_explicit_version_range
 tests/test_file.py::test_aborted_write
 tests/test_file.py::test_batch_sizes
 tests/test_file.py::test_dictionary
@@ -553,6 +562,7 @@ tests/test_fragment.py::test_fragment_scanner_matches_dataset_scanner[None]
 tests/test_fragment.py::test_fragment_scanner_matches_dataset_scanner[True]
 tests/test_fragment.py::test_fragment_scanner_rejects_invalid_late_materialization
 tests/test_fragment.py::test_fragment_scanner_use_scalar_index_disables_index_query
+tests/test_fragment.py::test_fragment_session
 tests/test_fragment.py::test_fragment_take_with_json_column
 tests/test_fragment.py::test_fragment_update_columns_basic
 tests/test_fragment.py::test_fragment_update_columns_error_on_metadata_column
@@ -637,6 +647,7 @@ tests/test_json.py::test_json_array_operations
 tests/test_json.py::test_json_basic_write_read
 tests/test_json.py::test_json_batch_operations
 tests/test_json.py::test_json_filter_append_missing_json_cast
+tests/test_json.py::test_json_fragment_session_take
 tests/test_json.py::test_json_get_functions
 tests/test_json.py::test_json_limit_offset_batch_transfer_preserves_extension_metadata
 tests/test_json.py::test_json_merge_insert

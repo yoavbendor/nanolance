@@ -286,3 +286,191 @@ def test_b7_merge_insert_delete_counts_equal_pylance(tmp_path):
     assert _metric(ours_analysis, "num_deleted_rows") == _metric(theirs_analysis, "num_deleted_rows") == 2
     assert _metric(ours_analysis, "num_files_written") == _metric(theirs_analysis, "num_files_written") == 0
     assert ours.count_rows() == 4 and ours.version == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# Phase C: dataset / fragment APIs (items 8-12)
+
+def _delta_summary(lance, uri, *, versions, **kwargs):
+    """What a delta reports, as plain values, for one engine."""
+    ds = lance.dataset(uri, version=versions)
+    delta = ds.delta(**kwargs)
+    out = {"txs": [type(t.operation).__name__ for t in delta.list_transactions()]}
+    for name in ("get_inserted_rows", "get_updated_rows"):
+        batches = list(getattr(delta, name)())
+        out[name] = [(b.schema.names, sorted(b.column("_rowid").to_pylist())) for b in batches]
+    out["get_deleted_row_ids"] = [
+        (b.schema.names, sorted(b.column("_rowid").to_pylist())) for b in delta.get_deleted_row_ids()
+    ]
+    return out
+
+
+def _delta_history(lance, uri):
+    """Version 1 (3 rows, stable row ids), then an insert, an update and a delete."""
+    table = pa.table({"id": pa.array([1, 2, 3], pa.int32()), "val": pa.array(["a", "b", "c"])})
+    ds = lance.write_dataset(table, uri, enable_stable_row_ids=True)
+    ds.insert(pa.table({"id": pa.array([4, 5], pa.int32()), "val": pa.array(["d", "e"])}))
+    ds.update({"val": "'b_updated'"}, where="id = 2")
+    ds.delete("id = 3")
+    return ds
+
+
+@pytest.mark.parametrize("kwargs", [{"compared_against": 1}, {"begin_version": 1, "end_version": 4}])
+def test_c8_delta_rows_and_transactions_equal_pylance(tmp_path, kwargs):
+    lance = require_pylance()
+    expected = _delta_history(lance, str(tmp_path / "p"))
+    got = _delta_history(nano, str(tmp_path / "n"))
+    assert expected.version == got.version == 4
+    want = _delta_summary(lance, str(tmp_path / "p"), versions=None, **kwargs)
+    have = _delta_summary(nano, str(tmp_path / "n"), versions=None, **kwargs)
+    assert have == want
+    assert want["txs"] == ["Append", "Update", "Delete"]
+
+
+def test_c8_delta_inserted_and_updated_columns_equal_pylance(tmp_path):
+    lance = require_pylance()
+    _delta_history(lance, str(tmp_path / "p"))
+    _delta_history(nano, str(tmp_path / "n"))
+    columns = ["id", "val", "_rowid", "_row_created_at_version", "_row_last_updated_at_version"]
+    for mod, path in ((lance, "p"), (nano, "n")):
+        delta = mod.dataset(str(tmp_path / path)).delta(compared_against=1)
+        inserted = pa.Table.from_batches(list(delta.get_inserted_rows()))
+        updated = pa.Table.from_batches(list(delta.get_updated_rows()))
+        assert inserted.schema.names == columns
+        assert inserted.column("_row_created_at_version").to_pylist() == [2, 2]
+        assert updated.column("id").to_pylist() == [2]
+        assert updated.column("_row_created_at_version").to_pylist() == [1]
+        assert updated.column("_row_last_updated_at_version").to_pylist() == [3]
+
+
+def test_c8_delta_errors_equal_pylance(tmp_path):
+    lance = require_pylance()
+    lance.write_dataset(pa.table({"id": pa.array([1, 2], pa.int32())}), str(tmp_path / "p"))
+    nano.write_dataset(pa.table({"id": pa.array([1, 2], pa.int32())}), str(tmp_path / "n"))
+    cases = [{}, {"begin_version": 1}, {"end_version": 2}, {"begin_version": 0, "end_version": 0},
+             {"begin_version": -1, "end_version": 1}, {"compared_against": -1}, {"compared_against": 9},
+             {"begin_version": 1, "end_version": 9}]
+    for kwargs in cases:
+        errors = []
+        for mod, path in ((lance, "p"), (nano, "n")):
+            try:
+                delta = mod.dataset(str(tmp_path / path)).delta(**kwargs)
+                delta.list_transactions()  # pylance reports a version past the latest here, not in delta()
+                errors.append(None)
+            except Exception as exc:  # the same class and the same message head
+                errors.append((type(exc), str(exc).split(", /home/")[0].split(", /")[0]))
+        assert errors[0] == errors[1], kwargs
+
+
+def test_c8_deleted_row_ids_need_stable_row_ids(tmp_path):
+    lance = require_pylance()
+    for mod, path in ((lance, "p"), (nano, "n")):
+        ds = mod.write_dataset(pa.table({"id": pa.array([1, 2, 3], pa.int32())}), str(tmp_path / path))
+        ds.delete("id = 1")
+        delta = ds.delta(compared_against=1)
+        with pytest.raises(ValueError, match="deleted row ids require stable row ids"):
+            delta.get_deleted_row_ids()
+
+
+# item 9: update(where=...) with _rowid / _rowaddr in the predicate
+
+
+@pytest.mark.parametrize("where_of", [lambda rid: f"_rowid = {rid}", lambda rid: f"_rowid in ({rid}, 0)",
+                                      lambda rid: f"_rowid = {rid} AND id > 100"])
+def test_c9_update_by_rowid_equals_pylance(tmp_path, where_of):
+    lance = require_pylance()
+    results = []
+    for mod, path in ((lance, "p"), (nano, "n")):
+        table = pa.table({"id": pa.array(range(30), pa.int64()), "name": ["foo"] * 30})
+        ds = mod.write_dataset(table, str(tmp_path / path), max_rows_per_file=10, enable_stable_row_ids=True)
+        rid = ds.to_table(columns=["id"], with_row_id=True).column("_rowid")[5].as_py()
+        stats = ds.update({"name": "'updated'"}, where=where_of(rid))
+        rows = ds.to_table(with_row_id=False).sort_by("id").to_pylist()
+        results.append((stats, [r["name"] for r in rows]))
+    assert results[0] == results[1]
+
+
+def test_c9_update_by_rowid_writes_only_the_selected_rows(tmp_path):
+    ds = nano.write_dataset(pa.table({"id": pa.array(range(30), pa.int64()), "name": ["foo"] * 30}),
+                            str(tmp_path / "n"), max_rows_per_file=10, enable_stable_row_ids=True)
+    rid = ds.to_table(columns=["id"], with_row_id=True).column("_rowid")[5].as_py()
+    assert ds.update({"name": "'x'"}, where=f"_rowid = {rid}") == {"num_rows_updated": 1}
+    assert ds.to_table(filter="name = 'x'").column("id").to_pylist() == [5]
+    assert ds.update({"name": "'y'"}, where="_rowid = 999999") == {"num_rows_updated": 0}
+
+
+# item 10: a vector index with train=False on an empty-trained dataset is refused as pylance refuses it
+
+
+def test_c10_empty_vector_index_refused_as_pylance(tmp_path):
+    lance = require_pylance()
+    dim = 32
+    values = pa.array([float(i % 7) for i in range(100 * dim)], pa.float32())
+    table = pa.table({"vector": pa.FixedSizeListArray.from_arrays(values, dim)})
+    messages = {}
+    for mod, path in ((lance, "p"), (nano, "n")):
+        ds = mod.write_dataset(table, str(tmp_path / path))
+        with pytest.raises(NotImplementedError, match="not yet implemented") as info:
+            ds.create_index("vector", "IVF_PQ", num_partitions=10, num_sub_vectors=8, train=False)
+        messages[path] = str(info.value).split(", /")[0]
+        assert ds.version == 1 and ds.describe_indices() == []
+    assert messages["p"].endswith("cannot be created without training.")
+    assert messages["n"].split("Not supported: ")[-1] == messages["p"].split("Not supported: ")[-1]
+
+
+# item 11: LanceFragment.open_session() -- a FragmentSession whose take() equals the fragment's take
+
+
+def test_c11_fragment_session_take_equals_pylance(tmp_path):
+    lance = require_pylance()
+    results = {}
+    for mod, path in ((lance, "p"), (nano, "n")):
+        ds = mod.write_dataset(pa.table({"a": range(100), "b": range(100, 200)}), str(tmp_path / path))
+        frag = ds.get_fragments()[0]
+        session = frag.open_session(columns=["a", "b"], with_row_address=False)
+        results[path] = (session.take(range(1, 50)).to_pydict(),
+                         frag.take(indices=range(1, 50), columns=["a", "b"]).to_pydict(),
+                         frag.open_session(columns=["a"], with_row_address=True).take([3, 7]).to_pydict(),
+                         session.take([]).schema.names, session.take([5, 2, 5]).to_pydict())
+    assert results["n"] == results["p"]
+
+
+def test_c11_fragment_session_take_out_of_range_as_pylance(tmp_path):
+    lance = require_pylance()
+    messages = {}
+    for mod, path in ((lance, "p"), (nano, "n")):
+        ds = mod.write_dataset(pa.table({"a": range(100)}), str(tmp_path / path))
+        session = ds.get_fragments()[0].open_session(columns=["a"])
+        with pytest.raises(OSError, match="100 addressable rows"):
+            session.take([100])
+        messages[path] = type(session.take([0])).__name__
+    assert messages["n"] == messages["p"] == "Table"
+
+
+# item 12: a CreateIndex commit whose covering fields are not valid is refused at commit, as pylance refuses it
+
+
+@pytest.mark.parametrize("covering_is", ["all_fields", "not_a_field"])
+def test_c12_invalid_covering_fields_refused_at_commit(tmp_path, covering_is):
+    lance = require_pylance()
+    from lance.dataset import Index as LanceIndex
+    from nanolance.lance._transactions import Index as NanoIndex
+
+    outcomes = {}
+    for mod, index_class, path in ((lance, LanceIndex, "p"), (nano, NanoIndex, "n")):
+        uri = str(tmp_path / path)
+        ds = mod.write_dataset(pa.table({"meta": ["a", "b", "c"], "x": [1, 2, 3]}), uri)
+        ds.create_scalar_index("meta", "BTREE", name="meta_idx")
+        ds = mod.dataset(uri)
+        ids = {f.name(): f.id() for f in ds.lance_schema.fields()}
+        seg = ds.describe_indices()[0].segments[0]
+        covering = [ids["meta"]] if covering_is == "all_fields" else [ids["x"]]
+        index = index_class(uuid=seg.uuid, name="meta_idx", fields=[ids["meta"]], dataset_version=ds.version,
+                            fragment_ids={f.fragment_id for f in ds.get_fragments()}, index_version=0,
+                            covering_fields=covering)
+        op = mod.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[])
+        with pytest.raises(OSError, match="covering fields") as info:
+            mod.LanceDataset.commit(uri, op, read_version=ds.version)
+        outcomes[path] = str(info.value).split(", /")[0].split("[")[0]
+        assert mod.dataset(uri).version == ds.version
+    assert outcomes["n"] == outcomes["p"]

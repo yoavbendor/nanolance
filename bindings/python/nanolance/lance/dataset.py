@@ -32,6 +32,7 @@ from nanolance.lance._sql import SqlQueryBuilder
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
 from nanolance.lance._session import Session, note_data_files, note_indexes, note_manifest
 from nanolance.lance._transactions import Index, IndexFile, LanceOperation, Transaction
+from nanolance.lance.delta import DatasetDelta
 
 LOGGER = logging.getLogger("lance.dataset")
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
@@ -957,8 +958,17 @@ class LanceDataset(pa.dataset.Dataset):
         if not updates:
             raise ValueError("update needs at least one column to set")
         assignments = [(str(k), str(v)) for k, v in updates.items()]
+        sql, allowlist = _filter_sql(where), None
+        if _references_row_ids(sql):
+            # `_rowid` / `_rowaddr` are read by the scan's Python filter, not the native update's: the rows
+            # the predicate selects become a row-address allowlist for the native update. They are resolved on
+            # the latest version, the one the update writes over (it is not retried on a conflict: addresses
+            # name one version's rows).
+            self.checkout_latest()
+            addresses = self.to_table(columns=[], filter=sql, with_row_address=True).column("_rowaddr")
+            allowlist, sql = serialize_row_addrs(addresses.to_pylist()), None
         with native():
-            updated, _ = _nanolance._ds_update(self._uri, _filter_sql(where), assignments)
+            updated, _ = _nanolance._ds_update(self._uri, sql, assignments, allowlist)
         self._refresh_latest("Update")
         return {"num_rows_updated": int(updated)}
 
@@ -1525,8 +1535,10 @@ class LanceDataset(pa.dataset.Dataset):
                               ("fragment_ids", fragment_ids), ("index_uuid", index_uuid)):
             if value is not None:
                 raise unsupported(f"create_index option {option}")
-        if not train:
-            raise unsupported("create_index(train=False)")
+        if not train:  # pylance refuses an empty vector index too, before writing anything
+            raise NotImplementedError(
+                f"Not supported: Creating empty vector indices with train=False is not yet implemented. "
+                f"Index '{name or f'{column}_idx'}' for column '{column}' cannot be created without training.")
         if accelerator is not None:
             if kind in ("IVF_PQ", "IVF_HNSW_PQ"):
                 raise unsupported(f"create_index(accelerator=) for {kind} (nanolance builds on the CPU)")
@@ -1753,6 +1765,30 @@ class LanceDataset(pa.dataset.Dataset):
         except FileNotFoundError:
             return None
         return decode_transaction(data)
+
+    def delta(self, compared_against: Optional[int] = None, *, begin_version: Optional[int] = None,
+              end_version: Optional[int] = None) -> DatasetDelta:
+        """The differences from ``compared_against`` (or ``begin_version``) to ``end_version`` (default this
+        version), as pylance's: rows inserted, updated and deleted, and the transactions in between."""
+        latest = self._version
+        if compared_against is not None:
+            begin, end = _delta_version(compared_against), latest
+            if begin > latest:
+                raise ValueError(f"Version not found error: Can not find version {latest + 1}, "
+                                 "please check if it has been cleanup.")
+        elif begin_version or end_version:
+            if not (begin_version and end_version):
+                raise ValueError("Invalid user input: Must specify both with_begin_version and with_end_version")
+            begin, end = _delta_version(begin_version), _delta_version(end_version)
+            if begin < end and end > latest:
+                raise ValueError(f"Version not found error: Can not find version {latest + 1}, "
+                                 "please check if it has been cleanup.")
+        else:
+            raise ValueError("Invalid user input: Must specify either compared_against_version or both "
+                             "with_begin_version and with_end_version")
+        older = self if begin == latest else LanceDataset(self._uri, version=begin, storage_options=self._storage_options)
+        newer = self if end == latest else LanceDataset(self._uri, version=end, storage_options=self._storage_options)
+        return DatasetDelta(older, newer)
 
     def validate(self) -> None:
         """Check the manifest against itself and the files, as Lance's validate does: fragment ids
@@ -1999,6 +2035,8 @@ class LanceDataset(pa.dataset.Dataset):
         names = {index.name for index in operation.new_indices}
         if len(names) != 1:
             raise unsupported("CreateIndex of more than one index name")
+        for index in operation.new_indices:
+            _check_covering_fields(index)
         ds = LanceDataset(uri)
         fields = {f["id"]: f for f in _nanolance._ds_fields(ds._uri, ds._version)}
         first = operation.new_indices[0]
@@ -2017,12 +2055,35 @@ class LanceDataset(pa.dataset.Dataset):
         known = {
             "create_index",
             "branches", "create_branch", "sql",
-            "shallow_clone", "deep_clone", "join", "delta",
+            "shallow_clone", "deep_clone", "join",
             "prewarm_index",
         }
         if name in known:
             raise unsupported(f"LanceDataset.{name}")
         raise AttributeError(name)
+
+
+def _check_covering_fields(index) -> None:
+    """An index's covering fields are among its fields, and at least one field stays indexed: checked at
+    commit, as pylance does (its Index is a plain dataclass)."""
+    covering = list(index.covering_fields or [])
+    if not covering:
+        return
+    fields = list(index.fields)
+    stray = [field for field in covering if field not in fields]
+    if stray:
+        raise OSError(f"Invalid user input: index '{index.name}' declares covering fields {covering} but {stray} "
+                      f"are not among its fields {fields}")
+    if all(field in covering for field in fields):
+        raise OSError(f"Invalid user input: index '{index.name}' declares covering fields {covering} but its fields "
+                      f"are {fields}; at least one field must remain indexed")
+
+
+def _delta_version(version) -> int:
+    """A version number for delta: a u64, so a negative one is pylance's OverflowError."""
+    if version < 0:
+        raise OverflowError("can't convert negative int to unsigned")
+    return int(version)
 
 
 def _field(obj, name: str):

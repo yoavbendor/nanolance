@@ -701,7 +701,7 @@ bool delete_once(const std::filesystem::path& dataset_path, const std::string& p
                  std::uint64_t& new_version, std::string& error);
 bool update_once(const std::filesystem::path& dataset_path, const std::string* predicate,
                  const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
-                 std::uint64_t& new_version, std::string& error);
+                 std::uint64_t& new_version, std::string& error, const RowAddrMask* row_mask);
 bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeInsertSpec& spec,
                        ArrowArrayStream& source, MergeInsertStats& stats, std::uint64_t& new_version,
                        std::string& error);
@@ -713,9 +713,15 @@ bool dataset_delete(const std::filesystem::path& dataset_path, const std::string
 
 bool dataset_update(const std::filesystem::path& dataset_path, const std::string* predicate,
                     const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
-                    std::uint64_t& new_version, std::string& error) {
+                    std::uint64_t& new_version, std::string& error, const RowAddrMask* row_mask) {
+    if (row_mask != nullptr) {
+        // Row addresses name rows of the version they were resolved against: a retry over a newer
+        // version could update other rows, so a conflict is reported instead of retried.
+        return update_once(dataset_path, predicate, assignments, updated, new_version, error, row_mask);
+    }
     return retry_on_conflict(
-        [&] { return update_once(dataset_path, predicate, assignments, updated, new_version, error); }, error);
+        [&] { return update_once(dataset_path, predicate, assignments, updated, new_version, error, row_mask); },
+        error);
 }
 
 bool dataset_merge_insert(const std::filesystem::path& dataset_path, const MergeInsertSpec& spec,
@@ -795,7 +801,7 @@ bool delete_once(const std::filesystem::path& dataset_path, const std::string& p
 
 bool update_once(const std::filesystem::path& dataset_path, const std::string* predicate,
                  const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
-                 std::uint64_t& new_version, std::string& error) {
+                 std::uint64_t& new_version, std::string& error, const RowAddrMask* row_mask) {
     error.clear();
     updated = 0;
     if (assignments.empty()) {
@@ -814,6 +820,7 @@ bool update_once(const std::filesystem::path& dataset_path, const std::string* p
     request.with_row_address = true;
     request.with_row_id = stable;  // after the data columns: _rowid, then _rowaddr
     request.filter = predicate != nullptr && !predicate->empty() ? predicate : nullptr;
+    request.row_mask = row_mask;
     OwnedSchema schema;
     OwnedBatches batches;
     if (!scan(dataset_path, request, schema, batches, error)) {

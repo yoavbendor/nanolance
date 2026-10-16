@@ -1374,14 +1374,18 @@ NB_MODULE(_nanolance, m) {
         return nb::make_tuple(deleted, version);
     });
     m.def("_ds_update", [](const std::filesystem::path& path, std::optional<std::string> where,
-                           const std::vector<std::pair<std::string, std::string>>& assignments) {
+                           const std::vector<std::pair<std::string, std::string>>& assignments,
+                           const std::optional<nb::bytes>& row_addr_allowlist) {
         std::uint64_t updated = 0;
         std::uint64_t version = 0;
+        const auto mask = row_addr_mask(row_addr_allowlist, std::nullopt);
         run_op([&](std::string& e) {
-            return nano_lance::dataset_update(path, where ? &*where : nullptr, assignments, updated, version, e);
+            return nano_lance::dataset_update(path, where ? &*where : nullptr, assignments, updated, version, e,
+                                              mask ? &*mask : nullptr);
         });
         return nb::make_tuple(updated, version);
-    }, nb::arg("path"), nb::arg("where").none(), nb::arg("assignments"));
+    }, nb::arg("path"), nb::arg("where").none(), nb::arg("assignments"),
+       nb::arg("row_addr_allowlist").none() = nb::none());
     // JSON columns: arrow.json text <-> Lance's JSONB (jsonb.hpp), a whole array at a time. Each
     // returns (schema capsule, array capsule): large_binary for _json_encode, utf8 for _json_decode.
     auto convert_json = [](nb::handle array, bool encode) {

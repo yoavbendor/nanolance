@@ -23,11 +23,14 @@ namespace nano_lance {
 bool dataset_delete(const std::filesystem::path& dataset_path, const std::string& predicate, std::uint64_t& deleted,
                     std::uint64_t& new_version, std::string& error);
 
-/// Set `assignments` (column, SQL value) on the rows where `predicate` is TRUE (every row when null).
-/// The rows are rewritten into a new fragment, as Lance does.
+struct RowAddrMask;
+
+/// Set `assignments` (column, SQL value) on the rows where `predicate` is TRUE (every row when null), and
+/// only on the rows `row_mask` allows when given (rows selected by _rowid / _rowaddr). The rows are
+/// rewritten into a new fragment, as Lance does.
 bool dataset_update(const std::filesystem::path& dataset_path, const std::string* predicate,
                     const std::vector<std::pair<std::string, std::string>>& assignments, std::uint64_t& updated,
-                    std::uint64_t& new_version, std::string& error);
+                    std::uint64_t& new_version, std::string& error, const RowAddrMask* row_mask = nullptr);
 
 /// Lance's merge insert: match `source` rows to the dataset's by the `on` columns.
 struct MergeInsertSpec {
