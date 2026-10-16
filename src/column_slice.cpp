@@ -258,6 +258,18 @@ RowRuns runs_of(const std::vector<std::uint8_t>& keep) {
             runs.emplace_back(i, end);
         }
         i = end;
+        // Skip the dropped rows eight at a time: a take keeps a few rows of a long mask.
+        while (i < total && keep[static_cast<std::size_t>(i)] == 0U && (i & 7U) != 0U) {
+            ++i;
+        }
+        while (i + 8U <= total) {
+            std::uint64_t word = 0;
+            std::memcpy(&word, keep.data() + i, sizeof(word));
+            if (word != 0U) {
+                break;
+            }
+            i += 8U;
+        }
         while (i < total && keep[static_cast<std::size_t>(i)] == 0U) {
             ++i;
         }
