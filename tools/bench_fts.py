@@ -160,6 +160,8 @@ def main() -> None:
     args.out.write_text(json.dumps(out, indent=1))
     print(f"wrote {args.out}")
     if args.work is None:
+        shutil.rmtree(work, ignore_errors=True)  # a temporary copy of every dataset: hundreds of MB
+    if args.work is None:
         shutil.rmtree(work, ignore_errors=True)
 
 
