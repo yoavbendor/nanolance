@@ -1026,11 +1026,8 @@ struct RowMask {
     }
 
     bool allows(std::uint64_t id) const {
-        if (resolver != nullptr && resolver->stable() && !resolver->find(id, id)) {
-            return false;  // an id whose row is gone
-        }
-        if (caller != nullptr && !caller->allows(id)) {
-            return false;  // the caller's mask (`id` is an address by now)
+        if ((resolver != nullptr || caller != nullptr) && !translate(id)) {
+            return false;
         }
         const auto frag = static_cast<std::uint32_t>(id >> 32U);
         const auto offset = id & 0xFFFFFFFFULL;
@@ -1042,6 +1039,15 @@ struct RowMask {
     }
 
 private:
+    /// Stable row ids to addresses, then the caller's masks. Out of line, so the usual case -- neither
+    /// -- stays an inlined bounds and bitmap check in the scoring loops.
+    [[gnu::noinline]] bool translate(std::uint64_t& id) const {
+        if (resolver != nullptr && resolver->stable() && !resolver->find(id, id)) {
+            return false;  // an id whose row is gone
+        }
+        return caller == nullptr || caller->allows(id);  // the caller's mask (`id` is an address by now)
+    }
+
     struct Frag {
         std::uint64_t rows = 0;
         const std::uint8_t* allowed = nullptr;  // null: every row
@@ -1675,12 +1681,15 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
                 d[r] = distance(index.metric, part->vectors.data() + r * dim, key.data(), dim, 1.0F);
             }
         }
+        // Gathered on the stack, not in `local`: the parallel callers' vectors share cache lines.
+        std::vector<Candidate> found;
         for (std::size_t r = 0; r < n; ++r) {
             if (in_range(d[r], q) && mask.allows(part->ids[r])) {
-                local.push_back(Candidate{d[r], part->ids[r]});
+                found.push_back(Candidate{d[r], part->ids[r]});
             }
         }
-        keep_best(local, kk);
+        keep_best(found, kk);
+        local.insert(local.end(), found.begin(), found.end());
         return true;
     };
     // The first `first` partitions are searched whatever they hold, in parallel.

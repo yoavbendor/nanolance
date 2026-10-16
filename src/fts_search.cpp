@@ -1385,6 +1385,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             groups.push_back(std::move(g));
         }
     }
+    const bool singles = std::all_of(groups.begin(), groups.end(), [](const auto& g) { return g.size() == 1U; });
     // A phrase: each query term's place, counted from the first term kept (Lance's
     // collect_query_tokens), and every distinct term required.
     std::vector<std::int32_t> query_positions;
@@ -1532,7 +1533,17 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             }
         }
         std::uint32_t need = 1U;
-        if (and_terms && phrase_) {
+        if (and_terms && !phrase_ && singles) {
+            // One token per position (the usual query): each token's documents count once.
+            for (const auto& g : groups) {
+                if (postings[p][g.front()] != nullptr) {
+                    for (const std::uint32_t d : postings[p][g.front()]->docs) {
+                        seen_[d] += 2U;
+                    }
+                }
+            }
+            need = 1U + 2U * static_cast<std::uint32_t>(groups.size());
+        } else if (and_terms && phrase_) {
             // Count each distinct token's documents (above the "touched" bit).
             for (std::size_t t = 0; t < nt; ++t) {
                 for (const std::uint32_t d : postings[p][t]->docs) {

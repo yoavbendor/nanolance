@@ -1624,10 +1624,19 @@ class LanceDataset(pa.dataset.Dataset):
             _nanolance._ds_drop_index(self._uri, str(name))
         self._refresh_latest("CreateIndex")
 
+    def _raw_indices(self) -> list:
+        # A version's indexes never change (a new index is a new version): read them once per version.
+        key = (self._uri, self._version)
+        cached = getattr(self, "_raw_indices_cache", None)
+        if cached is None or cached[0] != key:
+            with native():
+                cached = (key, _nanolance._ds_list_indices(self._uri, self._version))
+            self._raw_indices_cache = cached
+        return cached[1]
+
     def list_indices(self) -> List[Dict[str, Any]]:
-        with native():
-            indices = _nanolance._ds_list_indices(self._uri, self._version)
-        return [{"name": i["name"], "type": i["type"], "uuid": i["uuid"], "fields": i["fields"],
+        indices = self._raw_indices()
+        return [{"name": i["name"], "type": i["type"], "uuid": i["uuid"], "fields": list(i["fields"]),
                  "version": i["dataset_version"], "fragment_ids": set(i["fragment_ids"]), "base_id": None}
                 for i in indices]
 
