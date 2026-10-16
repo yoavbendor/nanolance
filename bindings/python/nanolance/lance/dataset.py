@@ -29,6 +29,7 @@ from nanolance import _nanolance
 from nanolance.lance import _native_log
 from nanolance.lance._errors import NotSupportedError, native, unsupported
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
+from nanolance.lance._session import Session, note_data_files, note_indexes, note_manifest
 from nanolance.lance._transactions import Index, IndexFile, LanceOperation, Transaction
 
 LOGGER = logging.getLogger("lance.dataset")
@@ -204,7 +205,8 @@ class LanceDataset(pa.dataset.Dataset):
         if index_cache_size is not None:
             warnings.warn("index_cache_size is deprecated; use index_cache_size_bytes instead",
                           DeprecationWarning, stacklevel=2)
-        self._index_cache_bytes = index_cache_size_bytes
+        self._session = session if session is not None else Session(
+            index_cache_size_bytes=index_cache_size_bytes, metadata_cache_size_bytes=metadata_cache_size_bytes)
         self._index_cache_hits = 0
         self._index_cache_misses = 0
         if isinstance(version, str):
@@ -227,6 +229,12 @@ class LanceDataset(pa.dataset.Dataset):
         self._version = int(info["version"])
         self._schema_cache = None
         self._fragment_message_cache = None
+        if getattr(self, "_session", None) is not None:
+            note_manifest(self)
+
+    def session(self) -> Session:
+        """This dataset's session: the caches and budgets its reads are accounted to."""
+        return self._session
 
     def _fragment_messages(self) -> Dict[int, bytes]:
         """This version's fragments as the manifest encodes them (lance.table.DataFragment), by id."""
@@ -281,7 +289,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def _index_cache_enabled(self) -> bool:
         # index_cache_size_bytes=0: no index cache for this handle; each search loads its indices afresh.
-        return getattr(self, "_index_cache_bytes", None) != 0
+        return self._session._index_budget() != 0
 
     def _count_index_cache(self, hits: int, misses: int) -> None:
         self._index_cache_hits = getattr(self, "_index_cache_hits", 0) + hits
@@ -701,6 +709,7 @@ class LanceDataset(pa.dataset.Dataset):
             if not names and not (with_row_id or with_row_address):
                 names, with_row_address = [], True  # something to count the rows by
         distinct = sorted(set(wanted))
+        note_data_files(self)
         with native():
             table = pa.table(_nanolance._ds_take(self._uri, self._version, distinct, names, with_row_id,
                                                  with_row_address, addresses, blob_handling))
@@ -1935,7 +1944,7 @@ class LanceDataset(pa.dataset.Dataset):
         known = {
             "create_index",
             "branches", "create_branch", "sql",
-            "shallow_clone", "deep_clone", "session", "join", "delta",
+            "shallow_clone", "deep_clone", "join", "delta",
             "prewarm_index",
         }
         if name in known:
@@ -3293,6 +3302,7 @@ class LanceScanner(pa.dataset.Scanner):
         import pyarrow.compute as pc
 
         length = -1 if self._limit is None else self._limit
+        note_data_files(self._ds)
         with native():
             table = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version, self._names, self._fragment_ids,
                                                  self._offset, length, True, True, False, self._filter,
@@ -3319,10 +3329,12 @@ class LanceScanner(pa.dataset.Scanner):
         length = -1 if self._limit is None else self._limit
         if self._names is not None and not self._names and not (self._with_row_id or self._with_row_address):
             self._drop_rowaddr = True
+            note_data_files(self._ds)
             with native():
                 return _nanolance._ds_scan(self._ds.uri, self._ds.version, [], self._fragment_ids, offset, length,
                                            False, True, stream, self._filter, self._blob_handling,
                                            self._use_scalar_index, **self._mask)
+        note_data_files(self._ds)
         with native():
             return _nanolance._ds_scan(self._ds.uri, self._ds.version, self._names, self._fragment_ids, offset,
                                        length, self._with_row_id, self._with_row_address, stream, self._filter,
@@ -3456,6 +3468,7 @@ class LanceScanner(pa.dataset.Scanner):
                      if n not in names and re.search(r"(?<![A-Za-z0-9_])" + re.escape(n) + r"(?![A-Za-z0-9_])", sql)]
             if not names and not (self._with_row_id or self._with_row_address):
                 self._drop_rowaddr = True
+        note_data_files(self._ds)
         with native():
             table = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version,
                                                  None if names is None else names + extra, self._fragment_ids, 0, -1,
@@ -3489,6 +3502,7 @@ class LanceScanner(pa.dataset.Scanner):
                 self._ds._index_cache_enabled(), self._index_segments, self._mask["row_addr_allowlist"],
                 self._mask["row_addr_blocklist"])
         self._ds._count_index_cache(hits, misses)
+        note_indexes(self._ds, column=n["column"])
         return ids, distances, plan
 
     def _nearest_table(self) -> pa.Table:
@@ -3523,9 +3537,11 @@ class LanceScanner(pa.dataset.Scanner):
     def _fts_search(self):
         limit = None if self._limit is None else self._offset + self._limit
         with native():
-            return _nanolance._ds_full_text_search(self._ds.uri, self._ds.version, self._fts, limit, self._filter,
-                                                   self._prefilter, self._fast_search,
-                                                   self._mask["row_addr_allowlist"], self._mask["row_addr_blocklist"])
+            found = _nanolance._ds_full_text_search(self._ds.uri, self._ds.version, self._fts, limit, self._filter,
+                                                    self._prefilter, self._fast_search,
+                                                    self._mask["row_addr_allowlist"], self._mask["row_addr_blocklist"])
+        note_indexes(self._ds, kind="inverted")
+        return found
 
     def _fts_table(self) -> pa.Table:
         """The matching rows, best first: the columns asked for, then ``_score`` (then the row id columns)."""
@@ -4311,15 +4327,16 @@ def dataset(
         ds._attach_namespace(namespace_client, table_id, managed)
         return ds
     if asof is not None:
-        ds = LanceDataset(uri)
+        ds = LanceDataset(uri, session=session)
         ts = asof if isinstance(asof, datetime) else datetime.fromisoformat(str(asof))
         candidates = [v for v in ds.versions() if v["timestamp"] <= ts]
         if not candidates:
             raise ValueError(f"no version of {uri} at or before {asof}")
-        return LanceDataset(uri, version=candidates[-1]["version"])
+        return LanceDataset(uri, version=candidates[-1]["version"], session=session)
     return LanceDataset(uri, version=version, default_scan_options=default_scan_options,
                         storage_options=storage_options, index_cache_size=index_cache_size,
-                        index_cache_size_bytes=index_cache_size_bytes)
+                        index_cache_size_bytes=index_cache_size_bytes,
+                        metadata_cache_size_bytes=metadata_cache_size_bytes, session=session)
 
 
 def __getattr__(name: str):

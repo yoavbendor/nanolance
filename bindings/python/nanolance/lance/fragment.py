@@ -18,6 +18,7 @@ import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance._errors import native, unsupported
+from nanolance.lance._session import session_for_write
 
 if TYPE_CHECKING:  # pragma: no cover
     from nanolance.lance.dataset import LanceDataset
@@ -408,6 +409,7 @@ class LanceFragment(pa.dataset.Fragment):
         """Write ``data`` as one fragment's data file, uncommitted: commit it with
         ``LanceOperation.Append`` or ``Overwrite``."""
         _check_namespace(namespace_client, table_id)
+        session_for_write(dataset_uri, session)
         data_storage_version = _storage_version(data_storage_version, use_legacy_format)
         fragments, _ = _write_uncommitted(data, dataset_uri, schema, mode=mode, max_rows_per_file=None,
                                           max_bytes_per_file=None, progress=progress,
@@ -805,6 +807,7 @@ def write_fragments(data, dataset_uri, schema: Optional[pa.Schema] = None, *, re
     from nanolance.lance.dataset import LanceDataset, _base_plan, _exists, _path_of, _set_base_plan
 
     _check_namespace(namespace_client, table_id)
+    session_for_write(dataset_uri, session)
     if external_blob_mode not in ("reference", "ingest"):
         raise ValueError(f"Invalid user input: Invalid external blob mode: {external_blob_mode}")
     if external_blob_mode == "ingest" and allow_external_blob_outside_bases:

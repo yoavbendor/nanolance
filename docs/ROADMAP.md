@@ -36,7 +36,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 | INVERTED format versions 1 / 3, 256-document posting blocks, the code analyzer (16 of pylance's tests) | `docs/tasks/FTS_FORMATS.md` | Haiku 5.5, reviewed by Opus | F1 done 2026-10-15 (+1; the six describe_indices also need JSON + NGRAM indexes); F2 done (+1); F3 done (+8): task done |
 | NGRAM and JSON scalar indexes, the ngram tokenizer for INVERTED (~11 of pylance's tests) | `docs/tasks/NGRAM_JSON.md` | Haiku 5.5, reviewed by Opus | N1 done 2026-10-15 (N1a +5, N1b +4); N2 done (N2a +6, N2b +2); N3 done (+1): task done |
 | Python surface: `lance.log` + Lance's log output, `lance.arrow` (bf16, image types), `lance.sampler` (~50 of pylance's tests) | `docs/tasks/PY_SURFACE.md` | Haiku 5.5, reviewed by Opus | P1 done 2026-10-15 (+17); P2 done (+17); P3 done (+12) |
-| `lance.tokenize`, `lance.Session` / cache sizes, batch (multi-query) KNN (~23 of pylance's tests) | `docs/tasks/PY_SURFACE_2.md` | Haiku 5.5, reviewed by Opus | Q1 done 2026-10-15 (+6); Q2, Q3 next |
+| `lance.tokenize`, `lance.Session` / cache sizes, batch (multi-query) KNN (~23 of pylance's tests) | `docs/tasks/PY_SURFACE_2.md` | Haiku 5.5, reviewed by Opus | Q1 done 2026-10-15 (+6); Q2 done (+10); Q3 next |
 | SQL expressions in projections, `LanceDataset.sql` (~15 of pylance's tests) | `docs/tasks/SQL_SURFACE.md` | Haiku 5.5, reviewed by Opus | specified 2026-10-15 (S1 / S2), after PY_SURFACE_2 |
 | IVF_RQ (RaBitQ), Hamming / binary vectors, fuzzy FTS, icu / jieba / lindera tokenizers, `lance.tokenize` | (Opus: format research first) | -- | not yet specified |
 

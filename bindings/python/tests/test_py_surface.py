@@ -705,3 +705,160 @@ def test_tokenize_result_is_fts_tokens_with_pylance_repr():
     expected = _json("pylance", TOKENIZE_SCRIPT, json.dumps([["the cats", {}]]))
     actual = _json("nanolance", TOKENIZE_SCRIPT, json.dumps([["the cats", {}]]))
     assert actual == expected == [{"tokens": [["cat", 0]], "repr": ['FtsToken(text="cat", position=0)']}]
+
+
+# ---------------------------------------------------------------------------------------------
+# lance.Session: budgets, sizes, sharing and errors (tests/test_session.py of pylance)
+# nanolance's caches are process-wide, so its sizes are per-session estimates (docs/tasks/PY_SURFACE_2.md)
+# ---------------------------------------------------------------------------------------------
+SESSION_ERROR_SCRIPT = r"""
+import json, re, sys
+out = []
+for kwargs in json.loads(sys.argv[1]):
+    try:
+        session = lance.Session(**kwargs)
+    except Exception as exc:
+        out.append([type(exc).__name__, re.sub(r", /home/runner/\S+$", "", str(exc))])
+    else:
+        out.append(["ok", repr(session), session.index_cache_size_bytes(), session.size_bytes()])
+print(json.dumps(out))
+"""
+
+# Each case: the keyword arguments of lance.Session. Both engines must raise the same exception type with the
+# same message (pylance's Rust source location aside), or return the same repr and sizes.
+SESSION_CASES = [
+    {"index_cache_size_bytes": 1024, "index_cache_backend": "moka://?capacity=1048576"},
+    {"metadata_cache_size_bytes": 1, "metadata_cache_backend": "moka://?capacity=5"},
+    {"index_cache_backend": "moka://"},
+    {"index_cache_backend": "moka://?capacity="},
+    {"index_cache_backend": "moka://?capacity=abc"},
+    {"index_cache_backend": "moka://?capacity=-1"},
+    {"index_cache_backend": "foo://?capacity=1"},
+    {"index_cache_backend": "1048576"},
+    {"index_cache_backend": ""},
+    {"index_cache_backend": {"kind": "moka", "capacity": "1048576"}},
+    {"index_cache_backend": {"options": {"capacity": "1"}}},
+    {"index_cache_backend": {"kind": 5, "options": {}}},
+    {"index_cache_backend": {"kind": "redis", "options": {}}},
+    {"index_cache_backend": {"kind": "moka"}},
+    {"index_cache_backend": {"kind": "moka", "options": {"capacity": 5}}},
+    {"index_cache_backend": {"kind": "moka", "options": "capacity=1"}},
+    {"index_cache_backend": 5},
+    {"metadata_cache_backend": "moka://"},
+    {"index_cache_size_bytes": -1},
+    {"index_cache_size_bytes": 1.5},
+    {"index_cache_backend": "moka://?capacity=1048576"},
+    {"index_cache_backend": {"kind": "MOKA", "options": {"capacity": "1048576"}}},
+    {"index_cache_size_bytes": 0, "metadata_cache_size_bytes": 0},
+    {},
+]
+
+
+def test_session_errors_and_reprs_match_pylance():
+    require_pylance()
+    payload = json.dumps(SESSION_CASES)
+    expected, actual = (_json(engine, SESSION_ERROR_SCRIPT, payload) for engine in ENGINES)
+    assert len(actual) == len(expected) == len(SESSION_CASES)
+    for case, e, a in zip(SESSION_CASES, expected, actual):
+        assert e == a, (case, e, a)
+    # The accepted forms are fresh sessions: nothing recorded yet, so the reprs read 0 and the size is the overhead.
+    accepted = [a for a in actual if a[0] == "ok"]
+    assert len(accepted) == 4
+    assert all(a[1] == "Session(index_cache_size_bytes=0, metadata_cache_size_bytes=0)" and a[3] == 152
+               for a in accepted)
+
+
+SESSION_STATE_SCRIPT = r"""
+import json, sys
+import pyarrow as pa
+from lance.fragment import write_fragments
+path = sys.argv[1]
+lance.write_dataset(pa.table({"a": range(1000)}), path, max_rows_per_file=250)
+out = {}
+ds = lance.dataset(path)
+s = ds.session()
+opened = s.size_bytes()
+ds.scanner().to_table()
+out["grows_after_scan"] = s.size_bytes() > opened > 0 or s.size_bytes() > opened
+out["repr_is_session"] = repr(s).startswith("Session(index_cache_size_bytes=0, metadata_cache_size_bytes=")
+zero = lance.dataset(path, metadata_cache_size_bytes=0)
+zero.to_table()
+out["zero_budget_size"] = zero.session().size_bytes()
+out["zero_budget_smaller"] = zero.session().size_bytes() < s.size_bytes()
+out["shared_is_same"] = lance.dataset(path, session=s).session().is_same_as(s)
+out["fresh_sessions_differ"] = not lance.dataset(path).session().is_same_as(lance.dataset(path).session())
+out["is_same_as_new_session"] = s.is_same_as(lance.Session())
+try:
+    s.is_same_as(None)
+except TypeError:
+    out["is_same_as_rejects_none"] = True
+before = s.size_bytes()
+shared = lance.dataset(path, session=s)
+shared.to_table()
+out["shared_read_grows_once"] = s.size_bytes() >= before
+out["index_cache_zero_without_index"] = s.index_cache_size_bytes() == 0
+dest = lance.dataset(path)
+owner = dest.session()
+before = owner.size_bytes()
+write_fragments(pa.table({"a": [1]}), path, mode="append", session=owner)
+out["write_fragments_grows"] = owner.size_bytes() > before
+try:
+    write_fragments(pa.table({"a": [1]}), dest, mode="append", session=lance.Session())
+except ValueError as exc:
+    out["foreign_session_message"] = "not the destination dataset's own session" in str(exc)
+print(json.dumps(out, sort_keys=True))
+"""
+
+
+def test_session_state_matches_pylance(tmp_path):
+    require_pylance()
+    expected, actual = (_json(engine, SESSION_STATE_SCRIPT, str(tmp_path / engine)) for engine in ENGINES)
+    assert actual == expected
+    assert expected["zero_budget_size"] == 152
+    assert expected["grows_after_scan"] and expected["write_fragments_grows"]
+
+
+SESSION_INDEX_SCRIPT = r"""
+import json, os, sys
+import numpy as np, pyarrow as pa
+path = sys.argv[1]
+vec = np.random.default_rng(0).standard_normal((200, 8)).astype("float32")
+table = pa.table({"id": pa.array(range(200)),
+                  "v": pa.FixedSizeListArray.from_arrays(pa.array(vec.ravel()), 8)})
+lance.write_dataset(table, path, max_rows_per_file=100).create_index("v", "IVF_FLAT", num_partitions=2,
+                                                                     metric="l2")
+query = {"column": "v", "q": vec[3].tolist(), "k": 3}
+out = {}
+ds = lance.dataset(path)
+s = ds.session()
+before = s.index_cache_size_bytes()
+out["ids"] = ds.to_table(nearest=query, columns=["id"]).column("id").to_pylist()
+after = s.index_cache_size_bytes()
+out["index_grows_on_search"] = after > before
+index_uuid = ds.list_indices()[0]["uuid"]
+index_dir = os.path.join(path, "_indices", str(index_uuid))
+out["index_is_on_disk_size"] = after == sum(os.path.getsize(os.path.join(root, f))
+                                            for root, _, files in os.walk(index_dir) for f in files)
+out["size_includes_index"] = s.size_bytes() == 152 + s.metadata_cache_size_bytes() + after
+no_index = lance.dataset(path, index_cache_size_bytes=0)
+out["zero_index_budget_ids"] = no_index.to_table(nearest=query, columns=["id"]).column("id").to_pylist()
+out["zero_index_budget_size"] = no_index.session().index_cache_size_bytes()
+shared = lance.dataset(path, session=s)
+shared.to_table(nearest=query, columns=["id"])
+out["shared_search_counts_once"] = s.index_cache_size_bytes() == after
+small = lance.Session(index_cache_size_bytes=1)
+lance.dataset(path, session=small).to_table(nearest=query, columns=["id"])
+out["small_budget_refuses_index"] = (small.index_cache_size_bytes() == 0
+                                     and small.size_bytes() == 152 + small.metadata_cache_size_bytes())
+print(json.dumps(out, sort_keys=True))
+"""
+
+
+def test_session_index_entries_are_on_disk_sizes(tmp_path):
+    out = _json("nanolance", SESSION_INDEX_SCRIPT, str(tmp_path / "vectors.lance"))
+    assert out["ids"] == out["zero_index_budget_ids"]
+    assert out["ids"][0] == 3
+    for key in ("index_grows_on_search", "index_is_on_disk_size", "size_includes_index",
+                "shared_search_counts_once", "small_budget_refuses_index"):
+        assert out[key] is True, key
+    assert out["zero_index_budget_size"] == 0

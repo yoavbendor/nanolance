@@ -385,6 +385,7 @@ tests/test_dataset.py::test_merge_separate_dataset
 tests/test_dataset.py::test_merge_with_commit
 tests/test_dataset.py::test_merge_with_schema_holes
 tests/test_dataset.py::test_metadata_apis_return_post_image
+tests/test_dataset.py::test_metadata_cache_size
 tests/test_dataset.py::test_nested_projection
 tests/test_dataset.py::test_null_reader_with_deletes
 tests/test_dataset.py::test_pickle
@@ -1028,6 +1029,15 @@ tests/test_schema_evolution.py::test_merge_nullability_assertion
 tests/test_schema_evolution.py::test_no_checkpoint_merge_columns
 tests/test_schema_evolution.py::test_project_nullability_assertion_round_trips
 tests/test_schema_evolution.py::test_query_after_merge
+tests/test_session.py::test_cache_backend_dict_config
+tests/test_session.py::test_cache_backend_rejects_moka_empty_capacity
+tests/test_session.py::test_cache_backend_rejects_moka_without_capacity
+tests/test_session.py::test_cache_backend_rejects_size_and_backend
+tests/test_session.py::test_cache_backend_rejects_unknown_dict_key
+tests/test_session.py::test_cache_backend_uri_config
+tests/test_session.py::test_cache_size_bytes
+tests/test_session.py::test_fragment_write_with_session
+tests/test_session.py::test_share_session
 tests/test_table_ops.py::test_commit_conflict_raises_typed_error
 tests/test_table_ops.py::test_data_file_create_basic
 tests/test_table_ops.py::test_data_file_create_end_to_end

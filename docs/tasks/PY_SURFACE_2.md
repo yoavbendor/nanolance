@@ -93,3 +93,20 @@ tokenizer is now a ValueError (`unknown base tokenizer X (...)`, as pylance) for
 too. Divergences: stemming / stop words outside English are NotSupported (nanolance's analyzer is
 English-only); unknown language names are accepted when they do not matter (pylance raises) --
 small item.
+
+**Q2 outcome (2026-10-16):** done in Python (`bindings/python/nanolance/lance/_session.py`), no C++ change.
+`lance.Session` with the pylance signature, `size_bytes()`, `index_cache_size_bytes()`,
+`metadata_cache_size_bytes()`, `is_same_as()`, pylance's repr; `ds.session()`; `lance.dataset(session=)`
+(budget kwargs are then ignored, as pylance does); `write_fragments(..., session=)` and
+`LanceFragment.create(session=)` (a dataset destination must use its own session). Backend URIs and dicts
+are validated with pylance's messages (Rust source suffixes stripped). Divergence: the sizes are
+**per-session estimates over shared process-wide caches**, not pylance's per-session caches. nanolance's
+C++ caches stay global. A session records each manifest (by uri and version: the manifest file's size),
+each data file's footer and column metadata (by path: the bytes from the column-metadata offset to the
+end of the file), and each vector or inverted index searched (by UUID: the size of `_indices/<uuid>`), once
+per session. A budget admits an entry only while the ledger plus the entry fits, so 0 and 64 record nothing
+(size 152, as pylance). A zero index budget still disables that handle's C++ index cache. Remote URIs get
+a fixed 1024-byte estimate per entry. Tests: `test_py_surface.py` Session section (3 tests, both engines
+for errors, reprs and behaviour; nanolance-only index estimates). Oracle: all 9 `test_session.py` tests and
+`test_metadata_cache_size` pass (+10). Remaining failure matched by the `-k`: `test_file.py::
+test_session_list_with_delimiter` (LanceFileSession listing, not Q2, failing before this change).
