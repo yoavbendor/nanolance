@@ -10,7 +10,9 @@
 #include "nanolance/jsonb.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstdio>
 #include <charconv>
 #include <cmath>
 #include <cstring>
@@ -29,7 +31,257 @@ namespace nano_lance::expr {
 
 namespace detail {
 
-enum class Kind { Null, Bool, Int, UInt, Double, String, Binary, Date, Timestamp, List };
+enum class Kind { Null, Bool, Int, UInt, Double, String, Binary, Date, Timestamp, List, Decimal };
+
+/// A decimal's unscaled value: 256-bit two's complement, least significant 64-bit limb first.
+using Limbs256 = std::array<std::uint64_t, 4>;
+
+/// An unsigned integer of 1024 bits (32-bit limbs, least significant first): exact decimal
+/// arithmetic on a 256-bit value rescaled by up to 10^160 stays inside it.
+struct Magnitude {
+    std::array<std::uint32_t, 32> w{};
+};
+
+void mag_mul_small(Magnitude& m, std::uint32_t f) {
+    std::uint64_t carry = 0;
+    for (auto& limb : m.w) {
+        const std::uint64_t t = static_cast<std::uint64_t>(limb) * f + carry;
+        limb = static_cast<std::uint32_t>(t);
+        carry = t >> 32;
+    }
+}
+
+void mag_add_small(Magnitude& m, std::uint32_t f) {
+    std::uint64_t carry = f;
+    for (auto& limb : m.w) {
+        const std::uint64_t t = static_cast<std::uint64_t>(limb) + carry;
+        limb = static_cast<std::uint32_t>(t);
+        carry = t >> 32;
+    }
+}
+
+/// Divides by d (at most 2^32) in place; returns the remainder.
+std::uint32_t mag_div_small(Magnitude& m, std::uint32_t d) {
+    std::uint64_t rem = 0;
+    for (auto it = m.w.rbegin(); it != m.w.rend(); ++it) {
+        const std::uint64_t cur = (rem << 32) | *it;
+        *it = static_cast<std::uint32_t>(cur / d);
+        rem = cur % d;
+    }
+    return static_cast<std::uint32_t>(rem);
+}
+
+std::uint32_t pow10_small(int k) {
+    std::uint32_t p = 1;
+    for (int i = 0; i < k; ++i) {
+        p *= 10;
+    }
+    return p;
+}
+
+void mag_mul_pow10(Magnitude& m, int k) {
+    for (; k >= 9; k -= 9) {
+        mag_mul_small(m, 1000000000U);
+    }
+    if (k > 0) {
+        mag_mul_small(m, pow10_small(k));
+    }
+}
+
+/// Divides by 10^k, rounding half away from zero (how pylance rounds decimal text and casts).
+void mag_div_pow10_round(Magnitude& m, int k) {
+    if (k <= 0) {
+        return;
+    }
+    // Floor division composes exactly, so dividing by 10^(k-1) first leaves the dropped digit last.
+    int rest = k - 1;
+    for (; rest >= 9; rest -= 9) {
+        mag_div_small(m, 1000000000U);
+    }
+    if (rest > 0) {
+        mag_div_small(m, pow10_small(rest));
+    }
+    if (mag_div_small(m, 10) >= 5) {
+        mag_add_small(m, 1);
+    }
+}
+
+int mag_cmp(const Magnitude& a, const Magnitude& b) {
+    for (auto i = a.w.size(); i-- > 0;) {
+        if (a.w[i] != b.w[i]) {
+            return a.w[i] < b.w[i] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+/// The digits of m (no sign, no point).
+std::string mag_digits(Magnitude m) {
+    std::vector<std::uint32_t> chunks;
+    do {
+        chunks.push_back(mag_div_small(m, 1000000000U));
+    } while (std::any_of(m.w.begin(), m.w.end(), [](std::uint32_t x) { return x != 0; }));
+    std::string out = std::to_string(chunks.back());
+    for (auto it = chunks.rbegin() + 1; it != chunks.rend(); ++it) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%09u", static_cast<unsigned>(*it));
+        out += buf;
+    }
+    return out;
+}
+
+/// m with `scale` digits after the point, as an arrow decimal shows it ("2.500", "0.999").
+std::string mag_text(const Magnitude& m, int scale, bool negative) {
+    std::string digits = mag_digits(m);
+    if (scale > 0) {
+        if (digits.size() <= static_cast<std::size_t>(scale)) {
+            digits.insert(0, static_cast<std::size_t>(scale) + 1 - digits.size(), '0');
+        }
+        digits.insert(digits.size() - static_cast<std::size_t>(scale), ".");
+    }
+    return (negative ? "-" : "") + digits;
+}
+
+bool limbs_negative(const Limbs256& l) { return (l[3] >> 63) != 0; }
+
+Magnitude limbs_magnitude(Limbs256 l) {
+    if (limbs_negative(l)) {
+        for (auto& x : l) {
+            x = ~x;
+        }
+        for (auto& x : l) {  // +1, with carry
+            if (++x != 0) {
+                break;
+            }
+        }
+    }
+    Magnitude m;
+    for (std::size_t k = 0; k < 4; ++k) {
+        m.w[2 * k] = static_cast<std::uint32_t>(l[k]);
+        m.w[2 * k + 1] = static_cast<std::uint32_t>(l[k] >> 32);
+    }
+    return m;
+}
+
+/// The two's complement limbs of a magnitude below 2^255, negated when `negative`.
+Limbs256 magnitude_limbs(const Magnitude& m, bool negative) {
+    Limbs256 l{};
+    for (std::size_t k = 0; k < 4; ++k) {
+        l[k] = static_cast<std::uint64_t>(m.w[2 * k]) | (static_cast<std::uint64_t>(m.w[2 * k + 1]) << 32);
+    }
+    if (negative) {
+        for (auto& x : l) {
+            x = ~x;
+        }
+        for (auto& x : l) {
+            if (++x != 0) {
+                break;
+            }
+        }
+    }
+    return l;
+}
+
+/// Parses number text as written ("-2.50", "12", "1e3", "0.0004") into digits and scale: the
+/// value is magnitude * 10^-scale, so "2.50" is 250 at scale 2. False when it is not a number
+/// this exact (more than 76 digits, or a scale beyond +-160).
+bool parse_decimal_text(std::string_view text, Magnitude& m, bool& negative, int& scale) {
+    std::size_t p = 0;
+    negative = false;
+    if (p < text.size() && (text[p] == '-' || text[p] == '+')) {
+        negative = text[p] == '-';
+        ++p;
+    }
+    int digits = 0;
+    int frac = 0;
+    bool point = false;
+    m = Magnitude{};
+    for (; p < text.size(); ++p) {
+        const char c = text[p];
+        if (c == '.' && !point) {
+            point = true;
+        } else if (c >= '0' && c <= '9') {
+            if (++digits > 76) {
+                return false;
+            }
+            mag_mul_small(m, 10);
+            mag_add_small(m, static_cast<std::uint32_t>(c - '0'));
+            frac += point ? 1 : 0;
+        } else {
+            break;
+        }
+    }
+    if (digits == 0) {
+        return false;
+    }
+    int exponent = 0;
+    if (p < text.size() && (text[p] == 'e' || text[p] == 'E')) {
+        ++p;
+        bool exp_negative = false;
+        if (p < text.size() && (text[p] == '-' || text[p] == '+')) {
+            exp_negative = text[p] == '-';
+            ++p;
+        }
+        if (p >= text.size()) {
+            return false;
+        }
+        for (; p < text.size(); ++p) {
+            if (text[p] < '0' || text[p] > '9' || exponent > 1000) {
+                return false;
+            }
+            exponent = exponent * 10 + (text[p] - '0');
+        }
+        exponent = exp_negative ? -exponent : exponent;
+    }
+    if (p != text.size()) {
+        return false;
+    }
+    scale = frac - exponent;
+    if (scale < -160 || scale > 160) {
+        return false;
+    }
+    if (scale < 0) {
+        mag_mul_pow10(m, -scale);
+        scale = 0;
+    }
+    return true;
+}
+
+/// The double nearest to the decimal (correctly rounded, through strtod on its exact digits).
+double decimal_as_double(const Limbs256& limbs, std::int32_t scale) {
+    const std::string text = (limbs_negative(limbs) ? "-" : "") + mag_digits(limbs_magnitude(limbs)) + "e" +
+                             std::to_string(-static_cast<std::int64_t>(scale));
+    return std::strtod(text.c_str(), nullptr);
+}
+
+/// `m` (negative when `negative`, with `scale`) as a decimal of `precision` digits: the rounded
+/// limbs at `to_scale`, or false with an error worded as arrow's cast error.
+bool fit_decimal(Magnitude m, bool negative, int scale, int to_scale, int precision, const char* width,
+                 Limbs256& out, std::string& error) {
+    if (to_scale >= scale) {
+        mag_mul_pow10(m, to_scale - scale);
+    } else {
+        mag_div_pow10_round(m, scale - to_scale);
+    }
+    Magnitude limit;
+    limit.w[0] = 1;
+    mag_mul_pow10(limit, precision);
+    if (mag_cmp(m, limit) >= 0) {
+        Magnitude nines = limit;  // limit - 1 (a power of ten, so the subtraction never runs out)
+        for (auto& x : nines.w) {
+            if (x-- != 0) {
+                break;
+            }
+        }
+        error = mag_text(m, to_scale, negative) + " is too large to store in a " + width + " of precision " +
+                std::to_string(precision) + ". Max is " + mag_text(nines, to_scale, negative);
+        return false;
+    }
+    out = magnitude_limbs(m, negative);
+    return true;
+}
+
+// ── value ───────────────────────────────────────────────────
 
 /// One value of an expression. Strings view either the batch's buffers, a literal, or `own`.
 struct Value {
@@ -41,6 +293,16 @@ struct Value {
     std::string_view s;   // String / Binary
     std::shared_ptr<std::string> own;
     std::shared_ptr<std::vector<Value>> items;  // List
+    Limbs256 dec{};       // Decimal: the unscaled value
+    std::int32_t scale = 0;  // Decimal: digits after the point (the value is dec * 10^-scale)
+
+    static Value decimal(const Limbs256& limbs, std::int32_t scale) {
+        Value x;
+        x.kind = Kind::Decimal;
+        x.dec = limbs;
+        x.scale = scale;
+        return x;
+    }
 
     static Value null() { return {}; }
     static Value boolean(bool v) {
@@ -106,6 +368,7 @@ struct Value {
             case Kind::Int: return static_cast<double>(i);
             case Kind::UInt: return static_cast<double>(u);
             case Kind::Double: return d;
+            case Kind::Decimal: return decimal_as_double(dec, scale);
             default: return 0.0;
         }
     }
@@ -241,6 +504,7 @@ inline std::string format_value(const Value& v) {
             }
             return out + "]";
         }
+        case Kind::Decimal: return mag_text(limbs_magnitude(v.dec), v.scale, limbs_negative(v.dec));
     }
     return "?";
 }
@@ -265,6 +529,10 @@ struct ColumnRef {
     // A list column (an array function's argument): its elements' type.
     ArrowType item_type = NANOARROW_TYPE_UNINITIALIZED;
     ArrowTimeUnit item_unit = NANOARROW_TIME_UNIT_SECOND;
+    // Decimal columns: precision and scale (of the leaf, or of a list's items).
+    int32_t precision = 0;
+    int32_t scale = 0;
+    int32_t item_scale = 0;
 };
 
 struct Node {
@@ -272,6 +540,7 @@ struct Node {
     Value literal;
     ColumnRef column;
     std::string name;  // Func: lower-cased name; Cast: target type name
+    std::string source;  // Literal numbers: the text as written ("-2.50"), for exact arrow_cast folding
     std::vector<std::unique_ptr<Node>> args;
     std::shared_ptr<const std::regex> regex;  // regexp_*: the pattern, when it is a literal
     enum class Family : std::uint8_t { Other, Json, Regexp } family = Family::Other;  // Func, set at parse
@@ -282,6 +551,42 @@ namespace {
 // ── tokens ──────────────────────────────────────────────────────────────────────────────────────
 
 enum class Tok { End, Ident, QuotedIdent, Number, String, Op, LParen, RParen, Comma, Dot, LBracket, RBracket };
+
+/// arrow_cast(<number literal>, 'Decimal128(p, s)' or 'Decimal256(p, s)'), folded exactly from the
+/// literal's text (so 2.555 rounds to 2.56, not through a double). Null with `error` set otherwise.
+std::unique_ptr<Node> fold_decimal_cast(const Node& arg, const std::string& type, std::string& error) {
+    int width = 0;
+    int precision = 0;
+    int scale = 0;
+    if (std::sscanf(type.c_str(), "Decimal%d(%d, %d)", &width, &precision, &scale) != 3 ||
+        (width != 128 && width != 256) || precision < 1 || precision > (width == 128 ? 38 : 76) || scale < -160 ||
+        scale > 160) {
+        error = "arrow_cast to '" + type + "' is not supported in nanolance filters";
+        return nullptr;
+    }
+    const bool number = arg.op == Op::Literal && (arg.literal.kind == Kind::Int || arg.literal.kind == Kind::UInt ||
+                                                  arg.literal.kind == Kind::Double);
+    if (!number || arg.source.empty()) {
+        error = "arrow_cast to '" + type + "' takes a number literal in nanolance filters";
+        return nullptr;
+    }
+    Magnitude m;
+    bool negative = false;
+    int source_scale = 0;
+    if (!parse_decimal_text(arg.source, m, negative, source_scale)) {
+        error = "cannot read '" + arg.source + "' as a decimal";
+        return nullptr;
+    }
+    Limbs256 limbs{};
+    if (!fit_decimal(m, negative, source_scale, scale, precision, width == 128 ? "Decimal128" : "Decimal256", limbs,
+                     error)) {
+        return nullptr;
+    }
+    auto n = std::make_unique<Node>();
+    n->op = Op::Literal;
+    n->literal = Value::decimal(limbs, scale);
+    return n;
+}
 
 struct Token {
     Tok kind = Tok::End;
@@ -640,10 +945,12 @@ private:
             }
             if (inner->op == Op::Literal && inner->literal.kind == Kind::Int) {
                 inner->literal.i = -inner->literal.i;
+                inner->source.insert(0, "-");
                 return inner;
             }
             if (inner->op == Op::Literal && inner->literal.kind == Kind::Double) {
                 inner->literal.d = -inner->literal.d;
+                inner->source.insert(0, "-");
                 return inner;
             }
             return make(Op::Neg, std::move(inner));
@@ -678,6 +985,21 @@ private:
         return n;
     }
 
+    /// A number as written: a float if it has a point or exponent, else an integer.
+    static std::unique_ptr<Node> number_literal(const std::string& text) {
+        if (text.find_first_of(".eE") != std::string::npos) {
+            return literal(Value::real(std::strtod(text.c_str(), nullptr)));
+        }
+        std::uint64_t u = 0;
+        const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), u);
+        if (ec != std::errc() || p != text.data() + text.size()) {
+            return literal(Value::real(std::strtod(text.c_str(), nullptr)));
+        }
+        return literal(u <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
+                           ? Value::integer(static_cast<std::int64_t>(u))
+                           : Value::uinteger(u));
+    }
+
     static std::unique_ptr<Node> literal(Value v) {
         auto n = std::make_unique<Node>();
         n->op = Op::Literal;
@@ -704,17 +1026,9 @@ private:
         }
         if (t.kind == Tok::Number) {
             next();
-            if (t.text.find_first_of(".eE") != std::string::npos) {
-                return literal(Value::real(std::strtod(t.text.c_str(), nullptr)));
-            }
-            std::uint64_t u = 0;
-            const auto [p, ec] = std::from_chars(t.text.data(), t.text.data() + t.text.size(), u);
-            if (ec != std::errc() || p != t.text.data() + t.text.size()) {
-                return literal(Value::real(std::strtod(t.text.c_str(), nullptr)));
-            }
-            return literal(u <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
-                               ? Value::integer(static_cast<std::int64_t>(u))
-                               : Value::uinteger(u));
+            auto n = number_literal(t.text);
+            n->source = t.text;
+            return n;
         }
         if (t.kind == Tok::String) {
             next();
@@ -887,6 +1201,11 @@ private:
                 return fail("arrow_cast(expression, 'Type') takes a type name");
             }
             const std::string type(n->args[1]->literal.s);
+            if (type.rfind("Decimal128(", 0) == 0 || type.rfind("Decimal256(", 0) == 0) {
+                std::string error;
+                auto folded = fold_decimal_cast(*n->args[0], type, error);
+                return folded ? std::move(folded) : fail(error);
+            }
             static const std::vector<std::pair<std::string, std::string>> types = {
                 {"Int8", "bigint"}, {"Int16", "bigint"}, {"Int32", "bigint"}, {"Int64", "bigint"},
                 {"UInt8", "bigint"}, {"UInt16", "bigint"}, {"UInt32", "bigint"}, {"UInt64", "bigint"},
@@ -1090,6 +1409,8 @@ bool scalar_type(ArrowType t) {
         case NANOARROW_TYPE_TIME32:
         case NANOARROW_TYPE_TIME64:
         case NANOARROW_TYPE_DURATION:
+        case NANOARROW_TYPE_DECIMAL128:
+        case NANOARROW_TYPE_DECIMAL256:
             return true;
         default:
             return false;
@@ -1139,6 +1460,8 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
         }
         c.type = sv.type;
         c.unit = sv.time_unit;
+        c.precision = sv.decimal_precision;
+        c.scale = sv.decimal_scale;
         c.item_type = NANOARROW_TYPE_UNINITIALIZED;
         if (under_array_function && is_list_type(sv.type)) {
             ArrowSchemaView item{};
@@ -1148,6 +1471,7 @@ bool bind_node(Node& n, const ArrowSchema& schema, bool under_null_test, std::st
             }
             c.item_type = item.type;
             c.item_unit = item.time_unit;
+            c.item_scale = item.decimal_scale;
             return true;
         }
         if (!scalar_type(sv.type) && !under_null_test) {
@@ -1223,6 +1547,21 @@ bool coerce(Node& n, std::string& error) {
     if (!compares) {
         return true;
     }
+    // pylance refuses a bare float literal against a decimal column (arrow_cast(x, 'Float64') is fine).
+    for (const auto& a : n.args) {
+        if (a->op != Op::Column || (a->column.type != NANOARROW_TYPE_DECIMAL128 &&
+                                    a->column.type != NANOARROW_TYPE_DECIMAL256)) {
+            continue;
+        }
+        for (const auto& b : n.args) {
+            if (b->op == Op::Literal && b->literal.kind == Kind::Double) {
+                error = "Received literal Float64(" + b->source + ") and could not convert to literal of type '" +
+                        (a->column.type == NANOARROW_TYPE_DECIMAL128 ? "Decimal128" : "Decimal256") + "(" +
+                        std::to_string(a->column.precision) + ", " + std::to_string(a->column.scale) + ")'";
+                return false;
+            }
+        }
+    }
     const Node* column = nullptr;
     for (const auto& a : n.args) {
         if (a->op == Op::Column && (temporal_type(a->column.type) || a->column.type == NANOARROW_TYPE_FLOAT)) {
@@ -1280,7 +1619,7 @@ struct Context {
     }
 };
 
-Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowTimeUnit unit);
+Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowTimeUnit unit, int32_t scale);
 
 Value read_column(const ColumnRef& c, int64_t row, Context& ctx) {
     const ArrowArrayView* view = ctx.batch;
@@ -1311,15 +1650,28 @@ Value read_column(const ColumnRef& c, int64_t row, Context& ctx) {
         for (auto e = begin; e < end; ++e) {
             items.push_back(ArrowArrayViewIsNull(view->children[0], e)
                                 ? Value::null()
-                                : read_scalar(view->children[0], e, c.item_type, c.item_unit));
+                                : read_scalar(view->children[0], e, c.item_type, c.item_unit, c.item_scale));
         }
         return Value::list(std::move(items));
     }
-    return read_scalar(view, at, c.type, c.unit);
+    return read_scalar(view, at, c.type, c.unit, c.scale);
 }
 
-Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowTimeUnit unit) {
+Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowTimeUnit unit, int32_t scale) {
     switch (type) {
+        case NANOARROW_TYPE_DECIMAL128:
+        case NANOARROW_TYPE_DECIMAL256: {
+            ArrowDecimal dec{};
+            ArrowDecimalInit(&dec, type == NANOARROW_TYPE_DECIMAL128 ? 128 : 256, 0, scale);
+            ArrowArrayViewGetDecimalUnsafe(view, at, &dec);
+            Limbs256 limbs{dec.words[0], dec.words[1], dec.words[2], dec.words[3]};
+            if (type == NANOARROW_TYPE_DECIMAL128) {  // sign-extend the 128-bit value
+                const std::uint64_t fill = static_cast<std::int64_t>(dec.words[1]) < 0 ? ~std::uint64_t{0} : 0;
+                limbs[2] = fill;
+                limbs[3] = fill;
+            }
+            return Value::decimal(limbs, scale);
+        }
         case NANOARROW_TYPE_BOOL: return Value::boolean(ArrowArrayViewGetIntUnsafe(view, at) != 0);
         case NANOARROW_TYPE_INT8:
         case NANOARROW_TYPE_INT16:
@@ -1372,8 +1724,59 @@ int float_way(double x, double y) {
     return rx < ry ? -1 : (rx > ry ? 1 : 0);
 }
 
+/// Exact limbs and scale of an integer or decimal value; false for anything else.
+bool exact_limbs(const Value& v, Limbs256& out, int32_t& scale) {
+    switch (v.kind) {
+        case Kind::Decimal:
+            out = v.dec;
+            scale = v.scale;
+            return true;
+        case Kind::Int:
+            out = {static_cast<std::uint64_t>(v.i), v.i < 0 ? ~std::uint64_t{0} : 0, v.i < 0 ? ~std::uint64_t{0} : 0,
+                   v.i < 0 ? ~std::uint64_t{0} : 0};
+            scale = 0;
+            return true;
+        case Kind::UInt:
+            out = {v.u, 0, 0, 0};
+            scale = 0;
+            return true;
+        default: return false;
+    }
+}
+
+/// Exact three-way comparison of two decimals, each as limbs at its scale: rescaled to the larger
+/// scale in full precision, so no digit is lost.
+int compare_decimal(const Limbs256& a, int32_t sa, const Limbs256& b, int32_t sb) {
+    const bool na = limbs_negative(a);
+    const bool nb = limbs_negative(b);
+    if (na != nb) {
+        return na ? -1 : 1;
+    }
+    Magnitude ma = limbs_magnitude(a);
+    Magnitude mb = limbs_magnitude(b);
+    const int32_t s = std::max(sa, sb);
+    mag_mul_pow10(ma, s - sa);
+    mag_mul_pow10(mb, s - sb);
+    const int c = mag_cmp(ma, mb);
+    return na ? -c : c;
+}
+
 /// -1, 0, 1, or nullopt when the two cannot be compared.
 std::optional<int> compare(const Value& a, const Value& b) {
+    if (a.kind == Kind::Decimal || b.kind == Kind::Decimal) {
+        // A float is compared as a double (arrow_cast(x, 'Float64')); integers and decimals exactly.
+        if (a.kind == Kind::Double || b.kind == Kind::Double) {
+            return float_way(a.as_double(), b.as_double());
+        }
+        Limbs256 x{};
+        Limbs256 y{};
+        int32_t sx = 0;
+        int32_t sy = 0;
+        if (!exact_limbs(a, x, sx) || !exact_limbs(b, y, sy)) {
+            return std::nullopt;
+        }
+        return compare_decimal(x, sx, y, sy);
+    }
     if (a.numeric() && b.numeric()) {
         if (a.kind == Kind::Double || b.kind == Kind::Double) {
             return float_way(a.as_double(), b.as_double());
@@ -1425,6 +1828,7 @@ const char* kind_name(Kind k) {
         case Kind::Date: return "date";
         case Kind::Timestamp: return "timestamp";
         case Kind::List: return "list";
+        case Kind::Decimal: return "decimal";
     }
     return "?";
 }
@@ -1560,7 +1964,7 @@ Value cast_value(const Value& v, const std::string& type, Context& ctx) {
             }
         }
     } else if (first == "float" || first == "double" || first == "real" || first == "decimal" || first == "numeric") {
-        if (v.numeric()) {
+        if (v.numeric() || v.kind == Kind::Decimal) {
             return Value::real(v.as_double());
         }
         if (v.kind == Kind::String) {
@@ -2129,6 +2533,29 @@ bool append_value(ArrowArray& out, const ArrowSchemaView& type, const Value& v, 
         case NANOARROW_TYPE_BOOL: {
             const Value b = cast_value(v, "boolean", ctx);
             return !ctx.failed && ArrowArrayAppendInt(&out, b.b ? 1 : 0) == NANOARROW_OK;
+        }
+        case NANOARROW_TYPE_DECIMAL128:
+        case NANOARROW_TYPE_DECIMAL256: {
+            Limbs256 limbs{};
+            int32_t scale = 0;
+            if (!exact_limbs(v, limbs, scale)) {
+                ctx.fail("cannot store " + format_value(v) + " in a decimal column");
+                return false;
+            }
+            const bool wide = type.type == NANOARROW_TYPE_DECIMAL256;
+            Limbs256 rounded{};
+            std::string error;
+            if (!fit_decimal(limbs_magnitude(limbs), limbs_negative(limbs), scale, type.decimal_scale,
+                             type.decimal_precision, wide ? "Decimal256" : "Decimal128", rounded, error)) {
+                ctx.fail(error);
+                return false;
+            }
+            ArrowDecimal dec{};
+            ArrowDecimalInit(&dec, wide ? 256 : 128, type.decimal_precision, type.decimal_scale);
+            for (std::size_t k = 0; k < 4; ++k) {
+                dec.words[k] = rounded[k];
+            }
+            return ArrowArrayAppendDecimal(&out, &dec) == NANOARROW_OK;
         }
         case NANOARROW_TYPE_INT8:
         case NANOARROW_TYPE_INT16:
@@ -2739,6 +3166,7 @@ TypeGuess guess(const Node& n, const ArrowSchema& root) {
                 case Kind::Timestamp: g.type = NANOARROW_TYPE_TIMESTAMP; break;
                 case Kind::Null: g.type = NANOARROW_TYPE_NA; break;
                 case Kind::List: g.type = NANOARROW_TYPE_LIST; break;
+                case Kind::Decimal: g.type = NANOARROW_TYPE_DECIMAL128; break;  // precision and scale: see result_type
             }
             return g;
         case Op::Column:
@@ -2873,6 +3301,10 @@ bool Expression::result_type(const std::string& name, ArrowSchema& out, std::str
         error = "the expression is not bound to a schema";
         return false;
     }
+    if (root_->op == Op::Literal && root_->literal.kind == Kind::Decimal) {
+        error = "a projection of a decimal literal is not supported in nanolance (use it in a filter)";
+        return false;
+    }
     const auto g = guess(*root_, binding_->schema);
     int rc = NANOARROW_OK;
     if (g.column != nullptr) {
@@ -2912,6 +3344,7 @@ std::unique_ptr<Node> clone(const Node& n) {
     out->literal = n.literal;
     out->column = n.column;
     out->name = n.name;
+    out->source = n.source;
     for (const auto& a : n.args) {
         out->args.push_back(clone(*a));
     }
