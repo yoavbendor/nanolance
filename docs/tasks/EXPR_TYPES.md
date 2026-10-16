@@ -109,6 +109,14 @@ type (43 more tests); duration arithmetic and `abs()` refused as pylance refuses
 kept on purpose: `arrow_cast(2.5, 'Duration(Millisecond)')` is an error here, an empty result in
 pylance. Three pylance tests pass now (`test_scalar_index_types[*-duration]`). A3 next.
 
+**A3 outcome (2026-10-16):** BTREE / BITMAP / ZONEMAP on decimal256 (a 256-bit key) and on uuid
+(keyed by its fixed_size_binary(16) storage; zonemap bounds null, as pylance writes them); index
+files equal pylance's for decimal128 / decimal256 / duration / uuid x the three kinds; index-on equals
+index-off. All 19 `test_scalar_index_types` cases pass (+4). Follow-up (small, A1 area): DataFusion
+refuses a decimal comparison whose common type needs more than 76 digits (`Cannot infer common
+argument type for comparison operation Decimal256(76, 3) = Decimal128(10, 4)`); nanolance compares
+them exactly -- refuse the same way. Lists of uuid stay unindexable.
+
 **Phase B -- bracket indexing, float16 list casts (2 of pylance's tests)**
 
 5. `l[1]` (list element, 1-based as DataFusion's `array_element`: measure; out of range -> null) and

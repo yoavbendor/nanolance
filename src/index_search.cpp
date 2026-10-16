@@ -567,9 +567,11 @@ bool search_zonemap(const std::filesystem::path& dir, const expr::Predicate& p, 
         return false;
     }
     const auto& zones = index->zones;
-    // A nested column's zones have no bounds (min and max are null): only their null counts answer.
+    // A nested column's zones have no bounds (min and max are null): only their null counts answer. A
+    // fixed-size binary's are null too (pylance writes them so), and every zone may match a predicate.
     const char* min_format = zones.schema.children[0]->format;
     const bool nested = min_format != nullptr && min_format[0] == '+';
+    const bool fixed_binary = min_format != nullptr && std::string_view(min_format).substr(0, 2) == "w:";
     if (nested && p.test() != Test::IsNull) {
         return true;
     }
@@ -579,7 +581,10 @@ bool search_zonemap(const std::filesystem::path& dir, const expr::Predicate& p, 
     const auto lengths = u64_column(zones, 6);
     std::vector<std::uint8_t> keep;
     bool handled = false;
-    if (!prune_by_bounds(p, zones, null_counts, keep, handled, error)) {
+    if (fixed_binary && p.test() != Test::IsNull) {
+        keep.assign(null_counts.size(), 1);
+        handled = true;
+    } else if (!prune_by_bounds(p, zones, null_counts, keep, handled, error)) {
         return false;
     }
     if (!handled) {

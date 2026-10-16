@@ -1265,6 +1265,21 @@ private:
                 {"Boolean", "boolean"}, {"Date32", "date"}, {"Date64", "date"},
             };
             std::string target;
+            // FixedSizeBinary(n): compared as binary, but a literal of another length fails as it does in
+            // DataFusion (its FixedSizeBinaryBuilder refuses the value).
+            if (type.rfind("FixedSizeBinary(", 0) == 0 && type.back() == ')') {
+                const std::string width = type.substr(16, type.size() - 17);
+                if (width.empty() || width.size() > 9 || width.find_first_not_of("0123456789") != std::string::npos) {
+                    return fail("arrow_cast to '" + type + "' is not supported in nanolance filters");
+                }
+                const Node& value = *n->args[0];
+                if (value.op == Op::Literal && value.literal.kind == Kind::Binary &&
+                    value.literal.s.size() != std::stoul(width)) {
+                    return fail("Invalid argument error: Byte slice does not have the same length as "
+                                "FixedSizeBinaryBuilder value lengths");
+                }
+                target = "binary";
+            }
             for (const auto& [arrow, sql] : types) {
                 if (type == arrow) {
                     target = sql;

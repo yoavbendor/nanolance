@@ -87,7 +87,7 @@ struct Items {
     bool is_null(std::size_t k) const { return ArrowArrayViewIsNull(views[view[k]], index[k]); }
 };
 
-enum class KeyKind { Int, UInt, Float16, Float32, Float64, Bool, Bytes, Decimal128 };
+enum class KeyKind { Int, UInt, Float16, Float32, Float64, Bool, Bytes, Decimal128, Decimal256 };
 
 bool key_kind_of(const ArrowSchemaView& type, KeyKind& kind, std::string& error) {
     switch (type.storage_type) {
@@ -124,6 +124,9 @@ bool key_kind_of(const ArrowSchemaView& type, KeyKind& kind, std::string& error)
         return true;
     case NANOARROW_TYPE_DECIMAL128:
         kind = KeyKind::Decimal128;
+        return true;
+    case NANOARROW_TYPE_DECIMAL256:
+        kind = KeyKind::Decimal256;
         return true;
     default:
         error = std::string("a scalar index on a column of type ") + ArrowTypeString(type.type) +
@@ -303,6 +306,34 @@ struct Int128Hash {
     }
 };
 
+/// A decimal256's value: the four 64-bit words of its two's-complement integer, least significant
+/// first (the top word is signed, so the sign decides the order before the lower words do).
+struct Int256 {
+    std::array<std::uint64_t, 4> w{};
+    bool operator<(const Int256& o) const {
+        if (w[3] != o.w[3]) {
+            return static_cast<std::int64_t>(w[3]) < static_cast<std::int64_t>(o.w[3]);
+        }
+        for (std::size_t k = 3; k-- > 0;) {
+            if (w[k] != o.w[k]) {
+                return w[k] < o.w[k];
+            }
+        }
+        return false;
+    }
+    bool operator==(const Int256& o) const { return w == o.w; }
+};
+
+struct Int256Hash {
+    std::size_t operator()(const Int256& v) const {
+        std::uint64_t h = 0;
+        for (const auto word : v.w) {
+            h = (h ^ word) * 0x9E3779B97F4A7C15ULL;
+        }
+        return std::hash<std::uint64_t>()(h);
+    }
+};
+
 template <typename K>
 struct KeyHash {
     using type = std::hash<K>;
@@ -314,6 +345,10 @@ struct KeyHash<StringKey> {
 template <>
 struct KeyHash<Int128> {
     using type = Int128Hash;
+};
+template <>
+struct KeyHash<Int256> {
+    using type = Int256Hash;
 };
 
 /// BTree order: every value sorted, ties by row address.
@@ -467,6 +502,16 @@ void sort_items(const Items& items, KeyKind kind, bool group, Sorted& out) {
                 Int128 value;  // little-endian: the low half first
                 std::memcpy(&value.lo, fixed_value(v, i, 16), 8);
                 std::memcpy(&value.hi, fixed_value(v, i, 16) + 8, 8);
+                return value;
+            },
+            group, out);
+        break;
+    case KeyKind::Decimal256:
+        order_items<Int256>(
+            items,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                Int256 value;  // little-endian: the least significant word first
+                std::memcpy(value.w.data(), fixed_value(v, i, 32), 32);
                 return value;
             },
             group, out);
@@ -966,6 +1011,16 @@ void zone_extrema_of(const Items& items, KeyKind kind, const std::vector<std::ui
                 Int128 value;
                 std::memcpy(&value.lo, fixed_value(v, i, 16), 8);
                 std::memcpy(&value.hi, fixed_value(v, i, 16) + 8, 8);
+                return value;
+            },
+            zones);
+        break;
+    case KeyKind::Decimal256:
+        zone_extrema<Int256>(
+            items, zone_of, false,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                Int256 value;
+                std::memcpy(value.w.data(), fixed_value(v, i, 32), 32);
                 return value;
             },
             zones);
@@ -1602,13 +1657,34 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         error = err.message;
         return false;
     }
+    // A uuid (pa.uuid(), the arrow.uuid extension over fixed_size_binary(16)) is keyed by its storage
+    // type, as pylance writes it: its index files hold fixed_size_binary values, not the extension.
+    const bool uuid_key =
+        key_view.extension_name.data != nullptr &&
+        std::string(key_view.extension_name.data, static_cast<std::size_t>(key_view.extension_name.size_bytes)) ==
+            "arrow.uuid" &&
+        key_view.type == NANOARROW_TYPE_FIXED_SIZE_BINARY && !list;
+    OwnedSchema uuid_storage;
+    if (uuid_key) {
+        ArrowSchemaInit(&uuid_storage.s);
+        ArrowSchemaSetTypeFixedSize(&uuid_storage.s, NANOARROW_TYPE_FIXED_SIZE_BINARY, key_view.fixed_size);
+        key_type = &uuid_storage.s;
+        if (ArrowSchemaViewInit(&key_view, key_type, &err) != NANOARROW_OK) {
+            error = err.message;
+            return false;
+        }
+    }
     if (type == ScalarIndexType::NGram && key_view.type != NANOARROW_TYPE_STRING &&
         key_view.type != NANOARROW_TYPE_LARGE_STRING) {
         error = "an NGRAM index needs a string column; '" + column + "' is " + ArrowTypeString(key_view.type);
         return false;
     }
     // A zonemap of a fixed-size list keeps only the null counts (zonemap.rs: nested types have no min or max).
+    // So does one of a fixed-size binary (uuids included): pylance's zonemap writes null min and max
+    // for fixed_size_binary, measured on 12.0.0.
     const bool nested = zoned_nested(type, key_view);
+    const bool no_extrema =
+        nested || (type == ScalarIndexType::ZoneMap && key_view.type == NANOARROW_TYPE_FIXED_SIZE_BINARY);
     const bool bloom = type == ScalarIndexType::BloomFilter;
     std::size_t value_width = 0;
     if (bloom) {
@@ -1652,7 +1728,8 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         const ArrowArray* addr_arr = batch.children[batch.n_children - 1];
         const auto* addrs = static_cast<const std::uint64_t*>(addr_arr->buffers[1]) + addr_arr->offset;
         auto view = std::make_unique<ArrowArrayView>();
-        if (ArrowArrayViewInitFromSchema(view.get(), col_type, &err) != NANOARROW_OK ||
+        // The values are read through the storage type: an extension's view has no element width.
+        if (ArrowArrayViewInitFromSchema(view.get(), uuid_key ? &uuid_storage.s : col_type, &err) != NANOARROW_OK ||
             ArrowArrayViewSetArray(view.get(), arr, &err) != NANOARROW_OK) {
             ArrowArrayViewReset(view.get());
             error = err.message;
@@ -1691,7 +1768,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     std::vector<Zone> zones;
     if (zoned) {
         zones = cut_zones(items, bloom ? number_of_items : rows_per_zone, zone_of);
-        if (!nested && !bloom) {
+        if (!no_extrema && !bloom) {
             zone_extrema_of(items, kind, zone_of, zones);
         }
     } else if (type != ScalarIndexType::NGram) {
@@ -1742,7 +1819,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     case ScalarIndexType::ZoneMap:
         written = write_zonemap(dir, *key_type, items, zones,
                                 kind == KeyKind::Float16 || kind == KeyKind::Float32 || kind == KeyKind::Float64,
-                                nested, rows_per_zone, files, error);
+                                no_extrema, rows_per_zone, files, error);
         details = "/lance.table.ZoneMapIndexDetails";
         break;
     case ScalarIndexType::NGram:

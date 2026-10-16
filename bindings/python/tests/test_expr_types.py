@@ -7,6 +7,8 @@ path is compared by building a btree index on decimal128 columns and filtering w
 
 from __future__ import annotations
 
+import glob
+import os
 import random
 from decimal import Decimal
 
@@ -298,3 +300,136 @@ def test_bare_duration_projection_equals_pylance(tmp_path, columns):
     assert mine.schema.types == other.schema.types
     assert [str(t) for t in mine.schema.types] == [str(t) for t in other.schema.types]
     assert mine.to_pydict() == other.to_pydict()
+
+
+# ---------------------------------------------------------------------------------------------
+# 4. Scalar indexes on decimal128 / decimal256 / duration / uuid (BTREE, BITMAP, ZONEMAP): index-on
+#    equals index-off equals pylance, the index is used, and the index files equal pylance's.
+
+INDEX_KINDS = ["BTREE", "BITMAP", "ZONEMAP"]
+UUID_A = b"0123012301230123"
+UUID_B = b"2345234523452345"
+UUID_HEX_A = "0x30313233303132333031323330313233"  # UUID_A as a hex literal
+UUID_HEX_B = "0x32333435323334353233343532333435"  # UUID_B
+
+
+def _index_table() -> pa.Table:
+    return pa.table(
+        {
+            "i": pa.array(range(9), pa.int64()),
+            "d": pa.array([D("2.55"), D("-2.55"), D("2.00"), None, D("0.01"), D("2.00"), D("1234567.89"),
+                           D("2.5"), D("-0.10")], pa.decimal128(10, 2)),
+            "e": pa.array([D("2.55"), D("-0.5"), D("2.000"), None, D("0.125"), D("2.000"), D("1.50"),
+                           D("-2.55"), D("0.125")], pa.decimal256(76, 3)),
+            "t": pa.array([2000, -1, 2000, None, 5, 2000, 0, 7, 1], pa.duration("ms")),
+            "u": pa.array([UUID_A, UUID_B, UUID_A, None, b"\x00" * 16, UUID_B, b"\xff" * 16, UUID_A, UUID_B],
+                          pa.uuid()),
+        }
+    )
+
+
+INDEX_FILTERS = {
+    "d": [
+        "d = 2",
+        "d = arrow_cast(2.5, 'Decimal128(3, 1)')",
+        "d = arrow_cast(2.50, 'Decimal256(76, 3)')",
+        "d > 1",
+        "d <= arrow_cast(-2.555, 'Decimal128(10, 3)')",
+        "d >= arrow_cast(0.005, 'Decimal128(10, 3)')",  # between two scales: exact, not rounded
+        "d < arrow_cast(2.001, 'Decimal128(10, 3)')",
+        "d IN (2, arrow_cast(0.01, 'Decimal128(10, 2)'), arrow_cast(-9.5, 'Decimal128(3, 1)'))",
+        "d IS NULL",
+        "d = arrow_cast(2.555, 'Decimal128(10, 3)')",  # no row: the literal is not a value of the scale
+    ],
+    "e": [
+        "e = arrow_cast(0.125, 'Decimal256(76, 3)')",
+        "e = arrow_cast(0.1250, 'Decimal128(10, 3)')",
+        "e = 2",
+        "e > arrow_cast(1.5, 'Decimal128(3, 1)')",
+        "e <= arrow_cast(-0.5, 'Decimal128(10, 2)')",
+        "e < arrow_cast(-0.499, 'Decimal128(10, 3)')",
+        "e IN (arrow_cast(2.55, 'Decimal128(10, 2)'), arrow_cast(1.5, 'Decimal128(10, 1)'))",
+        "e IS NULL",
+    ],
+    "t": [
+        "t = arrow_cast(2, 'Duration(Second)')",
+        "t = arrow_cast(2000000, 'Duration(Microsecond)')",
+        "t > arrow_cast(1500000, 'Duration(Microsecond)')",
+        "t <= arrow_cast(0, 'Duration(Second)')",
+        "t >= arrow_cast(0, 'Duration(Nanosecond)')",
+        "t IN (arrow_cast(5, 'Duration(Millisecond)'), arrow_cast(1, 'Duration(Second)'))",
+        "t IS NULL",
+        "t = 2",  # a bare integer is refused: pylance has no duration literal for it
+    ],
+    "u": [
+        f"u = arrow_cast({UUID_HEX_B}, 'FixedSizeBinary(16)')",
+        f"u = {UUID_HEX_A}",
+        f"u > arrow_cast({UUID_HEX_A}, 'FixedSizeBinary(16)')",
+        f"u IN (arrow_cast({UUID_HEX_A}, 'FixedSizeBinary(16)'), arrow_cast(0x00000000000000000000000000000000, 'FixedSizeBinary(16)'))",
+        "u IS NULL",
+        f"u = arrow_cast({UUID_HEX_A}, 'FixedSizeBinary(2)')",  # a 2-byte width: refused, as pylance does
+    ],
+}
+
+
+def _index_files(lance, path):
+    """Each index file under `_indices/<uuid>/`, by file name, read by pylance's reader."""
+    files = {}
+    for f in glob.glob(os.path.join(str(path), "_indices", "*", "*")):
+        if os.path.isfile(f):
+            files[os.path.basename(f)] = lance.file.LanceFileReader(f).read_all().to_table()
+    return files
+
+
+@pytest.mark.parametrize("kind", INDEX_KINDS)
+@pytest.mark.parametrize("column", list(INDEX_FILTERS))
+def test_index_filters_equal_pylance(tmp_path, kind, column):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _index_table(), max_rows_per_file=4)
+    for ds in (ours, theirs):
+        ds.create_scalar_index(column, index_type=kind)
+    for flt in INDEX_FILTERS[column]:
+        _assert_same(ours, theirs, flt)
+        assert _rows(ours, flt, use_scalar_index=False) == _rows(ours, flt), flt
+
+
+@pytest.mark.parametrize("kind", INDEX_KINDS)
+@pytest.mark.parametrize("column", list(INDEX_FILTERS))
+def test_index_is_used_for_comparisons_and_in(tmp_path, kind, column):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _index_table(), max_rows_per_file=4)
+    ours.create_scalar_index(column, index_type=kind)
+    for flt in INDEX_FILTERS[column]:
+        if not any(op in flt for op in (" = ", " < ", " > ", " <= ", " >= ", " IN ")):
+            continue
+        if _rows(theirs, flt)[0] == "error":
+            continue
+        assert "ScalarIndexQuery" in ours.scanner(filter=flt).explain_plan(), flt
+
+
+@pytest.mark.parametrize("kind", INDEX_KINDS)
+def test_index_files_equal_pylance(tmp_path, kind):
+    lance = require_pylance()
+    for column in INDEX_FILTERS:
+        root = tmp_path / column
+        root.mkdir()
+        ours, theirs = _datasets(lance, root, _index_table(), max_rows_per_file=4)
+        ours.create_scalar_index(column, index_type=kind)
+        theirs.create_scalar_index(column, index_type=kind)
+        mine = _index_files(lance, root / "nano.lance")
+        other = _index_files(lance, root / "lance.lance")
+        assert sorted(mine) == sorted(other), column
+        for name in other:
+            assert mine[name].schema == other[name].schema, (column, name, mine[name].schema, other[name].schema)
+            assert mine[name].to_pylist() == other[name].to_pylist(), (column, name)
+
+
+def test_uuid_index_keeps_the_extension_type(tmp_path):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _index_table())
+    ours.create_scalar_index("u", index_type="BTREE")
+    flt = INDEX_FILTERS["u"][0]
+    mine = ours.to_table(filter=flt, columns=["u"])
+    other = theirs.to_table(filter=flt, columns=["u"])
+    assert mine.schema == other.schema
+    assert mine.column("u").to_pylist() == other.column("u").to_pylist()
