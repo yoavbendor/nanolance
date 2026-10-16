@@ -7,6 +7,7 @@ path is compared by building a btree index on decimal128 columns and filtering w
 
 from __future__ import annotations
 
+import datetime as dt
 import glob
 import math
 import os
@@ -676,7 +677,7 @@ C1_PROJECTIONS = [
 ]
 
 # Known divergence, phase C3: arrow_cast to an integer type is parsed as CAST(... AS bigint).
-C1_XFAIL = [
+C1_ARROW_CAST = [
     "i8 + arrow_cast(1, 'Int32')",
     "i8 + arrow_cast(1, 'UInt8')",
 ]
@@ -761,8 +762,7 @@ def test_numeric_projection_equals_pylance(tmp_path, expr):
         assert _same_values(mine[2], other[2]), f"{expr!r}: {mine[2]} against pylance's {other[2]}"
 
 
-@pytest.mark.xfail(strict=True, reason="phase C3: arrow_cast to an integer type is parsed as CAST(... AS bigint)")
-@pytest.mark.parametrize("expr", C1_XFAIL)
+@pytest.mark.parametrize("expr", C1_ARROW_CAST)
 def test_numeric_projection_arrow_cast_equals_pylance(tmp_path, expr):
     lance = require_pylance()
     ours, theirs = _datasets(lance, tmp_path, _numeric_table())
@@ -922,3 +922,150 @@ def test_integer_arithmetic_filters_keep_their_rows(tmp_path, flt, rows):
     ours, theirs = _datasets(lance, tmp_path, _decimal_table())
     assert _rows(ours, flt) == ("rows", rows)
     assert _rows(theirs, flt) == ("rows", rows)
+
+
+# ── phase C3: integer and decimal casts, temporal arithmetic, in projections (and filters kept as they were) ──
+
+def _c3_table() -> pa.Table:
+    return pa.table(
+        {
+            "i": pa.array(range(4), pa.int64()),
+            "i8": pa.array([100, -128, 7, None], pa.int8()),
+            "i32": pa.array([2000000000, -7, 7, None], pa.int32()),
+            "i64": pa.array([5_000_000_000, -7, 7, None], pa.int64()),
+            "u8": pa.array([200, 1, 7, None], pa.uint8()),
+            "f32": pa.array([1.5, -2.25, 3.0, None], pa.float32()),
+            "f64": pa.array([2.345, -2.5, 3.9, None], pa.float64()),
+            "dec": pa.array([D("12.34"), D("-0.05"), D("1.00"), None], pa.decimal128(10, 2)),
+            "dur": pa.array([2000, 2001, None, 0], pa.duration("ms")),
+            "dur2": pa.array([2, -1, 3, None], pa.duration("ms")),
+            "durs": pa.array([1, 2, None, 0], pa.duration("s")),
+            "durus": pa.array([5, 6, 7, None], pa.duration("us")),
+            "durns": pa.array([1, 2, None, 0], pa.duration("ns")),
+            "ts": pa.array([dt.datetime(2020, 1, 2, 3, 4, 5, 2000), None, dt.datetime(2000, 1, 1, 0, 0, 1),
+                            dt.datetime(2021, 1, 1)], pa.timestamp("us")),
+            "tsms": pa.array([dt.datetime(2020, 1, 2, 3, 4, 5), None, dt.datetime(2000, 1, 1),
+                              dt.datetime(2021, 1, 1)], pa.timestamp("ms")),
+            "tss": pa.array([dt.datetime(2020, 1, 2, 3, 4, 5), None, dt.datetime(2000, 1, 1),
+                             dt.datetime(2021, 1, 1)], pa.timestamp("s")),
+            "tsns": pa.array([dt.datetime(2020, 1, 2, 3, 4, 5, 2000), None, dt.datetime(2000, 1, 1, 0, 0, 1),
+                              dt.datetime(2021, 1, 1)], pa.timestamp("ns")),
+            "d32": pa.array([dt.date(2020, 1, 2), None, dt.date(2000, 1, 1), dt.date(2021, 1, 1)], pa.date32()),
+            "d32b": pa.array([dt.date(2020, 1, 1), None, dt.date(2000, 1, 3), dt.date(2021, 1, 1)], pa.date32()),
+        }
+    )
+
+
+C3_PROJECTIONS = [
+    # integer arrow_cast keeps its target type in arithmetic
+    "i8 + arrow_cast(1, 'Int32')", "i8 + arrow_cast(1, 'UInt8')", "i8 + arrow_cast(1, 'Int64')",
+    "arrow_cast(i8, 'Int64') + i8", "arrow_cast(i8, 'Int32') + i8", "arrow_cast(u8, 'UInt16') - i8",
+    "arrow_cast(f64, 'Int32')", "arrow_cast(f64, 'Int8')", "arrow_cast(dec, 'Int32')", "arrow_cast(dec, 'UInt8')",
+    "arrow_cast(f32, 'Float64') + 1", "arrow_cast(dec, 'Float32')",
+    # decimal casts
+    "arrow_cast(dec, 'Decimal128(10,4)')", "arrow_cast(f32, 'Decimal128(10,4)')",
+    "arrow_cast(f64, 'Decimal128(10,2)')", "arrow_cast(dec, 'Decimal128(3,1)')",
+    "arrow_cast(dec, 'Decimal128(10,4)') / 2", "arrow_cast(dec, 'Decimal128(10,4)') * 2",
+    "dec + arrow_cast(1, 'Int64')", "dec * arrow_cast(2, 'Decimal128(3, 0)')",
+    "dec / arrow_cast(4, 'Decimal128(10, 4)')",
+    # SQL CAST
+    "CAST(dec AS INT)", "CAST(dec AS SMALLINT)", "CAST(dec AS TINYINT)", "CAST(dec AS BIGINT)",
+    "CAST(dec AS FLOAT)", "CAST(dec AS DOUBLE)", "CAST(dec AS DECIMAL(10,4))", "CAST(dec AS DECIMAL(3,1))",
+    "CAST(dec AS DECIMAL(2,0))", "CAST(i32 AS DECIMAL(12,2))", "CAST(f64 AS DECIMAL(10,2))",
+    "CAST(f64 AS DECIMAL(10,0))", "CAST(f32 AS DECIMAL(10,2))", "CAST(i8 AS DECIMAL(3,0))",
+    "CAST(i8 AS DECIMAL(3, 0)) + 1", "CAST(i8 AS TINYINT)", "CAST(f32 AS INT)", "CAST(u8 AS INT)",
+    "CAST(dec + 1 AS INT)", "CAST(i8 + 1 AS INT)",
+    # durations: same unit
+    "dur + dur2", "dur - dur2", "dur2 - dur", "dur + dur", "dur - dur", "dur - dur - dur2", "durus + durus",
+    "durus - durus", "coalesce(dur, dur2)",
+    # timestamps
+    "ts - ts", "ts - tsms", "tsms - ts", "tss - tsms", "tsms - tss", "tsns - tsms", "tsns - ts",
+    "ts + dur", "ts - dur", "tsms + dur", "tsms - dur", "tsms + durs", "tss - durs", "ts + durs", "ts + durus",
+    "dur + ts", "ts + arrow_cast(1, 'Duration(Second)')",
+    # dates
+    "d32 - d32", "d32 - d32b", "d32b - d32",
+]
+
+C3_REFUSALS = [
+    ("arrow_cast(i32, 'Int8')", "Cast error: Can't cast value 2000000000 to type Int8"),
+    ("arrow_cast(i64, 'Int32')", "Cast error: Can't cast value 5000000000 to type Int32"),
+    ("arrow_cast(i8, 'UInt8')", "Cast error: Can't cast value -128 to type UInt8"),
+    ("arrow_cast(u8, 'Int8')", "Cast error: Can't cast value 200 to type Int8"),
+    ("CAST(i64 AS SMALLINT)", "Cast error: Can't cast value 5000000000 to type Int16"),
+    ("CAST(u8 AS TINYINT)", "Cast error: Can't cast value 200 to type Int8"),
+    ("arrow_cast(i32, 'Decimal128(10,4)')",
+     "2000000000.0000 is too large to store in a Decimal128 of precision 10. Max is 999999.9999"),
+    ("CAST(i32 AS DECIMAL(10,2))",
+     "2000000000.00 is too large to store in a Decimal128 of precision 10. Max is 99999999.99"),
+    ("CAST(i8 AS DECIMAL(2,0))", "100 is too large to store in a Decimal128 of precision 2. Max is 99"),
+    ("d32 + dur", "Cannot coerce arithmetic expression Date32 + Duration(ms) to valid types"),
+    ("d32 - dur", "Cannot coerce arithmetic expression Date32 - Duration(ms) to valid types"),
+    ("dur + d32", "Cannot coerce arithmetic expression Duration(ms) + Date32 to valid types"),
+    ("d32 + durs", "Cannot coerce arithmetic expression Date32 + Duration(s) to valid types"),
+    ("abs(dur)", "Function 'abs' expects Numeric but received Duration(ms)"),
+    ("abs(durs)", "Function 'abs' expects Numeric but received Duration(s)"),
+    ("-dur", "Negation only supports numeric, interval and timestamp types"),
+    ("-durns", "Negation only supports numeric, interval and timestamp types"),
+]
+
+C3_MIXED_UNIT = ["dur + durs", "dur - durus", "durs + dur", "dur + durus", "ts - ts - dur"]
+
+
+@pytest.mark.parametrize("expr", C3_PROJECTIONS)
+def test_c3_projection_equals_pylance(tmp_path, expr):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _c3_table())
+    mine = _decimal_projection(ours, expr)
+    other = _decimal_projection(theirs, expr)
+    assert other[0] == "values", f"pylance refuses {expr!r}: {other[1]}"
+    assert mine[0] == "values", f"pylance returns {other[1]} for {expr!r}; nanolance refuses: {mine[1]}"
+    assert mine[1] == other[1], f"{expr!r}: type {mine[1]} against pylance's {other[1]}"
+    assert _same_values(mine[2], other[2]), f"{expr!r}: {mine[2]} against pylance's {other[2]}"
+
+
+@pytest.mark.parametrize("expr, message", C3_REFUSALS)
+def test_c3_refusals_equal_pylance(tmp_path, expr, message):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _c3_table())
+    mine = _decimal_projection(ours, expr)
+    other = _decimal_projection(theirs, expr)
+    assert other[0] == "error" and message in other[1], f"pylance says {other}"
+    assert mine[0] == "error" and message in mine[1], f"{expr!r}: nanolance {mine} against {other[1]!r}"
+
+
+@pytest.mark.parametrize("expr", C3_MIXED_UNIT)
+def test_c3_mixed_unit_duration_arithmetic_is_refused(tmp_path, expr):
+    # pylance returns a month_day_nano_interval here; nanolance refuses (EXPR_TYPES decision 3)
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _c3_table())
+    other = _decimal_projection(theirs, expr)
+    assert other[0] == "values" and other[1] == "month_day_nano_interval", other
+    mine = _decimal_projection(ours, expr)
+    assert mine[0] == "error" and "mixed-unit" in mine[1], mine
+
+
+@pytest.mark.parametrize(
+    "flt, outcome",
+    [
+        ("dur + dur2 > dur", "cannot apply '+' to duration and duration"),
+        ("CAST(dec AS INT) = 12", "cannot CAST 12.34 AS int"),
+        ("arrow_cast(dec, 'Decimal128(10,4)') > 1", "arrow_cast to 'Decimal128(10,4)' takes a number literal"),
+        ("ts - tsms > dur", "cannot apply '-' to timestamp and timestamp"),
+    ],
+)
+def test_c3_filters_keep_their_refusals(tmp_path, flt, outcome):
+    # filters keep their semantics: these were refused before C3 and still are
+    ours = nano.write_dataset(_c3_table(), str(tmp_path / "nano.lance"))
+    got = _rows(ours, flt)
+    assert got[0] == "error" and outcome in got[1], f"{flt!r}: {got}"
+
+
+@pytest.mark.parametrize("flt", ["i8 + arrow_cast(1, 'Int32') > 0", "i8 + arrow_cast(1, 'UInt8') < 0",
+                                 "CAST(i8 AS DECIMAL(3, 0)) > 0", "i8 + arrow_cast(1, 'Int64') > 0"])
+def test_c3_filter_rows_unchanged(tmp_path, flt):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _c3_table())
+    mine = _rows(ours, flt)
+    other = _rows(theirs, flt)
+    assert other[0] == "rows" and mine == other, f"{flt!r}: nanolance {mine} against {other}"
+

@@ -361,6 +361,7 @@ struct Value {
         Value x;
         x.kind = Kind::Timestamp;
         x.i = ns;
+        x.unit = NANOARROW_TIME_UNIT_NANO;  // a timestamp column's values carry its unit (temporal_arith)
         return x;
     }
     static Value list(std::vector<Value> values) {
@@ -1159,9 +1160,13 @@ private:
             while (peek().kind == Tok::Ident) {
                 type += (type.empty() ? "" : " ") + lower(next().text);
             }
-            if (peek().kind == Tok::LParen) {  // VARCHAR(10), DECIMAL(10, 2): the size is ignored
+            std::vector<std::string> sizes;
+            if (peek().kind == Tok::LParen) {  // VARCHAR(10): ignored; DECIMAL(10, 2): kept
                 while (peek().kind != Tok::RParen && peek().kind != Tok::End) {
-                    next();
+                    const Token tok = next();
+                    if (tok.kind == Tok::Number) {
+                        sizes.push_back(std::string(tok.text));
+                    }
                 }
                 next();
             }
@@ -1170,6 +1175,9 @@ private:
             }
             auto n = make(Op::Cast, std::move(inner));
             n->name = type;
+            if (type == "decimal" && sizes.size() == 2) {
+                n->name = "decimal " + sizes[0] + " " + sizes[1];
+            }
             return n;
         }
         if (peek(1).kind == Tok::LParen) {
@@ -1231,7 +1239,19 @@ private:
             if (type.rfind("Decimal128(", 0) == 0 || type.rfind("Decimal256(", 0) == 0) {
                 std::string error;
                 auto folded = fold_decimal_cast(*n->args[0], type, error);
-                return folded ? std::move(folded) : fail(error);
+                if (folded || n->args[0]->op == Op::Literal || type.rfind("Decimal256(", 0) == 0) {
+                    return folded ? std::move(folded) : fail(error);
+                }
+                // A column: a cast to decimal(p, s) in a projection. A filter refuses it when it evaluates it.
+                int precision = 0;
+                int scale = 0;
+                if (std::sscanf(type.c_str(), "Decimal128(%d, %d)", &precision, &scale) != 2) {
+                    return fail(error);
+                }
+                auto cast = make(Op::Cast, std::move(n->args[0]));
+                cast->name = "decimal " + std::to_string(precision) + " " + std::to_string(scale);
+                cast->source = type;
+                return cast;
             }
             if (type.rfind("Duration(", 0) == 0) {
                 // arrow_cast(<integer literal>, 'Duration(Unit)'): the count in that unit.
@@ -1263,9 +1283,9 @@ private:
                 return lit;
             }
             static const std::vector<std::pair<std::string, std::string>> types = {
-                {"Int8", "bigint"}, {"Int16", "bigint"}, {"Int32", "bigint"}, {"Int64", "bigint"},
-                {"UInt8", "bigint"}, {"UInt16", "bigint"}, {"UInt32", "bigint"}, {"UInt64", "bigint"},
-                {"Float16", "double"}, {"Float32", "double"}, {"Float64", "double"},
+                {"Int8", "int8"}, {"Int16", "int16"}, {"Int32", "int32"}, {"Int64", "int64"},
+                {"UInt8", "uint8"}, {"UInt16", "uint16"}, {"UInt32", "uint32"}, {"UInt64", "uint64"},
+                {"Float16", "double"}, {"Float32", "float"}, {"Float64", "double"},
                 {"Utf8", "string"}, {"LargeUtf8", "string"}, {"Utf8View", "string"},
                 {"Binary", "binary"}, {"LargeBinary", "binary"}, {"BinaryView", "binary"},
                 {"Boolean", "boolean"}, {"Date32", "date"}, {"Date64", "date"},
@@ -1856,6 +1876,7 @@ struct Context {
     const ArrowArrayView* batch = nullptr;
     std::string* error = nullptr;
     bool failed = false;
+    bool projection = false;  // a projection, not a filter: pylance's temporal arithmetic (temporal_arith)
 
     Value fail(const std::string& why) {
         if (!failed) {
@@ -1977,7 +1998,11 @@ Value read_scalar(const ArrowArrayView* view, int64_t at, ArrowType type, ArrowT
         }
         case NANOARROW_TYPE_DATE32: return Value::date(ArrowArrayViewGetIntUnsafe(view, at));
         case NANOARROW_TYPE_DATE64: return Value::timestamp(ArrowArrayViewGetIntUnsafe(view, at) * 1000000LL);
-        case NANOARROW_TYPE_TIMESTAMP: return Value::timestamp(ArrowArrayViewGetIntUnsafe(view, at) * unit_to_ns(unit));
+        case NANOARROW_TYPE_TIMESTAMP: {
+            Value t = Value::timestamp(ArrowArrayViewGetIntUnsafe(view, at) * unit_to_ns(unit));
+            t.unit = unit;
+            return t;
+        }
         default:
             // Bound only under a null test, where the value itself is never read: any non-null.
             return Value::boolean(true);
@@ -2206,9 +2231,73 @@ Value to_string_value(const Value& v) {
 
 Value eval(const Node& n, int64_t row, Context& ctx);
 
+/// A time unit as pylance prints it in a type: s, ms, µs, ns.
+const char* time_unit_abbrev(ArrowTimeUnit unit) {
+    switch (unit) {
+        case NANOARROW_TIME_UNIT_SECOND: return "s";
+        case NANOARROW_TIME_UNIT_MILLI: return "ms";
+        case NANOARROW_TIME_UNIT_MICRO: return "µs";
+        default: return "ns";
+    }
+}
+
+/// A projected duration, timestamp or date sum or difference, as pylance 12 types it (EXPR_TYPES C3):
+/// duration +/- duration of one unit; timestamp +/- duration (the timestamp's unit); timestamp -
+/// timestamp (the coarser unit); date - date (days). Mixed-unit durations are refused: pylance gives
+/// a month_day_nano_interval. `handled` is false for other operands (the caller keeps its rules).
+Value temporal_arith(Op op, const Value& a, const Value& b, Context& ctx, bool& handled) {
+    handled = true;
+    const bool addsub = op == Op::Add || op == Op::Sub;
+    if (addsub && a.kind == Kind::Duration && b.kind == Kind::Duration) {
+        if (a.unit != b.unit) {
+            return ctx.fail(std::string("nanolance refuses mixed-unit duration arithmetic (Duration(") +
+                            time_unit_abbrev(a.unit) + ") " + op_text(op) + " Duration(" + time_unit_abbrev(b.unit) +
+                            ")): pylance returns a month_day_nano_interval");
+        }
+        const auto x = static_cast<std::uint64_t>(a.i);
+        const auto y = static_cast<std::uint64_t>(b.i);
+        return Value::duration(static_cast<std::int64_t>(op == Op::Add ? x + y : x - y), a.unit);
+    }
+    const bool ts_dur = a.kind == Kind::Timestamp && b.kind == Kind::Duration;
+    if (addsub && (ts_dur || (op == Op::Add && a.kind == Kind::Duration && b.kind == Kind::Timestamp))) {
+        const Value& ts = ts_dur ? a : b;
+        const Value& d = ts_dur ? b : a;
+        const auto base = static_cast<std::uint64_t>(ts.i);
+        const auto shift = static_cast<std::uint64_t>(d.i) * static_cast<std::uint64_t>(unit_to_ns(d.unit));
+        Value r = Value::timestamp(static_cast<std::int64_t>(op == Op::Add ? base + shift : base - shift));
+        r.unit = ts.unit;
+        return r;
+    }
+    if (op == Op::Sub && a.kind == Kind::Timestamp && b.kind == Kind::Timestamp) {
+        // both sides are cut to the coarser unit, then subtracted
+        const ArrowTimeUnit unit = std::min(a.unit, b.unit);
+        const std::int64_t per = unit_to_ns(unit);
+        return Value::duration(a.i / per - b.i / per, unit);
+    }
+    if (op == Op::Sub && a.kind == Kind::Date && b.kind == Kind::Date) {
+        return Value::integer(a.i - b.i);
+    }
+    if (addsub && (a.kind == Kind::Date || b.kind == Kind::Date) && (a.kind == Kind::Duration || b.kind == Kind::Duration)) {
+        const auto name = [](const Value& v) {
+            return v.kind == Kind::Date ? std::string("Date32") : "Duration(" + std::string(time_unit_abbrev(v.unit)) + ")";
+        };
+        return ctx.fail("Invalid user input: Error during planning: Cannot coerce arithmetic expression " + name(a) +
+                        " " + op_text(op) + " " + name(b) + " to valid types");
+    }
+    handled = false;
+    return Value::null();
+}
+
 Value arith(Op op, const Value& a, const Value& b, Context& ctx) {
     if (a.is_null() || b.is_null()) {
         return Value::null();
+    }
+    if (ctx.projection) {
+        bool handled = false;
+        Value r = temporal_arith(op, a, b, ctx, handled);
+        if (handled) {
+            return r;
+        }
     }
     if (!a.numeric() || !b.numeric()) {
         return ctx.fail(std::string("cannot apply '") + op_text(op) + "' to " + kind_name(a.kind) + " and " +
@@ -2251,7 +2340,8 @@ Value cast_value(const Value& v, const std::string& type, Context& ctx) {
     const auto first_word = type.substr(0, type.find(' '));
     const auto first = first_word == "datetime" ? std::string("timestamp") : first_word;
     if (first == "int" || first == "integer" || first == "bigint" || first == "smallint" || first == "tinyint" ||
-        first == "int8" || first == "int16" || first == "int32" || first == "int64") {
+        first == "int8" || first == "int16" || first == "int32" || first == "int64" || first == "uint8" ||
+        first == "uint16" || first == "uint32" || first == "uint64") {
         if (v.kind == Kind::Int) {
             return v;
         }
@@ -2666,6 +2756,10 @@ Value eval(const Node& n, int64_t row, Context& ctx) {
             if (a.kind == Kind::UInt) {
                 return Value::integer(-static_cast<std::int64_t>(a.u));
             }
+            if (a.kind == Kind::Duration && ctx.projection) {
+                return ctx.fail("Invalid user input: Error during planning: Negation only supports numeric, interval "
+                                "and timestamp types");
+            }
             return ctx.fail("cannot negate a " + std::string(kind_name(a.kind)));
         }
         case Op::Concat: {
@@ -2678,7 +2772,12 @@ Value eval(const Node& n, int64_t row, Context& ctx) {
             const Value y = to_string_value(b);
             return Value::string(std::string(x.s) + std::string(y.s));
         }
-        case Op::Cast: return cast_value(eval(*n.args[0], row, ctx), n.name, ctx);
+        case Op::Cast:
+            if (!n.source.empty() && !ctx.projection) {  // a column's arrow_cast to decimal: projections only
+                return ctx.fail("invalid filter: arrow_cast to '" + n.source +
+                                "' takes a number literal in nanolance filters");
+            }
+            return cast_value(eval(*n.args[0], row, ctx), n.name, ctx);
         case Op::Func: {
             const auto& f = n.name;
             if (n.family == Node::Family::Json) {
@@ -2807,6 +2906,11 @@ Value eval(const Node& n, int64_t row, Context& ctx) {
                 }
                 if (a.numeric()) {
                     return a.kind == Kind::UInt ? a : Value::real(std::fabs(a.d));
+                }
+                if (a.kind == Kind::Duration && ctx.projection) {
+                    return ctx.fail(std::string("Invalid user input: Error during planning: Function 'abs' expects "
+                                                "Numeric but received Duration(") +
+                                    time_unit_abbrev(a.unit) + ")");
                 }
                 return ctx.fail("abs() needs a number");
             }
@@ -3824,7 +3928,7 @@ Value arith_decimal(Op op, int rs, const Value& a, const Value& b, Context& ctx)
 
 
 struct TypedNode {
-    enum class Shape : std::uint8_t { Constant, Column, Arith, Neg, Abs, Coalesce, ToDecimal };
+    enum class Shape : std::uint8_t { Constant, Column, Arith, Neg, Abs, Coalesce, ToDecimal, Cast };
     Shape shape = Shape::Constant;
     Op op = Op::Add;               // Arith
     NumType type = NumType::I64;   // integer or float (not used when dec)
@@ -3978,7 +4082,8 @@ bool decimal_operand(const TypedNode& n, const TypedNode& other, DecType& out) {
         return true;
     }
     // An integer column, or an integer literal that did not take a decimal's type: decimal(p, 0).
-    if ((n.shape != TypedNode::Shape::Column && n.shape != TypedNode::Shape::Constant) || !num_is_int(n.type)) {
+    if ((n.shape != TypedNode::Shape::Column && n.shape != TypedNode::Shape::Constant &&
+         n.shape != TypedNode::Shape::Cast) || !num_is_int(n.type)) {
         return false;
     }
     out = DecType{int_precision(n.type), 0};
@@ -4024,6 +4129,25 @@ bool build_decimal_arith(Op op, TypedPtr& a, TypedPtr& b, TypedPtr& out, std::st
 
 /// An operand of a numeric operator: a literal takes the type of a column beside it when that column is a
 /// decimal (at any depth) or, for the root only, a numeric column (pylance narrows nowhere deeper).
+/// The number type a cast names: arrow_cast's int8..uint64 and float32 / double, CAST's TINYINT, SMALLINT,
+/// INT, BIGINT, FLOAT, DOUBLE. False for any other name (a decimal, a string: the caller keeps its own).
+bool cast_num_target(const std::string& name, NumType& t) {
+    static const std::pair<const char*, NumType> names[] = {
+        {"int8", NumType::I8},       {"int16", NumType::I16},      {"int32", NumType::I32},
+        {"int64", NumType::I64},     {"uint8", NumType::U8},       {"uint16", NumType::U16},
+        {"uint32", NumType::U32},    {"uint64", NumType::U64},     {"tinyint", NumType::I8},
+        {"smallint", NumType::I16},  {"int", NumType::I32},        {"bigint", NumType::I64},
+        {"float", NumType::F32},     {"double", NumType::F64},
+    };
+    for (const auto& [text, type] : names) {
+        if (name == text) {
+            t = type;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool build_operand(const Node& n, const Node& other, bool narrow, TypedPtr& out, std::string& error) {
     if (n.op == Op::Literal && n.literal.kind != Kind::Decimal) {
         DecType dt{};
@@ -4099,6 +4223,32 @@ bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root) {
             out->type = t;
             out->args.push_back(std::move(a));
             out->args.push_back(std::move(b));
+            return true;
+        }
+        case Op::Cast: {
+            // arrow_cast / CAST to a number type (C3): the target is typed; the child is typed as usual.
+            NumType target = NumType::I64;
+            int dp = 0;
+            int ds = 0;
+            const bool decimal = std::sscanf(n.name.c_str(), "decimal %d %d", &dp, &ds) == 2;
+            if (!decimal && !cast_num_target(n.name, target)) {
+                return false;
+            }
+            TypedPtr a;
+            const Node& arg = *n.args[0];
+            const bool ok = arg.op == Op::Literal && arg.literal.kind != Kind::Decimal
+                                ? build_literal(arg, std::nullopt, a, error)
+                                : build_typed(arg, a, error);
+            if (!ok) {
+                return false;
+            }
+            out = std::make_unique<TypedNode>();
+            out->shape = TypedNode::Shape::Cast;
+            out->type = target;
+            out->dec = decimal;
+            out->dp = dp;
+            out->ds = ds;
+            out->args.push_back(std::move(a));
             return true;
         }
         case Op::Neg: {
@@ -4212,6 +4362,7 @@ bool build_projection(const Node& root, TypedPtr& typed, std::string& error) {
     error.clear();
     const bool numeric_root = root.op == Op::Add || root.op == Op::Sub || root.op == Op::Mul ||
                               root.op == Op::Div || root.op == Op::Mod || root.op == Op::Neg ||
+                              root.op == Op::Cast ||
                               (root.op == Op::Func && (root.name == "abs" || root.name == "coalesce" ||
                                                        root.name == "arrow_cast"));
     if (!numeric_root) {
@@ -4222,6 +4373,90 @@ bool build_projection(const Node& root, TypedPtr& typed, std::string& error) {
         return false;
     }
     return true;
+}
+
+/// CAST to an integer type, as Arrow's checked cast: floats and decimals truncate toward zero, and a
+/// value outside the type is an error ("Cast error: Can't cast value N to type Int8").
+Value cast_integer(const Value& v, NumType t, Context& ctx) {
+    bool negative = false;
+    bool fits = true;
+    std::uint64_t mag = 0;
+    if (v.kind == Kind::Int) {
+        negative = v.i < 0;
+        mag = negative ? 0 - static_cast<std::uint64_t>(v.i) : static_cast<std::uint64_t>(v.i);
+    } else if (v.kind == Kind::UInt) {
+        mag = v.u;
+    } else if (v.kind == Kind::Double) {
+        const double whole = std::trunc(v.d);
+        fits = std::isfinite(whole) && std::fabs(whole) < 18446744073709551616.0;
+        if (fits) {
+            negative = whole < 0;
+            mag = static_cast<std::uint64_t>(std::fabs(whole));
+        }
+    } else {
+        Magnitude m = limbs_magnitude(v.dec);
+        for (int k = 0; k < v.scale; ++k) {
+            mag_div_small(m, 10);
+        }
+        for (std::size_t k = 2; k < m.w.size(); ++k) {
+            fits = fits && m.w[k] == 0;
+        }
+        mag = static_cast<std::uint64_t>(m.w[0]) | (static_cast<std::uint64_t>(m.w[1]) << 32);
+        negative = limbs_negative(v.dec) && mag != 0;
+    }
+    const int bits = num_bits(t);
+    bool in_range = false;
+    if (num_is_signed(t)) {
+        const std::uint64_t limit = std::uint64_t{1} << (bits - 1);  // |min|; max is limit - 1
+        in_range = fits && (negative ? mag <= limit : mag < limit);
+    } else {
+        const std::uint64_t limit = bits == 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << bits) - 1;
+        in_range = fits && !negative && mag <= limit;
+    }
+    if (!in_range) {
+        const std::string text = v.kind == Kind::Double ? format_value(v) : (negative ? "-" : "") + std::to_string(mag);
+        return ctx.fail("Cast error: Can't cast value " + text + " to type " + num_name(t));
+    }
+    return int_value(num_is_signed(t) && negative ? 0 - mag : mag, t);
+}
+
+/// CAST to decimal(p, s): rounds half away from zero to the scale, then checks the precision (pylance's
+/// "... is too large to store in a Decimal128 of precision p" text).
+Value cast_decimal(const Value& v, int dp, int ds, Context& ctx) {
+    Magnitude m{};
+    bool negative = false;
+    int scale = 0;
+    if (v.kind == Kind::Decimal) {
+        m = limbs_magnitude(v.dec);
+        negative = limbs_negative(v.dec);
+        scale = v.scale;
+    } else if (v.kind == Kind::Double) {
+        if (!std::isfinite(v.d)) {
+            return ctx.fail("cannot cast a non-finite float to a decimal");
+        }
+        char buf[400];
+        std::snprintf(buf, sizeof buf, "%.15f", v.d);
+        if (!parse_decimal_text(buf, m, negative, scale)) {
+            return ctx.fail("cannot read a float as a decimal");
+        }
+    } else {
+        const std::uint64_t mag = v.kind == Kind::UInt         ? v.u
+                                  : v.i < 0                    ? 0 - static_cast<std::uint64_t>(v.i)
+                                                               : static_cast<std::uint64_t>(v.i);
+        negative = v.kind == Kind::Int && v.i < 0;
+        m.w[0] = static_cast<std::uint32_t>(mag);
+        m.w[1] = static_cast<std::uint32_t>(mag >> 32);
+    }
+    bool zero = true;
+    for (const auto x : m.w) {
+        zero = zero && x == 0;
+    }
+    Limbs256 out{};
+    std::string err;
+    if (!fit_decimal(m, negative && !zero, scale, ds, dp, "Decimal128", out, err)) {
+        return ctx.fail(err);
+    }
+    return Value::decimal(out, ds);
 }
 
 /// `a op b` in type `t`: both operands already of type `t`. Errors are DataFusion's.
@@ -4367,6 +4602,19 @@ Value eval_typed(const TypedNode& t, int64_t row, Context& ctx) {
             }
             return Value::integer(a.i < 0 ? -a.i : a.i);
         }
+        case TypedNode::Shape::Cast: {
+            const Value v = eval_typed(*t.args[0], row, ctx);
+            if (v.is_null()) {
+                return v;
+            }
+            if (t.dec) {
+                return cast_decimal(v, t.dp, t.ds, ctx);
+            }
+            if (num_is_int(t.type)) {
+                return cast_integer(v, t.type, ctx);
+            }
+            return as_num(Value::real(as_double_value(v)), t.type);
+        }
         case TypedNode::Shape::ToDecimal: {
             const Value v = as_num(eval_typed(*t.args[0], row, ctx), NumType::F64);
             if (v.is_null()) {
@@ -4456,6 +4704,7 @@ bool Expression::evaluate(const ArrowArray& batch, const ArrowSchema& type, Arro
     Context ctx;
     ctx.batch = &guard.view;
     ctx.error = &error;
+    ctx.projection = true;
     for (int64_t r = 0; r < batch.length; ++r) {
         const Value v = typed ? eval_typed(*typed, r, ctx) : eval(*root_, r, ctx);
         if (ctx.failed || !append_projected(out, tv, v, typed.get(), ctx)) {
@@ -4498,6 +4747,38 @@ bool integer_type(ArrowType t) {
            t == NANOARROW_TYPE_UINT32 || t == NANOARROW_TYPE_UINT64;
 }
 
+/// The type of a duration, timestamp or date sum or difference (temporal_arith's rules).
+bool temporal_result(Op op, const TypeGuess& a, const TypeGuess& b, TypeGuess& g) {
+    if (op != Op::Add && op != Op::Sub) {
+        return false;
+    }
+    if (a.type == NANOARROW_TYPE_DURATION && b.type == NANOARROW_TYPE_DURATION) {
+        g.type = NANOARROW_TYPE_DURATION;
+        g.unit = a.unit;
+        return true;
+    }
+    if (a.type == NANOARROW_TYPE_TIMESTAMP && b.type == NANOARROW_TYPE_DURATION) {
+        g.type = NANOARROW_TYPE_TIMESTAMP;
+        g.unit = a.unit;
+        return true;
+    }
+    if (op == Op::Add && a.type == NANOARROW_TYPE_DURATION && b.type == NANOARROW_TYPE_TIMESTAMP) {
+        g.type = NANOARROW_TYPE_TIMESTAMP;
+        g.unit = b.unit;
+        return true;
+    }
+    if (op == Op::Sub && a.type == NANOARROW_TYPE_TIMESTAMP && b.type == NANOARROW_TYPE_TIMESTAMP) {
+        g.type = NANOARROW_TYPE_DURATION;
+        g.unit = std::min(a.unit, b.unit);
+        return true;
+    }
+    if (op == Op::Sub && a.type == NANOARROW_TYPE_DATE32 && b.type == NANOARROW_TYPE_DATE32) {
+        g.type = NANOARROW_TYPE_INT64;
+        return true;
+    }
+    return false;
+}
+
 TypeGuess guess(const Node& n, const ArrowSchema& root) {
     TypeGuess g;
     switch (n.op) {
@@ -4532,6 +4813,9 @@ TypeGuess guess(const Node& n, const ArrowSchema& root) {
         case Op::Mod: {
             const auto a = guess(*n.args[0], root);
             const auto b = guess(*n.args[1], root);
+            if (temporal_result(n.op, a, b, g)) {
+                return g;
+            }
             if (integer_type(a.type) && integer_type(b.type)) {
                 if (a.column != nullptr && a.type == b.type) {
                     return a;  // int32 + int32 stays int32, as DataFusion keeps it
@@ -4567,6 +4851,14 @@ TypeGuess guess(const Node& n, const ArrowSchema& root) {
                 g.type = NANOARROW_TYPE_INT16;
             } else if (first == "tinyint" || first == "int8") {
                 g.type = NANOARROW_TYPE_INT8;
+            } else if (first == "uint8") {
+                g.type = NANOARROW_TYPE_UINT8;
+            } else if (first == "uint16") {
+                g.type = NANOARROW_TYPE_UINT16;
+            } else if (first == "uint32") {
+                g.type = NANOARROW_TYPE_UINT32;
+            } else if (first == "uint64") {
+                g.type = NANOARROW_TYPE_UINT64;
             } else if (first == "float" || first == "real") {
                 g.type = NANOARROW_TYPE_FLOAT;
             } else if (first == "double" || first == "decimal" || first == "numeric") {
@@ -4680,6 +4972,8 @@ bool Expression::result_type(const std::string& name, ArrowSchema& out, std::str
         ArrowSchemaInit(&out);
         if (g.type == NANOARROW_TYPE_TIMESTAMP) {
             rc = ArrowSchemaSetTypeDateTime(&out, NANOARROW_TYPE_TIMESTAMP, g.unit, nullptr);
+        } else if (g.type == NANOARROW_TYPE_DURATION) {
+            rc = ArrowSchemaSetTypeDateTime(&out, NANOARROW_TYPE_DURATION, g.unit, nullptr);
         } else if (typed && typed->dec) {
             rc = ArrowSchemaSetTypeDecimal(&out, NANOARROW_TYPE_DECIMAL128, typed->dp, typed->ds);
         } else {

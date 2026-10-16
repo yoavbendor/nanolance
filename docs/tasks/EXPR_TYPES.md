@@ -193,6 +193,18 @@ coalesce(dec, f64 column) -> decimal(30,15). Left: an integer subtree beside a d
 * 1` -> (22,2), `dec + i8 * 1` -> (15,2) in pylance; no rule found, refused here, strict xfail);
 integer arrow_cast / CAST (C3); decimal with float32; decimal256 projections untested.
 
+**C3 outcome (2026-10-16):** integer / float / decimal arrow_cast and CAST keep their target type
+(checked casts: `Cast error: Can't cast value N to type T`; float and decimal to int truncate;
+float and decimal to decimal round half away from zero; too large: `V is too large to store in a
+Decimal128 of precision P. Max is M`); dur +/- dur (same unit), ts - ts (duration of the coarser
+unit), ts +/- dur, d32 - d32 (int64 days), and pylance's texts for d32 +/- dur, abs(dur), -dur.
+Mixed-unit duration arithmetic refused (decision 3). Phase C is done; C1's two xfails pass. Left:
+`ts - arrow_cast(ts, 'Timestamp(Millisecond)')` (the parser drops the unit), arrow_cast of a column
+to Duration, `coalesce(ts, ts_ms)` (pylance: the coarser unit), `d32 - ts`, duration overflow not
+measured, float-to-decimal rounding goes through `%.15f` text (matched every measured case), and
+C2's `dec + i32 * 1`. A filter with `arrow_cast(column, 'Decimal128(..)')` is still refused, now on
+evaluation (an empty dataset returns no rows instead of the error).
+
 ## 3. Oracles
 
 `python3 tools/pylance_suite.py -k "<test names>" 2>&1 | grep -E "^FAILED|passed|failed" | tail -15`
