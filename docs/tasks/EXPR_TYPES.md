@@ -141,6 +141,39 @@ case-insensitive struct fields (pylance refuses `s.X`; nanolance accepts it -- a
    `ds.to_table(columns={"r": "<expr>"}).schema` on pylance; table them in your report. Change only
    the result types, not filter semantics.
 
+**Phase C measurement (C0, 2026-10-16):** the full table -- every case as pylance's type and values
+against nanolance's -- is `docs/tasks/data/expr_types_c0_table.txt` (`=` same, `!` differs). The
+rules it shows:
+- A literal is narrowed to its operand's type only when that operand is a column: cast if it fits,
+  else pylance's error (`Received literal Int64(1000) and could not convert to literal of type
+  'Int8'`; a float literal against an int column errors the same way, against a float32 column it
+  narrows). Elsewhere (`-i8 + 1`, `coalesce(i32, 0)`) a literal stays int64 / double.
+- Int with int: same signedness -> the wider; mixed -> signed of width max(2 x unsigned, signed);
+  u64 with any signed -> decimal128(21,0) (i64 * u64 -> decimal128(38,0)). Results wrap on
+  overflow; `x / 0` and `x % 0` error `Divide by zero error`; MIN / -1 errors `Arithmetic overflow:
+  Overflow happened on: -128 / -1`; `abs(MIN)` errors `Int8Array overflow on abs(-128)`; negating
+  an unsigned errors (`Negation only supports numeric, interval and timestamp types`).
+- Int with float32 -> float32 computed in float; with float64 -> double.
+- Decimal precisions of ints: i8/u8 3, i16/u16 5, i32/u32 10, i64/u64 20. add/sub: scale
+  max(s1, s2), precision max(p1-s1, p2-s2) + scale + 1; mul: p1+p2+1, s1+s2; div (s1 = 2): scale 6,
+  truncating (pin the rule for other scales); mod: min(p1-s1, p2-s2) + max(s1, s2); an int literal
+  takes the decimal column's type; -dec and abs(dec) keep the type; CAST(dec AS INT) truncates;
+  CAST(int / float AS DECIMAL(p, s)) is decimal (too large: `100 is too large to store in a
+  Decimal128(2,0)`).
+- coalesce: the common type of its arguments as above, literals not narrowed (coalesce(dec, 1) ->
+  decimal128(22,2), coalesce(dec, 1.5) -> decimal128(30,15)).
+- Temporal: dur +/- dur (same unit) -> duration; ts - ts -> duration; ts +/- dur -> timestamp;
+  d32 - d32 -> int64 days; d32 +/- dur -> pylance's coercion error.
+
+**Reviewer's decisions:** (1) filters keep their semantics (they return rows where pylance's
+literal coercion refuses `i16 > 40000` / `i32 = 7.0`) -- a recorded divergence; the typed rules
+apply to projections only (a mode of evaluation inside src/expr.cpp, not a planning change).
+(2) u64 with a signed int -> decimal128(21,0) / (38,0), as pylance. (3) match ts - ts, ts +/- dur,
+d32 - d32; refuse mixed-unit duration arithmetic (pylance's month_day_nano interval) with a clear
+error. Phase C is split: **C1** integers and floats (a typed pass through `guess()` /
+`result_type` and evaluation, wrapping, the error messages); **C2** decimals; **C3** temporal,
+CAST, coalesce leftovers.
+
 ## 3. Oracles
 
 `python3 tools/pylance_suite.py -k "<test names>" 2>&1 | grep -E "^FAILED|passed|failed" | tail -15`
