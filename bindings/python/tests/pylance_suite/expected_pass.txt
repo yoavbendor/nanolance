@@ -628,6 +628,12 @@ tests/test_lance.py::test_roundtrip_schema
 tests/test_lance.py::test_roundtrip_types
 tests/test_lance.py::test_table_roundtrip[False]
 tests/test_lance.py::test_table_roundtrip[True]
+tests/test_lance.py::test_tokenize_fts_query[a::b-options3-expected3]
+tests/test_lance.py::test_tokenize_fts_query[getUserName-options2-expected2]
+tests/test_lance.py::test_tokenize_fts_query[the cats and dogs-options0-expected0]
+tests/test_lance.py::test_tokenize_fts_query[the skip alpha-options1-expected1]
+tests/test_lance.py::test_tokenize_fts_query_can_disable_max_token_length
+tests/test_lance.py::test_tokenize_fts_query_validates_analyzer_options
 tests/test_lance.py::test_with_row_id[with_row_address-_rowaddr]
 tests/test_lance.py::test_with_row_id[with_row_id-_rowid]
 tests/test_log.py::test_default_logger_level

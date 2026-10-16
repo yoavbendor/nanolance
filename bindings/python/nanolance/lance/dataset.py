@@ -1145,13 +1145,14 @@ class LanceDataset(pa.dataset.Dataset):
         params["format_version"] = version
         params["block_size"] = block
 
-    def _inverted_params(self, kwargs) -> str:
-        """The analyzer settings among `kwargs` (taken out of it) as the native layer's JSON."""
+    @staticmethod
+    def _inverted_params(kwargs) -> str:
+        """The analyzer settings among `kwargs` (taken out of it) as the native layer's JSON (also for tokenize)."""
         import json
 
         params = {}
         for key in list(kwargs):
-            if key in self._INVERTED_OPTIONS:
+            if key in LanceDataset._INVERTED_OPTIONS:
                 value = kwargs.pop(key)
                 if value is not None or key in ("max_token_length", "custom_stop_words"):
                     params[key] = value
@@ -1160,8 +1161,8 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs.pop(ignored, None)
         if kwargs:
             raise unsupported(f"INVERTED index options {sorted(kwargs)}")
-        self._inverted_analyzer(params)
-        self._inverted_format_and_block(params)
+        LanceDataset._inverted_analyzer(params)
+        LanceDataset._inverted_format_and_block(params)
         return json.dumps(params)
 
     def _create_inverted_index(self, column, name, replace, kwargs) -> "LanceDataset":

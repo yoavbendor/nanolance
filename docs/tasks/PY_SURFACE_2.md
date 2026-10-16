@@ -86,3 +86,10 @@ Tails of: `cd build && ctest -j8 | grep "tests passed"` (if C++ changed); the or
 test file; `python3 tools/pylance_suite.py | tail -4`; last, once:
 `cd bindings/python && python3 -m pytest -o addopts= -q -rf -p no:cacheprovider tests | tail -3`.
 Files changed, per-test status, decisions, questions.
+
+**Q1 outcome (2026-10-15):** done. `lance.tokenize` / `FtsToken` over the C++ analyzer (`_fts_tokenize`
+binding), ~50 option sets equal to pylance's; all 6 tokenize tests (+6, 1115). An unknown base
+tokenizer is now a ValueError (`unknown base tokenizer X (...)`, as pylance) for create_scalar_index
+too. Divergences: stemming / stop words outside English are NotSupported (nanolance's analyzer is
+English-only); unknown language names are accepted when they do not matter (pylance raises) --
+small item.

@@ -36,7 +36,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 | INVERTED format versions 1 / 3, 256-document posting blocks, the code analyzer (16 of pylance's tests) | `docs/tasks/FTS_FORMATS.md` | Haiku 5.5, reviewed by Opus | F1 done 2026-10-15 (+1; the six describe_indices also need JSON + NGRAM indexes); F2 done (+1); F3 done (+8): task done |
 | NGRAM and JSON scalar indexes, the ngram tokenizer for INVERTED (~11 of pylance's tests) | `docs/tasks/NGRAM_JSON.md` | Haiku 5.5, reviewed by Opus | N1 done 2026-10-15 (N1a +5, N1b +4); N2 done (N2a +6, N2b +2); N3 done (+1): task done |
 | Python surface: `lance.log` + Lance's log output, `lance.arrow` (bf16, image types), `lance.sampler` (~50 of pylance's tests) | `docs/tasks/PY_SURFACE.md` | Haiku 5.5, reviewed by Opus | P1 done 2026-10-15 (+17); P2 done (+17); P3 done (+12) |
-| `lance.tokenize`, `lance.Session` / cache sizes, batch (multi-query) KNN (~23 of pylance's tests) | `docs/tasks/PY_SURFACE_2.md` | Haiku 5.5, reviewed by Opus | specified 2026-10-15 (Q1 / Q2 / Q3) |
+| `lance.tokenize`, `lance.Session` / cache sizes, batch (multi-query) KNN (~23 of pylance's tests) | `docs/tasks/PY_SURFACE_2.md` | Haiku 5.5, reviewed by Opus | Q1 done 2026-10-15 (+6); Q2, Q3 next |
 | SQL expressions in projections, `LanceDataset.sql` (~15 of pylance's tests) | `docs/tasks/SQL_SURFACE.md` | Haiku 5.5, reviewed by Opus | specified 2026-10-15 (S1 / S2), after PY_SURFACE_2 |
 | IVF_RQ (RaBitQ), Hamming / binary vectors, fuzzy FTS, icu / jieba / lindera tokenizers, `lance.tokenize` | (Opus: format research first) | -- | not yet specified |
 
@@ -48,6 +48,7 @@ was a 30-line fix; a fresh session per phase kept each one inside its context. N
 "finish" session its known facts up front, and say which pytest flags print a summary.
 
 Small items found by delegated sessions, not yet done:
+- Validate INVERTED / tokenize `language` names against Lance's list (pylance raises ValueError for unknown names; nanolance accepts them when stemming and stop words are off).
 - An intermittent failure in the full Python test run: `tests/test_index_optimize.py::test_vector_model_kept_or_retrained` raised a ValueError (message not captured) in 1 of ~6 full runs on 2026-10-15; 64 isolated runs, 24 of them 8-way parallel, all pass. Suspect: IVF / PQ training under full-suite state or threads. Next time: `-rf --tb=long` on the full run.
 - External blob URIs under a registered base path: the descriptor should carry the base id and a
   base-relative URI (pylance's `test_blob_extension_write_fragments_external_registered_base`).

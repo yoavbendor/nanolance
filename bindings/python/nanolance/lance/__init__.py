@@ -45,6 +45,7 @@ from nanolance.lance.base_path import DatasetBasePath
 from nanolance.lance.fragment import DataFile, DeletionFile, FragmentMetadata, LanceFragment
 from nanolance.lance._transactions import LanceOperation, Transaction
 from nanolance.lance.udf import batch_udf
+from nanolance.lance.fts_tokenize import FtsToken, tokenize
 
 #: The pylance release whose API (and test suite) this module tracks.
 PYLANCE_API_VERSION = "12.0.0"
@@ -58,6 +59,7 @@ __all__ = [
     "DataFile",
     "DatasetBasePath",
     "DeletionFile",
+    "FtsToken",
     "FragmentMetadata",
     "LanceDataset",
     "BlobDescriptor",
@@ -77,6 +79,7 @@ __all__ = [
     "dataset",
     "install_as_lance",
     "uninstall_as_lance",
+    "tokenize",
     "write_dataset",
 ]
 

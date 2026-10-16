@@ -557,3 +557,151 @@ def test_sampler_shards_partition_the_dataset(sampler_dataset):
         reservoir = _json(engine, SAMPLER_SCRIPT, sampler_dataset,
                           json.dumps([{"name": "r", "kind": "reservoir", "kw": {}}]))["r"]
         assert reservoir == [10, 10, True], engine
+
+
+# ---------------------------------------------------------------------------------------------
+# lance.tokenize: the analyzer of an INVERTED index on a query string (tests/test_lance.py of pylance)
+# ---------------------------------------------------------------------------------------------
+
+TOKENIZE_SCRIPT = r"""
+import json, sys
+out = []
+for query, options in json.loads(sys.argv[1]):
+    try:
+        tokens = lance.tokenize(query, **options)
+    except Exception as exc:
+        out.append({"error": [type(exc).__name__, str(exc)]})
+    else:
+        out.append({"tokens": [[t.text, t.position] for t in tokens], "repr": [repr(t) for t in tokens]})
+print(json.dumps(out))
+"""
+
+# Each case: (query, options). Both engines must give the same tokens, positions and reprs.
+TOKENIZE_CASES = [
+    ("the cats and dogs", {}),
+    ("The Cats AND Dogs are running quickly", {}),
+    ("the skip alpha", {"stem": False, "custom_stop_words": ["skip"]}),
+    ("the skip alpha", {"remove_stop_words": False}),
+    ("the cats", {"custom_stop_words": ["cat"]}),
+    ("The", {"custom_stop_words": ["THE"]}),
+    ("running jumps", {"stem": True, "remove_stop_words": False}),
+    ("running jumps", {"stem": False}),
+    ("runs running", {"stem": True, "remove_stop_words": False, "max_token_length": 4}),
+    ("running", {"language": "English", "stem": True}),
+    ("the Cats", {"base_tokenizer": "raw", "remove_stop_words": True}),
+    ("Hello-World foo.bar", {"base_tokenizer": "whitespace"}),
+    ("Hello-World foo.bar", {"base_tokenizer": "raw"}),
+    ("tab\tsep\nnewline", {"base_tokenizer": "raw", "lower_case": False}),
+    ('say "hi" it', {"base_tokenizer": "raw"}),
+    ("the way   the  cats", {"base_tokenizer": "whitespace", "custom_stop_words": ["the"]}),
+    ("hello", {"base_tokenizer": "ngram"}),
+    ("hello world", {"base_tokenizer": "ngram", "min_ngram_length": 2, "max_ngram_length": 3}),
+    ("hello", {"base_tokenizer": "ngram", "min_ngram_length": 2, "max_ngram_length": 3, "prefix_only": True}),
+    ("hello", {"base_tokenizer": "ngram", "min_ngram_length": 3, "max_ngram_length": 3, "lower_case": False}),
+    ("getUserName", {"analyzer": "code", "split_identifiers": True}),
+    ("getUserName", {"analyzer": "code"}),
+    ("getUserName2Abc", {"analyzer": "code", "split_identifiers": True, "split_on_numerics": True,
+                         "preserve_original": False}),
+    ("camelCaseWord and snake_case_name", {"analyzer": "code", "split_identifiers": True}),
+    ("a::b", {"analyzer": "code", "index_operators": True}),
+    ("a::b", {"analyzer": "code"}),
+    ("foo->bar.baz::qux", {"analyzer": "code", "index_operators": True}),
+    ("the Cats!!", {"analyzer": "code", "stem": True, "remove_stop_words": True}),
+    ("", {}),
+    ("   ", {}),
+    ("the", {}),
+    ("the", {"remove_stop_words": False, "stem": False}),
+    ("x" * 41, {}),
+    ("x" * 40, {}),
+    ("x" * 41, {"max_token_length": None}),
+    ("x" * 41, {"max_token_length": 3}),
+    ("the cats", {"max_token_length": 0}),
+    ("café naïve Ünïcödé ß", {}),
+    ("café naïve Ünïcödé ß", {"ascii_folding": False}),
+    ("Straße ＡＢＣ fullwidth", {}),
+    ("Ǆ İ ı", {}),
+    ("日本語 テキスト 中文", {}),
+    ("Привет мир", {}),
+    ("Running Cats", {"lower_case": False}),
+    ("emoji 😀 smile", {}),
+    ("hello_world foo-bar", {}),
+    ("it's don't", {}),
+]
+
+# Each case: (query, options, phrase) -- both engines must raise the same exception type, with the phrase in
+# their messages (pylance adds a "Failed to build tokenizer" prefix and a source location).
+TOKENIZE_ERRORS = [
+    ("getUserName", {"split_identifiers": True}, "code analyzer flags require analyzer='code'"),
+    ("x", {"analyzer": "text", "base_tokenizer": "code"}, "base_tokenizer='code' requires analyzer='code'"),
+    ("x", {"analyzer": "code", "base_tokenizer": "simple"}, "analyzer='code' requires base_tokenizer='code'"),
+    ("x", {"analyzer": "bogus"}, "unknown analyzer 'bogus', expected 'text' or 'code'"),
+    ("hello", {"base_tokenizer": "unknown"}, "unknown base tokenizer unknown"),
+    ("hello", {"base_tokenizer": "ngram", "min_ngram_length": 3, "max_ngram_length": 2},
+     "min_gram must not be greater than max_gram"),
+    ("hello", {"base_tokenizer": "ngram", "min_ngram_length": 0, "max_ngram_length": 2},
+     "min_gram must be greater than 0"),
+]
+
+# Options nanolance's analyzer does not implement (pylance tokenizes them): tokenize raises what
+# create_scalar_index raises, the same type and message.
+TOKENIZE_UNSUPPORTED = [
+    ("Bonjour le monde", {"language": "French"}),
+    ("Привет мир", {"language": "Russian"}),
+    ("the cats", {"language": "French", "remove_stop_words": True, "stem": False}),
+    ("hello", {"base_tokenizer": "jieba/default"}),
+    ("hello", {"base_tokenizer": "icu"}),
+    ("hello", {"base_tokenizer": "lindera/ipadic"}),
+    ("hello", {"base_tokenizer": "unknown"}),
+    ("getUserName", {"split_identifiers": True}),
+]
+
+TOKENIZE_UNSUPPORTED_SCRIPT = r"""
+import json, sys
+import pyarrow as pa
+path, cases = sys.argv[1], json.loads(sys.argv[2])
+lance.write_dataset(pa.table({"text": ["x"]}), path)
+ds = lance.dataset(path)
+
+def raised(call):
+    try:
+        call()
+    except Exception as exc:
+        return [type(exc).__name__, str(exc)]
+    return None
+
+out = []
+for query, options in cases:
+    out.append([raised(lambda: lance.tokenize(query, **options)),
+                raised(lambda: ds.create_scalar_index("text", index_type="INVERTED", **options))])
+print(json.dumps(out))
+"""
+
+
+def test_tokenize_matches_pylance(tmp_path):
+    require_pylance()
+    cases = TOKENIZE_CASES + [(query, options) for query, options, _ in TOKENIZE_ERRORS]
+    expected, actual = (_json(engine, TOKENIZE_SCRIPT, json.dumps(cases)) for engine in ENGINES)
+    assert len(actual) == len(expected) == len(cases)
+    ok = len(TOKENIZE_CASES)
+    mismatches = [(i, e, a) for i, (e, a) in enumerate(zip(expected[:ok], actual[:ok])) if e != a]
+    assert mismatches == []
+    for (query, options, phrase), e, a in zip(TOKENIZE_ERRORS, expected[ok:], actual[ok:]):
+        assert "error" in e and "error" in a, (query, options)
+        assert e["error"][0] == a["error"][0], (query, options, e, a)
+        assert phrase in e["error"][1] and phrase in a["error"][1], (query, options, e, a)
+
+
+def test_tokenize_errors_match_create_scalar_index(tmp_path):
+    results = _json("nanolance", TOKENIZE_UNSUPPORTED_SCRIPT, str(tmp_path / "t.lance"),
+                    json.dumps(TOKENIZE_UNSUPPORTED))
+    assert len(results) == len(TOKENIZE_UNSUPPORTED)
+    for (query, options), (tokenize_error, index_error) in zip(TOKENIZE_UNSUPPORTED, results):
+        assert tokenize_error is not None, (query, options)
+        assert tokenize_error == index_error, (query, options)
+
+
+def test_tokenize_result_is_fts_tokens_with_pylance_repr():
+    require_pylance()
+    expected = _json("pylance", TOKENIZE_SCRIPT, json.dumps([["the cats", {}]]))
+    actual = _json("nanolance", TOKENIZE_SCRIPT, json.dumps([["the cats", {}]]))
+    assert actual == expected == [{"tokens": [["cat", 0]], "repr": ['FtsToken(text="cat", position=0)']}]

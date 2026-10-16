@@ -361,8 +361,13 @@ bool Analyzer::init(const AnalyzerParams& params, std::string& error) {
     params_ = params;
     if (params.base_tokenizer != "simple" && params.base_tokenizer != "whitespace" && params.base_tokenizer != "raw" &&
         params.base_tokenizer != "code" && params.base_tokenizer != "ngram") {
-        error = "the '" + params.base_tokenizer +
-                "' tokenizer is not supported (simple, whitespace, raw, code and ngram are)";
+        // Lance's other base tokenizers (icu, jieba, lindera) exist, nanolance does not implement them.
+        const std::string& base = params.base_tokenizer;
+        const bool lance_tokenizer = base.rfind("icu", 0) == 0 || base.rfind("jieba", 0) == 0 ||
+                                     base.rfind("lindera", 0) == 0;
+        error = lance_tokenizer
+                    ? "the '" + base + "' tokenizer is not supported (simple, whitespace, raw, code and ngram are)"
+                    : "unknown base tokenizer " + base + " (simple, whitespace, raw, code and ngram are supported)";
         return false;
     }
     if (params.base_tokenizer == "ngram" && params.min_ngram_length == 0U) {

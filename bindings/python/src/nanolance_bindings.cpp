@@ -14,6 +14,7 @@
 #include <nanolance/expr.hpp>
 #include <nanolance/jsonb.hpp>
 #include <nanolance/fts_search.hpp>
+#include <nanolance/fts_tokenizer.hpp>
 #include <nanolance/index_optimize.hpp>
 #include <nanolance/index_segments.hpp>
 #include <nanolance/lance_table_reader.hpp>
@@ -1669,6 +1670,27 @@ NB_MODULE(_nanolance, m) {
             return nano_lance::dataset_create_inverted_index(path, column, options, version, e);
         });
         return version;
+    });
+    // lance.tokenize: the analyzer the params JSON describes, run on `text`; (text, position) pairs with
+    // the positions as the index counts them (Python makes them relative to the first token).
+    m.def("_fts_tokenize", [](const std::string& params, const std::string& text) {
+        nano_lance::fts::AnalyzerParams options;
+        std::string error;
+        if (!nano_lance::fts::parse_params(params, options, error)) {
+            throw std::runtime_error(error);
+        }
+        nano_lance::fts::Analyzer analyzer;
+        if (!analyzer.init(options, error)) {
+            throw std::runtime_error(error);
+        }
+        std::vector<nano_lance::fts::Token> tokens;
+        analyzer.tokenize(text, tokens);
+        std::vector<std::pair<std::string, std::uint32_t>> out;
+        out.reserve(tokens.size());
+        for (auto& token : tokens) {
+            out.emplace_back(std::move(token.text), token.position);
+        }
+        return out;
     });
     m.def("_index_segment_decode", [](const nb::bytes& message) { return segment_dict(vec_of(message)); });
     m.def("_index_segment_encode", [](const nb::dict& d) {
