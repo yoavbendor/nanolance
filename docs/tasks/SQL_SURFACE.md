@@ -90,3 +90,13 @@ changed: int32 + float32 -> float32 (nanolance double), uint8 + int32 -> int32 (
 float literal is an error in pylance, `abs(int32)` -> int64 there, `coalesce(x, 'lit')` non-null there,
 `S.X` case-insensitive struct access accepted by nanolance only, a stray trailing `)` accepted by
 pylance only. S2 next.
+
+**S2 outcome (2026-10-16):** done. `ds.sql(sql)` -> `SqlQueryBuilder` -> `SqlQuery` (`_sql.py`): a
+SELECT parser for `*` / expressions / aliases, one FROM table (case-insensitive), WHERE through
+nanolance's filter (scalar indexes apply), ORDER BY columns / aliases (NULLS last ASC, first DESC),
+LIMIT / OFFSET, `count(*)` alone; every other construct is a NotSupportedError naming it. All 9
+target tests (+9, 1144). Divergences: `int32_col * <int literal>` is int64 in DataFusion, int32 here
+(the result-type small item); unaliased computed columns are named as written (pylance: `dataset.id +
+Int64(1)`); without `batch_size` one batch for the result (pylance: one per fragment);
+`batch_size_bytes` validated, not applied; `to_stream_reader` materializes first; `SELECT FROM
+dataset` (no columns) is an error here. Task SQL_SURFACE done.

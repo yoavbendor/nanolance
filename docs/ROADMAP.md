@@ -37,7 +37,7 @@ Tasks needing format archaeology or design calls stay with Opus.
 | NGRAM and JSON scalar indexes, the ngram tokenizer for INVERTED (~11 of pylance's tests) | `docs/tasks/NGRAM_JSON.md` | Haiku 5.5, reviewed by Opus | N1 done 2026-10-15 (N1a +5, N1b +4); N2 done (N2a +6, N2b +2); N3 done (+1): task done |
 | Python surface: `lance.log` + Lance's log output, `lance.arrow` (bf16, image types), `lance.sampler` (~50 of pylance's tests) | `docs/tasks/PY_SURFACE.md` | Haiku 5.5, reviewed by Opus | P1 done 2026-10-15 (+17); P2 done (+17); P3 done (+12) |
 | `lance.tokenize`, `lance.Session` / cache sizes, batch (multi-query) KNN (~23 of pylance's tests) | `docs/tasks/PY_SURFACE_2.md` | Haiku 5.5, reviewed by Opus | ~~done 2026-10-16~~: Q1 (+6), Q2 (+10), Q3 (+7) |
-| SQL expressions in projections, `LanceDataset.sql` (~15 of pylance's tests) | `docs/tasks/SQL_SURFACE.md` | Haiku 5.5, reviewed by Opus | S1 done 2026-10-16 (+3; two tests need list indexing / f16 list cast); S2 next |
+| SQL expressions in projections, `LanceDataset.sql` (~15 of pylance's tests) | `docs/tasks/SQL_SURFACE.md` | Haiku 5.5, reviewed by Opus | ~~done 2026-10-16~~: S1 (+3; two tests need list indexing / f16 list cast), S2 (+9) |
 | IVF_RQ (RaBitQ), Hamming / binary vectors, fuzzy FTS, icu / jieba / lindera tokenizers, `lance.tokenize` | (Opus: format research first) | -- | not yet specified |
 
 Lessons from the first delegated task (blob writers, three Haiku sessions of 95-160k tokens each):

@@ -28,6 +28,7 @@ import pyarrow.dataset
 from nanolance import _nanolance
 from nanolance.lance import _native_log
 from nanolance.lance._errors import NotSupportedError, native, unsupported
+from nanolance.lance._sql import SqlQueryBuilder
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
 from nanolance.lance._session import Session, note_data_files, note_indexes, note_manifest
 from nanolance.lance._transactions import Index, IndexFile, LanceOperation, Transaction
@@ -676,6 +677,10 @@ class LanceDataset(pa.dataset.Dataset):
         )
         options.update({k: v for k, v in given.items() if v is not None})
         return LanceScanner(self, **options)
+
+    def sql(self, sql: str) -> SqlQueryBuilder:
+        """A SELECT over this dataset, as pylance's ``LanceDataset.sql`` (see ``_sql``)."""
+        return SqlQueryBuilder(self, sql)
 
     def to_table(self, columns=None, filter=None, limit=None, offset=None, nearest=None, batch_size=None,
                  batch_size_bytes=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None,
