@@ -263,6 +263,7 @@ tests/test_commit_index.py::test_commit_index_with_index_details
 tests/test_compat_version_snapshot.py::test_workers_share_the_controller_version_snapshot
 tests/test_dataset.py::test_access_config
 tests/test_dataset.py::test_add_null_columns
+tests/test_dataset.py::test_analyze_filtered_scan
 tests/test_dataset.py::test_append_with_commit
 tests/test_dataset.py::test_asof_checkout
 tests/test_dataset.py::test_auto_cleanup
@@ -540,9 +541,15 @@ tests/test_fragment.py::test_fragment_scanner_include_deleted_rows
 tests/test_fragment.py::test_fragment_scanner_include_deleted_rows_matches_dataset_scanner
 tests/test_fragment.py::test_fragment_scanner_include_deleted_rows_requires_row_id
 tests/test_fragment.py::test_fragment_scanner_io_buffer_size_forwarded
+tests/test_fragment.py::test_fragment_scanner_late_materialization[all_early]
+tests/test_fragment.py::test_fragment_scanner_late_materialization[all_late]
+tests/test_fragment.py::test_fragment_scanner_late_materialization[default]
+tests/test_fragment.py::test_fragment_scanner_late_materialization[early_column]
+tests/test_fragment.py::test_fragment_scanner_late_materialization[late_column]
 tests/test_fragment.py::test_fragment_scanner_matches_dataset_scanner[False]
 tests/test_fragment.py::test_fragment_scanner_matches_dataset_scanner[None]
 tests/test_fragment.py::test_fragment_scanner_matches_dataset_scanner[True]
+tests/test_fragment.py::test_fragment_scanner_rejects_invalid_late_materialization
 tests/test_fragment.py::test_fragment_scanner_use_scalar_index_disables_index_query
 tests/test_fragment.py::test_fragment_take_with_json_column
 tests/test_fragment.py::test_fragment_update_columns_basic

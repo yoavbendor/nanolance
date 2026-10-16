@@ -673,7 +673,7 @@ class LanceDataset(pa.dataset.Dataset):
             use_scalar_index=use_scalar_index, prefilter=prefilter, fast_search=fast_search,
             disable_scoring_autoprojection=disable_scoring_autoprojection, batch_size_bytes=batch_size_bytes,
             index_segments=index_segments, row_addr_allowlist=row_addr_allowlist,
-            row_addr_blocklist=row_addr_blocklist,
+            row_addr_blocklist=row_addr_blocklist, late_materialization=late_materialization,
         )
         options.update({k: v for k, v in given.items() if v is not None})
         return LanceScanner(self, **options)
@@ -2787,6 +2787,42 @@ class MergeInsertBuilder:
     def use_index(self, use_index: bool) -> "MergeInsertBuilder":
         return self
 
+    def _clauses(self) -> str:
+        matched = ("UpdateAll" if self._update_all else "Fail" if self._when_matched == "fail"
+                   else "Delete" if self._when_matched == "delete" else "Keep")
+        not_matched = "InsertAll" if self._insert_all else "Keep"
+        by_source = "Delete" if self._delete_by_source else "Keep"
+        return (f"MergeInsert: on=[{', '.join(self._on)}], when_matched={matched}, "
+                f"when_not_matched={not_matched}, when_not_matched_by_source={by_source}")
+
+    def explain_plan(self, source_schema: Optional[pa.Schema] = None, verbose: bool = False) -> str:
+        """The merge's clauses. nanolance runs a merge as one key join (no operator tree), so the plan is
+        the clauses; ``verbose`` adds the conditions and the write mode."""
+        lines = [self._clauses()]
+        if verbose:
+            if self._update_condition:
+                lines.append(f"  when_matched_update_condition={self._update_condition}")
+            if self._delete_condition:
+                lines.append(f"  when_not_matched_by_source_delete_condition={self._delete_condition}")
+            lines.append(f"  write_mode={self._write_mode}")
+        return "\n".join(lines)
+
+    def analyze_plan(self, source, *, schema: Optional[pa.Schema] = None) -> str:
+        """The plan with the row counts the merge would produce, computed by a key join of the source
+        against the dataset. Nothing is written; conditions are not evaluated, so counts that depend on
+        one are left out."""
+        src = _coerce_reader(source, schema).read_all()
+        tgt = self._ds.to_table(columns=self._on)
+        matched = src.join(tgt, keys=self._on, join_type="left semi").num_rows
+        metrics = [f"num_inserted_rows={src.num_rows - matched if self._insert_all else 0}"]
+        if not self._update_condition and self._when_matched != "delete":
+            metrics.append(f"num_updated_rows={matched if self._update_all else 0}")
+        if self._when_matched == "delete":
+            metrics.append(f"num_deleted_rows={matched}")
+        elif self._delete_by_source and not self._delete_condition:
+            metrics.append(f"num_deleted_rows={tgt.join(src.select(self._on), keys=self._on, join_type='left anti').num_rows}")
+        return f"{self._clauses()}\n  metrics=[{', '.join(metrics)}] (dry run: nothing written)"
+
     def execute(self, data_obj, *, schema: Optional[pa.Schema] = None) -> Dict[str, int]:
         reader = _coerce_reader(data_obj, schema)
         target = self._ds._data_schema
@@ -3271,7 +3307,7 @@ class LanceScanner(pa.dataset.Scanner):
                  include_deleted_rows=None, order_by=None, substrait_filter=None, scan_stats_callback=None,
                  blob_handling=None, use_scalar_index=None, prefilter=None, fast_search=None,
                  disable_scoring_autoprojection=None, batch_size_bytes=None, index_segments=None,
-                 row_addr_allowlist=None, row_addr_blocklist=None, **ignored):
+                 row_addr_allowlist=None, row_addr_blocklist=None, late_materialization=None, **ignored):
         self._args = {k: v for k, v in locals().items() if k not in ("self", "ds", "ignored", "__class__")}
         self._args.update(ignored)
         # order_by: the scan without limit and offset (and with the sort columns), sorted, then sliced.
@@ -3378,6 +3414,11 @@ class LanceScanner(pa.dataset.Scanner):
         self._mask = {"row_addr_allowlist": None if row_addr_allowlist is None else bytes(row_addr_allowlist),
                       "row_addr_blocklist": None if row_addr_blocklist is None else bytes(row_addr_blocklist)}
         self._masked = any(v is not None for v in self._mask.values())
+        if late_materialization is not None and not isinstance(late_materialization, (bool, list)):
+            raise ValueError("late_materialization must be a bool or a list of strings")
+        if isinstance(late_materialization, list) and not all(isinstance(c, str) for c in late_materialization):
+            raise ValueError("late_materialization must be a bool or a list of strings")
+        self._late_materialization = late_materialization
 
     def _read_with_deleted(self) -> pa.Table:
         """Every physical row, deleted ones too -- those with a null `_rowid`, as Lance returns them."""
@@ -3398,9 +3439,44 @@ class LanceScanner(pa.dataset.Scanner):
             table = table.drop_columns(["_rowaddr"])
         return table
 
+    def _filter_columns(self) -> List[str]:
+        sql = self._filter or ""
+        return [n for n in self._ds._data_schema.names
+                if re.search(r"(?<![A-Za-z0-9_])" + re.escape(n) + r"(?![A-Za-z0-9_])", sql)]
+
+    def _late_columns(self) -> List[str]:
+        """Columns fetched after the filter, by row address (late_materialization=True or a list of
+        names). Only a filtered projection without row id or row address is read this way; the filter's
+        own columns always come first, so they are never late."""
+        lm = self._late_materialization
+        if not lm or self._filter is None or self._include_deleted or self._masked \
+                or self._with_row_id or self._with_row_address or self._nearest is not None \
+                or self._fts is not None or self._order_by:
+            return []
+        filter_cols = self._filter_columns()
+        return [n for n in self._scan_names() if n not in filter_cols and (lm is True or n in lm)]
+
+    def _scan_names(self) -> List[str]:
+        return list(self._names) if self._names is not None else list(self._ds._data_schema.names)
+
+    def _read_late(self, late: List[str]) -> pa.Table:
+        eager = [n for n in self._scan_names() if n not in late]
+        length = -1 if self._limit is None else self._limit
+        note_data_files(self._ds)
+        with native():
+            head = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version, eager, self._fragment_ids,
+                                                self._offset, length, False, True, False, self._filter,
+                                                self._blob_handling, self._use_scalar_index, **self._mask))
+        taken = self._ds._take(head.column("_rowaddr").to_pylist(), late, addresses=True,
+                               blob_handling=self._blob_handling)
+        return pa.table({n: (taken.column(n) if n in late else head.column(n)) for n in self._scan_names()})
+
     def _read(self, stream: bool):
         if self._include_deleted:
             return self._read_with_deleted()
+        late = self._late_columns()
+        if late:
+            return self._read_late(late)
         if self._filter is None and not self._masked:
             n = self._ds.count_rows() if self._fragment_ids is None else sum(
                 self._ds.get_fragment(i).count_rows() for i in self._fragment_ids
@@ -3728,6 +3804,21 @@ class LanceScanner(pa.dataset.Scanner):
         return self._ds.schema
 
     def explain_plan(self, verbose: bool = False) -> str:
+        return self._explain(None)
+
+    def _read_lines(self, read_metrics) -> List[str]:
+        """The read of a filtered scan: eager columns in one read; late ones (late_materialization) by
+        row address after the filter. ``read_metrics`` (from analyze_plan) goes on the first line."""
+        names = self._scan_names()
+        late = self._late_columns()
+        tail = f", metrics=[{', '.join(read_metrics)}]" if read_metrics else ""
+        if not late:
+            return [f"  LanceRead: projection=[{', '.join(names)}]{tail}"]
+        eager = [n for n in names if n not in late]
+        return [f"  LanceRead: projection=[{', '.join(eager)}]{tail}",
+                f"  LanceRead: projection=[{', '.join(late)}], source=stream(_rowaddr)"]
+
+    def _explain(self, read_metrics) -> str:
         lines = [f"nanolance scan of {self._ds.uri} v{self._ds.version}"]
         if self._nearest is not None:
             first = self._nearest[0] if isinstance(self._nearest, list) else self._nearest
@@ -3740,6 +3831,7 @@ class LanceScanner(pa.dataset.Scanner):
             return "\n".join(lines)
         if self._filter is not None:
             lines.append(f"  filter={self._filter}")
+            lines += self._read_lines(read_metrics)
             if self._use_scalar_index:
                 with native():
                     lines += ["  " + line for line in _nanolance._ds_explain_filter(
@@ -3747,7 +3839,19 @@ class LanceScanner(pa.dataset.Scanner):
         return "\n".join(lines)
 
     def analyze_plan(self) -> str:
-        return self.explain_plan()
+        """The plan, after running the scan. A filtered scan without a scalar index reads every row of
+        its fragments (the filter is evaluated over them), so rows_scanned is their physical row count;
+        with an index the scan reads only what the index returns and rows_scanned is not reported."""
+        plan = self.explain_plan()
+        if self._filter is None or self._nearest is not None or self._fts is not None:
+            return plan
+        rows = self.to_table().num_rows
+        metrics = [f"output_rows={rows}"]
+        if "ScalarIndexQuery" not in plan and self._limit is None and not self._offset:
+            frags = [f for f in self._ds.get_fragments()
+                     if self._fragment_ids is None or f.fragment_id in self._fragment_ids]
+            metrics += [f"rows_scanned={sum(f.physical_rows for f in frags)}", f"fragments_scanned={len(frags)}"]
+        return self._explain(metrics)
 
 
 class ScannerBuilder:

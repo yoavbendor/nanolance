@@ -94,3 +94,19 @@ Decimal / Duration refused; duration literals are unit-unaware) and a 256-bit ke
 indexes -- shared type-system code, grouped with the result-type item on the roadmap. Reviewer also
 fixed a flaky batch-KNN test: with an index and a post-filter the per-query row counts depend on each
 engine's own index, so only query_index's shape is compared there (`matches_singles` stays exact).
+
+**Phase B outcome (2026-10-16), part 1:** item 4 done (`analyze_plan()` runs the scan and prints
+`LanceRead: ... metrics=[output_rows, rows_scanned, fragments_scanned]` for what really ran), item 6
+partial (`late_materialization=` bool / column list, a real late read: filter columns first, then take
+by address; plan lines only for what runs), item 7 partial (`MergeInsertBuilder.explain_plan()`, a dry
+`analyze_plan()`). +7 pylance tests (1159). Reviewer's facts for the rest:
+- Item 6 default (`late_materialization=None`), Lance 12 `MaterializationStyle::Heuristic`
+  (dataset/scanner.rs ~2811): local storage -> a column is read early when its type has a fixed byte
+  width < 10 bytes (`byte_width_opt() < 10`), late otherwise (variable-width types have no fixed width
+  -> late); cloud storage threshold 1000; a blob returned as descriptions is early.
+- Item 7: pylance's `merge_insert(...).analyze_plan(source)` really executes the write (bytes_written,
+  num_files_written) but does NOT commit (the dataset version is unchanged) -- nanolance should write the
+  fragments and report the real counts and bytes, leaving them uncommitted (orphaned files, as Lance).
+- Items 3 (`CountFromMask`: a count answered from an exact scalar-index mask without reading) and 5
+  (index cache hit / miss through `scan_stats_callback` / `ScanStatistics`) need shared scan /
+  planning code: roadmap items, not this bundle.

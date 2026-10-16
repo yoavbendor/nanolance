@@ -144,3 +144,75 @@ def test_decimal_and_duration_index_files_equal_pylance(tmp_path, index_type, ki
     assert ours.keys() == theirs.keys()
     for file in ours:
         assert ours[file].equals(theirs[file]), file
+
+
+# ---------------------------------------------------------------------------------------------
+# Phase B: plans and stats (items 4, 6, 7; items 3 and 5 are not in this file yet)
+
+import re  # noqa: E402
+
+import nanolance.lance as nano  # noqa: E402
+
+
+def test_b4_analyze_filtered_scan_reports_rows_read(tmp_path):
+    # The line pylance's test_analyze_filtered_scan searches for, on nanolance's own plan text.
+    ds = nano.write_dataset(pa.Table.from_pydict({"a": range(100), "b": range(100)}), str(tmp_path / "ds"))
+    plan = ds.scanner(columns=[], filter="a < 50", with_row_id=True).analyze_plan()
+    assert re.search(r"^\s*LanceRead:.*output_rows=50.*rows_scanned=100.*$", plan, re.MULTILINE), plan
+
+
+def test_b4_analyze_plan_with_index_does_not_claim_rows_scanned(tmp_path):
+    ds = nano.write_dataset(pa.Table.from_pydict({"a": range(100)}), str(tmp_path / "ds"))
+    ds.create_scalar_index("a", "BTREE")
+    plan = ds.scanner(columns=[], filter="a < 50", with_row_id=True).analyze_plan()
+    assert "ScalarIndexQuery" in plan
+    assert "output_rows=50" in plan
+    assert "rows_scanned" not in plan
+
+
+@pytest.mark.parametrize(
+    ("late_materialization", "is_late"),
+    [(None, False), (False, False), (True, True), (["values"], True), (["filter"], False)],
+    ids=["default", "all_early", "all_late", "late_column", "early_column"],
+)
+def test_b6_late_materialization_plan_lines_and_results(tmp_path, late_materialization, is_late):
+    lance = require_pylance()
+    table = pa.table({"filter": range(2000), "values": range(2000)})
+    ours = nano.write_dataset(table, str(tmp_path / "ds"), data_storage_version="stable")
+    theirs = lance.write_dataset(table, str(tmp_path / "theirs"), data_storage_version="stable")
+    # Default (None) is pylance's own heuristic; nanolance keeps every column eager, so it is not compared here.
+    if late_materialization is not None:
+        assert ours.scanner(filter="filter % 2 == 0", late_materialization=late_materialization).explain_plan(
+            True
+        ).count("source=stream") == (1 if is_late else 0)
+    expected = theirs.to_table(filter="filter % 2 == 0")
+    assert ours.to_table(filter="filter % 2 == 0", late_materialization=late_materialization) == expected
+
+
+def test_b6_late_materialization_rejects_bad_values(tmp_path):
+    ds = nano.write_dataset(pa.table({"a": range(10)}), str(tmp_path / "ds"))
+    with pytest.raises(ValueError, match="late_materialization must be a bool or a list of strings"):
+        ds.scanner(late_materialization=123)
+
+
+def test_b7_merge_insert_plan_and_dry_run_counts(tmp_path):
+    lance = require_pylance()
+    data = pa.table({"id": [1, 2, 3, 4], "value": ["a", "b", "c", "d"]})
+    ours = nano.write_dataset(data, str(tmp_path / "ours"))
+    theirs = lance.write_dataset(data, str(tmp_path / "theirs"))
+    source = pa.table({"id": [1, 5], "value": ["updated_a", "e"]})
+
+    def builder(ds):
+        return ds.merge_insert("id").when_matched_update_all().when_not_matched_insert_all()
+
+    plan = builder(ours).explain_plan()
+    assert plan.startswith("MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll")
+    assert "when_not_matched_by_source=Keep" in plan
+    assert "MergeInsert" in builder(theirs).explain_plan()
+    assert "write_mode=auto" in builder(ours).explain_plan(verbose=True)
+
+    version = ours.version
+    analysis = builder(ours).analyze_plan(source)
+    assert "num_inserted_rows=1" in analysis and "num_updated_rows=1" in analysis
+    assert "nothing written" in analysis
+    assert ours.version == version and ours.count_rows() == 4
