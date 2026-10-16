@@ -8,6 +8,7 @@ path is compared by building a btree index on decimal128 columns and filtering w
 from __future__ import annotations
 
 import glob
+import math
 import os
 import random
 from decimal import Decimal
@@ -607,3 +608,174 @@ def test_decimal_pairs_that_fit_are_not_refused(tmp_path, flt):
     lance = require_pylance()
     ours, theirs = _datasets(lance, tmp_path, _clash_table())
     _assert_same(ours, theirs, flt)
+
+
+# ---------------------------------------------------------------------------------------------
+# 5. Result types and values of integer and float projections (EXPR_TYPES phase C1). Each
+#    projection is typed as DataFusion types it: the same schema type and values as pylance, or
+#    both refuse and nanolance's message is part of pylance's. The rows are the integer and float
+#    rows of the C0 table (docs/tasks/data/expr_types_c0_table.txt) plus the cases the table lacks.
+#    Filters keep their own semantics (section 5b).
+C1_PROJECTIONS = [
+    "i8 + 3", "i8 - 3", "i8 * 3",
+    "i8 / 3", "i8 % 3", "i16 + 3",
+    "i16 - 3", "i16 * 3", "i16 / 3",
+    "i16 % 3", "i32 + 3", "i32 - 3",
+    "i32 * 3", "i32 / 3", "i32 % 3",
+    "i64 + 3", "i64 - 3", "i64 * 3",
+    "i64 / 3", "i64 % 3", "u8 + 3",
+    "u8 - 3", "u8 * 3", "u8 / 3",
+    "u8 % 3", "u16 + 3", "u16 - 3",
+    "u16 * 3", "u16 / 3", "u16 % 3",
+    "u32 + 3", "u32 - 3", "u32 * 3",
+    "u32 / 3", "u32 % 3", "u64 + 3",
+    "u64 - 3", "u64 * 3", "u64 / 3",
+    "u64 % 3", "i8 + 1.5", "i8 * 1.5",
+    "i32 + 1.5", "i32 * 1.5", "i64 + 1.5",
+    "i64 * 1.5", "u8 + 1.5", "u8 * 1.5",
+    "u32 + 1.5", "u32 * 1.5", "i8 + i8",
+    "i8 + i16", "i8 + i32", "i8 + i64",
+    "i16 + i8", "i32 + i64", "u8 + i8",
+    "u8 + i32", "u8 + u8", "u8 + u32",
+    "u32 + i32", "u8 * i8", "u8 - u8",
+    "u32 - u8", "i64 * u64", "u64 + i8",
+    "i32 + f32", "f32 * f64", "f32 + 1",
+    "f32 * 2.0", "f64 + i8", "f32 + 1.5",
+    "i8 * f32", "f32 / 0", "i32 + 1.0",
+    "u8 + 0.5", "i8 * 100", "i8 + 100",
+    "i32 * 2000000000", "i64 * 9223372036854775807", "i8 / 0",
+    "i32 % 0", "u8 - 10", "u32 - 5",
+    "i8 / 2", "-7 / 2", "i32 / i32",
+    "-i8", "-i16", "-i32",
+    "-i64", "-u8", "-u32",
+    "-f32", "abs(i8)", "abs(i16)",
+    "abs(i32)", "abs(i64)", "abs(u8)",
+    "abs(f32)", "abs(f64)", "abs(-3)",
+    "coalesce(i32, 0)", "coalesce(i8, 0)", "coalesce(i8, 1000)",
+    "coalesce(i32, 1.5)", "coalesce(i64, 2)", "coalesce(i32, i64)",
+    "coalesce(f32, 1.5)", "coalesce(u8, 300)", "i8 + 1000",
+    "i8 - 128", "i8 + 127", "u8 + 300",
+    "u8 - 300", "u8 + -5", "i8 + -129",
+    "i32 + 3000000000", "i64 + 3000000000", "u32 + 4294967296",
+    "u8 * 1000", "i8 / -1", "i8 % -1",
+    "i8 * -1", "i64 / 0", "i64 + f32",
+    "u32 + f32", "u8 + f32", "i64 + f64",
+    "u64 + i64", "u64 + i32", "u16 + i8",
+    "u32 + i8", "i64 * u32", "u64 + u8",
+    "i8 + u64", "u16 + i16", "f32 + 0.1",
+    "f32 * 1e40", "f32 + 1e40", "f32 + 3000000000",
+    "f32 + i64", "f32 + 3.0000001", "f32 * 2",
+    "f32 + 1000000000000", "coalesce(f32, 1)", "coalesce(f32, f64)",
+    "coalesce(i64, 1.5)", "coalesce(u8, -1)", "coalesce(i8, u8)",
+    "coalesce(i8, 1000, i16)", "coalesce(i32, i8)", "-i8 + 1",
+    "abs(i8) + 1", "abs(u32)", "-f64",
+    "abs(i8 + 1)", "u8 + -1", "u64 + -1",
+    "i8 % 0", "i64 / -1", "f32 % 0",
+    "i8 + i8 + 1000", "coalesce(i8,1000,i16)", "(i8 + 1) * 2",
+    "i8 + 1 + 1", "-(i8 + 1)",
+]
+
+# Known divergence, phase C3: arrow_cast to an integer type is parsed as CAST(... AS bigint).
+C1_XFAIL = [
+    "i8 + arrow_cast(1, 'Int32')",
+    "i8 + arrow_cast(1, 'UInt8')",
+]
+
+# Filters keep the rows nanolance returned before phase C1 (a bare float literal or an
+# out-of-range literal is not refused in a filter; see EXPR_TYPES.md, reviewer's decision 1).
+C1_FILTER_ROWS = [
+    ("i8 + 100 > 0", [0, 2]),
+    ("i8 + 100 = -56", []),
+    ("i16 > 40000", []),
+    ("i32 = 7.0", [2]),
+    ("i8 + 1.5 > 0", [0, 2]),
+    ("u8 - 10 > 100", [0]),
+    ("i8 * 100 = 16", []),
+    ("f32 + 0.1 > 1.6", [2]),
+    ("f32 * 1e40 > 0", [0, 2]),
+    ("i8 + i16 > 0", [0, 2]),
+    ("u8 + u8 = 144", []),
+    ("-i8 + 1 = -99", [0]),
+    ("i8 + arrow_cast(1, 'Int32') = 101", [0]),
+    ("coalesce(i8, 1000) = 1000", [3]),
+    ("i32 + f32 > 0", [0, 2]),
+    ("u64 - 3 > 1", [0, 2]),
+    ("i64 * 1.5 > 7", [0, 2]),
+    ("i8 / 0 = 1", "division by zero"),
+    ("u8 + 300 > 0", [0, 1, 2]),
+    ("f32 + 3.0000001 > 4.5", [0, 2]),
+    ("abs(i8 + 1) > 100", [0, 1]),
+    ("i8 - 3 < 0", [1]),
+]
+
+
+def _numeric_table() -> pa.Table:
+    return pa.table(
+        {
+            "i": pa.array(range(4), pa.int64()),
+            "i8": pa.array([100, -128, 7, None], pa.int8()),
+            "i16": pa.array([30000, -5, 7, None], pa.int16()),
+            "i32": pa.array([2000000000, -7, 7, None], pa.int32()),
+            "i64": pa.array([5, -7, 7, None], pa.int64()),
+            "u8": pa.array([200, 1, 7, None], pa.uint8()),
+            "u16": pa.array([60000, 1, 7, None], pa.uint16()),
+            "u32": pa.array([4000000000, 1, 7, None], pa.uint32()),
+            "u64": pa.array([5, 1, 7, None], pa.uint64()),
+            "f32": pa.array([1.5, -2.25, 3.0, None], pa.float32()),
+            "f64": pa.array([0.5, 2.5, -1.25, None], pa.float64()),
+        }
+    )
+
+
+def _numeric_projection(ds, expr):
+    try:
+        t = ds.to_table(columns={"r": expr})
+    except Exception as exc:  # noqa: BLE001 -- the outcome is what is compared
+        return ("error", str(exc))
+    return ("values", str(t.schema.field("r").type), t.column("r").to_pylist())
+
+
+def _same_values(a, b):
+    if len(a) != len(b):
+        return False
+    for x, y in zip(a, b):
+        if isinstance(x, float) and isinstance(y, float) and math.isnan(x) and math.isnan(y):
+            continue
+        if x != y:
+            return False
+    return True
+
+
+@pytest.mark.parametrize("expr", C1_PROJECTIONS)
+def test_numeric_projection_equals_pylance(tmp_path, expr):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _numeric_table())
+    mine = _numeric_projection(ours, expr)
+    other = _numeric_projection(theirs, expr)
+    if other[0] == "error":
+        assert mine[0] == "error", f"pylance refuses {expr!r} ({other[1]}); nanolance returned {mine}"
+        assert mine[1] in other[1], f"{expr!r}: {mine[1]!r} is not in pylance's {other[1]!r}"
+    else:
+        assert mine[0] == "values", f"pylance returns {other[1]} for {expr!r}; nanolance refuses: {mine[1]}"
+        assert mine[1] == other[1], f"{expr!r}: type {mine[1]} against pylance's {other[1]}"
+        assert _same_values(mine[2], other[2]), f"{expr!r}: {mine[2]} against pylance's {other[2]}"
+
+
+@pytest.mark.xfail(strict=True, reason="phase C3: arrow_cast to an integer type is parsed as CAST(... AS bigint)")
+@pytest.mark.parametrize("expr", C1_XFAIL)
+def test_numeric_projection_arrow_cast_equals_pylance(tmp_path, expr):
+    lance = require_pylance()
+    ours, theirs = _datasets(lance, tmp_path, _numeric_table())
+    mine = _numeric_projection(ours, expr)
+    other = _numeric_projection(theirs, expr)
+    assert mine[0] == "values" and mine[1] == other[1] and _same_values(mine[2], other[2])
+
+
+@pytest.mark.parametrize("flt, rows", C1_FILTER_ROWS)
+def test_numeric_filters_keep_their_rows(tmp_path, flt, rows):
+    ours = nano.write_dataset(_numeric_table(), str(tmp_path / "nano.lance"))
+    got = _rows(ours, flt)
+    if isinstance(rows, str):
+        assert got[0] == "error" and rows in got[1], f"{flt!r}: {got}"
+    else:
+        assert got == ("rows", rows), f"{flt!r}"

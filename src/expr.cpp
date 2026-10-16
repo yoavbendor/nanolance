@@ -3482,10 +3482,519 @@ bool Expression::filter(const ArrowArray& batch, std::vector<std::uint8_t>& keep
     return true;
 }
 
+// ── projection types (EXPR_TYPES phase C1) ──────────────────────────────────────────────────────
+//
+// A projected numeric operator is typed as DataFusion types it, not as evaluate()'s dynamic Values:
+// a literal beside a numeric column takes the column's type (cast when it fits, else refused); other
+// literals keep their own type (Int64, UInt64, Float64); int with int widens (same signedness: the
+// wider; mixed: the signed type of max(2 x unsigned width, signed width)); int with float32 is
+// float32, int with float64 is double; results wrap on overflow; division by zero and MIN / -1 are
+// errors. Only projections come here (result_type and evaluate); filters keep their own evaluation.
+
+namespace {
+
+enum class NumType : std::uint8_t { I8, I16, I32, I64, U8, U16, U32, U64, F32, F64 };
+
+bool num_is_int(NumType t) { return t <= NumType::U64; }
+bool num_is_signed(NumType t) { return t <= NumType::I64; }
+
+int num_bits(NumType t) {
+    switch (t) {
+        case NumType::I8:
+        case NumType::U8: return 8;
+        case NumType::I16:
+        case NumType::U16: return 16;
+        case NumType::I32:
+        case NumType::U32:
+        case NumType::F32: return 32;
+        default: return 64;
+    }
+}
+
+std::optional<NumType> num_of_arrow(ArrowType t) {
+    switch (t) {
+        case NANOARROW_TYPE_INT8: return NumType::I8;
+        case NANOARROW_TYPE_INT16: return NumType::I16;
+        case NANOARROW_TYPE_INT32: return NumType::I32;
+        case NANOARROW_TYPE_INT64: return NumType::I64;
+        case NANOARROW_TYPE_UINT8: return NumType::U8;
+        case NANOARROW_TYPE_UINT16: return NumType::U16;
+        case NANOARROW_TYPE_UINT32: return NumType::U32;
+        case NANOARROW_TYPE_UINT64: return NumType::U64;
+        case NANOARROW_TYPE_FLOAT: return NumType::F32;
+        case NANOARROW_TYPE_DOUBLE: return NumType::F64;
+        default: return std::nullopt;
+    }
+}
+
+ArrowType num_arrow(NumType t) {
+    switch (t) {
+        case NumType::I8: return NANOARROW_TYPE_INT8;
+        case NumType::I16: return NANOARROW_TYPE_INT16;
+        case NumType::I32: return NANOARROW_TYPE_INT32;
+        case NumType::I64: return NANOARROW_TYPE_INT64;
+        case NumType::U8: return NANOARROW_TYPE_UINT8;
+        case NumType::U16: return NANOARROW_TYPE_UINT16;
+        case NumType::U32: return NANOARROW_TYPE_UINT32;
+        case NumType::U64: return NANOARROW_TYPE_UINT64;
+        case NumType::F32: return NANOARROW_TYPE_FLOAT;
+        default: return NANOARROW_TYPE_DOUBLE;
+    }
+}
+
+/// The names DataFusion gives these types in its errors ('Int8', 'UInt64', 'Float32').
+const char* num_name(NumType t) {
+    switch (t) {
+        case NumType::I8: return "Int8";
+        case NumType::I16: return "Int16";
+        case NumType::I32: return "Int32";
+        case NumType::I64: return "Int64";
+        case NumType::U8: return "UInt8";
+        case NumType::U16: return "UInt16";
+        case NumType::U32: return "UInt32";
+        case NumType::U64: return "UInt64";
+        case NumType::F32: return "Float32";
+        default: return "Float64";
+    }
+}
+
+/// The array type named in Arrow's abs() overflow error ('Int8Array').
+const char* num_array_name(NumType t) {
+    switch (t) {
+        case NumType::I8: return "Int8Array";
+        case NumType::I16: return "Int16Array";
+        case NumType::I32: return "Int32Array";
+        default: return "Int64Array";
+    }
+}
+
+/// The largest value of a signed / unsigned integer type of `t`'s width.
+std::uint64_t num_umax(NumType t) { return ~std::uint64_t{0} >> (64 - num_bits(t)); }
+std::int64_t num_smax(NumType t) { return static_cast<std::int64_t>(num_umax(t) >> 1); }
+std::int64_t num_smin(NumType t) { return -num_smax(t) - 1; }
+
+/// The type of the common width of two numeric operands. A u64 with a signed int needs decimal128,
+/// which is phase C2: `decimal` is set and the projection keeps its own typing.
+NumType common_num(NumType a, NumType b, bool& decimal) {
+    if (a == b) {
+        return a;
+    }
+    if (!num_is_int(a) && !num_is_int(b)) {
+        return NumType::F64;  // float32 with float64
+    }
+    if (!num_is_int(a) || !num_is_int(b)) {
+        // int with float32 is float32; int with float64 is double
+        const NumType f = num_is_int(a) ? b : a;
+        return f == NumType::F32 ? NumType::F32 : NumType::F64;
+    }
+    if (num_is_signed(a) == num_is_signed(b)) {
+        return num_bits(a) >= num_bits(b) ? a : b;
+    }
+    const NumType u = num_is_signed(a) ? b : a;
+    const NumType s = num_is_signed(a) ? a : b;
+    const int bits = std::max(2 * num_bits(u), num_bits(s));
+    if (bits > 64) {
+        decimal = true;
+        return s;
+    }
+    switch (bits) {
+        case 16: return NumType::I16;
+        case 32: return NumType::I32;
+        default: return NumType::I64;
+    }
+}
+
+/// Whether an integer literal (Int or UInt) is in range for the integer type `t`.
+bool int_literal_fits(const Value& v, NumType t) {
+    const std::uint64_t umax = num_umax(t);
+    if (v.kind == Kind::UInt) {
+        return num_is_signed(t) ? v.u <= static_cast<std::uint64_t>(num_smax(t)) : v.u <= umax;
+    }
+    if (num_is_signed(t)) {
+        return v.i >= num_smin(t) && v.i <= num_smax(t);
+    }
+    return v.i >= 0 && static_cast<std::uint64_t>(v.i) <= umax;
+}
+
+/// `raw` (two's complement bits) wrapped to the width of integer type `t`.
+Value int_value(std::uint64_t raw, NumType t) {
+    if (num_is_signed(t)) {
+        switch (num_bits(t)) {
+            case 8: return Value::integer(static_cast<std::int8_t>(raw));
+            case 16: return Value::integer(static_cast<std::int16_t>(raw));
+            case 32: return Value::integer(static_cast<std::int32_t>(raw));
+            default: return Value::integer(static_cast<std::int64_t>(raw));
+        }
+    }
+    return Value::uinteger(raw & num_umax(t));
+}
+
+/// `v` as a value of numeric type `t`: integers take t's signedness, float32 values are rounded once.
+Value as_num(const Value& v, NumType t) {
+    if (v.is_null()) {
+        return v;
+    }
+    if (num_is_int(t)) {
+        return int_value(v.kind == Kind::UInt ? v.u : static_cast<std::uint64_t>(v.i), t);
+    }
+    if (t == NumType::F32) {
+        if (v.kind == Kind::UInt) {
+            return Value::real(static_cast<float>(v.u));
+        }
+        if (v.kind == Kind::Int) {
+            return Value::real(static_cast<float>(v.i));
+        }
+        return Value::real(round_to_float32(v.d));
+    }
+    if (v.kind == Kind::UInt) {
+        return Value::real(static_cast<double>(v.u));
+    }
+    if (v.kind == Kind::Int) {
+        return Value::real(static_cast<double>(v.i));
+    }
+    return Value::real(v.d);
+}
+
+struct TypedNode {
+    enum class Shape : std::uint8_t { Constant, Column, Arith, Neg, Abs, Coalesce };
+    Shape shape = Shape::Constant;
+    Op op = Op::Add;  // Arith
+    NumType type = NumType::I64;
+    bool decimal = false;          // Arith: u64 with a signed int, decimal128(p, 0) (root only)
+    int precision = 0;             // Arith when decimal
+    Value constant;                // Constant: already of `type`
+    const Node* column = nullptr;  // Column: the bound column reference
+    std::vector<std::unique_ptr<TypedNode>> args;
+};
+using TypedPtr = std::unique_ptr<TypedNode>;
+
+/// The decimal precision DataFusion gives an integer type (i8 3, i16 5, i32 10, i64 20).
+int int_precision(NumType t) {
+    switch (num_bits(t)) {
+        case 8: return 3;
+        case 16: return 5;
+        case 32: return 10;
+        default: return 20;
+    }
+}
+
+/// A numeric column (not a list element) and its type.
+std::optional<NumType> numeric_column(const Node& n) {
+    if (n.op != Op::Column) {
+        return std::nullopt;
+    }
+    for (const auto e : n.column.elements) {
+        if (e != ColumnRef::kNoElement) {
+            return std::nullopt;
+        }
+    }
+    return num_of_arrow(n.column.type);
+}
+
+// Builders return true with `out` set. false with an empty `error` means the expression is not one
+// of the typed shapes (the caller keeps its own typing); false with an error refuses it, as pylance does.
+
+bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root = false);
+
+bool build_literal(const Node& n, std::optional<NumType> beside, TypedPtr& out, std::string& error) {
+    const Value& v = n.literal;
+    if (v.kind != Kind::Int && v.kind != Kind::UInt && v.kind != Kind::Double) {
+        return false;
+    }
+    NumType t = NumType::F64;
+    if (v.kind == Kind::Int) {
+        t = beside ? *beside : NumType::I64;
+    } else if (v.kind == Kind::UInt) {
+        t = beside ? *beside : NumType::U64;
+    } else if (beside) {
+        t = *beside;
+    }
+    const bool refused = num_is_int(t) && (v.kind == Kind::Double || !int_literal_fits(v, t));
+    if (refused) {
+        error = "Received literal " + datafusion_literal(v) + " and could not convert to literal of type '" +
+                num_name(t) + "'";
+        return false;
+    }
+    out = std::make_unique<TypedNode>();
+    out->shape = TypedNode::Shape::Constant;
+    out->type = t;
+    out->constant = as_num(v, t);
+    return true;
+}
+
+/// An operand of a numeric operator: where the operator is the projection's root, a literal takes the
+/// type of a numeric column beside it (pylance narrows nowhere deeper: `abs(i8 + 1)` is int64).
+bool build_operand(const Node& n, const Node& other, bool narrow, TypedPtr& out, std::string& error) {
+    if (n.op == Op::Literal) {
+        return build_literal(n, narrow ? numeric_column(other) : std::nullopt, out, error);
+    }
+    return build_typed(n, out, error);
+}
+
+bool build_typed(const Node& n, TypedPtr& out, std::string& error, bool root) {
+    if (const auto t = numeric_column(n)) {
+        out = std::make_unique<TypedNode>();
+        out->shape = TypedNode::Shape::Column;
+        out->type = *t;
+        out->column = &n;
+        return true;
+    }
+    switch (n.op) {
+        case Op::Literal:
+            return build_literal(n, std::nullopt, out, error);
+        case Op::Add:
+        case Op::Sub:
+        case Op::Mul:
+        case Op::Div:
+        case Op::Mod: {
+            TypedPtr a;
+            TypedPtr b;
+            if (!build_operand(*n.args[0], *n.args[1], root, a, error) ||
+                !build_operand(*n.args[1], *n.args[0], root, b, error)) {
+                return false;
+            }
+            bool decimal = false;
+            const NumType t = common_num(a->type, b->type, decimal);
+            if (decimal && (!root || n.op == Op::Div || n.op == Op::Mod)) {
+                return false;  // decimal division and remainder are phase C2
+            }
+            out = std::make_unique<TypedNode>();
+            out->shape = TypedNode::Shape::Arith;
+            out->op = n.op;
+            out->type = t;
+            out->decimal = decimal;
+            if (decimal) {
+                // DataFusion's decimal rules for these integer precisions: add/sub max + 1, mul sum + 1
+                const int pa = int_precision(a->type);
+                const int pb = int_precision(b->type);
+                out->precision = std::min(38, n.op == Op::Mul ? pa + pb + 1 : std::max(pa, pb) + 1);
+                out->type = NumType::I64;  // not used: the result is decimal
+            }
+            out->args.push_back(std::move(a));
+            out->args.push_back(std::move(b));
+            return true;
+        }
+        case Op::Neg: {
+            TypedPtr a;
+            if (!build_typed(*n.args[0], a, error)) {
+                return false;
+            }
+            if (num_is_int(a->type) && !num_is_signed(a->type)) {
+                error = "Invalid user input: Error during planning: Negation only supports numeric, interval and "
+                        "timestamp types";
+                return false;
+            }
+            out = std::make_unique<TypedNode>();
+            out->shape = TypedNode::Shape::Neg;
+            out->type = a->type;
+            out->args.push_back(std::move(a));
+            return true;
+        }
+        case Op::Func: {
+            if (n.name == "abs" && n.args.size() == 1) {
+                TypedPtr a;
+                if (!build_typed(*n.args[0], a, error)) {
+                    return false;
+                }
+                out = std::make_unique<TypedNode>();
+                out->shape = TypedNode::Shape::Abs;
+                out->type = a->type;
+                out->args.push_back(std::move(a));
+                return true;
+            }
+            if (n.name == "coalesce" && !n.args.empty()) {
+                // coalesce's literals are not narrowed to a column: each keeps its own type.
+                TypedPtr c;
+                out = std::make_unique<TypedNode>();
+                out->shape = TypedNode::Shape::Coalesce;
+                for (const auto& arg : n.args) {
+                    TypedPtr item;
+                    const bool ok = arg->op == Op::Literal ? build_literal(*arg, std::nullopt, item, error)
+                                                           : build_typed(*arg, item, error);
+                    if (!ok) {
+                        return false;
+                    }
+                    out->args.push_back(std::move(item));
+                }
+                bool decimal = false;
+                NumType t = out->args[0]->type;
+                for (std::size_t k = 1; k < out->args.size(); ++k) {
+                    t = common_num(t, out->args[k]->type, decimal);
+                }
+                if (decimal) {
+                    return false;
+                }
+                out->type = t;
+                return true;
+            }
+            return false;
+        }
+        default:
+            return false;
+    }
+}
+
+/// The typed tree of a projection, when its root is a numeric operator. See the builders above.
+bool build_projection(const Node& root, TypedPtr& typed, std::string& error) {
+    error.clear();
+    const bool numeric_root = root.op == Op::Add || root.op == Op::Sub || root.op == Op::Mul ||
+                              root.op == Op::Div || root.op == Op::Mod || root.op == Op::Neg ||
+                              (root.op == Op::Func && (root.name == "abs" || root.name == "coalesce" ||
+                                                       root.name == "arrow_cast"));
+    if (!numeric_root) {
+        return false;
+    }
+    if (!build_typed(root, typed, error, true)) {
+        typed.reset();
+        return false;
+    }
+    return true;
+}
+
+/// `a op b` in type `t`: both operands already of type `t`. Errors are DataFusion's.
+Value arith_typed(Op op, NumType t, const Value& a, const Value& b, Context& ctx) {
+    if (num_is_int(t)) {
+        if (!num_is_signed(t)) {
+            const std::uint64_t x = a.u;
+            const std::uint64_t y = b.u;
+            switch (op) {
+                case Op::Add: return int_value(x + y, t);
+                case Op::Sub: return int_value(x - y, t);
+                case Op::Mul: return int_value(x * y, t);
+                case Op::Div:
+                    if (y == 0) {
+                        return ctx.fail("Divide by zero error");
+                    }
+                    return int_value(x / y, t);
+                default:
+                    if (y == 0) {
+                        return ctx.fail("Divide by zero error");
+                    }
+                    return int_value(x % y, t);
+            }
+        }
+        const std::int64_t x = a.i;
+        const std::int64_t y = b.i;
+        switch (op) {
+            case Op::Add: return int_value(static_cast<std::uint64_t>(x) + static_cast<std::uint64_t>(y), t);
+            case Op::Sub: return int_value(static_cast<std::uint64_t>(x) - static_cast<std::uint64_t>(y), t);
+            case Op::Mul: return int_value(static_cast<std::uint64_t>(x) * static_cast<std::uint64_t>(y), t);
+            case Op::Div:
+                if (y == 0) {
+                    return ctx.fail("Divide by zero error");
+                }
+                if (y == -1 && x == num_smin(t)) {
+                    return ctx.fail("Arithmetic overflow: Overflow happened on: " + std::to_string(x) + " / -1");
+                }
+                return int_value(static_cast<std::uint64_t>(x / y), t);
+            default:
+                if (y == 0) {
+                    return ctx.fail("Divide by zero error");
+                }
+                if (y == -1) {
+                    return Value::integer(0);
+                }
+                return int_value(static_cast<std::uint64_t>(x % y), t);
+        }
+    }
+    if (t == NumType::F32) {
+        const auto x = static_cast<float>(a.d);
+        const auto y = static_cast<float>(b.d);
+        float r = 0.0F;
+        switch (op) {
+            case Op::Add: r = x + y; break;
+            case Op::Sub: r = x - y; break;
+            case Op::Mul: r = x * y; break;
+            case Op::Div: r = x / y; break;
+            default: r = std::fmod(x, y); break;
+        }
+        return Value::real(static_cast<double>(r));
+    }
+    switch (op) {
+        case Op::Add: return Value::real(a.d + b.d);
+        case Op::Sub: return Value::real(a.d - b.d);
+        case Op::Mul: return Value::real(a.d * b.d);
+        case Op::Div: return Value::real(a.d / b.d);
+        default: return Value::real(std::fmod(a.d, b.d));
+    }
+}
+
+Value eval_typed(const TypedNode& t, int64_t row, Context& ctx) {
+    switch (t.shape) {
+        case TypedNode::Shape::Constant:
+            return t.constant;
+        case TypedNode::Shape::Column:
+            return as_num(eval(*t.column, row, ctx), t.type);
+        case TypedNode::Shape::Arith: {
+            if (t.decimal) {
+                const Value a = eval_typed(*t.args[0], row, ctx);
+                const Value b = eval_typed(*t.args[1], row, ctx);
+                if (a.is_null() || b.is_null()) {
+                    return Value::null();
+                }
+                const __int128 x = a.kind == Kind::UInt ? static_cast<__int128>(a.u) : static_cast<__int128>(a.i);
+                const __int128 y = b.kind == Kind::UInt ? static_cast<__int128>(b.u) : static_cast<__int128>(b.i);
+                const __int128 r = t.op == Op::Add ? x + y : t.op == Op::Sub ? x - y : x * y;
+                const auto lo = static_cast<std::uint64_t>(r);
+                const auto hi = static_cast<std::uint64_t>(static_cast<unsigned __int128>(r) >> 64);
+                const std::uint64_t sign = r < 0 ? ~std::uint64_t{0} : 0;
+                return Value::decimal(Limbs256{lo, hi, sign, sign}, 0);
+            }
+            const Value a = as_num(eval_typed(*t.args[0], row, ctx), t.type);
+            const Value b = as_num(eval_typed(*t.args[1], row, ctx), t.type);
+            if (a.is_null() || b.is_null()) {
+                return Value::null();
+            }
+            return arith_typed(t.op, t.type, a, b, ctx);
+        }
+        case TypedNode::Shape::Neg: {
+            const Value a = as_num(eval_typed(*t.args[0], row, ctx), t.type);
+            if (a.is_null()) {
+                return a;
+            }
+            if (num_is_int(t.type)) {
+                return int_value(std::uint64_t{0} - static_cast<std::uint64_t>(a.i), t.type);
+            }
+            return Value::real(-a.d);
+        }
+        case TypedNode::Shape::Abs: {
+            const Value a = as_num(eval_typed(*t.args[0], row, ctx), t.type);
+            if (a.is_null()) {
+                return a;
+            }
+            if (!num_is_int(t.type)) {
+                return Value::real(std::fabs(a.d));
+            }
+            if (!num_is_signed(t.type)) {
+                return a;
+            }
+            if (a.i == num_smin(t.type)) {
+                return ctx.fail(std::string(num_array_name(t.type)) + " overflow on abs(" + std::to_string(a.i) + ")");
+            }
+            return Value::integer(a.i < 0 ? -a.i : a.i);
+        }
+        case TypedNode::Shape::Coalesce:
+            for (const auto& arg : t.args) {
+                const Value v = as_num(eval_typed(*arg, row, ctx), t.type);
+                if (ctx.failed || !v.is_null()) {
+                    return v;
+                }
+            }
+            return Value::null();
+    }
+    return Value::null();
+}
+
+}  // namespace
+
 bool Expression::evaluate(const ArrowArray& batch, const ArrowSchema& type, ArrowArray& out, std::string& error) const {
     error.clear();
     if (!binding_) {
         error = "the expression is not bound to a schema";
+        return false;
+    }
+    TypedPtr typed;
+    if (!build_projection(*root_, typed, error) && !error.empty()) {
         return false;
     }
     ViewGuard guard;
@@ -3509,7 +4018,7 @@ bool Expression::evaluate(const ArrowArray& batch, const ArrowSchema& type, Arro
     ctx.batch = &guard.view;
     ctx.error = &error;
     for (int64_t r = 0; r < batch.length; ++r) {
-        const Value v = eval(*root_, r, ctx);
+        const Value v = typed ? eval_typed(*typed, r, ctx) : eval(*root_, r, ctx);
         if (ctx.failed || !append_value(out, tv, v, ctx)) {
             if (!ctx.failed) {
                 error = "cannot append a value to the output";
@@ -3711,9 +4220,17 @@ bool Expression::result_type(const std::string& name, ArrowSchema& out, std::str
         error = "a projection of a decimal literal is not supported in nanolance (use it in a filter)";
         return false;
     }
+    TypedPtr typed;
+    if (!build_projection(*root_, typed, error) && !error.empty()) {
+        return false;
+    }
     // _cast_list_f16(list): the same container (list or fixed_size_list), its items Float16.
     const bool list_cast = root_->op == Op::Func && root_->name == "_cast_list_f16";
-    const auto g = list_cast ? guess(*root_->args[0], binding_->schema) : guess(*root_, binding_->schema);
+    auto g = list_cast ? guess(*root_->args[0], binding_->schema) : guess(*root_, binding_->schema);
+    if (typed) {
+        g = TypeGuess{};
+        g.type = typed->decimal ? NANOARROW_TYPE_DECIMAL128 : num_arrow(typed->type);
+    }
     int rc = NANOARROW_OK;
     if (g.column != nullptr) {
         rc = ArrowSchemaDeepCopy(g.column, &out);
@@ -3724,6 +4241,8 @@ bool Expression::result_type(const std::string& name, ArrowSchema& out, std::str
         ArrowSchemaInit(&out);
         if (g.type == NANOARROW_TYPE_TIMESTAMP) {
             rc = ArrowSchemaSetTypeDateTime(&out, NANOARROW_TYPE_TIMESTAMP, g.unit, nullptr);
+        } else if (typed && typed->decimal) {
+            rc = ArrowSchemaSetTypeDecimal(&out, NANOARROW_TYPE_DECIMAL128, typed->precision, 0);
         } else {
             rc = ArrowSchemaSetType(&out, g.type == NANOARROW_TYPE_NA ? NANOARROW_TYPE_NA : g.type);
         }

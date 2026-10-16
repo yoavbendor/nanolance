@@ -174,6 +174,15 @@ error. Phase C is split: **C1** integers and floats (a typed pass through `guess
 `result_type` and evaluation, wrapping, the error messages); **C2** decimals; **C3** temporal,
 CAST, coalesce leftovers.
 
+**C1 outcome (2026-10-16):** projections whose root is + - * / %, unary -, abs, coalesce or
+arrow_cast take a typed path (filters never do; their 22 checked cases return the same rows as
+before): literal narrowing at the root binary node only (pylance does not narrow nested literals),
+int widths and wrapping, pylance's divide-by-zero / overflow / abs / unsigned-negation errors,
+float32 arithmetic, u64 with signed -> decimal for + - *. Every int / float row of the C0 table
+matches except `i8 + arrow_cast(1, 'Int32' / 'UInt8')` (the parser turns integer arrow_casts into
+CAST AS bigint: C3; strict xfails). Left: a comparison or boolean projection (`i8 + 100 > 0` as a
+column) keeps the old typing inside; u64-with-signed / and % (C2).
+
 ## 3. Oracles
 
 `python3 tools/pylance_suite.py -k "<test names>" 2>&1 | grep -E "^FAILED|passed|failed" | tail -15`
