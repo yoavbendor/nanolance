@@ -760,6 +760,50 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#vector-indexes-built-and-searched" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vector indexes: built and searched
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#distributed-index-builds" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Distributed index builds
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#full-text-indexes-built-and-searched" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Full-text indexes: built and searched
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#keeping-indexes-up-to-date" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keeping indexes up to date
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#indexes-nanolance-keeps" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -772,6 +816,28 @@
         
       </ul>
     </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#duckdb-polars-pandas-and-lancedb" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DuckDB, Polars, pandas and LanceDB
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#namespaces" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Namespaces
+      
+    </span>
+  </a>
   
 </li>
       
@@ -802,6 +868,17 @@
     <span class="md-ellipsis">
       
         Bugs the suite found in nanolance itself
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#stable-row-ids" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stable row ids
       
     </span>
   </a>
@@ -866,23 +943,31 @@ compared, results are checked against pylance on the same files, in both directi
 </tr>
 <tr>
 <td>Write</td>
-<td><code>lance.write_dataset(data, uri, schema=, mode="create" / "append" / "overwrite", max_rows_per_file=, max_bytes_per_file=)</code>. Takes a table, batches, a reader, pandas, polars, dicts, lists of dicts or pydantic models, another dataset. One version per call, as in pylance. <code>LanceDataset.insert</code>, <code>LanceDataset.from_pydantic_model</code>.</td>
+<td><code>lance.write_dataset(data, uri, schema=, mode="create" / "append" / "overwrite", max_rows_per_file=, max_bytes_per_file=)</code>. Takes a table, batches, a reader, pandas, polars, dicts, lists of dicts or pydantic models, another dataset. One version per call, as in pylance. <code>LanceDataset.insert</code>, <code>LanceDataset.from_pydantic_model</code>. An append may leave out nullable columns: as in Lance, its files hold only the columns given, and the others read as null (a struct or list column as a null value). Unlike pylance, an append whose column types differ from the dataset's is cast rather than refused.</td>
 </tr>
 <tr>
 <td>Read</td>
-<td><code>to_table</code>, <code>to_batches</code>, <code>scanner</code> (+ <code>ScannerBuilder</code>), <code>head</code>, <code>slice</code>, <code>take</code>, <code>_take_rows</code> / <code>take_rows</code>, <code>sample</code>, <code>count_rows</code>, <code>to_pandas</code>. <code>columns=</code> as a list or a <code>{alias: column}</code> rename, <code>limit</code>, <code>offset</code>, <code>batch_size</code>, <code>fragments=</code>, <code>with_row_id</code>, <code>with_row_address</code>, and the system columns <code>_rowid</code>, <code>_rowaddr</code>, <code>_rowoffset</code> in a projection.</td>
+<td><code>to_table</code>, <code>to_batches</code>, <code>scanner</code> (+ <code>ScannerBuilder</code>), <code>head</code>, <code>slice</code>, <code>take</code>, <code>_take_rows</code> / <code>take_rows</code>, <code>sample</code>, <code>count_rows</code>, <code>to_pandas</code>. <code>columns=</code> as a list or a <code>{alias: column}</code> rename (a nested field <code>s.x</code> or <code>`meta-data`.`id`</code> comes back under the name as written), <code>limit</code>, <code>offset</code>, <code>batch_size</code>, <code>fragments=</code>, <code>with_row_id</code>, <code>with_row_address</code>, <code>order_by</code> (column names or <code>ColumnOrdering</code>, exact names, per-key direction and null placement; floats in IEEE total order as Lance sorts them; after the filter, before offset and limit; the result is sorted in memory), <code>batch_size_bytes</code>, <code>LANCE_DEFAULT_BATCH_SIZE</code>, <code>disable_scoring_autoprojection</code>, <code>default_scan_options</code> (the dataset's schema shows the row id columns they add), and the system columns <code>_rowid</code>, <code>_rowaddr</code>, <code>_rowoffset</code>, <code>_row_created_at_version</code>, <code>_row_last_updated_at_version</code> in a projection or a <code>take</code>, and in a filter (<code>_rowid</code> / <code>_rowaddr</code>, evaluated over the scanned rows before limit and offset; not combined with vector or full-text search). Without stable row ids both version columns read 1, as in Lance.</td>
 </tr>
 <tr>
 <td>Versions</td>
-<td><code>version</code>, <code>latest_version</code>, <code>versions()</code> (with pylance's summary metadata), <code>checkout_version</code>, <code>checkout_latest</code>, <code>restore</code></td>
+<td><code>version</code>, <code>latest_version</code>, <code>versions()</code> (with pylance's summary metadata), <code>version_refs()</code>, <code>checkout_version</code> (a number or a tag), <code>checkout_latest</code>, <code>restore</code>; <code>tags</code> (<code>list</code>, <code>list_ordered</code>, <code>get_version</code>, <code>create</code>, <code>update</code>, <code>delete</code>, <code>replace_metadata</code>, in Lance's <code>_refs/tags</code> files, so pylance and nanolance see each other's); <code>cleanup_old_versions</code> / <code>explain_cleanup_old_versions</code> with all of pylance's options, by Lance's rules (the read version, newer and tagged versions kept; files no version names kept until 7 days old; only files no newer than the earliest version kept are listed); automatic cleanup from <code>lance.auto_cleanup.*</code> after every commit (<code>auto_cleanup_options</code>, <code>optimize.enable_auto_cleanup</code> / <code>disable_auto_cleanup</code>); <code>LanceDataset.drop</code> (refused unless the path holds a readable manifest). Branches are not supported.</td>
 </tr>
 <tr>
 <td>Metadata</td>
-<td><code>schema</code> (with its schema metadata), <code>data_storage_version</code>, <code>config</code> / <code>update_config</code> / <code>delete_config_keys</code>, <code>metadata</code> / <code>update_metadata</code>, <code>schema_metadata</code> / <code>update_schema_metadata</code> / <code>replace_schema_metadata</code></td>
+<td><code>schema</code> (with its schema metadata), <code>lance_schema</code> (<code>lance.schema.LanceSchema</code> / <code>LanceField</code>: ids, parents, field metadata, keys, <code>field</code> / <code>field_case_insensitive</code>, <code>from_pyarrow</code>, pickling), <code>data_storage_version</code>, <code>config</code> / <code>update_config</code> / <code>delete_config_keys</code>, <code>metadata</code> / <code>update_metadata</code>, <code>schema_metadata</code> / <code>update_schema_metadata</code> / <code>replace_schema_metadata</code>, <code>update_field_metadata</code> (by path; set, remove, replace)</td>
+</tr>
+<tr>
+<td>Statistics</td>
+<td><code>stats.dataset_stats</code>, <code>stats.data_stats</code> (bytes on disk per field, as Lance sums them), <code>stats.index_stats</code> / <code>index_statistics</code> (the same numbers as pylance's for BTree, Bitmap, LabelList, INVERTED, IVF_FLAT, IVF_PQ and IVF_HNSW_SQ, on either library's index), <code>validate</code></td>
+</tr>
+<tr>
+<td>Transactions</td>
+<td><code>read_transaction</code>, <code>get_transactions</code> (as <code>Transaction</code> / <code>LanceOperation.*</code>, from the <code>_transactions/*.txn</code> file every commit writes; pylance and nanolance read either library's the same way), <code>transaction_properties=</code> and <code>commit_message=</code> on writes. Hand-built transactions: <code>LanceDataset.commit</code> of <code>Append</code>, <code>Overwrite</code>, <code>Delete</code>, <code>Update</code>, <code>Merge</code>, <code>Project</code>, <code>Rewrite</code>, <code>Restore</code>, <code>UpdateConfig</code>, <code>DataReplacement</code> and <code>CreateIndex</code> operations, or of a <code>Transaction</code>; <code>commit_batch</code> (Append transactions); <code>detached=True</code>; <code>max_retries</code>, <code>commit_timeout</code>. Each is applied as Lance's <code>build_manifest</code> applies it, after Lance's checks, and checked against the transactions committed since its read version by Lance's conflict rules (<code>lance.commit.CommitConflictError</code>, <code>retryable</code> or not); the transaction file records the operation as given. <code>MergeInsertBuilder.execute_uncommitted</code>.</td>
 </tr>
 <tr>
 <td>Fragments</td>
-<td><code>get_fragments</code>, <code>get_fragment</code>; <code>LanceFragment</code>: <code>fragment_id</code>, <code>metadata</code> (<code>FragmentMetadata</code>, <code>DataFile</code>, <code>DeletionFile</code>), <code>count_rows</code>, <code>physical_rows</code>, <code>num_deletions</code>, <code>to_table</code>, <code>to_batches</code>, <code>scanner</code>, <code>head</code>, <code>take</code></td>
+<td><code>get_fragments</code>, <code>get_fragment</code>; <code>LanceFragment</code>: <code>fragment_id</code>, <code>metadata</code> (<code>FragmentMetadata</code>, <code>DataFile</code>, <code>DeletionFile</code>, as pylance shapes them: <code>to_json</code> / <code>from_json</code>, pickling), <code>count_rows</code>, <code>physical_rows</code>, <code>num_deletions</code>, <code>to_table</code>, <code>to_batches</code>, <code>scanner</code> (<code>include_deleted_rows</code>), <code>head</code>, <code>take</code>, <code>validate</code>. Writes apart from any commit, for a commit to publish: <code>lance.fragment.write_fragments</code> (fragments or, with <code>return_transaction</code>, the transaction), <code>LanceFragment.create</code>, <code>create_from_file</code>, <code>DataFile.create</code>, <code>delete</code> / <code>delete_rows</code> (a new deletion file), <code>merge_columns</code> (SQL expressions, a function of each batch, or data), <code>merge</code> (a join), <code>update_columns</code> (Lance's tombstoned layout, <code>with_offsets</code>). <code>add_columns</code> with a function or <code>lance.batch_udf</code> (and its checkpoint file).</td>
 </tr>
 <tr>
 <td>Filters</td>
@@ -890,11 +975,15 @@ compared, results are checked against pylance on the same files, in both directi
 </tr>
 <tr>
 <td>Changes</td>
-<td><code>delete</code>, <code>update</code> (SQL values), <code>merge_insert</code> (<code>when_matched_update_all</code> with a condition, <code>when_not_matched_insert_all</code>, <code>when_not_matched_by_source_delete</code>, <code>execute</code>), <code>add_columns</code> (SQL expressions, a <code>pa.field</code> / schema of null columns, or a reader), <code>drop_columns</code>, <code>alter_columns</code> (rename, nullability, data type), <code>optimize.compact_files</code>. Each is one version, and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column.</td>
+<td><code>delete</code>, <code>update</code> (SQL values), <code>merge_insert</code> (<code>when_matched_update_all</code>, with or without a condition over <code>source.*</code> / <code>target.*</code>, <code>when_matched_delete</code>, <code>when_matched_fail</code>, <code>when_not_matched_insert_all</code>, <code>when_not_matched_by_source_delete</code>, <code>write_mode</code>, <code>execute</code>; <code>on</code> defaults to the schema's unenforced primary key; a source with part of the columns keeps the matched rows' other values and gives inserted rows nulls there, written as whole rows in every <code>write_mode</code>), <code>add_columns</code> (SQL expressions, a <code>pa.field</code> / schema of null columns, or a reader), <code>merge</code> (new columns joined on a key; not yet into a dataset with deleted rows), <code>drop_columns</code>, <code>alter_columns</code> (rename, nullability, data type), <code>optimize.compact_files</code>, <code>optimize.optimize_indices</code>. Each is one version (compaction of indexed</td>
+</tr>
+<tr>
+<td>fragments two: see "Keeping indexes up to date"), and writes what pylance writes: deletion files, a schema-only drop, a schema-only null column.</td>
+<td></td>
 </tr>
 <tr>
 <td>Blobs</td>
-<td>Blob v2 columns, every storage kind pylance writes (inline, packed, dedicated, external, empty, null): <code>to_table</code> returns their descriptions, as pylance does, and <code>blob_handling="all_binary"</code> their bytes. <code>take_blobs</code> (by <code>ids</code>, <code>addresses</code> or <code>indices</code>) returns <code>lance.BlobFile</code> handles (<code>read</code>, <code>readall</code>, <code>readinto</code>, <code>seek</code>, <code>tell</code>, <code>size</code>, <code>read_range</code>, <code>read_ranges</code>), and <code>read_blobs</code> the bytes. A handle reads only the bytes asked for, where they are.</td>
+<td>Blob v2 columns, read and written, every storage kind: <code>lance.blob_field</code> (with <code>inline_size_threshold</code>, <code>dedicated_size_threshold</code>, <code>pack_file_size_threshold</code>), <code>lance.blob_array</code>, <code>Blob</code>, <code>BlobType</code>, <code>BlobArray</code>, <code>BlobColumn</code>. A blob given as bytes is stored as Lance stores it -- inline in the data file, in a shared packed sidecar or a dedicated sidecar by size, with the same descriptors, blob ids and sidecar files -- and a URI as an external reference (<code>allow_external_blob_outside_bases=True</code>, as pylance requires; <code>external_blob_mode="ingest"</code> copies the bytes in; <code>blob_pack_file_size_threshold</code>). The prepared-layout writers (<code>PackedBlobWriter</code>, <code>DedicatedBlobWriter</code>, <code>BlobDescriptorArrayBuilder</code>) write the sidecars and descriptor columns for a <code>LanceFileSession.open_writer</code> file committed by <code>DataReplacement</code>, as pylance's do. Nulls, empties, whole-object externals, several blob columns, blob columns inside structs and lists (and lists of structs) -- paged as Lance pages them, with the parents' definition and the lists' repetition levels -- and beside any other column (a vector, a list, a struct), appends (either logical shape; a threshold that differs from the dataset's is refused), delete / update / merge_insert / compaction. The write-side checks and their errors are pylance's. Reading: <code>to_table</code> returns descriptions, <code>blob_handling="all_binary"</code> the bytes; <code>take_blobs</code> returns <code>lance.BlobFile</code> handles (<code>read</code>, <code>readall</code>, <code>readinto</code>, <code>seek</code>, <code>tell</code>, <code>size</code>, <code>read_range</code>, <code>read_ranges</code>), <code>read_blobs</code> the bytes (both also by a nested field path, <code>"info.blob"</code>), <code>read_blob_ranges</code> byte ranges per row, and <code>to_pandas(blob_mode="lazy" / "bytes" / "descriptions")</code> handles, bytes or descriptions. Legacy (v1) blob columns of formats 2.0 and 2.1 read the same ways; writing one is refused for 2.2, as Lance refuses it.</td>
 </tr>
 <tr>
 <td>Files</td>
@@ -957,9 +1046,144 @@ index tests that need only these index types now pass too (<code>test_bitmap_ind
 1.5-3.6x faster than pylance (BTree on int64 0.79 s vs 1.16 s, on strings 1.47 s vs 2.19 s; Bitmap
 0.39 s vs 1.39 s; LabelList 0.97 s vs 2.26 s), and indexed reads are 1.1-3.2x faster, but for a
 one-row lookup returning every column (2.9 ms vs 1.3 ms).</p>
-<p>Not built: Lance's other scalar indexes (INVERTED full-text, NGRAM, ZONEMAP, BLOOMFILTER, JSON, RTREE),
-vector indexes, build options (<code>fragment_ids</code>, <code>train=False</code>, ...), and indexes on a dataset with
-stable row ids. Those a dataset already has are kept, as below.</p>
+<p>Not built: Lance's other scalar indexes (NGRAM, ZONEMAP, BLOOMFILTER, JSON, RTREE; INVERTED is below),
+build options (<code>fragment_ids</code>, <code>train=False</code>, ...).
+Those a dataset already has are kept, as below.</p>
+<h3 id="vector-indexes-built-and-searched">Vector indexes: built and searched<a class="headerlink" href="#vector-indexes-built-and-searched" title="Permanent link">&para;</a></h3>
+<p><code>to_table(nearest={...})</code> (and <code>scanner(nearest=...)</code>, <code>ScannerBuilder.nearest</code>) searches a vector
+column -- a fixed-size list of floats -- as pylance does, and <code>create_index(column, "IVF_FLAT" |
+"IVF_PQ" | "IVF_HNSW_SQ", metric=..., num_partitions=..., num_sub_vectors=..., num_bits=..., m=...,
+ef_construction=..., max_level=...)</code> builds Lance's index for it. The format and the search, step for step, are in <code>docs/VECTOR_INDEX.md</code>.</p>
+<ul>
+<li><strong>Searching</strong> (<code>src/vector_search.cpp</code>) an IVF_FLAT or IVF_PQ index -- built by pylance or by
+  nanolance -- gives pylance's answer: the same rows, in the same order, with the same <code>_distance</code>,
+  under L2, cosine and dot, for Lance's default (adaptive) probing, <code>nprobes</code> / <code>minimum_nprobes</code> /
+  <code>maximum_nprobes</code>, <code>refine_factor</code> and <code>distance_range</code>. With 4-bit PQ, which ranks by quantized
+  distances, rows at equal distance may come in another order. Around the index it does what pylance
+  does: fragments the index does not cover are searched exactly (and the index's candidates
+  re-scored), deleted rows and null vectors never come back, <code>prefilter=True</code> filters before the
+  search and otherwise the k nearest are filtered, <code>fast_search</code> searches only what is indexed, and
+  a <code>metric</code> other than the index's (or <code>use_index=False</code>, or no index) searches exactly.</li>
+<li><strong>Building</strong> (<code>src/vector_index_build.cpp</code>) follows Lance's defaults: k-means as Lance trains it
+  (random initial centroids, at most 50 iterations, 256 training vectors a partition, hierarchical
+  past 256 partitions), partitions from rows / 4096 (IVF_FLAT) or / 8192 (IVF_PQ), PQ codebooks
+  trained and codes chosen by L2 on residuals, files and manifest entry as Lance writes them. pylance
+  lists such an index, reports its stats, searches it with nanolance's results, and
+  <code>optimize_indices</code> folds new rows into it.</li>
+</ul>
+<p><code>test_vector_search.py</code> checks all of it against pylance. Speed, 200,000 vectors of 128 dimensions,
+256 partitions, 4 cores (<code>docs/BENCHMARKS.md</code>, "Vector indexes"): searches 2.6-3.7x faster than
+pylance (IVF_PQ k=10 2.9 ms vs 7.6 ms; IVF_FLAT 1.5 ms vs 5.3 ms), building 1.3x faster (IVF_PQ
+12.7 s vs 16.4 s), at the same recall.</p>
+<p><strong>IVF_HNSW_SQ</strong> (<code>test_hnsw.py</code>): pylance's indexes are searched with pylance's answers -- rows,
+order and distances for L2 and cosine, with and without deletions, for k, <code>nprobes</code>, <code>refine_factor</code>,
+<code>ef</code>, <code>distance_range</code> and filters before and after the search; for dot the same, except filtered
+searches, where pylance's parallel partition search can itself answer differently from run to run.
+Indexes nanolance builds (graphs built as Lance builds them, its node levels and entry points
+exactly) are searched by pylance with nanolance's answers, at the recall of pylance's own, and
+<code>optimize_indices</code> maintains them.</p>
+<p>Not supported: IVF_HNSW_PQ, IVF_HNSW_FLAT, IVF_SQ and IVF_RQ indexes (a search falls back to an exact
+one, its plan says why), batch and multivector queries, binary (Hamming) vectors, building an index on
+float16 / float64 vectors (training a model on them is supported, below).</p>
+<h3 id="distributed-index-builds">Distributed index builds<a class="headerlink" href="#distributed-index-builds" title="Permanent link">&para;</a></h3>
+<p>As pylance 12 builds an index on many machines, and with the same results:</p>
+<ul>
+<li><strong><code>create_index_uncommitted(column, index_type, fragment_ids=..., ...)</code></strong> builds one segment over
+  those fragments under <code>_indices/&lt;uuid&gt;/</code> and returns its <code>Index</code> (uuid, fields, dataset version,
+  <code>fragment_ids</code> as a <code>lance.bitmap.Bitmap</code>, <code>files</code>, <code>index_details</code>) without committing it. BTREE,
+  BITMAP, LABEL_LIST, INVERTED (with the analyzer options), IVF_FLAT, IVF_PQ and IVF_HNSW_SQ.
+  Vector segments take a shared model, <code>ivf_centroids</code> (and for IVF_PQ <code>pq_codebook</code>), or train
+  their own. Lance's rules and errors: BTREE / LABEL_LIST take no <code>index_uuid</code>; scalar types need
+  <code>fragment_ids</code>; a malformed UUID is "Invalid UUID ...".</li>
+<li><strong><code>merge_existing_index_segments(segments)</code></strong> folds a group into one new segment (a new UUID, the
+  union of their fragments, the oldest of their versions), with Lance's checks: one keyed field,
+  disjoint coverage, one index type, and for vector segments one model -- metric, partition count,
+  centroids and PQ codebook equal within 1e-5 ("IVF centroids mismatch across shards"; an
+  IVF_HNSW_SQ merge takes the first segment's SQ bounds, as Lance's does). A single vector segment
+  is returned as it is. nanolance merges by building the segment over the union of the fragments
+  with the first segment's model and settings -- the index Lance's merge produces, not a
+  byte-for-byte merge of the segments' files.</li>
+<li><strong><code>commit_existing_index_segments(name, column, segments)</code></strong> publishes segments (nanolance's or
+  pylance's <code>Index</code> objects) as one logical index, with Lance's replacement rules.</li>
+<li><strong>Legacy INVERTED flow</strong>: <code>create_scalar_index(..., fragment_ids=[f], index_uuid=u)</code> per fragment
+  stages the parts, <code>merge_index_metadata(u, "INVERTED", progress_callback=)</code> builds the index (with
+  Lance's three progress stages), and <code>LanceDataset.commit(uri, LanceOperation.CreateIndex([...],
+  []))</code> commits it (see "Transactions" for the other operations it takes); an <code>Index</code> without
+  <code>index_details</code> gets them from its files, as Lance infers them. BTREE / vector types get Lance's
+  "no longer supports merge_index_metadata".</li>
+<li><strong><code>lance.indices.IndicesBuilder</code></strong> (pylance's own module, its native calls in
+  <code>lance.lance.indices</code>): <code>train_ivf</code>, <code>train_pq</code>, <code>prepare_global_ivf_pq</code> on float16, float32 and
+  float64 vectors, over chosen fragments; <code>transform_vectors</code>, <code>shuffle_transformed_vectors</code>,
+  <code>load_shuffled_vectors</code>. <code>IvfModel</code> / <code>PqModel</code> save and load as Lance files either library reads.
+  Not supported: accelerators, the hamming distance, multivector columns.</li>
+<li><strong><code>centroids()</code></strong> / <strong><code>get_ivf_model()</code></strong> of a vector index.</li>
+</ul>
+<p><code>tests/test_distributed_index.py</code>: segments built, merged and committed by nanolance are answered
+by pylance as the index it builds in one go (the same rows, scores, and for vector indexes with a
+shared model the same rows and distances as pylance's own segments); pylance's segments are merged
+and committed by nanolance and nanolance's committed by pylance; models trained by either load in
+the other.</p>
+<h3 id="full-text-indexes-built-and-searched">Full-text indexes: built and searched<a class="headerlink" href="#full-text-indexes-built-and-searched" title="Permanent link">&para;</a></h3>
+<p><code>full_text_query=</code> on <code>to_table</code> and <code>scanner</code> (and <code>ScannerBuilder.full_text_search</code>) searches text
+columns as pylance does. <code>create_scalar_index(column, "INVERTED" | "FTS", ...)</code> builds Lance's index,
+with LanceDB's default analyzer or the settings given. <code>lance.query</code> has pylance's query classes:
+<code>MatchQuery</code>, <code>MultiMatchQuery</code>, <code>BoostQuery</code>, <code>BooleanQuery</code> (and <code>&amp;</code> / <code>|</code>), <code>PhraseQuery</code>.
+<code>docs/FTS_INDEX.md</code> has the format and the search, step for step.</p>
+<ul>
+<li><strong>Searching</strong> (<code>src/fts_search.cpp</code>) an INVERTED index, built by pylance or by nanolance, gives
+  pylance's answer: the same rows with the same <code>_score</code>, bit for bit. Lance's order among equal
+  scores is arbitrary; nanolance's is by row id. Around the index it does what pylance does:</li>
+<li>rows in fragments the index does not cover are tokenized on the fly and scored with the
+    index's statistics plus theirs;</li>
+<li>deleted rows never come back;</li>
+<li><code>prefilter=True</code> filters before the search, and otherwise the best <code>limit</code> rows are filtered;</li>
+<li><code>fast_search</code> searches only what is indexed;</li>
+<li>a <code>MatchQuery</code> on a column without an index is Lance's flat search: the bare simple tokenizer,
+    the documents' own statistics.</li>
+</ul>
+<p><code>_score</code> comes after the columns asked for, or where <code>columns</code> names it.
+- <strong>Building</strong> (<code>src/fts_index_build.cpp</code>) supports the simple, whitespace and raw tokenizers with
+  English stemming and stop words (or custom ones), lower-casing, ASCII folding and
+  <code>max_token_length</code>. For the same data, the files hold what pylance's and LanceDB's builds hold,
+  byte for byte: vocabulary (an <code>fst</code> map, ported), posting blocks, block scores and impact data.
+  Two things can differ: the partition number, and document order when Lance's workers take
+  fragments out of order. pylance and LanceDB search such an index as their own, and pylance's
+  <code>optimize_indices</code> merges new rows into it.
+- <strong>Phrase queries</strong> (<code>PhraseQuery</code>, with <code>slop</code>, or a string in double quotes) on indexes with
+  positions (<code>with_position=True</code>), built by pylance or by nanolance, give pylance's rows and
+  scores, unindexed and deleted rows included (<code>test_fts_phrase.py</code>, and 1,050 random phrases
+  checked against pylance).</p>
+<p><code>test_fts.py</code> checks all of it against pylance. Speed, 500,000 documents, 4 cores
+(<code>docs/BENCHMARKS.md</code>, "Full-text (INVERTED) indexes"):
+- building takes 4.1 s against pylance's 7.1 s, for an index of the same size;
+- searches are 1.8-8.9x faster: one common word, best 10, 0.31 ms vs 2.74 ms; three words 1.23 ms
+  vs 2.65 ms.</p>
+<p>Not supported:
+- fuzzy matching (<code>fuzziness</code> other than 0);
+- tokenizers other than simple, whitespace and raw (icu, ngram, code, jieba, lindera), and
+  languages other than English;
+- full-text search over list columns;
+- 256-document posting blocks (index format v3).</p>
+<h3 id="keeping-indexes-up-to-date">Keeping indexes up to date<a class="headerlink" href="#keeping-indexes-up-to-date" title="Permanent link">&para;</a></h3>
+<p><code>optimize.optimize_indices(num_indices_to_merge=None, index_names=None, retrain=False)</code> does what
+pylance's does (<code>lance/src/index/append.rs</code>), for the index kinds nanolance builds:</p>
+<ul>
+<li>the last <code>num_indices_to_merge</code> segments of each index (1 by default) are replaced by one covering
+  their fragments that still exist and every fragment no segment covers; 0 adds a segment over the
+  uncovered fragments alone; <code>retrain</code> trains a vector index's model anew over every fragment;</li>
+<li>the new segment keeps the replaced segment's parameters: a scalar index's type; an INVERTED index's
+  analyzer and its documents (deleted rows too, which Lance keeps counting until a rebuild, so the
+  scores stay pylance's, bit for bit); a vector index's centroids and PQ codebook, new rows assigned
+  and encoded with them, then the partitions rebalanced as Lance 12 rebalances them (split those over
+  four times the target size, join those under a quarter of it), even when nothing is new;</li>
+<li>every index optimized is committed in one version; an index with nothing to do is left alone; an
+  index of a kind nanolance cannot build (IVF_HNSW_PQ, NGRAM, ZONEMAP, ...) fails the call, so name
+  the others in <code>index_names</code>.</li>
+</ul>
+<p><code>test_index_optimize.py</code> optimizes copies of the same dataset with pylance and with nanolance and
+checks, with pylance: the same segments and coverage, no unindexed rows, the same filter rows,
+bit-identical full-text scores, the same vector distances and partition counts. Compaction uses the
+same machinery to give its rewritten rows back to the indexes.</p>
 <h3 id="indexes-nanolance-keeps">Indexes nanolance keeps<a class="headerlink" href="#indexes-nanolance-keeps" title="Permanent link">&para;</a></h3>
 <p>Every commit nanolance makes
 -- append, delete, update, <code>merge_insert</code>, column changes, compaction, restore -- writes the
@@ -983,7 +1207,7 @@ lance-table's <code>index_maintenance.rs</code>), so pylance goes on using them:
 </tr>
 <tr>
 <td>compaction</td>
-<td>the fragments it rewrites leave every index's coverage (the index points at their rows' old places)</td>
+<td>the fragments it rewrites leave every index's coverage (the index points at their rows' old places); then, in a second version, the indexes nanolance can rebuild take them back (<code>compact_files(reindex=False)</code> leaves them out)</td>
 </tr>
 <tr>
 <td>overwrite</td>
@@ -999,23 +1223,84 @@ lance-table's <code>index_maintenance.rs</code>), so pylance goes on using them:
 full-text and IVF_PQ indexes with pylance, changes the dataset with nanolance, and checks every
 indexed query against a plain scan. A dataset whose index section nanolance cannot read stays
 readable, but nanolance refuses to commit to it rather than drop its indices.</p>
+<h2 id="duckdb-polars-pandas-and-lancedb">DuckDB, Polars, pandas and LanceDB<a class="headerlink" href="#duckdb-polars-pandas-and-lancedb" title="Permanent link">&para;</a></h2>
+<p>A <code>nanolance.lance</code> dataset is a <code>pyarrow.dataset.Dataset</code> (its scanner a <code>pyarrow.dataset.Scanner</code>,
+its fragments <code>pyarrow.dataset.Fragment</code>s), as pylance's is, so the engines that read pylance
+datasets read nanolance's the same way, with projections and filters pushed into the scan:</p>
+<div class="language-python highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">nanolance</span><span class="o">.</span><span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">&quot;data.lance&quot;</span><span class="p">)</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">duckdb</span><span class="o">.</span><span class="n">sql</span><span class="p">(</span><span class="s2">&quot;SELECT s, count(*) FROM ds WHERE id &gt; 500 GROUP BY s&quot;</span><span class="p">)</span>   <span class="c1"># replacement scan</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="n">duckdb</span><span class="o">.</span><span class="n">from_arrow</span><span class="p">(</span><span class="n">ds</span><span class="p">)</span>                                               <span class="c1"># a relation</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="n">ds</span><span class="o">.</span><span class="n">to_polars</span><span class="p">()</span>                         <span class="c1"># a Polars LazyFrame, as LanceDB&#39;s Table.to_polars()</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="n">polars</span><span class="o">.</span><span class="n">scan_pyarrow_dataset</span><span class="p">(</span><span class="n">ds</span><span class="p">)</span>        <span class="c1"># the same</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="n">ds</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">()</span>                         <span class="c1"># as pylance&#39;s (blob columns per blob_mode)</span>
+</code></pre></div>
+<p>Other Lance implementations read the files nanolance writes: DuckDB's <code>lance</code> community extension
+(scans, filters, <code>lance_vector_search</code> and <code>lance_fts</code> over the IVF_PQ and INVERTED indexes
+nanolance built) and LanceDB (<code>open_table</code> on a nanolance dataset: <code>to_arrow</code>, <code>to_polars</code>,
+<code>to_pandas</code>, vector and full-text <code>search</code>, <code>where</code>; nanolance reads and appends to LanceDB's own
+tables, and LanceDB to nanolance's). <code>tests/test_interop.py</code> checks each against pylance and against
+the engine over the same table in memory; <code>tools/interop_suite.py</code> runs it in environments with the
+DuckDB extension (built for DuckDB 1.5.0, not 1.5.5) and LanceDB installed.</p>
+<h2 id="namespaces">Namespaces<a class="headerlink" href="#namespaces" title="Permanent link">&para;</a></h2>
+<p><code>lance.namespace.DirectoryNamespace</code>, <code>RestNamespace</code> and <code>RestAdapter</code>, and <code>lance.dataset</code> /
+<code>write_dataset</code> / <code>LanceDataset.commit</code> with <code>namespace_client</code> and <code>table_id</code>, are ports of Lance's
+(lance-namespace-impls 12: <code>dir.rs</code>, <code>dir/manifest.rs</code>, <code>rest.rs</code>, <code>rest_adapter.rs</code>), in Python over
+nanolance's datasets; <code>lance_namespace.connect("dir" | "rest", ...)</code> finds them.</p>
+<ul>
+<li><strong>The catalog on disk is Lance's.</strong> Root tables live at <code>&lt;root&gt;/&lt;name&gt;.lance</code>; with the manifest
+  enabled (the default) the <code>&lt;root&gt;/__manifest</code> Lance table records every namespace and table
+  (<code>object_id</code> -- the id joined by <code>$</code> --, <code>object_type</code>, <code>location</code>, <code>metadata</code> as JSON,
+  <code>base_objects</code>), and child tables get <code>&lt;hash&gt;_&lt;object_id&gt;</code> directories. Every change rewrites
+  that table as one fragment and commits it as an Overwrite at exactly the next version, so writers
+  in this process, other processes and pylance retry against what won (<code>commit_retries</code>). Either
+  library reads and writes the other's catalog; <code>tests/test_namespace.py</code> checks that both ways,
+  with both libraries writing one catalog at once.</li>
+<li><strong>Operations</strong>: namespaces (create, describe, list, exists, drop), tables (create with
+  Create / ExistOk / Overwrite, declare, describe with <code>check_declared</code> and
+  <code>load_detailed_metadata</code>, exists, list with pagination and <code>include_declared</code>, drop, register
+  with Lance's location checks, deregister, also without the manifest through <code>.lance-reserved</code> /
+  <code>.lance-deregistered</code> markers), versions (list, describe, create with Lance's version CAS,
+  batch delete), data (count rows, insert, merge insert, update, delete, query with filters,
+  projection, vector and full-text search, returned as Arrow IPC), indexes (create, create scalar,
+  list, stats, drop), tags, restore, schema metadata, table stats, query plans, add / alter / drop
+  columns, describe / alter transaction, ops metrics. Errors are lance_namespace's exceptions with
+  Lance's words: the test compares 21 failing calls against pylance's.</li>
+<li><strong>Managed versioning</strong> (<code>table_version_tracking_enabled</code>): <code>lance.dataset</code> resolves versions with
+  <code>list_table_versions</code> / <code>describe_table_version</code>, and every version nanolance commits through such
+  a dataset is published with <code>create_table_version</code>. nanolance has already written the manifest
+  itself (atomically), so the namespace sees the version published with the same bytes and takes
+  the call as an idempotent retry -- right for directory-backed catalogs; a namespace that keeps
+  versions somewhere else records them too, but cannot veto them.</li>
+<li><strong>REST</strong>: the client and the adapter speak the namespace REST spec as Lance's do (ids joined by the
+  delimiter and percent-encoded, Arrow IPC bodies, <code>ErrorResponse</code> with Lance's HTTP statuses, the
+  dynamic context provider's <code>headers.*</code>), so nanolance's client works against Lance's adapter and
+  Lance's client against nanolance's.</li>
+<li><strong>Not yet</strong>: table branches (nanolance has no branches), credential vending (local roots only),
+  <code>rename_table</code> (Lance's directory namespace refuses it too), materialized views, structured
+  full-text queries in <code>query_table</code>.</li>
+</ul>
 <h2 id="what-is-not-implemented">What is not implemented<a class="headerlink" href="#what-is-not-implemented" title="Permanent link">&para;</a></h2>
 <p>These raise <code>NotImplementedError</code> (<code>nanolance.lance.NotSupportedError</code>) naming the feature. None of
 them is silently ignored:</p>
 <ul>
-<li><code>order_by</code>, Substrait filters, and SQL functions beyond the list above (regular expressions,
-  JSON, array functions other than <code>array_has_any</code>, <code>array_has_all</code> and <code>array_contains</code> /
-  <code>array_has</code>). A function the filter dialect lacks is refused by name.</li>
-<li>The transaction API (<code>LanceOperation</code>, <code>commit</code>, <code>write_fragments</code>), <code>LanceFragment.merge_columns</code>
-  / <code>update_columns</code>, <code>cleanup_old_versions</code>. Conflicting writers are refused rather than retried:
-  a change built on a version another writer has since replaced fails with "commit conflict".</li>
-<li>Vector and full-text indexes and search (<code>nearest</code>, <code>full_text_query</code>), and scalar indexes other
-  than BTree, Bitmap and LabelList. An index pylance built is kept, though: see "Indexes" below.</li>
-<li>Tags and branches, stable row ids, multiple base paths, shallow and deep clones.</li>
-<li>Writing Lance's inline, packed and dedicated blob layouts (<code>lance.blob_field</code>, <code>lance.blob_array</code>):
-  nanolance writes external blobs, and reads every kind.</li>
-<li>Object stores and namespaces (<code>s3://</code>, <code>gs://</code>, REST and directory namespaces).</li>
-<li>torch and Hugging Face integration, UDFs, blob-file APIs, the memtable write-ahead log
+<li>Substrait filters, <code>LanceDataset.sql</code>, and SQL functions beyond those listed (the filter dialect
+  now has the <code>json_*</code> functions, <code>regexp_match</code> / <code>regexp_like</code>, <code>::</code> / <code>arrow_cast</code> casts and
+  <code>array_has_any</code> / <code>array_has_all</code> / <code>array_contains</code>). A function it lacks is refused by name.</li>
+<li><code>LanceOperation.DataOverlay</code> (Lance 12's unstable overlay files), <code>commit_lock</code>, <code>update_columns</code>
+  of a blob column, writing the legacy (v1) file format or V1 manifest names. (Racing writers are
+  retried as Lance retries them: an append or overwrite is built again on the newer version, a
+  change is rebased when the other writers only added fragments, and a delete, update, merge,
+  compaction or index optimization whose fragments another writer rewrote runs again on the latest
+  version, up to Lance's 20 tries.)</li>
+<li>Fuzzy full-text queries and the full-text features listed under "Full-text indexes",
+  vector indexes other than IVF_FLAT and IVF_PQ, and scalar indexes other than BTree, Bitmap,
+  LabelList and INVERTED. An index pylance built is kept, though: see "Indexes" below.</li>
+<li>Branches, shallow and deep clones.</li>
+<li>External blobs under registered base paths; blob data through <code>add_columns</code> or
+  <code>write_fragments</code>.</li>
+<li>Object stores (<code>s3://</code>, <code>gs://</code>); credential vending and the materialized-view, branch and rename
+  operations of namespaces.</li>
+<li>torch and Hugging Face integration, blob-file APIs, the memtable write-ahead log
   (<code>mem_wal</code>).</li>
 </ul>
 <p>A name from pylance that nanolance does not implement still imports, for example
@@ -1025,10 +1310,10 @@ keeps working. Using such a name raises <code>NotImplementedError</code>.</p>
 <p><code>tools/pylance_suite.py</code> fetches pylance's tests from the Lance repository at the tracked tag, with a
 sparse git checkout into <code>.deps/</code>. Nothing is copied into this repository. It runs them with
 nanolance installed as <code>lance</code>:</p>
-<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w">                 </span><span class="c1"># run; fail if a listed test no longer passes</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w"> </span>--update<span class="w">        </span><span class="c1"># rewrite the list of tests that pass</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w"> </span>--real-pylance<span class="w">  </span><span class="c1"># the same tests against pylance (baseline)</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w"> </span>-k<span class="w"> </span>take<span class="w">         </span><span class="c1"># extra arguments go to pytest</span>
+<div class="language-sh highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w">                 </span><span class="c1"># run; fail if a listed test no longer passes</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w"> </span>--update<span class="w">        </span><span class="c1"># rewrite the list of tests that pass</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w"> </span>--real-pylance<span class="w">  </span><span class="c1"># the same tests against pylance (baseline)</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>python<span class="w"> </span>tools/pylance_suite.py<span class="w"> </span>-k<span class="w"> </span>take<span class="w">         </span><span class="c1"># extra arguments go to pytest</span>
 </code></pre></div>
 <p><code>bindings/python/tests/pylance_suite/expected_pass.txt</code> lists the tests that pass. CI runs the suite
 on every push that touches the bindings (<code>.github/workflows/bindings-python.yml</code>) and fails if a
@@ -1048,7 +1333,7 @@ listed test stops passing, so the list only grows.</p>
 </tr>
 <tr>
 <td>nanolance.lance</td>
-<td><strong>216</strong>, every one of which pylance also passes (189 before scalar indexes)</td>
+<td><strong>828</strong>, every one of which pylance also passes (698 before namespaces, 603 before transactions and fragment-level writes, 483 before distributed index builds, 393 before blobs, 383 before the writer tail, 336 before the small dataset APIs, 316 before JSON columns and filter functions, 312 before compaction planning, 311 before transaction files, 305 before <code>order_by</code>, 286 before version housekeeping, 283 before nested paths, 271 before system columns, 259 before writes with part of the schema, 257 before phrase queries, 254 before optimize_indices and conditional merge_insert, 241 before full-text search, 216 before vector search, 189 before scalar indexes)</td>
 </tr>
 </tbody>
 </table>
@@ -1065,17 +1350,67 @@ listed test stops passing, so the list only grows.</p>
 <tr>
 <td>test_dataset.py</td>
 <td>250</td>
-<td>82</td>
+<td>176</td>
 </tr>
 <tr>
-<td>test_file.py</td>
-<td>40</td>
-<td>27</td>
+<td>test_namespace_dir.py</td>
+<td>101</td>
+<td>97</td>
+</tr>
+<tr>
+<td>test_blob.py</td>
+<td>214</td>
+<td>93</td>
 </tr>
 <tr>
 <td>test_scalar_index.py</td>
 <td>189</td>
+<td>84</td>
+</tr>
+<tr>
+<td>test_bitmap.py</td>
+<td>66</td>
+<td>55</td>
+</tr>
+<tr>
+<td>test_fragment.py</td>
+<td>85</td>
+<td>36</td>
+</tr>
+<tr>
+<td>test_vector_index.py</td>
+<td>97</td>
+<td>34</td>
+</tr>
+<tr>
+<td>test_namespace_rest.py</td>
+<td>33</td>
+<td>33</td>
+</tr>
+<tr>
+<td>test_file.py</td>
+<td>40</td>
+<td>31</td>
+</tr>
+<tr>
+<td>test_column_names.py</td>
 <td>27</td>
+<td>27</td>
+</tr>
+<tr>
+<td>test_filter.py</td>
+<td>26</td>
+<td>25</td>
+</tr>
+<tr>
+<td>test_indices.py</td>
+<td>27</td>
+<td>23</td>
+</tr>
+<tr>
+<td>test_schema_evolution.py</td>
+<td>23</td>
+<td>20</td>
 </tr>
 <tr>
 <td>test_map_type.py</td>
@@ -1083,56 +1418,74 @@ listed test stops passing, so the list only grows.</p>
 <td>17</td>
 </tr>
 <tr>
-<td>test_column_names.py</td>
-<td>27</td>
-<td>17</td>
-</tr>
-<tr>
-<td>test_filter.py</td>
-<td>26</td>
-<td>9</td>
-</tr>
-<tr>
 <td>test_lance.py</td>
 <td>23</td>
-<td>9</td>
+<td>11</td>
 </tr>
 <tr>
-<td>test_fragment.py</td>
-<td>85</td>
-<td>9</td>
+<td>test_coerce_query_vector.py</td>
+<td>10</td>
+<td>10</td>
 </tr>
 <tr>
 <td>test_json.py</td>
 <td>18</td>
-<td>5</td>
+<td>10</td>
+</tr>
+<tr>
+<td>test_optimize.py</td>
+<td>22</td>
+<td>8</td>
+</tr>
+<tr>
+<td>test_table_ops.py</td>
+<td>8</td>
+<td>7</td>
 </tr>
 <tr>
 <td>test_pydantic.py</td>
 <td>12</td>
+<td>6</td>
+</tr>
+<tr>
+<td>test_schema.py</td>
+<td>4</td>
 <td>4</td>
 </tr>
 <tr>
-<td>test_schema_evolution.py</td>
-<td>23</td>
-<td>2</td>
+<td>test_fragment_typing.py</td>
+<td>3</td>
+<td>3</td>
+</tr>
+<tr>
+<td>test_order_by.py</td>
+<td>3</td>
+<td>3</td>
+</tr>
+<tr>
+<td>test_vector.py</td>
+<td>9</td>
+<td>3</td>
 </tr>
 <tr>
 <td>others</td>
 <td></td>
-<td>6</td>
+<td>12</td>
 </tr>
 </tbody>
 </table>
 <p>The main reasons tests fail today:</p>
 <ul>
-<li>Most need vector or full-text indexes and search, scalar indexes other than BTree / Bitmap /
-  LabelList or their build options (about 160 in <code>test_scalar_index.py</code>), namespaces (about 130),
-  object stores or the <code>mem_wal</code>.</li>
-<li>About 90 need the transaction API, fragment-level writes, stable row ids or multiple base paths.</li>
+<li>Most need full-text features nanolance lacks (fuzzy matching, other
+  tokenizers, list columns), scalar indexes other than BTree / Bitmap / LabelList / INVERTED or
+  their build options (about 110 in <code>test_scalar_index.py</code>), vector index kinds other than
+  IVF_FLAT / IVF_PQ / IVF_HNSW_SQ, indexes on float16 / float64 / binary / multivector columns
+  (about 60), table branches, object stores or the <code>mem_wal</code>.</li>
+<li>Many need table branches.</li>
 <li>About 25 need filter functions nanolance lacks, or a data storage version other than 2.2.</li>
-<li>A tail of writer gaps in nanolance itself: Arrow dictionary arrays, empty structs, a nullable
-  fixed-size list of nullable values, bfloat16. Each is a real gap, listed by the run.</li>
+<li>A tail of writer gaps in nanolance itself: dictionary columns inside structs or lists, null
+  elements of a fixed-size list under a list or struct, bfloat16. Each is a real gap, listed by
+  the run.</li>
 </ul>
 <h2 id="bugs-the-suite-found-in-nanolance-itself">Bugs the suite found in nanolance itself<a class="headerlink" href="#bugs-the-suite-found-in-nanolance-itself" title="Permanent link">&para;</a></h2>
 <p>The runs found these bugs in nanolance's core. All are fixed and pinned in
@@ -1160,13 +1513,47 @@ listed test stops passing, so the list only grows.</p>
 <li><strong>A column pylance added without data could not be read.</strong> <code>add_columns(pa.field(...))</code> writes
   only the schema, and every existing fragment reads the column as nulls. nanolance refused the
   scan; it now synthesizes the nulls, and appending writes the column.</li>
-<li>
-<p><strong>Racing writers could lose a change.</strong> A change committed as "the version after the latest",
+<li><strong>Racing writers could lose a change.</strong> A change committed as "the version after the latest",
   re-read at commit time, so a change built on version N could land on top of another writer's
   N+1 and silently discard it. And two writers racing for one version shared a temp file name, so
   one could publish the other's manifest and still report success. A change now commits as the
   version after the one it read, the publish refuses to replace an existing version, and the temp
-  name is each writer's own (<code>test_concurrent_commits_lose_nothing</code>).</p>
+  name is each writer's own (<code>test_concurrent_commits_lose_nothing</code>).</li>
+<li><strong>JSON columns did not cross between pylance and nanolance.</strong> pylance stores a <code>pa.json_()</code>
+  column as JSONB (logical type "json"); nanolance refused such a dataset ("unsupported on-disk
+  logical type: json") and wrote its own JSON columns as plain text, which pylance refused in turn.
+  Both now read and write the same bytes (<code>test_json_columns.py</code>).</li>
+<li><strong>A pylance commit failed outright after a nanolance commit.</strong> nanolance wrote no transaction
+  files; pylance reads the transaction of every version committed since its read version to
+  decide whether its change still applies, and a version without one is a hard error ("Dataset
+  version N does not have a transaction file"). Every nanolance commit now writes Lance's
+  <code>_transactions/{read_version}-{uuid}.txn</code>, describing the change as pylance would
+  (<code>test_transactions.py</code>).</li>
+<li>
+<p><strong>Writers in different processes could overwrite each other's data files.</strong> A data file was
+  named <code>fragment-&lt;n&gt;.lance</code>, <code>n</code> one more than the highest number already in <code>data/</code>, so two
+  processes writing at once took the same name and the second file replaced the first -- also
+  one already committed. Data files are now named at random (128 bits from the system's entropy
+  source on every call, as a seeded generator would be copied into forked processes), as Lance
+  names them by UUID; deletion file ids take random bits too (<code>test_concurrent_writers.py</code>).</p>
+</li>
+<li>
+<p><strong>A dropped column's data files stayed in their fragments.</strong> Lance's Project removes a data file
+  left holding none of the schema's fields; nanolance kept it, so the two libraries' fragments of the
+  same dataset differed (and a new fragment for it took different field ids). Now removed as Lance
+  removes it.</p>
+</li>
+<li><strong>A data file written on its own could not be read in a dataset.</strong> A file from pylance's
+  <code>LanceFileWriter</code> numbers its fields from 0; the manifest maps them to the dataset's ids by
+  position, and nanolance looked the dataset's ids up in the file ("data file references unknown
+  field id"). It now matches them as Lance does.</li>
+<li><strong>New SQL columns were typed differently.</strong> <code>add_columns({"one": "1"})</code> gave a nullable field where
+  Lance's is <code>not null</code>, and <code>value + 1</code> over an int32 column an int64 one where Lance keeps int32
+  (its planner casts a literal to the column's type). Both now match, and the Merge transaction's
+  nullability claim with them.</li>
+<li>
+<p><strong>Data files are named as Lance names them</strong>: a random UUID's first 3 bytes as 24 binary digits,
+  then 26 hex digits (they were <code>fragment-&lt;hex&gt;.lance</code>).</p>
 </li>
 <li>
 <p><strong>Reading format 2.1 was refused outright</strong>, and a fixed-size-binary constant wider than 32 bytes
@@ -1191,6 +1578,28 @@ listed test stops passing, so the list only grows.</p>
 <p>The same work made the manifest codec keep everything pylance writes, so nanolance no longer drops
 it: timestamps, writer version, table config and metadata, schema metadata, feature flags, and
 fields it does not model.</p>
+<h2 id="stable-row-ids">Stable row ids<a class="headerlink" href="#stable-row-ids" title="Permanent link">&para;</a></h2>
+<p><code>write_dataset(..., enable_stable_row_ids=True)</code> (or <code>LanceDataset.commit(..., enable_stable_row_ids=True)</code>
+on a create / overwrite) gives every row an id that never changes: <code>_rowid</code> is not <code>_rowaddr</code>, and a
+row keeps its id through <code>update</code>, <code>merge_insert</code>, compaction, <code>restore</code> (the high-water mark
+<code>next_row_id</code> is kept) and <code>delete</code> of its neighbours. Supported as pylance 12 has them:</p>
+<ul>
+<li>the format: <code>DataFragment</code> row id sequences (all five segment kinds, read; written as Lance picks the
+  smallest), <code>created_at</code> / <code>last_updated_at</code> version sequences, <code>next_row_id</code>, the feature flag;</li>
+<li>reads: <code>_rowid</code> in <code>to_table</code> / <code>scanner</code> / <code>filter="_rowid in (...)"</code>, <code>_take_rows</code> / <code>take_rows</code>
+  (unknown and deleted ids are left out), <code>_row_created_at_version</code> / <code>_row_last_updated_at_version</code>;</li>
+<li>writes: <code>write_dataset</code> create / append / overwrite, <code>update</code>, <code>merge_insert</code>, <code>compact_files</code>,
+  <code>restore</code>, <code>add_columns</code>, <code>drop_columns</code>, <code>truncate_table</code>, hand-built <code>LanceDataset.commit</code> of every
+  operation (new fragments with no ids are numbered from <code>next_row_id</code>; fragments that carry their
+  own, as in pylance's "manual update", keep them);</li>
+<li><code>RowIdSequence</code>, <code>RowIdMeta</code>, <code>RowDatasetVersionMeta</code> and the <code>FragmentMetadata</code> fields, JSON and
+  pickle included;</li>
+<li>indexes: BTree, Bitmap, LabelList, INVERTED and IVF_* hold row ids, not addresses, and are searched,
+  kept up to date and re-covered after compaction as on a dataset without stable ids; an entry whose
+  row has since moved out of its segment's fragments (an update, a compaction) is ignored.</li>
+</ul>
+<p>Not supported: row ids kept in an external file (<code>DataFragment</code> fields 6 / 8 / 10), which Lance writes
+only for very large datasets.</p>
 
 
 

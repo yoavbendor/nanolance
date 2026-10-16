@@ -1,0 +1,1161 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/VECTOR_INDEX/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Vector indexes: Lance 12's IVF_FLAT, IVF_PQ and IVF_HNSW_SQ - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#vector-indexes-lance-12s-ivf_flat-ivf_pq-and-ivf_hnsw_sq" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Vector indexes: Lance 12's IVF_FLAT, IVF_PQ and IVF_HNSW_SQ
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#files" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Files
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#search" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Search
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#building-nanolance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Building (nanolance)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ivf_hnsw_sq" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        IVF_HNSW_SQ
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="IVF_HNSW_SQ">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#files_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Files
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quantization-and-distances" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quantization and distances
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#search_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Search
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#building-nanolance_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Building (nanolance)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="vector-indexes-lance-12s-ivf_flat-ivf_pq-and-ivf_hnsw_sq">Vector indexes: Lance 12's IVF_FLAT, IVF_PQ and IVF_HNSW_SQ<a class="headerlink" href="#vector-indexes-lance-12s-ivf_flat-ivf_pq-and-ivf_hnsw_sq" title="Permanent link">&para;</a></h1>
+<p>What nanolance reads, searches and (Phase 2c) writes, established against pylance 12.0.0 and the
+<code>lance</code> / <code>lance-index</code> 12.0.0 sources. A numpy model of everything below reproduces pylance's
+<code>nearest</code> results from the index files alone: the same rows, order and distances for IVF_FLAT and
+8-bit IVF_PQ under L2, cosine and dot, for default probing, <code>nprobes</code>, <code>refine_factor</code> and k from 1
+to 150; and for 4-bit IVF_PQ the same distances, with rows of equal (quantized) distance in another
+order.</p>
+<h2 id="files">Files<a class="headerlink" href="#files" title="Permanent link">&para;</a></h2>
+<p>An index is a directory <code>_indices/&lt;uuid&gt;/</code> with two Lance files (format 2.2 when the dataset is).</p>
+<p><strong><code>index.idx</code></strong> has no rows (one non-nullable <code>__flat_marker: uint64</code> column) and the schema metadata</p>
+<table>
+<thead>
+<tr>
+<th>key</th>
+<th>value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lance:index</code></td>
+<td><code>{"type":"IVF_PQ","distance_type":"l2"}</code> (or <code>IVF_FLAT</code>; <code>l2</code> / <code>cosine</code> / <code>dot</code>)</td>
+</tr>
+<tr>
+<td><code>lance:ivf</code></td>
+<td><code>"1"</code>: the global buffer holding the IVF model</td>
+</tr>
+<tr>
+<td><code>lance:flat</code></td>
+<td>one <code>""</code> per partition</td>
+</tr>
+</tbody>
+</table>
+<p>Global buffer 1 is a protobuf <code>IVF</code> (<code>lance-index/protos/index.proto</code>) whose <code>centroids_tensor</code> (field
+4) is a <code>Tensor { data_type = FLOAT32, shape = [num_partitions, dim], data }</code>; its <code>offsets</code> and
+<code>lengths</code> are zeros there.</p>
+<p><strong><code>auxiliary.idx</code></strong> holds every indexed row, grouped by partition, with the schema metadata
+<code>lance:ivf = "1"</code>, <code>distance_type</code>, and <code>storage_metadata</code>, a JSON list of one JSON string:</p>
+<ul>
+<li>IVF_FLAT: <code>{"dim":32}</code>; columns <code>_rowid: uint64</code>, <code>flat: fixed_size_list&lt;float&gt;[dim]</code> (the vector;
+  normalized for cosine).</li>
+<li>IVF_PQ: <code>{"codebook_position":2,"nbits":8,"num_sub_vectors":4,"dimension":32,"codebook_tensor":[],"transposed":true}</code>;
+  columns <code>_rowid: uint64</code>, <code>__pq_code: fixed_size_list&lt;uint8&gt;[m]</code> (<code>[m/2]</code> for 4 bits).</li>
+</ul>
+<p>Global buffer 1 is again an <code>IVF</code>, now with the partitions' row <code>offsets</code> (cumulative) and <code>lengths</code>
+(packed varints) and no centroids. For IVF_PQ, global buffer <code>codebook_position</code> is a <code>Tensor</code>
+<code>FLOAT32 [2^nbits, dim]</code> whose data is laid out sub-vector major: <code>[m][2^nbits][dim/m]</code>.</p>
+<p><code>_rowid</code> is the row address (<code>fragment &lt;&lt; 32 | offset</code>) unless the dataset has stable row ids.</p>
+<p><strong>Codes are transposed per partition</strong>: for a partition of <code>n</code> rows the <code>__pq_code</code> values are the
+bytes <code>[m][n]</code>, so byte <code>s*n + r</code> is row <code>r</code>'s code for sub-vector <code>s</code> -- the column's per-row lists
+are not the rows' codes. With 4 bits, byte <code>j</code> packs sub-vector <code>2j</code> in its low nibble and <code>2j+1</code> in
+the high one.</p>
+<p><strong>Residuals.</strong> For L2 and cosine, PQ encodes <code>vector - centroid</code> of the row's partition; dot encodes
+the vector. Cosine indexes normalize vectors (and queries) first and then work as L2; the centroids
+are not unit vectors.</p>
+<p>The manifest entry's <code>index_details</code> is a <code>/lance.table.VectorIndexDetails</code> (<code>metric_type</code>,
+<code>target_partition_size</code>, <code>compression</code> = <code>pq { num_bits, num_sub_vectors }</code> or <code>flat {}</code>, optional
+<code>hnsw_index_config</code>). pylance names the index from it: <code>IVF_PQ</code>, <code>IVF_FLAT</code>, <code>IVF_SQ</code>, <code>IVF_HNSW_*</code>.</p>
+<h2 id="search">Search<a class="headerlink" href="#search" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Query.</strong> Cosine: normalize it.</li>
+<li><strong>Partitions.</strong> Distances from the query to every centroid -- squared L2 (L2 and cosine) or
+   <code>1 - q.c</code> (dot) -- sorted ascending (stable).</li>
+<li><strong>How many to probe.</strong> <code>nprobes = n</code> fixes it at <code>min(n, P)</code>. Otherwise (<code>minimum_nprobes</code> 1 and
+   <code>maximum_nprobes</code> all, unless given):</li>
+<li>
+<p><em>Adaptive</em> -- IVF_FLAT, float32, L2 or cosine, <code>k &lt;= 100</code>, no <code>refine_factor &gt; 1</code>, no
+     <code>maximum_nprobes</code>: take the partitions with <code>d - d0 &lt;= margin * d0</code> (<code>d0</code> the nearest; f64
+     arithmetic), at least <code>floor</code> and at most <code>cap</code>, by k bucket (k&lt;=1, k&lt;=10, more):</p>
+<table>
+<thead>
+<tr>
+<th>metric</th>
+<th>margin</th>
+<th>floor</th>
+<th>cap</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L2</td>
+<td>0.2175 / 0.265 / 0.33</td>
+<td>5 / 6 / 11</td>
+<td>19 / 24 / 38</td>
+</tr>
+<tr>
+<td>cosine</td>
+<td>0.235 / 0.2875 / 0.38</td>
+<td>3 / 8 / 7</td>
+<td>50 / 77 / 106</td>
+</tr>
+</tbody>
+</table>
+</li>
+<li>
+<p><em>Legacy</em> -- everything else (every IVF_PQ, every dot): the partitions with
+     <code>d &lt;= d0 * f</code> in f32, <code>f</code> = 0.6 (k&lt;=1), 7 (k&lt;=10), 81 (more); at least <code>minimum_nprobes</code>.</p>
+</li>
+</ol>
+<p>Then, if the probed partitions gave fewer than k rows (a prefilter, deletions), more partitions
+   are searched one at a time, in order, until k rows or <code>maximum_nprobes</code>.
+4. <strong>Within a partition</strong> each row's distance, keeping the best <code>k * refine_factor</code> overall:
+   - IVF_FLAT: the metric on the stored vector -- squared L2; cosine <code>1 - x.q/(|x||q|)</code>; dot <code>1 - x.q</code>.
+   - IVF_PQ, 8 bits: a table <code>[m][256]</code> from the (residual) query's sub-vectors to the codebook's --
+     squared L2, or <code>1 - q_s.c</code> for dot -- summed over the row's codes in f32, sub-vector order;
+     dot then subtracts <code>m - 1</code>.
+   - IVF_PQ, 4 bits: the same sums for the partition's first <code>max(200, k)</code> rows and its last
+     <code>n % 16</code>; the rest from a u8 table, <code>round((t - tmin) * 255 / (qmax - tmin))</code> with <code>qmax</code> the
+     largest of those first sums and <code>tmin</code> the table's smallest entry, summed with saturation and
+     mapped back as <code>q * (qmax - tmin) / 255 + tmin</code>.
+5. <strong>Refine</strong> (<code>refine_factor</code>): the <code>k * refine_factor</code> candidates are re-scored exactly from the
+   dataset's vectors, and the best k returned with those distances.</p>
+<p><code>_distance</code> is that distance: squared L2, <code>1 - cos</code>, or <code>1 - dot</code> (PQ: their approximations).</p>
+<h2 id="building-nanolance">Building (nanolance)<a class="headerlink" href="#building-nanolance" title="Permanent link">&para;</a></h2>
+<p><code>create_index(column, "IVF_FLAT" | "IVF_PQ", ...)</code> (<code>src/vector_index_build.cpp</code>) writes the files
+and manifest entry above with Lance 12's defaults:</p>
+<ol>
+<li><strong>Vectors.</strong> The column (a fixed-size list of float32) is scanned with row addresses; null
+   vectors and vectors with a NaN or infinite value are left out (Lance's <code>filter_nan</code>). Cosine
+   normalizes them (and leaves out zero vectors).</li>
+<li><strong>Partitions.</strong> <code>num_partitions</code>, or rows / <code>target_partition_size</code> (4096 for IVF_FLAT, 8192 for
+   IVF_PQ), between 1 and 4096.</li>
+<li><strong>IVF.</strong> k-means on at most <code>sample_rate</code> (256) vectors a partition: random initial centroids,
+   at most <code>max_iters</code> (50) Lloyd iterations, stopping when the loss moves by less than 1e-4 of
+   itself, an empty cluster splitting the largest; past 256 partitions, hierarchical -- 16 clusters,
+   each given partitions in proportion to its vectors, recursively. Squared L2 (cosine: of the
+   normalized vectors); dot assigns by the largest product. Every vector then goes to its nearest
+   centroid.</li>
+<li><strong>PQ.</strong> Residuals (vector - its centroid; dot: the vector) of at most 256 * 2^nbits vectors train
+   one codebook per sub-vector by L2 k-means, whatever the metric -- Lance's v3 builder does the
+   same, and dot only scores the codes. Every row's codes are the nearest entries by L2. The
+   sub-vectors train side by side, each on its own seed.</li>
+<li><strong>Files.</strong> auxiliary.idx holds the rows partition by partition (ascending row address within
+   one); codes are transposed per partition and, with 4 bits, packed two to a byte. index.idx
+   holds the centroids and the k-means loss. The manifest entry is a
+   <code>/lance.index.pb.VectorIndexDetails</code> (metric, target partition size when it decided the count,
+   <code>pq { num_bits, num_sub_vectors }</code> or <code>flat {}</code>, Lance's runtime hints), index version 1.</li>
+</ol>
+<p>pylance lists such an index, reports its stats, searches it with nanolance's results, and its
+<code>optimize_indices</code> adds appended rows to it.</p>
+<h2 id="ivf_hnsw_sq">IVF_HNSW_SQ<a class="headerlink" href="#ivf_hnsw_sq" title="Permanent link">&para;</a></h2>
+<p>An IVF index whose partitions each hold an HNSW graph over 8-bit scalar-quantized (SQ) vectors.
+nanolance searches pylance's IVF_HNSW_SQ indexes with pylance's answers (rows, order and distances
+for L2 and cosine, with and without deletions, for k, <code>nprobes</code>, <code>refine_factor</code>, <code>ef</code>,
+<code>distance_range</code>, and filters before or after the search), and builds ones pylance searches as its
+own.</p>
+<h3 id="files_1">Files<a class="headerlink" href="#files_1" title="Permanent link">&para;</a></h3>
+<p><strong><code>auxiliary.idx</code></strong>: <code>_rowid: uint64</code> and <code>__sq_code: fixed_size_list&lt;uint8&gt;[dim]</code>, one row per
+indexed vector (not transposed), grouped by partition; schema metadata as above with
+<code>storage_metadata = ["{\"dim\":16,\"num_bits\":8,\"bounds\":{\"start\":-4.49,\"end\":4.73}}"]</code> --
+one pair of bounds for the whole index. Global buffer 1: the <code>IVF</code> with the partitions' row offsets
+and lengths. All fields are nullable.</p>
+<p><strong><code>index.idx</code></strong>: the graphs, <code>__vector_id: uint32</code>, <code>__neighbors: list&lt;uint32&gt;</code>,
+<code>_distance: list&lt;float&gt;</code> (the neighbours' distances), partition after partition; within a partition,
+level 0 (every node, by id) then each level above (its nodes, by id). Node ids are positions in the
+partition's rows of <code>auxiliary.idx</code>. Schema metadata:</p>
+<table>
+<thead>
+<tr>
+<th>key</th>
+<th>value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lance:index</code></td>
+<td><code>{"type":"IVF_HNSW_SQ","distance_type":"l2"}</code></td>
+</tr>
+<tr>
+<td><code>lance:ivf</code></td>
+<td><code>"1"</code>; global buffer 1 is the <code>IVF</code> with the centroids, and the graph rows' offsets and lengths per partition</td>
+</tr>
+<tr>
+<td><code>lance:hnsw</code></td>
+<td>a JSON list of one JSON string per partition: <code>{"entry_point":364,"params":{"max_level":7,"m":20,"ef_construction":150,"prefetch_distance":2},"level_offsets":[0,707,736,737,737,737,737,737]}</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>level_offsets</code> has <code>max_level + 1</code> entries: level <code>l</code>'s rows are <code>[level_offsets[l],
+level_offsets[l+1])</code> of the partition's rows. The manifest details carry <code>hnsw_index_config
+{ max_connections, construction_ef, max_level }</code> and <code>sq { num_bits: 8 }</code>.</p>
+<p>pylance writes the neighbour lists with 0-bit bit-packed definition levels and no level buffer (all
+valid); nanolance's decoder reads those as all-zero levels.</p>
+<h3 id="quantization-and-distances">Quantization and distances<a class="headerlink" href="#quantization-and-distances" title="Permanent link">&para;</a></h3>
+<p><code>code = (v - start) * 255 / (end - start)</code> in f64, cast to u8 saturating (NaN to 0); all zeros when
+<code>start == end</code>. Cosine indexes quantize normalized vectors; SQ never uses residuals. With
+<code>value_scale = (end - start) as f32 / 255</code> and <code>scale = value_scale^2</code>:</p>
+<ul>
+<li>L2 and cosine: the query is quantized too; <code>distance = sum((a - b)^2) as f32 * scale</code> over codes.</li>
+<li>Dot: the query stays float; <code>distance = 1 - (start * sum(q) + value_scale * sum(code * q))</code>.</li>
+<li>Between two stored vectors (building), dot: <code>1 - (dim * start^2 + start * value_scale *
+  (sum(a) + sum(b)) + scale * sum(a * b))</code>.</li>
+</ul>
+<p><code>refine_factor</code> re-scores with the original vectors, as for the other indexes.</p>
+<h3 id="search_1">Search<a class="headerlink" href="#search_1" title="Permanent link">&para;</a></h3>
+<p>Partitions are chosen as for IVF_PQ (the adaptive probing of IVF_FLAT does not apply). In a
+partition (lance-index <code>HNSW::search</code>):</p>
+<ol>
+<li>Greedy descent from the entry point through levels <code>max_level - 1</code> down to 1: move to the closest
+   neighbour while one is closer.</li>
+<li>A beam search on level 0 with <code>ef</code> (the query's, else <code>k + k / 2</code>, where k is <code>k * refine_factor</code>;
+   <code>ef &lt; k</code> is an error), and the best k of it.</li>
+<li>A prefilter: when every row passes, the plain search; when under 10% pass, an exact scan of the
+   passing rows; otherwise the beam only admits passing rows. A <code>distance_range</code> admits only results
+   in range.</li>
+</ol>
+<p>Lance keeps both heaps in Rust's <code>BinaryHeap</code>, compared by distance alone, so which of equally distant
+rows win depends on the heaps' exact sift order; nanolance's heap reproduces it.</p>
+<p>After the first <code>nprobes</code> partitions (searched together), Lance's HNSW path searches the rest
+<code>query_parallelism</code> at a time -- by default <code>min(compute CPUs, partitions)</code> -- while fewer than k rows
+were found, and keeps whatever those return. nanolance takes the partitions in that order, as if each
+finished in turn; when partitions race (a filtered search where several hold candidates) pylance itself
+can answer differently from run to run. When fewer rows pass the prefilter than k, Lance stops after the
+first probes.</p>
+<h3 id="building-nanolance_1">Building (nanolance)<a class="headerlink" href="#building-nanolance_1" title="Permanent link">&para;</a></h3>
+<p><code>create_index(column, "IVF_HNSW_SQ", num_partitions=..., m=20, ef_construction=150, max_level=7)</code> --
+pylance's options and defaults; without <code>num_partitions</code>, one per 2^20 rows. lance-c:
+<code>LANCE_INDEX_IVF_HNSW_SQ</code> with <code>hnsw_m</code> (required) and <code>hnsw_ef_construction</code>.</p>
+<ol>
+<li>IVF as for the other indexes (k-means on a sample).</li>
+<li>SQ bounds: the minimum and maximum value of a sample of <code>sample_rate * 256</code> vectors (the model's
+   bounds when <code>optimize_indices</code> reuses it).</li>
+<li>Each partition's graph, after lance-index's <code>HnswBuilder</code>:</li>
+<li>node levels drawn as Lance draws them -- <code>min(-ln(u) / ln(m), max_level - 1)</code> with <code>u</code> from
+     rand 0.9's <code>SmallRng</code> (Xoshiro256++) seeded with 42 -- so the levels and the entry point (the
+     first node of the highest level) are pylance's own;</li>
+<li>every other node inserted: a greedy descent to its level, then on each of its levels a beam of
+     <code>ef_construction</code>, Algorithm 4's neighbour heuristic (closest first; keep a candidate closer to
+     the node than to every kept one; refill from the rest) down to <code>m</code>, and reciprocal edges, each
+     neighbour pruned the same way to <code>2m</code> on level 0 and <code>m</code> above;</li>
+<li>nodes that level 0 cannot reach from the entry point linked from a nearby reachable node.</li>
+</ol>
+<p>Nodes are inserted on nanolance's threads, as Lance inserts them on its own, so the edges differ from
+one build to the next unless <code>NANOLANCE_THREADS=1</code>; pylance's do too. On 20,000 random 64-dimensional
+vectors the recall@10 of a nanolance-built index is that of pylance's own (0.65 / 0.57 / 0.59 for L2 /
+cosine / dot against pylance's 0.64 / 0.58 / 0.62), in about the same time.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

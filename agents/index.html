@@ -1349,8 +1349,12 @@ still passes when the rows come back right but slowly. Don't time it (CI machine
   <code>tools/real_lance_check.py</code> reads Lance datasets published on the Hugging Face Hub with both
   engines and compares them (<code>docs/REAL_DATASETS.md</code>); run it before calling a read path done.</li>
 <li><strong>The matrix is checked in CI</strong> as ratios to Rust Lance (<code>tools/bench_compare.py</code> against
-  <code>bench/results/matrix-quick.json</code>). A change that moves performance on purpose regenerates it:
-  <code>python tools/bench_matrix.py --quick --runs 3 --out bench/results/matrix-quick.json</code>.</li>
+  <code>bench/results/ci/</code>, one baseline per runner CPU: the ubuntu-latest pool mixes AMD and Intel, and
+  the ratios differ between them). A change that moves performance on purpose re-records them: run
+  the linux-bench workflow by hand (<code>matrix_runs</code> 7) and commit the <code>MATRIX_JSON</code> line of its log as
+  <code>bench/results/ci/&lt;cpu&gt;-&lt;cores&gt;c.json</code>, once per CPU the runs land on. A run on a CPU with no
+  baseline still checks correctness and per-type falls; its means are reported, not enforced.
+  <code>bench/results/matrix-quick.json</code> stays the dev-machine baseline for local comparisons.</li>
 </ul>
 <h2 id="7-when-adding-a-new-lance-encoding-how-this-codebase-does-it">7. When adding a new Lance encoding (how this codebase does it)<a class="headerlink" href="#7-when-adding-a-new-lance-encoding-how-this-codebase-does-it" title="Permanent link">&para;</a></h2>
 <ol>

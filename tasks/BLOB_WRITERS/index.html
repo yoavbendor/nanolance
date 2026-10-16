@@ -1,0 +1,1240 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/tasks/BLOB_WRITERS/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Task: pylance's prepared-layout blob writers (PackedBlobWriter, DedicatedBlobWriter, BlobDescriptorArrayBuilder) - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#task-pylances-prepared-layout-blob-writers-packedblobwriter-dedicatedblobwriter-blobdescriptorarraybuilder" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Task: pylance's prepared-layout blob writers (PackedBlobWriter, DedicatedBlobWriter, BlobDescriptorArrayBuilder)
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#0-context-budget-read-this-first" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        0. Context budget (read this first)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-goal-in-one-paragraph" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Goal, in one paragraph
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-done-means-acceptance-criteria-all-of-them" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Done means (acceptance criteria -- all of them)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-exact-behaviour-to-reproduce-measured-on-pylance-1200-in-this-container" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Exact behaviour to reproduce (measured on pylance 12.0.0 in this container)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Exact behaviour to reproduce (measured on pylance 12.0.0 in this container)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#31-where-the-bytes-go" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.1 Where the bytes go
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#32-packedblobwriter" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.2 PackedBlobWriter
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#33-dedicatedblobwriter" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.3 DedicatedBlobWriter
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#34-blobdescriptor" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.4 BlobDescriptor
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#35-blobdescriptorarraybuilderfield_name" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5 BlobDescriptorArrayBuilder(field_name)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#36-names" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.6 Names
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-plan-do-it-in-this-order" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Plan (do it in this order)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-rules-of-this-repository-read-agentsmd-first-it-is-short" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Rules of this repository (read AGENTS.md first -- it is short)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-the-differential-test-you-write-bindingspythonteststest_blob_writerspy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. The differential test you write: bindings/python/tests/test_blob_writers.py
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-docs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Docs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-when-you-are-stuck-or-must-decide-something-not-covered-here" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. When you are stuck or must decide something not covered here
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-your-final-report-keep-it-short" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. Your final report (keep it short)
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="task-pylances-prepared-layout-blob-writers-packedblobwriter-dedicatedblobwriter-blobdescriptorarraybuilder">Task: pylance's prepared-layout blob writers (<code>PackedBlobWriter</code>, <code>DedicatedBlobWriter</code>, <code>BlobDescriptorArrayBuilder</code>)<a class="headerlink" href="#task-pylances-prepared-layout-blob-writers-packedblobwriter-dedicatedblobwriter-blobdescriptorarraybuilder" title="Permanent link">&para;</a></h1>
+<p>Status: <strong>delegated</strong> (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5). Roadmap item
+"packed/dedicated blob writer file API" (docs/ROADMAP.md, tier 2).</p>
+<h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
+<p>You have about 100k tokens of context for the whole job. Spend them on code, not on output:</p>
+<ul>
+<li><strong>Never read a large file whole.</strong> Find the place with <code>grep -n</code>, then read a window of at most
+  ~120 lines with <code>sed -n 'A,Bp' file</code>. Files here are 1-3k lines (<code>src/blob_v2_external.cpp</code>,
+  <code>bindings/python/nanolance/lance/file.py</code>, <code>dataset.py</code> is 3k+).</li>
+<li><strong>Always cut command output</strong>: <code>... 2&gt;&amp;1 | tail -15</code> for pytest, <code>| tail -5</code> for
+  <code>tools/pylance_suite.py</code> (it prints thousands of lines otherwise), <code>ninja 2&gt;&amp;1 | grep -E
+  "error|warning|FAILED" | head -20</code> for builds. On a failure, rerun only that one test with
+  <code>-x -q 2&gt;&amp;1 | tail -40</code>.</li>
+<li>This file is the spec: do not re-derive what it states, and do not read pylance's test file
+  beyond the tests named in section 2 (<code>grep -n "def test_name" -A60</code>).</li>
+<li>Work in phases; the reviewer may run each phase as a separate session. Finish one phase cleanly
+  (tests green, short report) rather than half of two.</li>
+</ul>
+<h2 id="1-goal-in-one-paragraph">1. Goal, in one paragraph<a class="headerlink" href="#1-goal-in-one-paragraph" title="Permanent link">&para;</a></h2>
+<p>pylance 12 lets a distributed job write blob bytes to Lance's sidecar files <em>itself</em> and get back
+descriptors pointing at them, then write a data file whose blob column holds those descriptors and
+commit it (<code>LanceOperation.DataReplacement</code> / <code>Append</code>). nanolance.lance must offer the same four
+classes with the same behaviour, so that pylance's own tests for them pass against nanolance and a
+dataset built this way is read identically by nanolance and by pylance.</p>
+<h2 id="2-done-means-acceptance-criteria-all-of-them">2. Done means (acceptance criteria -- all of them)<a class="headerlink" href="#2-done-means-acceptance-criteria-all-of-them" title="Permanent link">&para;</a></h2>
+<ol>
+<li>These pylance tests pass against nanolance (they are in
+   <code>.deps/pylance-tests/v12.0.0/tests/test_blob.py</code>):</li>
+<li><code>test_packed_blob_writer_scalar_buffer_inputs</code> (4 params)</li>
+<li><code>test_packed_blob_writer_bulk_arrow_array</code> (all params)</li>
+<li><code>test_packed_blob_writer_bulk_excludes_physical_null_bytes</code></li>
+<li><code>test_packed_blob_writer_bulk_rejects_non_monotonic_offsets</code></li>
+<li><code>test_packed_blob_writer_mixed_calls_preserve_legacy_finish_alignment</code></li>
+<li><code>test_packed_blob_writer_bulk_rejects_non_binary_array</code></li>
+<li><code>test_packed_blob_writer_bulk_binary_view</code></li>
+<li><code>test_packed_blob_writer_bulk_fixed_size_binary</code></li>
+<li><code>test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_replacement</code>
+     (needs phase B)</li>
+<li><code>test_failed_blob_writer_traceback_can_be_released_on_another_thread</code> if it is reachable
+     (read it; if it depends on something unrelated and fails for that reason, report why).</li>
+<li>No regression: <code>python3 tools/pylance_suite.py</code> ends with <code>all N expected tests passed</code>
+   (it compares with <code>bindings/python/tests/pylance_suite/expected_pass.txt</code>). Then run
+   <code>python3 tools/pylance_suite.py --update</code> once so the new passes are recorded.</li>
+<li>A new differential test file <code>bindings/python/tests/test_blob_writers.py</code> (section 6) passes, and
+   the whole Python suite still passes: <code>cd bindings/python &amp;&amp; python3 -m pytest tests -q -x</code>.</li>
+<li>C++ tests still pass: <code>cd build &amp;&amp; ninja &amp;&amp; ctest -j8</code> (only needed if you touch C++).</li>
+<li>Docs updated (section 7). <strong>Do not commit or push</strong> -- the reviewer does that after review.</li>
+</ol>
+<h2 id="3-exact-behaviour-to-reproduce-measured-on-pylance-1200-in-this-container">3. Exact behaviour to reproduce (measured on pylance 12.0.0 in this container)<a class="headerlink" href="#3-exact-behaviour-to-reproduce-measured-on-pylance-1200-in-this-container" title="Permanent link">&para;</a></h2>
+<p>Real pylance is installed as <code>lance</code> (<code>import lance</code>); nanolance's module is <code>nanolance.lance</code>.
+<strong>When in doubt, run the same call on real pylance and copy what it does.</strong> These facts were measured:</p>
+<h3 id="31-where-the-bytes-go">3.1 Where the bytes go<a class="headerlink" href="#31-where-the-bytes-go" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>LanceFileSession(base).open_packed_blob_writer(path, blob_id)</code> and
+  <code>.open_dedicated_blob_writer(path, blob_id)</code>: <code>path</code> is a data file name such as <code>"abc.lance"</code>
+  relative to the session's base directory. The sidecar is
+  <code>&lt;base&gt;/&lt;path without .lance&gt;/&lt;blob_id as 32 binary digits, bit-reversed&gt;.blob</code>, e.g. blob_id 3
+  -&gt; <code>&lt;base&gt;/abc/11000000000000000000000000000000.blob</code>. nanolance already has this:
+  <code>blob_v2_sidecar_path</code> in <code>include/nanolance/blob_v2_external.hpp</code> (C++); in Python it is
+  <code>f"{int(f'{blob_id:032b}'[::-1], 2):032b}.blob"</code>.</li>
+<li><code>writer.path</code> is that sidecar path <strong>as a string without the leading <code>/</code></strong> (pylance prints
+  <code>tmp/pb/abc/1100...0.blob</code> for base <code>/tmp/pb</code>). <code>writer.blob_id</code> is the id.</li>
+<li>Packed: blobs are appended back to back into the one sidecar. Null rows write nothing. Empty
+  (non-null) blobs write nothing but get a descriptor of size 0 at the current offset.</li>
+<li>Dedicated: <code>write(data)</code> may be called several times; the bytes are concatenated into the sidecar.</li>
+</ul>
+<h3 id="32-packedblobwriter">3.2 <code>PackedBlobWriter</code><a class="headerlink" href="#32-packedblobwriter" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>write_blob(data)</code>: one blob. Accepts <code>bytes</code>, <code>bytearray</code>, <code>memoryview</code>, a list of ints 0..255.
+  Errors (exact type; message need not be identical but keep the gist):
+  <code>str</code> -&gt; <code>TypeError("argument 'data': Can't extract</code>str<code>to</code>Vec<code>")</code>; <code>int</code> / <code>None</code> -&gt; <code>TypeError</code>;
+  <code>[300]</code> -&gt; <code>OverflowError("out of range integral type conversion attempted")</code>. Returns <code>None</code>.</li>
+<li><code>write_blobs(payloads)</code>: <code>pa.BinaryArray</code>, <code>LargeBinaryArray</code>, <code>BinaryViewArray</code>,
+  <code>FixedSizeBinaryArray</code>, or a <code>pa.ChunkedArray</code> of those. One descriptor row per input row, in
+  order, across chunks and calls. <strong>Sliced arrays: only the slice counts. Bytes under null slots are
+  NOT written</strong> (see <code>test_packed_blob_writer_bulk_excludes_physical_null_bytes</code>: the junk between
+  offsets of a null row must not reach the sidecar). Returns <code>None</code>. Errors, all <code>ValueError</code>, and
+  the writer stays usable afterwards (a failed call writes nothing):</li>
+<li>non-binary Array: <code>Packed blob payload array must have a Binary Arrow type, got Int32</code></li>
+<li>non-binary ChunkedArray: <code>Packed blob payloads must have a Binary Arrow type, got Int32</code></li>
+<li>not Arrow at all (list, bytes): <code>payloads must be a pyarrow BinaryArray, LargeBinaryArray, or ChunkedArray, got list</code></li>
+<li>non-monotonic offsets (validate before writing anything!):
+    <code>Packed blob payload array contains invalid Arrow data: Invalid argument error: Offset invariant failure: non-monotonic offset at slot 1: 2 &gt; 1</code>;
+    in chunk k of a chunked array the prefix is <code>Packed blob payload chunk 1 contains invalid Arrow data: ...</code>.
+    <code>pa.Array.validate(full=True)</code> raises for these; build the message yourself around the slot numbers.</li>
+<li><code>finish()</code> -&gt; Python <code>list</code> of <code>BlobDescriptor</code> (null rows give the <code>Null</code> descriptor).
+  <code>repr</code>: <code>Packed { blob_id: 7, offset: 0, size: 7 }</code>, <code>Null</code>.</li>
+<li><code>finish_array(field_name)</code> -&gt; <code>pa.StructArray</code> of the descriptor type (3.5), null rows null.
+  After it, <code>writer.field</code> is the descriptor field named <code>field_name</code> (equal to
+  <code>BlobDescriptorArrayBuilder(field_name).field</code>). Before it, <code>writer.field</code> raises
+  <code>ValueError("PackedBlobWriter field is available after finish_array")</code>.</li>
+<li>After <code>finish</code>/<code>finish_array</code>, any call raises <code>ValueError("PackedBlobWriter is already finished")</code>.</li>
+</ul>
+<h3 id="33-dedicatedblobwriter">3.3 <code>DedicatedBlobWriter</code><a class="headerlink" href="#33-dedicatedblobwriter" title="Permanent link">&para;</a></h3>
+<p><code>write(data)</code> (same input rules as <code>write_blob</code>), returns <code>None</code>; <code>finish()</code> -&gt; one <code>BlobDescriptor</code>,
+repr <code>Dedicated { blob_id: 5, size: 6 }</code>; afterwards <code>ValueError("DedicatedBlobWriter is already finished")</code>.</p>
+<h3 id="34-blobdescriptor">3.4 <code>BlobDescriptor</code><a class="headerlink" href="#34-blobdescriptor" title="Permanent link">&para;</a></h3>
+<p>Opaque value object. Kinds and reprs: <code>Packed { blob_id, offset, size }</code>,
+<code>Dedicated { blob_id, size }</code>, <code>Null</code>; also inline and external (choose a repr like
+<code>Inline { size: N }</code> / <code>External { uri: "...", position: P, size: N }</code> -- not tested). <code>str == repr</code>.
+Equality / hash: value-based is fine.</p>
+<h3 id="35-blobdescriptorarraybuilderfield_name">3.5 <code>BlobDescriptorArrayBuilder(field_name)</code><a class="headerlink" href="#35-blobdescriptorarraybuilderfield_name" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>.field</code>: <code>pa.field(field_name, STRUCT, nullable=True, metadata={b"ARROW:extension:name": b"lance.blob.v2"})</code>
+  where STRUCT = <code>struct&lt;kind: uint8, data: large_binary, uri: string, blob_id: uint32, blob_size: uint64, position: uint64&gt;</code>.</li>
+<li>Methods: <code>append(descriptor)</code>, <code>extend(iterable of descriptors)</code>, <code>append_null()</code>,
+  <code>append_inline(data)</code>, <code>append_dedicated(blob_id, size)</code>, <code>extend_packed(blob_id, offsets, sizes)</code>,
+  <code>finish()</code> -&gt; <code>pa.StructArray</code> of STRUCT. Measured rows (<code>to_pylist()</code>):</li>
+<li>packed: <code>{'kind': 1, 'data': None, 'uri': None, 'blob_id': 2, 'blob_size': 3, 'position': 0}</code></li>
+<li>null descriptor / append_null: <code>None</code> (a null struct row)</li>
+<li>inline: <code>{'kind': 0, 'data': b'inl', 'uri': None, 'blob_id': None, 'blob_size': None, 'position': None}</code></li>
+<li>dedicated: <code>{'kind': 2, 'data': None, 'uri': None, 'blob_id': 9, 'blob_size': 100, 'position': None}</code></li>
+<li><code>extend_packed(3, [0, 10], [10, 5])</code> -&gt; two packed rows (positions 0, 10; sizes 10, 5).</li>
+<li>Errors: <code>append(b'raw')</code> / <code>extend([b'r'])</code> -&gt; <code>TypeError("'bytes' object is not an instance of 'BlobDescriptor'")</code>;
+  <code>append(None)</code> -&gt; <code>TypeError("'None' is not an instance of 'BlobDescriptor'")</code>;
+  <code>extend_packed</code> length mismatch -&gt; <code>ValueError("offsets and sizes must have the same length, got 1 and 2")</code>;
+  after <code>finish()</code>: <code>ValueError("BlobDescriptorArrayBuilder is already finished")</code>.
+  An empty builder's <code>finish()</code> returns a 0-length array of STRUCT.</li>
+</ul>
+<h3 id="36-names">3.6 Names<a class="headerlink" href="#36-names" title="Permanent link">&para;</a></h3>
+<p>Exported as <code>lance.PackedBlobWriter</code>, <code>lance.DedicatedBlobWriter</code>, <code>lance.BlobDescriptorArrayBuilder</code>,
+<code>lance.BlobDescriptor</code> and the same under <code>lance.blob</code>; the session methods on
+<code>lance.file.LanceFileSession</code>. Today these names resolve to placeholders (look at
+<code>bindings/python/nanolance/lance/_stubs.py</code> and how <code>__getattr__</code> in the modules uses it) -- replace
+the placeholders with the real classes.</p>
+<h2 id="4-plan-do-it-in-this-order">4. Plan (do it in this order)<a class="headerlink" href="#4-plan-do-it-in-this-order" title="Permanent link">&para;</a></h2>
+<p><strong>Phase A -- Python only, no C++.</strong> Implement 3.1-3.6 in a new module
+<code>bindings/python/nanolance/lance/_blob_writers.py</code>, export it from <code>nanolance/lance/__init__.py</code>,
+<code>nanolance/lance/blob.py</code> and add the two methods to <code>LanceFileSession</code> in <code>nanolance/lance/file.py</code>.
+Plain file I/O is fine (open the sidecar lazily or at open time -- check what pylance does if a writer
+is finished with no blobs: does the file exist? copy that). Use pyarrow's buffers
+(<code>arr.buffers()</code>, <code>arr.offset</code>, offsets dtype) to copy only valid slices; never <code>to_pylist()</code> the
+payload bytes of large arrays one by one if you can slice buffers instead (performance matters in
+this repo, but correctness first). Run the 8 phase-A pylance tests:</p>
+<div class="language-text highlight"><pre><span></span><code>cd /home/user/nanolance &amp;&amp; python3 tools/pylance_suite.py -k &quot;packed_blob_writer&quot;
+</code></pre></div>
+<p><strong>Phase B -- descriptor-form blob columns in the file writer (C++).</strong> The data-replacement test
+writes a data file whose <code>lance.blob.v2</code> column <em>is</em> the descriptor struct of 3.5. nanolance's writer
+rejects it today:</p>
+<div class="language-text highlight"><pre><span></span><code>OSError: Invalid user input: Blob v2 field &#39;blob&#39; must be struct&lt;data: large_binary, uri: utf8&gt; or struct&lt;data, uri, position: uint64, size: uint64&gt;
+</code></pre></div>
+<p>That comes from <code>append_blob_v2_batch_column_values</code> in <code>src/blob_v2_external.cpp</code> (~line 720).
+Teach it a third accepted input shape: children <code>kind, data, uri, blob_id, blob_size, position</code>
+(exactly STRUCT above). For each row emit the descriptor as given (kinds 1 packed / 2 dedicated /
+3 external: copy blob_id, blob_size -&gt; size, position, uri; kind 0 inline: the bytes in <code>data</code> are
+written inline exactly as the existing <code>struct&lt;data, uri&gt;</code> path writes inline data; null row: null).
+Look at how the existing paths fill <code>ColumnValues</code> / <code>BlobV2ExternalDescriptor</code> and reuse that --
+do not invent a new on-disk encoding; the page encoding must stay what <code>blob_v2_descriptor_page_encoding</code>
+produces. Do not try to validate that the sidecar exists. Then make the data-replacement test pass,
+plus the same scenario read back by <strong>real pylance</strong> (section 6).</p>
+<p><strong>Phase B design notes (from the reviewer, read before coding):</strong></p>
+<ul>
+<li>In <code>append_blob_v2_batch_column_values</code> (<code>src/blob_v2_external.cpp</code>, ~line 720) the input shape is
+  chosen from the children found with <code>find_child(mapping, blob_field.id, name)</code>. Add the
+  descriptor shape (all six names present) as a third branch; the existing loop (~lines 780-860) shows
+  how a row is read (<code>large_binary_value</code>, <code>utf8_value</code>, <code>uint64_value</code>), how a null row is recorded
+  (<code>record_validity(out, index, false)</code> + <code>row_packed_sizes.push_back(0U)</code>), and how a row is emitted:
+  <code>append_packed_row(out, kind, position, size, blob_id, uri_ptr, uri_len, error)</code> (~line 188). You
+  will need a <code>uint8</code> and a <code>uint32</code> reader like <code>uint64_value</code> -- add them next to it.</li>
+<li>Kinds 1 / 2 / 3: emit <code>append_packed_row(out, kind, position, blob_size, blob_id, &lt;uri or nullptr&gt;, ...)</code>
+  directly -- the bytes already exist, nothing is placed. A null <code>position</code> reads as 0.</li>
+<li>Kind 0 (inline bytes in <code>data</code>): today, rows with bytes are emitted as <code>kBlobKindPendingData</code> and
+  <code>BlobV2Placer::place</code> (~line 359) later decides inline / packed / dedicated <strong>by size thresholds</strong>.
+  A descriptor that says inline must stay inline: add <code>kBlobKindPendingInline = 0xFE</code> next to
+  <code>kBlobKindPendingData</code> in <code>include/nanolance/blob_v2_external.hpp</code>, emit that, and in <code>place</code> and
+  <code>blob_v2_has_pending</code> treat it like pending data but always take the inline branch.</li>
+<li>Then <code>finalize_blob_v2_schema_for_write</code> rewrites the field to the physical descriptor columns; check
+  it does not assume 2 or 4 input children (grep it; fix only if it does).</li>
+<li>Write a C++ test only if cheap; the Python differential test (section 6 item 5) is the oracle.</li>
+<li>If <code>DataFile.create</code> / the <code>DataReplacement</code> commit then fails for a reason in field ids or schema
+  mapping (not in the blob column itself), stop and report it with the error -- do not redesign that.</li>
+</ul>
+<p>Build after C++ changes (both are needed for Python to see it):</p>
+<div class="language-text highlight"><pre><span></span><code>cd /home/user/nanolance/build &amp;&amp; ninja &amp;&amp; ctest -j8
+cd /home/user/nanolance/bindings/python/build/cp311-cp311-linux_x86_64 &amp;&amp; ninja &amp;&amp; \
+  cp _nanolance.cpython-311-x86_64-linux-gnu.so /usr/local/lib/python3.11/dist-packages/nanolance/
+</code></pre></div>
+<h2 id="5-rules-of-this-repository-read-agentsmd-first-it-is-short">5. Rules of this repository (read <code>AGENTS.md</code> first -- it is short)<a class="headerlink" href="#5-rules-of-this-repository-read-agentsmd-first-it-is-short" title="Permanent link">&para;</a></h2>
+<ul>
+<li>A test may skip only for a missing optional dependency. Never weaken, skip or delete a test to get
+  green; never add <code>except Exception: pass</code> around a failing call.</li>
+<li>Match the surrounding code: comment density, naming, error style (<code>_errors.py</code>: <code>native()</code>,
+  <code>unsupported()</code>). Files start with the SPDX header used everywhere.</li>
+<li>Keep the diff to this task. No refactors of unrelated code.</li>
+<li>C++ must build without warnings (<code>-Wall -Wextra</code>); CI uses <code>-Werror</code>.</li>
+<li>Do not <code>git commit</code>, <code>git push</code>, or change branches.</li>
+</ul>
+<h2 id="6-the-differential-test-you-write-bindingspythonteststest_blob_writerspy">6. The differential test you write: <code>bindings/python/tests/test_blob_writers.py</code><a class="headerlink" href="#6-the-differential-test-you-write-bindingspythonteststest_blob_writerspy" title="Permanent link">&para;</a></h2>
+<p>Style: copy the header docstring / fixture pattern of <code>bindings/python/tests/test_stable_row_ids.py</code>
+(<code>require_pylance()</code> from <code>tests.support</code>). Every case runs the <strong>same calls on <code>nanolance.lance</code> and
+on real <code>lance</code></strong> and compares results:</p>
+<ol>
+<li>Packed writer, mixed <code>write_blob</code> / <code>write_blobs</code> (binary, large_binary, binary_view,
+   fixed-size binary, sliced, chunked, with nulls and empties): equal <code>repr</code>s of <code>finish()</code>, equal
+   <code>finish_array(...).to_pylist()</code>, equal <code>field</code>, byte-identical sidecar files, equal <code>writer.path</code>
+   relative to the base.</li>
+<li>Dedicated writer: two <code>write</code>s, equal descriptor repr and sidecar bytes.</li>
+<li>Builder: the full sequence of 3.5 on both, equal <code>finish().to_pylist()</code> and <code>field</code>.</li>
+<li>Every error in 3.2/3.3/3.5: same exception type on both engines.</li>
+<li>End to end (phase B): with nanolance, create a dataset (<code>id uint32</code>, <code>lance.blob_field("blob")</code>),
+   write a packed sidecar + a dedicated sidecar with nanolance's writers, write the data file with
+   nanolance's <code>LanceFileSession.open_writer</code>, commit <code>DataReplacement</code> (as in the pylance test), then
+   read the blobs with <code>take_blobs</code> / <code>read_blobs</code> in <strong>both</strong> nanolance and pylance: same bytes.
+   Also the reverse: sidecars written by pylance's writers, data file + commit by nanolance.</li>
+</ol>
+<h2 id="7-docs">7. Docs<a class="headerlink" href="#7-docs" title="Permanent link">&para;</a></h2>
+<ul>
+<li><code>docs/PYLANCE_COMPAT.md</code>: remove <code>PackedBlobWriter</code>, <code>DedicatedBlobWriter</code>,
+  <code>BlobDescriptorArrayBuilder</code> from the "not supported" list (search for them) and add one line where
+  blob writes are described.</li>
+<li><code>docs/PROGRESS.md</code>: append a short section in the style of the last ones (what, found on the way,
+  verified with numbers).</li>
+<li><code>docs/ROADMAP.md</code>: mark the item done (search "packed/dedicated" / "PackedBlobWriter").</li>
+</ul>
+<h2 id="8-when-you-are-stuck-or-must-decide-something-not-covered-here">8. When you are stuck or must decide something not covered here<a class="headerlink" href="#8-when-you-are-stuck-or-must-decide-something-not-covered-here" title="Permanent link">&para;</a></h2>
+<p>Stop and put the question at the top of your final report, with what you tried and the options you
+see. The reviewer will answer and you will continue. Do not guess on: on-disk format changes,
+public API names not listed above, or deleting existing behaviour.</p>
+<h2 id="9-your-final-report-keep-it-short">9. Your final report (keep it short)<a class="headerlink" href="#9-your-final-report-keep-it-short" title="Permanent link">&para;</a></h2>
+<ul>
+<li>What you changed (files), phase A / B status.</li>
+<li>The exact pylance-suite line (<code>... N passed ...</code> and <code>all N expected tests passed</code>), the
+  pytest summary line, ctest summary if C++ changed.</li>
+<li>Anything you could not make pass, with the error text.</li>
+<li>Open questions.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

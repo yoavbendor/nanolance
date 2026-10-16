@@ -913,6 +913,28 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#vector-indexes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Vector indexes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#full-text-inverted-indexes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Full-text (INVERTED) indexes
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -2659,6 +2681,184 @@
 <td style="text-align: right;">36.2</td>
 <td style="text-align: right;">18.2</td>
 <td style="text-align: right;">44.9</td>
+</tr>
+</tbody>
+</table>
+<h2 id="vector-indexes">Vector indexes<a class="headerlink" href="#vector-indexes" title="Permanent link">&para;</a></h2>
+<p><em>From <code>bench/results/vector_index.json</code>, produced by <code>tools/bench_vector_index.py</code> (generated data).</em> 200,000 vectors of 128 float32s around 1,000 centres, 256 partitions (IVF_PQ: 16 sub-vectors of 8 bits). Each engine builds the index on its own copy and searches the one it built; on pylance's index nanolance returns pylance's rows, order and distances. Recall@10 against an exact search, default probing. Search: ms a query, median of 5 passes over 50 queries, warm. nanolance <code>95a78b7</code>, pylance 12.0.0, 4 cores, 2026-10-08 08:35 UTC.</p>
+<table>
+<thead>
+<tr>
+<th>index</th>
+<th style="text-align: right;">build, pylance</th>
+<th style="text-align: right;">build, nanolance</th>
+<th style="text-align: right;">recall@10, pylance's index</th>
+<th style="text-align: right;">recall@10, nanolance's</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IVF_FLAT</td>
+<td style="text-align: right;">10.35 s</td>
+<td style="text-align: right;">5.14 s</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+<tr>
+<td>IVF_PQ</td>
+<td style="text-align: right;">20.66 s</td>
+<td style="text-align: right;">16.94 s</td>
+<td style="text-align: right;">0.284</td>
+<td style="text-align: right;">0.314</td>
+</tr>
+<tr>
+<td>IVF_HNSW_SQ</td>
+<td style="text-align: right;">13.50 s</td>
+<td style="text-align: right;">11.09 s</td>
+<td style="text-align: right;">0.962</td>
+<td style="text-align: right;">0.960</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>index</th>
+<th>search</th>
+<th style="text-align: right;">pylance</th>
+<th style="text-align: right;">nanolance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IVF_FLAT</td>
+<td>k=10</td>
+<td style="text-align: right;">4.11</td>
+<td style="text-align: right;">1.16</td>
+</tr>
+<tr>
+<td>IVF_FLAT</td>
+<td>k=100</td>
+<td style="text-align: right;">5.31</td>
+<td style="text-align: right;">1.58</td>
+</tr>
+<tr>
+<td>IVF_FLAT</td>
+<td>k=10, nprobes=32</td>
+<td style="text-align: right;">5.45</td>
+<td style="text-align: right;">1.72</td>
+</tr>
+<tr>
+<td>IVF_FLAT</td>
+<td>k=10, refine_factor=4</td>
+<td style="text-align: right;">17.81</td>
+<td style="text-align: right;">4.93</td>
+</tr>
+<tr>
+<td>IVF_PQ</td>
+<td>k=10</td>
+<td style="text-align: right;">8.18</td>
+<td style="text-align: right;">3.67</td>
+</tr>
+<tr>
+<td>IVF_PQ</td>
+<td>k=100</td>
+<td style="text-align: right;">8.61</td>
+<td style="text-align: right;">3.90</td>
+</tr>
+<tr>
+<td>IVF_PQ</td>
+<td>k=10, nprobes=32</td>
+<td style="text-align: right;">3.90</td>
+<td style="text-align: right;">1.54</td>
+</tr>
+<tr>
+<td>IVF_PQ</td>
+<td>k=10, refine_factor=4</td>
+<td style="text-align: right;">9.58</td>
+<td style="text-align: right;">3.67</td>
+</tr>
+<tr>
+<td>IVF_HNSW_SQ</td>
+<td>k=10</td>
+<td style="text-align: right;">17.96</td>
+<td style="text-align: right;">2.78</td>
+</tr>
+<tr>
+<td>IVF_HNSW_SQ</td>
+<td>k=100</td>
+<td style="text-align: right;">37.68</td>
+<td style="text-align: right;">8.63</td>
+</tr>
+<tr>
+<td>IVF_HNSW_SQ</td>
+<td>k=10, nprobes=32</td>
+<td style="text-align: right;">4.96</td>
+<td style="text-align: right;">1.25</td>
+</tr>
+<tr>
+<td>IVF_HNSW_SQ</td>
+<td>k=10, refine_factor=4</td>
+<td style="text-align: right;">25.78</td>
+<td style="text-align: right;">4.21</td>
+</tr>
+</tbody>
+</table>
+<h2 id="full-text-inverted-indexes">Full-text (INVERTED) indexes<a class="headerlink" href="#full-text-inverted-indexes" title="Permanent link">&para;</a></h2>
+<p><em>From <code>bench/results/fts_index.json</code>, produced by <code>tools/bench_fts.py</code> (generated data).</em> 500,000 documents of about 40 words (Zipf-distributed over 30,000 made-up words, with English stop words), Lance's default analyzer. Each engine builds the index on its own copy and searches the one it built; on pylance's index nanolance returns pylance's scores, bit for bit. Search: ms a query, median of 5 passes over 50 queries, warm. nanolance <code>4af2c68 with uncommitted changes</code>, pylance 12.0.0, 4 cores, 2026-10-06 21:02 UTC.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th style="text-align: right;">pylance</th>
+<th style="text-align: right;">nanolance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>build</td>
+<td style="text-align: right;">7.07 s</td>
+<td style="text-align: right;">4.06 s</td>
+</tr>
+<tr>
+<td>index size</td>
+<td style="text-align: right;">16.3 MB</td>
+<td style="text-align: right;">16.1 MB</td>
+</tr>
+<tr>
+<td>1 common word, limit 10</td>
+<td style="text-align: right;">2.74 ms</td>
+<td style="text-align: right;">0.31 ms</td>
+</tr>
+<tr>
+<td>1 rare word, limit 10</td>
+<td style="text-align: right;">2.41 ms</td>
+<td style="text-align: right;">0.49 ms</td>
+</tr>
+<tr>
+<td>2 words, limit 10</td>
+<td style="text-align: right;">2.55 ms</td>
+<td style="text-align: right;">1.34 ms</td>
+</tr>
+<tr>
+<td>3 words, limit 10</td>
+<td style="text-align: right;">2.65 ms</td>
+<td style="text-align: right;">1.23 ms</td>
+</tr>
+<tr>
+<td>3 words, limit 100</td>
+<td style="text-align: right;">3.65 ms</td>
+<td style="text-align: right;">2.03 ms</td>
+</tr>
+<tr>
+<td>2 words, AND, limit 10</td>
+<td style="text-align: right;">2.35 ms</td>
+<td style="text-align: right;">1.21 ms</td>
+</tr>
+<tr>
+<td>1 rare word, all matches</td>
+<td style="text-align: right;">2.86 ms</td>
+<td style="text-align: right;">1.25 ms</td>
 </tr>
 </tbody>
 </table>

@@ -1,0 +1,1092 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/tasks/NGRAM_JSON/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Task: NGRAM and JSON scalar indexes, the ngram tokenizer for INVERTED - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#task-ngram-and-json-scalar-indexes-the-ngram-tokenizer-for-inverted" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Task: NGRAM and JSON scalar indexes, the ngram tokenizer for INVERTED
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#0-context-budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        0. Context budget
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-facts-measured-on-pylance-1200-here" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Facts (measured on pylance 12.0.0 here)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-phases-and-oracles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Phases and oracles
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-tests-you-write" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Tests you write
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-rules-builds-stop-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Rules, builds, stop rules
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-done-per-phase-report-under-40-lines-sent-once" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Done per phase -- report (under 40 lines, sent once)
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="task-ngram-and-json-scalar-indexes-the-ngram-tokenizer-for-inverted">Task: NGRAM and JSON scalar indexes, the ngram tokenizer for INVERTED<a class="headerlink" href="#task-ngram-and-json-scalar-indexes-the-ngram-tokenizer-for-inverted" title="Permanent link">&para;</a></h1>
+<p>Status: <strong>delegated</strong> (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5). Roadmap item 5
+(scalar / FTS breadth). Three phases, each a fresh session: <strong>N1</strong> NGRAM index, <strong>N2</strong> JSON index,
+<strong>N3</strong> <code>base_tokenizer="ngram"</code> for INVERTED.</p>
+<h2 id="0-context-budget">0. Context budget<a class="headerlink" href="#0-context-budget" title="Permanent link">&para;</a></h2>
+<p>About 100k tokens per session. <code>grep -n</code> then <code>sed -n</code> windows of at most ~120 lines; never read
+<code>dataset.py</code> (3.5k+), <code>src/index_search.cpp</code>, <code>src/scalar_index.cpp</code> or Lance's <code>ngram.rs</code> (2.7k) /
+<code>json.rs</code> (1.7k) whole. Cut all output (<code>| tail -15</code>; pytest <code>-o addopts=</code> for a summary line;
+<code>tools/pylance_suite.py ... | tail -5</code>; <code>ninja 2&gt;&amp;1 | grep -E "error|warning:" | head</code>). Only your
+phase. Lance's source: <code>.deps/rust-suite/lance-index-12.0.0/src/scalar/{ngram.rs,json.rs}</code>,
+<code>.deps/rust-suite/lance-tokenizer-12.0.0/src/{ngram_tokenizer.rs,alphanum_only.rs}</code>. The model for
+adding an index kind is the ZONEMAP / BLOOMFILTER work (<code>docs/tasks/ZONED_INDEXES.md</code>): grep
+<code>ZONEMAP\|ZoneMap\|zonemap</code> in <code>src/scalar_index.cpp src/index_search.cpp src/index_segments.cpp
+src/index_files.cpp src/index_optimize.cpp include/nanolance/scalar_index.hpp
+bindings/python/nanolance/lance/dataset.py bindings/python/nanolance/lance/indices/builder.py</code> and
+follow the same path. Real pylance is <code>import lance</code> in plain <code>python3</code>; a probe that dumps both
+indexes: <code>/tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2c18b24f/scratchpad/ngram/probe.py</code>
+(copy it to your own scratch dir first).</p>
+<h2 id="1-facts-measured-on-pylance-1200-here">1. Facts (measured on pylance 12.0.0 here)<a class="headerlink" href="#1-facts-measured-on-pylance-1200-here" title="Permanent link">&para;</a></h2>
+<p><strong>NGRAM</strong> (<code>create_scalar_index(col, index_type="NGRAM")</code>, string / large_string columns):
+- One file <code>ngram_postings.lance</code>: schema <code>tokens: uint32</code> (nullable) + <code>posting_list: binary not
+  null</code> with field metadata <code>lance-encoding:compression = none</code>; one row per distinct token, sorted by
+  token. <code>posting_list</code> = a <strong>RoaringTreemap</strong> serialization of the row ids (u64 LE count of 32-bit
+  high keys, then per key <code>[u32 LE high][portable 32-bit Roaring]</code>) -- not the RowAddrTreeMap format
+  of <code>serialize_treemap</code>. <strong>Token 0 holds the null rows.</strong> Example: 5 rows
+  <code>["apple pie","Banana!",None,"","ÉCOLE ab"]</code> -&gt; 11 rows, token 0 -&gt; {2}.
+- Tokenizing (<code>ngram.rs</code> 87-160): per value, <code>RawTokenizer</code> + <code>LowerCaser</code> + <code>AsciiFoldingFilter</code>
+  (one token = the whole value lowered and folded), then <code>NgramTokenizer::all_ngrams(3, 3)</code> over
+  characters, then <code>AlphaNumOnlyFilter</code> (keep a trigram only if every char <code>is_ascii_alphanumeric</code>).
+  Token id: <code>ngram_to_token</code> (base 37; '0'-'9' -&gt; 1-10, 'a'-'z' -&gt; 11-36; first char * 37^2 ...).
+  nanolance already has lower-case and ASCII-folding code in <code>src/fts_tokenizer.cpp</code>: reuse it.
+- Manifest: <code>type_url</code> <code>/lance.table.NGramIndexDetails</code> (empty message), <code>index_version</code> 0,
+  <code>describe_indices()[i].index_type == "NGram"</code>; <code>stats.index_stats(name)</code>: <code>index_type "NGram"</code>,
+  <code>indices</code> / <code>segments</code> = <code>[{"num_ngrams": N}]</code>.
+- Search (<code>ngram.rs</code> 506-600): <code>contains(col, 'x')</code> (and Lance's other forms it routes to
+  <code>TextQuery::StringContains</code> -- grep <code>StringContains</code> in lance-index's <code>scalar/expression.rs</code>; check
+  <code>LIKE '%x%'</code>) -&gt; a needle of &lt; 3 chars: index knows nothing (recheck all rows); any needle trigram
+  missing from the index: exact empty; no trigrams after filtering: recheck all; else the
+  intersection of the posting lists as <strong>candidates to recheck</strong> (at_most). <code>regexp_like</code> uses
+  <code>ngram/ngram_regex.rs</code> -- out of scope (treat as recheck all) unless a target test needs it.
+  Results always equal a scan without the index; the plan shows
+  <code>ScalarIndexQuery: query=[contains(w, Utf8("apple"))]@w_idx(NGram)</code> (nanolance builds this line in
+  <code>src/index_search.cpp</code> ~1012).
+- Maintenance like the other scalar kinds: <code>optimize_indices</code> deltas, compaction re-cover,
+  <code>create_index_uncommitted(index_type="NGRAM", fragment_ids=...)</code>, <code>merge_existing_index_segments</code>,
+  <code>commit_existing_index_segments</code>, drop, empty dataset.</p>
+<p><strong>JSON</strong> (<code>create_scalar_index(col, IndexConfig(index_type="json", parameters={"target_index_type":
+"btree", "path": "x"}))</code>, on a JSON column):
+- Files = a normal <strong>BTree</strong> (<code>page_data.lance</code>: <code>values: &lt;T&gt;</code>, <code>ids: uint64 not null</code>;
+  <code>page_lookup.lance</code>: <code>min, max, null_count, page_idx</code>, metadata <code>batch_size</code>,
+  <code>range_partitioned = false</code>) over the value extracted at <code>path</code>. nanolance already writes BTree
+  files: reuse the builder with the extracted column.
+- Value type <code>&lt;T&gt;</code> (<code>json.rs</code> 531-590): the type of the <strong>first non-null</strong> extracted value --
+  bool -&gt; Boolean, int -&gt; Int64, float -&gt; Float64, string -&gt; Utf8, array / object -&gt; LargeBinary;
+  all null -&gt; Utf8. Later rows must be compatible (Float64 accepts ints) or the build fails with
+  <code>JSON path '{path}' expected {T:?}, but batch row {i} has JSON type {J:?}</code>. Missing path = null.
+- Manifest: <code>type_url</code> <code>/lance.index.pb.JsonIndexDetails</code> = <code>{string path = 1; Any target_details =
+  2}</code> with <code>target_details</code> the BTree's details Any; <code>index_version</code> 0; describe <code>index_type "Json"</code>,
+  details <code>{"path": "x", "target_details": {}}</code>; <code>stats.index_stats</code>: <code>index_type "BTree"</code>,
+  <code>indices</code> <code>[{"min":..,"max":..,"num_pages":..}]</code> as for a BTree. Default name <code>&lt;col&gt;_idx</code>.
+- Queries routed (<code>json.rs</code> ~300-460): <code>json_get_int / json_get_float / json_get_bool /
+  json_get_string(col, '&lt;path&gt;') &lt;op&gt; literal</code> where the function's type equals the index's <code>&lt;T&gt;</code> and
+  the path string equals the index path; plan line
+  <code>ScalarIndexQuery: query=[Json(j = 11-&gt;x)]@j_idx(BTree)</code>. <code>json_extract</code> is never routed.
+  nanolance evaluates these functions already (<code>src/expr.cpp</code> ~1650).</p>
+<p><strong>ngram tokenizer for INVERTED</strong> (N3): <code>base_tokenizer="ngram"</code>, <code>min_ngram_length</code> (default 3),
+<code>max_ngram_length</code> (default 3), <code>prefix_only</code>; <code>stem</code> / <code>remove_stop_words</code> default false for it.
+Port <code>ngram_tokenizer.rs</code> (221 lines, read whole) into <code>src/fts_tokenizer.cpp</code>'s chain. Oracle
+<code>test_fts_ngram_tokenizer</code> (read it).</p>
+<h2 id="2-phases-and-oracles">2. Phases and oracles<a class="headerlink" href="#2-phases-and-oracles" title="Permanent link">&para;</a></h2>
+<p>Run pylance's tests through the runner (it loads nanolance as <code>lance</code>):
+<code>python3 tools/pylance_suite.py -k "&lt;names&gt;" 2&gt;&amp;1 | grep -E "^FAILED|passed|failed" | tail -15</code>
+(a <code>tests/test_datagen.py</code> collection error shows with <code>-k</code>; ignore it).</p>
+<ul>
+<li><strong>N1 NGRAM:</strong> <code>test_ngram_index</code>, <code>test_ngram_fts</code>, <code>test_index_take_batch_size</code>,
+  <code>test_scalar_index_with_nulls</code>, <code>test_create_index_empty_dataset</code>, <code>test_optimize_no_new_data</code>,
+  <code>test_drop_index</code>, <code>test_ngram_segment_merge_and_commit_from_python</code>,
+  <code>test_optimize_indices_second_call_is_noop</code> (some use other index kinds too; read each before
+  starting). Byte-level: same token rows and identical <code>posting_list</code> blobs as pylance on the same
+  data (one fragment), both engines search each other's index.</li>
+<li><strong>N2 JSON:</strong> <code>test_describe_indices</code> (6 cases; it also builds NGRAM, so after N1). The
+  <code>test_json_index*</code> tests use <code>memory://</code> (object stores are last on the roadmap): write
+  equivalent tests on <code>tmp_path</code> instead.</li>
+<li><strong>N3:</strong> <code>test_fts_ngram_tokenizer</code>.</li>
+</ul>
+<h2 id="3-tests-you-write">3. Tests you write<a class="headerlink" href="#3-tests-you-write" title="Permanent link">&para;</a></h2>
+<p><code>bindings/python/tests/test_ngram_json_index.py</code> (new; follow <code>test_zoned_indexes.py</code>'s style):
+each engine builds, the other searches; same rows with and without the index; posting blobs /
+BTree pages equal; describe / stats equal; deletions, appends + optimize, nulls, empty strings,
+non-ASCII. N3 cases go in <code>test_fts.py</code>.</p>
+<h2 id="4-rules-builds-stop-rules">4. Rules, builds, stop rules<a class="headerlink" href="#4-rules-builds-stop-rules" title="Permanent link">&para;</a></h2>
+<p><code>AGENTS.md</code> sections 5 and 7 (grep the headings). No skipped / weakened tests. C++ without warnings.
+Existing indexes stay byte-identical. Do not commit, push, change branches, or run <code>--update</code>.
+Builds: <code>cd build &amp;&amp; ninja</code>, then <code>cd bindings/python/build/cp311-cp311-linux_x86_64 &amp;&amp; ninja &amp;&amp; cp
+_nanolance.cpython-311-x86_64-linux-gnu.so /usr/local/lib/python3.11/dist-packages/nanolance/</code>.
+Stop and ask (question first) if pylance's files differ from section 1, if routing a filter to the
+index needs changes to the expression evaluator beyond recognizing the call shape, or if a target
+test needs <code>regexp_like</code> index support.</p>
+<h2 id="5-done-per-phase-report-under-40-lines-sent-once">5. Done per phase -- report (under 40 lines, sent once)<a class="headerlink" href="#5-done-per-phase-report-under-40-lines-sent-once" title="Permanent link">&para;</a></h2>
+<p>Tails of: <code>cd build &amp;&amp; ctest -j8 | grep "tests passed"</code>; the oracle <code>-k</code> run; your test file;
+<code>python3 tools/pylance_suite.py | tail -4</code> ("all N expected tests passed"); last, once, quiet:
+<code>cd bindings/python &amp;&amp; python3 -m pytest -o addopts= -q -x -p no:cacheprovider tests | tail -1</code>.
+Files changed, per-test status, decisions, questions.</p>
+<p><strong>N1 investigation (2026-10-15), no code changed -- reviewer's answers:</strong>
+- N1 is split: <strong>N1a</strong> = RoaringTreemap encoder, tokenizer, build, search, <code>contains</code> routing, explain
+  line, describe / stats, drop, empty dataset, and the oracle tests among those; <strong>N1b</strong> = optimize
+  deltas, compaction re-cover, <code>create_index_uncommitted</code> / merge / commit segments,
+  <code>test_optimize_indices_second_call_is_noop</code>.
+- <strong>Approved:</strong> a new <code>expr::Predicate::Test::Contains</code> (include/nanolance/expr.hpp ~58), recognized
+  only from <code>contains(&lt;string column&gt;, '&lt;literal&gt;')</code> in the Condition walk (src/expr.cpp ~2980-3050,
+  <code>HasAny</code> / <code>Has</code> are the precedent), with <code>filter()</code>, <code>to_string()</code> (~3189), <code>predicate_node</code>
+  (~3080) and the switch arms in src/index_search.cpp (~407, ~443, ~626, ~790). Row-evaluation
+  semantics unchanged.
+- <code>LIKE '%x%'</code> and <code>regexp_like</code> are <strong>not</strong> routed in N1: Lance sends them through
+  <code>TextQuery::Regex</code> and <code>ngram/ngram_regex.rs</code> (<code>visit_like</code>, lance-index <code>scalar/expression.rs</code>
+  ~970). A later item.
+- Known pieces: <code>write_file</code> / <code>struct_schema</code> (src/index_files.cpp 183-197) drop child field metadata,
+  so <code>posting_list</code> needs a schema carrying <code>lance-encoding:compression = none</code>; the inner bitmaps can
+  use <code>roaring::encode</code> (roaring_bitmap.hpp:20); export a lower-case + ASCII-fold helper from
+  <code>Analyzer::emit</code> (src/fts_tokenizer.cpp 395-424) and include non-ASCII cases in the byte test (its
+  <code>kLower</code> table may differ from Rust's <code>to_lowercase</code> on rare characters: report any difference).</p>
+<p><strong>N1a outcome (2026-10-15):</strong> done. NGRAM build / search / <code>contains</code> routing / plan line / describe /
+stats / drop / empty dataset; token rows and posting bytes equal pylance's (nulls, empty strings,
+non-ASCII; a sweep of every code point U+0080..U+10FFFF found no lower-case table difference).
+Reviewer: <code>drop_index</code> of a missing name now raises pylance's <code>RuntimeError("Lance index not found:
+name=...")</code>. +5 pylance tests (1050). <strong>N1b</strong> next: <code>test_optimize_no_new_data</code>,
+<code>test_create_index_empty_dataset</code> (both reach <code>optimize_indices</code> on NGRAM),
+<code>test_optimize_indices_second_call_is_noop</code>, <code>test_ngram_segment_merge_and_commit_from_python</code>.</p>
+<p><strong>N1b outcome (2026-10-15):</strong> done. NGRAM <code>optimize_indices</code> (merge by default, a delta with
+<code>num_indices_to_merge=0</code>; replaced segments' postings kept, deleted rows included, as Lance's
+<code>open_and_merge_segments</code>), compaction re-cover, distributed segments; describe / stats / posting rows
+equal pylance's after the same steps, with and without stable row ids. Reviewer: after compaction
+nanolance re-indexes the rewritten fragments for every kind while pylance remaps and leaves them
+unindexed -- the documented divergence stands (answers equal a scan either way); the "kind nanolance
+cannot build" refusal is now tested with a pylance IVF_RQ index. +4 pylance tests (1054). N2 next.</p>
+<p><strong>N2 investigation (2026-10-15) -- reviewer's answers:</strong>
+- pylance's JSON index disagrees with its own scan for dotted / <code>$</code> paths (the index parses the path as
+  JSONPath; <code>json_get_*(col, 'k')</code> is a literal key lookup -- measured: index <code>a.b</code> answers <code>[0]</code> where
+  the scan gives <code>[]</code>). <strong>Decision (a):</strong> build every path as pylance does (byte-equal BTree), but route
+  to the index only identifier-like paths <code>[A-Za-z_][A-Za-z0-9_]*</code>; queries on other paths scan.
+  Documented divergence: nanolance's answers stay equal to a scan, pylance's do not.
+- <code>target_index_type</code>: <strong>btree only</strong> in N2 (any case). pylance also accepts bitmap, zonemap,
+  bloomfilter, ngram, inverted -- refuse those with <code>target_index_type 'X' is not supported yet
+  (supported: btree)</code>; label_list / json / unknown names get pylance's own errors. The other targets
+  are a later item.
+- IndexConfig is the only form (no kwargs <code>index_type="JSON"</code>). The plan line and stats name the
+  target (<code>@j_idx(BTree)</code>, <code>index_type "BTree"</code>) -- special-case it in src/index_search.cpp ~1190.</p>
+<p><strong>N2 code map (2026-10-15, second investigation session; no code changed).</strong> N2 is split:
+<strong>N2a</strong> = steps 1-3 + their tests, <strong>N2b</strong> = steps 4-6.
+1. Python: <code>create_scalar_index</code> (dataset.py ~973-1017) drops IndexConfig parameters other than
+   rows_per_zone / bloom options: add a json branch (IndexConfig only; validate <code>target_index_type</code> /
+   <code>path</code>, the agreed refusals). Native: <code>_ds_create_scalar_index</code>
+   (bindings/python/src/nanolance_bindings.cpp:1637) needs a path argument; <code>ScalarIndexOptions</code>
+   (include/nanolance/scalar_index.hpp:34) a <code>json_path</code> field.
+2. C++: in <code>create_scalar_index</code> (src/scalar_index.cpp ~1118-1415) the json branch must come before
+   the <code>key_kind_of</code> check (it rejects extension types). JSONPath subset: optional leading <code>$</code>,
+   dot-separated member names (<code>$['x']</code> -&gt; pylance's "Invalid JSONPath"). Extract per batch into typed
+   nanoarrow arrays, type inference with Lance's error text, then the existing <code>write_btree</code> /
+   <code>sort_items</code>; JsonIndexDetails wrapper (path=1, target Any=2), index_version 0.
+3. describe (<code>index_type "Json"</code> from the URL) / stats (as BTree): check both against pylance.
+   <code>test_describe_indices</code>' json column is all-null at path "x" -&gt; inferred type Utf8.
+4. Routing: <code>json_get_int/float/bool/string(col, 'k') &lt;op&gt; literal</code> for identifier-like paths only,
+   a new predicate kind as N1's <code>Test::Contains</code>; src/index_search.cpp ~1137-1190, plan line
+   <code>@j_idx(BTree)</code> (special-case the type name).
+5. Optimize / merge / compaction re-cover / drop as BTree (src/index_optimize.cpp Kind mapping,
+   src/index_segments.cpp type maps).
+6. Tests on tmp_path in test_ngram_json_index.py, including the <code>a.b</code> divergence test.</p>
+<p><strong>N2a outcome (2026-10-15):</strong> done. JSON index build (IndexConfig, btree target; JSONPath subset
+<code>$</code> + dotted names, others refused by name), Lance's type inference and messages, BTree pages equal
+pylance's for every value type, JsonIndexDetails, describe / stats; optimize on a JSON index refuses
+clearly until N2b. All 6 <code>test_describe_indices</code> pass (+6, 1060). Also fixed: BTree stats display for
+null-min pages, all-null and binary values (pre-existing divergence, display only). Accepted: error
+texts drop pylance's Rust source location; distributed JSON builds refused. <strong>N2b</strong> next: routing
+(only when the json_get_* type equals the index type -- pylance's own scan errors otherwise), optimize /
+merge / compaction, drop.</p>
+<p><strong>N2b outcome (2026-10-15):</strong> done. <code>json_get_int/float/bool/string(col, '&lt;identifier&gt;')</code> with =, &lt;&gt;,
+&lt;, &lt;=, &gt;, &gt;=, IN, BETWEEN, IS [NOT] NULL routed to the JSON index when the accessor type, the
+literal and the index value type match (bool =, &lt;&gt;, IN not routed, as pylance); optimize / compaction
+re-cover / drop as BTree; pylance's <code>test_json_index</code> and <code>test_json_index_non_exact_floats</code> pass
+(+2, 1062). Accepted divergences (answers equal a scan): the plan text for !=, BETWEEN and IS NOT NULL
+is one query where pylance prints NOT(...) / AND(...); <code>json_get_float</code> on an Int64 index scans
+(pylance routes it and its answer differed from its scan). Design: a <code>JsonAccess</code> on the Predicate
+instead of a new test kind. N3 next.</p>
+<p><strong>N3 outcome (2026-10-15):</strong> done (Haiku: tokenizer port, options, golden cases; reviewer: query
+semantics). <code>base_tokenizer="ngram"</code> with min / max / prefix_only, Lance's messages, 108 golden token
+cases from the Rust oracle; <code>test_fts_ngram_tokenizer</code> passes (+1, 1063). Reviewer found and fixed a
+<strong>general full-text rule</strong> (not ngram-specific), from lance-index <code>index/partition.rs</code>
+<code>load_posting_lists_with_policy</code> / <code>summarize_position_matches</code>: query tokens are de-duplicated by
+(token, position), and under AND the tokens sharing a query position form a union -- a document
+needs one token of each position's group (the score stays the sum of every matched token). The ngram
+tokenizer puts every gram at position 0, so AND over several grams answers as OR. Phrase queries are
+unchanged. Score comparisons allow 1e-6 relative (float32 summation order of many terms).
+Task NGRAM_JSON done; left for later: LIKE / regexp_like routing to NGRAM (<code>ngram_regex.rs</code>), JSON
+targets other than btree, pylance's NOT / AND plan text for JSON queries.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

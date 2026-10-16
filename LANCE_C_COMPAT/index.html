@@ -748,17 +748,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#out-of-scope" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Out of scope
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#lance-cs-own-tests" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -823,7 +812,8 @@ nanolance unchanged:</p>
 </code></pre></div>
 <p>The headers in <code>compat/lance-c/include/lance/</code> are lance-c's own, copied unmodified (Apache-2.0,
 The Lance Authors) from the commit in <code>compat/lance-c/UPSTREAM</code>. Every one of the 127 functions they
-declare is defined in <code>src/lance_c.cpp</code>. What nanolance implements does the work. The rest fails
+declare is defined in <code>src/lance_c.cpp</code>, and does the work, except for a few options and index kinds
+(below). Those fail
 the way lance-c reports any failure: the function's documented error value, with
 <code>lance_last_error_code()</code> set to <code>LANCE_ERR_NOT_SUPPORTED</code> and a message naming the feature. It never
 returns a silently different result. nanolance is not affiliated with the Lance project.</p>
@@ -862,7 +852,7 @@ returns a silently different result. nanolance is not affiliated with the Lance 
 </tr>
 <tr>
 <td>Scans</td>
-<td><code>lance_scanner_new</code> (projection), <code>set_limit</code>, <code>set_offset</code>, <code>set_batch_size</code>, <code>with_row_id</code>, <code>with_row_address</code>, <code>set_fragment_ids</code>, <code>set_blob_handling</code> (a blob column as its description by default, as its bytes with <code>ALL_BINARY</code>), <code>set_statistics_callback</code> (bytes and reads), the tuning setters (accepted, no effect on results), <code>to_arrow_stream</code>, <code>next</code> + <code>lance_batch_to_arrow</code> / <code>lance_batch_free</code>, <code>scan_async</code> + <code>async_stream_free</code>, <code>poll_next</code> (always ready: decoding is synchronous)</td>
+<td><code>lance_scanner_new</code> (projection), <code>set_limit</code>, <code>set_offset</code>, <code>set_batch_size</code>, <code>with_row_id</code>, <code>with_row_address</code>, <code>set_include_deleted_rows</code> (every stored row; a deleted one with a NULL <code>_rowid</code>, <code>with_row_id</code> required), <code>set_use_scalar_index</code>, <code>set_fragment_ids</code>, <code>set_blob_handling</code> (a blob column as its description by default, as its bytes with <code>ALL_BINARY</code>), <code>set_statistics_callback</code> (bytes and reads), the tuning setters (accepted, no effect on results), <code>to_arrow_stream</code>, <code>next</code> + <code>lance_batch_to_arrow</code> / <code>lance_batch_free</code>, <code>scan_async</code> + <code>async_stream_free</code>, <code>poll_next</code> (always ready: decoding is synchronous)</td>
 </tr>
 <tr>
 <td>Filters</td>
@@ -870,7 +860,7 @@ returns a silently different result. nanolance is not affiliated with the Lance 
 </tr>
 <tr>
 <td>Changes</td>
-<td><code>lance_dataset_delete</code>, <code>update</code>, <code>merge_insert</code> (every <code>when_matched</code> mode but <code>UPDATE_IF</code>, both <code>when_not_matched</code>, <code>when_not_matched_by_source</code> keep / delete / delete-if), <code>compact_files</code>, <code>drop_columns</code>, <code>alter_columns</code>, <code>add_columns_sql</code> / <code>add_columns_nulls</code> / <code>add_columns_stream</code>. Each commits one version and moves the handle to it, as lance-c does. A writer whose change is built on a replaced version gets <code>LANCE_ERR_COMMIT_CONFLICT</code>.</td>
+<td><code>lance_dataset_delete</code>, <code>update</code>, <code>merge_insert</code> (every <code>when_matched</code> mode but <code>UPDATE_IF</code>, both <code>when_not_matched</code>, <code>when_not_matched_by_source</code> keep / delete / delete-if), <code>compact_files</code>, <code>drop_columns</code>, <code>alter_columns</code>, <code>add_columns_sql</code> / <code>add_columns_nulls</code> / <code>add_columns_stream</code>. Merge insert's <code>when_matched</code> modes are all there, <code>UPDATE_IF</code> included (its condition over <code>source.&lt;column&gt;</code> and <code>target.&lt;column&gt;</code>). Each commits one version and moves the handle to it, as lance-c does. A writer whose change is built on a replaced version gets <code>LANCE_ERR_COMMIT_CONFLICT</code>.</td>
 </tr>
 <tr>
 <td>Blobs</td>
@@ -882,7 +872,19 @@ returns a silently different result. nanolance is not affiliated with the Lance 
 </tr>
 <tr>
 <td>Indexes</td>
-<td><code>lance_dataset_create_scalar_index</code> (BTREE, BITMAP, LABEL_LIST; no parameters), <code>lance_dataset_drop_index</code>, <code>lance_dataset_index_count</code> and <code>lance_dataset_index_list_json</code>. Scans use BTree, Bitmap and LabelList indexes, whoever built them. The changes above keep the indices a dataset has, by Lance's rules (<code>docs/PYLANCE_COMPAT.md</code>, "Indexes").</td>
+<td><code>lance_dataset_create_scalar_index</code> (BTREE, BITMAP, LABEL_LIST without parameters; INVERTED with its analyzer in <code>params_json</code>, Lance's <code>InvertedIndexParams</code> names, LanceDB's defaults for what is left out), <code>lance_dataset_create_vector_index</code> (IVF_FLAT, IVF_PQ, IVF_HNSW_SQ; L2, cosine, dot), <code>lance_dataset_drop_index</code>, <code>lance_dataset_index_count</code> and <code>lance_dataset_index_list_json</code>. Scans use BTree, Bitmap and LabelList indexes, whoever built them. The changes above keep the indices a dataset has, by Lance's rules, and compaction gives its rewritten rows back to them (<code>docs/PYLANCE_COMPAT.md</code>, "Indexes").</td>
+</tr>
+<tr>
+<td>Vector search</td>
+<td><code>lance_scanner_nearest</code> (float32, float16, float64, uint8 and int8 queries), <code>set_nprobes</code> / <code>set_minimum_nprobes</code> / <code>set_maximum_nprobes</code>, <code>set_refine_factor</code>, <code>set_metric</code>, <code>set_use_index</code>, <code>set_prefilter</code>, with the scanner's filter, projection, offset and limit. The rows come back nearest first: the columns asked for, then <code>_distance</code>, then the row id columns, as Lance returns them. IVF_FLAT, IVF_PQ and IVF_HNSW_SQ indexes are searched as pylance searches them (<code>docs/VECTOR_INDEX.md</code>); a column without one is searched exactly. <code>set_ef</code> sets the HNSW beam and <code>set_query_parallelism</code> how many HNSW partitions Lance searches at once past the first probes (which can change which rows a filtered search finds); <code>set_approx_mode</code> is validated and changes nothing (in Lance it only affects binary-quantized searches).</td>
+</tr>
+<tr>
+<td>Index segments</td>
+<td>Building an index in pieces, on other machines, and committing the pieces, as lance-c's distributed workers do. <code>lance_index_segment_builder_new_scalar</code> (BTREE, BITMAP, LABEL_LIST, INVERTED) / <code>new_vector</code> (IVF_FLAT, IVF_PQ, IVF_HNSW_SQ) over chosen fragments, with an assigned UUID and AUTO / LOCAL_TRAIN / PRECOMPUTED models; <code>lance_index_train_ivf_model</code> / <code>train_pq_model</code> (FixedSizeList<Float32> models carrying lance-c's provenance metadata, so a codebook only goes with the centroids it was trained on); <code>execute_uncommitted</code> (the segment's files written, its IndexMetadata returned, nothing committed) with <code>set_progress_callback</code> (stages <code>train_ivf</code>, <code>shuffle</code>, <code>train_quantizer</code>, <code>merge_partitions</code>; <code>load_data</code> and a write stage for scalar indexes; <code>tokenize_docs</code>, <code>write_metadata</code> for INVERTED); the <code>lance_index_segment_metadata_*</code> accessors; <code>lance_dataset_commit_index_segments</code> with Lance's rules (distinct UUIDs, disjoint coverage, one index type, the keyed column; segments covering an existing one replace it, disjoint ones are kept beside it, a partial overlap or a partial type change is refused; coexisting vector segments must share metric, dimension, sub-index and quantizer; coverage of fragments rewritten since a segment was built is dropped); <code>lance_dataset_index_segment_count</code> / <code>index_segments</code>. A search can be restricted to segments, as a distributed query fans out: <code>lance_scanner_set_index_segments</code> (nearest over those segments only, no exact search of other fragments), <code>set_fts_index_segments</code> (a prepared query over some of its segments, scored with all of them, so each worker's scores are the whole search's), <code>set_scalar_index_segment</code> (a scoped filtered scan of explicit <code>fragment_ids</code>; the rows are the filter's, the segment validated as Lance validates it). pylance lists, searches and uses indexes committed this way.</td>
+</tr>
+<tr>
+<td>Full-text search</td>
+<td><code>lance_scanner_full_text_search</code> (the query over the columns given, or every indexed column), and prepared contexts: <code>lance_dataset_prepare_fts_match_query</code> (OR / AND) and <code>lance_dataset_prepare_fts_query</code>, with STRICT coverage (every fragment indexed, or the prepare fails) and INDEX_ONLY (the indexed rows alone, scored by the index's statistics), <code>lance_scanner_set_fts_query_context</code> (only on a scanner of the same snapshot) and <code>lance_fts_query_context_close</code>. Rows come back best first, with <code>_score</code>, bit for bit pylance's scores (<code>docs/FTS_INDEX.md</code>).</td>
 </tr>
 </tbody>
 </table>
@@ -890,15 +892,29 @@ returns a silently different result. nanolance is not affiliated with the Lance 
 (<code>s3://</code>, ...) return <code>LANCE_ERR_NOT_SUPPORTED</code>. <code>storage_opts</code> is accepted and ignored.</p>
 <h2 id="not-implemented-yet">Not implemented yet<a class="headerlink" href="#not-implemented-yet" title="Permanent link">&para;</a></h2>
 <ul>
-<li><code>LANCE_MERGE_WHEN_MATCHED_UPDATE_IF</code> (its condition compares source and target rows).</li>
-<li><code>lance_scanner_set_include_deleted_rows(true)</code>: deleted rows would have to come back with a NULL
-  <code>_rowid</code>.</li>
-<li>Writing Lance's inline, packed and dedicated blob layouts. nanolance writes external blobs; it
-  reads all of them.</li>
+<li>Vector indexes other than IVF_FLAT, IVF_PQ and IVF_HNSW_SQ (IVF_SQ, IVF_HNSW_PQ, IVF_HNSW_FLAT), the
+  Hamming metric, and
+  multi-vector search (<code>lance_scanner_nearest_multivector</code>).</li>
+<li>Fuzzy full-text matching (<code>max_fuzzy_distance &gt; 0</code>). Phrase queries
+  (<code>lance_dataset_prepare_fts_phrase_query</code>) work on indexes with positions (<code>params_json</code>
+  <code>{"with_position": true}</code>); an index without them gets lance-c's own error.</li>
+<li>Parameters for BTREE, BITMAP and LABEL_LIST indexes (<code>params_json</code>).</li>
+<li>Nearest or full-text search combined with <code>set_fragment_ids</code>.</li>
+<li>Substrait filters and object stores. (Datasets with stable row ids work: <code>enable_stable_row_ids</code> in
+  <code>LanceWriteParams</code>, <code>_rowid</code> through delete / update / compaction, <code>lance_dataset_take_rows</code> and
+  <code>lance_dataset_take_blobs</code> by stable row id, indexes of every kind. Blob v2 columns are written
+  in all of Lance's layouts -- inline, packed, dedicated, external -- by <code>lance_dataset_write</code>, as by
+  the Python module, and read in all of them; pylance reads what lance-c writes.)</li>
 </ul>
-<h2 id="out-of-scope">Out of scope<a class="headerlink" href="#out-of-scope" title="Permanent link">&para;</a></h2>
-<p>Vector indexes, INVERTED (full-text) indexes, index segments and their builders, vector search
-(<code>nearest</code>), full-text search, and Substrait filters.</p>
+<p><code>tests/test_lance_c_search.cpp</code> drives the search API end to end through the C API (a dataset
+written with <code>lance_dataset_write</code>, its indexes built with lance-c's calls) and compares every
+result with nanolance's own search, which the Python tests check against pylance: rows, order,
+<code>_distance</code> / <code>_score</code>, the columns, offset and limit, filters, contexts and their coverage modes,
+<code>include_deleted_rows</code>, <code>UPDATE_IF</code>, and the documented errors. For index segments it trains one
+IVF_PQ model, builds a segment per fragment with it, commits them, and checks that searching each
+segment alone and merging gives the whole search; the replacement and refusal rules of the commit;
+scoped scans over BITMAP segments; and that each INVERTED segment's scores are the whole search's.
+It runs clean under AddressSanitizer and UBSan.</p>
 <h2 id="lance-cs-own-tests">lance-c's own tests<a class="headerlink" href="#lance-cs-own-tests" title="Permanent link">&para;</a></h2>
 <p><code>tools/lance_c_suite.py</code> fetches lance-c's <code>tests/cpp/test_c_api.c</code> and <code>test_cpp_api.cpp</code> at the
 pinned commit into <code>.deps/</code>. It runs them against <code>liblance_c</code> on the datasets lance-c's harness
@@ -910,29 +926,16 @@ builds (<code>tools/lance_c_fixtures.py</code>), once written by pylance and onc
 driver <code>#include</code>s it and runs each test function in its own child process, in the order its
 <code>main()</code> does. It is built with <code>NDEBUG</code> undefined so the <code>assert()</code>s of the C++ test are live. CI
 runs the suite in <code>.github/workflows/bindings-python.yml</code>.</p>
-<p><strong>90 of 106 pass: 18 of 22 C tests and 27 of 31 C++ tests, per fixture writer.</strong> Every test that
-fails needs a vector index or index segments. It was 88 before scalar indexes, 52 of 106 before
+<p><strong>106 of 106 pass: all 22 C tests and 31 C++ tests, per fixture writer.</strong> It was 90 before index
+segments, 88 before scalar indexes, 52 of 106 before
 filters and dataset changes, and 80 before Lance's blob layouts were read. (An earlier version of this page said "52 of 80": the runner
 missed tests whose result line was printed on the same line as the test's own output, so failing
 tests went uncounted. It now parses every result and fails if the count does not match the tests
-the driver ran.) Every implemented group above has a test that passes. The ones that fail today:</p>
-<table>
-<thead>
-<tr>
-<th>Tests</th>
-<th>Why</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>index_segment_builder(_progress), vector_models_and_reusable_segments, commit_index_segments</td>
-<td>vector indexes and index segments: out of scope</td>
-</tr>
-</tbody>
-</table>
-<p>Four C++ tests pass on purpose without the feature: <code>nearest_smoke</code>, <code>fts_smoke</code>,
-<code>index_segments_smoke</code> and <code>multivector_rejects_flat_column</code>. Upstream wrote them to prove the
-wrappers compile, link and report errors, and they accept an error as the outcome.</p>
+the driver ran.) Each test binary gets fresh fixtures, as lance-c's own runner gives them: the C
+tests commit indexes that the C++ tests' index counts must not see.</p>
+<p><code>nearest_smoke</code>, <code>fts_smoke</code>, <code>index_segments_smoke</code> and <code>multivector_rejects_flat_column</code> are smoke
+tests: upstream wrote them to prove the wrappers compile, link and report errors, and they accept an
+error as the outcome. <code>fts_smoke</code> now builds its INVERTED index and searches it.</p>
 <p>The same run under AddressSanitizer and UBSan (<code>build-asan</code>) reports no error in <code>liblance_c</code>.</p>
 <h2 id="found-on-the-way">Found on the way<a class="headerlink" href="#found-on-the-way" title="Permanent link">&para;</a></h2>
 <p>The blob tests found that nanolance read Blob v2 only in its own layout. That layout has external

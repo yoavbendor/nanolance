@@ -1,0 +1,1097 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A standalone C++ Arrow <-> Lance v2.2 writer and reader — no Rust lance core. Rows keep large payloads external (uri + offset + size, never copied); the reader is hardened against untrusted files (bounds/overflow-checked decode, allocation budgets, ASan+UBSan+LSan CI, continuous fuzzing).">
+      
+      
+      
+        <link rel="canonical" href="https://yoavbendor.github.io/nanolance/tasks/MULTI_BASE/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Task: multi-base datasets (DatasetBasePath, initial_bases, target_bases, add_bases) - nanolance</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#task-multi-base-datasets-datasetbasepath-initial_bases-target_bases-add_bases" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="nanolance" class="md-header__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            nanolance
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Task: multi-base datasets (DatasetBasePath, initial_bases, target_bases, add_bases)
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="nanolance" class="md-nav__button md-logo" aria-label="nanolance" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    nanolance
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/yoavbendor/nanolance" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    yoavbendor/nanolance
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../SAFETY/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory safety & Rust reviewers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../agents/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AI agent integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Benchmarks
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Benchmarks
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-write-read/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Write/read vs Parquet & Rust lance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bench-trusted-parity/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety-parity (trusted vs default)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../OPTIMIZATION_PLAN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Roadmap & review
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../PROGRESS/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Implementation progress
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../s3_reader_notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    S3 reader notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../disk-lru-block-cache/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Disk LRU block cache
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../lance_table_reader_plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Table reader design notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#0-context-budget-read-this-first" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        0. Context budget (read this first)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-goal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Goal
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-format-facts-measured-on-pylance-1200-in-this-container-do-not-re-derive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Format facts (measured on pylance 12.0.0 in this container -- do not re-derive)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-phases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Phases
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Phases">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#phase-a-read-c-a-little-python-ends-when-nanolance-reads-pylances-multi-base-datasets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase A -- read (C++ + a little Python). Ends when nanolance reads pylance's multi-base datasets.
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-b-write_dataset-and-add_bases-oracle-pylances-testmultibase-and-testaddbases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase B -- write_dataset and add_bases. Oracle: pylance's TestMultiBase and TestAddBases.
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-c-fragment-level-writes-oracle-testwritefragmentswithtargetbases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase C -- fragment-level writes. Oracle: TestWriteFragmentsWithTargetBases,
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-rules-read-agentsmd-sections-5-and-7-only-grep-the-headings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Rules (read AGENTS.md sections 5 and 7 only -- grep the headings)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-stop-and-ask-put-the-question-first-in-your-report-when" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Stop and ask (put the question first in your report) when
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-report-under-40-lines" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Report (under 40 lines)
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="task-multi-base-datasets-datasetbasepath-initial_bases-target_bases-add_bases">Task: multi-base datasets (<code>DatasetBasePath</code>, <code>initial_bases</code>, <code>target_bases</code>, <code>add_bases</code>)<a class="headerlink" href="#task-multi-base-datasets-datasetbasepath-initial_bases-target_bases-add_bases" title="Permanent link">&para;</a></h1>
+<p>Status: <strong>delegated</strong> (implementer: Claude Haiku 5.5, reviewer: Claude Opus 5.5). Roadmap order item 3.</p>
+<h2 id="0-context-budget-read-this-first">0. Context budget (read this first)<a class="headerlink" href="#0-context-budget-read-this-first" title="Permanent link">&para;</a></h2>
+<p>You have about 100k tokens for the whole session. Spend them on code, not output:</p>
+<ul>
+<li><strong>Never read a large file whole.</strong> <code>grep -n</code> first, then <code>sed -n 'A,Bp'</code> windows of at most ~120
+  lines. <code>src/lance_table_reader.cpp</code> is 3k+ lines, <code>bindings/python/nanolance/lance/dataset.py</code> 3.5k+.</li>
+<li><strong>Always cut output</strong>: <code>2&gt;&amp;1 | tail -15</code> (pytest), <code>| tail -5</code> (<code>tools/pylance_suite.py</code>),
+  <code>ninja 2&gt;&amp;1 | grep -E "error|warning:|FAILED" | head -20</code>. pytest's config already passes <code>-q</code>, so
+  for a summary line add <code>-o addopts=</code> (e.g. <code>python3 -m pytest -o addopts= -q tests/x.py | tail -2</code>).</li>
+<li>Read only the pylance tests named for your phase (<code>grep -n "def test_name" -A60 file</code>).</li>
+<li>Do only your phase. Finish it cleanly rather than half of two.</li>
+</ul>
+<h2 id="1-goal">1. Goal<a class="headerlink" href="#1-goal" title="Permanent link">&para;</a></h2>
+<p>A Lance dataset can keep data files outside its own directory, in other "base paths" listed in the
+manifest. pylance 12 creates them (<code>write_dataset(initial_bases=[DatasetBasePath(...)],
+target_bases=[...] | target_all_bases=True)</code>), adds bases (<code>ds.add_bases</code>), and writes fragments into
+them (<code>write_fragments(target_bases=)</code>, <code>merge_insert(...).execute(..., target_bases=)</code>). Today
+nanolance cannot even <strong>read</strong> such a dataset (it looks for every data file under <code>&lt;dataset&gt;/data</code>
+and fails with "data file is too small or unreadable"). Make nanolance read and write them as pylance
+does, verified against pylance on the same calls.</p>
+<h2 id="2-format-facts-measured-on-pylance-1200-in-this-container-do-not-re-derive">2. Format facts (measured on pylance 12.0.0 in this container -- do not re-derive)<a class="headerlink" href="#2-format-facts-measured-on-pylance-1200-in-this-container-do-not-re-derive" title="Permanent link">&para;</a></h2>
+<p>Protos: <code>.deps/rust-suite/lance-12.0.0/protos/table.proto</code>.</p>
+<ul>
+<li><code>Manifest.base_paths = 18</code>: <code>repeated BasePath</code>, where
+  <code>message BasePath { uint32 id = 1; optional string name = 2; bool is_dataset_root = 3; string path = 4; }</code>.
+  Ids count from 1 in the order the bases are given (0 / absent means "the dataset itself").</li>
+<li><code>DataFile.base_id = 7</code> (<code>optional uint32</code>); <code>DeletionFile.base_id = 7</code>; <code>IndexMetadata.base_id = 9</code>.
+  Absent = the dataset's own directory.</li>
+<li>Where a file is: base absent -&gt; <code>&lt;dataset&gt;/data/&lt;path&gt;</code>. Base with <code>is_dataset_root = false</code> -&gt;
+  <code>&lt;base.path&gt;/&lt;path&gt;</code> (directly in the base directory). Base with <code>is_dataset_root = true</code> -&gt;
+  <code>&lt;base.path&gt;/data/&lt;path&gt;</code>. Deletion files: same rule with <code>_deletions</code> instead of <code>data</code>
+  (pylance itself writes deletions of base fragments to the primary <code>_deletions</code>, base_id unset --
+  but honour a base_id if one is present). Blob sidecars sit next to their data file, so they follow it.</li>
+<li>Measured example: <code>write_dataset(t, primary, initial_bases=[DatasetBasePath(p1, name="path1"),
+  DatasetBasePath(p2, name="path2", is_dataset_root=True)], target_all_bases=True, max_rows_per_file=100)</code>
+  on 300 rows -&gt; 3 fragments with <code>base_id</code> <code>None, 1, 2</code> (rotation: the primary first, then each base
+  in order); files at <code>primary/data/x.lance</code>, <code>p1/y.lance</code>, <code>p2/data/z.lance</code>.</li>
+<li><code>DatasetBasePath(path, name=None, is_dataset_root=False, id=None)</code>, attributes <code>id, is_dataset_root,
+  name, path</code>, repr <code>DatasetBasePath(id=0, name=Some("n"), path=/x, is_dataset_root=false)</code>
+  (<code>name=None</code> when unnamed). Exported as <code>lance.DatasetBasePath</code>.</li>
+<li><code>DataFile.base_id</code> is already decoded/encoded by the Python transaction codec
+  (<code>bindings/python/nanolance/lance/_transactions.py</code>, <code>_data_file</code> / <code>_encode_data_file</code>).</li>
+<li>C++: the generated codec (<code>generated/lance_minimal.pb.hpp</code>) keeps fields it does not know in
+  <code>unknown</code> bytes (<code>Manifest::unknown</code>, <code>DataFile::unknown</code>, <code>DeletionFile::unknown</code>). That is how
+  base_paths / base_id survive today. <strong>Follow the pattern of <code>include/nanolance/row_ids.hpp</code></strong>
+  (<code>read_fragment_row_meta</code> / <code>write_fragment_row_meta</code> read and replace fields 5..10 inside
+  <code>DataFragment::unknown</code>) for reading <code>Manifest.unknown</code> field 18 and <code>DataFile.unknown</code> field 7. Do
+  not regenerate the codec.</li>
+</ul>
+<p><strong>When in doubt about behaviour, run the same call on real pylance (<code>import lance</code>) and copy it.</strong></p>
+<h2 id="3-phases">3. Phases<a class="headerlink" href="#3-phases" title="Permanent link">&para;</a></h2>
+<h3 id="phase-a-read-c-a-little-python-ends-when-nanolance-reads-pylances-multi-base-datasets">Phase A -- read (C++ + a little Python). Ends when nanolance reads pylance's multi-base datasets.<a class="headerlink" href="#phase-a-read-c-a-little-python-ends-when-nanolance-reads-pylances-multi-base-datasets" title="Permanent link">&para;</a></h3>
+<ol>
+<li>New header/source <code>include/nanolance/base_paths.hpp</code> + <code>src/base_paths.cpp</code> (add to the
+   <code>nanolance</code> library in <code>CMakeLists.txt</code> next to <code>src/row_ids.cpp</code>): <code>struct BasePath { id, name,
+   has_name, is_dataset_root, path }</code>; <code>read_base_paths(const pb::Manifest&amp;, std::vector&lt;BasePath&gt;&amp;, error)</code>;
+   <code>write_base_paths(pb::Manifest&amp;, const std::vector&lt;BasePath&gt;&amp;)</code> (phase B needs it);
+   <code>data_file_base_id(const pb::DataFile&amp;, std::optional&lt;uint32_t&gt;&amp;)</code> and a setter;
+   the same for <code>pb::DeletionFile</code>; and the one resolver everything uses:
+   <code>std::filesystem::path data_file_dir(dataset_path, manifest, data_file)</code> /
+   <code>deletion_file_dir(...)</code> returning the directory per section 2 (an unknown base_id is an error).</li>
+<li>Use the resolver at every read site. Find them with
+   <code>grep -rn '/ "data"\|"_deletions"' src/*.cpp</code>: <code>src/lance_table_reader.cpp</code> (the <code>PlannedFile</code>
+   has a <code>data_dir</code> field already -- empty means <code>&lt;dataset&gt;/data</code>; set it from the resolver where
+   PlannedFiles are built from manifest fragments), <code>src/dataset.cpp:~490</code>, <code>src/lance_c.cpp:~1373</code>,
+   <code>src/deletion_vector.cpp</code> (read side, ~673). Also Python: <code>bindings/python/nanolance/lance/dataset.py:~1348</code>
+   and <code>fragment.py:~408</code> join <code>data/</code> by hand -- give them the base directory too (expose a small
+   binding or compute it from the manifest's base paths in Python, your choice; keep it to one helper).</li>
+<li><code>DatasetBasePath</code> class in Python (new small module or in <code>dataset.py</code>), exported from
+   <code>nanolance.lance</code>; <code>LanceDataset</code> gains what pylance exposes for reading bases if a test needs it
+   (check <code>dir(lance.LanceDataset)</code> for <code>base_paths</code>-like names; do not invent API).</li>
+<li>Tests: new <code>bindings/python/tests/test_multi_base.py</code> (style of <code>tests/test_stable_row_ids.py</code>,
+   <code>require_pylance()</code>): datasets <strong>written by pylance</strong> with each base kind (not root, root,
+   target_all_bases, appends to a base, deletions of rows in base fragments, a blob column with
+   packed / dedicated blobs in a base, a scalar index), read by nanolance: <code>to_table</code>, filters,
+   <code>take</code>, <code>_take_rows</code>, <code>count_rows</code>, <code>take_blobs</code>, <code>data_files()[i].base_id</code> -- equal to pylance.
+   Also a C++ unit test for base_paths encode/decode in <code>tests/</code> only if cheap.</li>
+<li>Done: those tests pass; <code>cd build &amp;&amp; ninja &amp;&amp; ctest -j8 | tail -3</code> green; pylance suite
+   <code>python3 tools/pylance_suite.py 2&gt;&amp;1 | tail -4</code> ends "all N expected tests passed".</li>
+</ol>
+<h3 id="phase-b-write_dataset-and-add_bases-oracle-pylances-testmultibase-and-testaddbases">Phase B -- <code>write_dataset</code> and <code>add_bases</code>. Oracle: pylance's <code>TestMultiBase</code> and <code>TestAddBases</code>.<a class="headerlink" href="#phase-b-write_dataset-and-add_bases-oracle-pylances-testmultibase-and-testaddbases" title="Permanent link">&para;</a></h3>
+<p><code>.deps/pylance-tests/v12.0.0/tests/test_multi_base.py</code> classes <code>TestMultiBase</code> (lines 21-546) and
+<code>TestAddBases</code> (547-1026). Run them with
+<code>python3 tools/pylance_suite.py -k "TestMultiBase or TestAddBases" 2&gt;&amp;1 | grep -E "^FAILED|test suite"</code>.
+Read each failing test's body (<code>sed -n</code>), measure pylance, implement:
+- <code>write_dataset(initial_bases=, target_bases=, target_all_bases=)</code> in create / append / overwrite
+  (overwrite inherits the bases; validation errors such as "not found", "Cannot register new bases in
+  Append mode" -- copy pylance's messages); <code>storage_options</code> with <code>base_&lt;id&gt;.&lt;key&gt;</code> entries are
+  accepted and ignored for local paths.
+- The C++ writer must place each new fragment's file in its target directory and set <code>base_id</code>;
+  the manifest writer must carry <code>base_paths</code>. Find where the writer names data files
+  (<code>grep -n '"data"' src/writer.cpp src/manifest_writer.cpp</code>) and add a per-fragment target
+  directory + base id; plumb the bases list through <code>CommitExtras</code> (<code>include/nanolance/manifest_writer.hpp</code>)
+  the way <code>stable_row_ids</code> was plumbed.
+- <code>ds.add_bases([...], transaction_properties=?)</code>: a new version with the bases appended (Lance's
+  <code>UpdateBases</code> operation; check how <code>_transactions.py</code> encodes operations and what field number
+  UpdateBases has in <code>.deps/rust-suite/lance-12.0.0/protos/transaction.proto</code>).
+- Mutations nanolance already supports (update, delete, compaction, merge_insert without
+  target_bases) must keep working on a multi-base dataset: new files go to the primary unless a
+  target is given (check pylance for compaction).</p>
+<h3 id="phase-c-fragment-level-writes-oracle-testwritefragmentswithtargetbases">Phase C -- fragment-level writes. Oracle: <code>TestWriteFragmentsWithTargetBases</code>,<a class="headerlink" href="#phase-c-fragment-level-writes-oracle-testwritefragmentswithtargetbases" title="Permanent link">&para;</a></h3>
+<p><code>TestDataReplacementWithBases</code>, <code>TestMergeInsertMultiBase</code>, and in <code>test_blob.py</code>
+<code>test_blob_extension_write_fragments_external_registered_base</code>, <code>test_blob_extension_take_blobs_multi_base</code>.
+<code>write_fragments(target_bases=, initial_bases=)</code>, <code>DataFile.create(..., base_id=)</code> (today refused in
+<code>fragment.py:~80</code>), Overwrite transactions with <code>initial_bases</code> (refused in <code>_transactions.py:~769</code> and
+<code>src/dataset_transaction.cpp</code> <code>apply_operation</code>: <code>op.has_initial_bases</code>), <code>merge_insert</code> <code>target_bases</code>.
+<strong>Reviewer note for phase C:</strong> phase A plans one directory per fragment (<code>fragment_data_dir</code> in
+<code>src/lance_table_reader.cpp</code> refuses a fragment whose files span bases). <code>TestDataReplacementWithBases</code>
+adds a new column's file in a base to a fragment whose other files are in the primary: make the
+reader resolve the directory <strong>per data file</strong> (<code>PlannedFile</code> / the per-file open path) instead of
+per fragment -- that is the one planner change allowed here.</p>
+<p><strong>Phase A outcome (2026-10-15):</strong> done. Deletion files naming a base are refused (pylance never
+writes them); <code>fragment_data_dir</code> per fragment as above.</p>
+<h2 id="4-rules-read-agentsmd-sections-5-and-7-only-grep-the-headings">4. Rules (read <code>AGENTS.md</code> sections 5 and 7 only -- grep the headings)<a class="headerlink" href="#4-rules-read-agentsmd-sections-5-and-7-only-grep-the-headings" title="Permanent link">&para;</a></h2>
+<ul>
+<li>A test may skip only for a missing optional dependency. Never weaken, skip or delete a test; never
+  wrap a failure in <code>except Exception</code>.</li>
+<li>Match the surrounding code (comment density, naming, SPDX headers, <code>_errors.py</code> helpers
+  <code>native()</code> / <code>unsupported()</code>). C++ builds without warnings (<code>-Wall -Wextra</code>; CI uses <code>-Werror</code>).</li>
+<li>Keep the diff to the task. Do not commit, push or change branches. Do not run
+  <code>tools/pylance_suite.py --update</code> (the reviewer does).</li>
+<li>Builds:
+  <code>cd /home/user/nanolance/build &amp;&amp; ninja 2&gt;&amp;1 | grep -E "error|warning:" | head</code> and for Python
+  <code>cd /home/user/nanolance/bindings/python/build/cp311-cp311-linux_x86_64 &amp;&amp; ninja 2&gt;&amp;1 | grep -E "error:|warning:" | head &amp;&amp; cp _nanolance.cpython-311-x86_64-linux-gnu.so /usr/local/lib/python3.11/dist-packages/nanolance/</code>
+  (needed after any C++ change before Python sees it).</li>
+</ul>
+<h2 id="5-stop-and-ask-put-the-question-first-in-your-report-when">5. Stop and ask (put the question first in your report) when<a class="headerlink" href="#5-stop-and-ask-put-the-question-first-in-your-report-when" title="Permanent link">&para;</a></h2>
+<ul>
+<li>a change would alter what nanolance writes for datasets <strong>without</strong> bases (byte-for-byte today);</li>
+<li>you need a public name not listed here or seen in pylance;</li>
+<li>the work spills into object stores / URIs (<code>s3://...</code> bases): local paths only;</li>
+<li>a fix needs redesigning the reader's file planning beyond setting <code>data_dir</code>.</li>
+</ul>
+<h2 id="6-report-under-40-lines">6. Report (under 40 lines)<a class="headerlink" href="#6-report-under-40-lines" title="Permanent link">&para;</a></h2>
+<p>Files changed; per phase status; the tail lines of the done-commands; failures with error text;
+decisions you made that this spec did not cover; questions.</p>
+<p><strong>Phase B outcome (2026-10-15):</strong> done. 21 of pylance's TestMultiBase / TestAddBases tests pass.
+New writer calls <code>nano_lance_writer_set_initial_bases</code> / <code>set_fragment_targets</code> (fragments rotate
+over the targets per write call), the UpdateBases operation (field 114), a private
+<code>LanceDataset._ds.base_paths()</code> shim that pylance's own tests reach through. Overwrite with
+<code>initial_bases</code> in a hand-built transaction is still refused (phase C). Reviewer fix: <code>add_bases</code>
+raises its checks as ValueError, as pylance does.</p>
+<p><strong>Phase C outcome (2026-10-15):</strong> done but one test. <code>write_fragments(target_bases=)</code>,
+<code>DataFile.create(base_id=)</code>, Overwrite transactions with <code>initial_bases</code>, DataReplacement into a base
+(the reader now resolves a directory per data file when a fragment's files span bases),
+<code>merge_insert(...).target_bases / target_all_bases</code>. Left (reviewer's call): external blob URIs
+under a registered base -- they need the descriptor's blob_id to be the base id, which crosses the
+external-blob writer's URI-dictionary packing; logged in ROADMAP.md.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Apache-2.0
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/yoavbendor/nanolance" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.instant", "navigation.tracking", "navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "content.code.annotate", "search.suggest", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
