@@ -369,7 +369,6 @@ tests/test_dataset.py::test_input_data[NoneType-list]
 tests/test_dataset.py::test_input_data[Schema-list]
 tests/test_dataset.py::test_input_data[Schema-list_iterator]
 tests/test_dataset.py::test_late_materialization_batch_size
-tests/test_dataset.py::test_late_materialization_param
 tests/test_dataset.py::test_limit_offset[stable]
 tests/test_dataset.py::test_list_from_parquet
 tests/test_dataset.py::test_load_scanner_from_fragments

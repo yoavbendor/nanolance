@@ -3361,47 +3361,6 @@ def _restore_dataset(state) -> "LanceDataset":
     return ds
 
 
-def _fixed_width(t: pa.DataType) -> Optional[int]:
-    """A value's byte width when it is fixed (Lance's ``byte_width_opt``), else None. Lists take their
-    items' width, as the measured defaults of pylance 12 do; booleans and nulls have none."""
-    if pa.types.is_boolean(t) or pa.types.is_null(t) or pa.types.is_map(t):
-        return None
-    if pa.types.is_dictionary(t):
-        return _fixed_width(t.value_type)
-    if pa.types.is_fixed_size_binary(t):
-        return t.byte_width
-    if pa.types.is_fixed_size_list(t):
-        item = _fixed_width(t.value_type)
-        return None if item is None else item * t.list_size
-    if pa.types.is_list(t) or pa.types.is_large_list(t):
-        return _fixed_width(t.value_type)
-    if pa.types.is_struct(t):
-        widths = [_fixed_width(t.field(i).type) for i in range(t.num_fields)]
-        return None if any(w is None for w in widths) else sum(widths)
-    try:
-        return t.bit_width // 8
-    except ValueError:  # no fixed bit width: strings, binaries, extension types
-        return None
-
-
-def _whole_fragments(ds) -> bool:
-    """Whether every fragment is one data file holding all the dataset's columns (no partial schema, no
-    column added later in its own file): the layout the default late read is exact for."""
-    if any(_is_blob_field(f) for f in ds._data_schema):  # a blob's handling is not kept by the late read
-        return False
-    width = len(ds._data_schema.names)
-    return all(len(f.files) == 1 and len(f.files[0].column_indices) == width for f in ds.get_fragments())
-
-
-def _early_by_default(field: pa.Field) -> bool:
-    """Whether a column is read early when late_materialization is not given: Lance's heuristic for
-    local storage (a fixed width under 10 bytes; a blob returned as descriptions is early). nanolance
-    reads local datasets only, so the cloud threshold (1000 bytes) does not apply."""
-    if _is_blob_field(field):
-        return True
-    width = _fixed_width(field.type)
-    return width is not None and width < 10
-
 
 class LanceScanner(pa.dataset.Scanner):
     """A configured read. Mirrors ``lance.LanceScanner``."""
@@ -3559,11 +3518,13 @@ class LanceScanner(pa.dataset.Scanner):
             return []
         filter_cols = self._filter_columns()
         names = [n for n in self._scan_names() if n not in filter_cols]
-        if lm is None:  # the default: Lance's heuristic, column by column
-            schema = self._ds._data_schema
-            if not _whole_fragments(self._ds):  # partial schemas read early (the late read is not exact there)
-                return []
-            return [n for n in names if not _early_by_default(schema.field(n))]
+        if lm is None:
+            # The default reads early. Lance's heuristic (late for columns of 10+ bytes) was measured here:
+            # nanolance's scan is fast enough that a take by address afterwards loses -- 1.2x slower at
+            # 0.005% selectivity, ~3x at 10% and more, a win (0.88x) only around 1% of wide 2 KB strings
+            # (docs/tasks/SMALL_ITEMS_2.md, "Performance review"). An explicit True / column list still
+            # reads late.
+            return []
         return [n for n in names if lm is True or n in lm]
 
     def _scan_names(self) -> List[str]:
@@ -3577,8 +3538,16 @@ class LanceScanner(pa.dataset.Scanner):
             head = pa.table(_nanolance._ds_scan(self._ds.uri, self._ds.version, eager, self._fragment_ids,
                                                 self._offset, length, False, True, False, self._filter,
                                                 self._blob_handling, self._use_scalar_index, **self._mask))
-        taken = self._ds._take(head.column("_rowaddr").to_pylist(), late, addresses=True,
-                               blob_handling=self._blob_handling)
+        addrs = head.column("_rowaddr").to_numpy()
+        if not any(n in _SYSTEM_COLUMNS for n in late) and (addrs.size < 2 or bool(np.all(addrs[1:] > addrs[:-1]))):
+            # A scan's addresses come sorted and distinct: take them as they are (no Python sort, no set).
+            blob = _nanolance.BLOB_DESCRIPTIONS if self._blob_handling is None else self._blob_handling
+            note_data_files(self._ds)
+            with native():
+                taken = pa.table(_nanolance._ds_take(self._ds._uri, self._ds._version, addrs.tolist(), late, False,
+                                                     False, True, blob))
+        else:
+            taken = self._ds._take(addrs.tolist(), late, addresses=True, blob_handling=self._blob_handling)
         return pa.table({n: (taken.column(n) if n in late else head.column(n)) for n in self._scan_names()})
 
     def _read(self, stream: bool):

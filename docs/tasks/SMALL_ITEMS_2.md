@@ -129,3 +129,14 @@ latest version and is not retried on a conflict (the addresses name one version'
 `delete()` with `_rowid`; `delta()` raises version-not-found eagerly (pylance lazily);
 `test_create_empty_scalar_index` (train=False on a scalar index still indexes the rows). Task
 SMALL_ITEMS_2 done.
+
+**Performance review (2026-10-16, reviewer), late materialization.** Benchmarked against the build before
+this stretch (e9bf014): scalar-index queries over all columns were up to 3.7x slower (`cat = 'c7'`,
+100k of 5M rows: 45 -> 166 ms). Cause: the B2 default (Lance's heuristic: late for columns of 10+ bytes).
+Measured on nanolance, late (filter columns first, then a take by address) loses to its own scan:
+1.17x slower at 0.005% selectivity on 2 KB strings, 0.88x at 1%, ~3x at 10% and more, ~2x on mixed
+columns. Decision: the default (`late_materialization=None`) reads early -- nanolance's own choice, its
+plan says so; an explicit True / column list still reads late (now through a direct take of the scan's
+sorted addresses: no Python sort, no list round trip). pylance's
+`test_dataset.py::test_late_materialization_param` asserts pylance's default plan and leaves the
+expected list (1172 -> 1171) on purpose: the plan must describe what runs.
