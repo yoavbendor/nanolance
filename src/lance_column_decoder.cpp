@@ -36,6 +36,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <type_traits>
+#include <vector>
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -477,18 +479,31 @@ struct MiniBlockChunkView {
 /// per-chunk size check with "bitpacked chunk size does not match bit width".
 bool split_miniblock_payload(const std::vector<std::uint8_t>& payload, const MiniBlockChunkShape& shape,
                              std::vector<MiniBlockChunkView>& out, std::string& error) {
-    out.clear();
+    // `out`'s chunks are refilled in place, keeping their buffers' capacity: a page scan made a
+    // fresh vector per chunk, a whole second copy of the page allocated and given back on each read.
+    std::size_t used = 0;
     std::size_t offset = 0;
     while (offset < payload.size()) {
         MiniBlockChunkHeader header;
         if (!read_miniblock_chunk_header(payload, offset, shape, header, error)) {
+            out.resize(used);
             return false;
         }
         if (header.chunk_bytes == 0U) {
             error = "miniblock chunk declares no bytes";
+            out.resize(used);
             return false;
         }
-        MiniBlockChunkView chunk;
+        if (used == out.size()) {
+            out.emplace_back();
+        }
+        MiniBlockChunkView& chunk = out[used++];
+        chunk.values.clear();
+        chunk.extra_buffers.clear();
+        chunk.repdef.clear();
+        chunk.repdef_values = 0;
+        chunk.rep.clear();
+        chunk.items = 0;
         std::size_t at = offset + align_to_miniblock(shape.declared_bytes());
         chunk.num_levels = header.num_levels;
         if (shape.has_repetition && header.rep_size != 0U) {
@@ -504,18 +519,17 @@ bool split_miniblock_payload(const std::vector<std::uint8_t>& payload, const Min
         at += align_to_miniblock(header.def_size);
         for (std::size_t i = 0; i < header.buffer_sizes.size(); ++i) {
             const auto size = static_cast<std::size_t>(header.buffer_sizes[i]);
-            std::vector<std::uint8_t> buffer(payload.begin() + static_cast<std::ptrdiff_t>(at),
-                                             payload.begin() + static_cast<std::ptrdiff_t>(at + size));
+            const auto first = payload.begin() + static_cast<std::ptrdiff_t>(at);
             if (i == 0U) {
-                chunk.values = std::move(buffer);
+                chunk.values.assign(first, first + static_cast<std::ptrdiff_t>(size));
             } else {
-                chunk.extra_buffers.push_back(std::move(buffer));
+                chunk.extra_buffers.emplace_back(first, first + static_cast<std::ptrdiff_t>(size));
             }
             at += align_to_miniblock(size);
         }
-        out.push_back(std::move(chunk));
         offset += header.chunk_bytes;
     }
+    out.resize(used);
     return true;
 }
 
@@ -1552,6 +1566,17 @@ struct FullZipPageParams {
     std::size_t item_validity_bytes = 0;
 };
 
+/// Room for a FullZip page's variable-width values at once, given `encoded` bytes of them: growing
+/// value by value doubled the buffer a dozen times over a page, each a fresh mapping to fault in and
+/// copy into. FSST decodes at most 8 bytes per code, so that bound is exact; the pages of it never
+/// written are never faulted in.
+void reserve_full_zip_values(std::vector<std::uint8_t>& data, const FullZipPageParams& params, std::size_t encoded) {
+    constexpr std::uint64_t kReserveCap = std::uint64_t{256} << 20U;
+    const std::uint64_t expand =
+        params.fsst ? 8U : (params.value_scheme != page_layout::BufferScheme::kNone ? 4U : 1U);
+    reserve_more(data, static_cast<std::size_t>(std::min<std::uint64_t>(encoded * expand, kReserveCap)));
+}
+
 /// The levels (control words) in `data`, a run of whole rows of a FullZip list page, and how many of
 /// them carry a value -- what the page's layout states for the page as a whole.
 bool count_full_zip_levels(const std::vector<std::uint8_t>& data, const FullZipPageParams& params,
@@ -2041,6 +2066,58 @@ ColumnEncodingPlan classify_column_encoding(const pb::Field& field, const pb::Co
     return classify_from_metadata(field);
 }
 
+/// Bytes a pooled scratch object holds on to.
+std::size_t scratch_bytes(const std::vector<std::uint8_t>& v) { return v.capacity(); }
+std::size_t scratch_bytes(const std::vector<MiniBlockChunkView>& chunks) {
+    std::size_t bytes = chunks.capacity() * sizeof(MiniBlockChunkView);
+    for (const auto& c : chunks) {
+        bytes += c.values.capacity() + c.repdef.capacity() + c.rep.capacity();
+        for (const auto& b : c.extra_buffers) {
+            bytes += b.capacity();
+        }
+    }
+    return bytes;
+}
+
+/// A page-read buffer or chunk list from a small per-thread pool, handed back when done. A column's
+/// pages were read into fresh vectors: glibc gives large freed blocks back to the OS, so every read
+/// mapped and faulted in its buffers anew -- most of a single-core scan of an 8 MB decimal column.
+/// At most kKept objects holding up to kKeptBytes stay per thread and type; larger ones are freed.
+/// A buffer comes back empty; a chunk list keeps its chunks for split_miniblock_payload to refill.
+template <typename T>
+class Scratch {
+public:
+    Scratch() {
+        auto& free = pool();
+        if (!free.empty()) {
+            value_ = std::move(free.back());
+            free.pop_back();
+        }
+        if constexpr (std::is_same_v<T, std::vector<std::uint8_t>>) {
+            value_.clear();
+        }
+    }
+    ~Scratch() {
+        auto& free = pool();
+        if (free.size() < kKept && scratch_bytes(value_) <= kKeptBytes) {
+            free.push_back(std::move(value_));
+        }
+    }
+    Scratch(const Scratch&) = delete;
+    Scratch& operator=(const Scratch&) = delete;
+    T& get() { return value_; }
+
+private:
+    static constexpr std::size_t kKept = 2;
+    static constexpr std::size_t kKeptBytes = std::size_t{16} << 20U;
+    static std::vector<T>& pool() {
+        thread_local std::vector<T> free;
+        return free;
+    }
+    T value_;
+};
+using PageScratch = Scratch<std::vector<std::uint8_t>>;
+
 bool read_page_buffers(const std::filesystem::path& path, const pb::ColumnPage& page, bool blob_layout,
                        std::vector<std::uint8_t>& first, std::vector<std::uint8_t>& second, std::string& error) {
     if (page.buffer_offsets.size() < 2U || page.buffer_sizes.size() < 2U) {
@@ -2193,7 +2270,8 @@ bool decode_legacy_blob_column(const std::filesystem::path& path, const pb::Fiel
     out.blob_v2.data_file = path;
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;
-    std::vector<MiniBlockChunkView> chunks;
+    Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+    auto& chunks = chunks_scratch.get();
     for (const auto& page : column.pages) {
         if (page.length == 0U) {
             continue;
@@ -2677,9 +2755,12 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         if (checked_mul(declared_rows, static_cast<std::uint64_t>(bpv), reserve_bytes) && fits_size_t(reserve_bytes)) {
             reserve_capped(out.fixed, reserve_bytes);
         }
-        std::vector<std::uint8_t> control;
-        std::vector<std::uint8_t> data;
-        std::vector<MiniBlockChunkView> chunks;
+        PageScratch control_scratch;
+        PageScratch data_scratch;
+        auto& control = control_scratch.get();
+        auto& data = data_scratch.get();
+        Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+        auto& chunks = chunks_scratch.get();
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
             if (!read_page_buffers(data_file_path, page, false, control, data, error)) {
@@ -2740,7 +2821,8 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> dict_stored;
         DictionaryBlock dict;
-        std::vector<MiniBlockChunkView> chunks;
+        Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+        auto& chunks = chunks_scratch.get();
         std::vector<std::pair<std::uint32_t, std::uint8_t>> runs;  // (dictionary index, run length)
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
@@ -3136,6 +3218,8 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 if (params.items != 0U) {
                     out.items_per_row = params.items;
                 }
+            } else {
+                reserve_full_zip_values(out.variable.data, params, data.size());
             }
             std::size_t r = 0;  // the next item
             for (std::size_t level = 0; level < num_levels; ++level) {
@@ -3265,9 +3349,12 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
                 reserve_capped(out.fixed, reserve_bytes);
             }
         }
-        std::vector<std::uint8_t> control;
-        std::vector<std::uint8_t> payload;
-        std::vector<MiniBlockChunkView> chunks;
+        PageScratch control_scratch;
+        PageScratch payload_scratch;
+        auto& control = control_scratch.get();
+        auto& payload = payload_scratch.get();
+        Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+        auto& chunks = chunks_scratch.get();
         std::vector<std::uint8_t> raw;
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
@@ -3315,7 +3402,8 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
         reserve_capped(out.fixed, declared_rows);
         std::vector<std::uint8_t> control;
         std::vector<std::uint8_t> payload;
-        std::vector<MiniBlockChunkView> chunks;
+        Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+        auto& chunks = chunks_scratch.get();
         std::uint64_t validity_rows = 0;
         for (const auto& page : column_metadata.pages) {
             if (!read_page_buffers(data_file_path, page, false, control, payload, error)) {
@@ -3356,9 +3444,12 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     if (encoding_plan.kind == ColumnEncodingKind::kVariable) {
         out.kind = ColumnValues::Kind::VariableWidth;
         out.variable.large = lance_logical_type_has_large_offsets(on_disk_field.logical_type);
-        std::vector<std::uint8_t> control;
-        std::vector<std::uint8_t> payload;
-        std::vector<MiniBlockChunkView> chunks;
+        PageScratch control_scratch;
+        PageScratch payload_scratch;
+        auto& control = control_scratch.get();
+        auto& payload = payload_scratch.get();
+        Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+        auto& chunks = chunks_scratch.get();
         std::vector<std::uint8_t> raw;
         // Scratch for the FSST path only; hoisted so their capacity is reused across chunks.
         std::vector<std::uint8_t> fsst_offsets;
@@ -3502,7 +3593,8 @@ bool decode_column_impl(const std::filesystem::path& data_file_path, const pb::F
     }
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;
-    std::vector<MiniBlockChunkView> chunks;
+    Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+    auto& chunks = chunks_scratch.get();
     // Every page carries its own descriptor, and Rust Lance chooses per page: a float64 column
     // bit-packs its full pages and writes the short last one Flat, and a page with no nulls in it
     // carries no definition levels even when other pages do. Decoding every page with the first
@@ -3829,7 +3921,8 @@ bool decode_nested_column(const std::filesystem::path& data_file_path, const pb:
 
     std::vector<std::uint8_t> control;
     std::vector<std::uint8_t> payload;
-    std::vector<MiniBlockChunkView> chunks;
+    Scratch<std::vector<MiniBlockChunkView>> chunks_scratch;
+    auto& chunks = chunks_scratch.get();
     std::vector<std::uint16_t> rep;
     std::vector<std::uint16_t> def;
     std::uint64_t rows_total = 0;
@@ -4333,6 +4426,7 @@ bool take_full_zip_rows(const std::filesystem::path& path, const std::string& co
         if (!read_lance_data_file_bytes(path, page.buffer_offsets[0] + start, stop - start, bytes, error)) {
             return false;
         }
+        reserve_full_zip_values(out.variable.data, params, bytes.size());
         for (auto local = first_local; local <= last_local; ++local) {
             const auto row_begin = entry(local) - start;
             const auto row_end = entry(local + 1U) - start;
