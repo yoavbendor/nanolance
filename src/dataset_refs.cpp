@@ -3,6 +3,7 @@
 
 #include "nanolance/work_stats.hpp"
 #include <nanolance/dataset_refs.hpp>
+#include "nanolance/byte_source.hpp"
 
 #include <nanolance/manifest_reader.hpp>
 
@@ -71,15 +72,14 @@ void json_string(std::ostringstream& out, const std::string& s) {
 }
 
 bool read_text(const fs::path& path, std::string& out) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    std::vector<std::uint8_t> bytes;
+    std::string io_error;
+    if (!io::read_all(path.string(), bytes, io_error)) {
         return false;
     }
-    std::ostringstream buffer;
-    buffer << in.rdbuf();
-    out = buffer.str();
+    out.assign(bytes.begin(), bytes.end());
     work_stats::count_read(out.size());
-    return static_cast<bool>(in) || in.eof();
+    return true;
 }
 
 /// Write `bytes` to `path` through a temp file: replacing whatever is there (`replace`), or failing
@@ -426,14 +426,13 @@ std::string tags_named(const std::vector<TagInfo>& tags, const std::set<std::uin
 bool list_tags(const fs::path& dataset_path, std::vector<TagInfo>& out, std::string& error) {
     error.clear();
     out.clear();
-    std::error_code ec;
-    const auto dir = tags_dir(dataset_path);
-    if (!fs::exists(dir, ec)) {
-        return true;
+    std::vector<io::DirEntry> entries;
+    if (!io::list_dir(tags_dir(dataset_path).string(), entries, error)) {
+        return false;
     }
-    for (const auto& entry : fs::directory_iterator(dir, ec)) {
-        const auto name = entry.path().filename().string();
-        if (!entry.is_regular_file(ec) || !ends_with(name, ".json") || starts_with(name, ".")) {
+    for (const auto& entry : entries) {
+        const auto& name = entry.name;
+        if (entry.is_dir || !ends_with(name, ".json") || starts_with(name, ".")) {
             continue;
         }
         TagInfo tag;
@@ -441,10 +440,6 @@ bool list_tags(const fs::path& dataset_path, std::vector<TagInfo>& out, std::str
             return false;
         }
         out.push_back(std::move(tag));
-    }
-    if (ec) {
-        error = "failed to list tags: " + ec.message();
-        return false;
     }
     std::sort(out.begin(), out.end(), [](const TagInfo& a, const TagInfo& b) { return a.name < b.name; });
     return true;

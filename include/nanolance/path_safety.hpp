@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include "nanolance/byte_source.hpp"
+
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -45,6 +47,17 @@ namespace nano_lance {
         }
     }
 
+    if (io::is_remote(base.string())) {
+        // A URI is not a file-system path: lexical normalization would collapse its "//" (mem:///x to
+        // mem:/x). The components were checked above, so the URI is only joined.
+        std::filesystem::path joined = base;
+        for (const auto& part : relative) {
+            if (part != ".") {
+                joined /= part;
+            }
+        }
+        return joined;
+    }
     const std::filesystem::path base_norm = base.lexically_normal();
     const std::filesystem::path joined = (base_norm / relative).lexically_normal();
 

@@ -47,6 +47,23 @@ a user report can be matched to it.
 | icu / jieba / lindera tokenizers | 15 | large (external libraries, dictionaries) | CJK users only |
 | MSVC: build the Windows job once | -- | run `ci-platforms.yml` by hand | the portable 128-bit path is tested on Linux only |
 
+## Browser / remote reads (2026-10-17)
+
+- Done: every READ path goes through `io::ByteSource` (`include/nanolance/byte_source.hpp`): data
+  files (pread, cached file end, coalesced column metadata, small-read block), manifests and
+  version discovery, deletion files, tags, index-segment checks. An embedder registers a source
+  factory and a directory lister per URI scheme; `tests/test_byte_source_remote.cpp` reads a
+  dataset (fragments, deletions, a BTREE index) through a `mem://` store after deleting the local
+  directory. Measured level or faster than before on scans, takes and dataset opens.
+- WASM: the library compiles with Emscripten (reader + writer 569 KB gzipped at -Oz); the spike
+  is on the local branch `wasm-spike` (`/home/user/nl-wasm`), round trip passing under Node.
+- Left for the demo: an HTTP range source and a lister (Hugging Face tree API / S3 ListObjectsV2,
+  or an explicit version); a browser harness; exceptions are off in the WASM build (out of memory
+  aborts). Writers and maintenance (cleanup, drop, tag edits, index commits) stay on local files.
+  On Windows a URI joined with `/` gets a backslash -- remote paths are POSIX / Emscripten only.
+- Found on the way: clang-18 fails on `fts_json.hpp` (incomplete `json::Value` in a pair) in
+  `dataset_refs.cpp`, also at older commits; GCC is fine.
+
 ## Flaky tests to watch
 
 - `tests/test_index_optimize.py::test_optimize_after_append[nanolance]` (~1 run in 15-90): IVF_PQ

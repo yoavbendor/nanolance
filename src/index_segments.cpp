@@ -5,6 +5,7 @@
 // listing a logical index's segments.
 
 #include "nanolance/index_segments.hpp"
+#include "nanolance/byte_source.hpp"
 
 #include "index_build.hpp"
 #include "index_files.hpp"
@@ -885,10 +886,7 @@ bool infer_index_segment_details(const std::filesystem::path& dataset_path, cons
                                  const std::array<std::uint8_t, 16>& uuid, std::string& type_url,
                                  std::vector<std::uint8_t>& value, std::string& error) {
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
-    const auto has = [&](const char* name) {
-        std::error_code ec;
-        return std::filesystem::is_regular_file(dir / name, ec);
-    };
+    const auto has = [&](const char* name) { return io::exists((dir / name).string()); };
     value.clear();
     if (has("bitmap_page_lookup.lance")) {
         pb::Manifest manifest;

@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace nano_lance::io {
 
@@ -52,5 +53,32 @@ bool stat_local(const std::string& path, std::uint64_t& size, std::int64_t& vers
 
 /// Opens `path_or_uri`: through the factory registered for its scheme, else as a local file.
 std::unique_ptr<ByteSource> open_source(const std::string& path_or_uri, std::string& error);
+
+/// The whole file at `path_or_uri`, read through open_source (one read of its full size).
+bool read_all(const std::string& path_or_uri, std::vector<std::uint8_t>& out, std::string& error);
+
+/// Whether `path_or_uri` exists: a local path is stat'ed; a remote one is opened (a registered
+/// source that cannot be opened does not exist).
+bool exists(const std::string& path_or_uri);
+
+/// One entry of a directory listing. `name` is relative to the directory.
+struct DirEntry {
+    std::string name;
+    std::uint64_t size = 0;  // filled for remote listings; for local ones only when asked for
+    bool is_dir = false;
+};
+
+/// Lists the entries of a directory URI. A registered lister for a scheme must return every entry
+/// under the directory (an empty listing for a prefix with none).
+using ListFactory = std::function<bool(const std::string& dir_uri, std::vector<DirEntry>& out, std::string& error)>;
+
+/// Registers (or, with an empty factory, removes) the lister for `scheme`.
+void register_list_factory(const std::string& scheme, ListFactory factory);
+
+/// The entries of the directory `path_or_uri`: a local directory (`std::filesystem`), or the lister
+/// registered for its scheme; a remote scheme with no lister is an error. A local directory that does
+/// not exist lists as empty. Local entries' sizes are stat'ed only when `with_sizes` is set.
+bool list_dir(const std::string& path_or_uri, std::vector<DirEntry>& out, std::string& error,
+              bool with_sizes = false);
 
 }  // namespace nano_lance::io
