@@ -65,6 +65,12 @@ before it and against pylance 12.0.0 (`tools/bench_matrix.py`, `bench_scalar_ind
   dictionaries and FSST -- so pylance's multi-threaded writer is faster there (map_string_int64
   through Python 0.59x; nanolance's C++ writer on one core is level with Rust's). Needs page
   encoding of one column split across threads.
+  Since then (2026-10-16): the serializers side by side no longer share cache lines (four threads
+  53-60 ms against 56-65 on one), but four threads are still level with one. Most of a
+  map<string, int64> write is outside the two steps timed (rep/def serialize ~12 ms, page build
+  ~7 ms of ~60 ms user time): profile on a quiet machine first. Each write also faults in ~6,300
+  fresh pages (~20 ms of system time) -- retain buffers across pages as the read path now does.
+  Deferred to the next performance pass.
 
 Small items found by delegated sessions, not yet done:
 - MSVC: `unsigned __int128` in src/row_ids.cpp (since 2026-10-15) and `__int128` in src/expr.cpp's decimal projections (EXPR_TYPES C2) do not compile with MSVC; the Windows job (`ci-platforms.yml`, manual) builds with it. Needs a small portable 128-bit type (or `_mul128` / `_umul128` under `_MSC_VER`).
