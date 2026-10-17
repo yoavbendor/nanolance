@@ -48,6 +48,9 @@ struct NearestQuery {
     /// The distance; unset: the index's (L2 without one). A metric other than the index's searches
     /// exactly, as Lance does.
     std::optional<VectorMetric> metric;
+    /// Hamming distance (bits differing) over a binary column: a fixed-size list of uint8. Unset
+    /// with a uint8 column: hamming too. Only the flat (unindexed) search supports it.
+    bool hamming = false;
     bool use_index = true;
     /// Keep loaded indices in the process-wide cache (false: load them afresh for this search).
     bool index_cache = true;

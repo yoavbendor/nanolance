@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <cmath>
 #include <cstring>
@@ -327,6 +328,7 @@ struct BatchView {
 struct VectorRows {
     std::size_t dim = 0;
     std::vector<float> values;
+    std::vector<std::uint8_t> bytes;  // a uint8 (binary) column: dim bytes per row, instead of values
     std::vector<std::uint8_t> valid;
     std::vector<std::uint64_t> ids;
 };
@@ -356,6 +358,7 @@ bool collect_vectors(const ArrowSchema& schema, const std::vector<ArrowArray>& b
         const ArrowArrayView* ids = id_column < 0 ? nullptr : b.view.children[id_column];
         const auto dim = static_cast<std::int64_t>(out.dim);
         const bool f32 = items->storage_type == NANOARROW_TYPE_FLOAT;
+        const bool u8 = items->storage_type == NANOARROW_TYPE_UINT8;
         for (std::int64_t r = 0; r < batch.length; ++r) {
             const std::int64_t row = b.view.offset + r;
             const bool null = ArrowArrayViewIsNull(list, row);
@@ -363,7 +366,14 @@ bool collect_vectors(const ArrowSchema& schema, const std::vector<ArrowArray>& b
             const std::int64_t first = (list->offset + row) * dim;
             const std::size_t at = out.values.size();
             out.values.resize(at + out.dim);
-            if (!null) {
+            if (u8) {
+                const std::size_t at_bytes = out.bytes.size();
+                out.bytes.resize(at_bytes + out.dim);
+                if (!null) {
+                    std::memcpy(out.bytes.data() + at_bytes, items->buffer_views[1].data.as_uint8 + items->offset + first,
+                                out.dim);
+                }
+            } else if (!null) {
                 if (f32) {
                     std::memcpy(out.values.data() + at, items->buffer_views[1].data.as_float + items->offset + first,
                                 out.dim * sizeof(float));
@@ -417,6 +427,15 @@ float l2(const float* a, const float* b, std::size_t n) {
 }
 
 /// Lance's distance: squared L2, 1 - cos, or 1 - dot. `q_norm` is |q| (cosine only).
+/// Bits in which the `n` bytes of `a` and `b` differ.
+float hamming(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) {
+    std::uint32_t bits = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        bits += static_cast<std::uint32_t>(std::popcount(static_cast<unsigned>(a[i] ^ b[i])));
+    }
+    return static_cast<float>(bits);
+}
+
 float distance(VectorMetric metric, const float* x, const float* q, std::size_t n, float q_norm) {
     switch (metric) {
         case VectorMetric::Cosine: {
@@ -1839,9 +1858,10 @@ bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMet
     return true;
 }
 
-/// The best k of `fragments` by exact distance.
+/// The best k of `fragments` by exact distance; `binary_key` (a uint8 column's query): by Hamming distance.
 bool flat_search(const std::filesystem::path& path, const NearestQuery& q, VectorMetric metric, std::size_t dim,
-                 const std::vector<std::uint64_t>& fragments, std::vector<Candidate>& out, std::string& error) {
+                 const std::vector<std::uint64_t>& fragments, std::vector<Candidate>& out, std::string& error,
+                 const std::vector<std::uint8_t>* binary_key = nullptr) {
     if (fragments.empty()) {
         return true;
     }
@@ -1879,7 +1899,9 @@ bool flat_search(const std::filesystem::path& path, const NearestQuery& q, Vecto
                 if (v.valid[r] == 0U) {
                     continue;
                 }
-                const float d = distance(metric, v.values.data() + r * dim, q.key.data(), dim, q_norm);
+                const float d = binary_key != nullptr
+                                    ? hamming(v.bytes.data() + r * dim, binary_key->data(), dim)
+                                    : distance(metric, v.values.data() + r * dim, q.key.data(), dim, q_norm);
                 if (in_range(d, q)) {
                     found.push_back(Candidate{d, v.ids[r]});
                 }
@@ -2122,6 +2144,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
     }
     std::size_t dim = 0;
     bool f32_column = false;
+    bool binary = false;  // a uint8 column: binary vectors, searched by Hamming distance
     {
         const ArrowSchema* column = nullptr;
         const ArrowSchema* level = &schema;
@@ -2148,13 +2171,14 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         if (column != nullptr && format.rfind("+w:", 0) == 0) {
             dim = static_cast<std::size_t>(std::strtoull(format.c_str() + 3, nullptr, 10));
             f32_column = item == "f";
+            binary = item == "C";
         }
         schema.release(&schema);
         if (column == nullptr) {
             error = "Embedding column " + q.column + " is not in the dataset";
             return false;
         }
-        if (dim == 0U || (item != "f" && item != "e" && item != "g")) {
+        if (dim == 0U || (item != "f" && item != "e" && item != "g" && !binary)) {
             error = "Query column " + q.column + " must be a vector of floats";
             return false;
         }
@@ -2162,6 +2186,25 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
     if (q.key.size() != dim) {
         error = "Query vector size " + std::to_string(q.key.size()) + " does not match index column size " +
                 std::to_string(dim);
+        return false;
+    }
+    // Binary vectors: Hamming distance only, exact (no index), the query's values are bytes.
+    std::vector<std::uint8_t> binary_key;
+    if (binary) {
+        if (q.metric) {
+            error = std::string("Distance type ") + vector_metric_name(*q.metric) +
+                    " does not support UInt8 vectors, use hamming";
+            return false;
+        }
+        for (const float v : q.key) {
+            if (!(v >= 0.0F && v <= 255.0F && v == std::floor(v))) {
+                error = "the query for a UInt8 vector must hold whole numbers from 0 to 255";
+                return false;
+            }
+            binary_key.push_back(static_cast<std::uint8_t>(v));
+        }
+    } else if (q.hamming) {
+        error = "Distance type hamming does not support Float32 vectors, use l2, cosine or dot";
         return false;
     }
     if (q.k == 0U) {
@@ -2181,6 +2224,10 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                 segments.push_back(&index);
             }
         }
+    }
+    if (binary && !segments.empty()) {
+        error = "a vector index on a binary (UInt8) column is not supported; search it without an index";
+        return false;
     }
     const bool chosen = q.use_index && !q.segments.empty();
     if (chosen) {
@@ -2248,6 +2295,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         }
     }
     const VectorMetric metric = !loaded.empty() ? loaded.front()->metric : q.metric.value_or(VectorMetric::L2);
+    const char* metric_name = binary ? "hamming" : metric_name;
 
     std::vector<std::uint64_t> all_fragments;
     for (const auto& f : manifest.fragments) {
@@ -2263,12 +2311,12 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             out.plan.push_back("index " + index_name + " not used: " + not_used);
         }
         if (q.fast_search) {  // as pylance: fast_search skips the unindexed rows, so without an index, none
-            out.plan.push_back(std::string("KNNVectorDistance: metric=") + vector_metric_name(metric) +
+            out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
                                " (fast_search, no index: no rows)");
         } else {
-            out.plan.push_back(std::string("KNNVectorDistance: metric=") + vector_metric_name(metric) +
+            out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
                                " (exact, " + std::to_string(all_fragments.size()) + " fragments)");
-            if (!flat_search(dataset_path, q, metric, dim, all_fragments, hits, error)) {
+            if (!flat_search(dataset_path, q, metric, dim, all_fragments, hits, error, binary ? &binary_key : nullptr)) {
                 return false;
             }
         }
@@ -2279,7 +2327,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         std::vector<Candidate> ann;
         CacheCount counts;
         out.plan.push_back("ANNSubIndex: name=" + index_name + ", k=" + std::to_string(q.k) + ", deltas=" +
-                           std::to_string(loaded.size()) + ", metric=" + vector_metric_name(metric) + " (" +
+                           std::to_string(loaded.size()) + ", metric=" + metric_name + " (" +
                            loaded.front()->type + ")");
         for (std::size_t s = 0; s < loaded.size(); ++s) {
             RowMask mask;
@@ -2354,14 +2402,14 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                 return false;
             }
             keep_best(ann, q.k);
-            out.plan.push_back(std::string("KNNVectorDistance: metric=") + vector_metric_name(metric) +
+            out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
                                " (refine " + std::to_string(kk) + " candidates)");
         }
         hits = std::move(ann);
         if (!unindexed.empty()) {
-            out.plan.push_back(std::string("KNNVectorDistance: metric=") + vector_metric_name(metric) + " (exact, " +
+            out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name + " (exact, " +
                                std::to_string(unindexed.size()) + " unindexed fragments)");
-            if (!flat_search(dataset_path, q, metric, dim, unindexed, hits, error)) {
+            if (!flat_search(dataset_path, q, metric, dim, unindexed, hits, error, binary ? &binary_key : nullptr)) {
                 return false;
             }
         }

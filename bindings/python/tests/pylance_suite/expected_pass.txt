@@ -1099,7 +1099,11 @@ tests/test_tracing.py::test_tracing
 tests/test_tracing.py::test_tracing_callback
 tests/test_udf.py::test_batch_udf_constructor
 tests/test_udf.py::test_batch_udf_decorator
+tests/test_vector.py::test_binary_vectors_default_hamming
+tests/test_vector.py::test_binary_vectors_invalid_metric
 tests/test_vector.py::test_dict
+tests/test_vector.py::test_hamming_clustering_for_sample[16]
+tests/test_vector.py::test_hamming_clustering_for_sample[8]
 tests/test_vector.py::test_list
 tests/test_vector.py::test_ndarray
 tests/test_vector_index.py::test_ann

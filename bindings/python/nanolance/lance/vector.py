@@ -10,7 +10,7 @@ from typing import Optional, Union
 import numpy as np
 import pyarrow as pa
 
-__all__ = ["vec_to_table"]
+__all__ = ["vec_to_table", "hamming_clustering_for_sample"]
 
 
 def _normalize_vectors(vectors, ndim):
@@ -55,6 +55,51 @@ def vec_to_table(data: Union[dict, list, np.ndarray], names: Optional[Union[str,
     else:
         raise NotImplementedError(f"data must be dict, list, or ndarray, got {type(data)} instead")
     return pa.Table.from_arrays(arrays, names=names)
+
+
+_POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint16)
+
+
+def hamming_clustering_for_sample(dataset, column: str, sample_size: Optional[int],
+                                  threshold: int) -> pa.RecordBatchReader:
+    """Group the rows of a binary (fixed-size uint8) column whose Hamming distance is at most
+    ``threshold`` bits. Rows are taken in row-id order (all of them, or ``sample_size`` drawn at random),
+    and each unassigned row starts a cluster with every later unassigned row within the threshold.
+
+    Returns a reader of ``representative`` (uint64, the first row of the cluster) and ``duplicates``
+    (list<uint64>, the other rows, in order). Clusters of one row are not emitted. Null vectors are skipped.
+    """
+    table = dataset.to_table(columns=[column], with_row_id=True)
+    if sample_size is not None and sample_size < table.num_rows:
+        keep = np.sort(np.random.default_rng().choice(table.num_rows, size=int(sample_size), replace=False))
+        table = table.take(pa.array(keep, type=pa.int64()))
+    vectors = table[column].combine_chunks()
+    valid = np.asarray(vectors.is_valid())
+    width = vectors.type.list_size
+    flat = np.asarray(vectors.values.slice(vectors.offset * width, len(vectors) * width), dtype=np.uint8)
+    rows = flat.reshape(-1, width)
+    ids = np.asarray(table["_rowid"].to_numpy(), dtype=np.uint64)
+    rows, ids = rows[valid], ids[valid]
+    done = np.zeros(len(ids), dtype=bool)
+    representatives, duplicates = [], []
+    for i in range(len(ids)):
+        if done[i]:
+            continue
+        done[i] = True
+        rest = np.nonzero(~done[i + 1:])[0] + i + 1
+        if rest.size == 0:
+            continue
+        bits = _POPCOUNT[np.bitwise_xor(rows[rest], rows[i])].sum(axis=1)
+        members = rest[bits <= threshold]
+        if members.size:
+            done[members] = True
+            representatives.append(int(ids[i]))
+            duplicates.append(ids[members].tolist())
+    schema = pa.schema([("representative", pa.uint64()), ("duplicates", pa.list_(pa.uint64()))])
+    batch = pa.RecordBatch.from_arrays(
+        [pa.array(representatives, type=pa.uint64()), pa.array(duplicates, type=pa.list_(pa.uint64()))],
+        schema=schema)
+    return pa.RecordBatchReader.from_batches(schema, [batch])
 
 
 def __getattr__(name: str):

@@ -73,6 +73,15 @@ before it and against pylance 12.0.0 (`tools/bench_matrix.py`, `bench_scalar_ind
   Deferred to the next performance pass.
 
 Small items found by delegated sessions, not yet done:
+- Binary vectors (Hamming), the rest: flat search and `hamming_clustering_for_sample` are done
+  (2026-10-17, +4). Left: IVF_FLAT on binary vectors (`test_ivf_flat_over_binary_vector`),
+  `IvfModel` hamming (`test_ivf_centroids_hamming`), `hamming_clustering_for_ivf_partition` and the
+  multi-segment test. Measured on pylance 12.0.0: index.idx `{"type":"IVF_FLAT","distance_type":
+  "hamming"}`; auxiliary.idx's `flat` column is fixed_size_list<uint8>[dim] plus `_rowid`, metadata
+  storage_metadata `["{\"dim\":16}"]`, distance_type `hamming`, lance:ivf `1`; centroids are
+  uint8-valued, apparently per-bit majority (k-modes; whether seeded is unverified). The float-only
+  vector path (NearestQuery::key, IVF partitions, the builder) needs a uint8 element type -- several
+  sessions.
 - ~~MSVC: `__int128` in src/row_ids.cpp and src/expr.cpp~~ Done 2026-10-17: `src/int128.hpp` (two 64-bit words without `__int128`; `-DNANOLANCE_PORTABLE_INT128` forces it, built and ctest-passed on Linux), and `__builtin_clz` in src/fts_index_build.cpp replaced by `std::bit_width`. Not yet built with MSVC itself (run the manual Windows job). Also found: `-DNANOLANCE_WERROR=ON` fails with this GCC on unused functions / labels / parameters in blob_v2_external.cpp, fts_english_stem.inc, lance_table_reader.cpp, lance_column_decoder.cpp, dataset_refs.cpp.
 - Count from an exact scalar-index mask without reading (`CountFromMask`, tests/test_count_pushdown.py, 4) and scan statistics with index cache hit / miss (`scan_stats_callback`, `ScanStatistics`; btree / bitmap / fts cache tests, ~5) -- shared scan / planning code (SMALL_ITEMS_2 phase B).
 - ~~Expression grammar: list / bracket indexing (`l[1]`, `s['x']`, `list_struct[1]['x']`) and a float16 list cast in projections and filters (SQL_SURFACE S1: `test_nested_projection_list`, `test_dynamic_projection_with_vectors_index`).~~ Done 2026-10-16 (`docs/tasks/EXPR_TYPES.md`, phases A-C; what is left is listed there).

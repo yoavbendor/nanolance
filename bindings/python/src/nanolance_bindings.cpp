@@ -2018,7 +2018,9 @@ NB_MODULE(_nanolance, m) {
         q.minimum_nprobes = minimum_nprobes;
         q.maximum_nprobes = maximum_nprobes;
         q.refine_factor = refine_factor;
-        if (metric) {
+        if (metric && *metric == "hamming") {
+            q.hamming = true;
+        } else if (metric) {
             nano_lance::VectorMetric m;
             if (!nano_lance::parse_vector_metric(*metric, m)) {
                 throw nb::value_error(("unknown distance type '" + *metric + "'").c_str());
