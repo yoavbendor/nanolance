@@ -592,6 +592,43 @@ def test_code_analyzer_options_are_validated(tmp_path, kwargs, message):
     assert str(excinfo.value) == message
 
 
+LANGUAGE_NAMES = ["English", "French", "Norwegian", "German", "german", "english", "en", "Klingon", "", "NONE"]
+
+
+@pytest.mark.parametrize("language", LANGUAGE_NAMES)
+def test_language_names_are_validated_as_pylance_does(lance, tmp_path, language):
+    """Index creation and tokenize accept exactly the names pylance accepts (case-sensitive, Lance's list)."""
+    table = pa.table({"text": ["the quick fox"]})
+    ref, got = str(tmp_path / "ref.lance"), str(tmp_path / "got.lance")
+    lance.write_dataset(table, ref)
+    nl.write_dataset(table, got)
+    errors = {}
+    for name, module, path in (("pylance", lance, ref), ("nanolance", nl, got)):
+        try:
+            module.dataset(path).create_scalar_index("text", index_type="INVERTED", language=language,
+                                                     stem=False, remove_stop_words=False)
+            errors[name] = None
+        except ValueError as e:
+            errors[name] = str(e)
+    assert (errors["pylance"] is None) == (errors["nanolance"] is None), errors
+    if errors["pylance"] is not None:
+        for message in errors.values():
+            assert message.startswith(f"can't set tokenizer language to {language}: ")
+            assert f"unknown variant `{language}`, expected one of `Arabic`, " in message
+    tokens = {}
+    for name, module in (("pylance", lance), ("nanolance", nl)):
+        try:
+            tokens[name] = [t.text for t in module.tokenize("The Quick", language=language, stem=False,
+                                                            remove_stop_words=False)]
+        except ValueError as e:
+            tokens[name] = str(e)
+    assert isinstance(tokens["pylance"], str) == isinstance(tokens["nanolance"], str), tokens
+    if isinstance(tokens["pylance"], str):
+        assert f"unknown variant `{language}`" in tokens["nanolance"]
+    else:
+        assert tokens["pylance"] == tokens["nanolance"] == ["the", "quick"], tokens
+
+
 # ── the ngram base tokenizer (Lance's NgramTokenizer) ──────────────────────────────────────────
 
 NGRAM_OPTIONS = [

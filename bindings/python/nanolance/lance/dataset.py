@@ -1167,6 +1167,11 @@ class LanceDataset(pa.dataset.Dataset):
                          "max_ngram_length", "prefix_only", "format_version", "block_size", "analyzer",
                          "split_identifiers", "split_on_numerics", "preserve_original", "index_operators")
     _CODE_FLAGS = ("split_identifiers", "split_on_numerics", "preserve_original", "index_operators")
+    # The languages Lance's tokenizer knows (case-sensitive). pylance rejects any other name, whatever the
+    # stemming and stop-word settings are.
+    _INVERTED_LANGUAGES = ("Arabic", "Danish", "Dutch", "English", "Finnish", "French", "German", "Greek",
+                           "Hungarian", "Italian", "Norwegian", "Portuguese", "Romanian", "Russian", "Spanish",
+                           "Swedish", "Tamil", "Turkish")
 
     @classmethod
     def _inverted_analyzer(cls, params: dict) -> None:
@@ -1187,6 +1192,10 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError(f"analyzer='code' requires base_tokenizer='code', got '{base}'")
         if analyzer == "text" and any(params.get(flag) for flag in cls._CODE_FLAGS):
             raise ValueError("code analyzer flags require analyzer='code'")
+        language = params.get("language")
+        if language is not None and language not in cls._INVERTED_LANGUAGES:
+            raise ValueError(f"can't set tokenizer language to {language}: LanceError(Arrow): unknown variant "
+                             f"`{language}`, expected one of " + ", ".join(f"`{n}`" for n in cls._INVERTED_LANGUAGES))
         if analyzer == "text" and base == "ngram":
             # apply_ngram_defaults: substrings stay searchable, so no stemming and no stop words by default.
             params.setdefault("stem", False)
@@ -3437,6 +3446,8 @@ class LanceScanner(pa.dataset.Scanner):
         self._columns = columns
         self._names = _normalize_columns(columns)
         # Lance's system columns, named in the projection, come back where they were named.
+        self._asked_row_id = bool(with_row_id)  # before `_rowid` in the names turns it on
+        self._asked_row_address = bool(with_row_address)  # before `_rowaddr` in the names turns it on
         self._order = None
         self._row_offset = False
         if self._names is not None and any(n in _SYSTEM_COLUMNS for n in self._names):
@@ -3759,14 +3770,24 @@ class LanceScanner(pa.dataset.Scanner):
         names = self._names
         if self._order is not None and "_distance" in self._order:
             names = [c for c in names if c != "_distance"] if names is not None else None
-        table = self._ds._take(list(ids), names, addresses=True, with_row_id=self._with_row_id,
+        early = self._rowid_before_distance()
+        table = self._ds._take(list(ids), names, addresses=True, with_row_id=self._with_row_id or early,
                                with_row_address=self._with_row_address, blob_handling=self._blob_handling)
         system = [c for c in ("_rowid", "_rowaddr") if c in table.column_names]
         data = table.drop_columns(system)
-        out = data.append_column("_distance", pa.array(distances, pa.float32()))
+        out = data
+        if early and "_rowid" in system:
+            out = out.append_column("_rowid", table.column("_rowid"))
+        out = out.append_column("_distance", pa.array(distances, pa.float32()))
         for c in system:
-            out = out.append_column(c, table.column(c))
+            if c not in out.column_names:
+                out = out.append_column(c, table.column(c))
         return out
+
+    def _rowid_before_distance(self) -> bool:
+        """fast_search returns `_rowid` without it being asked for, before `_distance` (pylance 12); with
+        with_row_id it is one of the row id columns that come last."""
+        return bool(self._fast_search) and not self._asked_row_id
 
     def _nearest_table(self) -> pa.Table:
         """The k nearest rows. A batch (``self._nearest`` a list) runs each query in turn, its rows in query
@@ -3781,8 +3802,13 @@ class LanceScanner(pa.dataset.Scanner):
             out = out.slice(self._offset, self._limit)
         system = [c for c in ("_rowid", "_rowaddr") if c in out.column_names]
         if self._order is not None:
-            # Named columns where named; `_distance`, when not named, after them (as Lance).
-            order = [c for c in self._order if c in out.column_names]
+            # Named columns where named; `_distance`, when not named, after them; the row id columns last,
+            # `_rowid` then `_rowaddr`, wherever they were named (as Lance 12 orders them).
+            # The row id columns asked for with with_row_id / with_row_address go last; named ones stay where
+            # they are named; fast_search's `_rowid` (not asked for) goes before `_distance`.
+            explicit = [c for c in system if (self._asked_row_id if c == "_rowid" else self._asked_row_address)]
+            order = [c for c in self._order if c in out.column_names and c not in explicit]
+            order += [c for c in system if c not in explicit and c not in order]
             if "_distance" not in order and not self._no_score_autoprojection:
                 order.append("_distance")
             order += [c for c in system if c not in order]

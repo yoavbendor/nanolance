@@ -190,6 +190,40 @@ def test_output_shape(lance, indexed):
     assert nl.dataset(indexed["IVF_PQ", "l2", 8]).describe_indices()[0].index_type == "IVF_PQ"
 
 
+@pytest.mark.parametrize("columns", [
+    ["id", "_rowid"], ["_rowid", "id"], ["id"], ["_distance", "_rowid", "id"],
+    ["_rowid", "_rowaddr", "id"], ["id", "_rowaddr"],
+])
+def test_row_id_columns_go_last_as_pylance_orders_them(lance, indexed, tmp_path, columns):
+    """`_distance` follows the named columns, then the row id columns, `_rowid` before `_rowaddr`, wherever
+    they were named (pylance 12, flat and indexed, and fast_search)."""
+    q = _vectors()[8].tolist()
+    flat = str(tmp_path / "flat.lance")
+    nl.write_dataset(_table(_vectors()), flat, max_rows_per_file=1000)
+    for path in (flat, indexed["IVF_FLAT", "l2", 8]):
+        for extra in ({}, {"fast_search": True}):
+            nearest = {"column": "vec", "q": q, "k": 6}
+            kw = {"columns": columns, "with_row_id": True, "with_row_address": "_rowaddr" in columns, **extra}
+            ref = lance.dataset(path).to_table(nearest=nearest, **kw)
+            got = nl.dataset(path).to_table(nearest=nearest, **kw)
+            assert ref.column_names == got.column_names, (path, extra)
+            assert got.column("_rowid").to_pylist() == ref.column("_rowid").to_pylist()
+
+
+@pytest.mark.parametrize("columns", [None, ["id"], ["id", "_rowid"], ["_rowid", "id"], ["_distance", "id"]])
+def test_fast_search_returns_rowid_as_pylance_does(lance, indexed, columns):
+    """fast_search adds `_rowid` without with_row_id, before `_distance` (pylance 12)."""
+    path = indexed["IVF_FLAT", "l2", 8]
+    nearest = {"column": "vec", "q": _vectors()[8].tolist(), "k": 6}
+    kw = {"fast_search": True}
+    if columns is not None:
+        kw["columns"] = columns
+    ref = lance.dataset(path).to_table(nearest=nearest, **kw)
+    got = nl.dataset(path).to_table(nearest=nearest, **kw)
+    assert ref.column_names == got.column_names
+    assert got.column("_rowid").to_pylist() == ref.column("_rowid").to_pylist()
+
+
 @pytest.mark.parametrize("nearest,error", [
     ({"column": "nope", "q": [0.0] * DIM}, (ValueError, "Embedding column nope is not in the dataset")),
     ({"column": "id", "q": [0.0] * DIM}, (TypeError, "Query column id must be a vector")),

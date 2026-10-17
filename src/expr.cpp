@@ -8,6 +8,7 @@
 
 #include "nanolance/expr.hpp"
 #include "nanolance/jsonb.hpp"
+#include "int128.hpp"
 
 #include <algorithm>
 #include <array>
@@ -3765,18 +3766,17 @@ struct DecType {
     int s = 0;
 };
 
-using I128 = __int128;
 
 std::string i128_text(I128 v) {
     const bool neg = v < 0;
-    const auto u = static_cast<unsigned __int128>(v);
+    const auto u = static_cast<U128>(v);
     const std::uint64_t sign = neg ? ~std::uint64_t{0} : 0;
     return mag_text(limbs_magnitude(Limbs256{static_cast<std::uint64_t>(u), static_cast<std::uint64_t>(u >> 64), sign, sign}),
                     0, neg);
 }
 
 Value decimal_value(I128 v, int scale) {
-    const auto u = static_cast<unsigned __int128>(v);
+    const auto u = static_cast<U128>(v);
     const std::uint64_t sign = v < 0 ? ~std::uint64_t{0} : 0;
     return Value::decimal(Limbs256{static_cast<std::uint64_t>(u), static_cast<std::uint64_t>(u >> 64), sign, sign},
                           scale);
@@ -3795,7 +3795,7 @@ bool value_i128(const Value& v, I128& out, int& scale) {
         return true;
     }
     if (v.kind == Kind::Decimal) {
-        out = static_cast<I128>((static_cast<unsigned __int128>(v.dec[1]) << 64) | v.dec[0]);
+        out = static_cast<I128>((static_cast<U128>(v.dec[1]) << 64) | v.dec[0]);
         scale = v.scale;
         return true;
     }
@@ -3804,9 +3804,9 @@ bool value_i128(const Value& v, I128& out, int& scale) {
 
 /// a sym b with DataFusion's message on i128 overflow (the operands as they are used).
 bool checked_i128(char sym, I128 a, I128 b, I128& r, std::string& err) {
-    const bool of = sym == '+' ? __builtin_add_overflow(a, b, &r)
-                    : sym == '-' ? __builtin_sub_overflow(a, b, &r)
-                                 : __builtin_mul_overflow(a, b, &r);
+    const bool of = sym == '+' ? i128_add_overflow(a, b, r)
+                    : sym == '-' ? i128_sub_overflow(a, b, r)
+                                 : i128_mul_overflow(a, b, r);
     if (of) {
         err = "Arithmetic overflow: Overflow happened on: " + i128_text(a) + " " + std::string(1, sym) + " " +
               i128_text(b);
@@ -4020,10 +4020,10 @@ bool build_decimal_literal(const Node& n, DecType t, TypedPtr& out, std::string&
     if (v.kind != Kind::Int && v.kind != Kind::UInt) {
         return false;
     }
-    const auto mag = v.kind == Kind::UInt ? static_cast<unsigned __int128>(v.u)
-                     : v.i < 0            ? 0 - static_cast<unsigned __int128>(v.i)
-                                          : static_cast<unsigned __int128>(v.i);
-    unsigned __int128 bound = 1;
+    const auto mag = v.kind == Kind::UInt ? static_cast<U128>(v.u)
+                     : v.i < 0            ? 0 - static_cast<U128>(v.i)
+                                          : static_cast<U128>(v.i);
+    U128 bound = 1;
     for (int k = 0; k < t.p - t.s; ++k) {
         bound *= 10;
     }
@@ -4565,7 +4565,7 @@ Value eval_typed(const TypedNode& t, int64_t row, Context& ctx) {
                 I128 x = 0;
                 int scale = 0;
                 value_i128(a, x, scale);
-                return decimal_value(static_cast<I128>(0 - static_cast<unsigned __int128>(x)), t.ds);
+                return decimal_value(static_cast<I128>(0 - static_cast<U128>(x)), t.ds);
             }
             const Value a = as_num(eval_typed(*t.args[0], row, ctx), t.type);
             if (a.is_null()) {
@@ -4585,7 +4585,7 @@ Value eval_typed(const TypedNode& t, int64_t row, Context& ctx) {
                 I128 x = 0;
                 int scale = 0;
                 value_i128(a, x, scale);
-                return decimal_value(x < 0 ? static_cast<I128>(0 - static_cast<unsigned __int128>(x)) : x, t.ds);
+                return decimal_value(x < 0 ? static_cast<I128>(0 - static_cast<U128>(x)) : x, t.ds);
             }
             const Value a = as_num(eval_typed(*t.args[0], row, ctx), t.type);
             if (a.is_null()) {
