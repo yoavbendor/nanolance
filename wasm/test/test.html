@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>weblance test</title>
+  <style>
+    :root { color-scheme: light dark; --fg: #1d1d1f; --bg: #fff; --muted: #6e6e73; }
+    @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --bg: #1c1c1e; --muted: #98989d; } }
+    body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+           font: 14px/1.4 system-ui, sans-serif; }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    #status { color: var(--muted); }
+    img { max-width: 100%; height: auto; display: block; margin: 8px 0; }
+    pre { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>weblance test</h1>
+  <p id="status">starting</p>
+  <img id="image" alt="image_bytes value" hidden>
+  <pre id="out"></pre>
+  <script>
+    // Query: ?ds=<dataset URL>&rows=<comma-separated rows>&columns=<comma-separated columns>
+    // The worker reports; window.__result holds the report once the image has decoded (or failed).
+    const params = new URLSearchParams(location.search);
+    const config = {
+      ds: params.get('ds'),
+      rows: params.get('rows') || '0,1,100000,287359',
+      columns: params.get('columns') || undefined,
+    };
+    const status = document.getElementById('status');
+    const out = document.getElementById('out');
+    const img = document.getElementById('image');
+
+    function finish(result) {
+      const { image, ...report } = result;  // the bytes stay out of the page's global
+      window.__result = report;
+      document.body.dataset.done = '1';
+      status.textContent = result.ok ? 'done' : 'failed: ' + result.error;
+      out.textContent = JSON.stringify(result, (k, v) => (k === 'image' ? undefined : v), 2);
+    }
+
+    const worker = new Worker('worker.js');
+    worker.onerror = (e) => finish({ ok: false, error: 'worker: ' + e.message, steps: [] });
+    worker.onmessage = (ev) => {
+      const r = ev.data;
+      if (!r.ok || !r.image) {
+        finish(r);
+        return;
+      }
+      status.textContent = 'decoding the image';
+      const url = URL.createObjectURL(new Blob([r.image], { type: r.imageType }));
+      img.onload = () => {
+        r.imageDecoded = img.naturalWidth > 0;
+        r.imageSize = [img.naturalWidth, img.naturalHeight];
+        finish(r);
+      };
+      img.onerror = () => {
+        r.imageDecoded = false;
+        finish(r);
+      };
+      img.hidden = false;
+      img.src = url;
+    };
+    status.textContent = 'opening ' + config.ds;
+    worker.postMessage(config);
+  </script>
+</body>
+</html>
