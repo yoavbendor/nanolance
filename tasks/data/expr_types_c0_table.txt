@@ -1,0 +1,262 @@
+= i8 + 3 | P: int8 [103, -125, 10, None] | N: int8 [103, -125, 10, None]
+! i8 - 3 | P: int8 [97, 125, 4, None] | N: ERR value -131 does not fit the column
+! i8 * 3 | P: int8 [44, -128, 21, None] | N: ERR value 300 does not fit the column
+= i8 / 3 | P: int8 [33, -42, 2, None] | N: int8 [33, -42, 2, None]
+= i8 % 3 | P: int8 [1, -2, 1, None] | N: int8 [1, -2, 1, None]
+= i16 + 3 | P: int16 [30003, -2, 10, None] | N: int16 [30003, -2, 10, None]
+= i16 - 3 | P: int16 [29997, -8, 4, None] | N: int16 [29997, -8, 4, None]
+! i16 * 3 | P: int16 [24464, -15, 21, None] | N: ERR value 90000 does not fit the column
+= i16 / 3 | P: int16 [10000, -1, 2, None] | N: int16 [10000, -1, 2, None]
+= i16 % 3 | P: int16 [0, -2, 1, None] | N: int16 [0, -2, 1, None]
+= i32 + 3 | P: int32 [2000000003, -4, 10, None] | N: int32 [2000000003, -4, 10, None]
+= i32 - 3 | P: int32 [1999999997, -10, 4, None] | N: int32 [1999999997, -10, 4, None]
+! i32 * 3 | P: int32 [1705032704, -21, 21, None] | N: ERR value 6000000000 does not fit the column
+= i32 / 3 | P: int32 [666666666, -2, 2, None] | N: int32 [666666666, -2, 2, None]
+= i32 % 3 | P: int32 [2, -1, 1, None] | N: int32 [2, -1, 1, None]
+= i64 + 3 | P: int64 [8, -4, 10, None] | N: int64 [8, -4, 10, None]
+= i64 - 3 | P: int64 [2, -10, 4, None] | N: int64 [2, -10, 4, None]
+= i64 * 3 | P: int64 [15, -21, 21, None] | N: int64 [15, -21, 21, None]
+= i64 / 3 | P: int64 [1, -2, 2, None] | N: int64 [1, -2, 2, None]
+= i64 % 3 | P: int64 [2, -1, 1, None] | N: int64 [2, -1, 1, None]
+= u8 + 3 | P: uint8 [203, 4, 10, None] | N: uint8 [203, 4, 10, None]
+! u8 - 3 | P: uint8 [197, 254, 4, None] | N: ERR value -2 does not fit the column
+! u8 * 3 | P: uint8 [88, 3, 21, None] | N: ERR value 600 does not fit the column
+= u8 / 3 | P: uint8 [66, 0, 2, None] | N: uint8 [66, 0, 2, None]
+= u8 % 3 | P: uint8 [2, 1, 1, None] | N: uint8 [2, 1, 1, None]
+= u16 + 3 | P: uint16 [60003, 4, 10, None] | N: uint16 [60003, 4, 10, None]
+! u16 - 3 | P: uint16 [59997, 65534, 4, None] | N: ERR value -2 does not fit the column
+! u16 * 3 | P: uint16 [48928, 3, 21, None] | N: ERR value 180000 does not fit the column
+= u16 / 3 | P: uint16 [20000, 0, 2, None] | N: uint16 [20000, 0, 2, None]
+= u16 % 3 | P: uint16 [0, 1, 1, None] | N: uint16 [0, 1, 1, None]
+= u32 + 3 | P: uint32 [4000000003, 4, 10, None] | N: uint32 [4000000003, 4, 10, None]
+! u32 - 3 | P: uint32 [3999999997, 4294967294, 4, None] | N: ERR value -2 does not fit the column
+! u32 * 3 | P: uint32 [3410065408, 3, 21, None] | N: ERR value 12000000000 does not fit the column
+= u32 / 3 | P: uint32 [1333333333, 0, 2, None] | N: uint32 [1333333333, 0, 2, None]
+= u32 % 3 | P: uint32 [1, 1, 1, None] | N: uint32 [1, 1, 1, None]
+= u64 + 3 | P: uint64 [8, 4, 10, None] | N: uint64 [8, 4, 10, None]
+! u64 - 3 | P: uint64 [2, 18446744073709551614, 4, None] | N: ERR value -2 does not fit the column
+= u64 * 3 | P: uint64 [15, 3, 21, None] | N: uint64 [15, 3, 21, None]
+= u64 / 3 | P: uint64 [1, 0, 2, None] | N: uint64 [1, 0, 2, None]
+= u64 % 3 | P: uint64 [2, 1, 1, None] | N: uint64 [2, 1, 1, None]
+! i8 + 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: double [101.5, -126.5, 8.5, None]
+! i8 * 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: double [150.0, -192.0, 10.5, None]
+! i32 + 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: double [2000000001.5, -5.5, 8.5, None]
+! i32 * 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: double [3000000000.0, -10.5, 10.5, None]
+! i64 + 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: double [6.5, -5.5, 8.5, None]
+! i64 * 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: double [7.5, -10.5, 10.5, None]
+! u8 + 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: double [201.5, 2.5, 8.5, None]
+! u8 * 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: double [300.0, 1.5, 10.5, None]
+! u32 + 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: double [4000000001.5, 2.5, 8.5, None]
+! u32 * 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: double [6000000000.0, 1.5, 10.5, None]
+! i8 + i8 | P: int8 [-56, 0, 14, None] | N: ERR value 200 does not fit the column
+! i8 + i16 | P: int16 [30100, -133, 14, None] | N: int64 [30100, -133, 14, None]
+! i8 + i32 | P: int32 [2000000100, -135, 14, None] | N: int64 [2000000100, -135, 14, None]
+= i8 + i64 | P: int64 [105, -135, 14, None] | N: int64 [105, -135, 14, None]
+! i16 + i8 | P: int16 [30100, -133, 14, None] | N: int64 [30100, -133, 14, None]
+= i32 + i64 | P: int64 [2000000005, -14, 14, None] | N: int64 [2000000005, -14, 14, None]
+! u8 + i8 | P: int16 [300, -127, 14, None] | N: int64 [300, -127, 14, None]
+! u8 + i32 | P: int32 [2000000200, -6, 14, None] | N: int64 [2000000200, -6, 14, None]
+! u8 + u8 | P: uint8 [144, 2, 14, None] | N: ERR value 400 does not fit the column
+! u8 + u32 | P: uint32 [4000000200, 2, 14, None] | N: int64 [4000000200, 2, 14, None]
+= u32 + i32 | P: int64 [6000000000, -6, 14, None] | N: int64 [6000000000, -6, 14, None]
+! u8 * i8 | P: int16 [20000, -128, 49, None] | N: int64 [20000, -128, 49, None]
+= u8 - u8 | P: uint8 [0, 0, 0, None] | N: uint8 [0, 0, 0, None]
+! u32 - u8 | P: uint32 [3999999800, 0, 0, None] | N: int64 [3999999800, 0, 0, None]
+! i64 * u64 | P: decimal128(38, 0) ['25', '-7', '49', None] | N: int64 [25, -7, 49, None]
+! u64 + i8 | P: decimal128(21, 0) ['105', '-127', '14', None] | N: int64 [105, -127, 14, None]
+! i32 + f32 | P: float [2000000000.0, -9.25, 10.0, None] | N: double [2000000001.5, -9.25, 10.0, None]
+= f32 * f64 | P: double [2.25, 5.0625, 9.0, None] | N: double [2.25, 5.0625, 9.0, None]
+= f32 + 1 | P: float [2.5, -1.25, 4.0, None] | N: float [2.5, -1.25, 4.0, None]
+! f32 * 2.0 | P: float [3.0, -4.5, 6.0, None] | N: double [3.0, -4.5, 6.0, None]
+= f64 + i8 | P: double [101.5, -130.25, 10.0, None] | N: double [101.5, -130.25, 10.0, None]
+! f32 + 1.5 | P: float [3.0, -0.75, 4.5, None] | N: double [3.0, -0.75, 4.5, None]
+! i8 * f32 | P: float [150.0, 288.0, 21.0, None] | N: double [150.0, 288.0, 21.0, None]
+= f32 / 0 | P: float [inf, -inf, inf, None] | N: float [inf, -inf, inf, None]
+! i32 + 1.0 | P: ERR Invalid user input: Received literal Float64(1) and could not convert to literal of type ' | N: double [2000000001.0, -6.0, 8.0, None]
+! u8 + 0.5 | P: ERR Invalid user input: Received literal Float64(0.5) and could not convert to literal of type | N: double [200.5, 1.5, 7.5, None]
+! i8 * 100 | P: int8 [16, 0, -68, None] | N: ERR value 10000 does not fit the column
+! i8 + 100 | P: int8 [-56, -28, 107, None] | N: ERR value 200 does not fit the column
+! i32 * 2000000000 | P: int32 [-1651507200, -1115098112, 1115098112, None] | N: ERR value 4000000000000000000 does not fit the column
+= i64 * 9223372036854775807 | P: int64 [9223372036854775803, -9223372036854775801, 9223372036854775801, None] | N: int64 [9223372036854775803, -9223372036854775801, 9223372036854775801, None]
+= i8 / 0 | P: ERR External error: LanceError(Arrow): Divide by zero error, /home/runner/work/lance/lance/rus | N: ERR division by zero
+= i32 % 0 | P: ERR External error: LanceError(Arrow): Divide by zero error, /home/runner/work/lance/lance/rus | N: ERR division by zero
+= i8 // 2 | P: ERR Invalid user input: Operator // is not supported, /home/runner/work/lance/lance/rust/lance | N: ERR invalid filter: unexpected '/' (at position 4)
+! u8 - 10 | P: uint8 [190, 247, 253, None] | N: ERR value -9 does not fit the column
+! u32 - 5 | P: uint32 [3999999995, 4294967292, 2, None] | N: ERR value -4 does not fit the column
+= i8 / 2 | P: int8 [50, -64, 3, None] | N: int8 [50, -64, 3, None]
+= -7 / 2 | P: ERR Not supported: Scans must request at least one column.  Received only dynamic expressions: | N: ERR Not supported: Scans must request at least one column.  Received only dynamic expressions
+= i32 / i32 | P: int32 [1, 1, 1, None] | N: int32 [1, 1, 1, None]
+! -i8 | P: int8 [-100, -128, -7, None] | N: ERR value 128 does not fit the column
+= -i16 | P: int16 [-30000, 5, -7, None] | N: int16 [-30000, 5, -7, None]
+= -i32 | P: int32 [-2000000000, 7, -7, None] | N: int32 [-2000000000, 7, -7, None]
+= -i64 | P: int64 [-5, 7, -7, None] | N: int64 [-5, 7, -7, None]
+= -u8 | P: ERR Invalid user input: Error during planning: Negation only supports numeric, interval and ti | N: ERR value -200 does not fit the column
+= -u32 | P: ERR Invalid user input: Error during planning: Negation only supports numeric, interval and ti | N: ERR value -4000000000 does not fit the column
+= -f32 | P: float [-1.5, 2.25, -3.0, None] | N: float [-1.5, 2.25, -3.0, None]
+! -dec | P: decimal128(10, 2) ['-12.34', '0.05', '-1.00', None] | N: ERR cannot negate a decimal
+= abs(i8) | P: ERR External error: LanceError(Arrow): Compute error: Int8Array overflow on abs(-128), /home/r | N: ERR value 128 does not fit the column
+= abs(i16) | P: int16 [30000, 5, 7, None] | N: int16 [30000, 5, 7, None]
+= abs(i32) | P: int32 [2000000000, 7, 7, None] | N: int32 [2000000000, 7, 7, None]
+= abs(i64) | P: int64 [5, 7, 7, None] | N: int64 [5, 7, 7, None]
+= abs(u8) | P: uint8 [200, 1, 7, None] | N: uint8 [200, 1, 7, None]
+= abs(f32) | P: float [1.5, 2.25, 3.0, None] | N: float [1.5, 2.25, 3.0, None]
+= abs(f64) | P: double [1.5, 2.25, 3.0, None] | N: double [1.5, 2.25, 3.0, None]
+= abs(-3) | P: ERR Not supported: Scans must request at least one column.  Received only dynamic expressions: | N: ERR Not supported: Scans must request at least one column.  Received only dynamic expressions
+! coalesce(i32, 0) | P: int64 [2000000000, -7, 7, 0] | N: int32 [2000000000, -7, 7, 0]
+! coalesce(i8, 0) | P: int64 [100, -128, 7, 0] | N: int8 [100, -128, 7, 0]
+! coalesce(i8, 1000) | P: int64 [100, -128, 7, 1000] | N: ERR value 1000 does not fit the column
+! coalesce(i32, 1.5) | P: double [2000000000.0, -7.0, 7.0, 1.5] | N: int32 [2000000000, -7, 7, 1]
+= coalesce(i64, 2) | P: int64 [5, -7, 7, 2] | N: int64 [5, -7, 7, 2]
+! coalesce(i32, i64) | P: int64 [2000000000, -7, 7, None] | N: int32 [2000000000, -7, 7, None]
+! coalesce(f32, 1.5) | P: double [1.5, -2.25, 3.0, 1.5] | N: float [1.5, -2.25, 3.0, 1.5]
+! coalesce(u8, 300) | P: int64 [200, 1, 7, 300] | N: ERR value 300 does not fit the column
+= coalesce(s, 'x') | P: string ['a', 'bb', 'x', 'ccc'] | N: string ['a', 'bb', 'x', 'ccc']
+= coalesce(i8, 'x') | P: ERR LanceError(Arrow): Cast error: Cannot cast string 'x' to value of Int8 type, /home/runner/ | N: ERR cannot CAST 'x' AS bigint
+= CASE WHEN b THEN i8 ELSE i32 END | P: ERR Invalid user input: Expression 'CASE WHEN b THEN i8 ELSE i32 END' is not supported SQL in  | N: ERR invalid filter: unexpected 'WHEN' (at position 5)
+= CASE WHEN b THEN i32 ELSE 1.5 END | P: ERR Invalid user input: Expression 'CASE WHEN b THEN i32 ELSE 1.5 END' is not supported SQL in | N: ERR invalid filter: unexpected 'WHEN' (at position 5)
+= CASE WHEN b THEN i8 ELSE 0 END | P: ERR Invalid user input: Expression 'CASE WHEN b THEN i8 ELSE 0 END' is not supported SQL in la | N: ERR invalid filter: unexpected 'WHEN' (at position 5)
+= CASE WHEN b THEN f32 ELSE f64 END | P: ERR Invalid user input: Expression 'CASE WHEN b THEN f32 ELSE f64 END' is not supported SQL in | N: ERR invalid filter: unexpected 'WHEN' (at position 5)
+= CASE WHEN b THEN 1 ELSE 2 END | P: ERR Invalid user input: Expression 'CASE WHEN b THEN 1 ELSE 2 END' is not supported SQL in lan | N: ERR invalid filter: unexpected 'WHEN' (at position 5)
+= CASE WHEN b THEN i8 ELSE u8 END | P: ERR Invalid user input: Expression 'CASE WHEN b THEN i8 ELSE u8 END' is not supported SQL in l | N: ERR invalid filter: unexpected 'WHEN' (at position 5)
+= CAST(i8 AS INT) | P: int32 [100, -128, 7, None] | N: int32 [100, -128, 7, None]
+= CAST(i32 AS BIGINT) | P: int64 [2000000000, -7, 7, None] | N: int64 [2000000000, -7, 7, None]
+= CAST(i8 AS SMALLINT) | P: int16 [100, -128, 7, None] | N: int16 [100, -128, 7, None]
+= CAST(f32 AS INT) | P: int32 [1, -2, 3, None] | N: int32 [1, -2, 3, None]
+= CAST(i32 AS DOUBLE) | P: double [2000000000.0, -7.0, 7.0, None] | N: double [2000000000.0, -7.0, 7.0, None]
+= CAST(i32 AS FLOAT) | P: float [2000000000.0, -7.0, 7.0, None] | N: float [2000000000.0, -7.0, 7.0, None]
+= CAST(dec AS DOUBLE) | P: double [12.34, -0.05, 1.0, None] | N: double [12.34, -0.05, 1.0, None]
+! CAST(dec AS BIGINT) | P: int64 [12, 0, 1, None] | N: ERR cannot CAST 12.34 AS bigint
+! CAST(i32 AS DECIMAL(10,2)) | P: ERR External error: LanceError(Arrow): Invalid argument error: 2000000000.00 is too large to s | N: double [2000000000.0, -7.0, 7.0, None]
+= i8 > 3 | P: bool [True, False, True, None] | N: bool [True, False, True, None]
+! i32 = 7.0 | P: ERR Invalid user input: Received literal Float64(7) and could not convert to literal of type ' | N: bool [False, False, True, None]
+= f32 > 1.5 | P: bool [False, False, True, None] | N: bool [False, False, True, None]
+= b AND true | P: bool [True, False, None, True] | N: bool [True, False, None, True]
+! dec * 2 | P: decimal128(21, 4) ['24.6800', '-0.1000', '2.0000', None] | N: ERR cannot apply '*' to decimal and integer
+! dec + 1 | P: decimal128(11, 2) ['13.34', '0.95', '2.00', None] | N: ERR cannot apply '+' to decimal and integer
+! dec / 2 | P: decimal128(16, 6) ['6.170000', '-0.025000', '0.500000', None] | N: ERR cannot apply '/' to decimal and integer
+! abs(dec) | P: decimal128(10, 2) ['12.34', '0.05', '1.00', None] | N: ERR abs() needs a number
+! dec + dec | P: decimal128(11, 2) ['24.68', '-0.10', '2.00', None] | N: ERR cannot apply '+' to decimal and decimal
+! dec * dec | P: decimal128(21, 4) ['152.2756', '0.0025', '1.0000', None] | N: ERR cannot apply '*' to decimal and decimal
+! dec + i32 | P: decimal128(13, 2) ['2000000012.34', '-7.05', '8.00', None] | N: ERR cannot apply '+' to decimal and integer
+! dec + i64 | P: decimal128(23, 2) ['17.34', '-7.05', '8.00', None] | N: ERR cannot apply '+' to decimal and integer
+= dec + 1.5 | P: ERR Invalid user input: Received literal Float64(1.5) and could not convert to literal of type | N: ERR cannot apply '+' to decimal and float
+! dec + f64 | P: double [13.84, -2.3, 4.0, None] | N: ERR cannot apply '+' to decimal and float
+! dec - i8 | P: decimal128(11, 2) ['-87.66', '127.95', '-6.00', None] | N: ERR cannot apply '-' to decimal and integer
+! dec * u8 | P: decimal128(14, 2) ['2468.00', '-0.05', '7.00', None] | N: ERR cannot apply '*' to decimal and integer
+! dec / 3 | P: decimal128(16, 6) ['4.113333', '-0.016666', '0.333333', None] | N: ERR cannot apply '/' to decimal and integer
+! dec % 3 | P: decimal128(10, 2) ['0.34', '-0.05', '1.00', None] | N: ERR cannot apply '%' to decimal and integer
+= dec * 0.5 | P: ERR Invalid user input: Received literal Float64(0.5) and could not convert to literal of type | N: ERR cannot apply '*' to decimal and float
+= dec + 0.1 | P: ERR Invalid user input: Received literal Float64(0.1) and could not convert to literal of type | N: ERR cannot apply '+' to decimal and float
+= dec * 1.25 | P: ERR Invalid user input: Received literal Float64(1.25) and could not convert to literal of typ | N: ERR cannot apply '*' to decimal and float
+! dec + i32 * 1 | P: decimal128(22, 2) ['2000000012.34', '-7.05', '8.00', None] | N: ERR cannot apply '+' to decimal and integer
+! dec / dec | P: decimal128(16, 6) ['1.000000', '1.000000', '1.000000', None] | N: ERR cannot apply '/' to decimal and decimal
+= dec - 2.5 | P: ERR Invalid user input: Received literal Float64(2.5) and could not convert to literal of type | N: ERR cannot apply '-' to decimal and float
+= dec * 100000000000000000000 | P: ERR Invalid user input: Received literal Float64(100000000000000000000) and could not convert  | N: ERR cannot apply '*' to decimal and float
+! dur + dur2 | P: duration[ms] ['0:00:00.003000', '-1 day, 23:59:59.998000', None, '0:00:00'] | N: ERR cannot apply '+' to duration and duration
+! dur - dur2 | P: duration[ms] ['0:00:00.001000', '-1 day, 23:59:59.996000', None, '0:00:00'] | N: ERR cannot apply '-' to duration and duration
+= dur + 1 | P: ERR Invalid user input: Received literal Int64(1) and could not convert to literal of type 'Du | N: ERR cannot apply '+' to duration and integer
+= dur * 2 | P: ERR Invalid user input: Received literal Int64(2) and could not convert to literal of type 'Du | N: ERR cannot apply '*' to duration and integer
+! d32 - d32 | P: int64 [0, 0, None, 0] | N: ERR cannot apply '-' to date and date
+= d32 + 1 | P: ERR Invalid user input: Received literal Int64(1) and could not convert to literal of type 'Da | N: ERR cannot apply '+' to date and integer
+= d32 - 1 | P: ERR Invalid user input: Received literal Int64(1) and could not convert to literal of type 'Da | N: ERR cannot apply '-' to date and integer
+! ts - ts | P: duration[us] ['0:00:00', None, '0:00:00', '0:00:00'] | N: ERR cannot apply '-' to timestamp and timestamp
+! ts + dur | P: timestamp[us] ['2020-01-02 03:04:05.002000', None, None, '2021-01-01 00:00:00'] | N: ERR cannot apply '+' to timestamp and duration
+= d32 - dur | P: ERR Invalid user input: Error during planning: Cannot coerce arithmetic expression Date32 - Du | N: ERR cannot apply '-' to date and duration
+! ts - dur | P: timestamp[us] ['2020-01-02 03:04:04.998000', None, None, '2021-01-01 00:00:00'] | N: ERR cannot apply '-' to timestamp and duration
+= d32 + dur | P: ERR Invalid user input: Error during planning: Cannot coerce arithmetic expression Date32 + Du | N: ERR cannot apply '+' to date and duration
+= b | P: bool [True, False, None, True] | N: bool [True, False, None, True]
+= i8 > 3 AND b | P: bool [True, False, None, None] | N: bool [True, False, None, None]
+= s || 'x' | P: string ['ax', 'bbx', None, 'cccx'] | N: string ['ax', 'bbx', None, 'cccx']
+= length(s) | P: int32 [1, 2, None, 3] | N: int32 [1, 2, None, 3]
+= upper(s) | P: string ['A', 'BB', None, 'CCC'] | N: string ['A', 'BB', None, 'CCC']
+= i8 + 1000 | P: ERR Invalid user input: Received literal Int64(1000) and could not convert to literal of type  | N: ERR value 1100 does not fit the column
+= i8 - 128 | P: ERR Invalid user input: Received literal Int64(128) and could not convert to literal of type ' | N: ERR value -256 does not fit the column
+! i8 + 127 | P: int8 [-29, -1, -122, None] | N: ERR value 227 does not fit the column
+= u8 + 300 | P: ERR Invalid user input: Received literal Int64(300) and could not convert to literal of type ' | N: ERR value 500 does not fit the column
+= u8 - 300 | P: ERR Invalid user input: Received literal Int64(300) and could not convert to literal of type ' | N: ERR value -100 does not fit the column
+= u8 + -5 | P: ERR Invalid user input: Received literal Int64(-5) and could not convert to literal of type 'U | N: ERR value -4 does not fit the column
+= i8 + -129 | P: ERR Invalid user input: Received literal Int64(-129) and could not convert to literal of type  | N: ERR value -257 does not fit the column
+= i32 + 3000000000 | P: ERR Invalid user input: Received literal Int64(3000000000) and could not convert to literal of | N: ERR value 5000000000 does not fit the column
+= i64 + 3000000000 | P: int64 [3000000005, 2999999993, 3000000007, None] | N: int64 [3000000005, 2999999993, 3000000007, None]
+= u32 + 4294967296 | P: ERR Invalid user input: Received literal Int64(4294967296) and could not convert to literal of | N: ERR value 8294967296 does not fit the column
+! i16 > 40000 | P: ERR Invalid user input: Received literal Int64(40000) and could not convert to literal of type | N: bool [False, False, False, None]
+= u8 * 1000 | P: ERR Invalid user input: Received literal Int64(1000) and could not convert to literal of type  | N: ERR value 200000 does not fit the column
+= i8 / -1 | P: ERR External error: LanceError(Arrow): Arithmetic overflow: Overflow happened on: -128 / -1, / | N: ERR value 128 does not fit the column
+= i8 % -1 | P: int8 [0, 0, 0, None] | N: int8 [0, 0, 0, None]
+! i8 * -1 | P: int8 [-100, -128, -7, None] | N: ERR value 128 does not fit the column
+= i64 / 0 | P: ERR External error: LanceError(Arrow): Divide by zero error, /home/runner/work/lance/lance/rus | N: ERR division by zero
+= i8 // 0 | P: ERR Invalid user input: Operator // is not supported, /home/runner/work/lance/lance/rust/lance | N: ERR invalid filter: unexpected '/' (at position 4)
+! i64 + f32 | P: float [6.5, -9.25, 10.0, None] | N: double [6.5, -9.25, 10.0, None]
+! u32 + f32 | P: float [4000000000.0, -1.25, 10.0, None] | N: double [4000000001.5, -1.25, 10.0, None]
+! u8 + f32 | P: float [201.5, -1.25, 10.0, None] | N: double [201.5, -1.25, 10.0, None]
+= i64 + f64 | P: double [6.5, -9.25, 10.0, None] | N: double [6.5, -9.25, 10.0, None]
+! u64 + i64 | P: decimal128(21, 0) ['10', '-6', '14', None] | N: int64 [10, -6, 14, None]
+! u64 + i32 | P: decimal128(21, 0) ['2000000005', '-6', '14', None] | N: int64 [2000000005, -6, 14, None]
+! u16 + i8 | P: int32 [60100, -127, 14, None] | N: int64 [60100, -127, 14, None]
+= u32 + i8 | P: int64 [4000000100, -127, 14, None] | N: int64 [4000000100, -127, 14, None]
+= i64 * u32 | P: int64 [20000000000, -7, 49, None] | N: int64 [20000000000, -7, 49, None]
+! u64 + u8 | P: uint64 [205, 2, 14, None] | N: int64 [205, 2, 14, None]
+= u64 * 3 | P: uint64 [15, 3, 21, None] | N: uint64 [15, 3, 21, None]
+! i8 + u64 | P: decimal128(21, 0) ['105', '-127', '14', None] | N: int64 [105, -127, 14, None]
+! u16 + i16 | P: int32 [90000, -4, 14, None] | N: int64 [90000, -4, 14, None]
+! f32 + 0.1 | P: float [1.6, -2.15, 3.1, None] | N: double [1.6, -2.15, 3.1, None]
+! f32 * 1e40 | P: float [inf, -inf, inf, None] | N: double [1.5e+40, -2.25e+40, 3e+40, None]
+! f32 + 1e40 | P: float [inf, inf, inf, None] | N: double [1e+40, 1e+40, 1e+40, None]
+= f32 + 3000000000 | P: float [3000000000.0, 3000000000.0, 3000000000.0, None] | N: float [3000000000.0, 3000000000.0, 3000000000.0, None]
+= f32 + i64 | P: float [6.5, -9.25, 10.0, None] | N: float [6.5, -9.25, 10.0, None]
+! f32 + 3.0000001 | P: float [4.5, 0.75, 6.0, None] | N: double [4.5, 0.75, 6.0, None]
+= f32 + arrow_cast(1, 'Float64') | P: double [2.5, -1.25, 4.0, None] | N: double [2.5, -1.25, 4.0, None]
+= f32 * 2 | P: float [3.0, -4.5, 6.0, None] | N: float [3.0, -4.5, 6.0, None]
+= f32 + 1000000000000 | P: float [999999995904.0, 999999995904.0, 999999995904.0, None] | N: float [999999995904.0, 999999995904.0, 999999995904.0, None]
+= i8 + arrow_cast(1, 'Int64') | P: int64 [101, -127, 8, None] | N: int64 [101, -127, 8, None]
+! i8 + arrow_cast(1, 'Int32') | P: int32 [101, -127, 8, None] | N: int64 [101, -127, 8, None]
+! i8 + arrow_cast(1, 'UInt8') | P: int16 [101, -127, 8, None] | N: int64 [101, -127, 8, None]
+= coalesce(f32, 1) | P: float [1.5, -2.25, 3.0, 1.0] | N: float [1.5, -2.25, 3.0, 1.0]
+! coalesce(f32, f64) | P: double [1.5, -2.25, 3.0, None] | N: float [1.5, -2.25, 3.0, None]
+! coalesce(i64, 1.5) | P: double [5.0, -7.0, 7.0, 1.5] | N: int64 [5, -7, 7, 1]
+! coalesce(u8, -1) | P: int64 [200, 1, 7, -1] | N: ERR value -1 does not fit the column
+! coalesce(i8, u8) | P: int16 [100, -128, 7, None] | N: int8 [100, -128, 7, None]
+! coalesce(i8, 1000) | P: int64 [100, -128, 7, 1000] | N: ERR value 1000 does not fit the column
+! coalesce(i8, 1000, i16) | P: int64 [100, -128, 7, 1000] | N: ERR value 1000 does not fit the column
+! coalesce(dec, 1) | P: decimal128(22, 2) ['12.34', '-0.05', '1.00', '1.00'] | N: decimal128(10, 2) ['12.34', '-0.05', '1.00', '1.00']
+! coalesce(dec, 1.5) | P: decimal128(30, 15) ['12.340000000000000', '-0.050000000000000', '1.000000000000000', '1.500000000000000'] | N: ERR cannot store 1.5 in a decimal column
+= coalesce(dur, dur2) | P: duration[ms] ['0:00:00.002000', '-1 day, 23:59:59.997000', None, '0:00:00'] | N: duration[ms] ['0:00:00.002000', '-1 day, 23:59:59.997000', None, '0:00:00']
+= coalesce(i32, i8) | P: int32 [2000000000, -7, 7, None] | N: int32 [2000000000, -7, 7, None]
+= coalesce(b, true) | P: bool [True, False, True, True] | N: bool [True, False, True, True]
+! dec * arrow_cast(2, 'Decimal128(3, 0)') | P: decimal128(14, 2) ['24.68', '-0.10', '2.00', None] | N: ERR cannot apply '*' to decimal and decimal
+! arrow_cast(dec, 'Decimal128(10,4)') / 2 | P: decimal128(14, 8) ['6.17000000', '-0.02500000', '0.50000000', None] | N: ERR invalid filter: arrow_cast to 'Decimal128(10,4)' takes a number literal in nanolance filte
+! arrow_cast(dec, 'Decimal128(10,4)') * 2 | P: decimal128(31, 4) ['24.6800', '-0.1000', '2.0000', None] | N: ERR invalid filter: arrow_cast to 'Decimal128(10,4)' takes a number literal in nanolance filte
+! dec / arrow_cast(4, 'Decimal128(10, 4)') | P: decimal128(18, 6) ['3.085000', '-0.012500', '0.250000', None] | N: ERR cannot apply '/' to decimal and decimal
+! dec + arrow_cast(1, 'Int64') | P: decimal128(23, 2) ['13.34', '0.95', '2.00', None] | N: ERR cannot apply '+' to decimal and integer
+= dec % 0 | P: ERR External error: LanceError(Arrow): Divide by zero error, /home/runner/work/lance/lance/rus | N: ERR cannot apply '%' to decimal and integer
+= dec / 0 | P: ERR External error: LanceError(Arrow): Divide by zero error, /home/runner/work/lance/lance/rus | N: ERR cannot apply '/' to decimal and integer
+! dec * dec * dec | P: decimal128(32, 6) ['1879.080904', '-0.000125', '1.000000', None] | N: ERR cannot apply '*' to decimal and decimal
+! -dec * 2 | P: decimal128(31, 2) ['-24.68', '0.10', '-2.00', None] | N: ERR cannot negate a decimal
+! dec - dec | P: decimal128(11, 2) ['0.00', '0.00', '0.00', None] | N: ERR cannot apply '-' to decimal and decimal
+! dec * 0 | P: decimal128(21, 4) ['0.0000', '0.0000', '0.0000', None] | N: ERR cannot apply '*' to decimal and integer
+! dec + i8 | P: decimal128(11, 2) ['112.34', '-128.05', '8.00', None] | N: ERR cannot apply '+' to decimal and integer
+! dec * u64 | P: decimal128(31, 2) ['61.70', '-0.05', '7.00', None] | N: ERR cannot apply '*' to decimal and integer
+! dec + u64 | P: decimal128(23, 2) ['17.34', '0.95', '8.00', None] | N: ERR cannot apply '+' to decimal and integer
+! dec + u32 | P: decimal128(13, 2) ['4000000012.34', '0.95', '8.00', None] | N: ERR cannot apply '+' to decimal and integer
+! CAST(dec AS INT) | P: int32 [12, 0, 1, None] | N: ERR cannot CAST 12.34 AS int
+! CAST(dec AS SMALLINT) | P: int16 [12, 0, 1, None] | N: ERR cannot CAST 12.34 AS smallint
+= CAST(-12.5 AS INT) | P: ERR Not supported: Scans must request at least one column.  Received only dynamic expressions: | N: ERR Not supported: Scans must request at least one column.  Received only dynamic expressions
+! CAST(i32 AS DECIMAL(12,2)) | P: decimal128(12, 2) ['2000000000.00', '-7.00', '7.00', None] | N: double [2000000000.0, -7.0, 7.0, None]
+! CAST(i8 AS DECIMAL(3,0)) | P: decimal128(3, 0) ['100', '-128', '7', None] | N: double [100.0, -128.0, 7.0, None]
+! CAST(i8 AS DECIMAL(2,0)) | P: ERR External error: LanceError(Arrow): Invalid argument error: 100 is too large to store in a  | N: double [100.0, -128.0, 7.0, None]
+! CAST(f32 AS DECIMAL(10,2)) | P: decimal128(10, 2) ['1.50', '-2.25', '3.00', None] | N: double [1.5, -2.25, 3.0, None]
+= CAST(i64 AS UNSIGNED) | P: ERR Invalid user input: Unsupported data type: Unsigned. Supported types: ["int [unsigned]", " | N: ERR CAST to 'unsigned' is not supported
+! dur + arrow_cast(dur2, 'Duration(Second)') | P: month_day_nano_interval [[0, 0, 2000000], [0, 0, -3000000], None, [0, 0, 0]] | N: ERR invalid filter: arrow_cast to 'Duration(Second)' takes an integer literal in nanolance fil
+= dur * 1 | P: ERR Invalid user input: Received literal Int64(1) and could not convert to literal of type 'Du | N: ERR cannot apply '*' to duration and integer
+! dur - dur | P: duration[ms] ['0:00:00', '0:00:00', None, '0:00:00'] | N: ERR cannot apply '-' to duration and duration
+= abs(dur) | P: ERR Invalid user input: Error during planning: Function 'abs' expects Numeric but received Dur | N: ERR abs() needs a number
+= -dur | P: ERR Invalid user input: Error during planning: Negation only supports numeric, interval and ti | N: ERR cannot negate a duration
+! d32 - arrow_cast(d32, 'Date64') | P: int64 [0, 0, None, 0] | N: ERR cannot apply '-' to date and date
+! ts - arrow_cast(ts, 'Timestamp(Millisecond)') | P: duration[ms] ['0:00:00', None, '0:00:00', '0:00:00'] | N: ERR cannot apply '-' to timestamp and timestamp
+! ts + arrow_cast(1, 'Duration(Second)') | P: timestamp[us] ['2020-01-02 03:04:06', None, '2000-01-01 00:00:01', '2021-01-01 00:00:01'] | N: ERR cannot apply '+' to timestamp and duration
+= ts + ts | P: ERR Invalid user input: Error during planning: Cannot get result type for temporal operation T | N: ERR cannot apply '+' to timestamp and timestamp
+! -i8 + 1 | P: int64 [-99, -127, -6, None] | N: ERR value 129 does not fit the column
+= abs(i8) + 1 | P: ERR External error: LanceError(Arrow): Compute error: Int8Array overflow on abs(-128), /home/r | N: ERR value 129 does not fit the column
+= abs(u32) | P: uint32 [4000000000, 1, 7, None] | N: uint32 [4000000000, 1, 7, None]
+= -f64 | P: double [-1.5, 2.25, -3.0, None] | N: double [-1.5, 2.25, -3.0, None]
+! abs(i8 + 1) | P: int64 [101, 127, 8, None] | N: int8 [101, 127, 8, None]

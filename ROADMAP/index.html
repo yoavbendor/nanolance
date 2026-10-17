@@ -1110,12 +1110,54 @@ one pass; the stop rule worked -- phase B stopped at a reader / schema-mapping q
 redesigning it, and the reviewer's answer (pylance's <code>DataFile.create</code> reads only top-level names)
 was a 30-line fix; a fresh session per phase kept each one inside its context. Next time: give the
 "finish" session its known facts up front, and say which pytest flags print a summary.</p>
+<p>Performance review (2026-10-16, Opus), after the stretch of API work above, against the commit
+before it and against pylance 12.0.0 (<code>tools/bench_matrix.py</code>, <code>bench_scalar_index.py</code>,
+<code>bench_vector_index.py</code>, <code>bench_fts.py</code>):
+- Fixed: vector search scaled poorly across threads (an out-of-line row-mask check in the scoring
+  loop made its threads share cache lines); default late materialization (up to 3.7x slower);
+  takes of a few rows walked a fragment's whole row mask byte by byte, then decoded a whole small
+  column (a dictionary column: 15 ms for one row) or walked a cached copy of it; single-core scans
+  faulted in fresh memory for every page (string output grown value by value; mini-block chunks
+  copied into new vectors): Rust-written decimal128 7.5-10 -&gt; 2.4-2.7 ms (Rust 6.9), ~1 KB
+  strings 41-51 -&gt; 15 ms (Rust 40); BTREE builds sort integer keys with a radix sort.
+- Now, against pylance: vector search 3.8x, full-text 3.0x, scalar index queries 2.3x (all
+  faster; no query slower), index builds 1.2-3.8x, Python reads 3.5x, Python writes 1.9x.
+- Left: writes of a single nested column (map / list of strings / list of structs) do not use
+  threads -- the writer parallelizes across columns, and within a page only for string
+  dictionaries and FSST -- so pylance's multi-threaded writer is faster there (map_string_int64
+  through Python 0.59x; nanolance's C++ writer on one core is level with Rust's). Needs page
+  encoding of one column split across threads.
+  Since then (2026-10-16): the serializers side by side no longer share cache lines (four threads
+  53-60 ms against 56-65 on one), but four threads are still level with one. Most of a
+  map<string, int64> write is outside the two steps timed (rep/def serialize ~12 ms, page build
+  ~7 ms of ~60 ms user time): profile on a quiet machine first. Each write also faults in ~6,300
+  fresh pages (~20 ms of system time) -- retain buffers across pages as the read path now does.
+  Deferred to the next performance pass.</p>
 <p>Small items found by delegated sessions, not yet done:
-- Count from an exact scalar-index mask without reading (<code>CountFromMask</code>, tests/test_count_pushdown.py, 4) and scan statistics with index cache hit / miss (<code>scan_stats_callback</code>, <code>ScanStatistics</code>; btree / bitmap / fts cache tests, ~5) -- shared scan / planning code (SMALL_ITEMS_2 phase B).
-- Expression grammar: list / bracket indexing (<code>l[1]</code>, <code>s['x']</code>, <code>list_struct[1]['x']</code>) and a float16 list cast in projections and filters (SQL_SURFACE S1: <code>test_nested_projection_list</code>, <code>test_dynamic_projection_with_vectors_index</code>).
-- Expression result types: follow DataFusion's coercion as pylance does (int32 + float32 -&gt; float32, uint8 + int32 -&gt; int32, abs keeps int64, coalesce with a literal non-null; SQL_SURFACE S1 notes). Same area: Decimal and Duration value kinds in filters / <code>arrow_cast</code> (unit-aware durations) and a 256-bit key kind for decimal256 scalar indexes (<code>test_scalar_index_types[*-decimal*|*-duration]</code>, 9 tests; SMALL_ITEMS_2 phase A).
-- KNN column placement: with <code>with_row_id=True</code> and <code>_rowid</code> in <code>columns</code>, pylance puts <code>_rowid</code> last; pylance adds <code>_rowid</code> to <code>fast_search</code> output (PY_SURFACE_2 Q3 notes).
-- Validate INVERTED / tokenize <code>language</code> names against Lance's list (pylance raises ValueError for unknown names; nanolance accepts them when stemming and stop words are off).
+- Fuzzy FTS, the rest (fuzzy MatchQuery done 2026-10-17, +2): pylance refuses a fuzziness whose
+  Levenshtein automaton passes 10,000 states (<code>Levenshtein automaton exceeds size limit of 10000
+  states</code>); nanolance expands to every term within k instead. Accented query tokens: pylance's
+  distances do not follow char- or byte-level Levenshtein on the folded dictionary ("naive" at k=1
+  drops "naive" but keeps "nave"); nanolance uses char-level. lance-c's
+  <code>lance_scanner_full_text_search</code> takes <code>max_fuzzy_distance</code> (2026-10-17); the prepared-context path (<code>lance_dataset_prepare_fts_match_query</code>) still refuses fuzziness.
+  A fuzzy token scans the whole dictionary (~0.15 s per token on 1M terms).
+- Binary vectors (Hamming), the rest: flat search and <code>hamming_clustering_for_sample</code> are done
+  (2026-10-17, +4). Left: IVF_FLAT on binary vectors (<code>test_ivf_flat_over_binary_vector</code>),
+  <code>IvfModel</code> hamming (<code>test_ivf_centroids_hamming</code>), <code>hamming_clustering_for_ivf_partition</code> and the
+  multi-segment test. Measured on pylance 12.0.0: index.idx <code>{"type":"IVF_FLAT","distance_type":
+  "hamming"}</code>; auxiliary.idx's <code>flat</code> column is fixed_size_list<uint8>[dim] plus <code>_rowid</code>, metadata
+  storage_metadata <code>["{\"dim\":16}"]</code>, distance_type <code>hamming</code>, lance:ivf <code>1</code>; centroids are
+  uint8-valued, apparently per-bit majority (k-modes; whether seeded is unverified). The float-only
+  vector path (NearestQuery::key, IVF partitions, the builder) needs a uint8 element type -- several
+  sessions.
+- ~~MSVC: <code>__int128</code> in src/row_ids.cpp and src/expr.cpp~~ Done 2026-10-17: <code>src/int128.hpp</code> (two 64-bit words without <code>__int128</code>; <code>-DNANOLANCE_PORTABLE_INT128</code> forces it, built and ctest-passed on Linux), and <code>__builtin_clz</code> in src/fts_index_build.cpp replaced by <code>std::bit_width</code>. Not yet built with MSVC itself (run the manual Windows job). <code>-DNANOLANCE_WERROR=ON</code> builds clean with this GCC again (2026-10-17).
+- ~~Count from an exact scalar-index mask without reading (<code>CountFromMask</code>)~~ Done 2026-10-17 (BTREE / BITMAP, deletions, updates, partial coverage; +3). <code>io_stats_incremental()</code> done 2026-10-17 (+1): read / write IOPs and bytes from process-wide counters, each dataset object reporting the change since its own last call -- reads by other dataset objects in between are included (pylance counts per object). Left: LABEL_LIST exactness, the ScalarIndexQuery metrics in the count plan. Scan statistics done 2026-10-17 (<code>scan_stats_callback</code>, <code>ScanStatistics</code>; the 4 cache hit / miss tests). Left there: nanolance's index caches are process-wide (keyed by file path), pylance's are per dataset session -- a fresh dataset object hits where pylance misses; making them per-session means threading a session through the index loaders. Hit / miss counts for FTS and phrase queries differ in number from pylance's (direction matches); <code>indices_loaded</code> and <code>index_comparisons</code> are 0.
+- ~~<code>lance._datagen</code>~~ Done 2026-10-17: answers as a pylance wheel built without datagen (pylance's own wheel), so test_datagen.py imports, 1 passes, 3 skip.
+- ~~Expression grammar: list / bracket indexing (<code>l[1]</code>, <code>s['x']</code>, <code>list_struct[1]['x']</code>) and a float16 list cast in projections and filters (SQL_SURFACE S1: <code>test_nested_projection_list</code>, <code>test_dynamic_projection_with_vectors_index</code>).~~ Done 2026-10-16 (<code>docs/tasks/EXPR_TYPES.md</code>, phases A-C; what is left is listed there).
+- ~~Expression result types: follow DataFusion's coercion as pylance does (int32 + float32 -&gt; float32, uint8 + int32 -&gt; int32, abs keeps int64, coalesce with a literal non-null; SQL_SURFACE S1 notes). Same area: Decimal and Duration value kinds in filters / <code>arrow_cast</code> (unit-aware durations) and a 256-bit key kind for decimal256 scalar indexes (<code>test_scalar_index_types[*-decimal*|*-duration]</code>, 9 tests; SMALL_ITEMS_2 phase A).~~ Done 2026-10-16 (<code>docs/tasks/EXPR_TYPES.md</code>, phases A-C; what is left is listed there).
+- ~~KNN column placement: with <code>with_row_id=True</code> and <code>_rowid</code> in <code>columns</code>, pylance puts <code>_rowid</code> last; pylance adds <code>_rowid</code> to <code>fast_search</code> output (PY_SURFACE_2 Q3 notes).~~ Done 2026-10-17 (also <code>_rowaddr</code>; measured on flat and IVF_FLAT).
+- ~~Validate INVERTED / tokenize <code>language</code> names against Lance's list (pylance raises ValueError for unknown names; nanolance accepts them when stemming and stop words are off).~~ Done 2026-10-17 (pylance's 18 names, case-sensitive, any tokenizer). Left: stemming and stop words for languages other than English; ~~<code>language=None</code>~~ (TypeError as pylance, 2026-10-17).
+- Seen once under load (2026-10-17, two full runs at once): <code>test_hnsw.py::test_new_kinds_match_pylance[True-dot-IVF_SQ]</code> failed; passes alone and in its file.
 - Rare failures in <code>tests/test_index_optimize.py</code> (~1 run in 15-90): <code>test_optimize_after_append[nanolance]</code> (IVF_PQ <code>vec2</code> distances after pylance's vs nanolance's <code>optimize_indices</code> differ; captured 2026-10-16: pylance's copy returned consistently larger distances) and once <code>test_vector_model_kept_or_retrained</code> (a ValueError, message not captured). Found so far: IVF k-means is unseeded in both engines (pylance's partition sizes vary run to run as much as nanolance's), so each run tests a different index; with the default target both engines join the 4 partitions into one and pick the same survivor (20 probe runs, identical centroids); pylance's optimized index keeps some deleted rows (3767-3781 rows vs nanolance's 3760 live). Next: a seeded build loop that saves the datasets of a mismatching run, then diff the two optimized indexes partition by partition (codes, row ids). Probe scripts: scratchpad flaky3/probe*.py (recreate from this note if gone).
 - External blob URIs under a registered base path: the descriptor should carry the base id and a
   base-relative URI (pylance's <code>test_blob_extension_write_fragments_external_registered_base</code>).
@@ -1124,12 +1166,12 @@ was a 30-line fix; a fresh session per phase kept each one inside its context. N
   into the graph concurrently on nanolance's threads, as Lance builds it, so the graph differs between
   multi-threaded runs (with one thread, or <code>NANOLANCE_THREADS=1</code>, it is deterministic). Serializing the
   insertion would cost the build its parallelism for no compatibility gain.
-- <code>lance.dataset.VectorIndexReader</code> (<code>num_partitions</code>, <code>read_partition(id, with_vector=)</code>): Lance returns
-  <code>_rowid</code> plus <code>flat</code> (IVF_FLAT) or <code>__pq_code</code> (IVF_PQ) columns. Small, delegable.
-- <code>row_addr_allowlist=</code> / <code>serialize_row_addrs</code> in scans and searches (12 of pylance's tests in
-  <code>test_row_addr_prefilter.py</code>). Delegable.
-- <code>_take_rows</code> of a deleted row's address returns the row; pylance leaves it out (plain datasets,
-  without stable row ids). Found by the multi-base phase A session.</p>
+- ~~<code>lance.dataset.VectorIndexReader</code> (<code>num_partitions</code>, <code>read_partition(id, with_vector=)</code>): Lance returns
+  <code>_rowid</code> plus <code>flat</code> (IVF_FLAT) or <code>__pq_code</code> (IVF_PQ) columns. Small, delegable.~~ Done 2026-10-15 (Small items 1).
+- ~~<code>row_addr_allowlist=</code> / <code>serialize_row_addrs</code> in scans and searches (12 of pylance's tests in
+  <code>test_row_addr_prefilter.py</code>). Delegable.~~ Done 2026-10-15 (Small items 1).
+- ~~<code>_take_rows</code> of a deleted row's address returns the row; pylance leaves it out (plain datasets,
+  without stable row ids). Found by the multi-base phase A session.~~ Done 2026-10-15 (Small items 1).</p>
 <h2 id="priority-competing-with-pylance-directly-2026-10-08">Priority: competing with pylance directly (2026-10-08)<a class="headerlink" href="#priority-competing-with-pylance-directly-2026-10-08" title="Permanent link">&para;</a></h2>
 <p>This order supersedes the "Suggested order" lines further down. The evidence is pylance 12's own
 suite, run against nanolance.lance with every failure grouped by its cause: nanolance passes 259;
