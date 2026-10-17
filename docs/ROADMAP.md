@@ -8,6 +8,16 @@ Everything below was **measured against pylance 2.2 files written for this plan*
 backlog. That changed the picture substantially. Two gaps nobody had listed are bigger than lists, and
 two items the backlog called large are small.
 
+**Status 2026-10-17:** the current state, the open items by size, the known divergences from pylance
+and the performance targets are in `docs/NEXT_WEEK.md`; how the delegated work went is in
+`docs/DELEGATION.md`. Done 2026-10-16/17 (each in the sections below or in NEXT_WEEK): EXPR_TYPES
+phases A-C (decimal / duration filters and indexes, bracket indexing, DataFusion result types),
+MSVC-portable 128-bit integers, KNN row-id placement, FTS language validation, flat Hamming search
+over binary vectors, fuzzy full-text MatchQuery (Python and lance-c), count_rows from exact scalar
+indexes, io_stats_incremental, scan statistics, the byte-source I/O layer (every read path; faster
+natively), the WebAssembly build and the public browser demo (github.com/yoavbendor/weblance).
+pylance's suite: 1,200 expected passes.
+
 ---
 
 ## Working order and delegation (2026-10-15)

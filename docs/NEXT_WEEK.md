@@ -8,7 +8,7 @@ session, or several, or Opus work) and where its notes are. The detailed history
 
 - pylance 12.0.0's own suite against `nanolance.lance`: **1,200 expected passes** (1,171 at the
   start of this week). `tools/pylance_suite.py` checks them; `--update` records new ones.
-- nanolance's own tests: ctest 63 / 63; pytest `bindings/python/tests` 3,386 passed, 20 skipped,
+- nanolance's own tests: ctest 64 / 64; pytest `bindings/python/tests` 3,386 passed, 20 skipped,
   1 xfailed (2026-10-17).
 - Performance against Rust Lance and pylance: see "Performance" below (benchmarks re-run
   2026-10-17).
@@ -47,22 +47,35 @@ a user report can be matched to it.
 | icu / jieba / lindera tokenizers | 15 | large (external libraries, dictionaries) | CJK users only |
 | MSVC: build the Windows job once | -- | run `ci-platforms.yml` by hand | the portable 128-bit path is tested on Linux only |
 
-## Browser / remote reads (2026-10-17)
+## Browser: the weblance demo (shipped 2026-10-17)
 
-- Done: every READ path goes through `io::ByteSource` (`include/nanolance/byte_source.hpp`): data
-  files (pread, cached file end, coalesced column metadata, small-read block), manifests and
-  version discovery, deletion files, tags, index-segment checks. An embedder registers a source
-  factory and a directory lister per URI scheme; `tests/test_byte_source_remote.cpp` reads a
-  dataset (fragments, deletions, a BTREE index) through a `mem://` store after deleting the local
-  directory. Measured level or faster than before on scans, takes and dataset opens.
-- WASM: the library compiles with Emscripten (reader + writer 569 KB gzipped at -Oz); the spike
-  is on the local branch `wasm-spike` (`/home/user/nl-wasm`), round trip passing under Node.
-- Left for the demo: an HTTP range source and a lister (Hugging Face tree API / S3 ListObjectsV2,
-  or an explicit version); a browser harness; exceptions are off in the WASM build (out of memory
-  aborts). Writers and maintenance (cleanup, drop, tag edits, index commits) stay on local files.
-  On Windows a URI joined with `/` gets a backslash -- remote paths are POSIX / Emscripten only.
-- Found on the way: clang-18 fails on `fts_json.hpp` (incomplete `json::Value` in a pair) in
-  `dataset_refs.cpp`, also at older commits; GCC is fine.
+- **Live demo:** https://github.com/yoavbendor/weblance (public; GitHub Pages from `main`, root):
+  a map of 25,000 COCO images by their SigLIP2 embeddings; a click fetches the 12 nearest rows'
+  captions and JPEGs live from `jrmiller/coco-2017-siglip2-embeddings` on Hugging Face (one 48 GB
+  Lance data file) with HTTP Range requests, through nanolance compiled to WebAssembly (433 KB
+  gzipped) in six Web Workers. Verified in headless Chromium against the real dataset: 12 images,
+  3.66 MB fetched (0.008% of the file). The weblance repo holds only the built module, the page,
+  the map data (`tools/make_map.py` rebuilds it) and the license notices; nanolance stays private.
+- **How:** every READ path goes through `io::ByteSource` (`include/nanolance/byte_source.hpp`):
+  data files (pread, cached file end, coalesced column metadata, small-read block), manifests and
+  version discovery, deletion files, tags, index-segment checks. `wasm/weblance_glue.cpp`
+  registers an https source (synchronous XHR in a worker, single-range `Range` headers -- no CORS
+  preflight -- with the redirected CDN URL cached per file) and a Hugging Face tree-API lister;
+  `wasm/build_weblance.sh` builds the module; `tests/test_byte_source_remote.cpp` reads a dataset
+  through a `mem://` store after deleting the local directory. The I/O rework measured level or
+  faster natively (wide scans 2x, takes 15-37%, a stat storm of ~800 stats per take removed).
+
+**Open (the demo works; these make it better):**
+
+| item | why | size |
+|---|---|---|
+| ~18 HTTP requests per image on a click (223 for 12) | every column of every row is its own page lookup; the six workers hide it, a real browser feels it | 1 session: batch the page-metadata reads of one take, larger blocks for the image column |
+| Measure in a real browser (not through this session's proxy, which costs seconds per request) | the page's numbers are what a viewer sees | the user, 5 minutes |
+| Each of the six workers opens the dataset (~20 requests each) | share one open's metadata, or open in one worker and post it | small |
+| Similar-image search in the page (the dataset has an IVF_HNSW_SQ index; nanolance searches it) | the next demo step: click an image, find its neighbours by vector, reading only index partitions | 1-2 sessions |
+| C++ exceptions are off in the WASM build (out of memory aborts) | acceptable for the demo | measure `-fexceptions` size |
+| Remote paths joined with `/` get a backslash on Windows | remote reads are POSIX / Emscripten only | small |
+| clang-18 fails on `fts_json.hpp` (incomplete `json::Value` in a pair) in `dataset_refs.cpp`, at older commits too | GCC and Emscripten's clang are fine | small |
 
 ## Flaky tests to watch
 
