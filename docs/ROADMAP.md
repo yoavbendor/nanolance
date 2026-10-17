@@ -73,6 +73,13 @@ before it and against pylance 12.0.0 (`tools/bench_matrix.py`, `bench_scalar_ind
   Deferred to the next performance pass.
 
 Small items found by delegated sessions, not yet done:
+- Fuzzy FTS, the rest (fuzzy MatchQuery done 2026-10-17, +2): pylance refuses a fuzziness whose
+  Levenshtein automaton passes 10,000 states (`Levenshtein automaton exceeds size limit of 10000
+  states`); nanolance expands to every term within k instead. Accented query tokens: pylance's
+  distances do not follow char- or byte-level Levenshtein on the folded dictionary ("naive" at k=1
+  drops "naive" but keeps "nave"); nanolance uses char-level. lance-c's
+  `lance_scanner_full_text_search` with `max_fuzzy_distance > 0` still returns NOT_SUPPORTED.
+  A fuzzy token scans the whole dictionary (~0.15 s per token on 1M terms).
 - Binary vectors (Hamming), the rest: flat search and `hamming_clustering_for_sample` are done
   (2026-10-17, +4). Left: IVF_FLAT on binary vectors (`test_ivf_flat_over_binary_vector`),
   `IvfModel` hamming (`test_ivf_centroids_hamming`), `hamming_clustering_for_ivf_partition` and the

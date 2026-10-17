@@ -964,6 +964,7 @@ tests/test_scalar_index.py::test_describe_indices_vector_and_scalar
 tests/test_scalar_index.py::test_distribute_btree_index_build
 tests/test_scalar_index.py::test_distribute_fts_index_build
 tests/test_scalar_index.py::test_distributed_fts_boolean_query_validation
+tests/test_scalar_index.py::test_distributed_fts_fuzzy_query_validation
 tests/test_scalar_index.py::test_distributed_fts_multi_match_validation
 tests/test_scalar_index.py::test_distributed_fts_phrase_query_validation
 tests/test_scalar_index.py::test_distributed_fts_with_filter_validation
@@ -977,6 +978,7 @@ tests/test_scalar_index.py::test_fts_deleted_rows
 tests/test_scalar_index.py::test_fts_deleted_rows_with_stable_row_ids
 tests/test_scalar_index.py::test_fts_flat_fallback_matches_wand
 tests/test_scalar_index.py::test_fts_fts[simple]
+tests/test_scalar_index.py::test_fts_fuzzy_query
 tests/test_scalar_index.py::test_fts_multi_match_query
 tests/test_scalar_index.py::test_fts_ngram_tokenizer
 tests/test_scalar_index.py::test_fts_phrase_query

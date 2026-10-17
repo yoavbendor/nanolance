@@ -33,7 +33,7 @@ struct FtsQuery {
     std::vector<float> boosts;  // MultiMatch: per column (empty: 1)
 
     float boost = 1.0F;                            // Match: the score's factor
-    std::optional<std::uint32_t> fuzziness = 0;    // Match: only 0 (exact) is supported
+    std::optional<std::uint32_t> fuzziness = 0;    // Match: edits allowed per query token (0 = exact; unset = 0)
     std::uint32_t max_expansions = 50;
     std::uint32_t prefix_length = 0;
     bool and_operator = false;  // Match / MultiMatch: every term must occur (else any)
