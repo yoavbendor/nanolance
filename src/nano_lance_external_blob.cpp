@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/work_stats.hpp"
 #include "nanolance/nano_lance_reader.h"
 
 #include <algorithm>
@@ -213,6 +214,7 @@ int nano_lance_fetch_external_blob(const char* uri, uint64_t position, uint64_t 
     }
     in->read(reinterpret_cast<char*>(out_buf), to_read);
     *bytes_read = static_cast<size_t>(std::max<std::streamsize>(0, in->gcount()));
+    nano_lance::work_stats::count_read(*bytes_read);
 #ifdef NANO_LANCE_READER_HAS_S3
     // A range GET that failed mid-read (transport/HTTP error, not a clean EOF) leaves a thread error set.
     // Surface it instead of silently returning a short read.

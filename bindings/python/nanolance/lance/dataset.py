@@ -250,6 +250,23 @@ def _rename(table: pa.Table, columns) -> pa.Table:
     return table
 
 
+class IOStats:
+    """File I/O of a dataset since its last io_stats_incremental() call (pylance's attribute names):
+    read and write operations (one ranged read or one written file's bytes each) and the bytes moved."""
+
+    __slots__ = ("read_iops", "read_bytes", "write_iops", "written_bytes")
+
+    def __init__(self, read_iops: int = 0, read_bytes: int = 0, write_iops: int = 0, written_bytes: int = 0):
+        self.read_iops = read_iops
+        self.read_bytes = read_bytes
+        self.write_iops = write_iops
+        self.written_bytes = written_bytes
+
+    def __repr__(self) -> str:
+        return (f"IOStats(read_iops={self.read_iops}, read_bytes={self.read_bytes}, "
+                f"write_iops={self.write_iops}, written_bytes={self.written_bytes})")
+
+
 class LanceDataset(pa.dataset.Dataset):
     """A Lance dataset at a version. Mirrors ``lance.LanceDataset``."""
 
@@ -301,6 +318,8 @@ class LanceDataset(pa.dataset.Dataset):
         self._fragment_message_cache = None
         if getattr(self, "_session", None) is not None:
             note_manifest(self)
+        if getattr(self, "_io_mark", None) is None:  # io_stats_incremental() counts from the open
+            self._io_mark = _nanolance._io_counters()
 
     def session(self) -> Session:
         """This dataset's session: the caches and budgets its reads are accounted to."""
@@ -729,6 +748,17 @@ class LanceDataset(pa.dataset.Dataset):
         n = self.count_rows()
         start, end, _ = slice(start, end).indices(n)
         return self.to_table(columns=columns, offset=start, limit=max(end - start, 0))
+
+    def io_stats_incremental(self) -> IOStats:
+        """The file I/O done since the last call on this object (zero for the first call), then reset.
+
+        Counted by nanolance's process-wide I/O counters, so reads by other dataset objects in the same
+        process between two calls are included too."""
+        with native():
+            current = _nanolance._io_counters()
+        mark = self._io_mark
+        self._io_mark = current
+        return IOStats(*(now - before for now, before in zip(current, mark)))
 
     def count_rows(self, filter=None, **kwargs) -> int:
         if filter is not None:
@@ -3887,9 +3917,17 @@ class LanceScanner(pa.dataset.Scanner):
                 or self._limit is not None or self._offset or self._fragment_ids is not None
                 or not self._use_scalar_index):
             return None
-        with native():
-            exact, indexed, uncovered, lines = _nanolance._ds_count_from_index(
-                self._ds.uri, self._ds.version, self._filter)
+        # The answer is a function of the version and the filter (a version never changes), so this
+        # dataset object keeps it: a repeat count reads no index or deletion file. Keyed by version
+        # too -- delete() / insert() move this same object to a new version -- and bounded.
+        memo = self._ds.__dict__.setdefault("_count_from_index_memo", {})
+        key = (self._ds.version, self._filter)
+        if key not in memo:
+            if len(memo) >= 64:
+                memo.clear()
+            with native():
+                memo[key] = _nanolance._ds_count_from_index(self._ds.uri, self._ds.version, self._filter)
+        exact, indexed, uncovered, lines = memo[key]
         if not exact:
             return None
         scanned = 0

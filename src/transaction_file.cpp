@@ -9,6 +9,7 @@
 // indices, config -- except where the change alone cannot say (an overwrite, a restore, a
 // compaction: the commit says so in Manifest::operation).
 
+#include "nanolance/work_stats.hpp"
 #include "transaction_file.hpp"
 
 #include "nanolance/manifest_reader.hpp"
@@ -495,6 +496,7 @@ bool write_transaction_file(const std::filesystem::path& dataset_path, const pb:
     }
     out.write(reinterpret_cast<const char*>(tx.data()), static_cast<std::streamsize>(tx.size()));
     out.close();
+    work_stats::count_written_file(dir / file_name);
     if (!out) {
         std::filesystem::remove(dir / file_name, ec);
         error = "failed to write " + (dir / file_name).string();

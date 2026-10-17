@@ -46,6 +46,8 @@
 #include <string>
 #include <vector>
 
+#include "nanolance/work_stats.hpp"
+
 namespace nb = nanobind;
 using nanolance_py::arrow_capsule::BatchIterator;
 using nanolance_py::arrow_capsule::ExportedSchema;
@@ -1110,6 +1112,13 @@ NB_MODULE(_nanolance, m) {
           "Threads nanolance may use (1: all work on the calling thread; 0: the default).");
     m.def("get_threads", [] { return nano_lance_threads(); },
           "Threads nanolance may use: set_threads, else NANOLANCE_THREADS, else the CPUs available.");
+    m.def("_io_counters", [] {
+        // Process-wide file I/O (see nanolance/work_stats.hpp); LanceDataset.io_stats_incremental() diffs it.
+        const auto& c = nano_lance::work_stats::io_counters();
+        return nb::make_tuple(c.read_iops.load(std::memory_order_relaxed), c.read_bytes.load(std::memory_order_relaxed),
+                              c.write_iops.load(std::memory_order_relaxed),
+                              c.written_bytes.load(std::memory_order_relaxed));
+    });
     m.def("_work_stats", [] {
         NanoLanceWorkStats w{};
         nano_lance_work_stats(&w);

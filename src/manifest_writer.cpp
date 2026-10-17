@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/work_stats.hpp"
 #include "nanolance/manifest_writer.hpp"
 #include "nanolance/row_ids.hpp"
 
@@ -233,6 +234,7 @@ bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manif
     write_le16(out, 2);
     out.write("LANC", 4);
     out.close();
+    work_stats::count_written_file(temp_path);
     if (!out) {
         error = "failed to write manifest temp file";
         return false;

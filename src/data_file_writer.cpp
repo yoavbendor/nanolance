@@ -2178,6 +2178,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
         return false;
     }
 
+    work_stats::WrittenFileTally tally(full_path);
     std::ofstream out(full_path, std::ios::binary | std::ios::trunc);
     if (!out) {
         error = "failed to open data file for writing";

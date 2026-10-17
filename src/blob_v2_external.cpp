@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/work_stats.hpp"
 #include "nanolance/blob_v2_external.hpp"
 
 #include "nanolance/array_accessor.hpp"
@@ -1156,6 +1157,7 @@ bool blob_v2_read(const BlobV2Location& location, const std::uint64_t offset, co
     }
     in.seekg(static_cast<std::streamoff>(at));
     in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(length));
+    work_stats::count_read(length);
     if (!in) {
         error = "cannot read blob file " + location.file;
         out.clear();

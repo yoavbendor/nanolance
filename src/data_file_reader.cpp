@@ -156,6 +156,7 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
     in.seekg(static_cast<std::streamoff>(file_size - static_cast<std::uintmax_t>(tail_len)));
     std::vector<unsigned char> tail(static_cast<std::size_t>(tail_len));
     in.read(reinterpret_cast<char*>(tail.data()), tail_len);
+    work_stats::count_read(static_cast<std::uint64_t>(tail_len));
     if (!in || in.gcount() != tail_len) {
         error = "failed to read data file footer tail";
         return false;
@@ -244,6 +245,7 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
     in.seekg(static_cast<std::streamoff>(global_buffer_offset));
     std::vector<std::uint8_t> desc_bytes(static_cast<std::size_t>(descriptor_size));
     in.read(reinterpret_cast<char*>(desc_bytes.data()), static_cast<std::streamsize>(descriptor_size));
+    work_stats::count_read(static_cast<std::uint64_t>(descriptor_size));
     if (!in || static_cast<std::size_t>(in.gcount()) != static_cast<std::size_t>(descriptor_size)) {
         error = "failed to read data file descriptor bytes";
         return false;
@@ -320,6 +322,7 @@ bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::ui
         work_stats::add(stats.data_bytes_read, size);
         work_stats::add(stats.data_reads, 1U);
         work_stats::raise_to(stats.largest_read, size);
+        work_stats::count_read(size);
     }
     if (!in || static_cast<std::uint64_t>(in.gcount()) != size) {
         error = "failed to read data file byte range";
