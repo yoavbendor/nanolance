@@ -266,6 +266,7 @@ tests/test_count_pushdown.py::test_filtered_count_with_deleted_rows
 tests/test_count_pushdown.py::test_filtered_count_with_updated_rows
 tests/test_count_pushdown.py::test_filtered_count_with_whole_fragment_deleted
 tests/test_create_empty_index.py::test_create_empty_vector_index
+tests/test_datagen.py::test_import_error
 tests/test_dataset.py::test_access_config
 tests/test_dataset.py::test_add_null_columns
 tests/test_dataset.py::test_analyze_filtered_scan
