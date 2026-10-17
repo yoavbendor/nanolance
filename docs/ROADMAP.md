@@ -78,7 +78,7 @@ Small items found by delegated sessions, not yet done:
   states`); nanolance expands to every term within k instead. Accented query tokens: pylance's
   distances do not follow char- or byte-level Levenshtein on the folded dictionary ("naive" at k=1
   drops "naive" but keeps "nave"); nanolance uses char-level. lance-c's
-  `lance_scanner_full_text_search` with `max_fuzzy_distance > 0` still returns NOT_SUPPORTED.
+  `lance_scanner_full_text_search` takes `max_fuzzy_distance` (2026-10-17); the prepared-context path (`lance_dataset_prepare_fts_match_query`) still refuses fuzziness.
   A fuzzy token scans the whole dictionary (~0.15 s per token on 1M terms).
 - Binary vectors (Hamming), the rest: flat search and `hamming_clustering_for_sample` are done
   (2026-10-17, +4). Left: IVF_FLAT on binary vectors (`test_ivf_flat_over_binary_vector`),
