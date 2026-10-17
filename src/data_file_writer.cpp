@@ -2452,7 +2452,7 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
             MiniblockPageWriter page_writer(out);
             std::vector<std::uint8_t> bits;
             for (std::size_t off = 0; off < total;) {
-                const auto count = std::min(max_chunk_rows, total - off);
+                const auto count = std::min<std::size_t>(max_chunk_rows, static_cast<std::size_t>(total - off));
                 const auto first = static_cast<std::uint64_t>(off) * items;
                 const auto n = static_cast<std::uint64_t>(count) * items;
                 bits.assign(static_cast<std::size_t>((n + 7U) / 8U), 0U);

@@ -16,6 +16,7 @@
 #include "lance_minimal.pb.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <chrono>
 #include <cmath>
 #include <map>
