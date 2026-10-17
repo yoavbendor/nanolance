@@ -35,6 +35,7 @@ from nanolance.lance._errors import NotSupportedError
 from nanolance.lance.dataset import (
     LanceDataset,
     LanceScanner,
+    ScanStatistics,
     ScannerBuilder,
     dataset,
     write_dataset,
@@ -71,6 +72,7 @@ __all__ = [
     "LanceOperation",
     "LanceScanner",
     "NotSupportedError",
+    "ScanStatistics",
     "ScannerBuilder",
     "Transaction",
     "__version__",

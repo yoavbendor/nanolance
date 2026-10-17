@@ -267,6 +267,49 @@ class IOStats:
                 f"write_iops={self.write_iops}, written_bytes={self.written_bytes})")
 
 
+class ScanStatistics:
+    """What one scan did, passed to ``scan_stats_callback`` once per scan (pylance's attribute names).
+
+    ``index_cache_hits`` / ``index_cache_misses`` count the index lookups the scan made that the index cache
+    answered / that had to load the index from its files (see nanolance/work_stats.hpp). ``parts_loaded``
+    is the number of those misses. ``iops``, ``requests`` and ``bytes_read`` are the process-wide file reads
+    made while the scan ran, so they include reads by other threads. ``indices_loaded`` and
+    ``index_comparisons`` are not measured and stay 0."""
+
+    __slots__ = ("all_counts", "bytes_read", "index_cache_hits", "index_cache_misses", "index_comparisons",
+                 "indices_loaded", "iops", "parts_loaded", "requests")
+
+    def __init__(self, all_counts=None, bytes_read: int = 0, index_cache_hits: int = 0,
+                 index_cache_misses: int = 0, index_comparisons: int = 0, indices_loaded: int = 0,
+                 iops: int = 0, parts_loaded: int = 0, requests: int = 0):
+        self.all_counts = dict(all_counts or {})
+        self.bytes_read = bytes_read
+        self.index_cache_hits = index_cache_hits
+        self.index_cache_misses = index_cache_misses
+        self.index_comparisons = index_comparisons
+        self.indices_loaded = indices_loaded
+        self.iops = iops
+        self.parts_loaded = parts_loaded
+        self.requests = requests
+
+    def __repr__(self) -> str:
+        return ("ScanStatistics(" + ", ".join(f"{name}={getattr(self, name)!r}" for name in self.__slots__) + ")")
+
+
+def _scan_counters() -> tuple:
+    with native():
+        hits, misses = _nanolance._index_cache_counters()
+        reads, read_bytes, _, _ = _nanolance._io_counters()
+    return hits, misses, reads, read_bytes
+
+
+def _scan_statistics(before: tuple, after: tuple) -> ScanStatistics:
+    hits, misses, reads, read_bytes = (now - was for now, was in zip(after, before))
+    return ScanStatistics(all_counts={"index_cache_hits": hits, "index_cache_misses": misses},
+                          bytes_read=read_bytes, index_cache_hits=hits, index_cache_misses=misses,
+                          iops=reads, parts_loaded=misses, requests=reads)
+
+
 class LanceDataset(pa.dataset.Dataset):
     """A Lance dataset at a version. Mirrors ``lance.LanceDataset``."""
 
@@ -3696,7 +3739,22 @@ class LanceScanner(pa.dataset.Scanner):
             table = table.slice(self._offset, self._limit)
         return table.drop_columns(list(dict.fromkeys(extra))) if extra else table
 
+    _scan_open = False  # True while a to_table() that reports to scan_stats_callback runs (nested reads do not)
+
     def to_table(self) -> pa.Table:
+        callback = self._args.get("scan_stats_callback")
+        if callback is None or self._scan_open:
+            return self._scan_table()
+        self._scan_open = True
+        before = _scan_counters()
+        try:
+            table = self._scan_table()
+        finally:
+            self._scan_open = False
+        callback(_scan_statistics(before, _scan_counters()))
+        return table
+
+    def _scan_table(self) -> pa.Table:
         table = self._to_table()
         if self._expressions is not None:
             table = _evaluate_projection(table, self._expressions)
@@ -3713,11 +3771,11 @@ class LanceScanner(pa.dataset.Scanner):
         if not blobs or blob_mode == "descriptions":
             return table.to_pandas(**kwargs)
         if blob_mode == "bytes":
-            return LanceScanner(self._ds, **{**self._args, "blob_handling": "all_binary"}).to_table().to_pandas(**kwargs)
+            return LanceScanner(self._ds, **{**self._args, "blob_handling": "all_binary", "scan_stats_callback": None}).to_table().to_pandas(**kwargs)
         from .blob import BlobFile
 
         requested = bool(self._args.get("with_row_address"))
-        table = LanceScanner(self._ds, **{**self._args, "with_row_address": True}).to_table()
+        table = LanceScanner(self._ds, **{**self._args, "with_row_address": True, "scan_stats_callback": None}).to_table()
         addresses = table.column("_rowaddr").to_pylist()
         files = {}
         for name in blobs:

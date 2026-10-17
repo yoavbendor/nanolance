@@ -28,6 +28,7 @@
 // else answer nothing.
 
 #include "nanolance/index_search.hpp"
+#include "nanolance/work_stats.hpp"
 
 #include "index_files.hpp"
 
@@ -84,8 +85,10 @@ bool load_btree(const std::filesystem::path& dir, std::shared_ptr<const BTreeInd
     const auto lookup_path = dir / "page_lookup.lance";
     const auto key = file_key(lookup_path);
     if ((out = cache.find(key)) != nullptr) {
+        work_stats::count_index_cache(true);
         return true;
     }
+    work_stats::count_index_cache(false);
     auto index = std::make_shared<BTreeIndex>();
     index->page_data = dir / "page_data.lance";
     std::string value;
@@ -117,13 +120,16 @@ bool load_btree(const std::filesystem::path& dir, std::shared_ptr<const BTreeInd
     return true;
 }
 
-bool load_bitmap(const std::filesystem::path& dir, std::shared_ptr<const BitmapIndex>& out, std::string& error) {
+bool load_bitmap(const std::filesystem::path& dir, std::shared_ptr<const BitmapIndex>& out, bool& cached,
+                 std::string& error) {
     static IndexCache<BitmapIndex> cache;
     const auto path = dir / "bitmap_page_lookup.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
+        cached = true;
         return true;
     }
+    cached = false;
     auto index = std::make_shared<BitmapIndex>();
     index->file = path;
     std::string value;
@@ -161,8 +167,10 @@ bool load_zonemap(const std::filesystem::path& dir, std::shared_ptr<const ZoneMa
     const auto path = dir / "zonemap.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
+        work_stats::count_index_cache(true);
         return true;
     }
+    work_stats::count_index_cache(false);
     auto index = std::make_shared<ZoneMapIndex>();
     if (!read_table(path, nullptr, LanceRowRange{}, index->zones, error)) {
         return false;
@@ -621,8 +629,10 @@ bool load_bloomfilter(const std::filesystem::path& dir, std::shared_ptr<const Bl
     const auto path = dir / "bloomfilter.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
+        work_stats::count_index_cache(true);
         return true;
     }
+    work_stats::count_index_cache(false);
     auto index = std::make_shared<BloomFilterIndex>();
     if (!read_table(path, nullptr, LanceRowRange{}, index->zones, error)) {
         return false;
@@ -837,8 +847,10 @@ bool load_ngram(const std::filesystem::path& dir, std::shared_ptr<const NGramInd
     const auto path = dir / "ngram_postings.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
+        work_stats::count_index_cache(true);
         return true;
     }
+    work_stats::count_index_cache(false);
     auto index = std::make_shared<NGramIndex>();
     index->file = path;
     const std::vector<std::string> columns = {"tokens"};
@@ -1005,7 +1017,8 @@ bool search_bitmap(const std::filesystem::path& dir, bool label_list, const expr
         return true;  // every non-null list has all of no elements
     }
     std::shared_ptr<const BitmapIndex> index;
-    if (!load_bitmap(dir, index, error)) {
+    bool cached = false;
+    if (!load_bitmap(dir, index, cached, error)) {
         return false;
     }
     if (label_list && p.test() == Test::IsNull) {
@@ -1028,6 +1041,11 @@ bool search_bitmap(const std::filesystem::path& dir, bool label_list, const expr
             if (pass[r] != 0) {
                 rows.push_back(r);
             }
+        }
+        // One lookup per value found in the index (a value not in it reads nothing): a hit when the
+        // index was loaded before this search, else the load answered each of them.
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            work_stats::count_index_cache(cached);
         }
         return true;
     };

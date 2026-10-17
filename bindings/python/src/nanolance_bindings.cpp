@@ -1119,6 +1119,11 @@ NB_MODULE(_nanolance, m) {
                               c.write_iops.load(std::memory_order_relaxed),
                               c.written_bytes.load(std::memory_order_relaxed));
     });
+    m.def("_index_cache_counters", [] {
+        // Process-wide index cache lookups (see nanolance/work_stats.hpp); LanceScanner diffs them per scan.
+        const auto& c = nano_lance::work_stats::index_cache_counters();
+        return nb::make_tuple(c.hits.load(std::memory_order_relaxed), c.misses.load(std::memory_order_relaxed));
+    });
     m.def("_work_stats", [] {
         NanoLanceWorkStats w{};
         nano_lance_work_stats(&w);

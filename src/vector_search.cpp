@@ -14,6 +14,7 @@
 //             (distance, row id).
 
 #include "nanolance/vector_search.hpp"
+#include "nanolance/work_stats.hpp"
 #include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
 
@@ -704,11 +705,13 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
         const auto it = loaded.find(p);
         if (it != loaded.end()) {
             count.hits++;
+            work_stats::count_index_cache(true);
             out = it->second;
             return true;
         }
     }
     count.misses++;
+    work_stats::count_index_cache(false);
     auto part = std::make_shared<Partition>();
     const std::uint64_t n = lengths[p];
     if (n != 0U) {

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/fts_search.hpp"
+#include "nanolance/work_stats.hpp"
 #include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
 
@@ -827,9 +828,11 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
     const auto meta = dir / "metadata.lance";
     const std::string key = index_files::file_key(meta);
     if (auto hit = index_cache().find(key)) {
+        work_stats::count_index_cache(true);
         out = hit;
         return true;
     }
+    work_stats::count_index_cache(false);
     auto index = std::make_shared<InvertedIndex>();
     bool found = false;
     const std::string format = metadata_value(meta, "format_version", found, error);

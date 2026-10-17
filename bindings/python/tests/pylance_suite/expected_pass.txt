@@ -927,12 +927,14 @@ tests/test_scalar_index.py::test_all_null_chunk
 tests/test_scalar_index.py::test_backward_compatibility_no_fragment_ids
 tests/test_scalar_index.py::test_bitmap_empty_range
 tests/test_scalar_index.py::test_bitmap_index
+tests/test_scalar_index.py::test_bitmap_index_cache_hit_miss_stats
 tests/test_scalar_index.py::test_bitmap_remap
 tests/test_scalar_index.py::test_bitmap_uncommitted_segments_can_be_committed_from_python
 tests/test_scalar_index.py::test_bloomfilter_deletion_handling
 tests/test_scalar_index.py::test_bloomfilter_index
 tests/test_scalar_index.py::test_bloomfilter_segment_merge_and_commit_from_python
 tests/test_scalar_index.py::test_btree_fragment_ids_parameter_validation
+tests/test_scalar_index.py::test_btree_index_cache_hit_miss_stats
 tests/test_scalar_index.py::test_btree_query_comparison
 tests/test_scalar_index.py::test_btree_remap_big_deletions
 tests/test_scalar_index.py::test_build_distributed_fts_index_basic
@@ -984,6 +986,7 @@ tests/test_scalar_index.py::test_fts_deleted_rows_with_stable_row_ids
 tests/test_scalar_index.py::test_fts_flat_fallback_matches_wand
 tests/test_scalar_index.py::test_fts_fts[simple]
 tests/test_scalar_index.py::test_fts_fuzzy_query
+tests/test_scalar_index.py::test_fts_index_cache_hit_miss_stats
 tests/test_scalar_index.py::test_fts_multi_match_query
 tests/test_scalar_index.py::test_fts_ngram_tokenizer
 tests/test_scalar_index.py::test_fts_phrase_query
@@ -1024,6 +1027,7 @@ tests/test_scalar_index.py::test_ngram_index
 tests/test_scalar_index.py::test_ngram_segment_merge_and_commit_from_python
 tests/test_scalar_index.py::test_null_handling
 tests/test_scalar_index.py::test_optimize_no_new_data
+tests/test_scalar_index.py::test_phrase_query_cache_hit_miss_stats
 tests/test_scalar_index.py::test_rowid_order
 tests/test_scalar_index.py::test_scalar_index_types[bitmap-binary]
 tests/test_scalar_index.py::test_scalar_index_types[bitmap-decimal128]
@@ -1045,6 +1049,7 @@ tests/test_scalar_index.py::test_scalar_index_types[zonemap-duration]
 tests/test_scalar_index.py::test_scalar_index_types[zonemap-large-binary]
 tests/test_scalar_index.py::test_scalar_index_types[zonemap-large-string]
 tests/test_scalar_index.py::test_scalar_index_with_nulls
+tests/test_scalar_index.py::test_scan_statistics_callback
 tests/test_scalar_index.py::test_segment_fts[FTS]
 tests/test_scalar_index.py::test_segment_fts[INVERTED]
 tests/test_scalar_index.py::test_temporal_index
@@ -1061,6 +1066,7 @@ tests/test_scalar_index.py::test_zonemap_fsl_column
 tests/test_scalar_index.py::test_zonemap_index
 tests/test_scalar_index.py::test_zonemap_segment_merge_and_commit_from_python
 tests/test_scalar_index.py::test_zonemap_with_stable_row_ids_after_compaction
+tests/test_scalar_index.py::test_zonemap_zone_size
 tests/test_schema.py::test_lance_schema
 tests/test_schema.py::test_lance_schema_field_case_insensitive
 tests/test_schema.py::test_lance_schema_field_lookup

@@ -106,4 +106,24 @@ struct WrittenFileTally {
     ~WrittenFileTally() { count_written_file(path); }
 };
 
+/// Index cache lookups, process-wide: a lookup answered by a loaded index (or a loaded IVF partition) is a
+/// hit, one that had to load it from the index files a miss. Scalar indices count one lookup per index
+/// part a query needed (a B-tree page, one bitmap value, an inverted index), vector search one per partition.
+/// Never reset: a scan reports the difference between two reads (see nanolance._index_cache_counters).
+struct IndexCacheCounters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+};
+
+inline IndexCacheCounters& index_cache_counters() {
+    static IndexCacheCounters c;
+    return c;
+}
+
+/// One index cache lookup: \p hit when the index was already loaded. Relaxed atomics, one increment.
+inline void count_index_cache(bool hit) {
+    auto& c = index_cache_counters();
+    add(hit ? c.hits : c.misses, 1U);
+}
+
 }  // namespace nano_lance::work_stats
