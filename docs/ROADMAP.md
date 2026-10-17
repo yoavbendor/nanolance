@@ -88,12 +88,12 @@ Small items found by delegated sessions, not yet done:
   into the graph concurrently on nanolance's threads, as Lance builds it, so the graph differs between
   multi-threaded runs (with one thread, or `NANOLANCE_THREADS=1`, it is deterministic). Serializing the
   insertion would cost the build its parallelism for no compatibility gain.
-- `lance.dataset.VectorIndexReader` (`num_partitions`, `read_partition(id, with_vector=)`): Lance returns
-  `_rowid` plus `flat` (IVF_FLAT) or `__pq_code` (IVF_PQ) columns. Small, delegable.
-- `row_addr_allowlist=` / `serialize_row_addrs` in scans and searches (12 of pylance's tests in
-  `test_row_addr_prefilter.py`). Delegable.
-- `_take_rows` of a deleted row's address returns the row; pylance leaves it out (plain datasets,
-  without stable row ids). Found by the multi-base phase A session.
+- ~~`lance.dataset.VectorIndexReader` (`num_partitions`, `read_partition(id, with_vector=)`): Lance returns
+  `_rowid` plus `flat` (IVF_FLAT) or `__pq_code` (IVF_PQ) columns. Small, delegable.~~ Done 2026-10-15 (Small items 1).
+- ~~`row_addr_allowlist=` / `serialize_row_addrs` in scans and searches (12 of pylance's tests in
+  `test_row_addr_prefilter.py`). Delegable.~~ Done 2026-10-15 (Small items 1).
+- ~~`_take_rows` of a deleted row's address returns the row; pylance leaves it out (plain datasets,
+  without stable row ids). Found by the multi-base phase A session.~~ Done 2026-10-15 (Small items 1).
 
 ## Priority: competing with pylance directly (2026-10-08)
 
