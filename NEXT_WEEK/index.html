@@ -759,6 +759,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#browser-the-weblance-demo-shipped-2026-10-17" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Browser: the weblance demo (shipped 2026-10-17)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#flaky-tests-to-watch" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -830,7 +841,7 @@ session, or several, or Opus work) and where its notes are. The detailed history
 <ul>
 <li>pylance 12.0.0's own suite against <code>nanolance.lance</code>: <strong>1,200 expected passes</strong> (1,171 at the
   start of this week). <code>tools/pylance_suite.py</code> checks them; <code>--update</code> records new ones.</li>
-<li>nanolance's own tests: ctest 63 / 63; pytest <code>bindings/python/tests</code> 3,386 passed, 20 skipped,
+<li>nanolance's own tests: ctest 64 / 64; pytest <code>bindings/python/tests</code> 3,386 passed, 20 skipped,
   1 xfailed (2026-10-17).</li>
 <li>Performance against Rust Lance and pylance: see "Performance" below (benchmarks re-run
   2026-10-17).</li>
@@ -996,6 +1007,71 @@ a user report can be matched to it.</p>
 <td>--</td>
 <td>run <code>ci-platforms.yml</code> by hand</td>
 <td>the portable 128-bit path is tested on Linux only</td>
+</tr>
+</tbody>
+</table>
+<h2 id="browser-the-weblance-demo-shipped-2026-10-17">Browser: the weblance demo (shipped 2026-10-17)<a class="headerlink" href="#browser-the-weblance-demo-shipped-2026-10-17" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Live demo:</strong> https://github.com/yoavbendor/weblance (public; GitHub Pages from <code>main</code>, root):
+  a map of 25,000 COCO images by their SigLIP2 embeddings; a click fetches the 12 nearest rows'
+  captions and JPEGs live from <code>jrmiller/coco-2017-siglip2-embeddings</code> on Hugging Face (one 48 GB
+  Lance data file) with HTTP Range requests, through nanolance compiled to WebAssembly (433 KB
+  gzipped) in six Web Workers. Verified in headless Chromium against the real dataset: 12 images,
+  3.66 MB fetched (0.008% of the file). The weblance repo holds only the built module, the page,
+  the map data (<code>tools/make_map.py</code> rebuilds it) and the license notices; nanolance stays private.</li>
+<li><strong>How:</strong> every READ path goes through <code>io::ByteSource</code> (<code>include/nanolance/byte_source.hpp</code>):
+  data files (pread, cached file end, coalesced column metadata, small-read block), manifests and
+  version discovery, deletion files, tags, index-segment checks. <code>wasm/weblance_glue.cpp</code>
+  registers an https source (synchronous XHR in a worker, single-range <code>Range</code> headers -- no CORS
+  preflight -- with the redirected CDN URL cached per file) and a Hugging Face tree-API lister;
+  <code>wasm/build_weblance.sh</code> builds the module; <code>tests/test_byte_source_remote.cpp</code> reads a dataset
+  through a <code>mem://</code> store after deleting the local directory. The I/O rework measured level or
+  faster natively (wide scans 2x, takes 15-37%, a stat storm of ~800 stats per take removed).</li>
+</ul>
+<p><strong>Open (the demo works; these make it better):</strong></p>
+<table>
+<thead>
+<tr>
+<th>item</th>
+<th>why</th>
+<th>size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>~18 HTTP requests per image on a click (223 for 12)</td>
+<td>every column of every row is its own page lookup; the six workers hide it, a real browser feels it</td>
+<td>1 session: batch the page-metadata reads of one take, larger blocks for the image column</td>
+</tr>
+<tr>
+<td>Measure in a real browser (not through this session's proxy, which costs seconds per request)</td>
+<td>the page's numbers are what a viewer sees</td>
+<td>the user, 5 minutes</td>
+</tr>
+<tr>
+<td>Each of the six workers opens the dataset (~20 requests each)</td>
+<td>share one open's metadata, or open in one worker and post it</td>
+<td>small</td>
+</tr>
+<tr>
+<td>Similar-image search in the page (the dataset has an IVF_HNSW_SQ index; nanolance searches it)</td>
+<td>the next demo step: click an image, find its neighbours by vector, reading only index partitions</td>
+<td>1-2 sessions</td>
+</tr>
+<tr>
+<td>C++ exceptions are off in the WASM build (out of memory aborts)</td>
+<td>acceptable for the demo</td>
+<td>measure <code>-fexceptions</code> size</td>
+</tr>
+<tr>
+<td>Remote paths joined with <code>/</code> get a backslash on Windows</td>
+<td>remote reads are POSIX / Emscripten only</td>
+<td>small</td>
+</tr>
+<tr>
+<td>clang-18 fails on <code>fts_json.hpp</code> (incomplete <code>json::Value</code> in a pair) in <code>dataset_refs.cpp</code>, at older commits too</td>
+<td>GCC and Emscripten's clang are fine</td>
+<td>small</td>
 </tr>
 </tbody>
 </table>

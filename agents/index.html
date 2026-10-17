@@ -540,6 +540,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#8-delegated-sessions-and-remote-reads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Delegated sessions and remote reads
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1052,6 +1063,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#8-delegated-sessions-and-remote-reads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Delegated sessions and remote reads
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1380,6 +1402,14 @@ still passes when the rows come back right but slowly. Don't time it (CI machine
 <li><strong>CI builds with <code>-DNANOLANCE_WERROR=ON</code></strong> (<code>-Wall -Wextra -Werror</code> on nanolance's own three
   library targets), in <code>linux-bench.yml</code> under clang and <code>memory-safety.yml</code> under gcc. The option
   defaults OFF so a downstream build on an unknown compiler cannot be broken by a new warning.</li>
+</ul>
+<h2 id="8-delegated-sessions-and-remote-reads">8. Delegated sessions and remote reads<a class="headerlink" href="#8-delegated-sessions-and-remote-reads" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Delegating work to another model session: follow <code>docs/DELEGATION.md</code> (brief format, stop rules,
+  run-once test rules, what the reviewer checks). Current state and open items: <code>docs/NEXT_WEEK.md</code>.</li>
+<li>File I/O on read paths goes through <code>io::ByteSource</code> (<code>include/nanolance/byte_source.hpp</code>), never
+  <code>std::ifstream</code> or <code>std::filesystem</code> directly, so the reader keeps working from <code>https://</code> in the
+  WebAssembly build (<code>wasm/</code>). Writers and maintenance (cleanup, drop) stay on local files.</li>
 </ul>
 
 
