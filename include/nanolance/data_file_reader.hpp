@@ -54,6 +54,11 @@ bool read_lance_data_file_column_metadatas(const std::filesystem::path& path, co
 ///
 /// Scopes nest, and a nested one is its own operation: leaving it restores the enclosing scope,
 /// whose next lookup validates again.
+/// A data file's size and version token (its mtime, for a local file), from the handle the reader
+/// keeps for it: within a DataFileReadScope one stat per file per operation, outside one per call.
+/// Caches keyed on a file's identity use this instead of stat'ing the path on every lookup.
+bool data_file_identity(const std::filesystem::path& path, std::uint64_t& size, std::int64_t& version);
+
 class DataFileReadScope {
   public:
     DataFileReadScope();

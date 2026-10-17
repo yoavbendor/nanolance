@@ -4542,8 +4542,8 @@ std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::p
                                                        CacheFill fill) {
     using Clock = std::chrono::steady_clock;
     struct Entry {
-        std::uintmax_t size = 0;
-        std::filesystem::file_time_type mtime{};
+        std::uint64_t size = 0;
+        std::int64_t mtime = 0;
         std::shared_ptr<const ColumnValues> values;  // null: taken once, not decoded
         std::uint64_t bytes = 0;
         Clock::time_point used{};
@@ -4553,10 +4553,9 @@ std::shared_ptr<const ColumnValues> cached_whole_column(const std::filesystem::p
     static std::unordered_map<std::string, Entry> cache;
     static std::uint64_t held = 0;
     constexpr auto kIdle = std::chrono::seconds(10);
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
-    if (ec) {
+    std::uint64_t size = 0;
+    std::int64_t mtime = 0;
+    if (!data_file_identity(path, size, mtime)) {
         return nullptr;
     }
     const auto key = path.string() + '#' + std::to_string(field.id);
@@ -4659,15 +4658,12 @@ std::shared_ptr<const MiniBlockPageIndex> miniblock_page_index(const std::filesy
                    page.buffer_sizes[rep_at] != chunks * stride * 8U) {
         return nullptr;
     }
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
-    if (ec) {
+    std::uint64_t size = 0;
+    std::int64_t mtime = 0;
+    if (!data_file_identity(path, size, mtime)) {
         return nullptr;
     }
-    const auto key = path.string() + '#' + std::to_string(size) + '#' +
-                     std::to_string(static_cast<long long>(
-                         std::chrono::duration_cast<std::chrono::nanoseconds>(mtime.time_since_epoch()).count())) + '#' + std::to_string(page.buffer_offsets[0]);
+    const auto key = path.string() + '#' + std::to_string(size) + '#' + std::to_string(mtime) + '#' + std::to_string(page.buffer_offsets[0]);
     {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto it = cache.find(key);
@@ -4733,15 +4729,12 @@ std::shared_ptr<const std::vector<std::uint64_t>> full_zip_row_starts(const std:
     if (index_size == 0U || index_size % entries != 0U || (width != 1U && width != 2U && width != 4U && width != 8U)) {
         return nullptr;
     }
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
-    if (ec) {
+    std::uint64_t size = 0;
+    std::int64_t mtime = 0;
+    if (!data_file_identity(path, size, mtime)) {
         return nullptr;
     }
-    const auto key = path.string() + '#' + std::to_string(size) + '#' +
-                     std::to_string(static_cast<long long>(
-                         std::chrono::duration_cast<std::chrono::nanoseconds>(mtime.time_since_epoch()).count())) +
+    const auto key = path.string() + '#' + std::to_string(size) + '#' + std::to_string(mtime) +
                      '#' + std::to_string(page.buffer_offsets[1]);
     {
         const std::lock_guard<std::mutex> lock(mutex);
