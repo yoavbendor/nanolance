@@ -307,3 +307,12 @@ Two repo rules that came out of the same incident:
 - **CI builds with `-DNANOLANCE_WERROR=ON`** (`-Wall -Wextra -Werror` on nanolance's own three
   library targets), in `linux-bench.yml` under clang and `memory-safety.yml` under gcc. The option
   defaults OFF so a downstream build on an unknown compiler cannot be broken by a new warning.
+
+## 8. Delegated sessions and remote reads
+
+- Delegating work to another model session: follow `docs/DELEGATION.md` (brief format, stop rules,
+  run-once test rules, what the reviewer checks). Current state and open items: `docs/NEXT_WEEK.md`.
+- File I/O on read paths goes through `io::ByteSource` (`include/nanolance/byte_source.hpp`), never
+  `std::ifstream` or `std::filesystem` directly, so the reader keeps working from `https://` in the
+  WebAssembly build (`wasm/`). Writers and maintenance (cleanup, drop) stay on local files.
+

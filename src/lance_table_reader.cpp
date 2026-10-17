@@ -2635,18 +2635,18 @@ struct CachedFileMetadata {
 bool cached_file_metadata(const std::filesystem::path& path, std::shared_ptr<const CachedFileMetadata>& out,
                           std::string& error) {
     struct Entry {
-        std::uintmax_t size = 0;
-        std::filesystem::file_time_type mtime{};
+        std::uint64_t size = 0;
+        std::int64_t mtime = 0;
         std::shared_ptr<const CachedFileMetadata> metadata;
     };
     static std::mutex mutex;
     static std::unordered_map<std::string, Entry> cache;
     constexpr std::size_t kMaxFiles = 256U;
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    const auto mtime = ec ? std::filesystem::file_time_type{} : std::filesystem::last_write_time(path, ec);
+    std::uint64_t size = 0;
+    std::int64_t mtime = 0;
+    const bool known = data_file_identity(path, size, mtime);
     const auto key = path.string();
-    if (!ec) {
+    if (known) {
         const std::lock_guard<std::mutex> lock(mutex);
         const auto it = cache.find(key);
         if (it != cache.end() && it->second.size == size && it->second.mtime == mtime) {
@@ -2660,7 +2660,7 @@ bool cached_file_metadata(const std::filesystem::path& path, std::shared_ptr<con
         return false;
     }
     out = fresh;
-    if (!ec) {
+    if (known) {
         const std::lock_guard<std::mutex> lock(mutex);
         if (cache.size() >= kMaxFiles) {
             cache.clear();
@@ -3532,6 +3532,7 @@ bool lance_file_read(const std::filesystem::path& file_path, const LanceScanRequ
 bool lance_file_take(const std::filesystem::path& file_path, const LanceScanRequest& request,
                      const std::vector<std::uint64_t>& rows, ArrowSchema& out_schema,
                      std::vector<ArrowArray>& out_batches, std::string& error) {
+    const DataFileReadScope read_scope;  // one validation of each file for the whole take
     error.clear();
     out_batches.clear();
     ArrowSchemaInit(&out_schema);
@@ -3629,6 +3630,7 @@ bool open_take(const std::filesystem::path& dataset_path, const LanceScanRequest
 bool lance_dataset_take(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
                         const std::vector<std::uint64_t>& indices, ArrowSchema& out_schema,
                         std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+    const DataFileReadScope read_scope;  // one validation of each file for the whole take
     out_batches.clear();
     std::optional<ScopedReadLimits> trusted_scope;
     ReadPlan plan;
@@ -3674,6 +3676,7 @@ bool lance_dataset_take(const std::filesystem::path& dataset_path, const LanceSc
 bool lance_dataset_take_rows(const std::filesystem::path& dataset_path, const LanceScanRequest& request,
                              const std::vector<std::uint64_t>& addresses, ArrowSchema& out_schema,
                              std::vector<ArrowArray>& out_batches, std::string& error, bool trusted_input) {
+    const DataFileReadScope read_scope;  // one validation of each file for the whole take
     out_batches.clear();
     std::optional<ScopedReadLimits> trusted_scope;
     ReadPlan plan;

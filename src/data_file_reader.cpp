@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/data_file_reader.hpp"
+#include "nanolance/byte_source.hpp"
 #include "nanolance/work_stats.hpp"
 
 #include "nanolance/read_safety.hpp"
@@ -39,14 +40,19 @@ namespace {
 // reader could act on. Outside a scope the epoch is 0, which never matches a stamped entry, so every
 // lookup validates exactly as it did before.
 struct OpenDataFile {
-    std::ifstream stream;
+    std::unique_ptr<io::ByteSource> source;
     std::uint64_t file_size = 0;
-    std::filesystem::file_time_type mtime{};
     /// Read scope this entry was last validated in; 0 means "not validated in any scope".
     std::uint64_t checked_epoch = 0;
-    /// Where `stream`'s get pointer is, so a page read that continues where the last one stopped --
-    /// which is the common case, pages of a column are laid out in order -- can skip the seek.
-    std::uint64_t position = 0;
+    /// The file's last bytes, read once by the footer reader: the footer, the file descriptor and,
+    /// in most files, every column's metadata live there, so those reads become copies from memory
+    /// (and, from a remote source, one request instead of one per column).
+    std::vector<std::uint8_t> tail;
+    std::uint64_t tail_start = std::numeric_limits<std::uint64_t>::max();
+    /// The last block a small read came from: small reads next to each other (a page's buffers, many
+    /// columns' small pages) are copies from it, as they were from the old stream buffer.
+    std::vector<std::uint8_t> block;
+    std::uint64_t block_start = std::numeric_limits<std::uint64_t>::max();
 };
 constexpr std::size_t kMaxOpenDataFiles = 4;
 thread_local std::list<std::pair<std::filesystem::path, OpenDataFile>> g_open_data_files;
@@ -61,21 +67,19 @@ OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::str
         }
     }
 
-    std::error_code ec;
-    const auto file_size = std::filesystem::file_size(path, ec);
-    if (ec) {
-        error = "failed to stat data file: " + ec.message();
-        return nullptr;
-    }
-    const auto mtime = std::filesystem::last_write_time(path, ec);
-    if (ec) {
-        error = "failed to stat data file: " + ec.message();
+    // One stat of the path per read scope: a file replaced at the same path (a new inode) must not be
+    // read through the old handle.
+    std::uint64_t file_size = 0;
+    std::int64_t version = 0;
+    const bool local = !io::is_remote(path.string());
+    if (local && !io::stat_local(path.string(), file_size, version)) {
+        error = "failed to stat data file";
         return nullptr;
     }
 
     for (auto it = g_open_data_files.begin(); it != g_open_data_files.end(); ++it) {
         if (it->first == path) {
-            if (it->second.file_size == static_cast<std::uint64_t>(file_size) && it->second.mtime == mtime) {
+            if (!local || (it->second.file_size == file_size && it->second.source->version_token() == version)) {
                 it->second.checked_epoch = g_read_epoch;
                 g_open_data_files.splice(g_open_data_files.begin(), g_open_data_files, it);
                 return &g_open_data_files.front().second;
@@ -87,13 +91,11 @@ OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::str
         }
     }
     OpenDataFile fresh;
-    fresh.stream.open(path, std::ios::binary);
-    if (!fresh.stream) {
-        error = "failed to open data file for read";
+    fresh.source = io::open_source(path.string(), error);
+    if (fresh.source == nullptr) {
         return nullptr;
     }
-    fresh.file_size = static_cast<std::uint64_t>(file_size);
-    fresh.mtime = mtime;
+    fresh.file_size = fresh.source->size();
     fresh.checked_epoch = g_read_epoch;
     g_open_data_files.emplace_front(path, std::move(fresh));
     if (g_open_data_files.size() > kMaxOpenDataFiles) {
@@ -123,6 +125,17 @@ bool read_le64(const unsigned char* p, std::uint64_t& v) {
 
 }  // namespace
 
+bool data_file_identity(const std::filesystem::path& path, std::uint64_t& size, std::int64_t& version) {
+    std::string error;
+    auto* file = find_or_open_data_file(path, error);
+    if (file == nullptr) {
+        return false;
+    }
+    size = file->file_size;
+    version = file->source->version_token();
+    return true;
+}
+
 DataFileReadScope::DataFileReadScope() : saved_(g_read_epoch) { g_read_epoch = g_next_read_epoch++; }
 
 DataFileReadScope::~DataFileReadScope() { g_read_epoch = saved_; }
@@ -134,37 +147,37 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
     layout = LanceDataFileFooterLayout{};
     error.clear();
 
-    std::error_code ec;
-    const auto file_size = std::filesystem::file_size(path, ec);
-    if (ec || file_size < 64U) {
+    auto* file = find_or_open_data_file(path, error);
+    if (file == nullptr) {
         error = "data file is too small or unreadable";
         return false;
     }
-
-    // std::min<std::uintmax_t>, explicitly: std::filesystem::file_size returns uintmax_t, and on
-    // macOS libc++ that is `unsigned long` while std::uint64_t is `unsigned long long` -- two
-    // distinct types, so template argument deduction fails. On Linux/glibc they are the same type
-    // and the bare call compiles by coincidence, which is why this only showed up the first time the
-    // macOS CI job actually ran.
-    constexpr std::uintmax_t kTailBytes = 512;
-    const auto tail_len = static_cast<std::streamsize>(std::min<std::uintmax_t>(kTailBytes, file_size));
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        error = "failed to open data file";
+    const std::uint64_t file_size = file->file_size;
+    if (file_size < 64U) {
+        error = "data file is too small or unreadable";
         return false;
     }
-    in.seekg(static_cast<std::streamoff>(file_size - static_cast<std::uintmax_t>(tail_len)));
-    std::vector<unsigned char> tail(static_cast<std::size_t>(tail_len));
-    in.read(reinterpret_cast<char*>(tail.data()), tail_len);
-    work_stats::count_read(static_cast<std::uint64_t>(tail_len));
-    if (!in || in.gcount() != tail_len) {
-        error = "failed to read data file footer tail";
-        return false;
+    // One read of the file's end (its source says how much; all of a smaller file) serves the footer,
+    // the descriptor and often every column's metadata.
+    if (file->tail_start == std::numeric_limits<std::uint64_t>::max()) {
+        const auto len = std::min<std::uint64_t>(std::max<std::uint64_t>(file->source->footer_read_size(), 512U), file_size);
+        file->tail.resize(static_cast<std::size_t>(len));
+        if (!file->source->read_at(file_size - len, len, file->tail.data(), error)) {
+            file->tail.clear();
+            error = "failed to read data file footer tail";
+            return false;
+        }
+        work_stats::count_read(len);
+        file->tail_start = file_size - len;
     }
+    const std::vector<std::uint8_t>& tail = file->tail;
+    const auto tail_len = static_cast<std::uint64_t>(tail.size());
 
+    // The footer ends the file; its magic is in the last 512 bytes, where it was looked for before.
     constexpr unsigned char kMagic[] = {'L', 'A', 'N', 'C'};
     std::size_t magic_idx = static_cast<std::size_t>(-1);
-    for (std::size_t i = 0; i + 4U <= tail.size(); ++i) {
+    const std::size_t search_from = tail.size() > 512U ? tail.size() - 512U : 0U;
+    for (std::size_t i = search_from; i + 4U <= tail.size(); ++i) {
         if (std::memcmp(tail.data() + i, kMagic, 4) == 0) {
             magic_idx = i;
         }
@@ -218,7 +231,7 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
         return false;
     }
     // The global buffer table sits right before those offsets, as every Lance writer lays it out.
-    const std::uint64_t tail_base = file_size - static_cast<std::uint64_t>(tail_len);
+    const std::uint64_t tail_base = file_size - tail_len;
     const std::uint64_t table_bytes = 16ULL * num_global_buffers;
     if (magic_idx < 36U + table_bytes || global_offsets_start != tail_base + magic_idx - 36U - table_bytes) {
         error = "data file footer global_offsets_start mismatch";
@@ -241,12 +254,8 @@ bool read_lance_data_file_footer_and_descriptor(const std::filesystem::path& pat
         return false;
     }
 
-    in.clear();
-    in.seekg(static_cast<std::streamoff>(global_buffer_offset));
-    std::vector<std::uint8_t> desc_bytes(static_cast<std::size_t>(descriptor_size));
-    in.read(reinterpret_cast<char*>(desc_bytes.data()), static_cast<std::streamsize>(descriptor_size));
-    work_stats::count_read(static_cast<std::uint64_t>(descriptor_size));
-    if (!in || static_cast<std::size_t>(in.gcount()) != static_cast<std::size_t>(descriptor_size)) {
+    std::vector<std::uint8_t> desc_bytes;
+    if (!read_lance_data_file_bytes(path, global_buffer_offset, descriptor_size, desc_bytes, error)) {
         error = "failed to read data file descriptor bytes";
         return false;
     }
@@ -306,33 +315,46 @@ bool read_lance_data_file_bytes(const std::filesystem::path& path, const std::ui
         error = "read range exceeds data file size";
         return false;
     }
-    auto& in = file->stream;
-    in.clear();  // a previous read on this cached stream may have set eof/fail; clear before repositioning
-    // Skip the seek when the stream is already there. libstdc++'s seekg() discards the filebuf and
-    // always issues an lseek, and a column's pages are read in file order, so most of those seeks were
-    // asking the kernel to move the offset to where it already was.
-    if (file->position != offset) {
-        in.seekg(static_cast<std::streamoff>(offset));
-        file->position = offset;
-    }
     out.resize(static_cast<std::size_t>(size));
-    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(size));
     {
         auto& stats = work_stats::counters();
         work_stats::add(stats.data_bytes_read, size);
         work_stats::add(stats.data_reads, 1U);
         work_stats::raise_to(stats.largest_read, size);
-        work_stats::count_read(size);
     }
-    if (!in || static_cast<std::uint64_t>(in.gcount()) != size) {
-        error = "failed to read data file byte range";
-        // The stream's position is now wherever the short read left it, and `in` is in a failed state
-        // that the next call clears — forget it rather than trusting the cached value.
-        file->position = std::numeric_limits<std::uint64_t>::max();
+    if (size == 0U) {
+        return true;
+    }
+    if (offset >= file->tail_start) {  // inside the cached tail: a copy, no I/O
+        std::memcpy(out.data(), file->tail.data() + (offset - file->tail_start), static_cast<std::size_t>(size));
+        return true;
+    }
+    const std::uint64_t block = file->source->small_read_block();
+    if (size < block) {
+        if (file->block_start == std::numeric_limits<std::uint64_t>::max() || offset < file->block_start ||
+            offset + size > file->block_start + file->block.size()) {
+            // Load the aligned block holding the read (cut at the file's end; widened when the read
+            // crosses a block boundary).
+            const std::uint64_t start = offset - offset % block;
+            const std::uint64_t end = std::min(file->file_size, std::max(start + block, offset + size));
+            file->block.resize(static_cast<std::size_t>(end - start));
+            if (!file->source->read_at(start, end - start, file->block.data(), error)) {
+                file->block.clear();
+                file->block_start = std::numeric_limits<std::uint64_t>::max();
+                out.clear();
+                return false;
+            }
+            work_stats::count_read(end - start);
+            file->block_start = start;
+        }
+        std::memcpy(out.data(), file->block.data() + (offset - file->block_start), static_cast<std::size_t>(size));
+        return true;
+    }
+    if (!file->source->read_at(offset, size, out.data(), error)) {
         out.clear();
         return false;
     }
-    file->position = offset + size;
+    work_stats::count_read(size);
     return true;
 }
 
@@ -350,16 +372,35 @@ bool read_lance_data_file_column_metadatas(const std::filesystem::path& path,
         return false;
     }
     columns.resize(layout.num_columns);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges(layout.num_columns);
+    std::uint64_t lo = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t hi = 0;
+    std::uint64_t total = 0;
     for (std::uint32_t col = 0; col < layout.num_columns; ++col) {
         const auto base = static_cast<std::size_t>(col) * 16U;
-        std::uint64_t meta_offset = 0;
-        std::uint64_t meta_size = 0;
-        if (!read_le64(table.data() + base, meta_offset) || !read_le64(table.data() + base + 8U, meta_size)) {
+        if (!read_le64(table.data() + base, ranges[col].first) || !read_le64(table.data() + base + 8U, ranges[col].second)) {
             error = "failed to parse column metadata offset table";
             return false;
         }
-        std::vector<std::uint8_t> meta_bytes;
-        if (!read_lance_data_file_bytes(path, meta_offset, meta_size, meta_bytes, error)) {
+        lo = std::min(lo, ranges[col].first);
+        hi = std::max(hi, ranges[col].first + ranges[col].second);
+        total += ranges[col].second;
+    }
+    // Lance writes the column metadatas back to back: when they are (nearly) contiguous, one read of
+    // the span replaces one read per column -- one request instead of hundreds from a remote source.
+    std::vector<std::uint8_t> span;
+    const bool one_read = layout.num_columns > 1U && hi > lo && hi - lo <= 2U * total + 4096U &&
+                          hi - lo <= (std::uint64_t{64} << 20U);
+    if (one_read && !read_lance_data_file_bytes(path, lo, hi - lo, span, error)) {
+        return false;
+    }
+    std::vector<std::uint8_t> meta_bytes;
+    for (std::uint32_t col = 0; col < layout.num_columns; ++col) {
+        const auto [meta_offset, meta_size] = ranges[col];
+        if (one_read) {
+            meta_bytes.assign(span.begin() + static_cast<std::ptrdiff_t>(meta_offset - lo),
+                              span.begin() + static_cast<std::ptrdiff_t>(meta_offset - lo + meta_size));
+        } else if (!read_lance_data_file_bytes(path, meta_offset, meta_size, meta_bytes, error)) {
             return false;
         }
         if (!pb::decode_column_metadata(meta_bytes, columns[col])) {

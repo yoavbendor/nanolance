@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/data_file_reader.hpp"
 #include "index_files.hpp"
 
 #include "nanolance/bloom_filter.hpp"
@@ -54,10 +55,10 @@ bool take_table(const std::filesystem::path& path, const std::vector<std::string
 }
 
 std::string file_key(const std::filesystem::path& path) {
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    const auto mtime = std::filesystem::last_write_time(path, ec).time_since_epoch().count();
-    return path.string() + "|" + std::to_string(size) + "|" + std::to_string(static_cast<long long>(mtime));  // libc++'s file_clock counts in __int128
+    std::uint64_t size = 0;
+    std::int64_t mtime = 0;
+    data_file_identity(path, size, mtime);  // one stat per read scope; a missing file keys as size 0
+    return path.string() + "|" + std::to_string(size) + "|" + std::to_string(mtime);
 }
 
 bool schema_metadata(const std::filesystem::path& path, const std::string& key, std::string& value, bool& found,

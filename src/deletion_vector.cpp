@@ -3,6 +3,7 @@
 
 #include "nanolance/work_stats.hpp"
 #include "nanolance/deletion_vector.hpp"
+#include "nanolance/byte_source.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow_ipc.h>
@@ -685,17 +686,18 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
                              "-" + std::to_string(deletion_file.id) + (bitmap ? ".bin" : ".arrow");
     const auto path = dataset_path / "_deletions" / name;
 
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    std::string io_error;
+    const auto source = io::open_source(path.string(), io_error);
+    if (!source) {
         error = "failed to open deletion file " + name;
         return false;
     }
-    std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    work_stats::count_read(bytes.size());
-    if (!in.eof() && in.fail()) {
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(source->size()));
+    if (!bytes.empty() && !source->read_at(0, bytes.size(), bytes.data(), io_error)) {
         error = "failed to read deletion file " + name;
         return false;
     }
+    work_stats::count_read(bytes.size());
 
     if (bitmap) {
         // The manifest's count is the exact answer, so it is also the exact budget -- a file that

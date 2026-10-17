@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/byte_source.hpp"
 #include "nanolance/work_stats.hpp"
 #include "nanolance/manifest_reader.hpp"
 
@@ -8,7 +9,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <fstream>
 #include <string_view>
 #include <sstream>
 #include <limits>
@@ -17,10 +17,10 @@
 namespace nano_lance {
 namespace {
 
-bool read_exact(std::istream& in, void* dest, std::size_t n) {
-    const bool ok = static_cast<bool>(in.read(static_cast<char*>(dest), static_cast<std::streamsize>(n)));
+/// `n` bytes at `offset` of a manifest source, counted as a read.
+bool read_range(io::ByteSource& src, std::uint64_t offset, std::uint64_t n, void* dest, std::string& error) {
     work_stats::count_read(n);
-    return ok;
+    return src.read_at(offset, n, static_cast<std::uint8_t*>(dest), error);
 }
 
 std::uint32_t read_le32(const unsigned char* p) {
@@ -38,24 +38,17 @@ std::uint64_t read_le64(const unsigned char* p) {
 
 constexpr std::size_t kManifestV2Digits = 20U;
 
-/// The IndexSection message at `position` of a manifest file: [u32 length][protobuf], as Lance's
+/// The IndexSection message at `position` of a manifest: [u32 length][protobuf], as Lance's
 /// write_protobuf lays every message out.
-bool read_index_section(const std::filesystem::path& manifest_path, std::uint64_t position,
-                        std::vector<pb::IndexMetadata>& out, std::string& error) {
-    std::ifstream in(manifest_path, std::ios::binary);
-    if (!in) {
-        error = "failed to open manifest file";
-        return false;
-    }
-    in.seekg(0, std::ios::end);
-    const auto file_size = static_cast<std::uint64_t>(in.tellg());
+bool read_index_section(io::ByteSource& src, std::uint64_t position, std::vector<pb::IndexMetadata>& out,
+                        std::string& error) {
+    const std::uint64_t file_size = src.size();
     unsigned char len_le[4]{};
     if (position > file_size || file_size - position < 4U) {
         error = "manifest index section is past the end of the file";
         return false;
     }
-    in.seekg(static_cast<std::streamoff>(position), std::ios::beg);
-    if (!read_exact(in, len_le, 4)) {
+    if (!read_range(src, position, 4, len_le, error)) {
         error = "failed to read the manifest index section";
         return false;
     }
@@ -65,7 +58,7 @@ bool read_index_section(const std::filesystem::path& manifest_path, std::uint64_
         return false;
     }
     std::vector<std::uint8_t> body(length);
-    if (length != 0U && !read_exact(in, body.data(), length)) {
+    if (length != 0U && !read_range(src, position + 4U, length, body.data(), error)) {
         error = "failed to read the manifest index section";
         return false;
     }
@@ -75,7 +68,6 @@ bool read_index_section(const std::filesystem::path& manifest_path, std::uint64_
     }
     return true;
 }
-
 }  // namespace
 
 bool parse_manifest_version(const std::string& name, std::uint64_t& version_out) {
@@ -102,53 +94,34 @@ bool parse_manifest_version(const std::string& name, std::uint64_t& version_out)
 }
 
 
+
 std::uint64_t highest_manifest_version(const std::filesystem::path& dataset_path, std::string& error) {
     error.clear();
-    const auto versions_dir = dataset_path / "_versions";
-    std::error_code ec;
-    if (!std::filesystem::exists(versions_dir, ec)) {
-        if (ec) {
-            error = "failed to stat _versions: " + ec.message();
-            return 0;
-        }
+    std::vector<io::DirEntry> entries;
+    if (!io::list_dir((dataset_path / "_versions").string(), entries, error)) {
         return 0;
     }
     std::uint64_t max_version = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(versions_dir, ec)) {
-        if (ec) {
-            error = "failed to iterate _versions: " + ec.message();
-            return 0;
-        }
-        if (!entry.is_regular_file()) {
-            continue;
-        }
+    for (const auto& entry : entries) {
         std::uint64_t version = 0;
-        if (parse_manifest_version(entry.path().filename().string(), version)) {
+        if (!entry.is_dir && parse_manifest_version(entry.name, version)) {
             max_version = std::max(max_version, version);
         }
     }
     return max_version;
 }
 
-bool read_manifest_file(const std::filesystem::path& manifest_path, std::vector<std::uint8_t>& protobuf_body,
-                        std::string& error) {
-    error.clear();
-    protobuf_body.clear();
-    std::ifstream in(manifest_path, std::ios::binary);
-    if (!in) {
-        error = "failed to open manifest file";
-        return false;
-    }
-    in.seekg(0, std::ios::end);
-    const auto end_pos = in.tellg();
-    if (end_pos < static_cast<std::streamoff>(8 + 16)) {
+namespace {
+
+/// The protobuf of the manifest in `src`: the trailer says where it starts.
+bool read_manifest_body(io::ByteSource& src, std::vector<std::uint8_t>& protobuf_body, std::string& error) {
+    const std::uint64_t file_size = src.size();
+    if (file_size < 8U + 16U) {
         error = "manifest file too small";
         return false;
     }
-    const auto file_size = static_cast<std::uint64_t>(end_pos);
-    in.seekg(static_cast<std::streamoff>(file_size - 16U), std::ios::beg);
     unsigned char trailer[16]{};
-    if (!read_exact(in, trailer, 16)) {
+    if (!read_range(src, file_size - 16U, 16, trailer, error)) {
         error = "failed to read manifest trailer";
         return false;
     }
@@ -164,41 +137,48 @@ bool read_manifest_file(const std::filesystem::path& manifest_path, std::vector<
         error = "invalid manifest_position in trailer";
         return false;
     }
-    in.seekg(static_cast<std::streamoff>(manifest_position), std::ios::beg);
     unsigned char len_le[4]{};
-    if (!read_exact(in, len_le, 4)) {
+    if (!read_range(src, manifest_position, 4, len_le, error)) {
         error = "failed to read manifest protobuf length";
         return false;
     }
     const std::uint32_t proto_len = read_le32(len_le);
-    if (proto_len == 0 || static_cast<std::uint64_t>(manifest_position) + 4ULL + static_cast<std::uint64_t>(proto_len) >
-                             file_size - 16U) {
+    if (proto_len == 0 || manifest_position + 4ULL + static_cast<std::uint64_t>(proto_len) > file_size - 16U) {
         error = "invalid manifest protobuf length";
         return false;
     }
     protobuf_body.resize(proto_len);
-    if (!read_exact(in, protobuf_body.data(), proto_len)) {
+    if (!read_range(src, manifest_position + 4U, proto_len, protobuf_body.data(), error)) {
         error = "failed to read manifest protobuf";
         return false;
     }
     return true;
 }
 
+}  // namespace
+
+bool read_manifest_file(const std::filesystem::path& manifest_path, std::vector<std::uint8_t>& protobuf_body,
+                        std::string& error) {
+    error.clear();
+    protobuf_body.clear();
+    const auto source = io::open_source(manifest_path.string(), error);
+    if (!source) {
+        error = "failed to open manifest file";
+        return false;
+    }
+    return read_manifest_body(*source, protobuf_body, error);
+}
+
 std::vector<std::uint64_t> list_manifest_versions(const std::filesystem::path& dataset_path, std::string& error) {
     error.clear();
     std::vector<std::uint64_t> versions;
-    const auto versions_dir = dataset_path / "_versions";
-    std::error_code ec;
-    if (!std::filesystem::exists(versions_dir, ec)) {
-        return versions;
+    std::vector<io::DirEntry> entries;
+    if (!io::list_dir((dataset_path / "_versions").string(), entries, error)) {
+        return {};
     }
-    for (const auto& entry : std::filesystem::directory_iterator(versions_dir, ec)) {
-        if (ec) {
-            error = "failed to iterate _versions: " + ec.message();
-            return {};
-        }
+    for (const auto& entry : entries) {
         std::uint64_t version = 0;
-        if (entry.is_regular_file() && parse_manifest_version(entry.path().filename().string(), version)) {
+        if (!entry.is_dir && parse_manifest_version(entry.name, version)) {
             versions.push_back(version);
         }
     }
@@ -207,51 +187,26 @@ std::vector<std::uint64_t> list_manifest_versions(const std::filesystem::path& d
     return versions;
 }
 
-bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint64_t v, pb::Manifest& out,
-                           std::string& error) {
-    error.clear();
-    out = pb::Manifest{};
-    // The version is scheme-independent, so try both spellings rather than assuming one. A dataset
-    // nanolance appended to after pylance created it can legitimately hold a mix.
-    std::error_code path_ec;
-    if ((v & (1ULL << 63U)) != 0U) {  // a detached version: `d<version>.manifest`
-        const auto detached = dataset_path / "_versions" / ("d" + std::to_string(v) + ".manifest");
-        if (!std::filesystem::exists(detached, path_ec)) {
-            error = "version " + std::to_string(v) + " not found";
-            return false;
-        }
-        return load_manifest_file(detached, out, error);
-    }
-    auto manifest_path = dataset_path / "_versions" / (std::to_string(v) + ".manifest");
-    if (!std::filesystem::exists(manifest_path, path_ec)) {
-        std::ostringstream inverted;
-        inverted << std::setfill('0') << std::setw(static_cast<int>(kManifestV2Digits))
-                 << (std::numeric_limits<std::uint64_t>::max() - v);
-        manifest_path = dataset_path / "_versions" / (inverted.str() + ".manifest");
-        if (!std::filesystem::exists(manifest_path, path_ec)) {
-            error = "version " + std::to_string(v) + " not found";
-            return false;
-        }
-    }
-    return load_manifest_file(manifest_path, out, error);
-}
+namespace {
 
-bool load_manifest_file(const std::filesystem::path& manifest_path, pb::Manifest& out, std::string& error) {
+/// The manifest in `src`: its protobuf, and the indices a commit must carry on (see
+/// index_maintenance.hpp).
+bool load_manifest_source(io::ByteSource& src, pb::Manifest& out, std::string& error) {
     error.clear();
     out = pb::Manifest{};
     std::vector<std::uint8_t> body;
-    if (!read_manifest_file(manifest_path, body, error)) {
+    if (!read_manifest_body(src, body, error)) {
         return false;
     }
     if (!pb::decode_manifest(body, out)) {
         error = "failed to decode manifest protobuf";
         return false;
     }
-    // The version's indices, which a commit must carry on (see index_maintenance.hpp). A reader does
-    // not need them, so one it cannot parse fails only a later commit, which would otherwise drop them.
+    // A reader does not need the indices, so one it cannot parse fails only a later commit, which
+    // would otherwise drop them.
     if (out.has_index_section) {
         std::string index_error;
-        if (!read_index_section(manifest_path, out.index_section, out.indices, index_error)) {
+        if (!read_index_section(src, out.index_section, out.indices, index_error)) {
             out.indices.clear();
             out.index_section_error = index_error;
         }
@@ -271,6 +226,51 @@ bool load_manifest_file(const std::filesystem::path& manifest_path, pb::Manifest
         }
     }
     return true;
+}
+
+}  // namespace
+
+bool load_manifest_file(const std::filesystem::path& manifest_path, pb::Manifest& out, std::string& error) {
+    const auto source = io::open_source(manifest_path.string(), error);
+    if (!source) {
+        error = "failed to open manifest file";
+        out = pb::Manifest{};
+        return false;
+    }
+    return load_manifest_source(*source, out, error);
+}
+
+bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint64_t v, pb::Manifest& out,
+                           std::string& error) {
+    error.clear();
+    out = pb::Manifest{};
+    // The version is scheme-independent, so try both spellings rather than assuming one. A dataset
+    // nanolance appended to after pylance created it can legitimately hold a mix. Each candidate is
+    // opened once: a remote one costs a round trip per open.
+    std::vector<std::filesystem::path> candidates;
+    if ((v & (1ULL << 63U)) != 0U) {  // a detached version: `d<version>.manifest`
+        candidates.push_back(dataset_path / "_versions" / ("d" + std::to_string(v) + ".manifest"));
+    } else {
+        candidates.push_back(dataset_path / "_versions" / (std::to_string(v) + ".manifest"));
+        std::ostringstream inverted;
+        inverted << std::setfill('0') << std::setw(static_cast<int>(kManifestV2Digits))
+                 << (std::numeric_limits<std::uint64_t>::max() - v);
+        candidates.push_back(dataset_path / "_versions" / (inverted.str() + ".manifest"));
+    }
+    for (const auto& candidate : candidates) {
+        std::string open_error;
+        const auto source = io::open_source(candidate.string(), open_error);
+        if (!source) {
+            if (io::exists(candidate.string())) {
+                error = "failed to open manifest file";
+                return false;
+            }
+            continue;
+        }
+        return load_manifest_source(*source, out, error);
+    }
+    error = "version " + std::to_string(v) + " not found";
+    return false;
 }
 
 bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifest& out, std::uint64_t& version_out,

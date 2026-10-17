@@ -242,6 +242,7 @@ target_include_directories(nanolance_proto PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(nanolance_proto PRIVATE nanolance_nanom)
 
 add_library(nanolance_reader STATIC
+    src/byte_source.cpp
     src/manifest_reader.cpp
     src/nano_lance_reader.cpp
     src/nano_lance_external_blob.cpp
@@ -771,6 +772,10 @@ add_executable(nano_lance_roaring_bitmap_test tests/test_roaring_bitmap.cpp)
 target_compile_features(nano_lance_roaring_bitmap_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_roaring_bitmap_test PRIVATE nanolance)
 
+add_executable(nano_lance_byte_source_remote_test tests/test_byte_source_remote.cpp)
+target_compile_features(nano_lance_byte_source_remote_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_byte_source_remote_test PRIVATE nanolance nanolance_reader)
+
 add_executable(nano_lance_external_blob_test tests/test_nano_lance_external_blob.cpp)
 target_compile_features(nano_lance_external_blob_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_external_blob_test PRIVATE nanolance_reader)
@@ -926,6 +931,8 @@ add_test(NAME nano_lance_roaring_bitmap COMMAND $<TARGET_FILE:nano_lance_roaring
 add_test(NAME nano_lance_expr COMMAND $<TARGET_FILE:nano_lance_expr_test>)
 set_tests_properties(nano_lance_column_slice PROPERTIES LABELS "smoke")
 
+add_test(NAME nano_lance_byte_source_remote COMMAND $<TARGET_FILE:nano_lance_byte_source_remote_test>)
+set_tests_properties(nano_lance_byte_source_remote PROPERTIES LABELS "smoke")
 add_test(NAME nano_lance_external_blob COMMAND $<TARGET_FILE:nano_lance_external_blob_test>)
 set_tests_properties(nano_lance_external_blob PROPERTIES LABELS "smoke")
 
