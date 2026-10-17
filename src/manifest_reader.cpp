@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/work_stats.hpp"
 #include "nanolance/manifest_reader.hpp"
 
 #include "nanolance/read_safety.hpp"
@@ -17,7 +18,9 @@ namespace nano_lance {
 namespace {
 
 bool read_exact(std::istream& in, void* dest, std::size_t n) {
-    return static_cast<bool>(in.read(static_cast<char*>(dest), static_cast<std::streamsize>(n)));
+    const bool ok = static_cast<bool>(in.read(static_cast<char*>(dest), static_cast<std::streamsize>(n)));
+    work_stats::count_read(n);
+    return ok;
 }
 
 std::uint32_t read_le32(const unsigned char* p) {

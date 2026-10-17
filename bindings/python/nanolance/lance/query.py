@@ -54,6 +54,25 @@ def _granularity(document_granularity) -> None:
         raise unsupported("full-text search over list elements")
 
 
+_U32_MAX = 2**32 - 1
+_U64_MAX = 2**64 - 1
+
+
+def _unsigned(name: str, value, limit: int, negative_message: str) -> int:
+    """An argument pylance takes as an unsigned integer, with pylance's exception and message."""
+    import operator as _op
+
+    try:
+        number = _op.index(value)
+    except TypeError as exc:
+        raise TypeError(f"argument '{name}': {exc}") from None
+    if number < 0:
+        raise OverflowError(negative_message)
+    if number > limit:
+        raise OverflowError("out of range integral type conversion attempted")
+    return number
+
+
 def _operator(operator) -> str:
     value = operator.value if isinstance(operator, FullTextOperator) else str(operator)
     if value.upper() not in ("AND", "OR"):
@@ -85,10 +104,17 @@ class MatchQuery(FullTextQuery):
                  max_expansions: int = 50, operator: FullTextOperator = FullTextOperator.OR,
                  prefix_length: int = 0, document_granularity: Optional[DocumentGranularity] = None):
         _granularity(document_granularity)
+        # Checked as pylance checks them: None means exact matching for fuzziness, and nothing else
+        # is accepted but an integer in the range of its Rust type.
+        edits = 0 if fuzziness is None else _unsigned("fuzziness", fuzziness, _U32_MAX,
+                                                       "out of range integral type conversion attempted")
+        expansions = _unsigned("max_expansions", max_expansions, _U64_MAX, "can't convert negative int to unsigned")
+        prefix = _unsigned("prefix_length", prefix_length, _U32_MAX,
+                           "out of range integral type conversion attempted")
         self._inner = PyFullTextQuery({"match": {
-            "column": column, "terms": query, "boost": float(boost), "fuzziness": fuzziness,
-            "max_expansions": int(max_expansions), "operator": _operator(operator),
-            "prefix_length": int(prefix_length)}})
+            "column": column, "terms": query, "boost": float(boost), "fuzziness": edits,
+            "max_expansions": expansions, "operator": _operator(operator),
+            "prefix_length": prefix}})
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH

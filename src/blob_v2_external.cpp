@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/work_stats.hpp"
 #include "nanolance/blob_v2_external.hpp"
 
 #include "nanolance/array_accessor.hpp"
@@ -36,17 +37,6 @@ constexpr std::size_t kBlobV2RecordHeaderBytes = 4U + kBlobV2FixedDescriptorByte
 
 namespace {
 
-void append_le16(std::vector<std::uint8_t>& out, std::uint16_t value) {
-    out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
-    out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
-}
-
-void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value) {
-    out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
-    out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
-    out.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xFFU));
-    out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
-}
 
 bool arrow_row_is_null(const ArrowArray& array, std::int64_t row_index) {
     if (array.buffers == nullptr || array.buffers[0] == nullptr) {
@@ -1167,6 +1157,7 @@ bool blob_v2_read(const BlobV2Location& location, const std::uint64_t offset, co
     }
     in.seekg(static_cast<std::streamoff>(at));
     in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(length));
+    work_stats::count_read(length);
     if (!in) {
         error = "cannot read blob file " + location.file;
         out.clear();

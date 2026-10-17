@@ -6,6 +6,7 @@
 #include "nanolance/deletion_vector.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "proto_wire.hpp"
+#include "int128.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -253,9 +254,9 @@ std::vector<std::uint8_t> encode_segment(const std::vector<std::uint64_t>& value
     if (holes == 0) {
         return segment_range(min, max + 1);
     }
-    const unsigned __int128 holes_size = 24U + 4U * static_cast<unsigned __int128>(holes);
-    const unsigned __int128 bitmap_size = 24U + (static_cast<unsigned __int128>(total) + 7U) / 8U;
-    const unsigned __int128 array_size = 24U + 2U * static_cast<unsigned __int128>(count);
+    const U128 holes_size = 24U + 4U * static_cast<U128>(holes);
+    const U128 bitmap_size = 24U + (static_cast<U128>(total) + 7U) / 8U;
+    const U128 array_size = 24U + 2U * static_cast<U128>(count);
     if (holes_size <= bitmap_size && holes_size <= array_size) {
         std::vector<std::uint64_t> hole_values;
         hole_values.reserve(static_cast<std::size_t>(holes));

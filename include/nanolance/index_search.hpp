@@ -25,6 +25,9 @@ struct IndexCandidates {
     /// What answered: "ScalarIndexQuery: query=[<predicate>]@<index>(<type>)", one per predicate an
     /// index answered, as Lance's plans name it.
     std::vector<std::string> used;
+    /// True when `rows` is exactly the set of rows that pass the filter in the covered fragments (every
+    /// predicate answered by a BTREE or BITMAP, combined so no side is left to a scan).
+    bool exact = false;
 };
 
 /// `filter` must be bound. Nothing in `out` when no index applies to it. False only when an index

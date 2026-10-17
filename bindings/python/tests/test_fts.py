@@ -14,6 +14,7 @@ import glob
 import json
 import os
 import random
+import re
 import shutil
 
 import pyarrow as pa
@@ -328,8 +329,6 @@ def test_errors(built, tmp_path):
     ds = nl.dataset(path)
     with pytest.raises(Exception, match="position is not found"):
         ds.to_table(full_text_query=nq.PhraseQuery("file input", "text"))
-    with pytest.raises(Exception, match="fuzzy"):
-        ds.to_table(full_text_query=nq.MatchQuery("fil", "text", fuzziness=1))
     with pytest.raises(Exception, match="at least one should/must"):
         ds.to_table(full_text_query=nq.BooleanQuery([(nq.Occur.MUST_NOT, nq.MatchQuery("file", "text"))]))
     with pytest.raises(Exception, match="string column"):
@@ -592,6 +591,57 @@ def test_code_analyzer_options_are_validated(tmp_path, kwargs, message):
     assert str(excinfo.value) == message
 
 
+LANGUAGE_NAMES = ["English", "French", "Norwegian", "German", "german", "english", "en", "Klingon", "", "NONE"]
+
+
+@pytest.mark.parametrize("language", LANGUAGE_NAMES)
+def test_language_names_are_validated_as_pylance_does(lance, tmp_path, language):
+    """Index creation and tokenize accept exactly the names pylance accepts (case-sensitive, Lance's list)."""
+    table = pa.table({"text": ["the quick fox"]})
+    ref, got = str(tmp_path / "ref.lance"), str(tmp_path / "got.lance")
+    lance.write_dataset(table, ref)
+    nl.write_dataset(table, got)
+    errors = {}
+    for name, module, path in (("pylance", lance, ref), ("nanolance", nl, got)):
+        try:
+            module.dataset(path).create_scalar_index("text", index_type="INVERTED", language=language,
+                                                     stem=False, remove_stop_words=False)
+            errors[name] = None
+        except ValueError as e:
+            errors[name] = str(e)
+    assert (errors["pylance"] is None) == (errors["nanolance"] is None), errors
+    if errors["pylance"] is not None:
+        for message in errors.values():
+            assert message.startswith(f"can't set tokenizer language to {language}: ")
+            assert f"unknown variant `{language}`, expected one of `Arabic`, " in message
+    tokens = {}
+    for name, module in (("pylance", lance), ("nanolance", nl)):
+        try:
+            tokens[name] = [t.text for t in module.tokenize("The Quick", language=language, stem=False,
+                                                            remove_stop_words=False)]
+        except ValueError as e:
+            tokens[name] = str(e)
+    assert isinstance(tokens["pylance"], str) == isinstance(tokens["nanolance"], str), tokens
+    if isinstance(tokens["pylance"], str):
+        assert f"unknown variant `{language}`" in tokens["nanolance"]
+    else:
+        assert tokens["pylance"] == tokens["nanolance"] == ["the", "quick"], tokens
+
+
+def test_language_none_is_a_type_error_as_pylance_does(lance, tmp_path):
+    """language=None on an INVERTED index is a TypeError in pylance, not a silent English index."""
+    table = pa.table({"text": ["the quick fox"]})
+    ref, got = str(tmp_path / "ref.lance"), str(tmp_path / "got.lance")
+    lance.write_dataset(table, ref)
+    nl.write_dataset(table, got)
+    errors = {}
+    for name, module, path in (("pylance", lance, ref), ("nanolance", nl, got)):
+        with pytest.raises(TypeError) as excinfo:
+            module.dataset(path).create_scalar_index("text", index_type="INVERTED", language=None)
+        errors[name] = str(excinfo.value)
+    assert errors["nanolance"] == errors["pylance"] == "'None' is not an instance of 'str'", errors
+
+
 # ── the ngram base tokenizer (Lance's NgramTokenizer) ──────────────────────────────────────────
 
 NGRAM_OPTIONS = [
@@ -662,3 +712,162 @@ def test_ngram_tokenizer_lengths_are_validated(tmp_path, kwargs, message):
     with pytest.raises(ValueError) as excinfo:
         nl.dataset(path).create_scalar_index("text", "INVERTED", base_tokenizer="ngram", **kwargs)
     assert str(excinfo.value) == message
+
+
+# ── fuzzy matching: MatchQuery(fuzziness=, max_expansions=, prefix_length=) ─────────────────────
+#
+# What pylance 12.0.0 does (measured, and the expectations below are its answers): a query token
+# expands to the dictionary terms within `fuzziness` edits, where an insertion, deletion or
+# substitution is one edit and a transposition is two; `prefix_length` keeps the terms that start
+# with the token's first characters; the first `max_expansions` of the expansions in key order are
+# kept, one budget for the whole query, spent by its tokens in order (a term two tokens share uses
+# two of it); and each expansion scores as its own term, the expansions of a query summed as an OR,
+# or required one per token with operator AND.
+
+FUZZY_TEXTS = [
+    "fa", "fo", "fob", "focus", "foo", "food", "foul", "ofo", "of", "fo bar", "foo bar", "bar", "bad",
+    "bag", "barr", "xbar", "aar", "fooo", "foob", "car", "bar fob", "fob bar", "fob foo foo",
+]
+
+FUZZY_QUERIES = [
+    ("foo", {}),
+    ("foo", {"fuzziness": 0}),
+    ("foo", {"fuzziness": None}),
+    ("foo", {"fuzziness": 1}),
+    ("foo", {"fuzziness": 2}),
+    ("foo", {"fuzziness": 1, "max_expansions": 0}),
+    ("foo", {"fuzziness": 1, "max_expansions": 1}),
+    ("foo", {"fuzziness": 1, "max_expansions": 3}),
+    ("foo", {"fuzziness": 2, "max_expansions": 4}),
+    ("foo", {"fuzziness": 1, "prefix_length": 1}),
+    ("foo", {"fuzziness": 1, "prefix_length": 3}),
+    ("foo", {"fuzziness": 2, "prefix_length": 10}),
+    ("bar", {"fuzziness": 1}),
+    ("bar", {"fuzziness": 1, "max_expansions": 2, "prefix_length": 1}),
+    ("ofo", {"fuzziness": 1}),
+    ("fob", {"fuzziness": 2, "max_expansions": 5}),
+    ("foo", {"fuzziness": 1, "boost": 2.0}),
+    ("zzzz", {"fuzziness": 2}),
+    ("foo bar", {"fuzziness": 1}),
+    ("foo bar", {"fuzziness": 1, "max_expansions": 1}),
+    ("foo bar", {"fuzziness": 1, "max_expansions": 5}),
+    ("foo bar", {"fuzziness": 1, "operator": "AND"}),
+    ("foo bar", {"fuzziness": 1, "operator": "AND", "max_expansions": 1}),
+    ("foo bar", {"operator": "AND"}),
+    ("fob bar", {"fuzziness": 1, "operator": "AND"}),
+    ("bar fob", {"fuzziness": 2, "operator": "AND", "max_expansions": 9}),
+    ("foo fo", {"fuzziness": 1, "max_expansions": 3}),
+]
+
+
+def _fuzzy_query(mod, text, **kwargs):
+    query_module = nq if mod is nl else mod.query
+    if "operator" in kwargs:
+        kwargs = {**kwargs, "operator": query_module.FullTextOperator[kwargs["operator"]]}
+    return query_module.MatchQuery(text, "text", **kwargs)
+
+
+def _fuzzy_rows(mod, path, query):
+    """(id, score) of every row the query matches, sorted by id."""
+    t = mod.dataset(path).to_table(full_text_query=query, columns=["id", "_score"])
+    return sorted(zip(t["id"].to_pylist(), t["_score"].to_pylist()))
+
+
+@pytest.fixture(scope="module")
+def fuzzy(lance, tmp_path_factory):
+    """FUZZY_TEXTS indexed by pylance and by nanolance, with and without positions."""
+    root = tmp_path_factory.mktemp("fuzzy")
+    table = pa.table({"id": list(range(len(FUZZY_TEXTS))), "text": FUZZY_TEXTS})
+    out = {}
+    for with_position in (False, True):
+        for who, mod in (("pylance", lance), ("nanolance", nl)):
+            path = str(root / f"{who}-{with_position}.lance")
+            mod.write_dataset(table, path)
+            mod.dataset(path).create_scalar_index("text", "INVERTED", with_position=with_position)
+            out[who, with_position] = path
+    return out
+
+
+@pytest.mark.parametrize("with_position", [False, True])
+@pytest.mark.parametrize(("text", "kwargs"), FUZZY_QUERIES)
+def test_fuzzy_rows_and_scores_match_pylance(lance, fuzzy, with_position, text, kwargs):
+    ref = _fuzzy_rows(lance, fuzzy["pylance", with_position], _fuzzy_query(lance, text, **kwargs))
+    got = _fuzzy_rows(nl, fuzzy["nanolance", with_position], _fuzzy_query(nl, text, **kwargs))
+    assert got == ref
+
+
+@pytest.mark.parametrize("with_position", [False, True])
+@pytest.mark.parametrize("who", ["pylance", "nanolance"])
+def test_fuzzy_reads_either_engines_index(lance, fuzzy, who, with_position):
+    path = fuzzy[who, with_position]
+    kwargs = {"fuzziness": 2, "max_expansions": 6, "prefix_length": 1}
+    ref = _fuzzy_rows(lance, path, _fuzzy_query(lance, "foo bar", **kwargs))
+    assert ref
+    assert _fuzzy_rows(nl, path, _fuzzy_query(nl, "foo bar", **kwargs)) == ref
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"fuzziness": 1, "max_expansions": 2**40},
+    {"fuzziness": 1, "prefix_length": 2**31},
+])
+def test_fuzzy_large_limits_match_pylance(lance, fuzzy, kwargs):
+    ref = _fuzzy_rows(lance, fuzzy["pylance", False], _fuzzy_query(lance, "foo bar", **kwargs))
+    assert _fuzzy_rows(nl, fuzzy["nanolance", False], _fuzzy_query(nl, "foo bar", **kwargs)) == ref
+
+
+def test_fuzzy_expansion_rules(tmp_path):
+    texts = ["fa", "fo", "fob", "focus", "foo", "food", "foul", "ofo", "of"]
+    path = str(tmp_path / "small.lance")
+    nl.write_dataset(pa.table({"id": list(range(len(texts))), "text": texts}), path)
+    nl.dataset(path).create_scalar_index("text", "INVERTED")
+
+    def words(text, **kwargs):
+        return {texts[i] for i, _ in _fuzzy_rows(nl, path, _fuzzy_query(nl, text, **kwargs))}
+
+    assert words("foo") == {"foo"}
+    assert words("foo", fuzziness=1) == {"fo", "fob", "foo", "food"}
+    assert words("foo", fuzziness=1, max_expansions=3) == {"fo", "fob", "foo"}
+    assert words("foo", fuzziness=1, max_expansions=0) == set()
+    assert words("foo", fuzziness=1, prefix_length=3) == {"foo", "food"}
+    # "of" is an English stop word, so it is not in the dictionary (on either engine).
+    assert words("foo", fuzziness=2) == {"fa", "fo", "fob", "foo", "food", "foul", "ofo"}
+    # A transposition is two edits: "foo" does not reach "ofo" at one, and "ofo" does not reach "foo".
+    assert words("ofo", fuzziness=1) == {"ofo", "fo"}
+    assert "ofo" not in words("foo", fuzziness=1)
+
+
+@pytest.mark.parametrize(("kwargs", "error", "message"), [
+    ({"fuzziness": "auto"}, TypeError, "argument 'fuzziness': 'str' object cannot be interpreted as an integer"),
+    ({"fuzziness": 1.0}, TypeError, "argument 'fuzziness': 'float' object cannot be interpreted as an integer"),
+    ({"fuzziness": -1}, OverflowError, "out of range integral type conversion attempted"),
+    ({"fuzziness": 2**40}, OverflowError, "out of range integral type conversion attempted"),
+    ({"max_expansions": None}, TypeError,
+     "argument 'max_expansions': 'NoneType' object cannot be interpreted as an integer"),
+    ({"max_expansions": -1}, OverflowError, "can't convert negative int to unsigned"),
+    ({"prefix_length": -1}, OverflowError, "out of range integral type conversion attempted"),
+    ({"prefix_length": None}, TypeError,
+     "argument 'prefix_length': 'NoneType' object cannot be interpreted as an integer"),
+])
+def test_fuzzy_arguments_are_validated_as_pylance_does(lance, kwargs, error, message):
+    for mod in (lance, nl):
+        with pytest.raises(error, match=re.escape(message)):
+            _fuzzy_query(mod, "foo", **kwargs)
+
+
+@pytest.mark.parametrize("with_position", [False, True])
+def test_fuzzy_unindexed_fragments_match_pylance(lance, tmp_path, with_position):
+    """Rows in fragments the index does not cover match a fuzzy query by the query's exact tokens (no
+    expansion), scored as an exact query scores them, whatever the budget and the operator."""
+    paths = {}
+    for who, mod in (("pylance", lance), ("nanolance", nl)):
+        path = str(tmp_path / f"{who}.lance")
+        mod.write_dataset(pa.table({"id": [0, 1, 2], "text": ["foo", "fob", "baz"]}), path)
+        mod.dataset(path).create_scalar_index("text", "INVERTED", with_position=with_position)
+        mod.write_dataset(pa.table({"id": [3, 4, 5, 6], "text": ["fob", "food", "zz", "foo bar"]}), path,
+                          mode="append")
+        paths[who] = path
+    for kwargs in ({"fuzziness": 1}, {"fuzziness": 1, "max_expansions": 1}, {"fuzziness": 1, "max_expansions": 0},
+                   {"fuzziness": 1, "operator": "AND"}):
+        for text in ("foo", "food", "bar", "fob", "foo bar"):
+            ref = _fuzzy_rows(lance, paths["pylance"], _fuzzy_query(lance, text, **kwargs))
+            assert _fuzzy_rows(nl, paths["nanolance"], _fuzzy_query(nl, text, **kwargs)) == ref, (text, kwargs)

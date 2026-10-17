@@ -60,6 +60,8 @@ def tokenize(query, *, analyzer=None, base_tokenizer=None, language=None, max_to
     }
     if max_token_length is not Ellipsis:
         options["max_token_length"] = max_token_length
+    if options["language"] is None:  # tokenize takes language=None as no language (index creation does not)
+        del options["language"]
     params = LanceDataset._inverted_params(options)
     with _lance_errors():
         pairs = _nanolance._fts_tokenize(params, query)

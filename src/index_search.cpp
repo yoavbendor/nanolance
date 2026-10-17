@@ -28,6 +28,7 @@
 // else answer nothing.
 
 #include "nanolance/index_search.hpp"
+#include "nanolance/work_stats.hpp"
 
 #include "index_files.hpp"
 
@@ -84,8 +85,10 @@ bool load_btree(const std::filesystem::path& dir, std::shared_ptr<const BTreeInd
     const auto lookup_path = dir / "page_lookup.lance";
     const auto key = file_key(lookup_path);
     if ((out = cache.find(key)) != nullptr) {
+        work_stats::count_index_cache(true);
         return true;
     }
+    work_stats::count_index_cache(false);
     auto index = std::make_shared<BTreeIndex>();
     index->page_data = dir / "page_data.lance";
     std::string value;
@@ -117,13 +120,16 @@ bool load_btree(const std::filesystem::path& dir, std::shared_ptr<const BTreeInd
     return true;
 }
 
-bool load_bitmap(const std::filesystem::path& dir, std::shared_ptr<const BitmapIndex>& out, std::string& error) {
+bool load_bitmap(const std::filesystem::path& dir, std::shared_ptr<const BitmapIndex>& out, bool& cached,
+                 std::string& error) {
     static IndexCache<BitmapIndex> cache;
     const auto path = dir / "bitmap_page_lookup.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
+        cached = true;
         return true;
     }
+    cached = false;
     auto index = std::make_shared<BitmapIndex>();
     index->file = path;
     std::string value;
@@ -161,8 +167,10 @@ bool load_zonemap(const std::filesystem::path& dir, std::shared_ptr<const ZoneMa
     const auto path = dir / "zonemap.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
+        work_stats::count_index_cache(true);
         return true;
     }
+    work_stats::count_index_cache(false);
     auto index = std::make_shared<ZoneMapIndex>();
     if (!read_table(path, nullptr, LanceRowRange{}, index->zones, error)) {
         return false;
@@ -188,6 +196,9 @@ bool load_zonemap(const std::filesystem::path& dir, std::shared_ptr<const ZoneMa
 struct RowSet {
     std::set<std::uint32_t> covered;
     std::map<std::uint32_t, std::vector<std::uint32_t>> rows;
+    /// Every covered fragment's rows are exactly the rows that pass (a BTREE or BITMAP answer), so a
+    /// count of them needs no read. Zonemaps and bloom filters only prune: their rows are a superset.
+    bool exact = false;
 };
 
 void add_addresses(RowSet& set, std::vector<std::uint64_t>& addrs) {
@@ -228,6 +239,8 @@ RowSet both(const RowSet& a, const RowSet& b) {
             out.rows[f] = std::move(rows);
         }
     }
+    // A fragment only one side covers keeps that side's rows, a superset: exact only when both agree.
+    out.exact = a.exact && b.exact && a.covered == b.covered;
     return out;
 }
 
@@ -246,6 +259,7 @@ RowSet either(const RowSet& a, const RowSet& b) {
             out.rows[f] = std::move(rows);
         }
     }
+    out.exact = a.exact && b.exact;
     return out;
 }
 
@@ -567,9 +581,11 @@ bool search_zonemap(const std::filesystem::path& dir, const expr::Predicate& p, 
         return false;
     }
     const auto& zones = index->zones;
-    // A nested column's zones have no bounds (min and max are null): only their null counts answer.
+    // A nested column's zones have no bounds (min and max are null): only their null counts answer. A
+    // fixed-size binary's are null too (pylance writes them so), and every zone may match a predicate.
     const char* min_format = zones.schema.children[0]->format;
     const bool nested = min_format != nullptr && min_format[0] == '+';
+    const bool fixed_binary = min_format != nullptr && std::string_view(min_format).substr(0, 2) == "w:";
     if (nested && p.test() != Test::IsNull) {
         return true;
     }
@@ -579,7 +595,10 @@ bool search_zonemap(const std::filesystem::path& dir, const expr::Predicate& p, 
     const auto lengths = u64_column(zones, 6);
     std::vector<std::uint8_t> keep;
     bool handled = false;
-    if (!prune_by_bounds(p, zones, null_counts, keep, handled, error)) {
+    if (fixed_binary && p.test() != Test::IsNull) {
+        keep.assign(null_counts.size(), 1);
+        handled = true;
+    } else if (!prune_by_bounds(p, zones, null_counts, keep, handled, error)) {
         return false;
     }
     if (!handled) {
@@ -610,8 +629,10 @@ bool load_bloomfilter(const std::filesystem::path& dir, std::shared_ptr<const Bl
     const auto path = dir / "bloomfilter.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
+        work_stats::count_index_cache(true);
         return true;
     }
+    work_stats::count_index_cache(false);
     auto index = std::make_shared<BloomFilterIndex>();
     if (!read_table(path, nullptr, LanceRowRange{}, index->zones, error)) {
         return false;
@@ -826,8 +847,10 @@ bool load_ngram(const std::filesystem::path& dir, std::shared_ptr<const NGramInd
     const auto path = dir / "ngram_postings.lance";
     const auto key = file_key(path);
     if ((out = cache.find(key)) != nullptr) {
+        work_stats::count_index_cache(true);
         return true;
     }
+    work_stats::count_index_cache(false);
     auto index = std::make_shared<NGramIndex>();
     index->file = path;
     const std::vector<std::string> columns = {"tokens"};
@@ -994,7 +1017,8 @@ bool search_bitmap(const std::filesystem::path& dir, bool label_list, const expr
         return true;  // every non-null list has all of no elements
     }
     std::shared_ptr<const BitmapIndex> index;
-    if (!load_bitmap(dir, index, error)) {
+    bool cached = false;
+    if (!load_bitmap(dir, index, cached, error)) {
         return false;
     }
     if (label_list && p.test() == Test::IsNull) {
@@ -1017,6 +1041,11 @@ bool search_bitmap(const std::filesystem::path& dir, bool label_list, const expr
             if (pass[r] != 0) {
                 rows.push_back(r);
             }
+        }
+        // One lookup per value found in the index (a value not in it reads nothing): a hit when the
+        // index was loaded before this search, else the load answered each of them.
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            work_stats::count_index_cache(cached);
         }
         return true;
     };
@@ -1156,12 +1185,14 @@ struct Search {
         for (const auto& [name, segments] : by_name) {
             RowSet set;
             bool answered_all = true;
+            bool exact_all = true;
             for (const auto* index : segments) {
                 const auto& kind = index->details_type_url;
                 const auto dir = dataset_path / "_indices" / pb::uuid_string(index->uuid);
                 RowSet one;
                 bool answered = false;
                 bool ok = true;
+                bool exact_segment = false;
                 // A JSON index answers the JSON tests and they only it: a plain test of the column would
                 // compare the document, not the values at the path.
                 const bool json_index = kind == "/lance.index.pb.JsonIndexDetails";
@@ -1177,6 +1208,7 @@ struct Search {
                     std::any_of(index->files.begin(), index->files.end(),
                                 [](const pb::IndexMetadata::File& f) { return f.path == "page_lookup.lance"; })) {
                     ok = search_btree(dir, p, one, answered, error);
+                    exact_segment = true;
                 } else if (bloom && !index->files.empty()) {
                     ArrowSchema column{};
                     ok = arrow_column_type(*field, column, error) &&
@@ -1190,6 +1222,7 @@ struct Search {
                            !index->files.empty()) {
                     ok = search_bitmap(dir, kind == "/lance.table.LabelListIndexDetails", p, physical, one, answered,
                                        error);
+                    exact_segment = kind == "/lance.table.BitmapIndexDetails";
                 } else if (kind == "/lance.table.NGramIndexDetails" && !index->files.empty()) {
                     ok = search_ngram(dir, p, one, answered, error);
                 }
@@ -1200,6 +1233,7 @@ struct Search {
                     answered_all = false;
                     break;
                 }
+                exact_all = exact_all && exact_segment;
                 if (!zoned) {
                     to_addresses(one);  // a zonemap holds addresses already
                 }
@@ -1223,6 +1257,7 @@ struct Search {
                     type = "BTree";  // the plan names the BTree a JSON index is built over
                 }
                 used.push_back("ScalarIndexQuery: query=[" + p.to_string() + "]@" + name + "(" + type + ")");
+                set.exact = exact_all;
                 answer = std::move(set);
                 return true;
             }
@@ -1243,7 +1278,13 @@ struct Search {
                     return false;
                 }
                 if (c.kind == expr::Condition::Kind::And) {
-                    answer = a && b ? both(*a, *b) : (a ? std::move(a) : std::move(b));
+                    if (a && b) {
+                        answer = both(*a, *b);
+                    } else if (a || b) {
+                        // The side that is not answered may match any row: what is left only prunes.
+                        answer = a ? std::move(a) : std::move(b);
+                        answer->exact = false;
+                    }
                 } else if (a && b) {
                     answer = either(*a, *b);
                 }
@@ -1261,6 +1302,7 @@ bool index_candidates(const std::filesystem::path& dataset_path, const pb::Manif
                       const expr::Expression& filter, IndexCandidates& out, std::string& error) {
     out.rows.clear();
     out.used.clear();
+    out.exact = false;
     error.clear();
     // An index whose rows a deferred compaction moved needs the fragment-reuse index to be found again.
     if (manifest.indices.empty() ||
@@ -1284,6 +1326,7 @@ bool index_candidates(const std::filesystem::path& dataset_path, const pb::Manif
         return true;
     }
     out.used = std::move(search.used);
+    out.exact = answer->exact;
     for (const auto f : answer->covered) {
         if (search.physical.count(f) == 0U) {
             continue;  // a fragment the version no longer has

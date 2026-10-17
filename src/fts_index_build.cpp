@@ -21,6 +21,7 @@
 
 #include "lance_minimal.pb.hpp"
 
+#include <bit>
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
@@ -423,7 +424,7 @@ void encode_position_block(const std::uint32_t* positions, const std::uint32_t* 
             for (const auto v : pending) {
                 any |= v;
             }
-            const auto bits = static_cast<std::uint8_t>(any == 0U ? 0 : 32 - __builtin_clz(any));
+            const auto bits = static_cast<std::uint8_t>(std::bit_width(any));
             fts::bitpack4x_pack(pending, bits, packed);
             out.push_back(bits);
             out.insert(out.end(), packed, packed + static_cast<std::size_t>(bits) * fts::kPostingBlock / 8U);

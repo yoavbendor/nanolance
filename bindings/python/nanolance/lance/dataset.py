@@ -250,6 +250,66 @@ def _rename(table: pa.Table, columns) -> pa.Table:
     return table
 
 
+class IOStats:
+    """File I/O of a dataset since its last io_stats_incremental() call (pylance's attribute names):
+    read and write operations (one ranged read or one written file's bytes each) and the bytes moved."""
+
+    __slots__ = ("read_iops", "read_bytes", "write_iops", "written_bytes")
+
+    def __init__(self, read_iops: int = 0, read_bytes: int = 0, write_iops: int = 0, written_bytes: int = 0):
+        self.read_iops = read_iops
+        self.read_bytes = read_bytes
+        self.write_iops = write_iops
+        self.written_bytes = written_bytes
+
+    def __repr__(self) -> str:
+        return (f"IOStats(read_iops={self.read_iops}, read_bytes={self.read_bytes}, "
+                f"write_iops={self.write_iops}, written_bytes={self.written_bytes})")
+
+
+class ScanStatistics:
+    """What one scan did, passed to ``scan_stats_callback`` once per scan (pylance's attribute names).
+
+    ``index_cache_hits`` / ``index_cache_misses`` count the index lookups the scan made that the index cache
+    answered / that had to load the index from its files (see nanolance/work_stats.hpp). ``parts_loaded``
+    is the number of those misses. ``iops``, ``requests`` and ``bytes_read`` are the process-wide file reads
+    made while the scan ran, so they include reads by other threads. ``indices_loaded`` and
+    ``index_comparisons`` are not measured and stay 0."""
+
+    __slots__ = ("all_counts", "bytes_read", "index_cache_hits", "index_cache_misses", "index_comparisons",
+                 "indices_loaded", "iops", "parts_loaded", "requests")
+
+    def __init__(self, all_counts=None, bytes_read: int = 0, index_cache_hits: int = 0,
+                 index_cache_misses: int = 0, index_comparisons: int = 0, indices_loaded: int = 0,
+                 iops: int = 0, parts_loaded: int = 0, requests: int = 0):
+        self.all_counts = dict(all_counts or {})
+        self.bytes_read = bytes_read
+        self.index_cache_hits = index_cache_hits
+        self.index_cache_misses = index_cache_misses
+        self.index_comparisons = index_comparisons
+        self.indices_loaded = indices_loaded
+        self.iops = iops
+        self.parts_loaded = parts_loaded
+        self.requests = requests
+
+    def __repr__(self) -> str:
+        return ("ScanStatistics(" + ", ".join(f"{name}={getattr(self, name)!r}" for name in self.__slots__) + ")")
+
+
+def _scan_counters() -> tuple:
+    with native():
+        hits, misses = _nanolance._index_cache_counters()
+        reads, read_bytes, _, _ = _nanolance._io_counters()
+    return hits, misses, reads, read_bytes
+
+
+def _scan_statistics(before: tuple, after: tuple) -> ScanStatistics:
+    hits, misses, reads, read_bytes = (now - was for now, was in zip(after, before))
+    return ScanStatistics(all_counts={"index_cache_hits": hits, "index_cache_misses": misses},
+                          bytes_read=read_bytes, index_cache_hits=hits, index_cache_misses=misses,
+                          iops=reads, parts_loaded=misses, requests=reads)
+
+
 class LanceDataset(pa.dataset.Dataset):
     """A Lance dataset at a version. Mirrors ``lance.LanceDataset``."""
 
@@ -301,6 +361,8 @@ class LanceDataset(pa.dataset.Dataset):
         self._fragment_message_cache = None
         if getattr(self, "_session", None) is not None:
             note_manifest(self)
+        if getattr(self, "_io_mark", None) is None:  # io_stats_incremental() counts from the open
+            self._io_mark = _nanolance._io_counters()
 
     def session(self) -> Session:
         """This dataset's session: the caches and budgets its reads are accounted to."""
@@ -729,6 +791,17 @@ class LanceDataset(pa.dataset.Dataset):
         n = self.count_rows()
         start, end, _ = slice(start, end).indices(n)
         return self.to_table(columns=columns, offset=start, limit=max(end - start, 0))
+
+    def io_stats_incremental(self) -> IOStats:
+        """The file I/O done since the last call on this object (zero for the first call), then reset.
+
+        Counted by nanolance's process-wide I/O counters, so reads by other dataset objects in the same
+        process between two calls are included too."""
+        with native():
+            current = _nanolance._io_counters()
+        mark = self._io_mark
+        self._io_mark = current
+        return IOStats(*(now - before for now, before in zip(current, mark)))
 
     def count_rows(self, filter=None, **kwargs) -> int:
         if filter is not None:
@@ -1167,6 +1240,11 @@ class LanceDataset(pa.dataset.Dataset):
                          "max_ngram_length", "prefix_only", "format_version", "block_size", "analyzer",
                          "split_identifiers", "split_on_numerics", "preserve_original", "index_operators")
     _CODE_FLAGS = ("split_identifiers", "split_on_numerics", "preserve_original", "index_operators")
+    # The languages Lance's tokenizer knows (case-sensitive). pylance rejects any other name, whatever the
+    # stemming and stop-word settings are.
+    _INVERTED_LANGUAGES = ("Arabic", "Danish", "Dutch", "English", "Finnish", "French", "German", "Greek",
+                           "Hungarian", "Italian", "Norwegian", "Portuguese", "Romanian", "Russian", "Spanish",
+                           "Swedish", "Tamil", "Turkish")
 
     @classmethod
     def _inverted_analyzer(cls, params: dict) -> None:
@@ -1187,6 +1265,10 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError(f"analyzer='code' requires base_tokenizer='code', got '{base}'")
         if analyzer == "text" and any(params.get(flag) for flag in cls._CODE_FLAGS):
             raise ValueError("code analyzer flags require analyzer='code'")
+        language = params.get("language")
+        if language is not None and language not in cls._INVERTED_LANGUAGES:
+            raise ValueError(f"can't set tokenizer language to {language}: LanceError(Arrow): unknown variant "
+                             f"`{language}`, expected one of " + ", ".join(f"`{n}`" for n in cls._INVERTED_LANGUAGES))
         if analyzer == "text" and base == "ngram":
             # apply_ngram_defaults: substrings stay searchable, so no stemming and no stop words by default.
             params.setdefault("stem", False)
@@ -1246,6 +1328,9 @@ class LanceDataset(pa.dataset.Dataset):
         for key in list(kwargs):
             if key in LanceDataset._INVERTED_OPTIONS:
                 value = kwargs.pop(key)
+                if key == "language" and value is None:
+                    # pylance's binding extracts the name as a str: None is a TypeError, not English.
+                    raise TypeError("'None' is not an instance of 'str'")
                 if value is not None or key in ("max_token_length", "custom_stop_words"):
                     params[key] = value
         for ignored in ("num_workers", "memory_limit", "progress", "train", "progress_callback",
@@ -3437,6 +3522,8 @@ class LanceScanner(pa.dataset.Scanner):
         self._columns = columns
         self._names = _normalize_columns(columns)
         # Lance's system columns, named in the projection, come back where they were named.
+        self._asked_row_id = bool(with_row_id)  # before `_rowid` in the names turns it on
+        self._asked_row_address = bool(with_row_address)  # before `_rowaddr` in the names turns it on
         self._order = None
         self._row_offset = False
         if self._names is not None and any(n in _SYSTEM_COLUMNS for n in self._names):
@@ -3652,7 +3739,22 @@ class LanceScanner(pa.dataset.Scanner):
             table = table.slice(self._offset, self._limit)
         return table.drop_columns(list(dict.fromkeys(extra))) if extra else table
 
+    _scan_open = False  # True while a to_table() that reports to scan_stats_callback runs (nested reads do not)
+
     def to_table(self) -> pa.Table:
+        callback = self._args.get("scan_stats_callback")
+        if callback is None or self._scan_open:
+            return self._scan_table()
+        self._scan_open = True
+        before = _scan_counters()
+        try:
+            table = self._scan_table()
+        finally:
+            self._scan_open = False
+        callback(_scan_statistics(before, _scan_counters()))
+        return table
+
+    def _scan_table(self) -> pa.Table:
         table = self._to_table()
         if self._expressions is not None:
             table = _evaluate_projection(table, self._expressions)
@@ -3669,11 +3771,11 @@ class LanceScanner(pa.dataset.Scanner):
         if not blobs or blob_mode == "descriptions":
             return table.to_pandas(**kwargs)
         if blob_mode == "bytes":
-            return LanceScanner(self._ds, **{**self._args, "blob_handling": "all_binary"}).to_table().to_pandas(**kwargs)
+            return LanceScanner(self._ds, **{**self._args, "blob_handling": "all_binary", "scan_stats_callback": None}).to_table().to_pandas(**kwargs)
         from .blob import BlobFile
 
         requested = bool(self._args.get("with_row_address"))
-        table = LanceScanner(self._ds, **{**self._args, "with_row_address": True}).to_table()
+        table = LanceScanner(self._ds, **{**self._args, "with_row_address": True, "scan_stats_callback": None}).to_table()
         addresses = table.column("_rowaddr").to_pylist()
         files = {}
         for name in blobs:
@@ -3759,14 +3861,24 @@ class LanceScanner(pa.dataset.Scanner):
         names = self._names
         if self._order is not None and "_distance" in self._order:
             names = [c for c in names if c != "_distance"] if names is not None else None
-        table = self._ds._take(list(ids), names, addresses=True, with_row_id=self._with_row_id,
+        early = self._rowid_before_distance()
+        table = self._ds._take(list(ids), names, addresses=True, with_row_id=self._with_row_id or early,
                                with_row_address=self._with_row_address, blob_handling=self._blob_handling)
         system = [c for c in ("_rowid", "_rowaddr") if c in table.column_names]
         data = table.drop_columns(system)
-        out = data.append_column("_distance", pa.array(distances, pa.float32()))
+        out = data
+        if early and "_rowid" in system:
+            out = out.append_column("_rowid", table.column("_rowid"))
+        out = out.append_column("_distance", pa.array(distances, pa.float32()))
         for c in system:
-            out = out.append_column(c, table.column(c))
+            if c not in out.column_names:
+                out = out.append_column(c, table.column(c))
         return out
+
+    def _rowid_before_distance(self) -> bool:
+        """fast_search returns `_rowid` without it being asked for, before `_distance` (pylance 12); with
+        with_row_id it is one of the row id columns that come last."""
+        return bool(self._fast_search) and not self._asked_row_id
 
     def _nearest_table(self) -> pa.Table:
         """The k nearest rows. A batch (``self._nearest`` a list) runs each query in turn, its rows in query
@@ -3781,8 +3893,13 @@ class LanceScanner(pa.dataset.Scanner):
             out = out.slice(self._offset, self._limit)
         system = [c for c in ("_rowid", "_rowaddr") if c in out.column_names]
         if self._order is not None:
-            # Named columns where named; `_distance`, when not named, after them (as Lance).
-            order = [c for c in self._order if c in out.column_names]
+            # Named columns where named; `_distance`, when not named, after them; the row id columns last,
+            # `_rowid` then `_rowaddr`, wherever they were named (as Lance 12 orders them).
+            # The row id columns asked for with with_row_id / with_row_address go last; named ones stay where
+            # they are named; fast_search's `_rowid` (not asked for) goes before `_distance`.
+            explicit = [c for c in system if (self._asked_row_id if c == "_rowid" else self._asked_row_address)]
+            order = [c for c in self._order if c in out.column_names and c not in explicit]
+            order += [c for c in system if c not in explicit and c not in order]
             if "_distance" not in order and not self._no_score_autoprojection:
                 order.append("_distance")
             order += [c for c in system if c not in order]
@@ -3849,9 +3966,40 @@ class LanceScanner(pa.dataset.Scanner):
     def to_batches(self) -> Iterator[pa.RecordBatch]:
         return self._rebatch(self.to_table())
 
+    def _count_from_index(self):
+        """Count pushdown: the count of the filter from the scalar indices, when they answer it exactly.
+        Returns (indexed, uncovered, lines, scanned): the rows the covered fragments' indices count, the
+        fragments they do not cover and their scanned count, and the index lines. None when the indices
+        do not answer exactly (the caller scans)."""
+        if (self._filter is None or self._post_filter is not None or self._nearest is not None
+                or self._limit is not None or self._offset or self._fragment_ids is not None
+                or not self._use_scalar_index):
+            return None
+        # The answer is a function of the version and the filter (a version never changes), so this
+        # dataset object keeps it: a repeat count reads no index or deletion file. Keyed by version
+        # too -- delete() / insert() move this same object to a new version -- and bounded.
+        memo = self._ds.__dict__.setdefault("_count_from_index_memo", {})
+        key = (self._ds.version, self._filter)
+        if key not in memo:
+            if len(memo) >= 64:
+                memo.clear()
+            with native():
+                memo[key] = _nanolance._ds_count_from_index(self._ds.uri, self._ds.version, self._filter)
+        exact, indexed, uncovered, lines = memo[key]
+        if not exact:
+            return None
+        scanned = 0
+        if uncovered:
+            scanned = LanceScanner(self._ds, columns=[], filter=self._filter, fragments=uncovered,
+                                   with_row_address=True, use_scalar_index=False).to_table().num_rows
+        return indexed, uncovered, lines, scanned
+
     def count_rows(self) -> int:
         if self._fts is not None:
             return len(self._fts_search()[0][self._offset:])
+        counted = self._count_from_index()
+        if counted is not None:
+            return counted[0] + counted[3]
         if self._names is None and not (self._with_row_id or self._with_row_address):
             # Count by reading only what the filter needs (a row address column when it needs nothing).
             counter = LanceScanner(self._ds, columns=[], filter=self._post_filter or self._filter, limit=self._limit,
@@ -3926,10 +4074,14 @@ class LanceScanner(pa.dataset.Scanner):
                         self._ds.uri, self._ds.version, self._filter)]
         return "\n".join(lines)
 
-    def analyze_plan(self) -> str:
+    def analyze_plan(self, *, count_rows: bool = False) -> str:
         """The plan, after running the scan. A filtered scan without a scalar index reads every row of
         its fragments (the filter is evaluated over them), so rows_scanned is their physical row count;
-        with an index the scan reads only what the index returns and rows_scanned is not reported."""
+        with an index the scan reads only what the index returns and rows_scanned is not reported.
+        ``count_rows=True``: the plan of the count (``count_rows()``), which an exact scalar index can
+        answer from its mask (CountFromMask) for the fragments it covers."""
+        if count_rows:
+            return self._count_plan()
         plan = self.explain_plan()
         if self._filter is None or self._nearest is not None or self._fts is not None:
             return plan
@@ -3940,6 +4092,21 @@ class LanceScanner(pa.dataset.Scanner):
                      if self._fragment_ids is None or f.fragment_id in self._fragment_ids]
             metrics += [f"rows_scanned={sum(f.physical_rows for f in frags)}", f"fragments_scanned={len(frags)}"]
         return self._explain(metrics)
+
+    def _count_plan(self) -> str:
+        counted = self._count_from_index()
+        if counted is None:
+            return self.analyze_plan()
+        indexed, uncovered, lines, scanned = counted
+        body = [f"CountFromMask: output_rows={indexed}"] + [f"  {line}" for line in lines]
+        if uncovered:
+            # The fragments no index covers are scanned, and their count added to the masked one.
+            scan = [f"AggregateExec: mode=Partial, aggr=[count(*)], output_rows={scanned}",
+                    f"  LanceRead: projection=[], fragments={uncovered}, filter={self._filter}"]
+            body = ["UnionExec"] + ["  " + line for line in body + scan]
+        final = ["AggregateExec: mode=Final, aggr=[count(*)], output_rows=1"] + ["  " + line for line in body]
+        return "\n".join([f"nanolance count of {self._ds.uri} v{self._ds.version}"]
+                         + ["  " + line for line in final])
 
 
 class ScannerBuilder:

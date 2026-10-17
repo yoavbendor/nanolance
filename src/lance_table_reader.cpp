@@ -1435,7 +1435,14 @@ bool build_batch_from_schema(const ArrowSchema& batch_schema, const LanceSchemaM
             switch (plan.kind) {
                 case ColumnPlan::Kind::Skip:
                 case ColumnPlan::Kind::FixedSizeList:  // refused above: this path builds no nested arrays
-                    break;
+                case ColumnPlan::Kind::Dictionary:
+                    // Dictionary columns are filled only by the bulk path; refuse rather than leave
+                    // the column short in a batch that took this one.
+                    error = "column '" + plan.field->name +
+                            "': a dictionary-encoded column cannot be read in the same batch as a skipped "
+                            "logical field or a lance.blob.v2 column";
+                    ArrowArrayRelease(&batch);
+                    return false;
                 case ColumnPlan::Kind::Variable:
                     if (!append_string_at_row(*plan.array, plan.values->variable, static_cast<std::size_t>(row),
                                               error)) {

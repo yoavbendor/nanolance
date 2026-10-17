@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Yoav Bendor
 
 #include "nanolance/fts_search.hpp"
+#include "nanolance/work_stats.hpp"
 #include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
 
@@ -102,14 +103,21 @@ bool match_from(const Value& m, FtsQuery& q, std::string& error) {
         error = "malformed match query";
         return false;
     }
+    // Out-of-range numbers saturate (the bindings reject them first; a converted double must not overflow).
+    const auto saturate = [](double v) {
+        if (!(v > 0.0)) {
+            return std::uint32_t{0};
+        }
+        return v >= 4294967295.0 ? std::uint32_t{4294967295U} : static_cast<std::uint32_t>(v);
+    };
     q.boost = static_cast<float>(boost);
-    q.max_expansions = static_cast<std::uint32_t>(max_expansions);
-    q.prefix_length = static_cast<std::uint32_t>(prefix_length);
+    q.max_expansions = saturate(max_expansions);
+    q.prefix_length = saturate(prefix_length);
     const Value* fuzz = m.get("fuzziness");
     if (fuzz != nullptr && fuzz->kind == Value::Null) {
-        q.fuzziness.reset();
+        q.fuzziness.reset();  // None: exact matching, as pylance's default
     } else if (fuzz != nullptr && fuzz->kind == Value::Number) {
-        q.fuzziness = static_cast<std::uint32_t>(fuzz->n);
+        q.fuzziness = saturate(fuzz->n);
     }
     return operator_field(m, q.and_operator, error);
 }
@@ -820,9 +828,11 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
     const auto meta = dir / "metadata.lance";
     const std::string key = index_files::file_key(meta);
     if (auto hit = index_cache().find(key)) {
+        work_stats::count_index_cache(true);
         out = hit;
         return true;
     }
+    work_stats::count_index_cache(false);
     auto index = std::make_shared<InvertedIndex>();
     bool found = false;
     const std::string format = metadata_value(meta, "format_version", found, error);
@@ -1065,6 +1075,7 @@ struct Search {
     bool match(const FtsQuery& q, const std::string& column, float boost, Hits& out, std::string& error);
     /// A phrase query in progress (match() with every term required, and their positions checked).
     bool phrase_ = false;
+    bool flat_pass_ = false;  // a fuzzy query's pass over the unindexed fragments alone (exact tokens)
     std::uint32_t slop_ = 0;
     /// A partition's scored documents with `need` marks, in row order, into `sink`; the buffers
     /// left zeroed.
@@ -1299,6 +1310,118 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
     return ok;
 }
 
+// Fuzzy matching (Match with fuzziness k > 0): a query token expands to the dictionary terms within k
+// edits of it, where an insertion, deletion or substitution is one edit and a transposition is two
+// (measured against pylance 12.0.0). Only terms that start with the token's first prefix characters
+// qualify, and the first of them in key order are kept (pylance's order, not distance or document
+// frequency). max_expansions is one budget for the whole query: the query's tokens spend it in order.
+
+// The code points of a UTF-8 string; a byte that does not start a valid sequence stands for itself.
+std::vector<char32_t> code_points(const std::string& s) {
+    std::vector<char32_t> out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size();) {
+        const auto b0 = static_cast<unsigned char>(s[i]);
+        std::size_t extra = 0;
+        char32_t cp = b0;
+        if ((b0 & 0xE0U) == 0xC0U) {
+            extra = 1;
+            cp = b0 & 0x1FU;
+        } else if ((b0 & 0xF0U) == 0xE0U) {
+            extra = 2;
+            cp = b0 & 0x0FU;
+        } else if ((b0 & 0xF8U) == 0xF0U) {
+            extra = 3;
+            cp = b0 & 0x07U;
+        }
+        bool valid = extra > 0 && i + extra < s.size();
+        for (std::size_t j = 1; valid && j <= extra; ++j) {
+            const auto bj = static_cast<unsigned char>(s[i + j]);
+            valid = (bj & 0xC0U) == 0x80U;
+            cp = (cp << 6U) | (bj & 0x3FU);
+        }
+        if (!valid) {
+            cp = b0;
+            extra = 0;
+        }
+        out.push_back(cp);
+        i += extra + 1;
+    }
+    return out;
+}
+
+// Whether the edit distance between a and b is at most k (Levenshtein, with rows that cannot get back
+// under k abandoned early). prev and cur are scratch rows, reused across terms.
+bool within_edits(const std::vector<char32_t>& a, const std::vector<char32_t>& b, std::size_t k,
+                  std::vector<std::size_t>& prev, std::vector<std::size_t>& cur) {
+    const std::size_t n = a.size();
+    const std::size_t m = b.size();
+    if ((n > m ? n - m : m - n) > k) {
+        return false;
+    }
+    prev.resize(m + 1);
+    cur.resize(m + 1);
+    for (std::size_t j = 0; j <= m; ++j) {
+        prev[j] = j;
+    }
+    for (std::size_t i = 1; i <= n; ++i) {
+        cur[0] = i;
+        std::size_t row_min = cur[0];
+        for (std::size_t j = 1; j <= m; ++j) {
+            const std::size_t substitute = prev[j - 1] + (a[i - 1] == b[j - 1] ? 0U : 1U);
+            cur[j] = std::min(substitute, std::min(prev[j] + 1, cur[j - 1] + 1));
+            row_min = std::min(row_min, cur[j]);
+        }
+        if (row_min > k) {
+            return false;
+        }
+        std::swap(prev, cur);
+    }
+    return prev[m] <= k;
+}
+
+// The dictionary terms `token` expands to, in key order, at most max_expansions of them.
+bool expand_token(const InvertedIndex& index, const std::string& token, std::uint32_t k, std::uint32_t prefix,
+                  std::uint32_t max_expansions, std::vector<std::string>& out, std::string& error) {
+    const std::vector<char32_t> query = code_points(token);
+    const std::size_t keep = std::min<std::size_t>(prefix, query.size());
+    std::set<std::string> found;
+    std::vector<std::size_t> prev;
+    std::vector<std::size_t> cur;
+    const auto consider = [&](std::string_view key) {
+        const std::vector<char32_t> term = code_points(std::string(key));
+        if (term.size() < keep || !std::equal(query.begin(), query.begin() + static_cast<std::ptrdiff_t>(keep),
+                                              term.begin())) {
+            return;
+        }
+        if (within_edits(query, term, k, prev, cur)) {
+            found.emplace(key);
+        }
+    };
+    for (const auto& part : index.partitions) {
+        if (part->use_fst) {
+            const bool ok = part->fst.for_each(
+                [&](std::string_view key, std::uint64_t) { consider(key); });
+            if (!ok) {
+                error = "the full-text index's token dictionary is malformed";
+                return false;
+            }
+        } else {
+            for (const auto& entry : part->token_map) {
+                consider(entry.first);
+            }
+        }
+    }
+    out.clear();
+    for (const auto& term : found) {
+        if (out.size() >= max_expansions) {
+            break;
+        }
+        out.push_back(term);
+    }
+    return true;
+}
+
 bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hits& out, std::string& error) {
     auto it = columns.find(column);
     if (it == columns.end()) {
@@ -1335,12 +1458,56 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
     if (columns.count(column) != 0U) {
         ++indexed_used_;
     }
-    if (q.fuzziness.value_or(1U) != 0U) {
-        error = "fuzzy full-text matching (fuzziness != 0) is not supported by nanolance";
-        return false;
-    }
     std::vector<fts::Token> query_tokens;
     c.index->analyzer.tokenize(q.text, query_tokens);
+    // Fuzzy (pylance's rule, measured): the indexed rows match each token's expansions, one budget for
+    // the query; the unindexed fragments match the query's exact tokens, scored as an exact query would.
+    // The fragments are a pass of their own (exact tokens, no indexed rows), merged into this one's hits.
+    const std::uint32_t fuzziness = q.fuzziness.value_or(0U);
+    const bool fuzzy = fuzziness > 0U && !phrase_ && !flat_pass_;
+    Hits fragment_hits;
+    if (fuzzy) {
+        // Each query token becomes its expansions, all at the token's position: they are one group there
+        // (AND needs one of them in a document) and each scores as its own term, as an OR of terms does.
+        std::vector<fts::Token> expanded;
+        std::vector<std::string> terms;
+        bool some_token_has_no_term = false;
+        // One budget for the whole query, spent in query-token order (a term two tokens share uses two).
+        std::uint32_t budget = q.max_expansions;
+        for (const auto& t : query_tokens) {
+            if (!expand_token(*c.index, t.text, fuzziness, q.prefix_length, budget, terms, error)) {
+                return false;
+            }
+            budget -= static_cast<std::uint32_t>(terms.size());
+            some_token_has_no_term = some_token_has_no_term || terms.empty();
+            for (auto& term : terms) {
+                fts::Token token;
+                token.text = std::move(term);
+                token.position = t.position;
+                expanded.push_back(std::move(token));
+            }
+        }
+        FtsQuery exact = q;
+        exact.fuzziness = 0;
+        flat_pass_ = true;
+        const bool ok = match(exact, column, 1.0F, fragment_hits, error);
+        flat_pass_ = false;
+        if (!ok) {
+            return false;
+        }
+        // AND with a token that has no indexed term: no indexed row can match, only the fragments can.
+        if ((some_token_has_no_term && q.and_operator) || expanded.empty()) {
+            if (boost != 1.0F) {
+                for (auto& h : fragment_hits) {
+                    h.second *= boost;
+                }
+            }
+            sort_hits(fragment_hits);
+            out = std::move(fragment_hits);
+            return true;
+        }
+        query_tokens = std::move(expanded);
+    }
     if (query_tokens.empty()) {
         return true;
     }
@@ -1474,7 +1641,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         const std::size_t n = part.row_ids.size();
         const auto norms = part.length_norms(avg);
         const float* norm = norms->data();
-        if (nt == 1U && sink.limited() && !check_phrase) {
+        if (!flat_pass_ && nt == 1U && sink.limited() && !check_phrase) {
             // One word, the best rows only: its runs best first, until no run can beat the rows
             // kept. (A word repeated in the query scores its weight that many times over, which
             // keeps the order.)
@@ -1580,13 +1747,25 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
                               error)) {
             return false;
         }
-        emit(part, need, sink);
+        if (flat_pass_) {
+            // The indexed rows belong to the other pass; only the scoring buffers are cleared here.
+            for (const std::uint32_t d : touched_) {
+                scores_[d] = 0.0F;
+                seen_[d] = 0U;
+            }
+            touched_.clear();
+        } else {
+            emit(part, need, sink);
+        }
     }
     // Documents outside the index: their scores from the index's statistics and theirs.
     if (!scan_flat(c, error)) {
         return false;
     }
-    if (!c.flat.addrs.empty()) {
+    for (const auto& h : fragment_hits) {
+        sink.add(h.first, h.second);
+    }
+    if (!fuzzy && !c.flat.addrs.empty()) {
         const std::uint64_t n = c.num_docs + c.flat.addrs.size();
         const float flat_avg = static_cast<float>(c.total_tokens + c.flat.total_tokens) / static_cast<float>(n);
         std::vector<std::uint64_t> docs = token_docs;

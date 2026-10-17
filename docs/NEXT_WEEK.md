@@ -1,0 +1,125 @@
+# Next week (written 2026-10-17)
+
+Where things stand, and what is left, in one place. Each item names its size (one delegated Haiku
+session, or several, or Opus work) and where its notes are. The detailed history stays in
+`docs/ROADMAP.md` and the task specs in `docs/tasks/`.
+
+## Where nanolance stands
+
+- pylance 12.0.0's own suite against `nanolance.lance`: **1,200 expected passes** (1,171 at the
+  start of this week). `tools/pylance_suite.py` checks them; `--update` records new ones.
+- nanolance's own tests: ctest 63 / 63; pytest `bindings/python/tests` 3,386 passed, 20 skipped,
+  1 xfailed (2026-10-17).
+- Performance against Rust Lance and pylance: see "Performance" below (benchmarks re-run
+  2026-10-17).
+
+## Correctness: known divergences (decide or fix)
+
+These return an answer pylance would not. None is silent data corruption; each is recorded so
+a user report can be matched to it.
+
+| what | nanolance | pylance | size | notes |
+|---|---|---|---|---|
+| Index caches | process-wide, keyed by file | per dataset session | 1-2 sessions (thread a session through the index loaders) | a fresh dataset object reports cache hits where pylance reports misses; ROADMAP "Scan statistics" |
+| `io_stats_incremental()` | process-wide counters, per-object deltas | per object | 1 session | reads by other dataset objects between two calls are included |
+| Filters with literals that do not fit (`i16 > 40000`, `i32 = 7.0`) | return rows | coercion error | design call | EXPR_TYPES reviewer decision (1): kept on purpose |
+| Mixed-unit duration arithmetic | refused | month_day_nano interval | small if wanted | EXPR_TYPES decision (3) |
+| `arrow_cast(2.5, 'Duration(..)')` | error | empty result | -- | kept on purpose |
+| Struct field names | case-insensitive (`s.X` works) | refused | small | older divergence, EXPR_TYPES B notes |
+| Fuzzy FTS, huge fuzziness | expands to every term within k | `Levenshtein automaton exceeds size limit of 10000 states` | port the automaton bound | ROADMAP "Fuzzy FTS, the rest" |
+| Fuzzy FTS, accented query tokens | char-level distance | a rule not yet pinned down | measure first | same |
+| FTS / phrase cache hit-miss counts | right direction, other numbers | per page | small | ScanStatistics `indices_loaded`, `index_comparisons` are 0 |
+
+## Features left, smallest first
+
+| item | pylance tests | size | notes |
+|---|---|---|---|
+| Write data storage versions 2.1 / 2.0 | 85 | format research (Opus) + sessions | the largest group of pylance failures; see the suite breakdown below |
+| `Compaction.plan`, `lance.debug.format_fragment`, `lance.util.KMeans`, `lance.pydantic.Vector` | 3-4 each | small each | |
+| lance-c prepared fuzzy FTS (`lance_dataset_prepare_fts_match_query` with fuzziness) | -- | small | the fuzzy query exists |
+| Expression leftovers: `l[1 + 1]`, projecting a struct element `ls[1]`, `array_element(...)`, `ts - arrow_cast(ts, 'Timestamp(..)')` (unit dropped), arrow_cast of a column to Duration, `coalesce(ts, ts_ms)` (coarser unit), `d32 - ts`, `dec + i32 * 1` (strict xfail), comparisons as projections keep old typing | ~0 directly | 1 session | `docs/tasks/EXPR_TYPES.md` outcomes A1-C3 |
+| LABEL_LIST exact counts from the index; ScalarIndexQuery metrics in the count plan | -- | small | ROADMAP "Count from an exact scalar-index mask" |
+| Validate a fuzzy token's dictionary scan cost (~0.15 s per token on 1M terms) -- an FST walk | -- | 1 session | perf, not correctness |
+| Stemming and stop words for languages other than English | several | 1-2 sessions | the 18 language names are validated already |
+| External blob URIs under a registered base path | 1 | 1 session, Opus review | touches the external-blob writer |
+| IVF on binary vectors (IVF_FLAT hamming, `IvfModel` hamming, `hamming_clustering_for_ivf_partition`, multi-segment) | 4 | several sessions | the vector path is float-only; pylance's format is measured in ROADMAP "Binary vectors" |
+| IVF_RQ (RaBitQ) | 6 | format research (Opus) + 2-3 sessions | the most important search feature left |
+| icu / jieba / lindera tokenizers | 15 | large (external libraries, dictionaries) | CJK users only |
+| MSVC: build the Windows job once | -- | run `ci-platforms.yml` by hand | the portable 128-bit path is tested on Linux only |
+
+## Flaky tests to watch
+
+- `tests/test_index_optimize.py::test_optimize_after_append[nanolance]` (~1 run in 15-90): IVF_PQ
+  distances after pylance's vs nanolance's `optimize_indices` differ (ROADMAP).
+- `test_hnsw.py::test_new_kinds_match_pylance[True-dot-IVF_SQ]`: failed once with two full runs
+  at once; passes alone.
+
+## Performance
+
+Re-run 2026-10-17 on this 4-core container (`bench/results/*.json`, `docs/BENCHMARKS.md`,
+`bench/results/report.html`). Ratios are the other engine's time over nanolance's: above 1 means
+nanolance is faster. "1c" pins both to one core; "mt" is all cores; "py" is through Python
+(nanolance.lance against pylance).
+
+**Against Rust Lance, 27 data types (geometric means):**
+
+| | 1 core | all cores | Python |
+|---|---|---|---|
+| write | 1.45x | 1.71x | 1.86x |
+| read (files written by Rust) | 1.84x | 3.78x | 3.34x |
+
+**Against pylance, indexes (geometric means):** scalar index builds and queries 2.09x, vector
+indexes 2.86x (IVF_FLAT, IVF_PQ, IVF_HNSW_SQ; recall equal), full-text 2.61x.
+
+**Where Rust Lance is faster** (ratio below 1), the work for next week's performance pass:
+
+| shape | 1-core write | all-core write | 1-core read | what is known |
+|---|---|---|---|---|
+| map<string, int64> | 0.67 | 0.84 | 0.85 | nested write: four threads no faster than one; ~20 ms/write of fresh page faults; most time outside the rep/def serializer and page build (ROADMAP perf notes) |
+| list<string> | 1.20 | 0.66 | 1.08 | same nested-write path |
+| list<struct> | 0.78 | 0.94 | 0.63 | nested write and read |
+| list<list<int32>> | 1.06 | 1.22 | 0.73 (mt 0.98) | nested read |
+| struct_mixed | 0.76 | 0.91 | 1.11 | |
+| string_long / string_urls / binary_blobs | 0.77-0.93 | 0.96-1.36 | > 1 | single-core string writes |
+| vector_f32x128 | 0.94 | 1.17 | 1.35 | |
+| bool_flags | 0.78 | 2.14 | 5.05 | single-core boolean write |
+| string_lowcard | 1.40 | 1.00 | 0.99 | |
+| BTREE build on numeric columns | -- | 0.85-0.90 (pylance) | -- | bimodal run to run: 0.95 s or 1.45 s (pylance steady 1.2-1.3 s); find the slow mode |
+
+**Checked against older builds, so the numbers above are not regressions.** Today's ratios are
+lower than the committed 26 September run (single-core reads 3.7x then, 1.8x now), but Rust itself
+is ~1.4x slower on this machine today, and the 26 September build (`f852c5a`, worktree
+`/home/user/nl-baseline`) and today's measure the same on the same machine: int64 / float64 /
+string reads within noise, long-string writes level. Two things to measure properly: small-column
+single-core writes look ~1-2 ms slower than on 26 September (8-11 ms vs 6-9 ms for 2M int32;
+likely the per-commit transaction file, which Lance writes too), and a full-text
+change this week was A/B-timed level. Benchmark on a quiet machine before and after each
+optimization; compare engines within one run (ratios), never across days.
+
+## pylance's suite: what the 287 remaining failures are
+
+`COLUMNS=400 python3 tools/pylance_suite.py`, failures grouped by message (2026-10-17):
+
+| failures | cause | size |
+|---|---|---|
+| 85 | writing `data_storage_version` 2.0 / 2.1 (nanolance writes 2.2; reads all three) -- 72 of them in test_blob.py, parametrized over versions | **the biggest single lever**: a writer for 2.1 (and 2.0) layouts; format research first (Opus), then sessions |
+| 20 | icu / jieba / lindera tokenizers | large |
+| 17 | `mem_wal` (`initialize_mem_wal`, ...) | a subsystem; tier 4 |
+| 5 | IVF over binary vectors (hamming metric) | several sessions |
+| 5 | IVF_RQ | format research + sessions |
+| 5 | `lance.lance._ObjectStoreRegistry` (custom object stores) | small-medium |
+| 4 | table branches | medium |
+| 4 | `Compaction.plan` (the compaction planner as an API) | small: the planner exists |
+| 4 | full-text search over list columns | 1 session |
+| 3 each | `lance.util.KMeans`, `lance.pydantic.Vector`, `lance.debug.format_fragment`, `LanceFragment.update_columns` of a blob column | small each |
+| ~120 | assertion mismatches and one-offs | need grouping by test |
+
+## How to work (what worked this week)
+
+- One Haiku session per item, with pylance's behaviour measured first and written into its prompt
+  or spec; a stop rule for anything touching shared planning code; Opus reviews the diff, re-runs
+  the checks, answers questions, commits. Haiku sessions run ~100-200k tokens.
+- Review catches that mattered this week: a count memo keyed by filter only (stale after
+  `delete()`), a reader path that silently returned a short dictionary column, `__int128` breaking
+  MSVC, a full-text change that needed an A/B timing to show it was not slower.
+- Run one full pytest at a time; two at once caused one spurious failure.

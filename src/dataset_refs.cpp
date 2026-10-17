@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/work_stats.hpp"
 #include <nanolance/dataset_refs.hpp>
 
 #include <nanolance/manifest_reader.hpp>
@@ -77,6 +78,7 @@ bool read_text(const fs::path& path, std::string& out) {
     std::ostringstream buffer;
     buffer << in.rdbuf();
     out = buffer.str();
+    work_stats::count_read(out.size());
     return static_cast<bool>(in) || in.eof();
 }
 
@@ -94,6 +96,7 @@ bool write_file(const fs::path& path, const std::string& bytes, bool replace, bo
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
         out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         out.close();
+        work_stats::count_written_file(temp);
         if (!out) {
             fs::remove(temp, ec);
             error = "failed to write " + path.string();
@@ -676,7 +679,7 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
             const auto modified_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          fs::file_time_type::clock::to_sys(modified).time_since_epoch())
                                          .count();
-            if (!all && modified_ns > *cutoff_ns) {
+            if (!all && cutoff_ns && modified_ns > *cutoff_ns) {
                 continue;  // modified after the earliest kept version
             }
             file.maybe_in_progress = !policy.delete_unverified && age < kUnverifiedThresholdNs;

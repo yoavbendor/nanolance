@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/work_stats.hpp"
 #include "nanolance/deletion_vector.hpp"
 
 #include <nanoarrow/nanoarrow.h>
@@ -690,6 +691,7 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
         return false;
     }
     std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    work_stats::count_read(bytes.size());
     if (!in.eof() && in.fail()) {
         error = "failed to read deletion file " + name;
         return false;
@@ -810,6 +812,10 @@ bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_
          ArrowIpcWriterWriteSchema(&writer, &schema, &aerr) == NANOARROW_OK &&
          ArrowIpcWriterWriteArrayView(&writer, &view, &aerr) == NANOARROW_OK &&
          ArrowIpcWriterFinalizeFile(&writer, &aerr) == NANOARROW_OK;
+    if (ok) {
+        std::fflush(file);
+        work_stats::count_written_file(path);
+    }
     cleanup();
     if (!ok) {
         error = std::string("failed to write the deletion file: ") + aerr.message;

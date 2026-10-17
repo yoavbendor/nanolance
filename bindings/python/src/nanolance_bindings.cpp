@@ -46,6 +46,8 @@
 #include <string>
 #include <vector>
 
+#include "nanolance/work_stats.hpp"
+
 namespace nb = nanobind;
 using nanolance_py::arrow_capsule::BatchIterator;
 using nanolance_py::arrow_capsule::ExportedSchema;
@@ -1110,6 +1112,18 @@ NB_MODULE(_nanolance, m) {
           "Threads nanolance may use (1: all work on the calling thread; 0: the default).");
     m.def("get_threads", [] { return nano_lance_threads(); },
           "Threads nanolance may use: set_threads, else NANOLANCE_THREADS, else the CPUs available.");
+    m.def("_io_counters", [] {
+        // Process-wide file I/O (see nanolance/work_stats.hpp); LanceDataset.io_stats_incremental() diffs it.
+        const auto& c = nano_lance::work_stats::io_counters();
+        return nb::make_tuple(c.read_iops.load(std::memory_order_relaxed), c.read_bytes.load(std::memory_order_relaxed),
+                              c.write_iops.load(std::memory_order_relaxed),
+                              c.written_bytes.load(std::memory_order_relaxed));
+    });
+    m.def("_index_cache_counters", [] {
+        // Process-wide index cache lookups (see nanolance/work_stats.hpp); LanceScanner diffs them per scan.
+        const auto& c = nano_lance::work_stats::index_cache_counters();
+        return nb::make_tuple(c.hits.load(std::memory_order_relaxed), c.misses.load(std::memory_order_relaxed));
+    });
     m.def("_work_stats", [] {
         NanoLanceWorkStats w{};
         nano_lance_work_stats(&w);
@@ -1994,6 +2008,15 @@ NB_MODULE(_nanolance, m) {
         });
         return lines;
     });
+    m.def("_ds_count_from_index", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
+                                     const std::string& filter) {
+        nano_lance::IndexCount counted;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_count_from_index(path, version.has_value(), version.value_or(0), filter,
+                                                        counted, e);
+        });
+        return nb::make_tuple(counted.exact, counted.count, counted.uncovered, counted.lines);
+    });
     m.def("_ds_nearest", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
                             const std::string& column, const std::vector<float>& key, std::uint64_t k,
                             std::uint32_t minimum_nprobes, std::optional<std::uint32_t> maximum_nprobes,
@@ -2018,7 +2041,9 @@ NB_MODULE(_nanolance, m) {
         q.minimum_nprobes = minimum_nprobes;
         q.maximum_nprobes = maximum_nprobes;
         q.refine_factor = refine_factor;
-        if (metric) {
+        if (metric && *metric == "hamming") {
+            q.hamming = true;
+        } else if (metric) {
             nano_lance::VectorMetric m;
             if (!nano_lance::parse_vector_metric(*metric, m)) {
                 throw nb::value_error(("unknown distance type '" + *metric + "'").c_str());

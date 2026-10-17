@@ -50,7 +50,7 @@ class StubModule(types.ModuleType):
 
 # pylance's modules (v12) that nanolance has no implementation of. Importing one gives a StubModule.
 PYLANCE_MODULES = {
-    "_arrow", "_arrow.bf16", "_datagen", "_dataset", "_dataset.cache",
+    "_arrow", "_arrow.bf16", "_dataset", "_dataset.cache",
     "bitmap", "debug", "download", "hf", "indices",
     "indices.builder", "indices.ivf", "indices.pq", "io", "lance", "mem_wal",
     "otel", "schema", "torch", "torch.async_dataset", "torch.bench_utils", "torch.data",

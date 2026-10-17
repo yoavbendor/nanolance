@@ -5,6 +5,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
+#include <system_error>
+#include <utility>
 
 /// Counters of the work nanolance did -- bytes read from data files, page windows decoded, row ranges
 /// a read was cut into, bytes a write buffered -- for tests that guard HOW a result was produced, not
@@ -51,6 +54,76 @@ inline void reset() {
                     &c.buffer_pool_misses, &c.take_cache_hits, &c.indexed_fragments}) {
         x->store(0, std::memory_order_relaxed);
     }
+}
+
+/// Object-store style I/O counters (what pylance reports as IOStats): every file read or write nanolance
+/// issues, data, index, manifest, deletion and transaction files alike. A read is one ranged read call
+/// (a file open is not counted). Process-wide and never reset: a LanceDataset reports the difference
+/// since its last io_stats_incremental() call, so the counts are independent of reset().
+struct IoCounters {
+    std::atomic<std::uint64_t> read_iops{0};
+    std::atomic<std::uint64_t> read_bytes{0};
+    std::atomic<std::uint64_t> write_iops{0};
+    std::atomic<std::uint64_t> written_bytes{0};
+};
+
+inline IoCounters& io_counters() {
+    static IoCounters c;
+    return c;
+}
+
+/// One read of \p bytes bytes. Relaxed atomics: a read costs two uncontended increments.
+inline void count_read(std::uint64_t bytes) {
+    auto& c = io_counters();
+    add(c.read_iops, 1U);
+    add(c.read_bytes, bytes);
+}
+
+/// One write of \p bytes bytes.
+inline void count_write(std::uint64_t bytes) {
+    auto& c = io_counters();
+    add(c.write_iops, 1U);
+    add(c.written_bytes, bytes);
+}
+
+/// One written file, counted by its size once it is complete (call it after the file is closed, or after
+/// a flush of the stream that wrote it).
+inline void count_written_file(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (!ec) {
+        count_write(static_cast<std::uint64_t>(size));
+    }
+}
+
+/// Counts a file once it is complete: declare it before the stream that writes the file, so the stream
+/// is closed (and flushed) before the size is taken.
+struct WrittenFileTally {
+    std::filesystem::path path;
+    explicit WrittenFileTally(std::filesystem::path file) : path(std::move(file)) {}
+    WrittenFileTally(const WrittenFileTally&) = delete;
+    WrittenFileTally& operator=(const WrittenFileTally&) = delete;
+    ~WrittenFileTally() { count_written_file(path); }
+};
+
+/// Index cache lookups, process-wide: a lookup answered by a loaded index (or a loaded IVF partition) is a
+/// hit, one that had to load it from the index files a miss. Scalar indices count one lookup per index
+/// part a query needed (a B-tree page, one bitmap value, an inverted index), vector search one per partition.
+/// Never reset: a scan reports the difference between two reads (see nanolance._index_cache_counters).
+struct IndexCacheCounters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+};
+
+inline IndexCacheCounters& index_cache_counters() {
+    static IndexCacheCounters c;
+    return c;
+}
+
+/// One index cache lookup: \p hit when the index was already loaded. Relaxed atomics, one increment.
+inline void count_index_cache(bool hit) {
+    auto& c = index_cache_counters();
+    add(hit ? c.hits : c.misses, 1U);
 }
 
 }  // namespace nano_lance::work_stats

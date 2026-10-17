@@ -13,6 +13,7 @@
 #include "index_files.hpp"
 
 #include "nanolance/dataset_commit.hpp"
+#include "nanolance/deletion_vector.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/index_search.hpp"
 #include "nanolance/lance_file_writer.hpp"
@@ -27,6 +28,7 @@
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
+#include <type_traits>
 #include "nanolance/bloom_filter.hpp"
 #include "nanolance/fts_tokenizer.hpp"
 #include "nanolance/jsonb.hpp"
@@ -86,7 +88,7 @@ struct Items {
     bool is_null(std::size_t k) const { return ArrowArrayViewIsNull(views[view[k]], index[k]); }
 };
 
-enum class KeyKind { Int, UInt, Float16, Float32, Float64, Bool, Bytes, Decimal128 };
+enum class KeyKind { Int, UInt, Float16, Float32, Float64, Bool, Bytes, Decimal128, Decimal256 };
 
 bool key_kind_of(const ArrowSchemaView& type, KeyKind& kind, std::string& error) {
     switch (type.storage_type) {
@@ -123,6 +125,9 @@ bool key_kind_of(const ArrowSchemaView& type, KeyKind& kind, std::string& error)
         return true;
     case NANOARROW_TYPE_DECIMAL128:
         kind = KeyKind::Decimal128;
+        return true;
+    case NANOARROW_TYPE_DECIMAL256:
+        kind = KeyKind::Decimal256;
         return true;
     default:
         error = std::string("a scalar index on a column of type ") + ArrowTypeString(type.type) +
@@ -183,6 +188,52 @@ void parallel_sort(std::vector<T>& v, Less less) {
                        from->begin() + static_cast<std::ptrdiff_t>(mid), from->begin() + static_cast<std::ptrdiff_t>(b),
                        to->begin() + static_cast<std::ptrdiff_t>(a), less);
         });
+        std::swap(from, to);
+    }
+    if (from != &v) {
+        v.swap(other);
+    }
+}
+
+/// Stable LSD radix sort of `v` by `bits(entry)`, an unsigned integer, a byte per pass; a byte all
+/// keys share is skipped (ids 0..5M take 3 passes of 8). Entries that tie keep their order. A
+/// comparison sort of 5M random int64 keys was most of a BTREE build.
+template <typename T, typename Bits>
+void radix_sort(std::vector<T>& v, Bits bits) {
+    using U = decltype(bits(v.front()));
+    constexpr std::size_t kBytes = sizeof(U);
+    const std::size_t n = v.size();
+    if (n < 2048U) {
+        std::stable_sort(v.begin(), v.end(), [&](const T& a, const T& b) { return bits(a) < bits(b); });
+        return;
+    }
+    std::vector<std::array<std::size_t, 256>> counts(kBytes);
+    for (auto& c : counts) {
+        c.fill(0);
+    }
+    for (const auto& e : v) {
+        const U key = bits(e);
+        for (std::size_t b = 0; b < kBytes; ++b) {
+            ++counts[b][static_cast<std::size_t>((key >> (8U * b)) & 0xFFU)];
+        }
+    }
+    std::vector<T> other(n);
+    auto* from = &v;
+    auto* to = &other;
+    for (std::size_t b = 0; b < kBytes; ++b) {
+        auto& c = counts[b];
+        if (std::any_of(c.begin(), c.end(), [n](std::size_t k) { return k == n; })) {
+            continue;  // every key has the same byte here
+        }
+        std::size_t at = 0;
+        for (auto& k : c) {
+            const auto here = k;
+            k = at;
+            at += here;
+        }
+        for (const auto& e : *from) {
+            (*to)[c[static_cast<std::size_t>((bits(e) >> (8U * b)) & 0xFFU)]++] = e;
+        }
         std::swap(from, to);
     }
     if (from != &v) {
@@ -256,6 +307,34 @@ struct Int128Hash {
     }
 };
 
+/// A decimal256's value: the four 64-bit words of its two's-complement integer, least significant
+/// first (the top word is signed, so the sign decides the order before the lower words do).
+struct Int256 {
+    std::array<std::uint64_t, 4> w{};
+    bool operator<(const Int256& o) const {
+        if (w[3] != o.w[3]) {
+            return static_cast<std::int64_t>(w[3]) < static_cast<std::int64_t>(o.w[3]);
+        }
+        for (std::size_t k = 3; k-- > 0;) {
+            if (w[k] != o.w[k]) {
+                return w[k] < o.w[k];
+            }
+        }
+        return false;
+    }
+    bool operator==(const Int256& o) const { return w == o.w; }
+};
+
+struct Int256Hash {
+    std::size_t operator()(const Int256& v) const {
+        std::uint64_t h = 0;
+        for (const auto word : v.w) {
+            h = (h ^ word) * 0x9E3779B97F4A7C15ULL;
+        }
+        return std::hash<std::uint64_t>()(h);
+    }
+};
+
 template <typename K>
 struct KeyHash {
     using type = std::hash<K>;
@@ -267,6 +346,10 @@ struct KeyHash<StringKey> {
 template <>
 struct KeyHash<Int128> {
     using type = Int128Hash;
+};
+template <>
+struct KeyHash<Int256> {
+    using type = Int256Hash;
 };
 
 /// BTree order: every value sorted, ties by row address.
@@ -291,10 +374,20 @@ void sort_all(const Items& items, Extract extract, Sorted& out) {
     if (out.nulls > 0U) {
         out.group_starts.push_back(0);
     }
-    // Items are in row-address order, so the item number breaks ties by address.
-    parallel_sort(entries, [](const Entry& a, const Entry& b) {
-        return a.key < b.key || (!(b.key < a.key) && a.item < b.item);
-    });
+    // Items are in row-address order, so the item number breaks ties by address (a stable sort
+    // keeps it).
+    if constexpr (std::is_integral_v<K>) {
+        using U = std::make_unsigned_t<K>;
+        radix_sort(entries, [](const Entry& e) {
+            // Signed keys with the sign bit flipped order as unsigned ones.
+            return std::is_signed_v<K> ? static_cast<U>(static_cast<U>(e.key) ^ (U{1} << (sizeof(U) * 8U - 1U)))
+                                       : static_cast<U>(e.key);
+        });
+    } else {
+        parallel_sort(entries, [](const Entry& a, const Entry& b) {
+            return a.key < b.key || (!(b.key < a.key) && a.item < b.item);
+        });
+    }
     out.order.reserve(items.size());
     for (std::size_t i = 0; i < entries.size(); ++i) {
         if (i == 0 || entries[i - 1].key < entries[i].key) {
@@ -410,6 +503,16 @@ void sort_items(const Items& items, KeyKind kind, bool group, Sorted& out) {
                 Int128 value;  // little-endian: the low half first
                 std::memcpy(&value.lo, fixed_value(v, i, 16), 8);
                 std::memcpy(&value.hi, fixed_value(v, i, 16) + 8, 8);
+                return value;
+            },
+            group, out);
+        break;
+    case KeyKind::Decimal256:
+        order_items<Int256>(
+            items,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                Int256 value;  // little-endian: the least significant word first
+                std::memcpy(value.w.data(), fixed_value(v, i, 32), 32);
                 return value;
             },
             group, out);
@@ -909,6 +1012,16 @@ void zone_extrema_of(const Items& items, KeyKind kind, const std::vector<std::ui
                 Int128 value;
                 std::memcpy(&value.lo, fixed_value(v, i, 16), 8);
                 std::memcpy(&value.hi, fixed_value(v, i, 16) + 8, 8);
+                return value;
+            },
+            zones);
+        break;
+    case KeyKind::Decimal256:
+        zone_extrema<Int256>(
+            items, zone_of, false,
+            [](const ArrowArrayView* v, std::int64_t i) {
+                Int256 value;
+                std::memcpy(value.w.data(), fixed_value(v, i, 32), 32);
                 return value;
             },
             zones);
@@ -1545,13 +1658,34 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         error = err.message;
         return false;
     }
+    // A uuid (pa.uuid(), the arrow.uuid extension over fixed_size_binary(16)) is keyed by its storage
+    // type, as pylance writes it: its index files hold fixed_size_binary values, not the extension.
+    const bool uuid_key =
+        key_view.extension_name.data != nullptr &&
+        std::string(key_view.extension_name.data, static_cast<std::size_t>(key_view.extension_name.size_bytes)) ==
+            "arrow.uuid" &&
+        key_view.type == NANOARROW_TYPE_FIXED_SIZE_BINARY && !list;
+    OwnedSchema uuid_storage;
+    if (uuid_key) {
+        ArrowSchemaInit(&uuid_storage.s);
+        ArrowSchemaSetTypeFixedSize(&uuid_storage.s, NANOARROW_TYPE_FIXED_SIZE_BINARY, key_view.fixed_size);
+        key_type = &uuid_storage.s;
+        if (ArrowSchemaViewInit(&key_view, key_type, &err) != NANOARROW_OK) {
+            error = err.message;
+            return false;
+        }
+    }
     if (type == ScalarIndexType::NGram && key_view.type != NANOARROW_TYPE_STRING &&
         key_view.type != NANOARROW_TYPE_LARGE_STRING) {
         error = "an NGRAM index needs a string column; '" + column + "' is " + ArrowTypeString(key_view.type);
         return false;
     }
     // A zonemap of a fixed-size list keeps only the null counts (zonemap.rs: nested types have no min or max).
+    // So does one of a fixed-size binary (uuids included): pylance's zonemap writes null min and max
+    // for fixed_size_binary, measured on 12.0.0.
     const bool nested = zoned_nested(type, key_view);
+    const bool no_extrema =
+        nested || (type == ScalarIndexType::ZoneMap && key_view.type == NANOARROW_TYPE_FIXED_SIZE_BINARY);
     const bool bloom = type == ScalarIndexType::BloomFilter;
     std::size_t value_width = 0;
     if (bloom) {
@@ -1595,7 +1729,8 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         const ArrowArray* addr_arr = batch.children[batch.n_children - 1];
         const auto* addrs = static_cast<const std::uint64_t*>(addr_arr->buffers[1]) + addr_arr->offset;
         auto view = std::make_unique<ArrowArrayView>();
-        if (ArrowArrayViewInitFromSchema(view.get(), col_type, &err) != NANOARROW_OK ||
+        // The values are read through the storage type: an extension's view has no element width.
+        if (ArrowArrayViewInitFromSchema(view.get(), uuid_key ? &uuid_storage.s : col_type, &err) != NANOARROW_OK ||
             ArrowArrayViewSetArray(view.get(), arr, &err) != NANOARROW_OK) {
             ArrowArrayViewReset(view.get());
             error = err.message;
@@ -1634,7 +1769,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     std::vector<Zone> zones;
     if (zoned) {
         zones = cut_zones(items, bloom ? number_of_items : rows_per_zone, zone_of);
-        if (!nested && !bloom) {
+        if (!no_extrema && !bloom) {
             zone_extrema_of(items, kind, zone_of, zones);
         }
     } else if (type != ScalarIndexType::NGram) {
@@ -1685,7 +1820,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     case ScalarIndexType::ZoneMap:
         written = write_zonemap(dir, *key_type, items, zones,
                                 kind == KeyKind::Float16 || kind == KeyKind::Float32 || kind == KeyKind::Float64,
-                                nested, rows_per_zone, files, error);
+                                no_extrema, rows_per_zone, files, error);
         details = "/lance.table.ZoneMapIndexDetails";
         break;
     case ScalarIndexType::NGram:
@@ -1898,6 +2033,55 @@ bool dataset_explain_filter(const std::filesystem::path& dataset_path, bool has_
         return false;
     }
     lines = std::move(candidates.used);
+    return true;
+}
+
+bool dataset_count_from_index(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
+                              const std::string& filter, IndexCount& out, std::string& error) {
+    error.clear();
+    out = IndexCount{};
+    pb::Manifest manifest;
+    if (has_version) {
+        if (!load_manifest_version(dataset_path, version, manifest, error)) {
+            return false;
+        }
+    } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+        return false;
+    }
+    expr::Expression parsed;
+    if (!expr::Expression::parse(filter, parsed, error)) {
+        return false;
+    }
+    IndexCandidates candidates;
+    if (!index_candidates(dataset_path, manifest, parsed, candidates, error)) {
+        return false;
+    }
+    out.lines = candidates.used;
+    out.exact = candidates.exact;
+    for (const auto& f : manifest.fragments) {
+        const auto it = candidates.rows.find(f.id);
+        if (!out.exact || it == candidates.rows.end()) {
+            out.uncovered.push_back(f.id);
+            continue;
+        }
+        // The index lists deleted rows too: take out those the fragment's deletion vector holds. Both
+        // lists are ascending physical offsets.
+        std::vector<std::uint32_t> deleted;
+        if (!read_deletion_vector(dataset_path, f.id, f.deletion_file, deleted, error)) {
+            return false;
+        }
+        std::size_t hits = 0;
+        std::size_t next = 0;
+        for (const auto row : it->second) {
+            while (next < deleted.size() && deleted[next] < row) {
+                ++next;
+            }
+            if (next < deleted.size() && deleted[next] == row) {
+                ++hits;
+            }
+        }
+        out.count += static_cast<std::uint64_t>(it->second.size() - hits);
+    }
     return true;
 }
 

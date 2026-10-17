@@ -78,6 +78,18 @@ struct IndexInfo {
     std::uint64_t rows_indexed = 0;    // the rows of the fragments it covers, deleted ones aside
 };
 
+/// A filter's count taken from the scalar indices alone (count pushdown).
+struct IndexCount {
+    bool exact = false;                    // the indices answer the filter exactly; false: scan every fragment
+    std::uint64_t count = 0;               // rows of the covered fragments that pass, deleted rows left out
+    std::vector<std::uint64_t> uncovered;  // the fragments to scan for the rest of the count
+    std::vector<std::string> lines;        // the ScalarIndexQuery lines (as explain names them)
+};
+
+/// The count of `filter` in `version` (the latest when `has_version` is false) answered by the indices.
+bool dataset_count_from_index(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
+                              const std::string& filter, IndexCount& out, std::string& error);
+
 /// The index lines (index_search.hpp's IndexCandidates::used) a filtered read of `version` would use.
 bool dataset_explain_filter(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
                             const std::string& filter, std::vector<std::string>& lines, std::string& error);
