@@ -326,11 +326,6 @@ void test_errors(const std::string& uri) {
           "multivector");
     lance_scanner_close(sc);
 
-    LanceScanner* fs = lance_scanner_new(ds, nullptr, nullptr);
-    check(lance_scanner_full_text_search(fs, "apple", nullptr, 2) != 0 &&
-              lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED,
-          "fuzzy");
-    lance_scanner_close(fs);
     check(lance_dataset_prepare_fts_match_query(ds, "id", "x", 0, 0, LANCE_FTS_COVERAGE_STRICT) == nullptr &&
               lance_last_error_code() == LANCE_ERR_INVALID_ARGUMENT,
           "no FTS index on id");
@@ -842,6 +837,56 @@ void test_phrase(const std::filesystem::path& dir) {
     lance_dataset_close(ds);
 }
 
+/// Fuzzy full-text match: each query token expands to the index's terms within the edit distance.
+void test_fuzzy(const std::filesystem::path& dir) {
+    const std::string uri = (dir / "fuzzy.lance").string();
+    const char* texts[] = {"fa", "fo", "fob", "focus", "foo", "food", "foul"};
+    ArrowSchema schema;
+    ArrowSchemaInit(&schema);
+    ArrowSchemaSetTypeStruct(&schema, 2);
+    ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_INT64);
+    ArrowSchemaSetName(schema.children[0], "id");
+    ArrowSchemaSetType(schema.children[1], NANOARROW_TYPE_STRING);
+    ArrowSchemaSetName(schema.children[1], "text");
+    ArrowArray array;
+    ArrowArrayInitFromSchema(&array, &schema, nullptr);
+    ArrowArrayStartAppending(&array);
+    for (int64_t i = 0; i < 7; ++i) {
+        ArrowArrayAppendInt(array.children[0], i);
+        ArrowArrayAppendString(array.children[1], ArrowCharView(texts[i]));
+        ArrowArrayFinishElement(&array);
+    }
+    ArrowArrayFinishBuildingDefault(&array, nullptr);
+    ArrowSchema schema2;
+    ArrowSchemaDeepCopy(&schema, &schema2);
+    ArrowArrayStream stream;
+    ArrowBasicArrayStreamInit(&stream, &schema, 1);  // moves schema
+    ArrowBasicArrayStreamSetArray(&stream, 0, &array);
+    LanceDataset* out = nullptr;
+    check(lance_dataset_write(uri.c_str(), &schema2, &stream, LANCE_WRITE_CREATE, nullptr, &out) == 0,
+          "write fuzzy: " + last_error());
+    schema2.release(&schema2);
+    if (out != nullptr) {
+        check(lance_dataset_create_scalar_index(out, "text", "text_fts", LANCE_SCALAR_INVERTED,
+                                                R"({"base_tokenizer":"simple","language":"English"})", false) == 0,
+              "create INVERTED for fuzzy: " + last_error());
+        const auto ids_for = [&](uint32_t fuzziness) {
+            LanceScanner* sc = lance_scanner_new(out, nullptr, nullptr);
+            const char* cols[] = {"text", nullptr};
+            check(lance_scanner_full_text_search(sc, "foo", cols, fuzziness) == 0,
+                  "full_text_search fuzziness " + std::to_string(fuzziness) + ": " + last_error());
+            auto r = collect(sc, "_score");
+            lance_scanner_close(sc);
+            check(r.ok, "fuzzy scan: " + r.error);
+            std::sort(r.ids.begin(), r.ids.end());
+            return r.ids;
+        };
+        check(ids_for(0) == std::vector<int64_t>{4}, "fuzziness 0 matches only foo");
+        check(ids_for(1) == std::vector<int64_t>({1, 2, 4, 5}), "fuzziness 1 matches fo, fob, foo, food");
+        lance_dataset_close(out);
+    }
+}
+
 int main(int argc, char** argv) {
     const std::filesystem::path dir =
         argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::temp_directory_path() / "nl_lance_c_search";
@@ -874,6 +919,7 @@ int main(int argc, char** argv) {
     }
     test_segments(dir);
     test_phrase(dir);
+    test_fuzzy(dir);
     test_include_deleted_rows((dir / "deleted.lance").string());
     test_update_if((dir / "upsert.lance").string());
     if (std::getenv("NANOLANCE_KEEP_TEST_DATA") == nullptr) {

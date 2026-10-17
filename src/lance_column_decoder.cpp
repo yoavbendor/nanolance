@@ -5806,8 +5806,8 @@ namespace {
 /// column is not one.
 template <class Decode>
 bool decode_nested_blob_column(const std::filesystem::path& data_file_path, const pb::Field& field,
-                               const pb::ColumnMetadata& column_metadata, ColumnValues& out, std::string& error,
-                               bool& handled, Decode&& decode) {
+                               const pb::ColumnMetadata& column_metadata, ColumnValues& out,
+                               [[maybe_unused]] std::string& error, bool& handled, Decode&& decode) {
     handled = field.logical_type == "struct" && field_metadata_is_true(field, "lance-encoding:blob") &&
               !v20::is_v20_column(column_metadata) && column_is_nested(column_metadata);
     if (!handled) {

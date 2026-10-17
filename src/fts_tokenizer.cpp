@@ -23,7 +23,15 @@ namespace {
 
 namespace snow {
 #include "fts_snowball_env.inc"
+#if defined(__GNUC__)
+// The generated Snowball stemmer has labels its code never jumps to; they are its own, not ours.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-label"
+#endif
 #include "fts_english_stem.inc"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 }  // namespace snow
 
 // ── UTF-8 ───────────────────────────────────────────────────────────────────────────────────────

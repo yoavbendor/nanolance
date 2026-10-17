@@ -1255,6 +1255,9 @@ class LanceDataset(pa.dataset.Dataset):
         for key in list(kwargs):
             if key in LanceDataset._INVERTED_OPTIONS:
                 value = kwargs.pop(key)
+                if key == "language" and value is None:
+                    # pylance's binding extracts the name as a str: None is a TypeError, not English.
+                    raise TypeError("'None' is not an instance of 'str'")
                 if value is not None or key in ("max_token_length", "custom_stop_words"):
                     params[key] = value
         for ignored in ("num_workers", "memory_limit", "progress", "train", "progress_callback",

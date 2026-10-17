@@ -676,7 +676,7 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
             const auto modified_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          fs::file_time_type::clock::to_sys(modified).time_since_epoch())
                                          .count();
-            if (!all && modified_ns > *cutoff_ns) {
+            if (!all && cutoff_ns && modified_ns > *cutoff_ns) {
                 continue;  // modified after the earliest kept version
             }
             file.maybe_in_progress = !policy.delete_unverified && age < kUnverifiedThresholdNs;

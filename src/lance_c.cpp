@@ -4253,16 +4253,14 @@ int32_t lance_scanner_full_text_search(LanceScanner* scanner, const char* query,
             return invalid(
                 "cannot call full_text_search after attaching an FTS query context; the context already owns the query");
         }
-        if (max_fuzzy_distance > 0U) {
-            not_supported("fuzzy full-text matching (max_fuzzy_distance > 0)");
-            return false;
-        }
         // A query string over the columns given, or every column with an INVERTED index: Lance's
-        // FullTextSearchQuery::new(query).with_columns(columns).
+        // FullTextSearchQuery::new(query).with_columns(columns). max_fuzzy_distance > 0 is
+        // MatchQuery::with_fuzziness, with the defaults max_expansions 50 and prefix_length 0.
         nano_lance::FtsQuery q;
         q.kind = nano_lance::FtsQuery::Kind::MultiMatch;
         q.text = query;
         q.columns = column_list(columns);
+        q.fuzziness = max_fuzzy_distance;
         scanner->search.fts = std::move(q);
         return true;
     });

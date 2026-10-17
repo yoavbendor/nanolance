@@ -36,17 +36,6 @@ constexpr std::size_t kBlobV2RecordHeaderBytes = 4U + kBlobV2FixedDescriptorByte
 
 namespace {
 
-void append_le16(std::vector<std::uint8_t>& out, std::uint16_t value) {
-    out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
-    out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
-}
-
-void append_le32(std::vector<std::uint8_t>& out, std::uint32_t value) {
-    out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
-    out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
-    out.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xFFU));
-    out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
-}
 
 bool arrow_row_is_null(const ArrowArray& array, std::int64_t row_index) {
     if (array.buffers == nullptr || array.buffers[0] == nullptr) {

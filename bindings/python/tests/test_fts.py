@@ -628,6 +628,20 @@ def test_language_names_are_validated_as_pylance_does(lance, tmp_path, language)
         assert tokens["pylance"] == tokens["nanolance"] == ["the", "quick"], tokens
 
 
+def test_language_none_is_a_type_error_as_pylance_does(lance, tmp_path):
+    """language=None on an INVERTED index is a TypeError in pylance, not a silent English index."""
+    table = pa.table({"text": ["the quick fox"]})
+    ref, got = str(tmp_path / "ref.lance"), str(tmp_path / "got.lance")
+    lance.write_dataset(table, ref)
+    nl.write_dataset(table, got)
+    errors = {}
+    for name, module, path in (("pylance", lance, ref), ("nanolance", nl, got)):
+        with pytest.raises(TypeError) as excinfo:
+            module.dataset(path).create_scalar_index("text", index_type="INVERTED", language=None)
+        errors[name] = str(excinfo.value)
+    assert errors["nanolance"] == errors["pylance"] == "'None' is not an instance of 'str'", errors
+
+
 # ── the ngram base tokenizer (Lance's NgramTokenizer) ──────────────────────────────────────────
 
 NGRAM_OPTIONS = [
