@@ -1994,6 +1994,15 @@ NB_MODULE(_nanolance, m) {
         });
         return lines;
     });
+    m.def("_ds_count_from_index", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
+                                     const std::string& filter) {
+        nano_lance::IndexCount counted;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_count_from_index(path, version.has_value(), version.value_or(0), filter,
+                                                        counted, e);
+        });
+        return nb::make_tuple(counted.exact, counted.count, counted.uncovered, counted.lines);
+    });
     m.def("_ds_nearest", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
                             const std::string& column, const std::vector<float>& key, std::uint64_t k,
                             std::uint32_t minimum_nprobes, std::optional<std::uint32_t> maximum_nprobes,

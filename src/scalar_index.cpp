@@ -13,6 +13,7 @@
 #include "index_files.hpp"
 
 #include "nanolance/dataset_commit.hpp"
+#include "nanolance/deletion_vector.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/index_search.hpp"
 #include "nanolance/lance_file_writer.hpp"
@@ -2032,6 +2033,55 @@ bool dataset_explain_filter(const std::filesystem::path& dataset_path, bool has_
         return false;
     }
     lines = std::move(candidates.used);
+    return true;
+}
+
+bool dataset_count_from_index(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
+                              const std::string& filter, IndexCount& out, std::string& error) {
+    error.clear();
+    out = IndexCount{};
+    pb::Manifest manifest;
+    if (has_version) {
+        if (!load_manifest_version(dataset_path, version, manifest, error)) {
+            return false;
+        }
+    } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+        return false;
+    }
+    expr::Expression parsed;
+    if (!expr::Expression::parse(filter, parsed, error)) {
+        return false;
+    }
+    IndexCandidates candidates;
+    if (!index_candidates(dataset_path, manifest, parsed, candidates, error)) {
+        return false;
+    }
+    out.lines = candidates.used;
+    out.exact = candidates.exact;
+    for (const auto& f : manifest.fragments) {
+        const auto it = candidates.rows.find(f.id);
+        if (!out.exact || it == candidates.rows.end()) {
+            out.uncovered.push_back(f.id);
+            continue;
+        }
+        // The index lists deleted rows too: take out those the fragment's deletion vector holds. Both
+        // lists are ascending physical offsets.
+        std::vector<std::uint32_t> deleted;
+        if (!read_deletion_vector(dataset_path, f.id, f.deletion_file, deleted, error)) {
+            return false;
+        }
+        std::size_t hits = 0;
+        std::size_t next = 0;
+        for (const auto row : it->second) {
+            while (next < deleted.size() && deleted[next] < row) {
+                ++next;
+            }
+            if (next < deleted.size() && deleted[next] == row) {
+                ++hits;
+            }
+        }
+        out.count += static_cast<std::uint64_t>(it->second.size() - hits);
+    }
     return true;
 }
 

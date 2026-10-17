@@ -188,6 +188,9 @@ bool load_zonemap(const std::filesystem::path& dir, std::shared_ptr<const ZoneMa
 struct RowSet {
     std::set<std::uint32_t> covered;
     std::map<std::uint32_t, std::vector<std::uint32_t>> rows;
+    /// Every covered fragment's rows are exactly the rows that pass (a BTREE or BITMAP answer), so a
+    /// count of them needs no read. Zonemaps and bloom filters only prune: their rows are a superset.
+    bool exact = false;
 };
 
 void add_addresses(RowSet& set, std::vector<std::uint64_t>& addrs) {
@@ -228,6 +231,8 @@ RowSet both(const RowSet& a, const RowSet& b) {
             out.rows[f] = std::move(rows);
         }
     }
+    // A fragment only one side covers keeps that side's rows, a superset: exact only when both agree.
+    out.exact = a.exact && b.exact && a.covered == b.covered;
     return out;
 }
 
@@ -246,6 +251,7 @@ RowSet either(const RowSet& a, const RowSet& b) {
             out.rows[f] = std::move(rows);
         }
     }
+    out.exact = a.exact && b.exact;
     return out;
 }
 
@@ -1161,12 +1167,14 @@ struct Search {
         for (const auto& [name, segments] : by_name) {
             RowSet set;
             bool answered_all = true;
+            bool exact_all = true;
             for (const auto* index : segments) {
                 const auto& kind = index->details_type_url;
                 const auto dir = dataset_path / "_indices" / pb::uuid_string(index->uuid);
                 RowSet one;
                 bool answered = false;
                 bool ok = true;
+                bool exact_segment = false;
                 // A JSON index answers the JSON tests and they only it: a plain test of the column would
                 // compare the document, not the values at the path.
                 const bool json_index = kind == "/lance.index.pb.JsonIndexDetails";
@@ -1182,6 +1190,7 @@ struct Search {
                     std::any_of(index->files.begin(), index->files.end(),
                                 [](const pb::IndexMetadata::File& f) { return f.path == "page_lookup.lance"; })) {
                     ok = search_btree(dir, p, one, answered, error);
+                    exact_segment = true;
                 } else if (bloom && !index->files.empty()) {
                     ArrowSchema column{};
                     ok = arrow_column_type(*field, column, error) &&
@@ -1195,6 +1204,7 @@ struct Search {
                            !index->files.empty()) {
                     ok = search_bitmap(dir, kind == "/lance.table.LabelListIndexDetails", p, physical, one, answered,
                                        error);
+                    exact_segment = kind == "/lance.table.BitmapIndexDetails";
                 } else if (kind == "/lance.table.NGramIndexDetails" && !index->files.empty()) {
                     ok = search_ngram(dir, p, one, answered, error);
                 }
@@ -1205,6 +1215,7 @@ struct Search {
                     answered_all = false;
                     break;
                 }
+                exact_all = exact_all && exact_segment;
                 if (!zoned) {
                     to_addresses(one);  // a zonemap holds addresses already
                 }
@@ -1228,6 +1239,7 @@ struct Search {
                     type = "BTree";  // the plan names the BTree a JSON index is built over
                 }
                 used.push_back("ScalarIndexQuery: query=[" + p.to_string() + "]@" + name + "(" + type + ")");
+                set.exact = exact_all;
                 answer = std::move(set);
                 return true;
             }
@@ -1248,7 +1260,13 @@ struct Search {
                     return false;
                 }
                 if (c.kind == expr::Condition::Kind::And) {
-                    answer = a && b ? both(*a, *b) : (a ? std::move(a) : std::move(b));
+                    if (a && b) {
+                        answer = both(*a, *b);
+                    } else if (a || b) {
+                        // The side that is not answered may match any row: what is left only prunes.
+                        answer = a ? std::move(a) : std::move(b);
+                        answer->exact = false;
+                    }
                 } else if (a && b) {
                     answer = either(*a, *b);
                 }
@@ -1266,6 +1284,7 @@ bool index_candidates(const std::filesystem::path& dataset_path, const pb::Manif
                       const expr::Expression& filter, IndexCandidates& out, std::string& error) {
     out.rows.clear();
     out.used.clear();
+    out.exact = false;
     error.clear();
     // An index whose rows a deferred compaction moved needs the fragment-reuse index to be found again.
     if (manifest.indices.empty() ||
@@ -1289,6 +1308,7 @@ bool index_candidates(const std::filesystem::path& dataset_path, const pb::Manif
         return true;
     }
     out.used = std::move(search.used);
+    out.exact = answer->exact;
     for (const auto f : answer->covered) {
         if (search.physical.count(f) == 0U) {
             continue;  // a fragment the version no longer has

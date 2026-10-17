@@ -3878,9 +3878,32 @@ class LanceScanner(pa.dataset.Scanner):
     def to_batches(self) -> Iterator[pa.RecordBatch]:
         return self._rebatch(self.to_table())
 
+    def _count_from_index(self):
+        """Count pushdown: the count of the filter from the scalar indices, when they answer it exactly.
+        Returns (indexed, uncovered, lines, scanned): the rows the covered fragments' indices count, the
+        fragments they do not cover and their scanned count, and the index lines. None when the indices
+        do not answer exactly (the caller scans)."""
+        if (self._filter is None or self._post_filter is not None or self._nearest is not None
+                or self._limit is not None or self._offset or self._fragment_ids is not None
+                or not self._use_scalar_index):
+            return None
+        with native():
+            exact, indexed, uncovered, lines = _nanolance._ds_count_from_index(
+                self._ds.uri, self._ds.version, self._filter)
+        if not exact:
+            return None
+        scanned = 0
+        if uncovered:
+            scanned = LanceScanner(self._ds, columns=[], filter=self._filter, fragments=uncovered,
+                                   with_row_address=True, use_scalar_index=False).to_table().num_rows
+        return indexed, uncovered, lines, scanned
+
     def count_rows(self) -> int:
         if self._fts is not None:
             return len(self._fts_search()[0][self._offset:])
+        counted = self._count_from_index()
+        if counted is not None:
+            return counted[0] + counted[3]
         if self._names is None and not (self._with_row_id or self._with_row_address):
             # Count by reading only what the filter needs (a row address column when it needs nothing).
             counter = LanceScanner(self._ds, columns=[], filter=self._post_filter or self._filter, limit=self._limit,
@@ -3955,10 +3978,14 @@ class LanceScanner(pa.dataset.Scanner):
                         self._ds.uri, self._ds.version, self._filter)]
         return "\n".join(lines)
 
-    def analyze_plan(self) -> str:
+    def analyze_plan(self, *, count_rows: bool = False) -> str:
         """The plan, after running the scan. A filtered scan without a scalar index reads every row of
         its fragments (the filter is evaluated over them), so rows_scanned is their physical row count;
-        with an index the scan reads only what the index returns and rows_scanned is not reported."""
+        with an index the scan reads only what the index returns and rows_scanned is not reported.
+        ``count_rows=True``: the plan of the count (``count_rows()``), which an exact scalar index can
+        answer from its mask (CountFromMask) for the fragments it covers."""
+        if count_rows:
+            return self._count_plan()
         plan = self.explain_plan()
         if self._filter is None or self._nearest is not None or self._fts is not None:
             return plan
@@ -3969,6 +3996,21 @@ class LanceScanner(pa.dataset.Scanner):
                      if self._fragment_ids is None or f.fragment_id in self._fragment_ids]
             metrics += [f"rows_scanned={sum(f.physical_rows for f in frags)}", f"fragments_scanned={len(frags)}"]
         return self._explain(metrics)
+
+    def _count_plan(self) -> str:
+        counted = self._count_from_index()
+        if counted is None:
+            return self.analyze_plan()
+        indexed, uncovered, lines, scanned = counted
+        body = [f"CountFromMask: output_rows={indexed}"] + [f"  {line}" for line in lines]
+        if uncovered:
+            # The fragments no index covers are scanned, and their count added to the masked one.
+            scan = [f"AggregateExec: mode=Partial, aggr=[count(*)], output_rows={scanned}",
+                    f"  LanceRead: projection=[], fragments={uncovered}, filter={self._filter}"]
+            body = ["UnionExec"] + ["  " + line for line in body + scan]
+        final = ["AggregateExec: mode=Final, aggr=[count(*)], output_rows=1"] + ["  " + line for line in body]
+        return "\n".join([f"nanolance count of {self._ds.uri} v{self._ds.version}"]
+                         + ["  " + line for line in final])
 
 
 class ScannerBuilder:
