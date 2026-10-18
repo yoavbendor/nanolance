@@ -15,7 +15,7 @@ import nanolance   # fast C++ nanolance bindings (this package)
 
 ## Install
 
-Wheels are built for manylinux (x86_64) and macOS (arm64, x86_64) on CPython 3.9–3.13 and published
+Wheels are built for manylinux (x86_64) and macOS 13.3 or later (arm64, x86_64) on CPython 3.9–3.13 and published
 to PyPI on a version tag; each one links nanoarrow and zstd statically, so there is nothing to
 install alongside it. Until the first tag, install from source:
 

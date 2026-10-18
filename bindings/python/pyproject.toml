@@ -87,9 +87,9 @@ manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
 
 [tool.cibuildwheel.macos]
-# 11.0 is the first target where the C++ standard library ships the C++17/20 filesystem and charconv
-# bits this tree uses without a back-deployment shim.
-environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
+# 13.3 is the first target whose C++ library has floating-point to_chars and from_chars, which the
+# tree uses. Older macOS releases are not supported.
+environment = { MACOSX_DEPLOYMENT_TARGET = "13.3" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

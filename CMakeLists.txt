@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
 
+# macOS 13.3 is the first release whose C++ library has floating-point to_chars and from_chars, which
+# the tree uses. A build can still pick its own target by passing CMAKE_OSX_DEPLOYMENT_TARGET.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3")
+endif()
+
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(NANOLANCE_STANDALONE ON)
 else()
