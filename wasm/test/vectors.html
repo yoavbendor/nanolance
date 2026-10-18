@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>weblance vectors test</title></head>
+<body>
+<p id="status">starting</p>
+<script>
+// Query: ?ds=<dataset URL>&rows=<comma-separated rows>&column=<vector column>
+// window.__result holds the worker's report (see vectors-worker.js).
+const params = new URLSearchParams(location.search);
+const worker = new Worker('vectors-worker.js');
+worker.onerror = (e) => { window.__result = { ok: false, error: 'worker: ' + e.message }; };
+worker.onmessage = (ev) => { window.__result = ev.data; };
+worker.postMessage({
+  ds: params.get('ds'),
+  rows: params.get('rows').split(',').map(Number),
+  column: params.get('column'),
+});
+</script>
+</body>
+</html>

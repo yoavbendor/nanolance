@@ -222,7 +222,7 @@ public:
         return range_read(url_, offset, n, dst, error);
     }
 
-    // Small reads (the footer, column metadata, a short page) become one 256 KiB request, not many.
+    // Small reads (the footer, column metadata, a short page) become one WL_SMALL_BLOCK_KIB request, not many.
     std::uint64_t small_read_block() const override { return kSmallBlockBytes; }
     std::uint64_t footer_read_size() const override { return kFooterBytes; }
 
@@ -810,6 +810,97 @@ EMSCRIPTEN_KEEPALIVE char* wl_take_json(int handle, const std::int64_t* rows, in
     }
     out += ']';
     return dup_c(out);
+}
+
+// Rows `rows[0..n)` of a fixed_size_list<float> column as n*dim float32s (row-major, in the given
+// order), malloc'ed; *out_dim gets dim. A null vector is filled with NaN. fsl<double> and fsl<half>
+// are converted to float. NULL and wl_error() on failure. Caller frees with wl_free.
+EMSCRIPTEN_KEEPALIVE float* wl_take_vectors(int handle, const std::int64_t* rows, int n, const char* column,
+                                            int* out_dim) {
+    if (out_dim != nullptr) {
+        *out_dim = 0;
+    }
+    Dataset* ds = dataset(handle);
+    if (ds == nullptr) {
+        return nullptr;
+    }
+    if (rows == nullptr || n <= 0 || column == nullptr) {
+        g_error = "wl_take_vectors needs rows and a column";
+        return nullptr;
+    }
+    std::vector<std::uint64_t> wanted;
+    wanted.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        if (rows[i] < 0) {
+            g_error = "negative row " + std::to_string(rows[i]);
+            return nullptr;
+        }
+        wanted.push_back(static_cast<std::uint64_t>(rows[i]));
+    }
+    const std::vector<std::string> columns{column};
+    Take take;
+    std::string error;
+    if (!take.run(*ds, columns, wanted, error)) {
+        g_error = error;
+        return nullptr;
+    }
+    if (take.schema_.n_children != 1) {
+        g_error = "wl_take_vectors: expected one column";
+        return nullptr;
+    }
+    ArrowSchemaView column_view;
+    struct ArrowError err {};
+    if (ArrowSchemaViewInit(&column_view, take.schema_.children[0], &err) != NANOARROW_OK ||
+        column_view.type != NANOARROW_TYPE_FIXED_SIZE_LIST || take.schema_.children[0]->n_children != 1) {
+        g_error = std::string("column ") + column + " is not a fixed_size_list";
+        return nullptr;
+    }
+    const std::int64_t dim = column_view.fixed_size;
+    const ArrowSchema* element = take.schema_.children[0]->children[0];
+    ArrowSchemaView element_view;
+    if (dim < 1 || ArrowSchemaViewInit(&element_view, element, &err) != NANOARROW_OK) {
+        g_error = std::string("column ") + column + " has no vector dimension";
+        return nullptr;
+    }
+    switch (element_view.type) {
+        case NANOARROW_TYPE_FLOAT:
+        case NANOARROW_TYPE_DOUBLE:
+        case NANOARROW_TYPE_HALF_FLOAT:
+            break;
+        default:
+            g_error = std::string("column ") + column + " is not a fixed_size_list of float, double or half";
+            return nullptr;
+    }
+    const std::size_t total = static_cast<std::size_t>(n) * static_cast<std::size_t>(dim);
+    float* out = static_cast<float*>(std::malloc(total * sizeof(float)));
+    if (out == nullptr) {
+        g_error = "out of memory";
+        return nullptr;
+    }
+    for (int i = 0; i < n; ++i) {
+        std::size_t batch = 0;
+        std::int64_t offset = 0;
+        take.locate(take.sorted_position(wanted[static_cast<std::size_t>(i)]), batch, offset);
+        const ArrowArrayView* a = take.views_[batch].children[0];
+        float* dst = out + static_cast<std::size_t>(i) * static_cast<std::size_t>(dim);
+        if (ArrowArrayViewIsNull(a, offset) != 0) {
+            for (std::int64_t j = 0; j < dim; ++j) {
+                dst[j] = std::nanf("");
+            }
+            continue;
+        }
+        // The child holds the elements of every row back to back: row r starts at (r + offset) * dim.
+        // The child's own getter adds the child's offset.
+        const ArrowArrayView* child = a->children[0];
+        const std::int64_t first = (a->offset + offset) * dim;
+        for (std::int64_t j = 0; j < dim; ++j) {
+            dst[j] = static_cast<float>(ArrowArrayViewGetDoubleUnsafe(child, first + j));
+        }
+    }
+    if (out_dim != nullptr) {
+        *out_dim = static_cast<int>(dim);
+    }
+    return out;
 }
 
 // One binary (or string) value of one row, as a malloc'ed copy: caller frees with wl_free. *out_len
