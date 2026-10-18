@@ -2946,6 +2946,9 @@ dependencies = [
  "futures",
  "lance",
  "lance-file",
+ "lance-index",
+ "lance-linalg",
+ "serde_json",
  "tokio",
 ]
 

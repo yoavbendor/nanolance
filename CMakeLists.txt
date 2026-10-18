@@ -490,6 +490,10 @@ if(NANOLANCE_BUILD_TOOLS)
     target_compile_features(nlbench PRIVATE cxx_std_20)
     target_link_libraries(nlbench PRIVATE nanolance)
 
+    add_executable(nlbench_index tools/nlbench_index.cpp)
+    target_compile_features(nlbench_index PRIVATE cxx_std_20)
+    target_link_libraries(nlbench_index PRIVATE nanolance)
+
     add_executable(nlbench_gendata tools/nlbench_gendata.cpp)
     target_compile_features(nlbench_gendata PRIVATE cxx_std_20)
     target_link_libraries(nlbench_gendata PRIVATE nanolance)

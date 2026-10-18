@@ -1,39 +1,41 @@
 #!/usr/bin/env python3
-"""Vector indexes: nanolance against Rust Lance (pylance), building IVF_FLAT / IVF_PQ / IVF_HNSW_SQ and searching.
+"""Vector indexes: nanolance's C++ library against Rust Lance (the lance crate, 12.0.0, no Python in the process).
 
-    python tools/bench_vector_index.py [--rows 200000] [--dim 128] [--runs 5] [--work DIR]
+    python tools/bench_vector_index.py [--rows 200000] [--dim 128] [--min-seconds 10] [--work DIR]
                                        # writes bench/results/vector_index.json
 
-The data is generated (seeded): `dim`-dimensional float32 vectors around 1,000 random centres,
-written by pylance. Each engine builds each index (256 partitions; IVF_PQ with dim / 8 sub-vectors)
-on its own copy of the unindexed data, then searches the index it built: 50 queries near data
-points, Lance's default probing and fixed nprobes. Before timing, every search on the index pylance
-built must return what pylance returns (rows, order, distances), and recall@10 against an exact
-search is measured for both engines' indexes. Search times are the median of --runs passes over the
-50 queries (warm, files in the page cache), per query; builds run once.
+The data is generated (seeded): `dim`-dimensional float32 vectors around 1,000 random centres, written
+by pylance as one fragment (data generation, not timed). Each engine builds each index (256 partitions;
+IVF_PQ with dim / 8 sub-vectors) on its own copy of the unindexed data, then searches the index it built:
+50 queries near data points, with the default probing and fixed nprobes. Recall@10 is measured against an
+exact search for both engines and recorded; tools/perf_gate.py fails a run where nanolance's falls more
+than 0.03 below Rust Lance's. Nanolance's row addresses must be row ids (one fragment, so the address is
+the offset), or the run stops.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import platform
 import shutil
-import statistics
-import subprocess
 import tempfile
-import time
 import warnings
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 
+from index_bench_common import (CPP_CMD, RUST_CMD, check_drivers, combine_stats, environment, run_driver,
+                                write_workload)
+
 ROOT = Path(__file__).resolve().parents[1]
-SEARCHES = [("k=10", {"k": 10}), ("k=100", {"k": 100}), ("k=10, nprobes=32", {"k": 10, "nprobes": 32}),
-            ("k=10, refine_factor=4", {"k": 10, "refine_factor": 4})]
+KINDS = ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ"]
+SEARCHES = [("k=10", 10, None, None), ("k=100", 100, None, None), ("k=10, nprobes=32", 10, 32, None),
+            ("k=10, refine_factor=4", 10, None, 4)]
+
+
+def recall(hits: list[list[int]], truth: list[set[int]]) -> float:
+    return float(np.mean([len(set(h[:10]) & t) / 10 for h, t in zip(hits, truth)]))
 
 
 def main() -> None:
@@ -41,13 +43,12 @@ def main() -> None:
     ap.add_argument("--rows", type=int, default=200_000)
     ap.add_argument("--dim", type=int, default=128)
     ap.add_argument("--partitions", type=int, default=256)
-    ap.add_argument("--runs", type=int, default=5)
+    ap.add_argument("--min-seconds", type=float, default=10.0)
     ap.add_argument("--work", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=ROOT / "bench" / "results" / "vector_index.json")
     args = ap.parse_args()
     warnings.filterwarnings("ignore")
-    import lance
-    import nanolance.lance as nl
+    check_drivers()
 
     rng = np.random.default_rng(0)
     centres = rng.standard_normal((1000, args.dim)).astype(np.float32) * 2
@@ -56,70 +57,48 @@ def main() -> None:
     truth = [set(np.argsort(((v - q) ** 2).sum(1))[:10].tolist()) for q in queries]
 
     work = Path(args.work or tempfile.mkdtemp(prefix="nl_vi_"))
-    base = work / "base.lance"
+    work.mkdir(parents=True, exist_ok=True)
+    base = work / "vector_base.lance"
     if not base.exists():
+        import lance  # data generation only
         lance.write_dataset(pa.table({"id": pa.array(np.arange(args.rows)), "vec": pa.FixedSizeListArray.from_arrays(
             pa.array(v.ravel()), args.dim)}), str(base))
 
-    results = {}
-    for kind, kw in (("IVF_FLAT", {}), ("IVF_PQ", {"num_sub_vectors": args.dim // 8}), ("IVF_HNSW_SQ", {})):
-        rec = {"build_s": {}, "recall@10": {}, "search_ms": {}}
-        paths = {}
-        for who, mod in (("pylance", lance), ("nanolance", nl)):
-            path = work / f"{who}_{kind}.lance"
-            shutil.rmtree(path, ignore_errors=True)
-            shutil.copytree(base, path)
-            paths[who] = str(path)
-            t0 = time.perf_counter()
-            mod.dataset(str(path)).create_index("vec", kind, num_partitions=args.partitions, **kw)
-            rec["build_s"][who] = time.perf_counter() - t0
-            ds = lance.dataset(str(path))
-            rec["recall@10"][who] = float(np.mean([
-                len(set(ds.to_table(nearest={"column": "vec", "q": q, "k": 10}, columns=["id"]).column("id").to_pylist())
-                    & t) / 10 for q, t in zip(queries, truth)]))
-        # nanolance answers as pylance does on pylance's index.
-        theirs, ours = lance.dataset(paths["pylance"]), nl.dataset(paths["pylance"])
-        for name, extra in SEARCHES:
-            for q in queries[:10]:
-                nearest = {"column": "vec", "q": q, **extra}
-                a = theirs.to_table(nearest=nearest, columns=["id"])
-                b = ours.to_table(nearest=nearest, columns=["id"])
-                if a.column("id").to_pylist() != b.column("id").to_pylist() or not np.allclose(
-                        a.column("_distance").to_numpy(), b.column("_distance").to_numpy(), rtol=1e-4, atol=1e-4):
-                    raise SystemExit(f"nanolance answered {kind} {name} otherwise than pylance")
-        for name, extra in SEARCHES:
-            row = {}
-            for who, mod in (("pylance", lance), ("nanolance", nl)):
-                ds = mod.dataset(paths[who])
-                run = lambda: [ds.to_table(nearest={"column": "vec", "q": q, **extra}, columns=["id"]) for q in queries]
-                run()
-                xs = []
-                for _ in range(args.runs):
-                    t0 = time.perf_counter()
-                    run()
-                    xs.append((time.perf_counter() - t0) / len(queries))
-                row[who] = statistics.median(xs) * 1000
-            rec["search_ms"][name] = row
-        results[kind] = rec
-        print(kind, json.dumps(rec))
+    lines = [f"vector_config\tvec\t{args.partitions}\t{args.dim}"]
+    lines += [f"vector_kind\t{kind}\t{kind}" for kind in KINDS]
+    lines += [f"vector_query\t" + ",".join(f"{x:.7g}" for x in q) for q in queries]
+    for name, k, nprobes, refine in SEARCHES:
+        lines.append(f"vector_search\t{name}\t{k}\t{nprobes or 0}\t{refine or 0}")
+    workload = write_workload(work / "vector.txt", lines, args.min_seconds)
 
-    commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True,
-                            text=True).stdout.strip()
-    if subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
-                      capture_output=True, text=True).stdout.strip():
-        commit += " with uncommitted changes"
+    rust = run_driver(RUST_CMD, "vector", workload, work / "rust", base, work / "rust_vector.json")["vector"]
+    cpp = run_driver(CPP_CMD, "vector", workload, work / "cpp", base, work / "cpp_vector.json")["vector"]
+
+    builds = {kind: combine_stats(rust["builds"][kind], cpp["builds"][kind]) for kind in KINDS}
+    searches, recalls = {}, {}
+    for key, rust_stat in rust["searches"].items():
+        cpp_hits = cpp["hits"][key]
+        if any(addr >= 2**32 for hits in cpp_hits for addr in hits):
+            raise SystemExit(f"{key}: nanolance returned a row address outside fragment 0")
+        searches[key] = combine_stats(rust_stat, cpp["searches"][key])
+    for kind in KINDS:
+        # Recall@10 of the default search, against the exact answers, for both engines.
+        r_rust = recall(rust["hits"]["%s|k=10" % kind], truth)
+        r_cpp = recall(cpp["hits"]["%s|k=10" % kind], truth)
+        recalls[kind] = {"rust": r_rust, "nanolance": r_cpp}
+        if r_cpp < r_rust - 0.03:
+            # Recorded, not fatal: the performance gate (tools/perf_gate.py) fails on it.
+            print(f"warning: {kind} nanolance recall@10 {r_cpp:.3f} is below Rust Lance's {r_rust:.3f}")
+
     out = {
-        "environment": {"pylance": lance.__version__, "nanolance_commit": commit, "cores": os.cpu_count(),
-                        "machine": platform.processor() or platform.machine(),
-                        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")},
-        "rows": args.rows, "dim": args.dim, "partitions": args.partitions, "runs": args.runs, "indexes": results,
+        "environment": environment("vector"),
+        "rows": args.rows, "dim": args.dim, "partitions": args.partitions, "min_seconds": args.min_seconds,
+        "builds": builds, "searches": searches, "recall@10": recalls,
     }
     args.out.write_text(json.dumps(out, indent=1))
     print(f"wrote {args.out}")
     if args.work is None:
         shutil.rmtree(work, ignore_errors=True)  # a temporary copy of every dataset: hundreds of MB
-    if args.work is None:
-        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":

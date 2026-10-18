@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Performance gate for the index benchmarks: nanolance against pylance, run in the same job.
+"""Performance gate for the index benchmarks: nanolance against Rust Lance, run in the same job.
 
     python tools/perf_gate.py --scalar S.json --vector V.json --fts F.json --baseline-dir bench/results/perf
     python tools/perf_gate.py --scalar S.json --vector V.json --fts F.json --record bench/results/perf/CPU.json
@@ -7,7 +7,7 @@
 
 The inputs are the outputs of tools/bench_scalar_index.py, tools/bench_vector_index.py and
 tools/bench_fts.py. Every timed aspect (each index build, each query or search) becomes a metric:
-its speed is pylance's time over nanolance's, so 2.0 means nanolance takes half of pylance's time
+its speed is Rust Lance's time over nanolance's, so 2.0 means nanolance takes half of Rust Lance's time
 and 0.5 means it takes twice as long. The matrix (reads and writes) is gated by tools/bench_compare.py.
 
 A machine's baseline is the metrics recorded on it with --record (CI keeps one per runner CPU under
@@ -17,7 +17,7 @@ bench/results/perf/, as bench_compare.py does). Against it, a run fails when
     lead by most of that margin; where it lagged, the lag must not grow by more than 1 / FLOOR;
   * the geometric mean of a family (scalar, vector, fts) falls below FAMILY_FLOOR x its baseline,
     so many small slips that each pass the per-metric floor still fail together;
-  * a nanolance recall@10 is below pylance's by more than RECALL_SLACK, or a baseline metric is missing.
+  * a nanolance recall@10 is below Rust Lance's by more than RECALL_SLACK, or a baseline metric is missing.
 
 Metrics where either engine takes under MIN_MS are left out: below that, a shared runner's scheduling
 is most of the time. With no baseline for this machine, only the correctness checks run, and the
@@ -62,37 +62,37 @@ def machine_key(env: dict) -> tuple:
     return (env.get("cpu"), env.get("cores"))
 
 
-def metric(family: str, key: str, pylance_ms: float, nanolance_ms: float) -> dict:
+def metric(family: str, key: str, rust_ms: float, nanolance_ms: float) -> dict:
     return {
         "family": family,
-        "pylance_ms": pylance_ms,
+        "rust_ms": rust_ms,
         "nanolance_ms": nanolance_ms,
-        "speed": pylance_ms / nanolance_ms if nanolance_ms else None,
+        "speed": rust_ms / nanolance_ms if nanolance_ms else None,
     }
 
 
 def extract(scalar: dict | None, vector: dict | None, fts: dict | None) -> tuple[dict, dict]:
-    """Flat metrics and recalls from the three benchmark outputs, every time in milliseconds."""
+    """Flat metrics and recalls from the three benchmark outputs. Each aspect records Rust Lance's and
+    nanolance's median time in milliseconds; speed is Rust's time over nanolance's."""
     metrics, recall = {}, {}
     if scalar:
-        for name, rec in scalar.get("builds", {}).items():
-            metrics[f"scalar build {name}"] = metric("scalar", name, rec["pylance"], rec["nanolance"])
-        for name, rec in scalar.get("queries", {}).items():
-            # "all|" and "id|" name the same query on the same data; the gate keeps them apart.
-            metrics[f"scalar query {name}"] = metric("scalar", name, rec["pylance"], rec["nanolance"])
+        for name, rec in scalar["builds"].items():
+            metrics[f"scalar build {name}"] = metric("scalar", name, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+        for name, rec in scalar["queries"].items():
+            metrics[f"scalar query {name}"] = metric("scalar", name, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
     if vector:
-        for kind, rec in vector.get("indexes", {}).items():
-            build = rec["build_s"]
-            metrics[f"vector {kind} build"] = metric("vector", kind, build["pylance"] * 1000, build["nanolance"] * 1000)
-            for name, row in rec["search_ms"].items():
-                metrics[f"vector {kind} search {name}"] = metric("vector", kind, row["pylance"], row["nanolance"])
-            for who, value in rec["recall@10"].items():
-                recall[f"vector {kind}"] = {**recall.get(f"vector {kind}", {}), who: value}
+        for kind, rec in vector["builds"].items():
+            metrics[f"vector {kind} build"] = metric("vector", kind, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+        for key, rec in vector["searches"].items():
+            kind, name = key.split("|", 1)
+            metrics[f"vector {kind} search {name}"] = metric("vector", kind, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+        for kind, rec in vector.get("recall@10", {}).items():
+            recall[f"vector {kind}"] = rec
     if fts:
-        build = fts["build_s"]
-        metrics["fts build"] = metric("fts", "build", build["pylance"] * 1000, build["nanolance"] * 1000)
-        for name, row in fts["search_ms"].items():
-            metrics[f"fts search {name}"] = metric("fts", name, row["pylance"], row["nanolance"])
+        rec = fts["builds"]["INVERTED"]
+        metrics["fts build"] = metric("fts", "build", rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+        for name, rec in fts["searches"].items():
+            metrics[f"fts search {name}"] = metric("fts", name, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
     return metrics, recall
 
 
@@ -102,14 +102,14 @@ def family_geomean(metrics: dict, family: str) -> float | None:
 
 
 def timed_enough(m: dict) -> bool:
-    return min(m["pylance_ms"], m["nanolance_ms"]) >= MIN_MS
+    return min(m["rust_ms"], m["nanolance_ms"]) >= MIN_MS
 
 
 def compare(baseline: dict | None, metrics: dict, recall: dict) -> tuple[list[str], list[str]]:
     problems, lines = [], []
     for key, rec in recall.items():
-        if rec.get("nanolance", 0) < rec.get("pylance", 0) - RECALL_SLACK:
-            problems.append(f"{key}: recall@10 {rec['nanolance']:.3f}, pylance {rec['pylance']:.3f}")
+        if rec["nanolance"] < rec["rust"] - RECALL_SLACK:
+            problems.append(f"{key}: recall@10 {rec['nanolance']:.3f}, Rust Lance {rec['rust']:.3f}")
     if baseline is None:
         return problems, lines
     base_metrics, base_recall = baseline["metrics"], baseline.get("recall", {})
@@ -125,17 +125,18 @@ def compare(baseline: dict | None, metrics: dict, recall: dict) -> tuple[list[st
             continue
         if m["speed"] < FLOOR * base["speed"]:
             problems.append(
-                f"{key}: nanolance {m['speed']:.2f}x pylance's speed (baseline {base['speed']:.2f}x, "
-                f"floor {FLOOR * base['speed']:.2f}x): nanolance {m['nanolance_ms']:.2f} ms, pylance {m['pylance_ms']:.2f} ms")
+                f"{key}: nanolance {m['speed']:.2f}x Rust Lance's speed (baseline {base['speed']:.2f}x, "
+                f"floor {FLOOR * base['speed']:.2f}x): nanolance {m['nanolance_ms']:.2f} ms, Rust Lance {m['rust_ms']:.2f} ms")
     for family in FAMILIES:
         timed = {k: v for k, v in metrics.items() if k in base_metrics and timed_enough(v)}
         common = {k: v for k, v in timed.items() if timed_enough(base_metrics[k])}
-        now = family_geomean(common, family)
-        was = family_geomean({k: base_metrics[k] for k in common}, family)
+        in_family = [k for k in common if metrics[k]["family"] == family]
+        now = family_geomean({k: metrics[k] for k in in_family}, family)
+        was = family_geomean({k: base_metrics[k] for k in in_family}, family)
         if now and was:
-            lines.append(f"{family:8s} baseline {was:.2f}x  now {now:.2f}x  ({len(common)} metrics)")
+            lines.append(f"{family:8s} baseline {was:.2f}x  now {now:.2f}x  ({len(in_family)} metrics)")
             if now < FAMILY_FLOOR * was:
-                problems.append(f"{family}: geometric mean {now:.2f}x pylance's speed, baseline {was:.2f}x "
+                problems.append(f"{family}: geometric mean {now:.2f}x Rust Lance's speed, baseline {was:.2f}x "
                                 f"(floor {FAMILY_FLOOR * was:.2f}x)")
     return problems, lines
 

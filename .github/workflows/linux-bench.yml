@@ -116,14 +116,31 @@ jobs:
       # against pylance in the same process run, then gated by tools/perf_gate.py. Runs in sequence:
       # concurrent runs share the cores and swing the ratios by 2x. Skip with the dispatch input
       # skip_perf or a [skip perf] commit message.
-      - name: Index benchmarks (scalar, vector, full-text; quick scale)
+      # The Rust Lance driver (tools/lance_rs_bench, the lance crate 12.0.0 with no Python), cached by its
+      # lockfile: the first run builds the crate's dependencies, later runs reuse them.
+      - name: Cache the Rust Lance driver
+        if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') }}
+        uses: actions/cache@v4
+        with:
+          path: tools/lance_rs_bench/target
+          key: lance-rs-bench-${{ runner.os }}-${{ hashFiles('tools/lance_rs_bench/Cargo.lock') }}
+
+      - name: Build the Rust Lance driver
+        if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') }}
+        run: cargo build --release --manifest-path tools/lance_rs_bench/Cargo.toml
+
+      # The index benchmarks at quick scale, nanolance's C++ library against Rust Lance, each sample
+      # repeated until 10 seconds of timed work (tools/index_bench_common.py). nanolance's driver is
+      # built by the job's CMake build (build/nlbench_index). Runs in sequence: concurrent runs share the
+      # cores and swing the ratios.
+      - name: Index benchmarks (scalar, vector, full-text; quick scale, nanolance vs Rust Lance)
         if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') }}
         run: |
           python3 -m pip install --quiet --break-system-packages ./bindings/python numpy \
             || python3 -m pip install --quiet ./bindings/python numpy
-          python3 tools/bench_scalar_index.py --rows 500000 --runs 5 --out /tmp/perf-scalar.json
-          python3 tools/bench_vector_index.py --rows 50000 --runs 5 --out /tmp/perf-vector.json
-          python3 tools/bench_fts.py --rows 100000 --runs 5 --out /tmp/perf-fts.json
+          python3 tools/bench_scalar_index.py --rows 500000 --work /tmp/nlb-idx --out /tmp/perf-scalar.json
+          python3 tools/bench_vector_index.py --rows 50000 --work /tmp/nlb-idx --out /tmp/perf-vector.json
+          python3 tools/bench_fts.py --rows 100000 --work /tmp/nlb-idx --out /tmp/perf-fts.json
 
       - name: Performance gate (index benchmarks against pylance)
         if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') && !inputs.record_perf_baseline }}
