@@ -1019,14 +1019,24 @@ a user report can be matched to it.</p>
   gzipped) in six Web Workers. Verified in headless Chromium against the real dataset: 12 images,
   3.66 MB fetched (0.008% of the file). The weblance repo holds only the built module, the page,
   the map data (<code>tools/make_map.py</code> rebuilds it) and the license notices; nanolance stays private.</li>
-<li><strong>How:</strong> every READ path goes through <code>io::ByteSource</code> (<code>include/nanolance/byte_source.hpp</code>):
+<li>
+<p><strong>How:</strong> every READ path goes through <code>io::ByteSource</code> (<code>include/nanolance/byte_source.hpp</code>):
   data files (pread, cached file end, coalesced column metadata, small-read block), manifests and
   version discovery, deletion files, tags, index-segment checks. <code>wasm/weblance_glue.cpp</code>
   registers an https source (synchronous XHR in a worker, single-range <code>Range</code> headers -- no CORS
   preflight -- with the redirected CDN URL cached per file) and a Hugging Face tree-API lister;
   <code>wasm/build_weblance.sh</code> builds the module; <code>tests/test_byte_source_remote.cpp</code> reads a dataset
   through a <code>mem://</code> store after deleting the local directory. The I/O rework measured level or
-  faster natively (wide scans 2x, takes 15-37%, a stat storm of ~800 stats per take removed).</li>
+  faster natively (wide scans 2x, takes 15-37%, a stat storm of ~800 stats per take removed).</p>
+</li>
+<li>
+<p><strong>Explore page (2026-10-18):</strong> <code>explore.html</code> opens any public Hugging Face Lance image dataset
+  (presets: MNIST, CIFAR-10, Oxford Pets, Food-101, COCO): it finds the table, picks the image /
+  vector / label columns, samples up to 5,000 vectors (<code>wl_take_vectors</code>), lays them out with PCA in
+  a worker and colors them by class. Six <code>lance-format</code> datasets (2.0 and 2.1) match pylance through
+  the module; MNIST and Food-101 pass the page's real flow (<code>wasm/test/run_explore_test.cjs hf</code>).
+  Brief and outcome: <code>docs/tasks/WEBLANCE_EXPLORE.md</code>.</p>
+</li>
 </ul>
 <p><strong>Open (the demo works; these make it better):</strong></p>
 <table>
@@ -1047,6 +1057,16 @@ a user report can be matched to it.</p>
 <td>Measure in a real browser (not through this session's proxy, which costs seconds per request)</td>
 <td>the page's numbers are what a viewer sees</td>
 <td>the user, 5 minutes</td>
+</tr>
+<tr>
+<td>Each take window costs ~16 requests whatever its size (10 windows of 500 rows: ~160; 50 windows of 100: ~800, too slow)</td>
+<td>so the explore sample is 10 windows, and a class-sorted table (Food-101) shows ~14 of 101 classes</td>
+<td>same session as the row above: fewer page lookups per take</td>
+</tr>
+<tr>
+<td>Explore page: caption-region labels and the images-only grid are built but untested; discovery lists Lance's <code>__manifest</code> dirs</td>
+<td>rough edges</td>
+<td>small</td>
 </tr>
 <tr>
 <td>Each of the six workers opens the dataset (~20 requests each)</td>
