@@ -1,6 +1,6 @@
 # WEBLANCE_FASTER_MAP: read the explore sample with every worker
 
-Status: delegated 2026-10-18.
+Status: done 2026-10-18 (weblance main). Review: a failed image probe no longer fails the map; the PCA-equality check reads EXPLORE_PCA_BASELINE.
 
 ## What the user's iPhone measured (Safari, food101, debug report)
 
