@@ -13,7 +13,7 @@ B="${WASM_BUILD:-$ROOT/build-wasm}"
 NA="$ROOT/.deps/nanoarrow-src/src"
 [ -f "$B/libnanolance.a" ] || { echo "no $B/libnanolance.a: configure and build build-wasm first" >&2; exit 1; }
 
-EXPORTS='_wl_open,_wl_error,_wl_info_json,_wl_take_json,_wl_take_binary,_wl_stats_json,_wl_reset_stats,_wl_free,_malloc,_free'
+EXPORTS='_wl_open,_wl_error,_wl_info_json,_wl_take_json,_wl_take_vectors,_wl_take_binary,_wl_stats_json,_wl_reset_stats,_wl_free,_malloc,_free'
 RUNTIME='ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8,HEAPU8'
 
 em++ -std=c++20 -Oz -DNDEBUG ${WL_CXXFLAGS:-} -I"$ROOT/include" -I"$ROOT/generated" -I"$B/include" -I"$NA" -I"$B/_nanolance_nanoarrow_build/src" \

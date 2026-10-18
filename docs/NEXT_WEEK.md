@@ -65,12 +65,21 @@ a user report can be matched to it.
   through a `mem://` store after deleting the local directory. The I/O rework measured level or
   faster natively (wide scans 2x, takes 15-37%, a stat storm of ~800 stats per take removed).
 
+- **Explore page (2026-10-18):** `explore.html` opens any public Hugging Face Lance image dataset
+  (presets: MNIST, CIFAR-10, Oxford Pets, Food-101, COCO): it finds the table, picks the image /
+  vector / label columns, samples up to 5,000 vectors (`wl_take_vectors`), lays them out with PCA in
+  a worker and colors them by class. Six `lance-format` datasets (2.0 and 2.1) match pylance through
+  the module; MNIST and Food-101 pass the page's real flow (`wasm/test/run_explore_test.cjs hf`).
+  Brief and outcome: `docs/tasks/WEBLANCE_EXPLORE.md`.
+
 **Open (the demo works; these make it better):**
 
 | item | why | size |
 |---|---|---|
 | ~18 HTTP requests per image on a click (223 for 12) | every column of every row is its own page lookup; the six workers hide it, a real browser feels it | 1 session: batch the page-metadata reads of one take, larger blocks for the image column |
 | Measure in a real browser (not through this session's proxy, which costs seconds per request) | the page's numbers are what a viewer sees | the user, 5 minutes |
+| Each take window costs ~16 requests whatever its size (10 windows of 500 rows: ~160; 50 windows of 100: ~800, too slow) | so the explore sample is 10 windows, and a class-sorted table (Food-101) shows ~14 of 101 classes | same session as the row above: fewer page lookups per take |
+| Explore page: caption-region labels and the images-only grid are built but untested; discovery lists Lance's `__manifest` dirs | rough edges | small |
 | Each of the six workers opens the dataset (~20 requests each) | share one open's metadata, or open in one worker and post it | small |
 | Similar-image search in the page (the dataset has an IVF_HNSW_SQ index; nanolance searches it) | the next demo step: click an image, find its neighbours by vector, reading only index partitions | 1-2 sessions |
 | C++ exceptions are off in the WASM build (out of memory aborts) | acceptable for the demo | measure `-fexceptions` size |
