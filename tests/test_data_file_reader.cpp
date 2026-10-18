@@ -99,6 +99,18 @@ void test_open_file_cache() {
     require(!ec, "bump mtime");
     require(read_at(path, 0, 4) == "QQQQ", "a replaced file of the same size must not read stale bytes");
 
+    // The same replacement on a filesystem with coarse timestamps: the new bytes come with the OLD
+    // modification time, so size and timestamp both match the cached entry. Only the racy-timestamp rule
+    // (the entry was filled within the timestamp granularity of the file's last change) catches this.
+    write_file(path, "RRRRRRRRRRRRRRRR");
+    require(read_at(path, 0, 4) == "RRRR", "a fresh file reads its own bytes");
+    const auto stamp = std::filesystem::last_write_time(path, ec);
+    require(!ec, "stat the file's timestamp");
+    write_file(path, "SSSSSSSSSSSSSSSS");
+    std::filesystem::last_write_time(path, stamp, ec);
+    require(!ec, "restore the old timestamp");
+    require(read_at(path, 0, 4) == "SSSS", "a same-size rewrite that keeps its timestamp must not read stale bytes");
+
     // A refused read must not leave a cached position that misdirects the next one. This one is
     // refused by the bounds check before the stream is touched at all, so the position is simply
     // unchanged; the other path -- the stream itself failing after the bounds check passed -- needs
