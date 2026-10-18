@@ -62,6 +62,20 @@ function startRangeServer() {
   });
 }
 
+// The rows of the sample in window order, as explore.js's windowPlan lays them out: every row of a table of
+// up to 5,000 rows (windows of 500), else ten spread windows of 500.
+function planRows(n) {
+  const windows = [];
+  if (n <= 5000) {
+    for (let s = 0; s < n; s += 500) windows.push([s, Math.min(500, n - s)]);
+  } else {
+    for (let k = 0; k < 10; k++) windows.push([Math.round((k * (n - 500)) / 9), 500]);
+  }
+  const rows = [];
+  for (const [s, len] of windows) for (let i = 0; i < len; i++) rows.push(s + i);
+  return rows;
+}
+
 function expectedRows() {
   return JSON.parse(fs.readFileSync(path.join(workdir, 'local', 'expected.json'), 'utf8'));
 }
@@ -406,6 +420,25 @@ async function main() {
         assert.strictEqual(report.sampleRows.length, 3000);
         assert.strictEqual(report.sampleRows[1500], 1500);
       });
+      check('sample rows and their order equal the window plan', () => {
+        assert.deepStrictEqual(report.sampleRows, planRows(report.rows));
+      });
+      check('PCA coordinates equal the ones recorded before the change', () => {
+        // The layout must not change when the page's work is reorganized. EXPLORE_PCA_BASELINE names a
+        // file of x and y recorded by an earlier run (each run writes WORKDIR/pca-baseline.json); without
+        // it, this run records one for the next and compares nothing.
+        fs.writeFileSync(path.join(workdir, 'pca-baseline.json'), JSON.stringify({ x: report.x, y: report.y }));
+        if (!process.env.EXPLORE_PCA_BASELINE) {
+          console.log('no EXPLORE_PCA_BASELINE: recorded ' + path.join(workdir, 'pca-baseline.json'));
+          return;
+        }
+        const base = JSON.parse(fs.readFileSync(process.env.EXPLORE_PCA_BASELINE, 'utf8'));
+        assert.strictEqual(report.x.length, base.x.length, 'point count');
+        base.x.forEach((v, i) => {
+          assert.ok(Math.abs(report.x[i] - v) < 1e-9 && Math.abs(report.y[i] - base.y[i]) < 1e-9,
+            `point ${i}: (${report.x[i]}, ${report.y[i]}) vs (${v}, ${base.y[i]})`);
+        });
+      });
       check('PCA separates the classes', () => {
         const byLabel = new Map();
         report.labels.forEach((l, i) => {
@@ -497,6 +530,17 @@ async function main() {
           assert.match(dbgReport, new RegExp('\\+\\d+\\.\\d{3}s ' + kind.replace('.', '\\.') + ' '), kind);
         }
         assert.strictEqual((dbgReport.match(/ click\.image /g) || []).length, 12, 'click.image lines');
+      });
+      check('sample windows come from at least two workers', () => {
+        const ws = new Set([...dbgReport.matchAll(/ sample\.window w=(\d)/g)].map((m) => m[1]));
+        assert.ok(ws.size >= 2, 'workers: ' + [...ws].join(','));
+      });
+      check('one open line per worker, all before the map is drawn', () => {
+        const lines = dbgReport.split('\n');
+        const drawAt = lines.findIndex((l) => / map\.draw /.test(l));
+        assert.ok(drawAt > 0, 'no map.draw line');
+        const opens = lines.slice(0, drawAt).map((l) => /^\+\d+\.\d{3}s open w=(\d) /.exec(l)).filter(Boolean).map((m) => m[1]);
+        assert.deepStrictEqual(opens.slice().sort(), ['1', '2', '3', '4'], 'open lines before map.draw');
       });
       await ctx2.close();
 
