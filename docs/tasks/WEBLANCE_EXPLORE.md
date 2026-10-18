@@ -1,6 +1,10 @@
 # WEBLANCE_EXPLORE: open any Hugging Face Lance image dataset in the browser
 
-Status: delegated 2026-10-18.
+Status: done 2026-10-18 (nanolance 6fe2cd0, weblance 9b2b930). Outcome: all local checks pass;
+Hugging Face MNIST 186 requests / 10.2 MB / 10 classes, Food-101 168 requests / 10.0 MB / 14 of 101
+classes. Review: a 50 x 100-row sample was tried and reverted (each window costs ~16 requests, so
+~800 requests); class names shown with spaces; one retry on the tree-API fetch (one MNIST run
+failed on a single "Failed to fetch").
 
 ## Goal
 
