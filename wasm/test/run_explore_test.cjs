@@ -28,7 +28,7 @@ if (!['local', 'hf'].includes(mode) || !workdir || !wasmDir || !webDir) {
 }
 const testDir = __dirname;
 const site = path.join(workdir, `site-${mode}`);
-const PAGE_FILES = ['explore.html', 'explore.js', 'explore-worker.js', 'style.css', 'index.html'];
+const PAGE_FILES = ['explore.html', 'explore.js', 'explore-worker.js', 'style.css', 'index.html', 'app.js', 'worker.js', 'debug.js'];
 const TEST_FILES = ['vectors.html', 'vectors-worker.js'];
 const HF_RUNS = [
   { name: 'mnist', ds: 'lance-format/mnist-lance' },
@@ -85,6 +85,240 @@ async function waitForExplore(page, timeout) {
   });
   const report = await page.evaluate(() => window.__explore || null);
   return { report, message };
+}
+
+// ---- The debug log (debug.js): crash recovery, two tabs, storage blocked, a forced worker error and
+// index.html with Hugging Face blocked. Each scenario has its own browser context.
+
+const DEBUG_KEY = 'weblance-debug-v1';
+const CLICK_AT = 700;  // a sampled point, as in the click step
+
+// The image cards of a click are all decoded.
+async function clickSampledPoint(page, index) {
+  await page.locator('#map').scrollIntoViewIfNeeded();
+  const p = await page.evaluate((i) => {
+    const c = document.getElementById('map');
+    const r = c.getBoundingClientRect();
+    return { x: r.left + window.__explore.x[i] * c.clientWidth, y: r.top + window.__explore.y[i] * c.clientHeight };
+  }, index);
+  await page.mouse.click(p.x, p.y);
+  await page.waitForFunction(() => {
+    const imgs = [...document.querySelectorAll('#gallery .card img')];
+    return imgs.length === 12 && imgs.every((i) => i.complete && i.naturalWidth > 0);
+  }, null, { timeout: 120000, polling: 200 });
+}
+
+// The block of one visit in a report: from its '== visit <id>' line to the next visit.
+function blockOf(report, visitId) {
+  return report.split('\n== visit ').find((b) => b.startsWith(visitId + ' ')) || '';
+}
+
+// A renderer crash: chrome://crash, or CDP Page.crash when that does not crash the tab here.
+async function crashTab(ctx, page) {
+  const crashed = page.waitForEvent('crash', { timeout: 15000 }).then(() => true, () => false);
+  page.goto('chrome://crash').catch(() => {});
+  if (await crashed) return 'chrome://crash';
+  const cdp = await ctx.newCDPSession(page);
+  const crashed2 = page.waitForEvent('crash', { timeout: 15000 }).then(() => true, () => false);
+  cdp.send('Page.crash').catch(() => {});
+  if (await crashed2) return 'CDP Page.crash';
+  throw new Error('the tab did not crash: chrome://crash and CDP Page.crash both failed');
+}
+
+// The crashed visit is only recognised once its heartbeat is over 6 s old: wait for that on a page of the
+// same origin that has no debug log.
+async function waitUntilStale(ctx, base, visitId) {
+  const probe = await ctx.newPage();
+  await probe.goto(`${base}/style.css`);
+  await probe.waitForFunction((a) => {
+    const s = JSON.parse(localStorage.getItem(a.key) || '{"visits":[]}');
+    const v = s.visits.find((x) => x.id === a.id);
+    return !v || Date.now() - v.hb > 6500;
+  }, { key: DEBUG_KEY, id: visitId }, { timeout: 30000, polling: 250 });
+  await probe.close();
+}
+
+const bannerShown = (page) => page.evaluate(() => {
+  const b = document.querySelector('.wl-banner');
+  return !!b && !b.hidden;
+});
+
+async function debugScenarios({ browser, base, ds, check, out }) {
+  const viewport = { width: 1280, height: 900 };
+  const tableUrl = `${base}/explore.html?table_url=${encodeURIComponent(ds)}`;
+  out.steps.debug = out.steps.debug || {};
+
+  // 1. Crash recovery: a visit that samples and clicks, then its tab crashes. The next visit shows the
+  //    banner, and its report has the crashed visit's sample and click events; Copy puts it on the clipboard.
+  {
+    const ctx = await browser.newContext({ viewport });
+    await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: base });
+    const page = await ctx.newPage();
+    await page.goto(tableUrl);
+    await waitForExplore(page, 300000);
+    await clickSampledPoint(page, CLICK_AT);
+    const crashId = await page.evaluate(() => window.wlDebug.visitId);
+    // Ordinary events reach the store at most 300 ms after they happen: wait until the click is stored.
+    await page.waitForFunction(([key, id]) => {
+      const v = JSON.parse(localStorage.getItem(key)).visits.find((x) => x.id === id);
+      return !!v && v.events.some((e) => e.kind === 'click.done');
+    }, [DEBUG_KEY, crashId], { timeout: 30000, polling: 200 });
+    const how = await crashTab(ctx, page);
+    await waitUntilStale(ctx, base, crashId);
+    const next = await ctx.newPage();
+    const errors = [];
+    next.on('pageerror', (e) => errors.push(String(e)));
+    await next.goto(`${base}/explore.html`);
+    await next.waitForFunction(() => {
+      const b = document.querySelector('.wl-banner');
+      return !!b && !b.hidden;
+    }, null, { timeout: 30000, polling: 200 });
+    const bannerText = await next.locator('.wl-banner').innerText();
+    const report = await next.evaluate(() => window.wlDebug.report());
+    const block = blockOf(report, crashId);
+    fs.writeFileSync(path.join(workdir, 'debug-report-crash.txt'), report);
+    await next.locator('.wl-banner button', { hasText: 'Copy debug report' }).click();
+    await next.waitForFunction(() => /Copied|Copy is blocked/.test(document.querySelector('.wl-banner .wl-say').textContent), null, { timeout: 10000 });
+    const clip = await next.evaluate(() => navigator.clipboard.readText());
+    await next.locator('.wl-banner button', { hasText: 'Dismiss' }).click();
+    const afterDismiss = await bannerShown(next);
+    out.steps.debug.crash = { how, crashId, bannerText, blockLines: block.split('\n').length, clipStart: clip.slice(0, 60) };
+    check('crash: the next visit shows the banner', () => assert.match(bannerText, /The last visit ended unexpectedly/));
+    check('crash: the report has the crashed visit with its sample, PCA and click events', () => {
+      assert.match(block, /\(CRASHED\)/, 'visit not marked CRASHED');
+      for (const kind of ['sample.window', 'pca', 'click.image', 'click.done']) {
+        assert.match(block, new RegExp('\\+\\d+\\.\\d{3}s ' + kind.replace('.', '\\.') + ' '), kind);
+      }
+      assert.strictEqual((block.match(/ click\.image /g) || []).length, 12, 'click.image lines');
+    });
+    check('crash: Copy puts the report on the clipboard', () => {
+      assert.ok(clip.startsWith('weblance debug report'), clip.slice(0, 60));
+      assert.ok(clip.includes('== visit ' + crashId + ' '), 'crashed visit missing from the clipboard text');
+    });
+    check('crash: Dismiss hides the banner', () => assert.strictEqual(afterDismiss, false));
+    check('crash: no page errors on the next visit', () => assert.deepStrictEqual(errors, []));
+    await ctx.close();
+  }
+
+  // 2. Two tabs open at once: neither is marked crashed, not even a third one opened after both were alive
+  //    for a while (their heartbeats keep them unended).
+  {
+    const ctx = await browser.newContext({ viewport });
+    const a = await ctx.newPage();
+    await a.goto(`${base}/explore.html`);
+    const b = await ctx.newPage();
+    await b.goto(`${base}/explore.html`);
+    await a.waitForFunction(() => performance.now() > 7000, null, { timeout: 30000, polling: 500 });
+    const c = await ctx.newPage();
+    await c.goto(`${base}/explore.html`);
+    const shown = [];
+    for (const p of [a, b, c]) shown.push(await bannerShown(p));
+    out.steps.debug.twoTabs = { shown, visibility: await a.evaluate(() => document.visibilityState) };
+    check('two tabs: no banner in either', () => assert.deepStrictEqual(shown, [false, false, false]));
+    await ctx.close();
+  }
+
+  // 2b. A background tab: its page reports 'hidden', so it writes no heartbeat. A visit opened 7 s later must
+  //     not call it crashed: the tab is alive and still holds its Web Lock.
+  {
+    const ctx = await browser.newContext({ viewport });
+    const a = await ctx.newPage();
+    await a.addInitScript(() => Object.defineProperty(document, 'visibilityState', { get: () => 'hidden' }));
+    await a.goto(`${base}/explore.html`);
+    await a.waitForFunction(() => performance.now() > 7000, null, { timeout: 30000, polling: 500 });
+    const c = await ctx.newPage();
+    await c.goto(`${base}/explore.html`);
+    await c.waitForTimeout(500);  // the lock query is asynchronous
+    const shown = await bannerShown(c);
+    out.steps.debug.backgroundTab = { shown };
+    check('background tab: a live hidden tab is not reported as crashed', () => assert.strictEqual(shown, false));
+    await ctx.close();
+  }
+
+  // 3. Storage blocked: localStorage throws. The page still samples and clicks without page errors, and the
+  //    panel says the log is in memory only.
+  {
+    const ctx = await browser.newContext({ viewport });
+    await ctx.addInitScript(() => {
+      try {
+        Object.defineProperty(window, 'localStorage', {
+          configurable: true, get() { throw new DOMException('storage blocked by the test', 'SecurityError'); },
+        });
+      } catch (e) {
+        // the probe below reports whether the block took
+      }
+    });
+    const page = await ctx.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(String(e)));
+    await page.goto(tableUrl);
+    const { report } = await waitForExplore(page, 300000);
+    await clickSampledPoint(page, CLICK_AT);
+    await page.keyboard.press('Shift+D');
+    const panel = await page.evaluate(() => {
+      const p = document.getElementById('wl-debug');
+      const memNote = p && p.querySelector('.wl-mem');
+      return { open: !!p && !p.hidden, memVisible: !!memNote && !memNote.hidden, text: memNote ? memNote.textContent : '',
+        storageOk: window.wlDebug.storageOk, sampled: !!window.__explore };
+    });
+    out.steps.debug.blocked = panel;
+    check('storage blocked: the page samples and clicks without page errors', () => {
+      assert.ok(panel.sampled, 'no sample');
+      assert.deepStrictEqual(errors, []);
+    });
+    check('storage blocked: the panel says the log is in memory', () => {
+      assert.strictEqual(panel.open, true, 'panel not open');
+      assert.strictEqual(panel.memVisible, true, 'memory note hidden');
+      assert.strictEqual(panel.storageOk, false);
+      assert.match(panel.text, /in memory only/);
+    });
+    await ctx.close();
+  }
+
+  // 4. A forced worker error (test hook debug_fail=open): logged, shown and in the report.
+  {
+    const ctx = await browser.newContext({ viewport });
+    const page = await ctx.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(String(e)));
+    await page.goto(`${tableUrl}&debug_fail=open`);
+    const { message } = await waitForExplore(page, 120000);
+    const report = await page.evaluate(() => window.wlDebug.report());
+    out.steps.debug.forcedError = { message, lines: report.split('\n').filter((l) => /worker\.error|error /.test(l)).slice(0, 4) };
+    check('forced worker error: shown on the page and logged in the report', () => {
+      assert.match(message, /debug_fail=open/);
+      assert.match(report, /\+\d+\.\d{3}s worker\.error w=w\d op=open error=debug_fail=open/);
+    });
+    check('forced worker error: no uncaught page error', () => assert.deepStrictEqual(errors, []));
+    await ctx.close();
+  }
+
+  // 5. index.html with Hugging Face blocked: no page error, the failures are logged, and the panel opens from
+  //    the footer link. (Not run against Hugging Face.)
+  {
+    const ctx = await browser.newContext({ viewport });
+    let blocked = 0;
+    await ctx.route(/huggingface\.co/, (route) => { blocked++; route.abort(); });
+    const page = await ctx.newPage();
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(String(e)));
+    await page.goto(`${base}/index.html`);
+    await page.waitForFunction(() => /could not be opened/.test(document.getElementById('status').textContent),
+      null, { timeout: 180000, polling: 500 });
+    await page.locator('footer button.wl-open').click();
+    const report = await page.evaluate(() => window.wlDebug.report());
+    const panelOpen = await page.evaluate(() => !document.getElementById('wl-debug').hidden);
+    out.steps.debug.index = { blocked, panelOpen, failures: (report.match(/worker\.error|abort /g) || []).length,
+      mapLine: (report.match(/map\.load.*/) || [''])[0] };
+    check('index: Hugging Face requests reached the route block', () => assert.ok(blocked > 0, 'no request was routed'));
+    check('index: the failures are logged and the footer link opens the panel', () => {
+      assert.ok(out.steps.debug.index.failures > 0, 'no worker failure logged');
+      assert.strictEqual(panelOpen, true);
+    });
+    check('index: no page error', () => assert.deepStrictEqual(errors, []));
+    await ctx.close();
+  }
+  fs.writeFileSync(path.join(workdir, 'debug-scenarios.json'), JSON.stringify(out.steps.debug, null, 2));
 }
 
 async function main() {
@@ -243,6 +477,27 @@ async function main() {
         for (const c of click.captions) assert.ok(classes.has(c), 'caption ' + c);
       });
       check('no page errors', () => assert.deepStrictEqual(pageErrors, []));
+
+      // 5. The debug log: Shift+D opens its panel, and the visit's report has the open, sample, PCA and click events.
+      await page2.keyboard.press('Shift+D');
+      const dbgReport = await page2.evaluate(() => window.wlDebug.report());
+      const dbgPanel = await page2.evaluate(() => {
+        const p = document.getElementById('wl-debug');
+        return { open: !!p && !p.hidden, text: p ? p.textContent : '' };
+      });
+      fs.writeFileSync(path.join(workdir, 'debug-report-local.txt'), dbgReport);
+      out.steps.debug = out.steps.debug || {};
+      out.steps.debug.click = { panelOpen: dbgPanel.open, lines: dbgReport.split('\n').length };
+      check('debug panel opens with Shift+D and says where the log is', () => {
+        assert.strictEqual(dbgPanel.open, true);
+        assert.ok(dbgPanel.text.includes('Stored only in this browser; nothing is sent anywhere.'));
+      });
+      check('debug report has the open, sample, PCA and click events', () => {
+        for (const kind of ['open', 'sample.window', 'pca', 'click.image']) {
+          assert.match(dbgReport, new RegExp('\\+\\d+\\.\\d{3}s ' + kind.replace('.', '\\.') + ' '), kind);
+        }
+        assert.strictEqual((dbgReport.match(/ click\.image /g) || []).length, 12, 'click.image lines');
+      });
       await ctx2.close();
 
       // 4. Phone width: no sideways scroll.
@@ -253,7 +508,14 @@ async function main() {
       const widths = await page3.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
       out.steps.phone = widths;
       check('phone width does not scroll', () => assert.ok(widths.scroll <= widths.client, JSON.stringify(widths)));
+      // The debug panel at phone width too.
+      await page3.keyboard.press('Shift+D');
+      const panelWidths = await page3.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth,
+        open: !document.getElementById('wl-debug').hidden }));
+      out.steps.phonePanel = panelWidths;
+      check('phone width does not scroll with the debug panel open', () => assert.ok(panelWidths.open && panelWidths.scroll <= panelWidths.client, JSON.stringify(panelWidths)));
       await ctx3.close();
+      await debugScenarios({ browser, base, ds, check, out });
     } else {
       for (const run of HF_RUNS) {
         const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 }, ...contextOpts });

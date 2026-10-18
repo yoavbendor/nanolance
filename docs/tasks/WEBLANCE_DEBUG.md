@@ -1,6 +1,6 @@
 # WEBLANCE_DEBUG: a hidden debug panel that survives crashes
 
-Status: delegated 2026-10-18.
+Status: done 2026-10-18 (weblance main). Review: crashed visits are found with Web Locks (a live background tab keeps its lock); the brief's heartbeat-only rule reported hidden tabs as crashed and is now the fallback.
 
 ## Goal
 
