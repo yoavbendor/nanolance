@@ -24,6 +24,14 @@ on:
       matrix_runs:
         description: "Timed runs per matrix entry (3 on every push; more for a steadier baseline)"
         default: "3"
+      skip_perf:
+        description: "Skip the index performance gate (time is pressing); a push can say [skip perf] instead"
+        type: boolean
+        default: false
+      record_perf_baseline:
+        description: "Record this runner's index baseline (bench/results/perf) and commit it to this branch"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -41,7 +49,8 @@ jobs:
           sudo apt-get update
           # clang-19 fixes the ICE (exit 139) that clang 18.1.3 hits on dpar/lldp2lance_main.cpp
           sudo apt-get install -y clang-19 ninja-build valgrind cmake libfuse3-dev
-          python3 -m pip install --quiet --break-system-packages pyarrow pylance || python3 -m pip install --quiet pyarrow pylance
+          # pylance is pinned: the benchmark baselines (bench/results/ci, bench/results/perf) are pylance 12.0.0.
+          python3 -m pip install --quiet --break-system-packages pyarrow "pylance==12.0.0" || python3 -m pip install --quiet pyarrow "pylance==12.0.0"
 
       # Cache the FetchContent downloads + dep builds (a standalone configure parks them in ./.deps).
       # Keyed on the CMakeLists that declare the pins (nanoarrow/zstd/CLI11/nanos3reader), so a bump busts it.
@@ -102,6 +111,44 @@ jobs:
             || python3 -m pip install --quiet ./bindings/python numpy
           python3 tools/bench_matrix.py --quick --runs "${{ github.event.inputs.matrix_runs || '3' }}" \
             --out /tmp/matrix-quick.json
+
+      # The index benchmarks (scalar indexes, vector indexes, full-text) at quick scale, each timed
+      # against pylance in the same process run, then gated by tools/perf_gate.py. Runs in sequence:
+      # concurrent runs share the cores and swing the ratios by 2x. Skip with the dispatch input
+      # skip_perf or a [skip perf] commit message.
+      - name: Index benchmarks (scalar, vector, full-text; quick scale)
+        if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') }}
+        run: |
+          python3 -m pip install --quiet --break-system-packages ./bindings/python numpy \
+            || python3 -m pip install --quiet ./bindings/python numpy
+          python3 tools/bench_scalar_index.py --rows 500000 --runs 5 --out /tmp/perf-scalar.json
+          python3 tools/bench_vector_index.py --rows 50000 --runs 5 --out /tmp/perf-vector.json
+          python3 tools/bench_fts.py --rows 100000 --runs 5 --out /tmp/perf-fts.json
+
+      - name: Performance gate (index benchmarks against pylance)
+        if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') && !inputs.record_perf_baseline }}
+        run: |
+          python3 tools/perf_gate.py --scalar /tmp/perf-scalar.json --vector /tmp/perf-vector.json \
+            --fts /tmp/perf-fts.json --baseline-dir bench/results/perf
+
+      - name: Record the index baseline for this runner (manual runs only)
+        if: ${{ inputs.record_perf_baseline && !inputs.skip_perf }}
+        run: |
+          SLUG=$(python3 -c "import os, sys; sys.path.insert(0, 'tools'); import perf_gate as g; print(f'{g.cpu_slug(g.cpu_name())}-{os.cpu_count()}c')")
+          mkdir -p bench/results/perf
+          python3 tools/perf_gate.py --scalar /tmp/perf-scalar.json --vector /tmp/perf-vector.json \
+            --fts /tmp/perf-fts.json --record "bench/results/perf/$SLUG.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bench/results/perf
+          git commit -m "ci: index performance baseline for $SLUG [skip ci]" && git push
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && !inputs.skip_perf }}
+        with:
+          name: perf-index
+          path: /tmp/perf-*.json
+          if-no-files-found: ignore
 
       # The run's matrix, kept so the baseline can be re-recorded on this runner type: as an artifact,
       # and as one log line (MATRIX_JSON ...) for tools that read job logs. To re-baseline, run this
