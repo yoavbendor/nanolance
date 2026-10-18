@@ -19,6 +19,8 @@ if(NOT DEFINED FETCHCONTENT_BASE_DIR)
 endif()
 
 include(FetchContent)
+# NANOLANCE_GIT_BASE and NANOLANCE_GIT_URL_*: where nanoarrow and zstd are cloned from (GitHub, or a mirror).
+include("${NL_ROOT}/cmake/NanolanceDeps.cmake")
 
 # nanoarrow and zstd are brought in with add_subdirectory(... EXCLUDE_FROM_ALL), NOT
 # FetchContent_MakeAvailable, and the reason is the WHEEL. MakeAvailable runs a dependency's own
@@ -37,7 +39,7 @@ set(NANOARROW_BUILD_APPS OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     nanoarrow
-    GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow.git
+    GIT_REPOSITORY ${NANOLANCE_GIT_URL_NANOARROW}
     GIT_TAG ffe61d3cd2d02da9e60cfc405cd6c50c512f64b9
     GIT_SHALLOW FALSE
 )
@@ -52,7 +54,7 @@ if(NOT TARGET libzstd_static)
     set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
     FetchContent_Declare(
         _nanolance_py_zstd
-        GIT_REPOSITORY https://github.com/facebook/zstd.git
+        GIT_REPOSITORY ${NANOLANCE_GIT_URL_ZSTD}
         GIT_TAG v1.5.6
         GIT_SHALLOW TRUE
     )

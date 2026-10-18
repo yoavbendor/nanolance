@@ -325,6 +325,10 @@ nano_lance_writer_close(&w);
 
 Requires CMake 3.22+, C++20, network for first-time FetchContent (nanoarrow, zstd, CLI11).
 
+No GitHub access (a corporate GitLab mirror instead): set `NANOLANCE_GIT_BASE=https://gitlab.example.com/mirrors`
+(environment or `-D`) and every dependency is cloned from there; see
+[docs/BUILDING_BEHIND_A_FIREWALL.md](docs/BUILDING_BEHIND_A_FIREWALL.md) for what to mirror and the build and test commands.
+
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
