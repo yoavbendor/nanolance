@@ -213,20 +213,30 @@ async function main() {
         const imgs = [...document.querySelectorAll('#gallery .card img')];
         return imgs.length === 12 && imgs.every((i) => i.complete && i.naturalWidth > 0);
       }, null, { timeout: 120000, polling: 200 });
+      // The fade-in takes 0.25 s; give it a second, then count what is actually visible.
+      await page2.waitForFunction(() => [...document.querySelectorAll('#gallery .card img')]
+        .every((i) => getComputedStyle(i).opacity === '1'), null, { timeout: 1000, polling: 100 }).catch(() => {});
       const click = await page2.evaluate(() => {
         const cards = [...document.querySelectorAll('#gallery .card')];
         return {
           images: cards.length,
           decoded: cards.filter((c) => c.querySelector('img') && c.querySelector('img').naturalWidth > 0).length,
+          // Seen, not only decoded: style.css keeps a card's image transparent until the card is 'loaded'.
+          visible: cards.filter((c) => {
+            const img = c.querySelector('img');
+            const r = img ? img.getBoundingClientRect() : null;
+            return img && getComputedStyle(img).opacity === '1' && r.width > 0 && r.height > 0;
+          }).length,
           captions: cards.map((c) => c.querySelector('figcaption').textContent),
           requests: document.getElementById('s-click-requests').textContent,
           bytes: document.getElementById('s-click-bytes').textContent,
         };
       });
       out.steps.click = click;
-      check('click 12 images decode', () => {
+      check('click 12 images decode and show', () => {
         assert.strictEqual(click.images, 12);
         assert.strictEqual(click.decoded, 12);
+        assert.strictEqual(click.visible, 12, 'images decoded but not visible');
       });
       check('click labels are classes', () => {
         const classes = new Set(expected.rows.map((r) => r.label_name));
