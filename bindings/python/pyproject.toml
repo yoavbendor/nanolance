@@ -32,6 +32,12 @@ nanolance = "nanolance.__main__:main"
 test = ["pytest>=7", "pyarrow>=16", "pandas>=2", "polars>=1", "psutil>=5.9", "pylance>=0.17"]
 bench = ["pyarrow>=16", "psutil>=5.9", "pylance>=0.17"]
 
+# uv (`uv sync`, `uv run`) reads these groups; the same lists as the extras above, so `pip` and `uv`
+# install the same things. uv.lock pins every version (see docs/BUILDING_BEHIND_A_FIREWALL.md).
+[dependency-groups]
+test = ["pytest>=7", "pyarrow>=16", "pandas>=2", "polars>=1", "psutil>=5.9", "pylance>=0.17"]
+bench = ["pyarrow>=16", "psutil>=5.9", "pylance>=0.17"]
+
 [project.urls]
 Homepage = "https://github.com/yoavbendor/nanolance"
 Repository = "https://github.com/yoavbendor/nanolance"
