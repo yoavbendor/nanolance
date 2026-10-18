@@ -30,7 +30,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED = ROOT / "tests" / "lance_c" / "expected_pass.txt"
-REPO = "https://github.com/lance-format/lance-c.git"
+# The same settings as the CMake build (cmake/NanolanceDeps.cmake): NANOLANCE_GIT_URL_LANCE_C, else
+# NANOLANCE_GIT_BASE/lance-format/lance-c.git, else GitHub.
+REPO = os.environ.get("NANOLANCE_GIT_URL_LANCE_C") or (os.environ.get("NANOLANCE_GIT_BASE") or "https://github.com").rstrip("/") + "/lance-format/lance-c.git"
 
 
 def fetch(commit: str, cache: Path) -> Path:

@@ -30,7 +30,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED = ROOT / "bindings" / "python" / "tests" / "pylance_suite" / "expected_pass.txt"
-REPO = "https://github.com/lance-format/lance.git"
+# The same settings as the CMake build (cmake/NanolanceDeps.cmake): NANOLANCE_GIT_URL_LANCE, else
+# NANOLANCE_GIT_BASE/lance-format/lance.git, else GitHub.
+REPO = os.environ.get("NANOLANCE_GIT_URL_LANCE") or (os.environ.get("NANOLANCE_GIT_BASE") or "https://github.com").rstrip("/") + "/lance-format/lance.git"
 
 
 def api_version() -> str:

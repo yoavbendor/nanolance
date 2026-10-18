@@ -34,13 +34,14 @@ if(NOT FUSE3_FOUND)
                    "(fuse-3.16.2, static). meson=${MESON_EXE} ninja=${NINJA_EXE}")
 
     include(ExternalProject)
+    include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/NanolanceDeps.cmake")  # NANOLANCE_GIT_URL_LIBFUSE
 
     set(_FUSE3_INSTALL "${CMAKE_BINARY_DIR}/_deps/fuse3-install")
     set(_FUSE3_BUILD   "${CMAKE_BINARY_DIR}/_deps/fuse3-build")
     set(_FUSE3_LIB "${_FUSE3_INSTALL}/lib/libfuse3.a")
 
     ExternalProject_Add(fuse3_from_source
-        GIT_REPOSITORY  https://github.com/libfuse/libfuse.git
+        GIT_REPOSITORY  ${NANOLANCE_GIT_URL_LIBFUSE}
         GIT_TAG         fuse-3.16.2
         GIT_SHALLOW     TRUE
         PREFIX          "${CMAKE_BINARY_DIR}/_deps/fuse3"

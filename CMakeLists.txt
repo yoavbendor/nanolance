@@ -103,6 +103,8 @@ else()
 endif()
 
 include(FetchContent)
+# NANOLANCE_GIT_BASE and NANOLANCE_GIT_URL_*: where the dependencies below are cloned from (GitHub, or a mirror).
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/NanolanceDeps.cmake")
 
 # --- nanoarrow ---
 if(NOT TARGET nanoarrow_static OR NOT DEFINED nanoarrow_SOURCE_DIR)
@@ -116,7 +118,7 @@ if(NOT TARGET nanoarrow_static OR NOT DEFINED nanoarrow_SOURCE_DIR)
     set(NANOARROW_BUILD_APPS OFF CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(nanoarrow
-        GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow.git
+        GIT_REPOSITORY ${NANOLANCE_GIT_URL_NANOARROW}
         GIT_TAG ffe61d3cd2d02da9e60cfc405cd6c50c512f64b9
         # Pinned to a commit hash: a shallow clone can't check out an arbitrary SHA on many git servers
         # (corporate mirrors, GitHub Enterprise), which fails standalone configure with "reference is not a
@@ -158,7 +160,7 @@ if(NOT NANOLANCE_ZSTD_TARGET AND NANOLANCE_STANDALONE)
     set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
     set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(_nanolance_zstd
-        GIT_REPOSITORY https://github.com/facebook/zstd.git
+        GIT_REPOSITORY ${NANOLANCE_GIT_URL_ZSTD}
         GIT_TAG v1.5.6
         GIT_SHALLOW TRUE
     )
@@ -188,7 +190,7 @@ if(NANOLANCE_BUILD_TOOLS)
             message(FATAL_ERROR "nanolance: CLI11::CLI11 missing; set NANOLANCE_BUILD_TOOLS=OFF or add CLI11 to parent")
         endif()
         FetchContent_Declare(_nanolance_cli11
-            GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+            GIT_REPOSITORY ${NANOLANCE_GIT_URL_CLI11}
             GIT_TAG v2.4.2
             GIT_SHALLOW TRUE
         )
@@ -225,7 +227,7 @@ set(NANO_LANCE_BLOB_V2_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/golden/blob_v2")
 # own tests and benches are not pulled into this build, and only nanolance_proto's one .cpp sees
 # them (C++23), so nanolance's public headers stay C++20.
 FetchContent_Declare(nanom
-    GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
+    GIT_REPOSITORY ${NANOLANCE_GIT_URL_NANOM}
     GIT_TAG ffb03d35c3ce16d8ee5fd1702a6921989061383a
     GIT_SHALLOW FALSE)
 FetchContent_GetProperties(nanom)
@@ -276,7 +278,7 @@ elseif(NANOLANCE_ENABLE_S3)
     # nano_lance_block_cache_configure() forwards to. Pinned to the 0.2.0 commit; switch to the v0.2.0 tag
     # once it is published. An older reader still builds — the wrapper version-gates on NANOS3READER_VERSION.
     FetchContent_Declare(nanos3reader
-        GIT_REPOSITORY https://github.com/yoavbendor/nanos3reader.git
+        GIT_REPOSITORY ${NANOLANCE_GIT_URL_NANOS3READER}
         GIT_TAG 21558644771b37b6fefa440ee42ff7e8281c4748)
     FetchContent_MakeAvailable(nanos3reader)
     target_link_libraries(nanolance_reader PRIVATE nanos3reader::nanos3reader)
