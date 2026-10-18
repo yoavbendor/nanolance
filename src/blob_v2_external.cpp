@@ -363,6 +363,8 @@ bool BlobV2Placer::write_sidecar(const std::uint32_t id, const std::uint8_t* dat
     if (n != 0U) {
         file.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
     }
+    // The buffer is flushed on close, and a short write (a full disk) shows up only there: check after it.
+    file.close();
     if (!file) {
         error = "cannot write blob file " + path.string();
         return false;
