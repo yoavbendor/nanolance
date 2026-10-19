@@ -62,6 +62,39 @@ jobs:
           restore-keys: |
             deps-${{ runner.os }}-clang19-
 
+      # The Rust Lance driver (tools/lance_rs_bench, the lance crate 12.0.0 with no Python). It is built
+      # first, before the C++ build, so a broken driver fails the job in minutes rather than after the
+      # whole bench. Cached by its lockfile: the first run builds the crate's dependencies, later runs reuse
+      # them. The index benchmarks skip the driver build with skip_perf or a [skip perf] commit message.
+      - name: Cache the Rust Lance driver
+        if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') }}
+        uses: actions/cache@v4
+        with:
+          path: tools/lance_rs_bench/target
+          key: lance-rs-bench-${{ runner.os }}-${{ hashFiles('tools/lance_rs_bench/Cargo.lock') }}
+
+      - name: Build the Rust Lance driver
+        if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') }}
+        run: |
+          # The lance crate's build scripts compile .proto files with protoc. protoc finds the well-known
+          # types (google/protobuf/empty.proto and friends) only under /usr/include, which the
+          # protobuf-compiler package does not ship: libprotobuf-dev does. Without it the build fails with
+          # "google/protobuf/empty.proto: File not found" (run 39220035012 bench job, step 11).
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+          test -f /usr/include/google/protobuf/empty.proto || { echo "::error::libprotobuf-dev did not install google/protobuf/empty.proto"; exit 1; }
+          echo "protoc: $(protoc --version)"
+          echo "cargo:  $(cargo --version)  rustc: $(rustc --version)"
+          set -o pipefail
+          cargo build --release --manifest-path tools/lance_rs_bench/Cargo.toml 2>&1 | tee /tmp/rust-driver-build.log
+
+      - name: Upload the Rust driver build log
+        if: ${{ always() && !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-driver-build-log
+          path: /tmp/rust-driver-build.log
+          if-no-files-found: ignore
+
       - name: Configure + build (clang, Release)
         env:
           CC: clang-19
@@ -116,23 +149,6 @@ jobs:
       # against pylance in the same process run, then gated by tools/perf_gate.py. Runs in sequence:
       # concurrent runs share the cores and swing the ratios by 2x. Skip with the dispatch input
       # skip_perf or a [skip perf] commit message.
-      # The Rust Lance driver (tools/lance_rs_bench, the lance crate 12.0.0 with no Python), cached by its
-      # lockfile: the first run builds the crate's dependencies, later runs reuse them.
-      - name: Cache the Rust Lance driver
-        if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') }}
-        uses: actions/cache@v4
-        with:
-          path: tools/lance_rs_bench/target
-          key: lance-rs-bench-${{ runner.os }}-${{ hashFiles('tools/lance_rs_bench/Cargo.lock') }}
-
-      - name: Build the Rust Lance driver
-        if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') }}
-        run: |
-          # The lance crate's build scripts compile .proto files with protoc, which the runner image may not
-          # ship (the C++ build does not need it): install it explicitly.
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
-          cargo build --release --manifest-path tools/lance_rs_bench/Cargo.toml
-
       # The index benchmarks at quick scale, nanolance's C++ library against Rust Lance, each sample
       # repeated until 10 seconds of timed work (tools/index_bench_common.py). nanolance's driver is
       # built by the job's CMake build (build/nlbench_index). Runs in sequence: concurrent runs share the

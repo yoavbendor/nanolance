@@ -1,0 +1,70 @@
+name: rust-driver
+
+# Builds the Rust Lance driver (tools/lance_rs_bench, the lance crate 12.0.0 with no Python) by itself, so a
+# break in it shows in a few minutes instead of at the end of linux-bench. The same steps run inside
+# linux-bench before its C++ build. Runs on changes to the driver and by hand. Logs every tool version,
+# keeps the full cargo output as an artifact, and fails with the protoc or cargo error at its end.
+
+on:
+  push:
+    branches: ["claude/**"]
+    paths:
+      - "tools/lance_rs_bench/**"
+      - ".github/workflows/rust-driver.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-driver-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Show the runner
+        run: |
+          echo "runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          echo "cpus: $(nproc)  memory: $(free -h | awk '/Mem:/ {print $2}')"
+
+      - uses: actions/checkout@v4
+
+      - name: Install protoc and the well-known .proto files
+        run: |
+          sudo apt-get update
+          # protobuf-compiler alone lacks google/protobuf/*.proto; libprotobuf-dev supplies them under /usr/include.
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+          echo "protoc: $(protoc --version)"
+          dpkg -L libprotobuf-dev | grep 'google/protobuf/empty.proto' || true
+          test -f /usr/include/google/protobuf/empty.proto || { echo "::error::google/protobuf/empty.proto missing after installing libprotobuf-dev"; exit 1; }
+
+      - name: Show the toolchain
+        run: |
+          echo "cargo: $(cargo --version)"
+          echo "rustc: $(rustc --version)"
+          echo "cc:    $(cc --version | head -1)"
+          echo "lockfile sha256: $(sha256sum tools/lance_rs_bench/Cargo.lock | cut -d' ' -f1)"
+
+      - name: Cache the driver's target directory
+        uses: actions/cache@v4
+        with:
+          path: tools/lance_rs_bench/target
+          key: lance-rs-bench-${{ runner.os }}-${{ hashFiles('tools/lance_rs_bench/Cargo.lock') }}
+
+      - name: Build the driver
+        run: |
+          set -o pipefail
+          # Full cargo output goes to the log file as well as the job log, so the uploaded artifact has all of it
+          # even when the job log is cut short.
+          cargo build --release --manifest-path tools/lance_rs_bench/Cargo.toml 2>&1 | tee "$RUNNER_TEMP/rust-driver-build.log"
+
+      - name: Show the binary
+        run: ls -l tools/lance_rs_bench/target/release/lance_rs_bench
+
+      - name: Upload the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-driver-build-log
+          path: ${{ runner.temp }}/rust-driver-build.log
+          if-no-files-found: warn
