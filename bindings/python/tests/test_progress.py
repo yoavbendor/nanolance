@@ -147,8 +147,24 @@ def test_inverted_index_progress_matches_pylance(tmp_path):
         ds.create_scalar_index(column="text", index_type="INVERTED", remove_stop_words=False,
                                progress_callback=events)
         seen[name] = events.events
-    assert seen["nanolance"] == seen["pylance"]
-    assert [(e, s) for e, s, *_ in seen["nanolance"]][:2] == [("start", "load_data"), ("complete", "load_data")]
+
+    # pylance tokenizes fragments side by side, so the order of its tokenize_docs progress events (and the
+    # count its "complete" carries) varies from run to run; its own test checks the stage order and that
+    # the largest count is the row count. Compared here: the stages' start / complete order, every other
+    # stage's events exactly, and the tokenize_docs counts as a multiset.
+    def stages(events):
+        return [(e, s) for e, s, *_ in events if e != "progress"]
+
+    def others(events):
+        return [ev for ev in events if ev[1] != "tokenize_docs"]
+
+    def tokenized(events):
+        return sorted(c for e, s, c, *_ in events if s == "tokenize_docs" and e == "progress")
+
+    assert stages(seen["nanolance"]) == stages(seen["pylance"])
+    assert others(seen["nanolance"]) == others(seen["pylance"])
+    assert tokenized(seen["nanolance"]) == tokenized(seen["pylance"]) == [75, 150]
+    assert stages(seen["nanolance"])[:2] == [("start", "load_data"), ("complete", "load_data")]
 
 
 def test_ivf_pq_progress_stages_match_pylance(tmp_path):
