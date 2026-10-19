@@ -30,6 +30,19 @@ a user report can be matched to it.
 | Fuzzy FTS, accented query tokens | char-level distance | a rule not yet pinned down | measure first | same |
 | FTS / phrase cache hit-miss counts | right direction, other numbers | per page | small | ScanStatistics `indices_loaded`, `index_comparisons` are 0 |
 
+## Index plan for AI users (2026-10-19)
+
+The full plan, with each item's status, size, done-criteria and files, is in `docs/ROADMAP.md`
+("Index plan for AI users"). The next four items, in order:
+
+1. Fragment Reuse Index, complete (partial now, no tests): Opus design, then 1-2 sessions.
+2. Hybrid search, vector + full-text with RRF (refused now): one session plus Opus review.
+3. Object-store datasets, `s3://` and `gs://` writes and reads (not done; moved up from last): large, Opus design first.
+4. Multivector (ColBERT-style) search (not done): 2-3 sessions.
+
+Correction to earlier summaries: CJK segmentation (icu, jieba, lindera) is not done, and neither
+are multivector search or hybrid search.
+
 ## Features left, smallest first
 
 | item | pylance tests | size | notes |
