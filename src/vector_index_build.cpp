@@ -154,33 +154,72 @@ void assign(const Rows& x, const std::vector<float>& centroids, std::size_t k, b
     }
     constexpr std::size_t kChunk = 256;
     const std::size_t chunks = (x.n + kChunk - 1) / kChunk;
+    // Rows go four at a time, so each centroid column loaded from cache serves four rows. Every row's
+    // dot products are summed in the same order as one row at a time: the results are bit-identical.
+    constexpr std::size_t kBlock = 4;
     parallel::for_each(chunks, [&](std::size_t chunk) {
-        std::vector<float> acc(k);
+        std::vector<float> acc(kBlock * k);
         const std::size_t end = std::min(x.n, (chunk + 1) * kChunk);
-        for (std::size_t r = chunk * kChunk; r < end; ++r) {
-            const float* xr = x.row(r);
-            std::fill(acc.begin(), acc.end(), 0.0F);
-            float xnorm = 0.0F;
-            for (std::size_t j = 0; j < d; ++j) {
-                const float xj = xr[j];
-                xnorm += xj * xj;
-                const float* col = ct.data() + j * k;
+        for (std::size_t r0 = chunk * kChunk; r0 < end; r0 += kBlock) {
+            const std::size_t rows = std::min(kBlock, end - r0);
+            std::fill(acc.begin(), acc.begin() + static_cast<std::ptrdiff_t>(rows * k), 0.0F);
+            float xnorm[kBlock] = {0.0F, 0.0F, 0.0F, 0.0F};
+            if (rows == kBlock) {
+                const float* x0 = x.row(r0);
+                const float* x1 = x.row(r0 + 1U);
+                const float* x2 = x.row(r0 + 2U);
+                const float* x3 = x.row(r0 + 3U);
+                float* a0 = acc.data();
+                float* a1 = a0 + k;
+                float* a2 = a1 + k;
+                float* a3 = a2 + k;
+                for (std::size_t j = 0; j < d; ++j) {
+                    const float v0 = x0[j];
+                    const float v1 = x1[j];
+                    const float v2 = x2[j];
+                    const float v3 = x3[j];
+                    xnorm[0] += v0 * v0;
+                    xnorm[1] += v1 * v1;
+                    xnorm[2] += v2 * v2;
+                    xnorm[3] += v3 * v3;
+                    const float* col = ct.data() + j * k;
+                    for (std::size_t c = 0; c < k; ++c) {
+                        const float w = col[c];
+                        a0[c] += v0 * w;
+                        a1[c] += v1 * w;
+                        a2[c] += v2 * w;
+                        a3[c] += v3 * w;
+                    }
+                }
+            } else {
+                for (std::size_t i = 0; i < rows; ++i) {
+                    const float* xr = x.row(r0 + i);
+                    float* a = acc.data() + i * k;
+                    for (std::size_t j = 0; j < d; ++j) {
+                        const float xj = xr[j];
+                        xnorm[i] += xj * xj;
+                        const float* col = ct.data() + j * k;
+                        for (std::size_t c = 0; c < k; ++c) {
+                            a[c] += xj * col[c];
+                        }
+                    }
+                }
+            }
+            for (std::size_t i = 0; i < rows; ++i) {
+                const float* a = acc.data() + i * k;
+                std::size_t best = 0;
+                float best_score = std::numeric_limits<float>::infinity();
                 for (std::size_t c = 0; c < k; ++c) {
-                    acc[c] += xj * col[c];
+                    const float score = dot ? -a[c] : norm[c] - 2.0F * a[c];
+                    if (score < best_score) {
+                        best_score = score;
+                        best = c;
+                    }
                 }
-            }
-            std::size_t best = 0;
-            float best_score = std::numeric_limits<float>::infinity();
-            for (std::size_t c = 0; c < k; ++c) {
-                const float score = dot ? -acc[c] : norm[c] - 2.0F * acc[c];
-                if (score < best_score) {
-                    best_score = score;
-                    best = c;
+                label[r0 + i] = static_cast<std::uint32_t>(best);
+                if (dist != nullptr) {
+                    (*dist)[r0 + i] = dot ? 1.0F - a[best] : std::max(0.0F, xnorm[i] + best_score);
                 }
-            }
-            label[r] = static_cast<std::uint32_t>(best);
-            if (dist != nullptr) {
-                (*dist)[r] = dot ? 1.0F - acc[best] : std::max(0.0F, xnorm + best_score);
             }
         }
     });
