@@ -496,6 +496,35 @@ Rust Lance is measured in the CI gate (`docs/PERFORMANCE_GATE.md`).
 - **While Haiku runs a wave, Opus does the next wave's research**, so no session waits on a format
   question.
 
+### Order across indexes and the table format
+
+Checked 2026-10-19 against the table specification (lance.org/format/table: table, schema,
+versioning, transaction, layout, branch_tag, row_id_lineage, data_overlay_file,
+fragment_metadata, mem_wal). The site describes Lance's main branch, which is ahead of the pinned
+12.0.0. Lance 12.0.0 knows reader and writer flags up to bit 8 only (`FLAG_UNKNOWN = 1 << 9` in
+lance-table 12.0.0 `src/feature_flags.rs`). The newer parts are listed under "When the Lance pin
+moves past 12.0" below, not scheduled. The table-format items are T1-T6.
+
+1. **Wave 0: T1** (refuse unsupported feature flags), before anything else. It is a safety fix.
+2. **Wave 1:** index items 1-4, with T4 (dictionary columns) as a one-session filler.
+3. **Wave 2:** index item 5 (object-store reads), **T3** (branches and clones), index item 6
+   (IVF_RQ), **T2** (the conflict rules), index item 7 (binary IVF).
+4. **Wave 3:** index item 8 (object-store writes, with Lance's external manifest store), items
+   9-13, **T5** (small spec leftovers), **T6** (overlay refinements).
+
+Already done on the table side: manifests (V2 naming, `table_metadata`, `config`, base paths and
+`UpdateBases`), deletion files of both kinds, transaction files on every commit, all 16 operations
+in the Python transaction API, stable row ids with created-at / last-updated-at versions and
+`delta`, tags, data overlays (reads, commit, the index fallback, compaction; all 16 of pylance's
+overlay tests), unenforced primary keys, and every logical type except Arrow dictionary columns on
+write.
+
+### Wave 0: before anything else
+
+| # | Item | Status now | Opus first | Haiku | Why | Done when |
+|---|---|---|---|---|---|---|
+| T1 | **Refuse manifests whose feature flags nanolance does not support**, on open and on write | missing: `reader_feature_flags` is not checked when a dataset opens, and a write copies the prior manifest's flags (`src/manifest_writer.cpp`, about line 433) | copy Lance 12's supported set and its paired-flag rules (`ensure_can_read_manifest`, `can_write_dataset`) into the brief; check that nanolance honours bit 5 (no transaction file) and bit 7 (covered index metadata) | 1 session | a dataset from a newer Lance (fragment tree: `fragments` is empty) would read as an empty table, and a write could drop a feature it does not understand. pylance refuses both | a manifest with each unsupported bit is refused on open and on write with pylance's message; every pylance-written test dataset still opens; one test per bit |
+
 ### Wave 1: measured enough to delegate now (about 6-7 Haiku sessions, 18 pylance tests)
 
 | # | Item | Failing pylance tests | Opus first | Haiku | Why for AI users | Done when |
@@ -523,6 +552,27 @@ Rust Lance is measured in the CI gate (`docs/PERFORMANCE_GATE.md`).
 | 11 | **icu / jieba / lindera tokenizers** | 20 | Opus: licences (copied from the source trees, never from memory) and dictionary packaging; then 2-3 sessions | multilingual RAG | the 20 pass |
 | 12 | **MemWAL** | 20 | Opus design (a subsystem) | real-time agent memory | the 20 pass |
 | 13 | MinHash LSH, FM-index, RTree | -- | when a user asks | dedup, substring, spatial | -- |
+
+### Table-format items (T1 is above)
+
+| # | Item | Wave | Status now | Opus first | Haiku | Why for AI users | Done when |
+|---|---|---|---|---|---|---|---|
+| T2 | **Lance's conflict rules in the C++ commit path** | 2 | partial: C++ rebases only when the other writers just added fragments (`src/dataset.cpp` `rebase`); anything else fails as "commit conflict" and the operation re-runs. The Python transaction API has the fuller matrix (`_transactions.py` `conflict_with`) | the rebasable pairs from the transaction spec (Delete or Update deletion masks merged, CreateIndex pairs, ReserveFragments) and a two-writer test harness | 1-2 sessions | ingestion, deduplicating deletes, compaction and index builds run at once; every needless conflict re-runs the work | each pair in the spec's matrix is rebased, retryable or incompatible as in Lance 12; a two-writer test for each rebasable pair |
+| T3 | **Branches and clones**: `create_branch`, checkout of a branch, `shallow_clone`, `deep_clone`; `_refs/branches/*.json`, `tree/{branch}/`, the Clone operation | 2 | refused by name (`LanceDataset.__getattr__`, the namespace layer); tags are done | measure pylance's branch JSON and tree layout; shallow clones reuse base paths (done) | 2 sessions | a dataset version per training run or experiment, without copying the data | the 6 failing branch and tag tests pass; pylance opens nanolance's branches and the reverse |
+| T4 | **Arrow dictionary columns on write** (`dict:<value>:<key>:false`) | 1 (filler) | refused at `write_batch`; users cast first | measure how pylance 12 stores a dictionary column and what type it reads back | 1 session | pandas categoricals and label columns arrive as dictionaries | each engine reads the other's dictionary columns back as dictionaries; the encoding matrix test covers it |
+| T5 | **Small spec leftovers**: `_versions/latest_version_hint.json`, the inline transaction (12.0's `transaction_section`, field 21), `version_aux_data`, migration to stable row ids | 3 | not written or read (nanolance writes `.txn` files) | measure what pylance 12 writes and reads for each; drop those that change nothing | 1 session | correctness does not depend on them; listed so they are decided, not forgotten | each matches pylance 12, or is recorded as not needed |
+| T6 | **Overlay refinements**: per-row index exclusion with re-evaluation (the spec's exclusion set) in place of searching the fragment unindexed; sparse overlays written as such | 3 | the fallback is correct but whole-fragment | the speed verdict stays with Opus | 1-2 sessions | updating labels on an indexed embedding table keeps the index fast | same results as now; reviewer's before/after shows faster searches on overlaid fragments |
+
+### When the Lance pin moves past 12.0
+
+Not scheduled; T1 refuses each one until then. Roughly by size:
+- non-reusable field ids: `max_allocated_field_id` (field 24) with writer flag bit 15, writer-only, small;
+- managed blobs (bit 14), small;
+- the fragment reuse index flags (bits 9 and 10), which go with index item 4;
+- spilled row lineage (bit 11; `column_row_ids` and the version columns as hidden fields -3 to -5, table config `lance.row_lineage.spill`), medium;
+- independent covering fields (bit 13) and zone-statistics seeds (bit 16);
+- unenforced clustering keys (Field 14 and 15), and the inline transaction at field 23;
+- the fragment metadata tree (bit 12, `_bt/`): large, and experimental in the spec.
 
 Outside this plan, the largest single lever on pylance's suite is writing data storage versions
 2.0 / 2.1 (84 failing tests, `docs/NEXT_WEEK.md`). It is Opus format research that can run while

@@ -36,12 +36,15 @@ The plan, with each item's failing pylance tests, the Opus step, the Haiku sessi
 done-criteria, is in `docs/ROADMAP.md` ("Index plan for AI users"). Next, Wave 1, in order, each
 briefed by Opus and implemented by Haiku:
 
+0. **First, T1**: refuse manifests whose feature flags nanolance does not support, on open and on write.
+   Nothing checks them today, so a newer dataset can read as empty. 1 session.
 1. Full-text search on list columns: 5 tests, 1 session.
 2. Index build progress callbacks: 5 tests, 1 session. Also make the hybrid refusal pylance's exact message.
 3. Multivector search: 4 tests, 3 sessions (M1 flat, M2 search, M3 build) after Opus measures the format.
 4. Deferred index remap and the Fragment Reuse Index: 4 tests, 1-2 sessions.
 
-Meanwhile Opus researches Wave 2: object-store reads, IVF_RQ, binary IVF. Corrections to earlier
+T4 (Arrow dictionary columns on write) is a one-session filler. Meanwhile Opus researches Wave 2:
+object-store reads, branches and clones (T3), IVF_RQ, the commit conflict rules (T2), binary IVF. Corrections to earlier
 summaries: CJK segmentation is not done. Hybrid search is refused by pylance too, so it is LanceDB's
 feature. Compaction already remaps indexes; the FRI only serves deferred remap.
 
