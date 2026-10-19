@@ -208,6 +208,11 @@ void radix_sort(std::vector<T>& v, Bits bits) {
         std::stable_sort(v.begin(), v.end(), [&](const T& a, const T& b) { return bits(a) < bits(b); });
         return;
     }
+    // Keys already in order (row ids, timestamps appended in time order) stay as they are: the input is in
+    // item order, so the sorted order, ties included, is the input's. One pass, stopping at the first descent.
+    if (std::is_sorted(v.begin(), v.end(), [&](const T& a, const T& b) { return bits(a) < bits(b); })) {
+        return;
+    }
     std::vector<std::array<std::size_t, 256>> counts(kBytes);
     for (auto& c : counts) {
         c.fill(0);
