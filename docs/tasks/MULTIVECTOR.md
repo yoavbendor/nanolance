@@ -165,3 +165,13 @@ unindexed fragments. pylance 12 builds multivector indexes for cosine only; an L
 answered exactly. Refused for now (M2b): refine_factor and distance bounds on a multivector index;
 float16 multivector indexes still get the exact (M1) answer. Fixed-size vector search unchanged in speed
 (every benchmark search within noise).
+
+**M2b outcome (2026-10-19):** done in one Haiku session; reviewed. pylance 12 builds IVF_FLAT, IVF_PQ,
+IVF_SQ, IVF_HNSW_FLAT / SQ / PQ over float32 and float16 multivector columns, cosine only (L2 and dot
+builds are refused: "Build Vector Index: multivector type supports only cosine distance"). All six are
+searched through the XTR path and match pylance to 1e-6 in float32, mixed case and fast_search included.
+refine_factor, as Lance's scanner does it: XTR keeps k * refine_factor rows, re-scored exactly, top k
+(refine 10 equals the exact answer). Open: float16 indexes without refine give pylance's rows in its order
+but distances 1.4e-4 to 3e-4 apart; plain (single-vector) float16 IVF_FLAT search has the same gap today,
+so it is in the float16 path, not in XTR (likely how a cosine index stores normalized float16 vectors).
+Next: M2c (lance-c), then M3 (builds), which the pylance target tests need.

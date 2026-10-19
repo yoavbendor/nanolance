@@ -182,3 +182,4 @@ optimization; compare engines within one run (ratios), never across days.
   `delete()`), a reader path that silently returned a short dictionary column, `__int128` breaking
   MSVC, a full-text change that needed an A/B timing to show it was not slower.
 - Run one full pytest at a time; two at once caused one spurious failure.
+- float16 vector search over a pylance-built cosine index differs from pylance's distances by about 1.5e-4 (rows and order equal), plain and multivector alike: find how Lance stores normalized float16 vectors (docs/tasks/MULTIVECTOR.md, M2b outcome).

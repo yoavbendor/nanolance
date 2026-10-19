@@ -1,9 +1,9 @@
 """Multivector search (ColBERT-style: a list of fixed-size lists): flat search, the bar being pylance's answer.
 
 A row's distance sums, over the query's vectors, the least distance to any of the row's vectors. Rows
-with a null or empty vector list are left out, as Lance leaves them out. Over a float32 IVF_FLAT index the
-search is Lance's XTR (the candidates per query vector, then the sum; see the IVF_FLAT tests at the end);
-other index kinds are left unused, and their search is not written yet.
+with a null or empty vector list are left out, as Lance leaves them out. Over an IVF index (any kind pylance
+builds over a multivector column, cosine only) the search is Lance's XTR (the candidates per query vector, then
+the sum; see the index tests at the end), and refine_factor rescores the candidates exactly as Lance does.
 """
 
 from __future__ import annotations
@@ -150,30 +150,6 @@ def test_mixed_indexed_and_appended_rows_match_pylance(lance, tmp_path):
         np.testing.assert_allclose(got["_distance"].to_numpy(), [0.0, 0.0, 1.0, 2.0])
 
 
-def test_fast_search_over_an_ivf_sq_multivector_index_is_refused(lance, tmp_path):
-    """Only IVF_FLAT is searched over a multivector column so far: fast_search on another kind is refused."""
-    vt = pa.list_(pa.list_(pa.float32(), 2))
-    path = str(tmp_path / "fast.lance")
-    lance.write_dataset(pa.table({"id": pa.array([0, 1], pa.int32()),
-                                  "vector": pa.array([[[1.0, 0.0]], [[0.0, 1.0]]], type=vt)}), path)
-    lance.dataset(path).create_index("vector", index_type="IVF_SQ", metric="cosine", num_partitions=1)
-    nearest = {"column": "vector", "q": [[1.0, 0.0]], "k": 2, "metric": "cosine"}
-    with pytest.raises(nl.NotSupportedError, match="multivector"):
-        nl.dataset(path).to_table(columns=["id"], nearest=nearest, fast_search=True)
-
-
-def test_refine_factor_over_a_multivector_ivf_flat_index_is_refused(lance, tmp_path):
-    """Refine on a multivector index needs its own answer (not written yet): refused, not answered wrongly."""
-    vt = pa.list_(pa.list_(pa.float32(), 2))
-    path = str(tmp_path / "refine.lance")
-    lance.write_dataset(pa.table({"id": pa.array([0, 1], pa.int32()),
-                                  "vector": pa.array([[[1.0, 0.0]], [[0.0, 1.0]]], type=vt)}), path)
-    lance.dataset(path).create_index("vector", index_type="IVF_FLAT", metric="cosine", num_partitions=1)
-    nearest = {"column": "vector", "q": [[1.0, 0.0]], "k": 2, "metric": "cosine", "refine_factor": 2}
-    with pytest.raises(nl.NotSupportedError, match="refine_factor"):
-        nl.dataset(path).to_table(columns=["id"], nearest=nearest)
-
-
 @pytest.mark.parametrize("query, message", [
     ([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], f"Query vector size 2 does not match index column size {DIM}"),
     ([1.0, 0.0, 0.0], f"Query vector size 3 does not match index column size {DIM}"),
@@ -210,7 +186,7 @@ def test_multivector_uint8_query_is_refused_as_pylance_refuses_it(lance, tmp_pat
         nl.dataset(upath).to_table(columns=["id"], nearest=nearest)
 
 
-# -- IVF_FLAT over a multivector column: Lance's XTR (float32; pylance builds these with cosine only) --
+# -- IVF indexes over a multivector column: Lance's XTR and refine (pylance builds these with cosine only) --
 
 
 def _dense(rng, n):
@@ -218,16 +194,21 @@ def _dense(rng, n):
     return [rng.standard_normal((int(rng.integers(1, 5)), DIM)).astype(np.float32).tolist() for _ in range(n)]
 
 
-def _ivf_flat_dataset(lance, tmp_path, name, rows, indexed, parts):
-    """``rows`` written by pylance: the first ``indexed`` under a cosine IVF_FLAT index, the rest appended."""
+# The index kinds pylance 12 builds over a multivector column (cosine only; L2 and dot builds are refused).
+INDEX_KINDS = [("IVF_FLAT", {}), ("IVF_SQ", {}), ("IVF_PQ", {"num_sub_vectors": 2}), ("IVF_HNSW_FLAT", {}),
+               ("IVF_HNSW_SQ", {}), ("IVF_HNSW_PQ", {"num_sub_vectors": 2})]
+
+
+def _ivf_flat_dataset(lance, tmp_path, name, rows, indexed, parts, kind="IVF_FLAT", kw=None, elem=pa.float32()):
+    """``rows`` written by pylance: the first ``indexed`` under a cosine index of ``kind``, the rest appended."""
     path = str(tmp_path / f"{name}.lance")
-    vt = pa.list_(pa.list_(pa.float32(), DIM))
+    vt = pa.list_(pa.list_(elem, DIM))
 
     def table(lo, hi):
         return pa.table({"id": pa.array(np.arange(lo, hi), pa.int64()), "vec": pa.array(rows[lo:hi], type=vt)})
 
     lance.write_dataset(table(0, indexed), path)
-    lance.dataset(path).create_index("vec", index_type="IVF_FLAT", metric="cosine", num_partitions=parts)
+    lance.dataset(path).create_index("vec", index_type=kind, metric="cosine", num_partitions=parts, **(kw or {}))
     if indexed < len(rows):
         lance.write_dataset(table(indexed, len(rows)), path, mode="append")
     return path
@@ -277,3 +258,60 @@ def test_ivf_flat_after_optimize_indices_matches_pylance(lance, tmp_path):
     for kw in ({}, {"fast_search": True}):
         _same(lance.dataset(path).to_table(columns=["id"], nearest=nearest, **kw),
               nl.dataset(path).to_table(columns=["id"], nearest=nearest, **kw))
+
+
+@pytest.mark.parametrize("kind, kw", INDEX_KINDS)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_index_kinds_xtr_match_pylance(lance, tmp_path, kind, kw, mixed):
+    """Every kind pylance builds over a multivector column is searched by XTR: pylance's rows, order and
+    distances to 1e-6, with and without appended (unindexed) rows, plain and fast_search."""
+    rng = np.random.default_rng(31 + 2 * mixed)
+    rows = _dense(rng, 240)  # enough vectors to train PQ (256) in the indexed part
+    path = _ivf_flat_dataset(lance, tmp_path, f"xtr_{kind}_{mixed}", rows, 160 if mixed else 240, 2, kind, kw)
+    query = rng.standard_normal((3, DIM)).astype(np.float32)
+    for nprobes in (1, 2):
+        for k in (5, 50):
+            for extra in ({}, {"fast_search": True}) if not mixed else ({},):
+                nearest = {"column": "vec", "q": query, "k": k, "metric": "cosine", "nprobes": nprobes}
+                ref = lance.dataset(path).to_table(columns=["id"], nearest=nearest, **extra)
+                got = nl.dataset(path).to_table(columns=["id"], nearest=nearest, **extra)
+                _same(ref, got)
+
+
+@pytest.mark.parametrize("kind, kw", INDEX_KINDS)
+@pytest.mark.parametrize("refine", [1, 2, 10])
+def test_refine_factor_matches_pylance(lance, tmp_path, kind, kw, refine):
+    """refine_factor on a multivector index (Lance's scanner): the XTR candidates, k * refine of them, are
+    re-scored exactly and the top k kept; with appended rows the same before the unindexed rows merge in."""
+    rng = np.random.default_rng(41 + refine)
+    rows = _dense(rng, 480)  # enough vectors to train PQ (256) in the indexed part
+    path = _ivf_flat_dataset(lance, tmp_path, f"refine_{kind}_{refine}", rows, 400, 2, kind, kw)
+    query = rng.standard_normal((3, DIM)).astype(np.float32)
+    for nprobes in (1, 2):
+        nearest = {"column": "vec", "q": query, "k": 5, "metric": "cosine", "nprobes": nprobes,
+                   "refine_factor": refine}
+        ref = lance.dataset(path).to_table(columns=["id"], nearest=nearest)
+        got = nl.dataset(path).to_table(columns=["id"], nearest=nearest)
+        _same(ref, got)
+
+
+@pytest.mark.parametrize("kind, kw", INDEX_KINDS)
+def test_float16_index_matches_pylance(lance, tmp_path, kind, kw):
+    """float16 multivector indexes. With refine_factor the answer is exact: pylance's rows and distances to
+    1e-6. Without it the XTR distances of a float16 index differ from pylance's by up to about 2e-4 (the same
+    gap as a plain float16 IVF_FLAT search here: the cause is not explained yet), so there the rows and their
+    order must match and the distances agree to 5e-4."""
+    rng = np.random.default_rng(53)
+    rows = _dense(rng, 480)  # enough vectors to train PQ (256) in the indexed part
+    path = _ivf_flat_dataset(lance, tmp_path, f"f16_{kind}", rows, 400, 2, kind, kw, elem=pa.float16())
+    query = rng.standard_normal((3, DIM)).astype(np.float32)
+    for nprobes in (1, 2):
+        for refine in (None, 10):
+            nearest = {"column": "vec", "q": query, "k": 5, "metric": "cosine", "nprobes": nprobes}
+            if refine:
+                nearest["refine_factor"] = refine
+            ref = lance.dataset(path).to_table(columns=["id"], nearest=nearest)
+            got = nl.dataset(path).to_table(columns=["id"], nearest=nearest)
+            assert got["id"].to_pylist() == ref["id"].to_pylist()
+            _same(ref, got, rtol=1e-6 if refine else 5e-4, atol=1e-6 if refine else 5e-4)
+

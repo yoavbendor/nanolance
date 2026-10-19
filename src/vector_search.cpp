@@ -2501,15 +2501,6 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             std::string why;
             if (!load_ivf(dataset_path / "_indices" / pb::uuid_string(s->uuid), index, why, q.index_cache)) {
                 not_used = why;
-            } else if (multi && !(index->type == "IVF_FLAT" && f32_column)) {
-                // Only float32 IVF_FLAT is searched over a multivector column. Other kinds are left unused
-                // (as Lance's planner does for an index it cannot use); fast_search or an explicit segment
-                // list would need the index, so they are refused rather than answered wrongly.
-                if (q.fast_search || chosen) {
-                    error = "searching a vector index over a multivector column is not supported yet; use use_index=False";
-                    return false;
-                }
-                not_used = "multivector index search is not supported yet for " + index->type;
             } else if (q.metric && *q.metric != index->metric) {
                 if (chosen) {
                     error = std::string("with_index_segments requested metric ") + vector_metric_name(*q.metric) +
@@ -2624,29 +2615,28 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             }
         }
         if (multi) {
-            // XTR over the index (xtr_search). Refine and the distance bounds are not written for several
-            // vectors per row yet: refused rather than answered from the wrong distances.
-            if (q.refine_factor) {
-                error = "refine_factor on a multivector index is not supported yet";
-                return false;
-            }
+            // XTR over the index (xtr_search). Distance bounds are not written for several vectors per row
+            // yet: refused rather than answered from the wrong distances.
             if (q.lower_bound || q.upper_bound) {
                 error = "distance bounds on a multivector index are not supported yet";
                 return false;
             }
             constexpr std::uint32_t kXtrOverfetch = 10;  // Lance's DEFAULT_XTR_OVERFETCH
-            if (!xtr_search(q, loaded, masks, resolver, dim, f32_column, kXtrOverfetch, q.k, ann, out.plan, error,
+            // Lance's multivec_ann keeps k * refine_factor rows (1 without a refine_factor).
+            if (!xtr_search(q, loaded, masks, resolver, dim, f32_column, kXtrOverfetch, kk, ann, out.plan, error,
                             counts)) {
                 return false;
             }
             out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name + " (multivector XTR, " +
                                std::to_string(q.key_vectors) + " query vectors)");
-            if (!unindexed.empty()) {
-                // Lance's knn_combined: once unindexed fragments are merged in, the candidates are re-scored
-                // exactly (the XTR distances are only for choosing them).
+            if (q.refine_factor || !unindexed.empty()) {
+                // Lance's scanner: with a refine_factor, the candidates are re-scored exactly and the top k
+                // kept; knn_combined does the same once unindexed fragments are merged in. The XTR
+                // distances are only for choosing the candidates.
                 if (!rescore(dataset_path, q, metric, dim, ann, error, true)) {
                     return false;
                 }
+                keep_best(ann, q.k);
                 out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
                                    " (exact re-score of the XTR candidates)");
             }
