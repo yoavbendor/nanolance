@@ -127,7 +127,11 @@ jobs:
 
       - name: Build the Rust Lance driver
         if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') }}
-        run: cargo build --release --manifest-path tools/lance_rs_bench/Cargo.toml
+        run: |
+          # The lance crate's build scripts compile .proto files with protoc, which the runner image may not
+          # ship (the C++ build does not need it): install it explicitly.
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          cargo build --release --manifest-path tools/lance_rs_bench/Cargo.toml
 
       # The index benchmarks at quick scale, nanolance's C++ library against Rust Lance, each sample
       # repeated until 10 seconds of timed work (tools/index_bench_common.py). nanolance's driver is
