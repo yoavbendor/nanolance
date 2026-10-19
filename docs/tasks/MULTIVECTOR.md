@@ -139,3 +139,20 @@ rows are left out of the results (Lance's KNN drops NaN distances; the brief's "
 refused as pylance refuses it. Open for M2: float64 columns are compared in float32 (pylance's L2 differs
 by about one float32 ulp, 1.9e-6 at distances 8-16); a double path needs the binding to carry a double
 query.
+
+**M2 split (2026-10-19).** The first M2 session ran out of budget before coding; what it established from
+lance-12 (`dataset/scanner.rs` multivec_ann about lines 6836-6920; `io/exec/knn.rs`
+MultivectorScoringExec about lines 2807-2990), the facts for an exact float32 match:
+- Per query vector: an IVF search with refine_factor 10 (DEFAULT_XTR_OVERFETCH), then a sort by
+  (distance, row id) keeping k * 10. Distances are over the flattened vectors.
+- Per list: keep each row's first (best) entry; sim = 1 - dist (f32); min_sim = 1 - the last kept dist.
+- Combine in stream-arrival order: a row already seen adds its sim (or min_sim when it is not in this
+  list); a new row gets sim + the sum of the earlier lists' min_sim. Accumulate in f32, in that order.
+- Final distance = number of query vectors - sim (f32); sort (distance, row id); keep k * refine_factor;
+  the caller applies limit k.
+- Not yet known: how refine works for a multivector column (needed for IVF_PQ with refine and SQ / HNSW),
+  and Lance's rule for fragments no index covers (flat scoring, then merged or not). Measure against
+  pylance first.
+Phases now: **M2a** IVF_FLAT with the steps above and the mixed indexed / unindexed case
+(`test_multivec_search_paths`' fully_indexed step); **M2b** IVF_PQ / IVF_SQ / IVF_HNSW_* and the refine
+question; **M2c** lance-c (`lance_scanner_nearest_multivector`).
