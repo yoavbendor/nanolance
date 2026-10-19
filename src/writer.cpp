@@ -628,6 +628,10 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
     if (path == nullptr || path[0] == '\0') {
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "dataset path must not be empty");
     }
+    // Writers write local files only (a URI would become a local directory named after its scheme).
+    if (std::strstr(path, "://") != nullptr) {
+        return set_error(writer, NANO_LANCE_UNSUPPORTED, std::string("writes to object stores are not supported: ") + path);
+    }
     if (opts.compression_level < 0 || opts.compression_level > 22) {
         return set_error(writer, NANO_LANCE_INVALID_ARGUMENT, "zstd compression level must be in range 0..22");
     }

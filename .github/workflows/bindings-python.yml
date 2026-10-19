@@ -40,7 +40,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13 python3.12-dev
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13 python3.12-dev libcurl4-openssl-dev
 
       - name: Cache fetched deps
         uses: actions/cache@v4
@@ -57,6 +57,39 @@ jobs:
       - name: Run pytest (parity, full cycle, memory)
         working-directory: bindings/python
         run: pytest -m "not bench"
+
+      # s3:// reads (docs/tasks/OBJECT_STORE_READS.md) against a local S3 server. moto, as in
+      # nanos3reader's CI (the minio/minio image can no longer be pulled). With the endpoint set the
+      # tests run and must pass; a binding built without S3 fails them by name.
+      - name: Start the S3 server (moto)
+        run: |
+          python3 -m pip install "moto[server]==5.2.4"
+          nohup moto_server -H 127.0.0.1 -p 5055 > /tmp/moto.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:5055/ > /dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:5055/ > /dev/null
+          curl -sf -X PUT http://127.0.0.1:5055/nl-test
+
+      # lance-c's reader of s3:// datasets (tests/lance_c_s3_read.cpp), built with S3 and -Werror.
+      - name: Build lance-c's S3 reader
+        run: |
+          cmake -S . -B build-s3 -G Ninja -DCMAKE_BUILD_TYPE=Release -DNANOLANCE_ENABLE_S3=ON -DNANOLANCE_WERROR=ON
+          cmake --build build-s3 --target lance_c_s3_read
+
+      - name: Run the object-store tests
+        working-directory: bindings/python
+        env:
+          NANOLANCE_S3_TEST_ENDPOINT: http://127.0.0.1:5055
+          NANOLANCE_LANCE_C_S3_READ: ${{ github.workspace }}/build-s3/lance_c_s3_read
+        run: |
+          pytest -o addopts= -q -rs tests/test_object_store.py tests/test_object_store_writes.py | tee /tmp/object-store-tests.log
+          if grep -q skipped /tmp/object-store-tests.log; then echo "object-store tests must not skip here"; exit 1; fi
+
+      - name: Upload the S3 server log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moto-log
+          path: /tmp/moto.log
 
       # The same suite with every read cut into 1 KiB row ranges on 8 threads: every page of every
       # column split mid-page, the path a large read takes on a many-core machine (AGENTS.md 6a).

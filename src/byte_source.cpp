@@ -2,10 +2,16 @@
 // Copyright (c) 2026 Yoav Bendor
 #include "nanolance/byte_source.hpp"
 
+#include "nanolance/object_store.hpp"
+
 #include <filesystem>
 #include <map>
 #include <mutex>
 #include <system_error>
+
+#if defined(NANO_LANCE_HAS_S3_BYTE_SOURCE)
+#include "s3_byte_source.hpp"
+#endif
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -90,14 +96,33 @@ std::mutex& factories_mutex() {
     static std::mutex m;
     return m;
 }
+// The built-in object stores are registered when the registry is first made. Doing it in the static
+// initializer (not through register_*, which takes the lock this runs under) keeps that to one place.
 std::map<std::string, SourceFactory>& factories() {
-    static std::map<std::string, SourceFactory> f;
+    static std::map<std::string, SourceFactory> f = [] {
+        std::map<std::string, SourceFactory> built_in;
+#if defined(NANO_LANCE_HAS_S3_BYTE_SOURCE)
+        built_in.emplace("s3", &open_s3_source);
+#endif
+        return built_in;
+    }();
     return f;
 }
 
 std::map<std::string, ListFactory>& listers() {
-    static std::map<std::string, ListFactory> l;
+    static std::map<std::string, ListFactory> l = [] {
+        std::map<std::string, ListFactory> built_in;
+#if defined(NANO_LANCE_HAS_S3_BYTE_SOURCE)
+        built_in.emplace("s3", &list_s3);
+#endif
+        return built_in;
+    }();
     return l;
+}
+
+/// An s3:// URI in a build without S3 support: named, so the caller can tell it from a missing file.
+bool is_unbuilt_s3(const std::string& path_or_uri) {
+    return path_or_uri.rfind("s3://", 0) == 0 && !is_remote(path_or_uri);
 }
 
 }  // namespace
@@ -208,6 +233,10 @@ std::unique_ptr<ByteSource> open_source(const std::string& path_or_uri, std::str
         if (factory) {
             return factory(path_or_uri, error);
         }
+        if (is_unbuilt_s3(path_or_uri)) {
+            error = "nanolance was built without S3 support: cannot open " + path_or_uri;
+            return nullptr;
+        }
     }
     return open_local_file(path_or_uri, error);
 }
@@ -244,6 +273,36 @@ void register_list_factory(const std::string& scheme, ListFactory factory) {
     }
 }
 
+ObjectStoreOptions object_store_options_from(const std::vector<std::pair<std::string, std::string>>& pairs) {
+    ObjectStoreOptions o;
+    for (const auto& [key, value] : pairs) {
+        if (key == "access_key_id" || key == "aws_access_key_id") {
+            o.access_key_id = value;
+        } else if (key == "secret_access_key" || key == "aws_secret_access_key") {
+            o.secret_access_key = value;
+        } else if (key == "session_token" || key == "aws_session_token") {
+            o.session_token = value;
+        } else if (key == "region" || key == "aws_region") {
+            o.region = value;
+        } else if (key == "endpoint" || key == "aws_endpoint") {
+            o.endpoint = value;
+        } else if (key == "allow_http") {
+            o.allow_http = value == "true" || value == "True" || value == "1";
+        }
+    }
+    return o;
+}
+
+#if !defined(NANO_LANCE_HAS_S3_BYTE_SOURCE)
+bool set_object_store_options(const std::string& uri, const ObjectStoreOptions& /*options*/, std::string& error) {
+    if (uri.rfind("s3://", 0) == 0) {
+        error = "nanolance was built without S3 support: cannot set storage options for " + uri;
+        return false;
+    }
+    return true;
+}
+#endif
+
 bool list_dir(const std::string& path_or_uri, std::vector<DirEntry>& out, std::string& error, bool with_sizes) {
     out.clear();
     error.clear();
@@ -265,6 +324,10 @@ bool list_dir(const std::string& path_or_uri, std::vector<DirEntry>& out, std::s
         }
         if (has_source) {
             error = "cannot list " + path_or_uri + ": no directory listing is registered for " + scheme + "://";
+            return false;
+        }
+        if (is_unbuilt_s3(path_or_uri)) {
+            error = "nanolance was built without S3 support: cannot list " + path_or_uri;
             return false;
         }
     }

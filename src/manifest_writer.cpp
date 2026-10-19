@@ -159,6 +159,12 @@ bool check_data_file_versions(pb::Manifest& manifest, std::string& error) {
 bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
                       std::string& error) {
     error.clear();
+    // Writers write local files only: a URI (s3://, gs://, https://) would otherwise become a local
+    // directory named after its scheme.
+    if (dataset_path.string().find("://") != std::string::npos) {
+        error = "writes to object stores are not supported: " + dataset_path.string();
+        return false;
+    }
     // Before anything is written: a refused commit leaves the version and its files as they were.
     if (!check_manifest_writable(manifest, WriteKind::Commit, error)) {
         return false;

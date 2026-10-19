@@ -53,7 +53,8 @@ speedup). Full details, the threat model, and a reviewer checklist: **[docs/SAFE
   [docs/VECTOR_INDEX.md](docs/VECTOR_INDEX.md)) and full-text (INVERTED, LanceDB's defaults:
   [docs/FTS_INDEX.md](docs/FTS_INDEX.md)). pylance and LanceDB use an index nanolance built, and
   nanolance one they built, with the same results. A dataset's other indexes survive its appends,
-  deletes, updates and compactions.
+  deletes, updates and compactions. It also reads datasets on S3-compatible object stores
+  (`lance.dataset("s3://...", storage_options=...)`, when built with libcurl); writes stay local.
 - **Headline benefit:** rows keep big payloads **external** (`uri` + `position` + `size`, never copied),
   so a packet table costs a few bytes/row regardless of payload size; bytes are fetched on demand (local
   file or `s3://`).

@@ -290,6 +290,9 @@ elseif(NANOLANCE_ENABLE_S3)
     FetchContent_MakeAvailable(nanos3reader)
     target_link_libraries(nanolance_reader PRIVATE nanos3reader::nanos3reader)
     target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_READER_HAS_S3=1)
+    # s3:// datasets: the byte source and lister over S3Client (registered for "s3" by byte_source.cpp).
+    target_sources(nanolance_reader PRIVATE src/s3_byte_source.cpp)
+    target_compile_definitions(nanolance_reader PRIVATE NANO_LANCE_HAS_S3_BYTE_SOURCE=1)
     set(NANOLANCE_S3_NANOS3READER_ACTIVE ON)
 endif()
 
@@ -659,6 +662,11 @@ if(TARGET lance_c)
     target_link_libraries(nano_lance_lance_c_search_test PRIVATE lance_c nanolance)
     add_test(NAME nano_lance_lance_c_search COMMAND $<TARGET_FILE:nano_lance_lance_c_search_test>
              "${CMAKE_CURRENT_BINARY_DIR}/lance_c_search_tmp")
+
+    # Not a ctest: needs an S3 endpoint; bindings/python/tests/test_object_store.py drives it.
+    add_executable(lance_c_s3_read tests/lance_c_s3_read.cpp)
+    target_compile_features(lance_c_s3_read PRIVATE cxx_std_20)
+    target_link_libraries(lance_c_s3_read PRIVATE lance_c)
 
     add_executable(nano_lance_lance_c_stable_row_ids_test tests/test_lance_c_stable_row_ids.cpp)
     target_compile_features(nano_lance_lance_c_stable_row_ids_test PRIVATE cxx_std_20)

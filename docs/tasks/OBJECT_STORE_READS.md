@@ -138,3 +138,27 @@ API as built. O2: `cd build && ctest -j8 | tail -3`; `NANOLANCE_S3_TEST_ENDPOINT
 -o addopts= -q bindings/python/tests/test_object_store.py | tail -2`; last, once: the full pytest. O3:
 the workflow file and a local dry run of its commands. Report under 40 lines: questions first, then files,
 tails, decisions.
+
+**O1 outcome (2026-10-19):** nanos3reader 0.4.0 (`S3Client`; commits 3e83de0, 7158595); its CI runs the
+integration tests against moto, since `minio/minio` can no longer be pulled from Docker Hub.
+
+**O2 outcome (2026-10-19):** done in one Haiku session; reviewed. `s3://` datasets open through an
+`io::ByteSource` / lister over `S3Client` (`src/s3_byte_source.cpp`); storage_options from Python per
+bucket; whole table, projection, filters, take, count, BTREE, IVF_FLAT and INVERTED searches,
+deletions and versions match pylance on the same dataset (moto). The binding builds with S3 when
+libcurl is found. Review fix: writes to a URI were refused only in `nanolance.lance`; the low-level
+`nanolance.write_table` / `LanceWriter` went through `pathlib.Path`, which collapses `s3://b/x` into a
+local `s3:/b/x` and wrote there. Every writer now refuses a URI (Python before `Path`, C++ at writer
+open and at `publish_manifest`); `tests/test_object_store_writes.py`. Open: moto does not check SigV4
+signatures, so no server here or in CI verifies them (nanos3reader's SigV4 known-answer tests do);
+options are per bucket and process-wide.
+
+**O3 outcome (2026-10-19):** done by the reviewer (small enough not to delegate). CI
+(`bindings-python.yml`) installs libcurl, starts moto (MinIO's image cannot be pulled), builds lance-c's
+S3 reader with `-Werror` and runs `test_object_store.py` / `test_object_store_writes.py`; the step fails on
+any skip and uploads moto's log on failure. lance-c: `lance_dataset_open(uri, storage_opts, version)`
+opens `s3://` datasets with Lance's option keys (one key mapping, `io::object_store_options_from`, shared
+with the Python binding); writes through lance-c still refuse URIs. `tests/lance_c_s3_read.cpp`, driven
+by `test_lance_c_reads_s3_dataset` (version, count and take after a delete, against pylance). Not done:
+wheels still build without S3 (bundling libcurl and OpenSSL into manylinux wheels is its own decision);
+a wheel refuses `s3://` by name.

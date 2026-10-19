@@ -16,7 +16,7 @@ import numpy as np
 import pyarrow as pa
 
 from nanolance import _nanolance
-from nanolance.lance._errors import native, unsupported
+from nanolance.lance._errors import native, refuse_object_store_write, unsupported
 
 __all__ = ["indices"]
 
@@ -147,6 +147,7 @@ def shuffle_transformed_vectors(unsorted_filenames, dir_path, ivf_centroids, shu
 def load_shuffled_vectors(filenames, dir_path, dataset, column, ivf_centroids, pq_codebook, pq_dimension,
                           num_subvectors, distance_type, index_name=None, num_bits=8) -> None:
     """Commit an IVF_PQ index with these models over the fragments the sorted files hold."""
+    refuse_object_store_write(dataset.uri, "load shuffled vectors")
     from nanolance.lance.file import LanceFileReader
 
     fragments = set()

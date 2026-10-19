@@ -70,7 +70,7 @@ def write_table(
     native.blob_uri_dictionary = opts.blob_uri_dictionary
     native.ignore_nullability = opts.ignore_nullability
     native.append = opts.append
-    _nanolance.write_table(table, Path(path), native)
+    _nanolance.write_table(table, _local_write_path(path), native)
 
 
 class LanceWriter:
@@ -147,7 +147,7 @@ class LanceWriter:
         if max_rows_per_fragment < 0 or max_pending_bytes < 0:
             raise ValueError("max_rows_per_fragment and max_pending_bytes must be >= 0")
         self._writer = _nanolance.LanceWriter(
-            Path(path), native, int(max_rows_per_fragment), int(max_pending_bytes)
+            _local_write_path(path), native, int(max_rows_per_fragment), int(max_pending_bytes)
         )
 
     def write_batch(self, batch) -> None:
@@ -168,6 +168,17 @@ class LanceWriter:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         return self._writer.__exit__(exc_type, exc, tb)
+
+
+def _local_write_path(path: Union[str, os.PathLike]) -> Path:
+    """The local path a writer writes to. Writers write local files only: a URI (s3://, gs://, ...) is
+    refused here, since Path() would collapse it into a local directory named after its scheme."""
+    text = os.fspath(path)
+    if isinstance(text, bytes):
+        text = text.decode()
+    if "://" in text:
+        raise NotImplementedError(f"writes to object stores are not supported: {text}")
+    return Path(text)
 
 
 def _normalize_columns(columns: Optional[Sequence[str]]) -> Optional[list]:

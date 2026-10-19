@@ -17,7 +17,7 @@ import pyarrow as pa
 import pyarrow.dataset
 
 from nanolance import _nanolance
-from nanolance.lance._errors import native, unsupported
+from nanolance.lance._errors import native, refuse_object_store_write, unsupported
 from nanolance.lance._session import session_for_write
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -408,6 +408,7 @@ class LanceFragment(pa.dataset.Fragment):
                namespace_client=None, table_id=None, session=None) -> FragmentMetadata:
         """Write ``data`` as one fragment's data file, uncommitted: commit it with
         ``LanceOperation.Append`` or ``Overwrite``."""
+        refuse_object_store_write(dataset_uri, "write fragment data")
         _check_namespace(namespace_client, table_id)
         session_for_write(dataset_uri, session)
         data_storage_version = _storage_version(data_storage_version, use_legacy_format)
@@ -431,6 +432,7 @@ class LanceFragment(pa.dataset.Fragment):
     def delete(self, predicate: str) -> Optional[FragmentMetadata]:
         """The fragment with the rows where ``predicate`` holds deleted (a new deletion file; the data
         files are untouched), or None when no row would be left."""
+        refuse_object_store_write(self._ds._uri, "delete rows")
         from nanolance.lance.dataset import _filter_sql
 
         with native():
@@ -440,6 +442,7 @@ class LanceFragment(pa.dataset.Fragment):
 
     def delete_rows(self, offsets: Iterable[int]) -> Optional[FragmentMetadata]:
         """The fragment with the rows at these physical offsets deleted, or None when none is left."""
+        refuse_object_store_write(self._ds._uri, "delete rows")
         with native():
             message = _nanolance._fragment_delete(self._ds._uri, self._ds.version, self._id, None,
                                                   [int(o) for o in offsets])
@@ -450,6 +453,7 @@ class LanceFragment(pa.dataset.Fragment):
         """New columns for this fragment, uncommitted: from SQL expressions (``{name: expr}``), a
         function of each batch of the fragment (``columns`` read), or data (one row per row).
         Commit the fragments with ``LanceOperation.Merge`` and the schema returned."""
+        refuse_object_store_write(self._ds._uri, "merge columns")
         from nanolance.lance.udf import BatchUDF, normalize_transform
 
         transforms = normalize_transform(value_func, self, columns, reader_schema)
@@ -604,6 +608,7 @@ class LanceFragment(pa.dataset.Fragment):
     def _write_columns(self, live: pa.Table, replace: bool):
         """Write `live` (a value per live row) as a new data file of this fragment: deleted rows take
         a copy of a live row, so a column stays as non-nullable as its values."""
+        refuse_object_store_write(self._ds._uri, "write fragment data")
         if live.num_rows != self.count_rows():
             raise ValueError(f"Expected {self.count_rows()} rows for fragment {self._id}, got {live.num_rows}")
         physical = self.physical_rows
@@ -836,6 +841,7 @@ def write_fragments(data, dataset_uri, schema: Optional[pa.Schema] = None, *, re
     from nanolance.lance._transactions import LanceOperation, Transaction
     from nanolance.lance.dataset import LanceDataset, _base_plan, _exists, _path_of, _set_base_plan
 
+    refuse_object_store_write(dataset_uri, "write fragments")
     _check_namespace(namespace_client, table_id)
     session_for_write(dataset_uri, session)
     if external_blob_mode not in ("reference", "ingest"):

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 
 
 class NotSupportedError(NotImplementedError):
@@ -16,6 +17,19 @@ class NotSupportedError(NotImplementedError):
 
 def unsupported(what: str) -> NotSupportedError:
     return NotSupportedError(f"nanolance.lance does not support {what}")
+
+
+def refuse_object_store_write(target, what: str) -> None:
+    """Writes to an object store are not implemented (Wave 3): a write to ``s3://`` names itself and
+    raises before anything is touched. ``target`` is a uri, a path or a dataset."""
+    if isinstance(target, str):
+        text = target
+    elif isinstance(target, os.PathLike):
+        text = os.fspath(target)
+    else:
+        text = str(getattr(target, "uri", "") or "")
+    if text.startswith("s3://"):
+        raise unsupported(f"object-store writes ({what} on {text})")
 
 
 # Manifest feature flags this build does not support, as pylance raises them. The native message carries

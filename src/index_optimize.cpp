@@ -11,6 +11,7 @@
 
 #include "index_build.hpp"
 #include "index_files.hpp"
+#include "nanolance/byte_source.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/manifest_reader.hpp"
@@ -80,9 +81,8 @@ Kind kind_of(const std::filesystem::path& dataset_path, const pb::IndexMetadata&
     if (ends_with(url, "InvertedIndexDetails")) {
         return Kind::Inverted;
     }
-    std::error_code ec;
     if (ends_with(url, "VectorIndexDetails") ||
-        (url.empty() && std::filesystem::exists(segment_dir(dataset_path, index) / "index.idx", ec))) {
+        (url.empty() && io::exists((segment_dir(dataset_path, index) / "index.idx").string()))) {
         return Kind::Vector;
     }
     return Kind::Other;

@@ -20,6 +20,7 @@
 #include <nanolance/lance_table_reader.hpp>
 #include <nanolance/nano_lance_reader.h>
 #include <nanolance/nano_lance_writer.h>
+#include <nanolance/object_store.hpp>
 #include <nanolance/data_file_reader.hpp>
 #include <nanolance/row_ids.hpp>
 #include <nanolance/scalar_index.hpp>
@@ -609,6 +610,16 @@ nb::dict ds_info(const std::filesystem::path& path, std::optional<std::uint64_t>
     }
     d["base_paths"] = base_paths;
     return d;
+}
+
+// pylance's storage_options for an object-store bucket, as the next open of that bucket uses them. Keys
+// are pylance's (and the aws_-prefixed forms); keys this binding does not use are ignored.
+void ds_set_storage_options(const std::string& uri, const std::map<std::string, std::string>& options) {
+    const auto o = nano_lance::io::object_store_options_from({options.begin(), options.end()});
+    std::string error;
+    if (!nano_lance::io::set_object_store_options(uri, o, error)) {
+        throw std::runtime_error(error);
+    }
 }
 
 nb::list ds_versions(const std::filesystem::path& path) {
@@ -1218,6 +1229,7 @@ NB_MODULE(_nanolance, m) {
     }, nb::arg("data"));
     m.def("_ds_info", &ds_info, nb::arg("path"), nb::arg("version").none());
     m.def("_ds_versions", &ds_versions, nb::arg("path"));
+    m.def("_set_storage_options", &ds_set_storage_options, nb::arg("uri"), nb::arg("options"));
     m.def("_ds_latest_version", [](const std::filesystem::path& path) {
         std::uint64_t v = 0;
         std::string error;

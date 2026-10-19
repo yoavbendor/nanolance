@@ -29,6 +29,7 @@
 #include "nanolance/index_segments.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/manifest_reader.hpp"
+#include "nanolance/object_store.hpp"
 #include "nanolance/nano_lance_writer.h"
 #include "nanolance/path_safety.hpp"
 #include "nanolance/scalar_index.hpp"
@@ -272,7 +273,8 @@ std::filesystem::path memory_root() {
 
 /// A dataset URI as a local path: file://, memory:// (a directory private to the process) and plain
 /// paths. Object stores are not supported.
-bool resolve_uri(const char* uri, std::filesystem::path& out) {
+// `allow_object_store`: an s3:// URI is taken as is (reads only; nanolance writes local datasets).
+bool resolve_uri(const char* uri, std::filesystem::path& out, bool allow_object_store = false) {
     if (uri == nullptr || uri[0] == '\0') {
         return invalid("uri must not be NULL or empty");
     }
@@ -289,8 +291,14 @@ bool resolve_uri(const char* uri, std::filesystem::path& out) {
         out = memory_root() / (rest.empty() ? std::string("_root") : rest);
         return true;
     }
+    if (allow_object_store && text.rfind("s3://", 0) == 0) {
+        out = text;
+        return true;
+    }
     if (text.find("://") != std::string::npos) {
-        set_error(LANCE_ERR_NOT_SUPPORTED, "nanolance reads local datasets only, not " + text);
+        set_error(LANCE_ERR_NOT_SUPPORTED, allow_object_store
+                                               ? "nanolance reads local and s3:// datasets only, not " + text
+                                               : "nanolance writes local datasets only, not " + text);
         return false;
     }
     out = text;
@@ -306,10 +314,27 @@ bool load_info(const std::filesystem::path& path, uint64_t version, nano_lance::
     return true;
 }
 
-LanceDataset* open_dataset(const char* uri, uint64_t version) {
+// `storage_opts`: Lance's storage-option pairs (["k1", "v1", ..., NULL]) for an s3:// dataset's bucket.
+LanceDataset* open_dataset(const char* uri, const char* const* storage_opts, uint64_t version) {
     std::filesystem::path path;
-    if (!resolve_uri(uri, path)) {
+    if (!resolve_uri(uri, path, true)) {
         return nullptr;
+    }
+    if (path.native().rfind("s3://", 0) == 0) {
+        std::vector<std::pair<std::string, std::string>> pairs;
+        for (auto* kv = storage_opts; kv != nullptr && kv[0] != nullptr; kv += 2) {
+            if (kv[1] == nullptr) {
+                invalid("storage_opts must hold key-value pairs");
+                return nullptr;
+            }
+            pairs.emplace_back(kv[0], kv[1]);
+        }
+        std::string error;
+        if (!nano_lance::io::set_object_store_options(path.native(), nano_lance::io::object_store_options_from(pairs),
+                                                      error)) {
+            set_error(code_for(error), error);
+            return nullptr;
+        }
     }
     auto ds = std::make_unique<LanceDataset>();
     ds->path = path;
@@ -1346,7 +1371,7 @@ int32_t write_impl(const WriteRequest& req) {
         return -1;
     }
     if (req.out_dataset != nullptr) {
-        auto* ds = open_dataset(req.uri, version);
+        auto* ds = open_dataset(req.uri, nullptr, version);
         if (ds == nullptr) {
             return -1;
         }
@@ -1528,8 +1553,8 @@ int32_t lance_session_get_cache_stats(const LanceSession* session, LanceSessionC
 
 // ── dataset ─────────────────────────────────────────────────────────────────────────────────────
 
-LanceDataset* lance_dataset_open(const char* uri, const char* const* /*storage_opts*/, uint64_t version) {
-    return guarded<LanceDataset*>(nullptr, [&] { return open_dataset(uri, version); });
+LanceDataset* lance_dataset_open(const char* uri, const char* const* storage_opts, uint64_t version) {
+    return guarded<LanceDataset*>(nullptr, [&] { return open_dataset(uri, storage_opts, version); });
 }
 
 LanceDataset* lance_dataset_open_with_session(const char* uri, const char* const* storage_opts, uint64_t version,

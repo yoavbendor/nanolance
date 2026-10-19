@@ -27,7 +27,7 @@ import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance import _native_log
-from nanolance.lance._errors import NotSupportedError, index_build, native, unsupported
+from nanolance.lance._errors import NotSupportedError, index_build, native, refuse_object_store_write, unsupported
 from nanolance.lance._sql import SqlQueryBuilder
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
 from nanolance.lance._session import Session, note_data_files, note_indexes, note_manifest
@@ -107,6 +107,8 @@ def _path_of(uri: Union[str, Path, "LanceDataset"]) -> str:
         return os.path.join(_memory_root(), text[len("memory://"):].strip("/") or "_root")
     if text.startswith("file://"):
         text = text[len("file://"):]
+    elif text.startswith("s3://"):
+        return text  # an object-store dataset: read through nanos3reader, by its uri
     elif "://" in text:
         raise unsupported(f"the storage scheme of {text!r} (local paths only)")
     return os.path.abspath(os.path.expanduser(text))
@@ -345,6 +347,10 @@ class LanceDataset(pa.dataset.Dataset):
         self._default_scan_options = dict(default_scan_options or {})
         try:
             with native():
+                if self._uri.startswith("s3://"):
+                    # The bucket's options (pylance's storage_options keys) apply to the reads of this open.
+                    options = {str(k): str(v) for k, v in (storage_options or {}).items()}
+                    _nanolance._set_storage_options(self._uri, options)
                 info = _nanolance._ds_info(self._uri, version)
         except Exception:
             _native_log.loading(self._log_uri, status="error")
@@ -504,7 +510,7 @@ class LanceDataset(pa.dataset.Dataset):
         return f"LanceDataset(uri={self._uri!r}, version={self._version})"
 
     def __getstate__(self):
-        return {"uri": self._uri, "version": self._version, "pinned": self._pinned}
+        return {"uri": self._uri, "version": self._version, "pinned": self._pinned}  # no credentials pickled
 
     def __reduce__(self):  # over pyarrow.dataset.Dataset's, which would pickle a native dataset
         return (_restore_dataset, (self.__getstate__(),))
@@ -514,7 +520,7 @@ class LanceDataset(pa.dataset.Dataset):
         self._pinned = state.get("pinned", True)
 
     def __copy__(self):
-        return LanceDataset(self._uri, version=self._version)
+        return LanceDataset(self._uri, version=self._version, storage_options=self._storage_options)
 
     # ── versions ──────────────────────────────────────────────────────────────────────────────────
 
@@ -571,6 +577,8 @@ class LanceDataset(pa.dataset.Dataset):
 
     def _cleanup(self, older_than, retain_versions, delete_unverified, error_if_tagged, delete_rate_limit, versions,
                  execute, max_files):
+        if execute:
+            refuse_object_store_write(self._uri, "cleanup")
         if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
         older_than_ns = None
@@ -591,6 +599,7 @@ class LanceDataset(pa.dataset.Dataset):
              ignore_not_found: Optional[bool] = None) -> None:
         """Delete the dataset and everything under ``base_uri``. Refused (ValueError) unless the path
         holds a manifest that reads, as Lance refuses, so a parent directory given by mistake survives."""
+        refuse_object_store_write(base_uri, "drop")
         with _ref_errors():
             _nanolance._ds_drop(_path_of(base_uri), bool(ignore_not_found))
 
@@ -603,8 +612,8 @@ class LanceDataset(pa.dataset.Dataset):
                 raise unsupported("branches")
             version = number
         if version is None:
-            return LanceDataset(self._uri)
-        return LanceDataset(self._uri, version=version)
+            return LanceDataset(self._uri, storage_options=self._storage_options)
+        return LanceDataset(self._uri, version=version, storage_options=self._storage_options)
 
     def checkout_latest(self) -> "LanceDataset":
         with native():
@@ -613,6 +622,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self
 
     def restore(self) -> None:
+        refuse_object_store_write(self._uri, "restore")
         with native():
             _nanolance._ds_restore(self._uri, self._version)
         self._refresh_latest("Restore")
@@ -623,6 +633,7 @@ class LanceDataset(pa.dataset.Dataset):
         return dict(self._info["config"])
 
     def update_config(self, values: Dict[str, Optional[str]], *, replace: bool = False) -> Dict[str, str]:
+        refuse_object_store_write(self._uri, "update config")
         current = self.config()
         remove = [k for k, v in values.items() if v is None]
         if replace:
@@ -634,6 +645,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self.config()
 
     def delete_config_keys(self, keys: List[str]) -> None:
+        refuse_object_store_write(self._uri, "delete config keys")
         with native():
             _nanolance._ds_update_config(self._uri, {}, list(keys))
         self._refresh_latest("UpdateConfig")
@@ -643,6 +655,7 @@ class LanceDataset(pa.dataset.Dataset):
         return dict(self._info["table_metadata"])
 
     def update_metadata(self, values: Dict[str, Optional[str]], *, replace: bool = False) -> Dict[str, str]:
+        refuse_object_store_write(self._uri, "update metadata")
         merged = {} if replace else self.metadata
         for k, v in values.items():
             if v is None:
@@ -659,6 +672,7 @@ class LanceDataset(pa.dataset.Dataset):
         return {k.decode(): v.decode() for k, v in self._info["schema_metadata"].items()}
 
     def update_schema_metadata(self, values: Dict[str, Optional[str]], *, replace: bool = False) -> Dict[str, str]:
+        refuse_object_store_write(self._uri, "update schema metadata")
         merged = {} if replace else self.schema_metadata
         for k, v in values.items():
             if v is None:
@@ -1017,6 +1031,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def delete(self, predicate, *, conflict_retries: int = 10, retry_timeout=None) -> Dict[str, int]:
         """Delete the rows where `predicate` (SQL or a pyarrow expression) is true. One new version."""
+        refuse_object_store_write(self._uri, "delete")
         sql = _filter_sql(predicate)
         if sql is None:
             raise ValueError("delete needs a predicate")
@@ -1028,6 +1043,7 @@ class LanceDataset(pa.dataset.Dataset):
     def update(self, updates: Dict[str, str], where: Optional[str] = None, conflict_retries: int = 10,
                retry_timeout=None) -> Dict[str, int]:
         """Set columns to SQL values on the rows `where` selects (every row when None)."""
+        refuse_object_store_write(self._uri, "update")
         if not updates:
             raise ValueError("update needs at least one column to set")
         assignments = [(str(k), str(v)) for k, v in updates.items()]
@@ -1051,6 +1067,7 @@ class LanceDataset(pa.dataset.Dataset):
     def add_columns(self, transforms, read_columns=None, reader_schema=None, batch_size=None) -> None:
         """New columns: {name: SQL expression}, all-null fields (a pyarrow Field, list of Fields or
         Schema), or data (a table / reader with one row per row of the dataset)."""
+        refuse_object_store_write(self._uri, "add columns")
         if isinstance(transforms, dict):
             columns = [(str(k), str(v)) for k, v in transforms.items()]
             with native():
@@ -1099,6 +1116,7 @@ class LanceDataset(pa.dataset.Dataset):
         """Add the columns of ``data_obj`` (a table, reader, dataset ...), matched to this dataset's
         rows on ``left_on`` = ``right_on`` (Lance's hash join: rows without a match get nulls; the
         right key column itself is not added)."""
+        refuse_object_store_write(self._uri, "merge")
         right_on = left_on if right_on is None else right_on
         if left_on not in self._data_schema.names and _resolve_path(self._data_schema, left_on) is None:
             raise OSError(f"Invalid user input: Column {left_on} does not exist in the left side dataset")
@@ -1130,6 +1148,7 @@ class LanceDataset(pa.dataset.Dataset):
         self._refresh_latest("Merge")
 
     def drop_columns(self, columns: List[str]) -> None:
+        refuse_object_store_write(self._uri, "drop columns")
         if isinstance(columns, str):
             columns = [columns]
         with native():
@@ -1137,6 +1156,7 @@ class LanceDataset(pa.dataset.Dataset):
         self._refresh_latest("Project")
 
     def alter_columns(self, *alterations) -> None:
+        refuse_object_store_write(self._uri, "alter columns")
         items = []
         for a in alterations:
             if not isinstance(a, dict) or "path" not in a:
@@ -1165,6 +1185,7 @@ class LanceDataset(pa.dataset.Dataset):
         With `fragment_ids`, an INVERTED index is staged for those fragments under `index_uuid` and
         not committed (Lance's legacy distributed build): ``merge_index_metadata`` builds it once every
         part is staged. Other types build their segments with ``create_index_uncommitted``."""
+        refuse_object_store_write(self._uri, "create scalar index")
         if isinstance(column, str):
             path = _resolve_path(self._data_schema, column)
             if path is not None:
@@ -1217,6 +1238,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def _create_json_index(self, column, name, replace, config, fragment_ids) -> "LanceDataset":
         """A JSON index: a BTREE over the values at `path` of a JSON column, as Lance's JsonIndexDetails."""
+        refuse_object_store_write(self._uri, "create JSON index")
         if fragment_ids is not None:
             raise unsupported("distributed JSON indexes")
         for key in ("target_index_type", "path"):
@@ -1361,6 +1383,7 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError(f"unknown document granularity {value!r}") from None
 
     def _create_inverted_index(self, column, name, replace, kwargs) -> "LanceDataset":
+        refuse_object_store_write(self._uri, "create inverted index")
         granularity = self._document_granularity(kwargs)
         params = self._inverted_params(kwargs)
         if isinstance(column, (list, tuple)):
@@ -1403,6 +1426,7 @@ class LanceDataset(pa.dataset.Dataset):
         """Build the INVERTED index staged in parts under `index_uuid` (create_scalar_index with
         fragment_ids), over the union of their fragments. Does not commit: commit it with
         ``LanceDataset.commit(uri, LanceOperation.CreateIndex([...], []), read_version)``."""
+        refuse_object_store_write(self._uri, "merge index metadata")
         import json
 
         from nanolance.lance.indices import SupportedDistributedIndices
@@ -1473,6 +1497,7 @@ class LanceDataset(pa.dataset.Dataset):
         ``merge_existing_index_segments`` if wanted. BTREE, BITMAP, LABEL_LIST, INVERTED, IVF_FLAT,
         IVF_PQ and IVF_HNSW_SQ. Vector segments that share `ivf_centroids` (and `pq_codebook`) share
         one model and can be merged."""
+        refuse_object_store_write(self._uri, "create index segments")
         kind = str(getattr(index_type, "index_type", index_type)).upper()
         if kind == "FTS":
             kind = "INVERTED"
@@ -1538,6 +1563,7 @@ class LanceDataset(pa.dataset.Dataset):
     def merge_existing_index_segments(self, segments: List[Index]) -> Index:
         """Merge a group of uncommitted segments (create_index_uncommitted) into one, uncommitted:
         a new segment over the union of their fragments. Vector segments must share their model."""
+        refuse_object_store_write(self._uri, "merge index segments")
         messages = [_segment_message(self, s) for s in segments]
         with _lance_errors():
             message = _nanolance._index_merge_segments(self._uri, messages)
@@ -1545,6 +1571,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def commit_existing_index_segments(self, index_name: str, column: str, segments) -> "LanceDataset":
         """Commit built segments as the logical index `index_name` on `column`, in one new version."""
+        refuse_object_store_write(self._uri, "commit index segments")
         messages = [_segment_message(self, s) for s in segments]
         if isinstance(column, str):
             path = _resolve_path(self._data_schema, column)
@@ -1627,6 +1654,7 @@ class LanceDataset(pa.dataset.Dataset):
                      target_partition_size: Optional[int] = None, **kwargs) -> "LanceDataset":
         """Build an index on `column`, in Lance's format. IVF_FLAT, IVF_SQ, IVF_PQ, IVF_HNSW_FLAT, IVF_HNSW_PQ and IVF_HNSW_SQ vector indexes
         (pylance and LanceDB search them as their own); scalar index types go to create_scalar_index."""
+        refuse_object_store_write(self._uri, "create index")
         kind = str(index_type).upper()
         if isinstance(column, (list, tuple)):
             if len(column) != 1:
@@ -1726,6 +1754,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self
 
     def drop_index(self, name: str) -> None:
+        refuse_object_store_write(self._uri, "drop index")
         if not any(i["name"] == str(name) for i in self.list_indices()):
             raise RuntimeError(f"Lance index not found: name={name}")  # pylance's error for a missing name
         with native():
@@ -1992,6 +2021,7 @@ class LanceDataset(pa.dataset.Dataset):
                               replace: bool = False) -> None:
         """Set (a value) or remove (None) metadata keys of fields named by path; with ``replace``, a
         field's metadata becomes exactly the keys given a value."""
+        refuse_object_store_write(self._uri, "update field metadata")
         if not isinstance(field_updates, dict):
             raise TypeError(f"argument 'field_updates': '{type(field_updates).__name__}' object cannot be "
                             "converted to 'PyDict'")
@@ -2044,6 +2074,7 @@ class LanceDataset(pa.dataset.Dataset):
         step of a distributed write, whose workers wrote their files with ``write_fragments`` /
         ``LanceFragment.create`` and friends. Checked first against what was committed since
         ``read_version``, as Lance checks it (a conflict raises ``lance.commit.CommitConflictError``)."""
+        refuse_object_store_write(base_uri, "commit")
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
         elif isinstance(base_uri, LanceDataset):
@@ -2251,6 +2282,7 @@ def _commit_hand_built(path: str, operation, read_version: Optional[int], proper
     """Commit `operation` as Lance's commit_transaction does: check the transactions committed since
     `read_version` (a conflict raises CommitConflictError), apply it to the latest version, and try
     again when another writer takes that version first."""
+    refuse_object_store_write(path, "commit")
     import random
     import time
 
@@ -2416,20 +2448,24 @@ class Tags:
         return _tag_version(self._ds.uri, tag, ValueError)
 
     def create(self, tag: str, reference=None) -> None:
+        refuse_object_store_write(self._ds.uri, "create tag")
         version = _tag_reference(self._ds, reference)
         with _ref_errors():
             _nanolance._ds_create_tag(self._ds.uri, str(tag), version)
 
     def delete(self, tag: str) -> None:
+        refuse_object_store_write(self._ds.uri, "delete tag")
         with _ref_errors():
             _nanolance._ds_delete_tag(self._ds.uri, str(tag))
 
     def update(self, tag: str, reference=None) -> None:
+        refuse_object_store_write(self._ds.uri, "update tag")
         version = _tag_reference(self._ds, reference)
         with _ref_errors():
             _nanolance._ds_update_tag(self._ds.uri, str(tag), version)
 
     def replace_metadata(self, tag: str, metadata: Dict[str, str]) -> None:
+        refuse_object_store_write(self._ds.uri, "replace tag metadata")
         with _ref_errors():
             _nanolance._ds_replace_tag_metadata(self._ds.uri, str(tag), {str(k): str(v) for k, v in metadata.items()})
 
@@ -3012,6 +3048,7 @@ class MergeInsertBuilder:
         return f"{self._clauses()}, metrics=[{', '.join(f'{k}={v}' for k, v in metrics.items())}]"
 
     def execute(self, data_obj, *, schema: Optional[pa.Schema] = None) -> Dict[str, int]:
+        refuse_object_store_write(self._ds.uri, "merge insert")
         reader = _coerce_reader(data_obj, schema)
         target = self._ds._data_schema
         if not (self._update_all or self._insert_all or self._delete_by_source or self._when_matched):
@@ -3160,6 +3197,7 @@ class DatasetOptimizer:
         """Rewrite small fragments (and those with many deleted rows) into fewer, larger ones. The
         indexes that covered the rewritten rows take them back, as Lance's compaction remaps its
         indexes (a second version; nanolance's `reindex=False` leaves them covering fewer fragments)."""
+        refuse_object_store_write(self._ds.uri, "compact files")
         from nanolance.lance.optimize import CompactionMetrics
 
         with native():
@@ -3191,6 +3229,7 @@ class DatasetOptimizer:
         `num_indices_to_merge` (default 1) segments of each index are replaced by one covering their
         fragments and every uncovered one (0: a new segment over the uncovered fragments alone), with
         the index's parameters -- a vector index keeps its trained model unless `retrain`."""
+        refuse_object_store_write(self._ds.uri, "optimize indices")
         unknown = sorted(set(kwargs) - {"num_threads"})
         if unknown:
             raise unsupported(f"optimize_indices options {unknown}")
@@ -4390,6 +4429,7 @@ def write_dataset(
     packed or dedicated by size, URIs as external references -- which, the dataset having no
     registered external bases, takes ``allow_external_blob_outside_bases=True``. With
     ``external_blob_mode="ingest"`` the bytes a URI names are copied into the dataset instead."""
+    refuse_object_store_write(uri, "write_dataset")
     namespace_client = kwargs.pop("namespace_client", None)
     if namespace_client is None:
         namespace_client = namespace
@@ -4821,12 +4861,13 @@ def dataset(
         ds._attach_namespace(namespace_client, table_id, managed)
         return ds
     if asof is not None:
-        ds = LanceDataset(uri, session=session)
+        ds = LanceDataset(uri, session=session, storage_options=storage_options)
         ts = asof if isinstance(asof, datetime) else datetime.fromisoformat(str(asof))
         candidates = [v for v in ds.versions() if v["timestamp"] <= ts]
         if not candidates:
             raise ValueError(f"no version of {uri} at or before {asof}")
-        return LanceDataset(uri, version=candidates[-1]["version"], session=session)
+        return LanceDataset(uri, version=candidates[-1]["version"], session=session,
+                            storage_options=storage_options)
     return LanceDataset(uri, version=version, default_scan_options=default_scan_options,
                         storage_options=storage_options, index_cache_size=index_cache_size,
                         index_cache_size_bytes=index_cache_size_bytes,
