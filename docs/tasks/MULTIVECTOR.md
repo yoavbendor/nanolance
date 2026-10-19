@@ -128,3 +128,14 @@ Tails of: `cd build && ctest -j8 | tail -3`; the phase's target pylance tests ru
 tools/pylance_suite.py | tail -4`; the benchmark lines; last, once: `cd bindings/python && python3 -m
 pytest -o addopts= -q -x -p no:cacheprovider tests | tail -3`. Report under 40 lines: questions first,
 then files, per-test status, tails, decisions.
+
+**M1 outcome (2026-10-19):** done in one Haiku session (stopped once by a usage limit, resumed);
+reviewed. Flat multivector search (`list<fixed_size_list>` columns: Lance's multivec_distance, the least
+distance per query vector summed; L2, cosine, dot, Hamming on uint8; float16 queries rounded as pylance
+rounds them); an index over a multivector column is left unused in plain search and refused for
+`fast_search` / explicit segments. `tests/test_multivector.py` (25). Reviewer's answers: null and empty
+rows are left out of the results (Lance's KNN drops NaN distances; the brief's "sort last" was wrong);
+`test_multivec_search_paths` waits for M3 (it builds its index through nanolance); a uint8 multi-query is
+refused as pylance refuses it. Open for M2: float64 columns are compared in float32 (pylance's L2 differs
+by about one float32 ulp, 1.9e-6 at distances 8-16); a double path needs the binding to carry a double
+query.

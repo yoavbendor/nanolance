@@ -2809,9 +2809,7 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
         raise TypeError(f"nearest() got unexpected keyword arguments {sorted(unknown)}")
     column = nearest.get("column")
     rows, batch = _query_rows(nearest.get("q"))
-    if batch and "query_index" in ds._data_schema.names:
-        raise ValueError("Invalid user input: batch nearest neighbor search cannot be used on datasets "
-                         "with column 'query_index'")
+    multi = False
     node = None
     for i, part in enumerate(str(column).split(".")):
         if i > 0 and not pa.types.is_struct(node.type):
@@ -2827,9 +2825,18 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
     if pa.types.is_fixed_size_list(storage):
         dim = storage.list_size
     elif pa.types.is_list(storage) and pa.types.is_fixed_size_list(storage.value_type):
-        raise unsupported("multivector search")
+        # A multivector column: a list of vectors is one query (its vectors are summed, as Lance does).
+        multi = True
+        dim = storage.value_type.list_size
+        if batch and pa.types.is_uint8(storage.value_type.value_type):
+            # pylance 12 turns a list of vectors into a float32 query, which a uint8 column refuses
+            raise ValueError(f"Invalid user input: Column {column} has element type UInt8 and the query vector "
+                             "is Float32")
     else:
         raise TypeError(f"Query column {column} must be a vector. Got {arrow_type}.")
+    if not multi and batch and "query_index" in ds._data_schema.names:
+        raise ValueError("Invalid user input: batch nearest neighbor search cannot be used on datasets "
+                         "with column 'query_index'")
     if len(rows[0]) != dim:
         # pylance's message: for a batch, the size it names is the number of query rows.
         size = len(rows) if batch else len(rows[0])
@@ -2882,10 +2889,16 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
         "upper_bound": None if upper is None else float(upper),
         "ef": None if ef is None else int(ef),
     }
+    if multi:
+        if pa.types.is_float16(storage.value_type.value_type):
+            # pylance casts the query to the column's element type: a float16 column's query is rounded
+            rows = [row.astype(np.float16).astype(np.float32) for row in rows]
+        # The query's vectors one after another (the scanner reads them as n x dim).
+        return dict(shared, q=[x for row in rows for x in row.tolist()], vectors=len(rows))
     if batch:
         # One query per row, in row order: the list is the batch (see ScannerBuilder._nearest_table).
-        return [dict(shared, q=row.tolist()) for row in rows]
-    return dict(shared, q=rows[0].tolist())
+        return [dict(shared, q=row.tolist(), vectors=1) for row in rows]
+    return dict(shared, q=rows[0].tolist(), vectors=1)
 
 
 def _filter_sql(filter) -> Optional[str]:
@@ -3927,7 +3940,7 @@ class LanceScanner(pa.dataset.Scanner):
     def _search(self, n):
         with native():
             ids, distances, plan, hits, misses = _nanolance._ds_nearest(
-                self._ds.uri, self._ds.version, n["column"], n["q"], n["k"], n["minimum_nprobes"],
+                self._ds.uri, self._ds.version, n["column"], n["q"], n["vectors"], n["k"], n["minimum_nprobes"],
                 n["maximum_nprobes"], n["refine_factor"], n["metric"], n["use_index"], n["lower_bound"],
                 n["upper_bound"], self._filter, self._prefilter, self._fast_search, n.get("ef"),
                 self._ds._index_cache_enabled(), self._index_segments, self._mask["row_addr_allowlist"],

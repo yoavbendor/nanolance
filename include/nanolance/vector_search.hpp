@@ -31,6 +31,10 @@ struct NearestQuery {
     std::uint64_t version = 0;
     std::string column;
     std::vector<float> key;  // the query vector
+    /// A multivector column (a list of fixed-size lists of floats or whole numbers): `key` holds this
+    /// many query vectors, one after another, and a row's distance sums, over them, the least distance
+    /// to any of the row's vectors (Lance's multivec_distance). 1: an ordinary query vector.
+    std::size_t key_vectors = 1;
     std::uint64_t k = 10;
     /// Partitions to probe: at least `minimum_nprobes` (Lance's adaptive count when it is 1 and
     /// there is no maximum), at most `maximum_nprobes` (all when unset). `nprobes` sets both.

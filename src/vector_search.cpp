@@ -393,6 +393,73 @@ bool collect_vectors(const ArrowSchema& schema, const std::vector<ArrowArray>& b
     return true;
 }
 
+/// The vectors of a multivector column (a list of fixed-size lists): row r holds count[r] vectors of
+/// `dim` values, the first being vector first[r] of `values` (of `bytes` for a uint8 column). A null or
+/// empty row holds none.
+struct MultiRows {
+    std::size_t dim = 0;
+    std::vector<float> values;
+    std::vector<std::uint8_t> bytes;
+    std::vector<std::size_t> first;
+    std::vector<std::size_t> count;
+    std::vector<std::uint64_t> ids;
+};
+
+/// Append the rows of one batch: the multivector column at `vector_column` (inside structs along
+/// `sub_path`) and the row addresses at `id_column`. Values are read as collect_vectors reads them.
+bool collect_multivectors(const ArrowSchema& schema, const ArrowArray& batch, int vector_column, int id_column,
+                          MultiRows& out, std::string& error, const std::vector<int>& sub_path = {}) {
+    BatchView b(schema, batch, error);
+    if (!b.ok) {
+        return false;
+    }
+    const ArrowArrayView* list = b.view.children[vector_column];
+    for (const int child : sub_path) {
+        list = list->children[child];
+    }
+    const ArrowArrayView* vectors = list->children[0];  // the fixed-size lists
+    const ArrowArrayView* items = vectors->children[0];  // their values
+    const ArrowArrayView* ids = b.view.children[id_column];
+    const auto dim = static_cast<std::int64_t>(out.dim);
+    const bool f32 = items->storage_type == NANOARROW_TYPE_FLOAT;
+    const bool u8 = items->storage_type == NANOARROW_TYPE_UINT8;
+    const std::int32_t* offsets = list->buffer_views[1].data.as_int32;
+    for (std::int64_t r = 0; r < batch.length; ++r) {
+        const std::int64_t row = b.view.offset + r;
+        const bool null = ArrowArrayViewIsNull(list, row);
+        const std::int64_t begin = null ? 0 : offsets[list->offset + row];
+        const std::int64_t n = null ? 0 : offsets[list->offset + row + 1] - begin;
+        out.first.push_back(out.count.empty() ? 0 : out.first.back() + out.count.back());
+        out.count.push_back(static_cast<std::size_t>(n));
+        for (std::int64_t j = 0; j < n; ++j) {
+            // element begin + j of the fixed-size lists sits at (list offset + begin + j) * dim of the values
+            const std::int64_t at = (vectors->offset + begin + j) * dim;
+            if (u8) {
+                const std::size_t old = out.bytes.size();
+                out.bytes.resize(old + out.dim);
+                std::memcpy(out.bytes.data() + old, items->buffer_views[1].data.as_uint8 + items->offset + at,
+                            out.dim);
+            } else {
+                const std::size_t old = out.values.size();
+                out.values.resize(old + out.dim);
+                if (f32) {
+                    std::memcpy(out.values.data() + old, items->buffer_views[1].data.as_float + items->offset + at,
+                                out.dim * sizeof(float));
+                } else {
+                    for (std::int64_t k = 0; k < dim; ++k) {
+                        out.values[old + static_cast<std::size_t>(k)] =
+                            static_cast<float>(ArrowArrayViewGetDoubleUnsafe(items, at + k));
+                    }
+                }
+            }
+        }
+        if (ids != nullptr) {
+            out.ids.push_back(ArrowArrayViewGetUIntUnsafe(ids, row));
+        }
+    }
+    return true;
+}
+
 // ── distances ───────────────────────────────────────────────────────────────────────────────────
 
 float dot(const float* a, const float* b, std::size_t n) {
@@ -1861,10 +1928,43 @@ bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMet
     return true;
 }
 
+/// Row `r` of a multivector column against the query's vectors (Lance's multivec_distance): for each
+/// query vector, the least distance to a vector of the row, summed. A null or empty row is NaN. The
+/// query's uint8 values are `binary_key` (Hamming distance) when given.
+float multivec_distance(const MultiRows& v, std::size_t r, const NearestQuery& q, VectorMetric metric,
+                        const std::vector<std::uint8_t>* binary_key, std::size_t dim) {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    if (v.count[r] == 0U) {
+        return nan;
+    }
+    float total = 0;
+    for (std::size_t qi = 0; qi < q.key_vectors; ++qi) {
+        // the least distance, NaN only when every distance is NaN (Lance's min_by total_cmp order)
+        float best = nan;
+        const float* qv = binary_key != nullptr ? nullptr : q.key.data() + qi * dim;
+        const float q_norm = qv != nullptr && metric == VectorMetric::Cosine ? std::sqrt(dot(qv, qv, dim)) : 0.0F;
+        for (std::size_t j = 0; j < v.count[r]; ++j) {
+            const std::size_t at = (v.first[r] + j) * dim;
+            float d = 0;
+            if (binary_key != nullptr) {
+                d = hamming(v.bytes.data() + at, binary_key->data() + qi * dim, dim);
+            } else {
+                d = distance(metric, v.values.data() + at, qv, dim, q_norm);
+            }
+            if (std::isnan(best) || (!std::isnan(d) && d < best)) {
+                best = d;
+            }
+        }
+        total += best;
+    }
+    return total;
+}
+
 /// The best k of `fragments` by exact distance; `binary_key` (a uint8 column's query): by Hamming distance.
+/// `multi`: a multivector column, searched by multivec_distance.
 bool flat_search(const std::filesystem::path& path, const NearestQuery& q, VectorMetric metric, std::size_t dim,
                  const std::vector<std::uint64_t>& fragments, std::vector<Candidate>& out, std::string& error,
-                 const std::vector<std::uint8_t>* binary_key = nullptr) {
+                 const std::vector<std::uint8_t>* binary_key = nullptr, bool multi = false) {
     if (fragments.empty()) {
         return true;
     }
@@ -1892,7 +1992,21 @@ bool flat_search(const std::filesystem::path& path, const NearestQuery& q, Vecto
     }
     std::vector<Candidate> found;
     for (auto& batch : batches) {
-        if (ok) {
+        if (ok && multi) {
+            MultiRows v;
+            v.dim = dim;
+            ok = collect_multivectors(schema, batch, vc, ic, v, error, sub);
+            for (std::size_t r = 0; ok && r < v.ids.size(); ++r) {
+                // a null or empty row (a NaN distance) is left out, as Lance's KNN leaves it out
+                const float d = multivec_distance(v, r, q, metric, binary_key, dim);
+                if (!std::isnan(d) && in_range(d, q)) {
+                    found.push_back(Candidate{d, v.ids[r]});
+                }
+            }
+            if (found.size() > 4U * q.k + 1024U) {
+                keep_best(found, q.k);
+            }
+        } else if (ok) {
             VectorRows v;
             v.dim = dim;
             std::vector<ArrowArray> one;  // collect_vectors takes a list; reuse without copying ownership
@@ -2148,6 +2262,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
     std::size_t dim = 0;
     bool f32_column = false;
     bool binary = false;  // a uint8 column: binary vectors, searched by Hamming distance
+    bool multi = false;   // a list of fixed-size lists: a multivector column (multivec_distance)
     {
         const ArrowSchema* column = nullptr;
         const ArrowSchema* level = &schema;
@@ -2167,11 +2282,19 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             level = column;
             at = dot_at + 1U;
         }
-        std::string format = column == nullptr || column->format == nullptr ? "" : column->format;
-        std::string item = column == nullptr || column->n_children != 1 || column->children[0]->format == nullptr
+        // A multivector column is a list of fixed-size lists: the vectors are the inner lists'.
+        const ArrowSchema* vectors = column;
+        if (column != nullptr && column->format != nullptr && std::string(column->format) == "+l" &&
+            column->n_children == 1 && column->children[0]->format != nullptr &&
+            std::string(column->children[0]->format).rfind("+w:", 0) == 0) {
+            vectors = column->children[0];
+            multi = true;
+        }
+        std::string format = vectors == nullptr || vectors->format == nullptr ? "" : vectors->format;
+        std::string item = vectors == nullptr || vectors->n_children != 1 || vectors->children[0]->format == nullptr
                                ? ""
-                               : column->children[0]->format;
-        if (column != nullptr && format.rfind("+w:", 0) == 0) {
+                               : vectors->children[0]->format;
+        if (vectors != nullptr && format.rfind("+w:", 0) == 0) {
             dim = static_cast<std::size_t>(std::strtoull(format.c_str() + 3, nullptr, 10));
             f32_column = item == "f";
             binary = item == "C";
@@ -2186,9 +2309,13 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             return false;
         }
     }
-    if (q.key.size() != dim) {
-        error = "Query vector size " + std::to_string(q.key.size()) + " does not match index column size " +
-                std::to_string(dim);
+    if (!multi && q.key_vectors != 1U) {
+        error = "Query column " + q.column + " must be a multivector to take several query vectors";
+        return false;
+    }
+    if (q.key.size() != dim * q.key_vectors) {
+        error = "Query vector size " + std::to_string(q.key.size() / std::max<std::size_t>(q.key_vectors, 1U)) +
+                " does not match index column size " + std::to_string(dim);
         return false;
     }
     // Binary vectors: Hamming distance only, exact (no index), the query's values are bytes.
@@ -2265,6 +2392,17 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             return false;
         }
     }
+    if (multi && q.use_index && !segments.empty()) {
+        // Indexes over multivector columns are not searched yet: the rows are searched exactly, the
+        // index left unused (as Lance's planner does for an index it cannot use). fast_search or an
+        // explicit segment list would need the index, so they are refused rather than answered wrongly.
+        if (q.fast_search || chosen) {
+            error = "searching a vector index over a multivector column is not supported yet; use use_index=False";
+            return false;
+        }
+        out.plan.push_back("index " + index_name + " not used: multivector index search is not supported yet");
+        segments.clear();
+    }
     std::vector<std::shared_ptr<const IvfIndex>> loaded;
     std::string not_used;  // why the index was not used
     if (!q.use_index) {
@@ -2319,7 +2457,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         } else {
             out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
                                " (exact, " + std::to_string(all_fragments.size()) + " fragments)");
-            if (!flat_search(dataset_path, q, metric, dim, all_fragments, hits, error, binary ? &binary_key : nullptr)) {
+            if (!flat_search(dataset_path, q, metric, dim, all_fragments, hits, error, binary ? &binary_key : nullptr, multi)) {
                 return false;
             }
         }
@@ -2412,7 +2550,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         if (!unindexed.empty()) {
             out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name + " (exact, " +
                                std::to_string(unindexed.size()) + " unindexed fragments)");
-            if (!flat_search(dataset_path, q, metric, dim, unindexed, hits, error, binary ? &binary_key : nullptr)) {
+            if (!flat_search(dataset_path, q, metric, dim, unindexed, hits, error, binary ? &binary_key : nullptr, multi)) {
                 return false;
             }
         }

@@ -2090,8 +2090,8 @@ NB_MODULE(_nanolance, m) {
         return nb::make_tuple(counted.exact, counted.count, counted.uncovered, counted.lines);
     });
     m.def("_ds_nearest", [](const std::filesystem::path& path, std::optional<std::uint64_t> version,
-                            const std::string& column, const std::vector<float>& key, std::uint64_t k,
-                            std::uint32_t minimum_nprobes, std::optional<std::uint32_t> maximum_nprobes,
+                            const std::string& column, const std::vector<float>& key, std::uint64_t key_vectors,
+                            std::uint64_t k, std::uint32_t minimum_nprobes, std::optional<std::uint32_t> maximum_nprobes,
                             std::optional<std::uint32_t> refine_factor, std::optional<std::string> metric,
                             bool use_index, std::optional<float> lower_bound, std::optional<float> upper_bound,
                             std::optional<std::string> filter, bool prefilter, bool fast_search,
@@ -2109,6 +2109,7 @@ NB_MODULE(_nanolance, m) {
         q.version = version.value_or(0);
         q.column = column;
         q.key = key;
+        q.key_vectors = key_vectors;
         q.k = k;
         q.minimum_nprobes = minimum_nprobes;
         q.maximum_nprobes = maximum_nprobes;
