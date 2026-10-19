@@ -30,18 +30,20 @@ a user report can be matched to it.
 | Fuzzy FTS, accented query tokens | char-level distance | a rule not yet pinned down | measure first | same |
 | FTS / phrase cache hit-miss counts | right direction, other numbers | per page | small | ScanStatistics `indices_loaded`, `index_comparisons` are 0 |
 
-## Index plan for AI users (2026-10-19)
+## Index plan for AI users (2026-10-19, revised)
 
-The full plan, with each item's status, size, done-criteria and files, is in `docs/ROADMAP.md`
-("Index plan for AI users"). The next four items, in order:
+The plan, with each item's failing pylance tests, the Opus step, the Haiku sessions and the
+done-criteria, is in `docs/ROADMAP.md` ("Index plan for AI users"). Next, Wave 1, in order, each
+briefed by Opus and implemented by Haiku:
 
-1. Fragment Reuse Index, complete (partial now, no tests): Opus design, then 1-2 sessions.
-2. Hybrid search, vector + full-text with RRF (refused now): one session plus Opus review.
-3. Object-store datasets, `s3://` and `gs://` writes and reads (not done; moved up from last): large, Opus design first.
-4. Multivector (ColBERT-style) search (not done): 2-3 sessions.
+1. Full-text search on list columns: 5 tests, 1 session.
+2. Index build progress callbacks: 5 tests, 1 session. Also make the hybrid refusal pylance's exact message.
+3. Multivector search: 4 tests, 3 sessions (M1 flat, M2 search, M3 build) after Opus measures the format.
+4. Deferred index remap and the Fragment Reuse Index: 4 tests, 1-2 sessions.
 
-Correction to earlier summaries: CJK segmentation (icu, jieba, lindera) is not done, and neither
-are multivector search or hybrid search.
+Meanwhile Opus researches Wave 2: object-store reads, IVF_RQ, binary IVF. Corrections to earlier
+summaries: CJK segmentation is not done. Hybrid search is refused by pylance too, so it is LanceDB's
+feature. Compaction already remaps indexes; the FRI only serves deferred remap.
 
 ## Features left, smallest first
 

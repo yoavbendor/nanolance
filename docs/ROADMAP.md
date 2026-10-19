@@ -457,37 +457,76 @@ Two cheaper levers are worth trying before a task moves models at all:
 4. **Phase C**, then **D** — lists and maps, read before write.
 5. **Phase F** once correctness work has settled; **Phase G** in parallel throughout.
 
-## Index plan for AI users (2026-10-19)
+## Index plan for AI users (2026-10-19, revised)
 
-Written from a review of the index specification against what nanolance has, weighted to AI work
-(RAG, multimodal training curation, streaming ingestion). "Done when" is the oracle for the task:
-answers equal pylance's (or LanceDB's), not just "it runs". Speed figures are from
-`docs/BENCHMARKS.md` (pylance, 4 cores, 2026-10-17); Rust Lance speed is measured in the CI gate
-(`docs/PERFORMANCE_GATE.md`), not committed.
+Written from a review of Lance's index specification against nanolance, weighted to AI work (RAG,
+multimodal training curation, streaming ingestion), then revised the same day after measuring:
+
+- **Compaction already remaps indexes** (`CompactionOptions::reindex`, on by default, as Lance's
+  compaction does). The Fragment Reuse Index only serves pylance's `defer_index_remap=True`, which
+  lets a compaction commit alongside a concurrent index build. Demoted from first place.
+- **pylance refuses hybrid search itself**: a scan with both `nearest` and `full_text_query` raises
+  `Invalid user input: Cannot have both nearest and full text search` (pylance 12.0.0, measured).
+  Hybrid search with RRF is LanceDB's (`query_type="hybrid"`), and LanceDB already opens nanolance
+  datasets. nanolance's refusal is the compatible answer; only its message differs.
+- **The read side of object stores is mostly wiring**: `io::ByteSource` takes registered scheme
+  factories and directory listers (the WebAssembly build registers `https`), and nanos3reader already
+  does signed range reads. Writes need atomic commits and stay a design task.
 
 **Already done** (no work here): IVF_FLAT (search 3.1x pylance), IVF_PQ with refine (2.6x), IVF_SQ,
 IVF_HNSW_SQ (5.2x), IVF_HNSW_PQ and IVF_HNSW_FLAT; BTree (`id < 1000` 5.3x), Bitmap (3.5x), LabelList
 (3.3x), ZONEMAP, BLOOMFILTER, NGRAM, JSON; INVERTED with BM25, phrase queries and fuzzy MatchQuery
-(1 common word 5.8x); `optimize_indices`; stable row ids; distributed index builds; batch KNN; flat
-Hamming search; decimal and duration indexes and filters; indexes on nested paths (scalar).
+(1 common word 5.8x); `optimize_indices` and index remapping on compaction; stable row ids;
+distributed index builds; batch KNN; flat Hamming search; decimal and duration indexes and filters;
+scalar indexes on nested paths. Speeds are from `docs/BENCHMARKS.md` (pylance, 4 cores, 2026-10-17);
+Rust Lance is measured in the CI gate (`docs/PERFORMANCE_GATE.md`).
 
-**Order.** Items 1-4 are the next work, in this order. Item 3 moved up from "last" and items 1-2
-moved up from the Gemini-based list: a streaming AI workload needs them first. Items 5-8 follow; 9-11
-only when a user asks.
+### How the items are run (`docs/DELEGATION.md`)
 
-| # | Item | Status now | Size | Why for AI users | Done when | Files |
+- **Opus measures, then writes the brief** in `docs/tasks/`: facts measured on pylance, the target
+  tests by name, the oracle command, the stop rule. **Haiku implements one bounded item per
+  session** (budget about 200k tokens). Opus reviews the diff, reproduces the edge cases, re-runs
+  the checks, commits and updates `expected_pass.txt`.
+- **Format research, cross-module design and every speed verdict stay with Opus.** A new search
+  kind gets a row in the benchmark scripts; the reviewer runs the interleaved before/after.
+- **Prefer items whose oracle is pylance's own failing tests.** The counts below are failures in the
+  suite's last run (`.deps/pylance-tests/v12.0.0/nanolance.xml`: 287 of 1,849 failing).
+- **One session at a time.** Two may overlap only in separate worktrees on disjoint files, running
+  targeted tests only; the reviewer runs the one full suite.
+- **While Haiku runs a wave, Opus does the next wave's research**, so no session waits on a format
+  question.
+
+### Wave 1: measured enough to delegate now (about 6-7 Haiku sessions, 18 pylance tests)
+
+| # | Item | Failing pylance tests | Opus first | Haiku | Why for AI users | Done when |
 |---|---|---|---|---|---|---|
-| 1 | **Fragment Reuse Index**, complete | partial: an existing FRI is honoured when a compaction is deferred; nothing writes one; **no tests** | Opus design (read pylance's FRI on a dataset it compacted), then 1-2 Haiku sessions | appends make many small fragments; without FRI each compaction invalidates the vector indexes | a pylance-written FRI dataset reads and searches equal; a nanolance compaction keeps the vector index in use with no rebuild (work counters show no rebuild); the tests exist | `src/index_maintenance.cpp`, `src/index_search.cpp` (about line 1307), `tests/test_index_optimize.py` |
-| 2 | **Hybrid search**: vector + full-text fused with Reciprocal Rank Fusion, and a weighted form | not done: `dataset.py` refuses it ("hybrid (vector and full-text) search") | 1 Haiku session, Opus review. Built on the existing kNN and FTS, so no format work | RAG's standard retrieval; semantic embeddings miss exact SKUs, names and identifiers | equal to pylance/LanceDB's combined result where they have one; otherwise equal to RRF computed by hand from pylance's two result lists. Confirm the default `k` against LanceDB's reranker before coding | `bindings/python/nanolance/lance/dataset.py` (replace the refusal); lance-c after |
-| 3 | **Object-store datasets**: write and read `s3://` and `gs://` datasets | not done. External blob reads from `s3://` already work | large. Opus design: a store layer under `ByteSource` for writes, and atomic commits | most AI datasets live in object storage | a dataset written to and read from an S3-compatible test endpoint matches pylance's results; concurrent commits behave as Lance's do (tested). Needs a test endpoint in CI | `include/nanolance/byte_source.hpp`, commit path in `src/` |
-| 4 | **Multivector (ColBERT-style) search** | not done: refused on non-multivector columns (`multivector_rejects_flat_column` smoke test) | 2-3 sessions | late-interaction retrieval | results and MaxSim scores equal pylance's on the same dataset | vector search (`include/nanolance/vector_search.hpp`) |
-| 5 | **IVF_RQ (RaBitQ)** | refused. The most important vector kind left | Opus format research, then 2-3 sessions | 1-bit codes shrink embedding indexes on disk and in memory | a pylance-built IVF_RQ is searched with pylance's answers, following the existing pattern in `docs/VECTOR_INDEX.md` | `dataset.py`, `src/index_search.cpp`, `tests/test_index_optimize.py` (its refusal test) |
-| 6 | **Full-text breadth**: WAND / MaxScore top-k, INVERTED on nested fields, full-text on list columns | not done | 1-2 sessions each | multi-word queries; nested metadata; tags and captions stored as lists | equal to pylance's results and scores; timed with `tools/bench_fts.py` | `src/` FTS search, `docs/FTS_INDEX.md` |
-| 7 | **Tokenizers for other languages**: icu, jieba (Chinese), lindera (Japanese) | not done. Earlier summaries said CJK segmentation works; it does not | large: external libraries and dictionaries | multilingual RAG | each tokenizer's tokens equal pylance's on a fixed corpus | `src/` tokenizers |
-| 8 | **IVF on binary vectors** (IVF_FLAT with Hamming) | flat Hamming done; IVF not | several sessions | cheap binary embeddings at scale | the 4 pylance IVF-binary tests pass | `tests/test_binary_vectors.py` |
-| 9 | **MemWAL** (streaming writes, LSM buffer) | not done: the index is kept on existing datasets but never built or read | Opus design, large | real-time agent memory | crash-recovery and read-your-writes tests; pylance's MemWAL reads back | write path |
-| 10 | Index build progress callbacks | not done | small | long builds on large datasets | a callback reports fraction done, equal to pylance's stages | the index builders |
-| 11 | MinHash LSH, FM-index, RTree | not done | 1-2 sessions each, on demand | dedup for pretraining (MinHash); spatial crops (RTree). N-gram is already done | built only when a user asks for one | new index kinds |
+| 1 | **Full-text search on list columns** | 5 (`test_fts_on_list`, `test_fts_on_list_elements[*]`) | measure how pylance tokenizes and indexes list rows | 1 session | tags, captions and labels are stored as lists | the 5 pass; scores equal pylance's |
+| 2 | **Index build progress callbacks**, plus the hybrid refusal made pylance's exact message | 5 (`test_dataset_progress`, `test_create_inverted_index_progress_callback*`) | record pylance's stage names, order and error rules | 1 session | long builds on large embedding tables | the 5 pass |
+| 3 | **Multivector (ColBERT-style) search** | 4 (`test_multivec_ann`, `test_multivec_search_paths`, `test_multi_vector_field`, `test_ivf_centroids_multivector_fragment_ids`) | the format: column type, index layout, MaxSim scoring, refine. Split as M1 flat search, M2 search of a pylance-built index, M3 build | 3 sessions (M1-M3) | late-interaction retrieval | the 4 pass; rows, order and distances equal pylance's |
+| 4 | **Deferred index remap and the Fragment Reuse Index** | 4 (`test_defer_index_remap*`, `test_describe_indices_matches_list_indices_for_frag_reuse`) | the FRI on disk after `compact_files(defer_index_remap=True)`, and how search applies it | 1-2 sessions | compaction without conflicting with a concurrent index build | the 4 pass; a pylance FRI dataset searches equal; FRI has tests (none today) |
+
+### Wave 2: Opus research or design first, then delegated (about 6 sessions, 17 tests)
+
+| # | Item | Failing pylance tests | Opus first | Haiku | Why for AI users | Done when |
+|---|---|---|---|---|---|---|
+| 5 | **Object-store reads**: open `s3://` (and `gs://`) datasets; `lance.lance._ObjectStoreRegistry` | 6 (registry tests) | source and list factories over nanos3reader; credentials and endpoints from pylance's `storage_options`; a local S3 test endpoint (moto or MinIO) for tests and CI | 1-2 sessions | most AI datasets live in object storage | a dataset on the test endpoint reads equal to pylance's; the 6 pass; requests per scan counted by the work counters; reviewer times it |
+| 6 | **IVF_RQ (RaBitQ)** | 6 (`test_create_ivf_rq_*`) | format research: rotation, codes, correction factors, multi-bit | 2-3 sessions (R1 search a pylance-built index, R2 build) | 1-bit codes: the smallest embedding index | the 6 pass; pylance's answers on its index; recall within the gate on nanolance's |
+| 7 | **IVF on binary vectors (Hamming)** | 5 (`test_ivf_centroids_hamming`, ...) | pylance's format is measured (ROADMAP "Binary vectors"); the design call is how the float-only vector path takes bytes | 2 sessions | binary embeddings at scale | the 5 pass |
+
+### Wave 3: Opus-led, or when asked
+
+| # | Item | Failing pylance tests | Who | Why for AI users | Done when |
+|---|---|---|---|---|---|
+| 8 | **Object-store writes** with atomic commits (conditional put) | -- | Opus design, then sessions | write training sets straight to object storage | concurrent commits on the test endpoint behave as pylance's |
+| 9 | **Multi-word top-k (WAND / MaxScore)** | 0 (speed only) | Opus: design and verdict; Haiku for mechanical parts | multi-term queries (already about 2x pylance) | same results and scores; reviewer's A/B faster |
+| 10 | **INVERTED on nested fields** | not counted | Haiku after a short measurement | nested metadata | results equal pylance's |
+| 11 | **icu / jieba / lindera tokenizers** | 20 | Opus: licences (copied from the source trees, never from memory) and dictionary packaging; then 2-3 sessions | multilingual RAG | the 20 pass |
+| 12 | **MemWAL** | 20 | Opus design (a subsystem) | real-time agent memory | the 20 pass |
+| 13 | MinHash LSH, FM-index, RTree | -- | when a user asks | dedup, substring, spatial | -- |
+
+Outside this plan, the largest single lever on pylance's suite is writing data storage versions
+2.0 / 2.1 (84 failing tests, `docs/NEXT_WEEK.md`). It is Opus format research that can run while
+Wave 1 is delegated.
 
 ## Indexes: the open gaps (2026-10-07)
 
@@ -502,8 +541,8 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
 2. **HNSW and quantized vector indexes**: ~~IVF_HNSW_SQ~~ -- **done (2026-10-08)**: searched with
    pylance's answers, built so pylance uses it, kept up by `optimize_indices`, in lance-c too
    (`docs/VECTOR_INDEX.md`, `tests/test_hnsw.py`). ~~IVF_SQ, IVF_HNSW_PQ, IVF_HNSW_FLAT~~ -- done
-   2026-10-15 (VECTOR_COMBOS). Left: IVF_RQ (item 5 of the plan above). Related: ~~batch query
-   vectors~~ and ~~flat Hamming search~~ done; multivector (item 4) and IVF on binary vectors (item 8)
+   2026-10-15 (VECTOR_COMBOS). Left: IVF_RQ (item 6 of the plan above). Related: ~~batch query
+   vectors~~ and ~~flat Hamming search~~ done; multivector (item 3) and IVF on binary vectors (item 7)
    left; float16 / float64 build vectors (`stats.index_stats` is done).
 3. ~~**Stable row ids.**~~ -- **done (2026-10-10)**: format, reads, writes, mutations, compaction,
    indexes of every kind, lance-c.
@@ -511,16 +550,16 @@ pylance users rely on that nanolance does not do yet, roughly in order of how of
    - ~~positions (`with_position=True`) and phrase queries~~ -- **done (2026-10-08)**: read,
      searched (slop included) and built as Lance 12 does, in pylance and lance-c;
    - ~~fuzzy matching (`fuzziness`)~~ -- done (MatchQuery, Python and lance-c); huge-fuzziness bound left;
-   - other languages and their tokenizers: icu, jieba (Chinese), lindera (Japanese) (item 7 of the plan);
+   - other languages and their tokenizers: icu, jieba (Chinese), lindera (Japanese) (item 11 of the plan);
    - ~~the ngram tokenizer and the NGRAM index~~ -- done (NGRAM_JSON);
-   - full-text search over list columns (item 6 of the plan);
+   - full-text search over list columns (item 1 of the plan);
    - multi-word top-k that skips postings (WAND / MaxScore). Already about 2x faster than pylance
      without it.
 5. **Other scalar index types and column types:**
-   - ~~ZONEMAP, BLOOMFILTER, NGRAM, JSON~~ -- done (ZONED_INDEXES, NGRAM_JSON); RTREE not built (item 11);
+   - ~~ZONEMAP, BLOOMFILTER, NGRAM, JSON~~ -- done (ZONED_INDEXES, NGRAM_JSON); RTREE not built (item 13);
    - ~~decimal and duration filters and indexes~~ -- done (EXPR_TYPES, 2026-10-16/17); pylance's
      large-string index type test still fails (not yet diagnosed);
-   - ~~indexes on nested paths (`a.b`)~~ -- done for scalar indexes (T1.3); INVERTED on a nested field left (item 6).
+   - ~~indexes on nested paths (`a.b`)~~ -- done for scalar indexes (T1.3); INVERTED on a nested field left (item 10).
 6. **Less common:** ~~distributed builds (`fragment_ids`, `index_uuid`, merging index metadata),
    `lance.indices.IndicesBuilder`~~ (done 2026-10-09, see the priority table), progress callbacks
    of single-machine builds, index file format v3 (256-document posting blocks).
