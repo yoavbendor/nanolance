@@ -31,6 +31,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <system_error>
 #include <unordered_map>
 
@@ -378,7 +379,7 @@ bool add_element_documents(const ArrowArrayView* text, const ArrowArrayView* add
 /// The documents of `batches` (column 0 text, column 1 row address), added in order.
 bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, const fts::Analyzer& analyzer,
                    const AddressToRowId& to_row_id, Built& b, std::string& error,
-                   const std::function<void(std::size_t rows)>* batch_done = nullptr) {
+                   const std::function<void(std::size_t rows, std::uint64_t fragment)>* batch_done = nullptr) {
     for (auto& batch : batches) {
         ArrowArrayView view{};
         ArrowError e{};
@@ -390,14 +391,17 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
         }
         const ArrowArrayView* text = view.children[0];
         const ArrowArrayView* addr = view.children[1];
+        // A scan's batches do not cross fragments: the first row's names the batch's.
+        const std::uint64_t fragment =
+            batch.length > 0 ? ArrowArrayViewGetUIntUnsafe(addr, view.offset) >> 32U : 0U;
         if (b.elements) {
             const bool ok = add_element_documents(text, addr, view, batch.length, analyzer, to_row_id, b, error);
             ArrowArrayViewReset(&view);
             if (!ok) {
                 return false;
             }
-            if (batch_done != nullptr) {
-                (*batch_done)(static_cast<std::size_t>(batch.length));
+            if (batch_done != nullptr && batch.length > 0) {
+                (*batch_done)(static_cast<std::size_t>(batch.length), fragment);
             }
             continue;
         }
@@ -430,8 +434,8 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
                             0U, counts);
         }
         ArrowArrayViewReset(&view);
-        if (batch_done != nullptr) {
-            (*batch_done)(rows);
+        if (batch_done != nullptr && rows > 0) {
+            (*batch_done)(rows, fragment);
         }
     }
     return true;
@@ -864,18 +868,27 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     }
     report(2, "load_data", 0, "rows", 0);
 
+    // One progress event per fragment (the documents counted so far), as pylance reports: not per batch,
+    // whose size depends on how the scan was cut.
     std::uint64_t tokenized = 0;
-    const std::function<void(std::size_t)> counted = [&](std::size_t rows_done) {
+    std::optional<std::uint64_t> current_fragment;
+    const std::function<void(std::size_t, std::uint64_t)> counted = [&](std::size_t rows_done, std::uint64_t fragment) {
+        if (current_fragment && *current_fragment != fragment) {
+            report(1, "tokenize_docs", 0, "rows", tokenized);
+        }
+        current_fragment = fragment;
         tokenized += rows_done;
-        report(1, "tokenize_docs", 0, "rows", tokenized);
     };
-    const std::function<void(std::size_t)>* counted_ptr = progress != nullptr ? &counted : nullptr;
+    const std::function<void(std::size_t, std::uint64_t)>* counted_ptr = progress != nullptr ? &counted : nullptr;
     report(0, "tokenize_docs", 0, "rows", 0);
     if (old_rows && (!is_text(taken.s) || !add_documents(taken.s, rows.v, analyzer, to_row_id, built, error, counted_ptr))) {
         return false;
     }
     if (scan && (!is_text(scanned.s) || !add_documents(scanned.s, batches.v, analyzer, to_row_id, built, error, counted_ptr))) {
         return false;
+    }
+    if (current_fragment) {
+        report(1, "tokenize_docs", 0, "rows", tokenized);
     }
     report(2, "tokenize_docs", 0, "rows", tokenized);
 
