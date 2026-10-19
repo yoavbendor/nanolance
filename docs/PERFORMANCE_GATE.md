@@ -76,6 +76,29 @@ When time is pressing, the gate's cost can be dropped:
 
 A skipped run still builds, tests and runs the matrix. Only the index benchmarks and the gate are skipped.
 
+## Where the results go
+
+Every run of `linux-bench` publishes its results, pass or fail, in a separate `publish` job:
+
+- **The site:** [yoavbendor.github.io/nanolance/bench](https://yoavbendor.github.io/nanolance/bench/) (the
+  `bench/` folder of the `gh-pages` branch). `index.html` shows the latest run in full, with the gate's output
+  and the history of runs (date, branch, commit, gate result, headline speeds, and links to each run's JSON and
+  CI run). `runs/<id>.json` keeps every run's raw results; `latest.json` is the newest one.
+- **The README:** the summary table and `summary.svg`, the image the README shows. The image is served from the
+  site, so it changes with every run without a commit. The table text in the README is rewritten only by runs on
+  the default branch, in a `[skip ci]` commit, so feature branches never touch a tracked file.
+- **Runs at a time:** the publish job uses one concurrency group, so pushes to `gh-pages` never race. The
+  `pages` deploy (MkDocs) keeps `bench/` (`keep_files: true` in `pages.yml`).
+
+The tool is `tools/bench_publish.py`. You can run it on your own results:
+
+```sh
+python tools/bench_publish.py --matrix bench/results/matrix.json --scalar /tmp/perf-scalar.json \
+    --vector /tmp/perf-vector.json --fts /tmp/perf-fts.json --gate skipped --site /tmp/site
+```
+
+Open `/tmp/site/index.html` in a browser. The summary is the same table the README shows.
+
 ## Recording a baseline
 
 A baseline is the record of a known-good commit on one runner CPU. Re-record after a change that moves

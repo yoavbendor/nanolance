@@ -142,11 +142,13 @@ jobs:
           python3 tools/bench_vector_index.py --rows 50000 --work /tmp/nlb-idx --out /tmp/perf-vector.json
           python3 tools/bench_fts.py --rows 100000 --work /tmp/nlb-idx --out /tmp/perf-fts.json
 
-      - name: Performance gate (index benchmarks against pylance)
+      - name: Performance gate (index benchmarks against Rust Lance)
+        id: gate
         if: ${{ !inputs.skip_perf && !contains(github.event.head_commit.message, '[skip perf]') && !inputs.record_perf_baseline }}
         run: |
+          set -o pipefail
           python3 tools/perf_gate.py --scalar /tmp/perf-scalar.json --vector /tmp/perf-vector.json \
-            --fts /tmp/perf-fts.json --baseline-dir bench/results/perf
+            --fts /tmp/perf-fts.json --baseline-dir bench/results/perf | tee /tmp/gate.txt
 
       - name: Record the index baseline for this runner (manual runs only)
         if: ${{ inputs.record_perf_baseline && !inputs.skip_perf }}
@@ -165,6 +167,32 @@ jobs:
         with:
           name: perf-index
           path: /tmp/perf-*.json
+          if-no-files-found: ignore
+
+      # What the publish job needs: the gate's outcome as pass, fail or skipped, and its output.
+      - name: Record the gate outcome
+        if: always()
+        run: |
+          case "${{ steps.gate.outcome }}" in
+            success) echo pass > /tmp/gate-status.txt ;;
+            failure) echo fail > /tmp/gate-status.txt ;;
+            *) echo skipped > /tmp/gate-status.txt ;;
+          esac
+          touch /tmp/gate.txt
+
+      # The matrix (pylance) and the index suites (Rust Lance), for the publish job: it writes them to the
+      # gh-pages site, where they stay. See tools/bench_publish.py.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: |
+            /tmp/matrix-quick.json
+            /tmp/perf-scalar.json
+            /tmp/perf-vector.json
+            /tmp/perf-fts.json
+            /tmp/gate.txt
+            /tmp/gate-status.txt
           if-no-files-found: ignore
 
       # The run's matrix, kept so the baseline can be re-recorded on this runner type: as an artifact,
@@ -232,3 +260,72 @@ jobs:
           git add bench/linux-ci-results.md
           git commit -m "ci: linux benchmark + profile results [skip ci]" || { echo "no changes"; exit 0; }
           git push
+
+  # Publishes the run to the gh-pages site (bench/), where the results are read when wanted and the README
+  # summary image is served from. Runs one at a time across all branches (the concurrency group), so pushes to
+  # gh-pages never race. On the default branch it also writes the summary table into README.md. Feature-branch
+  # runs never change a tracked file: their results land on the site, labelled with the branch.
+  publish:
+    needs: bench
+    if: ${{ always() && needs.bench.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: bench-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-results
+          path: /tmp/bench-in
+
+      - name: Check out the gh-pages site
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: pages
+
+      - name: Publish the run to the site
+        run: |
+          set -eu
+          if [ ! -f /tmp/bench-in/matrix-quick.json ]; then
+            echo "no matrix results from this run: nothing to publish"
+            exit 0
+          fi
+          args="--matrix /tmp/bench-in/matrix-quick.json --gate $(cat /tmp/bench-in/gate-status.txt)"
+          args="$args --gate-log /tmp/bench-in/gate.txt --site pages/bench --branch $GITHUB_REF_NAME"
+          for suite in scalar vector fts; do
+            if [ -f "/tmp/bench-in/perf-$suite.json" ]; then args="$args --$suite /tmp/bench-in/perf-$suite.json"; fi
+          done
+          if [ "$GITHUB_REF_NAME" = "main" ]; then args="$args --readme README.md"; fi
+          python3 tools/bench_publish.py $args
+
+      - name: Push the results to gh-pages
+        working-directory: pages
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bench
+          if git diff --cached --quiet; then echo "no change to publish"; exit 0; fi
+          git commit -m "bench: $GITHUB_REF_NAME ${GITHUB_SHA::7} (run $GITHUB_RUN_ID) [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:gh-pages; then exit 0; fi
+            sleep $((2 ** i))
+            git pull --rebase -q origin gh-pages
+          done
+          echo "could not push the results to gh-pages" >&2
+          exit 1
+
+      - name: Commit the README summary (default branch only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -u
+          if git diff --quiet -- README.md; then echo "README summary unchanged"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "README: benchmark summary for run $GITHUB_RUN_ID [skip ci]"
+          git push origin HEAD:main || echo "::warning::could not push the README summary to main"
+
