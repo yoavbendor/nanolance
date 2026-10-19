@@ -87,6 +87,11 @@ Re-run any time: `python3 /tmp/claude-0/-home-user/8df192dc-e0a5-50ec-ba29-4d1c2
 - **L2**: list-element granularity: `document_granularity` in `create_scalar_index`, `MatchQuery`,
   `PhraseQuery` and `IndexConfig` parameters; the v3 docs layout; field 14 in the manifest; `_doc_index`
   in results; the two errors; flat search; prefilter. The four `test_fts_on_list_elements[*]` pass.
+  Also in L2 (found in L1, string columns too): a phrase query over rows no index covers (an unindexed
+  column, or rows appended after the index) fails with "position is not found but required for phrase
+  queries", where pylance answers it. Flat search must tokenize with positions for a phrase query, and
+  the planner must accept unindexed phrase columns; compare with pylance on a string column and a list
+  column, indexed + appended rows.
 
 ## 5. Tests you write
 
@@ -124,3 +129,9 @@ in `.deps/pylance-tests/v12.0.0/tests` (see `tools/pylance_suite.py --help` for 
 tests at nanolance); `python3 tools/pylance_suite.py | tail -4`; the benchmark lines; last, once: `cd
 bindings/python && python3 -m pytest -o addopts= -q -x -p no:cacheprovider tests | tail -3`. Report under
 40 lines: questions first, then files, per-test status, tails, decisions.
+
+**L1 outcome (2026-10-19):** done in one Haiku session; reviewed. A list row is its non-null elements
+joined by one space, then tokenized as one text (Lance's `materialize_string_list`, builder.rs line 1562:
+the same join, empty elements included); index files equal pylance's row for row, scores bit for bit
+in both directions. String-column FTS unchanged in speed (interleaved A/B, 100k documents: build 0.99x,
+searches within run-to-run noise). `test_fts_on_list` passes; the flat phrase gap moved to L2.

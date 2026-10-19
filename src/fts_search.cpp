@@ -6,6 +6,7 @@
 #include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
 
+#include "fts_document_text.hpp"
 #include "fts_fst.hpp"
 #include "fts_json.hpp"
 #include "fts_posting.hpp"
@@ -1259,6 +1260,7 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
         error = "cannot read column " + c.name;
     }
     std::vector<fts::Token> tokens;
+    std::string joined;  // a list row's text, joined as Lance joins it
     for (auto& batch : batches) {
         if (ok) {
             ArrowArrayView view{};
@@ -1269,19 +1271,19 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
                 ok = false;
             }
             const ArrowArrayView* text = ok ? view.children[tc] : nullptr;
-            if (ok && text->storage_type != NANOARROW_TYPE_STRING && text->storage_type != NANOARROW_TYPE_LARGE_STRING &&
-                text->storage_type != NANOARROW_TYPE_STRING_VIEW) {
-                error = "full-text search needs a string column; " + c.name + " is not one";
+            const fts::TextColumn kind = fts::text_column_kind(text);
+            if (ok && kind == fts::TextColumn::kNone) {
+                error = "full-text search needs a string column or a list of strings column; " + c.name + " is not one";
                 ok = false;
             }
             for (std::int64_t r = 0; ok && r < batch.length; ++r) {
                 const std::int64_t row = view.offset + r;
-                if (ArrowArrayViewIsNull(text, row)) {
+                std::string_view document;
+                if (!fts::row_text(text, kind, row, joined, document)) {
                     continue;
                 }
-                const ArrowStringView s = ArrowArrayViewGetStringUnsafe(text, row);
                 tokens.clear();
-                c.index->analyzer.tokenize(std::string_view(s.data, static_cast<std::size_t>(s.size_bytes)), tokens);
+                c.index->analyzer.tokenize(document, tokens);
                 if (tokens.empty()) {
                     continue;
                 }

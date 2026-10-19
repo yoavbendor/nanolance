@@ -9,6 +9,7 @@
 #include "index_build.hpp"
 #include "nanolance/fts_search.hpp"
 
+#include "fts_document_text.hpp"
 #include "fts_fst.hpp"
 #include "fts_json.hpp"
 #include "fts_posting.hpp"
@@ -288,16 +289,18 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
         }
         const ArrowArrayView* text = view.children[0];
         const ArrowArrayView* addr = view.children[1];
+        const fts::TextColumn kind = fts::text_column_kind(text);
         const auto rows = static_cast<std::size_t>(batch.length);
         // Tokenize side by side; then give ids and postings in row order.
         std::vector<std::vector<fts::Token>> tokens(rows);
         const std::size_t chunk = 1024;
         parallel::for_each((rows + chunk - 1) / chunk, [&](std::size_t c) {
+            std::string joined;  // a list row's text, joined as Lance joins it
             for (std::size_t r = c * chunk; r < std::min(rows, (c + 1) * chunk); ++r) {
                 const std::int64_t row = view.offset + static_cast<std::int64_t>(r);
-                if (!ArrowArrayViewIsNull(text, row)) {
-                    const ArrowStringView s = ArrowArrayViewGetStringUnsafe(text, row);
-                    analyzer.tokenize(std::string_view(s.data, static_cast<std::size_t>(s.size_bytes)), tokens[r]);
+                std::string_view document;
+                if (fts::row_text(text, kind, row, joined, document)) {
+                    analyzer.tokenize(document, tokens[r]);
                 }
             }
         });
@@ -709,10 +712,9 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     request.with_row_address = true;
     request.fragment_ids = target != nullptr ? target->fragments : nullptr;
     const auto is_text = [&](const ArrowSchema& schema) {
-        const char* format = schema.n_children == 2 ? schema.children[0]->format : nullptr;
-        if (format == nullptr || (std::strcmp(format, "u") != 0 && std::strcmp(format, "U") != 0 &&
-                                  std::strcmp(format, "vu") != 0)) {
-            error = "an INVERTED index needs a string column; " + column + " is not one";
+        const ArrowSchema* text = schema.n_children == 2 ? schema.children[0] : nullptr;
+        if (fts::text_schema_kind(text) == fts::TextColumn::kNone) {
+            error = "an INVERTED index needs a string column or a list of strings column; " + column + " is not one";
             return false;
         }
         return true;

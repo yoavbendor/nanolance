@@ -989,6 +989,7 @@ tests/test_scalar_index.py::test_fts_fuzzy_query
 tests/test_scalar_index.py::test_fts_index_cache_hit_miss_stats
 tests/test_scalar_index.py::test_fts_multi_match_query
 tests/test_scalar_index.py::test_fts_ngram_tokenizer
+tests/test_scalar_index.py::test_fts_on_list
 tests/test_scalar_index.py::test_fts_phrase_query
 tests/test_scalar_index.py::test_fts_score[simple]
 tests/test_scalar_index.py::test_fts_stats
