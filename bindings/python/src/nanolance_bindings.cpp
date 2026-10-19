@@ -1738,13 +1738,19 @@ NB_MODULE(_nanolance, m) {
         return version;
     });
     m.def("_ds_create_inverted_index", [](const std::filesystem::path& path, const std::string& column,
-                                          const std::string& name, bool replace, const std::string& params) {
+                                          const std::string& name, bool replace, const std::string& params,
+                                          const std::string& granularity) {
         nano_lance::InvertedIndexOptions options;
         options.name = name;
         options.replace = replace;
         std::string error;
         if (!nano_lance::fts::parse_params(params, options.params, error)) {
             throw nb::value_error(error.c_str());
+        }
+        if (granularity == "list_element") {
+            options.granularity = nano_lance::DocGranularity::ListElement;
+        } else if (granularity != "row") {
+            throw nb::value_error("unknown document granularity");
         }
         std::uint64_t version = 0;
         run_op([&](std::string& e) {
@@ -2105,7 +2111,12 @@ NB_MODULE(_nanolance, m) {
         r.fast_search = fast_search;
         nano_lance::FtsSearchResult result;
         run_op([&](std::string& e) { return nano_lance::dataset_full_text_search(path, r, result, e); });
-        return std::make_tuple(result.row_ids, result.scores, result.plan);
+        // The element of each hit when list-element documents were searched (else None).
+        std::optional<std::vector<std::uint32_t>> doc_indices;
+        if (result.has_doc_indices) {
+            doc_indices = result.doc_indices;
+        }
+        return std::make_tuple(result.row_ids, result.scores, result.plan, doc_indices);
     });
     m.def("_ds_create_vector_index", [](const std::filesystem::path& path, const std::string& column,
                                         const std::string& type, const std::string& name, const std::string& metric,

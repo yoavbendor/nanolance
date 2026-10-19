@@ -73,7 +73,7 @@ std::string posting_tail_codec(std::uint32_t format_version) {
     return format_version == 1U ? "fixed32_v1" : "varint_delta_v1";
 }
 
-std::vector<std::uint8_t> index_details(const fts::AnalyzerParams& p) {
+std::vector<std::uint8_t> index_details(const fts::AnalyzerParams& p, DocGranularity granularity) {
     std::vector<std::uint8_t> out;
     put_string(out, 1, p.base_tokenizer);
     put_string(out, 2, fts::json::quote(p.language));
@@ -115,6 +115,9 @@ std::vector<std::uint8_t> index_details(const fts::AnalyzerParams& p) {
         put_string(out, 13, std::string(code.begin(), code.end()));
     }
     put_uint(out, 15, fts::resolved_format_version(p));  // posting_format_version
+    if (granularity == DocGranularity::ListElement) {
+        put_uint(out, 14, 1);  // document_granularity: LIST_ELEMENT (ROW is the default, left out)
+    }
     return out;
 }
 
@@ -273,7 +276,103 @@ struct Built {
     std::vector<std::vector<std::uint32_t>> positions;
     std::uint32_t format_version = 2;  // 1: fixed32_v1 tails and the legacy per-document _position
     std::size_t block_size = 128;      // posting blocks: 128 (BitPacker4x) or 256 (BitPacker8x)
+    /// ListElement: one document per list element (`doc_index` is its position in the list), null and
+    /// empty elements included; Row: one per row (no `doc_index`).
+    bool elements = false;
+    std::vector<std::uint32_t> doc_index;
 };
+
+/// One document: its tokens (already positioned) given their row address and, for a list-element
+/// index, the element's position. Ids and postings follow in document order.
+void append_document(Built& b, std::vector<fts::Token>& tokens, std::uint64_t row_id, std::uint32_t element,
+                     std::vector<std::pair<std::uint32_t, std::uint32_t>>& counts) {
+    const auto doc = static_cast<std::uint32_t>(b.row_ids.size());
+    b.row_ids.push_back(row_id);
+    b.num_tokens.push_back(static_cast<std::uint32_t>(tokens.size()));
+    b.total_tokens += tokens.size();
+    if (b.elements) {
+        b.doc_index.push_back(element);
+    }
+    counts.clear();
+    for (auto& t : tokens) {
+        auto [it, inserted] = b.ids.emplace(t.text, static_cast<std::uint32_t>(b.tokens.size()));
+        if (inserted) {
+            b.tokens.push_back(std::move(t.text));
+            b.docs.emplace_back();
+            b.freqs.emplace_back();
+            if (b.with_positions) {
+                b.positions.emplace_back();
+            }
+        }
+        counts.emplace_back(it->second, b.with_positions ? t.position : 0U);
+    }
+    std::sort(counts.begin(), counts.end());
+    for (std::size_t i = 0; i < counts.size();) {
+        std::size_t j = i;
+        while (j < counts.size() && counts[j].first == counts[i].first) {
+            ++j;
+        }
+        b.docs[counts[i].first].push_back(doc);
+        b.freqs[counts[i].first].push_back(static_cast<std::uint32_t>(j - i));
+        if (b.with_positions) {
+            auto& p = b.positions[counts[i].first];
+            for (std::size_t k = i; k < j; ++k) {
+                p.push_back(counts[k].second);
+            }
+        }
+        i = j;
+    }
+}
+
+/// A list-element batch's documents: one per element of each non-null row, in row order then element
+/// order. Each element is tokenized alone, so its positions start at 0 (Lance's element documents).
+bool add_element_documents(const ArrowArrayView* text, const ArrowArrayView* addr, const ArrowArrayView& view,
+                           std::int64_t length, const fts::Analyzer& analyzer, const AddressToRowId& to_row_id,
+                           Built& b, std::string& error) {
+    struct Element {
+        std::int64_t row;  // the row, as the column's accessors take it
+        std::uint32_t k;   // the element's position in its list
+        std::string_view text;
+        bool present;
+    };
+    std::vector<Element> elements;
+    const ArrowArrayView* values = text->children[0];
+    for (std::int64_t r = 0; r < length; ++r) {
+        const std::int64_t row = view.offset + r;
+        if (ArrowArrayViewIsNull(text, row)) {
+            continue;  // a null row has no documents
+        }
+        const std::int64_t first = ArrowArrayViewListChildOffset(text, text->offset + row);
+        const std::int64_t last = ArrowArrayViewListChildOffset(text, text->offset + row + 1);
+        for (std::int64_t e = first; e < last; ++e) {
+            Element el{row, static_cast<std::uint32_t>(e - first), {}, !ArrowArrayViewIsNull(values, e)};
+            if (el.present) {
+                const ArrowStringView sv = ArrowArrayViewGetStringUnsafe(values, e);
+                el.text = std::string_view(sv.data, static_cast<std::size_t>(sv.size_bytes));
+            }
+            elements.push_back(el);
+        }
+    }
+    std::vector<std::vector<fts::Token>> tokens(elements.size());
+    const std::size_t chunk = 1024;
+    parallel::for_each((elements.size() + chunk - 1) / chunk, [&](std::size_t c) {
+        for (std::size_t i = c * chunk; i < std::min(elements.size(), (c + 1) * chunk); ++i) {
+            if (elements[i].present && !elements[i].text.empty()) {
+                analyzer.tokenize(elements[i].text, tokens[i]);
+            }
+        }
+    });
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> counts;  // token id, position
+    for (std::size_t i = 0; i < elements.size(); ++i) {
+        if (b.row_ids.size() >= std::numeric_limits<std::uint32_t>::max()) {
+            error = "more than 2^32 documents";
+            return false;
+        }
+        const std::uint64_t row_id = to_row_id(ArrowArrayViewGetUIntUnsafe(addr, elements[i].row));
+        append_document(b, tokens[i], row_id, elements[i].k, counts);
+    }
+    return true;
+}
 
 /// The documents of `batches` (column 0 text, column 1 row address), added in order.
 bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, const fts::Analyzer& analyzer,
@@ -289,6 +388,14 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
         }
         const ArrowArrayView* text = view.children[0];
         const ArrowArrayView* addr = view.children[1];
+        if (b.elements) {
+            const bool ok = add_element_documents(text, addr, view, batch.length, analyzer, to_row_id, b, error);
+            ArrowArrayViewReset(&view);
+            if (!ok) {
+                return false;
+            }
+            continue;
+        }
         const fts::TextColumn kind = fts::text_column_kind(text);
         const auto rows = static_cast<std::size_t>(batch.length);
         // Tokenize side by side; then give ids and postings in row order.
@@ -314,39 +421,8 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
                 error = "more than 2^32 documents";
                 return false;
             }
-            const auto doc = static_cast<std::uint32_t>(b.row_ids.size());
-            b.row_ids.push_back(to_row_id(ArrowArrayViewGetUIntUnsafe(addr, view.offset + static_cast<std::int64_t>(r))));
-            b.num_tokens.push_back(static_cast<std::uint32_t>(tokens[r].size()));
-            b.total_tokens += tokens[r].size();
-            counts.clear();
-            for (auto& t : tokens[r]) {
-                auto [it, inserted] = b.ids.emplace(t.text, static_cast<std::uint32_t>(b.tokens.size()));
-                if (inserted) {
-                    b.tokens.push_back(std::move(t.text));
-                    b.docs.emplace_back();
-                    b.freqs.emplace_back();
-                    if (b.with_positions) {
-                        b.positions.emplace_back();
-                    }
-                }
-                counts.emplace_back(it->second, b.with_positions ? t.position : 0U);
-            }
-            std::sort(counts.begin(), counts.end());
-            for (std::size_t i = 0; i < counts.size();) {
-                std::size_t j = i;
-                while (j < counts.size() && counts[j].first == counts[i].first) {
-                    ++j;
-                }
-                b.docs[counts[i].first].push_back(doc);
-                b.freqs[counts[i].first].push_back(static_cast<std::uint32_t>(j - i));
-                if (b.with_positions) {
-                    auto& p = b.positions[counts[i].first];
-                    for (std::size_t k = i; k < j; ++k) {
-                        p.push_back(counts[k].second);
-                    }
-                }
-                i = j;
-            }
+            append_document(b, tokens[r], to_row_id(ArrowArrayViewGetUIntUnsafe(addr, view.offset + static_cast<std::int64_t>(r))),
+                            0U, counts);
         }
         ArrowArrayViewReset(&view);
     }
@@ -389,14 +465,19 @@ bool write_tokens(const std::filesystem::path& dir, const Built& b, std::vector<
 bool write_docs(const std::filesystem::path& dir, const Built& b, std::vector<WrittenFile>& files, std::string& error) {
     OwnedSchema schema;
     OwnedArray batch;
-    if (!struct_schema(schema.s, 2) || !field(schema.s.children[0], "_rowid", NANOARROW_TYPE_UINT64, false) ||
-        !field(schema.s.children[1], "_num_tokens", NANOARROW_TYPE_UINT32, false) || !start(schema.s, batch.a)) {
+    // Lance's v3 layout for list elements adds the element's position in its list.
+    const std::int64_t columns = b.elements ? 3 : 2;
+    if (!struct_schema(schema.s, columns) || !field(schema.s.children[0], "_rowid", NANOARROW_TYPE_UINT64, false) ||
+        !field(schema.s.children[1], "_num_tokens", NANOARROW_TYPE_UINT32, false) ||
+        (b.elements && !field(schema.s.children[2], "_doc_index_0", NANOARROW_TYPE_UINT32, false)) ||
+        !start(schema.s, batch.a)) {
         error = "out of memory";
         return false;
     }
     for (std::size_t d = 0; d < b.row_ids.size(); ++d) {
         if (ArrowArrayAppendUInt(batch.a.children[0], b.row_ids[d]) != NANOARROW_OK ||
-            ArrowArrayAppendUInt(batch.a.children[1], b.num_tokens[d]) != NANOARROW_OK) {
+            ArrowArrayAppendUInt(batch.a.children[1], b.num_tokens[d]) != NANOARROW_OK ||
+            (b.elements && ArrowArrayAppendUInt(batch.a.children[2], b.doc_index[d]) != NANOARROW_OK)) {
             error = "out of memory";
             return false;
         }
@@ -688,14 +769,18 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     std::vector<std::string> parts;
     const auto* f = index_files::find_field(manifest, column, parts);
     if (f == nullptr) {
-        error = "column '" + column + "' not found";
+        error = column.find('[') != std::string::npos
+                    ? "FTS field path '" + column + "' does not exist in the dataset schema"  // a list element path
+                    : "column '" + column + "' not found";
         return false;
     }
     if (parts.size() != 1U) {
         error = "an INVERTED index on a nested column is not supported";
         return false;
     }
-    const std::string name = options.name.empty() ? column + "_idx" : options.name;
+    const bool elements = options.granularity == DocGranularity::ListElement;
+    // Lance's default names: the row index is <column>_idx, the list-element one <column>_list_element_idx.
+    const std::string name = options.name.empty() ? column + (elements ? "_list_element_idx" : "_idx") : options.name;
     const auto existing = std::find_if(manifest.indices.begin(), manifest.indices.end(),
                                        [&](const pb::IndexMetadata& i) { return i.name == name; });
     if (commit && existing != manifest.indices.end() && !options.replace) {
@@ -717,9 +802,14 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
             error = "an INVERTED index needs a string column or a list of strings column; " + column + " is not one";
             return false;
         }
+        if (elements && fts::text_schema_kind(text) != fts::TextColumn::kStringList) {
+            error = "Invalid user input: FTS field path '" + column + "' has no List layer and cannot use ListElement document granularity";
+            return false;
+        }
         return true;
     };
     Built built;
+    built.elements = elements;
     built.with_positions = params.with_position;
     built.format_version = format;
     built.block_size = params.block_size;
@@ -804,7 +894,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     auto entry = pb::make_index_metadata(uuid, {f->id}, name, version, fragment_ids,
                                                        "/lance.table.InvertedIndexDetails", format,
                                                        static_cast<std::uint64_t>(now), index_files_list,
-                                                       index_details(params));
+                                                       index_details(params, options.granularity));
     if (!commit) {
         *target->out = std::move(entry);
         return true;
@@ -837,8 +927,8 @@ bool index_build::build_inverted_segment(const std::filesystem::path& dataset_pa
     return create_inverted_index(dataset_path, column, options, &target, unused, error);
 }
 
-std::vector<std::uint8_t> index_build::inverted_details(const fts::AnalyzerParams& params) {
-    return index_details(params);
+std::vector<std::uint8_t> index_build::inverted_details(const fts::AnalyzerParams& params, DocGranularity granularity) {
+    return index_details(params, granularity);
 }
 
 }  // namespace nano_lance

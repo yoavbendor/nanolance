@@ -18,6 +18,7 @@
 #include "nanolance/manifest_reader.hpp"
 
 #include "lance_minimal.pb.hpp"
+#include "proto_wire.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
@@ -81,6 +82,24 @@ bool query_list(const Value* v, std::vector<FtsQuery>& out, std::string& error, 
     return true;
 }
 
+/// The "granularity" of a match or phrase query ("row" or "list_element"), when it has one.
+bool granularity_field(const Value& obj, std::optional<DocGranularity>& out, std::string& error) {
+    const Value* g = obj.get("granularity");
+    if (g == nullptr || g->kind == Value::Null) {
+        return true;
+    }
+    if (g->kind == Value::String && g->s == "row") {
+        out = DocGranularity::Row;
+        return true;
+    }
+    if (g->kind == Value::String && g->s == "list_element") {
+        out = DocGranularity::ListElement;
+        return true;
+    }
+    error = "document granularity must be \"row\" or \"list_element\"";
+    return false;
+}
+
 bool match_from(const Value& m, FtsQuery& q, std::string& error) {
     q.kind = FtsQuery::Kind::Match;
     const Value* column = m.get("column");
@@ -119,6 +138,9 @@ bool match_from(const Value& m, FtsQuery& q, std::string& error) {
         q.fuzziness.reset();  // None: exact matching, as pylance's default
     } else if (fuzz != nullptr && fuzz->kind == Value::Number) {
         q.fuzziness = saturate(fuzz->n);
+    }
+    if (!granularity_field(m, q.granularity, error)) {
+        return false;
     }
     return operator_field(m, q.and_operator, error);
 }
@@ -183,7 +205,7 @@ bool query_from(const Value& v, FtsQuery& q, std::string& error, int depth) {
         double slop = 0;
         number_field(body, "slop", slop);
         q.slop = static_cast<std::uint32_t>(slop);
-        return true;
+        return granularity_field(body, q.granularity, error);
     }
     if (kind == "multi_match") {
         q.kind = FtsQuery::Kind::MultiMatch;
@@ -253,6 +275,19 @@ bool is_inverted_index_url(const std::string& url) {
     return url.size() >= suffix.size() && url.compare(url.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+DocGranularity inverted_details_granularity(const std::vector<std::uint8_t>& details) {
+    // InvertedIndexDetails.document_granularity (field 14): ROW = 0 (the default), LIST_ELEMENT = 1.
+    proto_wire::Reader reader(details.data(), details.size());
+    proto_wire::Field f;
+    DocGranularity out = DocGranularity::Row;
+    while (reader.next(f)) {
+        if (f.number == 14U && f.wire == 0U && f.value == 1U) {
+            out = DocGranularity::ListElement;
+        }
+    }
+    return out;
+}
+
 // ── the index ───────────────────────────────────────────────────────────────────────────────────
 
 namespace {
@@ -300,6 +335,8 @@ struct Partition {
     bool use_fst = true;
     std::vector<std::uint64_t> row_ids;
     std::vector<std::uint32_t> num_tokens;
+    std::vector<std::uint32_t> elements;  // list-element documents: each one's position in its list (else empty)
+    std::uint32_t element_of(std::size_t d) const { return elements.empty() ? 0U : elements[d]; }
     bool quantized_lengths = false;  // 256-document blocks: scoring sees quantized_doc_length(num_tokens)
     std::uint64_t total_tokens = 0;
     bool rows_sorted = true;  // documents in row order (as nanolance writes them)
@@ -739,7 +776,8 @@ std::string metadata_value(const std::filesystem::path& path, const std::string&
     return value;
 }
 
-bool load_partition(const std::filesystem::path& dir, std::uint64_t id, Partition& part, std::string& error) {
+bool load_partition(const std::filesystem::path& dir, std::uint64_t id, bool elements, Partition& part,
+                    std::string& error) {
     const std::string prefix = "part_" + std::to_string(id) + "_";
     part.invert = dir / (prefix + "invert.lance");
     // Tokens: an fst map (token -> id), or token and id columns.
@@ -797,7 +835,10 @@ bool load_partition(const std::filesystem::path& dir, std::uint64_t id, Partitio
     // Documents: row ids and token counts.
     {
         FileTable table;
-        const std::vector<std::string> columns = {"_rowid", "_num_tokens"};
+        std::vector<std::string> columns = {"_rowid", "_num_tokens"};
+        if (elements) {
+            columns.push_back("_doc_index_0");  // Lance's v3 layout: the element's position in its list
+        }
         if (!index_files::read_table(dir / (prefix + "docs.lance"), &columns, LanceRowRange{}, table, error)) {
             return false;
         }
@@ -805,7 +846,7 @@ bool load_partition(const std::filesystem::path& dir, std::uint64_t id, Partitio
             ArrowArrayView view{};
             ArrowError e{};
             if (ArrowArrayViewInitFromSchema(&view, &table.schema, &e) != NANOARROW_OK ||
-                ArrowArrayViewSetArray(&view, &batch, &e) != NANOARROW_OK || view.n_children < 2) {
+                ArrowArrayViewSetArray(&view, &batch, &e) != NANOARROW_OK || view.n_children < (elements ? 3 : 2)) {
                 ArrowArrayViewReset(&view);
                 error = prefix + "docs.lance: unexpected columns";
                 return false;
@@ -816,6 +857,9 @@ bool load_partition(const std::filesystem::path& dir, std::uint64_t id, Partitio
                 const auto n = static_cast<std::uint32_t>(ArrowArrayViewGetUIntUnsafe(view.children[1], row));
                 part.num_tokens.push_back(n);
                 part.total_tokens += n;
+                if (elements) {
+                    part.elements.push_back(static_cast<std::uint32_t>(ArrowArrayViewGetUIntUnsafe(view.children[2], row)));
+                }
                 const auto size = part.row_ids.size();
                 part.rows_sorted = part.rows_sorted && (size < 2 || part.row_ids[size - 2] < part.row_ids[size - 1]);
             }
@@ -825,7 +869,8 @@ bool load_partition(const std::filesystem::path& dir, std::uint64_t id, Partitio
     return true;
 }
 
-bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const InvertedIndex>& out, std::string& error) {
+bool load_inverted(const std::filesystem::path& dir, bool elements, std::shared_ptr<const InvertedIndex>& out,
+                   std::string& error) {
     const auto meta = dir / "metadata.lance";
     const std::string key = index_files::file_key(meta);
     if (auto hit = index_cache().find(key)) {
@@ -898,7 +943,7 @@ bool load_inverted(const std::filesystem::path& dir, std::shared_ptr<const Inver
             return false;
         }
         auto part = std::make_shared<Partition>();
-        if (!load_partition(dir, static_cast<std::uint64_t>(p.n), *part, error)) {
+        if (!load_partition(dir, static_cast<std::uint64_t>(p.n), elements, *part, error)) {
             return false;
         }
         part->quantized_lengths = index->block_size == fts::kLargePostingBlock;
@@ -921,20 +966,26 @@ float doc_weight(std::uint32_t freq, std::uint32_t doc_tokens, float avg_doc_len
     return doc_weight_with_norm(freq, length_norm(doc_tokens, avg_doc_length));
 }
 
-/// Hits, ascending by row id.
-using Hits = std::vector<std::pair<std::uint64_t, float>>;
+/// A hit: a row (its id or its address), the element of a list-element document (0 for a row), and the
+/// score. Hits are ordered by (row, element).
+struct Hit {
+    std::uint64_t row = 0;
+    float score = 0.0F;
+    std::uint32_t element = 0;
+};
+using Hits = std::vector<Hit>;
+
+bool hit_before(const Hit& a, const Hit& b) { return a.row != b.row ? a.row < b.row : a.element < b.element; }
+bool same_doc(const Hit& a, const Hit& b) { return a.row == b.row && a.element == b.element; }
 
 void sort_hits(Hits& h) {
-    const auto by_row = [](const auto& a, const auto& b) { return a.first < b.first; };
-    if (!std::is_sorted(h.begin(), h.end(), by_row)) {
-        std::sort(h.begin(), h.end(), by_row);
+    if (!std::is_sorted(h.begin(), h.end(), hit_before)) {
+        std::sort(h.begin(), h.end(), hit_before);
     }
 }
 
-/// The better of two hits: the higher score, then the lower row id.
-bool better_hit(const std::pair<std::uint64_t, float>& a, const std::pair<std::uint64_t, float>& b) {
-    return a.second != b.second ? a.second > b.second : a.first < b.first;
-}
+/// The better of two hits: the higher score, then the lower row id (and element).
+bool better_hit(const Hit& a, const Hit& b) { return a.score != b.score ? a.score > b.score : hit_before(a, b); }
 
 /// Hits keeping only the best `k` (all when 0): a heap whose front is the worst kept.
 class HitSink {
@@ -942,26 +993,27 @@ public:
     HitSink(Hits& out, std::size_t k) : out_(out), k_(k) {}
     bool limited() const { return k_ != 0U; }
     bool full() const { return k_ != 0U && out_.size() == k_; }
-    float worst() const { return out_.front().second; }
-    void add(std::uint64_t row, float score) {
-        if (k_ != 0U && out_.size() == k_ && score < out_.front().second) {
+    float worst() const { return out_.front().score; }
+    void add(std::uint64_t row, std::uint32_t element, float score) {
+        const Hit h{row, score, element};
+        if (k_ != 0U && out_.size() == k_ && score < out_.front().score) {
             return;
         }
         if (k_ == 0U) {
-            out_.emplace_back(row, score);
+            out_.push_back(h);
             return;
         }
         if (out_.size() < k_) {
-            out_.emplace_back(row, score);
+            out_.push_back(h);
             std::push_heap(out_.begin(), out_.end(), better_hit);
             return;
         }
         const auto& worst = out_.front();
-        if (score < worst.second || (score == worst.second && row > worst.first)) {
+        if (score < worst.score || (score == worst.score && hit_before(worst, h))) {
             return;
         }
         std::pop_heap(out_.begin(), out_.end(), better_hit);
-        out_.back() = {row, score};
+        out_.back() = h;
         std::push_heap(out_.begin(), out_.end(), better_hit);
     }
 
@@ -1029,13 +1081,16 @@ int child_index(const ArrowSchema& schema, const std::string& name) {
 /// One column's documents outside the index: their row addresses and tokens.
 struct FlatDocs {
     std::vector<std::uint64_t> addrs;
+    std::vector<std::uint32_t> elements;  // list-element documents: each one's position in its list
     std::vector<std::vector<std::string>> tokens;  // only documents with tokens
     std::vector<std::vector<std::uint32_t>> positions;  // each token's position
     std::uint64_t total_tokens = 0;
 };
 
 struct ColumnIndex {
-    std::string name;
+    std::string name;   // the column
+    std::string index_name;  // its index's name (empty when unindexed)
+    bool element = false;    // the list-element documents (else the row documents)
     std::shared_ptr<const InvertedIndex> index;
     /// A search of some segments only: all of them, for the token document counts.
     std::shared_ptr<const InvertedIndex> stats;
@@ -1071,8 +1126,12 @@ struct Search {
     /// with a limit), a match keeps just those.
     std::size_t top_k_ = 0;
     std::size_t indexed_used_ = 0;  // matches answered from an index
+    bool element_used_ = false;     // some match was answered by list-element documents
 
     bool scan_flat(ColumnIndex& c, std::string& error);
+    /// Which index (or unindexed documents) of `column` answers `q`: the list-element documents when
+    /// `element` is set. Unset granularity: the one index on the column decides.
+    bool resolve(const FtsQuery& q, const std::string& column, bool& element, std::string& error) const;
     bool match(const FtsQuery& q, const std::string& column, float boost, Hits& out, std::string& error);
     /// A phrase query in progress (match() with every term required, and their positions checked).
     bool phrase_ = false;
@@ -1276,8 +1335,50 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
                 error = "full-text search needs a string column or a list of strings column; " + c.name + " is not one";
                 ok = false;
             }
+            if (ok && c.element && kind != fts::TextColumn::kStringList) {
+                error = "Invalid user input: FTS field path '" + c.name + "' has no List layer and cannot use ListElement document granularity";
+                ok = false;
+            }
+            const auto append = [&](std::uint64_t addr, std::uint32_t element) {
+                std::vector<std::string> words;
+                std::vector<std::uint32_t> at;
+                words.reserve(tokens.size());
+                at.reserve(tokens.size());
+                for (auto& t : tokens) {
+                    words.push_back(std::move(t.text));
+                    at.push_back(t.position);
+                }
+                c.flat.addrs.push_back(addr);
+                if (c.element) {
+                    c.flat.elements.push_back(element);
+                }
+                c.flat.positions.push_back(std::move(at));
+                c.flat.total_tokens += words.size();
+                c.flat.tokens.push_back(std::move(words));
+            };
             for (std::int64_t r = 0; ok && r < batch.length; ++r) {
                 const std::int64_t row = view.offset + r;
+                if (c.element) {
+                    // One document per element of a non-null row, empty and null ones included (no tokens).
+                    if (ArrowArrayViewIsNull(text, row)) {
+                        continue;
+                    }
+                    const ArrowArrayView* values = text->children[0];
+                    const std::int64_t first = ArrowArrayViewListChildOffset(text, text->offset + row);
+                    const std::int64_t last = ArrowArrayViewListChildOffset(text, text->offset + row + 1);
+                    const std::uint64_t addr = to_id(ArrowArrayViewGetUIntUnsafe(view.children[ac], row));
+                    for (std::int64_t k = first; k < last; ++k) {
+                        tokens.clear();
+                        if (!ArrowArrayViewIsNull(values, k)) {
+                            const ArrowStringView sv = ArrowArrayViewGetStringUnsafe(values, k);
+                            if (sv.size_bytes > 0) {
+                                c.index->analyzer.tokenize(std::string_view(sv.data, static_cast<std::size_t>(sv.size_bytes)), tokens);
+                            }
+                        }
+                        append(addr, static_cast<std::uint32_t>(k - first));
+                    }
+                    continue;
+                }
                 std::string_view document;
                 if (!fts::row_text(text, kind, row, joined, document)) {
                     continue;
@@ -1287,18 +1388,7 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
                 if (tokens.empty()) {
                     continue;
                 }
-                c.flat.addrs.push_back(to_id(ArrowArrayViewGetUIntUnsafe(view.children[ac], row)));
-                std::vector<std::string> words;
-                std::vector<std::uint32_t> at;
-                words.reserve(tokens.size());
-                at.reserve(tokens.size());
-                for (auto& t : tokens) {
-                    words.push_back(std::move(t.text));
-                    at.push_back(t.position);
-                }
-                c.flat.positions.push_back(std::move(at));
-                c.flat.total_tokens += words.size();
-                c.flat.tokens.push_back(std::move(words));
+                append(to_id(ArrowArrayViewGetUIntUnsafe(view.children[ac], row)), 0U);
             }
             ArrowArrayViewReset(&view);
         }
@@ -1424,13 +1514,58 @@ bool expand_token(const InvertedIndex& index, const std::string& token, std::uin
     return true;
 }
 
+/// The key of a column's index (or unindexed documents) in Search::columns / unindexed: the column, and
+/// for list-element documents the column with a separator no column name can carry.
+std::string column_key(const std::string& column, bool element) {
+    return element ? column + '\x1f' + "list_element" : column;
+}
+
+bool Search::resolve(const FtsQuery& q, const std::string& column, bool& element, std::string& error) const {
+    const auto row = columns.find(column_key(column, false));
+    const auto list = columns.find(column_key(column, true));
+    const bool has_row = row != columns.end();
+    const bool has_list = list != columns.end();
+    if (q.granularity == DocGranularity::Row) {
+        if (!has_row && has_list) {
+            error = "Invalid user input: FTS query for field '" + column + "' requested Row document granularity, but the existing FTS "
+                    "index uses a different granularity: '" + list->second.index_name + "' (ListElement)";
+            return false;
+        }
+        element = false;
+        return true;
+    }
+    if (q.granularity == DocGranularity::ListElement) {
+        if (!has_list && has_row) {
+            error = "Invalid user input: FTS query for field '" + column + "' requested ListElement document granularity, but the existing "
+                    "FTS index uses a different granularity: '" + row->second.index_name + "' (Row)";
+            return false;
+        }
+        element = true;
+        return true;
+    }
+    if (has_row && has_list) {
+        error = "Invalid user input: FTS query for field '" + column + "' is ambiguous because Row and ListElement indexes coexist: '" +
+                row->second.index_name + "' (Row), '" + list->second.index_name + "' (ListElement); specify "
+                "document_granularity";
+        return false;
+    }
+    element = has_list;
+    return true;
+}
+
 bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hits& out, std::string& error) {
-    auto it = columns.find(column);
+    bool element = false;
+    if (!resolve(q, column, element, error)) {
+        return false;
+    }
+    const std::string key = column_key(column, element);
+    element_used_ = element_used_ || element;
+    auto it = columns.find(key);
     if (it == columns.end()) {
         // No index: every document is searched as an unindexed one, split as Lance's flat search
         // splits it -- the simple tokenizer alone, no lower-casing, stemming, stop words, folding or
         // length limit.
-        it = unindexed.find(column);
+        it = unindexed.find(key);
         if (it == unindexed.end()) {
             bool known = false;
             for (const auto& f : manifest.fields) {
@@ -1447,17 +1582,19 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             raw.remove_stop_words = false;
             raw.ascii_folding = false;
             raw.max_token_length.reset();
+            raw.with_position = true;  // a phrase query's positions, as flat search reads them
             if (!index->analyzer.init(raw, error)) {
                 return false;
             }
             ColumnIndex c;
             c.name = column;
+            c.element = element;
             c.index = std::move(index);
-            it = unindexed.emplace(column, std::move(c)).first;
+            it = unindexed.emplace(key, std::move(c)).first;
         }
     }
     ColumnIndex& c = it->second;
-    if (columns.count(column) != 0U) {
+    if (columns.count(key) != 0U) {
         ++indexed_used_;
     }
     std::vector<fts::Token> query_tokens;
@@ -1501,7 +1638,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         if ((some_token_has_no_term && q.and_operator) || expanded.empty()) {
             if (boost != 1.0F) {
                 for (auto& h : fragment_hits) {
-                    h.second *= boost;
+                    h.score *= boost;
                 }
             }
             sort_hits(fragment_hits);
@@ -1609,10 +1746,32 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
             }
         }
     }
-    const float avg = static_cast<float>(c.total_tokens) / static_cast<float>(c.num_docs);
+    // The statistics the indexed documents are scored with. Row documents: the index's own. List-element
+    // documents with unindexed ones beside them: every document's, the unindexed ones counted in (Lance
+    // scores them so, measured against pylance 12.0.0).
+    std::uint64_t scoring_docs_total = c.num_docs;
+    std::uint64_t scoring_tokens = c.total_tokens;
+    std::vector<std::uint64_t> scoring_docs = token_docs;
+    if (c.element && !fuzzy) {
+        if (!scan_flat(c, error)) {
+            return false;
+        }
+        if (!c.flat.addrs.empty()) {
+            for (const auto& words : c.flat.tokens) {
+                for (std::size_t t = 0; t < nt; ++t) {
+                    if (std::find(words.begin(), words.end(), distinct[t]) != words.end()) {
+                        ++scoring_docs[t];
+                    }
+                }
+            }
+            scoring_docs_total += c.flat.addrs.size();
+            scoring_tokens += c.flat.total_tokens;
+        }
+    }
+    const float avg = static_cast<float>(scoring_tokens) / static_cast<float>(scoring_docs_total);
     std::vector<float> weights(nt, 0.0F);
     for (std::size_t t = 0; t < nt; ++t) {
-        weights[t] = token_docs[t] == 0U ? 0.0F : idf(token_docs[t], c.num_docs);
+        weights[t] = scoring_docs[t] == 0U ? 0.0F : idf(scoring_docs[t], scoring_docs_total);
     }
     Hits hits;
     // Only the best rows when the caller needs only those (a positive boost keeps the order).
@@ -1673,7 +1832,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
                     const std::uint32_t d = posting->docs[k];
                     const std::uint64_t row = part.row_ids[d];
                     if (mask.allows(row, part_cover)) {
-                        sink.add(row, score_of(doc_weight_with_norm(posting->freqs[k], norm[d])));
+                        sink.add(row, part.element_of(d), score_of(doc_weight_with_norm(posting->freqs[k], norm[d])));
                     }
                 }
             }
@@ -1765,7 +1924,7 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         return false;
     }
     for (const auto& h : fragment_hits) {
-        sink.add(h.first, h.second);
+        sink.add(h.row, h.element, h.score);
     }
     if (!fuzzy && !c.flat.addrs.empty()) {
         const std::uint64_t n = c.num_docs + c.flat.addrs.size();
@@ -1816,12 +1975,12 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
                     s += flat_weights[t] * doc_weight(counts[d][t], dl, flat_avg);
                 }
             }
-            sink.add(c.flat.addrs[d], s);
+            sink.add(c.flat.addrs[d], c.flat.elements.empty() ? 0U : c.flat.elements[d], s);
         }
     }
     if (boost != 1.0F) {
         for (auto& h : hits) {
-            h.second *= boost;
+            h.score *= boost;
         }
     }
     sort_hits(hits);
@@ -1835,7 +1994,7 @@ void Search::emit(const Partition& part, std::uint32_t need, HitSink& sink) {
         if (seen_[d] == need) {
             const std::uint64_t row = part.row_ids[d];
             if (mask.allows(row, part_cover)) {
-                sink.add(row, scores_[d]);
+                sink.add(row, part.element_of(d), scores_[d]);
             }
         }
         scores_[d] = 0.0F;
@@ -1904,10 +2063,17 @@ bool Search::run(const FtsQuery& q, Hits& out, std::string& error) {
             return match(q, q.columns[0], q.boost, out, error);
         }
         case FtsQuery::Kind::MultiMatch: {
+            // A string query asks for row documents, as Lance's full_text_query does.
+            FtsQuery per = q;
+            if (!per.granularity) {
+                per.granularity = DocGranularity::Row;
+            }
             std::vector<std::string> cols = q.columns;
             if (cols.empty()) {
-                for (const auto& [name, c] : columns) {
-                    cols.push_back(name);
+                for (const auto& [key, c] : columns) {
+                    if (!c.element) {
+                        cols.push_back(c.name);
+                    }
                 }
             }
             if (cols.empty()) {
@@ -1921,19 +2087,19 @@ bool Search::run(const FtsQuery& q, Hits& out, std::string& error) {
             }
             for (std::size_t i = 0; i < cols.size(); ++i) {
                 Hits one;
-                if (!match(q, cols[i], q.boosts.empty() ? 1.0F : q.boosts[i], one, error)) {
+                if (!match(per, cols[i], q.boosts.empty() ? 1.0F : q.boosts[i], one, error)) {
                     return false;
                 }
                 Hits merged;
                 std::size_t a = 0;
                 std::size_t b = 0;
                 while (a < out.size() || b < one.size()) {
-                    if (b == one.size() || (a < out.size() && out[a].first < one[b].first)) {
+                    if (b == one.size() || (a < out.size() && hit_before(out[a], one[b]))) {
                         merged.push_back(out[a++]);
-                    } else if (a == out.size() || one[b].first < out[a].first) {
+                    } else if (a == out.size() || hit_before(one[b], out[a])) {
                         merged.push_back(one[b++]);
                     } else {
-                        merged.emplace_back(out[a].first, std::max(out[a].second, one[b].second));
+                        merged.push_back(Hit{out[a].row, std::max(out[a].score, one[b].score), out[a].element});
                         ++a;
                         ++b;
                     }
@@ -1952,20 +2118,25 @@ bool Search::run(const FtsQuery& q, Hits& out, std::string& error) {
                     return false;
                 }
                 FtsQuery filled = q;
-                filled.columns = {columns.begin()->first};
+                filled.columns = {columns.begin()->second.name};
                 return run(filled, out, error);
             }
             if (q.columns.size() != 1U) {
                 error = "a phrase query needs one column";
                 return false;
             }
-            const auto it = columns.find(q.columns[0]);
-            if (it == columns.end() || !it->second.index->analyzer.params().with_position) {
+            // An unindexed column is searched as flat search does, with its positions.
+            bool element = false;
+            if (!resolve(q, q.columns[0], element, error)) {
+                return false;
+            }
+            const auto it = columns.find(column_key(q.columns[0], element));
+            if (it != columns.end() && !it->second.index->analyzer.params().with_position) {
                 error = "position is not found but required for phrase queries, try recreating the index with "
                         "position";
                 return false;
             }
-            if (!it->second.index->with_positions) {
+            if (it != columns.end() && !it->second.index->with_positions) {
                 error = it->second.index->positions_error;
                 return false;
             }
@@ -1991,11 +2162,11 @@ bool Search::run(const FtsQuery& q, Hits& out, std::string& error) {
             }
             std::size_t b = 0;
             for (auto& h : out) {
-                while (b < neg.size() && neg[b].first < h.first) {
+                while (b < neg.size() && hit_before(neg[b], h)) {
                     ++b;
                 }
-                if (b < neg.size() && neg[b].first == h.first) {
-                    h.second -= q.negative_boost * neg[b].second;
+                if (b < neg.size() && same_doc(neg[b], h)) {
+                    h.score -= q.negative_boost * neg[b].score;
                 }
             }
             return true;
@@ -2019,11 +2190,11 @@ bool Search::run(const FtsQuery& q, Hits& out, std::string& error) {
                 Hits kept;
                 std::size_t b = 0;
                 for (const auto& h : out) {
-                    while (b < one.size() && one[b].first < h.first) {
+                    while (b < one.size() && hit_before(one[b], h)) {
                         ++b;
                     }
-                    if (b < one.size() && one[b].first == h.first) {
-                        kept.emplace_back(h.first, h.second + one[b].second);
+                    if (b < one.size() && same_doc(one[b], h)) {
+                        kept.push_back(Hit{h.row, h.score + one[b].score, h.element});
                     }
                 }
                 out = std::move(kept);
@@ -2038,15 +2209,15 @@ bool Search::run(const FtsQuery& q, Hits& out, std::string& error) {
                 std::size_t a = 0;
                 std::size_t b = 0;
                 while (a < out.size() || b < one.size()) {
-                    if (b == one.size() || (a < out.size() && out[a].first < one[b].first)) {
+                    if (b == one.size() || (a < out.size() && hit_before(out[a], one[b]))) {
                         merged.push_back(out[a++]);
-                    } else if (a == out.size() || one[b].first < out[a].first) {
+                    } else if (a == out.size() || hit_before(one[b], out[a])) {
                         if (union_should) {
                             merged.push_back(one[b]);
                         }
                         ++b;
                     } else {
-                        merged.emplace_back(out[a].first, out[a].second + one[b].second);
+                        merged.push_back(Hit{out[a].row, out[a].score + one[b].score, out[a].element});
                         ++a;
                         ++b;
                     }
@@ -2058,11 +2229,11 @@ bool Search::run(const FtsQuery& q, Hits& out, std::string& error) {
                 if (!run(n, one, error)) {
                     return false;
                 }
-                std::set<std::uint64_t> excluded;
+                std::set<std::pair<std::uint64_t, std::uint32_t>> excluded;
                 for (const auto& h : one) {
-                    excluded.insert(h.first);
+                    excluded.insert({h.row, h.element});
                 }
-                out.erase(std::remove_if(out.begin(), out.end(), [&](const auto& h) { return excluded.count(h.first) != 0U; }),
+                out.erase(std::remove_if(out.begin(), out.end(), [&](const auto& h) { return excluded.count({h.row, h.element}) != 0U; }),
                           out.end());
             }
             return true;
@@ -2129,7 +2300,7 @@ bool post_filter(const std::filesystem::path& path, const FtsSearchRequest& q, H
     }
     std::vector<std::uint64_t> addrs;
     for (const auto& h : hits) {
-        addrs.push_back(h.first);
+        addrs.push_back(h.row);
     }
     std::sort(addrs.begin(), addrs.end());
     addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
@@ -2168,7 +2339,7 @@ bool post_filter(const std::filesystem::path& path, const FtsSearchRequest& q, H
     if (!ok) {
         return false;
     }
-    hits.erase(std::remove_if(hits.begin(), hits.end(), [&](const auto& h) { return pass.count(h.first) == 0U; }),
+    hits.erase(std::remove_if(hits.begin(), hits.end(), [&](const auto& h) { return pass.count(h.row) == 0U; }),
                hits.end());
     return true;
 }
@@ -2207,9 +2378,14 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
                             : !load_latest_manifest(dataset_path, s.manifest, version, error)) {
         return false;
     }
-    // The INVERTED indexes, by column: the segments of the first index on each.
-    std::map<std::string, std::string> index_names;
-    std::map<std::string, std::vector<const pb::IndexMetadata*>> segments;
+    // The INVERTED indexes, by column and granularity: the segments of the first index on each.
+    struct Group {
+        std::string column;
+        bool element = false;
+        std::string name;
+        std::vector<const pb::IndexMetadata*> segs;
+    };
+    std::map<std::string, Group> groups;  // by column_key
     for (const auto& index : s.manifest.indices) {
         if (index.fields.size() != 1U || !is_inverted_index_url(index.details_type_url)) {
             continue;
@@ -2218,9 +2394,11 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
         if (column.empty()) {
             continue;
         }
-        auto [it, inserted] = index_names.emplace(column, index.name);
-        if (it->second == index.name) {
-            segments[column].push_back(&index);
+        const bool element = inverted_details_granularity(index.details_value) == DocGranularity::ListElement;
+        const std::string key = column_key(column, element);
+        auto [it, inserted] = groups.emplace(key, Group{column, element, index.name, {}});
+        if (it->second.name == index.name) {
+            it->second.segs.push_back(&index);
         }
     }
     if (!AddressToRowId::build(s.manifest, s.to_id, error) ||
@@ -2232,8 +2410,8 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
     const std::set<std::array<std::uint8_t, 16>> chosen(request.segments.begin(), request.segments.end());
     for (const auto& uuid : chosen) {
         bool known = false;
-        for (const auto& [column, segs] : segments) {
-            for (const auto* seg : segs) {
+        for (const auto& [key, group] : groups) {
+            for (const auto* seg : group.segs) {
                 known = known || seg->uuid == uuid;
             }
         }
@@ -2243,14 +2421,17 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
             return false;
         }
     }
-    for (const auto& [column, segs] : segments) {
+    for (const auto& [key, group] : groups) {
+        const auto& segs = group.segs;
         ColumnIndex c;
-        c.name = column;
+        c.name = group.column;
+        c.element = group.element;
+        c.index_name = group.name;
         std::shared_ptr<InvertedIndex> merged;
         std::shared_ptr<InvertedIndex> picked;  // the chosen segments, when some are
         for (const auto* seg : segs) {
             std::shared_ptr<const InvertedIndex> index;
-            if (!load_inverted(dataset_path / "_indices" / pb::uuid_string(seg->uuid), index, error)) {
+            if (!load_inverted(dataset_path / "_indices" / pb::uuid_string(seg->uuid), group.element, index, error)) {
                 error = "index " + seg->name + ": " + error;
                 return false;
             }
@@ -2307,10 +2488,10 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
             c.stats = c.index;
             c.index = picked;
         }
-        out.plan.push_back("MatchQuery: column=" + column + ", index=" + index_names[column] + " (" +
+        out.plan.push_back("MatchQuery: column=" + group.column + ", index=" + group.name + " (" +
                            std::to_string(c.index->partitions.size()) + " partitions, " + std::to_string(c.num_docs) +
                            " documents)");
-        s.columns.emplace(column, std::move(c));
+        s.columns.emplace(key, std::move(c));
     }
     // The rows that may be returned.
     {
@@ -2367,7 +2548,7 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
     }
     if (s.resolver.stable()) {  // hits are ids; what is returned and filtered are addresses
         for (auto& hit : hits) {
-            s.resolver.find(hit.first, hit.first);
+            s.resolver.find(hit.row, hit.row);
         }
     }
     if (request.filter && !request.prefilter) {
@@ -2376,9 +2557,13 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
             return false;
         }
     }
+    out.has_doc_indices = s.element_used_;
     for (const auto& h : hits) {
-        out.row_ids.push_back(h.first);
-        out.scores.push_back(h.second);
+        out.row_ids.push_back(h.row);
+        out.scores.push_back(h.score);
+        if (out.has_doc_indices) {
+            out.doc_indices.push_back(h.element);
+        }
     }
     (void)version;
     return true;

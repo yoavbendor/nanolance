@@ -135,3 +135,15 @@ joined by one space, then tokenized as one text (Lance's `materialize_string_lis
 the same join, empty elements included); index files equal pylance's row for row, scores bit for bit
 in both directions. String-column FTS unchanged in speed (interleaved A/B, 100k documents: build 0.99x,
 searches within run-to-run noise). `test_fts_on_list` passes; the flat phrase gap moved to L2.
+
+**L2 outcome (2026-10-19):** done in one Haiku session (about 300k tokens, over budget); reviewed.
+List-element documents (one per element, null and empty ones included; the v3 docs layout with
+`_doc_index_0`; `InvertedIndexDetails.document_granularity`), `_doc_index` in results, pylance's three
+granularity errors, element-aware flat search, and phrase queries over rows no index covers (string and
+list columns). Element documents beside unindexed ones are scored with the combined statistics, as
+pylance does (measured; row documents keep the index's). All four `test_fts_on_list_elements[*]` pass.
+Review: string-column indexes byte-identical before and after (with and without positions); search
+instructions equal (callgrind, 168.7M vs 167.8M per run) and wall times equal on longer interleaved runs.
+Left open (ROADMAP small items): `IndexConfig(parameters=...)` is ignored for INVERTED builds other than
+list-element ones (pre-existing); staged distributed builds over list elements are refused;
+`infer_index_segment_details` would drop field 14.

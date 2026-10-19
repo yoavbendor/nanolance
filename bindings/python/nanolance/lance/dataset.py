@@ -1187,6 +1187,11 @@ class LanceDataset(pa.dataset.Dataset):
                              f'index_type="{kind}", fragment_ids=...)')
         uuid_bytes = _parse_index_uuid(index_uuid)
         if kind == "INVERTED":
+            if is_config and kwargs.get("document_granularity") is not None and \
+                    _granularity_name(kwargs["document_granularity"]) == "list_element":
+                # A list-element index takes its IndexConfig's parameters (positions for phrases). Other
+                # INVERTED builds keep ignoring them, as they always have.
+                kwargs = {**config, **kwargs}
             if fragment_ids is not None:
                 return self._stage_inverted_part(column, name, fragment_ids, uuid_bytes, kwargs)
             return self._create_inverted_index(column, name, replace, kwargs)
@@ -1334,8 +1339,7 @@ class LanceDataset(pa.dataset.Dataset):
                     raise TypeError("'None' is not an instance of 'str'")
                 if value is not None or key in ("max_token_length", "custom_stop_words"):
                     params[key] = value
-        for ignored in ("num_workers", "memory_limit", "progress", "train", "progress_callback",
-                        "document_granularity"):
+        for ignored in ("num_workers", "memory_limit", "progress", "train", "progress_callback"):
             kwargs.pop(ignored, None)
         if kwargs:
             raise unsupported(f"INVERTED index options {sorted(kwargs)}")
@@ -1343,14 +1347,29 @@ class LanceDataset(pa.dataset.Dataset):
         LanceDataset._inverted_format_and_block(params)
         return json.dumps(params)
 
+    @staticmethod
+    def _document_granularity(kwargs) -> str:
+        """The ``document_granularity`` argument (taken out of kwargs): "row" or "list_element"."""
+        from nanolance.lance.query import DocumentGranularity
+
+        value = kwargs.pop("document_granularity", None)
+        if value is None:
+            return DocumentGranularity.ROW.value
+        try:
+            return DocumentGranularity(value).value
+        except ValueError:
+            raise ValueError(f"unknown document granularity {value!r}") from None
+
     def _create_inverted_index(self, column, name, replace, kwargs) -> "LanceDataset":
+        granularity = self._document_granularity(kwargs)
         params = self._inverted_params(kwargs)
         if isinstance(column, (list, tuple)):
             if len(column) != 1:
                 raise unsupported("an index over more than one column")
             column = column[0]
         with _lance_errors():
-            _nanolance._ds_create_inverted_index(self._uri, str(column), name or "", bool(replace), params)
+            _nanolance._ds_create_inverted_index(self._uri, str(column), name or "", bool(replace), params,
+                                                 granularity)
         self._refresh_latest("CreateIndex")
         return self
 
@@ -1360,6 +1379,8 @@ class LanceDataset(pa.dataset.Dataset):
         import json
         import uuid as uuid_module
 
+        if self._document_granularity(kwargs) != "row":
+            raise unsupported("a distributed INVERTED build over list elements")
         params = self._inverted_params(kwargs)
         fragments = sorted({int(f) for f in fragment_ids})
         known = {f["id"] for f in self._info["fragments"]}
@@ -2637,6 +2658,13 @@ def _segment_message(ds: "LanceDataset", segment) -> bytes:
     })
 
 
+def _granularity_name(value) -> str:
+    """A document granularity argument ("row" or "list_element", or the enum) as its name."""
+    from nanolance.lance.query import DocumentGranularity
+
+    return DocumentGranularity(value).value
+
+
 @contextlib.contextmanager
 def _lance_errors():
     """Errors raised as pylance raises them: its Rust core's (k-means, PQ training, a name taken)
@@ -2652,6 +2680,8 @@ def _lance_errors():
         if ("KMeans cannot train" in text or "Not enough rows to train PQ" in text or "already exists" in text
                 or "num_bits" in text):
             raise RuntimeError(text) from None
+        if text.startswith("FTS field path ") and "does not exist in the dataset schema" in text:
+            raise RuntimeError(f"LanceError(Index): {text}") from None
         from nanolance.lance._errors import translate
         raise translate(text) from None
 
@@ -3926,7 +3956,7 @@ class LanceScanner(pa.dataset.Scanner):
 
     def _fts_table(self) -> pa.Table:
         """The matching rows, best first: the columns asked for, then ``_score`` (then the row id columns)."""
-        ids, scores, _ = self._fts_search()
+        ids, scores, _, doc_indices = self._fts_search()
         names = self._names
         if self._order is not None and "_score" in self._order:
             names = [c for c in names if c != "_score"] if names is not None else None
@@ -3935,6 +3965,8 @@ class LanceScanner(pa.dataset.Scanner):
         system = [c for c in ("_rowid", "_rowaddr") if c in table.column_names]
         data = table.drop_columns(system)
         out = data.append_column("_score", pa.array(scores, pa.float32()))
+        if doc_indices is not None:  # list-element documents: the element's position in its list
+            out = out.append_column("_doc_index", pa.array([[d] for d in doc_indices], pa.list_(pa.uint32())))
         for c in system:
             out = out.append_column(c, table.column(c))
         if self._offset:

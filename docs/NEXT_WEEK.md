@@ -53,6 +53,8 @@ feature. Compaction already remaps indexes; the FRI only serves deferred remap.
 | item | pylance tests | size | notes |
 |---|---|---|---|
 | Write data storage versions 2.1 / 2.0 | 85 | format research (Opus) + sessions | the largest group of pylance failures; see the suite breakdown below |
+| `create_scalar_index(IndexConfig(index_type="inverted", parameters={...}))` ignores the parameters for INVERTED builds (only list-element builds read them); found in FTS_LISTS L2 | -- | small | string-column builds made this way change, so test against pylance |
+| Staged (distributed) INVERTED builds over list elements are refused; `infer_index_segment_details` would drop `document_granularity` (field 14) | -- | small | FTS_LISTS L2 |
 | `Compaction.plan`, `lance.debug.format_fragment`, `lance.util.KMeans`, `lance.pydantic.Vector` | 3-4 each | small each | |
 | lance-c prepared fuzzy FTS (`lance_dataset_prepare_fts_match_query` with fuzziness) | -- | small | the fuzzy query exists |
 | Expression leftovers: `l[1 + 1]`, projecting a struct element `ls[1]`, `array_element(...)`, `ts - arrow_cast(ts, 'Timestamp(..)')` (unit dropped), arrow_cast of a column to Duration, `coalesce(ts, ts_ms)` (coarser unit), `d32 - ts`, `dec + i32 * 1` (strict xfail), comparisons as projections keep old typing | ~0 directly | 1 session | `docs/tasks/EXPR_TYPES.md` outcomes A1-C3 |
