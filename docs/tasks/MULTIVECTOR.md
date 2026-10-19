@@ -156,3 +156,12 @@ MultivectorScoringExec about lines 2807-2990), the facts for an exact float32 ma
 Phases now: **M2a** IVF_FLAT with the steps above and the mixed indexed / unindexed case
 (`test_multivec_search_paths`' fully_indexed step); **M2b** IVF_PQ / IVF_SQ / IVF_HNSW_* and the refine
 question; **M2c** lance-c (`lance_scanner_nearest_multivector`).
+
+**M2a outcome (2026-10-19):** done in one Haiku session; reviewed. pylance-built multivector IVF_FLAT
+indexes (float32) are searched with Lance's XTR steps and match pylance (rows, order, distances to 1e-6;
+2 and 8 partitions, nprobes 1 / 2 / all, k 5 / 50, after optimize_indices, fast_search). Mixed case, as
+Lance's knn_combined does it: the XTR candidates re-scored exactly, unioned with the exact top k of the
+unindexed fragments. pylance 12 builds multivector indexes for cosine only; an L2 query over one is
+answered exactly. Refused for now (M2b): refine_factor and distance bounds on a multivector index;
+float16 multivector indexes still get the exact (M1) answer. Fixed-size vector search unchanged in speed
+(every benchmark search within noise).

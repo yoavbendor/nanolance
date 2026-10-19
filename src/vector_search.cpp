@@ -1871,8 +1871,11 @@ bool vector_sub_path(const ArrowSchema& schema, const std::string& column, int& 
 }
 
 /// Exact distances of `rows`' vectors (null vectors dropped).
+float multivec_distance(const MultiRows& v, std::size_t r, const NearestQuery& q, VectorMetric metric,
+                        const std::vector<std::uint8_t>* binary_key, std::size_t dim);
+
 bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMetric metric, std::size_t dim,
-             std::vector<Candidate>& rows, std::string& error) {
+             std::vector<Candidate>& rows, std::string& error, bool multi = false) {
     if (rows.empty()) {
         return true;
     }
@@ -1898,6 +1901,39 @@ bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMet
     std::vector<ArrowArray> batches;
     if (!addrs.empty() && !lance_dataset_take_rows(path, request, addrs, schema, batches, error)) {
         return false;
+    }
+    if (multi) {
+        // A multivector column: each candidate's exact multivec_distance over all the query's vectors.
+        MultiRows v;
+        v.dim = dim;
+        int vc = -1;
+        std::vector<int> sub;
+        const int ic = child_index(schema, "_rowaddr");
+        bool ok = addrs.empty() || (vector_sub_path(schema, q.column, vc, sub, error) && ic >= 0);
+        for (std::size_t b = 0; ok && b < batches.size(); ++b) {
+            ok = collect_multivectors(schema, batches[b], vc, ic, v, error, sub);
+        }
+        for (auto& b : batches) {
+            b.release(&b);
+        }
+        if (schema.release != nullptr) {
+            schema.release(&schema);
+        }
+        if (!ok) {
+            return false;
+        }
+        std::vector<Candidate> out;
+        for (std::size_t r = 0; r < v.ids.size(); ++r) {
+            const float d = multivec_distance(v, r, q, metric, nullptr, dim);
+            if (!std::isnan(d)) {
+                out.push_back(Candidate{d, v.ids[r]});
+            }
+        }
+        for (const auto& [id, d] : keep) {
+            out.push_back(Candidate{d, id});
+        }
+        rows = std::move(out);
+        return true;
     }
     VectorRows v;
     v.dim = dim;
@@ -2237,6 +2273,66 @@ bool vector_index_details(const std::filesystem::path& index_dir, VectorIndexDet
     return true;
 }
 
+/// Lance's XTR search of a multivector query over an IVF_FLAT index (`multivec_ann` and
+/// `MultivectorScoringExec`). For each query vector: the index's best `kk` entries, sorted by (distance,
+/// row id), each row's first (best) entry kept; its similarity is 1 - distance. A row's similarity is
+/// summed over the query vectors in turn: a row missing from a list adds that list's `min_sim` (the
+/// similarity of its last kept entry), a row new to the sum starts at its similarity plus the earlier
+/// lists' `min_sim`s. The distance is the query vector count minus the sum; `keep` rows are kept.
+bool xtr_search(const NearestQuery& q, const std::vector<std::shared_ptr<const IvfIndex>>& loaded,
+                const std::vector<RowMask>& masks, RowIdToAddress& resolver, std::size_t dim, bool f32_column,
+                std::uint32_t overfetch, std::size_t keep, std::vector<Candidate>& out,
+                std::vector<std::string>& plan, std::string& error, CacheCount& counts) {
+    const std::size_t queries = q.key_vectors;
+    const std::size_t kk = static_cast<std::size_t>(q.k) * overfetch;  // the candidates per query vector
+    std::unordered_map<std::uint64_t, float> sums;
+    float missed = 0.0F;  // the sum of the earlier lists' min_sim
+    for (std::size_t qi = 0; qi < queries; ++qi) {
+        NearestQuery one = q;
+        one.key.assign(q.key.begin() + static_cast<std::ptrdiff_t>(qi * dim),
+                       q.key.begin() + static_cast<std::ptrdiff_t>((qi + 1U) * dim));
+        one.key_vectors = 1;
+        // Lance's per-vector query carries refine_factor = overfetch (its probing is then the legacy rule,
+        // not the adaptive one) and keeps k * overfetch candidates.
+        one.refine_factor = overfetch;
+        std::vector<Candidate> list;
+        for (std::size_t s = 0; s < loaded.size(); ++s) {
+            std::string line;
+            if (!search_segment(*loaded[s], one, f32_column, masks[s], kk, list, line, error, counts)) {
+                return false;
+            }
+            if (qi == 0) {
+                plan.push_back("  " + line);
+            }
+        }
+        if (resolver.stable()) {  // as the exact search: the candidates are addresses from here on
+            for (auto& hit : list) {
+                resolver.find(hit.id, hit.id);
+            }
+        }
+        keep_best(list, kk);
+        const float min_sim = list.empty() ? 0.0F : 1.0F - list.back().d;
+        std::unordered_map<std::uint64_t, float> first;  // the best entry of each row in this list
+        for (const auto& c : list) {
+            first.emplace(c.id, 1.0F - c.d);
+        }
+        for (auto& [id, sum] : sums) {
+            const auto it = first.find(id);
+            sum += it != first.end() ? it->second : min_sim;
+        }
+        for (const auto& [id, sim] : first) {
+            sums.emplace(id, sim + missed);  // emplace: a row already summed keeps its sum
+        }
+        missed += min_sim;
+    }
+    out.clear();
+    for (const auto& [id, sum] : sums) {
+        out.push_back(Candidate{static_cast<float>(queries) - sum, id});
+    }
+    keep_best(out, keep);
+    return true;
+}
+
 bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQuery& q, NearestResult& out,
                      std::string& error) {
     out = NearestResult{};
@@ -2392,17 +2488,6 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             return false;
         }
     }
-    if (multi && q.use_index && !segments.empty()) {
-        // Indexes over multivector columns are not searched yet: the rows are searched exactly, the
-        // index left unused (as Lance's planner does for an index it cannot use). fast_search or an
-        // explicit segment list would need the index, so they are refused rather than answered wrongly.
-        if (q.fast_search || chosen) {
-            error = "searching a vector index over a multivector column is not supported yet; use use_index=False";
-            return false;
-        }
-        out.plan.push_back("index " + index_name + " not used: multivector index search is not supported yet");
-        segments.clear();
-    }
     std::vector<std::shared_ptr<const IvfIndex>> loaded;
     std::string not_used;  // why the index was not used
     if (!q.use_index) {
@@ -2416,6 +2501,15 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             std::string why;
             if (!load_ivf(dataset_path / "_indices" / pb::uuid_string(s->uuid), index, why, q.index_cache)) {
                 not_used = why;
+            } else if (multi && !(index->type == "IVF_FLAT" && f32_column)) {
+                // Only float32 IVF_FLAT is searched over a multivector column. Other kinds are left unused
+                // (as Lance's planner does for an index it cannot use); fast_search or an explicit segment
+                // list would need the index, so they are refused rather than answered wrongly.
+                if (q.fast_search || chosen) {
+                    error = "searching a vector index over a multivector column is not supported yet; use use_index=False";
+                    return false;
+                }
+                not_used = "multivector index search is not supported yet for " + index->type;
             } else if (q.metric && *q.metric != index->metric) {
                 if (chosen) {
                     error = std::string("with_index_segments requested metric ") + vector_metric_name(*q.metric) +
@@ -2470,8 +2564,12 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         out.plan.push_back("ANNSubIndex: name=" + index_name + ", k=" + std::to_string(q.k) + ", deltas=" +
                            std::to_string(loaded.size()) + ", metric=" + metric_name + " (" +
                            loaded.front()->type + ")");
+        // Each segment's row mask (the fragments it covers, deletions, the prefilter), built once.
+        std::vector<RowMask> masks;
+        masks.reserve(loaded.size());
         for (std::size_t s = 0; s < loaded.size(); ++s) {
-            RowMask mask;
+            masks.emplace_back();
+            RowMask& mask = masks.back();
             mask.resolver = &resolver;
             mask.caller = q.row_mask;
             for (const auto& f : manifest.fragments) {
@@ -2516,20 +2614,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                 }
             }
             mask.seal();
-            std::string line;
-            if (!search_segment(*loaded[s], q, f32_column, mask, kk, ann, line, error, counts)) {
-                return false;
-            }
-            out.plan.push_back("  " + line);
         }
-        out.index_cache_hits = counts.hits.load();
-        out.index_cache_misses = counts.misses.load();
-        if (resolver.stable()) {  // from here on the candidates are addresses, as the exact search's are
-            for (auto& hit : ann) {
-                resolver.find(hit.id, hit.id);
-            }
-        }
-        keep_best(ann, kk);
         std::vector<std::uint64_t> unindexed;
         if (!q.fast_search && !chosen) {
             for (const auto& f : manifest.fragments) {
@@ -2538,14 +2623,58 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                 }
             }
         }
-        if (q.refine_factor || !unindexed.empty()) {
-            if (!rescore(dataset_path, q, metric, dim, ann, error)) {
+        if (multi) {
+            // XTR over the index (xtr_search). Refine and the distance bounds are not written for several
+            // vectors per row yet: refused rather than answered from the wrong distances.
+            if (q.refine_factor) {
+                error = "refine_factor on a multivector index is not supported yet";
                 return false;
             }
-            keep_best(ann, q.k);
-            out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
-                               " (refine " + std::to_string(kk) + " candidates)");
+            if (q.lower_bound || q.upper_bound) {
+                error = "distance bounds on a multivector index are not supported yet";
+                return false;
+            }
+            constexpr std::uint32_t kXtrOverfetch = 10;  // Lance's DEFAULT_XTR_OVERFETCH
+            if (!xtr_search(q, loaded, masks, resolver, dim, f32_column, kXtrOverfetch, q.k, ann, out.plan, error,
+                            counts)) {
+                return false;
+            }
+            out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name + " (multivector XTR, " +
+                               std::to_string(q.key_vectors) + " query vectors)");
+            if (!unindexed.empty()) {
+                // Lance's knn_combined: once unindexed fragments are merged in, the candidates are re-scored
+                // exactly (the XTR distances are only for choosing them).
+                if (!rescore(dataset_path, q, metric, dim, ann, error, true)) {
+                    return false;
+                }
+                out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
+                                   " (exact re-score of the XTR candidates)");
+            }
+        } else {
+            for (std::size_t s = 0; s < loaded.size(); ++s) {
+                std::string line;
+                if (!search_segment(*loaded[s], q, f32_column, masks[s], kk, ann, line, error, counts)) {
+                    return false;
+                }
+                out.plan.push_back("  " + line);
+            }
+            if (resolver.stable()) {  // from here on the candidates are addresses, as the exact search's are
+                for (auto& hit : ann) {
+                    resolver.find(hit.id, hit.id);
+                }
+            }
+            keep_best(ann, kk);
+            if (q.refine_factor || !unindexed.empty()) {
+                if (!rescore(dataset_path, q, metric, dim, ann, error)) {
+                    return false;
+                }
+                keep_best(ann, q.k);
+                out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name +
+                                   " (refine " + std::to_string(kk) + " candidates)");
+            }
         }
+        out.index_cache_hits = counts.hits.load();
+        out.index_cache_misses = counts.misses.load();
         hits = std::move(ann);
         if (!unindexed.empty()) {
             out.plan.push_back(std::string("KNNVectorDistance: metric=") + metric_name + " (exact, " +
