@@ -63,8 +63,10 @@ jobs:
       # tests run and must pass; a binding built without S3 fails them by name.
       - name: Start the S3 server (moto)
         run: |
-          python3 -m pip install "moto[server]==5.2.4"
-          nohup python3 -m moto.server -H 127.0.0.1 -p 5055 > /tmp/moto.log 2>&1 &
+          # Its own venv: the system Python's apt boto3 / pyOpenSSL break against pip's cryptography.
+          python3 -m venv /tmp/motoenv
+          /tmp/motoenv/bin/pip install --quiet "moto[server]==5.2.4"
+          nohup /tmp/motoenv/bin/moto_server -H 127.0.0.1 -p 5055 > /tmp/moto.log 2>&1 &
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:5055/ > /dev/null && break; sleep 1; done
           curl -sf http://127.0.0.1:5055/ > /dev/null || { cat /tmp/moto.log; exit 1; }
           curl -sf -X PUT http://127.0.0.1:5055/nl-test
