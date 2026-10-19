@@ -134,6 +134,63 @@ struct Rows {
     const float* row(std::size_t i) const { return v.data() + i * d; }
 };
 
+/// Four rows (consecutive, `d` floats each, from `x0`) against every centroid of `ct` ([d][k]): their dot
+/// products into `acc` ([4][k], zeroed) and their squared norms into `xnorm`. Built for AVX2 too where the
+/// compiler can pick a version at load time; never with FMA, so every multiply and add rounds as in the
+/// baseline build and the results are bit-identical on every machine.
+#if defined(__x86_64__) && defined(__linux__) && defined(__GNUC__) && !defined(__clang__)
+__attribute__((target_clones("avx2", "default")))
+#endif
+void dot_block4(const float* x0, std::size_t d, const float* ct, std::size_t k, float* acc, float* xnorm) {
+    const float* x1 = x0 + d;
+    const float* x2 = x1 + d;
+    const float* x3 = x2 + d;
+    for (std::size_t j = 0; j < d; ++j) {
+        xnorm[0] += x0[j] * x0[j];
+        xnorm[1] += x1[j] * x1[j];
+        xnorm[2] += x2[j] * x2[j];
+        xnorm[3] += x3[j] * x3[j];
+    }
+    // Sixteen centroids at a time, their four rows' sums kept in registers across every dimension: each
+    // sum still adds the dimensions in order from zero, as the one-column-at-a-time loop does.
+    constexpr std::size_t kTile = 16;
+    std::size_t c0 = 0;
+    for (; c0 + kTile <= k; c0 += kTile) {
+        float a0[kTile] = {};
+        float a1[kTile] = {};
+        float a2[kTile] = {};
+        float a3[kTile] = {};
+        for (std::size_t j = 0; j < d; ++j) {
+            const float* w = ct + j * k + c0;
+            const float v0 = x0[j];
+            const float v1 = x1[j];
+            const float v2 = x2[j];
+            const float v3 = x3[j];
+            for (std::size_t c = 0; c < kTile; ++c) {
+                a0[c] += v0 * w[c];
+                a1[c] += v1 * w[c];
+                a2[c] += v2 * w[c];
+                a3[c] += v3 * w[c];
+            }
+        }
+        for (std::size_t c = 0; c < kTile; ++c) {
+            acc[c0 + c] = a0[c];
+            acc[k + c0 + c] = a1[c];
+            acc[2 * k + c0 + c] = a2[c];
+            acc[3 * k + c0 + c] = a3[c];
+        }
+    }
+    for (std::size_t j = 0; j < d && c0 < k; ++j) {  // the last k % 16 centroids
+        const float* col = ct + j * k;
+        for (std::size_t c = c0; c < k; ++c) {
+            acc[c] += x0[j] * col[c];
+            acc[k + c] += x1[j] * col[c];
+            acc[2 * k + c] += x2[j] * col[c];
+            acc[3 * k + c] += x3[j] * col[c];
+        }
+    }
+}
+
 /// Each of `x`'s rows' nearest centroid: smallest squared L2, or (dot) largest dot product.
 /// `dist` (optional) gets the squared L2 distance, or 1 - dot.
 void assign(const Rows& x, const std::vector<float>& centroids, std::size_t k, bool dot, std::vector<std::uint32_t>& label,
@@ -165,32 +222,7 @@ void assign(const Rows& x, const std::vector<float>& centroids, std::size_t k, b
             std::fill(acc.begin(), acc.begin() + static_cast<std::ptrdiff_t>(rows * k), 0.0F);
             float xnorm[kBlock] = {0.0F, 0.0F, 0.0F, 0.0F};
             if (rows == kBlock) {
-                const float* x0 = x.row(r0);
-                const float* x1 = x.row(r0 + 1U);
-                const float* x2 = x.row(r0 + 2U);
-                const float* x3 = x.row(r0 + 3U);
-                float* a0 = acc.data();
-                float* a1 = a0 + k;
-                float* a2 = a1 + k;
-                float* a3 = a2 + k;
-                for (std::size_t j = 0; j < d; ++j) {
-                    const float v0 = x0[j];
-                    const float v1 = x1[j];
-                    const float v2 = x2[j];
-                    const float v3 = x3[j];
-                    xnorm[0] += v0 * v0;
-                    xnorm[1] += v1 * v1;
-                    xnorm[2] += v2 * v2;
-                    xnorm[3] += v3 * v3;
-                    const float* col = ct.data() + j * k;
-                    for (std::size_t c = 0; c < k; ++c) {
-                        const float w = col[c];
-                        a0[c] += v0 * w;
-                        a1[c] += v1 * w;
-                        a2[c] += v2 * w;
-                        a3[c] += v3 * w;
-                    }
-                }
+                dot_block4(x.row(r0), d, ct.data(), k, acc.data(), xnorm);
             } else {
                 for (std::size_t i = 0; i < rows; ++i) {
                     const float* xr = x.row(r0 + i);
