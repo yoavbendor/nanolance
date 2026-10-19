@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <system_error>
 #include <unordered_map>
@@ -376,7 +377,8 @@ bool add_element_documents(const ArrowArrayView* text, const ArrowArrayView* add
 
 /// The documents of `batches` (column 0 text, column 1 row address), added in order.
 bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, const fts::Analyzer& analyzer,
-                   const AddressToRowId& to_row_id, Built& b, std::string& error) {
+                   const AddressToRowId& to_row_id, Built& b, std::string& error,
+                   const std::function<void(std::size_t rows)>* batch_done = nullptr) {
     for (auto& batch : batches) {
         ArrowArrayView view{};
         ArrowError e{};
@@ -393,6 +395,9 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
             ArrowArrayViewReset(&view);
             if (!ok) {
                 return false;
+            }
+            if (batch_done != nullptr) {
+                (*batch_done)(static_cast<std::size_t>(batch.length));
             }
             continue;
         }
@@ -425,6 +430,9 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
                             0U, counts);
         }
         ArrowArrayViewReset(&view);
+        if (batch_done != nullptr) {
+            (*batch_done)(rows);
+        }
     }
     return true;
 }
@@ -813,14 +821,25 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     built.with_positions = params.with_position;
     built.format_version = format;
     built.block_size = params.block_size;
-    const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
-    if (progress != nullptr) {
-        (*progress)(0, "tokenize_docs", 0, "rows", 0);
-    }
-    if (target != nullptr && target->rows != nullptr && !target->rows->empty()) {
+    // Pylance's stages: load_data (the documents, an old segment's first), tokenize_docs (one progress
+    // event per batch, the documents counted so far), copy_partitions (the partition's files; this build
+    // writes one partition), write_metadata. Each event carries the stage's total, and "complete" the last
+    // count. Without a callback the work and its order are the same.
+    const index_build::Progress* progress = target != nullptr ? target->progress : (options.progress ? &options.progress : nullptr);
+    const auto report = [&](int event, const char* name, std::uint64_t total, const char* unit, std::uint64_t completed) {
+        if (progress != nullptr) {
+            (*progress)(event, name, total, unit, completed);
+        }
+    };
+    const bool old_rows = target != nullptr && target->rows != nullptr && !target->rows->empty();
+    const bool scan = request.fragment_ids == nullptr || !request.fragment_ids->empty();
+    OwnedSchema taken;
+    index_files::OwnedBatches rows;
+    OwnedSchema scanned;
+    index_files::OwnedBatches batches;
+    report(0, "load_data", 0, "rows", 0);
+    if (old_rows) {
         // An old segment's documents first, deleted or not.
-        OwnedSchema taken;
-        index_files::OwnedBatches rows;
         LanceScanRequest by_address = request;
         by_address.fragment_ids = nullptr;
         std::vector<std::uint64_t> addresses = *target->rows;
@@ -836,25 +855,31 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
             }
             addresses.erase(std::remove(addresses.begin(), addresses.end(), UINT64_MAX), addresses.end());
         }
-        if (!lance_dataset_take_rows(dataset_path, by_address, addresses, taken.s, rows.v, error) ||
-            !is_text(taken.s) || !add_documents(taken.s, rows.v, analyzer, to_row_id, built, error)) {
+        if (!lance_dataset_take_rows(dataset_path, by_address, addresses, taken.s, rows.v, error)) {
             return false;
         }
     }
-    if (request.fragment_ids == nullptr || !request.fragment_ids->empty()) {
-        OwnedSchema scanned;
-        index_files::OwnedBatches batches;
-        if (!lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error) || !is_text(scanned.s) ||
-            !add_documents(scanned.s, batches.v, analyzer, to_row_id, built, error)) {
-            return false;
-        }
+    if (scan && !lance_dataset_scan(dataset_path, request, scanned.s, batches.v, error)) {
+        return false;
     }
+    report(2, "load_data", 0, "rows", 0);
 
-    if (progress != nullptr) {
-        (*progress)(2, "tokenize_docs", 0, "", 0);
+    std::uint64_t tokenized = 0;
+    const std::function<void(std::size_t)> counted = [&](std::size_t rows_done) {
+        tokenized += rows_done;
+        report(1, "tokenize_docs", 0, "rows", tokenized);
+    };
+    const std::function<void(std::size_t)>* counted_ptr = progress != nullptr ? &counted : nullptr;
+    report(0, "tokenize_docs", 0, "rows", 0);
+    if (old_rows && (!is_text(taken.s) || !add_documents(taken.s, rows.v, analyzer, to_row_id, built, error, counted_ptr))) {
+        return false;
     }
+    if (scan && (!is_text(scanned.s) || !add_documents(scanned.s, batches.v, analyzer, to_row_id, built, error, counted_ptr))) {
+        return false;
+    }
+    report(2, "tokenize_docs", 0, "rows", tokenized);
 
-    // The files.
+    // The files: the partition's (copy_partitions), then the metadata (write_metadata).
     const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : index_files::new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
     std::error_code ec;
@@ -864,13 +889,22 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
         return false;
     }
     std::vector<WrittenFile> files;
-    if (!index_build::stage(progress, "write_metadata", 4, "files", [&] {
-            return write_postings(dir, built, files, error) && write_tokens(dir, built, files, error) &&
-                   write_docs(dir, built, files, error) && write_metadata(dir, params, files, error);
-        })) {
+    report(0, "copy_partitions", 1, "partitions", 0);
+    if (!(write_postings(dir, built, files, error) && write_tokens(dir, built, files, error) &&
+          write_docs(dir, built, files, error))) {
         std::filesystem::remove_all(dir, ec);
         return false;
     }
+    report(1, "copy_partitions", 1, "partitions", 1);
+    report(2, "copy_partitions", 1, "partitions", 1);
+
+    report(0, "write_metadata", 1, "files", 0);
+    if (!write_metadata(dir, params, files, error)) {
+        std::filesystem::remove_all(dir, ec);
+        return false;
+    }
+    report(1, "write_metadata", 1, "files", 1);
+    report(2, "write_metadata", 1, "files", 1);
 
     // The manifest entry.
     std::vector<std::uint32_t> fragment_ids;

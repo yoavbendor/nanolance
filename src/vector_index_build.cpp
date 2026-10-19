@@ -1048,35 +1048,27 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             return true;
         }
     }
+    const bool shuffle_first = model != nullptr && target->rebalance_target != 0U;
     std::vector<std::uint32_t> label;
-    index_build::stage(progress, "shuffle", data.n, "rows", [&] {
-        assign(data, centroids, partitions, dot_metric, label, nullptr);
-        if (model != nullptr && target->rebalance_target != 0U) {
-            adjust_partitions(data, centroids, partitions, label, target->rebalance_target, dot_metric,
-                              options.max_iters);
-        }
-        return true;
-    });
-    std::vector<std::uint64_t> lengths(partitions, 0);
-    for (const auto l : label) {
-        ++lengths[l];
+    bool labelled = false;  // the codebook's sample covered every row: the labels are complete already
+    const auto shuffle = [&] {
+        index_build::stage(progress, "shuffle", data.n, "rows", [&] {
+            if (!labelled) {
+                assign(data, centroids, partitions, dot_metric, label, nullptr);
+            }
+            if (model != nullptr && target->rebalance_target != 0U) {
+                adjust_partitions(data, centroids, partitions, label, target->rebalance_target, dot_metric,
+                                  options.max_iters);
+            }
+            if (progress != nullptr) {  // every row is labelled
+                (*progress)(1, "shuffle", data.n, "rows", data.n);
+            }
+            return true;
+        });
+    };
+    if (shuffle_first) {
+        shuffle();
     }
-    std::vector<std::uint64_t> offsets(partitions, 0);
-    for (std::size_t p = 1; p < partitions; ++p) {
-        offsets[p] = offsets[p - 1] + lengths[p - 1];
-    }
-    std::vector<std::size_t> order(data.n);  // rows grouped by partition, ascending address within
-    {
-        auto at = offsets;
-        for (std::size_t r = 0; r < data.n; ++r) {
-            order[at[label[r]]++] = r;
-        }
-    }
-    std::vector<std::uint64_t> sorted_ids(data.n);
-    for (std::size_t i = 0; i < data.n; ++i) {
-        sorted_ids[i] = ids[order[i]];
-    }
-
     // PQ: a codebook per sub-vector from a sample of residuals; every row's codes.
     const std::size_t m = pq ? options.num_sub_vectors : 0U;
     const std::size_t w = pq ? dim / m : 0U;
@@ -1085,14 +1077,14 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     std::vector<std::uint8_t> codes;       // per partition: [code_bytes][n_p], partitions in order
     std::vector<std::uint8_t> pq_rows;     // HNSW over PQ codes: [row][code_bytes], rows in `order`
     std::vector<float> pq_table;           // HNSW over PQ codes: Lance's pairwise table
+    const auto residual = [&](std::size_t r, float* out) {
+        const float* v = data.row(r);
+        const float* c = centroids.data() + static_cast<std::size_t>(label[r]) * dim;
+        for (std::size_t j = 0; j < dim; ++j) {
+            out[j] = dot_metric ? v[j] : v[j] - c[j];
+        }
+    };
     if (pq) {
-        const auto residual = [&](std::size_t r, float* out) {
-            const float* v = data.row(r);
-            const float* c = centroids.data() + static_cast<std::size_t>(label[r]) * dim;
-            for (std::size_t j = 0; j < dim; ++j) {
-                out[j] = dot_metric ? v[j] : v[j] - c[j];
-            }
-        };
         codebook.resize(m * nc * w);
         if (progress != nullptr) {
             (*progress)(0, "train_quantizer", 0, "", 0);
@@ -1100,7 +1092,18 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         if (model != nullptr && model->has_codebook) {
             codebook = model->codebook;
         } else {
+        if (!shuffle_first) {
+            label.resize(data.n);  // the sample's rows are labelled below; the shuffle labels every row later
+        }
         const auto picked = sample_indices(data.n, std::size_t{options.sample_rate} * nc, rng);
+        if (!shuffle_first) {
+            std::vector<std::uint32_t> picked_label;
+            assign(gather(data, picked), centroids, partitions, dot_metric, picked_label, nullptr);
+            for (std::size_t i = 0; i < picked.size(); ++i) {
+                label[picked[i]] = picked_label[i];
+            }
+            labelled = picked.size() == data.n;  // a sample of every row (k >= n) is the identity order
+        }
         std::vector<float> res(dim);
         std::vector<Rows> subs(m);
         for (std::size_t s = 0; s < m; ++s) {
@@ -1131,6 +1134,31 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         if (progress != nullptr) {
             (*progress)(2, "train_quantizer", 0, "", 0);
         }
+    }
+    if (!shuffle_first) {
+        shuffle();
+    }
+    std::vector<std::uint64_t> lengths(partitions, 0);
+    for (const auto l : label) {
+        ++lengths[l];
+    }
+    std::vector<std::uint64_t> offsets(partitions, 0);
+    for (std::size_t p = 1; p < partitions; ++p) {
+        offsets[p] = offsets[p - 1] + lengths[p - 1];
+    }
+    std::vector<std::size_t> order(data.n);  // rows grouped by partition, ascending address within
+    {
+        auto at = offsets;
+        for (std::size_t r = 0; r < data.n; ++r) {
+            order[at[label[r]]++] = r;
+        }
+    }
+    std::vector<std::uint64_t> sorted_ids(data.n);
+    for (std::size_t i = 0; i < data.n; ++i) {
+        sorted_ids[i] = ids[order[i]];
+    }
+
+    if (pq) {
         if (trained != nullptr) {
             trained->codebook = codebook;
             trained->has_codebook = true;
@@ -1532,7 +1560,14 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         details = *target->details;
     }
     if (progress != nullptr) {
-        (*progress)(2, "merge_partitions", 0, "", 0);
+        if (!hnsw) {  // the files hold every partition: each is reported once they are written
+            for (std::size_t p = 1; p <= partitions; ++p) {
+                (*progress)(1, "merge_partitions", partitions, "partitions", p);
+            }
+            (*progress)(2, "merge_partitions", partitions, "partitions", partitions);
+        } else {
+            (*progress)(2, "merge_partitions", 0, "", 0);
+        }
     }
     auto entry = pb::make_index_metadata(uuid, {field->id}, name, version, fragment_ids,
                                          "/lance.index.pb.VectorIndexDetails", 1, static_cast<std::uint64_t>(now),

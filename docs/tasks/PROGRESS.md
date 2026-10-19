@@ -104,3 +104,15 @@ Tails of: the five target tests run with pytest through nanolance; `python3 -m p
 bindings/python/tests/test_progress.py | tail -2`; `python3 tools/pylance_suite.py | tail -4`; last,
 once: `cd bindings/python && python3 -m pytest -o addopts= -q -x -p no:cacheprovider tests | tail -3`.
 Report under 40 lines: questions first, then files, per-test status, tails, decisions.
+
+**Outcome (2026-10-19):** done in one Haiku session (stopped once on three design questions, answered by
+the reviewer); reviewed. INVERTED builds report `load_data`, `tokenize_docs` (per batch),
+`copy_partitions`, `write_metadata`, as pylance does, an error raised by the last completion ignored;
+IVF_PQ trains the quantizer before the shuffle (the sample labelled alone; index files byte-identical to
+before on both sample paths); staged writers report each data file (begin when its first rows are
+buffered, complete when written), so `write_dataset`, `LanceFragment.create` and `write_fragments` call
+`FragmentWriteProgress`. The five targets and `test_write_fragment_with_progress` pass (expected list
+1210). Review: vector builds A/B 1.05x / 1.03x (noise), ctest 67/67. Differences kept: begin carries the
+planned file (pylance's has none); on append nanolance also calls complete (pylance calls only begin);
+k-means iterations are not reported per iteration. `test_fragment.py::test_dataset_progress`'s failing
+write runs in a spawn child on real pylance; `tests/test_progress.py` checks that case in-process.

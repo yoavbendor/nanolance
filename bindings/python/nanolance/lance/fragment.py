@@ -414,7 +414,8 @@ class LanceFragment(pa.dataset.Fragment):
         data_storage_version = _storage_version(data_storage_version, use_legacy_format)
         fragments, _ = _write_uncommitted(data, dataset_uri, schema, mode=mode, max_rows_per_file=None,
                                           max_bytes_per_file=None, progress=progress,
-                                          data_storage_version=data_storage_version, single=True)
+                                          data_storage_version=data_storage_version, single=True,
+                                          fragment_id=fragment_id)
         fragment = fragments[0]
         if fragment_id is not None:
             fragment.id = int(fragment_id)
@@ -791,7 +792,7 @@ def _storage_version(data_storage_version: Optional[str], use_legacy_format: Opt
 def _write_uncommitted(data, dataset_uri, schema, *, mode: str, max_rows_per_file: Optional[int],
                        max_bytes_per_file: Optional[int], progress, data_storage_version: Optional[str],
                        single: bool = False, external_blob_mode: str = "reference",
-                       allow_external_blob_outside_bases: bool = False, base_setup=None):
+                       allow_external_blob_outside_bases: bool = False, base_setup=None, fragment_id=None):
     """Write `data` as data files under `dataset_uri` without committing them: the fragments (ids 0,
     to be assigned at commit) and the schema they were written with (a LanceSchema)."""
     from nanolance.lance.dataset import LanceDataset, _coerce_reader, _path_of, _stage_write
@@ -809,7 +810,7 @@ def _write_uncommitted(data, dataset_uri, schema, *, mode: str, max_rows_per_fil
                                       max_rows_per_file=max_rows_per_file, max_bytes_per_file=max_bytes_per_file,
                                       external_blob_mode=external_blob_mode,
                                       allow_external_blob_outside_bases=allow_external_blob_outside_bases,
-                                      keep_empty=False, setup=base_setup)
+                                      keep_empty=False, setup=base_setup, progress=progress, fragment_id=fragment_id)
     with native():
         messages, fields = writer.take(False)
     fragments = [_decode_fragment(m) for m in messages]
@@ -818,10 +819,6 @@ def _write_uncommitted(data, dataset_uri, schema, *, mode: str, max_rows_per_fil
             raise OSError("Invalid user input: Cannot write a fragment with no rows")
         if len(fragments) > 1:  # one fragment, however many files the writer cut
             raise OSError("LanceFragment.create wrote more than one data file")
-    if progress is not None:
-        for fragment in fragments:
-            progress.begin(fragment)
-            progress.complete(fragment)
     lance_schema = LanceSchema._from_messages(list(fields), {k.decode(): v.decode()
                                                              for k, v in (reader.schema.metadata or {}).items()})
     return fragments, lance_schema

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -109,6 +110,11 @@ struct InvertedIndexOptions {
     fts::AnalyzerParams params;
     /// ListElement: one document per element of a list<string> column (Lance's v3 docs layout).
     DocGranularity granularity = DocGranularity::Row;
+    /// Where the build reports its stages (start, progress, complete: index_build::Progress); nothing when
+    /// empty. Called on the building thread, so a callback costs nothing when it is unset.
+    std::function<void(int event, const char* stage, std::uint64_t total, const char* unit,
+                       std::uint64_t completed)>
+        progress;
 };
 
 /// Build an INVERTED index on `column` (a string column) in Lance's format -- one pylance and LanceDB

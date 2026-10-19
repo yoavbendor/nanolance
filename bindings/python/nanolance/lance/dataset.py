@@ -1384,15 +1384,26 @@ class LanceDataset(pa.dataset.Dataset):
 
     def _create_inverted_index(self, column, name, replace, kwargs) -> "LanceDataset":
         refuse_object_store_write(self._uri, "create inverted index")
+        progress_callback = kwargs.pop("progress_callback", None)
         granularity = self._document_granularity(kwargs)
         params = self._inverted_params(kwargs)
         if isinstance(column, (list, tuple)):
             if len(column) != 1:
                 raise unsupported("an index over more than one column")
             column = column[0]
+        native_progress = None
+        if progress_callback is not None:
+            from nanolance.lance.progress import IndexProgress
+
+            events = ("start", "progress", "complete")
+
+            def native_progress(event, stage, total, unit, completed):
+                # Every event carries its count: complete reports the stage's last one, as pylance's does.
+                progress_callback(IndexProgress(events[event], stage, completed, total or None, unit))
         with _lance_errors():
+            extra = () if native_progress is None else (native_progress,)  # the callback only when given
             _nanolance._ds_create_inverted_index(self._uri, str(column), name or "", bool(replace), params,
-                                                 granularity)
+                                                 granularity, *extra)
         self._refresh_latest("CreateIndex")
         return self
 
@@ -1732,8 +1743,7 @@ class LanceDataset(pa.dataset.Dataset):
 
             def native_progress(event, stage, total, unit, completed):
                 try:
-                    progress_callback(IndexProgress(events[event], stage, completed if event == 1 else None,
-                                                    total or None, unit or None))
+                    progress_callback(IndexProgress(events[event], stage, completed, total or None, unit or None))
                 except BaseException as exc:
                     callback_errors.append(exc)  # the build stops; the callback's error is raised as is
                     raise
@@ -4536,7 +4546,7 @@ def write_dataset(
         _native_log.writing(shown, "Append" if append else ("Overwrite" if exists else "Create"))
         before_files = _native_log.data_files(path)
     with _native_log.quiet():
-        writer, _ = _stage_write(path, reader, mode=mode, max_rows_per_file=max_rows_per_file,
+        writer, _ = _stage_write(path, reader, mode=mode, progress=progress, max_rows_per_file=max_rows_per_file,
                                  max_bytes_per_file=max_bytes_per_file, external_blob_mode=external_blob_mode,
                                  allow_external_blob_outside_bases=allow_external_blob_outside_bases, setup=setup)
     with native():
@@ -4588,9 +4598,27 @@ def _set_base_plan(writer, initial_bases, targets, exists: bool) -> None:
                                         [int(base_id) for _, base_id in targets])
 
 
+def _file_events(progress, fragment_id):
+    """The writer's data-file events as a FragmentWriteProgress sees them (pylance's begin and complete): a
+    file begins with its first rows, under the name it will have, and completes once written."""
+    from nanolance.lance.fragment import DataFile, FragmentMetadata
+
+    def events(event: int, name: str, rows: int) -> None:
+        fragment = FragmentMetadata(id=0 if fragment_id is None else int(fragment_id),
+                                    files=[DataFile(path=name, fields=[])],
+                                    physical_rows=rows if event == 2 else None)
+        if event == 0:
+            progress.begin(fragment)
+        else:
+            progress.complete(fragment)
+
+    return events
+
+
 def _stage_write(path: str, reader: pa.RecordBatchReader, *, mode: str, max_rows_per_file: Optional[int],
                  max_bytes_per_file: Optional[int], external_blob_mode: str = "reference",
-                 allow_external_blob_outside_bases: bool = False, setup=None, keep_empty: bool = True):
+                 allow_external_blob_outside_bases: bool = False, setup=None, keep_empty: bool = True,
+                 progress=None, fragment_id=None):
     """Write `reader`'s rows as staged data files under `path` (none published): appended to the
     dataset's schema with mode "append" on a dataset that exists, a new schema otherwise. Returns the
     writer -- for its finish() to commit the files or take() to hand them over -- and the rows written."""
@@ -4615,6 +4643,9 @@ def _stage_write(path: str, reader: pa.RecordBatchReader, *, mode: str, max_rows
         target = pa.schema([f for f in target if f.name in reader.schema.names], metadata=target.metadata)
         with native():
             writer.project(target.names)
+    if progress is not None:
+        with native():
+            writer.set_file_events(_file_events(progress, fragment_id))
     wrote = False
     rows = 0
     limit = int(max_rows_per_file or 0)

@@ -329,6 +329,7 @@ tests/test_dataset.py::test_dataset_drop_rejects_paths_without_readable_manifest
 tests/test_dataset.py::test_dataset_drop_rejects_paths_without_readable_manifest[entries2]
 tests/test_dataset.py::test_dataset_from_record_batch_iterable
 tests/test_dataset.py::test_dataset_overwrite
+tests/test_dataset.py::test_dataset_progress
 tests/test_dataset.py::test_dataset_restore
 tests/test_dataset.py::test_dataset_schema
 tests/test_dataset.py::test_dataset_sql
@@ -544,6 +545,7 @@ tests/test_filter.py::test_timestamp_pyarrow_predicates[UTC-s]
 tests/test_filter.py::test_timestamp_pyarrow_predicates[UTC-us]
 tests/test_fork.py::test_table_roundtrip
 tests/test_fragment.py::test_create_from_file
+tests/test_fragment.py::test_dataset_progress
 tests/test_fragment.py::test_deletion_file_with_base_id_serialization
 tests/test_fragment.py::test_fragment_count_rows
 tests/test_fragment.py::test_fragment_create_with_json_column
@@ -951,6 +953,8 @@ tests/test_scalar_index.py::test_compare_fts_results_different_scores
 tests/test_scalar_index.py::test_compare_fts_results_identical
 tests/test_scalar_index.py::test_create_index_empty_dataset
 tests/test_scalar_index.py::test_create_inverted_index_explicit_format_version_overrides_env
+tests/test_scalar_index.py::test_create_inverted_index_progress_callback
+tests/test_scalar_index.py::test_create_inverted_index_progress_callback_error_after_completion_is_ignored
 tests/test_scalar_index.py::test_create_inverted_index_rejects_invalid_env_format_version
 tests/test_scalar_index.py::test_create_inverted_index_rejects_invalid_format_version
 tests/test_scalar_index.py::test_create_inverted_index_uses_env_format_version[1-creation_options0-1]
@@ -1142,6 +1146,7 @@ tests/test_vector_index.py::test_create_dot_index
 tests/test_vector_index.py::test_create_index_accelerator_fallback
 tests/test_vector_index.py::test_create_index_dot
 tests/test_vector_index.py::test_create_index_progress_callback_error_before_completion_propagates
+tests/test_vector_index.py::test_create_index_progress_callback_vector
 tests/test_vector_index.py::test_create_ivf_pq_skip_transpose
 tests/test_vector_index.py::test_create_ivf_pq_with_target_partition_size
 tests/test_vector_index.py::test_create_ivf_sq_index

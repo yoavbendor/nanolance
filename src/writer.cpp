@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
 #include <filesystem>
 #include <optional>
 #include <memory>
@@ -67,6 +68,10 @@ struct WriterState {
     /// Staged mode (NanoLanceWriteOptions::stage_fragments): a commit writes its data file and stages
     /// the fragment; nano_lance_writer_finish publishes them all as one version.
     bool stage = false;
+    /// A progress tracker's data-file events (writer_set_file_events): begin (0) when a file's first rows
+    /// are buffered, its name chosen then; complete (2) once the file is written.
+    std::function<void(int, const std::string&, std::uint64_t)> file_events;
+    std::string open_file_name;
     std::vector<nano_lance::NewFragment> staged;
     nano_lance::LanceSchemaMapping staged_schema;  // the on-disk schema the staged files were written with
     /// The Arrow schema metadata of the first batch, recorded in the manifest.
@@ -924,6 +929,10 @@ int nano_lance_write_batch(NanoLanceWriter* writer, struct ArrowArray* batch, st
         }
     }
 
+    if (state->file_events && state->pending_rows == 0 && batch->length > 0) {
+        state->open_file_name = new_data_file_name();
+        state->file_events(0, state->open_file_name, 0);
+    }
     ++state->pending_batches;
     state->pending_rows += static_cast<std::uint64_t>(batch->length);
     if (state->max_pending_bytes != 0U && state->pending_rows != 0U &&
@@ -1224,7 +1233,9 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     }
 
     nano_lance::DataFileResult data_file;
-    const auto data_file_name = new_data_file_name();
+    // A file a progress tracker began keeps its name.
+    const auto data_file_name = state->open_file_name.empty() ? new_data_file_name() : state->open_file_name;
+    state->open_file_name.clear();
     nano_lance::LanceFileExtras file_extras;
     file_extras.blob_pack_file_size = state->blob_pack_file_size;
     file_extras.schema_metadata = state->schema_metadata;  // Lance writes it into every data file
@@ -1255,6 +1266,9 @@ int commit_pending(NanoLanceWriter* writer, WriterState* state, bool is_append) 
     if (state->stage) {
         state->staged.push_back(nano_lance::NewFragment{data_file, state->pending_rows, base_id});
         state->staged_schema = disk_schema;
+        if (state->file_events) {
+            state->file_events(2, data_file_name, state->pending_rows);
+        }
     } else {
         std::uint64_t version = 0;
         nano_lance::CommitExtras extras;
@@ -1515,6 +1529,17 @@ bool writer_project_append(NanoLanceWriter* writer, const std::vector<std::strin
     renumber_columns_for_one_file(projected);
     state->schema_mapping = std::move(projected);
     reset_column_values(*state);
+    return true;
+}
+
+bool writer_set_file_events(NanoLanceWriter* writer, std::function<void(int, const std::string&, std::uint64_t)> events,
+                            std::string& error) {
+    auto* state = state_from(writer);
+    if (state == nullptr || !state->stage) {
+        error = "not a staged writer";
+        return false;
+    }
+    state->file_events = std::move(events);
     return true;
 }
 

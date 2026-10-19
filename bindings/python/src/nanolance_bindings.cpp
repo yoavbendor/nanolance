@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -780,6 +781,7 @@ public:
             }
             pending_ = 0;
         }
+        raise_pending();
     }
 
     /// An append that covers only these top-level columns (the rest read as null).
@@ -840,6 +842,35 @@ public:
     /// The staged data files as fragments (lance.table.DataFragment messages, ids not yet assigned)
     /// and the schema they were written with (lance.file.Field messages) -- for a commit made apart
     /// (LanceFragment.create / write_fragments) instead of finish().
+    /// A progress tracker's data-file events: events(event, file name, rows), 0 begin and 2 complete, called
+    /// with the GIL held. An error it raises is kept and raised by the call that reported it, after the
+    /// write has stopped at that point.
+    void set_file_events(nb::object events) {
+        std::string error;
+        auto callback = [this, events_fn = nb::object(events)](int event, const std::string& name,
+                                                              std::uint64_t rows) {
+            nb::gil_scoped_acquire acquire;
+            try {
+                events_fn(event, name, rows);
+            } catch (nb::python_error&) {
+                if (!pending_error_) {
+                    pending_error_ = std::current_exception();
+                }
+            }
+        };
+        if (!nano_lance::writer_set_file_events(&writer_, callback, error)) {
+            throw_dataset(error);
+        }
+    }
+
+    void raise_pending() {
+        if (pending_error_) {
+            const auto error = pending_error_;
+            pending_error_ = nullptr;
+            std::rethrow_exception(error);
+        }
+    }
+
     nb::tuple take(bool keep_empty) {
         std::vector<nano_lance::NewFragment> files;
         nano_lance::LanceSchemaMapping mapping;
@@ -850,6 +881,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             ok = nano_lance::writer_take_staged(&writer_, files, mapping, error, keep_empty);
         }
+        raise_pending();
         if (!ok) {
             throw_dataset(error);
         }
@@ -881,6 +913,7 @@ public:
                 rc = nano_lance_writer_finish(&writer_, mode, &version);
             }
         }
+        raise_pending();
         if (rc != NANO_LANCE_OK) {
             throw_lance_writer("commit", rc, &writer_);
         }
@@ -895,6 +928,7 @@ private:
     std::int64_t pending_ = 0;
     bool open_ = false;
     std::mutex mutex_;
+    std::exception_ptr pending_error_;  // raised by the next call (set_file_events)
 };
 
 
@@ -1381,6 +1415,7 @@ NB_MODULE(_nanolance, m) {
              nb::arg("path"), nb::arg("options"), nb::arg("append"), nb::arg("max_rows_per_file"),
              nb::arg("max_bytes_per_file"))
         .def("write_batch", &StagedWriter::write_batch)
+        .def("set_file_events", &StagedWriter::set_file_events)
         .def("project", &StagedWriter::project)
         .def("set_initial_config", &StagedWriter::set_initial_config)
         .def("set_initial_bases", &StagedWriter::set_initial_bases)
@@ -1751,7 +1786,7 @@ NB_MODULE(_nanolance, m) {
     });
     m.def("_ds_create_inverted_index", [](const std::filesystem::path& path, const std::string& column,
                                           const std::string& name, bool replace, const std::string& params,
-                                          const std::string& granularity) {
+                                          const std::string& granularity, nb::object progress) {
         nano_lance::InvertedIndexOptions options;
         options.name = name;
         options.replace = replace;
@@ -1764,12 +1799,31 @@ NB_MODULE(_nanolance, m) {
         } else if (granularity != "row") {
             throw nb::value_error("unknown document granularity");
         }
+        if (!progress.is_none()) {
+            // Called with the GIL held, as the vector build's callback is. An exception it raises unwinds the
+            // build and nothing is committed, except one raised by the last stage's completion: the index
+            // is committed by then, and pylance ignores that error.
+            options.progress = [callback = nb::object(progress)](int event, const char* stage, std::uint64_t total,
+                                                                 const char* unit, std::uint64_t completed) {
+                nb::gil_scoped_acquire acquire;
+                if (event == 2 && std::string_view(stage) == "write_metadata") {
+                    try {
+                        callback(event, std::string(stage), total, std::string(unit), completed);
+                    } catch (nb::python_error&) {
+                        // ignored: pylance does not raise it
+                    }
+                    return;
+                }
+                callback(event, std::string(stage), total, std::string(unit), completed);
+            };
+        }
         std::uint64_t version = 0;
         run_op([&](std::string& e) {
             return nano_lance::dataset_create_inverted_index(path, column, options, version, e);
         });
         return version;
-    });
+    }, nb::arg("path"), nb::arg("column"), nb::arg("name"), nb::arg("replace"), nb::arg("params"),
+       nb::arg("granularity"), nb::arg("progress") = nb::none());
     // lance.tokenize: the analyzer the params JSON describes, run on `text`; (text, position) pairs with
     // the positions as the index counts them (Python makes them relative to the first token).
     m.def("_fts_tokenize", [](const std::string& params, const std::string& text) {
