@@ -42,6 +42,21 @@ bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint6
 /// Load the manifest in one `_versions` file (any naming scheme, detached ones included).
 bool load_manifest_file(const std::filesystem::path& manifest_path, pb::Manifest& out, std::string& error);
 
+/// The same manifest read with no feature-flag check. Only dataset-root detection in drop uses it:
+/// Lance's drop accepts a manifest it would refuse to read (measured on pylance 12.0.0).
+bool load_manifest_file_unchecked(const std::filesystem::path& manifest_path, pb::Manifest& out,
+                                  std::string& error);
+
+/// Lance 12's feature-flag checks (lance-table feature_flags.rs). The paired bit 8 must be set in both
+/// words or neither (else the manifest is corrupt); a read refuses a reader word with a bit outside
+/// kSupportedFeatureFlags; a write refuses the same for the writer word. `error` is pylance's message.
+enum class WriteKind {
+    Insert,  // an append or overwrite through the writer (pylance's insert path wording)
+    Commit,  // any other commit: delete, update, merge_insert, compaction, index builds, ...
+};
+bool check_manifest_readable(const pb::Manifest& manifest, std::string& error);
+bool check_manifest_writable(const pb::Manifest& manifest, WriteKind kind, std::string& error);
+
 bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifest& out, std::uint64_t& version_out,
                           std::string& error);
 

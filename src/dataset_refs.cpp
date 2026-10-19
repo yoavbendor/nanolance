@@ -873,7 +873,7 @@ bool drop_dataset(const fs::path& dataset_path, bool ignore_not_found, std::stri
         }
         pb::Manifest manifest;
         std::string read_error;
-        qualifies = load_manifest_file(entry.path(), manifest, read_error);
+        qualifies = load_manifest_file_unchecked(entry.path(), manifest, read_error);
     }
     if (!qualifies) {
         error = "Invalid user input: Refusing to drop '" + dataset_path.generic_string() +

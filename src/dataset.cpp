@@ -186,6 +186,22 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
     if (read_version == 0U && !dataset_latest_version(dataset_path, read_version, error)) {
         return false;
     }
+    // Refused before anything is written. The message names the base's writer word, as Lance does: this
+    // commit may have set a known bit of its own (a deletion file) on the copy it publishes.
+    if (!check_manifest_writable(manifest, WriteKind::Commit, error)) {
+        const std::string own_error = error;
+        pb::Manifest base;
+        std::string base_error;
+        if (!load_manifest_version(dataset_path, read_version, base, base_error)) {
+            error = base_error;
+            return false;
+        }
+        if (!check_manifest_writable(base, WriteKind::Commit, error)) {
+            return false;
+        }
+        error = own_error;
+        return false;
+    }
     manifest.version = read_version + 1U;
     manifest.has_timestamp = true;
     const auto nanos =
@@ -216,6 +232,9 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
         std::uint64_t latest_version = 0;
         error.clear();
         if (!load_latest_manifest(dataset_path, latest, latest_version, error)) {
+            return false;
+        }
+        if (!check_manifest_writable(latest, WriteKind::Commit, error)) {
             return false;
         }
         pb::Manifest rebased = manifest;

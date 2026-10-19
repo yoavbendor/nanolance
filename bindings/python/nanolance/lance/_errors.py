@@ -18,9 +18,21 @@ def unsupported(what: str) -> NotSupportedError:
     return NotSupportedError(f"nanolance.lance does not support {what}")
 
 
+# Manifest feature flags this build does not support, as pylance raises them. The native message carries
+# the prefix of the call that failed, so the message is cut down to pylance's text.
+_FEATURE_FLAG_ERRORS = (
+    ("Not supported: This dataset cannot be read by", ValueError),
+    ("Not supported: This dataset cannot be written by", OSError),
+    ("Encountered corrupt file manifest:", ValueError),
+)
+
+
 def translate(message: str) -> Exception:
     text = str(message)
     lower = text.lower()
+    for marker, kind in _FEATURE_FLAG_ERRORS:
+        if marker in text:
+            return kind(text[text.index(marker):])
     # Filter errors, as pylance words them (DataFusion's planner behind "Invalid user input").
     import re
 
@@ -57,6 +69,23 @@ def translate(message: str) -> Exception:
     if "failed to open" in lower or "failed to read" in lower or "i/o" in lower:
         return OSError(text)
     return ValueError(text)
+
+
+def index_build(fn):
+    """pylance raises NotImplementedError, not OSError, when an index build meets a writer feature flag
+    it does not support (create_scalar_index and create_index; measured on pylance 12.0.0)."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except OSError as exc:
+            if str(exc).startswith("Not supported: This dataset cannot be written by"):
+                raise NotImplementedError(str(exc)) from None
+            raise
+
+    return wrapper
 
 
 @contextlib.contextmanager

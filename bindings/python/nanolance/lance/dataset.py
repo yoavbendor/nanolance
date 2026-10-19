@@ -27,7 +27,7 @@ import pyarrow.dataset
 
 from nanolance import _nanolance
 from nanolance.lance import _native_log
-from nanolance.lance._errors import NotSupportedError, native, unsupported
+from nanolance.lance._errors import NotSupportedError, index_build, native, unsupported
 from nanolance.lance._sql import SqlQueryBuilder
 from nanolance.lance.base_path import (_base_data_dir, _DatasetBases, _fragment_targets, _new_base_dicts)
 from nanolance.lance._session import Session, note_data_files, note_indexes, note_manifest
@@ -1154,6 +1154,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     # ── indices ───────────────────────────────────────────────────────────────────────────────────
 
+    @index_build
     def create_scalar_index(self, column: str, index_type: str, name: Optional[str] = None, *,
                             replace: bool = True, train: bool = True, fragment_ids: Optional[List[int]] = None,
                             index_uuid: Optional[str] = None, **kwargs) -> "LanceDataset":
@@ -1594,6 +1595,7 @@ class LanceDataset(pa.dataset.Dataset):
     # The kinds nanolance builds (create_index, create_index_uncommitted); IVF_RQ is not built yet.
     _BUILDABLE_VECTOR_INDEX_TYPES = ("IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ")
 
+    @index_build
     def create_index(self, column, index_type: str, name: Optional[str] = None, metric: str = "L2",
                      replace: bool = False, num_partitions: Optional[int] = None, ivf_centroids=None,
                      pq_codebook=None, num_sub_vectors: Optional[int] = None, accelerator=None,

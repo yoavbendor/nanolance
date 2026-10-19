@@ -1202,6 +1202,9 @@ bool dataset_commit_hand_built(const std::filesystem::path& dataset_path, const 
     if (exists && !load_manifest_version(dataset_path, commit.base_version, base, error)) {
         return false;
     }
+    if (exists && !check_manifest_writable(base, WriteKind::Commit, error)) {
+        return false;
+    }
     pb::Manifest next;
     if (op.kind == kRestore) {
         if (!exists) {

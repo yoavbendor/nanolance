@@ -189,9 +189,22 @@ std::vector<std::uint64_t> list_manifest_versions(const std::filesystem::path& d
 
 namespace {
 
+/// Bit 8 must be set in both words or in neither; otherwise the manifest is corrupt (Lance checks this
+/// before the read and the write checks).
+bool check_paired_flags(const pb::Manifest& manifest, std::string& error) {
+    const bool reader_bit = (manifest.reader_feature_flags & pb::kFlagMixedDataFileVersions) != 0U;
+    const bool writer_bit = (manifest.writer_feature_flags & pb::kFlagMixedDataFileVersions) != 0U;
+    if (reader_bit != writer_bit) {
+        error = "Encountered corrupt file manifest: Manifest has only one of the mixed data-file-version reader "
+                "and writer feature bits set, so its semantics are undefined";
+        return false;
+    }
+    return true;
+}
+
 /// The manifest in `src`: its protobuf, and the indices a commit must carry on (see
-/// index_maintenance.hpp).
-bool load_manifest_source(io::ByteSource& src, pb::Manifest& out, std::string& error) {
+/// index_maintenance.hpp). `check_flags` refuses what this build cannot read, as Lance does at open.
+bool load_manifest_source(io::ByteSource& src, pb::Manifest& out, std::string& error, bool check_flags) {
     error.clear();
     out = pb::Manifest{};
     std::vector<std::uint8_t> body;
@@ -200,6 +213,10 @@ bool load_manifest_source(io::ByteSource& src, pb::Manifest& out, std::string& e
     }
     if (!pb::decode_manifest(body, out)) {
         error = "failed to decode manifest protobuf";
+        return false;
+    }
+    if (check_flags && !check_manifest_readable(out, error)) {
+        out = pb::Manifest{};
         return false;
     }
     // A reader does not need the indices, so one it cannot parse fails only a later commit, which
@@ -237,7 +254,46 @@ bool load_manifest_file(const std::filesystem::path& manifest_path, pb::Manifest
         out = pb::Manifest{};
         return false;
     }
-    return load_manifest_source(*source, out, error);
+    return load_manifest_source(*source, out, error, true);
+}
+
+bool load_manifest_file_unchecked(const std::filesystem::path& manifest_path, pb::Manifest& out,
+                                  std::string& error) {
+    const auto source = io::open_source(manifest_path.string(), error);
+    if (!source) {
+        error = "failed to open manifest file";
+        out = pb::Manifest{};
+        return false;
+    }
+    return load_manifest_source(*source, out, error, false);
+}
+
+bool check_manifest_readable(const pb::Manifest& manifest, std::string& error) {
+    if (!check_paired_flags(manifest, error)) {
+        return false;
+    }
+    if ((manifest.reader_feature_flags & ~pb::kSupportedFeatureFlags) != 0U) {
+        error = "Not supported: This dataset cannot be read by this version of Lance. Please upgrade Lance to "
+                "read this dataset. Flags: " + std::to_string(manifest.reader_feature_flags);
+        return false;
+    }
+    return true;
+}
+
+bool check_manifest_writable(const pb::Manifest& manifest, WriteKind kind, std::string& error) {
+    if (!check_paired_flags(manifest, error)) {
+        return false;
+    }
+    if ((manifest.writer_feature_flags & ~pb::kSupportedFeatureFlags) != 0U) {
+        const std::string flags = std::to_string(manifest.writer_feature_flags);
+        error = kind == WriteKind::Insert
+                    ? "Not supported: This dataset cannot be written by this version of Lance. Please upgrade Lance "
+                      "to write to this dataset.\n Flags: " + flags
+                    : "Not supported: This dataset cannot be written by this version of Lance. Please upgrade Lance "
+                      "to write this dataset. Flags: " + flags;
+        return false;
+    }
+    return true;
 }
 
 bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint64_t v, pb::Manifest& out,
@@ -267,7 +323,7 @@ bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint6
             }
             continue;
         }
-        return load_manifest_source(*source, out, error);
+        return load_manifest_source(*source, out, error, true);
     }
     error = "version " + std::to_string(v) + " not found";
     return false;

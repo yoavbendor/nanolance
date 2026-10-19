@@ -685,6 +685,10 @@ int nano_lance_writer_open(NanoLanceWriter* writer, const char* path, const Nano
         if (!nano_lance::load_latest_manifest(state->dataset_path, manifest, manifest_version, load_error)) {
             return set_error(writer, NANO_LANCE_IO_ERROR, load_error);
         }
+        // Refused here, before any data file is written (pylance leaves no file behind either).
+        if (!nano_lance::check_manifest_writable(manifest, nano_lance::WriteKind::Insert, load_error)) {
+            return set_error(writer, NANO_LANCE_UNSUPPORTED, load_error);
+        }
         if (!nano_lance::lance_schema_mapping_from_manifest(manifest, state->schema_mapping, load_error)) {
             return set_error(writer, NANO_LANCE_UNSUPPORTED, load_error);
         }

@@ -207,6 +207,16 @@ public:
 
     /// `append`: rows of the dataset's own schema. Otherwise new columns, numbered from `field_id_base`.
     bool open(const std::filesystem::path& path, bool append, std::int32_t field_id_base, std::string& error) {
+        if (append) {
+            // The writer refuses an unsupported writer word with the insert wording. This operation (an update,
+            // merge or compaction) is worded as any other commit, so it is checked here, before its writer opens.
+            pb::Manifest latest;
+            std::uint64_t latest_version = 0;
+            if (!load_latest_manifest(path, latest, latest_version, error) ||
+                !check_manifest_writable(latest, WriteKind::Commit, error)) {
+                return false;
+            }
+        }
         NanoLanceWriteOptions options{};
         options.append = append;
         options.stage_fragments = true;

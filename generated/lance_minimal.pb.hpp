@@ -179,6 +179,9 @@ constexpr std::uint64_t kFlagMultipleBasePaths = 1U << 4U;
 /// commit that adds files of another version than the manifest's default, and refuses to read such a
 /// dataset without it.
 constexpr std::uint64_t kFlagMixedDataFileVersions = 1U << 8U;
+/// Every flag bit this build understands (bits 0-8, as Lance 12 defines them). A manifest with a bit
+/// outside it is refused: a reader word for a read, a writer word for a write.
+constexpr std::uint64_t kSupportedFeatureFlags = (1U << 9U) - 1U;
 
 struct Metadata {
     std::uint64_t page_table_position = 0;

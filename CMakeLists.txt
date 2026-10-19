@@ -753,6 +753,10 @@ target_compile_definitions(nano_lance_schema_mapper_test PRIVATE
     NANO_LANCE_BLOB_V2_GOLDEN_DIR="${NANO_LANCE_BLOB_V2_GOLDEN_DIR}"
 )
 
+add_executable(nano_lance_feature_flags_test tests/test_feature_flags.cpp)
+target_compile_features(nano_lance_feature_flags_test PRIVATE cxx_std_20)
+target_link_libraries(nano_lance_feature_flags_test PRIVATE nanolance)
+
 add_executable(nano_lance_manifest_reader_test tests/test_nano_lance_manifest_reader.cpp)
 target_compile_features(nano_lance_manifest_reader_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_manifest_reader_test PRIVATE nanolance)
@@ -925,6 +929,8 @@ add_test(NAME nano_lance_schema_mapper COMMAND $<TARGET_FILE:nano_lance_schema_m
 set_tests_properties(nano_lance_schema_mapper PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_manifest_reader COMMAND $<TARGET_FILE:nano_lance_manifest_reader_test>)
+add_test(NAME nano_lance_feature_flags COMMAND $<TARGET_FILE:nano_lance_feature_flags_test>)
+set_tests_properties(nano_lance_feature_flags PROPERTIES LABELS "smoke")
 set_tests_properties(nano_lance_manifest_reader PROPERTIES LABELS "smoke" DEPENDS nano_lance_blob_v2_golden_generate)
 
 add_test(NAME nano_lance_writer_append COMMAND $<TARGET_FILE:nano_lance_writer_append_test>)

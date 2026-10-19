@@ -159,6 +159,10 @@ bool check_data_file_versions(pb::Manifest& manifest, std::string& error) {
 bool publish_manifest(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
                       std::string& error) {
     error.clear();
+    // Before anything is written: a refused commit leaves the version and its files as they were.
+    if (!check_manifest_writable(manifest, WriteKind::Commit, error)) {
+        return false;
+    }
     const auto versions_dir = dataset_path / "_versions";
     std::error_code ec;
     std::filesystem::create_directories(versions_dir, ec);
@@ -382,6 +386,9 @@ bool commit_dataset_version_once(const std::filesystem::path& dataset_path, cons
     if (exists) {
         std::uint64_t prior_version = 0;
         if (!load_latest_manifest(dataset_path, prior, prior_version, error)) {
+            return false;
+        }
+        if (!check_manifest_writable(prior, WriteKind::Insert, error)) {
             return false;
         }
     }
