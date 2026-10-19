@@ -64,9 +64,9 @@ jobs:
       - name: Start the S3 server (moto)
         run: |
           python3 -m pip install "moto[server]==5.2.4"
-          nohup moto_server -H 127.0.0.1 -p 5055 > /tmp/moto.log 2>&1 &
-          for i in $(seq 1 30); do curl -sf http://127.0.0.1:5055/ > /dev/null && break; sleep 1; done
-          curl -sf http://127.0.0.1:5055/ > /dev/null
+          nohup python3 -m moto.server -H 127.0.0.1 -p 5055 > /tmp/moto.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:5055/ > /dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:5055/ > /dev/null || { cat /tmp/moto.log; exit 1; }
           curl -sf -X PUT http://127.0.0.1:5055/nl-test
 
       # lance-c's reader of s3:// datasets (tests/lance_c_s3_read.cpp), built with S3 and -Werror.
