@@ -514,14 +514,22 @@ summary; the image is served from the same site, so it updates with every run.
 
 <!-- bench-summary:start -->
 
+Latest run: 2026-10-19 08:56 UTC on `main` (`d67dfab`), [full results](https://yoavbendor.github.io/nanolance/bench/).
+
 | Benchmark | Reference | nanolance speed | Faster in |
 |---|---|---:|---:|
-| Read, C++ library, all cores | pylance | 3.44× | 27 of 27 |
-| Read, C++ library, 1 core | pylance | 2.69× | 26 of 27 |
-| Write, C++ library, all cores | pylance | 1.92× | 23 of 27 |
-| Write, C++ library, 1 core | pylance | 1.55× | 18 of 27 |
-| Read, Python binding, all cores | pylance | 3.53× | 27 of 27 |
-| Write, Python binding, all cores | pylance | 1.86× | 26 of 27 |
+| Read, C++ library, all cores | pylance | 2.81× | 24 of 27 |
+| Read, C++ library, 1 core | pylance | 3.49× | 27 of 27 |
+| Write, C++ library, all cores | pylance | 2.00× | 26 of 27 |
+| Write, C++ library, 1 core | pylance | 1.83× | 25 of 27 |
+| Read, Python binding, all cores | pylance | 2.74× | 27 of 27 |
+| Write, Python binding, all cores | pylance | 1.76× | 26 of 27 |
+| Scalar indexes, build | Rust Lance | not measured |  |
+| Scalar indexes, query | Rust Lance | not measured |  |
+| Vector indexes, build | Rust Lance | not measured |  |
+| Vector indexes, search | Rust Lance | not measured |  |
+| Full-text index, build | Rust Lance | not measured |  |
+| Full-text index, search | Rust Lance | not measured |  |
 
 <!-- bench-summary:end -->
 
