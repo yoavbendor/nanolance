@@ -63,6 +63,7 @@ struct Workload {
     std::string vector_column;
     std::size_t partitions = 0;
     std::size_t dim = 0;
+    std::size_t vector_builds = 5;  // builds per vector index kind, averaged over
     std::vector<std::vector<float>> vector_queries;
     std::vector<std::pair<std::string, std::string>> vector_kinds;
     std::vector<VectorSearch> vector_searches;
@@ -105,6 +106,7 @@ Workload parse_workload(const fs::path& path) {
             w.vector_column = f.at(1);
             w.partitions = std::stoull(f.at(2));
             w.dim = std::stoull(f.at(3));
+            if (f.size() > 4) w.vector_builds = std::stoull(f[4]);
         } else if (kind == "vector_kind") {
             w.vector_kinds.emplace_back(f.at(1), f.at(2));
         } else if (kind == "vector_query") {
@@ -279,6 +281,8 @@ std::string run_scalar(const Workload& w, const fs::path& work, const fs::path& 
     return "{\"builds\": " + json_object(builds) + ", \"queries\": " + json_object(queries) + "}";
 }
 
+// Each vector index is built w.vector_builds times, each on its own copy, because its training is random:
+// recall is measured on every build and averaged, and each search's time is pooled over the builds.
 std::string run_vector(const Workload& w, const fs::path& work, const fs::path& base) {
     std::vector<std::pair<std::string, std::string>> builds, searches, hits, distances;
     for (const auto& [name, type] : w.vector_kinds) {
@@ -287,23 +291,29 @@ std::string run_vector(const Workload& w, const fs::path& work, const fs::path& 
         options.metric = VectorMetric::L2;
         options.num_partitions = static_cast<std::uint32_t>(w.partitions);
         if (type == "IVF_PQ") options.num_sub_vectors = static_cast<std::uint32_t>(w.dim / 8);
-        const fs::path keep = work / ("cpp_" + name + ".lance");
-        const auto stat = sample_until(w.min_seconds, 3, [&] {
-            copy_dataset(base, keep);
+
+        std::vector<fs::path> copies;
+        std::vector<double> build_ms;
+        double total = 0.0;
+        while (build_ms.size() < w.vector_builds || total < w.min_seconds) {
+            const fs::path copy = work / ("cpp_" + name + "_" + std::to_string(build_ms.size()) + ".lance");
+            copy_dataset(base, copy);
             std::uint64_t version = 0;
             std::string error;
-            return timed_seconds([&] {
-                if (!dataset_create_vector_index(keep, w.vector_column, options, version, error)) {
+            const double secs = timed_seconds([&] {
+                if (!dataset_create_vector_index(copy, w.vector_column, options, version, error)) {
                     throw std::runtime_error("build " + name + ": " + error);
                 }
             });
-        });
-        builds.emplace_back(name, json_stat(stat));
+            total += secs;
+            build_ms.push_back(secs * 1000.0);
+            copies.push_back(copy);
+        }
+        builds.emplace_back(name, json_stat(summarise(build_ms)));
 
-        // The last build's copy serves the searches.
         for (const auto& s : w.vector_searches) {
             const std::string key = name + "|" + s.name;
-            const auto query_pass = [&](std::vector<std::vector<std::uint64_t>>* ids,
+            const auto query_pass = [&](const fs::path& dataset, std::vector<std::vector<std::uint64_t>>* ids,
                                         std::vector<std::vector<float>>* dists) {
                 for (const auto& q : w.vector_queries) {
                     NearestQuery nq;
@@ -317,24 +327,39 @@ std::string run_vector(const Workload& w, const fs::path& work, const fs::path& 
                     if (s.refine_factor) nq.refine_factor = *s.refine_factor;
                     NearestResult result;
                     std::string error;
-                    if (!dataset_nearest(keep, nq, result, error)) throw std::runtime_error("search " + key + ": " + error);
+                    if (!dataset_nearest(dataset, nq, result, error)) throw std::runtime_error("search " + key + ": " + error);
                     if (ids) ids->push_back(result.row_ids);
                     if (dists) dists->push_back(result.distances);
                 }
             };
-            std::vector<std::vector<std::uint64_t>> got_ids;
-            std::vector<std::vector<float>> got_dists;
-            query_pass(&got_ids, &got_dists);
-            std::vector<std::string> id_rows, dist_rows;
-            for (const auto& ids : got_ids) id_rows.push_back(json_array(ids));
-            for (const auto& d : got_dists) dist_rows.push_back(json_array(d));
-            hits.emplace_back(key, join_json(id_rows));
-            distances.emplace_back(key, join_json(dist_rows));
-            const auto stat = sample_until(w.min_seconds, 5, [&] {
-                return timed_seconds([&] { query_pass(nullptr, nullptr); });
-            }, static_cast<double>(w.vector_queries.size()));
-            searches.emplace_back(key, json_stat(stat));
+            // One pass per build: each build's answers, for recall and for the correctness checks.
+            std::vector<std::string> per_build_ids, per_build_dists;
+            for (const auto& copy : copies) {
+                std::vector<std::vector<std::uint64_t>> got_ids;
+                std::vector<std::vector<float>> got_dists;
+                query_pass(copy, &got_ids, &got_dists);
+                std::vector<std::string> id_rows, dist_rows;
+                for (const auto& ids : got_ids) id_rows.push_back(json_array(ids));
+                for (const auto& d : got_dists) dist_rows.push_back(json_array(d));
+                per_build_ids.push_back(join_json(id_rows));
+                per_build_dists.push_back(join_json(dist_rows));
+            }
+            hits.emplace_back(key, join_json(per_build_ids));
+            distances.emplace_back(key, join_json(per_build_dists));
+
+            // Timed passes, round-robin over the builds, until min_seconds of search (and a pass per build).
+            const std::size_t passes = std::max<std::size_t>(5, copies.size());
+            std::vector<double> samples;
+            double search_total = 0.0;
+            for (std::size_t turn = 0; samples.size() < passes || search_total < w.min_seconds; ++turn) {
+                const auto& copy = copies[turn % copies.size()];
+                const double secs = timed_seconds([&] { query_pass(copy, nullptr, nullptr); });
+                search_total += secs;
+                samples.push_back(secs * 1000.0 / static_cast<double>(w.vector_queries.size()));
+            }
+            searches.emplace_back(key, json_stat(summarise(samples)));
         }
+        for (const auto& copy : copies) fs::remove_all(copy);
     }
     return "{\"builds\": " + json_object(builds) + ", \"searches\": " + json_object(searches) +
            ", \"hits\": " + json_object(hits) + ", \"distances\": " + json_object(distances) + "}";

@@ -24,7 +24,10 @@ times, so a slower runner does not fail by itself.
 Every measurement repeats until its **timed total reaches 10 seconds** (`--min-seconds`), with a minimum
 number of samples:
 
-- a **build** runs on a fresh copy of the unindexed data (the copy is untimed), at least three builds;
+- a **build** runs on a fresh copy of the unindexed data (the copy is untimed), at least three builds. A **vector** index is
+  built five times (`--builds`), because its training is random: each build is a different index. Its recall is
+  measured on every build and averaged (the spread is recorded), and each search's time is pooled over the builds,
+  the passes going round-robin over them;
 - a **scalar query** is one sample per call, at least 20 calls;
 - a **vector or full-text search** is one sample per pass over its query set (50 queries), divided by 50, at least 5 passes.
 
@@ -32,7 +35,8 @@ The reported number is the median, with the minimum and the sample count. Both e
 workload file (`tools/index_bench_common.py` writes it) and the same data, and both use every core.
 
 Before any time is reported, the two engines must agree: scalar row counts match, full-text rows and BM25
-scores match (ties at the cut-off may differ), and vector recall@10 of nanolance is within 0.03 of Rust Lance's.
+scores match (ties at the cut-off may differ). Vector recall@10 is the mean over the builds; nanolance's mean
+must be within 0.03 of Rust Lance's.
 
 ## What fails
 
@@ -41,7 +45,7 @@ Against the baseline recorded on the same CPU model and core count:
 - **A metric** whose speed falls below 0.6 x its baseline speed: a loss of more than 40% relative to Rust Lance.
   Where nanolance led 2x, it must still lead 1.2x; where it lagged 0.5x, the lag may not grow past 0.3x.
 - **A family** (scalar, vector, full-text) whose geometric-mean speed falls below 0.85 x its baseline.
-- **Recall**: nanolance's recall@10 below Rust Lance's by more than 0.03.
+- **Recall**: nanolance's mean recall@10 (over the vector builds) below Rust Lance's by more than 0.03.
 - **A missing metric**: a baseline metric not measured in this run.
 
 A baseline for another CPU is not used: the ratios differ between CPU models. Such a run still checks

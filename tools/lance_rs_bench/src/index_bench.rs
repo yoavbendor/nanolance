@@ -9,7 +9,7 @@
 //!   min_seconds    SECONDS
 //!   scalar_build   COLUMN   BTREE|BITMAP|LABEL_LIST
 //!   scalar_query   NAME     FILTER     COLUMNS (comma-separated, or *)
-//!   vector_config  COLUMN   PARTITIONS  DIM
+//!   vector_config  COLUMN   PARTITIONS  DIM  BUILDS (default 5)
 //!   vector_kind    NAME     IVF_FLAT|IVF_PQ|IVF_HNSW_SQ
 //!   vector_query   COMMA-SEPARATED FLOATS            (one line per query)
 //!   vector_search  NAME     K  NPROBES  REFINE_FACTOR  (0: unset)
@@ -24,7 +24,7 @@
 //! set, divided by the number of queries. Medians are reported with the minimum and the sample count.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
@@ -59,6 +59,8 @@ pub struct Vector {
     pub column: String,
     pub partitions: usize,
     pub dim: usize,
+    /// Builds per index kind (each on its own copy), averaged over.
+    pub builds: usize,
     pub queries: Vec<Vec<f32>>,
     pub kinds: Vec<VectorKind>,
     pub searches: Vec<VectorSearch>,
@@ -134,6 +136,7 @@ pub fn parse_workload(text: &str) -> Workload {
                 v.column = f[1].into();
                 v.partitions = f[2].parse().expect("partitions");
                 v.dim = f[3].parse().expect("dim");
+                v.builds = f.get(4).map(|b| b.parse().expect("builds")).unwrap_or(5);
             }
             "vector_kind" => vector_of(&mut w).kinds.push(VectorKind { name: f[1].into(), kind: f[2].into() }),
             "vector_query" => vector_of(&mut w)
@@ -175,6 +178,7 @@ fn vector_of(w: &mut Workload) -> &mut Vector {
         column: String::new(),
         partitions: 0,
         dim: 0,
+        builds: 5,
         queries: Vec::new(),
         kinds: Vec::new(),
         searches: Vec::new(),
@@ -217,28 +221,41 @@ async fn create_index(ds: &mut Dataset, column: &str, index: IndexType, params: 
         .expect("create_index");
 }
 
-/// Builds the index on a fresh copy of the base dataset until the timed total reaches min_seconds (and
-/// three builds ran). The last copy is left at `keep`, indexed, for the queries. Returns each build's ms.
+/// Builds the index on a fresh copy of the base dataset until the timed total reaches min_seconds and at least
+/// `min_builds` builds ran. Build i's copy is `<prefix>_<i>.lance`, indexed. With `keep_all` every copy is kept
+/// (the vector indexes, which are searched on each build: their training is random); otherwise only the last.
+/// Returns each build's ms and the copies.
 async fn timed_builds(
     base: &Path,
-    keep: &Path,
+    prefix: &Path,
     min_seconds: f64,
+    min_builds: usize,
+    keep_all: bool,
     column: &str,
     index: IndexType,
     params: &dyn IndexParams,
-) -> Vec<f64> {
+) -> (Vec<f64>, Vec<PathBuf>) {
     let mut samples = Vec::new();
+    let mut copies: Vec<PathBuf> = Vec::new();
     let mut total = 0.0;
-    while samples.len() < 3 || total < min_seconds {
-        copy_dir(base, keep).expect("copy base");
-        let mut ds = Dataset::open(path_str(keep)).await.expect("open copy");
+    while samples.len() < min_builds || total < min_seconds {
+        let copy = PathBuf::from(format!("{}_{}.lance", prefix.display(), samples.len()));
+        copy_dir(base, &copy).expect("copy base");
+        let mut ds = Dataset::open(path_str(&copy)).await.expect("open copy");
         let t0 = Instant::now();
         create_index(&mut ds, column, index.clone(), params).await;
         let secs = t0.elapsed().as_secs_f64();
         total += secs;
         samples.push(secs * 1000.0);
+        if !keep_all {
+            copies.iter().for_each(|old| {
+                let _ = fs::remove_dir_all(old);
+            });
+            copies.clear();
+        }
+        copies.push(copy);
     }
-    samples
+    (samples, copies)
 }
 
 async fn scalar(spec: &Scalar, min_seconds: f64, work: &Path, base: &Path) -> Value {
@@ -256,8 +273,8 @@ async fn scalar(spec: &Scalar, min_seconds: f64, work: &Path, base: &Path) -> Va
             _ => BuiltinIndexType::LabelList,
         };
         let params = ScalarIndexParams::for_builtin(builtin);
-        let keep = work.join(format!("rust_build_{column}_{kind}.lance"));
-        let samples = timed_builds(base, &keep, min_seconds, column, index, &params).await;
+        let prefix = work.join(format!("rust_build_{column}_{kind}"));
+        let (samples, _) = timed_builds(base, &prefix, min_seconds, 3, false, column, index, &params).await;
         builds.insert(format!("{column} {kind}"), summary(samples));
     }
 
@@ -308,6 +325,8 @@ async fn scan_rows(ds: &Dataset, filter: &str, columns: Option<&[String]>) -> us
     batch.num_rows()
 }
 
+/// Every vector index is built `spec.builds` times, each on its own copy, because its training is random:
+/// recall is measured on every build and averaged, and each search's time is pooled over the builds.
 async fn vector(spec: &Vector, min_seconds: f64, work: &Path, base: &Path) -> Value {
     let mut builds = serde_json::Map::new();
     let mut searches = serde_json::Map::new();
@@ -315,27 +334,53 @@ async fn vector(spec: &Vector, min_seconds: f64, work: &Path, base: &Path) -> Va
     let mut distances = serde_json::Map::new();
     for kind in &spec.kinds {
         let params = vector_params(&kind.kind, spec.partitions, spec.dim);
-        let keep = work.join(format!("rust_{}.lance", kind.name));
-        let samples = timed_builds(base, &keep, min_seconds, &spec.column, IndexType::Vector, &params).await;
+        let prefix = work.join(format!("rust_{}", kind.name));
+        let (samples, copies) = timed_builds(
+            base,
+            &prefix,
+            min_seconds,
+            spec.builds,
+            true,
+            &spec.column,
+            IndexType::Vector,
+            &params,
+        )
+        .await;
         builds.insert(kind.name.clone(), summary(samples));
-
-        // The last build's copy serves the searches.
-        let ds = Dataset::open(path_str(&keep)).await.expect("open index copy");
+        let mut datasets = Vec::new();
+        for copy in &copies {
+            datasets.push(Dataset::open(path_str(copy)).await.expect("open index copy"));
+        }
         for s in &spec.searches {
             let key = format!("{}|{}", kind.name, s.name);
-            let (ids, dists) = vector_pass(&ds, spec, s).await;
-            hits.insert(key.clone(), json!(ids));
-            distances.insert(key.clone(), json!(dists));
+            // One pass per build: each build's answers, for recall and for the correctness checks.
+            let mut per_build_ids = Vec::new();
+            let mut per_build_dists = Vec::new();
+            for ds in &datasets {
+                let (ids, dists) = vector_pass(ds, spec, s).await;
+                per_build_ids.push(ids);
+                per_build_dists.push(dists);
+            }
+            hits.insert(key.clone(), json!(per_build_ids));
+            distances.insert(key.clone(), json!(per_build_dists));
+            // Timed passes, round-robin over the builds, until min_seconds of search (and a pass per build).
+            let passes = datasets.len().max(5);
             let mut samples = Vec::new();
             let mut total = 0.0;
-            while samples.len() < 5 || total < min_seconds {
+            let mut turn = 0;
+            while samples.len() < passes || total < min_seconds {
+                let ds = &datasets[turn % datasets.len()];
+                turn += 1;
                 let t0 = Instant::now();
-                vector_pass(&ds, spec, s).await;
+                vector_pass(ds, spec, s).await;
                 let secs = t0.elapsed().as_secs_f64();
                 total += secs;
                 samples.push(secs * 1000.0 / spec.queries.len() as f64);
             }
             searches.insert(key, summary(samples));
+        }
+        for copy in &copies {
+            let _ = fs::remove_dir_all(copy);
         }
     }
     json!({ "builds": builds, "searches": searches, "hits": hits, "distances": distances })
@@ -397,16 +442,19 @@ async fn vector_pass(ds: &Dataset, spec: &Vector, s: &VectorSearch) -> (Vec<Vec<
 }
 
 async fn fts(spec: &Fts, min_seconds: f64, work: &Path, base: &Path) -> Value {
-    let keep = work.join("rust_fts.lance");
-    let samples = timed_builds(
+    let prefix = work.join("rust_fts");
+    let (samples, copies) = timed_builds(
         base,
-        &keep,
+        &prefix,
         min_seconds,
+        3,
+        false,
         &spec.column,
         IndexType::Inverted,
         &InvertedIndexParams::default(),
     )
     .await;
+    let keep = copies.last().expect("a build").clone();
     let mut builds = serde_json::Map::new();
     builds.insert("INVERTED".into(), summary(samples));
 
