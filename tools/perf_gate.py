@@ -189,6 +189,12 @@ def main(argv=None) -> int:
         print("no baseline for this machine: correctness checks only. Record one with\n"
               "  python tools/perf_gate.py ... --record bench/results/perf/" + cpu_slug(cpu) + f"-{cores}c.json")
 
+    # Every metric, slowest relative to Rust Lance first, so each run's log shows where nanolance stands.
+    print("speed vs Rust Lance (Rust's time / nanolance's):")
+    for key, m in sorted(metrics.items(), key=lambda kv: kv[1]["speed"] or 0.0):
+        if m["speed"]:
+            print(f"  {m['speed']:6.2f}x  {key}  (nanolance {m['nanolance_ms']:.2f} ms, Rust Lance {m['rust_ms']:.2f} ms)")
+
     problems, lines = compare(baseline, metrics, recall)
     for line in lines:
         print(line)
