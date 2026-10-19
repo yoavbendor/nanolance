@@ -85,20 +85,49 @@ To use a local checkout of one dependency instead of cloning it:
 `-DFETCHCONTENT_SOURCE_DIR_NANOARROW=/path/to/arrow-nanoarrow` (likewise `_NANOM`, `_NANOS3READER`,
 `__NANOLANCE_ZSTD`, `__NANOLANCE_CLI11` -- the dependency names upper-cased).
 
-## 4. Python package
+## 4. Python package (uv)
 
-The Python build fetches nanoarrow and zstd again, through the same settings. pip itself needs a
-package index for the build tools (`scikit-build-core`, `nanobind`) and, for the tests, `pytest`,
-`pyarrow`, `pandas`, `polars`, `psutil` and `pylance`. Point pip at the corporate index:
+The Python side is one command once the mirror has the packages. The repository ships everything
+needed for a repeatable build:
+
+- `bindings/python/pyproject.toml`: the dependency groups (`test`, `bench`), with the same lists as
+  the pip extras.
+- `bindings/python/uv.lock`: every Python package version, pinned (from PyPI). It also records PyPI's
+  file URLs, which a firewall blocks, so it is not used behind the firewall (see below).
+- `tools/python_env_behind_firewall.sh`: locks against your mirror, installs the locked test group,
+  and builds nanolance into the same environment.
+
+You need `uv` (get it from the mirror: `pip install uv`), a C++ toolchain and CMake as in section 3,
+and the mirror settings from section 2.
 
 ```sh
-export NANOLANCE_GIT_BASE=https://gitlab.example.com/mirrors
-export PIP_INDEX_URL=https://artifactory.example.com/api/pypi/pypi/simple   # your PyPI mirror
-pip install -e "bindings/python[test]"
-cd bindings/python && pytest -q                       # ~3,400 tests, several minutes
+export UV_DEFAULT_INDEX=https://mirror.example.com/api/pypi/simple   # your PyPI mirror's simple index
+export NANOLANCE_GIT_BASE=https://gitlab.example.com/mirrors          # as in section 2
+tools/python_env_behind_firewall.sh                                  # a few minutes (faster on re-runs)
+cd bindings/python
+../../build/python-mirror/.venv/bin/python -m pytest                 # the full suite, several minutes
 ```
 
-A wheel to copy to other machines: `pip wheel ./bindings/python --no-deps -w dist/`.
+Why the script locks instead of using the committed `uv.lock`: the committed lock was made from
+PyPI, and `uv` downloads the exact file URLs a lock records, so `uv sync --frozen` would still reach
+`files.pythonhosted.org` even with `UV_DEFAULT_INDEX` set. The script writes its own lock, with the
+mirror's URLs, into `build/python-mirror/` (git ignores it). Re-running the script re-locks against
+whatever the mirror holds. To freeze the exact versions for your team, copy
+`build/python-mirror/uv.lock` into your internal repository and use `uv sync --frozen` there.
+
+Two requirements on the mirror, both standard for Artifactory, Nexus and devpi:
+- It must hold every file the lock needs, for every Python version the lock covers (3.9 to 3.13 for
+  this release; the install was verified here on Python 3.11, and the mirror was checked to hold the
+  files for 3.9 to 3.13). A pull-through PyPI proxy does this on demand; a hand-copied folder must be
+  complete, or the lock fails with "can't be installed because it doesn't have a source distribution
+  or wheel".
+- Its simple index must publish each file's `requires-python` (PyPI's `data-requires-python`
+  attribute). Without it, `uv` cannot split the lock by Python version and drops packages such as
+  `pylance` 13 for Python 3.10 and newer.
+
+Before the full suite, the installed versions can be checked against the lock with
+`build/python-mirror/.venv/bin/python -c "import lance; print(lance.__version__)"` (13.0.0 for
+Python 3.10 and newer, 8.0.1 for 3.9).
 
 The pylance-suite check (optional; clones `lance-format/lance` from the mirror):
 `python3 tools/pylance_suite.py` (1,200 expected passes).

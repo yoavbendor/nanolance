@@ -69,6 +69,6 @@ class IvfModel:
         metadata = reader.metadata().schema.metadata
         distance_type = metadata[b"distance_type"].decode()
         centroids = (
-            reader.read_all(batch_size=num_rows).to_table().column("centroids").chunk(0)
+            reader.read_all(batch_size=num_rows).to_table().column("centroids").combine_chunks()
         )
         return cls(centroids, distance_type)

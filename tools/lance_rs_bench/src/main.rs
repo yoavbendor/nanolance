@@ -27,6 +27,8 @@ use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
 
+mod index_bench;
+
 fn status_kb(field: &str) -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -125,7 +127,7 @@ async fn bench_read(path: &str, iters: usize, dump: Option<&str>) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: lance_rs_bench write <in.arrow> <out.lance> [iters]\n       lance_rs_bench read <dataset.lance> [iters] [--dump out.arrow]";
+    let usage = "usage: lance_rs_bench write <in.arrow> <out.lance> [iters]\n       lance_rs_bench read <dataset.lance> [iters] [--dump out.arrow]\n       lance_rs_bench index <workload.txt> <scalar|vector|fts> <work_dir> <base.lance> <out.json>";
     if args.len() < 3 {
         eprintln!("{usage}");
         std::process::exit(2);
@@ -158,6 +160,16 @@ fn main() {
                 }
             }
             runtime.block_on(bench_read(&args[2], iters, dump.as_deref()));
+        }
+        "index" if args.len() >= 7 => {
+            let workload = index_bench::parse_workload(&std::fs::read_to_string(&args[2]).expect("workload file"));
+            runtime.block_on(index_bench::run(
+                &workload,
+                &args[3],
+                std::path::Path::new(&args[4]),
+                std::path::Path::new(&args[5]),
+                std::path::Path::new(&args[6]),
+            ));
         }
         _ => {
             eprintln!("{usage}");

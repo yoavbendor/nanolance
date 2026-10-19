@@ -2298,7 +2298,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         }
     }
     const VectorMetric metric = !loaded.empty() ? loaded.front()->metric : q.metric.value_or(VectorMetric::L2);
-    const char* metric_name = binary ? "hamming" : metric_name;
+    const char* metric_name = binary ? "hamming" : vector_metric_name(metric);
 
     std::vector<std::uint64_t> all_fragments;
     for (const auto& f : manifest.fragments) {

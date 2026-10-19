@@ -507,34 +507,42 @@ Standalone configures use **`GIT_SHALLOW TRUE`** on FetchContent to keep *future
 
 ## Benchmarking
 
-**[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** has the full comparison against Rust Lance -- through
-pylance 12 and through the `lance` crate itself with no Python (`tools/lance_rs_bench`) -- and
-Parquet: 27 Arrow data types (numbers, dates, strings, nulls, vectors, structs, lists, maps and a
-mixed table), each written and read by nanolance C++, nanolance Python and Rust on one core and on all
-cores, every read checked against the source before it is timed, every file read by the other side,
-with peak memory and program size -- plus two real training datasets, COCO 2017 val (images,
-captions, boxes, polygons) and Speech Commands (audio). In short (geometric means, 4-core machine):
+**Live results: [yoavbendor.github.io/nanolance/bench](https://yoavbendor.github.io/nanolance/bench/)**
+-- updated by every benchmark run: the latest run in full, its raw JSON, and the history of runs
+(each run's branch, commit, gate result and link to its CI run). The table below is the latest run's
+summary; the image is served from the same site, so it updates with every run.
 
-| | both on all cores | both on 1 core |
-|---|---:|---:|
-| Read | 2.78x faster than Rust Lance | 2.91x faster |
-| Write | 1.92x faster | 1.48x faster |
-| Data types faster, all cores | 26 of 27 reads (the 27th a tie), 21 of 27 writes | |
-| Peak memory, read | 3.1x less | |
-| Peak memory, write with a 4 MiB budget | 3.3x less | |
-| File size | 99% of Rust's | |
-| Reader + writer program, stripped | 2.5 MB against 165 MB | |
+<!-- bench-summary:start -->
 
-| Training data, all cores | nanolance | Rust Lance |
-|---|---:|---:|
-| COCO: write the dataset / read an epoch / shuffled epoch | 1.0 s / 0.39 s / 0.38 s | 3.1 s / 4.1 s / 0.89 s |
-| Speech Commands: write / read an epoch / shuffled epoch | 1.06 s / 0.09 s / 0.29 s | 1.90 s / 0.38 s / 0.31 s |
+| Benchmark | Reference | nanolance speed | Faster in |
+|---|---|---:|---:|
+| Read, C++ library, all cores | pylance | 3.44× | 27 of 27 |
+| Read, C++ library, 1 core | pylance | 2.69× | 26 of 27 |
+| Write, C++ library, all cores | pylance | 1.92× | 23 of 27 |
+| Write, C++ library, 1 core | pylance | 1.55× | 18 of 27 |
+| Read, Python binding, all cores | pylance | 3.53× | 27 of 27 |
+| Write, Python binding, all cores | pylance | 1.86× | 26 of 27 |
 
-Where Rust on all cores still leads: writing a single large list or map column (map<string,int64>
-34 vs 51 ms) and random binary blobs. Python costs Rust Lance little, so pylance is a fair stand-in.
-Reproduce with `python tools/bench_matrix.py && python tools/bench_report.py && python tools/bench_html.py`
-(the last renders `bench/results/report.html`, with charts; the Rust-native columns need
-`cargo build --release` in `tools/lance_rs_bench`).
+<!-- bench-summary:end -->
+
+![nanolance benchmark summary](https://yoavbendor.github.io/nanolance/bench/summary.svg)
+
+Speed is the reference's median time over nanolance's: above 1× nanolance is faster. Two suites, both
+sampled until 10 seconds of timed work per aspect:
+
+- **Matrix, against pylance:** 27 Arrow data types (numbers, dates, strings, nulls, vectors, structs, lists,
+  maps and a mixed table), written and read by nanolance's C++ library and Python binding, on one core and on
+  all cores. Every read is checked against the source before it is timed.
+- **Indexes, against Rust Lance:** scalar, vector and full-text indexes, built and queried by nanolance's C++
+  library and by the `lance` crate (version 12.0.0) with no Python in the process. The answers must agree
+  before any time is reported. [docs/PERFORMANCE_GATE.md](docs/PERFORMANCE_GATE.md) describes the gate that
+  fails a run when nanolance loses ground on any of these.
+
+Memory, file size, program size, COCO and Speech Commands, and the full-scale numbers are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md). Reproduce a run with `python tools/bench_matrix.py` (the matrix)
+and the three `tools/bench_{scalar_index,vector_index,fts}.py` scripts (the indexes); `tools/bench_publish.py` turns them into the
+page above. The Rust driver needs `cargo build --release` in `tools/lance_rs_bench`, the C++ one
+`cmake --build build --target nlbench_index`.
 
 Older, narrower benchmarks: pcap-style columns and native-reader profiles in
 [bench/linux-ci-results.md](bench/linux-ci-results.md) (CI-owned; local runs go to

@@ -6,6 +6,7 @@
 // its lists' elements -- sorted nulls first, then ascending, ties by row address, and written in
 // Lance's index files; the index is committed in the manifest's index section as Lance commits one.
 
+#include "float_text.hpp"
 #include "index_build.hpp"
 #include "nanolance/scalar_index.hpp"
 #include "nanolance/vector_search.hpp"
@@ -1155,11 +1156,9 @@ bool write_bloomfilter(const std::filesystem::path& dir, const Items& items,
     OwnedArray batch;
     LanceFileExtras extras;
     // Lance's metadata: the probability as Rust prints an f64 (no exponent), read back as the same value.
-    char probability_text[64];
-    const auto end = std::to_chars(probability_text, probability_text + sizeof probability_text - 1, probability,
-                                   std::chars_format::fixed);
+    const std::string probability_text = float_text::to_text(probability, float_text::Format::Fixed);
     extras.schema_metadata["bloomfilter_item"] = bytes_of(std::to_string(number_of_items));
-    extras.schema_metadata["bloomfilter_probability"] = bytes_of(std::string(probability_text, end.ptr));
+    extras.schema_metadata["bloomfilter_probability"] = bytes_of(probability_text);
     extras.schema_metadata["null_bitmap"] = bytes_of("1");
     extras.global_buffers.push_back(null_bitmap);
     ArrowError err;

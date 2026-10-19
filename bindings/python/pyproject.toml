@@ -29,7 +29,14 @@ classifiers = [
 nanolance = "nanolance.__main__:main"
 
 [project.optional-dependencies]
-test = ["pytest>=7", "pyarrow>=16", "pandas>=2", "polars>=1", "psutil>=5.9", "pylance>=0.17"]
+test = ["pytest>=7", "pytest-xdist", "pytest-timeout", "pyarrow>=16", "pandas>=2", "polars>=1", "duckdb", "tqdm", "ml_dtypes", "pydantic", "psutil>=5.9", "pylance==12.0.0 ; python_version >= '3.10'", "pylance>=0.17,<13 ; python_version < '3.10'"]
+bench = ["pyarrow>=16", "psutil>=5.9", "pylance>=0.17"]
+
+# uv (`uv sync`, `uv run`) reads these groups. They are the packages .github/workflows/bindings-python.yml
+# installs, and pylance is pinned to 12.0.0 (Python 3.10 and newer; pylance 12 has no 3.9 wheels): the version
+# the tests and tools/pylance_suite.py compare with (pylance 13 changes results in about 16 tests). uv.lock pins every version (docs/BUILDING_BEHIND_A_FIREWALL.md).
+[dependency-groups]
+test = ["pytest>=7", "pytest-xdist", "pytest-timeout", "pyarrow>=16", "pandas>=2", "polars>=1", "duckdb", "tqdm", "ml_dtypes", "pydantic", "psutil>=5.9", "pylance==12.0.0 ; python_version >= '3.10'", "pylance>=0.17,<13 ; python_version < '3.10'"]
 bench = ["pyarrow>=16", "psutil>=5.9", "pylance>=0.17"]
 
 [project.urls]
@@ -80,9 +87,9 @@ manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
 
 [tool.cibuildwheel.macos]
-# 11.0 is the first target where the C++ standard library ships the C++17/20 filesystem and charconv
-# bits this tree uses without a back-deployment shim.
-environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
+# 13.3 is the first target whose C++ library has floating-point to_chars and from_chars, which the
+# tree uses. Older macOS releases are not supported.
+environment = { MACOSX_DEPLOYMENT_TARGET = "13.3" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

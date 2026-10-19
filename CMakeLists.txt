@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
 
+# macOS 13.3 is the first release whose C++ library has floating-point to_chars and from_chars, which
+# the tree uses. A build can still pick its own target by passing CMAKE_OSX_DEPLOYMENT_TARGET.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3")
+endif()
+
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(NANOLANCE_STANDALONE ON)
 else()
@@ -411,6 +417,11 @@ if(NANOLANCE_WARNING_FLAGS)
     if(TARGET lance_c)
         target_compile_options(lance_c PRIVATE ${NANOLANCE_WARNING_FLAGS})
     endif()
+    # GCC 13's libstdc++ std::regex raises a false -Wmaybe-uninitialized, inlined into expr.cpp's regex
+    # construction under -O2 with sanitizers. Downgrade that one warning for this file on GCC only.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set_source_files_properties(src/expr.cpp PROPERTIES COMPILE_OPTIONS "-Wno-error=maybe-uninitialized")
+    endif()
 endif()
 
 if(NANOLANCE_ENABLE_AVX2)
@@ -478,6 +489,10 @@ if(NANOLANCE_BUILD_TOOLS)
     add_executable(nlbench tools/nlbench.cpp)
     target_compile_features(nlbench PRIVATE cxx_std_20)
     target_link_libraries(nlbench PRIVATE nanolance)
+
+    add_executable(nlbench_index tools/nlbench_index.cpp)
+    target_compile_features(nlbench_index PRIVATE cxx_std_20)
+    target_link_libraries(nlbench_index PRIVATE nanolance)
 
     add_executable(nlbench_gendata tools/nlbench_gendata.cpp)
     target_compile_features(nlbench_gendata PRIVATE cxx_std_20)
@@ -586,6 +601,9 @@ endif()
 add_executable(nano_lance_proto_roundtrip_test tests/test_lance_minimal_pb.cpp)
 target_compile_features(nano_lance_proto_roundtrip_test PRIVATE cxx_std_20)
 target_link_libraries(nano_lance_proto_roundtrip_test PRIVATE nanolance_proto)
+
+add_executable(nano_lance_float_text_test tests/test_float_text.cpp)
+target_compile_features(nano_lance_float_text_test PRIVATE cxx_std_20)
 
 add_executable(nano_lance_writer_lifecycle_test tests/test_writer_lifecycle.cpp)
 target_compile_features(nano_lance_writer_lifecycle_test PRIVATE cxx_std_20)
@@ -804,6 +822,7 @@ if(NANOLANCE_BUILD_TOOLS)
 endif()
 
 add_test(NAME nano_lance_proto_roundtrip COMMAND $<TARGET_FILE:nano_lance_proto_roundtrip_test>)
+add_test(NAME nano_lance_float_text COMMAND $<TARGET_FILE:nano_lance_float_text_test>)
 set_tests_properties(nano_lance_proto_roundtrip PROPERTIES LABELS "smoke")
 
 add_test(NAME nano_lance_writer_lifecycle COMMAND $<TARGET_FILE:nano_lance_writer_lifecycle_test>)

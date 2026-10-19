@@ -76,6 +76,6 @@ class PqModel:
         num_subvectors = int(metadata[b"num_subvectors"].decode())
         num_bits = int(metadata.get(b"num_bits", b"8").decode())
         codebook = (
-            reader.read_all(batch_size=num_rows).to_table().column("codebook").chunk(0)
+            reader.read_all(batch_size=num_rows).to_table().column("codebook").combine_chunks()
         )
         return cls(num_subvectors, codebook, num_bits=num_bits)

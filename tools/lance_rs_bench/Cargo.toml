@@ -17,6 +17,9 @@ arrow-array = "58"
 arrow-ipc = "58"
 arrow-schema = "58"
 futures = "0.3"
+lance-index = "=12.0.0"
+lance-linalg = "=12.0.0"
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [profile.release]

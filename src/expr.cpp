@@ -8,6 +8,7 @@
 
 #include "nanolance/expr.hpp"
 #include "nanolance/jsonb.hpp"
+#include "float_text.hpp"
 #include "int128.hpp"
 
 #include <algorithm>
@@ -1704,11 +1705,7 @@ std::string datafusion_literal(const Value& v) {
     switch (v.kind) {
         case Kind::Int: return "Int64(" + std::to_string(v.i) + ")";
         case Kind::UInt: return "UInt64(" + std::to_string(v.u) + ")";
-        case Kind::Double: {
-            char buf[64];
-            const auto end = std::to_chars(buf, buf + sizeof buf, v.d).ptr;
-            return "Float64(" + std::string(buf, end) + ")";
-        }
+        case Kind::Double: return "Float64(" + float_text::to_text(v.d) + ")";
         case Kind::String: return "Utf8(\"" + std::string(v.s) + "\")";
         default: return {};
     }

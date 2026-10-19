@@ -27,6 +27,8 @@
 #include <limits>
 #include <map>
 
+#include "float_text.hpp"
+
 namespace nano_lance::jsonb {
 namespace {
 
@@ -429,12 +431,8 @@ private:
             digits.push_back('0');
         }
         double v = 0;
-        const auto [p, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), v);
-        if (ec != std::errc() && ec != std::errc::result_out_of_range) {
+        if (!float_text::parse(digits, v)) {
             return fail("invalid number", error);
-        }
-        if (ec == std::errc::result_out_of_range) {
-            v = std::strtod(digits.c_str(), nullptr);
         }
         out = {Number::Kind::Float, 0, 0, negative ? -v : v};
         return true;
@@ -577,9 +575,7 @@ void print_double(std::string& out, double v) {
         out += "null";
         return;
     }
-    char buf[64];
-    const auto [end, ec] = std::to_chars(buf, buf + sizeof(buf), v, std::chars_format::scientific);
-    std::string sci(buf, end);  // [-]d[.ddd]e[+-]xx
+    std::string sci = float_text::to_text(v, float_text::Format::Scientific);  // [-]d[.ddd]e[+-]xx
     std::string sign;
     if (sci.front() == '-') {
         sign = "-";

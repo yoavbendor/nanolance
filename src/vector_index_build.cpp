@@ -19,6 +19,7 @@
 #include "index_build.hpp"
 #include "nanolance/vector_search.hpp"
 
+#include "float_text.hpp"
 #include "hnsw_build.hpp"
 #include "index_files.hpp"
 
@@ -446,9 +447,7 @@ bool list_array(ArrowType item, std::size_t width, const std::vector<std::int32_
 
 /// A double as serde_json writes it: the shortest round-trip form, with ".0" when integral.
 std::string json_double(double x) {
-    char buf[64];
-    const auto r = std::to_chars(buf, buf + sizeof(buf), x);
-    std::string s(buf, r.ptr);
+    std::string s = float_text::to_text(x);
     if (s.find_first_of(".eEn") == std::string::npos) {
         s += ".0";
     }

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -39,11 +40,35 @@ namespace {
 // lookup only — the file cannot become a different file partway through a single read in any way the
 // reader could act on. Outside a scope the epoch is 0, which never matches a stamped entry, so every
 // lookup validates exactly as it did before.
+/// A local file's modification time is only as fine as its filesystem's clock: some network and FAT
+/// filesystems stamp to one or two seconds, so a rewrite that keeps the size can keep the timestamp.
+/// A cached entry whose file was modified within this window of when the entry was filled cannot be
+/// trusted to match the file, so it is reopened (git's "racy timestamp" rule).
+constexpr std::int64_t kRacyWindowNs = 2'000'000'000LL;
+
+std::int64_t now_unix_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+/// A local version token (io::stat_local) as nanoseconds since the Unix epoch. POSIX tokens already are;
+/// Windows tokens are FILETIME (100 ns ticks since 1601).
+std::int64_t version_unix_ns(std::int64_t version) {
+#if defined(_WIN32)
+    constexpr std::int64_t kUnixEpochTicks = 116444736000000000LL;
+    return (version - kUnixEpochTicks) * 100;
+#else
+    return version;
+#endif
+}
+
 struct OpenDataFile {
     std::unique_ptr<io::ByteSource> source;
     std::uint64_t file_size = 0;
     /// Read scope this entry was last validated in; 0 means "not validated in any scope".
     std::uint64_t checked_epoch = 0;
+    /// When the entry was filled (before its stat, so no write before the stat can hide in the gap).
+    std::int64_t filled_unix_ns = 0;
     /// The file's last bytes, read once by the footer reader: the footer, the file descriptor and,
     /// in most files, every column's metadata live there, so those reads become copies from memory
     /// (and, from a remote source, one request instead of one per column).
@@ -69,6 +94,7 @@ OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::str
 
     // One stat of the path per read scope: a file replaced at the same path (a new inode) must not be
     // read through the old handle.
+    const std::int64_t filled_at = now_unix_ns();
     std::uint64_t file_size = 0;
     std::int64_t version = 0;
     const bool local = !io::is_remote(path.string());
@@ -79,7 +105,11 @@ OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::str
 
     for (auto it = g_open_data_files.begin(); it != g_open_data_files.end(); ++it) {
         if (it->first == path) {
-            if (!local || (it->second.file_size == file_size && it->second.source->version_token() == version)) {
+            // Trusted only if the size and timestamp match AND the entry was filled after the file's last
+            // change could have been stamped (see kRacyWindowNs).
+            const bool racy = local && version_unix_ns(it->second.source->version_token()) >=
+                                           it->second.filled_unix_ns - kRacyWindowNs;
+            if (!local || (it->second.file_size == file_size && it->second.source->version_token() == version && !racy)) {
                 it->second.checked_epoch = g_read_epoch;
                 g_open_data_files.splice(g_open_data_files.begin(), g_open_data_files, it);
                 return &g_open_data_files.front().second;
@@ -97,6 +127,7 @@ OpenDataFile* find_or_open_data_file(const std::filesystem::path& path, std::str
     }
     fresh.file_size = fresh.source->size();
     fresh.checked_epoch = g_read_epoch;
+    fresh.filled_unix_ns = filled_at;
     g_open_data_files.emplace_front(path, std::move(fresh));
     if (g_open_data_files.size() > kMaxOpenDataFiles) {
         g_open_data_files.pop_back();

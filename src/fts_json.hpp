@@ -16,23 +16,34 @@
 
 namespace nano_lance::fts::json {
 
+struct Member;
+
 struct Value {
     enum Kind { Null, Bool, Number, String, Array, Object } kind = Null;
     bool b = false;
     double n = 0;
     std::string s;
-    std::vector<Value> items;                           // Array
-    std::vector<std::pair<std::string, Value>> fields;  // Object, in order
+    std::vector<Value> items;    // Array
+    std::vector<Member> fields;  // Object, in order (a vector of an incomplete type until Member is defined)
 
-    const Value* get(std::string_view key) const {
-        for (const auto& [k, v] : fields) {
-            if (k == key) {
-                return &v;
-            }
-        }
-        return nullptr;
-    }
+    const Value* get(std::string_view key) const;
 };
+
+// One key and value of an object. A named struct rather than std::pair: a pair of Value would need
+// Value complete inside its own definition, which GCC 14 and Apple clang reject.
+struct Member {
+    std::string first;
+    Value second;
+};
+
+inline const Value* Value::get(std::string_view key) const {
+    for (const auto& [k, v] : fields) {
+        if (k == key) {
+            return &v;
+        }
+    }
+    return nullptr;
+}
 
 class Reader {
 public:
