@@ -82,7 +82,14 @@ a few lines; otherwise leave Python alone.
 
 ### O2 -- nanolance reads `s3://` datasets
 
-- Bump the nanos3reader pin to O1's commit (pushed by the reviewer before O2 starts).
+- The nanos3reader pin is bumped already (0.4.0, `S3Client`; commit 7158595, in `CMakeLists.txt`).
+- S3 is OFF in every build today: `NANOLANCE_ENABLE_S3` defaults OFF (`CMakeLists.txt` line 68) and the
+  Python binding forces it OFF (`bindings/python/CMakeLists.txt` about line 71). Reviewer's decision: the
+  binding builds with S3 when libcurl is found (`find_package(CURL)`), without it otherwise; a build
+  without S3 refuses `s3://` with `nanolance was built without S3 support`. For your local builds
+  configure the main build with `-DNANOLANCE_ENABLE_S3=ON` (libcurl headers are installed here). Wheels
+  (cibuildwheel, `bindings/python/pyproject.toml` `[tool.cibuildwheel.linux]`, manylinux_2_28) get
+  libcurl in O3.
 - `src/s3_byte_source.cpp` (built when `NANOLANCE_S3_NANOS3READER_ACTIVE`): an `io::ByteSource` over
   `S3Client` (size from `head` at open; `read_at` = `read_range`; `small_read_block` 1 MiB and
   `footer_read_size` 64 KiB, so small reads become one request) and a lister over `list`, registered for
