@@ -38,6 +38,8 @@
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/bloom_filter.hpp"
 #include "nanolance/roaring_bitmap.hpp"
+
+#include <bit>
 #include "nanolance/schema_mapper.hpp"
 #include "nanolance/overlays.hpp"
 #include "nanolance/row_ids.hpp"
@@ -201,11 +203,69 @@ struct RowSet {
     bool exact = false;
 };
 
+/// `offsets` ascending, each once: a bitset over their range when they are dense enough (a range predicate's
+/// rows, in no order), else a sort.
+void sort_unique_offsets(std::vector<std::uint32_t>& offsets) {
+    if (offsets.size() < 64U) {
+        std::sort(offsets.begin(), offsets.end());
+        offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+        return;
+    }
+    const auto [lo, hi] = std::minmax_element(offsets.begin(), offsets.end());
+    const std::uint32_t base = *lo;
+    const std::uint64_t span = static_cast<std::uint64_t>(*hi) - base + 1U;
+    if (span / 64U > 4U * offsets.size()) {
+        std::sort(offsets.begin(), offsets.end());
+        offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+        return;
+    }
+    std::vector<std::uint64_t> bits(static_cast<std::size_t>((span + 63U) / 64U), 0U);
+    for (const auto o : offsets) {
+        const std::uint32_t d = o - base;
+        bits[d / 64U] |= std::uint64_t{1} << (d % 64U);
+    }
+    offsets.clear();
+    for (std::size_t w = 0; w < bits.size(); ++w) {
+        for (std::uint64_t word = bits[w]; word != 0U; word &= word - 1U) {
+            offsets.push_back(base + static_cast<std::uint32_t>(w * 64U) +
+                              static_cast<std::uint32_t>(std::countr_zero(word)));
+        }
+    }
+}
+
 void add_addresses(RowSet& set, std::vector<std::uint64_t>& addrs) {
-    std::sort(addrs.begin(), addrs.end());
-    addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
+    // By fragment (a dataset has few), then each fragment's offsets in order.
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> by_fragment;
+    std::size_t at = 0;
     for (const auto a : addrs) {
-        set.rows[static_cast<std::uint32_t>(a >> 32U)].push_back(static_cast<std::uint32_t>(a));
+        const auto fragment = static_cast<std::uint32_t>(a >> 32U);
+        if (at >= by_fragment.size() || by_fragment[at].first != fragment) {
+            at = 0;
+            while (at < by_fragment.size() && by_fragment[at].first != fragment) {
+                ++at;
+            }
+            if (at == by_fragment.size()) {
+                if (by_fragment.size() == 32U) {  // many fragments: one sort of the addresses instead
+                    std::sort(addrs.begin(), addrs.end());
+                    addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
+                    for (const auto b : addrs) {
+                        set.rows[static_cast<std::uint32_t>(b >> 32U)].push_back(static_cast<std::uint32_t>(b));
+                    }
+                    return;
+                }
+                by_fragment.emplace_back(fragment, std::vector<std::uint32_t>{});
+            }
+        }
+        by_fragment[at].second.push_back(static_cast<std::uint32_t>(a));
+    }
+    for (auto& [fragment, offsets] : by_fragment) {
+        sort_unique_offsets(offsets);
+        auto& rows = set.rows[fragment];
+        if (rows.empty()) {
+            rows = std::move(offsets);
+        } else {
+            rows.insert(rows.end(), offsets.begin(), offsets.end());
+        }
     }
 }
 
