@@ -195,6 +195,7 @@ def _snapshot(uri: str, storage) -> dict:
         "config": dict(ds.config()),
         "metadata": dict(ds.metadata),
         "schema_metadata": ds.schema.metadata,
+        "schemas": [str(lance.dataset(uri, version=v, storage_options=storage).schema) for v in versions],
         "tags": sorted((name, info["version"]) for name, info in ds.tags.list().items()),
     }
 
@@ -263,3 +264,129 @@ def test_tag_conflicts_and_missing_tags_as_locally():
     with pytest.raises(ValueError, match="Ref not found error: tag t1 does not exist"):
         ds.tags.delete("t1")
     assert nl.dataset(uri, storage_options=options()).tags.list() == {}
+
+
+# ── W2b: schema changes and compaction on s3:// (docs/OBJECT_STORE_W2.md) ──────────────────────────────
+
+def _wide(start: int, rows: int = 100) -> pa.Table:
+    return batch(start, rows).append_column("score", pa.array(range(start, start + rows), pa.int64()))
+
+
+def _two_fragments(uri: str, storage) -> None:
+    nl.write_dataset(_wide(0), uri, storage_options=storage)
+    nl.write_dataset(_wide(100), uri, mode="append", storage_options=storage)
+
+
+def _new_column_data(ds) -> pa.RecordBatchReader:
+    values = pa.array(range(ds.count_rows()), pa.int64())
+    return pa.RecordBatchReader.from_batches(pa.schema([pa.field("extra", pa.int64())]),
+                                             [pa.record_batch([values], names=["extra"])])
+
+
+def _compact_in_steps(ds) -> None:
+    from nanolance.lance.lance import Compaction
+
+    rewrites = [task.execute(ds) for task in Compaction.plan(ds).tasks]
+    Compaction.commit(ds, rewrites)
+
+
+W2B_OPS = {
+    "add_columns_sql": lambda ds: ds.add_columns({"extra": "id + 1"}),
+    "add_columns_nulls": lambda ds: ds.add_columns(pa.field("extra", pa.int64())),
+    "add_columns_data": lambda ds: ds.add_columns(_new_column_data(ds)),
+    "drop_columns": lambda ds: ds.drop_columns(["score"]),
+    "alter_columns": lambda ds: ds.alter_columns({"path": "score", "name": "score2"}),
+    "alter_columns_nullable": lambda ds: ds.alter_columns({"path": "score", "nullable": True}),
+    "compact_files": lambda ds: ds.optimize.compact_files(),
+    "compact_files_after_delete": lambda ds: (ds.delete("id < 10"), ds.optimize.compact_files()),
+    "compact_in_steps": lambda ds: (ds.delete("id < 10"), _compact_in_steps(ds)),
+}
+
+
+@pytest.mark.parametrize("name", list(W2B_OPS))
+def test_schema_change_or_compaction_on_s3_matches_the_local_copy(name, tmp_path):
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    for uri, storage in ((s3_uri, options()), (local, None)):
+        _two_fragments(uri, storage)
+        W2B_OPS[name](nl.dataset(uri, storage_options=storage))
+    assert _snapshot(s3_uri, options()) == _snapshot(local, None)
+
+
+def test_pylance_add_column_then_nanolance_drop_and_compact_on_s3():
+    lance = require_pylance()
+    uri = fresh_uri()
+    _two_fragments(uri, options())
+    lance.dataset(uri, storage_options=options()).add_columns({"extra": "id + 1"})
+    ds = nl.dataset(uri, storage_options=options())
+    ds.drop_columns(["score"])
+    ds.optimize.compact_files()
+    theirs = lance.dataset(uri, storage_options=options())
+    # Compaction first commits a version that reserves the new fragments' ids (a BaseOperation), then the rewrite.
+    assert theirs.version == 6
+    assert [theirs.read_transaction(v).operation.__class__.__name__ for v in range(1, 7)] == \
+        ["Overwrite", "Append", "Merge", "Project", "BaseOperation", "Rewrite"]
+    assert theirs.schema.names == ["id", "name", "extra"]
+    table = theirs.to_table().sort_by("id")
+    assert table.column("extra").to_pylist() == [i + 1 for i in range(200)]
+
+
+# A child process: adds one new column (SQL) per name given, then a JSON line of the names it added and the
+# errors of the others.
+ADDER = textwrap.dedent("""
+    import json, sys
+    import nanolance.lance as nl
+    uri, names, options = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
+    added, errors = [], []
+    for name in names:
+        try:
+            nl.dataset(uri, storage_options=options).add_columns({name: "id + 1"})
+            added.append(name)
+        except OSError as e:
+            errors.append(str(e))
+    print(json.dumps({"added": added, "errors": errors}))
+""")
+
+
+def test_racing_add_columns_land_or_conflict_and_lose_nothing():
+    lance = require_pylance()
+    uri = fresh_uri()
+    _two_fragments(uri, options())
+    names = [["a1", "a2"], ["b1", "b2"]]
+    procs = [subprocess.Popen([sys.executable, "-c", ADDER, uri, json.dumps(n), json.dumps(options())],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for n in names]
+    outcomes = [result(p) for p in procs]
+    added = sorted(n for o in outcomes for n in o["added"])
+    assert all("conflict" in e.lower() for o in outcomes for e in o["errors"]), outcomes
+    theirs = lance.dataset(uri, storage_options=options())
+    assert theirs.version == 2 + len(added)
+    assert sorted(theirs.schema.names) == sorted(["id", "name", "score"] + added)
+
+
+# A child process: `appends` appends of 100 rows, then a JSON line of the ones that succeeded and the errors.
+COMPACTOR = textwrap.dedent("""
+    import json, sys
+    import nanolance.lance as nl
+    uri, options = sys.argv[1], json.loads(sys.argv[2])
+    try:
+        ds = nl.dataset(uri, storage_options=options)
+        metrics = ds.optimize.compact_files()
+        print(json.dumps({"fragments_removed": metrics.fragments_removed, "errors": []}))
+    except OSError as e:
+        print(json.dumps({"fragments_removed": 0, "errors": [str(e)]}))
+""")
+
+
+def test_compaction_racing_an_append_loses_no_rows():
+    lance = require_pylance()
+    uri = fresh_uri()
+    _two_fragments(uri, options())
+    appender = start_appender(uri, 3, 200)
+    compactor = subprocess.Popen([sys.executable, "-c", COMPACTOR, uri, json.dumps(options())],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    appended = result(appender)
+    compacted = result(compactor)
+    assert appended["errors"] == [] and compacted["errors"] == [], (appended, compacted)
+    theirs = lance.dataset(uri, storage_options=options())
+    ids = sorted(theirs.to_table(columns=["id"])["id"].to_pylist())
+    assert ids == list(range(200 + 100 * appended["ok"]))
+

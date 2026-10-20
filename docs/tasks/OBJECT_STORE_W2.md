@@ -96,3 +96,9 @@ disjoint ranges both land. Found and fixed: a native delete on `s3://` wrote its
 local directory named `s3:` (fopen). Reviewer's decisions: a tag create is a create-only PUT (a racing
 create cannot silently replace another's tag; pylance's plain PUT would), a tag delete one DELETE (pylance:
 HEAD then a batch POST ?delete; same end state).
+
+**W2b outcome (2026-10-20): W2 done.** add_columns (SQL, nulls, data), drop_columns, alter_columns,
+optimize.compact_files and the Compaction plan / execute / commit steps work on `s3://`, equal to a local
+copy as pylance reads them (Python-only change: the C++ paths already wrote through the W1 sink); races of
+two schema changes and of compaction vs appends lose nothing. Still refused by name, moved to W3 with the
+index builds: add_columns from a function and `merge` (fragment-level writes and hand-built Merge commits).

@@ -227,11 +227,9 @@ class CompactionTask:
         return f"CompactionTask(read_version={self.read_version}, fragments={self.fragment_ids})"
 
     def execute(self, dataset) -> "RewriteResult":
-        from nanolance.lance._errors import refuse_object_store_write
         from nanolance.lance.fragment import _decode_fragment
         from nanolance.lance.optimize import CompactionMetrics, RewriteResult
 
-        refuse_object_store_write(dataset.uri, "compact files")
         with native():
             old_ids, messages = _nanolance._ds_compact_execute(self._uri, self.read_version, self.fragment_ids,
                                                                self._max_bytes_per_file, self._batch_size)
@@ -268,9 +266,6 @@ class Compaction:
 
     @staticmethod
     def plan(dataset, options: Optional[dict] = None) -> CompactionPlan:
-        from nanolance.lance._errors import refuse_object_store_write
-
-        refuse_object_store_write(dataset.uri, "compact files")
         o = dict(options or {})
 
         def opt(name, default):
@@ -296,10 +291,8 @@ class Compaction:
     def commit(dataset, rewrites, options: Optional[dict] = None):
         """Commit rewritten tasks as one version (``options``: ``defer_index_remap``, ``reindex``). Returns the
         CompactionMetrics. A writer that changed a rewritten fragment meanwhile makes it a conflict."""
-        from nanolance.lance._errors import refuse_object_store_write
         from nanolance.lance.optimize import CompactionMetrics
 
-        refuse_object_store_write(dataset.uri, "compact files")
         rewrites = list(rewrites)
         if not rewrites:
             return CompactionMetrics()

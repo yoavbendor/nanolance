@@ -19,6 +19,7 @@ import pytest
 import lance
 import nanolance
 import nanolance.lance as nl
+from nanolance.lance.udf import BatchUDF
 
 ENDPOINT = os.environ.get("NANOLANCE_S3_TEST_ENDPOINT", "")
 BUCKET = os.environ.get("NANOLANCE_S3_TEST_BUCKET", "nl-test")
@@ -177,13 +178,12 @@ def test_storage_option_spellings_agree(uri):
 
 
 WRITES = {
-    "add_columns": lambda ds, uri: ds.add_columns({"extra": "id + 1"}),
-    "drop_columns": lambda ds, uri: ds.drop_columns(["score"]),
+    "add_columns_from_a_function": lambda ds, uri: ds.add_columns(
+        BatchUDF(lambda b: pa.record_batch([b.column(0)], names=["extra"]))),
     "create_scalar_index": lambda ds, uri: ds.create_scalar_index("id", "BTREE"),
     "create_vector_index": lambda ds, uri: ds.create_index("vec", index_type="IVF_FLAT", num_partitions=4),
     "drop_index": lambda ds, uri: ds.drop_index("id_idx"),
     "cleanup_old_versions": lambda ds, uri: ds.cleanup_old_versions(retain_versions=1),
-    "compact_files": lambda ds, uri: ds.optimize.compact_files(),
     "optimize_indices": lambda ds, uri: ds.optimize.optimize_indices(),
     "drop_dataset": lambda ds, uri: nl.LanceDataset.drop(uri, storage_options=options()),
     "fragment_create": lambda ds, uri: nl.LanceFragment.create(uri, sample_table(10)),

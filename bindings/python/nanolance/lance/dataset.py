@@ -1152,7 +1152,6 @@ class LanceDataset(pa.dataset.Dataset):
     def add_columns(self, transforms, read_columns=None, reader_schema=None, batch_size=None) -> None:
         """New columns: {name: SQL expression}, all-null fields (a pyarrow Field, list of Fields or
         Schema), or data (a table / reader with one row per row of the dataset)."""
-        refuse_object_store_write(self._uri, "add columns")
         if isinstance(transforms, dict):
             columns = [(str(k), str(v)) for k, v in transforms.items()]
             with native():
@@ -1164,6 +1163,7 @@ class LanceDataset(pa.dataset.Dataset):
             with native():
                 _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields), self._version)
         elif callable(transforms):
+            refuse_object_store_write(self._uri, "add columns from a function")
             self._add_columns_udf(transforms, read_columns, batch_size)
             return
         else:
@@ -1233,7 +1233,6 @@ class LanceDataset(pa.dataset.Dataset):
         self._refresh_latest("Merge")
 
     def drop_columns(self, columns: List[str]) -> None:
-        refuse_object_store_write(self._uri, "drop columns")
         if isinstance(columns, str):
             columns = [columns]
         with native():
@@ -1241,7 +1240,6 @@ class LanceDataset(pa.dataset.Dataset):
         self._refresh_latest("Project")
 
     def alter_columns(self, *alterations) -> None:
-        refuse_object_store_write(self._uri, "alter columns")
         items = []
         for a in alterations:
             if not isinstance(a, dict) or "path" not in a:
@@ -3447,7 +3445,6 @@ class DatasetOptimizer:
         """Rewrite small fragments (and those with many deleted rows) into fewer, larger ones. The
         indexes that covered the rewritten rows take them back, as Lance's compaction remaps its
         indexes (a second version; nanolance's `reindex=False` leaves them covering fewer fragments)."""
-        refuse_object_store_write(self._ds.uri, "compact files")
         from nanolance.lance.optimize import CompactionMetrics
 
         with native():
