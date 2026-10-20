@@ -117,3 +117,17 @@ the non-power-of-two path), `rq_prepare`, `rq_row_codes` / `rq_binary_ip` (packe
   probe order with one shared heap, the gate as Lance computes it (`__error_factors` column), so the rows
   are pylance's. Other index kinds' search does not change. Tests must cover several seeds, k 1 / 10 /
   100, nprobes 1 / 2 / all, with and without refine, and the case above.
+
+**R1a outcome (2026-10-20):** done in two Haiku sessions; reviewed. pylance-built default IVF_RQ indexes
+(5 bits, fast rotation, raw_query estimator, packed codes, L2) are searched as pylance searches them:
+Lance's u8-quantized binary sums for full 32-row blocks, the 4-bit extended codes, and Lance's top-k gate
+(lower bound from `__error_factors` against one heap shared by the probed partitions, in probe order), so
+the rows are pylance's even where the gate drops a row whose full estimate would be in the top k. Every
+other RQ setting is refused by name (R1b). `tests/test_ivf_rq.py` (30: seeds 0 / 5 / 11, dims 64 / 128,
+2 / 16 partitions, k 1 / 10 / 100, nprobes 1 / 2 / all, refine none / 4, prefilter, deletions); 30
+repeated runs clean. Reviewer's decision on the tolerance: an RQ estimate is a difference of terms on the
+scale of the query-to-centroid distance, so float32 rounding leaves an absolute error on that scale
+(measured up to 2.2e-5 next to a row at dim 128, 9e-5 where results reach 280): distances agree to 1e-6 of
+max(2 * dim, the largest distance), and rows may swap only with a row whose distance is that close.
+Matching Lance's SIMD summation order exactly was judged not worth it. Other index kinds' search speed
+unchanged (benchmark searches 0.92x-1.15x, noise).

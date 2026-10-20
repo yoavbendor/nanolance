@@ -550,7 +550,15 @@ bool in_range(float d, const NearestQuery& q) {
 struct Partition {
     std::vector<std::uint64_t> ids;
     std::vector<float> vectors;       // IVF_FLAT: n * dim
-    std::vector<std::uint8_t> codes;  // IVF_PQ: [code bytes][n]; IVF_HNSW_SQ: [n][dim]
+    std::vector<std::uint8_t> codes;  // IVF_PQ: [code bytes][n]; IVF_HNSW_SQ: [n][dim]; IVF_RQ: packed bits
+    // IVF_RQ: the add / scale factors of the 1-bit code and of the extended code, one per row, and
+    // the extended codes in Lance's blocked layout ([n][ex row bytes]).
+    std::vector<float> rq_add;
+    std::vector<float> rq_scale;
+    std::vector<float> rq_ex_add;
+    std::vector<float> rq_ex_scale;
+    std::vector<float> rq_err;  // __error_factors: the lower bound's error term, per row
+    std::vector<std::uint8_t> rq_ex;
     // IVF_HNSW_SQ: the partition's graph. Level 0 holds every node (row == node id); an upper level
     // only the nodes on it.
     std::vector<std::uint32_t> level0_offsets;  // n + 1
@@ -593,7 +601,7 @@ struct CacheCount {
 };
 
 /// An IVF index's rows (auxiliary.idx): FLAT floats, PQ codes or 8-bit SQ codes.
-enum class Storage { Flat, Pq, Sq };
+enum class Storage { Flat, Pq, Sq, Rq };
 /// The sub-index over each partition (index.idx): FLAT (exhaustive) or an HNSW graph.
 enum class SubIndex { Flat, Hnsw };
 
@@ -610,6 +618,8 @@ bool split_index_type(const std::string& type, Storage& storage, SubIndex& sub) 
         storage = Storage::Pq;
     } else if (name == "SQ") {
         storage = Storage::Sq;
+    } else if (name == "RQ") {
+        storage = Storage::Rq;
     } else {
         return false;
     }
@@ -644,6 +654,10 @@ struct IvfIndex {
     std::uint32_t hnsw_ef_construction = 150;
     std::uint32_t hnsw_max_level = 7;
     std::vector<float> codebook_t;  // the same as [m][dim / m][2^nbits]: a table row is one sweep
+    // IVF_RQ: the fast rotation's sign bits (4 rounds of ceil(dim / 8) bytes) and the extended code's
+    // bytes per row (4 extended bits, blocked: padded dim * 4 / 8).
+    std::vector<std::uint8_t> rq_signs;
+    std::size_t rq_ex_len = 0;
 
     mutable std::mutex mutex;
     mutable std::unordered_map<std::size_t, std::shared_ptr<const Partition>> loaded;
@@ -765,6 +779,127 @@ bool IvfIndex::load_graph(std::size_t p, Partition& part, std::string& error) co
     return true;
 }
 
+/// IVF_RQ's storage_metadata (a JSON list of one JSON string): the rotation, the code and the query
+/// estimator. R1a reads the default layout only (5 bits, fast rotation, raw-query estimator, packed
+/// codes, L2); anything else is refused by name.
+bool load_rq_metadata(const std::string& text, IvfIndex& index, std::string& error) {
+    fts::json::Value list;
+    fts::json::Value meta;
+    if (!fts::json::parse(text, list) || list.kind != fts::json::Value::Array || list.items.empty() ||
+        list.items[0].kind != fts::json::Value::String || !fts::json::parse(list.items[0].s, meta)) {
+        error = "vector index: IVF_RQ storage metadata is malformed";
+        return false;
+    }
+    const auto* bits = meta.get("num_bits");
+    const auto* estimator = meta.get("query_estimator");
+    const auto* rotation = meta.get("rotation_type");
+    const auto* position = meta.get("rotate_mat_position");
+    const auto* packed = meta.get("packed");
+    const auto* code_dim = meta.get("code_dim");
+    const auto* signs = meta.get("fast_rotation_signs");
+    if (bits == nullptr || bits->n != 5.0) {
+        error = "vector index: IVF_RQ with " + std::to_string(bits == nullptr ? 0 : static_cast<int>(bits->n)) +
+                " bits is not supported yet";
+        return false;
+    }
+    if (estimator == nullptr || estimator->s != "raw_query") {
+        error = "vector index: IVF_RQ with the " + (estimator == nullptr ? std::string("missing") : estimator->s) +
+                " query estimator is not supported yet";
+        return false;
+    }
+    if (rotation == nullptr || rotation->s != "fast") {
+        error = "vector index: IVF_RQ with the " + (rotation == nullptr ? std::string("missing") : rotation->s) +
+                " rotation is not supported yet";
+        return false;
+    }
+    if (position != nullptr && position->kind != fts::json::Value::Null) {
+        error = "vector index: IVF_RQ with a dense rotation matrix is not supported yet";
+        return false;
+    }
+    if (packed == nullptr || packed->kind != fts::json::Value::Bool || !packed->b) {
+        error = "vector index: IVF_RQ codes that are not packed are not supported yet";
+        return false;
+    }
+    if (index.metric != VectorMetric::L2) {
+        error = "vector index: IVF_RQ is searched with L2 only so far";
+        return false;
+    }
+    const std::size_t dim = index.dim;
+    if (dim == 0U || dim % 8U != 0U || code_dim == nullptr || static_cast<std::size_t>(code_dim->n) != dim) {
+        error = "vector index: IVF_RQ code_dim does not match the centroids' dimension " + std::to_string(dim);
+        return false;
+    }
+    const std::size_t bytes_per_round = (dim + 7U) / 8U;
+    if (signs == nullptr || signs->kind != fts::json::Value::Array || signs->items.size() != 4U * bytes_per_round) {
+        error = "vector index: IVF_RQ has no fast rotation signs for dimension " + std::to_string(dim);
+        return false;
+    }
+    index.rq_signs.clear();
+    for (const auto& item : signs->items) {
+        index.rq_signs.push_back(static_cast<std::uint8_t>(item.n));
+    }
+    index.code_bytes = dim / 8U;
+    index.rq_ex_len = (dim + 63U) / 64U * 64U * 4U / 8U;  // 4 extended bits, blocked by 64 dims
+    return true;
+}
+
+/// One IVF_RQ partition: the 1-bit codes (packed), the factors and the blocked extended codes.
+bool load_rq_partition(const IvfIndex& index, std::uint64_t first, std::uint64_t n, Partition& part,
+                       std::string& error) {
+    const std::vector<std::string> columns = {"_rowid",           "_rabit_codes",    "__add_factors",
+                                              "__scale_factors",  "__add_factors_ex", "__scale_factors_ex",
+                                              "__blocked_ex_codes", "__error_factors"};
+    FileTable table;
+    if (!read_table(index.aux, &columns, LanceRowRange{first, n}, table, error)) {
+        return false;
+    }
+    int col[8];
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        col[c] = child_index(table.schema, columns[c]);
+        if (col[c] < 0) {
+            error = "vector index: auxiliary.idx has no " + columns[c] + " column";
+            return false;
+        }
+    }
+    const auto code_bytes = static_cast<std::int64_t>(index.code_bytes);
+    const auto ex_bytes = static_cast<std::int64_t>(index.rq_ex_len);
+    for (const auto& batch : table.batches) {
+        BatchView b(table.schema, batch, error);
+        if (!b.ok) {
+            return false;
+        }
+        const ArrowArrayView* ids = b.view.children[col[0]];
+        const ArrowArrayView* codes = b.view.children[col[1]];
+        const ArrowArrayView* code_items = codes->children[0];
+        const ArrowArrayView* ex = b.view.children[col[6]];
+        const ArrowArrayView* ex_items = ex->children[0];
+        for (std::int64_t r = 0; r < batch.length; ++r) {
+            const std::int64_t row = b.view.offset + r;
+            part.ids.push_back(ArrowArrayViewGetUIntUnsafe(ids, row));
+            const auto* src = code_items->buffer_views[1].data.as_uint8 + code_items->offset +
+                              (codes->offset + row) * code_bytes;
+            part.codes.insert(part.codes.end(), src, src + code_bytes);
+            const auto* ex_src = ex_items->buffer_views[1].data.as_uint8 + ex_items->offset +
+                                 (ex->offset + row) * ex_bytes;
+            part.rq_ex.insert(part.rq_ex.end(), ex_src, ex_src + ex_bytes);
+            part.rq_add.push_back(static_cast<float>(ArrowArrayViewGetDoubleUnsafe(b.view.children[col[2]], row)));
+            part.rq_scale.push_back(static_cast<float>(ArrowArrayViewGetDoubleUnsafe(b.view.children[col[3]], row)));
+            part.rq_ex_add.push_back(static_cast<float>(ArrowArrayViewGetDoubleUnsafe(b.view.children[col[4]], row)));
+            part.rq_ex_scale.push_back(
+                static_cast<float>(ArrowArrayViewGetDoubleUnsafe(b.view.children[col[5]], row)));
+            part.rq_err.push_back(static_cast<float>(ArrowArrayViewGetDoubleUnsafe(b.view.children[col[7]], row)));
+        }
+    }
+    if (part.ids.size() != n || part.codes.size() != n * index.code_bytes || part.rq_ex.size() != n * index.rq_ex_len ||
+        part.rq_add.size() != n || part.rq_scale.size() != n || part.rq_ex_add.size() != n ||
+        part.rq_ex_scale.size() != n || part.rq_err.size() != n) {
+        error = "vector index: IVF_RQ partition has " + std::to_string(part.ids.size()) + " rows, not " +
+                std::to_string(n);
+        return false;
+    }
+    return true;
+}
+
 bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, std::string& error,
                          CacheCount& count) const {
     {
@@ -781,7 +916,11 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
     work_stats::count_index_cache(false);
     auto part = std::make_shared<Partition>();
     const std::uint64_t n = lengths[p];
-    if (n != 0U) {
+    if (n != 0U && storage == Storage::Rq) {
+        if (!load_rq_partition(*this, offsets[p], n, *part, error)) {
+            return false;
+        }
+    } else if (n != 0U) {
         const std::vector<std::string> columns = {
             "_rowid", storage == Storage::Pq ? "__pq_code" : (storage == Storage::Sq ? "__sq_code" : "flat")};
         FileTable table;
@@ -986,6 +1125,11 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
                 param("max_level", index->hnsw_max_level);
             }
             index->hnsw_meta.push_back(std::move(m));
+        }
+    }
+    if (index->storage == Storage::Rq) {
+        if (!load_rq_metadata(storage, *index, error)) {
+            return false;
         }
     }
     if (index->storage == Storage::Pq) {
@@ -1274,6 +1418,225 @@ void pq_distances(const IvfIndex& index, const std::vector<float>& table, const 
         for (auto& x : d) {
             x -= diff;
         }
+    }
+}
+
+// ── IVF_RQ (RaBitQ) ───────────────────────────────────────────────────────────────────────────────
+// Lance's raw-query estimator (storage.rs, rotation.rs, ex_dot.rs): the query is rotated by the fast
+// rotation, the 1-bit codes give its inner product with each row's sign pattern through a table of
+// 4-dimension segments, and the 4 extended bits add the rest of the code. Codes are Lance's packed
+// layout (32 rows per block, PERM0 order); the extended codes are the blocked 64-dim layout.
+
+/// Lance's fast rotation: 4 rounds of random sign flips and a Walsh-Hadamard transform, with the
+/// Kac step for dimensions that are not powers of two.
+void rq_fwht(float* v, std::size_t n) {
+    for (std::size_t half = 1; half < n; half *= 2) {
+        for (std::size_t base = 0; base < n; base += 2 * half) {
+            for (std::size_t i = 0; i < half; ++i) {
+                const float x = v[base + i];
+                const float y = v[base + i + half];
+                v[base + i] = x + y;
+                v[base + i + half] = x - y;
+            }
+        }
+    }
+}
+
+void rq_flip(float* v, std::size_t n, const std::uint8_t* signs) {
+    for (std::size_t i = 0; i < n; ++i) {
+        if (((signs[i / 8U] >> (i % 8U)) & 1U) != 0U) {
+            v[i] = -v[i];
+        }
+    }
+}
+
+void rq_scale(float* v, std::size_t n, float factor) {
+    for (std::size_t i = 0; i < n; ++i) {
+        v[i] *= factor;
+    }
+}
+
+void rq_rotate(const float* in, std::size_t dim, const std::uint8_t* signs, float* out) {
+    constexpr std::size_t kRounds = 4;
+    std::copy(in, in + dim, out);
+    const std::size_t bytes_per_round = (dim + 7U) / 8U;
+    std::size_t trunc = 1;
+    while (trunc * 2U <= dim) {
+        trunc *= 2U;
+    }
+    const float scale = 1.0F / std::sqrt(static_cast<float>(trunc));
+    if (trunc == dim) {
+        for (std::size_t round = 0; round < kRounds; ++round) {
+            rq_flip(out, dim, signs + round * bytes_per_round);
+            rq_fwht(out, dim);
+            rq_scale(out, dim, scale);
+        }
+        return;
+    }
+    const std::size_t start = dim - trunc;
+    for (std::size_t round = 0; round < kRounds; ++round) {
+        rq_flip(out, dim, signs + round * bytes_per_round);
+        if (round % 2U == 0U) {
+            rq_fwht(out, trunc);
+            rq_scale(out, trunc, scale);
+        } else {
+            rq_fwht(out + start, trunc);
+            rq_scale(out + start, trunc, scale);
+        }
+        const std::size_t half = dim / 2U;  // the Kac mixing step (x, y) -> (x + y, x - y)
+        for (std::size_t i = 0; i < half; ++i) {
+            const float x = out[i];
+            const float y = out[half + i];
+            out[i] = x + y;
+            out[half + i] = x - y;
+        }
+    }
+    rq_scale(out, dim, 0.25F);
+}
+
+/// The query's side of the estimator, once per search: the rotated query (zero-padded to 64-dim
+/// blocks for the extended dot), its 4-dimension distance tables and its sum.
+struct RqQuery {
+    std::vector<float> dist_table;  // dim / 4 segments of 16 sums: entry [s * 16 + code]
+    std::vector<float> ex_query;    // the rotated query, padded to a multiple of 64
+    float sum_q = 0.0F;
+    // Lance's default (Normal) binary inner products of the full 32-row blocks come from the table
+    // quantized to u8 (affine over [qmin, qmax]) and the integer sums, dequantized as
+    // sum * range + segments * qmin. The remaining rows are exact. `exact_only` is Lance's fallback
+    // when that affine map would overflow f32.
+    std::vector<std::uint8_t> qtable;
+    float range = 0.0F;
+    float sum_min = 0.0F;
+    bool exact_only = false;
+};
+
+RqQuery rq_prepare(const IvfIndex& index, const float* key) {
+    const std::size_t dim = index.dim;
+    std::vector<float> rotated(dim);
+    rq_rotate(key, dim, index.rq_signs.data(), rotated.data());
+    RqQuery q;
+    q.dist_table.assign(dim * 4U, 0.0F);
+    for (std::size_t seg = 0; seg < dim / 4U; ++seg) {
+        float* table = q.dist_table.data() + seg * 16U;
+        table[0] = 0.0F;
+        for (std::size_t j = 1; j < 16U; ++j) {
+            const std::size_t low = j & (~j + 1U);  // lowbit(j)
+            std::size_t bit = 0;
+            while (((low >> bit) & 1U) == 0U) {
+                ++bit;
+            }
+            table[j] = table[j - low] + rotated[4U * seg + bit];
+        }
+    }
+    q.ex_query.assign((dim + 63U) / 64U * 64U, 0.0F);
+    std::copy(rotated.begin(), rotated.end(), q.ex_query.begin());
+    for (const float x : rotated) {
+        q.sum_q += x;
+    }
+    // quantize_dist_table_into (dist_table_quant.rs): min and max over the whole table.
+    const auto segments = static_cast<float>(dim / 4U);
+    const float qmin = *std::min_element(q.dist_table.begin(), q.dist_table.end());
+    const float qmax = *std::max_element(q.dist_table.begin(), q.dist_table.end());
+    if (!std::isfinite(segments * qmin) || !std::isfinite(segments * qmax) ||
+        !std::isfinite(segments * (qmax - qmin))) {
+        q.exact_only = true;
+        return q;
+    }
+    q.qtable.assign(q.dist_table.size(), 0U);
+    const float factor = 255.0F / (qmax - qmin);
+    if (std::isfinite(factor)) {
+        for (std::size_t i = 0; i < q.dist_table.size(); ++i) {
+            q.qtable[i] = static_cast<std::uint8_t>(std::nearbyint((q.dist_table[i] - qmin) * factor));
+        }
+    }
+    q.range = (qmax - qmin) / 255.0F;
+    q.sum_min = segments * qmin;
+    return q;
+}
+
+/// One row's 1-bit code, as sequential bytes (bit d of the code is byte d / 8, bit d % 8), read from
+/// Lance's packed layout: 32 rows per block of code_len 32-byte columns in PERM0 order, the remaining
+/// rows transposed after them.
+void rq_row_codes(const std::uint8_t* packed, std::size_t n, std::size_t code_len, std::size_t id,
+                  std::uint8_t* codes) {
+    static constexpr std::size_t kPerm0Inverse[16] = {0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15};
+    const std::size_t rem = n % 32U;
+    const std::size_t full = n - rem;
+    if (id < full) {
+        // The nibble pair of one column byte: lower nibble = segment 2c, upper = segment 2c + 1.
+        const std::size_t base = (id / 32U) * 32U * code_len;
+        const std::size_t in_batch = id % 32U;
+        const std::size_t idx = kPerm0Inverse[in_batch % 16U];
+        const bool lower = in_batch < 16U;
+        for (std::size_t col = 0; col < code_len; ++col) {
+            const std::uint8_t* block = packed + base + col * 32U;
+            codes[col] = lower ? static_cast<std::uint8_t>((block[idx] & 0x0FU) |
+                                                           static_cast<std::uint8_t>(block[idx + 16U] << 4U))
+                               : static_cast<std::uint8_t>((block[idx] >> 4U) | (block[idx + 16U] & 0xF0U));
+        }
+        return;
+    }
+    const std::size_t off = id - full;
+    const std::uint8_t* rest = packed + full * code_len;
+    for (std::size_t col = 0; col < code_len; ++col) {
+        codes[col] = rest[col * rem + off];
+    }
+}
+
+/// The row's binary inner product with the query: the exact sum of the dist table (Lance's
+/// compute_single_rq_distance) for the remainder rows and the exact fallback, else the dequantized
+/// sum of the u8 table (binary_distances_with_scratch).
+float rq_binary_ip(const RqQuery& q, const std::uint8_t* packed, std::size_t n, std::size_t code_len,
+                   std::size_t id) {
+    std::uint8_t codes[256];
+    rq_row_codes(packed, n, code_len, id, codes);
+    const bool simd_row = !q.exact_only && id < n - n % 32U;
+    if (simd_row) {
+        std::uint32_t sum = 0;
+        for (std::size_t col = 0; col < code_len; ++col) {
+            sum += q.qtable[(2U * col) * 16U + (codes[col] & 0x0FU)] +
+                   q.qtable[(2U * col + 1U) * 16U + (codes[col] >> 4U)];
+        }
+        return static_cast<float>(sum) * q.range + q.sum_min;
+    }
+    float dist = 0.0F;
+    for (std::size_t col = 0; col < code_len; ++col) {
+        dist += q.dist_table[(2U * col) * 16U + (codes[col] & 0x0FU)] +
+                q.dist_table[(2U * col + 1U) * 16U + (codes[col] >> 4U)];
+    }
+    return dist;
+}
+
+/// Lance's raw-query distance of one row (RabitDistCalculator::raw_query_multi_bit_exact_distance,
+/// 4 extended bits, L2): the binary inner product, the extended dot and the factors of the row.
+float rq_distance(const IvfIndex& index, const RqQuery& q, const Partition& part, std::size_t id,
+                  float query_factor, float binary_ip) {
+    // sum_d query[d] * ex[d], the extended code of dimension d in the blocked layout: 16 dims per
+    // 8-byte unit, low nibble for the first 8 of them, high nibble for the rest.
+    const std::uint8_t* ex = part.rq_ex.data() + id * index.rq_ex_len;
+    float ex_dot = 0.0F;
+    for (std::size_t d = 0; d < q.ex_query.size(); ++d) {
+        const std::size_t block = d / 64U;
+        const std::size_t r = d % 64U;
+        const std::size_t unit = r / 16U;
+        const std::size_t i = r % 16U;
+        const std::uint8_t byte = ex[block * 32U + unit * 8U + i % 8U];
+        const auto value = static_cast<std::uint8_t>((byte >> ((i / 8U) * 4U)) & 0x0FU);
+        ex_dot += q.ex_query[d] * static_cast<float>(value);
+    }
+    const float code_bias = -(16.0F - 0.5F);
+    const float full_dot = 16.0F * binary_ip + ex_dot + code_bias * q.sum_q;
+    return full_dot * part.rq_ex_scale[id] + part.rq_ex_add[id] + query_factor;
+}
+
+/// One IVF_RQ partition's distances to the query. `query_factor` is the squared distance to its centroid.
+void rq_distances(const IvfIndex& index, const RqQuery& q, const Partition& part, float query_factor,
+                  std::vector<float>& d) {
+    const std::size_t n = part.ids.size();
+    d.resize(n);
+    const std::size_t code_len = index.dim / 8U;
+    for (std::size_t r = 0; r < n; ++r) {
+        d[r] = rq_distance(index, q, part, r, query_factor, rq_binary_ip(q, part.codes.data(), n, code_len, r));
     }
 }
 
@@ -1694,6 +2057,46 @@ bool hnsw_search_partition(const Partition& part, const Dist& dist, const Neares
     return hnsw_search_partition(part, FloatDistance{&index, &part, &key}, q, mask, kk, local, why);
 }
 
+/// Lance's top-k scan of one IVF_RQ partition into the heap all the partitions share
+/// (accumulate_raw_query_multi_bit_topk). A row whose lower bound -- its 1-bit estimate less
+/// error_factor * query_error -- is at least the heap's worst distance, once the heap holds `k`
+/// rows, is skipped without its extended distance. Otherwise that distance is computed and the row
+/// replaces the worst one when it is smaller. `query_error` is sqrt of the squared distance to the
+/// centroid (raw_query_error, L2). Upper and lower bounds are f32 max and min: nothing is cut by them.
+template <typename Heap>
+void rq_gate_partition(const IvfIndex& index, const RqQuery& q, const Partition& part, float query_factor,
+                       const RowMask& mask, std::size_t k, Heap& heap) {
+    if (k == 0U) {
+        return;
+    }
+    const std::size_t n = part.ids.size();
+    const std::size_t code_len = index.dim / 8U;
+    const float query_error = query_factor > 0.0F ? std::sqrt(query_factor) : 0.0F;
+    const float top = std::numeric_limits<float>::max();
+    for (std::size_t r = 0; r < n; ++r) {
+        const std::uint64_t id = part.ids[r];
+        if (!mask.allows(id)) {
+            continue;
+        }
+        const float binary_ip = rq_binary_ip(q, part.codes.data(), n, code_len, r);
+        const float binary = (binary_ip - 0.5F * q.sum_q) * part.rq_scale[r] + part.rq_add[r] + query_factor;
+        const float lower = binary - part.rq_err[r] * query_error;
+        if (lower >= top || (heap.size() >= k && lower >= heap.peek().d)) {
+            continue;
+        }
+        const float d = rq_distance(index, q, part, r, query_factor, binary_ip);
+        if (d < -top || d >= top) {
+            continue;
+        }
+        if (heap.size() < k) {
+            heap.push(Candidate{d, id});
+        } else if (heap.peek().d > d) {
+            heap.pop();
+            heap.push(Candidate{d, id});
+        }
+    }
+}
+
 /// The best `kk` candidates of one index segment.
 bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_column, const RowMask& mask,
                     std::size_t kk, std::vector<Candidate>& out, std::string& plan, std::string& error,
@@ -1732,6 +2135,10 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
     const std::uint64_t max_results =
         mask.has_count ? std::min<std::uint64_t>(q.k, mask.count) : static_cast<std::uint64_t>(q.k);
 
+    RqQuery rq;  // IVF_RQ: the rotated query and its tables, once for every partition
+    if (index.storage == Storage::Rq) {
+        rq = rq_prepare(index, key.data());
+    }
     std::vector<float> dot_table;  // dot: one table for every partition
     if (index.storage == Storage::Pq && index.metric == VectorMetric::Dot) {
         pq_table(index, key.data(), dot_table);
@@ -1764,6 +2171,8 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
             for (std::size_t r = 0; r < n; ++r) {
                 d[r] = dist(static_cast<std::uint32_t>(r));
             }
+        } else if (index.storage == Storage::Rq) {
+            rq_distances(index, rq, *part, to_centroid[p], d);
         } else {
             d.resize(n);
             for (std::size_t r = 0; r < n; ++r) {
@@ -1781,6 +2190,51 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         local.insert(local.end(), found.begin(), found.end());
         return true;
     };
+    // The end of every search: the prefilter's rows the search did not reach, the best `kk`, the plan.
+    const auto finish = [&](std::size_t searched, std::uint64_t found) {
+        // Fewer rows pass the prefilter than k, and the search did not reach them all: Lance returns
+        // the rest too, at an infinite distance.
+        if (mask.has_count && mask.count <= q.k && found < mask.count) {
+            std::set<std::uint64_t> have;
+            for (const auto& c : out) {
+                have.insert(c.id);
+            }
+            for (const auto& [frag, rows] : mask.rows) {
+                for (std::size_t r = 0; r < rows.size(); ++r) {
+                    const std::uint64_t id = (static_cast<std::uint64_t>(frag) << 32U) | r;
+                    if (rows[r] != 0U && have.count(id) == 0U && mask.allows(id)) {
+                        out.push_back(Candidate{std::numeric_limits<float>::infinity(), id});
+                    }
+                }
+            }
+        }
+        keep_best(out, kk);
+        plan = "ANNIvfPartition: nprobes=" + std::to_string(searched) + " of " + std::to_string(P) +
+               " (minimum " + std::to_string(first) + ") minimum_nprobes=" + std::to_string(q.minimum_nprobes) +
+               " maximum_nprobes=" +
+               (q.maximum_nprobes ? "Some(" + std::to_string(*q.maximum_nprobes) + ")" : std::string("None"));
+        return true;
+    };
+
+    if (index.storage == Storage::Rq) {
+        // IVF_RQ searches as Lance's FLAT sub-index does under IVF's global top-k heap: every probed
+        // partition in probe order into one heap of kk entries, rows gated against it.
+        const auto by_dist = [](const Candidate& a, const Candidate& b) { return a.d < b.d; };
+        RustHeap<Candidate, decltype(by_dist)> heap(by_dist);
+        for (std::size_t i = 0; i < most; ++i) {
+            std::shared_ptr<const Partition> part;
+            if (!index.partition(order[i], part, error, count)) {
+                return false;
+            }
+            rq_gate_partition(index, rq, *part, to_centroid[order[i]], mask, kk, heap);
+        }
+        std::uint64_t added = 0;
+        for (const Candidate& c : std::move(heap).into_sorted()) {
+            out.push_back(c);
+            ++added;
+        }
+        return finish(most, added);
+    }
     // The first `first` partitions are searched whatever they hold, in parallel.
     std::vector<std::vector<Candidate>> early(std::min(first, most));
     std::vector<std::string> errors(early.size());
@@ -1817,28 +2271,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         }
         searched += pulled;
     }
-    // Fewer rows pass the prefilter than k, and the search did not reach them all: Lance returns
-    // the rest too, at an infinite distance.
-    if (mask.has_count && mask.count <= q.k && found < mask.count) {
-        std::set<std::uint64_t> have;
-        for (const auto& c : out) {
-            have.insert(c.id);
-        }
-        for (const auto& [frag, rows] : mask.rows) {
-            for (std::size_t r = 0; r < rows.size(); ++r) {
-                const std::uint64_t id = (static_cast<std::uint64_t>(frag) << 32U) | r;
-                if (rows[r] != 0U && have.count(id) == 0U && mask.allows(id)) {
-                    out.push_back(Candidate{std::numeric_limits<float>::infinity(), id});
-                }
-            }
-        }
-    }
-    keep_best(out, kk);
-    plan = "ANNIvfPartition: nprobes=" + std::to_string(searched) + " of " + std::to_string(P) +
-           " (minimum " + std::to_string(first) + ") minimum_nprobes=" + std::to_string(q.minimum_nprobes) +
-           " maximum_nprobes=" +
-           (q.maximum_nprobes ? "Some(" + std::to_string(*q.maximum_nprobes) + ")" : std::string("None"));
-    return true;
+    return finish(searched, found);
 }
 
 // ── exact distances ─────────────────────────────────────────────────────────────────────────────
