@@ -40,6 +40,9 @@ struct NearestQuery {
     /// many query vectors, one after another, and a row's distance sums, over them, the least distance
     /// to any of the row's vectors (Lance's multivec_distance). 1: an ordinary query vector.
     std::size_t key_vectors = 1;
+    /// Set by dataset_nearest for a float16 column: pylance casts the query to the column's type, so a
+    /// cosine index search normalizes the (already rounded) query and rounds it to float16 again.
+    bool f16_column = false;
     std::uint64_t k = 10;
     /// Partitions to probe: at least `minimum_nprobes` (Lance's adaptive count when it is 1 and
     /// there is no maximum), at most `maximum_nprobes` (all when unset). `nprobes` sets both.

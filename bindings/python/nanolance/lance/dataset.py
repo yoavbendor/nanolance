@@ -2937,10 +2937,12 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
         # IVF_RQ only (the other kinds ignore it, as pylance does); 'normal' is the default.
         "approx_mode": approx_mode,
     }
+    elem = storage.value_type.value_type if multi else getattr(storage, "value_type", None)
+    if elem is not None and pa.types.is_float16(elem):
+        # pylance casts the query to the column's element type: a float16 column's query is rounded
+        # (measured: its exact distances equal ours to 1e-7 only with the rounded query)
+        rows = [row.astype(np.float16).astype(np.float32) for row in rows]
     if multi:
-        if pa.types.is_float16(storage.value_type.value_type):
-            # pylance casts the query to the column's element type: a float16 column's query is rounded
-            rows = [row.astype(np.float16).astype(np.float32) for row in rows]
         # The query's vectors one after another (the scanner reads them as n x dim).
         return dict(shared, q=[x for row in rows for x in row.tolist()], vectors=len(rows))
     if batch:

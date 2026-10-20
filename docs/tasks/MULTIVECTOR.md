@@ -185,3 +185,8 @@ rows equal up to near-ties: the open float16 gap of M2b); recall within 0.01 of 
 3 builds). Single-vector index files byte-identical before and after. The four target tests pass
 (`test_multivec_search_paths`, `test_multivec_ann`, `test_ivf_centroids_multivector_fragment_ids`,
 `test_multi_vector_field`; expected list 1214). Left: M2c (lance-c multivector search).
+
+**float16 follow-up (2026-10-20):** the ~1.5e-4 float16 gap is closed (measured to 1e-7 against pylance,
+plain and multivector): pylance casts the query to float16; for a cosine index it normalizes the query, rounds
+it to float16 again and divides by that rounded query's true norm; PQ residuals (key - centroid) are rounded
+to float16. Tests: `tests/test_float16_vectors.py`, and test_multivector's float16 tolerances tightened to 1e-5.

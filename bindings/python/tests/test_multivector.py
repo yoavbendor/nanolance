@@ -68,11 +68,18 @@ def _query(elem, seed=2, vectors=2):
 
 
 def _same(ref, got, rtol=1e-6, atol=1e-6):
-    """The same rows in the same order, with the same distances (NaN rows are absent from both)."""
-    assert ref["id"].to_pylist() == got["id"].to_pylist()
+    """The same rows in the same order, with the same distances (NaN rows are absent from both). Two rows
+    whose distances agree within the tolerance may trade places: a float32 near-tie (one ulp apart) that
+    the engines' summation orders break differently."""
+    rids, gids = ref["id"].to_pylist(), got["id"].to_pylist()
     rd, gd = ref["_distance"].to_numpy(), got["_distance"].to_numpy()
     assert not np.isnan(rd).any() and not np.isnan(gd).any()
     np.testing.assert_allclose(gd, rd, rtol=rtol, atol=atol)
+    assert len(rids) == len(gids), (rids, gids)
+    for i, (r, g) in enumerate(zip(rids, gids)):
+        if r != g:
+            j = rids.index(g) if g in rids else -1
+            assert j >= 0 and abs(rd[j] - rd[i]) <= atol + rtol * abs(rd[i]), (i, rids, gids, rd.tolist())
 
 
 @pytest.mark.parametrize("elem, metric", [
@@ -302,7 +309,7 @@ def test_float16_index_matches_pylance(lance, tmp_path, kind, kw):
     """float16 multivector indexes. With refine_factor the answer is exact: pylance's rows and distances to
     1e-6. Without it the XTR distances of a float16 index differ from pylance's by up to about 2e-4 (the same
     gap as a plain float16 IVF_FLAT search here: the cause is not explained yet), so there the rows and their
-    order must match and the distances agree to 5e-4."""
+    order must match and the distances agree to 1e-5."""
     rng = np.random.default_rng(53)
     rows = _dense(rng, 480)  # enough vectors to train PQ (256) in the indexed part
     path = _ivf_flat_dataset(lance, tmp_path, f"f16_{kind}", rows, 400, 2, kind, kw, elem=pa.float16())
@@ -315,7 +322,7 @@ def test_float16_index_matches_pylance(lance, tmp_path, kind, kw):
             ref = lance.dataset(path).to_table(columns=["id"], nearest=nearest)
             got = nl.dataset(path).to_table(columns=["id"], nearest=nearest)
             assert got["id"].to_pylist() == ref["id"].to_pylist()
-            _same(ref, got, rtol=1e-6 if refine else 5e-4, atol=1e-6 if refine else 5e-4)
+            _same(ref, got, rtol=1e-6 if refine else 1e-5, atol=1e-6 if refine else 1e-5)
 
 
 
@@ -370,7 +377,7 @@ def test_nanolance_built_index_is_searched_as_pylance_searches_it(lance, tmp_pat
                 if f32:
                     _same(ref, got)
                 else:
-                    _same_modulo_ties(ref, got, 2e-3)
+                    _same_modulo_ties(ref, got, 1e-5)
 
 
 @pytest.mark.parametrize("elem", [pa.float32(), pa.float16()])

@@ -33,6 +33,8 @@
 
 #include <nanoarrow/nanoarrow.h>
 
+#include "float16.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -1982,9 +1984,10 @@ struct FloatDistance {
     const IvfIndex* index = nullptr;
     const Partition* part = nullptr;
     const std::vector<float>* key = nullptr;
+    float key_norm = 1.0F;  // |key|: 1 unless a float16 column's normalized query was rounded again
     float operator()(std::uint32_t id) const {
         return distance(index->metric, part->vectors.data() + static_cast<std::size_t>(id) * index->dim, key->data(),
-                        index->dim, 1.0F);
+                        index->dim, key_norm);
     }
 };
 
@@ -2206,7 +2209,7 @@ bool hnsw_search_partition(const Partition& part, const Dist& dist, const Neares
             std::vector<float> residual(index.dim);
             const float* c = index.centroids.data() + p * index.dim;
             for (std::size_t j = 0; j < index.dim; ++j) {
-                residual[j] = key[j] - c[j];
+                residual[j] = q.f16_column ? ArrowHalfFloatToFloat(float16_bits(key[j] - c[j])) : key[j] - c[j];
             }
             pq_table(index, residual.data(), table);
         }
@@ -2216,7 +2219,10 @@ bool hnsw_search_partition(const Partition& part, const Dist& dist, const Neares
     if (index.storage == Storage::Sq) {
         return hnsw_search_partition(part, SqDistance(index, part, key), q, mask, kk, local, why);
     }
-    return hnsw_search_partition(part, FloatDistance{&index, &part, &key}, q, mask, kk, local, why);
+    const float key_norm = index.metric == VectorMetric::Cosine && q.f16_column
+                               ? std::sqrt(dot(key.data(), key.data(), index.dim))
+                               : 1.0F;
+    return hnsw_search_partition(part, FloatDistance{&index, &part, &key, key_norm}, q, mask, kk, local, why);
 }
 
 /// Lance's top-k scan of one IVF_RQ partition into the heap all the partitions share
@@ -2281,9 +2287,15 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         const float norm = std::sqrt(sum);
         for (auto& x : key) {
             x /= norm;
+            if (q.f16_column) {  // pylance's normalized query is a float16 vector again (measured to 1e-7)
+                x = ArrowHalfFloatToFloat(float16_bits(x));
+            }
         }
     }
     const std::size_t dim = index.dim;
+    // |key| for the cosine distances: 1 for a normalized float32 query; a float16 one, rounded again after
+    // normalizing, is not quite of length 1 (pylance divides by its true norm).
+    const float key_norm = index.metric == VectorMetric::Cosine && q.f16_column ? std::sqrt(dot(key.data(), key.data(), dim)) : 1.0F;
     const std::size_t P = index.partitions;
     std::vector<float> to_centroid(P);
     for (std::size_t p = 0; p < P; ++p) {
@@ -2343,7 +2355,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
                 std::vector<float> residual(dim);
                 const float* c = index.centroids.data() + p * dim;
                 for (std::size_t j = 0; j < dim; ++j) {
-                    residual[j] = key[j] - c[j];
+                    residual[j] = q.f16_column ? ArrowHalfFloatToFloat(float16_bits(key[j] - c[j])) : key[j] - c[j];
                 }
                 pq_table(index, residual.data(), own);
             }
@@ -2362,7 +2374,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         } else {
             d.resize(n);
             for (std::size_t r = 0; r < n; ++r) {
-                d[r] = distance(index.metric, part->vectors.data() + r * dim, key.data(), dim, 1.0F);
+                d[r] = distance(index.metric, part->vectors.data() + r * dim, key.data(), dim, key_norm);
             }
         }
         // Gathered on the stack, not in `local`: the parallel callers' vectors share cache lines.
@@ -2966,10 +2978,11 @@ bool xtr_search(const NearestQuery& q, const std::vector<std::shared_ptr<const I
     return true;
 }
 
-bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQuery& q, NearestResult& out,
+bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQuery& query, NearestResult& out,
                      std::string& error) {
     out = NearestResult{};
     error.clear();
+    NearestQuery q = query;  // f16_column is set below, from the column's type
     if (q.key.empty()) {
         error = "the query vector is empty";
         return false;
@@ -3026,6 +3039,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         if (vectors != nullptr && format.rfind("+w:", 0) == 0) {
             dim = static_cast<std::size_t>(std::strtoull(format.c_str() + 3, nullptr, 10));
             f32_column = item == "f";
+            q.f16_column = item == "e";
             binary = item == "C";
         }
         schema.release(&schema);
