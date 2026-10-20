@@ -9,10 +9,13 @@
 #include "nanolance/dataset.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/dataset_ops.hpp"
+#include "nanolance/manifest_reader.hpp"
+#include "nanolance/scalar_index.hpp"
 #include "nanolance/nano_lance_writer.h"
 
 #include <nanoarrow/nanoarrow.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
@@ -275,6 +278,162 @@ void version_without_transaction_file_is_retryable() {
     fs::remove_all(path, ec);
 }
 
+
+/// Append `count` rows (ids from `first`) to the dataset at `path`, as a writer commits one.
+bool append_ids(const fs::path& path, std::int64_t first, std::size_t count) {
+    std::vector<std::int64_t> vals(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        vals[i] = first + static_cast<std::int64_t>(i);
+    }
+    NanoLanceWriter w{};
+    if (nano_lance_writer_init(&w, path.string().c_str(), 3) != NANO_LANCE_OK) {
+        return false;
+    }
+    ArrowArray batch{};
+    batch.length = static_cast<std::int64_t>(vals.size());
+    const void* buffers[] = {nullptr, vals.data()};
+    batch.n_buffers = 2;
+    batch.buffers = buffers;
+    ArrowSchema field{};
+    field.format = "l";  // int64
+    field.name = "id";
+    bool ok = nano_lance_write_batch(&w, &batch, &field) == NANO_LANCE_OK;
+    ok = ok && nano_lance_writer_commit(&w, /*is_append=*/true) == NANO_LANCE_OK;
+    return nano_lance_writer_close(&w) == NANO_LANCE_OK && ok;
+}
+
+/// The fragment ids of the latest manifest.
+std::vector<std::uint64_t> latest_fragment_ids(const fs::path& path) {
+    pb::Manifest m;
+    std::uint64_t v = 0;
+    std::string error;
+    check(nano_lance::load_latest_manifest(path, m, v, error), "load the latest manifest: " + error);
+    std::vector<std::uint64_t> ids;
+    for (const auto& f : m.fragments) {
+        ids.push_back(f.id);
+    }
+    return ids;
+}
+
+/// The fragment ids the index `name` covers, at the latest version.
+std::vector<std::uint32_t> index_fragment_ids(const fs::path& path, const std::string& name) {
+    std::vector<nano_lance::IndexInfo> infos;
+    std::string error;
+    check(nano_lance::dataset_list_indices(path, false, 0, infos, error), "list indices: " + error);
+    for (const auto& info : infos) {
+        if (info.name == name) {
+            return info.fragment_ids;
+        }
+    }
+    check(false, "index " + name + " is listed");
+    return {};
+}
+
+/// Ours (made from version 1) is rebased, not run again, when theirs is a compatible change. `check_result`
+/// looks at the outcome.
+void check_rebased(const char* what) {
+    const auto stats = nano_lance::commit_conflict_stats();
+    check(stats.rebased == 1 && stats.retried == 0 && stats.refused == 0,
+          std::string(what) + ": rebased, not run again (rebased 1, retried 0, refused 0)");
+}
+
+void delete_rebased_over_append() {
+    const fs::path path = "commit_conflicts_delete_append";
+    check(create_dataset(path), "create the dataset");
+    check(append_ids(path, 100, 5), "theirs: append commits version 2");
+    nano_lance::reset_commit_conflict_stats();
+    std::uint64_t deleted = 0;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_delete(path, "id = 2", deleted, version, error, 1U) && version == 3 && deleted == 1,
+          "ours from version 1 is committed as version 3: " + error);
+    check_rebased("delete over append");
+    check(latest_fragment_ids(path) == std::vector<std::uint64_t>({0, 1}),
+          "the rebased delete keeps the appended fragment");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+void update_config_rebased_over_delete() {
+    const fs::path path = "commit_conflicts_config_delete";
+    check(create_dataset(path), "create the dataset");
+    std::uint64_t deleted = 0;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_delete(path, "id = 3", deleted, version, error) && version == 2,
+          "theirs: delete commits version 2");
+    nano_lance::reset_commit_conflict_stats();
+    check(nano_lance::dataset_update_config(path, {{"b", "1"}}, {}, version, error, 1U) && version == 3,
+          "ours (other key) from version 1 is committed as version 3: " + error);
+    check_rebased("update_config over delete");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+void create_index_rebased_over_append() {
+    const fs::path path = "commit_conflicts_index_append";
+    check(create_dataset(path), "create the dataset");
+    check(append_ids(path, 100, 5), "theirs: append commits version 2");
+    nano_lance::reset_commit_conflict_stats();
+    nano_lance::ScalarIndexOptions options;
+    options.name = "id_idx";
+    options.read_version = 1U;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_create_scalar_index(path, "id", nano_lance::ScalarIndexType::BTree, options, version,
+                                                  error) && version == 3,
+          "ours (built from version 1) is published as version 3: " + error);
+    check_rebased("create index over append");
+    // The index covers the fragments it read (fragment 0), not the one theirs appended.
+    check(index_fragment_ids(path, "id_idx") == std::vector<std::uint32_t>({0}),
+          "the index covers only the fragments it was built from");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+/// Lance also prunes the rewritten fragment here (its fields_modified names the assigned column); nanolance's
+/// derived fields_modified does not (see the report).
+void create_index_rebased_over_update_of_its_field() {
+    const fs::path path = "commit_conflicts_index_update";
+    check(create_dataset(path), "create the dataset");
+    std::uint64_t updated = 0;
+    std::uint64_t version = 0;
+    std::string error;
+    const std::string predicate = "id = 2";
+    check(nano_lance::dataset_update(path, &predicate, {{"id", "id + 100"}}, updated, version, error) && version == 2,
+          "theirs: update of the indexed column commits version 2: " + error);
+    nano_lance::reset_commit_conflict_stats();
+    nano_lance::ScalarIndexOptions options;
+    options.name = "id_idx";
+    options.read_version = 1U;
+    check(nano_lance::dataset_create_scalar_index(path, "id", nano_lance::ScalarIndexType::BTree, options, version,
+                                                  error) && version == 3,
+          "ours (built from version 1) is published as version 3: " + error);
+    check_rebased("create index over update of its field");
+    // The index covers only fragments it was built from (fragment 0; theirs' new rows are in a fragment
+    // the index does not cover, and the deleted rows of fragment 0 are masked by its deletion file).
+    const auto ids = index_fragment_ids(path, "id_idx");
+    check(ids.size() <= 1U && (ids.empty() || ids[0] == 0U), "the index covers only the fragment it was built from");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+void restore_rebased_over_append() {
+    const fs::path path = "commit_conflicts_restore_append";
+    check(create_dataset(path), "create the dataset");
+    check(append_ids(path, 100, 5), "theirs: append commits version 2");
+    nano_lance::reset_commit_conflict_stats();
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_restore(path, 1, version, error, 1U) && version == 3,
+          "ours (restore of version 1, made from version 1) is committed as version 3: " + error);
+    check_rebased("restore over append");
+    check(latest_fragment_ids(path) == std::vector<std::uint64_t>({0}),
+          "the restore publishes the version it restores");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
 }  // namespace
 
 int main() {
@@ -283,6 +442,11 @@ int main() {
     incompatible_is_not_rerun();
     delete_raced_by_restore_is_not_rerun();
     version_without_transaction_file_is_retryable();
+    delete_rebased_over_append();
+    update_config_rebased_over_delete();
+    create_index_rebased_over_append();
+    create_index_rebased_over_update_of_its_field();
+    restore_rebased_over_append();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

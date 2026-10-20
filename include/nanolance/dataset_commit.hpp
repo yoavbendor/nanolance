@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <optional>
 
@@ -28,8 +29,9 @@ bool load_read_version(const std::filesystem::path& dataset_path, ReadVersion re
 
 /// Publish `manifest` (a version's manifest, changed) as the version after the one it was read at
 /// (`manifest.version`), stamped with the time and nanolance as its writer. When another writer took
-/// that version since, the change is rebased onto theirs if they only added fragments, as Lance
-/// rebases compatible transactions; otherwise it fails with "commit conflict".
+/// that version since: when every such change is compatible with it (Lance's verdicts), the change is applied
+/// to the latest version (rebased, not run again); a retryable verdict fails with "commit conflict" (the
+/// operation is run again by its caller), an incompatible one fails with Lance's message.
 bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest manifest, std::uint64_t& new_version,
                          std::string& error);
 
@@ -42,6 +44,12 @@ struct CommitConflictStats {
 };
 CommitConflictStats commit_conflict_stats();
 void reset_commit_conflict_stats();
+/// Lance's verdict on a change `ours` against a concurrent `theirs`, both operations as lance.table.Transaction
+/// carries them (field number and message): 0 compatible, 1 retryable, 2 incompatible. False with `error` when
+/// one does not decode. The conflict port of the Python transaction API is checked against it.
+bool commit_verdict(std::uint32_t ours_field, const std::vector<std::uint8_t>& ours_message,
+                    std::uint32_t theirs_field, const std::vector<std::uint8_t>& theirs_message, int& verdict,
+                    std::string& error);
 /// Count one run of an operation again after a retryable conflict (retry_on_conflict does this).
 void count_commit_retry();
 

@@ -551,3 +551,25 @@ Verdict check_txn(const Operation& ours, const Operation& theirs) {
 }
 
 }  // namespace nano_lance
+
+namespace nano_lance {
+
+bool commit_verdict(std::uint32_t ours_field, const std::vector<std::uint8_t>& ours_message,
+                    std::uint32_t theirs_field, const std::vector<std::uint8_t>& theirs_message, int& verdict,
+                    std::string& error) {
+    Operation ours;
+    Operation theirs;
+    if (!decode_operation(ours_field, ours_message, ours, error) ||
+        !decode_operation(theirs_field, theirs_message, theirs, error)) {
+        return false;
+    }
+    switch (check_txn(ours, theirs)) {
+        case Verdict::Compatible: verdict = 0; break;
+        case Verdict::Retryable: verdict = 1; break;
+        case Verdict::Incompatible: verdict = 2; break;
+    }
+    return true;
+}
+
+}  // namespace nano_lance
+

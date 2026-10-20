@@ -86,7 +86,7 @@ bool dataset_latest_version(const std::filesystem::path& dataset_path, std::uint
 
 /// Make `version` the latest again: a new version with its schema and fragments (Lance's restore).
 bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t version, std::uint64_t& new_version,
-                     std::string& error);
+                     std::string& error, std::optional<std::uint64_t> read_version = std::nullopt);
 
 /// Upsert (and, for `remove`, delete) table config keys in a new version.
 bool dataset_update_config(const std::filesystem::path& dataset_path,

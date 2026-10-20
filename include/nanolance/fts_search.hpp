@@ -102,6 +102,8 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
                               FtsSearchResult& out, std::string& error);
 
 struct InvertedIndexOptions {
+    /// The version the index is built from (the handle's, as a commit's read version): latest when unset.
+    std::optional<std::uint64_t> read_version;
     std::string name;  // empty: <column>_idx
     /// An index of the same name is replaced; without `replace`, that is an error.
     bool replace = true;

@@ -34,6 +34,8 @@ enum class ScalarIndexType { BTree, Bitmap, LabelList, ZoneMap, BloomFilter, NGr
 bool parse_scalar_index_type(const std::string& name, ScalarIndexType& type);
 
 struct ScalarIndexOptions {
+    /// The version the index is built from (the handle's, as a commit's read version): latest when unset.
+    std::optional<std::uint64_t> read_version;
     /// Empty: "<column>_idx", Lance's default.
     std::string name;
     /// An index of the same name is replaced; without `replace`, that is an error.

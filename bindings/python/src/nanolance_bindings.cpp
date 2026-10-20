@@ -48,6 +48,7 @@
 #include <string>
 #include <vector>
 
+#include "nanolance/dataset_commit.hpp"
 #include "nanolance/work_stats.hpp"
 
 namespace nb = nanobind;
@@ -1447,9 +1448,23 @@ NB_MODULE(_nanolance, m) {
             throw_dataset(error);
         }
     });
-    m.def("_ds_restore", [](const std::filesystem::path& path, std::uint64_t version) {
+    m.def("_commit_verdict", [](std::uint32_t ours_field, nb::bytes ours, std::uint32_t theirs_field, nb::bytes theirs) {
+        // Lance's verdict (0 compatible, 1 retryable, 2 incompatible) on two transaction operations, for the
+        // Python conflict port's agreement test.
+        const auto* a = static_cast<const std::uint8_t*>(ours.data());
+        const auto* b = static_cast<const std::uint8_t*>(theirs.data());
+        int verdict = 0;
+        std::string error;
+        if (!nano_lance::commit_verdict(ours_field, std::vector<std::uint8_t>(a, a + ours.size()), theirs_field,
+                                        std::vector<std::uint8_t>(b, b + theirs.size()), verdict, error)) {
+            throw nb::value_error(error.c_str());
+        }
+        return verdict;
+    });
+    m.def("_ds_restore", [](const std::filesystem::path& path, std::uint64_t version,
+                            std::optional<std::uint64_t> read_version) {
         return new_version_or_throw([&](std::uint64_t& v, std::string& e) {
-            return nano_lance::dataset_restore(path, version, v, e);
+            return nano_lance::dataset_restore(path, version, v, e, read_version);
         });
     });
     m.def("_ds_update_config", [](const std::filesystem::path& path, const std::map<std::string, std::string>& upsert,
@@ -1849,7 +1864,8 @@ NB_MODULE(_nanolance, m) {
     m.def("_ds_create_scalar_index", [](const std::filesystem::path& path, const std::string& column,
                                           const std::string& index_type, const std::string& name, bool replace,
                                           std::uint64_t rows_per_zone, std::uint64_t number_of_items,
-                                          double probability, std::optional<std::string> json_path) {
+                                          double probability, std::optional<std::string> json_path,
+                                          std::optional<std::uint64_t> read_version) {
         nano_lance::ScalarIndexType type{};
         if (!nano_lance::parse_scalar_index_type(index_type, type)) {
             throw nb::value_error(("unsupported index type '" + index_type + "'").c_str());
@@ -1861,6 +1877,7 @@ NB_MODULE(_nanolance, m) {
         options.number_of_items = number_of_items;
         options.probability = probability;
         options.json_path = json_path;
+        options.read_version = read_version;
         std::uint64_t version = 0;
         run_op([&](std::string& e) {
             return nano_lance::dataset_create_scalar_index(path, column, type, options, version, e);
@@ -1869,8 +1886,10 @@ NB_MODULE(_nanolance, m) {
     });
     m.def("_ds_create_inverted_index", [](const std::filesystem::path& path, const std::string& column,
                                           const std::string& name, bool replace, const std::string& params,
-                                          const std::string& granularity, nb::object progress) {
+                                          const std::string& granularity, std::optional<std::uint64_t> read_version,
+                                          nb::object progress) {
         nano_lance::InvertedIndexOptions options;
+        options.read_version = read_version;
         options.name = name;
         options.replace = replace;
         std::string error;
@@ -1906,7 +1925,7 @@ NB_MODULE(_nanolance, m) {
         });
         return version;
     }, nb::arg("path"), nb::arg("column"), nb::arg("name"), nb::arg("replace"), nb::arg("params"),
-       nb::arg("granularity"), nb::arg("progress") = nb::none());
+       nb::arg("granularity"), nb::arg("read_version") = nb::none(), nb::arg("progress") = nb::none());
     // lance.tokenize: the analyzer the params JSON describes, run on `text`; (text, position) pairs with
     // the positions as the index counts them (Python makes them relative to the first token).
     m.def("_fts_tokenize", [](const std::string& params, const std::string& text) {
@@ -2286,8 +2305,9 @@ NB_MODULE(_nanolance, m) {
                                         std::uint32_t hnsw_m, std::uint32_t ef_construction,
                                         std::uint32_t max_level, std::optional<nb::bytes> ivf_centroids,
                                         std::optional<nb::bytes> pq_codebook, bool skip_transpose,
-                                        nb::object progress) {
+                                        std::optional<std::uint64_t> read_version, nb::object progress) {
         nano_lance::VectorIndexOptions o;
+        o.read_version = read_version;
         o.type = type;
         o.ivf_centroids = floats_of(ivf_centroids);
         o.pq_codebook = floats_of(pq_codebook);
@@ -2322,7 +2342,8 @@ NB_MODULE(_nanolance, m) {
        nb::arg("num_partitions"), nb::arg("target_partition_size"), nb::arg("num_sub_vectors"), nb::arg("num_bits"),
        nb::arg("max_iters"), nb::arg("sample_rate"), nb::arg("seed"), nb::arg("hnsw_m"),
        nb::arg("ef_construction"), nb::arg("max_level"), nb::arg("ivf_centroids") = nb::none(),
-       nb::arg("pq_codebook") = nb::none(), nb::arg("skip_transpose") = false, nb::arg("progress") = nb::none());
+       nb::arg("pq_codebook") = nb::none(), nb::arg("skip_transpose") = false,
+        nb::arg("read_version") = nb::none(), nb::arg("progress") = nb::none());
     m.def("_ds_drop_columns", [](const std::filesystem::path& path, const std::vector<std::string>& columns,
                                  std::optional<std::uint64_t> read_version) {
         std::uint64_t version = 0;
@@ -2459,8 +2480,10 @@ NB_MODULE(_nanolance, m) {
         return nb::make_tuple(d, version);
     });
     m.def("_ds_optimize_indices", [](const std::filesystem::path& path, const std::vector<std::string>& names,
-                                     std::optional<std::uint32_t> num_indices_to_merge, bool retrain) {
+                                     std::optional<std::uint32_t> num_indices_to_merge, bool retrain,
+                                     std::optional<std::uint64_t> read_version) {
         nano_lance::OptimizeIndicesOptions options;
+        options.read_version = read_version;
         options.index_names = names;
         options.num_indices_to_merge = num_indices_to_merge;
         options.retrain = retrain;

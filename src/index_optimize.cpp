@@ -425,7 +425,14 @@ bool optimize_indices_once(const std::filesystem::path& dataset_path, const Opti
 
 bool dataset_optimize_indices(const std::filesystem::path& dataset_path, const OptimizeIndicesOptions& options,
                               OptimizeIndicesResult& result, std::string& error) {
-    return retry_on_conflict([&] { return optimize_indices_once(dataset_path, options, result, error); }, error);
+    return retry_from_read_version(
+        options.read_version,
+        [&](ReadVersion from) {
+            OptimizeIndicesOptions o = options;
+            o.read_version = from;
+            return optimize_indices_once(dataset_path, o, result, error);
+        },
+        error);
 }
 
 bool optimize_indices_once(const std::filesystem::path& dataset_path, const OptimizeIndicesOptions& options,
@@ -434,7 +441,7 @@ bool optimize_indices_once(const std::filesystem::path& dataset_path, const Opti
     result = OptimizeIndicesResult{};
     pb::Manifest manifest;
     std::uint64_t version = 0;
-    if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    if (!load_read_version(dataset_path, options.read_version, manifest, version, error)) {
         return false;
     }
     result.version = version;

@@ -115,6 +115,8 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
                      std::string& error);
 
 struct VectorIndexOptions {
+    /// The version the index is built from (the handle's, as a commit's read version): latest when unset.
+    std::optional<std::uint64_t> read_version;
     std::string type;  // "IVF_FLAT", "IVF_PQ", "IVF_RQ", "IVF_HNSW_SQ", ...
     std::string name;  // empty: <column>_idx
     VectorMetric metric = VectorMetric::L2;

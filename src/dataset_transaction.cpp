@@ -24,6 +24,7 @@
 #include <unordered_map>
 
 #include "dataset_operation.hpp"
+#include "dataset_transaction_ops.hpp"
 
 namespace nano_lance {
 namespace {
@@ -633,6 +634,39 @@ bool apply_operation(const pb::Manifest* base, const Operation& op, pb::Manifest
             }
             break;
         }
+        case kCreateIndex: {
+            // Lance's CreateIndex: the indices it removes go, and the ones it adds replace any of the same
+            // uuid. An index covers only the fragments still present (finish_create_index): the ones the
+            // change read and that another writer removed drop out of its bitmap.
+            for (const auto& gone : op.removed_indices) {
+                next.indices.erase(std::remove_if(next.indices.begin(), next.indices.end(),
+                                                  [&](const pb::IndexMetadata& i) { return i.uuid == gone.uuid; }),
+                                   next.indices.end());
+            }
+            std::set<std::uint64_t> present;
+            for (const auto& f : next.fragments) {
+                present.insert(f.id);
+            }
+            for (const auto& created : op.new_indices) {
+                pb::IndexMetadata index = created;
+                auto ids = index.fragment_ids;
+                ids.erase(std::remove_if(ids.begin(), ids.end(),
+                                         [&](std::uint64_t id) { return present.count(id) == 0U; }),
+                          ids.end());
+                if (ids.size() != index.fragment_ids.size()) {
+                    index.fragment_ids = std::move(ids);
+                    index.fragment_bitmap_changed = true;
+                }
+                auto it = std::find_if(next.indices.begin(), next.indices.end(),
+                                       [&](const pb::IndexMetadata& i) { return i.uuid == index.uuid; });
+                if (it != next.indices.end()) {
+                    *it = std::move(index);
+                } else {
+                    next.indices.push_back(std::move(index));
+                }
+            }
+            break;
+        }
         case kDataReplacement:
             if (!data_replacement(next, op, error)) {
                 return false;
@@ -761,6 +795,65 @@ bool load(const std::filesystem::path& path, bool has_version, std::uint64_t ver
 }
 
 }  // namespace
+
+bool rebase_operation(const pb::Manifest& latest, const pb::Manifest& ours, const Operation& op,
+                      const std::vector<Operation>& theirs, std::uint64_t new_version, pb::Manifest& next,
+                      std::string& error) {
+    if (op.kind == kRestore) {
+        // A restore publishes the manifest it restores (Lance's Restore): the other writers' changes give way
+        // to it. Only the high-water marks of the latest manifest carry over.
+        next = ours;
+        const std::uint64_t high = std::max(latest.has_max_fragment_id ? latest.max_fragment_id : 0U,
+                                            ours.has_max_fragment_id ? ours.max_fragment_id : 0U);
+        next.has_max_fragment_id = true;
+        next.max_fragment_id = static_cast<std::uint32_t>(high);
+        next.next_row_id = std::max(ours.next_row_id, latest.next_row_id);
+        return true;
+    }
+    const bool stable = (latest.reader_feature_flags & pb::kFlagStableRowIds) != 0U;
+    if (stable && (op.kind == kAppend || op.kind == kUpdate || op.kind == kMerge || op.kind == kOverwrite)) {
+        // Rows added by this change carry row ids from the base's counter; re-stamping them over the latest
+        // one is not done here, so the caller re-runs the operation instead (a retryable conflict).
+        error = "commit conflict: stable row ids: a rebase of " + std::string(operation_name(op.kind)) +
+                " is not supported";
+        return false;
+    }
+    if (!apply_operation(&latest, op, next, error, false, new_version)) {
+        return false;
+    }
+    if (op.kind == kCreateIndex) {
+        // Lance's finish_create_index: a concurrent Update that rewrote a field this index covers prunes the
+        // fragments it rewrote from the index (it covers them again only after a rebuild).
+        std::set<std::array<std::uint8_t, 16>> ours_uuids;
+        for (const auto& index : op.new_indices) {
+            ours_uuids.insert(index.uuid);
+        }
+        std::vector<pb::IndexMetadata> mine;
+        for (const auto& index : next.indices) {
+            if (ours_uuids.count(index.uuid) != 0U) {
+                mine.push_back(index);
+            }
+        }
+        for (const auto& t : theirs) {
+            if (t.kind != kUpdate) {
+                continue;
+            }
+            std::vector<std::uint64_t> updated;
+            for (const auto& f : t.updated_fragments) {
+                updated.push_back(f.id);
+            }
+            prune_updated_fields(mine, updated, t.fields_modified);
+        }
+        for (const auto& index : mine) {
+            auto it = std::find_if(next.indices.begin(), next.indices.end(),
+                                   [&](const pb::IndexMetadata& i) { return i.uuid == index.uuid; });
+            if (it != next.indices.end()) {
+                *it = index;
+            }
+        }
+    }
+    return true;
+}
 
 bool dataset_commit_hand_built(const std::filesystem::path& dataset_path, const HandBuiltCommit& commit,
                                std::uint64_t& new_version, std::string& error) {

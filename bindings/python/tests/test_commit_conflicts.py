@@ -16,6 +16,7 @@ import pyarrow as pa
 import pytest
 
 import nanolance.lance as nl
+from nanolance.lance import _transactions as T
 from tests.support import require_pylance
 
 # Rows where pylance surfaces a retryable conflict and nanolance re-runs the operation on the latest
@@ -159,3 +160,135 @@ def test_nanolance_writer_racing_pylance_writer(pylance, tmp_path):
     with pytest.raises(OSError, match="Incompatible transaction: This UpdateConfig transaction"):
         stale.update_config({"k": "2"})
     assert nl.dataset(d).config()["k"] == "1"
+
+
+# ── C2: a change made from a stale handle is rebased onto the other writer's change ────────────────────
+
+def _append(lib, uri):
+    lib.write_dataset(_table(range(2000, 2005)), uri, mode="append")
+
+
+def test_index_build_rebased_over_append_answers_like_pylance(pylance, tmp_path):
+    uri = _fresh(nl, tmp_path)
+    stale = nl.dataset(uri)  # version 1
+    _append(pylance, uri)  # version 2, by pylance
+    stale.create_scalar_index("id", "BTREE")  # built from version 1, rebased onto version 2: version 3
+    assert nl.dataset(uri).version == 3
+    assert pylance.dataset(uri).version == 3
+    for flt in ("id = 1", "id = 2002", "id >= 1990 AND id < 2003", "id = 500"):
+        ours = nl.dataset(uri).count_rows(flt)
+        assert ours == pylance.dataset(uri).count_rows(flt), flt
+
+
+def test_delete_rebased_over_append_matches_pylance(pylance, tmp_path):
+    uri = _fresh(nl, tmp_path)
+    stale = nl.dataset(uri)
+    _append(pylance, uri)
+    stale.delete("id = 2")  # made from version 1, committed over version 2
+    assert pylance.dataset(uri).version == 3
+    assert pylance.dataset(uri).count_rows() == 104
+    assert nl.dataset(uri).count_rows("id = 2") == 0
+    assert nl.dataset(uri).count_rows("id = 2002") == 1
+
+
+def test_restore_rebased_over_append_matches_pylance(pylance, tmp_path):
+    uri = _fresh(nl, tmp_path)
+    stale = nl.dataset(uri)
+    _append(pylance, uri)
+    stale.restore()  # restores version 1 over version 2: version 3, the 100 rows of version 1
+    assert pylance.dataset(uri).version == 3
+    assert pylance.dataset(uri).count_rows() == 100
+    assert pylance.dataset(uri).count_rows("id >= 2000") == 0
+
+
+def test_index_build_rebased_over_update_of_its_field_answers_like_pylance(pylance, tmp_path):
+    uri = _fresh(nl, tmp_path)
+    stale = nl.dataset(uri)
+    pylance.dataset(uri).update({"id": "id + 100"}, where="id = 2")  # version 2, by pylance
+    stale.create_scalar_index("id", "BTREE")
+    for flt in ("id = 102", "id = 2", "id < 10"):
+        assert nl.dataset(uri).count_rows(flt) == pylance.dataset(uri).count_rows(flt), flt
+    assert nl.dataset(uri).count_rows("id = 102") == 1
+
+
+# ── C2: Lance's verdicts, the C++ check and the Python port agree on every pair both express ─────────
+
+def _operation_bytes(data: bytes):
+    """(field number, message) of a transaction file's operation (lance.table.Transaction, fields 100-115)."""
+    i = 0
+    while i < len(data):
+        key, i = _varint(data, i)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            _, i = _varint(data, i)
+        elif wire == 2:
+            size, i = _varint(data, i)
+            if 100 <= number <= 115:
+                return number, bytes(data[i:i + size])
+            i += size
+        else:
+            raise AssertionError(f"unexpected wire type {wire}")
+    raise AssertionError("no operation in the transaction file")
+
+
+def _varint(data: bytes, i: int):
+    shift = value = 0
+    while True:
+        byte = data[i]
+        i += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 0x80:
+            return value, i
+
+
+def _committed_operation(uri: str, version: int):
+    """The operation of the commit that made `version` from `version - 1`: (decoded, field, message)."""
+    import glob
+    (path,) = glob.glob(f"{uri}/_transactions/{version - 1}-*.txn")
+    data = Path(path).read_bytes()
+    field, message = _operation_bytes(data)
+    return T.decode_transaction(data).operation, field, message
+
+
+def _overwrite_with_config(upserts):
+    return T.LanceOperation.Overwrite(pa.schema([pa.field("id", pa.int64()), pa.field("v", pa.float64())]), [],
+                                      None, upserts)
+
+
+OPERATIONS = {
+    "delete id=2": lambda ds: ds.delete("id = 2"),
+    "delete id=70": lambda ds: ds.delete("id = 70"),
+    "update id=2": lambda ds: ds.update({"v": "0.5"}, "id = 2"),
+    "update id=70": lambda ds: ds.update({"v": "0.5"}, "id = 70"),
+    "append": lambda ds: nl.write_dataset(_one_row(nl), ds.uri, mode="append"),
+    "overwrite": lambda ds: nl.write_dataset(_one_row(nl), ds.uri, mode="overwrite"),
+    "compaction": lambda ds: ds.optimize.compact_files(target_rows_per_fragment=1000),
+    "btree id": lambda ds: ds.create_scalar_index("id", "BTREE"),
+    "btree v": lambda ds: ds.create_scalar_index("v", "BTREE"),
+    "update_config k": lambda ds: ds.update_config({"k": "1"}),
+    "update_config j": lambda ds: ds.update_config({"j": "1"}),
+    "drop_columns v": lambda ds: ds.drop_columns(["v"]),
+    "restore": lambda ds: ds.restore(),
+}
+
+
+def test_verdicts_agree_between_cpp_and_python_port(tmp_path):
+    from nanolance import _nanolance
+    ops = {}
+    for name, make in OPERATIONS.items():  # each made from version 1, so each is a change from the same base
+        uri = _fresh(nl, tmp_path / name.replace(" ", "_").replace("=", ""))
+        make(nl.dataset(uri))
+        ops[name] = _committed_operation(uri, 2)
+    ops["overwrite config k"] = (_overwrite_with_config({"k": "1"}), *T.encode_operation(_overwrite_with_config({"k": "1"})))
+    ops["overwrite config j"] = (_overwrite_with_config({"j": "1"}), *T.encode_operation(_overwrite_with_config({"j": "1"})))
+    names = {0: "compatible", 1: "retryable", 2: "incompatible"}
+    seen = set()
+    for ours_name, (ours_py, ours_field, ours_msg) in ops.items():
+        for theirs_name, (theirs_py, theirs_field, theirs_msg) in ops.items():
+            py = T.conflict_with(ours_py, theirs_py)
+            cpp = names[_nanolance._commit_verdict(ours_field, ours_msg, theirs_field, theirs_msg)]
+            expected = "compatible" if py is None else py
+            assert cpp == expected, f"{ours_name} (ours) vs {theirs_name} (theirs): C++ {cpp}, Python {expected}"
+            seen.add(cpp)
+    assert seen == {"compatible", "retryable", "incompatible"}  # the table covers all three verdicts

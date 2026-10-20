@@ -14,6 +14,7 @@
 
 #include "commit_conflicts.hpp"
 #include "dataset_operation.hpp"
+#include "dataset_transaction_ops.hpp"
 #include "transaction_file.hpp"
 
 #include <algorithm>
@@ -49,123 +50,6 @@ bool load(const std::filesystem::path& dataset_path, bool has_version, std::uint
     }
     std::uint64_t latest = 0;
     return load_latest_manifest(dataset_path, manifest, latest, error);
-}
-
-bool same_file(const pb::DataFile& a, const pb::DataFile& b) {
-    return a.path == b.path && a.fields == b.fields && a.column_indices == b.column_indices;
-}
-
-bool same_fragment(const pb::DataFragment& a, const pb::DataFragment& b) {
-    if (a.id != b.id || a.physical_rows != b.physical_rows || a.files.size() != b.files.size() ||
-        a.deletion_file.present != b.deletion_file.present ||
-        (a.deletion_file.present && (a.deletion_file.id != b.deletion_file.id ||
-                                     a.deletion_file.read_version != b.deletion_file.read_version))) {
-        return false;
-    }
-    for (std::size_t i = 0; i < a.files.size(); ++i) {
-        if (!same_file(a.files[i], b.files[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool same_fields(const std::vector<pb::Field>& a, const std::vector<pb::Field>& b) {
-    if (a.size() != b.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        if (a[i].id != b[i].id || a[i].parent_id != b[i].parent_id || a[i].name != b[i].name ||
-            a[i].logical_type != b[i].logical_type || a[i].nullable != b[i].nullable) {
-            return false;
-        }
-    }
-    return true;
-}
-
-std::set<std::array<std::uint8_t, 16>> index_uuids(const pb::Manifest& m) {
-    std::set<std::array<std::uint8_t, 16>> out;
-    for (const auto& i : m.indices) {
-        out.insert(i.uuid);
-    }
-    return out;
-}
-
-/// Rebase `ours` -- a change made from `base` -- onto `latest`, which other writers committed in the
-/// meantime, as Lance's conflict resolution does for compatible transactions: when they only added
-/// fragments (every fragment of `base` unchanged, the same schema, indices and config), the change
-/// reads as made after theirs. Their new fragments join ours, and fragments ours added are numbered
-/// after theirs (with the indices that cover them). False: a real conflict.
-bool rebase(const pb::Manifest& base, const pb::Manifest& latest, pb::Manifest& ours) {
-    if (!same_fields(base.fields, latest.fields) || index_uuids(base) != index_uuids(latest) ||
-        base.config != latest.config || base.table_metadata != latest.table_metadata ||
-        base.schema_metadata != latest.schema_metadata ||
-        base.reader_feature_flags != latest.reader_feature_flags) {
-        return false;
-    }
-    std::map<std::uint64_t, const pb::DataFragment*> theirs;
-    for (const auto& f : latest.fragments) {
-        theirs[f.id] = &f;
-    }
-    std::set<std::uint64_t> in_base;
-    for (const auto& f : base.fragments) {
-        const auto it = theirs.find(f.id);
-        if (it == theirs.end() || !same_fragment(f, *it->second)) {
-            return false;  // they changed or removed a fragment this change was made from
-        }
-        in_base.insert(f.id);
-    }
-    std::uint64_t next = latest.has_max_fragment_id ? latest.max_fragment_id + 1ULL : 0ULL;
-    for (const auto& f : latest.fragments) {
-        next = std::max(next, f.id + 1U);
-    }
-    // Fragments this change added: numbered after every fragment the dataset has had.
-    std::map<std::uint32_t, std::uint32_t> renumber;
-    for (auto& f : ours.fragments) {
-        if (in_base.count(f.id) == 0U) {
-            renumber[static_cast<std::uint32_t>(f.id)] = static_cast<std::uint32_t>(next);
-            f.id = next++;
-        }
-    }
-    for (auto& index : ours.indices) {
-        bool changed = false;
-        for (auto& id : index.fragment_ids) {
-            const auto it = renumber.find(id);
-            if (it != renumber.end()) {
-                id = it->second;
-                changed = true;
-            }
-        }
-        if (changed) {
-            std::sort(index.fragment_ids.begin(), index.fragment_ids.end());
-            index.fragment_bitmap_changed = true;
-        }
-    }
-    for (const auto& f : latest.fragments) {
-        if (in_base.count(f.id) == 0U) {
-            ours.fragments.push_back(f);  // theirs
-        }
-    }
-    std::stable_sort(ours.fragments.begin(), ours.fragments.end(),
-                     [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
-    std::uint64_t max_id = latest.has_max_fragment_id ? latest.max_fragment_id : 0U;
-    for (const auto& f : ours.fragments) {
-        max_id = std::max(max_id, f.id);
-    }
-    if (ours.operation == pb::Manifest::Operation::Reserve && ours.reserved_fragments > 0U) {
-        // Reserved again, after every id the other writers used (Lance's ReserveFragments rebase).
-        max_id = std::max(max_id, next + ours.reserved_fragments - 1U);
-    }
-    ours.has_max_fragment_id = ours.has_max_fragment_id || latest.has_max_fragment_id || !ours.fragments.empty();
-    ours.max_fragment_id = static_cast<std::uint32_t>(max_id);
-    ours.next_row_id = std::max(ours.next_row_id, latest.next_row_id);
-    if (std::any_of(ours.fragments.begin(), ours.fragments.end(),
-                    [](const pb::DataFragment& f) { return f.deletion_file.present; })) {
-        ours.reader_feature_flags |= pb::kFlagDeletionFiles;
-        ours.writer_feature_flags |= pb::kFlagDeletionFiles;
-    }
-    ours.version = latest.version;
-    return true;
 }
 
 bool is_conflict(const std::string& error) {
@@ -230,9 +114,8 @@ bool concurrent_operation(const std::filesystem::path& dataset_path, const pb::M
 /// committed after it up to `latest`, in order; the first verdict that is not compatible decides.
 Outcome classify_concurrent(const std::filesystem::path& dataset_path, const pb::Manifest& base,
                             const pb::Manifest& ours, std::uint64_t read_version, std::uint64_t latest,
-                            std::string& error) {
+                            std::string& error, Operation& mine, std::vector<Operation>& theirs_ops) {
     const auto [ours_field, ours_message] = derive_transaction_operation(base, ours);
-    Operation mine;
     std::string why;
     if (!decode_operation(ours_field, ours_message, mine, why)) {
         error = retryable_error(read_version + 1U, operation_name(ours_field), "an operation");
@@ -262,6 +145,7 @@ Outcome classify_concurrent(const std::filesystem::path& dataset_path, const pb:
                         "transaction " + theirs_name + " at version " + std::to_string(version) + ".";
                 return Outcome::Refused;
         }
+        theirs_ops.push_back(std::move(theirs));
     }
     return Outcome::Compatible;
 }
@@ -348,20 +232,33 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
             return false;
         }
         // Lance's verdict on every version committed since: a refusal (incompatible, or retryable with the
-        // operation run again) is the error; compatible versions are rebased below.
-        if (classify_concurrent(dataset_path, base, manifest, read_version, latest_version, error) !=
+        // operation run again) is the error; when all are compatible the change is rebased onto the latest.
+        Operation mine;
+        std::vector<Operation> theirs;
+        if (classify_concurrent(dataset_path, base, manifest, read_version, latest_version, error, mine, theirs) !=
             Outcome::Compatible) {
             if (error.rfind("Incompatible transaction:", 0) == 0) {
                 g_refused.fetch_add(1, std::memory_order_relaxed);
             }
             return false;
         }
-        pb::Manifest rebased = manifest;
-        if (!rebase(base, latest, rebased)) {
-            error = first_error;
-            return false;
+        pb::Manifest rebased;
+        if (!rebase_operation(latest, manifest, mine, theirs, latest_version + 1U, rebased, error)) {
+            return false;  // a conflict the operation runs again for (retry_on_conflict), or not a conflict
         }
+        // The change keeps its own stamp and its own operation tag, which the transaction file is derived from.
         rebased.version = latest_version + 1U;
+        rebased.has_timestamp = manifest.has_timestamp;
+        rebased.timestamp_seconds = manifest.timestamp_seconds;
+        rebased.timestamp_nanos = manifest.timestamp_nanos;
+        rebased.writer_library = manifest.writer_library;
+        rebased.writer_version = manifest.writer_version;
+        rebased.operation = manifest.operation;
+        rebased.restored_version = manifest.restored_version;
+        rebased.reserved_fragments = manifest.reserved_fragments;
+        rebased.first_new_fragment = mine.kind == kAppend ? latest.fragments.size() : manifest.first_new_fragment;
+        rebased.transaction_file.clear();
+        rebased.tag.clear();
         new_version = rebased.version;
         if (publish_manifest(dataset_path, rebased, error)) {
             g_rebased.fetch_add(1, std::memory_order_relaxed);
@@ -487,8 +384,10 @@ bool dataset_versions(const std::filesystem::path& dataset_path, std::vector<Dat
     return true;
 }
 
-bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t version, std::uint64_t& new_version,
-                     std::string& error) {
+namespace {
+
+bool restore_once(const std::filesystem::path& dataset_path, std::uint64_t version, std::uint64_t& new_version,
+                  std::string& error, ReadVersion read_version) {
     pb::Manifest manifest;
     if (!load_manifest_version(dataset_path, version, manifest, error)) {
         return false;
@@ -497,6 +396,13 @@ bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t ve
     pb::Manifest latest;
     std::uint64_t latest_version = 0;
     if (!load_latest_manifest(dataset_path, latest, latest_version, error)) {
+        return false;
+    }
+    // The restore is made from the version the caller read (latest unless given): the other writers'
+    // commits since are checked against it, as for any other change.
+    pb::Manifest base;
+    std::uint64_t base_version = 0;
+    if (!load_read_version(dataset_path, read_version, base, base_version, error)) {
         return false;
     }
     if (latest.has_max_fragment_id) {
@@ -513,16 +419,26 @@ bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t ve
         return false;
     }
     manifest.next_row_id = std::max(manifest.next_row_id, latest.next_row_id);
-    manifest.version = latest_version;  // committed on top of the latest, which it replaces
+    manifest.version = base_version;  // committed on top of the version it was made from
     manifest.operation = pb::Manifest::Operation::Restore;
     manifest.restored_version = version;
     return commit_next_version(dataset_path, std::move(manifest), new_version, error);
 }
 
+}  // namespace
+
+bool dataset_restore(const std::filesystem::path& dataset_path, std::uint64_t version, std::uint64_t& new_version,
+                     std::string& error, ReadVersion read_version) {
+    // Made from the version the caller read; a retryable conflict restores again from the latest.
+    return retry_from_read_version(
+        read_version,
+        [&](ReadVersion from) { return restore_once(dataset_path, version, new_version, error, from); }, error);
+}
+
 bool dataset_update_config(const std::filesystem::path& dataset_path,
                            const std::map<std::string, std::string>& upsert, const std::vector<std::string>& remove,
                            std::uint64_t& new_version, std::string& error, ReadVersion read_version) {
-    // Re-run from the latest after a retryable conflict, as Lance's retries do (C2 rebases instead).
+    // Re-run from the latest after a retryable conflict, as Lance's retries do.
     ReadVersion from = read_version;
     return retry_on_conflict(
         [&] {

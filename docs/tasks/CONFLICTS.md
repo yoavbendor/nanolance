@@ -226,3 +226,15 @@ build's clang `-Werror` failed on it). Decisions:
   `check_update_config_txn`); Rewrite (ours) vs CreateIndex on overlapping fragments (retryable);
   Rewrite / Update (ours) vs DataOverlay on overlapping fragments (retryable); CreateIndex as ours. Add
   the C++-vs-Python agreement test over the pairs both can express.
+
+**C2 outcome (2026-10-20):** compatible pairs rebase by applying our operation to the latest manifest
+(`rebase_operation`, `src/dataset_transaction.cpp`; the append-only `rebase` is gone); index builds and
+restore commit from the handle's version; `_transactions.py` `conflict_with` agrees with the C++ port
+over all ordered pairs of 15 operations (`_commit_verdict` test). Measured: pylance writes
+`inserted_rows_filter` only for merge_insert on an unenforced primary key, `update_mode` only for
+`rewrite_columns`, and no `config_upsert_values` on a plain overwrite, so `derive_transaction_operation`
+is unchanged. Reviewer removed the old helpers (wasm clang `-Werror`). Accepted gaps: no key-existence
+filter (a pylance PK merge_insert racing a nanolance update re-runs where Lance refuses); a row-moving
+update of an indexed column does not prune the racing index build's coverage (results stay correct);
+rewrite_columns merges recorded as RewriteRows; on stable-row-id datasets Append / Update / Merge /
+Overwrite are re-run, not rebased (the old `rebase` kept base-counter row ids: possible duplicates).

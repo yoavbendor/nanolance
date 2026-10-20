@@ -770,7 +770,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     if (target != nullptr && target->manifest != nullptr) {
         manifest = *target->manifest;
         version = target->version;
-    } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    } else if (!load_read_version(dataset_path, options.read_version, manifest, version, error)) {
         return false;
     }
     const bool commit = target == nullptr || target->out == nullptr;
@@ -964,7 +964,14 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
 bool dataset_create_inverted_index(const std::filesystem::path& dataset_path, const std::string& column,
                                    const InvertedIndexOptions& options, std::uint64_t& new_version,
                                    std::string& error) {
-    return create_inverted_index(dataset_path, column, options, nullptr, new_version, error);
+    return retry_from_read_version(
+        options.read_version,
+        [&](ReadVersion from) {
+            InvertedIndexOptions o = options;
+            o.read_version = from;
+            return create_inverted_index(dataset_path, column, o, nullptr, new_version, error);
+        },
+        error);
 }
 
 bool index_build::build_inverted_segment(const std::filesystem::path& dataset_path, const std::string& column,

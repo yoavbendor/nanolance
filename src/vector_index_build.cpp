@@ -1297,7 +1297,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     if (target != nullptr && target->manifest != nullptr) {
         manifest = *target->manifest;
         version = target->version;
-    } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
+    } else if (!load_read_version(dataset_path, options.read_version, manifest, version, error)) {
         return false;
     }
     // Training alone (target->trained) commits nothing either.
@@ -2196,7 +2196,14 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
 bool dataset_create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,
                                  const VectorIndexOptions& options, std::uint64_t& new_version, std::string& error) {
     if (options.ivf_centroids.empty() && !options.progress) {
-        return create_vector_index(dataset_path, column, options, nullptr, new_version, error);
+        return retry_from_read_version(
+            options.read_version,
+            [&](ReadVersion from) {
+                VectorIndexOptions o = options;
+                o.read_version = from;
+                return create_vector_index(dataset_path, column, o, nullptr, new_version, error);
+            },
+            error);
     }
     // Supplied centroids (and codebook) are a model, as a distributed build's segments share theirs;
     // the build still commits. Its progress goes to the callback.

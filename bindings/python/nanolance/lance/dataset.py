@@ -704,7 +704,7 @@ class LanceDataset(pa.dataset.Dataset):
     def restore(self) -> None:
         refuse_object_store_write(self._uri, "restore")
         with native():
-            _nanolance._ds_restore(self._uri, self._version)
+            _nanolance._ds_restore(self._uri, self._version, self._version)
         self._refresh_latest("Restore")
 
     # ── config and metadata ───────────────────────────────────────────────────────────────────────
@@ -1307,7 +1307,7 @@ class LanceDataset(pa.dataset.Dataset):
             raise unsupported(f"create_scalar_index options {sorted(kwargs) + sorted(config)}")
         with native():
             _nanolance._ds_create_scalar_index(self._uri, str(column), kind, name or "", bool(replace), rows_per_zone,
-                                               number_of_items, probability, None)
+                                               number_of_items, probability, None, self._version)
         self._refresh_latest("CreateIndex")
         return self
 
@@ -1339,7 +1339,7 @@ class LanceDataset(pa.dataset.Dataset):
                                     "(supported: an optional '$', then dot-separated names)")
         with native():
             _nanolance._ds_create_scalar_index(self._uri, str(column), "BTREE", name or "", bool(replace), 0, 0, 0.0,
-                                               path)
+                                               path, self._version)
         self._refresh_latest("CreateIndex")
         return self
 
@@ -1483,7 +1483,7 @@ class LanceDataset(pa.dataset.Dataset):
         with _lance_errors():
             extra = () if native_progress is None else (native_progress,)  # the callback only when given
             _nanolance._ds_create_inverted_index(self._uri, str(column), name or "", bool(replace), params,
-                                                 granularity, *extra)
+                                                 granularity, self._version, *extra)
         self._refresh_latest("CreateIndex")
         return self
 
@@ -1855,7 +1855,7 @@ class LanceDataset(pa.dataset.Dataset):
                     None if target_partition_size is None else int(target_partition_size),
                     0 if num_sub_vectors is None else int(num_sub_vectors), num_bits, max_iters, sample_rate,
                     None if seed is None else int(seed), hnsw_m, ef_construction, max_level,
-                    centroids_bytes, codebook_bytes, skip_transpose, native_progress)
+                    centroids_bytes, codebook_bytes, skip_transpose, self._version, native_progress)
         except Exception:
             if callback_errors:
                 raise callback_errors[0] from None
@@ -3476,7 +3476,7 @@ class DatasetOptimizer:
         with native():
             _nanolance._ds_optimize_indices(self._ds.uri, names,
                                             None if num_indices_to_merge is None else int(num_indices_to_merge),
-                                            bool(retrain))
+                                            bool(retrain), self._ds._version)
         self._ds._refresh_latest("CreateIndex")
 
 
