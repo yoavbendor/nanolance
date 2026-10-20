@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/byte_source.hpp"
 #include "nanolance/dataset.hpp"
 #include "nanolance/base_paths.hpp"
 #include "nanolance/dataset_commit.hpp"
@@ -82,12 +83,8 @@ std::string retryable_error(std::uint64_t version, const std::string& ours, cons
 
 /// The whole of a transaction file: `_transactions/{name}`. False when it cannot be read.
 bool read_transaction_file(const std::filesystem::path& dataset_path, const std::string& name, OpBytes& bytes) {
-    std::ifstream in(dataset_path / "_transactions" / name, std::ios::binary);
-    if (!in) {
-        return false;
-    }
-    bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-    return true;
+    std::string io_error;
+    return io::read_all((dataset_path / "_transactions" / name).string(), bytes, io_error);
 }
 
 /// The bytes of the transaction that made `version`, as Lance reads it: its transaction file when that

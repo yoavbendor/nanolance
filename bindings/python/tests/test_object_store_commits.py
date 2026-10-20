@@ -145,3 +145,121 @@ def test_a_store_that_ignores_if_none_match_is_refused():
         assert len(o["errors"]) == 3 and all("does not honour conditional writes" in e for e in o["errors"]), o
     ds = nl.dataset(uri, storage_options=options())
     assert ds.version == 1 and ds.count_rows() == 100
+
+
+# ── W2a: mutations on s3:// (docs/OBJECT_STORE_W2.md) ──────────────────────────────────────────────
+# Each operation runs on an s3:// dataset and on a local copy of the same data; pylance reads both and must
+# see the same versions, rows, transaction kinds, config and tags.
+
+def _merge_source() -> pa.Table:
+    return pa.table({"id": pa.array([1, 2, 500], pa.int64()), "name": pa.array(["m1", "m2", "m500"])})
+
+
+def _commit_fragment_delete(ds, uri: str, storage) -> None:
+    meta = ds.get_fragments()[0].delete("id = 1")
+    nl.LanceDataset.commit(uri, nl.LanceOperation.Delete([meta], [], "id = 1"), read_version=ds.version,
+                           storage_options=storage)
+
+
+W2A_OPS = {
+    "delete": lambda ds, uri, storage: ds.delete("id < 10"),
+    "update": lambda ds, uri, storage: ds.update({"name": "'x'"}, where="id = 1"),
+    "update_all": lambda ds, uri, storage: ds.update({"name": "'y'"}),
+    "merge_insert": lambda ds, uri, storage: ds.merge_insert("id").when_matched_update_all()
+                                                 .when_not_matched_insert_all().execute(_merge_source()),
+    "restore": lambda ds, uri, storage: (ds.delete("id < 5"), ds.restore()),
+    "update_config": lambda ds, uri, storage: ds.update_config({"k": "v"}),
+    "delete_config_keys": lambda ds, uri, storage: (ds.update_config({"k": "v", "j": "w"}),
+                                                    ds.delete_config_keys(["k"])),
+    "update_metadata": lambda ds, uri, storage: ds.update_metadata({"k": "v"}),
+    "update_schema_metadata": lambda ds, uri, storage: ds.update_schema_metadata({"k": "v"}),
+    "update_field_metadata": lambda ds, uri, storage: ds.update_field_metadata({"id": {"unit": "ms"}}),
+    "fragment_delete": _commit_fragment_delete,
+    "tag_create": lambda ds, uri, storage: ds.tags.create("t1", 1),
+    "tag_update": lambda ds, uri, storage: (ds.delete("id < 5"), ds.tags.create("t1", 1), ds.tags.update("t1", 2)),
+    "tag_delete": lambda ds, uri, storage: (ds.tags.create("t1", 1), ds.tags.delete("t1")),
+    "tag_replace_metadata": lambda ds, uri, storage: (ds.tags.create("t1", 1),
+                                                      ds.tags.replace_metadata("t1", {"a": "b"})),
+}
+
+
+def _snapshot(uri: str, storage) -> dict:
+    lance = require_pylance()
+    ds = lance.dataset(uri, storage_options=storage)
+    versions = [v["version"] for v in ds.versions()]
+    return {
+        "versions": versions,
+        "transactions": [type(ds.read_transaction(v).operation).__name__ for v in versions],
+        "tables": [lance.dataset(uri, version=v, storage_options=storage).to_table().sort_by("id").to_pydict()
+                   for v in versions],
+        "config": dict(ds.config()),
+        "metadata": dict(ds.metadata),
+        "schema_metadata": ds.schema.metadata,
+        "tags": sorted((name, info["version"]) for name, info in ds.tags.list().items()),
+    }
+
+
+@pytest.mark.parametrize("name", list(W2A_OPS))
+def test_mutation_on_s3_matches_the_local_copy(name, tmp_path):
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    for uri, storage in ((s3_uri, options()), (local, None)):
+        nl.write_dataset(batch(0), uri, storage_options=storage)
+        W2A_OPS[name](nl.dataset(uri, storage_options=storage), uri, storage)
+    assert _snapshot(s3_uri, options()) == _snapshot(local, None)
+
+
+def test_pylance_delete_then_nanolance_update_on_s3():
+    lance = require_pylance()
+    uri = fresh_uri()
+    nl.write_dataset(batch(0), uri, storage_options=options())
+    lance.dataset(uri, storage_options=options()).delete("id < 10")
+    assert nl.dataset(uri, storage_options=options()).update({"name": "'x'"}, where="id = 50") == \
+        {"num_rows_updated": 1}
+    theirs = lance.dataset(uri, storage_options=options())
+    assert theirs.version == 3 and theirs.count_rows() == 90
+    assert [theirs.read_transaction(v).operation.__class__.__name__ for v in (1, 2, 3)] == \
+        ["Overwrite", "Delete", "Update"]
+    assert theirs.to_table(filter="id = 50").column("name").to_pylist() == ["x"]
+
+
+# A child process: deletes of each predicate in turn, then a JSON line of the rows deleted and the errors.
+DELETER = textwrap.dedent("""
+    import json, sys
+    import nanolance.lance as nl
+    uri, predicates, options = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
+    deleted, errors = 0, []
+    for predicate in predicates:
+        try:
+            deleted += nl.dataset(uri, storage_options=options).delete(predicate)["num_deleted_rows"]
+        except OSError as e:
+            errors.append(str(e))
+    print(json.dumps({"deleted": deleted, "errors": errors}))
+""")
+
+
+def test_racing_deletes_lose_and_double_nothing():
+    uri = fresh_uri()
+    nl.write_dataset(batch(0), uri, storage_options=options())
+    first = [f"id >= {a} and id < {a + 10}" for a in (0, 10, 20, 30)]
+    second = [f"id >= {a} and id < {a + 10}" for a in (60, 70, 80, 90)]
+    procs = [subprocess.Popen([sys.executable, "-c", DELETER, uri, json.dumps(p), json.dumps(options())],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for p in (first, second)]
+    outcomes = [result(p) for p in procs]
+    assert outcomes == [{"deleted": 40, "errors": []}, {"deleted": 40, "errors": []}], outcomes
+    ds = nl.dataset(uri, storage_options=options())
+    assert ds.version == 9
+    assert sorted(ds.to_table(columns=["id"])["id"].to_pylist()) == list(range(40, 60))
+
+
+def test_tag_conflicts_and_missing_tags_as_locally():
+    uri = fresh_uri()
+    nl.write_dataset(batch(0), uri, storage_options=options())
+    ds = nl.dataset(uri, storage_options=options())
+    ds.tags.create("t1", 1)
+    with pytest.raises(ValueError, match="Ref conflict error: tag t1 already exists"):
+        ds.tags.create("t1", 1)
+    ds.tags.delete("t1")
+    with pytest.raises(ValueError, match="Ref not found error: tag t1 does not exist"):
+        ds.tags.delete("t1")
+    assert nl.dataset(uri, storage_options=options()).tags.list() == {}

@@ -4,6 +4,7 @@
 #include "nanolance/work_stats.hpp"
 #include <nanolance/dataset_refs.hpp>
 #include "nanolance/byte_source.hpp"
+#include "nanolance/byte_sink.hpp"
 
 #include <nanolance/base_paths.hpp>
 #include <nanolance/manifest_reader.hpp>
@@ -136,15 +137,39 @@ bool write_file(const fs::path& path, const std::string& bytes, bool replace, bo
     return true;
 }
 
+/// A tag file. Local paths: write_file. An object store (s3://): a plain PUT replaces the file; without
+/// `replace` the PUT is create-only (If-None-Match), as write_file's hard link is locally.
+bool write_tag_file(const fs::path& path, const std::string& bytes, bool replace, bool& existed,
+                    std::string& error) {
+    if (!io::is_object_store_output(path.string())) {
+        return write_file(path, bytes, replace, existed, error);
+    }
+    existed = false;
+    if (replace) {
+        auto out = io::open_output(path.string(), error);
+        if (!out) {
+            return false;
+        }
+        out->write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        return out->commit(error);
+    }
+    const std::vector<std::uint8_t> data(bytes.begin(), bytes.end());
+    return io::put_if_absent(path.string(), data, existed, error);
+}
+
 /// The `_versions` file of `version`, and its size; false when there is none.
 bool manifest_file_of(const fs::path& dataset_path, std::uint64_t version, fs::path& path, std::uint64_t& size) {
-    std::error_code ec;
-    for (const auto& entry : fs::directory_iterator(dataset_path / "_versions", ec)) {
+    std::vector<io::DirEntry> entries;
+    std::string error;
+    if (!io::list_dir((dataset_path / "_versions").string(), entries, error, true)) {
+        return false;
+    }
+    for (const auto& entry : entries) {
         std::uint64_t v = 0;
-        if (entry.is_regular_file(ec) && parse_manifest_version(entry.path().filename().string(), v) && v == version) {
-            path = entry.path();
-            size = static_cast<std::uint64_t>(entry.file_size(ec));
-            return !ec;
+        if (!entry.is_dir && parse_manifest_version(entry.name, v) && v == version) {
+            path = dataset_path / "_versions" / entry.name;
+            size = entry.size;
+            return true;
         }
     }
     return false;
@@ -1303,7 +1328,7 @@ bool create_tag(const fs::path& root, const std::string& name, const std::string
     tag.name = name;
     tag.created_at = tag.updated_at = rfc3339(now_ns());
     bool existed = false;
-    if (!write_file(tags_dir(root) / (name + ".json"), tag_json(tag), false, existed, error)) {
+    if (!write_tag_file(tags_dir(root) / (name + ".json"), tag_json(tag), false, existed, error)) {
         if (existed) {
             error = "Ref conflict error: tag " + name + " already exists";
         }
@@ -1327,7 +1352,7 @@ bool update_tag(const fs::path& root, const std::string& name, const std::string
     }
     tag.updated_at = rfc3339(now_ns());
     bool existed = false;
-    return write_file(tags_dir(root) / (name + ".json"), tag_json(tag), true, existed, error);
+    return write_tag_file(tags_dir(root) / (name + ".json"), tag_json(tag), true, existed, error);
 }
 
 bool delete_tag(const fs::path& dataset_path, const std::string& name, std::string& error) {
@@ -1335,8 +1360,17 @@ bool delete_tag(const fs::path& dataset_path, const std::string& name, std::stri
     if (!check_valid_tag(name, error)) {
         return false;
     }
+    const auto path = tags_dir(dataset_path) / (name + ".json");
+    if (io::is_object_store_output(path.string())) {
+        // Lance's delete: a HEAD, then the DELETE. A missing tag is the same "not found" as locally.
+        if (!io::exists(path.string())) {
+            error = "Ref not found error: tag " + name + " does not exist";
+            return false;
+        }
+        return io::remove_output(path.string(), error);
+    }
     std::error_code ec;
-    if (!fs::remove(tags_dir(dataset_path) / (name + ".json"), ec)) {
+    if (!fs::remove(path, ec)) {
         error = ec ? "failed to delete tag " + name + ": " + ec.message()
                    : "Ref not found error: tag " + name + " does not exist";
         return false;
@@ -1353,7 +1387,7 @@ bool replace_tag_metadata(const fs::path& dataset_path, const std::string& name,
     }
     tag.metadata = metadata;
     bool existed = false;
-    return write_file(tags_dir(dataset_path) / (name + ".json"), tag_json(tag), true, existed, error);
+    return write_tag_file(tags_dir(dataset_path) / (name + ".json"), tag_json(tag), true, existed, error);
 }
 
 // ── cleanup ────────────────────────────────────────────────────────────────────────────────────────

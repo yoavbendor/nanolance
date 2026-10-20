@@ -714,7 +714,6 @@ class LanceDataset(pa.dataset.Dataset):
         return self
 
     def restore(self) -> None:
-        refuse_object_store_write(self._uri, "restore")
         with native():
             _nanolance._ds_restore(self._uri, self._version, self._version)
         self._refresh_latest("Restore")
@@ -725,7 +724,6 @@ class LanceDataset(pa.dataset.Dataset):
         return dict(self._info["config"])
 
     def update_config(self, values: Dict[str, Optional[str]], *, replace: bool = False) -> Dict[str, str]:
-        refuse_object_store_write(self._uri, "update config")
         current = self.config()
         remove = [k for k, v in values.items() if v is None]
         if replace:
@@ -737,7 +735,6 @@ class LanceDataset(pa.dataset.Dataset):
         return self.config()
 
     def delete_config_keys(self, keys: List[str]) -> None:
-        refuse_object_store_write(self._uri, "delete config keys")
         with native():
             _nanolance._ds_update_config(self._uri, {}, list(keys), self._version)
         self._refresh_latest("UpdateConfig")
@@ -747,7 +744,6 @@ class LanceDataset(pa.dataset.Dataset):
         return dict(self._info["table_metadata"])
 
     def update_metadata(self, values: Dict[str, Optional[str]], *, replace: bool = False) -> Dict[str, str]:
-        refuse_object_store_write(self._uri, "update metadata")
         merged = {} if replace else self.metadata
         for k, v in values.items():
             if v is None:
@@ -764,7 +760,6 @@ class LanceDataset(pa.dataset.Dataset):
         return {k.decode(): v.decode() for k, v in self._info["schema_metadata"].items()}
 
     def update_schema_metadata(self, values: Dict[str, Optional[str]], *, replace: bool = False) -> Dict[str, str]:
-        refuse_object_store_write(self._uri, "update schema metadata")
         merged = {} if replace else self.schema_metadata
         for k, v in values.items():
             if v is None:
@@ -1123,7 +1118,6 @@ class LanceDataset(pa.dataset.Dataset):
 
     def delete(self, predicate, *, conflict_retries: int = 10, retry_timeout=None) -> Dict[str, int]:
         """Delete the rows where `predicate` (SQL or a pyarrow expression) is true. One new version."""
-        refuse_object_store_write(self._uri, "delete")
         sql = _filter_sql(predicate)
         if sql is None:
             raise ValueError("delete needs a predicate")
@@ -1135,7 +1129,6 @@ class LanceDataset(pa.dataset.Dataset):
     def update(self, updates: Dict[str, str], where: Optional[str] = None, conflict_retries: int = 10,
                retry_timeout=None) -> Dict[str, int]:
         """Set columns to SQL values on the rows `where` selects (every row when None)."""
-        refuse_object_store_write(self._uri, "update")
         if not updates:
             raise ValueError("update needs at least one column to set")
         assignments = [(str(k), str(v)) for k, v in updates.items()]
@@ -2146,7 +2139,6 @@ class LanceDataset(pa.dataset.Dataset):
                               replace: bool = False) -> None:
         """Set (a value) or remove (None) metadata keys of fields named by path; with ``replace``, a
         field's metadata becomes exactly the keys given a value."""
-        refuse_object_store_write(self._uri, "update field metadata")
         if not isinstance(field_updates, dict):
             raise TypeError(f"argument 'field_updates': '{type(field_updates).__name__}' object cannot be "
                             "converted to 'PyDict'")
@@ -2199,7 +2191,7 @@ class LanceDataset(pa.dataset.Dataset):
         step of a distributed write, whose workers wrote their files with ``write_fragments`` /
         ``LanceFragment.create`` and friends. Checked first against what was committed since
         ``read_version``, as Lance checks it (a conflict raises ``lance.commit.CommitConflictError``)."""
-        refuse_object_store_write(base_uri, "commit")
+        _refuse_commit(base_uri, operation)
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
         elif isinstance(base_uri, LanceDataset):
@@ -2401,13 +2393,23 @@ def _uses_v2_manifest_paths(path: str) -> bool:
                for n in names)
 
 
+def _refuse_commit(target, operation) -> None:
+    """A hand-built commit to s3:// is refused, except a Delete: the publish of a fragment delete (W2a).
+    Every other operation waits for its phase (W2b, W3)."""
+    from nanolance.lance._transactions import operation_name
+
+    if isinstance(operation, LanceOperation.BaseOperation) and operation_name(operation) == "Delete":
+        return
+    refuse_object_store_write(target, "commit")
+
+
 def _commit_hand_built(path: str, operation, read_version: Optional[int], properties: Dict[str, str],
                        max_retries: int, timeout: Optional[float] = None,
                        enable_stable_row_ids: bool = False) -> int:
     """Commit `operation` as Lance's commit_transaction does: check the transactions committed since
     `read_version` (a conflict raises CommitConflictError), apply it to the latest version, and try
     again when another writer takes that version first."""
-    refuse_object_store_write(path, "commit")
+    _refuse_commit(path, operation)
     import random
     import time
 
@@ -2680,27 +2682,23 @@ class Tags:
 
     def create(self, tag: str, reference=None) -> None:
         root = self._ds._root
-        refuse_object_store_write(root, "create tag")
         branch, version = _reference(self._ds, reference, (self._ds._branch, 0))
         with _ref_errors():
             _nanolance._ds_create_tag(root, str(tag), branch, version)
 
     def delete(self, tag: str) -> None:
         root = self._ds._root
-        refuse_object_store_write(root, "delete tag")
         with _ref_errors():
             _nanolance._ds_delete_tag(root, str(tag))
 
     def update(self, tag: str, reference=None) -> None:
         root = self._ds._root
-        refuse_object_store_write(root, "update tag")
         branch, version = _reference(self._ds, reference, (self._ds._branch, 0))
         with _ref_errors():
             _nanolance._ds_update_tag(root, str(tag), branch, version)
 
     def replace_metadata(self, tag: str, metadata: Dict[str, str]) -> None:
         root = self._ds._root
-        refuse_object_store_write(root, "replace tag metadata")
         with _ref_errors():
             _nanolance._ds_replace_tag_metadata(root, str(tag), {str(k): str(v) for k, v in metadata.items()})
 
@@ -3301,7 +3299,6 @@ class MergeInsertBuilder:
         return f"{self._clauses()}, metrics=[{', '.join(f'{k}={v}' for k, v in metrics.items())}]"
 
     def execute(self, data_obj, *, schema: Optional[pa.Schema] = None) -> Dict[str, int]:
-        refuse_object_store_write(self._ds.uri, "merge insert")
         reader = _coerce_reader(data_obj, schema)
         target = self._ds._data_schema
         if not (self._update_all or self._insert_all or self._delete_by_source or self._when_matched):

@@ -4,6 +4,7 @@
 #include "nanolance/work_stats.hpp"
 #include "nanolance/deletion_vector.hpp"
 #include "nanolance/byte_source.hpp"
+#include "nanolance/byte_sink.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow_ipc.h>
@@ -11,7 +12,8 @@
 #include <atomic>
 #include <chrono>
 #include <random>
-#include <cstdio>
+#include <cerrno>
+#include <memory>
 
 #include "nanolance/base_paths.hpp"
 #include "nanolance/read_safety.hpp"
@@ -728,16 +730,35 @@ bool read_manifest_deletion_vector(const std::filesystem::path& dataset_path, co
     return read_deletion_vector(deletions_dir, fragment_id, deletion_file, out_sorted_offsets, error);
 }
 
+namespace {
+
+// The Arrow IPC stream writes into an io::OutputFile (a local file, or an object through the s3 sink).
+ArrowErrorCode write_to_output(ArrowIpcOutputStream* stream, const void* buf, int64_t size, int64_t* written,
+                               ArrowError* error) {
+    auto* out = static_cast<io::OutputFile*>(stream->private_data);
+    out->write(static_cast<const char*>(buf), static_cast<std::streamsize>(size));
+    if (!*out) {
+        *written = 0;
+        if (error != nullptr) {
+            ArrowErrorSet(error, "the output stream failed");
+        }
+        return EIO;
+    }
+    *written = size;
+    return NANOARROW_OK;
+}
+
+// The output is owned by the caller; the stream only borrows it.
+void release_output_stream(ArrowIpcOutputStream* stream) {
+    stream->release = nullptr;
+}
+
+}  // namespace
+
 bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_t fragment_id,
                          std::uint64_t read_version, const std::vector<std::uint32_t>& deleted,
                          pb::DeletionFile& out, std::string& error) {
     error.clear();
-    std::error_code ec;
-    std::filesystem::create_directories(dataset_path / "_deletions", ec);
-    if (ec) {
-        error = "failed to create _deletions: " + ec.message();
-        return false;
-    }
     // Random as well as clock-based: writers in other processes name files in the same directory.
     static std::atomic<std::uint64_t> counter{0};
     // (Drawn from the entropy source each time: a seeded generator would be shared by forked processes.)
@@ -795,19 +816,16 @@ bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_
         view_init = ok;
         ok = ok && ArrowArrayViewSetArray(&view, &array, &aerr) == NANOARROW_OK;
     }
-    FILE* file = ok ? std::fopen(path.string().c_str(), "wb") : nullptr;
-    if (ok && file == nullptr) {
-        error = "failed to open " + path.string() + " for writing";
-        cleanup();
-        return false;
-    }
+    std::unique_ptr<io::OutputFile> file;
     if (ok) {
-        ok = ArrowIpcOutputStreamInitFile(&stream, file, 1) == NANOARROW_OK;
-        if (!ok) {
-            std::fclose(file);
+        file = io::open_output(path.string(), error);
+        if (!file) {
+            cleanup();
+            return false;
         }
-    }
-    if (ok) {
+        stream.write = &write_to_output;
+        stream.release = &release_output_stream;
+        stream.private_data = file.get();
         ok = ArrowIpcWriterInit(&writer, &stream) == NANOARROW_OK;
         writer_init = ok;
     }
@@ -815,16 +833,24 @@ bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_
          ArrowIpcWriterWriteSchema(&writer, &schema, &aerr) == NANOARROW_OK &&
          ArrowIpcWriterWriteArrayView(&writer, &view, &aerr) == NANOARROW_OK &&
          ArrowIpcWriterFinalizeFile(&writer, &aerr) == NANOARROW_OK;
-    if (ok) {
-        std::fflush(file);
-        work_stats::count_written_file(path);
-    }
     cleanup();
     if (!ok) {
-        error = std::string("failed to write the deletion file: ") + aerr.message;
-        std::filesystem::remove(path, ec);
+        error = aerr.message[0] != '\0' ? "failed to write the deletion file: " + std::string(aerr.message)
+                                        : "failed to write the deletion file";
+    } else if (!file->commit(error)) {
+        ok = false;
+    }
+    if (!ok) {
+        // Close the output before removing what it may have left (a local file; an object store has none).
+        const bool opened = file != nullptr;
+        file.reset();
+        if (opened) {
+            std::string ignored;
+            io::remove_output(path.string(), ignored);
+        }
         return false;
     }
+    work_stats::count_written_file(path);
     out = pb::DeletionFile{};
     out.present = true;
     out.file_type = 0;

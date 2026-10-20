@@ -177,23 +177,15 @@ def test_storage_option_spellings_agree(uri):
 
 
 WRITES = {
-    "delete": lambda ds, uri: ds.delete("id = 1"),
-    "update": lambda ds, uri: ds.update({"name": "'x'"}, where="id = 1"),
     "add_columns": lambda ds, uri: ds.add_columns({"extra": "id + 1"}),
     "drop_columns": lambda ds, uri: ds.drop_columns(["score"]),
     "create_scalar_index": lambda ds, uri: ds.create_scalar_index("id", "BTREE"),
     "create_vector_index": lambda ds, uri: ds.create_index("vec", index_type="IVF_FLAT", num_partitions=4),
     "drop_index": lambda ds, uri: ds.drop_index("id_idx"),
-    "update_config": lambda ds, uri: ds.update_config({"k": "v"}),
-    "update_metadata": lambda ds, uri: ds.update_metadata({"k": "v"}),
-    "restore": lambda ds, uri: ds.restore(),
-    "create_tag": lambda ds, uri: ds.tags.create("t1", 1),
     "cleanup_old_versions": lambda ds, uri: ds.cleanup_old_versions(retain_versions=1),
     "compact_files": lambda ds, uri: ds.optimize.compact_files(),
     "optimize_indices": lambda ds, uri: ds.optimize.optimize_indices(),
-    "merge_insert": lambda ds, uri: ds.merge_insert("id").when_matched_update_all().execute(sample_table(10)),
     "drop_dataset": lambda ds, uri: nl.LanceDataset.drop(uri, storage_options=options()),
-    "fragment_delete": lambda ds, uri: ds.get_fragments()[0].delete("id = 1"),
     "fragment_create": lambda ds, uri: nl.LanceFragment.create(uri, sample_table(10)),
 }
 

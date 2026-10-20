@@ -88,3 +88,11 @@ Tails of: `cd build && ctest -j8 | tail -3`; the object-store tests against moto
 tests/test_object_store.py tests/test_object_store_writes.py tests/test_object_store_commits.py`, run from
 `bindings/python`); `python3 tools/pylance_suite.py | tail -4`; last, once, the full bindings suite. Report
 under 40 lines: questions first, then files, per-operation status, tails, decisions.
+
+**W2a outcome (2026-10-20):** delete, update, merge_insert, fragment delete (and its hand-built Delete
+commit), restore, config / table / schema / field metadata updates, tags (create / update / delete,
+replace_metadata) work on `s3://`, equal to a local copy as pylance reads them; two processes deleting
+disjoint ranges both land. Found and fixed: a native delete on `s3://` wrote its deletion file into a
+local directory named `s3:` (fopen). Reviewer's decisions: a tag create is a create-only PUT (a racing
+create cannot silently replace another's tag; pylance's plain PUT would), a tag delete one DELETE (pylance:
+HEAD then a batch POST ?delete; same end state).

@@ -433,7 +433,6 @@ class LanceFragment(pa.dataset.Fragment):
     def delete(self, predicate: str) -> Optional[FragmentMetadata]:
         """The fragment with the rows where ``predicate`` holds deleted (a new deletion file; the data
         files are untouched), or None when no row would be left."""
-        refuse_object_store_write(self._ds._uri, "delete rows")
         from nanolance.lance.dataset import _filter_sql
 
         with native():
@@ -443,7 +442,6 @@ class LanceFragment(pa.dataset.Fragment):
 
     def delete_rows(self, offsets: Iterable[int]) -> Optional[FragmentMetadata]:
         """The fragment with the rows at these physical offsets deleted, or None when none is left."""
-        refuse_object_store_write(self._ds._uri, "delete rows")
         with native():
             message = _nanolance._fragment_delete(self._ds._uri, self._ds.version, self._id, None,
                                                   [int(o) for o in offsets])
