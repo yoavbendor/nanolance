@@ -887,6 +887,50 @@ void test_fuzzy(const std::filesystem::path& dir) {
     }
 }
 
+// lance_scanner_set_approx_mode reaches IVF_RQ searches: each mode answers as nanolance's own search in
+// that mode (test_ivf_rq.py checks those against pylance), and 'fast' (1-bit estimates) is not 'normal'.
+void test_rq_approx_mode(const std::string& uri) {
+    check(write(uri, 0, 2000, LANCE_WRITE_CREATE), "write: " + last_error());
+    nano_lance::VectorIndexOptions o;
+    o.type = "IVF_RQ";
+    o.num_partitions = 4;
+    o.num_bits = 5;
+    o.seed = 7;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_create_vector_index(uri, "vec", o, version, error), "build IVF_RQ: " + error);
+    std::vector<std::vector<float>> by_mode;
+    for (const auto mode : {LANCE_APPROX_MODE_FAST, LANCE_APPROX_MODE_NORMAL, LANCE_APPROX_MODE_ACCURATE}) {
+        const auto q = query_vector(5);
+        nano_lance::NearestQuery core;
+        core.column = "vec";
+        core.key = q;
+        core.k = 20;
+        core.minimum_nprobes = 4;
+        core.maximum_nprobes = 4;
+        core.approx_mode = mode == LANCE_APPROX_MODE_FAST       ? nano_lance::ApproxMode::Fast
+                           : mode == LANCE_APPROX_MODE_ACCURATE ? nano_lance::ApproxMode::Accurate
+                                                                : nano_lance::ApproxMode::Normal;
+        nano_lance::NearestResult want;
+        check(nano_lance::dataset_nearest(uri, core, want, error), "core IVF_RQ nearest: " + error);
+        LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+        const char* cols[] = {"id", nullptr};
+        LanceScanner* sc = lance_scanner_new(ds, cols, nullptr);
+        check(lance_scanner_nearest(sc, "vec", q.data(), q.size(), LANCE_DTYPE_FLOAT32, 20) == 0, "nearest");
+        check(lance_scanner_set_nprobes(sc, 4) == 0, "nprobes");
+        check(lance_scanner_set_approx_mode(sc, mode) == 0, "approx_mode");
+        check(lance_scanner_with_row_id(sc, true) == 0, "with_row_id");
+        const auto got = collect(sc, "_distance");
+        lance_scanner_close(sc);
+        lance_dataset_close(ds);
+        const std::string tag = "IVF_RQ approx_mode " + std::to_string(static_cast<int>(mode));
+        check(got.ok, tag + ": " + got.error);
+        check(got.row_ids == want.row_ids && got.values == want.distances, tag + ": as the core search");
+        by_mode.push_back(got.values);
+    }
+    check(by_mode[0] != by_mode[1], "IVF_RQ approx_mode fast differs from normal");
+}
+
 int main(int argc, char** argv) {
     const std::filesystem::path dir =
         argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::temp_directory_path() / "nl_lance_c_search";
@@ -922,6 +966,7 @@ int main(int argc, char** argv) {
     test_fuzzy(dir);
     test_include_deleted_rows((dir / "deleted.lance").string());
     test_update_if((dir / "upsert.lance").string());
+    test_rq_approx_mode((dir / "rq.lance").string());
     if (std::getenv("NANOLANCE_KEEP_TEST_DATA") == nullptr) {
         std::filesystem::remove_all(dir);
     }

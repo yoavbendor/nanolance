@@ -159,5 +159,8 @@ NotImplementedError as pylance does (other kinds unchanged until measured).
 estimate alone, no top-k gate) and 'accurate' (Lance's hacc path: the binary sums from the distance table
 quantized to u16 over [qmin, qmax], u32 sums) answer as pylance does on IVF_RQ indexes, with filters and
 deletions; other kinds ignore approx_mode, as pylance does, and unknown names raise pylance's ValueError.
-The seventh target test (`test_create_ivf_rq_multi_bit_searches_l2_and_cosine`) passes. Open: the lance-c
-C API has no approx_mode setter yet (`lance_scanner_set_approx_mode`).
+The seventh target test (`test_create_ivf_rq_multi_bit_searches_l2_and_cosine`) passes. Reviewer's follow-ups:
+lance-c's `lance_scanner_set_approx_mode` reaches the search (it was validated but ignored); IVF_RQ with no
+maximum_nprobes probed every partition, now Lance's first-pass count and more only while short of k; the
+cosine query norm is Lance's sequential sum (the rare cosine flake: a last-bit difference moved a u8 table
+entry). Search speed A/B against the pre-R1c binary: unchanged (k=10, k=100, nprobes=32, refine 4).

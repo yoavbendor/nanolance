@@ -101,6 +101,7 @@ struct SearchSettings {
     std::optional<uint32_t> refine_factor;
     std::optional<uint32_t> ef;
     int32_t query_parallelism = 0;
+    nano_lance::ApproxMode approx_mode = nano_lance::ApproxMode::Normal;
     std::vector<std::array<uint8_t, 16>> index_segments;  // nearest: only these segments
     std::vector<std::array<uint8_t, 16>> fts_index_segments;  // a prepared FTS query: only these
     std::optional<std::array<uint8_t, 16>> scalar_segment;      // a plain scan scoped by one segment
@@ -771,6 +772,7 @@ bool open_search(const LanceScanner& scanner, ArrowArrayStream& out) {
         q.refine_factor = search.refine_factor;
         q.ef = search.ef;
         q.query_parallelism = search.query_parallelism;
+        q.approx_mode = search.approx_mode;
         q.segments = search.index_segments;
         q.metric = search.metric;
         q.use_index = search.use_index;
@@ -4147,13 +4149,17 @@ int32_t lance_scanner_set_maximum_nprobes(LanceScanner* scanner, uint32_t maximu
         return true;
     });
 }
-// The approximation mode changes only binary-quantized searches in Lance; for the indexes nanolance
-// searches it changes nothing, as in Lance.
+// The approximation mode changes only IVF_RQ searches, as in Lance; the other kinds ignore it.
 int32_t lance_scanner_set_approx_mode(LanceScanner* scanner, LanceApproxMode approx_mode) {
     return before_scan(scanner, [&] {
         const auto mode = static_cast<int32_t>(approx_mode);
-        return (mode >= 0 && mode <= 2) ||
-               invalid("approx_mode must be 0 (FAST), 1 (NORMAL), or 2 (ACCURATE), got " + std::to_string(mode));
+        if (mode < 0 || mode > 2) {
+            return invalid("approx_mode must be 0 (FAST), 1 (NORMAL), or 2 (ACCURATE), got " + std::to_string(mode));
+        }
+        scanner->search.approx_mode = mode == LANCE_APPROX_MODE_FAST       ? nano_lance::ApproxMode::Fast
+                                      : mode == LANCE_APPROX_MODE_ACCURATE ? nano_lance::ApproxMode::Accurate
+                                                                           : nano_lance::ApproxMode::Normal;
+        return true;
     });
 }
 int32_t lance_scanner_set_query_parallelism(LanceScanner* scanner, int32_t query_parallelism) {
