@@ -2166,6 +2166,7 @@ NB_MODULE(_nanolance, m) {
         d["partitions"] = part.partitions;
         d["width"] = part.width;
         d["column"] = part.column;
+        d["uint8"] = part.uint8;
         d["ids"] = nb::bytes(reinterpret_cast<const char*>(part.ids.data()), part.ids.size() * sizeof(std::uint64_t));
         if (!part.floats.empty()) {
             d["values"] = nb::bytes(reinterpret_cast<const char*>(part.floats.data()),

@@ -77,6 +77,7 @@ const char* vector_metric_name(VectorMetric metric) {
     switch (metric) {
         case VectorMetric::Cosine: return "cosine";
         case VectorMetric::Dot: return "dot";
+        case VectorMetric::Hamming: return "hamming";
         default: return "l2";
     }
 }
@@ -170,7 +171,7 @@ bool add_varints(const Field& f, std::vector<std::uint64_t>& out) {
 
 /// Tensor { data_type = 1, shape = 2, data = 3 }, its values as floats.
 bool decode_tensor(const std::uint8_t* data, std::size_t size, std::vector<std::uint64_t>& shape,
-                   std::vector<float>& values, std::string& error) {
+                   std::vector<float>& values, std::string& error, std::vector<std::uint8_t>* u8 = nullptr) {
     const auto* p = data;
     const auto* end = data + size;
     std::uint64_t type = 0;
@@ -208,6 +209,13 @@ bool decode_tensor(const std::uint8_t* data, std::size_t size, std::vector<std::
                 std::memcpy(values.data(), bytes, values.size() * 4U);
             }
             return true;
+        case 4:  // UINT8: a Hamming index's centroids, kept as bytes
+            if (u8 == nullptr) {
+                error = "a Tensor of data type 4 (UINT8) is not supported here";
+                return false;
+            }
+            u8->assign(bytes, bytes + nbytes);
+            return true;
         case 3: {  // FLOAT64
             values.resize(nbytes / 8U);
             for (std::size_t i = 0; i < values.size(); ++i) {
@@ -226,6 +234,7 @@ bool decode_tensor(const std::uint8_t* data, std::size_t size, std::vector<std::
 /// IVF { centroids = 1 (deprecated, floats), offsets = 2, lengths = 3, centroids_tensor = 4 }.
 struct IvfModel {
     std::vector<float> centroids;
+    std::vector<std::uint8_t> bytes;  // a UINT8 tensor (Hamming centroids), instead of centroids
     std::size_t partitions = 0;
     std::size_t dim = 0;
     std::vector<std::uint64_t> offsets;
@@ -270,7 +279,7 @@ bool decode_ivf(const std::vector<std::uint8_t>& message, IvfModel& out, std::st
             out.has_loss = true;
         } else if (f.number == 4 && f.wire == 2) {
             std::vector<std::uint64_t> shape;
-            if (!decode_tensor(f.data, f.size, shape, out.centroids, error)) {
+            if (!decode_tensor(f.data, f.size, shape, out.centroids, error, &out.bytes)) {
                 return false;
             }
             if (shape.size() == 2U) {
@@ -640,6 +649,7 @@ struct IvfIndex {
     std::size_t dim = 0;
     std::size_t partitions = 0;
     std::vector<float> centroids;  // partitions * dim
+    std::vector<std::uint8_t> binary_centroids;  // Hamming: partitions * dim bytes, instead of centroids
     std::vector<std::uint64_t> offsets;
     std::vector<std::uint64_t> lengths;
     std::uint32_t nbits = 8;
@@ -951,6 +961,14 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
             if (!load_sq_rows(table, id_col, value_col, *part, error)) {
                 return false;
             }
+        } else if (storage == Storage::Flat && metric == VectorMetric::Hamming) {
+            VectorRows rows;  // uint8 rows: dim bytes each, kept as codes
+            rows.dim = dim;
+            if (!collect_vectors(table.schema, table.batches, value_col, id_col, rows, error)) {
+                return false;
+            }
+            part->ids = std::move(rows.ids);
+            part->codes = std::move(rows.bytes);
         } else if (storage == Storage::Flat) {
             VectorRows rows;
             rows.dim = dim;
@@ -1006,6 +1024,15 @@ bool IvfIndex::partition(std::size_t p, std::shared_ptr<const Partition>& out, s
     return true;
 }
 
+/// An index's stored distance type: pylance's names, and "hamming" (IVF_FLAT over uint8 vectors).
+bool parse_index_metric(const std::string& name, VectorMetric& out) {
+    if (name == "hamming") {
+        out = VectorMetric::Hamming;
+        return true;
+    }
+    return parse_vector_metric(name, out);
+}
+
 bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>& out, std::string& error,
               bool use_cache = true) {
     static IndexCache<IvfIndex> cache;
@@ -1029,7 +1056,7 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
         error = "vector index type '" + index->type + "' is not supported";
         return false;
     }
-    if (!parse_vector_metric(json_value(value, "distance_type"), index->metric)) {
+    if (!parse_index_metric(json_value(value, "distance_type"), index->metric)) {
         error = "vector index: unknown distance type '" + json_value(value, "distance_type") + "'";
         return false;
     }
@@ -1047,7 +1074,16 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
         }
         return false;
     }
-    index->centroids = std::move(model.centroids);
+    const bool binary_index = index->metric == VectorMetric::Hamming;
+    if (binary_index) {
+        if (index->storage != Storage::Flat || index->sub != SubIndex::Flat) {
+            error = "vector index: a Hamming index must be IVF_FLAT";
+            return false;
+        }
+        index->binary_centroids = std::move(model.bytes);
+    } else {
+        index->centroids = std::move(model.centroids);
+    }
     index->partitions = model.partitions;
     index->dim = model.dim;
 
@@ -1071,7 +1107,8 @@ bool load_ivf(const std::filesystem::path& dir, std::shared_ptr<const IvfIndex>&
     }
     index->offsets = std::move(parts.offsets);
     index->lengths = std::move(parts.lengths);
-    if (index->partitions == 0U || index->dim == 0U || index->centroids.size() != index->partitions * index->dim ||
+    const std::size_t centroid_values = binary_index ? index->binary_centroids.size() : index->centroids.size();
+    if (index->partitions == 0U || index->dim == 0U || centroid_values != index->partitions * index->dim ||
         index->offsets.size() != index->partitions || index->lengths.size() != index->partitions) {
         error = "vector index: " + std::to_string(index->partitions) + " partitions of dimension " +
                 std::to_string(index->dim) + " do not match its centroids and partition table";
@@ -2268,6 +2305,36 @@ void rq_gate_partition(const IvfIndex& index, const RqQuery& q, const Partition&
     }
 }
 
+// The Hamming (binary IVF_FLAT) steps of search_segment, kept out of line so the float search loop
+// compiles as it did before they existed.
+[[gnu::noinline]] void hamming_to_centroids(const IvfIndex& index, const std::vector<std::uint8_t>& key,
+                                            std::vector<float>& out) {
+    for (std::size_t p = 0; p < index.partitions; ++p) {
+        out[p] = hamming(key.data(), index.binary_centroids.data() + p * index.dim, index.dim);
+    }
+}
+
+/// Each row of `part` into Lance's global top-k heap: a row replaces the heap's worst only when strictly
+/// closer, so among equal distances the one met first stays.
+template <typename Heap>
+[[gnu::noinline]] void hamming_into_heap(const Partition& part, const std::vector<std::uint8_t>& key, std::size_t dim,
+                                         const NearestQuery& q, const RowMask& mask, std::size_t kk, Heap& heap) {
+    const std::size_t n = part.ids.size();
+    for (std::size_t r = 0; r < n; ++r) {
+        const float d = hamming(part.codes.data() + r * dim, key.data(), dim);
+        if (!in_range(d, q) || !mask.allows(part.ids[r])) {
+            continue;
+        }
+        const Candidate c{d, part.ids[r]};
+        if (heap.size() < kk) {
+            heap.push(c);
+        } else if (heap.peek().d > d) {
+            heap.pop();
+            heap.push(c);
+        }
+    }
+}
+
 /// The best `kk` candidates of one index segment.
 bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_column, const RowMask& mask,
                     std::size_t kk, std::vector<Candidate>& out, std::string& plan, std::string& error,
@@ -2276,6 +2343,12 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         error = "Query vector size " + std::to_string(q.key.size()) + " does not match index column size " +
                 std::to_string(index.dim);
         return false;
+    }
+    std::vector<std::uint8_t> bkey;  // Hamming: the query's bytes (dataset_nearest checked them)
+    if (index.metric == VectorMetric::Hamming) {
+        for (const float x : q.key) {
+            bkey.push_back(static_cast<std::uint8_t>(x));
+        }
     }
     std::vector<float> key = q.key;
     if (index.metric == VectorMetric::Cosine) {
@@ -2299,9 +2372,13 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
     const float key_norm = index.metric == VectorMetric::Cosine && q.f16_column ? std::sqrt(dot(key.data(), key.data(), dim)) : 1.0F;
     const std::size_t P = index.partitions;
     std::vector<float> to_centroid(P);
-    for (std::size_t p = 0; p < P; ++p) {
-        const float* c = index.centroids.data() + p * dim;
-        to_centroid[p] = index.metric == VectorMetric::Dot ? 1.0F - dot(key.data(), c, dim) : l2(key.data(), c, dim);
+    if (index.metric == VectorMetric::Hamming) {
+        hamming_to_centroids(index, bkey, to_centroid);
+    } else {
+        for (std::size_t p = 0; p < P; ++p) {
+            const float* c = index.centroids.data() + p * dim;
+            to_centroid[p] = index.metric == VectorMetric::Dot ? 1.0F - dot(key.data(), c, dim) : l2(key.data(), c, dim);
+        }
     }
     std::vector<std::size_t> order(P);
     std::iota(order.begin(), order.end(), std::size_t{0});
@@ -2415,6 +2492,26 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
         return true;
     };
 
+    if (index.metric == VectorMetric::Hamming) {
+        // Lance's global top-k heap over the probed partitions (IVF_FLAT supports it): a row replaces the
+        // heap's worst only when strictly closer, so among equal distances the one met first stays.
+        const auto by_dist = [](const Candidate& a, const Candidate& b) { return a.d < b.d; };
+        RustHeap<Candidate, decltype(by_dist)> heap(by_dist);
+        std::size_t searched = 0;
+        for (std::size_t i = 0; i < most && (i < first || heap.size() < max_results); ++i, ++searched) {
+            std::shared_ptr<const Partition> part;
+            if (!index.partition(order[i], part, error, count)) {
+                return false;
+            }
+            hamming_into_heap(*part, bkey, dim, q, mask, kk, heap);
+        }
+        std::uint64_t added = 0;
+        for (const Candidate& c : std::move(heap).into_sorted()) {
+            out.push_back(c);
+            ++added;
+        }
+        return finish(searched, added);
+    }
     if (index.storage == Storage::Rq) {
         // IVF_RQ searches as Lance's FLAT sub-index does under IVF's global top-k heap: every probed
         // partition in probe order into one heap of kk entries, rows gated against it. The first
@@ -2512,7 +2609,8 @@ float multivec_distance(const MultiRows& v, std::size_t r, const NearestQuery& q
                         const std::vector<std::uint8_t>* binary_key, std::size_t dim);
 
 bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMetric metric, std::size_t dim,
-             std::vector<Candidate>& rows, std::string& error, bool multi = false) {
+             std::vector<Candidate>& rows, std::string& error, bool multi = false,
+             const std::vector<std::uint8_t>* binary_key = nullptr) {
     if (rows.empty()) {
         return true;
     }
@@ -2591,7 +2689,10 @@ bool rescore(const std::filesystem::path& path, const NearestQuery& q, VectorMet
     std::vector<Candidate> out;
     for (std::size_t r = 0; r < v.ids.size(); ++r) {
         if (v.valid[r] != 0U) {
-            out.push_back(Candidate{distance(metric, v.values.data() + r * dim, q.key.data(), dim, q_norm), v.ids[r]});
+            const float d = binary_key != nullptr
+                                ? hamming(v.bytes.data() + r * dim, binary_key->data(), dim)
+                                : distance(metric, v.values.data() + r * dim, q.key.data(), dim, q_norm);
+            out.push_back(Candidate{d, v.ids[r]});
         }
     }
     for (const auto& [id, d] : keep) {
@@ -3099,10 +3200,6 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             }
         }
     }
-    if (binary && !segments.empty()) {
-        error = "a vector index on a binary (UInt8) column is not supported; search it without an index";
-        return false;
-    }
     const bool chosen = q.use_index && !q.segments.empty();
     if (chosen) {
         // The segments asked for, in manifest order (Lance's with_index_segments).
@@ -3151,6 +3248,15 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             if (!index_dir_of(dataset_path, manifest, *s, seg_dir, why) ||
                 !load_ivf(seg_dir, index, why, q.index_cache)) {
                 not_used = why;
+            } else if (binary != (index->metric == VectorMetric::Hamming)) {
+                if (chosen) {
+                    error = "with_index_segments: the selected index segments cannot be searched: metric " +
+                            std::string(vector_metric_name(index->metric)) + " for this column";
+                    return false;
+                }
+                not_used = binary ? std::string("the index's metric is ") + vector_metric_name(index->metric) +
+                                        ", not hamming"
+                                  : std::string("the index's metric is hamming");
             } else if (q.metric && *q.metric != index->metric) {
                 if (chosen) {
                     error = std::string("with_index_segments requested metric ") + vector_metric_name(*q.metric) +
@@ -3305,7 +3411,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             }
             keep_best(ann, kk);
             if (q.refine_factor || !unindexed.empty()) {
-                if (!rescore(dataset_path, q, metric, dim, ann, error)) {
+                if (!rescore(dataset_path, q, metric, dim, ann, error, false, binary ? &binary_key : nullptr)) {
                     return false;
                 }
                 keep_best(ann, q.k);
@@ -3378,6 +3484,9 @@ bool read_vector_index_model(const std::filesystem::path& dir, VectorIndexModel&
         return false;
     }
     out.centroids = std::move(model.centroids);
+    for (const std::uint8_t b : model.bytes) {  // a Hamming index: its centroids' byte values
+        out.centroids.push_back(static_cast<float>(b));
+    }
     out.partitions = model.partitions;
     out.dim = model.dim;
     out.has_loss = model.has_loss;
@@ -3410,7 +3519,12 @@ bool read_vector_index_partition(const std::filesystem::path& dir, std::size_t p
         return true;
     }
     const std::size_t n = part->ids.size();
-    if (index->storage == Storage::Flat) {
+    if (index->storage == Storage::Flat && index->metric == VectorMetric::Hamming) {
+        out.column = "flat";
+        out.width = index->dim;
+        out.uint8 = true;
+        out.codes = part->codes;
+    } else if (index->storage == Storage::Flat) {
         out.column = "flat";
         out.width = index->dim;
         out.floats = part->vectors;

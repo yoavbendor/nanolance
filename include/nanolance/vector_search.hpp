@@ -20,7 +20,9 @@
 /// exactly over everything without one.
 namespace nano_lance {
 
-enum class VectorMetric { L2, Cosine, Dot };
+/// Hamming: an IVF_FLAT index over a uint8 column (its centroids and rows are bytes); only an index's
+/// own metric is Hamming, a query asks for it with NearestQuery::hamming.
+enum class VectorMetric { L2, Cosine, Dot, Hamming };
 
 /// pylance's approx_mode, which changes only IVF_RQ searches (other kinds ignore it, as in Lance).
 /// Fast: the 1-bit estimate alone, with no top-k gate. Accurate: the binary sums from a 16-bit
@@ -29,7 +31,7 @@ enum class ApproxMode { Normal, Fast, Accurate };
 
 /// "l2" / "euclidean", "cosine", "dot" (any case). False for anything else.
 bool parse_vector_metric(const std::string& name, VectorMetric& out);
-const char* vector_metric_name(VectorMetric metric);  // "l2", "cosine", "dot"
+const char* vector_metric_name(VectorMetric metric);  // "l2", "cosine", "dot", "hamming"
 
 struct NearestQuery {
     bool has_version = false;
@@ -186,6 +188,7 @@ struct VectorIndexPartition {
     std::size_t partitions = 0;
     std::size_t width = 0;  // values per row: dim (flat), code bytes (PQ), dim (SQ)
     std::string column;     // "flat", "__pq_code" or "__sq_code"
+    bool uint8 = false;     // "flat" holds uint8 values (a Hamming index): codes, not floats
     std::vector<std::uint64_t> ids;
     std::vector<float> floats;         // flat: ids.size() * width
     std::vector<std::uint8_t> codes;   // PQ / SQ: ids.size() * width, row by row as stored

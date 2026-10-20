@@ -144,3 +144,16 @@ bindings/python/tests/test_binary_ivf.py | tail -2`; the targets through nanolan
 tests/test_vector_index.py tests/test_indices.py tests/test_vector.py -k "hamming or binary" | tail -5`);
 `python3 tools/pylance_suite.py | tail -4`; last, once, the full bindings suite. Report under 40 lines:
 questions first, then files, per-target status, tails, decisions.
+
+**H1 outcome (2026-10-20):** nanolance searches pylance's Hamming IVF_FLAT indexes (centroids tensor
+data_type UINT8 = 4; rows kept as bytes; Lance's global top-k heap over the probed partitions, so among
+equal distances the row met first stays, as Lance's IVF_FLAT), with stats, describe_indices
+("HAMMING"), VectorIndexReader, `get_ivf_partition_info` and `hamming_clustering_for_ivf_partition`
+(segments, pylance's errors). `hamming_clustering_for_sample` now uses union-find as pylance's does (it
+was greedy). `bindings/python/tests/test_binary_ivf.py` (22). Reviewer: the Hamming steps moved out of
+line (`hamming_to_centroids`, `hamming_into_heap`) and a dead Hamming branch removed; float IVF_FLAT
+search interleaved A/B (k=10, 100k x 128, 4 alternations): 1.12 vs 1.15 ms median, within noise.
+Decisions for H2: keep nanolance's plan text format (pylance's differs for float IVF too); lance-c
+`LANCE_METRIC_HAMMING` over uint8 queries in H2, with Hamming still refused on float scanners
+(`tests/test_lance_c_search.cpp` ~317 stays); benchmarks: never overwrite `bench/results/*.json`
+(copy it back after a run).

@@ -1970,7 +1970,8 @@ class LanceDataset(pa.dataset.Dataset):
             return {}
         with native():
             built = _nanolance._ds_vector_index_details(os.path.join(self._uri, "_indices", index["uuid"]))
-        details = {"metric_type": {"l2": "L2", "cosine": "Cosine", "dot": "Dot"}[built["metric"]]}
+        details = {"metric_type": {"l2": "L2", "cosine": "Cosine", "dot": "Dot",
+                                   "hamming": "HAMMING"}[built["metric"]]}
         if built["pq"]:
             details["compression"] = {"type": "pq", "num_bits": built["num_bits"],
                                       "num_sub_vectors": built["num_sub_vectors"]}
@@ -3735,7 +3736,7 @@ class VectorIndexReader:
         fields = [pa.field("_rowid", pa.uint64())]
         if with_vector:
             width, column = part["width"], part["column"]
-            if column == "flat":
+            if column == "flat" and not part["uint8"]:
                 values = pa.array(np.frombuffer(part["values"], dtype=np.float32).copy())
                 arrays.append(pa.FixedSizeListArray.from_arrays(values, width))
                 fields.append(pa.field(column, pa.list_(pa.float32(), width), nullable=False))
