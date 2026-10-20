@@ -818,7 +818,16 @@ bool rebase_operation(const pb::Manifest& latest, const pb::Manifest& ours, cons
                 " is not supported";
         return false;
     }
-    if (!apply_operation(&latest, op, next, error, false, new_version)) {
+    // The fragments this change adds were numbered after the version it was made from; another writer may have
+    // taken those ids since, so they are numbered after the latest version's (as apply_operation numbers a new
+    // fragment whose id is 0).
+    Operation renumbered = op;
+    if (op.kind == kAppend || op.kind == kUpdate) {
+        for (auto& f : renumbered.fragments) {
+            f.id = 0;
+        }
+    }
+    if (!apply_operation(&latest, renumbered, next, error, false, new_version)) {
         return false;
     }
     if (op.kind == kCreateIndex) {

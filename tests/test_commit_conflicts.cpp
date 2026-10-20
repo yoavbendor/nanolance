@@ -9,6 +9,7 @@
 #include "nanolance/dataset.hpp"
 #include "nanolance/dataset_commit.hpp"
 #include "nanolance/dataset_ops.hpp"
+#include "nanolance/deletion_vector.hpp"
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/scalar_index.hpp"
 #include "nanolance/nano_lance_writer.h"
@@ -434,6 +435,195 @@ void restore_rebased_over_append() {
     fs::remove_all(path, ec);
 }
 
+/// The offsets the latest version deletes from fragment `id` (its deletion file's rows, sorted).
+std::vector<std::uint32_t> latest_deleted_offsets(const fs::path& path, std::uint64_t id) {
+    pb::Manifest m;
+    std::uint64_t v = 0;
+    std::string error;
+    check(nano_lance::load_latest_manifest(path, m, v, error), "load the latest manifest: " + error);
+    for (const auto& f : m.fragments) {
+        if (f.id != id) {
+            continue;
+        }
+        std::vector<std::uint32_t> rows;
+        if (f.deletion_file.present) {
+            check(nano_lance::read_manifest_deletion_vector(path, m, id, f.deletion_file, rows, error),
+                  "read the deletion file: " + error);
+        }
+        return rows;
+    }
+    check(false, "fragment " + std::to_string(id) + " is in the latest version");
+    return {};
+}
+
+/// Delete raced by a Delete on the same fragment: the rows merged (rebased, Lance's finish_delete_update).
+void delete_rebased_over_delete_same_fragment() {
+    const fs::path path = "commit_conflicts_delete_same_fragment";
+    check(create_dataset(path), "create the dataset");
+    std::uint64_t deleted = 0;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_delete(path, "id = 1", deleted, version, error) && version == 2,
+          "theirs: delete commits version 2");
+    nano_lance::reset_commit_conflict_stats();
+    check(nano_lance::dataset_delete(path, "id = 2", deleted, version, error, 1U) && version == 3 && deleted == 1,
+          "ours from version 1 is committed as version 3: " + error);
+    check_rebased("delete over delete of the same fragment");
+    check(latest_deleted_offsets(path, 0) == std::vector<std::uint32_t>({1, 2}),
+          "the merged deletion file holds both deletes");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+/// Delete raced by a Delete of the same row: an overlap of rows is retryable, so the delete runs again.
+void delete_same_row_is_run_again() {
+    const fs::path path = "commit_conflicts_delete_same_row";
+    check(create_dataset(path), "create the dataset");
+    std::uint64_t deleted = 0;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_delete(path, "id = 1", deleted, version, error) && version == 2,
+          "theirs: delete commits version 2");
+    nano_lance::reset_commit_conflict_stats();
+    check(nano_lance::dataset_delete(path, "id = 1", deleted, version, error, 1U) && version == 3 && deleted == 0,
+          "ours from version 1 runs again on version 2: " + error);
+    const auto stats = nano_lance::commit_conflict_stats();
+    check(stats.rebased == 0 && stats.retried == 1 && stats.refused == 0,
+          "delete of the same row: run again (rebased 0, retried 1, refused 0)");
+    check(latest_deleted_offsets(path, 0) == std::vector<std::uint32_t>({1}), "the row stays deleted once");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+/// Delete raced by a Delete on another fragment: compatible, rebased over it.
+void delete_rebased_over_delete_other_fragment() {
+    const fs::path path = "commit_conflicts_delete_other_fragment";
+    check(create_dataset(path), "create the dataset");
+    check(append_ids(path, 100, 5), "two fragments: append commits version 2");
+    std::uint64_t deleted = 0;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_delete(path, "id = 1", deleted, version, error) && version == 3,
+          "theirs: delete on fragment 0 commits version 3");
+    nano_lance::reset_commit_conflict_stats();
+    check(nano_lance::dataset_delete(path, "id = 101", deleted, version, error, 2U) && version == 4 && deleted == 1,
+          "ours from version 2 (fragment 1) is committed as version 4: " + error);
+    check_rebased("delete over delete of another fragment");
+    check(latest_deleted_offsets(path, 0) == std::vector<std::uint32_t>({1}) &&
+              latest_deleted_offsets(path, 1) == std::vector<std::uint32_t>({1}),
+          "each fragment keeps its own deletes");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+/// The merged deletes cover every row of a fragment: the fragment goes, as Lance removes it.
+void delete_merge_removes_fragment_when_all_rows_go() {
+    const fs::path path = "commit_conflicts_delete_whole_fragment";
+    check(create_dataset(path), "create the dataset");
+    check(append_ids(path, 100, 5), "two fragments: append commits version 2");
+    std::uint64_t deleted = 0;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_delete(path, "id >= 5 AND id < 10", deleted, version, error) && version == 3 &&
+              deleted == 5,
+          "theirs: deletes ids 5..9 of fragment 0, version 3: " + error);
+    nano_lance::reset_commit_conflict_stats();
+    check(nano_lance::dataset_delete(path, "id < 5", deleted, version, error, 2U) && version == 4 && deleted == 5,
+          "ours from version 2 deletes ids 0..4, version 4: " + error);
+    check_rebased("delete of the other half of a fragment");
+    check(latest_fragment_ids(path) == std::vector<std::uint64_t>({1}),
+          "fragment 0 has no live rows left, so it is removed");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+/// Delete raced by an Update that only changed the deletion file of the same fragment: rebased.
+void delete_rebased_over_update_same_fragment() {
+    const fs::path path = "commit_conflicts_delete_over_update";
+    check(create_dataset(path), "create the dataset");
+    std::uint64_t updated = 0;
+    std::uint64_t version = 0;
+    std::uint64_t deleted = 0;
+    std::string error;
+    const std::string theirs_predicate = "id = 1";
+    check(nano_lance::dataset_update(path, &theirs_predicate, {{"id", "101"}}, updated, version, error) &&
+              version == 2 && updated == 1,
+          "theirs: update commits version 2: " + error);
+    nano_lance::reset_commit_conflict_stats();
+    check(nano_lance::dataset_delete(path, "id = 2", deleted, version, error, 1U) && version == 3 && deleted == 1,
+          "ours from version 1 is committed as version 3: " + error);
+    check_rebased("delete over update of the same fragment");
+    check(latest_deleted_offsets(path, 0) == std::vector<std::uint32_t>({1, 2}),
+          "the merged deletion file holds the update's row and the delete's");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+/// Update raced by a Delete on the same fragment (other rows): rebased, its own rows kept.
+void update_rebased_over_delete_same_fragment() {
+    const fs::path path = "commit_conflicts_update_over_delete";
+    check(create_dataset(path), "create the dataset");
+    std::uint64_t deleted = 0;
+    std::uint64_t updated = 0;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_delete(path, "id = 1", deleted, version, error) && version == 2,
+          "theirs: delete commits version 2");
+    nano_lance::reset_commit_conflict_stats();
+    const std::string predicate = "id = 2";
+    check(nano_lance::dataset_update(path, &predicate, {{"id", "102"}}, updated, version, error, nullptr, 1U) &&
+              version == 3 && updated == 1,
+          "ours from version 1 is committed as version 3: " + error);
+    check_rebased("update over delete of the same fragment");
+    check(latest_deleted_offsets(path, 0) == std::vector<std::uint32_t>({1, 2}),
+          "the merged deletion file holds both deletes");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+/// Update raced by a Delete of the row it updates: an overlap, so the update runs again.
+void update_same_row_is_run_again() {
+    const fs::path path = "commit_conflicts_update_same_row";
+    check(create_dataset(path), "create the dataset");
+    std::uint64_t deleted = 0;
+    std::uint64_t updated = 0;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_delete(path, "id = 2", deleted, version, error) && version == 2,
+          "theirs: delete commits version 2");
+    nano_lance::reset_commit_conflict_stats();
+    const std::string predicate = "id = 2";
+    check(nano_lance::dataset_update(path, &predicate, {{"id", "102"}}, updated, version, error, nullptr, 1U) &&
+              updated == 0,
+          "ours from version 1 runs again on version 2, where the row is gone: " + error);
+    const auto stats = nano_lance::commit_conflict_stats();
+    check(stats.rebased == 0 && stats.retried == 1 && stats.refused == 0,
+          "update of the same row: run again (rebased 0, retried 1, refused 0)");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+/// Update rebased over an Append: the fragment the update adds takes an id after the latest version's, not the
+/// id it chose on the version it was made from (the append took that one).
+void update_rebased_over_append_takes_a_fresh_fragment_id() {
+    const fs::path path = "commit_conflicts_update_over_append";
+    check(create_dataset(path), "create the dataset");
+    check(append_ids(path, 100, 5), "theirs: append commits version 2 (fragment 1)");
+    nano_lance::reset_commit_conflict_stats();
+    std::uint64_t updated = 0;
+    std::uint64_t version = 0;
+    std::string error;
+    const std::string predicate = "id = 2";
+    check(nano_lance::dataset_update(path, &predicate, {{"id", "102"}}, updated, version, error, nullptr, 1U) &&
+              version == 3 && updated == 1,
+          "ours from version 1 is committed as version 3: " + error);
+    check_rebased("update over append");
+    check(latest_fragment_ids(path) == std::vector<std::uint64_t>({0, 1, 2}),
+          "the update's fragment is numbered after the append's");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
 }  // namespace
 
 int main() {
@@ -447,6 +637,14 @@ int main() {
     create_index_rebased_over_append();
     create_index_rebased_over_update_of_its_field();
     restore_rebased_over_append();
+    delete_rebased_over_delete_same_fragment();
+    delete_same_row_is_run_again();
+    delete_rebased_over_delete_other_fragment();
+    delete_merge_removes_fragment_when_all_rows_go();
+    delete_rebased_over_update_same_fragment();
+    update_rebased_over_delete_same_fragment();
+    update_same_row_is_run_again();
+    update_rebased_over_append_takes_a_fresh_fragment_id();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

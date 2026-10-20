@@ -519,6 +519,51 @@ Verdict append_check(const Operation& theirs) {
 
 }  // namespace
 
+namespace {
+
+bool same_data_files(const pb::DataFragment& a, const pb::DataFragment& b) {
+    if (a.files.size() != b.files.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.files.size(); ++i) {
+        const auto& x = a.files[i];
+        const auto& y = b.files[i];
+        if (x.path != y.path || x.fields != y.fields || x.column_indices != y.column_indices ||
+            x.file_major_version != y.file_major_version || x.file_minor_version != y.file_minor_version ||
+            x.file_size_bytes != y.file_size_bytes) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+Verdict check_txn_with_affected_rows(const Operation& ours, const Operation& theirs, const pb::Manifest& base) {
+    const Verdict plain = check_txn(ours, theirs);
+    const bool both = (ours.kind == kDelete || ours.kind == kUpdate) && (theirs.kind == kDelete || theirs.kind == kUpdate);
+    if (plain != Verdict::Retryable || !both) {
+        return plain;
+    }
+    const auto mine = delete_update_ids(ours);
+    for (const auto id : theirs.removed_ids) {
+        if (mine.count(id) != 0U) {
+            return Verdict::Retryable;  // a fragment this change deletes from is removed by the other
+        }
+    }
+    for (const auto& f : theirs.updated_fragments) {
+        if (mine.count(f.id) == 0U) {
+            continue;
+        }
+        const auto was = std::find_if(base.fragments.begin(), base.fragments.end(),
+                                      [&](const pb::DataFragment& b) { return b.id == f.id; });
+        if (was == base.fragments.end() || !same_data_files(*was, f)) {
+            return Verdict::Retryable;  // the other change rewrote the data of a fragment this one deletes from
+        }
+    }
+    return Verdict::Compatible;
+}
+
 Verdict check_txn(const Operation& ours, const Operation& theirs) {
     // Either order: the claim was checked without the write's data.
     if ((may_alter_nullability(ours) && supplies_values(theirs)) ||

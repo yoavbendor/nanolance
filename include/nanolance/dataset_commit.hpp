@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <random>
 #include <string>
 #include <thread>
@@ -27,13 +28,19 @@ using ReadVersion = std::optional<std::uint64_t>;
 bool load_read_version(const std::filesystem::path& dataset_path, ReadVersion read_version, pb::Manifest& manifest,
                        std::uint64_t& version, std::string& error);
 
+/// The rows a Delete, Update or merge insert deleted from the fragments it changed, by fragment id: their
+/// physical offsets (Lance's affected rows). A commit that has them can be rebased over a concurrent Delete
+/// or Update of the same fragments, when the rows do not overlap.
+using AffectedRows = std::map<std::uint64_t, std::vector<std::uint32_t>>;
+
 /// Publish `manifest` (a version's manifest, changed) as the version after the one it was read at
 /// (`manifest.version`), stamped with the time and nanolance as its writer. When another writer took
 /// that version since: when every such change is compatible with it (Lance's verdicts), the change is applied
 /// to the latest version (rebased, not run again); a retryable verdict fails with "commit conflict" (the
-/// operation is run again by its caller), an incompatible one fails with Lance's message.
+/// operation is run again by its caller), an incompatible one fails with Lance's message. `affected` is the
+/// change's affected rows, when it has them (null otherwise).
 bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest manifest, std::uint64_t& new_version,
-                         std::string& error);
+                         std::string& error, const AffectedRows* affected = nullptr);
 
 /// Commit conflicts since the last reset, for tests: commits rebased onto a concurrent version, operations
 /// run again after a retryable conflict, and commits refused as incompatible (not run again).

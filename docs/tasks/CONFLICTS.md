@@ -255,3 +255,15 @@ Overwrite are re-run, not rebased (the old `rebase` kept base-counter row ids: p
   Rewrite is retryable and the re-run reserves again, leaving an empty ReserveFragments version. Make
   the re-run reuse the reservation it already committed (or not reserve again when the reserved ids are
   still unused), so the probe ends at v4 again with the same rows.
+
+**C3 outcome (2026-10-20): task done.** Delete / Update raced by a Delete / Update on the same fragment
+merge deletion vectors as Lance's `finish_delete_update` (overlap -> retryable with Lance's message; a
+fragment left with no rows is removed); affected rows passed by delete, update and merge_insert
+(`AffectedRows`, `commit_next_version`). Compaction checks its rewritten fragments against the latest
+version before committing ReserveFragments, so the probe's compaction vs delete ends at v4 again (a
+writer landing between that check and the commit can still leave an empty ReserveFragments version:
+accepted). Found and fixed: C2's rebase kept the fragment id an Append / Update chose on its stale base,
+so it could duplicate a concurrent writer's id (a dropped row in `test_concurrent_writers`); added
+fragments are now numbered after the latest manifest's. Reviewer: `test_concurrent_writers` 6 of 6.
+Open, not reproduced: one `test_index_optimize.py::test_optimize_after_append[pylance]` failure in a full
+run (the known k-means flake in ROADMAP "Small items").

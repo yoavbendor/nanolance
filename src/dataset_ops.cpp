@@ -307,7 +307,7 @@ void add_fragments(pb::Manifest& manifest, const LanceSchemaMapping& mapping, co
 /// removed goes too -- Lance's retain_relevant_indices, which its Delete, Update, Merge and Project
 /// commits apply (a compaction narrows coverage instead; see index_maintenance.hpp).
 bool commit(const std::filesystem::path& path, pb::Manifest manifest, std::uint64_t& new_version, std::string& error,
-            bool retain_indices = true) {
+            bool retain_indices = true, const AffectedRows* affected = nullptr) {
     if (retain_indices) {
         retain_relevant_indices(manifest.indices, manifest.fields, manifest.fragments);
     }
@@ -315,7 +315,7 @@ bool commit(const std::filesystem::path& path, pb::Manifest manifest, std::uint6
     // compaction's new fragments (the highest ids) go last, not where the fragments they replace were.
     std::stable_sort(manifest.fragments.begin(), manifest.fragments.end(),
                      [](const pb::DataFragment& a, const pb::DataFragment& b) { return a.id < b.id; });
-    return commit_next_version(path, std::move(manifest), new_version, error);
+    return commit_next_version(path, std::move(manifest), new_version, error, affected);
 }
 
 bool is_stable(const pb::Manifest& manifest) {
@@ -809,7 +809,7 @@ bool delete_once(const std::filesystem::path& dataset_path, const std::string& p
         !apply_deletions(dataset_path, manifest, version, rows, error)) {
         return false;
     }
-    return commit(dataset_path, std::move(manifest), new_version, error);
+    return commit(dataset_path, std::move(manifest), new_version, error, true, &rows);
 }
 
 // ── update ──────────────────────────────────────────────────────────────────────────────────────
@@ -941,7 +941,7 @@ bool update_once(const std::filesystem::path& dataset_path, const std::string* p
         return false;
     }
     manifest.operation = pb::Manifest::Operation::Update;  // its transaction: Lance's Update
-    return commit(dataset_path, std::move(manifest), new_version, error);
+    return commit(dataset_path, std::move(manifest), new_version, error, true, &rewritten);
 }
 
 // ── merge insert ────────────────────────────────────────────────────────────────────────────────
@@ -1353,7 +1353,7 @@ bool merge_insert_once(const std::filesystem::path& dataset_path, const MergeIns
         new_version = version;
         return true;
     }
-    return commit(dataset_path, std::move(manifest), new_version, error);
+    return commit(dataset_path, std::move(manifest), new_version, error, true, &deletions);
 }
 
 // ── columns ─────────────────────────────────────────────────────────────────────────────────────
@@ -2192,9 +2192,33 @@ bool dataset_compact_commit(const std::filesystem::path& dataset_path, const Com
     metrics.fragments_added = created.size();
     metrics.files_added = created.size();
 
+    // The first rewritten fragment (of those the compaction replaces) that `current` no longer holds as `original`
+    // does: a writer changed it since the read version.
+    const auto changed_rewrite = [&](const pb::Manifest& current) -> std::optional<std::uint64_t> {
+        for (const auto rewritten : rewritten_ids) {
+            const auto now = std::find_if(current.fragments.begin(), current.fragments.end(),
+                                          [&](const pb::DataFragment& f) { return f.id == rewritten; });
+            const auto then = std::find_if(original.fragments.begin(), original.fragments.end(),
+                                           [&](const pb::DataFragment& f) { return f.id == rewritten; });
+            if (now == current.fragments.end() || pb::encode_data_fragment(*now) != pb::encode_data_fragment(*then)) {
+                return rewritten;
+            }
+        }
+        return std::nullopt;
+    };
     // As Lance commits a compaction: first a version reserving the new fragments' ids, then the rewrite, made on
     // top of the reserving version. A fragment it rewrote that a writer changed in between makes it a conflict,
-    // and it is planned again.
+    // and it is planned again. That is checked first, so a conflict known before the reservation leaves no
+    // reserved version behind (the planning again reserves once, as an undisturbed compaction does).
+    pb::Manifest latest;
+    std::uint64_t latest_version = 0;
+    if (!load_latest_manifest(dataset_path, latest, latest_version, error)) {
+        return false;
+    }
+    if (const auto changed = changed_rewrite(latest)) {
+        error = "commit conflict: fragment " + std::to_string(*changed) + " changed during the compaction";
+        return false;
+    }
     pb::Manifest reserve = original;
     reserve.operation = pb::Manifest::Operation::Reserve;
     reserve.reserved_fragments = static_cast<std::uint32_t>(created.size());
@@ -2210,15 +2234,9 @@ bool dataset_compact_commit(const std::filesystem::path& dataset_path, const Com
     if (!load_manifest_version(dataset_path, reserved_version, manifest, error)) {
         return false;
     }
-    for (const auto rewritten : rewritten_ids) {
-        const auto now = std::find_if(manifest.fragments.begin(), manifest.fragments.end(),
-                                      [&](const pb::DataFragment& f) { return f.id == rewritten; });
-        const auto then = std::find_if(original.fragments.begin(), original.fragments.end(),
-                                       [&](const pb::DataFragment& f) { return f.id == rewritten; });
-        if (now == manifest.fragments.end() || pb::encode_data_fragment(*now) != pb::encode_data_fragment(*then)) {
-            error = "commit conflict: fragment " + std::to_string(rewritten) + " changed during the compaction";
-            return false;
-        }
+    if (const auto changed = changed_rewrite(manifest)) {
+        error = "commit conflict: fragment " + std::to_string(*changed) + " changed during the compaction";
+        return false;
     }
     const std::uint64_t first_new_id = manifest.max_fragment_id + 1U - created.size();
     for (std::size_t k = 0; k < created.size(); ++k) {

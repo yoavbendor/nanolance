@@ -293,3 +293,27 @@ def test_verdicts_agree_between_cpp_and_python_port(tmp_path):
             assert cpp == expected, f"{ours_name} (ours) vs {theirs_name} (theirs): C++ {cpp}, Python {expected}"
             seen.add(cpp)
     assert seen == {"compatible", "retryable", "incompatible"}  # the table covers all three verdicts
+
+
+# ── C3: deletes on the same fragment merge their deletion files, whichever engine wrote the other ─────
+
+def test_delete_rebased_over_pylance_delete_merges_deletion_files(pylance, tmp_path):
+    """nanolance's stale delete reads pylance's deletion file and merges its own rows into it."""
+    uri = _fresh(nl, tmp_path)
+    stale = nl.dataset(uri)
+    pylance.dataset(uri).delete("id = 1")  # version 2: pylance's deletion file of fragment 0
+    stale.delete("id = 2")  # made from version 1, committed as version 3
+    assert pylance.dataset(uri).version == 3
+    assert pylance.dataset(uri).count_rows() == 98
+    assert nl.dataset(uri).count_rows("id IN (1, 2)") == 0
+
+
+def test_pylance_delete_rebased_over_nanolance_delete_merges_deletion_files(pylance, tmp_path):
+    """pylance's stale delete reads nanolance's deletion file and merges its own rows into it."""
+    uri = _fresh(nl, tmp_path)
+    stale = pylance.dataset(uri)
+    nl.dataset(uri).delete("id = 1")  # version 2: nanolance's deletion file of fragment 0
+    stale.delete("id = 2")  # made from version 1, committed as version 3
+    assert pylance.dataset(uri).version == 3
+    assert pylance.dataset(uri).count_rows() == 98
+    assert nl.dataset(uri).count_rows("id IN (1, 2)") == 0

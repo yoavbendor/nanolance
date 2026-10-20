@@ -7,6 +7,7 @@
 
 #include "nanolance/manifest_reader.hpp"
 #include "nanolance/lance_table_reader.hpp"
+#include "nanolance/deletion_vector.hpp"
 #include "nanolance/manifest_writer.hpp"
 #include "nanolance/path_safety.hpp"
 
@@ -110,11 +111,96 @@ bool concurrent_operation(const std::filesystem::path& dataset_path, const pb::M
     return true;
 }
 
+bool same_deletion_file(const pb::DeletionFile& a, const pb::DeletionFile& b) {
+    return a.present == b.present && a.file_type == b.file_type && a.read_version == b.read_version && a.id == b.id &&
+           a.num_deleted_rows == b.num_deleted_rows && a.unknown == b.unknown;
+}
+
+/// Lance's finish_delete_update: a Delete or Update rebased over a concurrent change to the deletion file of a
+/// fragment it deletes from. The rows it deleted (`affected`) must not be deleted already in the latest
+/// version (retryable, Lance's message); its deletion file becomes the latest's plus its rows, and a fragment
+/// left with no rows is removed. Fragments whose deletion file no one changed keep the change's own.
+bool merge_deletion_vectors(const std::filesystem::path& dataset_path, const pb::Manifest& base,
+                            const pb::Manifest& latest, std::uint64_t latest_version, const AffectedRows& affected,
+                            const std::string& theirs_name, Operation& mine, std::string& error) {
+    const std::string ours_name = operation_name(mine.kind);
+    // Lance's check for one fragment this change deletes from: a deletion file the other change changed, and
+    // rows of its own among the rows already deleted there, conflict. `merged` gets the union of the two.
+    const auto merge_fragment = [&](std::uint64_t id, std::vector<std::uint32_t>& merged) -> bool {
+        const auto was = std::find_if(base.fragments.begin(), base.fragments.end(),
+                                      [&](const pb::DataFragment& f) { return f.id == id; });
+        const auto now = std::find_if(latest.fragments.begin(), latest.fragments.end(),
+                                      [&](const pb::DataFragment& f) { return f.id == id; });
+        if (was == base.fragments.end() || now == latest.fragments.end()) {
+            error = retryable_error(latest_version, ours_name, theirs_name);
+            return false;
+        }
+        merged.clear();
+        if (same_deletion_file(was->deletion_file, now->deletion_file)) {
+            return true;  // nothing changed here since the base: the change's own deletion file stands
+        }
+        std::vector<std::uint32_t> existing;
+        if (!read_manifest_deletion_vector(dataset_path, latest, id, now->deletion_file, existing, error)) {
+            return false;
+        }
+        std::vector<std::uint32_t> ours_rows;
+        if (const auto rows = affected.find(id); rows != affected.end()) {
+            ours_rows = rows->second;
+        }
+        std::sort(ours_rows.begin(), ours_rows.end());
+        ours_rows.erase(std::unique(ours_rows.begin(), ours_rows.end()), ours_rows.end());
+        std::vector<std::uint32_t> both;
+        std::set_intersection(existing.begin(), existing.end(), ours_rows.begin(), ours_rows.end(),
+                              std::back_inserter(both));
+        if (!both.empty()) {
+            std::string addresses;
+            for (std::size_t i = 0; i < both.size() && i < 5; ++i) {
+                addresses += (i == 0 ? "" : ", ") + std::to_string((id << 32U) | both[i]);
+            }
+            error = "commit conflict: This " + ours_name + " transaction was preempted by concurrent transaction " +
+                    theirs_name + " at version " + std::to_string(latest_version) + " (both modified rows at addresses [" +
+                    addresses + "]). Please retry.";
+            return false;
+        }
+        std::set_union(existing.begin(), existing.end(), ours_rows.begin(), ours_rows.end(), std::back_inserter(merged));
+        return true;
+    };
+    for (const auto id : mine.removed_ids) {
+        std::vector<std::uint32_t> merged;
+        if (!merge_fragment(id, merged)) {
+            return false;  // a fragment removed here, deleted from by the other change: its rows overlap
+        }
+    }
+    for (auto it = mine.updated_fragments.begin(); it != mine.updated_fragments.end();) {
+        std::vector<std::uint32_t> merged;
+        if (!merge_fragment(it->id, merged)) {
+            return false;
+        }
+        if (merged.empty()) {
+            ++it;  // (an empty union: the fragment's deletion file is the change's own)
+            continue;
+        }
+        const auto now = std::find_if(latest.fragments.begin(), latest.fragments.end(),
+                                      [&](const pb::DataFragment& f) { return f.id == it->id; });
+        if (merged.size() >= now->physical_rows) {
+            mine.removed_ids.push_back(it->id);  // every row deleted: the fragment goes
+            it = mine.updated_fragments.erase(it);
+            continue;
+        }
+        if (!write_deletion_file(dataset_path, it->id, latest_version, merged, it->deletion_file, error)) {
+            return false;
+        }
+        ++it;
+    }
+    return true;
+}
+
 /// Lance's verdict on `ours`, the change made from `base` (read at `read_version`), against each version
 /// committed after it up to `latest`, in order; the first verdict that is not compatible decides.
 Outcome classify_concurrent(const std::filesystem::path& dataset_path, const pb::Manifest& base,
                             const pb::Manifest& ours, std::uint64_t read_version, std::uint64_t latest,
-                            std::string& error, Operation& mine, std::vector<Operation>& theirs_ops) {
+                            const AffectedRows* affected, std::string& error, Operation& mine,
+                            std::vector<Operation>& theirs_ops) {
     const auto [ours_field, ours_message] = derive_transaction_operation(base, ours);
     std::string why;
     if (!decode_operation(ours_field, ours_message, mine, why)) {
@@ -134,7 +220,7 @@ Outcome classify_concurrent(const std::filesystem::path& dataset_path, const pb:
             return Outcome::Refused;
         }
         const std::string theirs_name = theirs.kind == kCloneField ? "Clone" : operation_name(theirs.kind);
-        switch (check_txn(mine, theirs)) {
+        switch (affected != nullptr ? check_txn_with_affected_rows(mine, theirs, base) : check_txn(mine, theirs)) {
             case Verdict::Compatible:
                 break;
             case Verdict::Retryable:
@@ -175,7 +261,7 @@ void count_commit_retry() {
 /// what keeps a concurrent change from being lost: if another writer took that version meanwhile, the
 /// publish refuses (commit conflict) instead of stacking a stale manifest on top of it.
 bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest manifest, std::uint64_t& new_version,
-                         std::string& error) {
+                         std::string& error, const AffectedRows* affected) {
     std::uint64_t read_version = manifest.version;
     if (read_version == 0U && !dataset_latest_version(dataset_path, read_version, error)) {
         return false;
@@ -235,16 +321,34 @@ bool commit_next_version(const std::filesystem::path& dataset_path, pb::Manifest
         // operation run again) is the error; when all are compatible the change is rebased onto the latest.
         Operation mine;
         std::vector<Operation> theirs;
-        if (classify_concurrent(dataset_path, base, manifest, read_version, latest_version, error, mine, theirs) !=
-            Outcome::Compatible) {
+        if (classify_concurrent(dataset_path, base, manifest, read_version, latest_version, affected, error, mine,
+                                theirs) != Outcome::Compatible) {
             if (error.rfind("Incompatible transaction:", 0) == 0) {
                 g_refused.fetch_add(1, std::memory_order_relaxed);
             }
             return false;
         }
+        if (affected != nullptr && (mine.kind == kDelete || mine.kind == kUpdate)) {
+            // The concurrent change the merge reports: the last one, as Lance names it.
+            std::string theirs_name;
+            if (!theirs.empty()) {
+                theirs_name = theirs.back().kind == kCloneField ? "Clone" : operation_name(theirs.back().kind);
+            }
+            if (!merge_deletion_vectors(dataset_path, base, latest, latest_version, *affected, theirs_name, mine,
+                                        error)) {
+                return false;
+            }
+        }
         pb::Manifest rebased;
         if (!rebase_operation(latest, manifest, mine, theirs, latest_version + 1U, rebased, error)) {
             return false;  // a conflict the operation runs again for (retry_on_conflict), or not a conflict
+        }
+        // A merged deletion file is a deletion file of the version: its flags, as apply_deletions sets them.
+        const bool deletions = std::any_of(rebased.fragments.begin(), rebased.fragments.end(),
+                                           [](const pb::DataFragment& f) { return f.deletion_file.present; });
+        if (deletions) {
+            rebased.reader_feature_flags |= pb::kFlagDeletionFiles;
+            rebased.writer_feature_flags |= pb::kFlagDeletionFiles;
         }
         // The change keeps its own stamp and its own operation tag, which the transaction file is derived from.
         rebased.version = latest_version + 1U;
