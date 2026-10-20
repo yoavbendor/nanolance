@@ -1159,6 +1159,7 @@ tests/test_vector_index.py::test_create_ivf_pq_skip_transpose
 tests/test_vector_index.py::test_create_ivf_pq_with_target_partition_size
 tests/test_vector_index.py::test_create_ivf_rq_index
 tests/test_vector_index.py::test_create_ivf_rq_mostly_null
+tests/test_vector_index.py::test_create_ivf_rq_multi_bit_searches_l2_and_cosine
 tests/test_vector_index.py::test_create_ivf_rq_requires_dim_divisible_by_8
 tests/test_vector_index.py::test_create_ivf_rq_skip_transpose
 tests/test_vector_index.py::test_create_ivf_sq_index

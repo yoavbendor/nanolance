@@ -2272,7 +2272,13 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
     }
     std::vector<float> key = q.key;
     if (index.metric == VectorMetric::Cosine) {
-        const float norm = std::sqrt(dot(key.data(), key.data(), key.size()));
+        // Lance's normalize_arrow: a sequential f32 sum of squares (not a lane-wise dot), then x / norm.
+        // The order matters: the norm's last bit moves the RQ distance table across a u8 rounding step.
+        float sum = 0.0F;
+        for (const float x : key) {
+            sum += x * x;
+        }
+        const float norm = std::sqrt(sum);
         for (auto& x : key) {
             x /= norm;
         }
