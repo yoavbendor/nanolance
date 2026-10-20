@@ -37,6 +37,7 @@
 #include <nanoarrow/nanoarrow.h>
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -121,6 +122,17 @@ std::vector<std::uint8_t> tensor_message_half(const std::vector<std::uint64_t>& 
     put_varint(out, 1);  // FLOAT16
     put_packed(out, 2, shape);
     put_bytes(out, 3, bits.data(), bits.size() * sizeof(std::uint16_t));
+    return out;
+}
+
+/// Tensor { data_type = UINT8, shape, data }: a Hamming index's centroids, as bytes.
+std::vector<std::uint8_t> tensor_message_bytes(const std::vector<std::uint64_t>& shape,
+                                               const std::vector<std::uint8_t>& data) {
+    std::vector<std::uint8_t> out;
+    put_key(out, 1, 0);
+    put_varint(out, 4);  // UINT8
+    put_packed(out, 2, shape);
+    put_bytes(out, 3, data.data(), data.size());
     return out;
 }
 
@@ -441,6 +453,122 @@ std::vector<float> kmeans(const Rows& x, std::size_t k, bool dot, std::uint32_t 
         out.insert(out.end(), c.begin(), c.end());
     }
     return out;
+}
+
+// ── Binary (Hamming) IVF: k-modes. Separate from the float k-means above, which it does not touch. ──
+
+/// `n` vectors of `d` bytes, row-major (a uint8 column's vectors, as stored).
+struct ByteRows {
+    std::vector<std::uint8_t> v;
+    std::size_t n = 0;
+    std::size_t d = 0;
+    const std::uint8_t* row(std::size_t i) const { return v.data() + i * d; }
+};
+
+ByteRows gather_bytes(const ByteRows& x, const std::vector<std::size_t>& which) {
+    ByteRows out;
+    out.d = x.d;
+    out.n = which.size();
+    out.v.resize(out.n * out.d);
+    for (std::size_t i = 0; i < which.size(); ++i) {
+        std::memcpy(out.v.data() + i * out.d, x.row(which[i]), out.d);
+    }
+    return out;
+}
+
+/// Bits in which the `n` bytes of `a` and `b` differ.
+std::uint32_t hamming_bits(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) {
+    std::uint32_t bits = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        bits += static_cast<std::uint32_t>(std::popcount(static_cast<unsigned>(a[i] ^ b[i])));
+    }
+    return bits;
+}
+
+/// Each row's nearest centroid by Hamming distance (the first one at the least distance), and the distance.
+void hamming_assign(const ByteRows& x, const std::vector<std::uint8_t>& centroids, std::size_t k,
+                    std::vector<std::uint32_t>& label, std::vector<float>* dist) {
+    label.resize(x.n);
+    if (dist != nullptr) {
+        dist->resize(x.n);
+    }
+    constexpr std::size_t kChunk = 1024;
+    const std::size_t chunks = (x.n + kChunk - 1U) / kChunk;
+    parallel::for_each(chunks, [&](std::size_t chunk) {
+        for (std::size_t r = chunk * kChunk; r < std::min(x.n, (chunk + 1U) * kChunk); ++r) {
+            std::uint32_t best = std::numeric_limits<std::uint32_t>::max();
+            std::uint32_t arg = 0;
+            for (std::size_t c = 0; c < k; ++c) {
+                const std::uint32_t h = hamming_bits(x.row(r), centroids.data() + c * x.d, x.d);
+                if (h < best) {
+                    best = h;
+                    arg = static_cast<std::uint32_t>(c);
+                }
+            }
+            label[r] = arg;
+            if (dist != nullptr) {
+                (*dist)[r] = static_cast<float>(best);
+            }
+        }
+    });
+}
+
+/// Lance's binary k-means (KModeAlgo): Hamming assignment, then each centroid bit is 1 when more than half
+/// of its cluster's vectors have it set (a tie is 0), bits least significant first within each byte.
+/// Initial centroids are k sampled rows, as the float k-means; an empty cluster keeps its centroid.
+/// Stops after `max_iters` or when the loss changes by less than kTolerance of itself.
+std::vector<std::uint8_t> kmodes(const ByteRows& x, std::size_t k, std::uint32_t max_iters, std::mt19937_64& rng,
+                                 double& loss) {
+    const std::size_t d = x.d;
+    std::vector<std::uint8_t> centroids(k * d);
+    const auto init = sample_indices(x.n, k, rng);
+    for (std::size_t c = 0; c < k; ++c) {
+        std::memcpy(centroids.data() + c * d, x.row(init[c]), d);
+    }
+    std::vector<std::uint32_t> label;
+    std::vector<float> dist;
+    double previous = std::numeric_limits<double>::infinity();
+    loss = 0;
+    for (std::uint32_t it = 0; it < std::max<std::uint32_t>(max_iters, 1U); ++it) {
+        hamming_assign(x, centroids, k, label, &dist);
+        loss = 0;
+        for (const float v : dist) {
+            loss += v;
+        }
+        std::vector<std::vector<std::size_t>> members(k);
+        for (std::size_t r = 0; r < x.n; ++r) {
+            members[label[r]].push_back(r);
+        }
+        for (std::size_t c = 0; c < k; ++c) {
+            const auto& rows = members[c];
+            if (rows.empty()) {
+                continue;
+            }
+            std::vector<std::size_t> ones(d * 8U, 0);  // per bit: the cluster's vectors with it set
+            for (const auto r : rows) {
+                const std::uint8_t* xr = x.row(r);
+                for (std::size_t j = 0; j < d; ++j) {
+                    for (std::size_t b = 0; b < 8U; ++b) {
+                        ones[j * 8U + b] += (xr[j] >> b) & 1U;
+                    }
+                }
+            }
+            for (std::size_t j = 0; j < d; ++j) {
+                std::uint8_t byte = 0;
+                for (std::size_t b = 0; b < 8U; ++b) {
+                    if (ones[j * 8U + b] * 2U > rows.size()) {
+                        byte = static_cast<std::uint8_t>(byte | (1U << b));
+                    }
+                }
+                centroids[c * d + j] = byte;
+            }
+        }
+        if (std::isfinite(previous) && std::fabs(previous - loss) <= kTolerance * std::fabs(previous)) {
+            break;
+        }
+        previous = loss;
+    }
+    return centroids;
 }
 
 // ── Arrow output ────────────────────────────────────────────────────────────────────────────────
@@ -1271,6 +1399,12 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                 "' is not supported (IVF_FLAT, IVF_SQ, IVF_PQ, IVF_RQ, IVF_HNSW_FLAT, IVF_HNSW_SQ and IVF_HNSW_PQ are)";
         return false;
     }
+    // A Hamming index (over uint8 vectors, as pylance builds it) is IVF_FLAT: byte centroids and rows.
+    const bool binary = options.metric == VectorMetric::Hamming;
+    if (binary && options.type != "IVF_FLAT") {
+        error = "vector index: a Hamming index must be IVF_FLAT";
+        return false;
+    }
     if (hnsw) {
         // lance-index HnswBuildParams::validate.
         if (options.hnsw_max_level == 0U || options.hnsw_max_level > 65535U) {
@@ -1368,7 +1502,17 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     // float16, as pylance's does (auxiliary.idx "flat" is halffloat).
     const bool trains_only = target != nullptr && target->trained != nullptr;
     const bool half_storage = multi && item == "e";
-    if (format.rfind("+w:", 0) != 0 || !(item == "f" || half_storage || (trains_only && (item == "e" || item == "g")))) {
+    if (binary && item != "C") {
+        error = "Distance type hamming does not support Float32 vectors, use l2, cosine or dot";
+        return false;
+    }
+    if (!binary && item == "C") {
+        error = std::string("Distance type ") + vector_metric_name(options.metric) +
+                " does not support UInt8 vectors, use hamming";
+        return false;
+    }
+    if (format.rfind("+w:", 0) != 0 ||
+        !(item == "f" || item == "C" || half_storage || (trains_only && (item == "e" || item == "g")))) {
         error = "Vector column " + column + " must be a fixed-size list of float32 (got '" + format + "' of '" + item +
                 "')";
         return false;
@@ -1379,7 +1523,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         return false;
     }
     if (model != nullptr &&
-        (model->dim != dim || model->centroids.size() != model->partitions * dim ||
+        (model->dim != dim ||
+         (binary ? model->binary_centroids.size() : model->centroids.size()) != model->partitions * dim ||
          (pq && model->has_codebook && model->codebook.size() != (std::size_t{1} << model->nbits) * dim))) {
         error = "vector index on " + column + ": its model does not match the column's dimension " +
                 std::to_string(dim);
@@ -1411,13 +1556,21 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     data.d = dim;
     std::vector<std::uint64_t> ids;  // one per vector: a multivector row's id repeats for each of its vectors
     std::vector<std::size_t> row_starts;  // multivector: the first vector of each row that has vectors (+ the end)
-    const bool widen = item != "f";
+    const bool widen = item != "f" && !binary;
     const bool half = item == "e";
     std::vector<float> widened(widen ? dim : 0U);
+    ByteRows binary_rows;  // a Hamming index: the vectors' bytes
+    binary_rows.d = dim;
     // Appends the vector at `at` (its index in `fsl`, offset applied) unless it holds NaN or infinite
     // values; for cosine it is normalized first. False when it is left out.
     const auto add_vector = [&](const ArrowArrayView* fsl, std::int64_t at) {
         const ArrowArrayView* items = fsl->children[0];
+        if (binary) {
+            const std::uint8_t* src =
+                items->buffer_views[1].data.as_uint8 + items->offset + at * static_cast<std::int64_t>(dim);
+            binary_rows.v.insert(binary_rows.v.end(), src, src + dim);
+            return true;
+        }
         const float* v = nullptr;
         if (widen) {
             const std::int64_t first = items->offset + at * static_cast<std::int64_t>(dim);
@@ -1504,6 +1657,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         ArrowArrayViewReset(&view);
     }
     data.n = ids.size();
+    binary_rows.n = ids.size();
     row_starts.push_back(data.n);  // the end of the last row
 
     std::size_t partitions = 0;
@@ -1587,7 +1741,18 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     index_build::VectorModel* trained = target != nullptr ? target->trained : nullptr;
     double loss = 0;
     std::vector<float> centroids;
+    std::vector<std::uint8_t> binary_centroids;  // Hamming: [partitions][dim] bytes; `centroids` stays empty
     index_build::stage(progress, "train_ivf", options.max_iters, "iterations", [&] {
+        if (binary) {
+            if (model != nullptr) {
+                binary_centroids = model->binary_centroids;
+            } else {
+                const auto train =
+                    gather_bytes(binary_rows, training_sample(std::size_t{options.sample_rate} * partitions));
+                binary_centroids = kmodes(train, partitions, options.max_iters, rng, loss);
+            }
+            return true;
+        }
         if (model != nullptr) {
             centroids = model->centroids;
         } else {
@@ -1608,6 +1773,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         trained->dim = dim;
         trained->partitions = partitions;
         trained->centroids = centroids;
+        trained->binary_centroids = binary_centroids;
         trained->nbits = options.num_bits;
         trained->m = pq ? options.num_sub_vectors : 0U;
         trained->has_codebook = false;
@@ -1617,15 +1783,20 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             return true;
         }
     }
-    const bool shuffle_first = model != nullptr && target->rebalance_target != 0U;
+    // A Hamming index keeps its partitions as they are: Lance's split and join are float k-means.
+    const bool shuffle_first = model != nullptr && target->rebalance_target != 0U && !binary;
     std::vector<std::uint32_t> label;
     bool labelled = false;  // the codebook's sample covered every row: the labels are complete already
     const auto shuffle = [&] {
         index_build::stage(progress, "shuffle", data.n, "rows", [&] {
             if (!labelled) {
-                assign(data, centroids, partitions, dot_metric, label, nullptr);
+                if (binary) {
+                    hamming_assign(binary_rows, binary_centroids, partitions, label, nullptr);
+                } else {
+                    assign(data, centroids, partitions, dot_metric, label, nullptr);
+                }
             }
-            if (model != nullptr && target->rebalance_target != 0U) {
+            if (model != nullptr && target->rebalance_target != 0U && !binary) {
                 adjust_partitions(data, centroids, partitions, label, target->rebalance_target, dot_metric,
                                   options.max_iters);
             }
@@ -1912,7 +2083,9 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             !(pq     ? fsl_schema("__pq_code", NANOARROW_TYPE_UINT8, static_cast<std::int64_t>(code_bytes), true,
                                   children[1])
               : sq_storage ? fsl_schema("__sq_code", NANOARROW_TYPE_UINT8, static_cast<std::int64_t>(dim), true, children[1])
-                     : fsl_schema("flat", half_storage ? NANOARROW_TYPE_HALF_FLOAT : NANOARROW_TYPE_FLOAT,
+                     : fsl_schema("flat",
+                                  binary ? NANOARROW_TYPE_UINT8
+                                         : half_storage ? NANOARROW_TYPE_HALF_FLOAT : NANOARROW_TYPE_FLOAT,
                                   static_cast<std::int64_t>(dim), false, children[1])) ||
             !table_schema(children, schema.s)) {
             return fail("out of memory");
@@ -1921,7 +2094,13 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         OwnedArray values;
         std::vector<float> flat;
         std::vector<std::uint16_t> flat_half;  // a float16 multivector index: the same values, as halffloat
-        if (flat_storage && half_storage) {
+        std::vector<std::uint8_t> flat_bytes;  // a Hamming index: the rows' bytes, grouped by partition
+        if (flat_storage && binary) {
+            flat_bytes.resize(data.n * dim);
+            for (std::size_t i = 0; i < data.n; ++i) {
+                std::memcpy(flat_bytes.data() + i * dim, binary_rows.row(order[i]), dim);
+            }
+        } else if (flat_storage && half_storage) {
             flat_half.resize(data.n * dim);
             for (std::size_t i = 0; i < data.n; ++i) {
                 for (std::size_t j = 0; j < dim; ++j) {
@@ -1939,6 +2118,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                                  static_cast<std::int64_t>(code_bytes), values.a)
               : sq_storage ? fsl_array(NANOARROW_TYPE_UINT8, 1, sq.data(), static_cast<std::int64_t>(data.n),
                                  static_cast<std::int64_t>(dim), values.a)
+                     : binary ? fsl_array(NANOARROW_TYPE_UINT8, 1, flat_bytes.data(), static_cast<std::int64_t>(data.n),
+                                          static_cast<std::int64_t>(dim), values.a)
                      : half_storage
                          ? fsl_array(NANOARROW_TYPE_HALF_FLOAT, 2, flat_half.data(), static_cast<std::int64_t>(data.n),
                                      static_cast<std::int64_t>(dim), values.a)
@@ -2065,8 +2246,9 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         extras.schema_metadata["lance:index"] =
             bytes_of("{\"type\":\"" + options.type + "\",\"distance_type\":\"" + metric_name + "\"}");
         extras.schema_metadata["lance:ivf"] = bytes_of("1");
-        const auto tensor = half_storage ? tensor_message_half({partitions, dim}, centroids)
-                                         : tensor_message({partitions, dim}, centroids);
+        const auto tensor = binary ? tensor_message_bytes({partitions, dim}, binary_centroids)
+                                   : half_storage ? tensor_message_half({partitions, dim}, centroids)
+                                                  : tensor_message({partitions, dim}, centroids);
         const std::vector<std::uint64_t> zeros(partitions, 0);
         extras.global_buffers.push_back(ivf_message(zeros, zeros, &tensor, &loss));
         if (!write_file(dir, "index.idx", schema.s, batch.a, extras, files, error)) {
@@ -2078,7 +2260,9 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
     std::vector<std::uint8_t> details;
     if (options.metric != VectorMetric::L2) {
         put_key(details, 1, 0);
-        put_varint(details, options.metric == VectorMetric::Cosine ? 1U : 2U);
+        put_varint(details, options.metric == VectorMetric::Cosine  ? 1U
+                            : options.metric == VectorMetric::Hamming ? 3U
+                                                                      : 2U);
     }
     if (!options.num_partitions) {
         put_key(details, 2, 0);
@@ -2195,6 +2379,10 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
 
 bool dataset_create_vector_index(const std::filesystem::path& dataset_path, const std::string& column,
                                  const VectorIndexOptions& options, std::uint64_t& new_version, std::string& error) {
+    if (options.metric == VectorMetric::Hamming && !options.ivf_centroids.empty()) {
+        error = "vector index: supplied ivf_centroids are not supported for a Hamming index (its centroids are bytes)";
+        return false;
+    }
     if (options.ivf_centroids.empty() && !options.progress) {
         return retry_from_read_version(
             options.read_version,
@@ -2240,6 +2428,10 @@ bool dataset_create_vector_index(const std::filesystem::path& dataset_path, cons
 bool index_build::build_vector_segment(const std::filesystem::path& dataset_path, const std::string& column,
                                        const VectorIndexOptions& options, const SegmentTarget& target,
                                        std::string& error) {
+    if (options.metric == VectorMetric::Hamming && target.model != nullptr && target.model->binary_centroids.empty()) {
+        error = "vector index: a Hamming index's model must hold byte centroids (not float ones)";
+        return false;
+    }
     std::uint64_t unused = 0;
     return create_vector_index(dataset_path, column, options, &target, unused, error);
 }

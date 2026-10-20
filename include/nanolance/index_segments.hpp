@@ -113,6 +113,7 @@ struct TrainedVectorModel {
     std::size_t partitions = 0;
     std::vector<float> centroids;  // [partitions][dim]
     std::vector<float> codebook;   // IVF_PQ: [num_sub_vectors][2^num_bits][dim / num_sub_vectors]
+    std::vector<std::uint8_t> binary_centroids;  // Hamming (uint8 vectors): [partitions][dim] bytes, not centroids
 };
 
 /// Train IVF centroids (`options.type` IVF_FLAT), or with `ivf_centroids` given a PQ codebook on

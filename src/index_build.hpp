@@ -30,6 +30,8 @@ struct VectorModel {
     std::size_t dim = 0;
     std::size_t partitions = 0;
     std::vector<float> centroids;  // partitions * dim
+    /// Hamming (IVF_FLAT over uint8 vectors): the centroids as bytes, partitions * dim; `centroids` is empty.
+    std::vector<std::uint8_t> binary_centroids;
     std::uint32_t nbits = 8;
     std::size_t m = 0;             // PQ sub-vectors
     std::vector<float> codebook;   // [m][2^nbits][dim / m]

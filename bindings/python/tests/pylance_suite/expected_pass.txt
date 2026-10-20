@@ -638,6 +638,7 @@ tests/test_indices.py::test_ivf_centroids[f32]
 tests/test_indices.py::test_ivf_centroids[f64]
 tests/test_indices.py::test_ivf_centroids_distance_type
 tests/test_indices.py::test_ivf_centroids_fragment_ids
+tests/test_indices.py::test_ivf_centroids_hamming
 tests/test_indices.py::test_ivf_centroids_mostly_null[cosine]
 tests/test_indices.py::test_ivf_centroids_mostly_null[dot]
 tests/test_indices.py::test_ivf_centroids_mostly_null[l2]
@@ -1141,6 +1142,8 @@ tests/test_vector.py::test_binary_vectors_invalid_metric
 tests/test_vector.py::test_dict
 tests/test_vector.py::test_hamming_clustering_for_sample[16]
 tests/test_vector.py::test_hamming_clustering_for_sample[8]
+tests/test_vector.py::test_hamming_clustering_multi_segment[16]
+tests/test_vector.py::test_hamming_clustering_multi_segment[8]
 tests/test_vector.py::test_list
 tests/test_vector.py::test_ndarray
 tests/test_vector_index.py::test_ann
@@ -1201,6 +1204,8 @@ tests/test_vector_index.py::test_index_with_nans[V3]
 tests/test_vector_index.py::test_index_with_pq_codebook
 tests/test_vector_index.py::test_index_with_pq_codebook_rejects_wrong_num_bits_shape
 tests/test_vector_index.py::test_invalid_subvectors
+tests/test_vector_index.py::test_ivf_flat_over_binary_vector
+tests/test_vector_index.py::test_ivf_flat_respects_index_metric_binary
 tests/test_vector_index.py::test_knn_deleted_rows
 tests/test_vector_index.py::test_knn_with_deletions
 tests/test_vector_index.py::test_multivec_ann

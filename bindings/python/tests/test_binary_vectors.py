@@ -138,9 +138,10 @@ def test_row_ids_and_bounds(lance, tmp_path):
         assert all(10 <= d < 40 for d in bounded["_distance"].to_pylist())
 
 
-def test_ivf_index_on_binary_is_refused(tmp_path):
+def test_ivf_index_on_binary_needs_hamming(tmp_path):
+    # An IVF_FLAT index over uint8 vectors is built with metric="hamming" (test_binary_ivf.py); any other metric is refused.
     ours = nl.write_dataset(binary_table(random_rows(13, 300, 8), 8), str(tmp_path / "nanolance"))
-    with pytest.raises(ValueError, match="float32"):
+    with pytest.raises(ValueError, match="does not support UInt8 vectors, use hamming"):
         ours.create_index("vector", "IVF_FLAT", num_partitions=2)
 
 

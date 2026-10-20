@@ -2914,6 +2914,7 @@ bool index_build::load_vector_model(const std::filesystem::path& dir, VectorMode
     out.dim = index->dim;
     out.partitions = index->partitions;
     out.centroids = index->centroids;
+    out.binary_centroids = index->binary_centroids;
     out.nbits = index->storage == Storage::Rq ? index->rq_bits : index->nbits;
     out.rq_signs = index->storage == Storage::Rq ? index->rq_signs : std::vector<std::uint8_t>{};
     out.m = index->storage == Storage::Pq ? index->m : 0U;
@@ -3309,7 +3310,7 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
         std::vector<Candidate> ann;
         CacheCount counts;
         out.plan.push_back("ANNSubIndex: name=" + index_name + ", k=" + std::to_string(q.k) + ", deltas=" +
-                           std::to_string(loaded.size()) + ", metric=" + metric_name + " (" +
+                           std::to_string(loaded.size()) + ", metric=" + (binary ? "Hamming" : metric_name) + " (" +
                            loaded.front()->type + ")");
         // Each segment's row mask (the fragments it covers, deletions, the prefilter), built once.
         std::vector<RowMask> masks;

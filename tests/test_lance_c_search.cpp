@@ -931,6 +931,89 @@ void test_rq_approx_mode(const std::string& uri) {
     check(by_mode[0] != by_mode[1], "IVF_RQ approx_mode fast differs from normal");
 }
 
+/// LANCE_METRIC_HAMMING over a Hamming IVF_FLAT index of uint8 vectors (built by nanolance): a uint8 query
+/// searches it by bit distance, exactly as the brute force over the rows; the index is probed in full.
+void test_hamming(const std::filesystem::path& dir) {
+    constexpr int kBytes = 16;
+    constexpr int kRows = 300;
+    const std::string uri = (dir / "hamming.lance").string();
+    std::mt19937_64 rng(11);
+    std::vector<uint8_t> rows(kRows * kBytes);
+    for (auto& b : rows) b = static_cast<uint8_t>(rng());
+    ArrowSchema schema;
+    ArrowArray array;
+    ArrowSchemaInit(&schema);
+    ArrowSchemaSetTypeStruct(&schema, 2);
+    ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_INT64);
+    ArrowSchemaSetName(schema.children[0], "id");
+    ArrowSchemaSetTypeFixedSize(schema.children[1], NANOARROW_TYPE_FIXED_SIZE_LIST, kBytes);
+    ArrowSchemaSetName(schema.children[1], "vec");
+    ArrowSchemaSetType(schema.children[1]->children[0], NANOARROW_TYPE_UINT8);
+    ArrowArrayInitFromSchema(&array, &schema, nullptr);
+    ArrowArrayStartAppending(&array);
+    for (int i = 0; i < kRows; ++i) {
+        ArrowArrayAppendInt(array.children[0], i);
+        for (int b = 0; b < kBytes; ++b) {
+            ArrowArrayAppendUInt(array.children[1]->children[0], rows[i * kBytes + b]);
+        }
+        ArrowArrayFinishElement(array.children[1]);
+        ArrowArrayFinishElement(&array);
+    }
+    ArrowArrayFinishBuildingDefault(&array, nullptr);
+    ArrowArrayStream stream;
+    ArrowBasicArrayStreamInit(&stream, &schema, 1);
+    ArrowBasicArrayStreamSetArray(&stream, 0, &array);
+    LanceDataset* created = nullptr;
+    check(lance_dataset_write(uri.c_str(), &schema, &stream, LANCE_WRITE_CREATE, nullptr, &created) == 0,
+          "write uint8: " + last_error());
+    if (created != nullptr) lance_dataset_close(created);
+
+    nano_lance::VectorIndexOptions o;
+    o.type = "IVF_FLAT";
+    o.metric = nano_lance::VectorMetric::Hamming;
+    o.num_partitions = 4;
+    o.seed = 5;
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_create_vector_index(uri, "vec", o, version, error), "hamming index: " + error);
+
+    for (int seed = 0; seed < 4; ++seed) {
+        std::vector<uint8_t> q(kBytes);
+        for (auto& b : q) b = static_cast<uint8_t>(rng());
+        std::vector<std::pair<int, int>> brute;  // (distance, id)
+        for (int i = 0; i < kRows; ++i) {
+            int bits = 0;
+            for (int b = 0; b < kBytes; ++b) bits += __builtin_popcount(rows[i * kBytes + b] ^ q[b]);
+            brute.emplace_back(bits, i);
+        }
+        std::sort(brute.begin(), brute.end());
+        LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+        const char* cols[] = {"id", nullptr};
+        LanceScanner* sc = lance_scanner_new(ds, cols, nullptr);
+        check(lance_scanner_nearest(sc, "vec", q.data(), q.size(), LANCE_DTYPE_UINT8, 10) == 0,
+              "uint8 nearest: " + last_error());
+        check(lance_scanner_set_metric(sc, LANCE_METRIC_HAMMING) == 0, "hamming on a uint8 query: " + last_error());
+        check(lance_scanner_set_nprobes(sc, 4) == 0, "nprobes");
+        const auto r = collect(sc, "_distance");
+        check(r.error.empty(), "hamming search: " + r.error);
+        check(r.values.size() == 10, "ten hamming neighbours");
+        for (std::size_t i = 0; i < r.values.size() && i < 10; ++i) {
+            check(r.values[i] == static_cast<float>(brute[i].first), "hamming distance " + std::to_string(i));
+        }
+        lance_scanner_close(sc);
+        lance_dataset_close(ds);
+    }
+    // A float query is refused by Hamming, as it is over a float column.
+    LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+    LanceScanner* sc = lance_scanner_new(ds, nullptr, nullptr);
+    const std::vector<float> f(kBytes, 1.0F);
+    check(lance_scanner_nearest(sc, "vec", f.data(), f.size(), LANCE_DTYPE_FLOAT32, 3) == 0, "float nearest");
+    check(lance_scanner_set_metric(sc, LANCE_METRIC_HAMMING) != 0 && lance_last_error_code() == LANCE_ERR_NOT_SUPPORTED,
+          "hamming on a float query");
+    lance_scanner_close(sc);
+    lance_dataset_close(ds);
+}
+
 int main(int argc, char** argv) {
     const std::filesystem::path dir =
         argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::temp_directory_path() / "nl_lance_c_search";
@@ -967,6 +1050,7 @@ int main(int argc, char** argv) {
     test_include_deleted_rows((dir / "deleted.lance").string());
     test_update_if((dir / "upsert.lance").string());
     test_rq_approx_mode((dir / "rq.lance").string());
+    test_hamming(dir);
     if (std::getenv("NANOLANCE_KEEP_TEST_DATA") == nullptr) {
         std::filesystem::remove_all(dir);
     }

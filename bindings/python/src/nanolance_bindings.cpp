@@ -1032,6 +1032,15 @@ std::array<std::uint8_t, 16> uuid_of(const nb::bytes& b) {
     return out;
 }
 
+/// A build's metric: the vector metrics, and "hamming" (an IVF_FLAT index over uint8 vectors).
+bool parse_build_metric(const std::string& name, nano_lance::VectorMetric& out) {
+    if (name == "hamming") {
+        out = nano_lance::VectorMetric::Hamming;
+        return true;
+    }
+    return nano_lance::parse_vector_metric(name, out);
+}
+
 nano_lance::VectorIndexOptions vector_options_of(const nb::dict& d) {
     nano_lance::VectorIndexOptions o;
     if (d.contains("skip_transpose")) {
@@ -1044,8 +1053,8 @@ nano_lance::VectorIndexOptions vector_options_of(const nb::dict& d) {
     }
     if (d.contains("metric")) {
         const auto metric = nb::cast<std::string>(d["metric"]);
-        if (!nano_lance::parse_vector_metric(metric, o.metric)) {
-            throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot)").c_str());
+        if (!parse_build_metric(metric, o.metric)) {
+            throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot, hamming)").c_str());
         }
     }
     if (d.contains("num_partitions") && !d["num_partitions"].is_none()) {
@@ -2042,8 +2051,11 @@ NB_MODULE(_nanolance, m) {
                                                           fragments ? &*fragments : nullptr,
                                                           ivf_centroids ? &centroids : nullptr, model, e);
         });
-        return nb::make_tuple(model.dim, model.partitions,
-                              bytes_of(model.centroids.data(), model.centroids.size() * sizeof(float)),
+        // The centroids in the index's element type: float32, or uint8 for a Hamming index.
+        const auto centroid_bytes = o.metric == nano_lance::VectorMetric::Hamming
+                                        ? bytes_of(model.binary_centroids.data(), model.binary_centroids.size())
+                                        : bytes_of(model.centroids.data(), model.centroids.size() * sizeof(float));
+        return nb::make_tuple(model.dim, model.partitions, centroid_bytes,
                               bytes_of(model.codebook.data(), model.codebook.size() * sizeof(float)));
     });
     m.def("_ds_drop_index", [](const std::filesystem::path& path, const std::string& name) {
@@ -2322,8 +2334,8 @@ NB_MODULE(_nanolance, m) {
             };
         }
         o.name = name;
-        if (!nano_lance::parse_vector_metric(metric, o.metric)) {
-            throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot)").c_str());
+        if (!parse_build_metric(metric, o.metric)) {
+            throw nb::value_error(("metric '" + metric + "' is not supported (l2, cosine, dot, hamming)").c_str());
         }
         o.replace = replace;
         o.num_partitions = num_partitions;

@@ -807,7 +807,7 @@ bool dataset_merge_index_segments(const std::filesystem::path& dataset_path,
             if (m.dim != first.dim) {
                 return mismatch("Dimension mismatch across shards");
             }
-            if (!close(m.centroids, first.centroids)) {
+            if (!close(m.centroids, first.centroids) || m.binary_centroids != first.binary_centroids) {
                 return mismatch("IVF centroids mismatch across shards");
             }
             if (m.type == "IVF_RQ") {  // one rotation for every shard (Lance's shared rabitq_model)
@@ -884,6 +884,7 @@ bool dataset_train_vector_model(const std::filesystem::path& dataset_path, std::
     out.dim = trained.dim;
     out.partitions = trained.partitions;
     out.centroids = std::move(trained.centroids);
+    out.binary_centroids = std::move(trained.binary_centroids);
     out.codebook = std::move(trained.codebook);
     return true;
 }

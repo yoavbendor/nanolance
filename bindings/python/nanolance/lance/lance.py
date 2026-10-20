@@ -41,9 +41,8 @@ def _float32_rows(array, dimension: int) -> np.ndarray:
     return np.ascontiguousarray(values, dtype=np.float32).reshape(-1, dimension)
 
 
-def _fixed_size_list(values: np.ndarray, list_size: int) -> pa.FixedSizeListArray:
-    return pa.FixedSizeListArray.from_arrays(pa.array(np.ascontiguousarray(values, np.float32).reshape(-1)),
-                                             list_size)
+def _fixed_size_list(values: np.ndarray, list_size: int, dtype=np.float32) -> pa.FixedSizeListArray:
+    return pa.FixedSizeListArray.from_arrays(pa.array(np.ascontiguousarray(values, dtype).reshape(-1)), list_size)
 
 
 def _fragments(fragment_ids) -> Optional[List[int]]:
@@ -52,12 +51,16 @@ def _fragments(fragment_ids) -> Optional[List[int]]:
 
 def train_ivf_model(dataset, column, dimension, num_partitions, distance_type, sample_rate, max_iters,
                     fragment_ids=None) -> pa.FixedSizeListArray:
-    """IVF centroids by k-means over a sample of `column` (sample_rate rows per partition)."""
-    options = {"metric": _metric(distance_type), "num_partitions": int(num_partitions),
+    """IVF centroids by k-means over a sample of `column` (sample_rate rows per partition); k-modes over a
+    uint8 column with distance_type "hamming" (uint8 centroids)."""
+    hamming = str(distance_type).lower() == "hamming"
+    options = {"metric": "hamming" if hamming else _metric(distance_type), "num_partitions": int(num_partitions),
                "sample_rate": int(sample_rate), "max_iters": int(max_iters)}
     with native():
         dim, _, centroids, _ = _nanolance._index_train_model(dataset.uri, dataset.version, str(column), "IVF_FLAT",
                                                              options, _fragments(fragment_ids), None)
+    if hamming:
+        return _fixed_size_list(np.frombuffer(centroids, dtype=np.uint8), dim, np.uint8)
     return _fixed_size_list(np.frombuffer(centroids, dtype=np.float32), dim)
 
 

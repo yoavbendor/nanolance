@@ -95,6 +95,8 @@ struct SearchSettings {
     bool nearest = false;
     std::string column;
     std::vector<float> key;
+    bool key_uint8 = false;  // the query was given as uint8 (a binary column's query)
+    bool hamming = false;    // LANCE_METRIC_HAMMING: Hamming distance over uint8 vectors
     uint32_t k = 0;
     std::optional<uint32_t> minimum_nprobes;
     std::optional<uint32_t> maximum_nprobes;
@@ -782,6 +784,7 @@ bool open_search(const LanceScanner& scanner, ArrowArrayStream& out) {
         q.approx_mode = search.approx_mode;
         q.segments = search.index_segments;
         q.metric = search.metric;
+        q.hamming = search.hamming;
         q.use_index = search.use_index;
         if (!scanner.filter.empty()) {
             q.filter = scanner.filter;
@@ -4108,6 +4111,7 @@ int32_t lance_scanner_nearest(LanceScanner* scanner, const char* column, const v
         scanner->search.nearest = true;
         scanner->search.column = column;
         scanner->search.key = std::move(key);
+        scanner->search.key_uint8 = element_type == LANCE_DTYPE_UINT8;
         scanner->search.k = k;
         return true;
     });
@@ -4194,10 +4198,28 @@ int32_t lance_scanner_set_ef(LanceScanner* scanner, uint32_t e) {
 int32_t lance_scanner_set_metric(LanceScanner* scanner, LanceMetricType metric) {
     return before_scan(scanner, [&] {
         switch (metric) {
-        case LANCE_METRIC_L2: scanner->search.metric = nano_lance::VectorMetric::L2; return true;
-        case LANCE_METRIC_COSINE: scanner->search.metric = nano_lance::VectorMetric::Cosine; return true;
-        case LANCE_METRIC_DOT: scanner->search.metric = nano_lance::VectorMetric::Dot; return true;
-        case LANCE_METRIC_HAMMING: not_supported("the hamming metric"); return false;
+        case LANCE_METRIC_L2:
+            scanner->search.metric = nano_lance::VectorMetric::L2;
+            scanner->search.hamming = false;
+            return true;
+        case LANCE_METRIC_COSINE:
+            scanner->search.metric = nano_lance::VectorMetric::Cosine;
+            scanner->search.hamming = false;
+            return true;
+        case LANCE_METRIC_DOT:
+            scanner->search.metric = nano_lance::VectorMetric::Dot;
+            scanner->search.hamming = false;
+            return true;
+        case LANCE_METRIC_HAMMING:
+            // Hamming searches uint8 queries over a uint8 column's Hamming index (or exact search); a float
+            // query is refused, as the Float32 distance check is.
+            if (scanner->search.nearest && !scanner->search.key_uint8) {
+                not_supported("the hamming metric for a float query");
+                return false;
+            }
+            scanner->search.metric.reset();
+            scanner->search.hamming = true;
+            return true;
         }
         return invalid("unknown metric " + std::to_string(static_cast<int>(metric)));
     });

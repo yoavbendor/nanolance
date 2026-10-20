@@ -157,3 +157,13 @@ Decisions for H2: keep nanolance's plan text format (pylance's differs for float
 `LANCE_METRIC_HAMMING` over uint8 queries in H2, with Hamming still refused on float scanners
 (`tests/test_lance_c_search.cpp` ~317 stays); benchmarks: never overwrite `bench/results/*.json`
 (copy it back after a run).
+
+**H2 outcome (2026-10-20): task done.** nanolance builds Hamming IVF_FLAT indexes (Lance's k-modes:
+Hamming assignment, per-bit majority update; uint8 centroids and rows; pylance's files and metadata,
+details metric_type 3), `train_ivf(distance_type="hamming")`, `IvfModel` save / load cross-compatible
+with pylance, `optimize_indices` delta segments, `create_index_uncommitted`; lance-c scanners take
+`LANCE_METRIC_HAMMING` with a uint8 query (still refused with a float one). The five targets pass (added
+to the expected list: 1239). Float IVF_FLAT build and search unchanged (within noise). Left, accepted:
+no partition rebalancing for Hamming indexes in `optimize_indices` (sizes can drift from pylance's after
+large appends); k-modes trains flat above 256 partitions (Lance goes hierarchical); supplied
+`ivf_centroids` refused for Hamming; lance-c index creation with Hamming refused.
