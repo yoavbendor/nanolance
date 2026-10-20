@@ -22,6 +22,11 @@ namespace nano_lance {
 
 enum class VectorMetric { L2, Cosine, Dot };
 
+/// pylance's approx_mode, which changes only IVF_RQ searches (other kinds ignore it, as in Lance).
+/// Fast: the 1-bit estimate alone, with no top-k gate. Accurate: the binary sums from a 16-bit
+/// quantized distance table (Lance's hacc path). Normal: the default.
+enum class ApproxMode { Normal, Fast, Accurate };
+
 /// "l2" / "euclidean", "cosine", "dot" (any case). False for anything else.
 bool parse_vector_metric(const std::string& name, VectorMetric& out);
 const char* vector_metric_name(VectorMetric metric);  // "l2", "cosine", "dot"
@@ -55,6 +60,8 @@ struct NearestQuery {
     /// Hamming distance (bits differing) over a binary column: a fixed-size list of uint8. Unset
     /// with a uint8 column: hamming too. Only the flat (unindexed) search supports it.
     bool hamming = false;
+    /// IVF_RQ only: how the binary sums and the top-k gate are computed (see ApproxMode).
+    ApproxMode approx_mode = ApproxMode::Normal;
     bool use_index = true;
     /// Keep loaded indices in the process-wide cache (false: load them afresh for this search).
     bool index_cache = true;

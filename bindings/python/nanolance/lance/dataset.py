@@ -2896,13 +2896,6 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
     approx_mode = nearest.get("approx_mode")
     if approx_mode is not None and approx_mode not in ("fast", "normal", "accurate"):
         raise ValueError(f"approx_mode must be one of 'fast', 'normal', or 'accurate', got '{approx_mode}'")
-    if approx_mode in ("fast", "accurate") and nearest.get("use_index", True):
-        # pylance answers an IVF_RQ search differently in these modes (fast: 1-bit scores without the
-        # top-k gate; accurate: another distance table); nanolance has only the normal one, so it refuses
-        # rather than answer the normal way. Other index kinds do not look at approx_mode.
-        if any(i.get("type") == "IVF_RQ" and column in (i.get("fields") or []) for i in ds.list_indices()):
-            raise NotSupportedError(f"approx_mode='{approx_mode}' on an IVF_RQ index is not supported yet "
-                                    "(supported: 'normal')")
     minimum, maximum = nearest.get("minimum_nprobes"), nearest.get("maximum_nprobes")
     refine = nearest.get("refine_factor")
     if k is not None and int(k) <= 0:
@@ -2941,6 +2934,8 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
         "lower_bound": None if lower is None else float(lower),
         "upper_bound": None if upper is None else float(upper),
         "ef": None if ef is None else int(ef),
+        # IVF_RQ only (the other kinds ignore it, as pylance does); 'normal' is the default.
+        "approx_mode": approx_mode,
     }
     if multi:
         if pa.types.is_float16(storage.value_type.value_type):
@@ -3997,7 +3992,7 @@ class LanceScanner(pa.dataset.Scanner):
                 n["maximum_nprobes"], n["refine_factor"], n["metric"], n["use_index"], n["lower_bound"],
                 n["upper_bound"], self._filter, self._prefilter, self._fast_search, n.get("ef"),
                 self._ds._index_cache_enabled(), self._index_segments, self._mask["row_addr_allowlist"],
-                self._mask["row_addr_blocklist"])
+                self._mask["row_addr_blocklist"], n.get("approx_mode"))
         self._ds._count_index_cache(hits, misses)
         note_indexes(self._ds, column=n["column"])
         return ids, distances, plan

@@ -154,3 +154,10 @@ with approx_mode 'fast' and 'accurate', which stay refused (answering the normal
 answers than pylance's); porting those two modes is **R1c**. pylance's build_rq_model has no rotation
 option and never writes the dense one, so a dense model is refused by name. An empty IVF_RQ build raises
 NotImplementedError as pylance does (other kinds unchanged until measured).
+
+**R1c outcome (2026-10-20):** done in one Haiku session; reviewed. `approx_mode` 'fast' (the 1-bit
+estimate alone, no top-k gate) and 'accurate' (Lance's hacc path: the binary sums from the distance table
+quantized to u16 over [qmin, qmax], u32 sums) answer as pylance does on IVF_RQ indexes, with filters and
+deletions; other kinds ignore approx_mode, as pylance does, and unknown names raise pylance's ValueError.
+The seventh target test (`test_create_ivf_rq_multi_bit_searches_l2_and_cosine`) passes. Open: the lance-c
+C API has no approx_mode setter yet (`lance_scanner_set_approx_mode`).

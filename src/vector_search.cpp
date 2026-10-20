@@ -1513,7 +1513,8 @@ struct RqQuery {
     std::vector<float> rotated;     // the rotated query (dot: its inner product with the rotated centroids)
     float sum_q = 0.0F;
     bool packed = true;  // the index's binary codes are packed (else row-major: skip_transpose)
-    bool gate = false;   // Lance's top-k lower-bound gate: raw_query with num_bits > 1
+    bool gate = false;   // Lance's top-k lower-bound gate: raw_query with num_bits > 1, not approx Fast
+    ApproxMode approx = ApproxMode::Normal;  // pylance's approx_mode (Fast: 1-bit scores only)
     // Lance's default (Normal) binary inner products of the full 32-row blocks come from the table
     // quantized to u8 (affine over [qmin, qmax]) and the integer sums, dequantized as
     // sum * range + segments * qmin. The remaining rows are exact. `exact_only` is Lance's fallback
@@ -1522,15 +1523,20 @@ struct RqQuery {
     float range = 0.0F;
     float sum_min = 0.0F;
     bool exact_only = false;
+    // Approx Accurate (Lance's hacc path): the same sums from the table quantized to u16 over
+    // [qmin, qmax], dequantized as sum * (qmax - qmin) / 65535 + segments * qmin.
+    std::vector<std::uint16_t> qtable16;
+    float range16 = 0.0F;
 };
 
-RqQuery rq_prepare(const IvfIndex& index, const float* key) {
+RqQuery rq_prepare(const IvfIndex& index, const float* key, ApproxMode approx) {
     const std::size_t dim = index.dim;
     std::vector<float> rotated(dim);
     rq_rotate(key, dim, index.rq_signs.data(), rotated.data());
     RqQuery q;
     q.packed = index.rq_packed;
-    q.gate = index.rq_bits > 1U;
+    q.approx = approx;
+    q.gate = index.rq_bits > 1U && approx != ApproxMode::Fast;
     q.rotated = rotated;
     q.dist_table.assign(dim * 4U, 0.0F);
     for (std::size_t seg = 0; seg < dim / 4U; ++seg) {
@@ -1557,6 +1563,19 @@ RqQuery rq_prepare(const IvfIndex& index, const float* key) {
     if (!std::isfinite(segments * qmin) || !std::isfinite(segments * qmax) ||
         !std::isfinite(segments * (qmax - qmin))) {
         q.exact_only = true;
+        return q;
+    }
+    if (approx == ApproxMode::Accurate) {
+        // quantize_dist_table_u16_into: the same affine map over 16 bits.
+        q.qtable16.assign(q.dist_table.size(), 0U);
+        const float factor16 = 65535.0F / (qmax - qmin);
+        if (std::isfinite(factor16)) {
+            for (std::size_t i = 0; i < q.dist_table.size(); ++i) {
+                q.qtable16[i] = static_cast<std::uint16_t>(std::nearbyint((q.dist_table[i] - qmin) * factor16));
+            }
+        }
+        q.range16 = (qmax - qmin) / 65535.0F;
+        q.sum_min = segments * qmin;
         return q;
     }
     q.qtable.assign(q.dist_table.size(), 0U);
@@ -1602,7 +1621,7 @@ void rq_row_codes(const std::uint8_t* packed, std::size_t n, std::size_t code_le
 
 /// The row's binary inner product with the query: the exact sum of the dist table (Lance's
 /// compute_single_rq_distance) for the remainder rows and the exact fallback, else the dequantized
-/// sum of the u8 table (binary_distances_with_scratch).
+/// sum of the u8 table (binary_distances_with_scratch; the u16 table for approx Accurate, hacc).
 float rq_binary_ip(const RqQuery& q, const std::uint8_t* packed, std::size_t n, std::size_t code_len,
                    std::size_t id) {
     std::uint8_t codes_buf[256];
@@ -1613,6 +1632,14 @@ float rq_binary_ip(const RqQuery& q, const std::uint8_t* packed, std::size_t n, 
         codes = packed + id * code_len;  // row-major (skip_transpose): Lance packs these at load
     }
     const bool simd_row = !q.exact_only && id < n - n % 32U;
+    if (simd_row && q.approx == ApproxMode::Accurate) {
+        std::uint32_t sum = 0;
+        for (std::size_t col = 0; col < code_len; ++col) {
+            sum += q.qtable16[(2U * col) * 16U + (codes[col] & 0x0FU)] +
+                   q.qtable16[(2U * col + 1U) * 16U + (codes[col] >> 4U)];
+        }
+        return static_cast<float>(sum) * q.range16 + q.sum_min;
+    }
     if (simd_row) {
         std::uint32_t sum = 0;
         for (std::size_t col = 0; col < code_len; ++col) {
@@ -1730,7 +1757,7 @@ void rq_unpack_ex(unsigned bits, const std::uint8_t* row, std::size_t padded, st
 /// extended dot and the factors of the row. `ex_values` is scratch of `q.ex_query.size()` bytes.
 float rq_distance(const IvfIndex& index, const RqQuery& q, const Partition& part, std::size_t id,
                   float query_factor, float binary_ip, std::uint8_t* ex_values) {
-    if (index.rq_bits <= 1U) {
+    if (index.rq_bits <= 1U || q.approx == ApproxMode::Fast) {
         return (binary_ip - 0.5F * q.sum_q) * part.rq_scale[id] + part.rq_add[id] + query_factor;
     }
     const unsigned ex_bits = index.rq_bits - 1U;
@@ -2275,7 +2302,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
     RqQuery rq;  // IVF_RQ: the rotated query and its tables, once for every partition
     std::vector<float> rq_rotated_centroids;  // IVF_RQ dot: the centroids rotated (Lance's search cache)
     if (index.storage == Storage::Rq) {
-        rq = rq_prepare(index, key.data());
+        rq = rq_prepare(index, key.data(), q.approx_mode);
         if (index.metric == VectorMetric::Dot) {
             rq_rotated_centroids.resize(P * dim);
             for (std::size_t p = 0; p < P; ++p) {
@@ -2371,10 +2398,12 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
 
     if (index.storage == Storage::Rq) {
         // IVF_RQ searches as Lance's FLAT sub-index does under IVF's global top-k heap: every probed
-        // partition in probe order into one heap of kk entries, rows gated against it.
+        // partition in probe order into one heap of kk entries, rows gated against it. The first
+        // `first` partitions always; then more, one at a time, only while fewer than k rows were found.
         const auto by_dist = [](const Candidate& a, const Candidate& b) { return a.d < b.d; };
         RustHeap<Candidate, decltype(by_dist)> heap(by_dist);
-        for (std::size_t i = 0; i < most; ++i) {
+        std::size_t searched = 0;
+        for (std::size_t i = 0; i < most && (i < first || heap.size() < max_results); ++i, ++searched) {
             std::shared_ptr<const Partition> part;
             if (!index.partition(order[i], part, error, count)) {
                 return false;
@@ -2389,7 +2418,7 @@ bool search_segment(const IvfIndex& index, const NearestQuery& q, bool f32_colum
             out.push_back(c);
             ++added;
         }
-        return finish(most, added);
+        return finish(searched, added);
     }
     // The first `first` partitions are searched whatever they hold, in parallel.
     std::vector<std::vector<Candidate>> early(std::min(first, most));

@@ -2104,11 +2104,19 @@ NB_MODULE(_nanolance, m) {
                             bool use_index, std::optional<float> lower_bound, std::optional<float> upper_bound,
                             std::optional<std::string> filter, bool prefilter, bool fast_search,
                             std::optional<std::uint32_t> ef, bool index_cache, const std::vector<nb::bytes>& segments,
-                            std::optional<nb::bytes> row_addr_allowlist, std::optional<nb::bytes> row_addr_blocklist) {
+                            std::optional<nb::bytes> row_addr_allowlist, std::optional<nb::bytes> row_addr_blocklist,
+                            std::optional<std::string> approx_mode) {
         nano_lance::NearestQuery q;
         const auto mask = row_addr_mask(row_addr_allowlist, row_addr_blocklist);
         q.row_mask = mask ? &*mask : nullptr;
         q.ef = ef;
+        if (approx_mode && *approx_mode == "fast") {
+            q.approx_mode = nano_lance::ApproxMode::Fast;
+        } else if (approx_mode && *approx_mode == "accurate") {
+            q.approx_mode = nano_lance::ApproxMode::Accurate;
+        } else if (approx_mode && *approx_mode != "normal") {
+            throw nb::value_error(("approx_mode must be 'fast', 'normal' or 'accurate', got '" + *approx_mode + "'").c_str());
+        }
         q.index_cache = index_cache;
         for (const auto& s : segments) {
             q.segments.push_back(uuid_of(s));

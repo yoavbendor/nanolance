@@ -2,7 +2,7 @@
 the same rows in the same order, distances within the tolerance of ``_same``.
 
 Phase R1a: the default index (L2, fast rotation, 5 bits). Phase R1b: every num_bits pylance accepts (1 to 9),
-cosine and dot, skip_transpose, and index_stats. Phase R2: nanolance builds IVF_RQ indexes that pylance searches
+cosine and dot, skip_transpose, and index_stats. Phase R1c: approx_mode 'fast' and 'accurate'. Phase R2: nanolance builds IVF_RQ indexes that pylance searches
 with nanolance's own answers, the recall bound, seeded and shared-model builds, and the refusals.
 """
 
@@ -78,7 +78,8 @@ def _same(ref, got, dim):
     if not rids:
         return
     tol = 1e-6 * max(2.0 * dim, float(np.abs(rd).max()))
-    assert np.allclose(gd, rd, rtol=0, atol=tol), (rd[:5].tolist(), gd[:5].tolist())
+    worst = int(np.argmax(np.abs(gd - rd)))
+    assert np.allclose(gd, rd, rtol=0, atol=tol), (worst, rids[worst], gids[worst], float(rd[worst]), float(gd[worst]), tol)
     near = 2 * tol
     for i, (r, g) in enumerate(zip(rids, gids)):
         if r != g:  # a swap: only among rows whose distances tie to within `near`
@@ -161,7 +162,7 @@ def variants(lance, tmp_path_factory):
     return get
 
 
-def _compare_all(lance, path, dim, parts, queries, ks=(1, 10, 100)):
+def _compare_all(lance, path, dim, parts, queries, ks=(1, 10, 100), approx_mode=None):
     """Every k, nprobes (1, 2, all) and refine (none, 4) for each query, both engines on one index."""
     for q in queries:
         for k in ks:
@@ -170,6 +171,8 @@ def _compare_all(lance, path, dim, parts, queries, ks=(1, 10, 100)):
                     extra = {"k": k, "nprobes": nprobes}
                     if refine:
                         extra["refine_factor"] = refine
+                    if approx_mode:
+                        extra["approx_mode"] = approx_mode
                     nearest = {"column": "vec", "q": q, **extra}
                     ref = lance.dataset(path).to_table(nearest=nearest, columns=["id"])
                     got = nl.dataset(path).to_table(nearest=nearest, columns=["id"])
@@ -226,6 +229,23 @@ def test_filters_and_deletions_for_other_widths(lance, variants, tmp_path, num_b
           nl.dataset(copy).to_table(nearest=nearest, columns=["id"]), 64)
 
 
+@pytest.mark.parametrize("mode", ["fast", "normal"])
+@pytest.mark.parametrize("num_bits", [1, 9])
+def test_default_nprobes_with_deletions(lance, variants, tmp_path, num_bits, mode):
+    """With no nprobes given, Lance probes the partitions its first-pass rule picks and then more only while
+    fewer than k rows were found; it does not probe them all. The nearest row deleted makes that visible at
+    k=1: the first partition still holds a live row, which pylance answers with."""
+    path = variants(5, 128, 16, num_bits=num_bits)
+    copy = str(tmp_path / "deleted.lance")
+    shutil.copytree(path, copy)
+    lance.dataset(copy).delete("id IN (7, 8, 9) OR g = 2")
+    for q in _queries(_vectors(128, 5), 5):
+        for k in (1, 2, 10, 100):
+            nearest = {"column": "vec", "q": q, "k": k, "approx_mode": mode}
+            _same(lance.dataset(copy).to_table(nearest=nearest, columns=["id"]),
+                  nl.dataset(copy).to_table(nearest=nearest, columns=["id"]), 128)
+
+
 @pytest.mark.parametrize("num_bits, metric, skip", [(1, None, False), (5, "cosine", False), (9, "dot", True)])
 def test_index_stats_match_pylance(lance, variants, num_bits, metric, skip):
     """stats.index_stats for IVF_RQ: the same dict as pylance reports (sub_index: rotation, code_dim,
@@ -242,18 +262,62 @@ def test_index_stats_match_pylance(lance, variants, num_bits, metric, skip):
     assert sub["rotation_type"] == "fast"
 
 
-@pytest.mark.parametrize("mode", ["fast", "accurate"])
-def test_other_approx_modes_are_refused(lance, built, mode):
-    """pylance answers an IVF_RQ search differently with approx_mode 'fast' or 'accurate'; nanolance has
-    only the normal mode, so it refuses the others by name rather than answer the normal way."""
-    from nanolance.lance._errors import NotSupportedError
+# ── R1c: approx_mode 'fast' and 'accurate' ──────────────────────────────────────────────────────────
 
+@pytest.mark.parametrize("mode", ["fast", "accurate"])
+@pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
+@pytest.mark.parametrize("dim", DIMS)
+@pytest.mark.parametrize("num_bits", [1, 5, 9])
+def test_approx_modes_match_pylance(lance, variants, mode, num_bits, dim, metric):
+    """pylance's 'fast' (1-bit scores, no top-k gate) and 'accurate' (16-bit binary table) answers, for
+    num_bits 1 (no gate; 'fast' is then the normal answer), 5 and 9, both dims, every metric."""
+    path = variants(0, dim, 4, num_bits=num_bits, metric=None if metric == "l2" else metric)
+    _compare_all(lance, path, dim, 4, _queries(_vectors(dim, 0), 0), approx_mode=mode)
+
+
+@pytest.mark.parametrize("mode", ["fast", "accurate"])
+@pytest.mark.parametrize("flt", ["g = 3", "id < 500"])
+@pytest.mark.parametrize("prefilter", [False, True])
+def test_approx_modes_with_filters_and_deletions(lance, variants, tmp_path, mode, flt, prefilter):
+    path = variants(5, 128, 16, num_bits=9)
+    q = _queries(_vectors(128, 5), 5)[0]
+    for k in (10, 100):
+        nearest = {"column": "vec", "q": q, "k": k, "nprobes": 16, "approx_mode": mode}
+        ref = lance.dataset(path).to_table(nearest=nearest, filter=flt, prefilter=prefilter, columns=["id", "g"])
+        got = nl.dataset(path).to_table(nearest=nearest, filter=flt, prefilter=prefilter, columns=["id", "g"])
+        _same(ref, got, 128)
+    copy = str(tmp_path / "approx_deleted.lance")
+    shutil.copytree(path, copy)
+    lance.dataset(copy).delete("id IN (7, 8, 9) OR g = 2")
+    # Explicit nprobes: pylance's adaptive count (minimum_nprobes 1, no maximum) differs from nanolance's
+    # once rows are deleted (see the R1c outcome in docs/tasks/IVF_RQ.md), in every mode, not only these.
+    for k in (1, 10, 100):
+        for nprobes in (1, 16):
+            nearest = {"column": "vec", "q": q, "k": k, "nprobes": nprobes, "approx_mode": mode}
+            ref = lance.dataset(copy).to_table(nearest=nearest, columns=["id"])
+            got = nl.dataset(copy).to_table(nearest=nearest, columns=["id"])
+            _same(ref, got, 128)
+
+
+@pytest.mark.parametrize("mode", ["fast", "accurate", "normal"])
+def test_approx_mode_is_ignored_by_other_kinds(lance, tmp_path, mode):
+    """IVF_PQ: approx_mode changes nothing, as in pylance."""
+    v = _vectors(64, 0)
+    path = str(tmp_path / "pq.lance")
+    lance.write_dataset(_table(v, 64), path)
+    lance.dataset(path).create_index("vec", "IVF_PQ", num_partitions=4, num_sub_vectors=8)
+    for q in _queries(v, 0):
+        nearest = {"column": "vec", "q": q, "k": 10, "approx_mode": mode}
+        ref = lance.dataset(path).to_table(nearest=nearest, columns=["id"])
+        got = nl.dataset(path).to_table(nearest=nearest, columns=["id"])
+        _same(ref, got, 64)
+
+
+def test_approx_mode_rejects_unknown_names(built):
     path = built[SEEDS[0], DIMS[0], PARTS[0]]
     q = _queries(_vectors(DIMS[0], SEEDS[0]), SEEDS[0])[0]
-    with pytest.raises(NotSupportedError, match="approx_mode"):
-        nl.dataset(path).to_table(nearest={"column": "vec", "q": q, "k": 5, "approx_mode": mode})
-    exact = nl.dataset(path).to_table(nearest={"column": "vec", "q": q, "k": 5, "approx_mode": mode, "use_index": False})
-    assert exact.num_rows == 5
+    with pytest.raises(ValueError, match="approx_mode"):
+        nl.dataset(path).to_table(nearest={"column": "vec", "q": q, "k": 5, "approx_mode": "turbo"})
 
 
 # ── R2: nanolance builds IVF_RQ ─────────────────────────────────────────────────────────────────────────────
