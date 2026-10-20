@@ -169,9 +169,13 @@ jobs:
           set -o pipefail
           python3 tools/perf_gate.py --scalar /tmp/perf-scalar.json --vector /tmp/perf-vector.json \
             --fts /tmp/perf-fts.json --baseline-dir bench/results/perf | tee /tmp/gate.txt
+          # A runner CPU with no baseline yet: the next step records one, so later runs on it are gated.
+          if grep -q "no baseline for this machine" /tmp/gate.txt; then echo "missing=true" >> "$GITHUB_OUTPUT"; fi
 
-      - name: Record the index baseline for this runner (manual runs only)
-        if: ${{ inputs.record_perf_baseline && !inputs.skip_perf }}
+      # Recorded on a manual run that asks for it, and on a push whose runner CPU has no baseline yet
+      # (GitHub's runners come on several CPUs; without one the gate only checks correctness).
+      - name: Record the index baseline for this runner
+        if: ${{ !inputs.skip_perf && (inputs.record_perf_baseline || (github.event_name == 'push' && steps.gate.outputs.missing == 'true')) }}
         run: |
           SLUG=$(python3 -c "import os, sys; sys.path.insert(0, 'tools'); import perf_gate as g; print(f'{g.cpu_slug(g.cpu_name())}-{os.cpu_count()}c')")
           mkdir -p bench/results/perf
