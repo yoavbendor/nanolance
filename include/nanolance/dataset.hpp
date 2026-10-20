@@ -77,6 +77,16 @@ struct DatasetInfo {
 bool dataset_info(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
                   DatasetInfo& out, std::string& error);
 
+/// The transaction that made `version`: the bytes of its transaction file, or of its inline section.
+/// `found` is false when the version has none (no error).
+bool dataset_transaction(const std::filesystem::path& dataset_path, std::uint64_t version,
+                         std::vector<std::uint8_t>& bytes, bool& found, std::string& error);
+
+/// Lance's manifest_needs_migration for the version (the latest when `has_version` is false): a manifest an
+/// older writer made, which the next commit rewrites.
+bool dataset_needs_migration(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
+                             bool& out, std::string& error);
+
 /// Every version of the dataset, oldest first.
 bool dataset_versions(const std::filesystem::path& dataset_path, std::vector<DatasetVersionInfo>& out,
                       std::string& error);

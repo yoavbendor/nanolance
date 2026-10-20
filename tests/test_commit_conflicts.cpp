@@ -20,7 +20,10 @@
 #include <cstdio>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -275,6 +278,73 @@ void version_without_transaction_file_is_retryable() {
           "ours from version 1 is re-run on the latest and committed: " + error);
     const auto stats = nano_lance::commit_conflict_stats();
     check(stats.retried == 1 && stats.refused == 0, "a version without a transaction file is retryable");
+    std::error_code ec;
+    fs::remove_all(path, ec);
+}
+
+/// Pylance 12 writes a version's transaction inline in its manifest (field 21) as well as in a file.
+/// Rewrite version 2 that way and drop its file: the race is then decided by the inline transaction
+/// (Lance's read order) rather than as a version without one, which is retryable.
+void inline_transaction_decides_the_verdict() {
+    const fs::path path = "commit_conflicts_inline_transaction";
+    check(create_dataset(path), "create the dataset");
+    std::uint64_t version = 0;
+    std::string error;
+    check(nano_lance::dataset_update_config(path, {{"k", "1"}}, {}, version, error) && version == 2,
+          "theirs: update_config commits version 2");
+    pb::Manifest theirs;
+    check(nano_lance::load_manifest_version(path, 2, theirs, error) && !theirs.transaction_file.empty(),
+          "version 2 names its transaction file");
+    std::vector<std::uint8_t> transaction;
+    {
+        std::ifstream in(path / "_transactions" / theirs.transaction_file, std::ios::binary);
+        transaction.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    check(!transaction.empty(), "version 2's transaction file is read");
+    std::vector<std::uint8_t> protobuf;
+    // nanolance writes V2 names: 20 digits of u64::max - version.
+    const fs::path manifest_2 =
+        path / "_versions" / (std::to_string(std::numeric_limits<std::uint64_t>::max() - 2) + ".manifest");
+    const bool read_ok = nano_lance::read_manifest_file(manifest_2, protobuf, error);
+    check(read_ok, "read version 2's manifest: " + error);
+    // Field 21 (varint, wire type 0) = 0: the inline transaction is at offset 0 of the file.
+    protobuf.insert(protobuf.end(), {0xA8, 0x01, 0x00});
+    const auto put_u32 = [](std::vector<std::uint8_t>& out, std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            out.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+        }
+    };
+    // [u32 length][Transaction] [u32 length][Manifest] [trailer: u64 manifest position, u32, "LANC"]
+    std::vector<std::uint8_t> file;
+    put_u32(file, static_cast<std::uint32_t>(transaction.size()));
+    file.insert(file.end(), transaction.begin(), transaction.end());
+    const auto manifest_at = static_cast<std::uint64_t>(file.size());
+    put_u32(file, static_cast<std::uint32_t>(protobuf.size()));
+    file.insert(file.end(), protobuf.begin(), protobuf.end());
+    for (int i = 0; i < 8; ++i) {
+        file.push_back(static_cast<std::uint8_t>(manifest_at >> (8 * i)));
+    }
+    put_u32(file, 0);
+    file.insert(file.end(), {'L', 'A', 'N', 'C'});
+    {
+        std::ofstream out(manifest_2, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+    }
+    remove_transaction_files(path, 1);
+
+    std::vector<std::uint8_t> read_back;
+    bool found = false;
+    const bool read_back_ok = nano_lance::dataset_transaction(path, 2, read_back, found, error);
+    check(read_back_ok && found && read_back == transaction,
+          "version 2's transaction is read from its manifest: " + error);
+    nano_lance::reset_commit_conflict_stats();
+    check(!nano_lance::dataset_update_config(path, {{"k", "2"}}, {}, version, error, 1U),
+          "ours from version 1: refused by the inline transaction");
+    check(error == "Incompatible transaction: This UpdateConfig transaction is incompatible with concurrent "
+                   "transaction UpdateConfig at version 2.",
+          "decided by the inline transaction, got: " + error);
+    const auto stats = nano_lance::commit_conflict_stats();
+    check(stats.retried == 0 && stats.refused == 1, "an inline transaction is not treated as missing");
     std::error_code ec;
     fs::remove_all(path, ec);
 }
@@ -632,6 +702,7 @@ int main() {
     incompatible_is_not_rerun();
     delete_raced_by_restore_is_not_rerun();
     version_without_transaction_file_is_retryable();
+    inline_transaction_decides_the_verdict();
     delete_rebased_over_append();
     update_config_rebased_over_delete();
     create_index_rebased_over_append();

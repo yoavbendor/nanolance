@@ -120,3 +120,10 @@ optimize_indices, unindexed nested fragments scanned flat as pylance does), lanc
 column; a document is null when any struct above its leaf is null. Both targets pass (expected list
 1241). Rows tied on a score may come in either order between engines (tests compare scores in order and
 rows with their scores).
+
+**S outcome (2026-10-20): task done.** Manifest field 21 (the inline transaction) is read when there is no
+transaction file, by `read_transaction` and by the C++ conflict classifier; `manifest_needs_migration` and
+`migrate_manifest_paths_v2` as pylance's (local datasets only: a rename on an object store is not atomic).
+The target passes (expected list 1242). Recorded, not changed: nanolance writes V2 manifest names for new
+datasets even with `enable_v2_manifest_paths=False`; `manifest_needs_migration` does not check the
+presence of physical_rows / num_deleted_rows.

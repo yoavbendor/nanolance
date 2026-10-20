@@ -57,6 +57,16 @@ enum class WriteKind {
 bool check_manifest_readable(const pb::Manifest& manifest, std::string& error);
 bool check_manifest_writable(const pb::Manifest& manifest, WriteKind kind, std::string& error);
 
+/// The inline transaction of version `version` (field 21 of its manifest): the protobuf body of the
+/// `Transaction` message, read from the manifest file. False with `error` when the manifest has no such
+/// section or it cannot be read.
+bool read_inline_transaction(const std::filesystem::path& dataset_path, std::uint64_t version,
+                             const pb::Manifest& manifest, std::vector<std::uint8_t>& body, std::string& error);
+
+/// Rename every V1 manifest name (`{version}.manifest`) in `_versions` to its V2 name, as Lance's
+/// migrate_manifest_paths_v2 does. Versions are unchanged; V2 and detached names are left alone.
+bool migrate_manifest_names_v2(const std::filesystem::path& dataset_path, std::string& error);
+
 bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifest& out, std::uint64_t& version_out,
                           std::string& error);
 

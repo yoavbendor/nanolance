@@ -48,7 +48,9 @@
 #include <string>
 #include <vector>
 
+#include "nanolance/dataset.hpp"
 #include "nanolance/dataset_commit.hpp"
+#include "nanolance/manifest_reader.hpp"
 #include "nanolance/work_stats.hpp"
 
 namespace nb = nanobind;
@@ -1281,6 +1283,32 @@ NB_MODULE(_nanolance, m) {
         return sequence.to_vector();
     }, nb::arg("data"));
     m.def("_ds_info", &ds_info, nb::arg("path"), nb::arg("version").none());
+    m.def("_ds_transaction", [](const std::filesystem::path& path, std::uint64_t version) -> std::optional<nb::bytes> {
+        std::vector<std::uint8_t> bytes;
+        bool found = false;
+        std::string error;
+        if (!nano_lance::dataset_transaction(path, version, bytes, found, error)) {
+            throw_dataset(error);
+        }
+        if (!found) {
+            return std::nullopt;
+        }
+        return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }, nb::arg("path"), nb::arg("version"));
+    m.def("_ds_needs_migration", [](const std::filesystem::path& path, std::uint64_t version) {
+        bool out = false;
+        std::string error;
+        if (!nano_lance::dataset_needs_migration(path, true, version, out, error)) {
+            throw_dataset(error);
+        }
+        return out;
+    }, nb::arg("path"), nb::arg("version"));
+    m.def("_ds_migrate_manifest_paths_v2", [](const std::filesystem::path& path) {
+        std::string error;
+        if (!nano_lance::migrate_manifest_names_v2(path, error)) {
+            throw_dataset(error);
+        }
+    }, nb::arg("path"));
     m.def("_ds_versions", &ds_versions, nb::arg("path"));
     m.def("_set_storage_options", &ds_set_storage_options, nb::arg("uri"), nb::arg("options"));
     m.def("_ds_latest_version", [](const std::filesystem::path& path) {

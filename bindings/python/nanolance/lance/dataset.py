@@ -2009,20 +2009,21 @@ class LanceDataset(pa.dataset.Dataset):
         return DatasetOptimizer(self)
 
     def read_transaction(self, version: int) -> Optional["Transaction"]:
-        """The transaction that made ``version``, from the file its manifest names; None without one."""
+        """The transaction that made ``version``: its transaction file, or the inline one in its manifest
+        (pylance 12 writes both); None without one."""
         from nanolance.lance._transactions import decode_transaction
 
         with native():
-            info = _nanolance._ds_info(self._uri, int(version))
-        name = info.get("transaction_file") or ""
-        if not name:
-            return None
-        try:
-            with open(os.path.join(self._uri, "_transactions", name), "rb") as handle:
-                data = handle.read()
-        except FileNotFoundError:
-            return None
-        return decode_transaction(data)
+            data = _nanolance._ds_transaction(self._uri, int(version))
+        return None if data is None else decode_transaction(data)
+
+    def migrate_manifest_paths_v2(self) -> None:
+        """Rename the V1 manifest names (``{version}.manifest``) to the V2 names pylance's default writes
+        (20 digits), as Lance's migrate_manifest_paths_v2 does. The dataset moves to its latest version."""
+        refuse_object_store_write(self._uri, "migrate manifest paths")
+        with native():
+            _nanolance._ds_migrate_manifest_paths_v2(self._uri)
+        self._refresh_latest("MigrateManifestPaths")
 
     def delta(self, compared_against: Optional[int] = None, *, begin_version: Optional[int] = None,
               end_version: Optional[int] = None) -> DatasetDelta:

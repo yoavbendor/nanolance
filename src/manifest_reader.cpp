@@ -13,6 +13,8 @@
 #include <sstream>
 #include <limits>
 #include <iomanip>
+#include <memory>
+#include <system_error>
 
 namespace nano_lance {
 namespace {
@@ -38,28 +40,38 @@ std::uint64_t read_le64(const unsigned char* p) {
 
 constexpr std::size_t kManifestV2Digits = 20U;
 
-/// The IndexSection message at `position` of a manifest: [u32 length][protobuf], as Lance's
-/// write_protobuf lays every message out.
-bool read_index_section(io::ByteSource& src, std::uint64_t position, std::vector<pb::IndexMetadata>& out,
-                        std::string& error) {
+/// The message body at `position` of a manifest: [u32 length][protobuf], as Lance's write_protobuf lays
+/// every message out. `what` names the message in the errors.
+bool read_message_body(io::ByteSource& src, std::uint64_t position, const char* what,
+                       std::vector<std::uint8_t>& body, std::string& error) {
     const std::uint64_t file_size = src.size();
     unsigned char len_le[4]{};
     if (position > file_size || file_size - position < 4U) {
-        error = "manifest index section is past the end of the file";
+        error = std::string("manifest ") + what + " is past the end of the file";
         return false;
     }
     if (!read_range(src, position, 4, len_le, error)) {
-        error = "failed to read the manifest index section";
+        error = std::string("failed to read the manifest ") + what;
         return false;
     }
     const std::uint32_t length = read_le32(len_le);
     if (length > file_size - position - 4U) {
-        error = "manifest index section runs past the end of the file";
+        error = std::string("manifest ") + what + " runs past the end of the file";
         return false;
     }
-    std::vector<std::uint8_t> body(length);
+    body.assign(length, 0);
     if (length != 0U && !read_range(src, position + 4U, length, body.data(), error)) {
-        error = "failed to read the manifest index section";
+        error = std::string("failed to read the manifest ") + what;
+        return false;
+    }
+    return true;
+}
+
+/// The IndexSection message at `position` of a manifest.
+bool read_index_section(io::ByteSource& src, std::uint64_t position, std::vector<pb::IndexMetadata>& out,
+                        std::string& error) {
+    std::vector<std::uint8_t> body;
+    if (!read_message_body(src, position, "index section", body, error)) {
         return false;
     }
     if (!pb::decode_index_section(body, out, error)) {
@@ -67,6 +79,43 @@ bool read_index_section(io::ByteSource& src, std::uint64_t position, std::vector
         return false;
     }
     return true;
+}
+
+/// The V2 name of version `v`: 20 digits of `u64::MAX - v`, so the newest sorts first.
+std::string manifest_name_v2(std::uint64_t v) {
+    std::ostringstream inverted;
+    inverted << std::setfill('0') << std::setw(static_cast<int>(kManifestV2Digits))
+             << (std::numeric_limits<std::uint64_t>::max() - v);
+    return inverted.str() + ".manifest";
+}
+
+/// The manifest file of version `v`, in whichever naming scheme it has. Each candidate is opened once: a
+/// remote one costs a round trip per open. Null with `error` when there is none.
+std::unique_ptr<io::ByteSource> open_version_manifest(const std::filesystem::path& dataset_path, std::uint64_t v,
+                                                      std::string& error) {
+    error.clear();
+    std::vector<std::filesystem::path> candidates;
+    if ((v & (1ULL << 63U)) != 0U) {  // a detached version: `d<version>.manifest`
+        candidates.push_back(dataset_path / "_versions" / ("d" + std::to_string(v) + ".manifest"));
+    } else {
+        // The version is scheme-independent, so try both spellings rather than assuming one. A dataset
+        // nanolance appended to after pylance created it can legitimately hold a mix.
+        candidates.push_back(dataset_path / "_versions" / (std::to_string(v) + ".manifest"));
+        candidates.push_back(dataset_path / "_versions" / manifest_name_v2(v));
+    }
+    for (const auto& candidate : candidates) {
+        std::string open_error;
+        auto source = io::open_source(candidate.string(), open_error);
+        if (source) {
+            return source;
+        }
+        if (io::exists(candidate.string())) {
+            error = "failed to open manifest file";
+            return nullptr;
+        }
+    }
+    error = "version " + std::to_string(v) + " not found";
+    return nullptr;
 }
 }  // namespace
 
@@ -300,33 +349,50 @@ bool load_manifest_version(const std::filesystem::path& dataset_path, std::uint6
                            std::string& error) {
     error.clear();
     out = pb::Manifest{};
-    // The version is scheme-independent, so try both spellings rather than assuming one. A dataset
-    // nanolance appended to after pylance created it can legitimately hold a mix. Each candidate is
-    // opened once: a remote one costs a round trip per open.
-    std::vector<std::filesystem::path> candidates;
-    if ((v & (1ULL << 63U)) != 0U) {  // a detached version: `d<version>.manifest`
-        candidates.push_back(dataset_path / "_versions" / ("d" + std::to_string(v) + ".manifest"));
-    } else {
-        candidates.push_back(dataset_path / "_versions" / (std::to_string(v) + ".manifest"));
-        std::ostringstream inverted;
-        inverted << std::setfill('0') << std::setw(static_cast<int>(kManifestV2Digits))
-                 << (std::numeric_limits<std::uint64_t>::max() - v);
-        candidates.push_back(dataset_path / "_versions" / (inverted.str() + ".manifest"));
+    auto source = open_version_manifest(dataset_path, v, error);
+    if (!source) {
+        return false;
     }
-    for (const auto& candidate : candidates) {
-        std::string open_error;
-        const auto source = io::open_source(candidate.string(), open_error);
-        if (!source) {
-            if (io::exists(candidate.string())) {
-                error = "failed to open manifest file";
-                return false;
-            }
+    return load_manifest_source(*source, out, error, true);
+}
+
+bool read_inline_transaction(const std::filesystem::path& dataset_path, std::uint64_t version,
+                             const pb::Manifest& manifest, std::vector<std::uint8_t>& body, std::string& error) {
+    error.clear();
+    body.clear();
+    if (!manifest.has_transaction_section) {
+        error = "manifest has no transaction section";
+        return false;
+    }
+    auto source = open_version_manifest(dataset_path, version, error);
+    if (!source) {
+        return false;
+    }
+    return read_message_body(*source, manifest.transaction_section, "transaction section", body, error);
+}
+
+bool migrate_manifest_names_v2(const std::filesystem::path& dataset_path, std::string& error) {
+    error.clear();
+    std::vector<io::DirEntry> entries;
+    if (!io::list_dir((dataset_path / "_versions").string(), entries, error)) {
+        return false;
+    }
+    for (const auto& entry : entries) {
+        std::uint64_t version = 0;
+        // Only V1 names (`{version}.manifest`, not 20 digits) move; V2 names and detached ones stay.
+        if (entry.is_dir || !parse_manifest_version(entry.name, version) ||
+            entry.name.size() - std::string(".manifest").size() == kManifestV2Digits) {
             continue;
         }
-        return load_manifest_source(*source, out, error, true);
+        std::error_code ec;
+        std::filesystem::rename(dataset_path / "_versions" / entry.name,
+                                dataset_path / "_versions" / manifest_name_v2(version), ec);
+        if (ec) {
+            error = "failed to rename manifest " + entry.name + ": " + ec.message();
+            return false;
+        }
     }
-    error = "version " + std::to_string(v) + " not found";
-    return false;
+    return true;
 }
 
 bool load_latest_manifest(const std::filesystem::path& dataset_path, pb::Manifest& out, std::uint64_t& version_out,

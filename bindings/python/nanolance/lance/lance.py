@@ -316,6 +316,13 @@ class Compaction:
         return CompactionMetrics(**{k: int(v) for k, v in metrics.items() if not k.startswith("indexes_")})
 
 
+def manifest_needs_migration(dataset) -> bool:
+    """Whether the dataset's latest manifest was written by an older writer, so the next commit rewrites it
+    (Lance's manifest_needs_migration)."""
+    with native():
+        return bool(_nanolance._ds_needs_migration(dataset.uri, int(dataset.version)))
+
+
 def __getattr__(name: str):
     from nanolance.lance._stubs import placeholder
 

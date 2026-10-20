@@ -411,6 +411,7 @@ tests/test_dataset.py::test_merge_with_commit
 tests/test_dataset.py::test_merge_with_schema_holes
 tests/test_dataset.py::test_metadata_apis_return_post_image
 tests/test_dataset.py::test_metadata_cache_size
+tests/test_dataset.py::test_migrate_manifest
 tests/test_dataset.py::test_nested_projection
 tests/test_dataset.py::test_nested_projection_list
 tests/test_dataset.py::test_null_reader_with_deletes

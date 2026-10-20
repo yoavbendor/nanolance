@@ -19,6 +19,7 @@
 #include "transaction_file.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -79,20 +80,44 @@ std::string retryable_error(std::uint64_t version, const std::string& ours, cons
            std::to_string(version) + ". Please retry.";
 }
 
-/// The operation a version committed, from its transaction file. False with `reason` when it has none,
-/// or the file cannot be read or decoded.
-bool concurrent_operation(const std::filesystem::path& dataset_path, const pb::Manifest& manifest, Operation& op,
-                          std::string& reason) {
-    if (manifest.transaction_file.empty()) {
-        reason = "no transaction file";
-        return false;
-    }
-    std::ifstream in(dataset_path / "_transactions" / manifest.transaction_file, std::ios::binary);
+/// The whole of a transaction file: `_transactions/{name}`. False when it cannot be read.
+bool read_transaction_file(const std::filesystem::path& dataset_path, const std::string& name, OpBytes& bytes) {
+    std::ifstream in(dataset_path / "_transactions" / name, std::ios::binary);
     if (!in) {
-        reason = "an unreadable transaction file";
         return false;
     }
-    const OpBytes bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return true;
+}
+
+/// The bytes of the transaction that made `version`, as Lance reads it: its transaction file when that
+/// is named and readable, else the inline section of its manifest (field 21, which pylance 12 writes
+/// beside the file). False with `reason` when neither is there.
+bool version_transaction_bytes(const std::filesystem::path& dataset_path, std::uint64_t version,
+                               const pb::Manifest& manifest, OpBytes& bytes, std::string& reason) {
+    if (!manifest.transaction_file.empty() && read_transaction_file(dataset_path, manifest.transaction_file, bytes)) {
+        return true;
+    }
+    if (manifest.has_transaction_section) {
+        std::string error;
+        if (read_inline_transaction(dataset_path, version, manifest, bytes, error)) {
+            return true;
+        }
+        reason = "an unreadable transaction section";
+        return false;
+    }
+    reason = manifest.transaction_file.empty() ? "no transaction file" : "an unreadable transaction file";
+    return false;
+}
+
+/// The operation a version committed, from its transaction (see version_transaction_bytes). False with
+/// `reason` when it has none, or it cannot be read or decoded.
+bool concurrent_operation(const std::filesystem::path& dataset_path, std::uint64_t version,
+                          const pb::Manifest& manifest, Operation& op, std::string& reason) {
+    OpBytes bytes;
+    if (!version_transaction_bytes(dataset_path, version, manifest, bytes, reason)) {
+        return false;
+    }
     std::uint32_t field = 0;
     OpBytes message;
     std::string why;
@@ -215,7 +240,7 @@ Outcome classify_concurrent(const std::filesystem::path& dataset_path, const pb:
         }
         Operation theirs;
         std::string reason;
-        if (!concurrent_operation(dataset_path, committed, theirs, reason)) {
+        if (!concurrent_operation(dataset_path, version, committed, theirs, reason)) {
             error = retryable_error(version, ours_name, "an operation (" + reason + ")");
             return Outcome::Refused;
         }
@@ -402,6 +427,65 @@ bool dataset_latest_version(const std::filesystem::path& dataset_path, std::uint
         error = "Dataset at path " + dataset_path.string() + " was not found";
         return false;
     }
+    return true;
+}
+
+bool dataset_transaction(const std::filesystem::path& dataset_path, std::uint64_t version, OpBytes& bytes,
+                         bool& found, std::string& error) {
+    found = false;
+    bytes.clear();
+    pb::Manifest manifest;
+    if (!load_manifest_version(dataset_path, version, manifest, error)) {
+        return false;
+    }
+    // A named transaction file that is gone counts as none, as it always has; an inline section is read.
+    if (!manifest.transaction_file.empty() && read_transaction_file(dataset_path, manifest.transaction_file, bytes)) {
+        found = true;
+        return true;
+    }
+    if (!manifest.has_transaction_section) {
+        return true;
+    }
+    if (!read_inline_transaction(dataset_path, version, manifest, bytes, error)) {
+        return false;
+    }
+    found = true;
+    return true;
+}
+
+namespace {
+
+/// Lance's must_recalculate_fragment_bitmap: an index whose coverage is unknown, or that an older Lance
+/// (before 0.8.15) wrote, is rebuilt by the next commit.
+bool bitmap_needs_recalculation(const pb::IndexMetadata& index, const pb::Manifest& manifest) {
+    if (!index.has_fragment_bitmap) {
+        return true;
+    }
+    if (manifest.writer_library != "lance") {
+        return false;
+    }
+    unsigned major = 0;
+    unsigned minor = 0;
+    unsigned patch = 0;
+    if (std::sscanf(manifest.writer_version.c_str(), "%u.%u.%u", &major, &minor, &patch) != 3) {
+        return true;
+    }
+    return major == 0 && (minor < 8 || (minor == 8 && patch < 15));
+}
+
+}  // namespace
+
+bool dataset_needs_migration(const std::filesystem::path& dataset_path, bool has_version, std::uint64_t version,
+                             bool& out, std::string& error) {
+    pb::Manifest manifest;
+    if (!load(dataset_path, has_version, version, manifest, error)) {
+        return false;
+    }
+    // Lance's manifest_needs_migration. Not checked: physical_rows and deletion num_deleted_rows being
+    // absent; the reader does not keep their presence, and every Lance writes them.
+    out = manifest.writer_library.empty() ||
+          std::any_of(manifest.indices.begin(), manifest.indices.end(),
+                      [&](const pb::IndexMetadata& index) { return bitmap_needs_recalculation(index, manifest); });
     return true;
 }
 
