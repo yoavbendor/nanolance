@@ -175,3 +175,13 @@ refine_factor, as Lance's scanner does it: XTR keeps k * refine_factor rows, re-
 but distances 1.4e-4 to 3e-4 apart; plain (single-vector) float16 IVF_FLAT search has the same gap today,
 so it is in the float16 path, not in XTR (likely how a cosine index stores normalized float16 vectors).
 Next: M2c (lance-c), then M3 (builds), which the pylance target tests need.
+
+**M3 outcome (2026-10-20):** done in one Haiku session; reviewed. nanolance builds every kind pylance
+builds over multivector columns (IVF_FLAT, IVF_PQ, IVF_SQ, IVF_HNSW_FLAT / SQ / PQ; float32 and float16;
+cosine only, L2 and dot refused with pylance's message): one entry per vector with its row id, the
+training sample taken by rows as Lance takes it, float16 vectors and tensors stored as pylance stores
+them. pylance searches nanolance's indexes with nanolance's answers (float32 exactly; float16 within 2e-3,
+rows equal up to near-ties: the open float16 gap of M2b); recall within 0.01 of pylance's (IVF_PQ, mean of
+3 builds). Single-vector index files byte-identical before and after. The four target tests pass
+(`test_multivec_search_paths`, `test_multivec_ann`, `test_ivf_centroids_multivector_fragment_ids`,
+`test_multi_vector_field`; expected list 1214). Left: M2c (lance-c multivector search).

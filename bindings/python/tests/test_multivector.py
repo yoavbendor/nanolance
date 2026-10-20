@@ -8,6 +8,8 @@ the sum; see the index tests at the end), and refine_factor rescores the candida
 
 from __future__ import annotations
 
+import collections
+import glob
 import uuid
 
 import numpy as np
@@ -315,3 +317,157 @@ def test_float16_index_matches_pylance(lance, tmp_path, kind, kw):
             assert got["id"].to_pylist() == ref["id"].to_pylist()
             _same(ref, got, rtol=1e-6 if refine else 5e-4, atol=1e-6 if refine else 5e-4)
 
+
+
+# -- Builds: nanolance writes the indexes pylance 12 writes over a multivector column (M3) --
+
+
+def _table(rows, elem, dim=DIM):
+    vt = pa.list_(pa.list_(elem, dim))
+    return pa.table({"id": pa.array(np.arange(len(rows)), pa.int64()), "vec": pa.array(rows, type=vt)})
+
+
+def _built_dataset(tmp_path, name, rows, kind, kw=None, elem=pa.float32(), parts=2):
+    """``rows`` written and indexed by nanolance: a cosine index of ``kind`` over the whole column."""
+    path = str(tmp_path / f"{name}.lance")
+    nl.write_dataset(_table(rows, elem), path)
+    nl.dataset(path).create_index("vec", index_type=kind, metric="cosine", num_partitions=parts, **(kw or {}))
+    return path
+
+
+def _same_modulo_ties(ref, got, tol):
+    """float16 distances differ by about 1e-3 between the engines, so rows whose distances tie (or nearly)
+    may swap places: the distances agree rank by rank to ``tol``, and every row clearly inside the top k
+    (more than 2 * tol from the k-th distance) is in both answers."""
+    rd, gd = ref["_distance"].to_numpy(), got["_distance"].to_numpy()
+    assert len(rd) == len(gd)
+    np.testing.assert_allclose(gd, rd, rtol=0, atol=tol)
+    rids, gids = ref["id"].to_pylist(), got["id"].to_pylist()
+    cut = rd[-1] - 2 * tol if len(rd) else 0.0
+    for rid, d in zip(rids, rd):
+        assert d >= cut or rid in gids, (rid, d)
+    for gid, d in zip(gids, gd):
+        assert d >= cut or gid in rids, (gid, d)
+
+
+@pytest.mark.parametrize("kind, kw", INDEX_KINDS)
+@pytest.mark.parametrize("elem", [pa.float32(), pa.float16()])
+def test_nanolance_built_index_is_searched_as_pylance_searches_it(lance, tmp_path, kind, kw, elem):
+    """Every kind nanolance builds over a multivector column: pylance searches it, and nanolance searches
+    it. Float32: the same rows and order, plain and fast_search, distances to 1e-6. Float16: the distances
+    agree to 2e-3 and the rows agree up to near-ties (see _same_modulo_ties)."""
+    rng = np.random.default_rng(61)
+    rows = _dense(rng, 480)  # enough vectors to train PQ (256) on
+    path = _built_dataset(tmp_path, f"built_{kind}_{elem}", rows, kind, kw, elem)
+    query = rng.standard_normal((3, DIM)).astype(np.float32)
+    f32 = elem == pa.float32()
+    for nprobes in (1, 2):
+        for k in (5, 50):
+            for extra in ({}, {"fast_search": True}) if f32 else ({},):
+                nearest = {"column": "vec", "q": query, "k": k, "metric": "cosine", "nprobes": nprobes}
+                ref = nl.dataset(path).to_table(columns=["id"], nearest=nearest, **extra)
+                got = lance.dataset(path).to_table(columns=["id"], nearest=nearest, **extra)
+                if f32:
+                    _same(ref, got)
+                else:
+                    _same_modulo_ties(ref, got, 2e-3)
+
+
+@pytest.mark.parametrize("elem", [pa.float32(), pa.float16()])
+def test_built_index_layout_matches_pylance(lance, tmp_path, elem):
+    """The files of an IVF_FLAT build: auxiliary.idx holds one row per vector (a row id per vector, the
+    vectors as halffloat for float16), with pylance's schema and metadata; index.idx has pylance's metadata."""
+    from lance.file import LanceFileReader
+
+    rng = np.random.default_rng(71)
+    rows = _dense(rng, 120)
+    built = _built_dataset(tmp_path, f"layout_n_{elem}", rows, "IVF_FLAT", None, elem)
+    made = _ivf_flat_dataset(lance, tmp_path, f"layout_p_{elem}", rows, 120, 2, "IVF_FLAT", None, elem)
+
+    def files(path, name):
+        return glob.glob(f"{path}/_indices/*/{name}")[0]
+
+    aux_n = LanceFileReader(files(built, "auxiliary.idx")).read_all().to_table()
+    aux_p = LanceFileReader(files(made, "auxiliary.idx")).read_all().to_table()
+    assert aux_n.schema.types == aux_p.schema.types
+    assert aux_n.schema.metadata == aux_p.schema.metadata
+    total = sum(len(r) for r in rows)
+    assert aux_n.num_rows == total
+    counts = collections.Counter(aux_n.column("_rowid").to_pylist())
+    assert counts == {i: len(r) for i, r in enumerate(rows)}  # each row id once per vector
+    idx_n = LanceFileReader(files(built, "index.idx")).metadata().schema.metadata
+    idx_p = LanceFileReader(files(made, "index.idx")).metadata().schema.metadata
+    assert idx_n == idx_p
+
+
+@pytest.mark.parametrize("metric", ["l2", "dot"])
+def test_build_refuses_non_cosine_as_pylance_does(lance, tmp_path, metric):
+    rng = np.random.default_rng(81)
+    rows = _dense(rng, 60)
+    message = "multivector type supports only cosine distance"
+    path = str(tmp_path / f"refuse_{metric}.lance")
+    lance.write_dataset(_table(rows, pa.float32()), path)
+    with pytest.raises(RuntimeError, match=message):
+        lance.dataset(path).create_index("vec", index_type="IVF_FLAT", metric=metric, num_partitions=2)
+    with pytest.raises(RuntimeError, match=message):
+        nl.dataset(path).create_index("vec", index_type="IVF_FLAT", metric=metric, num_partitions=2)
+    assert nl.dataset(path).list_indices() == []
+
+
+def test_optimize_indices_after_nanolance_build_matches_pylance(lance, tmp_path):
+    """Rows appended after a nanolance build are unindexed until optimize_indices indexes them; then both
+    engines' plain and fast searches agree on the whole column."""
+    rng = np.random.default_rng(91)
+    rows = _dense(rng, 200)
+    path = _built_dataset(tmp_path, "optimize_built", rows[:120], "IVF_FLAT", None, pa.float32(), parts=4)
+    nl.write_dataset(_table(rows, pa.float32()).slice(120), path, mode="append")
+    nl.dataset(path).optimize.optimize_indices()
+    query = rng.standard_normal((3, DIM)).astype(np.float32)
+    for extra in ({}, {"fast_search": True}):
+        nearest = {"column": "vec", "q": query, "k": 50, "metric": "cosine", "nprobes": 2}
+        _same(lance.dataset(path).to_table(columns=["id"], nearest=nearest, **extra),
+              nl.dataset(path).to_table(columns=["id"], nearest=nearest, **extra))
+
+
+def _topic_rows(rng, n, vectors, dim):
+    """One topic per row: each row's vectors are its topic plus noise, so a query made of a row's vectors
+    has a few true neighbours (the recall is meaningful, unlike on random rows)."""
+    centers = rng.standard_normal((n, dim)).astype(np.float32)
+    rows = [(centers[r] + 0.25 * rng.standard_normal((vectors, dim))).astype(np.float32).tolist() for r in range(n)]
+    return rows, centers
+
+
+def test_nanolance_ivf_pq_recall_within_pylance(lance, tmp_path):
+    """IVF_PQ over 2,000 rows of 8 vectors: recall@10 of nanolance's index against pylance's, the exact
+    answer as truth, the mean over three seeded builds each; the two means differ by at most 0.03."""
+    rng = np.random.default_rng(101)
+    n, vectors, dim = 2000, 8, 32
+    rows, centers = _topic_rows(rng, n, vectors, dim)
+    queries = [(centers[rng.integers(0, n, 4)] + 0.25 * rng.standard_normal((4, dim))).astype(np.float32)
+               for _ in range(20)]
+    src = str(tmp_path / "recall_src.lance")
+    nl.write_dataset(_table(rows, pa.float32(), dim), src)
+    truth = [set(nl.dataset(src).to_table(columns=["id"], nearest={
+        "column": "vec", "q": q, "k": 10, "metric": "cosine", "use_index": False})["id"].to_pylist())
+        for q in queries]
+
+    def mean_recall(engine, path):
+        hits = 0.0
+        for q, gt in zip(queries, truth):
+            got = engine.dataset(path).to_table(columns=["id"], nearest={
+                "column": "vec", "q": q, "k": 10, "metric": "cosine", "nprobes": 16, "refine_factor": 2})
+            hits += len(set(got["id"].to_pylist()) & gt) / 10
+        return hits / len(queries)
+
+    means = {}
+    for name, engine in (("nanolance", nl), ("pylance", lance)):
+        scores = []
+        for seed in (1, 2, 3):
+            path = str(tmp_path / f"recall_{name}_{seed}.lance")
+            engine.write_dataset(_table(rows, pa.float32(), dim), path)
+            engine.dataset(path).create_index("vec", index_type="IVF_PQ", metric="cosine", num_partitions=16,
+                                              num_sub_vectors=8, seed=seed)
+            scores.append(mean_recall(engine, path))
+        means[name] = float(np.mean(scores))
+        assert means[name] > 0.2  # the test measures something: random answers would score about 0.005
+    assert abs(means["nanolance"] - means["pylance"]) <= 0.03, means

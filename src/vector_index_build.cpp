@@ -19,6 +19,7 @@
 #include "index_build.hpp"
 #include "nanolance/vector_search.hpp"
 
+#include "float16.hpp"
 #include "float_text.hpp"
 #include "hnsw_build.hpp"
 #include "index_files.hpp"
@@ -104,6 +105,21 @@ std::vector<std::uint8_t> tensor_message(const std::vector<std::uint64_t>& shape
     put_varint(out, 2);  // FLOAT32
     put_packed(out, 2, shape);
     put_bytes(out, 3, data.data(), data.size() * sizeof(float));
+    return out;
+}
+
+/// Tensor { data_type = FLOAT16, shape, data }: the values, already rounded to binary16 (pylance's
+/// centroids of a float16 multivector index).
+std::vector<std::uint8_t> tensor_message_half(const std::vector<std::uint64_t>& shape, const std::vector<float>& data) {
+    std::vector<std::uint16_t> bits(data.size());
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        bits[i] = float16_bits(data[i]);
+    }
+    std::vector<std::uint8_t> out;
+    put_key(out, 1, 0);
+    put_varint(out, 1);  // FLOAT16
+    put_packed(out, 2, shape);
+    put_bytes(out, 3, bits.data(), bits.size() * sizeof(std::uint16_t));
     return out;
 }
 
@@ -920,12 +936,28 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         }
         type = next;
     }
+    // A multivector column (a list of fixed-size lists): its vectors are the list's items, and Lance
+    // builds these with cosine only (its message, lance-12 index/vector.rs).
+    const bool multi = type->format != nullptr && std::string(type->format) == "+l";
+    if (multi) {
+        if (options.metric != VectorMetric::Cosine) {
+            error = "Build Vector Index: multivector type supports only cosine distance";
+            return false;
+        }
+        if (type->n_children != 1 || type->children[0] == nullptr) {
+            error = "Vector column " + column + " must be a list of fixed-size lists of float32";
+            return false;
+        }
+        type = type->children[0];
+    }
     const std::string format = type->format == nullptr ? "" : type->format;
     const std::string item = type->n_children == 1 && type->children[0]->format != nullptr ? type->children[0]->format : "";
     // Training alone (IndicesBuilder) takes float16 and float64 vectors too, as Lance's does; the
-    // index files nanolance writes hold float32.
+    // index files nanolance writes hold float32. A multivector index over float16 vectors stores
+    // float16, as pylance's does (auxiliary.idx "flat" is halffloat).
     const bool trains_only = target != nullptr && target->trained != nullptr;
-    if (format.rfind("+w:", 0) != 0 || !(item == "f" || (trains_only && (item == "e" || item == "g")))) {
+    const bool half_storage = multi && item == "e";
+    if (format.rfind("+w:", 0) != 0 || !(item == "f" || half_storage || (trains_only && (item == "e" || item == "g")))) {
         error = "Vector column " + column + " must be a fixed-size list of float32 (got '" + format + "' of '" + item +
                 "')";
         return false;
@@ -958,7 +990,51 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
 
     Rows data;
     data.d = dim;
-    std::vector<std::uint64_t> ids;
+    std::vector<std::uint64_t> ids;  // one per vector: a multivector row's id repeats for each of its vectors
+    std::vector<std::size_t> row_starts;  // multivector: the first vector of each row that has vectors (+ the end)
+    const bool widen = item != "f";
+    const bool half = item == "e";
+    std::vector<float> widened(widen ? dim : 0U);
+    // Appends the vector at `at` (its index in `fsl`, offset applied) unless it holds NaN or infinite
+    // values; for cosine it is normalized first. False when it is left out.
+    const auto add_vector = [&](const ArrowArrayView* fsl, std::int64_t at) {
+        const ArrowArrayView* items = fsl->children[0];
+        const float* v = nullptr;
+        if (widen) {
+            const std::int64_t first = items->offset + at * static_cast<std::int64_t>(dim);
+            for (std::size_t j = 0; j < dim; ++j) {
+                widened[j] = half ? ArrowHalfFloatToFloat(items->buffer_views[1].data.as_uint16[first + j])
+                                  : static_cast<float>(items->buffer_views[1].data.as_double[first + j]);
+            }
+            v = widened.data();
+        } else {
+            v = items->buffer_views[1].data.as_float + items->offset + at * static_cast<std::int64_t>(dim);
+        }
+        if (!std::all_of(v, v + dim, [](float x) { return std::isfinite(x); })) {
+            return false;
+        }
+        if (options.metric == VectorMetric::Cosine) {
+            float norm = 0;
+            for (std::size_t j = 0; j < dim; ++j) {
+                norm += v[j] * v[j];
+            }
+            norm = std::sqrt(norm);
+            if (!(norm > 0.0F)) {
+                return false;
+            }
+            for (std::size_t j = 0; j < dim; ++j) {
+                data.v.push_back(v[j] / norm);
+            }
+        } else {
+            data.v.insert(data.v.end(), v, v + dim);
+        }
+        if (half_storage) {  // the index stores float16: the vector is rounded as it is stored
+            for (std::size_t j = data.v.size() - dim; j < data.v.size(); ++j) {
+                data.v[j] = ArrowHalfFloatToFloat(float16_bits(data.v[j]));
+            }
+        }
+        return true;
+    };
     for (const auto& batch : batches.v) {
         ArrowArrayView view;
         ArrowError e{};
@@ -980,49 +1056,36 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                 }
             }
         }
-        const ArrowArrayView* items = list->children[0];
         const ArrowArrayView* addrs = view.children[view.n_children - 1];
-        const float* values = items->buffer_views[1].data.as_float + items->offset;
-        const bool widen = item != "f";
-        const bool half = item == "e";
-        std::vector<float> widened(widen ? dim : 0U);
+        // A multivector column: `list` holds the rows' vector lists, `fsl` the vectors themselves.
+        const ArrowArrayView* fsl = multi ? list->children[0] : list;
         for (std::int64_t r = 0; r < batch.length; ++r) {
             const std::int64_t row = view.offset + r;
             if (ArrowArrayViewIsNull(list, row)) {
                 continue;
             }
-            const float* v = values + (list->offset + row) * static_cast<std::int64_t>(dim);
-            if (widen) {
-                const std::int64_t first = items->offset + (list->offset + row) * static_cast<std::int64_t>(dim);
-                for (std::size_t j = 0; j < dim; ++j) {
-                    widened[j] = half ? ArrowHalfFloatToFloat(items->buffer_views[1].data.as_uint16[first + j])
-                                             : static_cast<float>(items->buffer_views[1].data.as_double[first + j]);
+            const std::uint64_t id = to_row_id(ArrowArrayViewGetUIntUnsafe(addrs, row));
+            if (!multi) {
+                if (add_vector(fsl, fsl->offset + row)) {
+                    ids.push_back(id);
                 }
-                v = widened.data();
-            }
-            if (!std::all_of(v, v + dim, [](float x) { return std::isfinite(x); })) {
                 continue;
             }
-            if (options.metric == VectorMetric::Cosine) {
-                float norm = 0;
-                for (std::size_t j = 0; j < dim; ++j) {
-                    norm += v[j] * v[j];
+            const std::size_t first = ids.size();
+            const std::int32_t* offsets = list->buffer_views[1].data.as_int32;
+            for (std::int32_t e = offsets[list->offset + row]; e < offsets[list->offset + row + 1]; ++e) {
+                if (!ArrowArrayViewIsNull(fsl, e) && add_vector(fsl, fsl->offset + e)) {
+                    ids.push_back(id);
                 }
-                norm = std::sqrt(norm);
-                if (!(norm > 0.0F)) {
-                    continue;
-                }
-                for (std::size_t j = 0; j < dim; ++j) {
-                    data.v.push_back(v[j] / norm);
-                }
-            } else {
-                data.v.insert(data.v.end(), v, v + dim);
             }
-            ids.push_back(to_row_id(ArrowArrayViewGetUIntUnsafe(addrs, row)));
+            if (ids.size() > first) {
+                row_starts.push_back(first);
+            }
         }
         ArrowArrayViewReset(&view);
     }
     data.n = ids.size();
+    row_starts.push_back(data.n);  // the end of the last row
 
     std::size_t partitions = 0;
     if (options.num_partitions) {
@@ -1050,6 +1113,33 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                                               static_cast<std::uint64_t>(
                                                   std::chrono::steady_clock::now().time_since_epoch().count())));
 
+    // The training sample. A multivector column is sampled by rows, as Lance samples it (lance-12
+    // index/vector/utils.rs maybe_sample_training_data): about hint / (vectors per row) rows, at least
+    // 128, each with all its vectors. Vectors per row: the mean, rounded up. Other columns: the vectors.
+    const auto training_sample = [&](std::size_t hint) {
+        if (!multi) {
+            return sample_indices(data.n, hint, rng);
+        }
+        const std::size_t rows_n = row_starts.size() - 1U;
+        std::vector<std::size_t> all(data.n);
+        std::iota(all.begin(), all.end(), std::size_t{0});
+        if (rows_n == 0U) {
+            return all;
+        }
+        const std::size_t per_row = (data.n + rows_n - 1U) / rows_n;
+        const std::size_t want = std::max<std::size_t>(128U, (hint + per_row - 1U) / per_row);
+        if (rows_n <= want) {
+            return all;
+        }
+        std::vector<std::size_t> out;
+        for (const auto s : sample_indices(rows_n, want, rng)) {
+            for (std::size_t v = row_starts[s]; v < row_starts[s + 1U]; ++v) {
+                out.push_back(v);
+            }
+        }
+        return out;
+    };
+
     // IVF: train on a sample, then every vector to its nearest centroid.
     const bool dot_metric = options.metric == VectorMetric::Dot;
     const index_build::Progress* progress = target != nullptr ? target->progress : nullptr;
@@ -1061,8 +1151,13 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             centroids = model->centroids;
         } else {
             const auto train =
-                gather(data, sample_indices(data.n, std::size_t{options.sample_rate} * partitions, rng));
+                gather(data, training_sample(std::size_t{options.sample_rate} * partitions));
             centroids = kmeans(train, partitions, dot_metric, options.max_iters, rng, loss);
+        }
+        if (half_storage) {  // stored as float16: assigned against the rounded centroids
+            for (auto& c : centroids) {
+                c = ArrowHalfFloatToFloat(float16_bits(c));
+            }
         }
         return true;
     });
@@ -1127,7 +1222,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         if (!shuffle_first) {
             label.resize(data.n);  // the sample's rows are labelled below; the shuffle labels every row later
         }
-        const auto picked = sample_indices(data.n, std::size_t{options.sample_rate} * nc, rng);
+        const auto picked = training_sample(std::size_t{options.sample_rate} * nc);
         if (!shuffle_first) {
             std::vector<std::uint32_t> picked_label;
             assign(gather(data, picked), centroids, partitions, dot_metric, picked_label, nullptr);
@@ -1162,6 +1257,11 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             const auto c = kmeans_flat(subs[s], nc, false, options.max_iters, sub_rng, sub_loss);
             std::copy(c.begin(), c.end(), codebook.begin() + static_cast<std::ptrdiff_t>(s * nc * w));
         });
+        }
+        if (half_storage) {  // stored as float16: the codes are computed against the rounded codebook
+            for (auto& c : codebook) {
+                c = ArrowHalfFloatToFloat(float16_bits(c));
+            }
         }
         if (progress != nullptr) {
             (*progress)(2, "train_quantizer", 0, "", 0);
@@ -1267,7 +1367,7 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         } else {
             sq_start = std::numeric_limits<double>::max();
             sq_end = std::numeric_limits<double>::lowest();
-            for (const auto r : sample_indices(data.n, std::size_t{options.sample_rate} * 256U, rng)) {
+            for (const auto r : training_sample(std::size_t{options.sample_rate} * 256U)) {
                 const float* x = data.row(r);
                 for (std::size_t j = 0; j < dim; ++j) {
                     sq_start = std::min(sq_start, static_cast<double>(x[j]));
@@ -1365,14 +1465,23 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
             !(pq     ? fsl_schema("__pq_code", NANOARROW_TYPE_UINT8, static_cast<std::int64_t>(code_bytes), true,
                                   children[1])
               : sq_storage ? fsl_schema("__sq_code", NANOARROW_TYPE_UINT8, static_cast<std::int64_t>(dim), true, children[1])
-                     : fsl_schema("flat", NANOARROW_TYPE_FLOAT, static_cast<std::int64_t>(dim), false, children[1])) ||
+                     : fsl_schema("flat", half_storage ? NANOARROW_TYPE_HALF_FLOAT : NANOARROW_TYPE_FLOAT,
+                                  static_cast<std::int64_t>(dim), false, children[1])) ||
             !table_schema(children, schema.s)) {
             return fail("out of memory");
         }
         OwnedArray rowid;
         OwnedArray values;
         std::vector<float> flat;
-        if (flat_storage) {
+        std::vector<std::uint16_t> flat_half;  // a float16 multivector index: the same values, as halffloat
+        if (flat_storage && half_storage) {
+            flat_half.resize(data.n * dim);
+            for (std::size_t i = 0; i < data.n; ++i) {
+                for (std::size_t j = 0; j < dim; ++j) {
+                    flat_half[i * dim + j] = float16_bits(data.row(order[i])[j]);
+                }
+            }
+        } else if (flat_storage) {
             flat.resize(data.n * dim);
             for (std::size_t i = 0; i < data.n; ++i) {
                 std::memcpy(flat.data() + i * dim, data.row(order[i]), dim * sizeof(float));
@@ -1383,8 +1492,11 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
                                  static_cast<std::int64_t>(code_bytes), values.a)
               : sq_storage ? fsl_array(NANOARROW_TYPE_UINT8, 1, sq.data(), static_cast<std::int64_t>(data.n),
                                  static_cast<std::int64_t>(dim), values.a)
-                     : fsl_array(NANOARROW_TYPE_FLOAT, 4, flat.data(), static_cast<std::int64_t>(data.n),
-                                 static_cast<std::int64_t>(dim), values.a))) {
+                     : half_storage
+                         ? fsl_array(NANOARROW_TYPE_HALF_FLOAT, 2, flat_half.data(), static_cast<std::int64_t>(data.n),
+                                     static_cast<std::int64_t>(dim), values.a)
+                         : fsl_array(NANOARROW_TYPE_FLOAT, 4, flat.data(), static_cast<std::int64_t>(data.n),
+                                     static_cast<std::int64_t>(dim), values.a))) {
             return fail("out of memory");
         }
         OwnedArray batch;
@@ -1408,7 +1520,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         extras.schema_metadata["storage_metadata"] = bytes_of("[" + json_string(storage) + "]");
         extras.global_buffers.push_back(ivf_message(offsets, lengths, nullptr, nullptr));
         if (pq) {
-            extras.global_buffers.push_back(tensor_message({nc, dim}, codebook));
+            extras.global_buffers.push_back(half_storage ? tensor_message_half({nc, dim}, codebook)
+                                                         : tensor_message({nc, dim}, codebook));
         }
         if (!write_file(dir, "auxiliary.idx", schema.s, batch.a, extras, files, error)) {
             return fail(error);
@@ -1479,7 +1592,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         extras.schema_metadata["lance:index"] =
             bytes_of("{\"type\":\"" + options.type + "\",\"distance_type\":\"" + metric_name + "\"}");
         extras.schema_metadata["lance:ivf"] = bytes_of("1");
-        const auto tensor = tensor_message({partitions, dim}, centroids);
+        const auto tensor = half_storage ? tensor_message_half({partitions, dim}, centroids)
+                                         : tensor_message({partitions, dim}, centroids);
         extras.global_buffers.push_back(ivf_message(graph_offsets, graph_lengths, &tensor, &loss));
         if (!write_file(dir, "index.idx", schema.s, batch.a, extras, files, error)) {
             return fail(error);
@@ -1504,7 +1618,8 @@ bool create_vector_index(const std::filesystem::path& dataset_path, const std::s
         extras.schema_metadata["lance:index"] =
             bytes_of("{\"type\":\"" + options.type + "\",\"distance_type\":\"" + metric_name + "\"}");
         extras.schema_metadata["lance:ivf"] = bytes_of("1");
-        const auto tensor = tensor_message({partitions, dim}, centroids);
+        const auto tensor = half_storage ? tensor_message_half({partitions, dim}, centroids)
+                                         : tensor_message({partitions, dim}, centroids);
         const std::vector<std::uint64_t> zeros(partitions, 0);
         extras.global_buffers.push_back(ivf_message(zeros, zeros, &tensor, &loss));
         if (!write_file(dir, "index.idx", schema.s, batch.a, extras, files, error)) {

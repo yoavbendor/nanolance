@@ -312,6 +312,12 @@ def _scan_statistics(before: tuple, after: tuple) -> ScanStatistics:
                           iops=reads, parts_loaded=misses, requests=reads)
 
 
+def _is_vector_column(storage) -> bool:
+    """A vector column: a fixed-size list, or a multivector column (a list of fixed-size lists)."""
+    return pa.types.is_fixed_size_list(storage) or (
+        pa.types.is_list(storage) and pa.types.is_fixed_size_list(storage.value_type))
+
+
 class LanceDataset(pa.dataset.Dataset):
     """A Lance dataset at a version. Mirrors ``lance.LanceDataset``."""
 
@@ -1636,9 +1642,11 @@ class LanceDataset(pa.dataset.Dataset):
         if field is None:
             raise KeyError(f"{column} not found in schema")
         storage = getattr(field.type, "storage_type", field.type)
-        if not pa.types.is_fixed_size_list(storage):
+        if not _is_vector_column(storage):
             raise TypeError(f"Vector column {column} must be FixedSizeListArray 1-dimensional "
                             f"FixedShapeTensorArray, got {field.type}")
+        if pa.types.is_list(storage):  # a multivector column: the dimension of its vectors
+            storage = storage.value_type
         return storage.list_size
 
     def _field(self, column: str) -> Optional[pa.Field]:
@@ -1712,7 +1720,7 @@ class LanceDataset(pa.dataset.Dataset):
         field = next((f for f in self._data_schema if f.name == str(column)), None)
         if field is not None:
             storage = getattr(field.type, "storage_type", field.type)
-            if not pa.types.is_fixed_size_list(storage):
+            if not _is_vector_column(storage):
                 raise TypeError(f"Vector column {column} must be FixedSizeListArray 1-dimensional "
                                 f"FixedShapeTensorArray, got {field.type}")
         centroids_bytes = codebook_bytes = None
@@ -2721,7 +2729,8 @@ def _lance_errors():
         text = str(exc)
         if text.startswith("dimension (") or "num_sub_vectors are required" in text:
             raise ValueError(text) from None
-        if "mismatch across shards" in text or "do not share a storage format" in text:
+        if "mismatch across shards" in text or "do not share a storage format" in text or (
+                "multivector type supports only cosine distance" in text):  # pylance's Rust error, as it raises it
             raise RuntimeError(f"LanceError(Index): {text}") from None
         if ("KMeans cannot train" in text or "Not enough rows to train PQ" in text or "already exists" in text
                 or "num_bits" in text):

@@ -637,6 +637,7 @@ tests/test_indices.py::test_ivf_centroids_fragment_ids
 tests/test_indices.py::test_ivf_centroids_mostly_null[cosine]
 tests/test_indices.py::test_ivf_centroids_mostly_null[dot]
 tests/test_indices.py::test_ivf_centroids_mostly_null[l2]
+tests/test_indices.py::test_ivf_centroids_multivector_fragment_ids
 tests/test_indices.py::test_load_shuffled_vectors[f32]
 tests/test_indices.py::test_num_partitions
 tests/test_indices.py::test_pq_fragment_ids
@@ -894,6 +895,7 @@ tests/test_order_by.py::test_all_order_by_support_functions
 tests/test_order_by.py::test_one_column_order_by
 tests/test_order_by.py::test_two_column_order_by
 tests/test_pydantic.py::test_int_enum_uses_native_type
+tests/test_pydantic.py::test_multi_vector_field
 tests/test_pydantic.py::test_naive_datetime_field
 tests/test_pydantic.py::test_nested_model_becomes_struct
 tests/test_pydantic.py::test_optional_field_is_nullable
@@ -1181,6 +1183,8 @@ tests/test_vector_index.py::test_index_with_pq_codebook_rejects_wrong_num_bits_s
 tests/test_vector_index.py::test_invalid_subvectors
 tests/test_vector_index.py::test_knn_deleted_rows
 tests/test_vector_index.py::test_knn_with_deletions
+tests/test_vector_index.py::test_multivec_ann
+tests/test_vector_index.py::test_multivec_search_paths
 tests/test_vector_index.py::test_nearest_errors
 tests/test_vector_index.py::test_nested_field_vector_index
 tests/test_vector_index.py::test_no_include_deleted_rows
