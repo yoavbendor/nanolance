@@ -615,6 +615,7 @@ LanceFtsQueryContext* prepare_fts(const LanceDataset* dataset, const char* colum
     }
     std::set<uint64_t> covered;
     std::string uuid;
+    std::optional<std::uint32_t> index_base;  // the base path the index's files are in, if any
     std::string name;  // the column's first INVERTED index: its segments
     bool found = false;
     for (const auto& index : indices) {
@@ -625,6 +626,7 @@ LanceFtsQueryContext* prepare_fts(const LanceDataset* dataset, const char* colum
             found = true;
             name = index.name;
             uuid = index.uuid;
+            index_base = index.base_id;
             covered.insert(index.fragment_ids.begin(), index.fragment_ids.end());
         }
     }
@@ -652,7 +654,12 @@ LanceFtsQueryContext* prepare_fts(const LanceDataset* dataset, const char* colum
     if (phrase) {
         // Phrase queries need positions.
         nano_lance::fts::AnalyzerParams params;
-        if (nano_lance::index_build::load_inverted_params(dataset->path / "_indices" / uuid, params, error) &&
+        std::filesystem::path index_dir;
+        if (!nano_lance::indices_dir(dataset->path, dataset->info.base_paths, index_base, index_dir, error)) {
+            fail(error);
+            return nullptr;
+        }
+        if (nano_lance::index_build::load_inverted_params(index_dir / uuid, params, error) &&
             !params.with_position) {
             invalid("FTS index for column '" + std::string(column) +
                     "' does not store token positions required by Phrase queries; recreate the index with positions "

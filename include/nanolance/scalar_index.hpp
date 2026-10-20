@@ -65,6 +65,7 @@ bool dataset_drop_index(const std::filesystem::path& dataset_path, const std::st
 struct IndexInfo {
     std::string name;
     std::string uuid;
+    std::optional<std::uint32_t> base_id;  // the base path its files are in; nullopt: the dataset's own
     std::string type;  // "BTree", "Bitmap", "LabelList", "Inverted", "Vector", ...: from its details
     std::vector<std::string> fields;  // column paths
     std::vector<std::uint32_t> fragment_ids;

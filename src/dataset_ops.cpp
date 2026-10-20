@@ -155,7 +155,7 @@ bool apply_deletions(const std::filesystem::path& path, pb::Manifest& manifest, 
         const auto it = deleted.find(fragment.id);
         if (it != deleted.end() && !it->second.empty()) {
             std::vector<std::uint32_t> rows;
-            if (!read_deletion_vector(path, fragment.id, fragment.deletion_file, rows, error)) {
+            if (!read_manifest_deletion_vector(path, manifest, fragment.id, fragment.deletion_file, rows, error)) {
                 return false;
             }
             rows.insert(rows.end(), it->second.begin(), it->second.end());
@@ -475,7 +475,8 @@ bool stamp_new_fragments(pb::Manifest& manifest, std::size_t first, const std::v
 }
 
 /// The live rows of `fragment` in order: their ids, creation and last update versions.
-bool live_row_meta(const std::filesystem::path& dataset_path, const pb::DataFragment& fragment,
+bool live_row_meta(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
+                   const pb::DataFragment& fragment,
                    std::vector<std::uint64_t>& ids, std::vector<std::uint64_t>& created,
                    std::vector<std::uint64_t>& updated, std::string& error) {
     RowIdSequence sequence;
@@ -503,7 +504,7 @@ bool live_row_meta(const std::filesystem::path& dataset_path, const pb::DataFrag
     }
     std::vector<std::uint32_t> deleted;
     if (fragment.deletion_file.present &&
-        !read_deletion_vector(dataset_path, fragment.id, fragment.deletion_file, deleted, error)) {
+        !read_manifest_deletion_vector(dataset_path, manifest, fragment.id, fragment.deletion_file, deleted, error)) {
         return false;
     }
     std::size_t next_deleted = 0;
@@ -1939,7 +1940,7 @@ bool rewrite_members(const std::filesystem::path& dataset_path, const pb::Manife
     std::vector<std::uint64_t> bin_updated;
     for (const auto m : members) {
         ids.push_back(old[m].id);
-        if (stable && !live_row_meta(dataset_path, old[m], bin_ids, bin_created, bin_updated, error)) {
+        if (stable && !live_row_meta(dataset_path, manifest, old[m], bin_ids, bin_created, bin_updated, error)) {
             return false;
         }
     }
@@ -2185,7 +2186,7 @@ bool dataset_compact_commit(const std::filesystem::path& dataset_path, const Com
                                               [&](const pb::DataFragment& g) { return g.id == id; });
                 std::vector<std::uint32_t> deleted;
                 if (f.deletion_file.present &&
-                    !read_deletion_vector(dataset_path, f.id, f.deletion_file, deleted, error)) {
+                    !read_manifest_deletion_vector(dataset_path, original, f.id, f.deletion_file, deleted, error)) {
                     return false;
                 }
                 for (std::uint64_t offset = 0; offset < f.physical_rows; ++offset) {
@@ -2339,7 +2340,7 @@ bool fragment_delete_rows(const std::filesystem::path& dataset_path, std::uint64
         return false;
     }
     std::vector<std::uint32_t> rows;
-    if (!read_deletion_vector(dataset_path, fragment->id, fragment->deletion_file, rows, error)) {
+    if (!read_manifest_deletion_vector(dataset_path, manifest, fragment->id, fragment->deletion_file, rows, error)) {
         return false;
     }
     const auto before = rows.size();

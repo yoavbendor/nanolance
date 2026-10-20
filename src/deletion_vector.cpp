@@ -662,7 +662,7 @@ bool parse_roaring_bitmap(const std::vector<std::uint8_t>& bytes,
     return true;
 }
 
-bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64_t fragment_id,
+bool read_deletion_vector(const std::filesystem::path& deletions_dir, std::uint64_t fragment_id,
                           const pb::DeletionFile& deletion_file,
                           std::vector<std::uint32_t>& out_sorted_offsets, std::string& error) {
     out_sorted_offsets.clear();
@@ -670,21 +670,11 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
     if (!deletion_file.present) {
         return true;
     }
-    // Lance writes the deletions of rows in a base path to the dataset's own _deletions, with no
-    // base_id (the case here). A deletion file that names a base is not read yet.
-    std::optional<std::uint32_t> base_id;
-    if (!deletion_file_base_id(deletion_file, base_id, error)) {
-        return false;
-    }
-    if (base_id && *base_id != 0U) {
-        error = "deletion file of fragment " + std::to_string(fragment_id) + " is in a base path, which is not supported";
-        return false;
-    }
 
     const bool bitmap = deletion_file.file_type == 1U;
     const std::string name = std::to_string(fragment_id) + "-" + std::to_string(deletion_file.read_version) +
                              "-" + std::to_string(deletion_file.id) + (bitmap ? ".bin" : ".arrow");
-    const auto path = dataset_path / "_deletions" / name;
+    const auto path = deletions_dir / name;
 
     std::string io_error;
     const auto source = io::open_source(path.string(), io_error);
@@ -725,6 +715,17 @@ bool read_deletion_vector(const std::filesystem::path& dataset_path, std::uint64
         return false;
     }
     return true;
+}
+
+bool read_manifest_deletion_vector(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
+                                   std::uint64_t fragment_id, const pb::DeletionFile& deletion_file,
+                                   std::vector<std::uint32_t>& out_sorted_offsets, std::string& error) {
+    std::filesystem::path deletions_dir;
+    if (!deletion_file_dir(dataset_path, manifest, deletion_file, deletions_dir, error)) {
+        out_sorted_offsets.clear();
+        return false;
+    }
+    return read_deletion_vector(deletions_dir, fragment_id, deletion_file, out_sorted_offsets, error);
 }
 
 bool write_deletion_file(const std::filesystem::path& dataset_path, std::uint64_t fragment_id,

@@ -610,6 +610,7 @@ nb::dict ds_info(const std::filesystem::path& path, std::optional<std::uint64_t>
         base_paths.append(bd);
     }
     d["base_paths"] = base_paths;
+    d["branch"] = info.branch.empty() ? nb::none() : nb::object(nb::str(info.branch.c_str()));
     return d;
 }
 
@@ -1281,6 +1282,30 @@ NB_MODULE(_nanolance, m) {
         return v;
     });
     // Tags, cleanup and drop (dataset_refs.hpp).
+    m.def("_ds_branches", [](const std::filesystem::path& path) {
+        std::vector<nano_lance::BranchInfo> branches;
+        std::string error;
+        if (!nano_lance::list_branches(path, branches, error)) {
+            throw_dataset(error);
+        }
+        nb::list out;
+        for (const auto& b : branches) {
+            nb::dict d;
+            d["name"] = b.name;
+            d["parent_branch"] = b.parent_branch ? nb::object(nb::str(b.parent_branch->c_str())) : nb::none();
+            nb::list identifier;
+            for (const auto& [version, id] : b.identifier) {
+                identifier.append(nb::make_tuple(version, id));
+            }
+            d["branch_identifier"] = identifier;
+            d["parent_version"] = b.parent_version;
+            d["create_at"] = b.create_at;
+            d["manifest_size"] = b.manifest_size;
+            d["metadata"] = b.metadata;
+            out.append(d);
+        }
+        return out;
+    });
     m.def("_ds_tags", [](const std::filesystem::path& path) {
         std::vector<nano_lance::TagInfo> tags;
         std::string error;
@@ -1976,6 +2001,7 @@ NB_MODULE(_nanolance, m) {
             d["details"] = nb::bytes(reinterpret_cast<const char*>(i.details_value.data()), i.details_value.size());
             d["field_ids"] = i.field_ids;
             d["created_at"] = i.created_at;
+            d["base_id"] = i.base_id ? nb::object(nb::int_(*i.base_id)) : nb::none();
             d["size_bytes"] = i.size_bytes;
             d["rows_indexed"] = i.rows_indexed;
             out.append(d);

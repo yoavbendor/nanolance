@@ -27,6 +27,7 @@
 // AND intersects answers where both apply; OR unites them where both apply; NOT and anything
 // else answer nothing.
 
+#include "nanolance/base_paths.hpp"
 #include "nanolance/index_search.hpp"
 #include "nanolance/work_stats.hpp"
 
@@ -1274,7 +1275,10 @@ struct Search {
             bool exact_all = true;
             for (const auto* index : segments) {
                 const auto& kind = index->details_type_url;
-                const auto dir = dataset_path / "_indices" / pb::uuid_string(index->uuid);
+                std::filesystem::path dir;
+                if (!index_dir_of(dataset_path, manifest, *index, dir, error)) {
+                    return false;
+                }
                 RowSet one;
                 bool answered = false;
                 bool ok = true;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/base_paths.hpp"
 #include "nanolance/fts_search.hpp"
 #include "nanolance/work_stats.hpp"
 #include "nanolance/overlays.hpp"
@@ -2431,7 +2432,9 @@ bool dataset_full_text_search(const std::filesystem::path& dataset_path, const F
         std::shared_ptr<InvertedIndex> picked;  // the chosen segments, when some are
         for (const auto* seg : segs) {
             std::shared_ptr<const InvertedIndex> index;
-            if (!load_inverted(dataset_path / "_indices" / pb::uuid_string(seg->uuid), group.element, index, error)) {
+            std::filesystem::path seg_dir;
+            if (!index_dir_of(dataset_path, s.manifest, *seg, seg_dir, error) ||
+                !load_inverted(seg_dir, group.element, index, error)) {
                 error = "index " + seg->name + ": " + error;
                 return false;
             }

@@ -42,7 +42,8 @@ public:
 
     /// Decodes `details` (a FragmentReuseIndexDetails message) into a remap; `dataset_path` and `uuid` locate
     /// its external content, when it has any.
-    static bool from_details(const std::filesystem::path& dataset_path, const pb::IndexMetadata& index,
+    static bool from_details(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
+                             const pb::IndexMetadata& index,
                              std::shared_ptr<const FragReuse>& out, std::string& error);
 
     struct NewRange {

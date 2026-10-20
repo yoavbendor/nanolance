@@ -30,6 +30,22 @@ struct TagInfo {
     std::map<std::string, std::string> metadata;
 };
 
+// ── branches ───────────────────────────────────────────────────────────────────────────────────────
+
+/// A branch's reference (`_refs/branches/<name>.json`), as Lance writes it.
+struct BranchInfo {
+    std::string name;
+    std::optional<std::string> parent_branch;  // null: forked from main
+    std::vector<std::pair<std::uint64_t, std::string>> identifier;  // (parent version, id), root first
+    std::uint64_t parent_version = 0;
+    std::uint64_t create_at = 0;  // Unix seconds
+    std::uint64_t manifest_size = 0;
+    std::map<std::string, std::string> metadata;
+};
+
+/// Every branch, by name.
+bool list_branches(const std::filesystem::path& dataset_path, std::vector<BranchInfo>& out, std::string& error);
+
 /// Every tag, by name.
 bool list_tags(const std::filesystem::path& dataset_path, std::vector<TagInfo>& out, std::string& error);
 bool get_tag(const std::filesystem::path& dataset_path, const std::string& name, TagInfo& out, std::string& error);

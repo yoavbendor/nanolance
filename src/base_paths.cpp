@@ -16,7 +16,9 @@ namespace {
 using namespace proto_wire;
 
 constexpr std::uint32_t kManifestBasePaths = 18;
+constexpr std::uint32_t kManifestBranch = 20;
 constexpr std::uint32_t kBaseIdField = 7;  // DataFile and DeletionFile
+constexpr std::uint32_t kIndexBaseIdField = 9;  // IndexMetadata
 
 /// `unknown` without the fields numbered `number`.
 std::vector<std::uint8_t> without_field(const std::vector<std::uint8_t>& unknown, std::uint32_t number) {
@@ -125,6 +127,22 @@ bool read_base_paths(const pb::Manifest& manifest, std::vector<BasePath>& out, s
     return true;
 }
 
+bool read_manifest_branch(const pb::Manifest& manifest, std::string& out, std::string& error) {
+    out.clear();
+    Reader r(manifest.unknown.data(), manifest.unknown.size());
+    Field f;
+    while (r.next(f)) {
+        if (f.number == kManifestBranch && f.wire == 2) {
+            out.assign(reinterpret_cast<const char*>(f.data), f.size);
+        }
+    }
+    if (!r.ok()) {
+        error = "malformed manifest branch";
+        return false;
+    }
+    return true;
+}
+
 void write_base_paths(pb::Manifest& manifest, const std::vector<BasePath>& bases) {
     std::vector<std::uint8_t> out = without_field(manifest.unknown, kManifestBasePaths);
     for (const auto& base : bases) {
@@ -159,22 +177,134 @@ void set_deletion_file_base_id(pb::DeletionFile& file, std::optional<std::uint32
     put_base_id(file.unknown, id);
 }
 
+bool index_base_id(const pb::IndexMetadata& index, std::optional<std::uint32_t>& out, std::string& error) {
+    Reader r(index.raw.data(), index.raw.size());
+    Field f;
+    out.reset();
+    while (r.next(f)) {
+        if (f.number == kIndexBaseIdField && f.wire == 0) {
+            if (f.value > std::numeric_limits<std::uint32_t>::max()) {
+                error = "index base_id does not fit in 32 bits";
+                return false;
+            }
+            out = static_cast<std::uint32_t>(f.value);
+        }
+    }
+    if (!r.ok()) {
+        error = "malformed index base_id";
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+/// The base path `base_id` names; false (and `error`) when there is none.
+bool find_base(const std::vector<BasePath>& bases, std::uint32_t base_id, const BasePath*& out, std::string& error) {
+    const auto it = std::find_if(bases.begin(), bases.end(), [&](const BasePath& b) { return b.id == base_id; });
+    if (it == bases.end()) {
+        error = "refers to unknown base path " + std::to_string(base_id);
+        return false;
+    }
+    out = &*it;
+    return true;
+}
+
+}  // namespace
+
 bool data_file_dir(const std::filesystem::path& dataset_path, const std::vector<BasePath>& bases,
                    const pb::DataFile& file, std::filesystem::path& out, std::string& error) {
     std::optional<std::uint32_t> base_id;
     if (!data_file_base_id(file, base_id, error)) {
         return false;
     }
-    if (!base_id || *base_id == 0U) {
+    if (!base_id) {
         out = dataset_path / "data";
         return true;
     }
-    const auto base = std::find_if(bases.begin(), bases.end(), [&](const BasePath& b) { return b.id == *base_id; });
-    if (base == bases.end()) {
-        error = "data file refers to unknown base path " + std::to_string(*base_id);
+    const BasePath* base = nullptr;
+    if (!find_base(bases, *base_id, base, error)) {
+        error = "data file " + error;
         return false;
     }
     out = base->is_dataset_root ? std::filesystem::path(base->path) / "data" : std::filesystem::path(base->path);
+    return true;
+}
+
+bool deletion_dir(const std::filesystem::path& dataset_path, const std::vector<BasePath>& bases,
+                  std::optional<std::uint32_t> base_id, std::filesystem::path& out, std::string& error) {
+    if (!base_id) {
+        out = dataset_path / "_deletions";
+        return true;
+    }
+    const BasePath* base = nullptr;
+    if (!find_base(bases, *base_id, base, error)) {
+        error = "deletion file " + error;
+        return false;
+    }
+    if (!base->is_dataset_root) {
+        error = "deletion file names base path " + std::to_string(*base_id) + ", which is not a dataset root";
+        return false;
+    }
+    out = std::filesystem::path(base->path) / "_deletions";
+    return true;
+}
+
+bool deletion_file_dir(const std::filesystem::path& dataset_path, const std::vector<BasePath>& bases,
+                       const pb::DeletionFile& file, std::filesystem::path& out, std::string& error) {
+    std::optional<std::uint32_t> base_id;
+    if (!deletion_file_base_id(file, base_id, error)) {
+        return false;
+    }
+    return deletion_dir(dataset_path, bases, base_id, out, error);
+}
+
+bool deletion_file_dir(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
+                       const pb::DeletionFile& file, std::filesystem::path& out, std::string& error) {
+    std::optional<std::uint32_t> base_id;
+    if (!deletion_file_base_id(file, base_id, error)) {
+        return false;
+    }
+    if (!base_id) {
+        return deletion_dir(dataset_path, {}, base_id, out, error);
+    }
+    std::vector<BasePath> bases;
+    if (!read_base_paths(manifest, bases, error)) {
+        return false;
+    }
+    return deletion_dir(dataset_path, bases, base_id, out, error);
+}
+
+bool index_dir_of(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
+                  const pb::IndexMetadata& index, std::filesystem::path& out, std::string& error) {
+    std::optional<std::uint32_t> base_id;
+    if (!index_base_id(index, base_id, error)) {
+        return false;
+    }
+    std::vector<BasePath> bases;
+    if (base_id && !read_base_paths(manifest, bases, error)) {
+        return false;
+    }
+    std::filesystem::path dir;
+    if (!indices_dir(dataset_path, bases, base_id, dir, error)) {
+        return false;
+    }
+    out = dir / pb::uuid_string(index.uuid);
+    return true;
+}
+
+bool indices_dir(const std::filesystem::path& dataset_path, const std::vector<BasePath>& bases,
+                 std::optional<std::uint32_t> base_id, std::filesystem::path& out, std::string& error) {
+    if (!base_id) {
+        out = dataset_path / "_indices";
+        return true;
+    }
+    const BasePath* base = nullptr;
+    if (!find_base(bases, *base_id, base, error)) {
+        error = "index " + error;
+        return false;
+    }
+    out = base->is_dataset_root ? std::filesystem::path(base->path) / "_indices" : std::filesystem::path(base->path);
     return true;
 }
 

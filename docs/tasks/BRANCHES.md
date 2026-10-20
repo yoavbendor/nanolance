@@ -49,7 +49,9 @@ forked from.
 
 The branch's first manifest has the **same version number as the parent version** it forks (branch from
 v1: the branch's `_versions/` holds version 1), and is the parent's manifest with:
-- every inherited data file (and deletion file) gets `base_id = 0` (DataFile field 7);
+- every inherited data file (and deletion file) gets `base_id = 0` (DataFile field 7): base path id 0,
+  not "the dataset itself" -- only an absent base_id means the dataset's own directory (Lance
+  `dataset.rs` `data_file_dir_for_base`);
 - `base_paths` (Manifest field 18) gains `{id: 0, is_dataset_root: true, path: <parent's root, as the
   dataset was opened: relative if opened relative>}` (BasePath fields 1, 3, 4);
 - reader and writer feature flags (Manifest fields 9, 10) gain 16 (base paths);
@@ -157,3 +159,22 @@ tests/test_dataset.py -k "branches or clone" | tail -5`); `python3 -m pytest -o 
 bindings/python/tests/test_branches.py | tail -2`; `python3 tools/pylance_suite.py | tail -4`; last, once:
 `cd bindings/python && python3 -m pytest -o addopts= -q -p no:cacheprovider tests | tail -3`. Report
 under 40 lines: questions first, then files, per-test status, tails, decisions.
+
+**B1 outcome (2026-10-20):** done in one Haiku session; reviewed. pylance's branches open by
+`<root>/tree/B` and by `checkout_version((B, v))` / `(B, None)` / a branch tag; data, deletion and index
+files resolve through the manifest's base paths (base_id 0 is base path 0; index `base_id`, IndexMetadata
+field 9, honoured on every index read path); `branches.list()` / `list_ordered()` (pylance's order:
+parent_version descending, then name), tags with a branch, names with `/`; nanolance appends and
+overwrites on a pylance branch and pylance reads the result. `tests/test_branches.py` (12). Reviewer's
+decisions for B2:
+- **Cleanup must be branch-aware** (the session found the data loss): pylance's `cleanup_old_versions`
+  keeps every version a branch forks from (measured: main v1 forked as `keep`, main overwritten, cleanup
+  with `older_than=0, delete_unverified=True` -> `old_versions: 0`, the branch still reads). nanolance's
+  cleanup (and `restore` / `drop` where they delete) must keep the same versions and files; a test
+  reproduces the loss first (`scratchpad/br-work/clean2.py`).
+- `latest_version_hint.json`: not written (pylance opens branches without it; no new files on datasets
+  without branches).
+- Index write and maintenance paths (`index_segments` commit / merge, `index_optimize` segment dirs) still
+  use `<dataset>/_indices`: B2 makes them branch-correct (an index built on a branch lives under
+  `tree/B/_indices`).
+- `checkout_version((B, v)).uri` is `tree/B` (pylance reports the root); keep it, writes need it.

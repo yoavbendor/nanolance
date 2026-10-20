@@ -278,7 +278,7 @@ bool dataset_info(const std::filesystem::path& dataset_path, bool has_version, s
         return false;
     }
     out.version = version_info(manifest);
-    if (!read_base_paths(manifest, out.base_paths, error)) {
+    if (!read_base_paths(manifest, out.base_paths, error) || !read_manifest_branch(manifest, out.branch, error)) {
         return false;
     }
     if (out.version.version == 0U) {

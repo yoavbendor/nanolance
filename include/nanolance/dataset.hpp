@@ -54,6 +54,7 @@ struct DatasetInfo {
     std::string data_storage_version;  // e.g. "2.2"
     std::vector<DatasetFragmentInfo> fragments;  // in manifest order
     std::vector<BasePath> base_paths;            // the dataset's base paths, in manifest order
+    std::string branch;                          // the branch this version is on; empty: main
     std::uint64_t max_fragment_id = 0;
     bool has_max_fragment_id = false;
     std::map<std::string, std::string> config;

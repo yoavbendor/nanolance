@@ -8,6 +8,7 @@
 
 #include "float_text.hpp"
 #include "index_build.hpp"
+#include "nanolance/base_paths.hpp"
 #include "nanolance/frag_reuse.hpp"
 #include "nanolance/scalar_index.hpp"
 #include "nanolance/vector_search.hpp"
@@ -1982,6 +1983,13 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
         IndexInfo info;
         info.name = index.name;
         info.uuid = pb::uuid_string(index.uuid);
+        if (!index_base_id(index, info.base_id, error)) {
+            return false;
+        }
+        std::filesystem::path index_dir;
+        if (!index_dir_of(dataset_path, manifest, index, index_dir, error)) {
+            return false;
+        }
         const auto& url = index.details_type_url;
         const auto dot = url.rfind('.');
         std::string details = dot == std::string::npos ? url : url.substr(dot + 1);
@@ -1992,7 +2000,7 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
         info.type = details;
         if (is_vector_index_url(url)) {
             const auto type =  // IVF_PQ, IVF_FLAT, ...
-                vector_index_type(dataset_path / "_indices" / pb::uuid_string(index.uuid), index.details_value);
+                vector_index_type(index_dir, index.details_value);
             if (!type.empty()) {
                 info.type = type;
             }
@@ -2080,7 +2088,7 @@ bool dataset_count_from_index(const std::filesystem::path& dataset_path, bool ha
         // The index lists deleted rows too: take out those the fragment's deletion vector holds. Both
         // lists are ascending physical offsets.
         std::vector<std::uint32_t> deleted;
-        if (!read_deletion_vector(dataset_path, f.id, f.deletion_file, deleted, error)) {
+        if (!read_manifest_deletion_vector(dataset_path, manifest, f.id, f.deletion_file, deleted, error)) {
             return false;
         }
         std::size_t hits = 0;

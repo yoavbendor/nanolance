@@ -1550,6 +1550,7 @@ struct PlannedFile {
     std::uint64_t skip = 0;            // logical rows to drop from the front
     std::uint64_t take = 0;            // logical rows to keep
     std::filesystem::path data_dir;    // where the data files are; empty: <dataset>/data
+    std::filesystem::path deletions_dir;  // where the deletion file is (<dataset>/_deletions, or a base's)
     /// Where each data file is, by index, when the files are in different base paths (else empty and
     /// data_dir holds for all of them).
     std::vector<std::filesystem::path> file_dirs;
@@ -2422,7 +2423,7 @@ bool read_data_file_batches(const std::filesystem::path& dataset_path, const Pla
             return false;
         }
         std::vector<std::uint32_t> deleted;
-        if (!read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
+        if (!read_deletion_vector(planned.deletions_dir, planned.fragment_id, planned.deletion_file, deleted, error)) {
             return false;
         }
         keep.assign(static_cast<std::size_t>(physical), 1U);
@@ -2674,7 +2675,7 @@ bool cached_file_metadata(const std::filesystem::path& path, std::shared_ptr<con
 /// counted without the deleted ones. Deleted rows are mapped out first, then every projected column
 /// decodes just those physical rows (decode_lance_physical_column_rows).
 /// The physical offsets (deleted rows counted) of a fragment's `logical` rows (ascending).
-bool physical_rows_of(const std::filesystem::path& dataset_path, const PlannedFile& planned,
+bool physical_rows_of(const PlannedFile& planned,
                       const std::vector<std::uint64_t>& logical, std::vector<std::uint64_t>& physical,
                       std::string& error) {
     physical.clear();
@@ -2684,7 +2685,7 @@ bool physical_rows_of(const std::filesystem::path& dataset_path, const PlannedFi
         return true;
     }
     std::vector<std::uint32_t> deleted;
-    if (!read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
+    if (!read_deletion_vector(planned.deletions_dir, planned.fragment_id, planned.deletion_file, deleted, error)) {
         return false;
     }
     std::sort(deleted.begin(), deleted.end());
@@ -2855,7 +2856,7 @@ bool read_candidate_rows(const std::filesystem::path& dataset_path, const Planne
     physical.reserve(planned.candidates->size());
     std::vector<std::uint32_t> deleted;
     if (planned.deletion_file.present &&
-        !read_deletion_vector(dataset_path, planned.fragment_id, planned.deletion_file, deleted, error)) {
+        !read_deletion_vector(planned.deletions_dir, planned.fragment_id, planned.deletion_file, deleted, error)) {
         return false;
     }
     std::sort(deleted.begin(), deleted.end());
@@ -3261,6 +3262,10 @@ bool open_read_plan_from_manifest(const std::filesystem::path& dataset_path, pb:
             planned.row_ids = std::make_shared<const RowIdSequence>(std::move(sequence));
         }
         planned.deletion_file = fragment.deletion_file;
+        if (!deletion_file_dir(dataset_path, bases, fragment.deletion_file, planned.deletions_dir, error)) {
+            release_schema_if_held(out_schema);
+            return false;
+        }
         if (fragment_has_overlays(fragment)) {
             auto overlays = std::make_shared<std::vector<DataOverlay>>();
             if (!read_fragment_overlays(fragment, *overlays, error)) {
@@ -3664,7 +3669,7 @@ bool lance_dataset_take(const std::filesystem::path& dataset_path, const LanceSc
             continue;
         }
         std::vector<std::uint64_t> physical;
-        if (!physical_rows_of(plan.dataset_path, planned, logical, physical, error)) {
+        if (!physical_rows_of(planned, logical, physical, error)) {
             release_schema_if_held(out_schema);
             return false;
         }

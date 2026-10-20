@@ -366,7 +366,12 @@ class LanceDataset(pa.dataset.Dataset):
         self._index_cache_hits = 0
         self._index_cache_misses = 0
         if isinstance(version, str):
-            version = _tag_version(self._uri, version, ValueError)
+            # A tag's branch is read from the dataset's root (tags are kept there), so the root comes first.
+            with native():
+                probe = _nanolance._ds_info(self._uri, None)
+            root = _root_of(self._uri, probe["branch"])
+            branch, version = _tag_target(root, version, ValueError)
+            self._uri = _branch_uri(root, branch) if branch is not None else root
         self._storage_options = storage_options
         self._default_scan_options = dict(default_scan_options or {})
         try:
@@ -379,6 +384,7 @@ class LanceDataset(pa.dataset.Dataset):
         except Exception:
             _native_log.loading(self._log_uri, status="error")
             raise
+        self._root = _root_of(self._uri, info["branch"])
         _native_log.loading(self._log_uri, status="success", version=int(info["version"]))
         _native_log.debug("nanolance::dataset", f"opened {self._log_uri} at version {int(info['version'])}")
         self._pinned = version is not None
@@ -573,6 +579,10 @@ class LanceDataset(pa.dataset.Dataset):
     def tags(self) -> "Tags":
         return Tags(self)
 
+    @property
+    def branches(self) -> "Branches":
+        return Branches(self)
+
     def cleanup_old_versions(self, older_than: Optional[timedelta] = None, retain_versions: Optional[int] = None, *,
                              delete_unverified: bool = False, error_if_tagged_old_versions: bool = True,
                              delete_rate_limit: Optional[int] = None,
@@ -629,12 +639,13 @@ class LanceDataset(pa.dataset.Dataset):
 
     def checkout_version(self, version) -> "LanceDataset":
         if isinstance(version, str):
-            version = _tag_version(self._uri, version, OSError)
+            version = _tag_target(self._root, version, OSError)
         if isinstance(version, tuple):
             branch, number = version
-            if branch not in (None, "main"):
-                raise unsupported("branches")
-            version = number
+            if branch in (None, "main"):
+                return LanceDataset(self._root, version=number, storage_options=self._storage_options)
+            uri = _existing_branch_uri(self._root, branch)
+            return LanceDataset(uri, version=number, storage_options=self._storage_options)
         if version is None:
             return LanceDataset(self._uri, storage_options=self._storage_options)
         return LanceDataset(self._uri, version=version, storage_options=self._storage_options)
@@ -1828,7 +1839,7 @@ class LanceDataset(pa.dataset.Dataset):
     def list_indices(self) -> List[Dict[str, Any]]:
         indices = self._raw_indices()
         return [{"name": i["name"], "type": i["type"], "uuid": i["uuid"], "fields": list(i["fields"]),
-                 "version": i["dataset_version"], "fragment_ids": set(i["fragment_ids"]), "base_id": None}
+                 "version": i["dataset_version"], "fragment_ids": set(i["fragment_ids"]), "base_id": i["base_id"]}
                 for i in indices]
 
     @property
@@ -2257,7 +2268,7 @@ class LanceDataset(pa.dataset.Dataset):
     def __getattr__(self, name: str):
         known = {
             "create_index",
-            "branches", "create_branch", "sql",
+            "create_branch", "sql",
             "shallow_clone", "deep_clone", "join",
             "prewarm_index",
         }
@@ -2447,13 +2458,46 @@ def _ref_errors():
         raise translate(text) from None
 
 
+def _root_of(uri: str, branch: Optional[str]) -> str:
+    """The dataset root a dataset at ``uri`` on ``branch`` sits in: its uri without ``tree/<branch>``."""
+    if not branch:
+        return uri
+    suffix = os.path.join("tree", branch)
+    if not uri.rstrip("/").endswith(suffix):
+        raise OSError(f"Invalid user input: {uri} is not the location of branch {branch}")
+    return uri.rstrip("/")[: -len(suffix)].rstrip("/")
+
+
+def _branch_uri(root: str, branch: str) -> str:
+    """Where a branch's versions live: ``<root>/tree/<branch>``, as pylance lays it out."""
+    return os.path.join(root, "tree", branch)
+
+
+def _existing_branch_uri(root: str, branch: str) -> str:
+    """The location of ``branch``, which must exist: pylance's ValueError for one that does not."""
+    uri = _branch_uri(root, branch)
+    with native():
+        names = {b["name"] for b in _nanolance._ds_branches(root)}
+    if branch not in names:
+        raise ValueError(f"Not found: {os.path.join(uri, '_versions')}")
+    return uri
+
+
+def _tag_target(root: str, name: str, error_type) -> Tuple[Optional[str], int]:
+    """A tag's ``(branch, version)`` in the dataset at ``root``; branch None is main."""
+    for tag in _nanolance._ds_tags(root):
+        if tag["name"] == name:
+            return tag["branch"], int(tag["version"])
+    raise error_type(f"Ref not found error: tag {name} does not exist")
+
+
 def _tag_reference(ds: "LanceDataset", reference) -> int:
     """A tag's target as pylance takes it: a version, another tag's name, ``(branch, version)`` on the
     main branch (``None`` for the latest), or ``None`` for the latest; 0 means the latest."""
     if reference is None:
         return 0
     if isinstance(reference, str):
-        return _tag_version(ds.uri, reference, ValueError)
+        return _tag_version(ds._root, reference, ValueError)
     if isinstance(reference, tuple):
         branch, number = reference
         if branch not in (None, "main"):
@@ -2463,12 +2507,45 @@ def _tag_reference(ds: "LanceDataset", reference) -> int:
 
 
 def _tag_version(uri: str, name: str, error_type) -> int:
-    for tag in _nanolance._ds_tags(uri):
-        if tag["name"] == name:
-            if tag["branch"] is not None:
-                raise unsupported("branches")
-            return int(tag["version"])
-    raise error_type(f"Ref not found error: tag {name} does not exist")
+    branch, version = _tag_target(uri, name, error_type)
+    if branch is not None:
+        raise unsupported("branches")
+    return version
+
+
+class Branches:
+    """Mirrors ``lance.dataset.Branches``: the branches of the dataset's root (``_refs/branches``)."""
+
+    def __init__(self, dataset: "LanceDataset"):
+        self._ds = dataset
+
+    def _all(self):
+        with _ref_errors():
+            raw = _nanolance._ds_branches(self._ds._root)
+        return [(b["name"], {"parent_branch": b["parent_branch"],
+                             "branch_identifier": [(int(v), i) for v, i in b["branch_identifier"]],
+                             "parent_version": int(b["parent_version"]), "create_at": int(b["create_at"]),
+                             "manifest_size": int(b["manifest_size"]), "metadata": dict(b["metadata"])})
+                for b in raw]
+
+    def list(self) -> Dict[str, Dict[str, Any]]:
+        return dict(self._all())
+
+    def list_ordered(self, order: Optional[str] = None) -> List[Tuple[str, Dict[str, Any]]]:
+        """By parent version, newest first (``order="desc"``, the default) or oldest first; then by name, as
+        Lance orders them."""
+        if order not in (None, "asc", "desc"):
+            raise ValueError(f"Invalid order: {order}; expected 'asc' or 'desc'")
+        branches = self._all()
+        branches.sort(key=lambda b: b[0])
+        branches.sort(key=lambda b: b[1]["parent_version"], reverse=order != "asc")
+        return branches
+
+    def delete(self, name: str) -> None:
+        raise unsupported("branches")
+
+    def replace_metadata(self, name: str, metadata: Dict[str, str]) -> None:
+        raise unsupported("branches")
 
 
 class Tags:
@@ -2480,7 +2557,7 @@ class Tags:
 
     def _all(self):
         with _ref_errors():
-            raw = _nanolance._ds_tags(self._ds.uri)
+            raw = _nanolance._ds_tags(self._ds._root)
         return [(t["name"], {"branch": t["branch"], "version": int(t["version"]),
                              "created_at": _parse_rfc3339(t["created_at"]),
                              "updated_at": _parse_rfc3339(t["updated_at"]),
@@ -2500,29 +2577,39 @@ class Tags:
         return tags
 
     def get_version(self, tag: str) -> int:
-        return _tag_version(self._ds.uri, tag, ValueError)
+        return _tag_target(self._ds._root, tag, ValueError)[1]
+
+    def _writable_root(self) -> str:
+        """Tags are written at the root; a tag on a branch's own versions is not written yet (B2)."""
+        if self._ds._uri != self._ds._root:
+            raise unsupported("branches")
+        return self._ds._root
 
     def create(self, tag: str, reference=None) -> None:
-        refuse_object_store_write(self._ds.uri, "create tag")
+        root = self._writable_root()
+        refuse_object_store_write(root, "create tag")
         version = _tag_reference(self._ds, reference)
         with _ref_errors():
-            _nanolance._ds_create_tag(self._ds.uri, str(tag), version)
+            _nanolance._ds_create_tag(root, str(tag), version)
 
     def delete(self, tag: str) -> None:
-        refuse_object_store_write(self._ds.uri, "delete tag")
+        root = self._writable_root()
+        refuse_object_store_write(root, "delete tag")
         with _ref_errors():
-            _nanolance._ds_delete_tag(self._ds.uri, str(tag))
+            _nanolance._ds_delete_tag(root, str(tag))
 
     def update(self, tag: str, reference=None) -> None:
-        refuse_object_store_write(self._ds.uri, "update tag")
+        root = self._writable_root()
+        refuse_object_store_write(root, "update tag")
         version = _tag_reference(self._ds, reference)
         with _ref_errors():
-            _nanolance._ds_update_tag(self._ds.uri, str(tag), version)
+            _nanolance._ds_update_tag(root, str(tag), version)
 
     def replace_metadata(self, tag: str, metadata: Dict[str, str]) -> None:
-        refuse_object_store_write(self._ds.uri, "replace tag metadata")
+        root = self._writable_root()
+        refuse_object_store_write(root, "replace tag metadata")
         with _ref_errors():
-            _nanolance._ds_replace_tag_metadata(self._ds.uri, str(tag), {str(k): str(v) for k, v in metadata.items()})
+            _nanolance._ds_replace_tag_metadata(root, str(tag), {str(k): str(v) for k, v in metadata.items()})
 
 
 class CleanupStats:

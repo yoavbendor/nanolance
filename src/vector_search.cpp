@@ -13,6 +13,7 @@
 //             indexed -- and an exact scan of the fragments the index does not cover; best k by
 //             (distance, row id).
 
+#include "nanolance/base_paths.hpp"
 #include "nanolance/vector_search.hpp"
 #include "rabitq_build.hpp"
 #include "nanolance/work_stats.hpp"
@@ -3146,7 +3147,9 @@ bool dataset_nearest(const std::filesystem::path& dataset_path, const NearestQue
             }
             std::shared_ptr<const IvfIndex> index;
             std::string why;
-            if (!load_ivf(dataset_path / "_indices" / pb::uuid_string(s->uuid), index, why, q.index_cache)) {
+            std::filesystem::path seg_dir;
+            if (!index_dir_of(dataset_path, manifest, *s, seg_dir, why) ||
+                !load_ivf(seg_dir, index, why, q.index_cache)) {
                 not_used = why;
             } else if (q.metric && *q.metric != index->metric) {
                 if (chosen) {

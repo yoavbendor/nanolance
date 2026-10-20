@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
+#include "nanolance/base_paths.hpp"
 #include "nanolance/frag_reuse.hpp"
 
 #include "nanolance/byte_source.hpp"
@@ -263,8 +264,13 @@ bool build_step(const RawVersion& raw, FragReuse::Step& step, std::string& error
 
 }  // namespace
 
-bool FragReuse::from_details(const std::filesystem::path& dataset_path, const pb::IndexMetadata& index,
-                             std::shared_ptr<const FragReuse>& out, std::string& error) {
+bool FragReuse::from_details(const std::filesystem::path& dataset_path, const pb::Manifest& manifest,
+                             const pb::IndexMetadata& index, std::shared_ptr<const FragReuse>& out,
+                             std::string& error) {
+    std::filesystem::path index_dir;
+    if (!index_dir_of(dataset_path, manifest, index, index_dir, error)) {
+        return false;
+    }
     out.reset();
     const auto& url = index.details_type_url;
     if (url.size() < std::string(kFragReuseDetails).size() ||
@@ -298,7 +304,7 @@ bool FragReuse::from_details(const std::filesystem::path& dataset_path, const pb
                 }
             }
             std::vector<std::uint8_t> file;
-            const auto file_path = dataset_path / "_indices" / pb::uuid_string(index.uuid) / path;
+            const auto file_path = index_dir / path;
             if (e.bad() || path.empty() || !io::read_all(file_path.string(), file, error)) {
                 error = error.empty() ? "fragment reuse index: unreadable external details" : error;
                 return false;
@@ -351,7 +357,7 @@ bool FragReuse::load(const std::filesystem::path& dataset_path, const pb::Manife
         return true;
     }
     std::shared_ptr<const FragReuse> loaded;
-    if (!from_details(dataset_path, *newest, loaded, error)) {
+    if (!from_details(dataset_path, manifest, *newest, loaded, error)) {
         return false;
     }
     cache.put(key, loaded);

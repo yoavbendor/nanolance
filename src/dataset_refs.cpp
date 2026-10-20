@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -442,6 +443,90 @@ bool list_tags(const fs::path& dataset_path, std::vector<TagInfo>& out, std::str
         out.push_back(std::move(tag));
     }
     std::sort(out.begin(), out.end(), [](const TagInfo& a, const TagInfo& b) { return a.name < b.name; });
+    return true;
+}
+
+/// A branch file's name without `.json`, as Lance names it: its path segments percent-encoded
+/// (`team/x` is `team%2Fx.json`). Undecodable escapes are kept as written.
+std::string decode_branch_file_name(const std::string& encoded) {
+    std::string out;
+    for (std::size_t i = 0; i < encoded.size(); ++i) {
+        if (encoded[i] == '%' && i + 2 < encoded.size() && std::isxdigit(static_cast<unsigned char>(encoded[i + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(encoded[i + 2]))) {
+            out.push_back(static_cast<char>(std::stoi(encoded.substr(i + 1, 2), nullptr, 16)));
+            i += 2;
+        } else {
+            out.push_back(encoded[i]);
+        }
+    }
+    return out;
+}
+
+bool list_branches(const fs::path& dataset_path, std::vector<BranchInfo>& out, std::string& error) {
+    error.clear();
+    out.clear();
+    const fs::path dir = dataset_path / "_refs" / "branches";
+    std::vector<io::DirEntry> entries;
+    if (!io::list_dir(dir.string(), entries, error)) {
+        return false;
+    }
+    for (const auto& entry : entries) {
+        const auto& file = entry.name;
+        if (entry.is_dir || !ends_with(file, ".json") || starts_with(file, ".")) {
+            continue;
+        }
+        const std::string name = decode_branch_file_name(file.substr(0, file.size() - 5));
+        std::string text;
+        if (!read_text(dir / file, text)) {
+            error = "failed to read branch " + name;
+            return false;
+        }
+        json::Value root;
+        json::Reader reader(text);
+        if (!reader.parse(root) || root.kind != json::Value::Object) {
+            error = "branch " + name + " is not a valid branch file";
+            return false;
+        }
+        BranchInfo branch;
+        branch.name = name;
+        const auto* parent_version = root.get("parentVersion");
+        if (parent_version == nullptr || parent_version->kind != json::Value::Number) {
+            error = "branch " + name + " is not a valid branch file";
+            return false;
+        }
+        branch.parent_version = static_cast<std::uint64_t>(parent_version->n);
+        if (const auto* p = root.get("parentBranch"); p != nullptr && p->kind == json::Value::String) {
+            branch.parent_branch = p->s;
+        }
+        if (const auto* id = root.get("identifier"); id != nullptr && id->kind == json::Value::Object) {
+            if (const auto* mapping = id->get("version_mapping");
+                mapping != nullptr && mapping->kind == json::Value::Array) {
+                for (const auto& pair : mapping->items) {
+                    if (pair.kind != json::Value::Array || pair.items.size() != 2U ||
+                        pair.items[0].kind != json::Value::Number || pair.items[1].kind != json::Value::String) {
+                        error = "branch " + name + " has a malformed identifier";
+                        return false;
+                    }
+                    branch.identifier.emplace_back(static_cast<std::uint64_t>(pair.items[0].n), pair.items[1].s);
+                }
+            }
+        }
+        if (const auto* c = root.get("createAt"); c != nullptr && c->kind == json::Value::Number) {
+            branch.create_at = static_cast<std::uint64_t>(c->n);
+        }
+        if (const auto* m = root.get("manifestSize"); m != nullptr && m->kind == json::Value::Number) {
+            branch.manifest_size = static_cast<std::uint64_t>(m->n);
+        }
+        if (const auto* md = root.get("metadata"); md != nullptr && md->kind == json::Value::Object) {
+            for (const auto& [k, v] : md->fields) {
+                if (v.kind == json::Value::String) {
+                    branch.metadata[k] = v.s;
+                }
+            }
+        }
+        out.push_back(std::move(branch));
+    }
+    std::sort(out.begin(), out.end(), [](const BranchInfo& a, const BranchInfo& b) { return a.name < b.name; });
     return true;
 }
 
