@@ -99,6 +99,4 @@ worker process that only wrote and committed had no credentials (they are regist
 `write_dataset` does). `DataFile.create` reads the footer and size natively (`_file_top_fields`, a new
 `_file_size`). DataOverlay is not tested: pylance 12 cannot read the manifest flags it writes, on local disks too.
 Reviewer (W3b): fragment writes and commits register the bucket's storage_options as write_dataset does
-(a worker that only writes fragments and commits needs them). Open, unverified: the session reports that a
-hand-built DataOverlay commit writes a manifest pylance 12 cannot read (feature flag 64), locally too --
-check against `tests/test_data_overlay*.py` before W4.
+(a worker that only writes fragments and commits needs them). Checked: a DataOverlay commit's manifest (feature flag 64) is read by pylance 12 only with `LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES=1`, pylance's own gate for its unstable overlay files (`tests/test_data_overlay.py` sets it); not a nanolance defect.
