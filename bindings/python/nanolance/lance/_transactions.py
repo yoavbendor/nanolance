@@ -75,7 +75,6 @@ class LanceOperation:
         new_schema: Any
         fragments: List[FragmentMetadata]
         initial_bases: Optional[list] = None
-        config_upserts: Optional[Dict[str, str]] = None  # Lance's config_upsert_values (none by default)
 
         def __post_init__(self):
             self.new_schema = _as_lance_schema(self.new_schema)
@@ -474,7 +473,10 @@ def _operation(number: int, data: bytes) -> LanceOperation.BaseOperation:
         metadata = dict(_map_entry(v) for n, _, v in items if n == 3)
         schema = _schema([v for n, _, v in items if n == 2], {k.decode(): bytes(v or b"") for k, v in metadata.items()})
         upserts = {k.decode(): bytes(v or b"").decode() for k, v in (_map_entry(v) for n, _, v in items if n == 4)}
-        return LanceOperation.Overwrite(schema, [_fragment(v) for n, _, v in items if n == 1], None, upserts or None)
+        op = LanceOperation.Overwrite(schema, [_fragment(v) for n, _, v in items if n == 1], None)
+        if upserts:
+            op.config_upserts = upserts  # Lance's config_upsert_values; not a field of pylance's Overwrite
+        return op
     if number == 103:
         return LanceOperation.CreateIndex([_index(v) for n, _, v in items if n == 1],
                                           [_index(v) for n, _, v in items if n == 2])
@@ -852,7 +854,7 @@ def encode_operation(op: LanceOperation.BaseOperation) -> Tuple[int, bytes]:
             _put_bytes(out, 2, m)
         for k, v in metadata.items():
             _put_map_entry(out, 3, k.encode(), v.encode())
-        for k, v in (op.config_upserts or {}).items():
+        for k, v in (getattr(op, "config_upserts", None) or {}).items():  # not a pylance field
             _put_map_entry(out, 4, k.encode(), v.encode())
         for i, base in enumerate(op.initial_bases or []):
             entry = bytearray()
@@ -1001,7 +1003,7 @@ def _updates_schema_metadata(op) -> bool:
 def _upsert_keys(op) -> Tuple[Set[str], Set[str]]:
     """(config keys set, config keys removed) by an Overwrite or UpdateConfig."""
     if isinstance(op, LanceOperation.Overwrite):
-        return set(op.config_upserts or {}), set()
+        return set(getattr(op, "config_upserts", None) or {}), set()
     if isinstance(op, LanceOperation.UpdateConfig) and op.config_updates is not None:
         upserts = {k for k, v in op.config_updates.updates.items() if v is not None}
         deletes = {k for k, v in op.config_updates.updates.items() if v is None}

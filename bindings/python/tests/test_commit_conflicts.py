@@ -252,8 +252,9 @@ def _committed_operation(uri: str, version: int):
 
 
 def _overwrite_with_config(upserts):
-    return T.LanceOperation.Overwrite(pa.schema([pa.field("id", pa.int64()), pa.field("v", pa.float64())]), [],
-                                      None, upserts)
+    op = T.LanceOperation.Overwrite(pa.schema([pa.field("id", pa.int64()), pa.field("v", pa.float64())]), [], None)
+    op.config_upserts = upserts  # internal: pylance's Overwrite has no such field
+    return op
 
 
 OPERATIONS = {
