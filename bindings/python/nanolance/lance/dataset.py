@@ -1901,7 +1901,8 @@ class LanceDataset(pa.dataset.Dataset):
                 name=name, type_url=first["type_url"], index_type=first["type"] if first["type_url"] else "Unknown",
                 fields=list(first["field_ids"]), field_names=list(first["fields"]),
                 num_rows_indexed=sum(s["rows_indexed"] for s in segments),
-                total_size_bytes=sum(s["size_bytes"] for s in segments), details=self._index_details(first),
+                total_size_bytes=None if name == "__lance_frag_reuse" else sum(s["size_bytes"] for s in segments),
+                details=self._index_details(first),
                 segments=[IndexSegmentDescription(
                     uuid=s["uuid"], fragment_ids=set(s["fragment_ids"]), index_version=s["index_version"],
                     dataset_version_at_last_update=s["dataset_version"], size_bytes=s["size_bytes"],

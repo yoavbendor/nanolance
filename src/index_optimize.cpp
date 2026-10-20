@@ -7,6 +7,7 @@
 // scalar segment (rebuild_scalar_segment) and, for a vector index, with the existing model, as its
 // default (non-retraining) merge assigns new rows to the existing partitions.
 
+#include "nanolance/frag_reuse.hpp"
 #include "nanolance/index_optimize.hpp"
 
 #include "index_build.hpp"
@@ -186,9 +187,22 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
     for (const auto& f : manifest.fragments) {
         live.insert(f.id);
     }
+    // Coverage as Lance reads it: a deferred compaction moved the fragments an index covered.
+    std::shared_ptr<const FragReuse> frag_reuse;
+    if (!FragReuse::load(dataset_path, manifest, frag_reuse, error)) {
+        return false;
+    }
+    const auto coverage = [&](const pb::IndexMetadata& index) {
+        auto ids = index.fragment_ids;
+        if (frag_reuse != nullptr) {
+            frag_reuse->remap_coverage(ids);
+        }
+        return ids;
+    };
     std::set<std::uint64_t> covered;
     for (const auto* s : segments) {
-        covered.insert(s->fragment_ids.begin(), s->fragment_ids.end());
+        const auto ids = coverage(*s);
+        covered.insert(ids.begin(), ids.end());
     }
     std::vector<std::uint64_t> unindexed;
     for (const auto id : live) {
@@ -235,7 +249,7 @@ bool optimize_one(const std::filesystem::path& dataset_path, const pb::Manifest&
     }
     std::set<std::uint64_t> target(unindexed.begin(), unindexed.end());
     for (const auto* s : replaced) {
-        for (const auto id : s->fragment_ids) {
+        for (const auto id : coverage(*s)) {
             if (live.count(id) != 0U) {
                 target.insert(id);
             }

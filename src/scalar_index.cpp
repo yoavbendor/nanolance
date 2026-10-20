@@ -8,6 +8,7 @@
 
 #include "float_text.hpp"
 #include "index_build.hpp"
+#include "nanolance/frag_reuse.hpp"
 #include "nanolance/scalar_index.hpp"
 #include "nanolance/vector_search.hpp"
 
@@ -1958,6 +1959,10 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
     } else if (!load_latest_manifest(dataset_path, manifest, version, error)) {
         return false;
     }
+    std::shared_ptr<const FragReuse> frag_reuse;
+    if (!FragReuse::load(dataset_path, manifest, frag_reuse, error)) {
+        return false;
+    }
     std::map<std::int32_t, const pb::Field*> by_id;
     for (const auto& f : manifest.fields) {
         by_id[f.id] = &f;
@@ -1970,7 +1975,8 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
         return path;
     };
     for (const auto& index : manifest.indices) {
-        if (is_system_index(index)) {
+        // The fragment-reuse index is listed as Lance lists it; the other system indexes are not.
+        if (is_system_index(index) && index.name != "__lance_frag_reuse") {
             continue;
         }
         IndexInfo info;
@@ -1995,6 +2001,9 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
             info.fields.push_back(path_of(id));
         }
         info.fragment_ids = index.fragment_ids;
+        if (frag_reuse != nullptr) {
+            frag_reuse->remap_coverage(info.fragment_ids);  // coverage as Lance reads it
+        }
         info.dataset_version = index.dataset_version;
         info.index_version = index.index_version;
         info.type_url = index.details_type_url;
@@ -2005,7 +2014,7 @@ bool dataset_list_indices(const std::filesystem::path& dataset_path, bool has_ve
             info.size_bytes += f.size;
         }
         for (const auto& f : manifest.fragments) {
-            if (std::binary_search(index.fragment_ids.begin(), index.fragment_ids.end(),
+            if (std::binary_search(info.fragment_ids.begin(), info.fragment_ids.end(),
                                    static_cast<std::uint32_t>(f.id))) {
                 info.rows_indexed +=
                     f.physical_rows - (f.deletion_file.present ? f.deletion_file.num_deleted_rows : 0U);

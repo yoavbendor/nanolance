@@ -303,6 +303,7 @@ add_library(nanolance STATIC
     src/blob_v2_external.cpp
     src/buffer_pool.cpp
     src/column_slice.cpp
+    src/frag_reuse.cpp
     src/index_maintenance.cpp
     src/lance_file_writer.cpp
     src/scalar_index.cpp

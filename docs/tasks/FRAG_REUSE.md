@@ -111,3 +111,23 @@ pytest -o addopts= -q bindings/python/tests/test_frag_reuse.py | tail -2`; `pyth
 tools/pylance_suite.py | tail -4`; last, once: `cd bindings/python && python3 -m pytest -o addopts= -q
 -x -p no:cacheprovider tests | tail -3`. Report under 40 lines: questions first, then files, per-test
 status, tails, decisions.
+
+**R1 outcome (2026-10-20):** done for scalar indexes in one Haiku session; reviewed. The FRI is decoded
+(inline and external `details.binpb`, the per-version remap from `changed_row_addrs` and the digests;
+cached per dataset and uuid); BTREE, BITMAP, ZONEMAP and BLOOMFILTER answers are remapped (deleted rows
+drop, moved rows land in their new fragments; not with stable row ids, whose ids do not move), coverage
+is remapped by Lance's straddle rule, `list_indices` / `describe_indices` show `__lance_frag_reuse` as
+pylance does, and `optimize_indices` no longer rebuilds an index the FRI still covers.
+`tests/test_frag_reuse.py` (9). Reviewer's decisions on the session's questions:
+- Vector and full-text indexes after a deferred remap are answered by an exact scan of the rewritten
+  fragments (right rows, index not used). Translating their candidate addresses is its own phase,
+  **R1b** (vector: the candidate ids in the IVF / HNSW loops and the count fill; FTS: postings and
+  document lengths keyed by row address).
+- pylance 12.0.0 answers wrongly after an eager compaction on top of a deferred one (an indexed `i = 600`
+  returns no row where a scan returns one; its BTREE keeps stale addresses). nanolance does not copy
+  wrong answers: on its own eager compaction it keeps the results right (its index metadata then differs
+  from pylance's); on a dataset pylance left in that state it reads what is on disk, as pylance does.
+  Recorded for an upstream report.
+- Index listing order (pylance sorts by name; nanolance keeps manifest order): a small item, not FRI's.
+The pylance targets (`test_defer_index_remap*`, `test_describe_indices_matches_list_indices_for_frag_reuse`)
+need nanolance's `compact_files(defer_index_remap=True)`: R2.

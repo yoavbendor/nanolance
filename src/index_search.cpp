@@ -34,6 +34,7 @@
 
 #include "nanolance/data_file_reader.hpp"
 #include "nanolance/fts_tokenizer.hpp"
+#include "nanolance/frag_reuse.hpp"
 #include "nanolance/index_maintenance.hpp"
 #include "nanolance/lance_table_reader.hpp"
 #include "nanolance/bloom_filter.hpp"
@@ -1146,6 +1147,30 @@ bool search_bitmap(const std::filesystem::path& dir, bool label_list, const expr
 
 // ── the filter ──────────────────────────────────────────────────────────────────────────────────
 
+/// The rows of `set` as the fragment-reuse index says they are now: deleted rows drop out, moved rows
+/// land in their new fragments. A fragment no version rewrote keeps its rows as they are.
+void remap_rows(const FragReuse& fri, RowSet& set) {
+    std::map<std::uint32_t, std::vector<std::uint32_t>> moved;
+    for (auto& [fragment, offsets] : set.rows) {
+        if (!fri.touches(fragment)) {
+            auto& to = moved[fragment];
+            to.insert(to.end(), offsets.begin(), offsets.end());
+            continue;
+        }
+        for (const auto offset : offsets) {
+            std::uint64_t to = 0;
+            if (fri.resolve((static_cast<std::uint64_t>(fragment) << 32U) | offset, to)) {
+                moved[static_cast<std::uint32_t>(to >> 32U)].push_back(static_cast<std::uint32_t>(to));
+            }
+        }
+    }
+    for (auto& [fragment, offsets] : moved) {
+        std::sort(offsets.begin(), offsets.end());
+        offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+    }
+    set.rows = std::move(moved);
+}
+
 struct Search {
     const std::filesystem::path& dataset_path;
     const pb::Manifest& manifest;
@@ -1153,6 +1178,7 @@ struct Search {
     std::string& error;
     std::vector<std::string> used;
     const RowIdToAddress* row_ids = nullptr;  // with stable row ids: what an index holds are ids
+    const FragReuse* frag_reuse = nullptr;    // a deferred compaction moved rows: the indexes hold old addresses
 
     /// An answer read from an index of a dataset with stable row ids is in ids; make it addresses
     /// (a row whose id is gone, deleted, is dropped).
@@ -1294,10 +1320,19 @@ struct Search {
                     break;
                 }
                 exact_all = exact_all && exact_segment;
+                // The rows an index holds are addresses, as they were when it was built: a compaction
+                // that deferred the index remap moved them since (stable row ids: the ids do not move).
+                if (frag_reuse != nullptr && (row_ids == nullptr || !row_ids->stable())) {
+                    remap_rows(*frag_reuse, one);
+                }
                 if (!zoned) {
                     to_addresses(one);  // a zonemap holds addresses already
                 }
-                one.covered.insert(index->fragment_ids.begin(), index->fragment_ids.end());
+                auto coverage = index->fragment_ids;
+                if (frag_reuse != nullptr) {
+                    frag_reuse->remap_coverage(coverage);
+                }
+                one.covered.insert(coverage.begin(), coverage.end());
                 for (const auto stale : fragments_stale_for_index(manifest, index->fields, index->dataset_version)) {
                     one.covered.erase(stale);  // overlaid since the index was built: scanned instead
                 }
@@ -1364,17 +1399,18 @@ bool index_candidates(const std::filesystem::path& dataset_path, const pb::Manif
     out.used.clear();
     out.exact = false;
     error.clear();
-    // An index whose rows a deferred compaction moved needs the fragment-reuse index to be found again.
-    if (manifest.indices.empty() ||
-        std::any_of(manifest.indices.begin(), manifest.indices.end(),
-                    [](const pb::IndexMetadata& i) { return i.name == "__lance_frag_reuse"; })) {
+    if (manifest.indices.empty()) {
         return true;
+    }
+    std::shared_ptr<const FragReuse> frag_reuse;
+    if (!FragReuse::load(dataset_path, manifest, frag_reuse, error)) {
+        return false;
     }
     RowIdToAddress resolver;
     if (!RowIdToAddress::build(dataset_path, manifest, resolver, error)) {
         return false;
     }
-    Search search{dataset_path, manifest, {}, error, {}, &resolver};
+    Search search{dataset_path, manifest, {}, error, {}, &resolver, frag_reuse.get()};
     for (const auto& f : manifest.fragments) {
         search.physical[static_cast<std::uint32_t>(f.id)] = f.physical_rows;
     }
