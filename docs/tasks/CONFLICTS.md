@@ -163,3 +163,39 @@ Tails of: `cd build && ctest -j8 | tail -3`; `./build/test_commit_conflicts | ta
 `python3 tools/pylance_suite.py | tail -4`; last, once: `cd bindings/python && python3 -m pytest -o
 addopts= -q -p no:cacheprovider tests | tail -3`. Report under 40 lines: questions first, then files,
 per-pair status, tails, decisions.
+
+**C1 outcome (2026-10-20, first session):** verdicts implemented (`src/commit_conflicts.{hpp,cpp}`, decoder
+moved to `src/dataset_operation.{hpp,cpp}`, `classify_concurrent` in `commit_next_version`, counters in
+`include/nanolance/dataset_commit.hpp`, `_errors.py` maps "Incompatible transaction:" to OSError,
+`tests/test_commit_conflicts.cpp` at verdict level). Reviewer found: **the probe of section 2 is unchanged
+end to end**, because nanolance's Python mutations never race from a stale handle -- `delete_once`
+(`src/dataset_ops.cpp` ~791) and the other `*_once` functions `load_latest`, so a handle opened at v1
+deletes from v3. pylance commits from the handle's own version (`read_version`), then resolves.
+Reviewer's answers to the session's questions:
+1-2. `Update.inserted_rows_filter` and `update_mode`: record them in `derive_transaction_operation` as
+   pylance does (C2; measure pylance's .txn for a keyed merge_insert and an update first).
+3. Overwrite `config_upsert_values`: write what pylance writes (C2; measure a pylance overwrite's .txn
+   carrying an unchanged config key). Until then, accepted.
+4. Lance wins: change `_transactions.py` `conflict_with` to agree with Lance on 4a-4d (C1b).
+5. lance-c: keep `LANCE_ERR_INTERNAL` (lance.h is upstream's header; never add codes; pylance raises a
+   plain OSError for it, not CommitConflictError).
+6. FRI / MemWAL names: accepted as absent.
+
+**C1b (second session):** finish C1.
+- **Read version.** Each mutation commits from the version the dataset object was opened at, as
+  pylance does: the Python methods pass the handle's version (`self._version`, or "latest" when the
+  object follows latest) down through the bindings to the C++ `*_once` functions, which load that
+  version instead of `load_latest`; on a lost race the classification of C1 decides (compatible ->
+  rebase, retryable -> `retry_on_conflict` re-runs on latest, as pylance's own retries do; incompatible
+  -> error). Operations: delete, update, merge_insert, add_columns / drop_columns / alter_columns,
+  update_config / table and schema metadata, compaction, create_index / create_scalar_index,
+  optimize_indices, restore. Overwrite and append need no read version (their pairs do not depend on
+  it beyond Lance's rules for Append / Overwrite as "ours"). C++ API: an optional read version
+  parameter (default: latest, today's behaviour, so lance-c and C++ callers are unchanged).
+- The two "wrong" rows of section 2 now raise pylance's OSError through `nanolance.lance`; the four
+  "re-run: keep" rows still succeed; every other row unchanged. Write
+  `bindings/python/tests/test_commit_conflicts.py` (section 5) and the C++ two-writer tests
+  (incompatible not re-run; no transaction file -> retryable).
+- Align `_transactions.py` `conflict_with` with Lance on 4a-4d above, and add the C++-vs-Python
+  agreement test for the pairs both express.
+- Check the wasm build still compiles the touched sources (`docs/../AGENTS.md`, wasm note).
