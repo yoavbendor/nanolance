@@ -654,6 +654,34 @@ class LanceDataset(pa.dataset.Dataset):
             _nanolance._ds_create_branch(self._root, str(name), branch, int(version))
         return LanceDataset(_branch_uri(self._root, str(name)), storage_options=self._storage_options)
 
+    def shallow_clone(self, target_path, reference, storage_options: Optional[Dict[str, str]] = None,
+                      **kwargs) -> "LanceDataset":
+        """Clone ``reference`` (an int version of this dataset's branch, a tag, or ``(branch, version)``) into a new
+        dataset at ``target_path``. The clone's files stay in this dataset, reached through a base path; nothing
+        is copied. Returns the clone, opened."""
+        return self._clone(target_path, reference, False, storage_options, kwargs)
+
+    def deep_clone(self, target_path, reference, storage_options: Optional[Dict[str, str]] = None,
+                   **kwargs) -> "LanceDataset":
+        """As ``shallow_clone``, but the data, deletion and index files the version names are copied into the
+        clone, which reads on after this dataset is deleted."""
+        return self._clone(target_path, reference, True, storage_options, kwargs)
+
+    def _clone(self, target_path, reference, deep: bool, storage_options, kwargs) -> "LanceDataset":
+        target = _path_of(target_path)
+        refuse_object_store_write(target, "deep clone" if deep else "shallow clone")
+        if isinstance(reference, str):
+            branch, version = _tag_target(self._root, reference, OSError)
+        else:
+            branch, version = _reference(self, reference, (self._branch, self._version))
+        if version == 0:
+            version = _latest_of(self._root, branch)
+        with _clone_errors():
+            _nanolance._ds_clone(self._root, branch, int(version), target, bool(deep))
+        if storage_options is None:
+            storage_options = self._storage_options
+        return LanceDataset(target, storage_options=storage_options, **kwargs)
+
     def checkout_version(self, version) -> "LanceDataset":
         if isinstance(version, str):
             version = _tag_target(self._root, version, OSError)
@@ -2286,7 +2314,7 @@ class LanceDataset(pa.dataset.Dataset):
         known = {
             "create_index",
             "create_branch", "sql",
-            "shallow_clone", "deep_clone", "join",
+            "join",
             "prewarm_index",
         }
         if name in known:
@@ -2486,6 +2514,21 @@ def _branch_errors():
         if text.startswith(("Ref not found", "Version not found")):
             raise ValueError(text) from None
         if text.startswith("Ref "):
+            raise OSError(text) from None
+        from nanolance.lance._errors import translate
+
+        raise translate(text) from None
+
+
+@contextlib.contextmanager
+def _clone_errors():
+    """Clone errors as pylance raises them: a missing version, tag or branch and a target that already holds a
+    dataset are OSErrors (not the ValueErrors of a missing branch)."""
+    try:
+        yield
+    except RuntimeError as exc:
+        text = str(exc)
+        if "not found" in text or "already exists" in text:
             raise OSError(text) from None
         from nanolance.lance._errors import translate
 

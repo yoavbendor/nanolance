@@ -337,6 +337,7 @@ tests/test_dataset.py::test_dataset_sql
 tests/test_dataset.py::test_dataset_sql_batch_size_rows
 tests/test_dataset.py::test_dataset_sql_rejects_invalid_batch_size[0]
 tests/test_dataset.py::test_dataset_sql_rejects_invalid_batch_size[4294967296]
+tests/test_dataset.py::test_deep_clone
 tests/test_dataset.py::test_default_scan_options
 tests/test_dataset.py::test_default_scan_options_nearest
 tests/test_dataset.py::test_default_storage_version
@@ -436,6 +437,7 @@ tests/test_dataset.py::test_schema_project_drop_column
 tests/test_dataset.py::test_schema_project_rename_column
 tests/test_dataset.py::test_schema_project_swap_column
 tests/test_dataset.py::test_scoring_columns
+tests/test_dataset.py::test_shallow_clone
 tests/test_dataset.py::test_sharded_iterator_batches
 tests/test_dataset.py::test_sharded_iterator_fragments
 tests/test_dataset.py::test_sharded_iterator_non_full_batch
@@ -826,6 +828,10 @@ tests/test_namespace_dir.py::TestNamespaceProperties::test_namespace_with_proper
 tests/test_namespace_dir.py::TestNamespaceProperties::test_namespace_with_properties[DirectoryNamespace]
 tests/test_namespace_dir.py::TestPythonNamespaceErrorMapping::test_foreign_code_attribute_not_trusted
 tests/test_namespace_dir.py::TestPythonNamespaceErrorMapping::test_namespace_error_identity_preserved
+tests/test_namespace_dir.py::TestTableBranchOperations::test_branch_crud_round_trip[CustomNamespace]
+tests/test_namespace_dir.py::TestTableBranchOperations::test_branch_crud_round_trip[DirectoryNamespace]
+tests/test_namespace_dir.py::TestTableBranchOperations::test_create_branch_from_other_branch[CustomNamespace]
+tests/test_namespace_dir.py::TestTableBranchOperations::test_create_branch_from_other_branch[DirectoryNamespace]
 tests/test_namespace_dir.py::TestTableOperations::test_deregister_table[CustomNamespace]
 tests/test_namespace_dir.py::TestTableOperations::test_deregister_table[DirectoryNamespace]
 tests/test_namespace_dir.py::TestTableOperations::test_drop_table[CustomNamespace]

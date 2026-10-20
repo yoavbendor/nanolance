@@ -196,3 +196,18 @@ files their manifests name here are kept. `test_branches` and `test_tag` pass (e
   cannot read its own index (`Not found under tree/sub/_indices`); nanolance keeps the inherited base id,
   which pylance reads. Recorded for an upstream report.
 - nanolance records base paths absolute (it opens paths absolute); pylance reads both.
+
+**B3 outcome (2026-10-20):** done in one Haiku session; reviewed. `shallow_clone` (one manifest at the source
+version, files through base paths: base 0 the source root, or a base named after a source branch; flags
+16; no field 20; Clone transaction with is_shallow, ref_name, ref_version) and `deep_clone` (data,
+deletions and indices copied, no base paths) as pylance writes them, compared field by field; a failed
+clone removes only what it created. Namespace `create_table_branch` / `list_table_branches` /
+`delete_table_branch`, `list_table_versions(branch=)`. `test_shallow_clone`, `test_deep_clone` and the four
+namespace branch tests pass (expected list 1234); `tests/test_branches.py` 31. Reviewer's decisions:
+- Cleanup on a shallow clone's *source* can remove files the clone reads -- pylance does the same
+  (measured): the source keeps no record of its shallow clones, so its cleanup cannot know them. Kept as
+  pylance; documented here.
+- An inherited index on a shallow clone of a branch keeps its base id (pylance remaps it and then cannot
+  read its own index), as in B2.
+- Also fixed in review: a GCC -O3 `-Wmaybe-uninitialized` in B2's cleanup (a copied std::optional), which
+  failed CI's -Werror build of lance-c's S3 reader.

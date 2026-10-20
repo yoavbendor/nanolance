@@ -12,7 +12,7 @@
 #include <vector>
 
 /// A dataset's versions kept and let go, as Lance keeps them: tags (`_refs/tags/<name>.json`), branches
-/// (`_refs/branches/<name>.json`, created, deleted and described here),
+/// (`_refs/branches/<name>.json`, created, deleted and described here), shallow and deep clones of a version,
 /// cleanup of old versions and the files only they use, the automatic cleanup a dataset's
 /// `lance.auto_cleanup.*` config asks for after each commit, and dropping a whole dataset. The rules
 /// follow Lance 12 (`dataset/cleanup.rs`, `dataset/refs.rs`, `validate_dataset_root_for_drop`), so a
@@ -57,6 +57,18 @@ std::filesystem::path branch_location(const std::filesystem::path& root, const s
 /// is taken, the version does not exist or the parent branch does not.
 bool create_branch(const std::filesystem::path& root, const std::string& name, const std::string& source_branch,
                    std::uint64_t version, std::string& error);
+
+/// Clone version `version` of branch `source_branch` ("": main) of the dataset at `root` into `target`, a
+/// new dataset root (or an empty directory), as Lance's shallow_clone: the clone's only version is the
+/// source's, its files stay in the source (reached through a base path), and nothing is copied. Its Clone
+/// transaction names the source. Fails when `target` already holds a dataset or the version does not exist.
+bool shallow_clone(const std::filesystem::path& root, const std::string& source_branch, std::uint64_t version,
+                   const std::filesystem::path& target, std::string& error);
+
+/// As shallow_clone, but the version's data, deletion and index files are copied into `target`, and no base
+/// path points at the source: the clone reads on after the source is deleted (Lance's deep_clone).
+bool deep_clone(const std::filesystem::path& root, const std::string& source_branch, std::uint64_t version,
+                const std::filesystem::path& target, std::string& error);
 
 /// Delete branch `name` and its versions. Refused for main, for a branch another branch forks from, and
 /// for a branch a tag names (Lance's refusals), with its messages.

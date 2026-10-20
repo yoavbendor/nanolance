@@ -1347,6 +1347,16 @@ NB_MODULE(_nanolance, m) {
             throw_dataset(error);
         }
     }, nb::arg("path"), nb::arg("name"), nb::arg("source_branch").none(), nb::arg("version"));
+    m.def("_ds_clone", [](const std::filesystem::path& path, std::optional<std::string> source_branch,
+                          std::uint64_t version, const std::filesystem::path& target, bool deep) {
+        std::string error;
+        const auto branch = source_branch.value_or(std::string());
+        const bool ok = deep ? nano_lance::deep_clone(path, branch, version, target, error)
+                             : nano_lance::shallow_clone(path, branch, version, target, error);
+        if (!ok) {
+            throw_dataset(error);
+        }
+    }, nb::arg("path"), nb::arg("source_branch").none(), nb::arg("version"), nb::arg("target"), nb::arg("deep"));
     m.def("_ds_delete_branch", [](const std::filesystem::path& path, const std::string& name) {
         std::string error;
         if (!nano_lance::delete_branch(path, name, error)) {

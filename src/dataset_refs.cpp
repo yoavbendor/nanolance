@@ -844,64 +844,45 @@ void put_string_bytes(std::vector<std::uint8_t>& out, std::uint32_t field, const
     out.insert(out.end(), s.begin(), s.end());
 }
 
-/// The Clone operation a branch's first version records (lance.table.Transaction.Clone): a shallow
-/// clone of `source_branch`'s version `version` at `source_dir`, as the branch `name`.
+/// The Clone operation a clone's first version records (lance.table.Transaction.Clone): the clone of
+/// `source_branch`'s version `version` at `source_dir`. A shallow clone sets is_shallow; a branch sets
+/// branch_name; a clone of a dataset (not a branch) leaves it out.
 std::vector<std::uint8_t> clone_operation(const std::string& source_branch, std::uint64_t version,
-                                          const std::string& source_dir, const std::string& name) {
+                                          const std::string& source_dir, const std::string& branch_name,
+                                          bool shallow) {
     std::vector<std::uint8_t> out;
-    put_key_bytes(out, 1, 0);
-    put_varint_bytes(out, 1);  // is_shallow
+    if (shallow) {
+        put_key_bytes(out, 1, 0);
+        put_varint_bytes(out, 1);  // is_shallow
+    }
     if (!source_branch.empty()) {
         put_string_bytes(out, 2, source_branch);  // ref_name: absent for main
     }
     put_key_bytes(out, 3, 0);
     put_varint_bytes(out, version);  // ref_version
     put_string_bytes(out, 4, source_dir);
-    put_string_bytes(out, 5, name);  // branch_name
+    if (!branch_name.empty()) {
+        put_string_bytes(out, 5, branch_name);
+    }
     return out;
 }
 
-}  // namespace
-
-bool create_branch(const fs::path& root, const std::string& name, const std::string& source_branch,
-                   std::uint64_t version, std::string& error) {
-    error.clear();
-    if (!check_valid_branch(name, error)) {
-        return false;
-    }
-    std::vector<BranchInfo> branches;
-    if (!list_branches(root, branches, error)) {
-        return false;
-    }
-    std::error_code ec;
-    if (find_branch(branches, name) != nullptr || fs::exists(branch_ref_path(root, name), ec)) {
-        error = "Ref conflict error: branch " + name + " already exists";
-        return false;
-    }
-    std::vector<std::pair<std::uint64_t, std::string>> identifier;
-    if (!source_branch.empty()) {
-        const auto* parent = find_branch(branches, source_branch);
-        if (parent == nullptr) {
-            error = "Ref not found error: parent branch " + source_branch + " does not exist";
-            return false;
-        }
-        identifier = parent->identifier;
-    }
-    const auto source_dir = branch_location(root, source_branch);
+/// The shallow form of the source's manifest at `version`, as a branch or a shallow clone starts from it: the
+/// files and deletions the source's version names keep their base; those with no base (the source's own
+/// directory) point at a new base path, the source's directory as a dataset root, numbered after the
+/// source's. The source's base paths are kept. The caller sets the branch field, the Clone operation and
+/// the version.
+bool shallow_manifest(const fs::path& source_dir, const std::string& source_branch, std::uint64_t version,
+                      pb::Manifest& manifest, std::uint64_t& manifest_size, std::string& error) {
     fs::path manifest_path;
-    std::uint64_t manifest_size = 0;
     if (version == 0 || !manifest_file_of(source_dir, version, manifest_path, manifest_size)) {
         error = "Version not found error: Manifest file " + (source_dir / "_versions").string() + " for version " +
                 std::to_string(version) + " does not exist";
         return false;
     }
-    pb::Manifest manifest;
     if (!load_manifest_file(manifest_path, manifest, error)) {
         return false;
     }
-    // The branch's files inherit through base paths, as Lance's shallow clone makes them: a new base
-    // path (the source's directory, as a dataset root), numbered after the source's, which the files
-    // without a base of their own point at. Files the source inherited keep their base.
     std::vector<BasePath> bases;
     if (!read_base_paths(manifest, bases, error)) {
         return false;
@@ -947,16 +928,21 @@ bool create_branch(const fs::path& root, const std::string& name, const std::str
     inherited.path = source_dir.string();
     bases.push_back(inherited);
     write_base_paths(manifest, bases);
-    write_manifest_branch(manifest, name);
     manifest.reader_feature_flags |= pb::kFlagMultipleBasePaths;
     manifest.writer_feature_flags |= pb::kFlagMultipleBasePaths;
-    // The first version of the branch is the source's version, not the one after the latest: a branch
-    // starts at its fork (Lance's CommitBuilder with the Clone transaction read at that version).
+    return true;
+}
+
+/// Make a clone's manifest the first version of its dataset: `version`, the Clone operation read at that
+/// version, a timestamp now, and nanolance as the writer.
+void finish_clone(pb::Manifest& manifest, std::uint64_t version, std::vector<std::uint8_t> operation) {
+    // The first version of a clone is the source's version, not the one after the latest: a branch starts at
+    // its fork (Lance's CommitBuilder with the Clone transaction read at that version).
     manifest.version = version;
     manifest.transaction_file.clear();
     manifest.tag.clear();
     manifest.explicit_operation_field = 113;  // Transaction.clone
-    manifest.explicit_operation = clone_operation(source_branch, version, source_dir.string(), name);
+    manifest.explicit_operation = std::move(operation);
     manifest.explicit_read_version = version;
     manifest.has_timestamp = true;
     const auto nanos =
@@ -966,6 +952,207 @@ bool create_branch(const fs::path& root, const std::string& name, const std::str
     manifest.timestamp_nanos = static_cast<std::int32_t>(nanos % 1000000000LL);
     manifest.writer_library = "nanolance";
     manifest.writer_version = nanolance_writer_version();
+}
+
+/// The directories a deep clone creates in its target, and whether each already existed.
+struct CloneDirs {
+    static constexpr std::array<const char*, 5> names{"_versions", "_transactions", "data", "_deletions", "_indices"};
+    std::array<bool, 5> existed{};
+};
+
+CloneDirs remember_clone_dirs(const fs::path& target) {
+    CloneDirs dirs;
+    std::error_code ec;
+    for (std::size_t i = 0; i < CloneDirs::names.size(); ++i) {
+        dirs.existed[i] = fs::exists(target / CloneDirs::names[i], ec);
+    }
+    return dirs;
+}
+
+/// Remove what a failed clone created in `target` (the target itself when this clone created it).
+void undo_clone(const fs::path& target, bool target_existed, const CloneDirs& dirs) {
+    std::error_code ec;
+    if (!target_existed) {
+        fs::remove_all(target, ec);
+        return;
+    }
+    for (std::size_t i = 0; i < CloneDirs::names.size(); ++i) {
+        if (!dirs.existed[i]) {
+            fs::remove_all(target / CloneDirs::names[i], ec);
+        }
+    }
+}
+
+/// Whether `target` already holds a dataset (a manifest in its `_versions`).
+bool holds_dataset(const fs::path& target) {
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(target / "_versions", ec)) {
+        std::uint64_t v = 0;
+        if (entry.is_regular_file(ec) && parse_manifest_version(entry.path().filename().string(), v)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The deep form of the source's version: its data, deletion and index files copied into `target`, and no
+/// base path to the source (a base is what an absent base_id, or base 0 of a branch, names in the source).
+bool deep_manifest(const fs::path& source_dir, std::uint64_t version, const fs::path& target,
+                   pb::Manifest& manifest, std::string& error) {
+    fs::path manifest_path;
+    std::uint64_t manifest_size = 0;
+    if (version == 0 || !manifest_file_of(source_dir, version, manifest_path, manifest_size)) {
+        error = "Version not found error: Manifest file " + (source_dir / "_versions").string() + " for version " +
+                std::to_string(version) + " does not exist";
+        return false;
+    }
+    if (!load_manifest_file(manifest_path, manifest, error)) {
+        return false;
+    }
+    std::vector<BasePath> bases;
+    if (!read_base_paths(manifest, bases, error)) {
+        return false;
+    }
+    // Copy first, with the source's bases still in the manifest: every file is resolved against them.
+    std::error_code ec;
+    for (const auto& fragment : manifest.fragments) {
+        for (const auto& file : fragment.files) {
+            fs::path dir;
+            if (!data_file_dir(source_dir, bases, file, dir, error)) {
+                return false;
+            }
+            fs::create_directories(target / "data", ec);
+            fs::copy_file(dir / file.path, target / "data" / file.path, fs::copy_options::none, ec);
+            if (ec) {
+                error = "failed to copy data file " + file.path + ": " + ec.message();
+                return false;
+            }
+        }
+        if (fragment.deletion_file.present) {
+            fs::path dir;
+            if (!deletion_file_dir(source_dir, bases, fragment.deletion_file, dir, error)) {
+                return false;
+            }
+            const auto name = fs::path(deletion_file_name(fragment)).filename();
+            fs::create_directories(target / "_deletions", ec);
+            fs::copy_file(dir / name, target / "_deletions" / name, fs::copy_options::none, ec);
+            if (ec) {
+                error = "failed to copy deletion file " + name.string() + ": " + ec.message();
+                return false;
+            }
+        }
+    }
+    for (const auto& index : manifest.indices) {
+        fs::path dir;
+        if (!index_dir_of(source_dir, manifest, index, dir, error)) {
+            return false;
+        }
+        const auto dst = target / "_indices" / pb::uuid_string(index.uuid);
+        fs::create_directories(dst.parent_path(), ec);
+        fs::copy(dir, dst, fs::copy_options::recursive, ec);
+        if (ec) {
+            error = "failed to copy index " + pb::uuid_string(index.uuid) + ": " + ec.message();
+            return false;
+        }
+    }
+    // Then the manifest names the copies: no base on any file, index or deletion, and no base path.
+    for (auto& fragment : manifest.fragments) {
+        for (auto& file : fragment.files) {
+            set_data_file_base_id(file, std::nullopt);
+        }
+        if (fragment.deletion_file.present) {
+            set_deletion_file_base_id(fragment.deletion_file, std::nullopt);
+        }
+    }
+    for (auto& index : manifest.indices) {
+        set_index_base_id(index, std::nullopt);
+    }
+    write_base_paths(manifest, {});
+    manifest.reader_feature_flags &= ~pb::kFlagMultipleBasePaths;
+    manifest.writer_feature_flags &= ~pb::kFlagMultipleBasePaths;
+    return true;
+}
+
+bool clone_version(const fs::path& root, const std::string& source_branch, std::uint64_t version,
+                   const fs::path& target, bool deep, std::string& error) {
+    error.clear();
+    const auto source_dir = branch_location(root, source_branch);
+    fs::path source_manifest;
+    std::uint64_t source_size = 0;
+    if (version == 0 || !manifest_file_of(source_dir, version, source_manifest, source_size)) {
+        // pylance's words for a version that is not there (an OSError there, as for a missing tag).
+        error = "Dataset at path " + (source_dir / "_versions" / (std::to_string(version) + ".manifest")).string() +
+                " was not found";
+        return false;
+    }
+    if (holds_dataset(target)) {
+        error = "Dataset already exists: " + target.string();
+        return false;
+    }
+    std::error_code ec;
+    const bool target_existed = fs::exists(target, ec);
+    const auto dirs = remember_clone_dirs(target);
+    pb::Manifest manifest;
+    std::uint64_t manifest_size = 0;
+    const bool built = deep ? deep_manifest(source_dir, version, target, manifest, error)
+                            : shallow_manifest(source_dir, source_branch, version, manifest, manifest_size, error);
+    if (!built) {
+        undo_clone(target, target_existed, dirs);
+        return false;
+    }
+    write_manifest_branch(manifest, "");  // a clone is a dataset of its own, not a branch
+    finish_clone(manifest, version, clone_operation(source_branch, version, source_dir.string(), "", !deep));
+    if (!publish_manifest(target, manifest, error)) {
+        undo_clone(target, target_existed, dirs);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool shallow_clone(const fs::path& root, const std::string& source_branch, std::uint64_t version,
+                   const fs::path& target, std::string& error) {
+    return clone_version(root, source_branch, version, target, false, error);
+}
+
+bool deep_clone(const fs::path& root, const std::string& source_branch, std::uint64_t version,
+                const fs::path& target, std::string& error) {
+    return clone_version(root, source_branch, version, target, true, error);
+}
+
+bool create_branch(const fs::path& root, const std::string& name, const std::string& source_branch,
+                   std::uint64_t version, std::string& error) {
+    error.clear();
+    if (!check_valid_branch(name, error)) {
+        return false;
+    }
+    std::vector<BranchInfo> branches;
+    if (!list_branches(root, branches, error)) {
+        return false;
+    }
+    std::error_code ec;
+    if (find_branch(branches, name) != nullptr || fs::exists(branch_ref_path(root, name), ec)) {
+        error = "Ref conflict error: branch " + name + " already exists";
+        return false;
+    }
+    std::vector<std::pair<std::uint64_t, std::string>> identifier;
+    if (!source_branch.empty()) {
+        const auto* parent = find_branch(branches, source_branch);
+        if (parent == nullptr) {
+            error = "Ref not found error: parent branch " + source_branch + " does not exist";
+            return false;
+        }
+        identifier = parent->identifier;
+    }
+    const auto source_dir = branch_location(root, source_branch);
+    pb::Manifest manifest;
+    std::uint64_t manifest_size = 0;
+    if (!shallow_manifest(source_dir, source_branch, version, manifest, manifest_size, error)) {
+        return false;
+    }
+    write_manifest_branch(manifest, name);
+    finish_clone(manifest, version, clone_operation(source_branch, version, source_dir.string(), name, true));
     if (!publish_manifest(branch_location(root, name), manifest, error)) {
         return false;
     }
@@ -1347,13 +1534,14 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
     // Lance lists only files no newer than the earliest version kept (a newer file may belong to a
     // write in progress), unless a removed version is newer than a kept one (a tagged old version):
     // then everything, so the removed version's files are not orphaned. Index files: always all.
-    std::optional<std::int64_t> cutoff_ns = earliest_kept_ns;
-    if (earliest_kept_ns && latest_removed_ns && *latest_removed_ns > *earliest_kept_ns) {
-        cutoff_ns.reset();
-    }
+    // A flag and a value rather than a copied std::optional: GCC's -O3 flow analysis flags the copy as
+    // maybe-uninitialized (-Werror in CI).
+    const bool has_cutoff = earliest_kept_ns.has_value() &&
+                            !(latest_removed_ns.has_value() && *latest_removed_ns > *earliest_kept_ns);
+    const std::int64_t cutoff_ns = has_cutoff ? *earliest_kept_ns : 0;
     std::vector<CleanupCandidate> files;
     for (const char* dir : {"_versions", "_transactions", "data", "_indices", "_deletions"}) {
-        const bool all = std::string_view(dir) == "_indices" || !cutoff_ns;
+        const bool all = std::string_view(dir) == "_indices" || !has_cutoff;
         std::error_code walk_ec;
         if (!fs::exists(dataset_path / dir, walk_ec)) {
             continue;
@@ -1376,7 +1564,7 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
             const auto modified_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          fs::file_time_type::clock::to_sys(modified).time_since_epoch())
                                          .count();
-            if (!all && cutoff_ns && modified_ns > *cutoff_ns) {
+            if (!all && modified_ns > cutoff_ns) {
                 continue;  // modified after the earliest kept version
             }
             file.maybe_in_progress = !policy.delete_unverified && age < kUnverifiedThresholdNs;
