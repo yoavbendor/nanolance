@@ -131,3 +131,15 @@ pylance does, and `optimize_indices` no longer rebuilds an index the FRI still c
 - Index listing order (pylance sorts by name; nanolance keeps manifest order): a small item, not FRI's.
 The pylance targets (`test_defer_index_remap*`, `test_describe_indices_matches_list_indices_for_frag_reuse`)
 need nanolance's `compact_files(defer_index_remap=True)`: R2.
+
+**R2 outcome (2026-10-20):** done in one Haiku session; reviewed. `compact_files(defer_index_remap=True)`
+(and the commit-options form) writes the FRI as pylance writes it (in the rewrite's version, index
+version 3, prior versions kept), which pylance and R1's reader both read; the other indexes' coverage is
+swapped for whole rewritten groups, and nothing is re-indexed. `lance.Compaction.plan` / `.commit`,
+`CompactionPlan`, `CompactionTask.execute`, `RewriteResult` (C++: `dataset_compact_plan` / `_execute` /
+`_commit`; eager compaction now runs through the same three steps). Review: eager compaction's output
+unchanged (fragments, rows, contents and index answers equal to the previous build's on plain, row-target,
+byte-limit and delete cases). Five more of pylance's tests pass (expected list 1219). Open:
+`test_optimize_max_bytes` wants the byte limit cut at batch granularity (2 fragments where nanolance
+writes 8): it changes eager output, so it is a decision, not done; `defer_index_remap` on a dataset with
+stable row ids is refused; an FRI larger than 200 KB (external details) is refused when writing.

@@ -177,6 +177,127 @@ indices = types.SimpleNamespace(
 )
 
 
+# ── compaction: pylance's Compaction.plan / CompactionPlan / CompactionTask / Compaction.commit ──────────────
+
+
+def _fragments_by_id(uri: str, version: int):
+    from nanolance.lance._transactions import _fragment_id
+    from nanolance.lance.fragment import _decode_fragment
+
+    with native():
+        messages = _nanolance._ds_fragment_messages(uri, int(version))
+    return {_fragment_id(m): _decode_fragment(bytes(m)) for m in messages}
+
+
+class CompactionTask:
+    """One bin of a plan: the fragments one rewrite takes. ``execute`` writes them; nothing is committed."""
+
+    def __init__(self, uri: str, read_version: int, fragment_ids: List[int], fragments, max_bytes_per_file: int,
+                 batch_size: int):
+        self._uri = uri
+        self.read_version = read_version
+        self.fragment_ids = fragment_ids
+        self.fragments = fragments
+        self._max_bytes_per_file = max_bytes_per_file
+        self._batch_size = batch_size
+
+    def __eq__(self, other) -> bool:
+        return (isinstance(other, CompactionTask) and self.read_version == other.read_version
+                and self.fragment_ids == other.fragment_ids and self.fragments == other.fragments)
+
+    def __repr__(self) -> str:
+        return f"CompactionTask(read_version={self.read_version}, fragments={self.fragment_ids})"
+
+    def execute(self, dataset) -> "RewriteResult":
+        from nanolance.lance._errors import refuse_object_store_write
+        from nanolance.lance.fragment import _decode_fragment
+        from nanolance.lance.optimize import CompactionMetrics, RewriteResult
+
+        refuse_object_store_write(dataset.uri, "compact files")
+        with native():
+            old_ids, messages = _nanolance._ds_compact_execute(self._uri, self.read_version, self.fragment_ids,
+                                                               self._max_bytes_per_file, self._batch_size)
+        messages = [bytes(m) for m in messages]
+        new = [_decode_fragment(m) for m in messages]
+        old = list(self.fragments)
+        metrics = CompactionMetrics(
+            fragments_removed=len(old), fragments_added=len(new),
+            files_removed=sum(len(f.files) + (f.deletion_file is not None) for f in old), files_added=len(new))
+        return RewriteResult(read_version=self.read_version, new_fragments=new, old_fragments=old, metrics=metrics,
+                             _messages=messages)
+
+
+class CompactionPlan:
+    """The tasks a compaction would run on one version (``Compaction.plan``)."""
+
+    def __init__(self, read_version: int, tasks: List[CompactionTask]):
+        self.read_version = read_version
+        self.tasks = tasks
+
+    def num_tasks(self) -> int:
+        return len(self.tasks)
+
+    def __eq__(self, other) -> bool:
+        return (isinstance(other, CompactionPlan) and self.read_version == other.read_version
+                and self.tasks == other.tasks)
+
+    def __repr__(self) -> str:
+        return f"CompactionPlan(read_version={self.read_version}, tasks=<{len(self.tasks)} compaction tasks>)"
+
+
+class Compaction:
+    """Compaction in steps: ``plan`` the tasks, ``execute`` each (in any process), ``commit`` the results."""
+
+    @staticmethod
+    def plan(dataset, options: Optional[dict] = None) -> CompactionPlan:
+        from nanolance.lance._errors import refuse_object_store_write
+
+        refuse_object_store_write(dataset.uri, "compact files")
+        o = dict(options or {})
+
+        def opt(name, default):
+            return default if o.get(name) is None else o[name]
+
+        def limit(name):
+            return None if o.get(name) is None else int(o[name])
+
+        with native():
+            read_version, tasks = _nanolance._ds_compact_plan(
+                dataset.uri, int(opt("target_rows_per_fragment", 1024 * 1024)),
+                bool(opt("materialize_deletions", True)), float(opt("materialize_deletions_threshold", 0.1)),
+                limit("max_source_fragments"), limit("max_source_rows"), limit("max_source_bytes"),
+                sorted({int(i) for i in (o.get("excluded_fragment_ids") or [])}),
+                int(o.get("max_bytes_per_file") or 0), int(o.get("batch_size") or 0))
+        by_id = _fragments_by_id(dataset.uri, read_version)
+        max_bytes, batch = int(o.get("max_bytes_per_file") or 0), int(o.get("batch_size") or 0)
+        return CompactionPlan(read_version, [
+            CompactionTask(dataset.uri, read_version, list(ids), [by_id[i] for i in ids], max_bytes, batch)
+            for ids in tasks])
+
+    @staticmethod
+    def commit(dataset, rewrites, options: Optional[dict] = None):
+        """Commit rewritten tasks as one version (``options``: ``defer_index_remap``, ``reindex``). Returns the
+        CompactionMetrics. A writer that changed a rewritten fragment meanwhile makes it a conflict."""
+        from nanolance.lance._errors import refuse_object_store_write
+        from nanolance.lance.optimize import CompactionMetrics
+
+        refuse_object_store_write(dataset.uri, "compact files")
+        rewrites = list(rewrites)
+        if not rewrites:
+            return CompactionMetrics()
+        o = dict(options or {})
+        versions = {r.read_version for r in rewrites}
+        if len(versions) != 1:
+            raise ValueError(f"the rewrites were made from different versions: {sorted(versions)}")
+        with native():
+            metrics, _ = _nanolance._ds_compact_commit(
+                dataset.uri, rewrites[0].read_version, [[int(f.id) for f in r.old_fragments] for r in rewrites],
+                [list(r._messages) for r in rewrites], bool(o.get("defer_index_remap", False)),
+                bool(o.get("reindex", True)))
+        dataset._refresh_latest("Rewrite")
+        return CompactionMetrics(**{k: int(v) for k, v in metrics.items() if not k.startswith("indexes_")})
+
+
 def __getattr__(name: str):
     from nanolance.lance._stubs import placeholder
 

@@ -2266,9 +2266,11 @@ NB_MODULE(_nanolance, m) {
                                   std::optional<std::uint64_t> max_source_rows,
                                   std::optional<std::uint64_t> max_source_bytes,
                                   const std::vector<std::uint64_t>& excluded_fragment_ids,
-                                  std::uint64_t max_bytes_per_file, std::uint64_t batch_size) {
+                                  std::uint64_t max_bytes_per_file, std::uint64_t batch_size,
+                                  bool defer_index_remap) {
         nano_lance::CompactionOptions options;
         options.reindex = reindex;
+        options.defer_index_remap = defer_index_remap;
         options.max_source_fragments = max_source_fragments;
         options.max_source_rows = max_source_rows;
         options.max_source_bytes = max_source_bytes;
@@ -2281,6 +2283,74 @@ NB_MODULE(_nanolance, m) {
         nano_lance::CompactionMetrics metrics;
         std::uint64_t version = 0;
         run_op([&](std::string& e) { return nano_lance::dataset_compact_files(path, options, metrics, version, e); });
+        nb::dict d;
+        d["fragments_removed"] = metrics.fragments_removed;
+        d["fragments_added"] = metrics.fragments_added;
+        d["files_removed"] = metrics.files_removed;
+        d["files_added"] = metrics.files_added;
+        d["indexes_reindexed"] = metrics.indexes_reindexed;
+        d["indexes_not_reindexed"] = metrics.indexes_not_reindexed;
+        return nb::make_tuple(d, version);
+    });
+    // Compaction as Compaction.plan / CompactionTask.execute / Compaction.commit: the same options as
+    // _ds_compact_files, the tasks' fragment ids, and each rewrite's new fragment messages.
+    m.def("_ds_compact_plan", [](const std::filesystem::path& path, std::uint64_t target_rows,
+                                 bool materialize_deletions, double threshold,
+                                 std::optional<std::uint64_t> max_source_fragments,
+                                 std::optional<std::uint64_t> max_source_rows,
+                                 std::optional<std::uint64_t> max_source_bytes,
+                                 const std::vector<std::uint64_t>& excluded_fragment_ids,
+                                 std::uint64_t max_bytes_per_file, std::uint64_t batch_size) {
+        nano_lance::CompactionOptions options;
+        options.max_source_fragments = max_source_fragments;
+        options.max_source_rows = max_source_rows;
+        options.max_source_bytes = max_source_bytes;
+        options.excluded_fragment_ids = excluded_fragment_ids;
+        options.max_bytes_per_file = max_bytes_per_file;
+        options.batch_size = batch_size;
+        options.target_rows_per_fragment = target_rows;
+        options.materialize_deletions = materialize_deletions;
+        options.materialize_deletions_threshold = threshold;
+        std::uint64_t read_version = 0;
+        std::vector<std::vector<std::uint64_t>> tasks;
+        run_op([&](std::string& e) { return nano_lance::dataset_compact_plan(path, options, read_version, tasks, e); });
+        return nb::make_tuple(read_version, tasks);
+    });
+    m.def("_ds_compact_execute", [](const std::filesystem::path& path, std::uint64_t read_version,
+                                    const std::vector<std::uint64_t>& fragment_ids, std::uint64_t max_bytes_per_file,
+                                    std::uint64_t batch_size) {
+        nano_lance::CompactionOptions options;
+        options.max_bytes_per_file = max_bytes_per_file;
+        options.batch_size = batch_size;
+        nano_lance::CompactionRewrite rewrite;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_compact_execute(path, options, read_version, fragment_ids, rewrite, e);
+        });
+        nb::list messages;
+        for (const auto& b : rewrite.new_fragments) {
+            messages.append(bytes_of(b.data(), b.size()));
+        }
+        return nb::make_tuple(rewrite.old_fragment_ids, messages);
+    });
+    m.def("_ds_compact_commit", [](const std::filesystem::path& path, std::uint64_t read_version,
+                                   const std::vector<std::vector<std::uint64_t>>& old_ids,
+                                   const std::vector<nb::list>& messages, bool defer_index_remap, bool reindex) {
+        std::vector<nano_lance::CompactionRewrite> rewrites(old_ids.size());
+        for (std::size_t r = 0; r < old_ids.size(); ++r) {
+            rewrites[r].old_fragment_ids = old_ids[r];
+            for (auto item : messages.at(r)) {
+                const auto b = nb::borrow<nb::bytes>(item);
+                rewrites[r].new_fragments.emplace_back(b.c_str(), b.c_str() + b.size());
+            }
+        }
+        nano_lance::CompactionOptions options;
+        options.defer_index_remap = defer_index_remap;
+        options.reindex = reindex;
+        nano_lance::CompactionMetrics metrics;
+        std::uint64_t version = 0;
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_compact_commit(path, options, read_version, rewrites, metrics, version, e);
+        });
         nb::dict d;
         d["fragments_removed"] = metrics.fragments_removed;
         d["fragments_added"] = metrics.fragments_added;

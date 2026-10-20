@@ -6,8 +6,10 @@
 #include "nanolance/byte_source.hpp"
 #include "nanolance/roaring_bitmap.hpp"
 #include "index_files.hpp"
+#include "proto_wire.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -405,6 +407,82 @@ void FragReuse::remap_coverage(std::vector<std::uint32_t>& ids) const {
 
 bool FragReuse::touches(std::uint32_t fragment) const {
     return std::any_of(steps_.begin(), steps_.end(), [&](const Step& s) { return s.frags.count(fragment) != 0U; });
+}
+
+
+bool fragment_reuse_index_entry(const pb::IndexMetadata* prior, std::uint64_t version,
+                                const std::vector<FragReuseWriteGroup>& groups,
+                                const std::vector<std::uint32_t>& coverage, pb::IndexMetadata& out,
+                                std::string& error) {
+    using proto_wire::put_bytes_field;
+    using proto_wire::put_u64_field;
+    // FragmentReuseIndexDetails { InlineContent inline = 1; } with InlineContent { repeated Version versions = 1; }:
+    // the prior versions are copied as they are, then this one is appended.
+    std::vector<std::uint8_t> versions;
+    if (prior != nullptr) {
+        Wire w(prior->details_value.data(), prior->details_value.size());
+        Field f;
+        while (w.next(f)) {
+            if (f.number == 2U) {
+                error = "the fragment reuse index keeps its versions in an external file: not written yet";
+                return false;
+            }
+            if (f.number != 1U || f.wire != 2U) {
+                continue;
+            }
+            Wire inner(f.data, f.size);
+            Field v;
+            while (inner.next(v)) {
+                if (v.number == 1U && v.wire == 2U) {
+                    put_bytes_field(versions, 1, std::vector<std::uint8_t>(v.data, v.data + v.size));
+                }
+            }
+            if (inner.bad()) {
+                error = "the fragment reuse index's details are malformed";
+                return false;
+            }
+        }
+        if (w.bad()) {
+            error = "the fragment reuse index's details are malformed";
+            return false;
+        }
+    }
+    // Version { uint64 dataset_version = 1; repeated Group groups = 3; }
+    // Group { bytes changed_row_addrs = 1; repeated FragmentDigest old_fragments = 2, new_fragments = 3; }
+    // FragmentDigest { uint64 id = 1; uint64 physical_rows = 2; uint64 num_deleted_rows = 3; }
+    std::vector<std::uint8_t> version_msg;
+    put_u64_field(version_msg, 1, version);
+    auto digest = [](const std::array<std::uint64_t, 3>& d) {
+        std::vector<std::uint8_t> out_d;
+        put_u64_field(out_d, 1, d[0]);
+        put_u64_field(out_d, 2, d[1]);
+        put_u64_field(out_d, 3, d[2]);
+        return out_d;
+    };
+    for (const auto& g : groups) {
+        std::vector<std::uint8_t> group;
+        put_bytes_field(group, 1, roaring::encode_treemap(g.changed_row_addrs));
+        for (const auto& d : g.old_fragments) {
+            put_bytes_field(group, 2, digest(d));
+        }
+        for (const auto& d : g.new_fragments) {
+            put_bytes_field(group, 3, digest(d));
+        }
+        put_bytes_field(version_msg, 3, group);
+    }
+    put_bytes_field(versions, 1, version_msg);
+    std::vector<std::uint8_t> details;
+    put_bytes_field(details, 1, versions);  // inline = 1, InlineContent { versions }
+
+    std::vector<std::uint32_t> ids = coverage;
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch()).count();
+    out = pb::make_index_metadata(index_files::new_uuid(), {}, kFragReuseName, version, ids,
+                                  std::string("/lance.table.") + kFragReuseDetails, 3,  // index_version 3, as pylance
+                                  static_cast<std::uint64_t>(now), {}, details);
+    return true;
 }
 
 }  // namespace nano_lance

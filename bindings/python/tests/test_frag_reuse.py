@@ -122,3 +122,62 @@ def test_list_and_describe_show_the_system_index_as_pylance_does(tmp_path: Path)
     assert desc["__lance_frag_reuse"].fields == [] and desc["__lance_frag_reuse"].total_size_bytes is None
     pylance = {d.name: d for d in lance.dataset(path).describe_indices()}
     assert desc["i_idx"].num_rows_indexed == pylance["i_idx"].num_rows_indexed
+
+
+# ── R2: nanolance writes the index (compact_files, and Compaction.plan / execute / commit) ────────────
+
+
+def _nanolance_deferred(path: str, how: str = "compact_files") -> None:
+    shutil.rmtree(path, ignore_errors=True)
+    ds = nl.write_dataset(_table(), path, max_rows_per_file=1_000)
+    ds.create_scalar_index("i", "BTREE")
+    ds.delete("i < 500")
+    if how == "compact_files":
+        ds.optimize.compact_files(target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1)
+        return
+    from nanolance.lance.lance import Compaction
+
+    plan = Compaction.plan(ds, options=dict(target_rows_per_fragment=2_000))
+    results = [task.execute(ds) for task in plan.tasks]
+    Compaction.commit(ds, results, options={"defer_index_remap": True})
+
+
+def test_pylance_reads_the_index_nanolance_wrote(tmp_path: Path):
+    lance = require_pylance()
+    path = str(tmp_path / "nl.lance")
+    _nanolance_deferred(path)
+    described = {d.name: d.index_type for d in lance.dataset(path).describe_indices()}
+    assert described.get("__lance_frag_reuse") == "FragmentReuse"
+    _check(lance, path)  # pylance's rows, and nanolance's, through the index the nanolance compaction left
+
+
+@pytest.mark.parametrize("how", ["compact_files", "plan"])
+def test_plan_execute_commit_defers_as_compact_files_does(tmp_path: Path, how: str):
+    lance = require_pylance()
+    path = str(tmp_path / f"{how}.lance")
+    _nanolance_deferred(path, how)
+    assert {d.name for d in lance.dataset(path).describe_indices()} >= {"i_idx", "__lance_frag_reuse"}
+    _check(lance, path)
+
+
+def test_two_nanolance_deferred_compactions_in_a_row(tmp_path: Path):
+    lance = require_pylance()
+    path = str(tmp_path / "two.lance")
+    _nanolance_deferred(path)
+    ds = nl.dataset(path)
+    ds.delete("i >= 5900")
+    ds.optimize.compact_files(target_rows_per_fragment=6_000, defer_index_remap=True, num_threads=1)
+    _check(lance, path, FILTERS + ["i = 5950"])
+
+
+def test_eager_compaction_writes_no_frag_reuse_index(tmp_path: Path):
+    lance = require_pylance()
+    path = str(tmp_path / "eager.lance")
+    shutil.rmtree(path, ignore_errors=True)
+    ds = nl.write_dataset(_table(), path, max_rows_per_file=1_000)
+    ds.create_scalar_index("i", "BTREE")
+    ds.delete("i < 500")
+    ds.optimize.compact_files(target_rows_per_fragment=2_000, num_threads=1)
+    assert all(d.name != "__lance_frag_reuse" for d in nl.dataset(path).describe_indices())
+    assert all(d.name != "__lance_frag_reuse" for d in lance.dataset(path).describe_indices())
+    _check(lance, path)

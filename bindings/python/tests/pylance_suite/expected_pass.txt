@@ -888,8 +888,13 @@ tests/test_optimize.py::test_compact_files_max_source_fragments
 tests/test_optimize.py::test_compact_files_source_budgets
 tests/test_optimize.py::test_compact_with_write
 tests/test_optimize.py::test_compaction_generates_rewrite_transaction
+tests/test_optimize.py::test_dataset_distributed_optimize
 tests/test_optimize.py::test_dataset_optimize
 tests/test_optimize.py::test_dataset_optimize_excluded_fragment_ids
+tests/test_optimize.py::test_defer_index_remap
+tests/test_optimize.py::test_defer_index_remap_via_commit_options[False]
+tests/test_optimize.py::test_defer_index_remap_via_commit_options[True]
+tests/test_optimize.py::test_describe_indices_matches_list_indices_for_frag_reuse
 tests/test_optimize.py::test_optimize_indices_second_call_is_noop
 tests/test_order_by.py::test_all_order_by_support_functions
 tests/test_order_by.py::test_one_column_order_by

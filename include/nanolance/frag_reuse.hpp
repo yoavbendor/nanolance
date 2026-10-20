@@ -5,6 +5,7 @@
 
 #include "lance_minimal.pb.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -68,5 +69,22 @@ public:
 private:
     std::vector<Step> steps_;
 };
+
+/// One rewrite group of a deferred compaction, as the index records it.
+struct FragReuseWriteGroup {
+    /// The surviving rows of the old fragments, as old row addresses (fragment id << 32 | offset), ascending.
+    std::vector<std::uint64_t> changed_row_addrs;
+    /// Each old and new fragment: id, physical rows, deleted rows.
+    std::vector<std::array<std::uint64_t, 3>> old_fragments;
+    std::vector<std::array<std::uint64_t, 3>> new_fragments;
+};
+
+/// The `__lance_frag_reuse` index entry after a deferred compaction at `version`: `prior` (null: none yet)
+/// with one more version of `groups` appended, covering `coverage` (ascending). Written inline, as Lance
+/// writes it below 200 KB. False with `error` when `prior` keeps its versions outside the manifest.
+bool fragment_reuse_index_entry(const pb::IndexMetadata* prior, std::uint64_t version,
+                                const std::vector<FragReuseWriteGroup>& groups,
+                                const std::vector<std::uint32_t>& coverage, pb::IndexMetadata& out,
+                                std::string& error);
 
 }  // namespace nano_lance

@@ -183,3 +183,7 @@ optimization; compare engines within one run (ratios), never across days.
   MSVC, a full-text change that needed an A/B timing to show it was not slower.
 - Run one full pytest at a time; two at once caused one spurious failure.
 - float16 vector search over a pylance-built cosine index differs from pylance's distances by about 1.5e-4 (rows and order equal), plain and multivector alike: find how Lance stores normalized float16 vectors (docs/tasks/MULTIVECTOR.md, M2b outcome).
+- Compaction with `max_bytes_per_file`: pylance cuts files at batch granularity (`test_optimize_max_bytes` wants 2 fragments, nanolance writes 8); changes eager compaction output, decide first.
+- `list_indices()` / `describe_indices()`: pylance sorts by name and reports each index's own version; nanolance keeps manifest order and reports the dataset version.
+- `compact_files(defer_index_remap=True)` with stable row ids is refused; FRI details over 200 KB (external) are refused when writing.
+

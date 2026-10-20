@@ -106,6 +106,10 @@ struct CompactionOptions {
     /// Lance's compaction remaps its indexes: committed as a second version. Without it, an index
     /// stops covering the fragments compaction rewrote, and those rows are scanned.
     bool reindex = true;
+    /// Lance's deferred index remap: the indexes keep their old row addresses, and a fragment reuse index
+    /// (`__lance_frag_reuse`) records how the rewritten rows moved. Instead of `reindex`. Not with stable
+    /// row ids.
+    bool defer_index_remap = false;
     /// Lance's source budgets: plan whole tasks, in order, while their source fragments, live rows
     /// and data-file bytes stay within every one set. A first task over budget plans nothing; a
     /// budget of 0 is refused.
@@ -135,6 +139,34 @@ struct CompactionMetrics {
 /// nothing when there is nothing to compact (`new_version` is then the current one).
 bool dataset_compact_files(const std::filesystem::path& dataset_path, const CompactionOptions& options,
                            CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error);
+
+// ── compaction as pylance's Compaction.plan / execute / commit ──────────────────────────────────
+//
+// plan: the tasks (each a list of fragment ids) of the latest version; execute: one task rewritten into new
+// data files, uncommitted (the fragment messages, ids unassigned); commit: the rewrites committed as one
+// version, with the indexes remapped (reindex, or the fragment reuse index with `defer_index_remap`).
+
+/// One task rewritten: the fragments it removes, and the new fragments (lance.table.DataFragment messages).
+struct CompactionRewrite {
+    std::vector<std::uint64_t> old_fragment_ids;
+    std::vector<std::vector<std::uint8_t>> new_fragments;
+};
+
+/// The tasks the planner would run on the latest version (`read_version` is that version).
+bool dataset_compact_plan(const std::filesystem::path& dataset_path, const CompactionOptions& options,
+                          std::uint64_t& read_version, std::vector<std::vector<std::uint64_t>>& tasks,
+                          std::string& error);
+
+/// Rewrites the fragments `fragment_ids` of version `read_version` into new data files, committing nothing.
+bool dataset_compact_execute(const std::filesystem::path& dataset_path, const CompactionOptions& options,
+                             std::uint64_t read_version, const std::vector<std::uint64_t>& fragment_ids,
+                             CompactionRewrite& out, std::string& error);
+
+/// Commits rewrites made from version `read_version` as one Rewrite version (planned again by the caller on a
+/// conflict). Nothing when `rewrites` is empty.
+bool dataset_compact_commit(const std::filesystem::path& dataset_path, const CompactionOptions& options,
+                            std::uint64_t read_version, const std::vector<CompactionRewrite>& rewrites,
+                            CompactionMetrics& metrics, std::uint64_t& new_version, std::string& error);
 
 // ── one fragment, uncommitted ────────────────────────────────────────────────────────────────────
 //
