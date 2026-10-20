@@ -107,6 +107,22 @@ bool dataset_merge_index_segments(const std::filesystem::path& dataset_path,
                                   const std::vector<std::vector<std::uint8_t>>& segments,
                                   std::vector<std::uint8_t>& merged, std::string& error, SegmentErrorKind& kind);
 
+/// Writes `bytes` as the file `name` of the staging directory `_indices/<uuid_text>` of a distributed
+/// INVERTED build (the partition metadata of create_scalar_index with fragment_ids). Through io::open_output,
+/// so it is a local file or an object.
+bool dataset_write_staged_part(const std::filesystem::path& dataset_path, const std::string& uuid_text,
+                               const std::string& name, const std::vector<std::uint8_t>& bytes, std::string& error);
+
+/// The staged partition files of `_indices/<uuid_text>`, sorted by name, each with its bytes (none when the
+/// directory does not exist).
+bool dataset_read_staged_parts(const std::filesystem::path& dataset_path, const std::string& uuid_text,
+                               std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& parts,
+                               std::string& error);
+
+/// Removes the staged partition files `names` of `_indices/<uuid_text>` (a missing one is not an error).
+bool dataset_remove_staged_parts(const std::filesystem::path& dataset_path, const std::string& uuid_text,
+                                 const std::vector<std::string>& names, std::string& error);
+
 /// A trained IVF (and PQ) model (Lance's IndicesBuilder.train_ivf / train_pq).
 struct TrainedVectorModel {
     std::size_t dim = 0;

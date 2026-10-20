@@ -77,3 +77,13 @@ Tails of: `cd build && ctest -j8 | tail -3`; the object-store tests against moto
 tests/test_object_store_commits.py`); `python3 tools/pylance_suite.py | tail -4`; last, once, the full
 bindings suite. Report under 40 lines: questions first, then files, per-operation status, tails,
 decisions, `df -h /`.
+
+**W3a outcome (2026-10-20):** every index kind nanolance builds (BTREE, BITMAP, LABEL_LIST, INVERTED,
+NGRAM, ZONEMAP, BLOOMFILTER, JSON; IVF_FLAT, IVF_SQ, IVF_PQ, IVF_RQ, IVF_HNSW_*, Hamming IVF_FLAT),
+drop_index, optimize_indices and the distributed segment API work on `s3://`; pylance uses nanolance's S3
+indexes and the reverse. Index directories are not created on object stores, and a failed build removes
+the objects it wrote (`index_files` create_index_dir / remove_index_dir); the legacy staged INVERTED parts
+go through native I/O (they used os.makedirs / open, which would have made a local `s3:` directory).
+Measured: pylance's index requests are plain PUTs; only the manifest is conditional. Approximate kinds
+(IVF_PQ, IVF_RQ, IVF_HNSW_*) train a fresh model per build, so their tests compare S3 with pylance on the
+same index exactly and with a local build by overlap; exact kinds are compared exactly.

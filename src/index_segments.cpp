@@ -5,6 +5,7 @@
 // listing a logical index's segments.
 
 #include "nanolance/index_segments.hpp"
+#include "nanolance/byte_sink.hpp"
 #include "nanolance/byte_source.hpp"
 
 #include "index_build.hpp"
@@ -68,9 +69,38 @@ std::vector<std::string> field_files(const pb::DataFragment& fragment, const std
     return out;
 }
 
+/// The same over an object-store prefix (no directories there: a LIST per level, the files under it).
+bool list_remote_files(const std::string& dir, const std::string& prefix, bool inverted,
+                       std::vector<pb::IndexMetadata::File>& out, std::string& error) {
+    std::vector<io::DirEntry> entries;
+    if (!io::list_dir(dir, entries, error, true)) {
+        return false;
+    }
+    for (const auto& entry : entries) {
+        const std::string rel = prefix + entry.name;
+        if (entry.is_dir) {
+            if (!list_remote_files(dir + "/" + entry.name, rel + "/", inverted, out, error)) {
+                return false;
+            }
+        } else if (!(inverted && rel.rfind("staging/", 0) == 0)) {
+            out.push_back({rel, entry.size});
+        }
+    }
+    return true;
+}
+
 /// Every file under `dir`, relative to it, with its size; Lance's committed segment files
 /// (staging/ left out for an INVERTED index).
 bool list_files(const std::filesystem::path& dir, bool inverted, std::vector<pb::IndexMetadata::File>& out) {
+    if (io::is_object_store_output(dir.string())) {
+        std::string error;
+        if (!list_remote_files(dir.string(), "", inverted, out, error) || out.empty()) {
+            out.clear();  // an index prefix with no objects is no segment, as a missing directory is not
+            return false;
+        }
+        std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.path < b.path; });
+        return true;
+    }
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec)) {
         return false;
@@ -397,6 +427,61 @@ bool dataset_commit_index_segments(const std::filesystem::path& dataset_path, co
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
         kind = SegmentErrorKind::Other;
         return false;
+    }
+    return true;
+}
+
+namespace {
+
+/// A staged partition file: `part_<fragment>_nanolance.json` (see the INVERTED staging in the Python bindings).
+bool is_staged_part(const std::string& name) {
+    return name.rfind("part_", 0) == 0 && ends_with(name, "_nanolance.json");
+}
+
+}  // namespace
+
+bool dataset_write_staged_part(const std::filesystem::path& dataset_path, const std::string& uuid_text,
+                               const std::string& name, const std::vector<std::uint8_t>& bytes, std::string& error) {
+    auto out = io::open_output((dataset_path / "_indices" / uuid_text / name).string(), error);
+    if (!out) {
+        return false;
+    }
+    out->write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return out->commit(error);
+}
+
+bool dataset_read_staged_parts(const std::filesystem::path& dataset_path, const std::string& uuid_text,
+                               std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& parts,
+                               std::string& error) {
+    parts.clear();
+    const auto dir = (dataset_path / "_indices" / uuid_text).string();
+    std::vector<io::DirEntry> entries;
+    if (!io::list_dir(dir, entries, error)) {
+        return false;
+    }
+    std::vector<std::string> names;
+    for (const auto& entry : entries) {
+        if (!entry.is_dir && is_staged_part(entry.name)) {
+            names.push_back(entry.name);
+        }
+    }
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) {
+        std::vector<std::uint8_t> bytes;
+        if (!io::read_all(dir + "/" + name, bytes, error)) {
+            return false;
+        }
+        parts.emplace_back(name, std::move(bytes));
+    }
+    return true;
+}
+
+bool dataset_remove_staged_parts(const std::filesystem::path& dataset_path, const std::string& uuid_text,
+                                 const std::vector<std::string>& names, std::string& error) {
+    for (const auto& name : names) {
+        if (!io::remove_output((dataset_path / "_indices" / uuid_text / name).string(), error)) {
+            return false;
+        }
     }
     return true;
 }

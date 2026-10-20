@@ -911,17 +911,14 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     // The files: the partition's (copy_partitions), then the metadata (write_metadata).
     const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : index_files::new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        error = "cannot create " + dir.string() + ": " + ec.message();
+    if (!index_files::create_index_dir(dir, error)) {
         return false;
     }
     std::vector<WrittenFile> files;
     report(0, "copy_partitions", 1, "partitions", 0);
     if (!(write_postings(dir, built, files, error) && write_tokens(dir, built, files, error) &&
           write_docs(dir, built, files, error))) {
-        std::filesystem::remove_all(dir, ec);
+        index_files::remove_index_dir(dir);
         return false;
     }
     report(1, "copy_partitions", 1, "partitions", 1);
@@ -929,7 +926,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
 
     report(0, "write_metadata", 1, "files", 0);
     if (!write_metadata(dir, params, files, error)) {
-        std::filesystem::remove_all(dir, ec);
+        index_files::remove_index_dir(dir);
         return false;
     }
     report(1, "write_metadata", 1, "files", 1);
@@ -969,7 +966,7 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     }
     manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
-        std::filesystem::remove_all(dir, ec);
+        index_files::remove_index_dir(dir);
         return false;
     }
     return true;

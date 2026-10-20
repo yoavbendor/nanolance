@@ -470,9 +470,8 @@ bool optimize_indices_once(const std::filesystem::path& dataset_path, const Opti
     std::vector<pb::IndexMetadata> built;
     std::set<const pb::IndexMetadata*> replaced_all;
     const auto cleanup = [&] {
-        std::error_code ec;
         for (const auto& b : built) {
-            std::filesystem::remove_all(segment_dir(dataset_path, b), ec);
+            index_files::remove_index_dir(segment_dir(dataset_path, b));
         }
     };
     for (const auto& name : names) {

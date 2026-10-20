@@ -2043,6 +2043,26 @@ NB_MODULE(_nanolance, m) {
               });
               return bytes_of(segment.data(), segment.size());
           });
+    m.def("_index_stage_write", [](const std::filesystem::path& path, const std::string& uuid_text,
+                                   const std::string& name, const nb::bytes& text) {
+        const auto bytes = vec_of(text);
+        run_op([&](std::string& e) {
+            return nano_lance::dataset_write_staged_part(path, uuid_text, name, bytes, e);
+        });
+    });
+    m.def("_index_stage_remove", [](const std::filesystem::path& path, const std::string& uuid_text,
+                                    const std::vector<std::string>& names) {
+        run_op([&](std::string& e) { return nano_lance::dataset_remove_staged_parts(path, uuid_text, names, e); });
+    });
+    m.def("_index_stage_read", [](const std::filesystem::path& path, const std::string& uuid_text) {
+        std::vector<std::pair<std::string, std::vector<std::uint8_t>>> parts;
+        run_op([&](std::string& e) { return nano_lance::dataset_read_staged_parts(path, uuid_text, parts, e); });
+        nb::list out;
+        for (const auto& [name, bytes] : parts) {
+            out.append(nb::make_tuple(name, bytes_of(bytes.data(), bytes.size())));
+        }
+        return out;
+    });
     m.def("_index_merge_segments", [](const std::filesystem::path& path, const std::vector<nb::bytes>& segments) {
         std::vector<std::vector<std::uint8_t>> in;
         for (const auto& s : segments) {

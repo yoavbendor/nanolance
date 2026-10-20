@@ -1268,7 +1268,6 @@ class LanceDataset(pa.dataset.Dataset):
         With `fragment_ids`, an INVERTED index is staged for those fragments under `index_uuid` and
         not committed (Lance's legacy distributed build): ``merge_index_metadata`` builds it once every
         part is staged. Other types build their segments with ``create_index_uncommitted``."""
-        refuse_object_store_write(self._uri, "create scalar index")
         if isinstance(column, str):
             path = _resolve_path(self._data_schema, column)
             if path is not None:
@@ -1321,7 +1320,6 @@ class LanceDataset(pa.dataset.Dataset):
 
     def _create_json_index(self, column, name, replace, config, fragment_ids) -> "LanceDataset":
         """A JSON index: a BTREE over the values at `path` of a JSON column, as Lance's JsonIndexDetails."""
-        refuse_object_store_write(self._uri, "create JSON index")
         if fragment_ids is not None:
             raise unsupported("distributed JSON indexes")
         for key in ("target_index_type", "path"):
@@ -1466,7 +1464,6 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError(f"unknown document granularity {value!r}") from None
 
     def _create_inverted_index(self, column, name, replace, kwargs) -> "LanceDataset":
-        refuse_object_store_write(self._uri, "create inverted index")
         progress_callback = kwargs.pop("progress_callback", None)
         granularity = self._document_granularity(kwargs)
         params = self._inverted_params(kwargs)
@@ -1507,12 +1504,11 @@ class LanceDataset(pa.dataset.Dataset):
         if self._field(str(column)) is None:
             raise ValueError(f"column '{column}' does not exist")
         segment = str(uuid_module.UUID(bytes=uuid_bytes)) if uuid_bytes else str(uuid_module.uuid4())
-        directory = os.path.join(self._uri, "_indices", segment)
-        os.makedirs(directory, exist_ok=True)
         part = {"column": str(column), "name": name or "", "params": json.loads(params),
                 "dataset_version": self._version, "fragment_ids": fragments}
-        with open(os.path.join(directory, f"part_{fragments[0]}_nanolance.json"), "w") as handle:
-            json.dump(part, handle)
+        with _lance_errors():
+            _nanolance._index_stage_write(self._uri, segment, f"part_{fragments[0]}_nanolance.json",
+                                          json.dumps(part).encode())
         return self
 
     def merge_index_metadata(self, index_uuid: str, index_type: str, batch_readhead: Optional[int] = None,
@@ -1520,7 +1516,6 @@ class LanceDataset(pa.dataset.Dataset):
         """Build the INVERTED index staged in parts under `index_uuid` (create_scalar_index with
         fragment_ids), over the union of their fragments. Does not commit: commit it with
         ``LanceDataset.commit(uri, LanceOperation.CreateIndex([...], []), read_version)``."""
-        refuse_object_store_write(self._uri, "merge index metadata")
         import json
 
         from nanolance.lance.indices import SupportedDistributedIndices
@@ -1546,15 +1541,15 @@ class LanceDataset(pa.dataset.Dataset):
                 progress_callback(IndexProgress(event, stage, completed, total, unit))
 
         directory = os.path.join(self._uri, "_indices", str(index_uuid))
-        names = sorted(n for n in (os.listdir(directory) if os.path.isdir(directory) else [])
-                       if n.startswith("part_") and n.endswith("_nanolance.json"))
-        if not names:
+        with _lance_errors():
+            staged = _nanolance._index_stage_read(self._uri, str(index_uuid))
+        if not staged:
             raise OSError(f"No partition metadata files found in index directory: {directory}")
+        names = [name for name, _ in staged]
         report("start", "read_partition_metadata", 0, len(names), "partitions")
         parts = []
-        for i, part_name in enumerate(names):
-            with open(os.path.join(directory, part_name)) as handle:
-                parts.append(json.load(handle))
+        for i, (_, text) in enumerate(staged):
+            parts.append(json.loads(text))
             report("progress", "read_partition_metadata", i + 1, len(names), "partitions")
         report("complete", "read_partition_metadata", len(names), len(names), "partitions")
         fragments = sorted({f for p in parts for f in p["fragment_ids"]})
@@ -1564,8 +1559,8 @@ class LanceDataset(pa.dataset.Dataset):
             _nanolance._index_build_segment(self._uri, first["column"], "INVERTED", first["name"],
                                             min(p["dataset_version"] for p in parts), fragments, uuid_bytes,
                                             json.dumps(first["params"]), {}, None, None)
-        for part_name in names:  # built: the staged parts are done with (kept if the build failed)
-            os.remove(os.path.join(directory, part_name))
+        with _lance_errors():  # built: the staged parts are done with (kept if the build failed)
+            _nanolance._index_stage_remove(self._uri, str(index_uuid), names)
         report("progress", "remap_partition_files", len(fragments), len(fragments), "fragments")
         report("complete", "remap_partition_files", len(fragments), len(fragments), "fragments")
         report("start", "write_merged_metadata", 0, 1, "files")
@@ -1591,7 +1586,6 @@ class LanceDataset(pa.dataset.Dataset):
         ``merge_existing_index_segments`` if wanted. BTREE, BITMAP, LABEL_LIST, INVERTED, IVF_FLAT,
         IVF_PQ and IVF_HNSW_SQ. Vector segments that share `ivf_centroids` (and `pq_codebook`) share
         one model and can be merged."""
-        refuse_object_store_write(self._uri, "create index segments")
         kind = str(getattr(index_type, "index_type", index_type)).upper()
         if kind == "FTS":
             kind = "INVERTED"
@@ -1669,7 +1663,6 @@ class LanceDataset(pa.dataset.Dataset):
     def merge_existing_index_segments(self, segments: List[Index]) -> Index:
         """Merge a group of uncommitted segments (create_index_uncommitted) into one, uncommitted:
         a new segment over the union of their fragments. Vector segments must share their model."""
-        refuse_object_store_write(self._uri, "merge index segments")
         messages = [_segment_message(self, s) for s in segments]
         with _lance_errors():
             message = _nanolance._index_merge_segments(self._uri, messages)
@@ -1677,7 +1670,6 @@ class LanceDataset(pa.dataset.Dataset):
 
     def commit_existing_index_segments(self, index_name: str, column: str, segments) -> "LanceDataset":
         """Commit built segments as the logical index `index_name` on `column`, in one new version."""
-        refuse_object_store_write(self._uri, "commit index segments")
         messages = [_segment_message(self, s) for s in segments]
         if isinstance(column, str):
             path = _resolve_path(self._data_schema, column)
@@ -1764,7 +1756,6 @@ class LanceDataset(pa.dataset.Dataset):
         """Build an index on `column`, in Lance's format. IVF_FLAT, IVF_SQ, IVF_PQ, IVF_RQ, IVF_HNSW_FLAT, IVF_HNSW_PQ and
         IVF_HNSW_SQ vector indexes (pylance and LanceDB search them as their own); scalar index types go to
         create_scalar_index. IVF_RQ takes num_bits (1 to 9, default 5) and skip_transpose."""
-        refuse_object_store_write(self._uri, "create index")
         kind = str(index_type).upper()
         if isinstance(column, (list, tuple)):
             if len(column) != 1:
@@ -1867,7 +1858,6 @@ class LanceDataset(pa.dataset.Dataset):
         return self
 
     def drop_index(self, name: str) -> None:
-        refuse_object_store_write(self._uri, "drop index")
         if not any(i["name"] == str(name) for i in self.list_indices()):
             raise RuntimeError(f"Lance index not found: name={name}")  # pylance's error for a missing name
         with native():
@@ -3476,7 +3466,6 @@ class DatasetOptimizer:
         `num_indices_to_merge` (default 1) segments of each index are replaced by one covering their
         fragments and every uncovered one (0: a new segment over the uncovered fragments alone), with
         the index's parameters -- a vector index keeps its trained model unless `retrain`."""
-        refuse_object_store_write(self._ds.uri, "optimize indices")
         unknown = sorted(set(kwargs) - {"num_threads"})
         if unknown:
             raise unsupported(f"optimize_indices options {unknown}")

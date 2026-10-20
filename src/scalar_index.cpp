@@ -1784,10 +1784,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
 
     const auto uuid = target != nullptr && target->uuid != nullptr ? *target->uuid : new_uuid();
     const auto dir = dataset_path / "_indices" / pb::uuid_string(uuid);
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        error = "cannot create " + dir.string() + ": " + ec.message();
+    if (!index_files::create_index_dir(dir, error)) {
         return false;
     }
     std::vector<WrittenFile> files;
@@ -1841,7 +1838,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
         break;
     }
     if (!written) {
-        std::filesystem::remove_all(dir, ec);
+        index_files::remove_index_dir(dir);
         return false;
     }
     if (progress != nullptr) {
@@ -1880,7 +1877,7 @@ bool create_scalar_index(const std::filesystem::path& dataset_path, const std::s
     }
     manifest.indices.push_back(std::move(entry));
     if (!commit_next_version(dataset_path, std::move(manifest), new_version, error)) {
-        std::filesystem::remove_all(dir, ec);
+        index_files::remove_index_dir(dir);
         return false;
     }
     return true;

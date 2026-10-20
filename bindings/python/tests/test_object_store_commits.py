@@ -14,12 +14,15 @@ import sys
 import textwrap
 import uuid
 
+import numpy as np
 import pyarrow as pa
 import pytest
 
 from tests.support import require_pylance
 
 import nanolance.lance as nl
+from nanolance import _nanolance
+from nanolance.lance.indices import IndexConfig, IndicesBuilder
 
 ENDPOINT = os.environ.get("NANOLANCE_S3_TEST_ENDPOINT", "")
 BUCKET = os.environ.get("NANOLANCE_S3_TEST_BUCKET", "nl-test")
@@ -390,3 +393,323 @@ def test_compaction_racing_an_append_loses_no_rows():
     ids = sorted(theirs.to_table(columns=["id"])["id"].to_pylist())
     assert ids == list(range(200 + 100 * appended["ok"]))
 
+
+
+# ── W3a: index builds and maintenance on s3:// (docs/OBJECT_STORE_W3.md) ─────────────────────────────
+# Each index is built on an s3:// dataset and on a local copy; nanolance and pylance both read the S3 one,
+# and the answers must equal the local copy's. Trained vector models differ from one build to the next
+# (k-means and PQ start from random seeds), so for the approximate kinds the check is the S3 index against
+# itself in both engines, and against the local copy by overlap.
+
+INDEX_ROWS = 600
+INDEX_FRAGMENT_ROWS = 200
+
+
+def _index_table() -> pa.Table:
+    rng = np.random.default_rng(7)
+    n = INDEX_ROWS
+    return pa.table({
+        "id": pa.array(range(n), pa.int64()),
+        "name": pa.array([f"row {i}" for i in range(n)]),
+        "text": pa.array([f"alpha beta gamma{i % 13}" for i in range(n)]),
+        "cat": pa.array([f"c{i % 5}" for i in range(n)]),
+        "tags": pa.array([[f"t{i % 7}", "x"] for i in range(n)], pa.list_(pa.string())),
+        "js": pa.array([f'{{"a": {i % 9}}}' for i in range(n)], pa.json_(pa.utf8())),
+        "vec": pa.FixedSizeListArray.from_arrays(pa.array(rng.random(n * 8).astype("float32")), 8),
+        "bits": pa.FixedSizeListArray.from_arrays(pa.array(rng.integers(0, 256, n * 8, dtype=np.uint8)), 8),
+    })
+
+
+def _indexed_copy(uri: str, storage, build) -> None:
+    nl.write_dataset(_index_table(), uri, storage_options=storage, max_rows_per_file=INDEX_FRAGMENT_ROWS)
+    build(nl.dataset(uri, storage_options=storage))
+
+
+def _nanolance_json_config():
+    return IndexConfig(index_type="json", parameters={"target_index_type": "btree", "path": "a"})
+
+
+def _pylance_json_config():
+    from lance.indices import IndexConfig as PylanceIndexConfig
+
+    return PylanceIndexConfig(index_type="json", parameters={"target_index_type": "btree", "path": "a"})
+
+
+# Scalar kinds: the builder (nanolance's, or pylance's for the reverse check) and the queries.
+SCALAR_BUILDS = {
+    "BTREE": lambda ds, json_config: ds.create_scalar_index("id", "BTREE", name="idx"),
+    "BITMAP": lambda ds, json_config: ds.create_scalar_index("cat", "BITMAP", name="idx"),
+    "LABEL_LIST": lambda ds, json_config: ds.create_scalar_index("tags", "LABEL_LIST", name="idx"),
+    "INVERTED": lambda ds, json_config: ds.create_scalar_index("text", "INVERTED", name="idx"),
+    "NGRAM": lambda ds, json_config: ds.create_scalar_index("name", "NGRAM", name="idx"),
+    "ZONEMAP": lambda ds, json_config: ds.create_scalar_index("id", "ZONEMAP", name="idx"),
+    "BLOOMFILTER": lambda ds, json_config: ds.create_scalar_index("id", "BLOOMFILTER", name="idx"),
+    "JSON": lambda ds, json_config: ds.create_scalar_index("js", json_config(), name="idx"),
+}
+SCALAR_QUERIES = {
+    "BTREE": [{"filter": "id = 77"}, {"filter": "id BETWEEN 100 AND 110"}],
+    "BITMAP": [{"filter": "cat = 'c1'"}, {"filter": "cat IN ('c0', 'c4')"}],
+    "LABEL_LIST": [{"filter": "array_has_any(tags, ['t3'])"}, {"filter": "array_has_all(tags, ['t0', 'x'])"}],
+    "INVERTED": [{"full_text_query": "gamma3"}, {"full_text_query": "beta alpha"}],
+    "NGRAM": [{"filter": "name LIKE '%row 12%'"}],
+    "ZONEMAP": [{"filter": "id = 77"}, {"filter": "id > 590"}],
+    "BLOOMFILTER": [{"filter": "id = 77"}, {"filter": "id IN (5, 6)"}],
+    "JSON": [{"filter": "json_get_int(js, 'a') = 3"}],
+}
+# Vector kinds, with what must equal the local copy's answer: "rows" (every partition is searched, so the
+# answer does not depend on the training), "distances" (ties at the k-th place may swap rows), or None.
+VECTOR_BUILDS = {
+    "IVF_FLAT": (dict(index_type="IVF_FLAT", num_partitions=4), "vec", "rows"),
+    "IVF_SQ": (dict(index_type="IVF_SQ", num_partitions=4), "vec", "rows"),
+    "IVF_PQ": (dict(index_type="IVF_PQ", num_partitions=4, num_sub_vectors=4), "vec", None),
+    "IVF_RQ": (dict(index_type="IVF_RQ", num_partitions=4), "vec", None),
+    "IVF_HNSW_FLAT": (dict(index_type="IVF_HNSW_FLAT", num_partitions=2), "vec", None),
+    "IVF_HNSW_SQ": (dict(index_type="IVF_HNSW_SQ", num_partitions=2), "vec", None),
+    "IVF_HNSW_PQ": (dict(index_type="IVF_HNSW_PQ", num_partitions=2, num_sub_vectors=4), "vec", None),
+    "HAMMING": (dict(index_type="IVF_FLAT", num_partitions=4, metric="hamming"), "bits", "distances"),
+}
+VECTOR_QUERY = np.random.default_rng(11).random(8).astype("float32")
+NEAREST_K = 7
+
+
+def _near(column: str):
+    query = VECTOR_QUERY if column == "vec" else np.arange(8, dtype=np.uint8) * 31
+    return {"nearest": {"column": column, "q": query, "k": NEAREST_K}}
+
+
+def _answers(ds, queries) -> list:
+    """Each query's rows: (id, score or distance) sorted, floats rounded to 4 places."""
+    out = []
+    for kw in queries:
+        extra = ["_score"] if "full_text_query" in kw else ["_distance"] if "nearest" in kw else []
+        table = ds.to_table(columns=["id", *extra], **kw).to_pydict()
+        rows = zip(*(table[c] for c in ["id", *extra]))
+        out.append(sorted(tuple(round(v, 4) if isinstance(v, float) else v for v in row) for row in rows))
+    return out
+
+
+def _index_names(ds) -> list:
+    return sorted((i["name"], tuple(i["fields"])) for i in ds.list_indices())
+
+
+def _uses_index(lance, uri: str, flt: str) -> bool:
+    return "ScalarIndexQuery" in lance.dataset(uri, storage_options=options()).scanner(filter=flt).explain_plan()
+
+
+@pytest.mark.parametrize("name", list(SCALAR_BUILDS))
+def test_scalar_index_on_s3_answers_as_the_local_copy(name, tmp_path):
+    lance = require_pylance()
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    _indexed_copy(s3_uri, options(), lambda ds: SCALAR_BUILDS[name](ds, _nanolance_json_config))
+    _indexed_copy(local, None, lambda ds: SCALAR_BUILDS[name](ds, _nanolance_json_config))
+    queries = SCALAR_QUERIES[name]
+    ours = _answers(nl.dataset(s3_uri, storage_options=options()), queries)
+    assert ours == _answers(nl.dataset(local), queries)
+    assert ours == _answers(lance.dataset(s3_uri, storage_options=options()), queries)  # pylance reads it
+    assert _index_names(nl.dataset(s3_uri, storage_options=options())) == _index_names(nl.dataset(local))
+    for kw in queries:
+        if "filter" in kw and name != "NGRAM":
+            assert _uses_index(lance, s3_uri, kw["filter"]), kw
+
+
+@pytest.mark.parametrize("name", list(SCALAR_BUILDS))
+def test_scalar_index_built_by_pylance_on_s3_is_read_by_nanolance(name):
+    lance = require_pylance()
+    uri = fresh_uri()
+    _indexed_copy(uri, options(), lambda ds: None)
+    SCALAR_BUILDS[name](lance.dataset(uri, storage_options=options()), _pylance_json_config)
+    queries = SCALAR_QUERIES[name]
+    assert _answers(nl.dataset(uri, storage_options=options()), queries) == \
+        _answers(lance.dataset(uri, storage_options=options()), queries)
+
+
+@pytest.mark.parametrize("name", list(VECTOR_BUILDS))
+def test_vector_index_on_s3_answers_as_the_local_copy(name, tmp_path):
+    lance = require_pylance()
+    params, column, exact = VECTOR_BUILDS[name]
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    _indexed_copy(s3_uri, options(), lambda ds: ds.create_index(column, name="idx", **params))
+    _indexed_copy(local, None, lambda ds: ds.create_index(column, name="idx", **params))
+    queries = [_near(column)]
+    ours = _answers(nl.dataset(s3_uri, storage_options=options()), queries)
+    theirs = _answers(lance.dataset(s3_uri, storage_options=options()), queries)
+    assert ours == theirs  # the same S3 index, read by both engines
+    assert _index_names(nl.dataset(s3_uri, storage_options=options())) == _index_names(nl.dataset(local))
+    local_answer = _answers(nl.dataset(local), queries)
+    if exact == "rows":
+        assert ours == local_answer
+    elif exact == "distances":
+        assert [sorted(row[1] for row in q) for q in ours] == [sorted(row[1] for row in q) for q in local_answer]
+    else:  # trained afresh on each build: the nearest seven must mostly agree
+        assert len({row[0] for row in ours[0]} & {row[0] for row in local_answer[0]}) >= NEAREST_K - 2
+
+
+@pytest.mark.parametrize("name", list(VECTOR_BUILDS))
+def test_vector_index_built_by_pylance_on_s3_is_read_by_nanolance(name):
+    lance = require_pylance()
+    params, column, _ = VECTOR_BUILDS[name]
+    uri = fresh_uri()
+    _indexed_copy(uri, options(), lambda ds: None)
+    lance.dataset(uri, storage_options=options()).create_index(column, name="idx", **params)
+    queries = [_near(column)]
+    assert _answers(nl.dataset(uri, storage_options=options()), queries) == \
+        _answers(lance.dataset(uri, storage_options=options()), queries)
+
+
+def _snapshot_with_indices(uri: str, storage) -> dict:
+    lance = require_pylance()
+    snap = _snapshot(uri, storage)
+    snap["indices"] = [(v, _index_names(lance.dataset(uri, version=v, storage_options=storage)))
+                       for v in snap["versions"]]
+    return snap
+
+
+def test_drop_index_on_s3_matches_the_local_copy(tmp_path):
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    for uri, storage in ((s3_uri, options()), (local, None)):
+        def build(ds):
+            ds.create_scalar_index("id", "BTREE", name="id_idx")
+            ds.create_scalar_index("text", "INVERTED", name="fts")
+            ds.drop_index("id_idx")
+        _indexed_copy(uri, storage, build)
+    assert _snapshot_with_indices(s3_uri, options()) == _snapshot_with_indices(local, None)
+    assert _index_names(nl.dataset(s3_uri, storage_options=options())) == [("fts", ("text",))]
+
+
+def test_optimize_indices_on_s3_matches_the_local_copy(tmp_path):
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    for uri, storage in ((s3_uri, options()), (local, None)):
+        def build(ds):
+            ds.create_scalar_index("id", "BTREE", name="id_idx")
+            ds.create_scalar_index("text", "INVERTED", name="fts")
+            ds.create_index("vec", index_type="IVF_FLAT", num_partitions=4, name="vec_idx")
+        _indexed_copy(uri, storage, build)
+        nl.write_dataset(_index_table().slice(0, 50), uri, mode="append", storage_options=storage)
+        nl.dataset(uri, storage_options=storage).optimize.optimize_indices()
+    assert _snapshot_with_indices(s3_uri, options()) == _snapshot_with_indices(local, None)
+    queries = [{"filter": "id = 3"}, {"full_text_query": "gamma3"}, _near("vec")]
+    lance = require_pylance()
+    assert _answers(lance.dataset(s3_uri, storage_options=options()), queries) == \
+        _answers(nl.dataset(local), queries)
+
+
+DISTRIBUTED_SCALAR = {
+    "BTREE": ("id", "BTREE", ["id < 100", "id >= 500 AND id < 520", "id IN (3, 333, 500)"]),
+    "BITMAP": ("cat", "BITMAP", ["cat = 'c3'", "cat IN ('c1', 'c4')"]),
+    "LABEL_LIST": ("tags", "LABEL_LIST", ["array_has_any(tags, ['t2'])", "array_has_all(tags, ['t0', 'x'])"]),
+    "INVERTED": ("text", "INVERTED", None),
+}
+
+
+def _fragment_groups(ds) -> list:
+    ids = [f.fragment_id for f in ds.get_fragments()]
+    return [ids[:2], ids[2:]]
+
+
+@pytest.mark.parametrize("kind", list(DISTRIBUTED_SCALAR))
+def test_scalar_segments_built_on_s3_merged_and_committed(kind, tmp_path):
+    lance = require_pylance()
+    column, index_type, filters = DISTRIBUTED_SCALAR[kind]
+    queries = [{"full_text_query": "gamma3"}] if filters is None else [{"filter": f} for f in filters]
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    nl.write_dataset(_index_table(), s3_uri, storage_options=options(), max_rows_per_file=INDEX_FRAGMENT_ROWS)
+    ours = nl.dataset(s3_uri, storage_options=options())
+    segments = [ours.create_index_uncommitted(column, index_type, name="idx", fragment_ids=g)
+                for g in _fragment_groups(ours)]
+    assert ours.list_indices() == []  # nothing committed yet
+    merged = ours.merge_existing_index_segments(segments)
+    ours.commit_existing_index_segments("idx", column, [merged])
+    _indexed_copy(local, None, lambda ds: ds.create_scalar_index(column, index_type, name="idx"))
+    answers = _answers(lance.dataset(s3_uri, storage_options=options()), queries)
+    assert answers == _answers(nl.dataset(s3_uri, storage_options=options()), queries)
+    assert answers == _answers(nl.dataset(local), queries)
+
+
+def test_vector_segments_with_a_shared_model_built_on_s3(tmp_path):
+    lance = require_pylance()
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    nl.write_dataset(_index_table(), s3_uri, storage_options=options(), max_rows_per_file=INDEX_FRAGMENT_ROWS)
+    ours = nl.dataset(s3_uri, storage_options=options())
+    centroids = IndicesBuilder(ours, "vec").train_ivf(4, sample_rate=8, max_iters=10).centroids
+    segments = [ours.create_index_uncommitted("vec", "IVF_FLAT", name="vi", num_partitions=4, fragment_ids=g,
+                                              ivf_centroids=centroids) for g in _fragment_groups(ours)]
+    ours.commit_existing_index_segments("vi", "vec", [ours.merge_existing_index_segments(segments)])
+    _indexed_copy(local, None, lambda ds: ds.create_index("vec", name="vi", index_type="IVF_FLAT", num_partitions=4))
+    queries = [_near("vec")]
+    answer = _answers(lance.dataset(s3_uri, storage_options=options()), queries)
+    assert answer == _answers(nl.dataset(s3_uri, storage_options=options()), queries)
+    assert answer == _answers(nl.dataset(local), queries)
+
+
+def test_legacy_inverted_partial_build_stages_its_parts_on_s3(tmp_path):
+    """create_scalar_index(fragment_ids, index_uuid) per fragment, then merge_index_metadata: the staged
+    parts are written to and read from the object store, and removed once the segment is built. The
+    LanceDataset.commit of that segment is W3b."""
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    outcome = {}
+    for uri, storage in ((s3_uri, options()), (local, None)):
+        nl.write_dataset(_index_table(), uri, storage_options=storage, max_rows_per_file=INDEX_FRAGMENT_ROWS)
+        ds = nl.dataset(uri, storage_options=storage)
+        index_id = str(uuid.uuid4())
+        for fragment in ds.get_fragments():
+            ds.create_scalar_index("text", "INVERTED", name="fts", replace=False, index_uuid=index_id,
+                                   fragment_ids=[fragment.fragment_id], remove_stop_words=False)
+        events = []
+        ds.merge_index_metadata(index_id, index_type="INVERTED", progress_callback=events.append)
+        outcome[uri] = [e.stage for e in events if e.event == "complete"]
+        assert _nanolance._index_stage_read(uri, index_id) == []  # the parts are gone
+    assert outcome[s3_uri] == outcome[local] == [
+        "read_partition_metadata", "remap_partition_files", "write_merged_metadata"]
+
+
+def _index_builder_child(uri: str, options_json: str) -> str:
+    return textwrap.dedent(f"""
+        import json
+        import nanolance.lance as nl
+        ds = nl.dataset({uri!r}, storage_options=json.loads({options_json!r}))
+        ds.create_scalar_index("id", "BTREE", name="id_idx")
+        print("built")
+    """)
+
+
+def test_index_build_racing_an_append_is_rebased_and_loses_no_rows():
+    lance = require_pylance()
+    uri = fresh_uri()
+    nl.write_dataset(batch(0, INDEX_ROWS), uri, storage_options=options(), max_rows_per_file=INDEX_FRAGMENT_ROWS)
+    builder = subprocess.Popen([sys.executable, "-c", _index_builder_child(uri, json.dumps(options()))],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    appender = start_appender(uri, 3, INDEX_ROWS)
+    appended = result(appender)
+    built = builder.communicate()
+    assert appended["errors"] == [] and built[0].strip() == "built", (appended, built)
+    theirs = lance.dataset(uri, storage_options=options())
+    ids = sorted(theirs.to_table(columns=["id"])["id"].to_pylist())
+    assert ids == list(range(INDEX_ROWS + 100 * appended["ok"]))
+    assert [i["name"] for i in theirs.list_indices()] == ["id_idx"]
+    assert theirs.to_table(filter="id = 77", columns=["id"])["id"].to_pylist() == [77]
+
+
+def _objects_under(uri: str, prefix: str) -> list:
+    """The object keys under `prefix` of the s3:// `uri`'s bucket, listed by pyarrow's S3 client."""
+    from pyarrow import fs as pafs
+
+    bucket, _, key = uri[len("s3://"):].partition("/")
+    s3 = pafs.S3FileSystem(access_key=options()["aws_access_key_id"], secret_key=options()["aws_secret_access_key"],
+                           region=options()["aws_region"], endpoint_override=ENDPOINT, scheme="http")
+    selector = pafs.FileSelector(f"{bucket}/{key.rstrip('/')}/{prefix}", recursive=True, allow_not_found=True)
+    return [info.path for info in s3.get_file_info(selector) if info.type == pafs.FileType.File]
+
+
+def test_index_build_whose_manifest_is_refused_leaves_no_index_objects():
+    # The build writes its index objects, then the manifest PUT fails on every attempt: the build fails
+    # and removes the objects it wrote (remove_index_dir), so nothing under _indices/ is left behind.
+    lance = require_pylance()
+    uri = fresh_uri()
+    nl.write_dataset(batch(0), uri, storage_options=options())
+    child = _index_builder_child(uri, json.dumps(options()))
+    proc = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, check=False,
+                          env=dict(os.environ, NANOS3READER_FAULTS="fail:PUT:_versions/:*"))
+    assert proc.returncode != 0 and "built" not in proc.stdout, proc
+    theirs = lance.dataset(uri, storage_options=options())
+    assert theirs.version == 1 and theirs.list_indices() == []
+    assert _objects_under(uri, "_indices/") == []
