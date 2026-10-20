@@ -36,6 +36,9 @@ bool read_manifest_branch(const pb::Manifest& manifest, std::string& out, std::s
 /// Replace the manifest's base paths (field 18 of its unknown bytes).
 void write_base_paths(pb::Manifest& manifest, const std::vector<BasePath>& bases);
 
+/// Set the manifest's branch (field 20 of its unknown bytes); empty: the main branch (no field).
+void write_manifest_branch(pb::Manifest& manifest, const std::string& branch);
+
 /// DataFile.base_id (field 7): nullopt when absent, which means the dataset's own directory.
 bool data_file_base_id(const pb::DataFile& file, std::optional<std::uint32_t>& out, std::string& error);
 void set_data_file_base_id(pb::DataFile& file, std::optional<std::uint32_t> id);
@@ -46,6 +49,9 @@ void set_deletion_file_base_id(pb::DeletionFile& file, std::optional<std::uint32
 
 /// IndexMetadata.base_id (field 9): nullopt when absent, which means the dataset's own directory.
 bool index_base_id(const pb::IndexMetadata& index, std::optional<std::uint32_t>& out, std::string& error);
+
+/// Set IndexMetadata.base_id (field 9 of its raw message); nullopt: the dataset's own directory.
+void set_index_base_id(pb::IndexMetadata& index, std::optional<std::uint32_t> id);
 
 /// The directory a data file of `manifest` lives in: `<dataset>/data` when it has no base, else the
 /// base's directory (`<path>` when the base is not a dataset root, `<path>/data` when it is). False

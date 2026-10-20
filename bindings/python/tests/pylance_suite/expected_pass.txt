@@ -276,6 +276,7 @@ tests/test_dataset.py::test_asof_checkout
 tests/test_dataset.py::test_auto_cleanup
 tests/test_dataset.py::test_auto_cleanup_invalid
 tests/test_dataset.py::test_batch_size_bytes_chopping_fallback
+tests/test_dataset.py::test_branches
 tests/test_dataset.py::test_checkout
 tests/test_dataset.py::test_cleanup_around_tagged_old_versions
 tests/test_dataset.py::test_cleanup_error_when_tagged_old_versions
@@ -442,6 +443,7 @@ tests/test_dataset.py::test_stats
 tests/test_dataset.py::test_strict_overwrite
 tests/test_dataset.py::test_system_columns
 tests/test_dataset.py::test_table_metadata_updates
+tests/test_dataset.py::test_tag
 tests/test_dataset.py::test_tag_order
 tests/test_dataset.py::test_take
 tests/test_dataset.py::test_take_duplicate_index[indices0]

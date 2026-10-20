@@ -637,6 +637,23 @@ class LanceDataset(pa.dataset.Dataset):
         with _ref_errors():
             _nanolance._ds_drop(_path_of(base_uri), bool(ignore_not_found))
 
+    @property
+    def _branch(self) -> Optional[str]:
+        """The branch this dataset's version is on (None: main)."""
+        return self._info["branch"] or None
+
+    def create_branch(self, name: str, reference=None) -> "LanceDataset":
+        """Create branch ``name`` forked from ``reference``: this dataset's version on its branch (``None``), an
+        int version of it, a tag, or ``(branch, version)`` (``"main"`` or None is main; a None version is that
+        branch's latest). Returns the branch at its first version, opened at ``<root>/tree/<name>``."""
+        refuse_object_store_write(self._root, "create branch")
+        branch, version = _reference(self, reference, (self._branch, self._version))
+        if version == 0:
+            version = _latest_of(self._root, branch)
+        with _branch_errors():
+            _nanolance._ds_create_branch(self._root, str(name), branch, int(version))
+        return LanceDataset(_branch_uri(self._root, str(name)), storage_options=self._storage_options)
+
     def checkout_version(self, version) -> "LanceDataset":
         if isinstance(version, str):
             version = _tag_target(self._root, version, OSError)
@@ -2458,6 +2475,23 @@ def _ref_errors():
         raise translate(text) from None
 
 
+@contextlib.contextmanager
+def _branch_errors():
+    """Branch errors as pylance raises them: a missing branch or version is a ValueError, a refused change an
+    OSError (its ``Ref`` messages, and "already exists")."""
+    try:
+        yield
+    except RuntimeError as exc:
+        text = str(exc)
+        if text.startswith(("Ref not found", "Version not found")):
+            raise ValueError(text) from None
+        if text.startswith("Ref "):
+            raise OSError(text) from None
+        from nanolance.lance._errors import translate
+
+        raise translate(text) from None
+
+
 def _root_of(uri: str, branch: Optional[str]) -> str:
     """The dataset root a dataset at ``uri`` on ``branch`` sits in: its uri without ``tree/<branch>``."""
     if not branch:
@@ -2491,26 +2525,27 @@ def _tag_target(root: str, name: str, error_type) -> Tuple[Optional[str], int]:
     raise error_type(f"Ref not found error: tag {name} does not exist")
 
 
-def _tag_reference(ds: "LanceDataset", reference) -> int:
-    """A tag's target as pylance takes it: a version, another tag's name, ``(branch, version)`` on the
-    main branch (``None`` for the latest), or ``None`` for the latest; 0 means the latest."""
+def _reference(ds: "LanceDataset", reference, unset: Tuple[Optional[str], int]) -> Tuple[Optional[str], int]:
+    """A reference as ``(branch, version)``, branch None for main and version 0 for that branch's latest: an
+    int is a version of this dataset's branch, a tag name is the tag's ``(branch, version)``, a
+    ``(branch, version)`` tuple is as given (``"main"`` is main; ``None`` the latest). ``None`` itself is
+    ``unset``."""
     if reference is None:
-        return 0
+        return unset
     if isinstance(reference, str):
-        return _tag_version(ds._root, reference, ValueError)
+        return _tag_target(ds._root, reference, ValueError)
     if isinstance(reference, tuple):
         branch, number = reference
-        if branch not in (None, "main"):
-            raise unsupported("branches")
-        return 0 if number is None else int(number)
-    return int(reference)
+        branch = None if branch in (None, "main") else str(branch)
+        return branch, 0 if number is None else int(number)
+    return ds._branch, int(reference)
 
 
-def _tag_version(uri: str, name: str, error_type) -> int:
-    branch, version = _tag_target(uri, name, error_type)
-    if branch is not None:
-        raise unsupported("branches")
-    return version
+def _latest_of(root: str, branch: Optional[str]) -> int:
+    """The latest version of ``branch`` (None: main) of the dataset at ``root``."""
+    uri = _branch_uri(root, branch) if branch else root
+    with native():
+        return int(_nanolance._ds_info(uri, None)["version"])
 
 
 class Branches:
@@ -2542,10 +2577,17 @@ class Branches:
         return branches
 
     def delete(self, name: str) -> None:
-        raise unsupported("branches")
+        """Delete a branch and its versions. Refused (OSError) for main, for a branch another branch forks from, and
+        for a branch a tag names."""
+        refuse_object_store_write(self._ds._root, "delete branch")
+        with _branch_errors():
+            _nanolance._ds_delete_branch(self._ds._root, str(name))
 
     def replace_metadata(self, name: str, metadata: Dict[str, str]) -> None:
-        raise unsupported("branches")
+        refuse_object_store_write(self._ds._root, "replace branch metadata")
+        with _branch_errors():
+            _nanolance._ds_replace_branch_metadata(self._ds._root, str(name),
+                                                   {str(k): str(v) for k, v in metadata.items()})
 
 
 class Tags:
@@ -2579,34 +2621,28 @@ class Tags:
     def get_version(self, tag: str) -> int:
         return _tag_target(self._ds._root, tag, ValueError)[1]
 
-    def _writable_root(self) -> str:
-        """Tags are written at the root; a tag on a branch's own versions is not written yet (B2)."""
-        if self._ds._uri != self._ds._root:
-            raise unsupported("branches")
-        return self._ds._root
-
     def create(self, tag: str, reference=None) -> None:
-        root = self._writable_root()
+        root = self._ds._root
         refuse_object_store_write(root, "create tag")
-        version = _tag_reference(self._ds, reference)
+        branch, version = _reference(self._ds, reference, (self._ds._branch, 0))
         with _ref_errors():
-            _nanolance._ds_create_tag(root, str(tag), version)
+            _nanolance._ds_create_tag(root, str(tag), branch, version)
 
     def delete(self, tag: str) -> None:
-        root = self._writable_root()
+        root = self._ds._root
         refuse_object_store_write(root, "delete tag")
         with _ref_errors():
             _nanolance._ds_delete_tag(root, str(tag))
 
     def update(self, tag: str, reference=None) -> None:
-        root = self._writable_root()
+        root = self._ds._root
         refuse_object_store_write(root, "update tag")
-        version = _tag_reference(self._ds, reference)
+        branch, version = _reference(self._ds, reference, (self._ds._branch, 0))
         with _ref_errors():
-            _nanolance._ds_update_tag(root, str(tag), version)
+            _nanolance._ds_update_tag(root, str(tag), branch, version)
 
     def replace_metadata(self, tag: str, metadata: Dict[str, str]) -> None:
-        root = self._writable_root()
+        root = self._ds._root
         refuse_object_store_write(root, "replace tag metadata")
         with _ref_errors():
             _nanolance._ds_replace_tag_metadata(root, str(tag), {str(k): str(v) for k, v in metadata.items()})

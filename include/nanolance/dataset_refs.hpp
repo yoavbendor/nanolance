@@ -11,7 +11,8 @@
 #include <string>
 #include <vector>
 
-/// A dataset's versions kept and let go, as Lance keeps them: tags (`_refs/tags/<name>.json`),
+/// A dataset's versions kept and let go, as Lance keeps them: tags (`_refs/tags/<name>.json`), branches
+/// (`_refs/branches/<name>.json`, created, deleted and described here),
 /// cleanup of old versions and the files only they use, the automatic cleanup a dataset's
 /// `lance.auto_cleanup.*` config asks for after each commit, and dropping a whole dataset. The rules
 /// follow Lance 12 (`dataset/cleanup.rs`, `dataset/refs.rs`, `validate_dataset_root_for_drop`), so a
@@ -46,16 +47,36 @@ struct BranchInfo {
 /// Every branch, by name.
 bool list_branches(const std::filesystem::path& dataset_path, std::vector<BranchInfo>& out, std::string& error);
 
+/// Where branch `branch` ("": main) of the dataset at `root` keeps its versions: `root`, or
+/// `<root>/tree/<branch>` (pylance's layout; a name with `/` nests).
+std::filesystem::path branch_location(const std::filesystem::path& root, const std::string& branch);
+
+/// Create branch `name` forked from `source_branch` ("": main) at its version `version`, as Lance's
+/// create_branch: the branch's first version is the source's manifest at `version` (a clone that
+/// inherits the source's files through a base path), and its reference is written. Fails when the name
+/// is taken, the version does not exist or the parent branch does not.
+bool create_branch(const std::filesystem::path& root, const std::string& name, const std::string& source_branch,
+                   std::uint64_t version, std::string& error);
+
+/// Delete branch `name` and its versions. Refused for main, for a branch another branch forks from, and
+/// for a branch a tag names (Lance's refusals), with its messages.
+bool delete_branch(const std::filesystem::path& root, const std::string& name, std::string& error);
+
+/// Replace a branch's metadata.
+bool replace_branch_metadata(const std::filesystem::path& root, const std::string& name,
+                             const std::map<std::string, std::string>& metadata, std::string& error);
+
 /// Every tag, by name.
 bool list_tags(const std::filesystem::path& dataset_path, std::vector<TagInfo>& out, std::string& error);
 bool get_tag(const std::filesystem::path& dataset_path, const std::string& name, TagInfo& out, std::string& error);
-/// Tag `version` (0: the latest) as `name`. Fails when the tag exists or the version does not, with
-/// Lance's messages ("Ref conflict error: ...", "Version not found error: ...").
-bool create_tag(const std::filesystem::path& dataset_path, const std::string& name, std::uint64_t version,
-                std::string& error);
-/// Point an existing tag at `version` (0: the latest), keeping its creation time and metadata.
-bool update_tag(const std::filesystem::path& dataset_path, const std::string& name, std::uint64_t version,
-                std::string& error);
+/// Tag `version` (0: the latest) of `branch` ("": main) as `name`, in the dataset at `root`. Fails when
+/// the tag exists or the version does not, with Lance's messages ("Ref conflict error: ...", "Version not
+/// found error: ...").
+bool create_tag(const std::filesystem::path& root, const std::string& name, const std::string& branch,
+                std::uint64_t version, std::string& error);
+/// Point an existing tag at `version` (0: the latest) of `branch`, keeping its creation time and metadata.
+bool update_tag(const std::filesystem::path& root, const std::string& name, const std::string& branch,
+                std::uint64_t version, std::string& error);
 bool delete_tag(const std::filesystem::path& dataset_path, const std::string& name, std::string& error);
 /// Replace a tag's metadata (its version and times unchanged, as in Lance).
 bool replace_tag_metadata(const std::filesystem::path& dataset_path, const std::string& name,

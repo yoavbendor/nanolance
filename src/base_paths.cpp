@@ -161,6 +161,14 @@ void write_base_paths(pb::Manifest& manifest, const std::vector<BasePath>& bases
     manifest.unknown = std::move(out);
 }
 
+void write_manifest_branch(pb::Manifest& manifest, const std::string& branch) {
+    std::vector<std::uint8_t> out = without_field(manifest.unknown, kManifestBranch);
+    if (!branch.empty()) {
+        put_bytes_field(out, kManifestBranch, std::vector<std::uint8_t>(branch.begin(), branch.end()));
+    }
+    manifest.unknown = std::move(out);
+}
+
 bool data_file_base_id(const pb::DataFile& file, std::optional<std::uint32_t>& out, std::string& error) {
     return find_varint(file.unknown, kBaseIdField, out, error);
 }
@@ -175,6 +183,15 @@ bool deletion_file_base_id(const pb::DeletionFile& file, std::optional<std::uint
 
 void set_deletion_file_base_id(pb::DeletionFile& file, std::optional<std::uint32_t> id) {
     put_base_id(file.unknown, id);
+}
+
+void set_index_base_id(pb::IndexMetadata& index, std::optional<std::uint32_t> id) {
+    // IndexMetadata's field (9), not the file field the other base ids use.
+    index.raw = without_field(index.raw, kIndexBaseIdField);
+    if (id) {
+        put_key(index.raw, kIndexBaseIdField, 0);
+        put_varint(index.raw, *id);
+    }
 }
 
 bool index_base_id(const pb::IndexMetadata& index, std::optional<std::uint32_t>& out, std::string& error) {

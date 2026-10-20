@@ -5,12 +5,15 @@
 #include <nanolance/dataset_refs.hpp>
 #include "nanolance/byte_source.hpp"
 
+#include <nanolance/base_paths.hpp>
 #include <nanolance/manifest_reader.hpp>
+#include <nanolance/manifest_writer.hpp>
 
 #include "fts_json.hpp"
 #include "lance_minimal.pb.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -251,17 +254,17 @@ bool read_tag(const fs::path& dataset_path, const std::string& name, TagInfo& ou
 }
 
 /// `version` (0: the latest) and its manifest's size, or Lance's "version not found".
-bool resolve_tag_target(const fs::path& dataset_path, std::uint64_t version, std::uint64_t& resolved,
-                        std::uint64_t& manifest_size, std::string& error) {
+bool resolve_tag_target(const fs::path& location, const std::string& branch, std::uint64_t version,
+                        std::uint64_t& resolved, std::uint64_t& manifest_size, std::string& error) {
     resolved = version;
     if (resolved == 0) {
         std::string ignored;
-        resolved = highest_manifest_version(dataset_path, ignored);
+        resolved = highest_manifest_version(location, ignored);
     }
     fs::path path;
-    if (resolved == 0 || !manifest_file_of(dataset_path, resolved, path, manifest_size)) {
-        error = "Version not found error: version main:" + (version == 0 ? std::string("latest") : std::to_string(version)) +
-                " does not exist";
+    if (resolved == 0 || !manifest_file_of(location, resolved, path, manifest_size)) {
+        error = "Version not found error: version " + (branch.empty() ? std::string("main") : branch) + ":" +
+                (version == 0 ? std::string("latest") : std::to_string(version)) + " does not exist";
         return false;
     }
     return true;
@@ -276,16 +279,19 @@ struct ReferencedFiles {
     std::unordered_set<std::string> index_uuids;
 };
 
+/// A fragment's deletion file, relative to its dataset (`_deletions/<fragment>-<read version>-<id>`).
+std::string deletion_file_name(const pb::DataFragment& fragment) {
+    return "_deletions/" + std::to_string(fragment.id) + "-" + std::to_string(fragment.deletion_file.read_version) +
+           "-" + std::to_string(fragment.deletion_file.id) + (fragment.deletion_file.file_type == 1U ? ".bin" : ".arrow");
+}
+
 void reference(const pb::Manifest& manifest, ReferencedFiles& files) {
     for (const auto& fragment : manifest.fragments) {
         for (const auto& file : fragment.files) {
             files.data_paths.insert("data/" + file.path);
         }
         if (fragment.deletion_file.present) {
-            files.delete_paths.insert("_deletions/" + std::to_string(fragment.id) + "-" +
-                                      std::to_string(fragment.deletion_file.read_version) + "-" +
-                                      std::to_string(fragment.deletion_file.id) +
-                                      (fragment.deletion_file.file_type == 1U ? ".bin" : ".arrow"));
+            files.delete_paths.insert(deletion_file_name(fragment));
         }
     }
     if (!manifest.transaction_file.empty()) {
@@ -296,14 +302,184 @@ void reference(const pb::Manifest& manifest, ReferencedFiles& files) {
     }
 }
 
-constexpr std::int64_t kUnverifiedThresholdNs = 7LL * 24 * 3600 * 1000000000LL;
-
 bool starts_with(const std::string& s, std::string_view prefix) {
     return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
 }
 bool ends_with(const std::string& s, std::string_view suffix) {
     return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
+
+constexpr std::int64_t kUnverifiedThresholdNs = 7LL * 24 * 3600 * 1000000000LL;
+
+std::int64_t manifest_timestamp_ns(const pb::Manifest& manifest) {
+    return manifest.has_timestamp ? manifest.timestamp_seconds * 1000000000LL + manifest.timestamp_nanos : 0;
+}
+
+// ── branches, as cleanup sees them ─────────────────────────────────────────────────────────────────
+
+/// The root a dataset directory sits in, and the branch the directory holds ("" for main). A branch
+/// lives at `<root>/tree/<branch>`, as pylance lays it out; its tags, branch references and the
+/// branches it forks from are the root's.
+struct BranchScope {
+    fs::path root;
+    std::string branch;
+};
+
+std::string canonical_text(const fs::path& path) {
+    std::error_code ec;
+    const auto canonical = fs::weakly_canonical(path, ec);
+    return (ec ? path.lexically_normal() : canonical).generic_string();
+}
+
+bool branch_scope_of(const fs::path& dataset_path, const std::string& branch, BranchScope& out, std::string& error) {
+    out.branch = branch;
+    out.root = dataset_path;
+    if (branch.empty()) {
+        return true;
+    }
+    std::string text = dataset_path.lexically_normal().generic_string();
+    while (text.size() > 1 && text.back() == '/') {
+        text.pop_back();
+    }
+    const std::string suffix = "/tree/" + branch;
+    if (text.size() <= suffix.size() || text.compare(text.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        error = "branch " + branch + " is not at " + dataset_path.string() + ", where a branch lives: <root>/tree/" +
+                branch;
+        return false;
+    }
+    out.root = text.substr(0, text.size() - suffix.size());
+    return true;
+}
+
+/// A branch forked from this lineage: its name, its directory, and the version of this lineage it
+/// forks from (Lance's collect_referenced_versions: a branch whose identifier extends this one's).
+struct ForkedBranch {
+    std::string name;
+    fs::path dir;
+    std::uint64_t version = 0;
+};
+
+bool forked_branches(const BranchScope& scope, std::vector<ForkedBranch>& out, std::string& error) {
+    std::vector<BranchInfo> branches;
+    if (!list_branches(scope.root, branches, error)) {
+        return false;
+    }
+    std::vector<std::pair<std::uint64_t, std::string>> own;
+    if (!scope.branch.empty()) {
+        const auto self = std::find_if(branches.begin(), branches.end(),
+                                       [&](const BranchInfo& b) { return b.name == scope.branch; });
+        if (self == branches.end()) {
+            error = "branch " + scope.branch + " has no reference file under " + (scope.root / "_refs").string();
+            return false;
+        }
+        own = self->identifier;
+    }
+    for (const auto& b : branches) {
+        if (b.name == scope.branch || b.identifier.size() <= own.size() ||
+            !std::equal(own.begin(), own.end(), b.identifier.begin())) {
+            continue;
+        }
+        const auto version = b.identifier[own.size()].first;
+        if (version != 0) {
+            out.push_back({b.name, scope.root / "tree" / b.name, version});
+        }
+    }
+    return true;
+}
+
+/// Whether `base_id` names a base path that is the dataset root at `dir_text` (canonical).
+bool names_dataset_dir(const std::vector<BasePath>& bases, const std::optional<std::uint32_t>& base_id,
+                       const std::string& dir_text) {
+    if (!base_id) {
+        return false;  // absent: the branch's own directory, not this one
+    }
+    for (const auto& base : bases) {
+        if (base.id == *base_id) {
+            // pylance records the root as it was opened: a relative path cannot be resolved from here
+            // (it was relative to that process's directory), so it is taken to name this one -- keeping
+            // files another directory's branch uses costs space; removing this one's loses data.
+            if (base.is_dataset_root && !fs::path(base.path).is_absolute()) {
+                return true;
+            }
+            return base.is_dataset_root && canonical_text(base.path) == dir_text;
+        }
+    }
+    return false;
+}
+
+/// What a fork's branch still uses from this dataset directory (Lance's retain_branch_lineage_files):
+/// the fork version itself is kept, and the files, deletions and indices it names here.
+struct ForkProtection {
+    std::set<std::uint64_t> versions;
+    ReferencedFiles files;
+};
+
+/// Scan every manifest of the branch `fork` and record what names files in `dataset_path`. A manifest
+/// that names one protects the version the branch forks from.
+bool protect_fork(const fs::path& dataset_path, const ForkedBranch& fork, ForkProtection& out, std::string& error) {
+    const std::string own = canonical_text(dataset_path);
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(fork.dir / "_versions", ec)) {
+        const auto name = entry.path().filename().string();
+        std::uint64_t version = 0;
+        const bool attached = parse_manifest_version(name, version);
+        const bool detached = !attached && starts_with(name, "d") && ends_with(name, ".manifest");
+        if (!entry.is_regular_file(ec) || (!attached && !detached)) {
+            continue;
+        }
+        pb::Manifest manifest;
+        if (!load_manifest_file(entry.path(), manifest, error)) {
+            error = "cannot clean up: a branch " + fork.name + " manifest could not be read: " + error;
+            return false;
+        }
+        std::vector<BasePath> bases;
+        if (!read_base_paths(manifest, bases, error)) {
+            return false;
+        }
+        bool names_here = false;
+        for (const auto& fragment : manifest.fragments) {
+            for (const auto& file : fragment.files) {
+                std::optional<std::uint32_t> base;
+                if (!data_file_base_id(file, base, error)) {
+                    return false;
+                }
+                if (names_dataset_dir(bases, base, own)) {
+                    out.files.data_paths.insert("data/" + file.path);
+                    names_here = true;
+                }
+            }
+            if (fragment.deletion_file.present) {
+                std::optional<std::uint32_t> base;
+                if (!deletion_file_base_id(fragment.deletion_file, base, error)) {
+                    return false;
+                }
+                if (names_dataset_dir(bases, base, own)) {
+                    out.files.delete_paths.insert(deletion_file_name(fragment));
+                    names_here = true;
+                }
+            }
+        }
+        for (const auto& index : manifest.indices) {
+            std::optional<std::uint32_t> base;
+            if (!index_base_id(index, base, error)) {
+                return false;
+            }
+            if (names_dataset_dir(bases, base, own)) {
+                out.files.index_uuids.insert(pb::uuid_string(index.uuid));
+                names_here = true;
+            }
+        }
+        if (names_here) {
+            out.versions.insert(fork.version);
+        }
+    }
+    if (ec) {
+        error = "failed to list " + (fork.dir / "_versions").string() + ": " + ec.message();
+        return false;
+    }
+    return true;
+}
+
 
 struct File {
     std::string relative;
@@ -530,22 +706,417 @@ bool list_branches(const fs::path& dataset_path, std::vector<BranchInfo>& out, s
     return true;
 }
 
+fs::path branch_location(const fs::path& root, const std::string& branch) {
+    return branch.empty() ? root : root / "tree" / branch;
+}
+
+namespace {
+
+/// Lance's check_valid_branch: the names a branch may have (`main` is the main branch's own).
+bool check_valid_branch(const std::string& name, std::string& error) {
+    const auto fail = [&](const std::string& why) {
+        error = "Ref is invalid: " + why;
+        return false;
+    };
+    if (name.empty()) {
+        return fail("Branch name cannot be empty");
+    }
+    if (name.front() == '/' || name.back() == '/') {
+        return fail("Branch name cannot start or end with a '/'");
+    }
+    if (name.find("//") != std::string::npos) {
+        return fail("Branch name cannot contain consecutive '/'");
+    }
+    if (name.find("..") != std::string::npos || name.find('\\') != std::string::npos) {
+        return fail("Branch name cannot contain '..' or '\\'");
+    }
+    std::size_t start = 0;
+    while (start <= name.size()) {
+        const auto end = std::min(name.find('/', start), name.size());
+        const auto segment = name.substr(start, end - start);
+        if (segment.empty()) {
+            return fail("Branch name cannot have empty segments between '/'");
+        }
+        for (const char c : segment) {
+            if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '.' && c != '-' && c != '_') {
+                return fail("Branch segment '" + segment +
+                            "' contains invalid characters. Only alphanumeric, '.', '-', '_' are allowed.");
+            }
+        }
+        start = end + 1;
+    }
+    if (ends_with(name, ".lock")) {
+        return fail("Branch name cannot end with '.lock'");
+    }
+    if (name == "main") {
+        return fail("Branch name cannot be 'main'");
+    }
+    return true;
+}
+
+/// A branch's reference file: pylance's name for it, with the `/` of a name percent-encoded (`team%2Fx`).
+fs::path branch_ref_path(const fs::path& root, const std::string& name) {
+    std::string file;
+    for (const char c : name) {
+        if (c == '/') {
+            file += "%2F";
+        } else {
+            file.push_back(c);
+        }
+    }
+    return root / "_refs" / "branches" / (file + ".json");
+}
+
+/// The branch's reference as Lance writes it (serde_json, pretty), its key order too.
+std::string branch_json(const BranchInfo& branch) {
+    std::ostringstream out;
+    out << "{\n  \"parentBranch\": ";
+    if (branch.parent_branch) {
+        json_string(out, *branch.parent_branch);
+    } else {
+        out << "null";
+    }
+    out << ",\n  \"identifier\": {\n    \"version_mapping\": [";
+    bool first = true;
+    for (const auto& [version, id] : branch.identifier) {
+        out << (first ? "\n      [\n        " : ",\n      [\n        ") << version << ",\n        ";
+        json_string(out, id);
+        out << "\n      ]";
+        first = false;
+    }
+    out << (branch.identifier.empty() ? "]" : "\n    ]") << "\n  },\n  \"parentVersion\": " << branch.parent_version
+        << ",\n  \"createAt\": " << branch.create_at << ",\n  \"manifestSize\": " << branch.manifest_size
+        << ",\n  \"metadata\": {";
+    first = true;
+    for (const auto& [k, v] : branch.metadata) {
+        out << (first ? "\n    " : ",\n    ");
+        json_string(out, k);
+        out << ": ";
+        json_string(out, v);
+        first = false;
+    }
+    out << (branch.metadata.empty() ? "}" : "\n  }") << "\n}";
+    return out.str();
+}
+
+/// A version id as Lance makes one: a random (version 4) UUID, simple form (32 lowercase hex digits).
+std::string new_branch_id() {
+    static std::mt19937_64 engine{std::random_device{}()};
+    std::array<std::uint8_t, 16> bytes{};
+    for (auto& b : bytes) {
+        b = static_cast<std::uint8_t>(engine() & 0xFFU);
+    }
+    bytes[6] = static_cast<std::uint8_t>((bytes[6] & 0x0FU) | 0x40U);
+    bytes[8] = static_cast<std::uint8_t>((bytes[8] & 0x3FU) | 0x80U);
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    for (const auto b : bytes) {
+        out.push_back(hex[b >> 4U]);
+        out.push_back(hex[b & 0x0FU]);
+    }
+    return out;
+}
+
+const BranchInfo* find_branch(const std::vector<BranchInfo>& branches, const std::string& name) {
+    for (const auto& b : branches) {
+        if (b.name == name) {
+            return &b;
+        }
+    }
+    return nullptr;
+}
+
+void put_varint_bytes(std::vector<std::uint8_t>& out, std::uint64_t v) {
+    while (v >= 0x80U) {
+        out.push_back(static_cast<std::uint8_t>((v & 0x7FU) | 0x80U));
+        v >>= 7U;
+    }
+    out.push_back(static_cast<std::uint8_t>(v));
+}
+
+void put_key_bytes(std::vector<std::uint8_t>& out, std::uint32_t field, std::uint32_t wire) {
+    put_varint_bytes(out, (static_cast<std::uint64_t>(field) << 3U) | wire);
+}
+
+void put_string_bytes(std::vector<std::uint8_t>& out, std::uint32_t field, const std::string& s) {
+    put_key_bytes(out, field, 2);
+    put_varint_bytes(out, s.size());
+    out.insert(out.end(), s.begin(), s.end());
+}
+
+/// The Clone operation a branch's first version records (lance.table.Transaction.Clone): a shallow
+/// clone of `source_branch`'s version `version` at `source_dir`, as the branch `name`.
+std::vector<std::uint8_t> clone_operation(const std::string& source_branch, std::uint64_t version,
+                                          const std::string& source_dir, const std::string& name) {
+    std::vector<std::uint8_t> out;
+    put_key_bytes(out, 1, 0);
+    put_varint_bytes(out, 1);  // is_shallow
+    if (!source_branch.empty()) {
+        put_string_bytes(out, 2, source_branch);  // ref_name: absent for main
+    }
+    put_key_bytes(out, 3, 0);
+    put_varint_bytes(out, version);  // ref_version
+    put_string_bytes(out, 4, source_dir);
+    put_string_bytes(out, 5, name);  // branch_name
+    return out;
+}
+
+}  // namespace
+
+bool create_branch(const fs::path& root, const std::string& name, const std::string& source_branch,
+                   std::uint64_t version, std::string& error) {
+    error.clear();
+    if (!check_valid_branch(name, error)) {
+        return false;
+    }
+    std::vector<BranchInfo> branches;
+    if (!list_branches(root, branches, error)) {
+        return false;
+    }
+    std::error_code ec;
+    if (find_branch(branches, name) != nullptr || fs::exists(branch_ref_path(root, name), ec)) {
+        error = "Ref conflict error: branch " + name + " already exists";
+        return false;
+    }
+    std::vector<std::pair<std::uint64_t, std::string>> identifier;
+    if (!source_branch.empty()) {
+        const auto* parent = find_branch(branches, source_branch);
+        if (parent == nullptr) {
+            error = "Ref not found error: parent branch " + source_branch + " does not exist";
+            return false;
+        }
+        identifier = parent->identifier;
+    }
+    const auto source_dir = branch_location(root, source_branch);
+    fs::path manifest_path;
+    std::uint64_t manifest_size = 0;
+    if (version == 0 || !manifest_file_of(source_dir, version, manifest_path, manifest_size)) {
+        error = "Version not found error: Manifest file " + (source_dir / "_versions").string() + " for version " +
+                std::to_string(version) + " does not exist";
+        return false;
+    }
+    pb::Manifest manifest;
+    if (!load_manifest_file(manifest_path, manifest, error)) {
+        return false;
+    }
+    // The branch's files inherit through base paths, as Lance's shallow clone makes them: a new base
+    // path (the source's directory, as a dataset root), numbered after the source's, which the files
+    // without a base of their own point at. Files the source inherited keep their base.
+    std::vector<BasePath> bases;
+    if (!read_base_paths(manifest, bases, error)) {
+        return false;
+    }
+    std::uint32_t new_base = 0;
+    for (const auto& base : bases) {
+        new_base = std::max(new_base, base.id + 1U);
+    }
+    for (auto& fragment : manifest.fragments) {
+        for (auto& file : fragment.files) {
+            std::optional<std::uint32_t> base;
+            if (!data_file_base_id(file, base, error)) {
+                return false;
+            }
+            if (!base) {
+                set_data_file_base_id(file, new_base);
+            }
+        }
+        if (fragment.deletion_file.present) {
+            std::optional<std::uint32_t> base;
+            if (!deletion_file_base_id(fragment.deletion_file, base, error)) {
+                return false;
+            }
+            if (!base) {
+                set_deletion_file_base_id(fragment.deletion_file, new_base);
+            }
+        }
+    }
+    for (auto& index : manifest.indices) {
+        std::optional<std::uint32_t> base;
+        if (!index_base_id(index, base, error)) {
+            return false;
+        }
+        if (!base) {
+            set_index_base_id(index, new_base);
+        }
+    }
+    BasePath inherited;
+    inherited.id = new_base;
+    inherited.name = source_branch;
+    inherited.has_name = !source_branch.empty();
+    inherited.is_dataset_root = true;
+    inherited.path = source_dir.string();
+    bases.push_back(inherited);
+    write_base_paths(manifest, bases);
+    write_manifest_branch(manifest, name);
+    manifest.reader_feature_flags |= pb::kFlagMultipleBasePaths;
+    manifest.writer_feature_flags |= pb::kFlagMultipleBasePaths;
+    // The first version of the branch is the source's version, not the one after the latest: a branch
+    // starts at its fork (Lance's CommitBuilder with the Clone transaction read at that version).
+    manifest.version = version;
+    manifest.transaction_file.clear();
+    manifest.tag.clear();
+    manifest.explicit_operation_field = 113;  // Transaction.clone
+    manifest.explicit_operation = clone_operation(source_branch, version, source_dir.string(), name);
+    manifest.explicit_read_version = version;
+    manifest.has_timestamp = true;
+    const auto nanos =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    manifest.timestamp_seconds = static_cast<std::int64_t>(nanos / 1000000000LL);
+    manifest.timestamp_nanos = static_cast<std::int32_t>(nanos % 1000000000LL);
+    manifest.writer_library = "nanolance";
+    manifest.writer_version = nanolance_writer_version();
+    if (!publish_manifest(branch_location(root, name), manifest, error)) {
+        return false;
+    }
+
+    BranchInfo branch;
+    branch.name = name;
+    if (!source_branch.empty()) {
+        branch.parent_branch = source_branch;
+    }
+    branch.identifier = identifier;
+    branch.identifier.emplace_back(version, new_branch_id());
+    branch.parent_version = version;
+    branch.create_at = static_cast<std::uint64_t>(now_ns() / 1000000000LL);
+    branch.manifest_size = manifest_size;
+    bool existed = false;
+    if (!write_file(branch_ref_path(root, name), branch_json(branch), false, existed, error)) {
+        if (existed) {
+            error = "Ref conflict error: branch " + name + " already exists";
+        }
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
+/// Lance's "[(\"name\", version), ...]" for the (name, version) pairs a refusal lists.
+std::string pairs_text(const std::vector<std::pair<std::string, std::uint64_t>>& pairs) {
+    std::string out = "[";
+    bool first = true;
+    for (const auto& [name, version] : pairs) {
+        out += (first ? "(\"" : ", (\"") + name + "\", " + std::to_string(version) + ")";
+        first = false;
+    }
+    return out + "]";
+}
+
+/// Remove `dir` and then the directories above it that are left empty, up to (not including) `stop`.
+void remove_branch_dirs(const fs::path& dir, const fs::path& stop) {
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    for (auto up = dir.parent_path(); up.generic_string().size() > stop.generic_string().size(); up = up.parent_path()) {
+        if (!fs::is_directory(up, ec) || !fs::is_empty(up, ec) || ec) {
+            break;
+        }
+        fs::remove(up, ec);
+    }
+}
+
+}  // namespace
+
+bool delete_branch(const fs::path& root, const std::string& name, std::string& error) {
+    error.clear();
+    if (name == "main") {
+        error = "Ref is invalid: Branch name cannot be 'main'";
+        return false;
+    }
+    std::vector<BranchInfo> branches;
+    if (!list_branches(root, branches, error)) {
+        return false;
+    }
+    const auto* self = find_branch(branches, name);
+    if (self == nullptr) {
+        error = "Ref not found error: Branch " + name + " does not exist";
+        return false;
+    }
+    // Branches forked from this one (deepest first, as Lance lists them), then the tags naming it.
+    std::vector<const BranchInfo*> children;
+    for (const auto& b : branches) {
+        if (b.name != name && b.identifier.size() > self->identifier.size() &&
+            std::equal(self->identifier.begin(), self->identifier.end(), b.identifier.begin())) {
+            children.push_back(&b);
+        }
+    }
+    if (!children.empty()) {
+        std::sort(children.begin(), children.end(),
+                  [](const BranchInfo* a, const BranchInfo* b) { return a->identifier > b->identifier; });
+        std::vector<std::pair<std::string, std::uint64_t>> referenced;
+        for (const auto* child : children) {
+            referenced.emplace_back(child->name, child->identifier[self->identifier.size()].first);
+        }
+        error = "Ref conflict error: Branch " + name + " is referenced by " + pairs_text(referenced) +
+                " versions, can not delete";
+        return false;
+    }
+    std::vector<TagInfo> tags;
+    if (!list_tags(root, tags, error)) {
+        return false;
+    }
+    std::vector<std::pair<std::string, std::uint64_t>> tagged;
+    for (const auto& tag : tags) {
+        if (tag.branch && *tag.branch == name) {
+            tagged.emplace_back(tag.name, tag.version);
+        }
+    }
+    if (!tagged.empty()) {
+        error = "Ref conflict error: Branch " + name + " is referenced by tags " + pairs_text(tagged) +
+                ", can not delete";
+        return false;
+    }
+    std::error_code ec;
+    fs::remove(branch_ref_path(root, name), ec);
+    if (ec) {
+        error = "failed to delete the reference of branch " + name + ": " + ec.message();
+        return false;
+    }
+    remove_branch_dirs(branch_location(root, name), root / "tree");
+    return true;
+}
+
+bool replace_branch_metadata(const fs::path& root, const std::string& name,
+                             const std::map<std::string, std::string>& metadata, std::string& error) {
+    error.clear();
+    if (!check_valid_branch(name, error)) {
+        return false;
+    }
+    std::vector<BranchInfo> branches;
+    if (!list_branches(root, branches, error)) {
+        return false;
+    }
+    const auto* found = find_branch(branches, name);
+    if (found == nullptr) {
+        error = "Ref not found error: branch " + name + " does not exist";
+        return false;
+    }
+    BranchInfo branch = *found;
+    branch.metadata = metadata;
+    bool existed = false;
+    return write_file(branch_ref_path(root, name), branch_json(branch), true, existed, error);
+}
+
 bool get_tag(const fs::path& dataset_path, const std::string& name, TagInfo& out, std::string& error) {
     error.clear();
     return check_valid_tag(name, error) && read_tag(dataset_path, name, out, error);
 }
 
-bool create_tag(const fs::path& dataset_path, const std::string& name, std::uint64_t version, std::string& error) {
+bool create_tag(const fs::path& root, const std::string& name, const std::string& branch, std::uint64_t version,
+                std::string& error) {
     error.clear();
     TagInfo tag;
     if (!check_valid_tag(name, error) ||
-        !resolve_tag_target(dataset_path, version, tag.version, tag.manifest_size, error)) {
+        !resolve_tag_target(branch_location(root, branch), branch, version, tag.version, tag.manifest_size, error)) {
         return false;
+    }
+    if (!branch.empty()) {
+        tag.branch = branch;
     }
     tag.name = name;
     tag.created_at = tag.updated_at = rfc3339(now_ns());
     bool existed = false;
-    if (!write_file(tags_dir(dataset_path) / (name + ".json"), tag_json(tag), false, existed, error)) {
+    if (!write_file(tags_dir(root) / (name + ".json"), tag_json(tag), false, existed, error)) {
         if (existed) {
             error = "Ref conflict error: tag " + name + " already exists";
         }
@@ -554,17 +1125,22 @@ bool create_tag(const fs::path& dataset_path, const std::string& name, std::uint
     return true;
 }
 
-bool update_tag(const fs::path& dataset_path, const std::string& name, std::uint64_t version, std::string& error) {
+bool update_tag(const fs::path& root, const std::string& name, const std::string& branch, std::uint64_t version,
+                std::string& error) {
     error.clear();
     TagInfo tag;
-    if (!check_valid_tag(name, error) || !read_tag(dataset_path, name, tag, error) ||
-        !resolve_tag_target(dataset_path, version, tag.version, tag.manifest_size, error)) {
+    if (!check_valid_tag(name, error) || !read_tag(root, name, tag, error) ||
+        !resolve_tag_target(branch_location(root, branch), branch, version, tag.version, tag.manifest_size, error)) {
         return false;
     }
+    // The tag now names the reference's branch, as Lance's update does.
     tag.branch.reset();
+    if (!branch.empty()) {
+        tag.branch = branch;
+    }
     tag.updated_at = rfc3339(now_ns());
     bool existed = false;
-    return write_file(tags_dir(dataset_path) / (name + ".json"), tag_json(tag), true, existed, error);
+    return write_file(tags_dir(root) / (name + ".json"), tag_json(tag), true, existed, error);
 }
 
 bool delete_tag(const fs::path& dataset_path, const std::string& name, std::string& error) {
@@ -636,20 +1212,70 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
     }
     out.read_version = read_version;
 
+    // The branch this directory holds: its tags are the ones on it, and the root's branches and tags
+    // are the ones the other branches of the lineage keep (as Lance's cleanup works on a branch).
+    pb::Manifest current;
+    std::string branch;
+    BranchScope scope;
+    if (!load_manifest_version(dataset_path, read_version, current, error) ||
+        !read_manifest_branch(current, branch, error) || !branch_scope_of(dataset_path, branch, scope, error)) {
+        return false;
+    }
     std::vector<TagInfo> tags;
-    if (!list_tags(dataset_path, tags, error)) {
+    if (!list_tags(scope.root, tags, error)) {
         return false;
     }
     std::set<std::uint64_t> tagged;
     for (const auto& tag : tags) {
-        if (!tag.branch) {
+        const bool on_this_branch = scope.branch.empty() ? !tag.branch : (tag.branch && *tag.branch == scope.branch);
+        if (on_this_branch) {
             tagged.insert(tag.version);
+        }
+    }
+
+    // Whether a version with commit time `ts` is one the policy removes.
+    const auto selected = [&policy](std::uint64_t version, std::int64_t ts) {
+        bool should_clean = true;
+        if (policy.before_timestamp_ns) {
+            should_clean = should_clean && ts < *policy.before_timestamp_ns;
+        }
+        if (policy.before_version) {
+            should_clean = should_clean && version < *policy.before_version;
+        }
+        if (policy.versions) {
+            should_clean = should_clean && policy.versions->count(version) != 0;
+        }
+        return should_clean;
+    };
+    // The versions a branch forks from are kept, with the files a branch's manifests name here. Only a
+    // fork the policy would remove needs it (Lance's find_referenced_branches).
+    std::vector<ForkedBranch> forks;
+    if (!forked_branches(scope, forks, error)) {
+        return false;
+    }
+    ForkProtection protection;
+    for (const auto& fork : forks) {
+        fs::path fork_manifest_path;
+        std::uint64_t fork_manifest_size = 0;
+        if (!manifest_file_of(dataset_path, fork.version, fork_manifest_path, fork_manifest_size)) {
+            continue;  // no such version here: nothing for the branch to hold
+        }
+        pb::Manifest fork_manifest;
+        if (!load_manifest_file(fork_manifest_path, fork_manifest, error)) {
+            return false;
+        }
+        if (selected(fork.version, manifest_timestamp_ns(fork_manifest)) &&
+            !protect_fork(dataset_path, fork, protection, error)) {
+            return false;
         }
     }
 
     // Every manifest: the ones kept say which files are in use; the ones removed vouch for theirs.
     ReferencedFiles referenced;
     ReferencedFiles verified;
+    referenced.data_paths = protection.files.data_paths;
+    referenced.delete_paths = protection.files.delete_paths;
+    referenced.index_uuids = protection.files.index_uuids;
     std::set<std::uint64_t> tagged_old;
     std::vector<CleanupCandidate> old_manifests;
     std::optional<std::int64_t> earliest_kept_ns;  // commit times, for Lance's listing cutoff
@@ -683,24 +1309,15 @@ bool cleanup_old_versions(const fs::path& dataset_path, std::uint64_t read_versi
             reference(manifest, referenced);  // never removed here; its files stay
             continue;
         }
-        bool should_clean = true;
-        const std::int64_t ts =
-            manifest.has_timestamp ? manifest.timestamp_seconds * 1000000000LL + manifest.timestamp_nanos : 0;
-        if (policy.before_timestamp_ns) {
-            should_clean = should_clean && ts < *policy.before_timestamp_ns;
-        }
-        if (policy.before_version) {
-            should_clean = should_clean && version < *policy.before_version;
-        }
-        if (policy.versions) {
-            should_clean = should_clean && policy.versions->count(version) != 0;
-        }
+        const std::int64_t ts = manifest_timestamp_ns(manifest);
+        const bool should_clean = selected(version, ts);
         const bool is_latest = read_version <= version;
         const bool is_tagged = tagged.count(version) != 0;
+        const bool is_forked = protection.versions.count(version) != 0;
         if (is_tagged && !is_latest && should_clean) {
             tagged_old.insert(version);
         }
-        const bool keep = is_latest || !should_clean || is_tagged;
+        const bool keep = is_latest || !should_clean || is_tagged || is_forked;
         reference(manifest, keep ? referenced : verified);
         auto& bound = keep ? earliest_kept_ns : latest_removed_ns;
         if (!bound || (keep ? ts < *bound : ts > *bound)) {

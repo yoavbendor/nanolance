@@ -1326,15 +1326,37 @@ NB_MODULE(_nanolance, m) {
         }
         return out;
     });
-    m.def("_ds_create_tag", [](const std::filesystem::path& path, const std::string& name, std::uint64_t version) {
+    m.def("_ds_create_tag", [](const std::filesystem::path& path, const std::string& name,
+                               std::optional<std::string> branch, std::uint64_t version) {
         std::string error;
-        if (!nano_lance::create_tag(path, name, version, error)) {
+        if (!nano_lance::create_tag(path, name, branch.value_or(std::string()), version, error)) {
+            throw_dataset(error);
+        }
+    }, nb::arg("path"), nb::arg("name"), nb::arg("branch").none(), nb::arg("version"));
+    m.def("_ds_update_tag", [](const std::filesystem::path& path, const std::string& name,
+                               std::optional<std::string> branch, std::uint64_t version) {
+        std::string error;
+        if (!nano_lance::update_tag(path, name, branch.value_or(std::string()), version, error)) {
+            throw_dataset(error);
+        }
+    }, nb::arg("path"), nb::arg("name"), nb::arg("branch").none(), nb::arg("version"));
+    m.def("_ds_create_branch", [](const std::filesystem::path& path, const std::string& name,
+                                  std::optional<std::string> source_branch, std::uint64_t version) {
+        std::string error;
+        if (!nano_lance::create_branch(path, name, source_branch.value_or(std::string()), version, error)) {
+            throw_dataset(error);
+        }
+    }, nb::arg("path"), nb::arg("name"), nb::arg("source_branch").none(), nb::arg("version"));
+    m.def("_ds_delete_branch", [](const std::filesystem::path& path, const std::string& name) {
+        std::string error;
+        if (!nano_lance::delete_branch(path, name, error)) {
             throw_dataset(error);
         }
     });
-    m.def("_ds_update_tag", [](const std::filesystem::path& path, const std::string& name, std::uint64_t version) {
+    m.def("_ds_replace_branch_metadata", [](const std::filesystem::path& path, const std::string& name,
+                                            const std::map<std::string, std::string>& metadata) {
         std::string error;
-        if (!nano_lance::update_tag(path, name, version, error)) {
+        if (!nano_lance::replace_branch_metadata(path, name, metadata, error)) {
             throw_dataset(error);
         }
     });

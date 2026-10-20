@@ -178,3 +178,21 @@ decisions for B2:
   use `<dataset>/_indices`: B2 makes them branch-correct (an index built on a branch lives under
   `tree/B/_indices`).
 - `checkout_version((B, v)).uri` is `tree/B` (pylance reports the root); keep it, writes need it.
+
+**B2 outcome (2026-10-20):** done in one Haiku session; reviewed. `create_branch` (every reference form;
+branches of branches), the branch manifest and refs JSON as pylance writes them (a test compares the two
+field by field), the Clone transaction, `branches.delete` (Lance's refusals: main, referenced by a
+branch, referenced by a tag), `replace_metadata`, tags on branches, index builds / `optimize_indices` /
+uncommitted segments on a branch under `tree/B/_indices`. Cleanup is branch-aware (Lance's
+`find_referenced_branches` / `retain_branch_lineage_files`): the versions branches fork from and the
+files their manifests name here are kept. `test_branches` and `test_tag` pass (expected list 1228);
+`tests/test_branches.py` 24. Reviewer's changes and decisions:
+- Fixed a data-loss case in the new cleanup: a branch pylance made from a *relative* open records its
+  parent root as that relative text, which the cleanup compared after resolving it against its own
+  working directory; run from elsewhere, it removed the branch's files. A relative root is now taken to
+  name the dataset being cleaned (keeps files rather than lose them); a test fails without the fix.
+- `Dataset.drop(root/tree/B)`: as Lance (removes that directory only; ref and children not touched).
+- Inherited index on a branch of a branch: pylance 12 remaps its base_id to the new base path and then
+  cannot read its own index (`Not found under tree/sub/_indices`); nanolance keeps the inherited base id,
+  which pylance reads. Recorded for an upstream report.
+- nanolance records base paths absolute (it opens paths absolute); pylance reads both.
