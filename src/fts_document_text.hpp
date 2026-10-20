@@ -15,6 +15,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace nano_lance::fts {
 
@@ -98,6 +99,69 @@ inline bool row_text(const ArrowArrayView* column, TextColumn kind, std::int64_t
     }
     text = joined;
     return true;
+}
+
+/// A text column below struct fields (`meta.body.text`): the struct children from the top-level column's
+/// schema down to the leaf, by name. `names` are the path's parts after the top-level column.
+inline bool text_child_path(const ArrowSchema* column, const std::vector<std::string>& names,
+                            std::vector<std::size_t>& index) {
+    index.clear();
+    const ArrowSchema* at = column;
+    for (const auto& name : names) {
+        std::size_t found = 0;
+        bool any = false;
+        for (std::int64_t c = 0; at != nullptr && c < at->n_children; ++c) {
+            if (at->children[c] != nullptr && at->children[c]->name != nullptr && name == at->children[c]->name) {
+                found = static_cast<std::size_t>(c);
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
+            return false;
+        }
+        index.push_back(found);
+        at = at->children[found];
+    }
+    return true;
+}
+
+/// The schema of the leaf a path names (null when the path does not fit the schema).
+inline const ArrowSchema* text_schema_at(const ArrowSchema* column, const std::vector<std::size_t>& index) {
+    const ArrowSchema* at = column;
+    for (const auto c : index) {
+        if (at == nullptr || static_cast<std::int64_t>(c) >= at->n_children) {
+            return nullptr;
+        }
+        at = at->children[c];
+    }
+    return at;
+}
+
+/// The view of the leaf a path names. `above` gets the struct views from the top-level column down to
+/// the leaf's parent: a document is null where any of them is null, as a null struct has no text.
+inline const ArrowArrayView* text_view_at(const ArrowArrayView* column, const std::vector<std::size_t>& index,
+                                          std::vector<const ArrowArrayView*>& above) {
+    above.clear();
+    const ArrowArrayView* at = column;
+    for (const auto c : index) {
+        if (at == nullptr || static_cast<std::int64_t>(c) >= at->n_children) {
+            return nullptr;
+        }
+        above.push_back(at);
+        at = at->children[c];
+    }
+    return at;
+}
+
+/// True when some struct above the leaf is null at `row` (the leaf's own nulls are row_text's).
+inline bool null_above(const std::vector<const ArrowArrayView*>& above, std::int64_t row) {
+    for (const auto* parent : above) {
+        if (ArrowArrayViewIsNull(parent, row)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace nano_lance::fts

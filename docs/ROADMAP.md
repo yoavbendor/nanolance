@@ -548,7 +548,7 @@ write.
 |---|---|---|---|---|---|
 | 8 | **Object-store writes** with atomic commits (conditional put) | -- | Opus design, then sessions | write training sets straight to object storage | concurrent commits on the test endpoint behave as pylance's |
 | 9 | **Multi-word top-k (WAND / MaxScore)** | 0 (speed only) | Opus: design and verdict; Haiku for mechanical parts | multi-term queries (already about 2x pylance) | same results and scores; reviewer's A/B faster |
-| 10 | **INVERTED on nested fields** | not counted | Haiku after a short measurement | nested metadata | results equal pylance's |
+| 10 | ~~**INVERTED on nested fields**~~ (done 2026-10-20, `docs/tasks/WAVE3_SMALL.md` N; +2 pylance tests) | not counted | Haiku after a short measurement | nested metadata | results equal pylance's |
 | 11 | **icu / jieba / lindera tokenizers** | 20 | Opus: licences (copied from the source trees, never from memory) and dictionary packaging; then 2-3 sessions | multilingual RAG | the 20 pass |
 | 12 | **MemWAL** | 20 | Opus design (a subsystem) | real-time agent memory | the 20 pass |
 | 13 | MinHash LSH, FM-index, RTree | -- | when a user asks | dedup, substring, spatial | -- |

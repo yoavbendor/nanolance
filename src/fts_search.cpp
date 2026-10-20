@@ -1298,7 +1298,14 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
     if (frags.empty()) {
         return true;
     }
-    const std::vector<std::string> cols = {c.name};
+    // The column's documents: the text leaf below the struct fields of the top-level column the scan reads.
+    std::vector<std::string> parts;
+    if (index_files::find_field(manifest, c.name, parts) == nullptr) {
+        error = "Column " + c.name + " not found in the dataset";
+        return false;
+    }
+    const std::vector<std::string> cols = {parts.front()};
+    const std::vector<std::string> below(parts.begin() + 1, parts.end());
     LanceScanRequest scan;
     scan.row_mask = request->row_mask;
     scan.columns = &cols;
@@ -1313,11 +1320,16 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
     if (!lance_dataset_scan(path, scan, schema, batches, error)) {
         return false;
     }
-    const int tc = child_index(schema, c.name);
+    const int tc = child_index(schema, parts.front());
     const int ac = child_index(schema, "_rowaddr");
     bool ok = tc >= 0 && ac >= 0;
     if (!ok) {
         error = "cannot read column " + c.name;
+    }
+    std::vector<std::size_t> path;
+    if (ok && !fts::text_child_path(schema.children[tc], below, path)) {
+        error = "cannot read column " + c.name;
+        ok = false;
     }
     std::vector<fts::Token> tokens;
     std::string joined;  // a list row's text, joined as Lance joins it
@@ -1330,7 +1342,12 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
                 error = std::string("cannot read a batch: ") + e.message;
                 ok = false;
             }
-            const ArrowArrayView* text = ok ? view.children[tc] : nullptr;
+            std::vector<const ArrowArrayView*> above;  // the structs above the text, null where they are
+            const ArrowArrayView* text = ok ? fts::text_view_at(view.children[tc], path, above) : nullptr;
+            if (ok && text == nullptr) {
+                error = "cannot read column " + c.name;
+                ok = false;
+            }
             const fts::TextColumn kind = fts::text_column_kind(text);
             if (ok && kind == fts::TextColumn::kNone) {
                 error = "full-text search needs a string column or a list of strings column; " + c.name + " is not one";
@@ -1361,7 +1378,7 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
                 const std::int64_t row = view.offset + r;
                 if (c.element) {
                     // One document per element of a non-null row, empty and null ones included (no tokens).
-                    if (ArrowArrayViewIsNull(text, row)) {
+                    if (ArrowArrayViewIsNull(text, row) || fts::null_above(above, row)) {
                         continue;
                     }
                     const ArrowArrayView* values = text->children[0];
@@ -1381,7 +1398,7 @@ bool Search::scan_flat(ColumnIndex& c, std::string& error) {
                     continue;
                 }
                 std::string_view document;
-                if (!fts::row_text(text, kind, row, joined, document)) {
+                if (fts::null_above(above, row) || !fts::row_text(text, kind, row, joined, document)) {
                     continue;
                 }
                 tokens.clear();
@@ -1568,11 +1585,8 @@ bool Search::match(const FtsQuery& q, const std::string& column, float boost, Hi
         // length limit.
         it = unindexed.find(key);
         if (it == unindexed.end()) {
-            bool known = false;
-            for (const auto& f : manifest.fields) {
-                known = known || (f.parent_id == -1 && f.name == column);
-            }
-            if (!known) {
+            std::vector<std::string> parts;
+            if (index_files::find_field(manifest, column, parts) == nullptr) {
                 error = "Column " + column + " not found in the dataset";
                 return false;
             }

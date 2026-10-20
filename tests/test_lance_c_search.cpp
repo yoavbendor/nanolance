@@ -1014,6 +1014,100 @@ void test_hamming(const std::filesystem::path& dir) {
     lance_dataset_close(ds);
 }
 
+// ── INVERTED on struct leaves through lance-c: "meta.title" and "meta.body.text" name the leaves ────
+void test_nested(const std::filesystem::path& dir) {
+    const std::string uri = (dir / "nested.lance").string();
+    ArrowSchema schema;
+    ArrowSchemaInit(&schema);
+    ArrowSchemaSetTypeStruct(&schema, 2);
+    ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_INT64);
+    ArrowSchemaSetName(schema.children[0], "id");
+    ArrowSchemaSetName(schema.children[1], "meta");
+    ArrowSchemaSetTypeStruct(schema.children[1], 2);
+    ArrowSchema* meta = schema.children[1];
+    ArrowSchemaSetType(meta->children[0], NANOARROW_TYPE_STRING);
+    ArrowSchemaSetName(meta->children[0], "title");
+    ArrowSchemaSetName(meta->children[1], "body");
+    ArrowSchemaSetTypeStruct(meta->children[1], 1);
+    ArrowSchemaSetType(meta->children[1]->children[0], NANOARROW_TYPE_STRING);
+    ArrowSchemaSetName(meta->children[1]->children[0], "text");
+
+    // Null leaves, no null structs: a leaf's null is a document with no tokens.
+    const std::vector<std::pair<const char*, const char*>> rows = {
+        {"red apple pie", "sweet fruit"}, {nullptr, "apple tree"}, {"blue sky", "no fruit here"},
+        {"apple apple", nullptr}, {"green apple", "sour fruit"}, {"plum fig", "fresh fruit"}};
+    ArrowArray array;
+    ArrowArrayInitFromSchema(&array, &schema, nullptr);
+    ArrowArrayStartAppending(&array);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        ArrowArrayAppendInt(array.children[0], static_cast<int64_t>(i));
+        ArrowArray* m = array.children[1];
+        if (rows[i].first != nullptr) {
+            ArrowArrayAppendString(m->children[0], ArrowCharView(rows[i].first));
+        } else {
+            ArrowArrayAppendNull(m->children[0], 1);
+        }
+        ArrowArray* body = m->children[1];
+        if (rows[i].second != nullptr) {
+            ArrowArrayAppendString(body->children[0], ArrowCharView(rows[i].second));
+        } else {
+            ArrowArrayAppendNull(body->children[0], 1);
+        }
+        ArrowArrayFinishElement(body);
+        ArrowArrayFinishElement(m);
+        ArrowArrayFinishElement(&array);
+    }
+    ArrowArrayFinishBuildingDefault(&array, nullptr);
+    ArrowArrayStream stream;
+    ArrowBasicArrayStreamInit(&stream, &schema, 1);
+    ArrowBasicArrayStreamSetArray(&stream, 0, &array);
+    ArrowSchema schema2;
+    ArrowSchemaDeepCopy(&schema, &schema2);
+    LanceDataset* out = nullptr;
+    check(lance_dataset_write(uri.c_str(), &schema2, &stream, LANCE_WRITE_CREATE, nullptr, &out) == 0,
+          "write nested: " + last_error());
+    schema2.release(&schema2);
+    if (out != nullptr) {
+        lance_dataset_close(out);
+    }
+
+    LanceDataset* ds = lance_dataset_open(uri.c_str(), nullptr, 0);
+    check(ds != nullptr, "open nested: " + last_error());
+    check(lance_dataset_create_scalar_index(ds, "meta.title", "title_fts", LANCE_SCALAR_INVERTED,
+                                            R"({"base_tokenizer":"simple"})", false) == 0,
+          "create INVERTED on meta.title: " + last_error());
+    check(lance_dataset_create_scalar_index(ds, "meta.body.text", "text_fts", LANCE_SCALAR_INVERTED,
+                                            R"({"base_tokenizer":"simple"})", false) == 0,
+          "create INVERTED on meta.body.text: " + last_error());
+    const std::vector<std::pair<std::string, std::string>> queries = {
+        {"meta.title", "apple"}, {"meta.body.text", "fruit"}, {"meta.title", "plum fig"}};
+    for (const auto& [column, text] : queries) {
+        nano_lance::FtsSearchRequest core;
+        core.query.kind = nano_lance::FtsQuery::Kind::Match;
+        core.query.text = text;
+        core.query.columns = {column};
+        nano_lance::FtsSearchResult want;
+        std::string error;
+        check(nano_lance::dataset_full_text_search(uri, core, want, error), "core nested fts: " + error);
+        check(!want.row_ids.empty(), "nested fts finds rows: " + column + " " + text);
+
+        LanceFtsQueryContext* ctx =
+            lance_dataset_prepare_fts_match_query(ds, column.c_str(), text.c_str(), LANCE_FTS_MATCH_OPERATOR_OR, 0,
+                                                  LANCE_FTS_COVERAGE_STRICT);
+        check(ctx != nullptr, "prepare nested match: " + last_error());
+        LanceScanner* cs = lance_scanner_new(ds, nullptr, nullptr);
+        check(lance_scanner_set_fts_query_context(cs, ctx) == 0, "set nested context");
+        lance_fts_query_context_close(ctx);
+        lance_scanner_with_row_id(cs, true);
+        const auto got = collect(cs, "_score");
+        lance_scanner_close(cs);
+        check(got.ok, std::string("nested fts: ") + got.error);
+        check(got.row_ids == want.row_ids && got.values == want.scores,
+              "nested rows and scores: " + column + " " + text);
+    }
+    lance_dataset_close(ds);
+}
+
 int main(int argc, char** argv) {
     const std::filesystem::path dir =
         argc > 1 ? std::filesystem::path(argv[1]) : std::filesystem::temp_directory_path() / "nl_lance_c_search";
@@ -1046,6 +1140,7 @@ int main(int argc, char** argv) {
     }
     test_segments(dir);
     test_phrase(dir);
+    test_nested(dir);
     test_fuzzy(dir);
     test_include_deleted_rows((dir / "deleted.lance").string());
     test_update_if((dir / "upsert.lance").string());

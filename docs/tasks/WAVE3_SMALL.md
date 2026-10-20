@@ -113,3 +113,10 @@ Tails of: `cd build && ctest -j8 | tail -3`; your new tests; the phase's targets
 .deps/pylance-tests/v12.0.0 && python3 -m pytest -o addopts= -q -p nanolance.lance._pytest_plugin
 <target ids> | tail -5`); `python3 tools/pylance_suite.py | tail -4`; last, once, the full bindings suite.
 Report under 40 lines: questions first, then files, per-target status, tails, decisions.
+
+**N outcome (2026-10-20):** INVERTED indexes on struct leaves at any depth (build, search by dotted
+path, default columns, MatchQuery, element granularity under a struct, append / delete /
+optimize_indices, unindexed nested fragments scanned flat as pylance does), lance-c FTS on a nested
+column; a document is null when any struct above its leaf is null. Both targets pass (expected list
+1241). Rows tied on a score may come in either order between engines (tests compare scores in order and
+rows with their scores).

@@ -1044,9 +1044,11 @@ tests/test_scalar_index.py::test_large_string_scalar_index[ZONEMAP]
 tests/test_scalar_index.py::test_merge_index_metadata_btree_soft_break
 tests/test_scalar_index.py::test_merge_index_metadata_inverted_index_progress_callback
 tests/test_scalar_index.py::test_multi_index_create
+tests/test_scalar_index.py::test_multiple_nested_field_fts_indices_e2e
 tests/test_scalar_index.py::test_nan_handling
 tests/test_scalar_index.py::test_nested_field_bitmap_index
 tests/test_scalar_index.py::test_nested_field_btree_index
+tests/test_scalar_index.py::test_nested_field_fts_index
 tests/test_scalar_index.py::test_ngram_fts
 tests/test_scalar_index.py::test_ngram_index
 tests/test_scalar_index.py::test_ngram_segment_merge_and_commit_from_python

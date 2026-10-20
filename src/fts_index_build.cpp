@@ -328,9 +328,10 @@ void append_document(Built& b, std::vector<fts::Token>& tokens, std::uint64_t ro
 
 /// A list-element batch's documents: one per element of each non-null row, in row order then element
 /// order. Each element is tokenized alone, so its positions start at 0 (Lance's element documents).
-bool add_element_documents(const ArrowArrayView* text, const ArrowArrayView* addr, const ArrowArrayView& view,
-                           std::int64_t length, const fts::Analyzer& analyzer, const AddressToRowId& to_row_id,
-                           Built& b, std::string& error) {
+bool add_element_documents(const ArrowArrayView* text, const std::vector<const ArrowArrayView*>& above,
+                           const ArrowArrayView* addr, const ArrowArrayView& view, std::int64_t length,
+                           const fts::Analyzer& analyzer, const AddressToRowId& to_row_id, Built& b,
+                           std::string& error) {
     struct Element {
         std::int64_t row;  // the row, as the column's accessors take it
         std::uint32_t k;   // the element's position in its list
@@ -341,8 +342,8 @@ bool add_element_documents(const ArrowArrayView* text, const ArrowArrayView* add
     const ArrowArrayView* values = text->children[0];
     for (std::int64_t r = 0; r < length; ++r) {
         const std::int64_t row = view.offset + r;
-        if (ArrowArrayViewIsNull(text, row)) {
-            continue;  // a null row has no documents
+        if (ArrowArrayViewIsNull(text, row) || fts::null_above(above, row)) {
+            continue;  // a null row (or one under a null struct) has no documents
         }
         const std::int64_t first = ArrowArrayViewListChildOffset(text, text->offset + row);
         const std::int64_t last = ArrowArrayViewListChildOffset(text, text->offset + row + 1);
@@ -378,8 +379,15 @@ bool add_element_documents(const ArrowArrayView* text, const ArrowArrayView* add
 
 /// The documents of `batches` (column 0 text, column 1 row address), added in order.
 bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, const fts::Analyzer& analyzer,
-                   const AddressToRowId& to_row_id, Built& b, std::string& error,
+                   const AddressToRowId& to_row_id, Built& b, const std::vector<std::string>& below,
+                   std::string& error,
                    const std::function<void(std::size_t rows, std::uint64_t fragment)>* batch_done = nullptr) {
+    // The text leaf: `below` names the struct fields under the top-level column (none for a top-level column).
+    std::vector<std::size_t> path;
+    if (!fts::text_child_path(schema.children[0], below, path)) {
+        error = "the scanned batches have no text column";
+        return false;
+    }
     for (auto& batch : batches) {
         ArrowArrayView view{};
         ArrowError e{};
@@ -389,13 +397,19 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
             error = std::string("cannot read a batch: ") + e.message;
             return false;
         }
-        const ArrowArrayView* text = view.children[0];
+        std::vector<const ArrowArrayView*> above;  // the structs above the text, null where they are
+        const ArrowArrayView* text = fts::text_view_at(view.children[0], path, above);
         const ArrowArrayView* addr = view.children[1];
+        if (text == nullptr) {
+            ArrowArrayViewReset(&view);
+            error = "the scanned batches have no text column";
+            return false;
+        }
         // A scan's batches do not cross fragments: the first row's names the batch's.
         const std::uint64_t fragment =
             batch.length > 0 ? ArrowArrayViewGetUIntUnsafe(addr, view.offset) >> 32U : 0U;
         if (b.elements) {
-            const bool ok = add_element_documents(text, addr, view, batch.length, analyzer, to_row_id, b, error);
+            const bool ok = add_element_documents(text, above, addr, view, batch.length, analyzer, to_row_id, b, error);
             ArrowArrayViewReset(&view);
             if (!ok) {
                 return false;
@@ -415,7 +429,7 @@ bool add_documents(const ArrowSchema& schema, std::vector<ArrowArray>& batches, 
             for (std::size_t r = c * chunk; r < std::min(rows, (c + 1) * chunk); ++r) {
                 const std::int64_t row = view.offset + static_cast<std::int64_t>(r);
                 std::string_view document;
-                if (fts::row_text(text, kind, row, joined, document)) {
+                if (!fts::null_above(above, row) && fts::row_text(text, kind, row, joined, document)) {
                     analyzer.tokenize(document, tokens[r]);
                 }
             }
@@ -786,10 +800,9 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
                     : "column '" + column + "' not found";
         return false;
     }
-    if (parts.size() != 1U) {
-        error = "an INVERTED index on a nested column is not supported";
-        return false;
-    }
+    // A nested column: its documents are the text leaf below the struct fields (parts[1..]); the scan reads
+    // the top-level column, as a scalar index's does.
+    const std::vector<std::string> below(parts.begin() + 1, parts.end());
     const bool elements = options.granularity == DocGranularity::ListElement;
     // Lance's default names: the row index is <column>_idx, the list-element one <column>_list_element_idx.
     const std::string name = options.name.empty() ? column + (elements ? "_list_element_idx" : "_idx") : options.name;
@@ -804,12 +817,15 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     LanceScanRequest request;
     request.has_version = true;
     request.version = version;
-    const std::vector<std::string> columns = {column};
+    const std::vector<std::string> columns = {parts.front()};
     request.columns = &columns;
     request.with_row_address = true;
     request.fragment_ids = target != nullptr ? target->fragments : nullptr;
     const auto is_text = [&](const ArrowSchema& schema) {
-        const ArrowSchema* text = schema.n_children == 2 ? schema.children[0] : nullptr;
+        std::vector<std::size_t> path;
+        const ArrowSchema* text = schema.n_children == 2 && fts::text_child_path(schema.children[0], below, path)
+                                      ? fts::text_schema_at(schema.children[0], path)
+                                      : nullptr;
         if (fts::text_schema_kind(text) == fts::TextColumn::kNone) {
             error = "an INVERTED index needs a string column or a list of strings column; " + column + " is not one";
             return false;
@@ -881,10 +897,10 @@ bool create_inverted_index(const std::filesystem::path& dataset_path, const std:
     };
     const std::function<void(std::size_t, std::uint64_t)>* counted_ptr = progress != nullptr ? &counted : nullptr;
     report(0, "tokenize_docs", 0, "rows", 0);
-    if (old_rows && (!is_text(taken.s) || !add_documents(taken.s, rows.v, analyzer, to_row_id, built, error, counted_ptr))) {
+    if (old_rows && (!is_text(taken.s) || !add_documents(taken.s, rows.v, analyzer, to_row_id, built, below, error, counted_ptr))) {
         return false;
     }
-    if (scan && (!is_text(scanned.s) || !add_documents(scanned.s, batches.v, analyzer, to_row_id, built, error, counted_ptr))) {
+    if (scan && (!is_text(scanned.s) || !add_documents(scanned.s, batches.v, analyzer, to_row_id, built, below, error, counted_ptr))) {
         return false;
     }
     if (current_fragment) {
