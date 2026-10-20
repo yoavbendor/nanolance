@@ -464,20 +464,22 @@ bool variable_column_dict_beneficial(nano_lance::ColumnValues& cv) {
     // reasonable predictor of the full-column ratio; only skip the full scan when the sample already
     // shows the ratio decisively blown (not merely close), to keep false negatives rare -- the cost of
     // a false negative here is a slightly larger encoding (falls back to zstd/plain), never wrong data.
-    // Sample distinct-count via sort+unique (one vector allocation total) rather than a hash set (one
-    // heap allocation per distinct element even for this small sample) -- no per-row allocation at all.
+    // Sample distinct-count via sort+unique of the values' 64-bit hashes (one vector allocation total, and
+    // integer compares instead of string compares) rather than a hash set (one heap allocation per
+    // distinct element even for this small sample). A collision could only undercount by one.
     constexpr std::size_t kSampleRows = 4096U;
     constexpr double kSampleRejectMargin = 1.5;  // require the sample ratio to exceed the real cutoff by 50%
     if (rows > kSampleRows * 4U) {
-        std::vector<std::string_view> sample;
+        std::vector<std::size_t> sample;
         sample.reserve(kSampleRows);
+        const std::hash<std::string_view> hash;
         for (std::size_t i = 0; i < kSampleRows; ++i) {
             const auto s = read_offset(i);
             const auto e = read_offset(i + 1);
             if (s < 0 || e < s || static_cast<std::size_t>(e) > data_size) {
                 return false;
             }
-            sample.emplace_back(base + s, static_cast<std::size_t>(e - s));
+            sample.push_back(hash(std::string_view(base + s, static_cast<std::size_t>(e - s))));
         }
         std::sort(sample.begin(), sample.end());
         const auto sample_distinct_count =

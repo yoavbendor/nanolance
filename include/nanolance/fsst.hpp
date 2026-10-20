@@ -46,6 +46,8 @@
 
 #pragma once
 
+#include <cstring>
+
 // The codec itself is nanom's (nanom/fsst.hpp, nanom/fsst_encode.hpp, namespace nanom::codec::fsst):
 // the table format, the decoder and the encoder described above. This header keeps nanolance's
 // calling convention -- byte vectors and an error string -- over it.
@@ -100,6 +102,45 @@ inline std::size_t compress_into(const Encoder& encoder, const std::uint8_t* dat
     return ::nanom::codec::fsst::compress_unchecked(
         encoder, std::span<const std::byte>(reinterpret_cast<const std::byte*>(data), size),
         reinterpret_cast<std::byte*>(dst));
+}
+
+/// `compress_into` for a value with at least 7 readable bytes after it (any bytes): the 8-byte loads run
+/// to the value's end instead of finishing the last bytes from a zero-padded copy, which for short values
+/// (ids, codes) is most of them. The same output: a long symbol (3+ bytes) matches only within the value,
+/// the two-byte lookup is used only when two bytes remain, and the three-byte hash reads only value bytes
+/// whenever a long symbol could fit.
+inline std::size_t compress_into_padded(const Encoder& encoder, const std::uint8_t* data, std::size_t size,
+                                        std::uint8_t* dst) {
+    namespace f = ::nanom::codec::fsst;
+    if (encoder.short_or_byte.empty()) {  // an encoder built without train(): the general path
+        return compress_into(encoder, data, size, dst);
+    }
+    std::uint8_t* out = dst;
+    std::size_t pos = 0;
+    while (pos < size) {
+        std::uint64_t word = 0;
+        std::memcpy(&word, data + pos, 8);
+        const std::size_t remaining = size - pos;
+        const auto& s = encoder.long_codes[f::enc_detail::hash3(word)];
+        if (s.length != 0 && s.length <= remaining && ((word ^ s.value) << (64 - 8 * s.length)) == 0) {
+            *out++ = s.code;
+            pos += s.length;
+            continue;
+        }
+        std::uint16_t entry = 0;
+        if (remaining >= 2) {
+            entry = encoder.short_or_byte[word & 0xFFFF];
+        } else {
+            const auto one = encoder.byte_codes[word & 0xFF];
+            entry = static_cast<std::uint16_t>((1U << 8) | (one != Encoder::kNone ? one : f::kEscape));
+        }
+        const auto code = static_cast<std::uint8_t>(entry & 0xFF);
+        out[0] = code;
+        out[1] = static_cast<std::uint8_t>(word & 0xFF);
+        out += code == f::kEscape ? 2 : 1;
+        pos += entry >> 8;
+    }
+    return static_cast<std::size_t>(out - dst);
 }
 
 /// The `kSymbolTableBytes` serialization `parse_symbol_table` (and Lance) reads, encoder switch on.
