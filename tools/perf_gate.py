@@ -73,26 +73,32 @@ def metric(family: str, key: str, rust_ms: float, nanolance_ms: float) -> dict:
 
 def extract(scalar: dict | None, vector: dict | None, fts: dict | None) -> tuple[dict, dict]:
     """Flat metrics and recalls from the three benchmark outputs. Each aspect records Rust Lance's and
-    nanolance's median time in milliseconds; speed is Rust's time over nanolance's."""
+    nanolance's median time in milliseconds; speed is Rust's time over nanolance's. An aspect Rust Lance's
+    driver does not measure (an index kind it cannot build) has no Rust time and is left out."""
     metrics, recall = {}, {}
+
+    def add(key: str, family: str, name: str, rec: dict) -> None:
+        if rec.get("rust") and rec.get("nanolance"):
+            metrics[key] = metric(family, name, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+
     if scalar:
         for name, rec in scalar["builds"].items():
-            metrics[f"scalar build {name}"] = metric("scalar", name, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+            add(f"scalar build {name}", "scalar", name, rec)
         for name, rec in scalar["queries"].items():
-            metrics[f"scalar query {name}"] = metric("scalar", name, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+            add(f"scalar query {name}", "scalar", name, rec)
     if vector:
         for kind, rec in vector["builds"].items():
-            metrics[f"vector {kind} build"] = metric("vector", kind, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+            add(f"vector {kind} build", "vector", kind, rec)
         for key, rec in vector["searches"].items():
             kind, name = key.split("|", 1)
-            metrics[f"vector {kind} search {name}"] = metric("vector", kind, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+            add(f"vector {kind} search {name}", "vector", kind, rec)
         for kind, rec in vector.get("recall@10", {}).items():
-            recall[f"vector {kind}"] = rec
+            if rec.get("rust") is not None and rec.get("nanolance") is not None:
+                recall[f"vector {kind}"] = rec
     if fts:
-        rec = fts["builds"]["INVERTED"]
-        metrics["fts build"] = metric("fts", "build", rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+        add("fts build", "fts", "build", fts["builds"]["INVERTED"])
         for name, rec in fts["searches"].items():
-            metrics[f"fts search {name}"] = metric("fts", name, rec["rust"]["median_ms"], rec["nanolance"]["median_ms"])
+            add(f"fts search {name}", "fts", name, rec)
     return metrics, recall
 
 
