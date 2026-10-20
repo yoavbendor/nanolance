@@ -19,7 +19,6 @@ import pytest
 import lance
 import nanolance
 import nanolance.lance as nl
-from nanolance.lance.udf import BatchUDF
 
 ENDPOINT = os.environ.get("NANOLANCE_S3_TEST_ENDPOINT", "")
 BUCKET = os.environ.get("NANOLANCE_S3_TEST_BUCKET", "nl-test")
@@ -178,11 +177,8 @@ def test_storage_option_spellings_agree(uri):
 
 
 WRITES = {
-    "add_columns_from_a_function": lambda ds, uri: ds.add_columns(
-        BatchUDF(lambda b: pa.record_batch([b.column(0)], names=["extra"]))),
     "cleanup_old_versions": lambda ds, uri: ds.cleanup_old_versions(retain_versions=1),
     "drop_dataset": lambda ds, uri: nl.LanceDataset.drop(uri, storage_options=options()),
-    "fragment_create": lambda ds, uri: nl.LanceFragment.create(uri, sample_table(10)),
 }
 
 

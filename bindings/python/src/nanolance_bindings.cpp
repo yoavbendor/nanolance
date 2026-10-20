@@ -6,6 +6,7 @@
 #include "arrow_capsule.hpp"
 
 #include <nanolance/blob_v2_external.hpp>
+#include <nanolance/byte_source.hpp>
 #include <nanolance/dataset.hpp>
 #include <nanolance/dataset_ops.hpp>
 #include <nanolance/dataset_refs.hpp>
@@ -731,6 +732,16 @@ nb::tuple file_top_fields(const std::filesystem::path& path) {
         }
     }
     return nb::make_tuple(names, layout.major_version, layout.minor_version);
+}
+
+/// A data file's size in bytes, local or s3:// (what DataFile.create records).
+std::uint64_t file_size(const std::string& path) {
+    std::string error;
+    const auto source = nano_lance::io::open_source(path, error);
+    if (!source) {
+        throw_dataset(error);
+    }
+    return source->size();
 }
 
 /// A writer that stages fragments and publishes them as one version at finish() -- a Lance write.
@@ -1529,6 +1540,7 @@ NB_MODULE(_nanolance, m) {
     m.def("_file_take", &file_take, nb::arg("path"), nb::arg("rows"), nb::arg("columns").none());
     m.def("_file_info", &file_info, nb::arg("path"));
     m.def("_file_top_fields", &file_top_fields, nb::arg("path"));
+    m.def("_file_size", &file_size, nb::arg("path"));
     nb::class_<StagedWriter>(m, "_StagedWriter")
         .def(nb::init<const std::filesystem::path&, const LanceWriterOptions&, bool, std::int64_t, std::uint64_t>(),
              nb::arg("path"), nb::arg("options"), nb::arg("append"), nb::arg("max_rows_per_file"),

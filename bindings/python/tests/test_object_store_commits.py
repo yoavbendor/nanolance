@@ -22,7 +22,10 @@ from tests.support import require_pylance
 
 import nanolance.lance as nl
 from nanolance import _nanolance
+from nanolance.lance.fragment import DataFile, write_fragments
 from nanolance.lance.indices import IndexConfig, IndicesBuilder
+from nanolance.lance.schema import LanceSchema
+from nanolance.lance.udf import BatchUDF
 
 ENDPOINT = os.environ.get("NANOLANCE_S3_TEST_ENDPOINT", "")
 BUCKET = os.environ.get("NANOLANCE_S3_TEST_BUCKET", "nl-test")
@@ -713,3 +716,233 @@ def test_index_build_whose_manifest_is_refused_leaves_no_index_objects():
     theirs = lance.dataset(uri, storage_options=options())
     assert theirs.version == 1 and theirs.list_indices() == []
     assert _objects_under(uri, "_indices/") == []
+
+
+# ── W3b: fragment-level writes and hand-built commits (docs/tasks/OBJECT_STORE_W3.md) ────────────────
+# Each operation writes its fragments with nanolance on s3:// and on a local copy of the same dataset, then
+# commits them; pylance reads both and must see the same versions, rows, schemas and transaction kinds.
+
+def _new_fragment(uri: str, storage, start: int = 200, rows: int = 100):
+    return nl.LanceFragment.create(uri, _wide(start, rows), storage_options=storage)
+
+
+def _commit_append(uri: str, storage, fragments) -> None:
+    ds = nl.dataset(uri, storage_options=storage)
+    nl.LanceDataset.commit(uri, nl.LanceOperation.Append(fragments), read_version=ds.version, storage_options=storage)
+
+
+def _commit_transaction(uri: str, storage, txn) -> None:
+    nl.LanceDataset.commit(uri, txn, storage_options=storage)
+
+
+def _reader_for(rows: int) -> pa.RecordBatchReader:
+    values = pa.array(range(rows), pa.int64())
+    return pa.RecordBatchReader.from_batches(pa.schema([pa.field("extra", pa.int64())]),
+                                             [pa.record_batch([values], names=["extra"])])
+
+
+def _extra_udf() -> BatchUDF:
+    return BatchUDF(lambda b: pa.record_batch([b.column(0)], names=["extra"]))
+
+
+def _merge_every_fragment(uri: str, storage, column_for) -> None:
+    ds = nl.dataset(uri, storage_options=storage)
+    fragments, schema = [], None
+    for fragment in ds.get_fragments():
+        meta, schema = column_for(fragment)
+        fragments.append(meta)
+    nl.LanceDataset.commit(uri, nl.LanceOperation.Merge(fragments, schema), read_version=ds.version,
+                           storage_options=storage)
+
+
+def _join_table() -> pa.Table:
+    return pa.table({"id": pa.array([1, 2, 500], pa.int64()), "tag": pa.array(["a", "b", "c"])})
+
+
+def _restore_by_hand(uri: str, storage) -> None:
+    nl.dataset(uri, storage_options=storage).delete("id < 50")
+    nl.LanceDataset.commit(uri, nl.LanceOperation.Restore(1), storage_options=storage)
+
+
+def _update_by_hand(uri: str, storage) -> None:
+    ds = nl.dataset(uri, storage_options=storage)
+    removed = ds.get_fragments()[0].fragment_id
+    nl.LanceDataset.commit(uri, nl.LanceOperation.Update(removed_fragment_ids=[removed],
+                                                         new_fragments=[_new_fragment(uri, storage, 0)]),
+                           read_version=ds.version, storage_options=storage)
+
+
+def _rewrite_by_hand(uri: str, storage) -> None:
+    ds = nl.dataset(uri, storage_options=storage)
+    old = [f.metadata for f in ds.get_fragments()]
+    merged = _new_fragment(uri, storage, 0, rows=200)
+    nl.LanceDataset.commit(uri, nl.LanceOperation.Rewrite([nl.LanceOperation.RewriteGroup(old, [merged])], []),
+                           read_version=ds.version, storage_options=storage)
+
+
+def _config_by_hand(uri: str, storage) -> None:
+    ds = nl.dataset(uri, storage_options=storage)
+    update = nl.LanceOperation.UpdateMap({"k": "v"})
+    nl.LanceDataset.commit(uri, nl.LanceOperation.UpdateConfig(config_updates=update), read_version=ds.version,
+                           storage_options=storage)
+
+
+def _project_without_score(uri: str, storage) -> None:
+    """Lance's Project: the dataset's fields but ``score``, as the field messages the manifest holds."""
+    ds = nl.dataset(uri, storage_options=storage)
+    messages, metadata = _nanolance._ds_field_messages(ds.uri, ds.version)
+    infos = _nanolance._ds_fields(ds.uri, ds.version)
+    kept = [m for m, info in zip(messages, infos) if info["name"] != "score"]
+    nl.LanceDataset.commit(uri, nl.LanceOperation.Project(LanceSchema._from_messages(kept, metadata)),
+                           read_version=ds.version, storage_options=storage)
+
+
+def _replace_score_by_hand(uri: str, storage) -> None:
+    """Lance's DataReplacement: a file holding the new ``score`` values replaces the column of fragment 0."""
+    ds = nl.dataset(uri, storage_options=storage)
+    values = pa.table({"score": pa.array(range(1000, 1100), pa.int64())})
+    new_file = DataFile.create(ds, str(nl.LanceFragment.create(uri, values, storage_options=storage).files[0].path))
+    fragment = ds.get_fragments()[0].fragment_id
+    nl.LanceDataset.commit(uri, nl.LanceOperation.DataReplacement(
+        [nl.LanceOperation.DataReplacementGroup(fragment, new_file)]), read_version=ds.version,
+        storage_options=storage)
+
+
+def _batch_of_appends(uri: str, storage) -> None:
+    ds = nl.dataset(uri, storage_options=storage)
+    txns = [nl.Transaction(ds.version, nl.LanceOperation.Append([_new_fragment(uri, storage, start)]))
+            for start in (300, 400)]
+    nl.LanceDataset.commit_batch(uri, txns, storage_options=storage)
+
+
+W3B_OPS = {
+    "fragment_create_append": lambda uri, st: _commit_append(uri, st, [_new_fragment(uri, st)]),
+    "fragment_create_from_file": lambda uri, st: _commit_append(uri, st, [nl.LanceFragment.create_from_file(
+        str(_new_fragment(uri, st).files[0].path), nl.dataset(uri, storage_options=st), fragment_id=2)]),
+    "write_fragments_append": lambda uri, st: _commit_transaction(uri, st, write_fragments(
+        _wide(200), uri, mode="append", return_transaction=True, storage_options=st)),
+    "write_fragments_overwrite": lambda uri, st: _commit_transaction(uri, st, write_fragments(
+        _wide(200), uri, mode="overwrite", return_transaction=True, storage_options=st)),
+    "write_fragments_split_in_files": lambda uri, st: _commit_transaction(uri, st, write_fragments(
+        _wide(300), uri, mode="append", max_rows_per_file=100, return_transaction=True, storage_options=st)),
+    "merge_columns_sql": lambda uri, st: _merge_every_fragment(
+        uri, st, lambda f: f.merge_columns({"extra": "score + 1"})),
+    "merge_columns_data": lambda uri, st: _merge_every_fragment(
+        uri, st, lambda f: f.merge_columns(_reader_for(f.count_rows()))),
+    "merge_columns_udf": lambda uri, st: _merge_every_fragment(
+        uri, st, lambda f: f.merge_columns(_extra_udf(), columns=["score"])),
+    "add_columns_from_a_function": lambda uri, st: nl.dataset(uri, storage_options=st).add_columns(_extra_udf()),
+    "merge_join": lambda uri, st: nl.dataset(uri, storage_options=st).merge(_join_table(), "id"),
+    "commit_overwrite": lambda uri, st: nl.LanceDataset.commit(
+        uri, nl.LanceOperation.Overwrite(nl.dataset(uri, storage_options=st).lance_schema,
+                                         [_new_fragment(uri, st, 300)]), storage_options=st),
+    "commit_restore": _restore_by_hand,
+    "commit_update": _update_by_hand,
+    "commit_rewrite": _rewrite_by_hand,
+    "commit_update_config": _config_by_hand,
+    "commit_batch_of_appends": _batch_of_appends,
+    "commit_project": _project_without_score,
+    "commit_data_replacement": _replace_score_by_hand,
+    "merge_columns_sql_after_delete": lambda uri, st: (nl.dataset(uri, storage_options=st).delete("id < 30"),
+                                                       _merge_every_fragment(
+                                                           uri, st, lambda f: f.merge_columns({"extra": "id * 2"}))),
+    "add_columns_udf_after_delete": lambda uri, st: (nl.dataset(uri, storage_options=st).delete("id < 30"),
+                                                     nl.dataset(uri, storage_options=st).add_columns(_extra_udf())),
+}
+
+
+@pytest.mark.parametrize("name", list(W3B_OPS))
+def test_fragment_write_or_commit_on_s3_matches_the_local_copy(name, tmp_path):
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    for uri, storage in ((s3_uri, options()), (local, None)):
+        _two_fragments(uri, storage)
+        W3B_OPS[name](uri, storage)
+    assert _snapshot(s3_uri, options()) == _snapshot(local, None)
+
+
+def test_fragment_write_on_a_pylance_dataset_on_s3_matches_the_local_copy(tmp_path):
+    lance = require_pylance()
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    for uri, storage in ((s3_uri, options()), (local, None)):
+        lance.write_dataset(_wide(0), uri, storage_options=storage)
+        _merge_every_fragment(uri, storage, lambda f: f.merge_columns({"extra": "score + 1"}))
+    assert _snapshot(s3_uri, options()) == _snapshot(local, None)
+
+
+# A child process: `commits` hand-built appends of 100 rows each, every one checked against the dataset as the
+# commit finds it (a conflict is retried by the commit itself), then a JSON line of the rows it committed.
+APPENDER = textwrap.dedent("""
+    import json, sys
+    import pyarrow as pa
+    import nanolance.lance as nl
+    uri, first, commits, options = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), json.loads(sys.argv[4])
+    for i in range(commits):
+        start = first + i * 100
+        t = pa.table({"id": pa.array(range(start, start + 100), pa.int64()),
+                      "name": pa.array([f"row {j}" for j in range(start, start + 100)]),
+                      "score": pa.array(range(start, start + 100), pa.int64())})
+        fragment = nl.LanceFragment.create(uri, t, storage_options=options)
+        ds = nl.dataset(uri, storage_options=options)
+        nl.LanceDataset.commit(uri, nl.LanceOperation.Append([fragment]), read_version=ds.version,
+                               storage_options=options)
+    print(json.dumps({"committed": commits}))
+""")
+
+
+def test_racing_hand_built_appends_lose_and_double_nothing():
+    uri = fresh_uri()
+    _two_fragments(uri, options())
+    procs = [subprocess.Popen([sys.executable, "-c", APPENDER, uri, str(first), "3", json.dumps(options())],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for first in (1000, 2000)]
+    outcomes = [result(p) for p in procs]
+    assert outcomes == [{"committed": 3}, {"committed": 3}], outcomes
+    ds = nl.dataset(uri, storage_options=options())
+    assert ds.version == 2 + 6  # the two writes of the base, then six appends, each one version
+    expected = list(range(200)) + [i for first in (1000, 2000) for i in range(first, first + 300)]
+    assert sorted(ds.to_table(columns=["id"])["id"].to_pylist()) == sorted(expected)
+
+
+def test_add_bases_on_s3_matches_the_local_copy(tmp_path):
+    """Lance's UpdateBases (pylance's add_bases): a base directory outside the dataset, registered as a base."""
+    from nanolance.lance.base_path import DatasetBasePath
+
+    other = str(tmp_path / "other.lance")
+    nl.write_dataset(batch(5000), other)
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    for uri, storage in ((s3_uri, options()), (local, None)):
+        _two_fragments(uri, storage)
+        nl.dataset(uri, storage_options=storage).add_bases(
+            [DatasetBasePath(path=other, name="b1", is_dataset_root=True)])
+    assert _snapshot(s3_uri, options()) == _snapshot(local, None)
+
+
+def _outcome(fn) -> str:
+    try:
+        fn()
+    except (OSError, nl.NotSupportedError) as error:  # the refusal of a commit is the outcome compared here
+        return f"{type(error).__name__}: {error}"
+    return "ok"
+
+
+def _conflicting_commits(uri: str, storage) -> list:
+    """A Merge and an Append both made from version 2 of the dataset: the second commit is checked against
+    the first as on a local copy (an incompatible or retryable conflict, or both commit)."""
+    _two_fragments(uri, storage)
+    ds = nl.dataset(uri, storage_options=storage)
+    merged = [f.merge_columns({"extra": "score + 1"}) for f in ds.get_fragments()]
+    schema = merged[0][1]
+    outcomes = [_outcome(lambda: _commit_append(uri, storage, [_new_fragment(uri, storage, 300)]))]
+    outcomes.append(_outcome(lambda: nl.LanceDataset.commit(
+        uri, nl.LanceOperation.Merge([m for m, _ in merged], schema), read_version=ds.version,
+        storage_options=storage)))
+    return outcomes
+
+
+def test_conflicting_hand_built_commits_match_the_local_copy(tmp_path):
+    s3_uri, local = fresh_uri(), str(tmp_path / "ds.lance")
+    s3_outcomes = _conflicting_commits(s3_uri, options())
+    local_outcomes = _conflicting_commits(local, None)
+    assert s3_outcomes == local_outcomes
+    assert _snapshot(s3_uri, options()) == _snapshot(local, None)
+

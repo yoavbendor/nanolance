@@ -114,6 +114,17 @@ def _path_of(uri: Union[str, Path, "LanceDataset"]) -> str:
     return os.path.abspath(os.path.expanduser(text))
 
 
+def _register_storage(uri, storage_options) -> None:
+    """The bucket's credentials and endpoint (pylance's storage_options keys) for the native calls that follow
+    a write to s3:// given them, as write_dataset and an open do; without them the bucket's options stay."""
+    if storage_options is None:
+        return
+    path = _path_of(uri)
+    if path.startswith("s3://"):
+        with native():
+            _nanolance._set_storage_options(path, {str(k): str(v) for k, v in storage_options.items()})
+
+
 def _exists(path: str) -> bool:
     if path.startswith("s3://"):
         # One LIST of _versions/. Only "not found" means absent: any other failure (the network, the
@@ -1163,7 +1174,6 @@ class LanceDataset(pa.dataset.Dataset):
             with native():
                 _nanolance._ds_add_columns_nulls(self._uri, pa.schema(fields), self._version)
         elif callable(transforms):
-            refuse_object_store_write(self._uri, "add columns from a function")
             self._add_columns_udf(transforms, read_columns, batch_size)
             return
         else:
@@ -1201,7 +1211,6 @@ class LanceDataset(pa.dataset.Dataset):
         """Add the columns of ``data_obj`` (a table, reader, dataset ...), matched to this dataset's
         rows on ``left_on`` = ``right_on`` (Lance's hash join: rows without a match get nulls; the
         right key column itself is not added)."""
-        refuse_object_store_write(self._uri, "merge")
         right_on = left_on if right_on is None else right_on
         if left_on not in self._data_schema.names and _resolve_path(self._data_schema, left_on) is None:
             raise OSError(f"Invalid user input: Column {left_on} does not exist in the left side dataset")
@@ -2179,7 +2188,6 @@ class LanceDataset(pa.dataset.Dataset):
         step of a distributed write, whose workers wrote their files with ``write_fragments`` /
         ``LanceFragment.create`` and friends. Checked first against what was committed since
         ``read_version``, as Lance checks it (a conflict raises ``lance.commit.CommitConflictError``)."""
-        _refuse_commit(base_uri, operation)
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
         elif isinstance(base_uri, LanceDataset):
@@ -2188,6 +2196,7 @@ class LanceDataset(pa.dataset.Dataset):
             raise TypeError(f"base_uri must be str, Path, or LanceDataset, got {type(base_uri)}")
         if commit_lock and not callable(commit_lock):
             raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
+        _register_storage(base_uri, storage_options)
         if (isinstance(operation, LanceOperation.BaseOperation) and read_version is None
                 and not isinstance(operation, (LanceOperation.Overwrite, LanceOperation.Restore))):
             raise ValueError("read_version is required for all operations except Overwrite and Restore")
@@ -2264,6 +2273,7 @@ class LanceDataset(pa.dataset.Dataset):
             raise TypeError(f"base_uri must be str, Path, or LanceDataset, got {type(dest)}")
         if commit_lock and not callable(commit_lock):
             raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
+        _register_storage(dest, storage_options)
         transactions = list(transactions)
         if not transactions:
             raise ValueError("Invalid user input: commit_batch needs at least one transaction")
@@ -2381,23 +2391,12 @@ def _uses_v2_manifest_paths(path: str) -> bool:
                for n in names)
 
 
-def _refuse_commit(target, operation) -> None:
-    """A hand-built commit to s3:// is refused, except a Delete: the publish of a fragment delete (W2a).
-    Every other operation waits for its phase (W2b, W3)."""
-    from nanolance.lance._transactions import operation_name
-
-    if isinstance(operation, LanceOperation.BaseOperation) and operation_name(operation) == "Delete":
-        return
-    refuse_object_store_write(target, "commit")
-
-
 def _commit_hand_built(path: str, operation, read_version: Optional[int], properties: Dict[str, str],
                        max_retries: int, timeout: Optional[float] = None,
                        enable_stable_row_ids: bool = False) -> int:
     """Commit `operation` as Lance's commit_transaction does: check the transactions committed since
     `read_version` (a conflict raises CommitConflictError), apply it to the latest version, and try
     again when another writer takes that version first."""
-    _refuse_commit(path, operation)
     import random
     import time
 
