@@ -131,3 +131,14 @@ scale of the query-to-centroid distance, so float32 rounding leaves an absolute 
 max(2 * dim, the largest distance), and rows may swap only with a row whose distance is that close.
 Matching Lance's SIMD summation order exactly was judged not worth it. Other index kinds' search speed
 unchanged (benchmark searches 0.92x-1.15x, noise).
+
+**R1b outcome (2026-10-20):** done in one Haiku session; reviewed. Every IVF_RQ index pylance 12 writes
+is searched as pylance searches it: num_bits 1 to 9 (1: binary codes only, no gate; pylance accepts 9 and
+its own target test uses it), unpacked codes, cosine and dot (dot through the rotated centroids, as
+Lance's cache does; cosine's query factor measured to be dist(q, c) without Lance's -1, pylance's
+distances equal to 1e-8), skip_transpose, and `stats.index_stats` as pylance reports it. pylance never
+writes the dense rotation or the residual-query estimator (checked over num_bits 1-9, l2 / cosine / dot,
+skip_transpose), so with no oracle they stay refused by name. Reviewer's change: `approx_mode` 'fast' and
+'accurate' change pylance's RQ answers (fast: 1-bit scores without the gate; accurate: another distance
+table) and were ignored here; they are now refused by name on an IVF_RQ index (other kinds ignore
+approx_mode, as pylance does). `tests/test_ivf_rq.py`: 73, five clean runs. Next: R2 (build).

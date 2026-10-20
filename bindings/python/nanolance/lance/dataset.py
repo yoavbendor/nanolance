@@ -2860,6 +2860,13 @@ def _nearest_query(ds, nearest, limit=None) -> dict:
     approx_mode = nearest.get("approx_mode")
     if approx_mode is not None and approx_mode not in ("fast", "normal", "accurate"):
         raise ValueError(f"approx_mode must be one of 'fast', 'normal', or 'accurate', got '{approx_mode}'")
+    if approx_mode in ("fast", "accurate") and nearest.get("use_index", True):
+        # pylance answers an IVF_RQ search differently in these modes (fast: 1-bit scores without the
+        # top-k gate; accurate: another distance table); nanolance has only the normal one, so it refuses
+        # rather than answer the normal way. Other index kinds do not look at approx_mode.
+        if any(i.get("type") == "IVF_RQ" and column in (i.get("fields") or []) for i in ds.list_indices()):
+            raise NotSupportedError(f"approx_mode='{approx_mode}' on an IVF_RQ index is not supported yet "
+                                    "(supported: 'normal')")
     minimum, maximum = nearest.get("minimum_nprobes"), nearest.get("maximum_nprobes")
     refine = nearest.get("refine_factor")
     if k is not None and int(k) <= 0:
@@ -3418,7 +3425,7 @@ def _segment_statistics(ds: "LanceDataset", segment: dict) -> Dict[str, Any]:
             return int(_nanolance._file_info(os.path.join(directory, name))[0])
 
     try:
-        if kind in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ", "IVF_SQ", "IVF_HNSW_PQ", "IVF_HNSW_FLAT"):
+        if kind in ("IVF_FLAT", "IVF_PQ", "IVF_HNSW_SQ", "IVF_SQ", "IVF_HNSW_PQ", "IVF_HNSW_FLAT", "IVF_RQ"):
             return _vector_statistics(ds, segment, directory)
         if kind == "ZoneMap":
             meta = metadata("zonemap.lance")

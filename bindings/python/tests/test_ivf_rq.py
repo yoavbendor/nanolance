@@ -1,7 +1,8 @@
-"""IVF_RQ (RaBitQ): ``nearest=`` answered from pylance-built default IVF_RQ indexes (L2, fast rotation,
-5 bits), against pylance's own answers: the same rows in the same order, distances within 1e-5 relative.
+"""IVF_RQ (RaBitQ): ``nearest=`` answered from pylance-built IVF_RQ indexes, against pylance's own answers:
+the same rows in the same order, distances within the tolerance of ``_same``.
 
-Phase R1a (search). Building IVF_RQ (R2) and the other rotations and bit counts (R1b) are not here.
+Phase R1a: the default index (L2, fast rotation, 5 bits). Phase R1b: every num_bits pylance accepts (1 to 9),
+cosine and dot, skip_transpose, and index_stats. Building IVF_RQ (R2) is not here.
 """
 
 from __future__ import annotations
@@ -133,3 +134,121 @@ def test_deleted_rows(lance, built, tmp_path, key):
                 ref = lance.dataset(path).to_table(nearest=nearest, columns=["id"])
                 got = nl.dataset(path).to_table(nearest=nearest, columns=["id"])
                 _same(ref, got, key[1])
+
+
+# ── R1b: num_bits, cosine and dot, skip_transpose, index statistics ─────────────────────────────
+
+@pytest.fixture(scope="module")
+def variants(lance, tmp_path_factory):
+    """pylance-built IVF_RQ indexes by (seed, dim, partitions, num_bits, metric, skip_transpose)."""
+    root = tmp_path_factory.mktemp("ivf_rq_r1b")
+    cache = {}
+
+    def get(seed, dim, parts, num_bits=5, metric=None, skip=False):
+        key = (seed, dim, parts, num_bits, metric, skip)
+        if key not in cache:
+            path = str(root / ("rq_" + "_".join(str(x) for x in key) + ".lance"))
+            lance.write_dataset(_table(_vectors(dim, seed), dim), path)
+            kwargs = {"num_bits": num_bits, "skip_transpose": skip}
+            if metric is not None:
+                kwargs["metric"] = metric
+            lance.dataset(path).create_index("vec", "IVF_RQ", num_partitions=parts, **kwargs)
+            cache[key] = path
+        return cache[key]
+
+    return get
+
+
+def _compare_all(lance, path, dim, parts, queries, ks=(1, 10, 100)):
+    """Every k, nprobes (1, 2, all) and refine (none, 4) for each query, both engines on one index."""
+    for q in queries:
+        for k in ks:
+            for nprobes in sorted({1, min(2, parts), parts}):
+                for refine in (None, 4):
+                    extra = {"k": k, "nprobes": nprobes}
+                    if refine:
+                        extra["refine_factor"] = refine
+                    nearest = {"column": "vec", "q": q, **extra}
+                    ref = lance.dataset(path).to_table(nearest=nearest, columns=["id"])
+                    got = nl.dataset(path).to_table(nearest=nearest, columns=["id"])
+                    _same(ref, got, dim)
+
+
+@pytest.mark.parametrize("num_bits", list(range(1, 10)))
+def test_num_bits_matches_pylance(lance, variants, num_bits):
+    """num_bits 1 (no extended codes, no top-k gate) to 9 (8 extended bits), dim 64, 2 partitions."""
+    path = variants(0, 64, 2, num_bits=num_bits)
+    _compare_all(lance, path, 64, 2, _queries(_vectors(64, 0), 0))
+
+
+@pytest.mark.parametrize("num_bits", [1, 2, 3, 6, 7, 8, 9])
+def test_num_bits_dim128_many_partitions(lance, variants, num_bits):
+    """The extended layouts for the other widths at dim 128 (two 64-dim blocks), 16 partitions."""
+    path = variants(5, 128, 16, num_bits=num_bits)
+    _compare_all(lance, path, 128, 16, _queries(_vectors(128, 5), 5), ks=(10, 100))
+
+
+@pytest.mark.parametrize("metric", ["cosine", "dot"])
+@pytest.mark.parametrize("num_bits", [1, 5, 9])
+@pytest.mark.parametrize("key", [(0, 64, 2), (5, 128, 16)])
+def test_cosine_and_dot_match_pylance(lance, variants, metric, num_bits, key):
+    seed, dim, parts = key
+    path = variants(seed, dim, parts, num_bits=num_bits, metric=metric)
+    _compare_all(lance, path, dim, parts, _queries(_vectors(dim, seed), seed))
+
+
+@pytest.mark.parametrize("num_bits", [1, 5, 9])
+@pytest.mark.parametrize("key", [(0, 64, 2), (5, 128, 16)])
+def test_skip_transpose_matches_pylance(lance, variants, num_bits, key):
+    """skip_transpose keeps the binary codes row-major; Lance packs them at load, so answers are the same."""
+    seed, dim, parts = key
+    path = variants(seed, dim, parts, num_bits=num_bits, skip=True)
+    _compare_all(lance, path, dim, parts, _queries(_vectors(dim, seed), seed))
+
+
+@pytest.mark.parametrize("flt", ["g = 3", "id < 500"])
+@pytest.mark.parametrize("num_bits", [1, 9])
+def test_filters_and_deletions_for_other_widths(lance, variants, tmp_path, num_bits, flt):
+    path = variants(0, 64, 2, num_bits=num_bits, metric="cosine")
+    q = _queries(_vectors(64, 0), 0)[0]
+    for k in (10, 100):
+        nearest = {"column": "vec", "q": q, "k": k}
+        ref = lance.dataset(path).to_table(nearest=nearest, filter=flt, prefilter=True, columns=["id", "g"])
+        got = nl.dataset(path).to_table(nearest=nearest, filter=flt, prefilter=True, columns=["id", "g"])
+        _same(ref, got, 64)
+    copy = str(tmp_path / "deleted.lance")
+    shutil.copytree(path, copy)
+    lance.dataset(copy).delete("id IN (7, 8, 9) OR g = 2")
+    nearest = {"column": "vec", "q": q, "k": 100, "nprobes": 2}
+    _same(lance.dataset(copy).to_table(nearest=nearest, columns=["id"]),
+          nl.dataset(copy).to_table(nearest=nearest, columns=["id"]), 64)
+
+
+@pytest.mark.parametrize("num_bits, metric, skip", [(1, None, False), (5, "cosine", False), (9, "dot", True)])
+def test_index_stats_match_pylance(lance, variants, num_bits, metric, skip):
+    """stats.index_stats for IVF_RQ: the same dict as pylance reports (sub_index: rotation, code_dim,
+    num_bits, packed, query_estimator, index_type RQ, the sign bits)."""
+    path = variants(0, 64, 2, num_bits=num_bits, metric=metric, skip=skip)
+    name = lance.dataset(path).list_indices()[0]["name"]
+    ref = lance.dataset(path).stats.index_stats(name)
+    got = nl.dataset(path).stats.index_stats(name)
+    assert got == ref
+    sub = got["indices"][0]["sub_index"]
+    assert sub["num_bits"] == num_bits
+    assert sub["packed"] is (not skip)
+    assert sub["query_estimator"] == "raw_query"
+    assert sub["rotation_type"] == "fast"
+
+
+@pytest.mark.parametrize("mode", ["fast", "accurate"])
+def test_other_approx_modes_are_refused(lance, built, mode):
+    """pylance answers an IVF_RQ search differently with approx_mode 'fast' or 'accurate'; nanolance has
+    only the normal mode, so it refuses the others by name rather than answer the normal way."""
+    from nanolance.lance._errors import NotSupportedError
+
+    path = built[SEEDS[0], DIMS[0], PARTS[0]]
+    q = _queries(_vectors(DIMS[0], SEEDS[0]), SEEDS[0])[0]
+    with pytest.raises(NotSupportedError, match="approx_mode"):
+        nl.dataset(path).to_table(nearest={"column": "vec", "q": q, "k": 5, "approx_mode": mode})
+    exact = nl.dataset(path).to_table(nearest={"column": "vec", "q": q, "k": 5, "approx_mode": mode, "use_index": False})
+    assert exact.num_rows == 5
