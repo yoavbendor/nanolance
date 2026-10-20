@@ -238,3 +238,20 @@ filter (a pylance PK merge_insert racing a nanolance update re-runs where Lance 
 update of an indexed column does not prune the racing index build's coverage (results stay correct);
 rewrite_columns merges recorded as RewriteRows; on stable-row-id datasets Append / Update / Merge /
 Overwrite are re-run, not rebased (the old `rebase` kept base-counter row ids: possible duplicates).
+
+**C3 scope, in addition to section 4:**
+- Affected rows: `delete_once` / `update_once` (and merge_insert's delete / update paths) know the row
+  offsets they delete per fragment (`apply_deletions` gets them). Pass them to the commit (a new optional
+  argument of `commit_next_version`, or a field next to `ReadVersion`), so a Delete / Update raced by a
+  Delete / Update on the same fragment with unchanged data files is merged as `finish_delete_update`
+  does: read the latest deletion file of each such fragment, overlap -> retryable with Lance's message
+  (`This {Ours} transaction was preempted by concurrent transaction {Theirs} at version {v} (both
+  modified rows at addresses [...]). Please retry`, up to 5 addresses), else write a merged deletion
+  file (Lance's name and format, as `apply_deletions` writes them) and drop a fragment whose rows are
+  now all deleted. Counter: `rebased`, not `retried`. Two-writer tests: disjoint rows (merged, rows
+  equal pylance's), the same row (retryable -> re-run, rows equal pylance's), all rows of a fragment.
+- Found in the C2 review: a compaction raced by a delete now ends one version later than before (probe
+  `compaction vs delete`: v5, was v4): its ReserveFragments commit rebases over the delete, then the
+  Rewrite is retryable and the re-run reserves again, leaving an empty ReserveFragments version. Make
+  the re-run reuse the reservation it already committed (or not reserve again when the reserved ids are
+  still unused), so the probe ends at v4 again with the same rows.
